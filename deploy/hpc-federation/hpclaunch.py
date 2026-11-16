@@ -23,11 +23,15 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 
 import hpcstate
 from hpcsettings import HpcSettings, Site
-from hpcslurm import Completed, Slurm, Step, allowlist
+from hpcslurm import Completed, Slurm, Step, allowlist, home_env
 
 LOCK = "hpc-federation.lock"  # held around each change of the state file
 LIFECYCLE = ".lifecycle.lock"  # held for a whole up or down: `<root>.lifecycle.lock`, BESIDE the root (lifecycle)
 STEP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
+# Every step's HOME until it makes a private directory of its own: a path under a file, which nobody can make, so a
+# tool reads nothing there and writes nothing anywhere. Not a path on the node's shared tmpfs, which another user could
+# make first and fill (a ~/.curlrc, a git configuration) before the step reads it.
+NO_HOME = "/dev/null/hpcop-home"
 
 
 class StateStore:
@@ -140,7 +144,9 @@ class Launcher:
     def _step(self, node: str, argv: Sequence[str], name: str, kind: str, output: Optional[str] = None) -> Step:
         job, group, component, site = self._where(node, name)
         size = self.settings.control if kind == "control" else self.settings.size(kind)
-        env = allowlist(site.step_path, site.node_tmp)
+        # never the account's home: none at all, until the bundle's scripts point it into the service's own work
+        # directory on the node's tmpfs, once they know it (lib.sh, home_in)
+        env = allowlist(site.step_path, site.node_tmp, home_env(NO_HOME))
         return Step(job, node, name, size.cpus, size.memory_mib, env, tuple(argv), output, group, component)
 
     def control(self, node: str, argv: Sequence[str], *, name: str, timeout_s: float) -> Completed:

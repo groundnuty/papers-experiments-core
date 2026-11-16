@@ -152,8 +152,14 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
 - **The environment is an allowlist**, set on the node by `env -i`, so neither the login environment (srun passes it
   otherwise) nor a site task prolog decides it: `PATH` (`HPC_STEP_PATH` from `site.env`, by default
   `/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin`: the site's nodes keep `ss` in `/usr/sbin`, and the first
-  live zone step, without it, failed in its first second), `LC_ALL=C`, and
-  `TMPDIR=<node tmpfs>` (`HPC_NODE_TMP`, default `/tmp`). Nothing else, and never a secret. The bundle's helpers
+  live zone step, without it, failed in its first second), `LC_ALL=C`, `TMPDIR=<node tmpfs>` (`HPC_NODE_TMP`, default
+  `/tmp`), and **no home** (`hpcslurm.home_env`): with `HOME` unset many tools take the passwd entry's home, which
+  every job and agent of the account shares, so `HOME`, the XDG base directories, Apptainer's configuration and cache
+  (`APPTAINER_CONFIGDIR`, `APPTAINER_CACHEDIR`) and uv's and pip's caches name a path below `/dev/null`, which nobody
+  can make (a path on the shared tmpfs another user could make first, and fill), with `PYTHONNOUSERSITE=1`,
+  `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`. A service's scripts point every one of them into its own
+  work directory once they have it (`lib.sh`'s `home_in`, made 0700 there, gone with it), before Apptainer runs; a
+  shard step's dispatcher gets them in the step's own directory (`shards.py step`). Nothing else, and never a secret. The bundle's helpers
   then run on the first `python3.11` on that `PATH` (`lib.sh`'s default `HPCOP_PY`), which must be the node's own:
   `supervise.py`, which holds every service, needs `os.pidfd_open`, which uv's standalone Python lacks. Only the core's
   step (`HPC_CORE_PYTHON`) runs a venv's Python.

@@ -138,7 +138,30 @@ def test_service_steps_and_control_steps_are_exact_and_sized_by_the_layout(hpc, 
     controls = [s for s in rig.fake.sruns if s not in rig.fake.spawned]
     assert controls
     assert {(s.cpus, s.mem) for s in controls} == {(1, "1024M")}
-    assert {tuple(s.env) for s in rig.fake.sruns} == {("PATH=/usr/bin:/bin", "LC_ALL=C", "TMPDIR=/tmp")}
+    homeless = tuple(f"{k}={v}" for k, v in hpc.slurm.home_env(hpc.launch.NO_HOME).items())
+    assert {tuple(s.env) for s in rig.fake.sruns} == {("PATH=/usr/bin:/bin", "LC_ALL=C", "TMPDIR=/tmp", *homeless)}
+
+
+HOME_NAMES = ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPTAINER_CONFIGDIR",
+              "APPTAINER_CACHEDIR", "UV_CACHE_DIR", "PIP_CACHE_DIR")  # fmt: skip
+
+
+def test_o57_no_step_of_up_or_down_can_fall_back_to_the_accounts_home(hpc, tmp_path, site):
+    """O57: with env -i and HOME unset, many tools take the passwd entry's home, which every job and agent of the
+    account shares. Every step of up and down, control and service, names HOME, the XDG base directories, Apptainer's,
+    uv's and pip's directories under a path nobody can make (below /dev/null, not a path of the shared tmpfs another
+    user could make first), Python's user site off and no git configuration; nothing else joins the allowlist."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    rig.driver.down()
+    assert rig.fake.spawned
+    for srun in rig.fake.sruns:
+        env = dict(word.split("=", 1) for word in srun.env)
+        assert set(env) == {"PATH", "LC_ALL", "TMPDIR", *HOME_NAMES, "PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL",
+                            "GIT_CONFIG_NOSYSTEM"}, srun.name  # fmt: skip
+        assert all(env[name].startswith("/dev/null/") for name in HOME_NAMES), srun.name
+        flags = [env[n] for n in ("PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")]
+        assert flags == ["1", "/dev/null", "1"], srun.name
 
 
 def test_each_provider_is_registered_by_a_token_piped_from_the_zone_before_its_verdict(hpc, tmp_path, site):

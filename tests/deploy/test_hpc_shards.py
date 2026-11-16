@@ -80,12 +80,68 @@ def test_the_step_line_is_an_exact_step_on_the_sandbox_node_with_the_allowlist_a
     assert "--overlap" not in line
     assert line[line.index("-w") + 1] == "node-s2"
     at = line.index("-i") + 1
-    env = line[at : at + 4]
-    assert [e.split("=")[0] for e in env] == ["PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT"]
+    homeless = [f"{k}={v}" for k, v in shards.home_env(shards.NO_HOME).items()]
+    env = line[at : at + 4 + len(homeless)]
+    assert [e.split("=")[0] for e in env[:4]] == ["PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT"]
     assert env[3] == f"EXPCORE_FED_ROOT={shard.root}"
-    assert line[at + 4 : at + 7] == [plan.python, "-I", str(SCRIPT)]
+    assert env[4:] == homeless
+    assert line[at + len(env) : at + len(env) + 3] == [plan.python, "-I", str(SCRIPT)]
     assert line[line.index("--index") + 1 : line.index("--index") + 2] == ["2"]
     assert line[line.index("--label") + 1] == "fed-b"
+
+
+def test_o57_the_step_line_sends_no_home_and_the_dispatcher_one_in_the_steps_own_directory(shards, tmp_path):
+    """O57: no tool of a shard step may fall back to the account's home, which every job and agent of the account
+    shares: the step's line points HOME, the XDG base directories, Apptainer's, uv's and pip's directories under a path
+    nobody can make, with Python's user site off and no git configuration; the dispatcher (the agent's cells) gets every
+    one of them in the step's own private directory on the node's tmpfs."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    line = shards.step_argv(plan, plan.shards[0], shards.federation(plan.shards[0]), SCRIPT)
+    words = dict(w.split("=", 1) for w in line[line.index("-i") + 1 :] if "=" in w and w.split("=")[0].isupper())
+    names = ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPTAINER_CONFIGDIR",
+             "APPTAINER_CACHEDIR", "UV_CACHE_DIR", "PIP_CACHE_DIR")  # fmt: skip
+    assert all(words[name].startswith("/dev/null/") for name in names)
+    flags = ("PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")
+    assert [words[name] for name in flags] == ["1", "/dev/null", "1"]
+    run, seen = _dispatcher()
+    seen_dirs = {}
+
+    def looking(argv, env, cwd):  # the caches are made by their tools, inside the home made here
+        seen_dirs.update({name: Path(env[name]).is_dir() for name in names if not name.endswith("_CACHE_DIR")})
+        return run(argv, env, cwd)
+
+    assert shards.step(_step_args(tmp_path), runner=looking, core_found=lambda path: True) == 0
+    home = Path(seen["env"]["HOME"])
+    assert home.parent.parent == tmp_path / "tmpfs"  # <tmpfs>/expcore-shard-<label>.<random>/home
+    assert all(seen["env"][name] == str(home) or seen["env"][name].startswith(f"{home}/") for name in names)
+    assert (seen["env"]["PYTHONNOUSERSITE"], seen["env"]["GIT_CONFIG_GLOBAL"]) == ("1", "/dev/null")
+    assert seen_dirs
+    assert all(seen_dirs.values())  # made, private to the step, before the dispatcher starts
+    assert hpc_home_env("/h") == shards.home_env("/h")
+    assert hpc_launch_no_home() == shards.NO_HOME
+
+
+def _deploy_module(name: str):
+    """A module of deploy/hpc-federation loaded by its path, as this file loads shards.py, its imports beside it."""
+    spec = importlib.util.spec_from_file_location(f"hpc_{name}_for_shards", SCRIPT.parent / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return module
+
+
+def hpc_home_env(home: str) -> dict:
+    """The launcher's own home_env (hpcslurm.py), which shards.py keeps a copy of."""
+    return _deploy_module("hpcslurm").home_env(home)
+
+
+def hpc_launch_no_home() -> str:
+    """hpclaunch.NO_HOME, read from its source: the module imports the driver's others by their plain names."""
+    text = (SCRIPT.parent / "hpclaunch.py").read_text(encoding="utf-8")
+    return text.split('NO_HOME = "', 1)[1].split('"', 1)[0]
 
 
 def test_a_federation_whose_state_names_no_held_job_is_refused(shards, tmp_path):

@@ -143,10 +143,12 @@ def test_o59_each_owner_is_given_its_tree_after_the_peers_and_a_mirror_that_owns
 
 def test_o59_the_import_arguments_are_the_only_place_a_tree_path_travels(hpc, tmp_path, site, environ):
     """O59: the node's environment is an allowlist that never carries the variables: every step's `env -i` list is the
-    same three names, and a tree's path is in a provider.sbatch argument alone, never in a control step."""
+    same, three names and no home (O57), and a tree's path is in a provider.sbatch argument alone, never in a control
+    step."""
     rig = Rig(hpc, tmp_path, site, environ)
     rig.up()
-    assert {tuple(s.env) for s in rig.fake.sruns} == {("PATH=/usr/bin:/bin", "LC_ALL=C", "TMPDIR=/tmp")}
+    homeless = tuple(f"{k}={v}" for k, v in hpc.slurm.home_env(hpc.launch.NO_HOME).items())
+    assert {tuple(s.env) for s in rig.fake.sruns} == {("PATH=/usr/bin:/bin", "LC_ALL=C", "TMPDIR=/tmp", *homeless)}
     paths = [tree_of(environ, space) for space in SPACES]
     with_path = [s for s in rig.fake.sruns if any(p in " ".join(s.command) for p in paths)]
     assert with_path == [s for s in rig.fake.spawned if s.command[1].endswith("provider.sbatch")][1:]  # the owners

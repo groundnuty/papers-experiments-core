@@ -297,6 +297,28 @@ class Step:
         ]
 
 
+def home_env(home: str) -> Dict[str, str]:
+    """A step's own home, so that no tool of a step falls back to the account's home, which every job and agent of the
+    account shares (with HOME unset, many tools take the passwd entry's): HOME, the XDG base directories, Apptainer's
+    configuration and cache, uv's and pip's caches, all under `home`; Python's user site off; git's global and system
+    configuration none. The launcher names a path nobody can make (`hpclaunch.NO_HOME`); a step that makes a private
+    directory of its own on the node's tmpfs points them into it (`lib.sh`'s home_in, `shards.py step`)."""
+    return {
+        "HOME": home,
+        "XDG_CONFIG_HOME": f"{home}/.config",
+        "XDG_CACHE_HOME": f"{home}/.cache",
+        "XDG_DATA_HOME": f"{home}/.local/share",
+        "XDG_STATE_HOME": f"{home}/.local/state",
+        "APPTAINER_CONFIGDIR": f"{home}/.apptainer",
+        "APPTAINER_CACHEDIR": f"{home}/.apptainer/cache",
+        "UV_CACHE_DIR": f"{home}/.cache/uv",
+        "PIP_CACHE_DIR": f"{home}/.cache/pip",
+        "PYTHONNOUSERSITE": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+
+
 def allowlist(step_path: str, node_tmp: str, extra: Mapping[str, str] = {}) -> Tuple[str, ...]:
     """The whole environment of a step: PATH, the C locale, TMPDIR on the node's tmpfs (never Slurm's per-job
     TMPDIR, a link into a shared filesystem on the site), and any extra the caller names. Never a secret."""

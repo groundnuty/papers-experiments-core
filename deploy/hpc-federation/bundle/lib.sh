@@ -49,6 +49,20 @@ need_tools() {
   for t in "$@"; do command -v -- "$t" > /dev/null 2>&1 || missing+=("$t"); done
   (( ${#missing[@]} == 0 )) || die "not found on PATH ($PATH): ${missing[*]}; HPC_STEP_PATH must name the directories that hold them"
 }
+# <work directory>: this step's home, made private in the work directory, and every variable the driver's allowlist
+# points at no home at all (hpcslurm.home_env: HOME, the XDG base directories, Apptainer's configuration and cache, uv's
+# and pip's caches, Python's user site off, no git configuration) pointed into it, exported for every child. So no
+# tool of a service falls back to the account's home, which every job and agent of the account shares; the home goes
+# with the work directory.
+home_in() {
+  local h=$1/home
+  install -d -m 700 -- "$h" "$h/.config" "$h/.cache" "$h/.local" "$h/.local/share" "$h/.local/state" \
+    "$h/.apptainer" "$h/.apptainer/cache"
+  export HOME=$h XDG_CONFIG_HOME=$h/.config XDG_CACHE_HOME=$h/.cache XDG_DATA_HOME=$h/.local/share \
+    XDG_STATE_HOME=$h/.local/state APPTAINER_CONFIGDIR=$h/.apptainer APPTAINER_CACHEDIR=$h/.apptainer/cache \
+    UV_CACHE_DIR=$h/.cache/uv PIP_CACHE_DIR=$h/.cache/pip PYTHONNOUSERSITE=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_NOSYSTEM=1
+}
 
 # The job's TMPDIR, decided once, here, in the shell that sources this file, before any work directory is
 # made or removed. Some sites set the per-job TMPDIR to a link into a shared parallel filesystem (seen live:
@@ -505,6 +519,7 @@ run_service() {  # <workdir>: become the service (apptainer exec) in the foregro
   # Seconds before the bind, not minutes (node-init checked too, before the untar).
   if [[ ${HPCOP_SKIP_PORTCHECK:-0} == 1 ]]; then say "port check skipped (offline test)"; else ports_free "$COMP" "$epmd"; fi
   install -d -m 700 -- "$W/work"
+  home_in "$W"   # apptainer's configuration and cache, and every other tool's, in the work directory: never ~
   b=$(import_binds "$W") || die "the shared imported trees of $W cannot be bound (see above): the service is not started"
   if [[ -n $b ]]; then mapfile -t binds <<<"$b"; fi
   "$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" check || die "$HPCOP_PY cannot use pidfds, which the service's stop needs"

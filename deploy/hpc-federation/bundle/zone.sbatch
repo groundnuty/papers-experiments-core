@@ -30,6 +30,7 @@ TAR=$1 NAME=$2; shift 2
 
 export HPCOP_OWNER_PID=$$   # node-init.sh records this batch script as the owner of the work directory
 W=$(bash "$B/node-init.sh" oz "$TAR")
+home_in "$W"   # every child's HOME, caches and Apptainer's directories in the work directory, never the account's ~
 svc='' svc_start=''
 cleanup() {
   if kept_stop "$W"; then   # teardown.sh --keep (hpcfed.py stop): stop what still runs, remove nothing

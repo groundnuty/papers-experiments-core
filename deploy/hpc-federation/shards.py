@@ -18,7 +18,10 @@ state file's `sandbox` record's: a component of the federation's heterogeneous j
 (`separate`). Nothing here runs srun.
 
 **How it reaches its federation.** The step's environment is an allowlist: `PATH`, `LC_ALL`, and the federation's
-`EXPCORE_FED_ROOT_PARENT` and `EXPCORE_FED_ROOT`. `step` copies the federation's `<root>/platform.toml`, where its
+`EXPCORE_FED_ROOT_PARENT` and `EXPCORE_FED_ROOT`, and no home: `HOME`, the XDG base directories, Apptainer's, uv's and
+pip's directories under a path nobody can make, Python's user site off and no git configuration (`home_env`), so no
+tool falls back to the account's home, which every job and agent of the account shares. The dispatcher's are in the
+step's own directory on the tmpfs, made private there. `step` copies the federation's `<root>/platform.toml`, where its
 `up` rendered it with every path absolute into the root (secrets, CA, fault journal) on the filesystem the nodes see,
 into its copy of the study beside `study.toml`, where the study's plugin loads it: a copy, never a link out of the
 study, and never a path of the federation's in `study.toml`, whose bytes and hash are every shard's. A study that holds
@@ -145,6 +148,32 @@ OWNER_STATUS = ".step.status.json"  # the same with the dispatcher's exit status
 RUNNING, ARCHIVING = "running", "archiving"  # the step's phase: its dispatcher runs; it ended and out/ is whole
 ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not be archived, so it is kept
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
+
+
+# The step's HOME, and every directory a tool writes under one, until it has made its directory on the tmpfs: a path
+# under a file, which nobody can make (`hpclaunch.NO_HOME`); the dispatcher's are in that directory (`step`).
+NO_HOME = "/dev/null/hpcop-home"
+HOME_DIRS = (".config", ".cache", ".local", ".local/share", ".local/state", ".apptainer", ".apptainer/cache")
+
+
+def home_env(home: str) -> dict[str, str]:
+    """A step's own home, so that no tool falls back to the account's home, which every job and agent of the account
+    shares: as `hpcslurm.home_env` gives it (this file runs on a node by itself, so it keeps its own copy; a test
+    compares the two)."""
+    return {
+        "HOME": home,
+        "XDG_CONFIG_HOME": f"{home}/.config",
+        "XDG_CACHE_HOME": f"{home}/.cache",
+        "XDG_DATA_HOME": f"{home}/.local/share",
+        "XDG_STATE_HOME": f"{home}/.local/state",
+        "APPTAINER_CONFIGDIR": f"{home}/.apptainer",
+        "APPTAINER_CACHEDIR": f"{home}/.apptainer/cache",
+        "UV_CACHE_DIR": f"{home}/.cache/uv",
+        "PIP_CACHE_DIR": f"{home}/.cache/pip",
+        "PYTHONNOUSERSITE": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
 
 
 class ShardsError(Exception):
@@ -300,7 +329,7 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
     """The login node's `srun` of one shard's step (the module's docstring): `--exact`, never `--overlap`; an
     environment of the allowlist alone, set on the node by `env -i`, with no secret in it."""
     env = [f"PATH={plan.step_path}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={shard.root.parent}",
-           f"EXPCORE_FED_ROOT={shard.root}"]  # fmt: skip
+           f"EXPCORE_FED_ROOT={shard.root}", *(f"{k}={v}" for k, v in home_env(NO_HOME).items())]  # fmt: skip
     step = [plan.python, "-I", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
             "--results", str(plan.results), "--core-src", str(plan.core_src),
@@ -952,10 +981,10 @@ def step(
             (copy / PLATFORM).chmod(0o600)
         if args.resume:
             resume_into(args, spec, base, work, copy / "out")
-        for name in ("home", "tmp"):
+        for name in ("home", "tmp", *(f"home/{sub}" for sub in HOME_DIRS)):
             (work / name).mkdir(mode=0o700)
         env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
-        env |= {"HOME": str(work / "home"), "TMPDIR": str(work / "tmp")}
+        env |= {**home_env(str(work / "home")), "TMPDIR": str(work / "tmp")}  # never the account's ~
         journals = args.results / args.label / JOURNALS
         journals.mkdir(parents=True, exist_ok=True)
         journal = journals / f"{_stamp()}-{os.getpid()}-{secrets.token_hex(4)}.jsonl"

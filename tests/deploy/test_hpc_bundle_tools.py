@@ -8,6 +8,7 @@ whose `ss` fails, or prints listeners as the real one does."""
 import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -108,6 +109,34 @@ def test_a_listing_that_ss_gave_is_read_as_before(tmp_path, working_ss):
     done = run(working_ss, tmp_path, "ports_free oz && echo passed")
     assert done.stdout == "passed\n"
     assert "ok: ports free" in done.stderr
+
+
+def test_o57_home_in_points_every_home_a_tool_uses_into_the_work_directory_made_private(tmp_path):
+    """O57: a service's scripts never fall back to the account's home: home_in makes `<work>/home` and the directories
+    under it (0700) and exports HOME, the XDG base directories, Apptainer's configuration and cache, uv's and pip's
+    caches there, Python's user site off and no git configuration, for every child (apptainer among them)."""
+    work = tmp_path / "work"
+    work.mkdir(mode=0o700)
+    names = ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPTAINER_CONFIGDIR",
+             "APPTAINER_CACHEDIR", "UV_CACHE_DIR", "PIP_CACHE_DIR", "PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL",
+             "GIT_CONFIG_NOSYSTEM")  # fmt: skip
+    shown = " ".join(f'"{name}=${{{name}}}"' for name in names)
+    linked = bin_dir(tmp_path / "more", None)
+    (linked / "install").symlink_to(shutil.which("install"))
+    (linked / "env").symlink_to(shutil.which("env"))
+    done = run(linked, tmp_path, f'home_in "{work}"; env -i {shown} env')  # what a child of the script sees
+    assert done.returncode == 0, done.stderr
+    env = dict(line.split("=", 1) for line in done.stdout.splitlines())
+    home = work / "home"
+    assert env["HOME"] == str(home)
+    for name in names[1:9]:
+        assert env[name].startswith(f"{home}/"), name
+    assert (env["PYTHONNOUSERSITE"], env["GIT_CONFIG_GLOBAL"], env["GIT_CONFIG_NOSYSTEM"]) == ("1", "/dev/null", "1")
+    for name in names[:7]:
+        path = Path(env[name])
+        assert path.is_dir(), name
+        assert not path.is_symlink(), name
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700, name
 
 
 def test_node_init_names_a_missing_ss_before_it_makes_anything(tmp_path, no_ss):
