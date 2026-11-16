@@ -46,6 +46,7 @@ from expcore_onedata.provision import Provisioner, resolve_provider_ids  # noqa:
 from expcore_onedata.rangemap import load_placement  # noqa: E402
 from expcore_onedata.reset import STAGES, ResetFailed, SpaceReset  # noqa: E402
 from expcore_onedata.storageimport import ImportedSpace, ImportFailed, SpaceCheck, manifest_of_tree  # noqa: E402
+from expcore_onedata.tool_admission import shared_admission  # noqa: E402
 
 PLATFORM = Path(os.environ["EXPCORE_LIVE_PLATFORM"])
 TREE = Path(os.environ["EXPCORE_LIVE_IMPORT_TREE"])
@@ -116,7 +117,7 @@ def pair(tmp_path_factory):
         mirrors = [p for p in every if p != imp.settings.holder]
         try:  # the mirrors hold no replica of the imported copy after the module, whatever ran: recorded, not asserted
             plan = {mirror: top_paths(manifest) for mirror in mirrors}
-            FACTS["imported_final_reset_ok"] = SpaceReset(imp).run(plan)["ok"]
+            FACTS["imported_final_reset_ok"] = held_reset(imp, plan)["ok"]
         except ResetFailed as failed:
             FACTS["imported_final_reset_ok"] = False
             FACTS["imported_final_reset_stage"] = failed.stage
@@ -161,6 +162,13 @@ def emptied(provisioner, path: str, file_id: str, mirror: str) -> None:
     """Evict a file from a mirror and require its block map there empty, so what a test places next is its own."""
     assert provisioner.evict(path, mirror)["empty"] is True
     assert provisioner.holds(mirror, [file_id], retry=provisioner.retry) == 0
+
+
+def held_reset(provisioner, plan) -> dict:
+    """The space's reset under the tools' shared admission: every reset holds the federation's reset lock (O66), and
+    on a platform with `[faults]` it takes it only under an admission."""
+    with shared_admission(provisioner.config, reason="live: the imported space's reset"):
+        return SpaceReset(provisioner).run(plan)
 
 
 def settled_blocks(provisioner, file_id: str, provider: str) -> list:
@@ -310,7 +318,7 @@ def test_o41_the_reset_evicts_and_verifies_both_copies_alike(pair):
             provisioner.replicate(small, mirror)
             provisioner.fetch(mirror, listed[path].file_id, 0, 1)
             settled_blocks(provisioner, listed[path].file_id, mirror)  # the eviction has bytes to remove
-        record = SpaceReset(provisioner).run({mirror: tops(pair) for mirror in pair["mirrors"]})
+        record = held_reset(provisioner, {mirror: tops(pair) for mirror in pair["mirrors"]})
         assert record["ok"] is True
         stages.append([stage for stage in STAGES if record["stages"][stage]["ok"]])
         for mirror in pair["mirrors"]:
@@ -338,7 +346,7 @@ def test_o41_a_qos_requirement_is_fulfilled_and_viewed_alike_in_both_copies(pair
         )
         summary = provisioner.client.get(f"/data/{file_id}/qos/summary", provider=holder)
         views.append((fulfilled.converged, sorted(fulfilled.value or {}), qid in summary.get("requirements", {})))
-        reset = SpaceReset(provisioner).run({mirror: tops(pair) for mirror in pair["mirrors"]})  # whatever ran before
+        reset = held_reset(provisioner, {mirror: tops(pair) for mirror in pair["mirrors"]})  # whatever ran before
         assert reset["stages"]["qos"]["removed"] >= 1
     FACTS["qos_views"] = views
     assert views[0] == views[1]
