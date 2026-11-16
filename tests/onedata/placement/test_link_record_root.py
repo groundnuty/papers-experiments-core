@@ -8,6 +8,7 @@ root's record, and nothing lands beside the derived file. A check run without `[
 nothing. A `[faults] journal` whose parent holds no `platform.toml` is refused at load.
 """
 
+import contextlib
 import json
 from functools import partial
 
@@ -15,6 +16,7 @@ import pytest
 from fault_support import SERVICES, faults_table
 from link_support import BOUND_S, GAMMA_ID, add_providers, three_providers
 
+from expcore.campaign import prerun
 from expcore.config.loading import ConfigError
 from expcore_onedata import fault_serves, health, linkcheck
 from expcore_onedata.client import OnezoneClient
@@ -23,7 +25,7 @@ from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import load_faults
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.linkcheck import check_links
-from expcore_onedata.linkrecord import LOCK, RECORD, record_text
+from expcore_onedata.linkrecord import LINK_RECORD_NOTE, LOCK, RECORD, record_text
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, write_platform
 from expcore_onedata.testing.world import with_link_check
 from expcore_onedata.tokens import TokenIssuer
@@ -155,6 +157,54 @@ def test_o35_a_routine_check_that_raises_removes_the_older_record(root, fake, ti
     assert not verdict.ok
     assert "RuntimeError" in verdict.detail
     assert not (root / RECORD).exists()
+
+
+def test_o35_a_routine_check_whose_record_was_written_says_nothing_of_it(root, fake, ticker):
+    """O35: the fact is absent when the record was written as it always was: the gate holds none and the try's note,
+    which the run's own admission and executor read, has no such key."""
+    gate = health_through(root / "platform.toml", fake, ticker)
+    with prerun.opened() as note:
+        assert gate().ok
+    assert gate.link_record is None
+    assert LINK_RECORD_NOTE not in note
+
+
+def test_o35_a_routine_check_that_cannot_take_the_lock_says_so_to_the_run_whose_check_it_was(
+    root, fake, ticker, monkeypatch
+):
+    """O35: a routine check whose record lock could not be taken writes no record, and the run whose pre-run check it
+    was learns it from more than a log line: the try's note holds `link_record: "not_written"` with the reason
+    `lock_not_taken` (what an executor reads, with `prerun.current()`, to put it in the run's record), and the gate's
+    `link_record` holds it for the latest check. The verdict is the check's, as ever."""
+
+    @contextlib.contextmanager
+    def unlocked(path):
+        yield False
+
+    monkeypatch.setattr(fault_serves, "recording", unlocked)
+    gate = health_through(root / "platform.toml", fake, ticker)
+    with prerun.opened() as note:
+        verdict = gate()
+    assert verdict.ok, verdict.detail
+    said = {"link_record": "not_written", "link_record_reason": "lock_not_taken"}
+    assert note[LINK_RECORD_NOTE] == said
+    assert gate.link_record == said
+    assert not (root / RECORD).exists()
+
+
+def test_o35_a_routine_check_whose_record_cannot_be_written_says_write_failed(root, fake, ticker, monkeypatch):
+    """O35: the lock taken and the write refused is the other reason, `write_failed`, a fixed word."""
+
+    def refused(report, path):
+        raise PermissionError(13, "read-only file system")
+
+    monkeypatch.setattr(fault_serves, "write_record", refused)
+    gate = health_through(root / "platform.toml", fake, ticker)
+    with prerun.opened() as note:
+        verdict = gate()
+    assert verdict.ok, verdict.detail
+    assert note[LINK_RECORD_NOTE] == {"link_record": "not_written", "link_record_reason": "write_failed"}
+    assert gate.link_record == note[LINK_RECORD_NOTE]
 
 
 def test_o35_a_restore_check_through_a_derived_file_writes_the_roots_record_and_nothing_beside_the_derived_file(

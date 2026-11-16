@@ -36,6 +36,12 @@ start failed in settling an injection an earlier run left open (the injector's `
 such step and an injection open in the journal, or a journal that cannot be read. `not_injected` is only a start that
 failed before anything was journalled, with nothing open. The provider is named by its label and an identity by its
 digest, as the injector names them (O12).
+
+**A link check whose record was not written is a fact of the restore (O35).** A restore's link check, and each read of
+the pairs a heal makes, write `link-check.json`, and one that could not be serialized or written leaves none. When the
+injector's snapshot says so (`link_record: "not_written"` with `link_record_reason`, `lock_not_taken` or
+`write_failed`), `restored`'s facts hold the same two keys, and the day-0 report shows them as one line each in the
+check's facts. Neither key is there when every record was written.
 """
 
 import asyncio
@@ -48,6 +54,7 @@ from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.faults import FaultInjector
+from expcore_onedata.linkrecord import NOT_WRITTEN, fact
 
 RESTORED = ("restored", "found_restored")  # the injector's ways of a verified restore
 LEFT_OPEN = "earlier_injection_open"  # a start's recovery of an earlier injection failed or left it open
@@ -169,6 +176,8 @@ class Outage:
         if verified and verified.get("ready_after_s") is not None:
             facts["ready_after_s"] = verified["ready_after_s"]  # from the identity change to serving
         facts["journal_steps"] = [step["step"] for step in snapshot["steps"]]
+        if snapshot.get("link_record") == NOT_WRITTEN:  # a link check's record was not written (O35)
+            facts.update(fact(str(snapshot["link_record_reason"])))
         return facts
 
     def left_open(self, steps: list[Mapping[str, Any]]) -> list[dict[str, Any]]:

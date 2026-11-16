@@ -58,6 +58,15 @@ journal too).
 **The record is advisory.** The federation's link epoch (`fault_epoch`) and the gate's heal journal are what a run's
 admission compares (`admission_recheck`); the record is read by no admission and lives in the root, not in the fault
 journal's directory. Writing it never raises or lowers the epoch.
+
+**A record that was not written is a fact of the run, not only a log line.** A check that could not be serialized (the
+lock not taken) or whose record could not be written leaves no record, and the older one is removed
+(`fault_serves.recorded`). The report it answers with says so (`LinkReport.not_written`: `LOCK_NOT_TAKEN` or
+`WRITE_FAILED`, fixed words that hold no path and no error text), and that reaches the record of the run whose restore,
+heal or routine check it was, as an optional fact, `link_record: "not_written"` with `link_record_reason` (`fact`):
+the fault injector's snapshot for a restore and for a heal (`faults`), the heal's own matrices, the try's note for a
+routine check (`LINK_RECORD_NOTE`, `health.PlatformHealth.link_record`). It is absent, never null, when the record was
+written. It is never part of the record file, whose bytes stay what `up` always wrote.
 """
 
 import contextlib
@@ -73,10 +82,15 @@ from typing import Any
 from expcore_onedata.fault_journal import _fsync_directory
 
 __all__ = [
+    "LINK_RECORD_NOTE",
     "LOCK",
+    "LOCK_NOT_TAKEN",
+    "NOT_WRITTEN",
     "RECORD",
     "ROOT_FILE",
+    "WRITE_FAILED",
     "discard_record",
+    "fact",
     "federation_root",
     "record_path",
     "record_text",
@@ -87,6 +101,17 @@ __all__ = [
 RECORD = "link-check.json"  # in the federation's root, beside facts.json and platform.toml
 LOCK = "link-check.lock"  # beside the record: held exclusively around a check and the writing of its record
 ROOT_FILE = "platform.toml"  # what a federation's root holds: `up` renders it there (`fedlayout.Layout.platform`)
+NOT_WRITTEN = "not_written"  # the value of a run's `link_record` fact: the check's record was not written
+LOCK_NOT_TAKEN = "lock_not_taken"  # why: the check could not be serialized, so its verdict was published by no one
+WRITE_FAILED = "write_failed"  # why: the lock was taken and the record could not be written
+LINK_RECORD_NOTE = "link_record"  # the try's note (`expcore.campaign.prerun`) a routine check that wrote none leaves
+
+
+def fact(reason: str) -> dict[str, str]:
+    """The optional fact a run's record holds for a check whose record was not written: `link_record` is
+    `NOT_WRITTEN` and `link_record_reason` is `reason` (`LOCK_NOT_TAKEN` or `WRITE_FAILED`). A check that wrote its
+    record has no such fact, and its readings hold neither key."""
+    return {"link_record": NOT_WRITTEN, "link_record_reason": reason}
 
 
 def federation_root(journal: Path) -> Path:

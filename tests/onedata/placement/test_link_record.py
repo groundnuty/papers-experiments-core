@@ -276,3 +276,49 @@ def test_o35_the_file_is_the_record_text_of_the_report_the_check_made(tmp_path, 
     serves.matrix(SERVICE)
     (report,) = made
     assert (tmp_path / RECORD).read_text(encoding="utf-8") == record_text(report)
+
+
+# --- a record that was not written is said in the run's facts, not only in the log -----------------------------------
+
+
+def test_o35_a_check_whose_record_was_written_says_nothing_of_it(serves):
+    """O35: the optional fact is absent, not null, when the record was written as it always was: the matrix's JSON,
+    which the heal's record and the injector's snapshot hold, is the one it always was."""
+    matrix = serves.matrix(SERVICE)
+    assert matrix is not None
+    assert matrix.not_written is None
+    assert "link_record" not in matrix.to_json()
+    assert "link_record_reason" not in matrix.to_json()
+
+
+def test_o35_a_check_that_cannot_take_the_lock_says_lock_not_taken_in_its_matrix(serves, monkeypatch):
+    """O35: the log line is not the run's record: a check whose record lock could not be taken (so nothing was written)
+    answers with its matrix saying `link_record: "not_written"` and why, `lock_not_taken`, which no other check does."""
+
+    @contextlib.contextmanager
+    def unlocked(path):
+        yield False
+
+    monkeypatch.setattr(fault_serves, "recording", unlocked)
+    matrix = serves.matrix(SERVICE)
+    assert matrix is not None
+    assert matrix.ok
+    reading = matrix.to_json()
+    assert reading["link_record"] == "not_written"
+    assert reading["link_record_reason"] == "lock_not_taken"
+
+
+def test_o35_a_record_that_cannot_be_written_says_write_failed_in_its_matrix(tmp_path, serves, monkeypatch):
+    """O35: the lock was taken and the write refused: the matrix says `not_written` with the reason `write_failed`, a
+    fixed word that holds no path and no error text, and the check's own answer is as made."""
+
+    def refused(report, path):
+        raise PermissionError(13, f"read-only file system: {tmp_path}")
+
+    monkeypatch.setattr(fault_serves, "write_record", refused)
+    matrix = serves.matrix(SERVICE)
+    assert matrix is not None
+    assert matrix.ok
+    reading = matrix.to_json()
+    assert (reading["link_record"], reading["link_record_reason"]) == ("not_written", "write_failed")
+    assert str(tmp_path) not in json.dumps(reading)
