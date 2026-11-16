@@ -184,7 +184,7 @@ def test_the_run_mount_and_proc_devices_come_from_the_hosts_table():
 def test_a_protected_directory_resolves_to_its_device_and_its_path_in_its_file_system(tmp_path):
     with open("/proc/self/mountinfo", encoding="utf-8") as stream:
         mountinfo = stream.read()
-    found = MP.resolve(str(tmp_path), mountinfo)
+    found = MP.protected_at(str(tmp_path), mountinfo)
     info = os.stat(tmp_path)
     assert found.dev == f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}"
     assert found.fs_path is not None
@@ -192,7 +192,7 @@ def test_a_protected_directory_resolves_to_its_device_and_its_path_in_its_file_s
 
 
 def test_a_directory_on_no_mount_of_the_table_is_unresolved(tmp_path):
-    assert MP.resolve(str(tmp_path), table(("9:9", "/", "/", "ext4"))) == MP.Protected(None, None)
+    assert MP.protected_at(str(tmp_path), table(("9:9", "/", "/", "ext4"))) == MP.Protected(None, None)
 
 
 def test_a_cell_first_seen_before_its_mounts_are_made_is_proved_once_they_are():

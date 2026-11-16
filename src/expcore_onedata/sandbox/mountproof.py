@@ -136,7 +136,7 @@ def start_time(stat_text: str) -> int | None:
     return int(fields[19]) if len(fields) > 19 and fields[19].isdigit() else None
 
 
-def resolve(path: str, host_mountinfo: str) -> Protected:
+def protected_at(path: str, host_mountinfo: str) -> Protected:
     """A protected directory's device and its path inside its file system, from the host's mount table: the mount whose
     point is the longest prefix of the real path, held to the device `stat` gives. Unresolved on any doubt."""
     try:
@@ -307,4 +307,4 @@ class CellPoll:
         return link if link.startswith("pid:[") else None
 
 
-__all__ = ["CellPoll", "Host", "HostProc", "ProcView", "Protected", "fuse_dev", "proc_devs", "resolve"]
+__all__ = ["CellPoll", "Host", "HostProc", "ProcView", "Protected", "fuse_dev", "proc_devs", "protected_at"]

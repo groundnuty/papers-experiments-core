@@ -191,7 +191,7 @@ class Watcher:
             devs = frozenset()
         mountpoint = os.path.realpath(args.mountpoint)
         dev = MP.fuse_dev(mountinfo, mountpoint) if devs else None
-        protected = tuple(MP.resolve(path, mountinfo) for path in args.protect)
+        protected = tuple(MP.protected_at(path, mountinfo) for path in args.protect)
         self.host = MP.Host(len(depth), uid, devs, dev, mountpoint, protected, int(pid))
         self.log.write("start", format=FORMAT, nonce=args.nonce, pid=os.getpid(), uid=uid, nspid_depth=len(depth),
                        ptrace_scope=_ptrace_scope(), watches=watches, mount_seen=dev is not None)  # fmt: skip
