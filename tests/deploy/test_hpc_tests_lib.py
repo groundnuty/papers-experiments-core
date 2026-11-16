@@ -119,9 +119,12 @@ def test_o64_nothing_of_site_env_but_the_job_root_and_path_is_on_the_step_comman
 
 def test_the_remote_command_quotes_every_word_and_execs_srun(hpct, site):
     argv = step(hpct, site).argv()
+    assert "\n" in hpct.lib.BOOT
     line = hpct.lib.remote_command(argv)
     assert line.startswith("exec srun ")
     assert shlex.split(line)[1:] == argv
+    with pytest.raises(hpct.lib.HpcTestsError, match="NUL"):
+        hpct.lib.remote_command(["srun", "a\0b"])
 
 
 @pytest.mark.parametrize("root", ["/home/user/x", "/tmp", "/tmp/a/b", "/scratch/x", "/tmp/../etc", "tmp/x"])

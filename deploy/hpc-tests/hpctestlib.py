@@ -244,9 +244,10 @@ class Step:
 
 
 def remote_command(argv: Sequence[str]) -> str:
-    """The line the login node's shell runs: every word quoted, and `exec`, so a dropped ssh reaches srun itself."""
-    if any("\n" in word or "\0" in word for word in argv):
-        raise HpcTestsError("a remote word holds a newline or a NUL")
+    """The line the login node's shell runs: every word quoted (the boot's newlines stay inside its quotes), and
+    `exec`, so a dropped ssh reaches srun itself."""
+    if any("\0" in word for word in argv):
+        raise HpcTestsError("a remote word holds a NUL")
     return "exec " + shlex.join(argv)
 
 

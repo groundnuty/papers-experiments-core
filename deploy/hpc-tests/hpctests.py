@@ -122,9 +122,9 @@ def write_payload(work: Path, files: dict[str, bytes], bundle: Path | None) -> t
     return payload, digest
 
 
-def stream_step(remote: Remote, step: lib.Step, payload: Path, bound_s: float, transport: Path) -> parse.Streamed:
-    """Run the step with the payload on its stdin, read what it prints, and end ssh once the step has said all."""
-    command = lib.remote_command(step.argv())
+def stream_step(remote: Remote, command: str, payload: Path, bound_s: float, transport: Path) -> parse.Streamed:
+    """Run the step's remote command with the payload on its stdin, read what it prints, and end ssh once the step has
+    said all."""
     reader = parse.StreamParser()
     with payload.open("rb") as stdin, transport.open("wb") as stderr:
         process = subprocess.Popen(
@@ -252,10 +252,11 @@ def cmd_run(site: lib.Site, remote: Remote, args: argparse.Namespace) -> int:
             lib.allowlist(lib.step_environment(site)),
             lib.boot_command(site.node_root, run_id, digest, "run"),
         )
+        command = lib.remote_command(step.argv())
         meta: dict[str, object] = {"run": run_id, "commit": sha, "job": job.id, "cores": args.cores, "mem": args.mem}
         meta["pytest_args"] = args.pytest
         try:
-            streamed = stream_step(remote, step, payload, args.time * 60 + WAIT_FOR_CORES_S, out / "transport.log")
+            streamed = stream_step(remote, command, payload, args.time * 60 + WAIT_FOR_CORES_S, out / "transport.log")
         except lib.HpcTestsError as error:
             print(f"the results did not verify: {error}")
             return 71
@@ -281,7 +282,7 @@ def cmd_clean(site: lib.Site, remote: Remote, args: argparse.Namespace) -> int:
             lib.allowlist(lib.step_environment(site)),
             lib.boot_command(site.node_root, run_id, digest, "clean", mode),
         )
-        streamed = stream_step(remote, step, payload, 1200, work / "transport.log")
+        streamed = stream_step(remote, lib.remote_command(step.argv()), payload, 1200, work / "transport.log")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     if streamed.failure:
