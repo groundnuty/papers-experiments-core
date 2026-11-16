@@ -243,10 +243,18 @@ class Admission:
     steps: _Steps = field(default_factory=_Steps, compare=False, repr=False)
     endings: list[Callable[[], None]] = field(default_factory=list, compare=False, repr=False)
     reset: ResetShare | None = field(default=None, compare=False, repr=False)  # shared only: its federation.reset
+    # what stops a wait under it (the campaign's, ending with it): a reset's wait for the reset lock (`resetgrant.py`)
+    cancel: threading.Event | None = field(default=None, compare=False, repr=False)
 
     @property
     def held(self) -> bool:
         return self.lock.held
+
+    @property
+    def owner_left(self) -> bool:
+        """Whether its owner has given up its share (`close`): only workers' shares may still hold it."""
+        with self.shares.lock:
+            return self.shares.owner_left
 
     def begin_step(self, name: str) -> Callable[[], None]:
         """Count a step of the run that uses its tokens (`TOOL_SERVER_STEP`, `SANDBOX_STEP`) as begun; return the call
@@ -564,11 +572,18 @@ class FederationLock:
             time.sleep(self._poll_s)
 
     def _admit(
-        self, main: HeldLock, exclusive: bool, purpose: str, target: str | None, reset: HeldLock | None = None
+        self,
+        main: HeldLock,
+        exclusive: bool,
+        purpose: str,
+        target: str | None,
+        reset: HeldLock | None = None,
+        cancel: threading.Event | None = None,
     ) -> Admission:
-        """The admission of a lock just taken. Exclusive, it writes its holder record (or lets the lock go and raises
-        InfraError of kind `injector_failure`); shared, it clears any record, which no holder can then own, and records
-        its share of the reset lock (`reset`), or lets both locks go and raises when that cannot be recorded."""
+        """The admission of a lock just taken, carrying the `cancel` of its wait. Exclusive, it writes its holder record
+        (or lets the lock go and raises InfraError of kind `injector_failure`); shared, it clears any record, which no
+        holder can then own, and records its share of the reset lock (`reset`), or lets both locks go and raises when
+        that cannot be recorded."""
         journal = self._journal
         if not exclusive:
             with contextlib.suppress(OSError):  # a stale record only misleads a diagnosis, which reads its holder
@@ -584,7 +599,7 @@ class FederationLock:
                 finally:
                     main.close()
                 raise
-            return Admission(False, main, self.federation, reset=share)
+            return Admission(False, main, self.federation, reset=share, cancel=cancel)
         record = {"token": uuid.uuid4().hex, **holder(), "purpose": purpose, "target": target}
         record["since_utc"] = datetime.now(UTC).isoformat(timespec="seconds")
         try:
@@ -597,7 +612,7 @@ class FederationLock:
             raise
         self._settle_tools()
         drain = SessionDrain(self._drain_s, clock=self._clock, sleep=self._sleep, journal=journal, wall=self._wall)
-        return Admission(True, main, self.federation, journal, record, drain=drain)
+        return Admission(True, main, self.federation, journal, record, drain=drain, cancel=cancel)
 
     def _share(self, reset: HeldLock) -> ResetShare:
         """A shared admission's share of the reset lock just taken, recorded (`resetlock.ResetShare`)."""
@@ -680,13 +695,13 @@ class FederationLock:
             raise
         self._await_drain(main.close, deadline, cancel)
         if exclusive:
-            return self._admit(main, exclusive, purpose, target)
+            return self._admit(main, exclusive, purpose, target, cancel=cancel)
         try:  # after the main lock and outside the turnstile: the order every holder keeps
             reset = self._wait(FEDERATION_RESET, fcntl.LOCK_SH, deadline, cancel)
         except BaseException:
             main.close()
             raise
-        return self._admit(main, exclusive, purpose, target, reset)
+        return self._admit(main, exclusive, purpose, target, reset, cancel)
 
     def _explained(self, busy: FederationBusy) -> FederationBusy:
         """An exclusive wait that ran out, with the tools outside a campaign that hold the federation shared named,

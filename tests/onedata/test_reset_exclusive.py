@@ -1,10 +1,10 @@
-"""O11: a shortcut reset holds the reset lock exclusively, and nothing that can place bytes holds it beside.
+"""O11: a reset holds the reset lock exclusively, and nothing that can place bytes holds it beside.
 
 Every shared admission (a campaign run's, a tool's outside a campaign) holds `federation.reset` shared beside its share
-of `federation.lock`. A shortcut reset gives up its own run's share of `federation.reset`, never of `federation.lock`,
-and waits, within a bound, for `federation.reset` exclusively; past the bound it is told the shortcut is unavailable,
-with the holders, and takes its share back. Every test runs against the real locks on the fixture's journal directory;
-the waits are real seconds, kept short.
+of `federation.lock`. A reset's section gives up its own run's share of `federation.reset`, never of `federation.lock`,
+and waits, within `[faults] admission_timeout_s`, for `federation.reset` exclusively; past the bound it is refused
+(`ResetLockBusy`, uncharged), naming the holders, and takes its share back (O66: it never resets under them). Every test
+runs against the real locks on the fixture's journal directory; the waits are real seconds, kept short.
 """
 
 import ast
@@ -52,7 +52,7 @@ from expcore_onedata.resetgrant import (
     NO_ADMISSION,
     OFF,
     SHARES_RETAINED,
-    UNAVAILABLE,
+    ResetLockBusy,
     exclusive,
     federation_for,
 )
@@ -185,25 +185,27 @@ def test_o11_the_shortcut_proceeds_when_a_tools_hold_ends_within_the_bound(tmp_p
     thread.join(WAIT_S)
 
 
-def test_o11_a_tools_hold_past_the_bound_makes_the_shortcut_unavailable_and_names_the_holders(tmp_path):
-    """O11: a tool outside a campaign holds the reset lock shared past the bound: the shortcut is unavailable, never a
-    failure; the grant says how long it waited and names the live holder by its process (pid, boot id, start time),
-    never by its reason (O12), and the run has its share back for its agent."""
-    config, _settings, lock = federation(tmp_path)
+def test_o11_a_tools_hold_past_the_bound_refuses_the_section_and_names_the_holders(tmp_path):
+    """O11: a tool outside a campaign holds the reset lock shared past `admission_timeout_s`: the section is refused
+    (`ResetLockBusy`, uncharged), never entered under it (O66; it used to give a grant with no shortcut, and the reset
+    then ran beside the tool); the refusal says how long it waited and names the live holder by its process (pid, boot
+    id, start time), never by its reason (O12), and the run has its share back for its agent."""
+    config, _settings, lock = federation(tmp_path, admission_timeout_s=SHORT_S)
     release = threading.Event()
     thread, _ = tool_in_thread(config, release, reason="a reason that names the first space")
     try:
-        with lock.held(exclusive=False, timeout_s=PROBE_S) as admission, exclusive(config, shortcut(SHORT_S)) as grant:
-            assert (grant.mode, grant.why, grant.shortcut, grant.held) == (None, UNAVAILABLE, False, False)
-            facts = grant.facts()
-            assert facts["wait_s"] >= SHORT_S
-            (holder,) = facts["holders"]
+        with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+            with pytest.raises(ResetLockBusy) as refused, exclusive(config, shortcut()):
+                pass
+            assert refused.value.wait_s >= SHORT_S
+            (holder,) = refused.value.holders
             assert holder["status"] == "live"
             assert (holder["pid"], holder["boot_id"]) == (os.getpid(), boot_id())
             assert isinstance(holder["start_time"], str)
             assert holder["start_time"]
             assert holder["in_campaign"] is False
-            assert "first space" not in json.dumps(facts)
+            assert f"pid {os.getpid()} (live)" in refused.value.detail
+            assert "first space" not in str(refused.value)
             assert admission.reset.shared  # the run's agent may start: its share is back
             require_admission(config)
     finally:
@@ -213,8 +215,8 @@ def test_o11_a_tools_hold_past_the_bound_makes_the_shortcut_unavailable_and_name
 
 def test_o11_a_dead_holder_beside_a_live_one_is_shown_as_holder_gone(tmp_path):
     """O11: the record of the holds names the process each was taken by; one whose process is gone is shown as
-    `holder_gone`, beside the live holder that kept the shortcut out."""
-    config, _settings, lock = federation(tmp_path, admission_timeout_s=10)
+    `holder_gone`, beside the live holder whose hold refused the section."""
+    config, _settings, lock = federation(tmp_path, admission_timeout_s=SHORT_S)
     platform = Path(config.file)
     child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(platform), "a killed tool"))
     child.start()
@@ -223,12 +225,14 @@ def test_o11_a_dead_holder_beside_a_live_one_is_shown_as_holder_gone(tmp_path):
     release = threading.Event()
     thread, _ = tool_in_thread(config, release)
     try:
-        with lock.held(exclusive=False, timeout_s=PROBE_S), exclusive(config, shortcut(SHORT_S)) as grant:
-            statuses = sorted(holder["status"] for holder in grant.facts()["holders"])
-            assert grant.why == UNAVAILABLE
+        with lock.held(exclusive=False, timeout_s=PROBE_S):
+            with pytest.raises(ResetLockBusy) as refused, exclusive(config, shortcut()):
+                pass
+            statuses = sorted(holder["status"] for holder in refused.value.holders)
             assert statuses == ["holder_gone", "live"]
-            gone = next(h for h in grant.facts()["holders"] if h["status"] == "holder_gone")
+            gone = next(h for h in refused.value.holders if h["status"] == "holder_gone")
             assert gone["pid"] == child.pid
+            assert f"pid {child.pid} (holder_gone)" in refused.value.detail
     finally:
         release.set()
         thread.join(WAIT_S)
@@ -236,16 +240,20 @@ def test_o11_a_dead_holder_beside_a_live_one_is_shown_as_holder_gone(tmp_path):
 
 def test_o11_a_grant_that_finds_a_dead_holder_gives_no_shortcut_and_ends_its_record(tmp_path):
     """O11: a holder that died may have left a read in flight, and a tool server it started may still run: the
-    kernel let its lock go, so the exclusive hold is granted, but the shortcut is refused (`holder_gone`, full reads),
-    the dead holder's line is ended as `holder_gone`, and the run's share is taken back at once."""
+    kernel let its lock go, so the exclusive hold is granted, but the shortcut is refused (`holder_gone`, full reads)
+    and the dead holder's line is ended as `holder_gone`. The hold is kept for the whole section (O66: the run's share
+    used to be taken back at once, and the full reset then ran beside every holder); the share is back after it."""
     config, settings, lock = federation(tmp_path)
     child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(config.file), "a killed tool"))
     child.start()
     child.join(120)
-    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission, exclusive(config, shortcut()) as grant:
-        assert (grant.why, grant.shortcut) == (HOLDER_GONE, False)
-        (holder,) = grant.facts()["holders"]
-        assert (holder["pid"], holder["status"]) == (child.pid, "holder_gone")
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+        with exclusive(config, shortcut()) as grant:
+            assert (grant.why, grant.shortcut, grant.held) == (HOLDER_GONE, False, True)
+            (holder,) = grant.facts()["holders"]
+            assert (holder["pid"], holder["status"]) == (child.pid, "holder_gone")
+            assert not admission.reset.shared
+            assert not free(settings, FEDERATION_RESET)
         assert admission.reset.shared
     dead = [hold for hold in reset_holds(settings) if hold["owner"]["process"].split(":")[1] == str(child.pid)]
     assert [hold["how"] for hold in dead] == ["holder_gone"]
@@ -256,8 +264,8 @@ def test_o11_a_grant_that_finds_a_dead_holder_gives_no_shortcut_and_ends_its_rec
 
 def test_o11_two_resetters_do_not_deadlock_and_never_hold_the_lock_together(tmp_path):
     """O11: two runs reset at once: each gives up its own share before it waits, so neither waits on the other's
-    share; one is granted, the other is granted once the first has ended its run (or is told the shortcut is
-    unavailable), and their exclusive holds never overlap."""
+    share; one is granted, the other is granted once the first has ended its section, and their exclusive holds never
+    overlap."""
     config, _, lock = federation(tmp_path, admission_timeout_s=10)
     barrier = threading.Barrier(2)
     spans: dict[str, tuple[float, float]] = {}
@@ -333,23 +341,28 @@ def test_o11_the_runs_share_of_the_federation_lock_is_held_throughout_the_shortc
     assert got == [], "the run's share of federation.lock lapsed during its shortcut reset"
 
 
-def test_o11_a_worker_that_holds_a_share_keeps_the_shortcut_off_and_nothing_is_given_up(tmp_path):
+def test_o11_a_worker_that_holds_a_share_keeps_the_shortcut_off_and_the_lock_is_held_all_the_same(tmp_path):
     """O11: a worker of the run that holds a share of its admission (a sandbox's start thread, a task reusing the
     admission through a tool's hold) may be reading, which the section cannot rule out: no shortcut
-    (`shares_retained`), and the run's share of the reset lock is never given up."""
+    (`shares_retained`). The run's share of the reset lock is still given up and the lock held exclusively, so no other
+    holder acts during the reset (O66: nothing used to be given up, and the reset ran beside every holder); nothing of
+    the run may act meanwhile, and its share is back after the section."""
     config, settings, lock = federation(tmp_path)
     with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
         give_up = admission.retain()
         with exclusive(config, shortcut()) as grant:
-            assert (grant.why, grant.shortcut, grant.mode) == (SHARES_RETAINED, False, None)
-            assert admission.reset.shared
+            assert (grant.why, grant.shortcut, grant.mode, grant.held) == (SHARES_RETAINED, False, EXCLUSIVE, True)
+            assert not admission.reset.shared
+            assert not admission.may_act
             assert not free(settings, FEDERATION_RESET)
+        assert admission.reset.shared
         give_up()
 
 
-def test_o11_a_section_entered_after_the_owner_left_a_worker_holding_the_last_share_gives_no_shortcut(tmp_path):
-    """O11: the owner has left and a worker it handed a share still holds the admission, and may be reading: a section
-    entered from a context that inherited the admission is not sealed, gives no shortcut and gives nothing up."""
+def test_o11_a_section_entered_after_the_owner_left_a_worker_holding_the_last_share_is_refused(tmp_path):
+    """O11: the owner has left and a worker it handed a share still holds the admission: a section entered from a
+    context that inherited it is refused, giving nothing up, since the worker's release would let the hold go during
+    the reset (O66: it used to give no shortcut, and the reset ran beside every holder)."""
     config, settings, lock = federation(tmp_path)
     with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
         give_up = admission.retain()
@@ -357,10 +370,10 @@ def test_o11_a_section_entered_after_the_owner_left_a_worker_holding_the_last_sh
     assert admission.seal() is False
     token = admission_module._ADMISSION.set(admission)  # a context that inherited it, as a task inherits its parent's
     try:
-        with exclusive(config, shortcut()) as grant:
-            assert (grant.why, grant.shortcut) == (SHARES_RETAINED, False)
-            assert admission.reset.shared
-            assert not free(settings, FEDERATION_RESET)
+        with pytest.raises(AdmissionRefused, match="owner"), exclusive(config, shortcut()):
+            pass
+        assert admission.reset.shared
+        assert not free(settings, FEDERATION_RESET)
     finally:
         admission_module._ADMISSION.reset(token)
         give_up()
@@ -540,15 +553,20 @@ def test_o11_a_run_holding_the_federation_exclusively_has_the_shortcut_without_a
         assert (grant.mode, grant.why, grant.held) == (FEDERATION_EXCLUSIVE, None, True)
 
 
-def test_o11_the_shortcut_is_off_by_default_and_unavailable_with_no_admission(tmp_path):
-    """O11: with `reset_shortcut` off nothing is taken; with it on and no admission held there is no exclusivity to
-    show, so the shortcut is unavailable."""
-    config, settings, _lock = federation(tmp_path)
-    with exclusive(config, PlacementSettings(holder="alpha")) as grant:
-        assert (grant.why, grant.mode) == (OFF, None)
-    with exclusive(config, shortcut()) as grant:
-        assert (grant.why, grant.shortcut) == (NO_ADMISSION, False)
+def test_o11_with_the_shortcut_off_the_lock_is_held_and_with_no_admission_the_section_is_refused(tmp_path):
+    """O11: with `reset_shortcut` off (the default) the section still holds the lock exclusively and gives no shortcut
+    (`off`); with no admission held, on a platform with `[faults]`, it is refused whatever the setting, taking nothing
+    (O66: with the shortcut off nothing used to be taken, and with no admission the reset ran unheld)."""
+    config, settings, lock = federation(tmp_path)
+    for placement in (PlacementSettings(holder="alpha"), shortcut()):
+        with pytest.raises(AdmissionRefused, match="shared_admission"), exclusive(config, placement):
+            pass
     assert reset_holds(settings) == []
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+        with exclusive(config, PlacementSettings(holder="alpha")) as grant:
+            assert (grant.why, grant.mode, grant.held, grant.shortcut) == (OFF, EXCLUSIVE, True, False)
+            assert not free(settings, FEDERATION_RESET)
+        assert admission.reset.shared
 
 
 def test_o11_a_platform_without_faults_gives_no_shortcut(tmp_path):

@@ -316,9 +316,10 @@ class SpaceReset:
         return plan_scan(self, never_holds=never_holds)
 
     def exclusive(self) -> AbstractContextManager[ResetGrant]:
-        """The exclusive section of a shortcut reset (`resetgrant.exclusive`): the planner's reading and the reset that
-        uses it go inside, under the run's shared admission, which keeps its share of `federation.lock` throughout.
-        With `[placement] reset_shortcut` off it takes nothing."""
+        """The exclusive hold of the reset lock (`resetgrant.exclusive`), which `run` takes itself unless it runs inside
+        a live one: a shortcut reset's planner's reading and the reset that uses it go inside, under the run's shared
+        admission, which keeps its share of `federation.lock` throughout. With `[placement] reset_shortcut` off it
+        holds the lock all the same, and gives no shortcut (`off`)."""
         return resetgrant.exclusive(self._p.config, self._p.settings)
 
     # -- 1. QoS requirements, and 1a. their files settled (`resetqos.py`) -------------------

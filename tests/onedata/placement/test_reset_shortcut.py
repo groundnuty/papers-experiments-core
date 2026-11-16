@@ -16,12 +16,14 @@ from qos_world import FILES, federation, two_providers
 from expcore.config.loading import ConfigError
 from expcore_onedata import resetshortcut
 from expcore_onedata.admission import FederationLock
+from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import load_faults
 from expcore_onedata.occupancy import Listing
 from expcore_onedata.provision import Provisioner, resolve_provider_ids
 from expcore_onedata.rangemap import load_placement
 from expcore_onedata.reset import SpaceReset
+from expcore_onedata.resetgrant import ResetLockBusy
 from expcore_onedata.resetspaces import ResetPlan, SpacesReset
 from expcore_onedata.testing import BETA_ID, DATA, write_platform
 from expcore_onedata.tool_admission import shared_admission
@@ -140,12 +142,21 @@ def test_o51_a_reading_used_after_its_exclusive_section_ended_gets_the_full_read
     assert (record["occupancy_reads"]["mode"], record["occupancy_reads"]["why"]) == ("full", "outside_grant")
 
 
-def test_o51_a_tools_hold_past_the_bound_gives_the_full_reads_and_the_record_names_the_holder(
-    client, config, platform_file, ticker, tmp_path, fake, lock
-):
-    """O51: a tool outside a campaign holds the federation past `reset_exclusive_wait_s`: the reset does not fail, it
-    reads every file, and its record says `shortcut_unavailable` with the wait and the holder by its process."""
-    p = provisioner(client, config, platform_file, ticker, tmp_path, wait_s=0.3)
+def test_o51_a_tools_hold_past_the_bound_refuses_the_reset_naming_the_holder_and_sends_nothing(ticker, tmp_path, fake):
+    """O51: a tool outside a campaign holds the federation past `[faults] admission_timeout_s`: the reset is refused
+    (`ResetLockBusy`, the hold `federation_busy`, uncharged) before the planner reads anything, naming the holder by
+    its process and never by its reason (O66: it used to give the full reads, `shortcut_unavailable`, beside it)."""
+
+    def short_bound(data):
+        two_providers(data)
+        data["faults"] = faults_table(admission_timeout_s=0.3)
+
+    (tmp_path / "short").mkdir()
+    path = write_platform(tmp_path / "short", short_bound)
+    config = load_platform(path)
+    lock = FederationLock(load_faults(path, config))
+    client = OnezoneClient(config, http=fake.client_http())
+    p = provisioner(client, config, path, ticker, tmp_path)
     holding, release = threading.Event(), threading.Event()
 
     def tool():
@@ -157,18 +168,17 @@ def test_o51_a_tools_hold_past_the_bound_gives_the_full_reads_and_the_record_nam
     thread.start()
     try:
         assert holding.wait(10)
-        with lock.held(exclusive=False, timeout_s=1.0):
-            record, reads = reset_with_leftover(fake, SpaceReset(p, now=ticker.clock), ticker)
+        before = {name: distribution_reads(fake, name) for name in FILES}
+        with lock.held(exclusive=False, timeout_s=1.0), pytest.raises(ResetLockBusy) as refused:
+            reset_with_leftover(fake, SpaceReset(p, now=ticker.clock), ticker)
     finally:
         release.set()
         thread.join(10)
-    assert {path: reads[path] for path in UNTOUCHED} == dict.fromkeys(UNTOUCHED, 2)
-    mode = record["occupancy_reads"]
-    assert (mode["mode"], mode["why"]) == ("full", "shortcut_unavailable")
-    assert mode["grant"]["wait_s"] >= 0.3
-    (holder,) = mode["grant"]["holders"]
+    assert {name: distribution_reads(fake, name) for name in FILES} == before
+    assert refused.value.wait_s >= 0.3
+    (holder,) = refused.value.holders
     assert holder["status"] == "live"
-    assert "warm-up" not in str(mode)
+    assert "warm-up" not in str(refused.value)
 
 
 def test_o51_a_transfer_since_the_reading_on_a_directory_gives_the_full_reads(

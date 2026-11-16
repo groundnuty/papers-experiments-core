@@ -72,6 +72,11 @@ from expcore_onedata.reset import FAILURES, NOT_IN_SPACE, STAGES, ResetFailed, S
 from expcore_onedata.resetgrant import ResetGrant, federation_for
 from expcore_onedata.resetplan import Holdings, given_scan
 
+LAPSED = (
+    "the reset lock's exclusive hold lapsed during the reset (the run's admission was let go): another holder may "
+    "have acted since, so the reset certifies nothing from here"
+)
+
 
 @dataclass(frozen=True)
 class ResetPlan:
@@ -158,6 +163,12 @@ class _Space:
     @property
     def live(self) -> bool:
         return self.failure is None
+
+    def start(self, grant: ResetGrant) -> None:
+        """Begin the space's reset once the reset lock is held: its seconds count from now, its wait for the lock
+        apart, under `reset_lock` (`ResetGrant.facts`)."""
+        self._began, self._retried = self.p.clock(), self.p.reads_retried
+        self.record["reset_lock"] = grant.facts()
 
     def verify(self) -> None:
         """Verify the space's live name before any stage (`Provisioner.verify_space`), its read under a reset's policy
@@ -261,6 +272,10 @@ class SpacesReset:
         self._resets = list(resets)
         if not self._resets:
             raise ValueError("a reset of several spaces resets at least one")
+        if len({federation_for(reset.provisioner.config) for reset in self._resets}) > 1:
+            raise ValueError(
+                "a reset of several spaces holds one federation's reset lock: reset one federation's spaces"
+            )
         positions = [reset.provisioner.space.position for reset in self._resets]
         if len(set(positions)) != len(positions):
             raise ValueError("a reset of several spaces names each space once")
@@ -273,39 +288,52 @@ class SpacesReset:
 
     # -- the run -----------------------------------------------------------------
     def run(self, plans: Sequence[ResetPlan] | None = None) -> dict[str, Any]:
-        """Check every plan, verify every space, run the stages and return the record; raise ResetFailed, with every
-        space's record, once a stage has failed in any space. `plans` holds one plan per reset, in the same order
-        (by default an empty plan for each)."""
-        began = self._clock()
-        spaces = self._run(plans)
-        record = self._record(spaces, began)
-        failures = [space.failure for space in spaces if space.failure is not None]
-        if not failures:
-            return record
-        where = ", ".join(f"{failure.record['space']} at its {failure.stage} stage" for failure in failures)
-        record.update(failed=[failure.record["space"] for failure in failures], stage=failures[0].stage)
-        message = f"the reset of {len(spaces)} space(s) failed: {where}. The first: {failures[0]}"
-        raise ResetFailed(message, failures[0].stage, record)
+        """Check every plan, hold the reset lock exclusively (`exclusive`), verify every space, run the stages and
+        return the record; raise ResetFailed, with every space's record, once a stage has failed in any space, and the
+        hold's refusal (`resetgrant.ResetLockBusy`, `AdmissionRefused`) before anything is sent. `plans` holds one plan
+        per reset, in the same order (by default an empty plan for each)."""
+        spaces = self._spaces(plans)
+        with self.exclusive() as grant:
+            began = self._clock()
+            self._run(spaces, grant)
+            record = self._record(spaces, began)
+            failures = [space.failure for space in spaces if space.failure is not None]
+            if not failures:
+                return record
+            where = ", ".join(f"{failure.record['space']} at its {failure.stage} stage" for failure in failures)
+            record.update(failed=[failure.record["space"] for failure in failures], stage=failures[0].stage)
+            message = f"the reset of {len(spaces)} space(s) failed: {where}. The first: {failures[0]}"
+            raise ResetFailed(message, failures[0].stage, record)
 
     def exclusive(self) -> AbstractContextManager[ResetGrant]:
-        """The exclusive section of a shortcut reset of every space (`SpaceReset.exclusive`, one for all: the reset
-        lock is the federation's): every planner's reading and the reset go inside."""
+        """The exclusive hold of the reset lock for every space (`SpaceReset.exclusive`, one for all: the reset lock is
+        the federation's), which `run` takes itself unless it runs inside a live one: every planner's reading the
+        shortcut uses goes inside, with the reset."""
         return self._resets[0].exclusive()
 
     def run_one(self, plan: ResetPlan) -> dict[str, Any]:
         """The reset of the one space this driver holds, as `SpaceReset.run` returns it and raises."""
         if len(self._resets) != 1:
             raise ValueError("run_one resets one space")
-        (space,) = self._run([plan])
-        if space.failure is not None:
-            raise space.failure
-        return space.record
+        (space,) = self._spaces([plan])
+        with self.exclusive() as grant:
+            self._run([space], grant)
+            if space.failure is not None:
+                raise space.failure
+            return space.record
 
-    def _run(self, plans: Sequence[ResetPlan] | None) -> list["_Space"]:
+    def _spaces(self, plans: Sequence[ResetPlan] | None) -> list["_Space"]:
+        """Every space's part of the reset, its plan checked: nothing is sent, and the lock is not yet taken."""
         given = list(plans) if plans is not None else [ResetPlan() for _ in self._resets]
         if len(given) != len(self._resets):
             raise ValueError("a reset of several spaces takes one plan per space, in the order of its resets")
-        spaces = [_Space(reset, plan) for reset, plan in zip(self._resets, given, strict=True)]
+        return [_Space(reset, plan) for reset, plan in zip(self._resets, given, strict=True)]
+
+    def _run(self, spaces: list["_Space"], grant: ResetGrant) -> None:
+        """Under the exclusive hold (`grant`): verify every space and run the stages, beginning none once the hold has
+        lapsed (`_lapsed`)."""
+        for space in spaces:
+            space.start(grant)
         for space in spaces:
             space.verify()
         self._waits, self._walls = {}, {}
@@ -320,17 +348,28 @@ class SpacesReset:
         }
         for index, stage in enumerate(STAGES):
             started = self._clock()
-            stages[stage](spaces)
+            if grant.lapsed:
+                self._lapsed(spaces, stage)
+            else:
+                stages[stage](spaces)
             self._walls[stage] = round(self._clock() - started, 3)
             if any(not space.live for space in spaces):
                 following = STAGES[index + 1] if index + 1 < len(STAGES) else None
                 for space in spaces:
                     if space.live:
                         space.close(ok=False, halted_before=following)
-                return spaces
+                return
         for space in spaces:
             space.close(ok=True)
-        return spaces
+
+    @staticmethod
+    def _lapsed(spaces: list[_Space], stage: str) -> None:
+        """The hold has lapsed (the run's admission was let go): another holder may act, so every space fails the stage
+        it would begin, and none begins a later one."""
+        for space in spaces:
+            if space.live:
+                space.begin(stage)
+                space.fail(stage, ProvisionError(LAPSED))
 
     def _record(self, spaces: list[_Space], began: float) -> dict[str, Any]:
         return {
