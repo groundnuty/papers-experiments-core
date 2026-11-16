@@ -1,5 +1,5 @@
 """The HPC bundle's start-again path (deploy/hpc-federation/bundle): status.sh, exec.sh, restart.sh and the identity
-record a first start leaves (O56).
+record a first start leaves (O58).
 
 Run in plain bash on this host: fake processes stand for the service, and stand-ins for apptainer, curl and hostname
 (tests/deploy/hpcnode.py) for what a node has. Nothing here starts a container, reaches Slurm or opens a connection.
@@ -55,8 +55,8 @@ def status(work, env):
 # --- status.sh ---
 
 
-def test_o56_status_of_a_running_service_is_alive_with_its_record(holder, env, processes):
-    """O56: alive, and the PID and start tick service.pid records; not ready until the marker is written."""
+def test_o58_status_of_a_running_service_is_alive_with_its_record(holder, env, processes):
+    """O58: alive, and the PID and start tick service.pid records; not ready until the marker is written."""
     work = node.make_work(holder)
     service = node.spawn(processes)
     node.record(work, service)
@@ -68,8 +68,8 @@ def test_o56_status_of_a_running_service_is_alive_with_its_record(holder, env, p
     }
 
 
-def test_o56_status_is_ready_when_the_marker_holds_service_pid(holder, env, processes):
-    """O56: ready is alive plus a service-verified that holds exactly the bytes of service.pid."""
+def test_o58_status_is_ready_when_the_marker_holds_service_pid(holder, env, processes):
+    """O58: ready is alive plus a service-verified that holds exactly the bytes of service.pid."""
     work = node.make_work(holder)
     service = node.spawn(processes)
     node.record(work, service)
@@ -77,8 +77,8 @@ def test_o56_status_is_ready_when_the_marker_holds_service_pid(holder, env, proc
     assert status(work, env)["ready"] is True
 
 
-def test_o56_a_marker_from_an_earlier_launch_is_not_ready(holder, env, processes):
-    """O56: a stale service-verified (another PID or start tick) never reads as this launch's."""
+def test_o58_a_marker_from_an_earlier_launch_is_not_ready(holder, env, processes):
+    """O58: a stale service-verified (another PID or start tick) never reads as this launch's."""
     work = node.make_work(holder)
     service = node.spawn(processes)
     node.record(work, service)
@@ -88,8 +88,8 @@ def test_o56_a_marker_from_an_earlier_launch_is_not_ready(holder, env, processes
     assert reading["ready"] is False
 
 
-def test_o56_a_stopped_service_is_not_alive_and_not_ready_even_with_its_marker(holder, env, processes):
-    """O56: a stopped service is alive false, ready false, exit 0, whatever the marker says."""
+def test_o58_a_stopped_service_is_not_alive_and_not_ready_even_with_its_marker(holder, env, processes):
+    """O58: a stopped service is alive false, ready false, exit 0, whatever the marker says."""
     work = node.make_work(holder)
     pid, tick = node.dead_record(processes)
     node.put(work / "service.pid", f"{pid} {tick}\n")
@@ -99,30 +99,30 @@ def test_o56_a_stopped_service_is_not_alive_and_not_ready_even_with_its_marker(h
     assert reading["ready"] is False
 
 
-def test_o56_a_recycled_pid_is_not_the_service(holder, env, processes):
-    """O56: the recorded PID under another start tick is another process: not alive."""
+def test_o58_a_recycled_pid_is_not_the_service(holder, env, processes):
+    """O58: the recorded PID under another start tick is another process: not alive."""
     work = node.make_work(holder)
     bystander = node.spawn(processes)
     node.put(work / "service.pid", f"{bystander.pid} 1\n")
     assert status(work, env)["alive"] is False
 
 
-def test_o56_a_service_that_never_started_has_no_record(holder, env):
-    """O56: no service.pid: alive false, pid and start null."""
+def test_o58_a_service_that_never_started_has_no_record(holder, env):
+    """O58: no service.pid: alive false, pid and start null."""
     work = node.make_work(holder)
     assert status(work, env) == {"alive": False, "pid": None, "start": None, "ready": False}
 
 
 @pytest.mark.parametrize("bad", ["not a pid\n", "12 x\n", "0 5\n", ""])
-def test_o56_a_malformed_service_record_reads_as_no_record(bad, holder, env):
-    """O56: anything but a PID and a start tick is no record."""
+def test_o58_a_malformed_service_record_reads_as_no_record(bad, holder, env):
+    """O58: anything but a PID and a start tick is no record."""
     work = node.make_work(holder)
     node.put(work / "service.pid", bad)
     assert status(work, env) == {"alive": False, "pid": None, "start": None, "ready": False}
 
 
-def test_o56_status_fails_only_for_a_directory_that_is_not_a_work_directory(holder, env, tmp_path):
-    """O56: non-zero, and nothing on stdout, for a path that is no private hpcop work directory of the kind."""
+def test_o58_status_fails_only_for_a_directory_that_is_not_a_work_directory(holder, env, tmp_path):
+    """O58: non-zero, and nothing on stdout, for a path that is no private hpcop work directory of the kind."""
     other = tmp_path / "plain"
     other.mkdir(mode=0o700)
     assert node.script("status.sh", "op", "--workdir", str(other), env=env).stdout == ""
@@ -134,8 +134,8 @@ def test_o56_status_fails_only_for_a_directory_that_is_not_a_work_directory(hold
     assert node.script("status.sh", "op", "--workdir", str(zone), env=env).returncode != 0
 
 
-def test_o56_status_changes_nothing(holder, env, processes):
-    """O56: it is read-only."""
+def test_o58_status_changes_nothing(holder, env, processes):
+    """O58: it is read-only."""
     work = node.make_work(holder)
     service = node.spawn(processes)
     node.record(work, service)
@@ -159,8 +159,8 @@ def fakes(tmp_path, env):
     }
 
 
-def test_o56_exec_refuses_when_no_service_runs(holder, fakes, processes):
-    """O56: no recorded process alive: refused, and apptainer is never started."""
+def test_o58_exec_refuses_when_no_service_runs(holder, fakes, processes):
+    """O58: no recorded process alive: refused, and apptainer is never started."""
     work = node.make_work(holder)
     pid, tick = node.dead_record(processes)
     node.put(work / "service.pid", f"{pid} {tick}\n")
@@ -171,8 +171,8 @@ def test_o56_exec_refuses_when_no_service_runs(holder, fakes, processes):
     assert not list(work.glob("exec.*"))
 
 
-def test_o56_exec_refuses_without_a_command(holder, fakes, processes):
-    """O56: nothing after `--` is a usage error, not an empty exec."""
+def test_o58_exec_refuses_without_a_command(holder, fakes, processes):
+    """O58: nothing after `--` is a usage error, not an empty exec."""
     work = node.make_work(holder)
     service = node.spawn(processes)
     node.record(work, service)
@@ -181,8 +181,8 @@ def test_o56_exec_refuses_without_a_command(holder, fakes, processes):
     assert not Path(fakes["FAKE_EXEC_ARGS"]).exists()
 
 
-def test_o56_exec_runs_the_command_in_a_new_container_on_the_same_rootfs(holder, fakes, processes):
-    """O56: apptainer exec with run_service's flags but not --writable, a per-call --workdir under the work directory,
+def test_o58_exec_runs_the_command_in_a_new_container_on_the_same_rootfs(holder, fakes, processes):
+    """O58: apptainer exec with run_service's flags but not --writable, a per-call --workdir under the work directory,
     env HOME=/root and the argv, stdin /dev/null; the per-call directory is removed afterwards."""
     work = node.make_work(holder)
     service = node.spawn(processes)
@@ -207,8 +207,8 @@ def test_o56_exec_runs_the_command_in_a_new_container_on_the_same_rootfs(holder,
 
 
 @pytest.mark.parametrize("rc", [0, 3, 41])
-def test_o56_exec_passes_output_through_and_exits_with_the_commands_status(rc, holder, fakes, processes):
-    """O56: stdout and stderr unchanged, the exit status the command's."""
+def test_o58_exec_passes_output_through_and_exits_with_the_commands_status(rc, holder, fakes, processes):
+    """O58: stdout and stderr unchanged, the exit status the command's."""
     work = node.make_work(holder)
     service = node.spawn(processes)
     node.record(work, service)
@@ -222,8 +222,8 @@ def test_o56_exec_passes_output_through_and_exits_with_the_commands_status(rc, h
 # --- the identity record and the ready marker ---
 
 
-def test_o56_the_ready_marker_is_a_copy_of_service_pid_0600(holder, env):
-    """O56: mark_verified writes exactly the bytes of service.pid, mode 0600, and replaces an older marker."""
+def test_o58_the_ready_marker_is_a_copy_of_service_pid_0600(holder, env):
+    """O58: mark_verified writes exactly the bytes of service.pid, mode 0600, and replaces an older marker."""
     work = node.make_work(holder)
     node.put(work / "service.pid", "4242 777\n")
     node.put(work / "service-verified", "old\n")
@@ -232,15 +232,15 @@ def test_o56_the_ready_marker_is_a_copy_of_service_pid_0600(holder, env):
     assert oct((work / "service-verified").stat().st_mode & 0o777) == "0o600"
 
 
-def test_o56_the_ready_marker_needs_a_service_record(holder, env):
-    """O56: no service.pid, no marker."""
+def test_o58_the_ready_marker_needs_a_service_record(holder, env):
+    """O58: no service.pid, no marker."""
     work = node.make_work(holder)
     assert node.lib('mark_verified "$1"', str(work), env=env).returncode != 0
     assert not (work / "service-verified").exists()
 
 
-def test_o56_the_identity_is_recorded_as_json_0600(holder, env):
-    """O56: write_identity records the kind and the named values, valid JSON, 0600, and check_identity reads it."""
+def test_o58_the_identity_is_recorded_as_json_0600(holder, env):
+    """O58: write_identity records the kind and the named values, valid JSON, 0600, and check_identity reads it."""
     work = node.make_work(holder)
     done = node.lib('write_identity "$1" op providerId abc123 domain "$2"', str(work), DOMAIN, env=env)
     assert done.returncode == 0, done.stderr
@@ -258,8 +258,8 @@ def test_o56_the_identity_is_recorded_as_json_0600(holder, env):
 
 
 @pytest.mark.parametrize("value", ['a"b', "a b", "", "x\ny", "a\\b", "caf\u00e9", "tab\there", "x" * 254])
-def test_o56_an_identity_value_that_could_break_the_json_is_refused(value, holder, env):
-    """O56: the file is always valid JSON: a quote, a backslash, a space or control character, anything but printable
+def test_o58_an_identity_value_that_could_break_the_json_is_refused(value, holder, env):
+    """O58: the file is always valid JSON: a quote, a backslash, a space or control character, anything but printable
     ASCII, or a value too long, is refused, and nothing is written."""
     work = node.make_work(holder)
     done = node.lib('write_identity "$1" op providerId "$2" domain d', str(work), value, env=env)
@@ -268,8 +268,8 @@ def test_o56_an_identity_value_that_could_break_the_json_is_refused(value, holde
 
 
 @pytest.mark.parametrize("value", ["0a1b2c", "a/b+c=", "user@host:8443", "Zone-1_x.y", "%7B~!#$&*()[]{};,<>?|^`'"])
-def test_o56_an_identity_value_of_any_printable_ascii_is_recorded_as_valid_json(value, holder, env):
-    """O56: no first start fails on an id format nobody has seen: whatever is printable ASCII without a space, a quote
+def test_o58_an_identity_value_of_any_printable_ascii_is_recorded_as_valid_json(value, holder, env):
+    """O58: no first start fails on an id format nobody has seen: whatever is printable ASCII without a space, a quote
     or a backslash is written, and the file reads back as the same value."""
     work = node.make_work(holder)
     done = node.lib('write_identity "$1" op providerId "$2" domain d', str(work), value, env=env)
@@ -344,8 +344,8 @@ def break_owner_runs(work, processes):
     ],
     ids=lambda f: f.__name__.removeprefix("break_"),
 )
-def test_o56_restart_refuses_and_changes_nothing(broken, holder, fakes, processes):
-    """O56: a directory that is not a kept stop with its identity and secrets, or whose service or owner still runs, is
+def test_o58_restart_refuses_and_changes_nothing(broken, holder, fakes, processes):
+    """O58: a directory that is not a kept stop with its identity and secrets, or whose service or owner still runs, is
     refused before anything is touched: no marker removed, no owner record rewritten, nothing started."""
     work = kept_work(holder)
     node.put(work / "service-verified", "stale\n")
@@ -358,8 +358,8 @@ def test_o56_restart_refuses_and_changes_nothing(broken, holder, fakes, processe
     assert not Path(fakes["FAKE_LOG"]).exists()
 
 
-def test_o56_restart_refuses_a_path_that_is_not_a_work_directory(tmp_path, fakes):
-    """O56: only an hpcop work directory of the kind, 0700 and ours."""
+def test_o58_restart_refuses_a_path_that_is_not_a_work_directory(tmp_path, fakes):
+    """O58: only an hpcop work directory of the kind, 0700 and ours."""
     other = tmp_path / "plain"
     other.mkdir(mode=0o700)
     assert node.script("restart.sh", "op", "--workdir", str(other), env=fakes).returncode != 0
@@ -454,8 +454,8 @@ def restart(request, tmp_path, holder, env, processes):
 
 
 @node.needs_pidfd
-def test_o56_a_restart_clears_the_old_markers_before_starting_and_checks_before_it_is_ready(restart):
-    """O56: stop-requested, service-verified and the stale ready lock are gone before the service starts; the guard,
+def test_o58_a_restart_clears_the_old_markers_before_starting_and_checks_before_it_is_ready(restart):
+    """O58: stop-requested, service-verified and the stale ready lock are gone before the service starts; the guard,
     the identity, the rotation and the live check pass; only then is service-verified written, as service.pid."""
     proc = restart.start()
     restart.wait_ready(proc)
@@ -474,8 +474,8 @@ def test_o56_a_restart_clears_the_old_markers_before_starting_and_checks_before_
 
 
 @node.needs_pidfd
-def test_o56_a_restart_rotates_the_couchbase_password_and_retires_the_old_one(restart):
-    """O56: the restart rotates (Couchbase holds a new password, and the files agree), and the old one joins the
+def test_o58_a_restart_rotates_the_couchbase_password_and_retires_the_old_one(restart):
+    """O58: the restart rotates (Couchbase holds a new password, and the files agree), and the old one joins the
     retired list, which grows by one on each restart."""
     secrets = node.secrets_of(restart.work)
     retired = []
@@ -493,8 +493,8 @@ def test_o56_a_restart_rotates_the_couchbase_password_and_retires_the_old_one(re
 
 
 @node.needs_pidfd
-def test_o56_after_a_restart_the_service_is_alive_and_ready_and_after_a_stop_neither(restart):
-    """O56: status.sh reads the restarted service as alive and ready, and the stopped one as neither; the work
+def test_o58_after_a_restart_the_service_is_alive_and_ready_and_after_a_stop_neither(restart):
+    """O58: status.sh reads the restarted service as alive and ready, and the stopped one as neither; the work
     directory and its secrets are kept by the stop."""
     proc = restart.start()
     restart.wait_ready(proc)
@@ -513,8 +513,8 @@ def test_o56_after_a_restart_the_service_is_alive_and_ready_and_after_a_stop_nei
 
 
 @node.needs_pidfd
-def test_o56_a_changed_identity_fails_the_restart_before_the_rotation_and_keeps_the_directory(restart):
-    """O56: the service reports another provider id or user id: the restart fails, nothing was rotated, the service is
+def test_o58_a_changed_identity_fails_the_restart_before_the_rotation_and_keeps_the_directory(restart):
+    """O58: the service reports another provider id or user id: the restart fails, nothing was rotated, the service is
     stopped, no ready marker is written, and `keep` is back in stop-requested so the directory stays."""
     restart.set_state(providerId="pid-2", adminUserId="admin-2")
     before = restart.couchbase_password()
@@ -536,8 +536,8 @@ def test_o56_a_changed_identity_fails_the_restart_before_the_rotation_and_keeps_
 
 
 @node.needs_pidfd
-def test_o56_a_failed_guard_fails_the_restart_stops_the_service_and_keeps_the_directory(restart):
-    """O56: the guard's FAILED line fails the restart: the service is stopped, no marker, the directory is kept."""
+def test_o58_a_failed_guard_fails_the_restart_stops_the_service_and_keeps_the_directory(restart):
+    """O58: the guard's FAILED line fails the restart: the service is stopped, no marker, the directory is kept."""
     restart.env["FAKE_GUARD"] = "fail"
     proc = restart.start()
     assert proc.wait(timeout=90) != 0
@@ -555,8 +555,8 @@ def test_o56_a_failed_guard_fails_the_restart_stops_the_service_and_keeps_the_di
 
 
 @node.needs_pidfd
-def test_o56_a_stop_without_keep_during_a_restarted_service_removes_the_work_directory(restart):
-    """O56: down's teardown.sh (no --keep) on a restarted service still removes everything, as for a first start."""
+def test_o58_a_stop_without_keep_during_a_restarted_service_removes_the_work_directory(restart):
+    """O58: down's teardown.sh (no --keep) on a restarted service still removes everything, as for a first start."""
     proc = restart.start()
     restart.wait_ready(proc)
     done = subprocess.run(
@@ -576,8 +576,8 @@ def test_o56_a_stop_without_keep_during_a_restarted_service_removes_the_work_dir
 
 
 @pytest.mark.parametrize("kind", ["op", "oz"])
-def test_o56_a_first_start_records_the_identity_it_verified(kind, tmp_path, holder, env, processes):
-    """O56: finish.sh (provider: id and domain) and finish-zone.sh (zone: admin user id and domain) write
+def test_o58_a_first_start_records_the_identity_it_verified(kind, tmp_path, holder, env, processes):
+    """O58: finish.sh (provider: id and domain) and finish-zone.sh (zone: admin user id and domain) write
     identity.json once every check has passed, and not before: the live check stand-in sees none yet."""
     session = Restart(tmp_path, holder, env, processes, kind)
     work = session.work

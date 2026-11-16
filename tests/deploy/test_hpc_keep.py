@@ -1,5 +1,5 @@
 """The HPC bundle's kept stop (deploy/hpc-federation/bundle): teardown.sh --keep, the batch scripts' cleanup, the
-sweep's keep-until mark, the retired Couchbase passwords, and the restart mode of wait_ready (O56).
+sweep's keep-until mark, the retired Couchbase passwords, and the restart mode of wait_ready (O58).
 
 Run in plain bash on this host with fake processes (tests/deploy/hpcnode.py): nothing here starts a container,
 reaches Slurm or opens a connection.
@@ -52,8 +52,8 @@ def stop_line(result):
 
 
 @node.needs_pidfd
-def test_o56_a_kept_stop_ends_the_service_and_removes_nothing(holder, env, processes):
-    """O56: --keep stops the recorded service gracefully and leaves the work directory, its secrets and its data."""
+def test_o58_a_kept_stop_ends_the_service_and_removes_nothing(holder, env, processes):
+    """O58: --keep stops the recorded service gracefully and leaves the work directory, its secrets and its data."""
     work = node.make_work(holder)
     (work / "rootfs" / "data").write_text("bucket", encoding="utf-8")
     service = node.spawn(processes, node.GRACEFUL, str(work))
@@ -68,8 +68,8 @@ def test_o56_a_kept_stop_ends_the_service_and_removes_nothing(holder, env, proce
 
 
 @node.needs_pidfd
-def test_o56_the_keep_marks_are_written_before_the_sigterm(holder, env, processes):
-    """O56: stop-requested's first line is `keep` and keep-until holds the epoch, 0600, when the signal arrives: the
+def test_o58_the_keep_marks_are_written_before_the_sigterm(holder, env, processes):
+    """O58: stop-requested's first line is `keep` and keep-until holds the epoch, 0600, when the signal arrives: the
     batch script's cleanup, which runs as the service ends, must find them."""
     work = node.make_work(holder)
     service = node.spawn(processes, node.GRACEFUL, str(work))
@@ -83,8 +83,8 @@ def test_o56_the_keep_marks_are_written_before_the_sigterm(holder, env, processe
 
 
 @node.needs_pidfd
-def test_o56_a_kept_stop_reports_a_graceful_end_with_the_seconds_it_took(holder, env, processes):
-    """O56: stdout is exactly one `hpcop-stop` line: ended `exit`, and the seconds from the TERM to the process gone."""
+def test_o58_a_kept_stop_reports_a_graceful_end_with_the_seconds_it_took(holder, env, processes):
+    """O58: stdout is exactly one `hpcop-stop` line: ended `exit`, and the seconds from the TERM to the process gone."""
     work = node.make_work(holder)
     service = node.spawn(processes, node.GRACEFUL, str(work))
     node.record(work, service)
@@ -95,8 +95,8 @@ def test_o56_a_kept_stop_reports_a_graceful_end_with_the_seconds_it_took(holder,
 
 
 @node.needs_pidfd
-def test_o56_a_service_that_ignores_the_term_is_killed_and_reported_as_kill(holder, env, processes):
-    """O56: past --timeout the stop escalates as stop_service does (SIGUSR1, which supervise.py turns into SIGKILL),
+def test_o58_a_service_that_ignores_the_term_is_killed_and_reported_as_kill(holder, env, processes):
+    """O58: past --timeout the stop escalates as stop_service does (SIGUSR1, which supervise.py turns into SIGKILL),
     and the evidence says `kill`; the work directory is still kept."""
     work = node.make_work(holder)
     service = node.spawn(processes, node.STUBBORN)
@@ -110,8 +110,8 @@ def test_o56_a_service_that_ignores_the_term_is_killed_and_reported_as_kill(hold
 
 
 @node.needs_pidfd
-def test_o56_a_kept_stop_of_a_stopped_service_signals_nothing_and_succeeds_again(holder, env, processes):
-    """O56: `none` when no service of this launch runs (its process ended, its PID may be another process now): exit
+def test_o58_a_kept_stop_of_a_stopped_service_signals_nothing_and_succeeds_again(holder, env, processes):
+    """O58: `none` when no service of this launch runs (its process ended, its PID may be another process now): exit
     0, no signal, and a repeat gives the same answer; the keep mark is still there for restart.sh."""
     work = node.make_work(holder)
     pid, tick = node.dead_record(processes)
@@ -126,8 +126,8 @@ def test_o56_a_kept_stop_of_a_stopped_service_signals_nothing_and_succeeds_again
 
 
 @node.needs_pidfd
-def test_o56_a_pid_that_is_another_process_now_is_not_signalled_by_a_kept_stop(holder, env, processes):
-    """O56: the recorded PID with another start tick (a reused PID) is not our service: not signalled, `none`."""
+def test_o58_a_pid_that_is_another_process_now_is_not_signalled_by_a_kept_stop(holder, env, processes):
+    """O58: the recorded PID with another start tick (a reused PID) is not our service: not signalled, `none`."""
     work = node.make_work(holder)
     bystander = node.spawn(processes, node.GRACEFUL, str(work))
     node.put(work / "service.pid", f"{bystander.pid} 1\n")
@@ -138,8 +138,8 @@ def test_o56_a_pid_that_is_another_process_now_is_not_signalled_by_a_kept_stop(h
 
 
 @node.needs_pidfd
-def test_o56_a_kept_stop_fails_when_the_process_survives_the_kill(holder, env, processes, tmp_path):
-    """O56: non-zero, and no evidence line, when the process is still there after the KILL (here supervise.py is a
+def test_o58_a_kept_stop_fails_when_the_process_survives_the_kill(holder, env, processes, tmp_path):
+    """O58: non-zero, and no evidence line, when the process is still there after the KILL (here supervise.py is a
     stand-in whose signals reach nothing); the directory stays kept."""
     bundle = tmp_path / "bundle"
     shutil.copytree(node.BUNDLE, bundle)
@@ -162,8 +162,8 @@ def test_o56_a_kept_stop_fails_when_the_process_survives_the_kill(holder, env, p
     "extra",
     [["--keep-until", "1999999999"], ["--keep", "--keep-until", "soon"], ["--keep", "--keep-until", "1 2"]],
 )
-def test_o56_keep_until_takes_one_epoch_and_only_with_keep(holder, env, extra):
-    """O56: a keep-until without --keep, or that is not one integer, is refused before anything is written."""
+def test_o58_keep_until_takes_one_epoch_and_only_with_keep(holder, env, extra):
+    """O58: a keep-until without --keep, or that is not one integer, is refused before anything is written."""
     work = node.make_work(holder)
     result = node.script("teardown.sh", "op", "--workdir", str(work), *extra, env=env)
     assert result.returncode != 0
@@ -172,8 +172,8 @@ def test_o56_keep_until_takes_one_epoch_and_only_with_keep(holder, env, extra):
 
 
 @node.needs_pidfd
-def test_o56_a_stop_without_keep_still_removes_the_work_directory(holder, env, processes):
-    """O56: the path without --keep is as before: an empty stop-requested, the SIGTERM, the work directory removed."""
+def test_o58_a_stop_without_keep_still_removes_the_work_directory(holder, env, processes):
+    """O58: the path without --keep is as before: an empty stop-requested, the SIGTERM, the work directory removed."""
     work = node.make_work(holder)
     service = node.spawn(processes, node.GRACEFUL, str(work))
     node.record(work, service)
@@ -199,8 +199,8 @@ def run_cleanup(job, work, env, *, svc="", svc_start=""):
 
 
 @pytest.mark.parametrize("job", ["provider.sbatch", "zone.sbatch"])
-def test_o56_the_batch_cleanup_keeps_a_work_directory_whose_stop_kept_it(job, holder, env):
-    """O56: stop-requested beginning with `keep`: the cleanup removes nothing, neither the secrets nor the directory."""
+def test_o58_the_batch_cleanup_keeps_a_work_directory_whose_stop_kept_it(job, holder, env):
+    """O58: stop-requested beginning with `keep`: the cleanup removes nothing, neither the secrets nor the directory."""
     work = node.make_work(holder, kind="op" if job.startswith("provider") else "oz")
     node.put(work / "stop-requested", "keep\n")
     result = run_cleanup(job, work, env)
@@ -211,8 +211,8 @@ def test_o56_the_batch_cleanup_keeps_a_work_directory_whose_stop_kept_it(job, ho
 
 @pytest.mark.parametrize("job", ["provider.sbatch", "zone.sbatch"])
 @node.needs_pidfd
-def test_o56_the_batch_cleanup_stops_a_service_that_still_runs_before_keeping(job, holder, env, processes):
-    """O56: a kept stop whose service is somehow still running: it is stopped, and still nothing is removed."""
+def test_o58_the_batch_cleanup_stops_a_service_that_still_runs_before_keeping(job, holder, env, processes):
+    """O58: a kept stop whose service is somehow still running: it is stopped, and still nothing is removed."""
     work = node.make_work(holder)
     node.put(work / "stop-requested", "keep\n")
     service = node.spawn(processes, node.GRACEFUL, str(work))
@@ -225,8 +225,8 @@ def test_o56_the_batch_cleanup_stops_a_service_that_still_runs_before_keeping(jo
 
 @pytest.mark.parametrize("marker", [None, ""])
 @pytest.mark.parametrize("job", ["provider.sbatch", "zone.sbatch"])
-def test_o56_the_batch_cleanup_still_removes_everything_when_no_stop_kept_it(job, marker, holder, env):
-    """O56: no stop-requested, or an empty one (teardown.sh without --keep): the secrets and the directory go."""
+def test_o58_the_batch_cleanup_still_removes_everything_when_no_stop_kept_it(job, marker, holder, env):
+    """O58: no stop-requested, or an empty one (teardown.sh without --keep): the secrets and the directory go."""
     work = node.make_work(holder, kind="op" if job.startswith("provider") else "oz")
     if marker is not None:
         node.put(work / "stop-requested", marker)
@@ -236,8 +236,8 @@ def test_o56_the_batch_cleanup_still_removes_everything_when_no_stop_kept_it(job
 
 
 @pytest.mark.parametrize("job", ["provider.sbatch", "zone.sbatch"])
-def test_o56_a_service_that_ran_to_the_end_leaves_the_ready_marker(job):
-    """O56: the batch script writes the ready marker right after finish*.sh succeeded, before it holds the service."""
+def test_o58_a_service_that_ran_to_the_end_leaves_the_ready_marker(job):
+    """O58: the batch script writes the ready marker right after finish*.sh succeeded, before it holds the service."""
     text = (node.BUNDLE / job).read_text(encoding="utf-8")
     assert text.index('mark_verified "$W"') < text.index('status=0; wait "$svc"')
     finish = "finish.sh" if job.startswith("provider") else "finish-zone.sh"
@@ -262,15 +262,15 @@ def leftover(holder, processes, until=None, suffix="Zz9Zz9"):
     return work
 
 
-def test_o56_the_sweep_removes_a_leftover_whose_owner_has_ended(holder, env, processes):
-    """O56: as before the keep mark: a work directory whose owner process is gone is removed."""
+def test_o58_the_sweep_removes_a_leftover_whose_owner_has_ended(holder, env, processes):
+    """O58: as before the keep mark: a work directory whose owner process is gone is removed."""
     work = leftover(holder, processes)
     assert sweep(env, holder).returncode == 0
     assert not work.exists()
 
 
-def test_o56_the_sweep_keeps_a_directory_whose_keep_until_is_in_the_future(holder, env, processes):
-    """O56: a stopped service's directory has no owner, and must outlive the next job's sweep until the allocation
+def test_o58_the_sweep_keeps_a_directory_whose_keep_until_is_in_the_future(holder, env, processes):
+    """O58: a stopped service's directory has no owner, and must outlive the next job's sweep until the allocation
     ends."""
     work = leftover(holder, processes, until=f"{int(time.time()) + 3600}\n")
     result = sweep(env, holder)
@@ -279,8 +279,8 @@ def test_o56_the_sweep_keeps_a_directory_whose_keep_until_is_in_the_future(holde
     assert (node.secrets_of(work) / "passphrase").exists()
 
 
-def test_o56_the_sweep_removes_a_kept_directory_once_its_keep_until_has_passed(holder, env, processes):
-    """O56: kept until that time, and no longer."""
+def test_o58_the_sweep_removes_a_kept_directory_once_its_keep_until_has_passed(holder, env, processes):
+    """O58: kept until that time, and no longer."""
     work = leftover(holder, processes, until=f"{int(time.time()) - 5}\n")
     assert sweep(env, holder).returncode == 0
     assert not work.exists()
@@ -289,15 +289,15 @@ def test_o56_the_sweep_removes_a_kept_directory_once_its_keep_until_has_passed(h
 @pytest.mark.parametrize(
     "mark", ["soon\n", "99999999999\n99999999999\n", "-5\n", "", "99999999999 x\n", "9" * 20 + "\n"]
 )
-def test_o56_a_keep_until_that_is_not_one_integer_keeps_nothing(mark, holder, env, processes):
-    """O56: only a file holding one integer protects a directory; anything else is no mark."""
+def test_o58_a_keep_until_that_is_not_one_integer_keeps_nothing(mark, holder, env, processes):
+    """O58: only a file holding one integer protects a directory; anything else is no mark."""
     work = leftover(holder, processes, until=mark)
     assert sweep(env, holder).returncode == 0
     assert not work.exists()
 
 
-def test_o56_a_keep_until_that_is_a_link_keeps_nothing(holder, env, processes, tmp_path):
-    """O56: a link is no mark (it could point anywhere), even to a file holding a future epoch."""
+def test_o58_a_keep_until_that_is_a_link_keeps_nothing(holder, env, processes, tmp_path):
+    """O58: a link is no mark (it could point anywhere), even to a file holding a future epoch."""
     work = leftover(holder, processes)
     target = tmp_path / "epoch"
     target.write_text(f"{int(time.time()) + 3600}\n", encoding="utf-8")
@@ -306,8 +306,8 @@ def test_o56_a_keep_until_that_is_a_link_keeps_nothing(holder, env, processes, t
     assert not work.exists()
 
 
-def test_o56_the_sweep_keeps_a_directory_whose_owner_still_runs(holder, env, processes):
-    """O56: the owner check is unchanged: a running owner keeps its directory with or without a mark."""
+def test_o58_the_sweep_keeps_a_directory_whose_owner_still_runs(holder, env, processes):
+    """O58: the owner check is unchanged: a running owner keeps its directory with or without a mark."""
     work = node.make_work(holder)
     owner = node.spawn(processes, node.GRACEFUL, str(work))
     node.put(work / "owner.pid", f"{owner.pid} {node.start_tick(owner.pid)}\n")
@@ -318,8 +318,8 @@ def test_o56_the_sweep_keeps_a_directory_whose_owner_still_runs(holder, env, pro
 # --- the retired Couchbase passwords ---
 
 
-def test_o56_secret_values_lists_every_retired_password_and_the_others(holder, env):
-    """O56: scrub and redaction read secret_values_file: every line of the retired list, not the first only."""
+def test_o58_secret_values_lists_every_retired_password_and_the_others(holder, env):
+    """O58: scrub and redaction read secret_values_file: every line of the retired list, not the first only."""
     work = node.make_work(holder)
     secrets = node.secrets_of(work)
     node.put(secrets / "couchbase-password.retired", "retiredOne\nretiredTwo\nretiredThree\n")
@@ -332,8 +332,8 @@ def test_o56_secret_values_lists_every_retired_password_and_the_others(holder, e
     assert oct(out.stat().st_mode & 0o777) == "0o600"
 
 
-def test_o56_a_retired_password_is_appended_never_overwritten(holder, env):
-    """O56: each rotation adds a line; the earlier ones stay; the file stays 0600."""
+def test_o58_a_retired_password_is_appended_never_overwritten(holder, env):
+    """O58: each rotation adds a line; the earlier ones stay; the file stays 0600."""
     work = node.make_work(holder)
     secrets = node.secrets_of(work)
     for old in ("first", "second", "third"):
@@ -343,8 +343,8 @@ def test_o56_a_retired_password_is_appended_never_overwritten(holder, env):
     assert oct(path.stat().st_mode & 0o777) == "0o600"
 
 
-def test_o56_a_retired_list_with_the_wrong_mode_is_refused_and_left_alone(holder, env):
-    """O56: a list that is not 0600 is not trusted, and the refusal does not rewrite it."""
+def test_o58_a_retired_list_with_the_wrong_mode_is_refused_and_left_alone(holder, env):
+    """O58: a list that is not 0600 is not trusted, and the refusal does not rewrite it."""
     work = node.make_work(holder)
     secrets = node.secrets_of(work)
     path = secrets / "couchbase-password.retired"
@@ -368,8 +368,8 @@ write_cb_overlay() { :; }
 """
 
 
-def test_o56_every_rotation_retires_one_more_password(holder, env):
-    """O56: cb_rotate on a deployment, and again after a restart: Couchbase holds the newest password, and the retired
+def test_o58_every_rotation_retires_one_more_password(holder, env):
+    """O58: cb_rotate on a deployment, and again after a restart: Couchbase holds the newest password, and the retired
     list holds the deploy-time one and the first rotation's."""
     work = node.make_work(holder)
     secrets = node.secrets_of(work)
@@ -391,8 +391,8 @@ def test_o56_every_rotation_retires_one_more_password(holder, env):
     assert len(set(retired)) == 2
 
 
-def test_o56_the_live_default_check_refuses_every_retired_password():
-    """O56: check-defaults.sh --live asks Couchbase about each line of the retired list (the live part runs only on a
+def test_o58_the_live_default_check_refuses_every_retired_password():
+    """O58: check-defaults.sh --live asks Couchbase about each line of the retired list (the live part runs only on a
     node: this reads the script)."""
     text = (node.BUNDLE / "check-defaults.sh").read_text(encoding="utf-8")
     assert 'retired_passwords "$S"' in text
@@ -419,15 +419,15 @@ def wait_ready(env, work, mode):
     return node.lib('wait_ready "$1" "$$" 5 "$2"', str(work), mode, env=env)
 
 
-def test_o56_a_restart_is_ready_without_a_fresh_deployment_line(holder, env):
-    """O56: a restart over an existing deployment prints no `Congratulations! New`: the lock and the guard's passed
+def test_o58_a_restart_is_ready_without_a_fresh_deployment_line(holder, env):
+    """O58: a restart over an existing deployment prints no `Congratulations! New`: the lock and the guard's passed
     line are enough in restart mode."""
     work = ready_dir(holder, f"starting\n{GUARD_PASSED}\n")
     assert wait_ready(env, work, "restart").returncode == 0
 
 
-def test_o56_a_fresh_start_still_needs_the_fresh_deployment_line(holder, env):
-    """O56: the default mode is unchanged: the same log is refused as a fresh start."""
+def test_o58_a_fresh_start_still_needs_the_fresh_deployment_line(holder, env):
+    """O58: the default mode is unchanged: the same log is refused as a fresh start."""
     work = ready_dir(holder, f"starting\n{GUARD_PASSED}\n")
     result = wait_ready(env, work, "fresh")
     assert result.returncode != 0
@@ -435,39 +435,39 @@ def test_o56_a_fresh_start_still_needs_the_fresh_deployment_line(holder, env):
     assert node.lib('wait_ready "$1" "$$" 5', str(work), env=env).returncode != 0
 
 
-def test_o56_a_fresh_start_with_the_line_passes_in_both_modes(holder, env):
-    """O56: a log with the fresh deployment line and the guard's line is ready in either mode."""
+def test_o58_a_fresh_start_with_the_line_passes_in_both_modes(holder, env):
+    """O58: a log with the fresh deployment line and the guard's line is ready in either mode."""
     work = ready_dir(holder, f"Congratulations! New deployment\n{GUARD_PASSED}\n")
     assert wait_ready(env, work, "fresh").returncode == 0
     assert wait_ready(env, work, "restart").returncode == 0
 
 
-def test_o56_a_restart_without_the_guards_passed_line_is_not_ready(holder, env):
-    """O56: the lock alone is not enough: the guard must have confirmed this launch's administrator."""
+def test_o58_a_restart_without_the_guards_passed_line_is_not_ready(holder, env):
+    """O58: the lock alone is not enough: the guard must have confirmed this launch's administrator."""
     work = ready_dir(holder, "starting\n")
     result = wait_ready(env, work, "restart")
     assert result.returncode != 0
     assert "guard never confirmed" in result.stderr
 
 
-def test_o56_a_restart_fails_on_the_guards_failed_line(holder, env):
-    """O56: the guard's FAILED line ends a restart at once, with or without the lock."""
+def test_o58_a_restart_fails_on_the_guards_failed_line(holder, env):
+    """O58: the guard's FAILED line ends a restart at once, with or without the lock."""
     work = ready_dir(holder, "starting\nhpcop: Couchbase guard FAILED: no administrator\n", lock=False)
     result = wait_ready(env, work, "restart")
     assert result.returncode != 0
     assert "guard FAILED" in result.stderr
 
 
-def test_o56_a_restart_fails_on_the_launchers_start_error(holder, env):
-    """O56: the launcher's own error ends a restart, as it ends a fresh start."""
+def test_o58_a_restart_fails_on_the_launchers_start_error(holder, env):
+    """O58: the launcher's own error ends a restart, as it ends a fresh start."""
     work = ready_dir(holder, "ERROR: Starting the container failed: boom\n", lock=False)
     result = wait_ready(env, work, "restart")
     assert result.returncode != 0
     assert "deployment failed" in result.stderr
 
 
-def test_o56_a_restart_fails_when_the_service_exits_before_it_is_ready(holder, env, processes):
-    """O56: a service that ended without the lock is a failed restart, not a wait until the timeout."""
+def test_o58_a_restart_fails_when_the_service_exits_before_it_is_ready(holder, env, processes):
+    """O58: a service that ended without the lock is a failed restart, not a wait until the timeout."""
     work = ready_dir(holder, "starting\n", lock=False)
     pid, _ = node.dead_record(processes)
     result = node.lib('wait_ready "$1" "$2" 30 restart', str(work), str(pid), env=env)
@@ -475,7 +475,7 @@ def test_o56_a_restart_fails_when_the_service_exits_before_it_is_ready(holder, e
     assert "exited before it was ready" in result.stderr
 
 
-def test_o56_an_unknown_wait_mode_is_refused(holder, env):
-    """O56: only fresh and restart exist."""
+def test_o58_an_unknown_wait_mode_is_refused(holder, env):
+    """O58: only fresh and restart exist."""
     work = ready_dir(holder, f"Congratulations! New\n{GUARD_PASSED}\n")
     assert wait_ready(env, work, "resume").returncode != 0

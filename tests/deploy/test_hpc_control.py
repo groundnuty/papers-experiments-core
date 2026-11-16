@@ -1,4 +1,4 @@
-"""The four service verbs of an HPC federation (deploy/hpc-federation/hpcfed_control.py), against fakes (O56).
+"""The four service verbs of an HPC federation (deploy/hpc-federation/hpcfed_control.py), against fakes (O58).
 
 The module is pure logic over two injected objects, the step launcher and the state file that `hpcfed.py` supplies.
 Here both are fakes, so nothing reaches a cluster, and the clock is a fake too, so the bounds cost no time.
@@ -163,13 +163,13 @@ TEARDOWN = 'hpcop-stop {"ended": "exit", "seconds": 4.2}\n'
 # --- what the module is -------------------------------------------------------------------------------------------
 
 
-def test_o56_the_four_verbs_are_stop_start_status_exec():
-    """O56: the names M1's dispatch tests membership of."""
+def test_o58_the_four_verbs_are_stop_start_status_exec():
+    """O58: the names M1's dispatch tests membership of."""
     assert control.VERBS == ("stop", "start", "status", "exec")
 
 
-def test_o56_the_docstring_states_the_contract_the_hook_and_that_nothing_has_run_live():
-    """O56: a reader of the module finds the contract, how hpcfed.py calls it, and that no cluster has seen it."""
+def test_o58_the_docstring_states_the_contract_the_hook_and_that_nothing_has_run_live():
+    """O58: a reader of the module finds the contract, how hpcfed.py calls it, and that no cluster has seen it."""
     doc = control.__doc__
     assert "if verb in hpcfed_control.VERBS" in doc
     assert "hpcfed_control.run(" in doc
@@ -178,8 +178,8 @@ def test_o56_the_docstring_states_the_contract_the_hook_and_that_nothing_has_run
         assert word in doc
 
 
-def test_o56_the_bundle_is_the_one_beside_the_module():
-    """O56: the scripts every step runs are this checkout's, never found anywhere else."""
+def test_o58_the_bundle_is_the_one_beside_the_module():
+    """O58: the scripts every step runs are this checkout's, never found anywhere else."""
     assert BUNDLE == HPC / "bundle"
     for script in ("status.sh", "teardown.sh", "restart.sh", "exec.sh"):
         assert (BUNDLE / script).is_file()
@@ -220,8 +220,8 @@ def test_o56_the_bundle_is_the_one_beside_the_module():
         "no services",
     ],
 )
-def test_o56_a_service_the_state_does_not_describe_is_refused_without_naming_a_node_or_a_path(name, mutate, world):
-    """O56: exit 2, nothing launched or run, nothing on stdout, and a message that names neither a node nor a path."""
+def test_o58_a_service_the_state_does_not_describe_is_refused_without_naming_a_node_or_a_path(name, mutate, world):
+    """O58: exit 2, nothing launched or run, nothing on stdout, and a message that names neither a node nor a path."""
     doc = document()
     mutate(doc)
     world.state.doc = doc
@@ -236,14 +236,14 @@ def test_o56_a_service_the_state_does_not_describe_is_refused_without_naming_a_n
     assert world.state.history == []
 
 
-def test_o56_an_unknown_verb_is_refused(world):
-    """O56: exit 2 for a verb that is not one of the four."""
+def test_o58_an_unknown_verb_is_refused(world):
+    """O58: exit 2 for a verb that is not one of the four."""
     assert verb(world, "restart")[0] == 2
     assert world.launcher.controls == []
 
 
-def test_o56_a_state_that_cannot_be_read_is_refused_naming_only_the_error_type(world):
-    """O56: exit 2, and the message holds the error's type, never its text (which names a path)."""
+def test_o58_a_state_that_cannot_be_read_is_refused_naming_only_the_error_type(world):
+    """O58: exit 2, and the message holds the error's type, never its text (which names a path)."""
 
     def unreadable():
         raise OSError("/secret/path/state.json")
@@ -257,8 +257,8 @@ def test_o56_a_state_that_cannot_be_read_is_refused_naming_only_the_error_type(w
 
 
 @pytest.mark.parametrize("bad", [0, -1, 2.5, "600", True])
-def test_o56_stop_seconds_must_be_a_positive_whole_number(bad, world):
-    """O56: refused before anything runs."""
+def test_o58_stop_seconds_must_be_a_positive_whole_number(bad, world):
+    """O58: refused before anything runs."""
     assert verb(world, "stop", stop_seconds=bad)[0] == 2
     assert world.launcher.controls == []
 
@@ -266,8 +266,8 @@ def test_o56_stop_seconds_must_be_a_positive_whole_number(bad, world):
 # --- status -------------------------------------------------------------------------------------------------------
 
 
-def test_o56_status_of_a_running_service_prints_one_json_line_with_its_identity(world):
-    """O56: running is listed and alive; identity is launch:pid:start; node, step and state come from the state."""
+def test_o58_status_of_a_running_service_prints_one_json_line_with_its_identity(world):
+    """O58: running is listed and alive; identity is launch:pid:start; node, step and state come from the state."""
     world.launcher.on_control = lambda argv: alive(ready=True)
     status, out, err = verb(world, "status")
     assert status == 0, err
@@ -293,8 +293,8 @@ def test_o56_status_of_a_running_service_prints_one_json_line_with_its_identity(
     ("listed", "reading", "running"),
     [(True, "alive", True), (False, "alive", False), (True, "dead", False), (False, "dead", False)],
 )
-def test_o56_a_service_runs_only_when_its_step_is_listed_and_its_process_is_alive(listed, reading, running, world):
-    """O56: both halves are needed, and an identity exists only for a running service."""
+def test_o58_a_service_runs_only_when_its_step_is_listed_and_its_process_is_alive(listed, reading, running, world):
+    """O58: both halves are needed, and an identity exists only for a running service."""
     if not listed:
         world.launcher.steps.clear()
     world.launcher.on_control = lambda argv: alive() if reading == "alive" else DEAD
@@ -306,8 +306,8 @@ def test_o56_a_service_runs_only_when_its_step_is_listed_and_its_process_is_aliv
     assert record["ready"] is False
 
 
-def test_o56_a_service_is_ready_only_when_it_runs_and_its_marker_is_current(world):
-    """O56: ready comes from status.sh, and only while the service is running."""
+def test_o58_a_service_is_ready_only_when_it_runs_and_its_marker_is_current(world):
+    """O58: ready comes from status.sh, and only while the service is running."""
     world.launcher.on_control = lambda argv: alive(ready=True)
     world.launcher.steps.clear()
     assert json.loads(verb(world, "status")[1])["ready"] is False
@@ -328,8 +328,8 @@ def test_o56_a_service_is_ready_only_when_it_runs_and_its_marker_is_current(worl
     ],
     ids=["failed", "silent", "not json", "no alive", "alive not a bool", "no pid", "no start", "two lines", "timeout"],
 )
-def test_o56_a_status_that_cannot_be_read_is_exit_1_with_nothing_on_stdout(answer, world):
-    """O56: a control step that fails, times out or answers something unreadable is a reading that failed."""
+def test_o58_a_status_that_cannot_be_read_is_exit_1_with_nothing_on_stdout(answer, world):
+    """O58: a control step that fails, times out or answers something unreadable is a reading that failed."""
     world.launcher.on_control = lambda argv: answer
     status, out, err = verb(world, "status")
     assert status == 1
@@ -338,8 +338,8 @@ def test_o56_a_status_that_cannot_be_read_is_exit_1_with_nothing_on_stdout(answe
     assert "/" not in err
 
 
-def test_o56_status_changes_nothing_in_the_state(world):
-    """O56: it reads."""
+def test_o58_status_changes_nothing_in_the_state(world):
+    """O58: it reads."""
     world.launcher.on_control = lambda argv: alive()
     verb(world, "status")
     assert world.state.history == []
@@ -359,8 +359,8 @@ def stopping_launcher(world, stdout=TEARDOWN, returncode=0, steps_end=True):
     world.launcher.on_control = on_control
 
 
-def test_o56_a_stop_records_stopping_before_its_control_step_then_stopped_when_the_step_is_gone(world, clock):
-    """O56: the state says stopping before teardown runs, and stopped once teardown exited 0 and the step is gone."""
+def test_o58_a_stop_records_stopping_before_its_control_step_then_stopped_when_the_step_is_gone(world, clock):
+    """O58: the state says stopping before teardown runs, and stopped once teardown exited 0 and the step is gone."""
     stopping_launcher(world)
     status, _out, err = verb(world, "stop")
     assert status == 0, err
@@ -369,8 +369,8 @@ def test_o56_a_stop_records_stopping_before_its_control_step_then_stopped_when_t
     assert world.state.service()["state"] == "stopped"
 
 
-def test_o56_a_stop_runs_teardown_with_keep_the_allocations_end_and_the_stop_bound(world, clock):
-    """O56: teardown.sh --keep --keep-until <allocation end as epoch> --timeout <stop_seconds>, bounded past it."""
+def test_o58_a_stop_runs_teardown_with_keep_the_allocations_end_and_the_stop_bound(world, clock):
+    """O58: teardown.sh --keep --keep-until <allocation end as epoch> --timeout <stop_seconds>, bounded past it."""
     stopping_launcher(world)
     verb(world, "stop", stop_seconds=300)
     [call] = world.launcher.controls
@@ -391,8 +391,8 @@ def test_o56_a_stop_runs_teardown_with_keep_the_allocations_end_and_the_stop_bou
     assert call["name"].startswith(f"{PREFIX}-prov-a-stop-")
 
 
-def test_o56_a_stop_prints_its_evidence_and_records_the_same_object_under_the_service(world, clock):
-    """O56: one JSON line: stopped, how it ended (teardown's line), the seconds from the request to the step gone, and
+def test_o58_a_stop_prints_its_evidence_and_records_the_same_object_under_the_service(world, clock):
+    """O58: one JSON line: stopped, how it ended (teardown's line), the seconds from the request to the step gone, and
     both times; the same object is appended to `stops` in the state."""
 
     def on_control(argv):
@@ -420,8 +420,8 @@ def test_o56_a_stop_prints_its_evidence_and_records_the_same_object_under_the_se
     "stdout",
     ["", "hpcop-stop not json\n", 'hpcop-stop {"ended": "gone"}\n', 'hpcop-stop {"seconds": 1}\n', "stopped\n"],
 )
-def test_o56_the_ended_word_is_null_when_teardowns_line_cannot_be_read(stdout, world, clock):
-    """O56: unreadable evidence is null, not a guess, and the stop still succeeds on teardown's exit status."""
+def test_o58_the_ended_word_is_null_when_teardowns_line_cannot_be_read(stdout, world, clock):
+    """O58: unreadable evidence is null, not a guess, and the stop still succeeds on teardown's exit status."""
     stopping_launcher(world, stdout=stdout)
     status, out, _ = verb(world, "stop")
     assert status == 0
@@ -430,14 +430,14 @@ def test_o56_the_ended_word_is_null_when_teardowns_line_cannot_be_read(stdout, w
 
 
 @pytest.mark.parametrize("ended", ["exit", "kill", "none"])
-def test_o56_the_ended_word_is_teardowns(ended, world, clock):
-    """O56: exit, kill or none, as teardown printed it."""
+def test_o58_the_ended_word_is_teardowns(ended, world, clock):
+    """O58: exit, kill or none, as teardown printed it."""
     stopping_launcher(world, stdout=f'hpcop-stop {{"ended": "{ended}", "seconds": 0.5}}\n')
     assert json.loads(verb(world, "stop")[1])["ended"] == ended
 
 
-def test_o56_a_stop_of_a_stopped_service_answers_none_at_once_and_changes_nothing(world, clock):
-    """O56: idempotent: state stopped and the step not listed: ended none, exit 0, no control step, no new record."""
+def test_o58_a_stop_of_a_stopped_service_answers_none_at_once_and_changes_nothing(world, clock):
+    """O58: idempotent: state stopped and the step not listed: ended none, exit 0, no control step, no new record."""
     world.state.doc["services"]["prov-a"]["state"] = "stopped"
     world.launcher.steps.clear()
     for _ in range(2):
@@ -452,8 +452,8 @@ def test_o56_a_stop_of_a_stopped_service_answers_none_at_once_and_changes_nothin
     assert "stops" not in world.state.service()
 
 
-def test_o56_a_stopped_service_whose_step_is_still_listed_is_stopped_for_real(world, clock):
-    """O56: `stopped` in the state is not enough while the step is still in the list: the stop runs."""
+def test_o58_a_stopped_service_whose_step_is_still_listed_is_stopped_for_real(world, clock):
+    """O58: `stopped` in the state is not enough while the step is still in the list: the stop runs."""
     world.state.doc["services"]["prov-a"]["state"] = "stopped"
     stopping_launcher(world, stdout='hpcop-stop {"ended": "none", "seconds": 0}\n')
     assert verb(world, "stop")[0] == 0
@@ -461,8 +461,8 @@ def test_o56_a_stopped_service_whose_step_is_still_listed_is_stopped_for_real(wo
 
 
 @pytest.mark.parametrize("answer", [Done(1, ""), Done(2, TEARDOWN), TimeoutError(), RuntimeError("boom")])
-def test_o56_a_stop_whose_teardown_fails_leaves_the_state_stopping(answer, world, clock):
-    """O56: teardown that did not exit 0, timed out or could not run: exit 1, `stopping` stays, the evidence says
+def test_o58_a_stop_whose_teardown_fails_leaves_the_state_stopping(answer, world, clock):
+    """O58: teardown that did not exit 0, timed out or could not run: exit 1, `stopping` stays, the evidence says
     stopped false, and no step is cancelled (the keep marks may not have been written)."""
     world.launcher.on_control = lambda argv: answer
     status, out, err = verb(world, "stop")
@@ -478,8 +478,8 @@ def test_o56_a_stop_whose_teardown_fails_leaves_the_state_stopping(answer, world
     assert NODE not in err
 
 
-def test_o56_a_stop_whose_step_never_leaves_the_list_cancels_it_by_its_id_then_fails_if_it_stays(world, clock):
-    """O56: teardown exited 0 but the step is listed at the bound: cancelled by its own id, once; still listed after
+def test_o58_a_stop_whose_step_never_leaves_the_list_cancels_it_by_its_id_then_fails_if_it_stays(world, clock):
+    """O58: teardown exited 0 but the step is listed at the bound: cancelled by its own id, once; still listed after
     that: exit 1 and `stopping` stays."""
     stopping_launcher(world, steps_end=False)
     world.launcher.cancel = lambda step_id: world.launcher.cancels.append(step_id)  # the cancel does not take
@@ -491,8 +491,8 @@ def test_o56_a_stop_whose_step_never_leaves_the_list_cancels_it_by_its_id_then_f
     assert clock.slept >= control.STEP_GONE_WAIT_S
 
 
-def test_o56_a_step_that_lingers_after_a_good_teardown_is_cancelled_and_the_stop_succeeds(world, clock):
-    """O56: the cancel takes: the step is gone, so the service is recorded stopped."""
+def test_o58_a_step_that_lingers_after_a_good_teardown_is_cancelled_and_the_stop_succeeds(world, clock):
+    """O58: the cancel takes: the step is gone, so the service is recorded stopped."""
     stopping_launcher(world, steps_end=False)
     status, out, _ = verb(world, "stop")
     assert status == 0
@@ -501,8 +501,8 @@ def test_o56_a_step_that_lingers_after_a_good_teardown_is_cancelled_and_the_stop
     assert world.state.service()["state"] == "stopped"
 
 
-def test_o56_a_stop_waits_for_a_step_that_ends_a_moment_after_teardown(world, clock):
-    """O56: the step leaves the list on the third poll: no cancel, and the wait was short of the bound."""
+def test_o58_a_stop_waits_for_a_step_that_ends_a_moment_after_teardown(world, clock):
+    """O58: the step leaves the list on the third poll: no cancel, and the wait was short of the bound."""
     polls = []
 
     def listed(name):
@@ -521,8 +521,8 @@ def test_o56_a_stop_waits_for_a_step_that_ends_a_moment_after_teardown(world, cl
     "ends",
     [ENDS, "2026-11-16T14:00:00+00:00", "2026-11-16T14:00:00", "2026-11-16 14:00:00", str(ENDS_EPOCH), ENDS_EPOCH],
 )
-def test_o56_the_allocations_end_is_read_as_utc_in_each_form(ends, world, clock):
-    """O56: a Z, an offset, no zone (UTC), a space, epoch seconds as text or a number: all the same epoch."""
+def test_o58_the_allocations_end_is_read_as_utc_in_each_form(ends, world, clock):
+    """O58: a Z, an offset, no zone (UTC), a space, epoch seconds as text or a number: all the same epoch."""
     world.state.doc["allocation"]["ends"] = ends
     stopping_launcher(world)
     verb(world, "stop")
@@ -531,8 +531,8 @@ def test_o56_the_allocations_end_is_read_as_utc_in_each_form(ends, world, clock)
 
 
 @pytest.mark.parametrize("ends", [None, "", "soon", True, "2026-13-45"])
-def test_o56_an_allocation_without_a_usable_end_refuses_a_stop_before_it_changes_anything(ends, world, clock):
-    """O56: without a time to keep the directory until, a stop could let the sweep remove it: refused, exit 2."""
+def test_o58_an_allocation_without_a_usable_end_refuses_a_stop_before_it_changes_anything(ends, world, clock):
+    """O58: without a time to keep the directory until, a stop could let the sweep remove it: refused, exit 2."""
     world.state.doc["allocation"]["ends"] = ends
     status, out, _ = verb(world, "stop")
     assert status == 2
@@ -541,8 +541,8 @@ def test_o56_an_allocation_without_a_usable_end_refuses_a_stop_before_it_changes
     assert world.state.history == []
 
 
-def test_o56_a_stop_of_the_zone_runs_teardown_for_an_onezone(world, clock):
-    """O56: the kind and the work directory are the service's own."""
+def test_o58_a_stop_of_the_zone_runs_teardown_for_an_onezone(world, clock):
+    """O58: the kind and the work directory are the service's own."""
 
     def on_control(argv):
         world.launcher.steps.pop(f"{PREFIX}-zone-run-1")
@@ -563,8 +563,8 @@ def stopped_provider(world):
     world.launcher.steps.pop(f"{PREFIX}-prov-a-run-1")
 
 
-def test_o56_a_start_of_a_running_service_launches_nothing(world, clock):
-    """O56: listed and alive: exit 0, no service step, no state change."""
+def test_o58_a_start_of_a_running_service_launches_nothing(world, clock):
+    """O58: listed and alive: exit 0, no service step, no state change."""
     world.launcher.on_control = lambda argv: alive()
     assert verb(world, "start")[0] == 0
     assert world.launcher.services == []
@@ -573,8 +573,8 @@ def test_o56_a_start_of_a_running_service_launches_nothing(world, clock):
     assert call["argv"][1].endswith("status.sh")
 
 
-def test_o56_a_start_writes_the_state_before_it_launches_the_step(world, clock):
-    """O56: when the launcher is asked, the state already says starting, launch + 1 and the new step's name."""
+def test_o58_a_start_writes_the_state_before_it_launches_the_step(world, clock):
+    """O58: when the launcher is asked, the state already says starting, launch + 1 and the new step's name."""
     stopped_provider(world)
     status, _out, err = verb(world, "start")
     assert status == 0, err
@@ -586,8 +586,8 @@ def test_o56_a_start_writes_the_state_before_it_launches_the_step(world, clock):
     assert seen["log"] == f"/logs/{PREFIX}-prov-a-run-2.log"
 
 
-def test_o56_a_start_launches_restart_sh_on_the_same_node_and_records_the_listed_step(world, clock):
-    """O56: restart.sh <kind> --workdir W, detached, under the new step's name and a log beside the old one; once it is
+def test_o58_a_start_launches_restart_sh_on_the_same_node_and_records_the_listed_step(world, clock):
+    """O58: restart.sh <kind> --workdir W, detached, under the new step's name and a log beside the old one; once it is
     listed its id and `running` are recorded."""
     stopped_provider(world)
     verb(world, "start")
@@ -604,8 +604,8 @@ def test_o56_a_start_launches_restart_sh_on_the_same_node_and_records_the_listed
     assert record["log"] == call["log"]
 
 
-def test_o56_a_second_start_is_a_no_op(world, clock):
-    """O56: idempotent: after one start the service is listed, and a start while it is alive launches nothing more."""
+def test_o58_a_second_start_is_a_no_op(world, clock):
+    """O58: idempotent: after one start the service is listed, and a start while it is alive launches nothing more."""
     stopped_provider(world)
     assert verb(world, "start")[0] == 0
     world.launcher.on_control = lambda argv: alive()
@@ -613,8 +613,8 @@ def test_o56_a_second_start_is_a_no_op(world, clock):
     assert len(world.launcher.services) == 1
 
 
-def test_o56_a_step_that_is_not_listed_in_time_fails_the_start_and_leaves_the_state_starting(world, clock):
-    """O56: exit 1 after the bound, with the attempt recorded; a stop brings it back."""
+def test_o58_a_step_that_is_not_listed_in_time_fails_the_start_and_leaves_the_state_starting(world, clock):
+    """O58: exit 1 after the bound, with the attempt recorded; a stop brings it back."""
     stopped_provider(world)
     world.launcher.on_service = lambda name: None
     status, out, err = verb(world, "start")
@@ -626,8 +626,8 @@ def test_o56_a_step_that_is_not_listed_in_time_fails_the_start_and_leaves_the_st
     assert NODE not in err
 
 
-def test_o56_a_step_that_is_listed_after_a_few_polls_is_waited_for(world, clock):
-    """O56: the step appears on the fourth poll: the start succeeds, short of the bound."""
+def test_o58_a_step_that_is_listed_after_a_few_polls_is_waited_for(world, clock):
+    """O58: the step appears on the fourth poll: the start succeeds, short of the bound."""
     stopped_provider(world)
     polls = []
 
@@ -642,8 +642,8 @@ def test_o56_a_step_that_is_listed_after_a_few_polls_is_waited_for(world, clock)
 
 
 @pytest.mark.parametrize("state", ["running", "starting", "stopping", "failed", None])
-def test_o56_a_service_that_is_not_stopped_is_not_started(state, world, clock):
-    """O56: a step that is not listed and a state other than stopped: exit 1, nothing launched, nothing changed."""
+def test_o58_a_service_that_is_not_stopped_is_not_started(state, world, clock):
+    """O58: a step that is not listed and a state other than stopped: exit 1, nothing launched, nothing changed."""
     world.state.doc["services"]["prov-a"]["state"] = state
     world.launcher.steps.pop(f"{PREFIX}-prov-a-run-1")
     status, _out, err = verb(world, "start")
@@ -653,8 +653,8 @@ def test_o56_a_service_that_is_not_stopped_is_not_started(state, world, clock):
     assert "stop" in err
 
 
-def test_o56_a_listed_step_whose_process_is_gone_is_not_started_over(world, clock):
-    """O56: the step is still in the list but nothing runs in it: a stop must clear it first."""
+def test_o58_a_listed_step_whose_process_is_gone_is_not_started_over(world, clock):
+    """O58: the step is still in the list but nothing runs in it: a stop must clear it first."""
     world.launcher.on_control = lambda argv: DEAD
     status, _, err = verb(world, "start")
     assert status == 1
@@ -662,23 +662,23 @@ def test_o56_a_listed_step_whose_process_is_gone_is_not_started_over(world, cloc
     assert "stop it first" in err
 
 
-def test_o56_a_start_whose_status_cannot_be_read_launches_nothing(world, clock):
-    """O56: unknown whether it runs: no second service."""
+def test_o58_a_start_whose_status_cannot_be_read_launches_nothing(world, clock):
+    """O58: unknown whether it runs: no second service."""
     world.launcher.on_control = lambda argv: TimeoutError()
     assert verb(world, "start")[0] == 1
     assert world.launcher.services == []
 
 
-def test_o56_a_start_without_a_recorded_log_directory_is_refused(world, clock):
-    """O56: the new step's log goes beside the old one; with none recorded there is nowhere to put it."""
+def test_o58_a_start_without_a_recorded_log_directory_is_refused(world, clock):
+    """O58: the new step's log goes beside the old one; with none recorded there is nowhere to put it."""
     stopped_provider(world)
     del world.state.doc["services"]["prov-a"]["log"]
     assert verb(world, "start")[0] == 2
     assert world.launcher.services == []
 
 
-def test_o56_a_launcher_that_fails_to_launch_leaves_the_attempt_in_the_state(world, clock):
-    """O56: exit 1, naming only the error type, and `starting` stays so a stop can clear it."""
+def test_o58_a_launcher_that_fails_to_launch_leaves_the_attempt_in_the_state(world, clock):
+    """O58: exit 1, naming only the error type, and `starting` stays so a stop can clear it."""
     stopped_provider(world)
 
     def broken(name):
@@ -695,8 +695,8 @@ def test_o56_a_launcher_that_fails_to_launch_leaves_the_attempt_in_the_state(wor
 # --- exec ---------------------------------------------------------------------------------------------------------
 
 
-def test_o56_exec_runs_exec_sh_in_a_control_step_with_the_argv_after_the_separator(world, clock):
-    """O56: bash exec.sh <kind> --workdir W -- <argv>, on the service's node, bounded generously."""
+def test_o58_exec_runs_exec_sh_in_a_control_step_with_the_argv_after_the_separator(world, clock):
+    """O58: bash exec.sh <kind> --workdir W -- <argv>, on the service's node, bounded generously."""
     verb(world, "exec", argv=["/usr/sbin/op_worker", "ping", "a b"])
     [call] = world.launcher.controls
     assert call["node"] == NODE
@@ -716,8 +716,8 @@ def test_o56_exec_runs_exec_sh_in_a_control_step_with_the_argv_after_the_separat
 
 
 @pytest.mark.parametrize("rc", [0, 1, 3, 127])
-def test_o56_exec_passes_the_output_through_unchanged_and_returns_the_commands_status(rc, world, clock):
-    """O56: stdout and stderr exactly as the step gave them (no newline added), the exit status the command's."""
+def test_o58_exec_passes_the_output_through_unchanged_and_returns_the_commands_status(rc, world, clock):
+    """O58: stdout and stderr exactly as the step gave them (no newline added), the exit status the command's."""
     world.launcher.on_control = lambda argv: Done(rc, "out without newline", "err\nsecond line\n")
     status, out, err = verb(world, "exec", argv=["cmd"])
     assert status == rc
@@ -725,14 +725,14 @@ def test_o56_exec_passes_the_output_through_unchanged_and_returns_the_commands_s
     assert err == "err\nsecond line\n"
 
 
-def test_o56_exec_decodes_bytes_the_launcher_gives(world, clock):
-    """O56: a launcher that returns bytes is passed through as text."""
+def test_o58_exec_decodes_bytes_the_launcher_gives(world, clock):
+    """O58: a launcher that returns bytes is passed through as text."""
     world.launcher.on_control = lambda argv: Done(0, b"caf\xc3\xa9", b"")
     assert verb(world, "exec", argv=["cmd"])[1] == "café"
 
 
-def test_o56_exec_that_times_out_is_124(world, clock):
-    """O56: the launcher's TimeoutError is 124, with nothing on stdout."""
+def test_o58_exec_that_times_out_is_124(world, clock):
+    """O58: the launcher's TimeoutError is 124, with nothing on stdout."""
     world.launcher.on_control = lambda argv: TimeoutError()
     status, out, err = verb(world, "exec", argv=["sleep", "999"])
     assert status == 124
@@ -740,8 +740,8 @@ def test_o56_exec_that_times_out_is_124(world, clock):
     assert NODE not in err
 
 
-def test_o56_exec_whose_step_could_not_run_is_125_naming_only_the_error_type(world, clock):
-    """O56: not the command's status (1 could be); 125, and the message holds no node."""
+def test_o58_exec_whose_step_could_not_run_is_125_naming_only_the_error_type(world, clock):
+    """O58: not the command's status (1 could be); 125, and the message holds no node."""
     world.launcher.on_control = lambda argv: RuntimeError("could not reach node-x1")
     status, _out, err = verb(world, "exec", argv=["cmd"])
     assert status == 125
@@ -750,8 +750,8 @@ def test_o56_exec_whose_step_could_not_run_is_125_naming_only_the_error_type(wor
 
 
 @pytest.mark.parametrize("argv", [[], [1, 2]])
-def test_o56_exec_without_a_command_is_refused(argv, world, clock):
-    """O56: nothing (or no string) after `--` is exit 2, and no step runs."""
+def test_o58_exec_without_a_command_is_refused(argv, world, clock):
+    """O58: nothing (or no string) after `--` is exit 2, and no step runs."""
     status, out, _ = verb(world, "exec", argv=argv)
     assert status == 2
     assert out == ""
