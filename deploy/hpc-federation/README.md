@@ -163,7 +163,7 @@ against `tests/fake_couchbase.py`, a loopback stand-in with Couchbase 4.5's acce
 A mount run on a batch node (O60, `expcore_onedata.sandbox.apptainer.hostmount`) runs oneclient on the node, outside
 every cell, so that its FUSE mount is in the node's mount namespace, where the setuid starter binds it into each cell.
 A batch node has no oneclient of its own, and one started from a SIF mounts inside the SIF's own mount namespace. So
-the host mount runs a **relocatable bundle** of the very build the Compose federation's mount sidecar runs (O64):
+the host mount runs a **relocatable bundle** of the very build the Compose federation's mount sidecar runs (O65):
 
 ```sh
 python3 deploy/hpc-federation/oneclient_bundle.py --image onedata/oneclient@sha256:<id> --id sha256:<id> \
@@ -187,14 +187,14 @@ python3 deploy/hpc-federation/oneclient_bundle.py --image onedata/oneclient@sha2
   --library-path lib bin/oneclient ...`. The image's libraries carry the DT_RPATH `/opt/oneclient/lib`, which glibc
   searches *before* `--library-path`, and a library opened at run time would fall back to the node's
   `/etc/ld.so.cache`: with both inhibited, a name is looked for in the bundle and then only in the loader's own
-  Debian-layout directories. `--self-check` runs that launcher on the build host: `--list` must place every library
+  Debian-layout directories (a node that keeps its libraries under `/usr/lib64` has none there). `--self-check` runs that launcher on the build host: `--list` must place every library
   in the bundle, and `--version` must run with no object initialised from outside it (`LD_DEBUG=files`).
 - **Declared and pinned:** put the tar on the filesystem the nodes see and declare it in `[sandbox.apptainer]`,
   `oneclient_bundle` and `oneclient_bundle_sha256` (from `site.env`'s `HPC_ONECLIENT_BUNDLE` and
   `HPC_ONECLIENT_BUNDLE_SHA256` for the pilot's template; `up` checks the file against the pin before the cluster is
   touched). A mount level without it does not load. Each run unpacks its own copy into a private directory of the
   run from the bytes it hashes, records `oneclient_build` (oneclient's `--version`, the binary's build id, the pin)
-  in the mount helper's metadata, and removes the copy at its stop. The pin is in the campaign fingerprint
+  in the mount helper's metadata (the sandbox's `metadata()["mount"]`), and removes the copy at its stop. The pin is in the campaign fingerprint
   (`sandbox_backend`), so runs on two bundles are never one experiment.
 - **What the node must give:** a setuid `fusermount3` (the bundle's libfuse 3 runs `/usr/bin/fusermount3`, then
   `fusermount3` on `PATH`), a `/dev/fuse` the job's uid may open, and a run directory on a filesystem that is not
@@ -342,7 +342,7 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   42 units per hour, against 63 for one uniform 18 GB shape (`DESIGN.md`, section 1).
 - **The agent's sandbox** (O63): the pilot's template declares the Apptainer sandbox, whose limits size the agent's
   node (an 8-core, 17 GiB step), and names the site's values as placeholders `up` fills from `site.env`:
-  `HPC_AGENT_SIF`, `HPC_EGRESS_SHIM` and `HPC_ONECLIENT_BUNDLE` (the mount level's oneclient, O64) with their
+  `HPC_AGENT_SIF`, `HPC_EGRESS_SHIM` and `HPC_ONECLIENT_BUNDLE` (the mount level's oneclient, O65) with their
   `..._SHA256`, and `HPC_AGENT_WORK_ROOT` (`site.env.example`). A pin
   is a declaration: `up` reads each file and refuses, before the cluster is touched, a variable not set, a file
   missing or one whose SHA-256 is not the one declared, naming the variable and never the path. The egress collector
@@ -485,6 +485,6 @@ against a fake Slurm (O57): the layout's sizes and the held job's shape, the sub
 allowlist, a hung client and a step past its bound, the state file, `up`'s placement, peers and token pipes, `down`
 after a whole or a partial `up`, the core's phase writing `platform.toml` and the ten-pair link-check record, and
 `zone-export.sh` on a stand-in work directory. `tests/deploy/test_hpc_oneclient_bundle.py` builds the oneclient bundle
-from invented images against a fake Docker (O64): the closure inside the image, the scratch container's discipline, a
+from invented images against a fake Docker (O65): the closure inside the image, the scratch container's discipline, a
 reproducible tar and the self-check's refusals. The bundle's wider offline suite reads files copied out of the two pinned images
 (patch drift, the images' binaries under the shim) and is not in the repository; neither are those files.

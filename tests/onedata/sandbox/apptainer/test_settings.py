@@ -164,7 +164,7 @@ def test_oneclient_s_bundle_is_a_pin_of_the_backend_resolved_like_the_others(tmp
 
 
 def test_a_mount_level_on_the_apptainer_backend_without_the_bundle_is_refused_at_load(tmp_path):
-    """O64: a mount level's oneclient is declared and pinned, or the platform does not load."""
+    """O65: a mount level's oneclient is declared and pinned, or the platform does not load."""
     with pytest.raises(ConfigError, match="oneclient_bundle"):
         _load(tmp_path, _mounting())
 
@@ -176,7 +176,7 @@ def test_a_bundle_declared_by_half_is_refused_naming_the_missing_key(tmp_path, k
 
 
 def test_a_platform_without_the_bundle_keeps_the_record_it_had(tmp_path):
-    """O64: a REST-only Apptainer platform declares no bundle: its fingerprint is the one it had before the key."""
+    """O65: a REST-only Apptainer platform declares no bundle: its fingerprint is the one it had before the key."""
     record = _load(tmp_path, _document()).apptainer.record()
     assert "oneclient_bundle_sha256" not in record
     assert set(record) == {"backend", "image_sha256", "egress_shim_sha256", "egress_collector_sha256",
@@ -184,7 +184,7 @@ def test_a_platform_without_the_bundle_keeps_the_record_it_had(tmp_path):
 
 
 def test_two_oneclient_bundles_give_two_campaign_fingerprints(tmp_path, fake):
-    """O64: HPC mount runs on another oneclient are another experiment: a resume or a merge across them is refused."""
+    """O65: HPC mount runs on another oneclient are another experiment: a resume or a merge across them is refused."""
     from expcore_onedata.config import load_platform
     from expcore_onedata.testing import write_platform
 

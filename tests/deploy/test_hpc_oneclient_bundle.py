@@ -123,7 +123,7 @@ def closure_of(ob, entries: dict):
 
 
 def test_the_closure_follows_runpath_origin_and_absolute_links_inside_the_image(ob):
-    """O64: an absolute link is resolved from the image's root, never this host's; $ORIGIN is the needing object's."""
+    """O65: an absolute link is resolved from the image's root, never this host's; $ORIGIN is the needing object's."""
     built = closure_of(ob, oneclient_image())
     sources = {entry.name: entry.source for entry in built.libraries}
     assert sources["lib/liba.so.1"] == "/opt/oneclient/lib/real/liba.so.1.0"
@@ -138,7 +138,7 @@ def test_a_library_found_through_an_rpath_is_in_the_closure(ob):
 
 
 def test_the_modules_glibc_opens_by_name_are_added_with_their_own_closure(ob):
-    """O64: ldd never lists the NSS modules a host lookup opens; without them the node's own would be opened."""
+    """O65: ldd never lists the NSS modules a host lookup opens; without them the node's own would be opened."""
     names = {Path(entry.name).name for entry in closure_of(ob, oneclient_image()).libraries}
     assert {"libnss_files.so.2", "libnss_dns.so.2", "libresolv.so.2"} <= names
 
@@ -175,7 +175,7 @@ def test_a_binary_whose_loader_is_not_the_x86_64_loader_is_refused(ob):
 
 # ------------------------------------------------------------------------------------------------------- docker
 def test_the_image_is_read_only_through_one_never_started_container_removed_by_its_own_name(ob, tmp_path):
-    """O64: created by id with --pull never, checked never started, copied from, then removed by its own name."""
+    """O65: created by id with --pull never, checked never started, copied from, then removed by its own name."""
     docker = FakeDocker(image_tar(oneclient_image()))
     ob.copy_root(docker, REFERENCE, IMAGE_ID, tmp_path / "root.tar")
     assert docker.verbs() == ["image inspect", "create", "container inspect", "cp", "rm"]
@@ -186,7 +186,7 @@ def test_the_image_is_read_only_through_one_never_started_container_removed_by_i
     assert name.startswith(ob.CONTAINER_PREFIX)
     assert docker.calls[3] == ["cp", f"{name}:/", "-"]
     assert docker.calls[4] == ["rm", "-v", name]
-    assert not ({"start", "run", "exec", "pull", "rmi", "tag"} & {word for call in docker.calls for word in call})
+    assert all(ob.allowed(call) for call in docker.calls)
 
 
 def test_the_container_is_removed_even_when_the_copy_fails(ob, tmp_path):
@@ -211,16 +211,22 @@ def test_a_container_that_is_not_a_never_started_one_of_the_image_is_refused_and
     assert docker.verbs()[-1] == "rm"
 
 
-def test_the_docker_command_refuses_every_verb_that_would_run_pull_or_remove_anything_else(ob):
-    run = ob.docker_cli("/nonexistent/docker")
-    for verb in ("start", "run", "exec", "pull", "rmi", "tag"):
-        with pytest.raises(ob.BuildError, match="never run"):
-            run([verb, "x"])
+@pytest.mark.parametrize(
+    "argv",
+    [["start", "x"], ["run", "img"], ["pull", "img"], ["rmi", "img"], ["tag", "a", "b"], ["image", "rm", "img"],
+     ["container", "start", "expcore-oneclient-bundle-1"], ["rm", "-v", "another-studys-container"],
+     ["rm", "-f", "expcore-oneclient-bundle-1"], ["create", "--name", "expcore-oneclient-bundle-1", "img"],
+     ["cp", "another:/", "-"]],
+)  # fmt: skip
+def test_the_docker_command_allows_only_the_build_s_own_calls_on_its_own_container(ob, argv):
+    """O65: an allow-list of the five calls step 1 makes, so no other image or container is ever touched."""
+    with pytest.raises(ob.BuildError, match="not a call the bundle's build makes"):
+        ob.docker_cli("/nonexistent/docker")(argv)
 
 
 # ------------------------------------------------------------------------------------------------------- the tar
 def test_two_builds_of_one_image_give_one_sha256_whatever_the_image_s_times(ob, tmp_path):
-    """O64: the pin is the tar's SHA-256: a rebuild of the same image must not change it (no time, owner, order)."""
+    """O65: the pin is the tar's SHA-256: a rebuild of the same image must not change it (no time, owner, order)."""
     first = ob.build(FakeDocker(image_tar(oneclient_image(), mtime=1)), REFERENCE, IMAGE_ID, tmp_path / "a")
     second = ob.build(FakeDocker(image_tar(oneclient_image(), mtime=2)), REFERENCE, IMAGE_ID, tmp_path / "b")
     assert first["tarball_sha256"] == second["tarball_sha256"]
@@ -283,7 +289,7 @@ def test_the_loader_s_listing_flags_a_library_outside_the_bundle_or_not_found(ob
 
 
 def test_the_launcher_inhibits_the_cache_and_every_file_s_rpath(ob, tmp_path):
-    """O64: the image's libraries carry an RPATH that glibc searches before --library-path, and a module opened later
+    """O65: the image's libraries carry an RPATH that glibc searches before --library-path, and a module opened later
     would fall back to the node's cache: both are switched off for every file of the bundle."""
     (tmp_path / "lib").mkdir()
     (tmp_path / "bin").mkdir()

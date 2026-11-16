@@ -46,7 +46,7 @@ def test_the_bundle_is_unpacked_as_private_files_and_only_the_binary_and_loader_
 
 
 def test_a_tar_that_is_not_the_pinned_file_is_refused_and_nothing_of_it_is_left(tmp_path, root):
-    """O64: only the pinned bytes run; an unpacked copy of any other file is removed before the refusal."""
+    """O65: only the pinned bytes run; an unpacked copy of any other file is removed before the refusal."""
     pin = pinned_tar(tmp_path)
     with pytest.raises(StartRefused, match="pinned"):
         OB.unpack(Pinned(pin.path, "0" * 64), root)
@@ -54,7 +54,7 @@ def test_a_tar_that_is_not_the_pinned_file_is_refused_and_nothing_of_it_is_left(
 
 
 def test_bytes_after_the_archive_s_end_are_hashed_too(tmp_path, root):
-    """O64: the pin covers the whole file, not only what tar reads: a file with something appended is another."""
+    """O65: the pin covers the whole file, not only what tar reads: a file with something appended is another."""
     pin = pinned_tar(tmp_path)
     with open(pin.path, "ab") as handle:
         handle.write(b"appended after the end-of-archive blocks\n")
@@ -69,7 +69,7 @@ def test_bytes_after_the_archive_s_end_are_hashed_too(tmp_path, root):
     ids=["a link among the libraries", "a link beside the binary"],
 )
 def test_a_pinned_tar_that_holds_a_link_is_refused(tmp_path, root, extra):
-    """O64: even pinned, a link would let the loader open a file outside the bundle."""
+    """O65: even pinned, a link would let the loader open a file outside the bundle."""
     with pytest.raises(StartRefused, match="no regular file"):
         OB.unpack(pinned_tar(tmp_path, extra=[extra]), root)
     assert os.listdir(root) == []
@@ -113,7 +113,7 @@ def test_the_bundle_goes_only_into_an_empty_directory_whose_path_holds_no_colon(
 
 
 def test_the_launcher_inhibits_the_cache_and_every_rpath_of_the_bundle_s_files(tmp_path, root):
-    """O64: the image's libraries carry an RPATH glibc searches before --library-path, and a module opened at run
+    """O65: the image's libraries carry an RPATH glibc searches before --library-path, and a module opened at run
     time would fall back to the node's cache: both are off for every file the bundle holds."""
     bundle = OB.unpack(pinned_tar(tmp_path), root)
     words = bundle.launcher()

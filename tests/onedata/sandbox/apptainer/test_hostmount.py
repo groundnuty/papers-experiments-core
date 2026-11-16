@@ -160,7 +160,7 @@ def test_a_bundle_that_is_not_the_pinned_file_is_refused_before_the_token_is_wri
 
 
 def test_a_platform_that_declares_no_bundle_is_refused(node, settings):
-    """O64: oneclient is the platform's declared bundle, never a binary found on the node."""
+    """O65: oneclient is the platform's declared bundle, never a binary found on the node."""
     bare = dataclasses.replace(settings, apptainer=dataclasses.replace(settings.apptainer, oneclient_bundle=None))
     with pytest.raises(StartRefused, match="oneclient_bundle"):
         helper(node, bare).start()
@@ -168,7 +168,7 @@ def test_a_platform_that_declares_no_bundle_is_refused(node, settings):
 
 
 def test_the_run_records_the_oneclient_that_served_it(node, settings, bundle):
-    """O64: its own --version, run on the node through the bundle's launcher, the binary's GNU build id, the pin."""
+    """O65: its own --version, run on the node through the bundle's launcher, the binary's GNU build id, the pin."""
     mount = helper(node, settings)
     try:
         mount.start()
@@ -199,7 +199,7 @@ def test_the_stop_removes_the_bundle_s_copy_once_oneclient_is_gone(node, setting
 
 
 def test_the_factory_refuses_a_oneclient_given_in_code():
-    """O64: a binary given to the factory would serve runs the campaign fingerprint does not tell apart."""
+    """O65: a binary given to the factory would serve runs the campaign fingerprint does not tell apart."""
     with pytest.raises(TypeError, match="oneclient_bundle"):
         HM.host_mount_factory(object())
     with pytest.raises(TypeError, match="oneclient_bundle"):
@@ -355,6 +355,20 @@ def test_through_the_sandbox_every_cell_binds_the_mount_point_alone_and_the_coll
     finally:
         box.stop()
     assert node.mounted_at is None
+
+
+def test_the_sandbox_s_metadata_names_the_oneclient_that_served_the_run_and_the_backend_s_pin(node, settings, bundle):
+    """O65: what a study keeps of a run's sandbox names its oneclient (version, build id) and the bundle's pin."""
+    factory = HM.host_mount_factory(mountinfo=node.mountinfo)
+    box = ApptainerSandbox.start(node, settings, make_spec("mounted"), **options(mount_helper=factory))
+    try:
+        meta = box.metadata()
+        assert meta["mount"]["oneclient_build"]["version"] == "25.0"
+        assert meta["mount"]["oneclient_build"]["build_id"] == "ab" * 20
+        assert meta["mount"]["oneclient_build"]["bundle_sha256"] == bundle.sha256
+        assert meta["backend"]["oneclient_bundle_sha256"] == bundle.sha256
+    finally:
+        box.stop()
 
 
 def test_the_run_record_lists_the_mounts_token_file_before_the_start_writes_it(node, settings):

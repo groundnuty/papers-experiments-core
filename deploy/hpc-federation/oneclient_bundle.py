@@ -28,10 +28,10 @@ runs, so that both backends run one oneclient build.
 The bundle runs from wherever it is unpacked as `lib/LOADER --inhibit-cache --inhibit-rpath <every file of the bundle>
 --library-path lib bin/oneclient ...` (`expcore_onedata.sandbox.apptainer.oneclient_bundle.Bundle.launcher`): the
 image's libraries carry the DT_RPATH `/opt/oneclient/lib`, which glibc searches before `--library-path`, and a library
-opened at run time would fall back to the node's `/etc/ld.so.cache`; with both inhibited, the loader and every library
-are the image's, none the node's. `--self-check` runs that launcher here with an empty environment: `--list` must place
-every library inside the unpacked bundle, `--version` must run with no object initialised from outside it
-(`LD_DEBUG=files`), and its lines are recorded.
+opened at run time would fall back to the node's `/etc/ld.so.cache`; with both inhibited, a name is looked for in the
+bundle, then only in the loader's own (Debian-layout) directories. `--self-check` runs that launcher here with an empty
+environment: `--list` must place every library inside the unpacked bundle, `--version` must run with no object
+initialised from outside it (`LD_DEBUG=files`), and its lines are recorded.
 """
 
 from __future__ import annotations
@@ -60,7 +60,6 @@ FORMAT = "expcore-oneclient-bundle/1"
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 NAME = re.compile(r"[A-Za-z0-9._+-]{1,128}\Z")  # a library's name as DT_NEEDED gives it: never a path
 CONTAINER_PREFIX = "expcore-oneclient-bundle-"
-FORBIDDEN_VERBS = frozenset({"start", "run", "exec", "pull", "rmi", "tag", "commit", "push", "kill", "restart"})
 MAX_LINKS = 40
 DOCKER_TIMEOUT_S = 1800
 CHECK_TIMEOUT_S = 60
@@ -377,10 +376,26 @@ def sha256_of(path: Path) -> str:
 Docker = Callable[[Sequence[str], Optional[io.BufferedWriter]], "subprocess.CompletedProcess[bytes]"]
 
 
+def allowed(argv: Sequence[str]) -> bool:
+    """Whether a docker call is one of the build's five (step 1), the scratch container named by its own prefix: an
+    allow-list, so nothing is ever started, pulled, tagged or removed besides that container."""
+    words = list(argv)
+    ours = len(words) > 2 and words[-1].startswith(CONTAINER_PREFIX)
+    return (
+        (words[:3] == ["image", "inspect", "--format"] and len(words) == 5)
+        or (words[:4] == ["create", "--pull", "never", "--name"] and len(words) == 6 and words[4].startswith(
+            CONTAINER_PREFIX) and IMAGE_ID.fullmatch(words[5]) is not None)
+        or (words[:3] == ["container", "inspect", "--format"] and len(words) == 5 and ours)
+        or (len(words) == 3 and words[0] == "cp" and words[2] == "-" and words[1].startswith(CONTAINER_PREFIX)
+            and words[1].endswith(":/"))
+        or (words[:2] == ["rm", "-v"] and len(words) == 3 and ours)
+    )  # fmt: skip
+
+
 def docker_cli(command: str = "docker") -> Docker:
     def run(argv: Sequence[str], stdout: io.BufferedWriter | None = None) -> subprocess.CompletedProcess[bytes]:
-        if argv and argv[0] in FORBIDDEN_VERBS:  # the build never runs, pulls or removes anything else
-            raise BuildError(f"docker {argv[0]} is never run by the bundle's build")
+        if not allowed(argv):  # the build never runs, pulls, tags or removes anything else
+            raise BuildError(f"docker {' '.join(argv[:2])} is not a call the bundle's build makes")
         sink = subprocess.PIPE if stdout is None else stdout
         return subprocess.run([command, *argv], stdout=sink, stderr=subprocess.PIPE, timeout=DOCKER_TIMEOUT_S)
 

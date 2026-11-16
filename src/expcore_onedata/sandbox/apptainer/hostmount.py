@@ -13,13 +13,13 @@ path a cell binds; the cell binds only the mount point, `<run>/mount`, read-only
 1. oneclient's bundle, the tar `[sandbox.apptainer] oneclient_bundle` pins, is unpacked into `oneclient-bundle/` from
    the bytes that are hashed (`oneclient_bundle.unpack`: another file refuses the start), and its own `--version` and
    the binary's GNU build id are read for the record. The token is written to `token/token` (0600), and oneclient is
-   started on the node through the bundle's launcher (the image's loader and libraries, never the node's): `sh -c`
-   reads that file into `ONECLIENT_ACCESS_TOKEN`, refuses an empty one, then becomes `env` without the variables that
-   could set an option (`UNSET_ENV`), with `HOME` its own `oneclient-home/` and, with the platform's `ca_file`,
-   `SSL_CERT_FILE` a copy of the CA bundle; then oneclient in the foreground with `-o ro` (no `allow_other`, which the
-   node refuses), the declared force-I/O option, `--log-dir oneclient-log/`, `--config /dev/null`,
-   `--disable-log-buffering` (#307), the provider's port and the study's extra arguments. The token is never in an
-   argument or in the driver's environment;
+   started on the node through the bundle's launcher (the image's loader and libraries, with no RPATH and no loader
+   cache consulted): `sh -c` reads that file into `ONECLIENT_ACCESS_TOKEN`, refuses an empty one, then becomes `env`
+   without the variables that could set an option (`UNSET_ENV`), with `HOME` its own `oneclient-home/` and, with the
+   platform's `ca_file`, `SSL_CERT_FILE` a copy of the CA bundle; then oneclient in the foreground with `-o ro` (no
+   `allow_other`, which the node refuses), the declared force-I/O option, `--log-dir oneclient-log/`, `--config
+   /dev/null`, `--disable-log-buffering` (#307), the provider's port and the study's extra arguments. The token is
+   never in an argument or in the driver's environment;
 2. once the FUSE mount is up at the mount point (this uid's, read-only, no `allow_other`), the watcher
    (`expcore_onedata.sandbox.mountwatch`) is started on the token file, its directory and the mount, with the five
    private directories as the protected ones; then the token file is removed (verified) and the watcher, seeing the
