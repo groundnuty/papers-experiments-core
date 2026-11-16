@@ -88,7 +88,7 @@ Ask for what the selection needs: most of the suite is single-threaded, so 2 to 
   node's name failed for a minute) is tried again, up to three times 30 s apart, with the same run id. A lost launch
   reply looks the same as a launch that never happened, so the boot's first act on the node is an atomic, durable mark
   of the run id (`attempts/<run>`, kept after the run): a retry whose earlier attempt started there refuses (exit 72)
-  rather than run again or hide that attempt's result. `clean` removes the marks of runs gone longer than its bound.
+  rather than run again or hide that attempt's result. `clean`, `--all` included, removes only marks older than a day whose runs are gone.
 - **The srun client of a finished step can hang** while the step's results are already out (seen on a site). The run
   ends ssh 30 s after the end marker, and keeps the results. On the login node the step runs under `timeout` (the
   step's time limit plus an hour for waiting for cores), so a client left behind ends by then.

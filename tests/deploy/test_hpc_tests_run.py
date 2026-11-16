@@ -204,7 +204,7 @@ def test_clean_removes_a_dead_run_s_directory_and_keeps_young_ones(cli, world, c
     assert not dead.exists()
     assert young.exists()
     marks = sorted(p.name for p in (world.node_root / "attempts").iterdir() if not p.name.startswith("clean-"))
-    assert marks == ["young-run"]  # the dead run's mark went with it; a mark outlives its own run on purpose
+    assert marks == ["dead-run", "young-run"]  # a mark outlives its run: a retry of that run id must still find it
 
 
 def test_the_payload_must_arrive_intact(cli, world):
@@ -352,3 +352,19 @@ def test_o64_a_retry_whose_earlier_attempt_ran_on_the_node_refuses_instead_of_ru
     (world.fake / "launch-lost").write_text("")
     assert run(cli, world, "tests") == 72
     assert '"rc": 72' in (only_run(world) / "run.json").read_text()
+
+
+@pytest.mark.parametrize("mode", [["--all"], ["--stale", "1"]])
+def test_o64_clean_keeps_every_attempt_mark_younger_than_a_day_and_removes_older_ones(cli, world, mode):
+    """O64: a retry of a failed launch keeps its run id and must find the mark of an earlier attempt, so a clean (even
+    --all, between two attempts) removes only marks older than a day whose run directories are gone."""
+    allocate(cli, world)
+    attempts = world.node_root / "attempts"
+    fresh, old = attempts / "fresh-run", attempts / "old-run"
+    for mark in (fresh, old):
+        mark.mkdir(parents=True)
+    then = time.time() - 2 * 86400
+    os.utime(old, (then, then))
+    assert cli.main(["--site", str(world.site), "clean", *mode]) == 0
+    assert fresh.exists()
+    assert not old.exists()
