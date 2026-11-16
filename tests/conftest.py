@@ -7,8 +7,20 @@ import sys
 from pathlib import Path
 
 import pytest
+from core_pin import pinned  # tests/support, which pytest's `pythonpath` puts on the path before any conftest
 
+from expcore.provenance import core_identity
 from expcore.provenance.study_tokens import render_hash_file
+
+
+@pytest.fixture(scope="session", autouse=True)
+def committed_core():
+    """Every test sees the checkout's core identity as if it were committed (`support/core_pin.py`): the suite's
+    outcome must not depend on uncommitted changes in the checkout it runs from. Tests of the identity read their own
+    repositories, or replace `core_identity.current` themselves."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(core_identity, "current", pinned)
+        yield pinned()
 
 
 class Repo:

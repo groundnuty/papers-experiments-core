@@ -38,15 +38,16 @@ from expcore.campaign.merge import (
 )
 from expcore.errors import study_kinds
 from expcore.provenance.codestamp import require_known
-from expcore.provenance.environment import differences
+from expcore.provenance.core_check import require_core
+from expcore.provenance.environment import differences, is_earlier_form
 from expcore.replay.check import UNEXPECTED_STAGE, BatchNotVerified, describe_unexpected, unexpected_in, verify_batch
 from expcore.replay.side_file_placement import settle_side_files
 from expcore.study.config import StudyConfig, find_study_root, load_study
 from expcore.study.pipeline import (
     HASHED_ONLY,
     campaign_environment,
+    environment_like,
     import_what_the_records_need,
-    study_environment,
 )
 from expcore.study.selection_start import pricing_of
 
@@ -99,7 +100,7 @@ def _merge(study: StudyConfig, out: Path, shard_outs: list[Path], allow_dirty: b
     _refuse_inside_a_shard(out, shard_outs)
     refuse_non_empty(out)
     code = require_known("merge", code_root or study.root, study.scope, allow_dirty=allow_dirty)
-    env = study_environment(study)
+    require_core("merge", allow_dirty=allow_dirty)  # a dirty core merges a pilot's shards only when allowed (P01)
     out.parent.mkdir(parents=True, exist_ok=True)
     stage = out.parent / f".{out.name}.merge-{os.getpid()}"
     shutil.rmtree(stage, ignore_errors=True)
@@ -108,6 +109,7 @@ def _merge(study: StudyConfig, out: Path, shard_outs: list[Path], allow_dirty: b
         pricing = pricing_of(study)  # what a selection's spend is counted with (C38); a shard's is not read
         facts = [read_shard(path, stage / f"read-{n}.sqlite", pricing) for n, path in enumerate(shard_outs)]
         shards = check_shards(facts, study.manifest, pricing)
+        env = _environment_of(study, shards)
         copies = stage / REPLAY_DIR
         copies.mkdir(mode=0o700)
         staged = [_replay(study, shard, code, env, copies / str(n)) for n, shard in enumerate(shards)]
@@ -122,6 +124,19 @@ def _merge(study: StudyConfig, out: Path, shard_outs: list[Path], allow_dirty: b
             make_writable(stage)
         shutil.rmtree(stage, ignore_errors=True)
     return Merged(out, len(shards), sum(len(shard.runs) for shard in shards))
+
+
+def _environment_of(study: StudyConfig, shards: Sequence[ShardFacts]) -> dict[str, Any]:
+    """The environment the shards are replayed under: the one in use, in the form the shards record the core in, which
+    `check_core` made one form for all of them; shards an earlier core recorded merge under its form, said on stderr."""
+    recorded = campaign_environment(shards[0].fingerprint)
+    if is_earlier_form(recorded):
+        print(
+            "merge: every shard recorded the core in its earlier form, by how it was installed; they merge under "
+            "that form",
+            file=sys.stderr,
+        )
+    return environment_like(study, recorded)
 
 
 def _replay(study: StudyConfig, shard: ShardFacts, code: Any, env: Any, copy: Path) -> ShardFacts:

@@ -90,7 +90,14 @@ from expcore.package.wheels import REQUIREMENTS, Vendor, Wheel, makefile, requir
 from expcore.package.wheelscan import scan_wheels
 from expcore.package.withhold import withhold_headers
 from expcore.provenance.codestamp import STAMP, CodeVersionUnknown, covered_files, is_sha
-from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_environment
+from expcore.provenance.core_check import recorded_core_problem
+from expcore.provenance.environment import (
+    EnvironmentUnknown,
+    differences,
+    environment,
+    is_earlier_form,
+    is_environment,
+)
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.hashfile import Hashes
 from expcore.provenance.redact import Redactor, stop_message
@@ -170,12 +177,21 @@ def _clean_code(check: Mapping[str, object], where: str) -> Mapping[str, object]
 
 
 def _environment(study: StudyConfig, check: Mapping[str, object], where: str) -> Mapping[str, Any]:
-    """The environment the check ran under; refuse a check that records none, or a build under another one."""
+    """The environment the check ran under; refuse a check that records none, one whose core was dirty or unknown (a
+    package ships the code of one commit, the core's included), or a build under another environment, which is
+    computed in the form the check holds the core in (`study.core_legacy`)."""
     recorded = check.get("environment")
     if not is_environment(recorded):
         raise PackageError(f"{where}: records no environment; run `python -m expcore check` again with this core")
+    problem = recorded_core_problem(recorded)
+    if problem is not None:
+        raise PackageError(
+            f"{where}: the replay check was made under a core that is not a clean commit ({problem}); install the "
+            "core from a clean commit, then run the study's commands again: a package ships the code of one commit"
+        )
     try:
-        now = environment(study.requires)
+        earlier = is_earlier_form(recorded)
+        now = environment(study.requires, earlier_core=True) if earlier else environment(study.requires)
     except EnvironmentUnknown as error:
         raise PackageError(str(error)) from None
     changed = differences(recorded, now)
