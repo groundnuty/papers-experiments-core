@@ -119,6 +119,8 @@ class HpcSettings:
     def roles(self, providers: Tuple[str, ...]) -> Tuple[Role, ...]:
         """The held job's nodes in order: the zone, each provider in the layout's order, then the agent's node."""
         roles = [Role("zone", "oz"), *(Role(name, "op") for name in providers)]
+        if self.sandbox is not None and "sandbox" in providers:
+            raise SettingsError('a provider named "sandbox" would lose its node to the agent\'s: rename the provider')
         if self.sandbox is not None:
             roles.append(Role("sandbox", "sandbox"))
         return tuple(roles)

@@ -448,6 +448,7 @@ class Slurm:
         """Every component's record of the job just submitted, read back; unless each is what was asked, cancel that
         one job (a heterogeneous job by its leader's id, which ends every component) and fail, naming the fields."""
         records = self.components(job)
+        self._ours(job, records, asked.name)
         wrong = ["the job itself"] if records is None else component_mismatches(records, asked, job)
         if wrong:
             self.cancel(job)
@@ -459,12 +460,20 @@ class Slurm:
         """`checked`, reduced to the read-back's fields of component 0."""
         return {field: self.checked(job, asked)[0][field] for field in READBACK}
 
-    def wait_running(self, job: str, timeout_s: float) -> Dict[str, str]:
+    @staticmethod
+    def _ours(job: str, records: Optional[Sequence[Mapping[str, str]]], name: Optional[str]) -> None:
+        """Slurm reuses ids: a job id whose job (component 0) carries another name than the one submitted is not ours,
+        and is never cancelled; fail instead, naming it."""
+        if records and name is not None and records[0].get("JobName") != name:
+            raise SlurmError(f"job {job} carries another job's name: not the job submitted, and not cancelled")
+
+    def wait_running(self, job: str, timeout_s: float, name: Optional[str] = None) -> Dict[str, str]:
         """Wait for the held job (every component of it) to run; at the bound, or if it ends first, cancel it by its
-        id and fail."""
+        id and fail. With `name`, a job that carries another is never cancelled (`_ours`)."""
         deadline = self.clock() + timeout_s
         while True:
             records = self.components(job) or []
+            self._ours(job, records, name)
             states = [record.get("JobState") for record in records]
             if states and all(state == "RUNNING" for state in states):
                 return records[0]

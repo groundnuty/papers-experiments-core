@@ -36,17 +36,23 @@ def site(tmp_path):
     return {**SITE, "SH": str(images), "L": str(logs)}
 
 
-def agent_layout(folder: Path, placement: str = "het", template_extra: str = "", hpc_extra: str = AGENT) -> Path:
-    """The pilot-shape layout with the agent's node and its placement, beside its platform template."""
+def agent_layout(
+    folder: Path, placement: str = "het", template_extra: str = "", hpc_extra: str = AGENT, rename=("", "")
+) -> Path:
+    """The pilot-shape layout with the agent's node and its placement, beside its platform template; `rename` gives a
+    provider another name in both."""
     folder.mkdir()
     text = LAYOUT.read_text(encoding="utf-8")
     assert CONTROL in text
     assert PLACEMENT in text  # the pilot's layout records the coordinator's choice
     text = text.replace(PLACEMENT, f'sandbox_placement = "{placement}"')
     text = text.replace(CONTROL, f"{CONTROL}\n{hpc_extra}") if hpc_extra else text
-    (folder / LAYOUT.name).write_text(text, encoding="utf-8")
     template = LAYOUT.parent / "pilot-shape.platform.toml.template"
-    (folder / template.name).write_text(template.read_text(encoding="utf-8") + template_extra, encoding="utf-8")
+    plate = template.read_text(encoding="utf-8") + template_extra
+    if rename[0]:
+        text, plate = text.replace(*rename), plate.replace(*rename)
+    (folder / LAYOUT.name).write_text(text, encoding="utf-8")
+    (folder / template.name).write_text(plate, encoding="utf-8")
     return folder / LAYOUT.name
 
 
@@ -62,12 +68,12 @@ def apptainer_limits(cpus: int = 8, memory: int = 8 * GIB, work: int = 4 * GIB, 
 class Rig:
     """A driver over the fake Slurm, the core's phase recorded instead of run."""
 
-    def __init__(self, hpc, tmp_path, site, placement="het", fake=None):
+    def __init__(self, hpc, tmp_path, site, placement="het", fake=None, rename=("", "")):
         self.hpc = hpc
         self.fake = fake or FakeSlurm()
         self.root = tmp_path / "fed" / "root"
         self.site = site
-        self.layout = agent_layout(tmp_path / "layout", placement)
+        self.layout = agent_layout(tmp_path / "layout", placement, rename=rename)
         self.driver = hpc.cli.make_driver(self.layout, str(self.root), runner=self.fake)
         self.driver.sleep = lambda s: None
         self.driver.poll_s = 0.0
@@ -159,18 +165,34 @@ def test_the_layouts_template_gives_the_driver_the_agents_node(hpc, tmp_path):
     assert driver.settings.sandbox == hpc.settings.Size(10, 17 * 1024)
 
 
-def test_down_never_reads_the_agents_limits_so_an_edited_template_cannot_keep_a_job_billing(hpc, tmp_path):
-    """O57: the agent's limits are read for up and describe alone: after the template's limits outgrew [hpc] sandbox
-    (or it stopped parsing), up and describe refuse, naming the key, while down still runs."""
-    (tmp_path / "fed").mkdir()
-    layout = agent_layout(tmp_path / "layout", template_extra=apptainer_limits(memory=64 * GIB))
-    root = str(tmp_path / "fed" / "root")
-    for command in ("up", "describe"):
-        assert hpc.cli.main(["--layout", str(layout), "--root", root, command], {}, runner=FakeSlurm()) == 2
-    assert hpc.cli.main(["--layout", str(layout), "--root", root, "down"], {}, runner=FakeSlurm()) == 0
-    template = layout.parent / "pilot-shape.platform.toml.template"
-    template.write_text(template.read_text(encoding="utf-8") + "\nnot = toml = at all\n", encoding="utf-8")
-    assert hpc.cli.main(["--layout", str(layout), "--root", root, "down"], {}, runner=FakeSlurm()) == 0
+@pytest.mark.parametrize(
+    "tail", [apptainer_limits(memory=64 * GIB), "\nnot = toml = at all\n"], ids=["limits outgrew it", "not toml"]
+)
+def test_down_never_reads_the_agents_limits_so_an_edited_template_cannot_keep_a_job_billing(hpc, tmp_path, site, tail):
+    """O57: the agent's limits are read for up and describe alone: once a federation is up, a template whose limits
+    outgrew [hpc] sandbox (or that stopped parsing) makes describe refuse, while down still cancels the held job and
+    removes the root."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    template = rig.layout.parent / "pilot-shape.platform.toml.template"
+    template.write_text(template.read_text(encoding="utf-8") + tail, encoding="utf-8")
+    words = ["--layout", str(rig.layout), "--root", str(rig.root)]
+    assert hpc.cli.main([*words, "describe"], {}, runner=rig.fake) == 2
+    assert hpc.cli.main([*words, "down"], {}, runner=rig.fake) == 0
+    assert rig.fake.cancelled == ["4242"]
+    assert not rig.root.exists()
+
+
+def test_a_provider_named_like_the_agents_role_is_refused_before_any_submit(hpc, tmp_path, site):
+    """O57: the agent's node is the role "sandbox"; a provider of that name would lose its node to it, so a layout
+    with both is refused before anything is submitted."""
+    with pytest.raises(hpc.settings.SettingsError, match="sandbox"):
+        hpc.settings.load_settings({"sandbox": {"cpus": 8, "memory": "17g"}}).roles(("aspen", "sandbox"))
+    assert [r.name for r in hpc.settings.load_settings({}).roles(("aspen", "sandbox"))] == ["zone", "aspen", "sandbox"]
+    rig = Rig(hpc, tmp_path, site, rename=("hazel", "sandbox"))
+    with pytest.raises(hpc.settings.SettingsError, match="sandbox"):
+        rig.up()
+    assert rig.sbatches() == []
 
 
 # -- Slurm: a heterogeneous job --------------------------------------------------------------------------------
@@ -220,6 +242,22 @@ def test_each_component_is_read_back_and_a_mismatch_in_either_cancels_only_that_
     with pytest.raises(hpc.slurm.SlurmError, match=words):
         slurm.checked(job, asked)
     assert fake.cancelled == ["4242"]
+
+
+@pytest.mark.parametrize("het", [False, True], ids=["one component", "heterogeneous"])
+def test_a_submitted_id_that_now_names_another_job_is_never_cancelled(hpc, het):
+    """O57: Slurm reuses ids: a submitted id whose job (component 0) now carries another name is not the job just
+    submitted, so neither the read-back nor the wait for it to run cancels it; up fails, naming it."""
+    fake = FakeSlurm(recorded={"JobName": "someone-elses-job"})
+    slurm = hpc.slurm.Slurm(fake, sleep=lambda s: None)
+    plain = hpc.slurm.Allocation("hpcop-p-abcd", "a", "p", 6, 5, 11264, "02:00:00", 7200)
+    asked = het_allocation(hpc) if het else plain
+    job = slurm.submit(asked)
+    with pytest.raises(hpc.slurm.SlurmError, match="another job's name"):
+        slurm.checked(job, asked)
+    with pytest.raises(hpc.slurm.SlurmError, match="another job's name"):
+        slurm.wait_running(job, 60.0, name=asked.name)
+    assert fake.cancelled == []
 
 
 def test_a_heterogeneous_job_recorded_without_its_second_component_is_cancelled(hpc):

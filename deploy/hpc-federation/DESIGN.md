@@ -268,6 +268,9 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    `het`, the same sbatch has a second component (section 1), and **each component's record** is read back (one per
    line, by `HetJobOffset`), a mismatch named with its component; under `separate`, a second held job for S is
    submitted, recorded and read back the same way, a mismatch cancelling that job alone (`down` releases the first).
+   A job id that already carries another name (Slurm reuses ids) is not the job submitted: the read-back and the wait
+   for it to run never cancel it, and `up` fails naming it. A provider named `sandbox` is refused with an agent's node,
+   whose role has that name.
 3. **Wait for it to run** (each job, under `separate`), bounded (30 min); at the bound, or if it ends first, it is
    cancelled by its id. **The read-back runs again on the running job**: a scheduler that allocated more than the
    pending request showed is caught there, and the job cancelled before any step; so is a component, or a job, on

@@ -121,6 +121,7 @@ class Driver(Down):
     # -- up: what is checked and recorded before the cluster is touched -----------------------------------------------
 
     def preflight(self, site: Site) -> None:
+        self.settings.roles(tuple(p.name for p in self.spec.providers))  # a provider named like the agent's role
         if any(space.imported for space in self.spec.spaces):
             raise RuntimeError("the layout declares an imported space, which the HPC driver does not hold yet (M3)")
         if self.layout.outer_roots or self.layout.inner_roots:
@@ -251,8 +252,8 @@ class Driver(Down):
         held = [(self.submit(asked, "allocation"), asked)]
         if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
             held.append((self.submit(alone, "sandbox"), alone))
-        for job, _ in held:
-            self.slurm.wait_running(job, self.timeouts["queue"])
+        for job, wanted in held:
+            self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name)
         # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
         records = [(job, shape, record) for job, wanted in held for shape, record in zip(
             wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
