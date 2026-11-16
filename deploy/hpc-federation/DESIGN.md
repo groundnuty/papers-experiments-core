@@ -72,9 +72,11 @@ sbatch --parsable --job-name=<name> --account --partition --no-requeue --time --
      : --account --partition --time --nodes=1 --ntasks-per-node=1 --cpus-per-task=<S> --mem=<S>
 ```
 
-- **Component 0 holds the services' nodes, component 1 holds S.** Its leader's id (component 0's) is the job's id:
-  every step on a service node is as before (a step with no `--het-group` runs in component 0), and **every step on S
-  runs with `--het-group=1`**. `--wrap` stands once, in component 0 (sbatch builds the script once, for component 0's
+- **Component 0 holds the services' nodes, component 1 holds S.** Its leader's id (component 0's) is the job's id.
+  **Every step names its component:** `--het-group=0` on a service node, `--het-group=1` on S. The site's Slurm
+  refuses a step of a heterogeneous job that names none ("No directives to start application on any available hetjob
+  components", the first live slot), so a step with no `--het-group` does not run in component 0 there. A held job of
+  one component (no S, or `separate`) names none. `--wrap` stands once, in component 0 (sbatch builds the script once, for component 0's
   first node). Component 1 repeats the account, partition and time: Slurm propagates no partition, nodes or cores to a
   later component, and the read-back checks what it recorded rather than trusting propagation.
 - **The read-back checks both components** (section 5): `scontrol show job -o <leader>` answers one record per
@@ -148,8 +150,18 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
 ```
 
 - **The environment is an allowlist**, set on the node by `env -i`, so neither the login environment (srun passes it
-  otherwise) nor a site task prolog decides it: `PATH` (`HPC_STEP_PATH` from `site.env`), `LC_ALL=C`, and
-  `TMPDIR=<node tmpfs>` (`HPC_NODE_TMP`, default `/tmp`). Nothing else, and never a secret. The bundle's helpers
+  otherwise) nor a site task prolog decides it: `PATH` (`HPC_STEP_PATH` from `site.env`, by default
+  `/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin`: the site's nodes keep `ss` in `/usr/sbin`, and the first
+  live zone step, without it, failed in its first second), `LC_ALL=C`, `TMPDIR=<node tmpfs>` (`HPC_NODE_TMP`, default
+  `/tmp`), and **no home** (`hpcslurm.home_env`): with `HOME` unset many tools take the passwd entry's home, which
+  every job and agent of the account shares, so `HOME`, the XDG base directories, Apptainer's configuration and cache
+  (`APPTAINER_CONFIGDIR`, `APPTAINER_CACHEDIR`) and uv's and pip's caches name a path below `/dev/null`, which nobody
+  can make (a path on the shared tmpfs another user could make first, and fill), with `PYTHONNOUSERSITE=1`,
+  `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`: a tool then fails rather than read what another user
+  planted. Every bundle script that knows a service's work directory (the batch scripts, `teardown.sh`, `status.sh`,
+  `exec.sh`, `restart.sh`, `zone-export.sh`, the token's mint and delivery, and `run_service`) points every one of
+  them into it (`lib.sh`'s `home_in`, made 0700 there, gone with it) before any command that may read a home, Apptainer
+  and curl among them (`status.sh`, which writes nothing, points them there without making it: `home_at`); a shard step's dispatcher gets them in the step's own directory (`shards.py step`). Nothing else, and never a secret. The bundle's helpers
   then run on the first `python3.11` on that `PATH` (`lib.sh`'s default `HPCOP_PY`), which must be the node's own:
   `supervise.py`, which holds every service, needs `os.pidfd_open`, which uv's standalone Python lacks. Only the core's
   step (`HPC_CORE_PYTHON`) runs a venv's Python.
@@ -160,7 +172,9 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   `^<tmpfs>/hpcop-o[pz]\.[A-Za-z0-9]{6}$`.
 - **Every step has a name** (`-J`), `<prefix>-<service>-<verb>-<n>`, where `<prefix>` is the allocation's name (section
   5). The step id is read back by name from `squeue -s -j <job> -o '%i %j'`, so `down` finds a step whether or not its
-  id reached the state file.
+  id reached the state file; under `het` from `squeue -s -j <component 1's own id>` too, since a step of component 1
+  is listed there alone, as `<component id>.<n>`, never under the leader's id (seen live), and under `separate` from
+  the agent's own job's.
 - **A finished step's srun client can hang on the login node** with its work done (another study saw 25 minutes). A
   control step's client is ended only when its step has been gone from `squeue -s` for three polls in a row; a step
   still listed at the bound is cancelled by its own id (`scancel <job>.<step>`), never more. Both ends of a token's
@@ -277,7 +291,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    another count of nodes than asked, or on a node another holds.
 4. **Place** (section 1), then one control step per node prints the node's FQDN and its IPv4 address on the
    cluster's network (`nodefacts.py`, Python 3.9-compatible, stdlib only); on S, with `--het-group=1` under `het` and
-   S's own job id under `separate`. Nothing else of `up` runs on S.
+   S's own job id under `separate`, and on a service node with `--het-group=0` under `het`. Nothing else of `up` runs
+   on S.
 5. **The zone**: a detached service step, `zone.sbatch <bundle> <zone tar> <zone name> <every provider's address>`,
    run as a step (it holds the service for the step's life, as the standing run did). `up` waits for its log's verdict
    (`hpcop: OK zone`, or `FINISH FAILED` or `hpcop: ERROR`, which fail `up`).
@@ -289,7 +304,13 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    its node proves the tree read-only (section 8).
 7. **The root's secrets and CA**: the zone's admin passphrase through a control step's stdout into
    `secrets/zone.passphrase` (0600), as the registration tokens travel; the Onedata test CA of the zone's rootfs (public)
-   into `ca/federation-ca.pem`.
+   into `ca/federation-ca.pem`, **its `CERTIFICATE` blocks alone** (`hpcca.py`): the image's file holds the CA's
+   private key before its certificate (seen live), and a key block of any kind is left out, so the root never holds a
+   key; an export with no certificate, or a block that is not whole, fails `up`. The core's refusal of a key in
+   `ca_file` stays as the backstop. **The CA stays the image's own**, the same for every federation of one image: its
+   digest is in the campaign fingerprint (`PlatformConfig.fingerprint()`), so a CA made per federation would stop
+   shards of different federations merging, as a Onezone id did. If one is ever wanted, its digest must leave the
+   fingerprint first.
 8. **The core's phase** (`hpcboot.core_phase`), on the login node or in a control step on the zone's node, as `[hpc]
    core` says (section 9). **The bootstrap** is the Compose federation's own `fedboot.Bootstrap` over a layout whose
    services' URLs are `https://<node FQDN>:8443`: the admin's token, the users, the spaces, the support (on each
@@ -309,9 +330,12 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
-**`up` and `down` each hold the root's lifecycle lock** (`hpc-federation.lifecycle.lock`, `flock`, never waited
-for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job and
-remove the root); the service verbs do not take it.
+**`up` and `down` each hold the root's lifecycle lock** (`<root>.lifecycle.lock`, beside the root, `flock`, never
+waited for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job
+and remove the root); the service verbs do not take it. **It lies outside the root and is never removed.** On the
+site's shared filesystem (NFS) a file held open while it is removed becomes a silly-rename file (`.nfsXXXX`) until its
+last close: the first live `down` held the lock inside the root it removed, which was then not empty. A lock file
+removed while held would let the next `up` or `down` lock another file of the same name, so it stays.
 
 **`down`** (login node), whatever `up` reached:
 
@@ -327,16 +351,28 @@ remove the root); the service verbs do not take it.
    never touched once its id names another job; a lookup that fails is reported, and the other job is still cancelled.
 2. If the job runs: a `teardown.sh` control step per service with a recorded work directory (providers first, then
    the zone), each bounded by `stop_seconds`; then wait until no step but `batch` and `extern` is listed in `squeue -s`
-   (ending each service step's srun client only then); a step still listed at the bound is cancelled by its own id.
-3. One read-only control step per node checks that no recorded work directory is left on it.
+   under the held job's id and, under `het`, its component 1's own id (S's steps, a shard step's among them, are listed
+   there alone), one deadline for both (ending each service step's srun client only then); a step still listed at the
+   bound is cancelled by its own id.
+3. One read-only control step per node checks that no recorded work directory is left on it. A service whose step
+   was launched but whose log never named a work directory (seen live: a zone that failed in node-init before making
+   one) is clean only when both are shown: its step has ended (listed no more, once seen listed, or cancelled by its
+   id in 2, or with its srun client ended), and a read-only step on its node (`bundle/leftovers.py`) counts no work
+   directory of ours of its kind in the tmpfs. A step whose end cannot be shown, a log that names a work directory the
+   driver refused, a tmpfs that is a link (the bundle then makes its work directories elsewhere, `lib.sh`), or a check
+   that fails or prints no count, keeps it unverified.
 4. `scancel <job>`, by the recorded id only; wait until `squeue -j` lists it no more (nor any `<job>+<k>`: a
    heterogeneous job's leader's cancel ends every component, S's included). Under `separate`, the agent's own job too,
    by its own id: both are cancelled before either's failure is raised, and the srun clients of both are ended. **Whatever
    fails in 0 to 3 (a relay that will not stop, a failed `squeue`, a work directory the driver refuses), the job is
    still cancelled and every client ended; the failure is reported as unverified.** A cancel that fails is raised once
    every job was tried, the clients left (their steps may still run) and the root kept for a second `down`.
-5. Remove the root, as Compose's `down` does. The service logs stay in the log directory (no secret: the bundle
-   redacts them), named in the run's output.
+5. Remove the root, as Compose's `down` does, **its marker last**. A file another process holds open becomes a
+   silly-rename file, which only its holder's close removes: the removal never removes one, and waits up to 30 s in
+   all for them to go. At the bound it fails, saying the job is gone, with the marker kept, so a second `down` finishes
+   the removal. A root a removal left unmarked (empty, or of nothing but silly files, with its lifecycle lock beside
+   it) is finished by a second `down` too, by `rmdir` alone; any other unmarked root is refused. The service logs stay
+   in the log directory (no secret: the bundle redacts them), named in the run's output.
 
 A job already ended (its `--time`, a failure) skips 2 and 3: Slurm stopped its steps, the bundle's cleanup removed
 what its time allowed, and the next job of ours on a node sweeps what is left (`sweep_leftovers`). `down` says which
@@ -556,13 +592,15 @@ federation whose step is gone), then releases it.
 5. **The pair count**: the rendered `platform.toml` of the pilot's layout gives ten pairs (`link_pairs`), and each
    passes over the cluster's network.
 6. **The heterogeneous job** (`sandbox_placement = "het"`). Proven on the site: `sbatch --test-only` accepted two such
-   jobs, with `--wrap` in component 0 and component 1 naming only `-N`, `-c` and `--mem`. Not proven: that
-   `scontrol show job -o <leader>` answers one line per component with `HetJobId` and `HetJobOffset` and each
-   component's `Requeue` and `TimeLimit` as asked; that `squeue -h -j <leader> -o %i` lists `<leader>+<k>`; that an
-   `srun --jobid=<leader> --het-group=1 -w <S>` from the login node lands on S; the form squeue -s gives a component's
-   step (`<leader>+1.<n>` or `<component id>.<n>`; both are read, and `scancel` gets the one listed); and that a
-   leader's `scancel` ends component 1 (without `whole_hetjob` a component's own id would cancel only that
-   component, which the driver never does). **The fallback is a setting:** `sandbox_placement = "separate"`.
+   jobs, with `--wrap` in component 0 and component 1 naming only `-N`, `-c` and `--mem`. **Proven by the first live
+   slot (16 Nov 2026):** `scontrol show job -o <leader>` answers one line per component with `HetJobId` and
+   `HetJobOffset` and each component's `Requeue` and `TimeLimit` as asked; `squeue -h -j <leader> -o %i` lists
+   `<leader>+<k>` (the leader as `+0`); an `srun --jobid=<leader> --het-group=1 -w <S>` from the login node lands on S;
+   a step of component 1 is listed by `squeue -s -j <component id>` alone, as `<component id>.<n>`; and a leader's
+   `scancel` ends component 1. **Found by it:** a step that names no `--het-group` is refused, component 0 included
+   (section 1). Not seen yet: how `squeue -s -j <leader>` lists a step of component 0 (read as `<leader>.<n>` or
+   `<leader>+0.<n>`), `scancel <component id>.<n>`, and `sacct -j <component id>` for a step's status. **The fallback
+   is a setting:** `sandbox_placement = "separate"`.
 
 ## 10. Who builds what
 

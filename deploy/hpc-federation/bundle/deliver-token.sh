@@ -12,6 +12,7 @@ token=
 IFS= read -r -t 600 token || [[ -n $token ]] || die "no token arrived on stdin"
 [[ $token =~ ^[A-Za-z0-9_-]{32,4096}$ ]] || die "the token on stdin is empty or malformed (did the mint fail?)"
 W=$(wait_workdir op 900 "${2:-}"); S=$(secrets_dir "$W")
+home_in "$W"   # every tool's HOME, caches and Apptainer's directories in the work directory, never the account's ~
 end=$((SECONDS + 900))
 until [[ -e $W/rootfs.complete && -d $S ]]; do (( SECONDS < end )) || die "node-init.sh never finished in $W"; sleep 5; done
 [[ ! -e $S/registration-token ]] || die "a registration token was already delivered for this launch"

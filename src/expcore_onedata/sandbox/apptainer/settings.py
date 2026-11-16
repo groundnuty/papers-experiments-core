@@ -8,7 +8,7 @@ work_root = "/node/tmpfs/dir"    # an existing 0700 directory of the driver's ui
 [sandbox.limits]                 # as for Docker; on this backend memory_bytes, tmp_bytes, shm_bytes and
                                  # work_disk_bytes are the harness's watch's bounds, and cpus, pids, nofile and
                                  # gate_memory_bytes are recorded, not enforced (facts.py)
-[sandbox.data_paths]             # as for Docker; a mount level is refused at start until the mount lands
+[sandbox.data_paths]             # as for Docker; a mount level needs oneclient_bundle below
 
 [sandbox.apptainer]
 apptainer = ["apptainer"]        # optional: the command words
@@ -28,13 +28,17 @@ hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: anonymous 
 preload =[{ path = "x.so", sha256 = "<64 hex>" }]   # optional (hook b): libraries the cell preloads BEFORE the egress
                                  # shim, so a connect hook's rewrite reaches the shim through RTLD_NEXT
 binds = [{ path = "f", sha256 = "<64 hex>", target = "/etc/x" }]   # optional (hook b): files bound read-only
+oneclient_bundle = "oneclient-bundle.tar"  # the host mount's oneclient (hostmount), required by a mount level: the tar
+oneclient_bundle_sha256 = "<64 hex>"      # deploy/hpc-federation/oneclient_bundle.py builds from the sidecar's image
 [sandbox.apptainer.gate_options] # optional (hook a): further keys of the gate's configuration, never one it sets
 ```
 
 Every file is copied into the run's directory at the start, its copy hashed and compared with the pin, and only the
 copy is used; the SIF, too large to copy, is hashed once per identity (device, inode, size, times) and its identity
-checked again before every exec (`sandbox.py`). A path is a configured value: a message names the key, never the path,
-and a record holds the hashes alone (`record`).
+checked again before every exec (`sandbox.py`); oneclient's bundle is unpacked for each mount run from the bytes that
+are hashed (`oneclient_bundle.unpack`). A path is a configured value: a message names the key, never the path, and a
+record holds the hashes alone (`record`), the bundle's only when it is declared, so a platform without one keeps its
+fingerprint while two bundles are two experiments.
 """
 
 from __future__ import annotations
@@ -99,6 +103,7 @@ class ApptainerSettings:
     binds: tuple[PinnedBind, ...] = ()
     gate_options: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     hidden_memory_margin_bytes: int = DEFAULT_MARGIN_BYTES
+    oneclient_bundle: Pinned | None = None  # the host mount's oneclient (`hostmount`), a tar pinned by its SHA-256
 
     def __post_init__(self) -> None:
         low, high = MARGIN_BOUNDS
@@ -129,6 +134,8 @@ class ApptainerSettings:
             # a margin set away from its default only, so a fingerprint made before the key existed is unchanged
             **({} if self.hidden_memory_margin_bytes == DEFAULT_MARGIN_BYTES else
                {"hidden_memory_margin_bytes": self.hidden_memory_margin_bytes}),
+            # another oneclient is another experiment; a platform that declares none keeps the record it had
+            **({"oneclient_bundle_sha256": self.oneclient_bundle.sha256} if self.oneclient_bundle is not None else {}),
         }  # fmt: skip
 
 
@@ -192,7 +199,7 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
     section.reject_unknown(
         ("apptainer", "image", "image_sha256", "python", "host_python", "egress_shim", "egress_shim_sha256",
          "egress_collector", "egress_collector_sha256", "memory_poll_s", "disk_poll_s", "preload", "binds",
-         "gate_options", "hidden_memory_margin_bytes")
+         "gate_options", "hidden_memory_margin_bytes", "oneclient_bundle", "oneclient_bundle_sha256")
     )  # fmt: skip
     words = section.strings("apptainer") or ("apptainer",)
     if any(not COMMAND_WORD.fullmatch(word) for word in words):
@@ -207,6 +214,8 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
         if not isinstance(value, list):
             raise section.fail(key, "must be an array of tables")
         lists[key] = [_entry_pin(section, key, n, e, base, target=key == "binds") for n, e in enumerate(value)]
+    declared = "oneclient_bundle" in section.data or "oneclient_bundle_sha256" in section.data
+    bundle = _pinned(section, base, "oneclient_bundle") if declared else None
     targets = [b.target for b in lists["binds"]]
     if len(set(targets)) != len(targets):
         raise section.fail("binds", "names a target twice")
@@ -224,6 +233,7 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
             binds=tuple(lists["binds"]),
             gate_options=_gate_options(section),
             hidden_memory_margin_bytes=_margin(section),
+            oneclient_bundle=bundle,
         )
     except ValueError as error:  # the dataclass's own checks, which the loader already made: never a value
         raise ConfigError(f"{section.file}: {section.where}: {error}") from None

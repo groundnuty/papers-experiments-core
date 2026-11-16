@@ -16,6 +16,11 @@ leader ends every component, and an option of Slurm's propagated list (`PROPAGAT
 next while `--partition`, `--nodes`, `--ntasks-per-node` and `--cpus-per-task` fall back to Slurm's defaults. A second
 `sbatch` gets `second_id` (`[hpc] sandbox_placement = "separate"`). Every step must land on a node of the job and the
 component (`--het-group`) it names, or the fake fails the test.
+
+As the site's Slurm does (its first live slot, 16 Nov 2026): a step of a heterogeneous job that names no `--het-group`
+is refused, its srun exiting 1 with `HET_REFUSAL` on stderr and no step made, component 0 included; and a step of
+component k > 0 is listed by `squeue -s -j <component k's own id>` alone, as `<component id>.<n>`, never under the
+leader's id. How a step of component 0 is listed was not seen live; here it is `<leader>.<n>`, under the leader's id.
 """
 
 import hashlib
@@ -30,6 +35,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
+from fake_elf import bundle_members, write_tar
 
 HPC = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation"
 LAYOUT = HPC / "layouts" / "pilot-shape.toml"
@@ -63,17 +69,21 @@ PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"  # no cer
 
 def agent_site(directory: Path, sif: bytes = b"an invented SIF image\n", shim: bytes = b"an invented egress shim\n",
                work_root: Path | None = None) -> dict:  # fmt: skip
-    """The site's variables of the agent's Apptainer sandbox (the pilot template's `[sandbox]`), its two files written
-    into `directory` and pinned by their SHA-256; the work root `work_root`, or one under `directory` (made by the
-    shard step on the agent's node, never here)."""
+    """The site's variables of the agent's Apptainer sandbox (the pilot template's `[sandbox]`), its files written
+    into `directory` and pinned by their SHA-256 (oneclient's bundle an invented tar a host mount can unpack:
+    fake_elf); the work root `work_root`, or one under `directory` (made by the shard step on the agent's node, never
+    here)."""
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "agent.sif").write_bytes(sif)
     (directory / "egresslog.so").write_bytes(shim)
+    bundle = directory / "oneclient-bundle.tar"
     return {
         "HPC_AGENT_SIF": str(directory / "agent.sif"),
         "HPC_AGENT_SIF_SHA256": hashlib.sha256(sif).hexdigest(),
         "HPC_EGRESS_SHIM": str(directory / "egresslog.so"),
         "HPC_EGRESS_SHIM_SHA256": hashlib.sha256(shim).hexdigest(),
+        "HPC_ONECLIENT_BUNDLE": str(bundle),
+        "HPC_ONECLIENT_BUNDLE_SHA256": write_tar(bundle, bundle_members()),
         "HPC_AGENT_WORK_ROOT": str(work_root or directory / "agent-work"),
     }
 
@@ -131,6 +141,8 @@ def pin_values(directory: Path) -> dict:
 # Options Slurm passes from one component of a heterogeneous job to the next (heterogeneous_jobs.html, those sbatch
 # takes that the driver uses); every other option of a later component falls back to Slurm's default.
 PROPAGATED = ("--job-name", "--account", "--time", "--mem", "--no-requeue", "--export", "--output", "--chdir")
+# What the site's srun says, exiting 1, of a step of a heterogeneous job with no --het-group (live slot 1).
+HET_REFUSAL = "srun: error: No directives to start application on any available hetjob components\n"
 
 
 @contextmanager
@@ -205,6 +217,7 @@ class Srun:
     exact: bool
     overlap: bool
     het_group: int | None = None
+    refused: bool = False  # a step of a heterogeneous job that names no component: srun refuses it, as the site's does
 
 
 def parse_srun(argv: list) -> Srun:
@@ -265,6 +278,7 @@ class FakeSlurm:
     relays: list = field(default_factory=list)  # each relay started: its argv
     stray_clients: list = field(default_factory=list)  # srun clients of the job found on the host, never recorded
     unkillable: list = field(default_factory=list)  # clients that survive their end
+    dead_clients: list = field(default_factory=list)  # clients that exited by themselves (a refused step's)
     running_recorded: dict = field(default_factory=dict)  # fields scontrol reports once the job has been read twice
     reads: int = 0
     second_id: str = "4343"  # the id a second sbatch prints (the agent's own held job)
@@ -276,6 +290,7 @@ class FakeSlurm:
     node_tmp: str = "/tmp"  # the nodes' tmpfs, where a service's work directory is (the site's HPC_NODE_TMP)
     sweep_here: bool = False  # run down's sweep of the agent's node on this host (its tmpfs is here), else answer it
     sweeps: list = field(default_factory=list)  # each sweep step down launched
+    leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -301,11 +316,14 @@ class FakeSlurm:
         if argv[:3] == ["scontrol", "show", "hostnames"]:
             return Completed(0, "\n".join(n for n in argv[3].split(",") if n) + "\n", "")
         if tool == "squeue" and "-s" in argv:
-            if self.job_id in self.cancelled or self.job_id not in argv[argv.index("-j") + 1].split(","):
-                return Completed(0, "", "")
-            lines = [f"{self.job_id}.batch batch", f"{self.job_id}.extern extern"]
-            lines += [f"{step} {name}" for name, step in self.steps.items()]
-            return Completed(0, "\n".join(lines) + "\n", "")
+            lines = []
+            for ident in argv[argv.index("-j") + 1].split(","):  # a job's or a component's own id
+                if self.leader_of(ident) is None or self.gone_job(self.leader_of(ident)):
+                    continue
+                lines += [f"{ident}.batch batch"] if self.leader_of(ident) == ident else []
+                lines += [f"{ident}.extern extern"]
+                lines += [f"{step} {name}" for name, step in self.steps.items() if step.split(".")[0] == ident]
+            return Completed(0, "".join(f"{line}\n" for line in lines), "")
         if tool == "squeue" and "-n" in argv:
             name = argv[argv.index("-n") + 1]
             named = [i for i in self.listed_ids() if self._options(i.split("+")[0])[0].get("--job-name") == name]
@@ -319,8 +337,8 @@ class FakeSlurm:
             self.cancelled.append(target)
             if "." in target:
                 self.steps = {n: s for n, s in self.steps.items() if s != target}
-            elif target == self.job_id:
-                self.steps = {}
+            else:  # a job's cancel ends its steps, a leader's those of every component
+                self.steps = {n: s for n, s in self.steps.items() if self.leader_of(s.split(".")[0]) != target}
             return Completed(0, "", "")
         if tool == "sacct":
             return Completed(0, "", "")
@@ -346,6 +364,20 @@ class FakeSlurm:
 
     def _options(self, ident) -> list:
         return self.submitted.get(ident) or [self.asked]
+
+    def leader_of(self, ident) -> str | None:
+        """The job an id belongs to: a job's own id, a component's own id (the leader's plus k) or `<leader>+<k>`, as
+        its leader's id; None for an id no sbatch printed."""
+        head = ident.split("+")[0]
+        for job in self.submitted or {self.job_id: None}:
+            own = {str(int(job) + k) for k in range(1, len(self._options(job)))}
+            if head == job or ("+" not in ident and head in own):
+                return job
+        return None
+
+    def listing_of(self, srun: Srun) -> str:
+        """The id squeue -s lists a step under: its job's, or its component's own id for a component above 0."""
+        return str(int(srun.job) + srun.het_group) if srun.het_group else srun.job
 
     def gone_job(self, ident) -> bool:
         if ident in self.cancelled:
@@ -412,12 +444,15 @@ class FakeSlurm:
             assert srun.node in self.placed(srun.job, srun.het_group or 0), (
                 f"a step on {srun.node}, outside component {srun.het_group or 0} of job {srun.job}"
             )
+            srun.refused = srun.het_group is None and len(self.submitted[srun.job]) > 1
         return srun
 
     def start(self, argv, data=None):
         from hpcslurm import Completed
 
         srun = self._step(argv)
+        if srun.refused:
+            return FakeProcess(Completed(1, "", HET_REFUSAL))
         if self.on_control is not None:
             answer = self.on_control(srun)
             if answer is not None:
@@ -444,6 +479,8 @@ class FakeSlurm:
             return self.teardown_rc, "", "ok: service stopped\n"
         if command[0] == "test":
             return 0, "", ""
+        if any(Path(word).name == "leftovers.py" for word in command):  # down's count of a node's work directories
+            return 0, json.dumps({"kind": command[-2], "count": self.leftovers.get(srun.node, 0)}) + "\n", ""
         if any(Path(word).name == "shards.py" for word in command) and "sweep" in command:
             self.sweeps.append(srun)
             if not self.sweep_here:
@@ -467,6 +504,9 @@ class FakeSlurm:
         mint, deliver = self._step(first), self._step(second)
         assert Path(mint.command[1]).name == "mint-registration-token.sh"
         assert Path(deliver.command[1]).name == "deliver-token.sh"
+        if mint.refused or deliver.refused:  # no token is minted, or none delivered
+            ends = [Completed(1, "", HET_REFUSAL) if s.refused else Completed(0, "", "") for s in (mint, deliver)]
+            return FakeProcess(ends[0]), FakeProcess(ends[1])
         provider = mint.command[2]
         self.delivered.append(provider)
         log = Path(self.logs[provider])
@@ -482,8 +522,12 @@ class FakeSlurm:
             return Client(9999, 1)
         srun = self._step(argv)
         self.spawned.append(srun)
+        if srun.refused:  # srun exits at once with its error in the client's log; no step is made, no log written
+            Path(client_log).write_text(HET_REFUSAL, encoding="utf-8")
+            self.dead_clients.append(Client(20000 + len(self.spawned), 77))
+            return self.dead_clients[-1]
         self.next_step += 1
-        self.steps[srun.name] = f"{self.job_id}.{self.next_step}"
+        self.steps[srun.name] = f"{self.listing_of(srun)}.{self.next_step}"
         script = Path(srun.command[1]).name
         kind = "oz" if script == "zone.sbatch" else "op"
         service = "zone" if kind == "oz" else srun.command[4]
@@ -495,7 +539,7 @@ class FakeSlurm:
         return Client(10000 + self.next_step, 77)
 
     def client_alive(self, client) -> bool:
-        return client not in self.ended_clients
+        return client not in self.ended_clients and client not in self.dead_clients
 
     def clients_of(self, job):
         return list(self.stray_clients)

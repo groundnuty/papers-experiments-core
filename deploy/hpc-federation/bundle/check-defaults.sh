@@ -114,6 +114,7 @@ if [[ -e $R$HPCOP_ERLANG_ENV || $LIVE == --live ]]; then
 fi
 
 if [[ $LIVE == --live ]]; then
+  need_tools ss   # the live check reads the node's listeners: without ss it would check nothing, so it never starts
   T=$(mktemp -d "$W/tmp/check.XXXXXX"); trap 'rm -rf -- "$T"' EXIT
   SECRETS=("$PASS" "$COOKIE" "$CB_PASS")
   RETIRED=()   # every password a rotation retired (a restart rotates again), not only the last
@@ -186,7 +187,7 @@ if [[ $LIVE == --live ]]; then
   # ours is owner-checked (held by a program whose accept() goes through the shim); our only UDP socket is
   # the zone's DNS; the ports our clients dial by number are ours; our epmd is on this job's port.
   EPMD=$(epmd_port_of "$R")
-  live_ports_ok() { check_listeners "$COMP" "$(id -u)" "$EPMD" < <(listeners); }
+  live_ports_ok() { live_listeners_ok "$COMP" "$(id -u)" "$EPMD"; }   # a listing that fails is a FAIL (ports.sh)
   check "every listener of this service off loopback is public ($(public_ports "$COMP")), every loopback one owner-checked; epmd on 127.0.0.1:$EPMD" live_ports_ok
 fi
 

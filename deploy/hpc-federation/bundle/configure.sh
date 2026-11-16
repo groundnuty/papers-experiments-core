@@ -16,6 +16,7 @@
 #        configure.sh oz --workdir W <zone-name> [peer-ip ...]
 source "$(dirname "$0")/lib.sh"
 component "${1:-}"; shift
+need_tools ss od   # this job's epmd port is picked from the node's listeners (pick_epmd_port), up front
 [[ ${1:-} == --workdir ]] || die "usage: configure.sh <op|oz> --workdir W ..."
 W=$(find_workdir "$COMP" "${2:-}"); shift 2
 R=$W/rootfs; S=$(secrets_dir "$W")

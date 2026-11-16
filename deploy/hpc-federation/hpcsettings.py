@@ -28,14 +28,24 @@ SANDBOX_PLACEMENTS = ("het", "separate")
 KILL_TAIL_S = 30  # supervise.py's SIGKILL tail after the graceful stop's bound (lib.sh, stop_service)
 STEP_END_S = 60  # the longest the driver polls for a stopped service's step to leave squeue -s
 SETTLE_SLACK_S = 60  # what settle_timeout_s keeps beyond the stop's bound
+STEP_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"  # HPC_STEP_PATH's default
 SANDBOX_SPARE_CPUS = 2  # beside the agent's cores on its node: the gate, the dispatcher and the egress collector
 SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatcher, the collector, the store, the SIF
 PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a value the platform template leaves to up (fedfacts)
 SHA256 = re.compile(r"[0-9a-f]{64}")
 # The site's variables of the agent's Apptainer sandbox (M5), by the Site field each fills: the files' paths and the
-# work root, and the SHA-256 each file is declared to have.
-AGENT_PATHS = {"HPC_AGENT_SIF": "agent_sif", "HPC_EGRESS_SHIM": "egress_shim", "HPC_AGENT_WORK_ROOT": "agent_work_root"}
-AGENT_PINS = {"HPC_AGENT_SIF_SHA256": "agent_sif_sha256", "HPC_EGRESS_SHIM_SHA256": "egress_shim_sha256"}
+# work root, and the SHA-256 each file is declared to have (oneclient's bundle: the host mount's oneclient).
+AGENT_PATHS = {
+    "HPC_AGENT_SIF": "agent_sif",
+    "HPC_EGRESS_SHIM": "egress_shim",
+    "HPC_ONECLIENT_BUNDLE": "oneclient_bundle",
+    "HPC_AGENT_WORK_ROOT": "agent_work_root",
+}
+AGENT_PINS = {
+    "HPC_AGENT_SIF_SHA256": "agent_sif_sha256",
+    "HPC_EGRESS_SHIM_SHA256": "egress_shim_sha256",
+    "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
+}
 AGENT_VARIABLES = {**AGENT_PATHS, **AGENT_PINS}
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
@@ -298,19 +308,24 @@ class Site:
     partition: str
     images: str  # SH: the rootfs tarballs and their .provenance
     logs: str  # L: the service steps' logs, on a filesystem the login node and the nodes see
-    step_path: str = "/usr/local/bin:/usr/bin:/bin"  # PATH inside every step
+    # PATH inside every step. The sbin directories hold ss (the bundle's port checks) on the site's nodes: without them
+    # the zone's step failed in its first second (the first live slot).
+    step_path: str = STEP_PATH
     node_tmp: str = "/tmp"  # the node's tmpfs: TMPDIR inside every step, never Slurm's per-job TMPDIR
     node_python: str = "python3.11"  # the nodes' Python for the stdlib helpers (the bundle's HPCOP_PY)
     core_python: str = ""  # the core's Python on the nodes (a venv's), for [hpc] core = "step"
     admin_mail: str = "admin@example.org"
     billing_weight: Optional[float] = None  # the site's billing weight per GB of memory, for describe
     # The agent's Apptainer sandbox (M5), for a platform template that names them (`hpcpins`): the SIF and the egress
-    # shim built for it on the filesystem the nodes see, each with the SHA-256 it is declared to have, and the
-    # sandbox's work_root on the agent's node's tmpfs. Empty when the site declares none.
+    # shim built for it on the filesystem the nodes see, and oneclient's bundle (oneclient_bundle.py), each with the
+    # SHA-256 it is declared to have, and the sandbox's work_root on the agent's node's tmpfs. Empty when the site
+    # declares none.
     agent_sif: str = ""
     agent_sif_sha256: str = ""
     egress_shim: str = ""
     egress_shim_sha256: str = ""
+    oneclient_bundle: str = ""
+    oneclient_bundle_sha256: str = ""
     agent_work_root: str = ""
 
     def to_json(self) -> dict:

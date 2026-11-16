@@ -66,13 +66,21 @@ parse_listeners() {  # stdin: `ss -Hlntuep` lines; stdout: "<proto> <address> <p
   }'
 }
 
-listeners() {  # every listening TCP and bound UDP socket on this node, as parse_listeners prints them
+listeners() {  # every listening TCP and bound UDP socket on this node, as parse_listeners prints them. A missing
+  # or failing ss dies, naming it: a listing that could not be read is never one with no listener (live: a check
+  # whose ss was not on PATH counted no listener, a false pass). Call it as `out=$(listeners) || ...`, never in a
+  # pipeline or a process substitution, where its status is lost.
   local out
+  need_tools ss
   out=$(ss -Hlntuep) || die "ss failed: cannot list this node's listeners"
   parse_listeners <<<"$out"
 }
 
-used_ports() { listeners | awk '{ print $3 }' | sort -nu; }
+used_ports() {  # every listener's port, one per line; status 1 when the listeners could not be listed
+  local out
+  out=$(listeners) || return 1
+  awk '{ print $3 }' <<<"$out" | sort -nu
+}
 
 count_free() {  # <lo-hi> <used ports, one per line>
   local lo=${1%-*} hi=${1#*-} n
@@ -82,7 +90,7 @@ count_free() {  # <lo-hi> <used ports, one per line>
 
 ports_free() {  # <comp> [epmd port]: before a start, the ports this service binds by number must be free
   local used p r free busy=()
-  used=$(used_ports)
+  used=$(used_ports) || die "this node's listeners could not be listed: the port check fails closed"
   for p in $(public_ports "$1") $(dialled_ports "$1" "${2:-}"); do
     if grep -qx -- "$p" <<<"$used"; then busy+=("$p"); fi
   done
@@ -96,7 +104,8 @@ ports_free() {  # <comp> [epmd port]: before a start, the ports this service bin
 
 pick_epmd_port() {  # print a free port of HPCOP_EPMD_RANGE, starting at a random one
   local lo=${HPCOP_EPMD_RANGE%-*} hi=${HPCOP_EPMD_RANGE#*-} used n start k p
-  used=$(used_ports)
+  # `$(...)` clears -e, so a caller's EPMD=$(pick_epmd_port) would go on with no listing: fail here, explicitly
+  used=$(used_ports) || die "this node's listeners could not be listed: no epmd port is picked blind"
   n=$(( hi - lo + 1 )); start=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % n ))
   for (( k = 0; k < n; k++ )); do
     p=$(( lo + (start + k) % n ))
@@ -159,6 +168,16 @@ check_listeners() {  # <comp> <uid> <epmd port>; stdin: parse_listeners lines. A
   if (( !seen )); then printf 'FAIL: no listener of this service on 8443\n' >&2; bad=1; fi
   if (( !seen_epmd )); then printf 'FAIL: no epmd of this service on this job port %s\n' "$epmd" >&2; bad=1; fi
   return "$bad"
+}
+
+live_listeners_ok() {  # <comp> <uid> <epmd port>: check_listeners over this node's listeners, read first; a listing
+  # that could not be read (ss missing or failing) is a FAIL, never a node with no listener to check
+  local out
+  if ! out=$(listeners); then
+    printf "FAIL: this node's listeners could not be listed (ss missing or failing): nothing was checked\n" >&2
+    return 1
+  fi
+  if [[ -z $out ]]; then check_listeners "$1" "$2" "$3" < /dev/null; else check_listeners "$1" "$2" "$3" <<<"$out"; fi
 }
 
 epmd_port_of() {  # <rootfs>: this job's epmd port from the rootfs's erlang env file
