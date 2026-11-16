@@ -627,11 +627,10 @@ federation whose step is gone), then releases it.
 The cluster's shared scratch filesystem has room for a federation's data and a limited **inode** quota: a pilot-shape
 federation's data is about 17,500 files, and every federation of an account counts against one quota. With
 `HPC_STORAGE_ROOT` set in `site.env` (an invented `<scratch_root>/hpcop-storage`; `site.env.example`), `up` makes the
-federation's provider storage there, guards the quota before it submits anything, and `down` removes it. With none set
-nothing of this runs and `up` and `down` are what they were. **What is built:** the guard, the directories, their
-record and their removal. **What is not:** the bundle's bind of each directory onto its provider's `/volumes/posix`
-(`provider.sbatch`, `configure.sh`, `run_service`), so a provider's posix storage is still on its node's tmpfs until that
-is built and run live; the directories `up` makes are the ones that bind will take.
+federation's provider storage there, guards the quota before it submits anything, and binds each provider's own
+directory onto its posix storage, and `down` removes it. With none set nothing of this runs: each provider stores on its
+node's tmpfs, and `up` and `down` are what they were. The bind and the guard are built and tested offline; their live
+run is open.
 
 **The inode guard** (`hpcquota.py`; the preflight, before the root, the state or any job exists):
 
@@ -658,9 +657,11 @@ is built and run live; the directories `up` makes are the ones that bind will ta
 pattern does not compile or lacks `used` or `quota`; the command cannot run, exits non-zero or does not answer in time;
 the pattern matches the output never or more than once; a figure is no count (including `unlimited`) or is cut out of a
 longer one; the quota is 0.
-Only `HPC_QUOTA_CHECK=off` skips the check (the one value; any other, `OFF` and `0` included, is refused at the
-start; unset is not off), and `up` says it was skipped. A site that sets `HPC_STORAGE_ROOT` and neither names a
-command nor turns the check off cannot `up`.
+**The check is mandatory for a federation bound onto scratch.** `HPC_QUOTA_CHECK=off` with `HPC_STORAGE_ROOT` is
+refused as the site is loaded (`hpcsettings.checked_site`), naming the combination, and again by the guard itself for a
+site however it was built; any value other than `off` is refused at the start whatever else is set. Without a scratch
+root nothing lands on scratch, there is no check, and `off` changes nothing. A site that sets `HPC_STORAGE_ROOT` and
+names no command cannot `up`.
 
 **The directories** (`hpcstorage.py`): below `HPC_STORAGE_ROOT` (a directory only this user can write, owned by this user
 with no group or other write bit, which is neither the
@@ -668,10 +669,45 @@ federation's root nor inside it, and is no shared tree and holds or lies inside 
 nothing may be written to a shared tree) `up` makes `<root>/<allocation name>` (0700; the name's random part is the
 allocation's) and in it one directory per provider (0700), each by an exclusive `mkdir`: anything already there refuses
 `up`, and is never adopted. Each directory holds the owner marker `.hpcop-storage-owner` (0600): the allocation's name and
-a random token the state file also holds, and a provider's directory's also names the provider. (The marker lies in the
-provider's storage directory, which is to become its posix mount point: a hidden file at its root, outside any space.)
+a random token the state file also holds, and a provider's directory's also names the provider. Each provider's
+directory also holds, beside its marker, the empty directory the provider stores in (`posix`, 0700), made after the
+marker so a failure there leaves a directory `down` can prove; the marker is outside what is bound, so the provider
+never sees it.
 A marker that cannot be written, for want of inodes, removes the empty directory just made. The state file records every path **before** the first `mkdir`, and the
 directories are made after the state exists and before the job is submitted, so a failure here leaves no job billing.
+
+**The bind** (`hpcstorage.provider_args`, `bundle/posixstorage.py`, `configure.sh`, `run_service`):
+
+- `up` gives each provider's batch script one more argument, last, `--storage=<its directory>/posix`, read from the
+  state's record checked whole (`hpcstorage.checked`): a step is never given another provider's directory or a path the
+  record does not name, and a state that names a scratch root and no record starts no provider (it never falls back to
+  tmpfs). The zone takes none. Without a scratch root the argument is absent and every step is what it was.
+- `configure.sh` takes it out of the peers and has `posixstorage.py prepare` check it: a plain absolute path of
+  characters that cannot end a bind option; of `up`'s form for this provider, `<…>/<allocation>/<provider>/posix`; no
+  link at any step of the path; the bound directory, the provider's and the allocation's each a directory of this user,
+  mode 0700, that this user can write; the provider's directory holding `up`'s marker that names this provider and this
+  allocation (a regular file of this user, never read through a link); neither inside nor holding the work directory;
+  empty; and not on node-local memory (the mount table: tmpfs or ramfs is refused, since the bind is there to keep the
+  data off the node). The rootfs's `/volumes/posix`, which the bind covers, must be a real directory holding nothing.
+  Only then is the path recorded in the work directory (`posix-storage`, 0600, `<provider><TAB><path>`, by a draft made
+  exclusively and replaced whole). A refusal fails the job, naming what was refused and never the path.
+- `run_service` binds the recorded directory, writable, onto `/volumes/posix` (`--bind <path>:/volumes/posix:rw`, after
+  any shared import's read-only binds and before the rootfs) at every start, `restart.sh`'s included: `posixstorage.py
+  binds` checks it again (all but the emptiness and the mount table, since after a first start it holds the provider's
+  data) and a failure stops the start. With no record nothing is bound and the argv is word for word what it was.
+- **Ownership and mode.** Setuid Apptainer without `--fakeroot` runs the cell's processes as the job's user, and
+  `finish.sh` declares the posix storage owned by that uid and gid (`rootUid`, `rootGid`), as on tmpfs, whose
+  `/volumes/posix` is a 0700 directory of the same user: a 0700 directory of this user is what the provider needs, and the
+  node's check refuses one that is not this user's (a uid that differs between the login node and the nodes included).
+- **The same storage in the cell.** The provider sees its storage at `/volumes/posix` either way, so `finish.sh` adds the
+  same `posix-local` storage, and `platform.toml`, which names no storage path, is the same: a tmpfs and a scratch
+  federation's shards share one platform fingerprint (`PlatformConfig.fingerprint`), and a test shows it. The data
+  check (`hpcdata.check`, O63) reads each space through its owner's REST, so it reads the space where that provider stores
+  it, on scratch; nothing of it changes.
+- **The work directory never reaches scratch.** The bind exists only in the container's mount namespace; on the node the
+  rootfs's `/volumes/posix` stays the empty mountpoint, so the teardown's removal of the work directory, the next job's
+  sweep of leftovers and the failure path's scrub never touch the storage. Only `down` removes it, from the login node,
+  once the provider has stopped.
 
 **`down` removes exactly what `up` made.** After the job is gone and every service verified clean (section 5, step 5):
 

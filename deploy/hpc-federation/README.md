@@ -232,16 +232,18 @@ section are the provider storage on scratch and its inode guard.
 
 ## Provider storage on scratch, and the inode guard
 
-The shared scratch filesystem has room for a federation's data and a limited inode quota (a pilot-shape federation's
-data is about 17,500 files, and every federation of an account counts against one quota). `DESIGN.md`, section 11, is
-the full contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
+With `HPC_STORAGE_ROOT` set, each provider stores its data (its posix storage, `/volumes/posix` in its cell) in a
+directory of its own on the shared scratch filesystem instead of its node's tmpfs, and the inode guard is mandatory. The
+shared scratch filesystem has room for a federation's data and a limited inode quota (a pilot-shape federation's data is
+about 17,500 files, and every federation of an account counts against one quota). `DESIGN.md`, section 11, is the full
+contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
 
 | Key | What |
 |---|---|
 | `HPC_STORAGE_ROOT` | an existing directory on the scratch filesystem that only you can write (`<scratch_root>/hpcop-storage`, `mkdir -m 700`: owned by you, no group or other write bit, which `up` and `down` both check), neither inside the federation's root nor a shared tree. With none, nothing below runs |
 | `HPC_QUOTA_CMD` | the site's command that prints the account's inode usage and quota (`<quota tool> --inodes <scratch_root>`), split as a shell would split it and **run without a shell** on the login node |
 | `HPC_QUOTA_PATTERN` | a regular expression with the named groups `used` and `quota` that reads its output and matches **exactly once** (`inodes used (?P<used>[0-9,]+) of (?P<quota>[0-9,]+)` reads an invented line); you write it for the real output, which this repository never holds |
-| `HPC_QUOTA_CHECK` | `off` skips the check, and `up` says so; the only value, and unset is not off |
+| `HPC_QUOTA_CHECK` | **refused with `HPC_STORAGE_ROOT`**: the check is mandatory for a federation bound onto scratch, so the site is not loaded with both. Without a scratch root there is no check, and `off` (its only value) changes nothing |
 
 - **`up` checks before it submits anything:** it reads the usage and the quota through the command, estimates the
   federation's inodes from its data manifests (every space's manifest once, files and directories; a shared import's
@@ -250,14 +252,22 @@ the full contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   exactly at the line passes. **It fails closed:** a command or pattern that is not set, a pattern that does not compile or
   lacks a group, a command that cannot run, fails or does not answer in 120 s, an output the pattern does not match exactly
   once, a figure that is no count (`unlimited` is none) or that the pattern cut out of a longer one (`1000.5`, `2G`: the
-  pattern must capture the whole figure) and a quota of 0 all refuse `up`, naming why; only
-  `HPC_QUOTA_CHECK=off` turns the check off. For the ingest layout the estimate is a handful (its spaces declare no data);
+  pattern must capture the whole figure) and a quota of 0 all refuse `up`, naming why; nothing turns the check off.
+  For the ingest layout the estimate is a handful (its spaces declare no data);
   for `layouts/pilot-shape-import.toml` it is the four imported manifests.
 - **`up` then makes the federation's storage:** below `HPC_STORAGE_ROOT`, one directory of its own named for its allocation
   (0700) and one per provider, each by an exclusive `mkdir` that never adopts what is already there and each holding an
-  owner marker, recorded in the state file before the first is made. **Not built yet:** the bundle's bind of each directory onto its
-  provider's `/volumes/posix`; until it is, a provider's posix storage is on its node's tmpfs and the directories are
-  empty. The guard and the removal are written for that bind.
+  owner marker, recorded in the state file before the first is made, and in each provider's, beside its marker, the
+  empty directory it stores in (`posix`, 0700).
+- **Each provider stores there:** its job is given that directory (`--storage=PATH`, from the state's record checked
+  whole), `configure.sh` has `bundle/posixstorage.py` check it (the form `up` makes for this provider, no link on the
+  way, 0700 and yours, the marker naming the provider and the allocation, empty and not on the node's memory) and
+  record it in the work directory, and the service binds it writable onto `/volumes/posix` at every start, `hpcfed.py
+  start` included. A refusal stops the start: a provider never falls back to tmpfs. The provider runs as you in its
+  cell, so 0700 is all it needs, and it never sees the marker, which stays beside the bound directory. Its storage is at
+  the same path in the cell, so it is declared to Onedata as before (`finish.sh`), `platform.toml` and its fingerprint
+  are the same as a tmpfs federation's, and the data check reads each space through its owner, wherever that stores it.
+  Without `HPC_STORAGE_ROOT` the provider's step and the service's argv are word for word what they were.
 - **`down` removes exactly those directories,** after the job is gone and every service verified clean, and counts what
   remains: any entry fails it loudly, with the root and the state kept for a second `down`. It reads the paths from the
   state file alone, refuses a record that is not the exact form `up` writes (a state with the scratch root and no record
@@ -265,6 +275,8 @@ the full contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   this `up`'s marker (a provider's directory replaced by another of yours included), a link in a directory's place, an
   entry it did not make. Each directory is held open and proved before any is removed, and emptied through its
   descriptor, so a path swapped afterwards is never followed. A link inside a directory is removed, never followed.
+  The bind lives only in the provider's container, so the teardown's removal of its work directory never reaches the
+  storage on scratch: only `down` removes it, after the provider has stopped.
 
 ## A shared imported tree
 
@@ -444,6 +456,7 @@ import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs
 | `build-rootfs.sh` | job | pull, build the shim with the image's gcc, prep, preload check, tar, SHA-256 |
 | `node-init.sh` | batch step | node checks, leftovers of earlier jobs removed, tarball checks, work directory, per-launch secrets, file default check |
 | `configure.sh`, `run-node.sh`, `run-zone.sh` | batch step | configuration, peers, the service under `supervise.py` |
+| `importstorage.py`, `posixstorage.py` | batch step | a shared imported tree's read-only bind (O59); a provider's own storage directory on scratch, checked and bound onto `/volumes/posix` (O57) |
 | `finish.sh`, `finish-zone.sh` | batch step | readiness and the guard's verdict, the host-side guard, storage, REST checks, rotation, live default and port check |
 | `check-defaults.sh` | node | fails on an image default, a leaked secret or a listener outside the model |
 | `mint-registration-token.sh`, `deliver-token.sh` | steps | a 1 h single-use registration token, from the zone's job into a 0600 file of the provider's |
@@ -533,9 +546,13 @@ allowlist, a hung client and a step past its bound, the state file, `up`'s place
 after a whole or a partial `up`, the core's phase writing `platform.toml` and the ten-pair link-check record, and
 `zone-export.sh` on a stand-in work directory. `tests/deploy/test_hpc_inode_guard.py` and `test_hpc_fed_storage.py` run
 the provider storage on scratch (O57) against the same fake Slurm, with an invented quota command and a temporary
-directory for scratch: usage under, at and one past the 95% line, every way a quota can fail to be read, the override, the
-estimate against the manifests `up` writes, the directories `up` makes and records first, and `down` removing exactly the
-recorded ones, shown gone by a count, never following a link and never touching what `up` did not make.
+directory for scratch: usage under, at and one past the 95% line, every way a quota can fail to be read, the override
+refused on scratch, the estimate against the manifests `up` writes, the directories `up` makes and records first, and
+`down` removing exactly the recorded ones, shown gone by a count, never following a link and never touching what `up` did
+not make. `test_hpc_storage_bind.py` and `test_hpc_posix_storage.py` run the bind: each provider's step given its own
+directory and, without the key, word for word as before; the node's checks and refusals; the service's argv with the bind
+and without; one platform fingerprint for a tmpfs and a scratch federation; and the data check reading the storage on
+scratch.
 `tests/deploy/test_hpc_oneclient_bundle.py` builds the oneclient bundle
 from invented images against a fake Docker (O65): the closure inside the image, the scratch container's discipline, a
 reproducible tar and the self-check's refusals. The bundle's wider offline suite reads files copied out of the two pinned images

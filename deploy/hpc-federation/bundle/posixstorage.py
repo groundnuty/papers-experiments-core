@@ -78,7 +78,7 @@ def parse_arg(arg):
     return path
 
 
-def _walk(path):
+def _no_link_on_the_way(path):
     """Every step of the path, from the first below / to the path itself, each lstat'ed: refused at a link."""
     parts = path.split("/")[1:]
     for depth in range(1, len(parts) + 1):
@@ -136,7 +136,7 @@ def check_storage(path, provider, workdir, mountinfo=None, first=False):
         raise StorageRefused(
             "the storage is not of the form up makes: <its allocation's directory>/<this provider>/posix"
         )
-    _walk(path)
+    _no_link_on_the_way(path)
     directory, allocation = os.path.dirname(path), os.path.dirname(os.path.dirname(path))
     _private(path, "the storage")
     _private(directory, "its provider's directory")

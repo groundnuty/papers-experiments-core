@@ -4,9 +4,11 @@ real addresses (DESIGN.md, sections 5 and 6).
 - **The services' URLs** are `https://<node FQDN>:8443` (the shim moves the worker's 443 there), so `HpcService` is the
   Compose `Service` with the node's name in place of the loopback port; the Compose bootstrap (`fedboot.Bootstrap`), the
   baseline (`fedcontent.Content`) and the facts (`fedfacts`) then run unchanged.
-- **The storage** is the one posix storage the bundle's `finish.sh` adds to each provider, owned by the job's uid on
-  the node's tmpfs, with Onedata's LUMA local feed: each support also maps the space's default credentials, and every
-  user of the federation, to that uid (as `bundle/onboard.py` does), or the users could reach none of its files. The
+- **The storage** is the one posix storage the bundle's `finish.sh` adds to each provider at `/volumes/posix`, owned by
+  the job's uid, on the node's tmpfs or, with `HPC_STORAGE_ROOT`, bound from the provider's own directory on scratch
+  (`hpcstorage`; the same storage in the cell either way), with Onedata's LUMA local feed: each support also maps the
+  space's default credentials, and every user of the federation, to that uid (as `bundle/onboard.py` does), or the
+  users could reach none of its files. The
   owner of a shared imported space (O59) has a second, `import-<space>`, on its tree on the shared filesystem, made
   with the same ids (`hpcimport.import_storage_extra`) and mapped the same way, on the storage its support names; the
   core's phase waits for the scan, and verifies each space against its manifest (`fedimport.verify_imports`) over the
