@@ -1,0 +1,72 @@
+# platform.toml of the pilot-shape layout, rendered by hpcfed.py up into the federation's root. Each @...@ is filled
+# from facts.json (the ids are new at every up; every URL is https://<node FQDN>:8443) or by the HPC driver: hpc_command
+# is its argv prefix with --layout and --root, hpc_settle_timeout_s is above a stop's whole bound ([hpc] stop_seconds +
+# 90 s), and hpc_token_margin_s is the least [tokens] margin_s the platform layer accepts with those values. Every path
+# is relative to the root. The four data spaces give the link check ten ordered pairs.
+zone = { name = "zone", url = "@zone_url@" }
+providers.aspen = { url = "@provider_url.aspen@", id = "@provider_id.aspen@" }
+providers.larch = { url = "@provider_url.larch@", id = "@provider_id.larch@" }
+providers.rowan = { url = "@provider_url.rowan@", id = "@provider_id.rowan@" }
+providers.alder = { url = "@provider_url.alder@", id = "@provider_id.alder@" }
+providers.hazel = { url = "@provider_url.hazel@", id = "@provider_id.hazel@" }
+credentials.admin = { file = "secrets/admin.token" }
+credentials.users = { directory = "secrets/users", pattern = "{user}.pass" }
+principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-reader@" }
+principals.toolserver = { username = "alpha-tools", user_id = "@user_id.alpha-tools@" }
+principals.service = { username = "alpha-health", user_id = "@user_id.alpha-health@" }
+tls = { ca_file = "ca/federation-ca.pem" }   # the Onedata test CA here: each service's generated web certificate
+link_check = { name = "link-probes", id = "@space_id.link-probes@", prefixes = ["link-"], providers = ["aspen", "larch", "rowan", "alder", "hazel"] }
+
+[tokens]
+margin_s = @hpc_token_margin_s@
+
+[[spaces]]
+label = "alpha"
+name = "alpha-space"
+id = "@space_id.alpha-space@"
+prefixes = ["alpha-"]
+providers = ["larch", "aspen", "rowan"]
+local = "aspen"
+holder = "larch"
+
+[[spaces]]
+label = "beta"
+name = "beta-space"
+id = "@space_id.beta-space@"
+prefixes = ["beta-"]
+providers = ["rowan", "aspen"]
+local = "aspen"
+holder = "rowan"
+
+[[spaces]]
+label = "gamma"
+name = "gamma-space"
+id = "@space_id.gamma-space@"
+prefixes = ["gamma-"]
+providers = ["alder", "aspen"]
+local = "aspen"
+holder = "alder"
+
+[[spaces]]
+label = "delta"
+name = "delta-space"
+id = "@space_id.delta-space@"
+prefixes = ["delta-"]
+providers = ["hazel", "aspen"]
+local = "aspen"
+holder = "hazel"
+
+[faults]                                     # the HPC backend's (M4): its service verbs are hpcfed.py's
+sanctioned = false                           # the configuration's half of the sanction: true only for a study that injects
+backend = "hpc"
+journal = "fault-journal"
+command = @hpc_command@
+settle_timeout_s = @hpc_settle_timeout_s@
+poll_s = 10                                  # every status is a step on a node's one control core
+
+[faults.services]
+aspen = "aspen"
+larch = "larch"
+rowan = "rowan"
+alder = "alder"
+hazel = "hazel"
