@@ -1,0 +1,235 @@
+"""The HPC test runner end to end (deploy/hpc-tests), with the cluster faked: `ssh` runs the remote command in a local
+shell, `srun` drops its options and runs the step's command (behind the real `/usr/bin/env -i`), Slurm answers from
+files, and `uv` builds a small venv whose pytest is a stand-in. The boot, node.sh, the payload's and the results'
+SHA-256, the self-check, the clean and the local report are the real ones, on a real tmpfs (the node root).
+"""
+
+import os
+import secrets
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import hpct_fakes as fakes
+import pytest
+
+
+def tmpfs_base():
+    for base in ("/tmp", "/dev/shm"):
+        probe = Path(base)
+        if probe.is_dir() and os.access(base, os.W_OK):
+            kind = subprocess.run(["stat", "-f", "-c", "%T", base], capture_output=True, text=True, check=False)
+            if kind.stdout.strip() == "tmpfs":
+                return base
+    return None
+
+
+BASE = tmpfs_base()
+pytestmark = pytest.mark.skipif(BASE is None, reason="needs a writable tmpfs at /tmp or /dev/shm for the node root")
+
+
+@pytest.fixture(scope="module")
+def cli():
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(str(fakes.DEPLOY))
+        import hpctestlib
+        import hpctests
+
+        yield SimpleNamespace(lib=hpctestlib, main=hpctests.main, module=hpctests)
+
+
+def commit(repo: Path, files: dict) -> str:
+    for name, text in files.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(text)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@invalid", "commit", "-q", "-m", "x"],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    bin_dir, fake, home, repo = (tmp_path / n for n in ("bin", "fake", "home", "repo"))
+    for path in (bin_dir, fake, home, repo):
+        path.mkdir()
+    fakes.slurm(bin_dir, fake)
+    fakes.remote(bin_dir, fake)
+    uv = fakes.uv(tmp_path / "uv")
+    root = f"{BASE}/hpct-test-{secrets.token_hex(4)}"
+    site = tmp_path / "site.env"
+    site.write_text(
+        f"HPCT_HOST=fake-login\nHPCT_NODE_ROOT={root}\nHPCT_UV={uv}\nHPCT_UV_VERSION=0.11.19\n"
+        f"HPCT_OUT={tmp_path / 'out'}\n"
+        f"HPCT_WORK={tmp_path}\nHPCT_STEP_PATH=/usr/bin:/bin\nHPCT_ACCOUNT=acct-x\nHPCT_PARTITION=std-part\n"
+    )
+    site.chmod(0o600)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    sha = commit(repo, {"src/expcore/__init__.py": "", "src/expcore_onedata/__init__.py": "", "tests/test_x.py": ""})
+    for key, value in fakes.environment(bin_dir, fake, home).items():
+        monkeypatch.setenv(key, value)
+    # What a login shell holds and a step must never see.
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/run/agent.sock")
+    monkeypatch.setenv("SLURM_JOB_ID", "1")
+    monkeypatch.setenv("HPCT_SITE_SECRET", "x")
+    node_root = Path(f"{root}-{os.getuid()}")
+    yield SimpleNamespace(site=site, fake=fake, repo=repo, sha=sha, out=tmp_path / "out", node_root=node_root)
+    shutil.rmtree(node_root, ignore_errors=True)
+
+
+def allocate(cli, world):
+    assert cli.main(["--site", str(world.site), "install"]) == 0
+    assert cli.main(["--site", str(world.site), "submit"]) == 0
+    now = int(time.time())
+    start, end = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) for t in (now - 60, now + 43200))
+    (world.fake / "squeue").write_text(f"700|expcore-tests|RUNNING|{start}|{end}|16|30G\n")
+
+
+def run(cli, world, *pytest_args):
+    return cli.main(
+        [
+            "--site",
+            str(world.site),
+            "run",
+            "--repo",
+            str(world.repo),
+            "--cores",
+            "2",
+            "--mem",
+            "1G",
+            "--time",
+            "10",
+            "--",
+            *pytest_args,
+        ]
+    )
+
+
+def only_run(world) -> Path:
+    (out,) = world.out.iterdir()
+    return out
+
+
+def test_o64_a_selection_runs_at_the_commit_in_an_exact_step_and_its_results_come_back(cli, world, capsys):
+    """O64: `run` ships the commit, runs pytest in an `--exact` step of our allocation behind the allowlist, brings
+    back pytest's exit status, summary, `-ra` lines and JUnit XML, checked by SHA-256, and leaves no run directory on
+    the node; nothing of the login shell's environment reaches the tests."""
+    allocate(cli, world)
+    assert run(cli, world, "tests", "-k", "not slow and x") == 0
+    printed = capsys.readouterr().out
+    assert "2 passed, 1 skipped in 0.50s" in printed
+    assert "SKIPPED [1] tests/test_x.py:3: a stand-in skip" in printed
+    assert "fake-login" not in printed
+    out = only_run(world)
+    assert (out / "results" / "junit.xml").exists()
+    log = (out / "results" / "pytest.log").read_text()
+    keys = set(log.split("env-keys: ", 1)[1].split("\n", 1)[0].split(","))
+    assert not keys & {"SSH_AUTH_SOCK", "SLURM_JOB_ID", "HPCT_SITE_SECRET", "FAKE", "TZ"}
+    assert {"PATH", "HOME", "TMPDIR"} <= keys
+    assert '"tests", "-k", "not slow and x"' in log
+    srun = (world.fake / "srun.argv").read_text().split("--\n")[0].splitlines()
+    assert srun[:4] == ["--jobid=700", "--exact", "-N1", "-n1"]
+    assert "--overlap" not in srun
+    assert not (world.node_root / "runs").exists() or not any((world.node_root / "runs").iterdir())
+
+
+def test_a_failing_selection_returns_pytest_s_own_status_and_names_the_failures(cli, world, capsys):
+    allocate(cli, world)
+    commit(world.repo, {"fake-outcome-fail": ""})
+    assert run(cli, world, "tests") == 1
+    printed = capsys.readouterr().out
+    assert "FAILED tests/test_x.py::test_b - assert 0" in printed
+    assert '"rc": 1' in (only_run(world) / "run.json").read_text()
+
+
+def test_o64_a_venv_that_does_not_import_the_shipped_core_runs_no_test(cli, world, capsys):
+    """O64: the self-check comes first: when the venv's isolated interpreter does not import the core from the
+    shipped clone's src/, no test runs and the run exits 97."""
+    allocate(cli, world)
+    commit(world.repo, {"fake-wrong-core": ""})
+    assert run(cli, world, "tests") == 97
+    assert "SELF-CHECK FAILED" in capsys.readouterr().out
+    assert not (only_run(world) / "results" / "pytest.log").exists()
+
+
+def test_an_srun_client_that_does_not_return_after_its_step_is_ended_and_the_results_kept(cli, world, monkeypatch):
+    allocate(cli, world)
+    (world.fake / "hang").write_text("")
+    monkeypatch.setattr(cli.module, "GRACE_S", 1.0)
+    started = time.monotonic()
+    assert run(cli, world, "tests") == 0
+    assert time.monotonic() - started < 60
+
+
+def test_only_committed_work_ships(cli, world, capsys):
+    allocate(cli, world)
+    (world.repo / "fake-outcome-fail").write_text("")  # untracked, not committed: not shipped
+    (world.repo / "tests" / "test_x.py").write_text("changed\n")
+    assert run(cli, world, "tests") == 0
+    assert "uncommitted changes" in capsys.readouterr().out
+
+
+def test_no_running_allocation_of_ours_is_exit_69_and_no_step(cli, world):
+    assert cli.main(["--site", str(world.site), "install"]) == 0
+    assert run(cli, world, "tests") == 69
+    assert not (world.fake / "srun.argv").exists()
+
+
+def test_a_site_env_others_can_read_is_refused(cli, world):
+    world.site.chmod(0o644)
+    assert cli.main(["--site", str(world.site), "jobs"]) == 64
+
+
+def test_clean_removes_a_dead_run_s_directory_and_keeps_young_ones(cli, world, capsys):
+    allocate(cli, world)
+    runs = world.node_root / "runs"
+    runs.mkdir(parents=True)
+    dead, young = runs / "dead-run", runs / "young-run"
+    for path in (dead, young):
+        (path / "repo").mkdir(parents=True)
+        (path / "pid").write_text("999999999\n")
+    (dead / "repo").chmod(0o500)  # a tree a test left read-only
+    old = time.time() - 600
+    os.utime(dead, (old, old))
+    assert cli.main(["--site", str(world.site), "clean", "--stale", "5"]) == 0
+    assert "removed 1 run directories, kept 1 younger ones" in capsys.readouterr().out
+    assert not dead.exists()
+    assert young.exists()
+
+
+def test_the_payload_must_arrive_intact(cli, world):
+    root = f"{BASE}/hpct-test-{secrets.token_hex(4)}"
+    command = cli.lib.boot_command(root, "r1", "0" * 64, "run")
+    env = {"PATH": "/usr/bin:/bin"}
+    try:
+        out = subprocess.run(
+            list(command), input=b"not the payload", capture_output=True, env=env, timeout=60, check=False
+        )
+        assert out.returncode == 72
+        assert b"HPCT-FAIL boot: the payload arrived as sha256" in out.stdout
+        assert not (Path(f"{root}-{os.getuid()}") / "runs" / "r1").exists()
+    finally:
+        shutil.rmtree(f"{root}-{os.getuid()}", ignore_errors=True)
+
+
+def test_o64_the_boot_refuses_a_root_whose_filesystem_is_not_a_tmpfs_and_creates_nothing(cli):
+    """O64: a step writes only to the node's tmpfs: a root under a /tmp that is not a tmpfs (on a site where /tmp is a
+    disk) is refused before anything is made there."""
+    if (
+        subprocess.run(["stat", "-f", "-c", "%T", "/tmp"], capture_output=True, text=True, check=False).stdout.strip()
+        == "tmpfs"
+    ):
+        pytest.skip("/tmp is a tmpfs here")
+    root = f"/tmp/hpct-test-{secrets.token_hex(4)}"
+    command = cli.lib.boot_command(root, "r1", "0" * 64, "run")
+    out = subprocess.run(
+        list(command), input=b"", capture_output=True, env={"PATH": "/usr/bin:/bin"}, timeout=60, check=False
+    )
+    assert b"HPCT-FAIL boot: the node root is not on a tmpfs" in out.stdout
+    assert not Path(f"{root}-{os.getuid()}").exists()
