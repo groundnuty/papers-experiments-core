@@ -33,9 +33,18 @@ SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatche
 PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a value the platform template leaves to up (fedfacts)
 SHA256 = re.compile(r"[0-9a-f]{64}")
 # The site's variables of the agent's Apptainer sandbox (M5), by the Site field each fills: the files' paths and the
-# work root, and the SHA-256 each file is declared to have.
-AGENT_PATHS = {"HPC_AGENT_SIF": "agent_sif", "HPC_EGRESS_SHIM": "egress_shim", "HPC_AGENT_WORK_ROOT": "agent_work_root"}
-AGENT_PINS = {"HPC_AGENT_SIF_SHA256": "agent_sif_sha256", "HPC_EGRESS_SHIM_SHA256": "egress_shim_sha256"}
+# work root, and the SHA-256 each file is declared to have (oneclient's bundle: the host mount's oneclient).
+AGENT_PATHS = {
+    "HPC_AGENT_SIF": "agent_sif",
+    "HPC_EGRESS_SHIM": "egress_shim",
+    "HPC_ONECLIENT_BUNDLE": "oneclient_bundle",
+    "HPC_AGENT_WORK_ROOT": "agent_work_root",
+}
+AGENT_PINS = {
+    "HPC_AGENT_SIF_SHA256": "agent_sif_sha256",
+    "HPC_EGRESS_SHIM_SHA256": "egress_shim_sha256",
+    "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
+}
 AGENT_VARIABLES = {**AGENT_PATHS, **AGENT_PINS}
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
@@ -305,12 +314,15 @@ class Site:
     admin_mail: str = "admin@example.org"
     billing_weight: Optional[float] = None  # the site's billing weight per GB of memory, for describe
     # The agent's Apptainer sandbox (M5), for a platform template that names them (`hpcpins`): the SIF and the egress
-    # shim built for it on the filesystem the nodes see, each with the SHA-256 it is declared to have, and the
-    # sandbox's work_root on the agent's node's tmpfs. Empty when the site declares none.
+    # shim built for it on the filesystem the nodes see, and oneclient's bundle (oneclient_bundle.py), each with the
+    # SHA-256 it is declared to have, and the sandbox's work_root on the agent's node's tmpfs. Empty when the site
+    # declares none.
     agent_sif: str = ""
     agent_sif_sha256: str = ""
     egress_shim: str = ""
     egress_shim_sha256: str = ""
+    oneclient_bundle: str = ""
+    oneclient_bundle_sha256: str = ""
     agent_work_root: str = ""
 
     def to_json(self) -> dict:

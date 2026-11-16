@@ -10,15 +10,18 @@ sandbox takes (`mount_helper=`).
 **`start()`**, before the gate and any cell, under `<run>/mount-guard/` (every directory 0700, none of them under any
 path a cell binds; the cell binds only the mount point, `<run>/mount`, read-only at `[sandbox.mount] path`):
 
-1. the token is written to `token/token` (0600), and oneclient is started on the node: `sh -c` reads that file into
-   `ONECLIENT_ACCESS_TOKEN`, refuses an empty one, then becomes `env` without the variables that could set an option
-   (`UNSET_ENV`), with `HOME` its own `oneclient-home/` and, with the platform's `ca_file`, `SSL_CERT_FILE` a copy of
-   the bundle; then oneclient in the foreground with `-o ro` (no `allow_other`, which the node refuses), the declared
-   force-I/O option, `--log-dir oneclient-log/`, `--config /dev/null`, `--disable-log-buffering` (#307), the
-   provider's port and the study's extra arguments. The token is never in an argument or in the driver's environment;
-   the binary is pinned by its SHA-256 (O13);
+1. oneclient's bundle, the tar `[sandbox.apptainer] oneclient_bundle` pins, is unpacked into `oneclient-bundle/` from
+   the bytes that are hashed (`oneclient_bundle.unpack`: another file refuses the start), and its own `--version` and
+   the binary's GNU build id are read for the record. The token is written to `token/token` (0600), and oneclient is
+   started on the node through the bundle's launcher (the image's loader and libraries, never the node's): `sh -c`
+   reads that file into `ONECLIENT_ACCESS_TOKEN`, refuses an empty one, then becomes `env` without the variables that
+   could set an option (`UNSET_ENV`), with `HOME` its own `oneclient-home/` and, with the platform's `ca_file`,
+   `SSL_CERT_FILE` a copy of the CA bundle; then oneclient in the foreground with `-o ro` (no `allow_other`, which the
+   node refuses), the declared force-I/O option, `--log-dir oneclient-log/`, `--config /dev/null`,
+   `--disable-log-buffering` (#307), the provider's port and the study's extra arguments. The token is never in an
+   argument or in the driver's environment;
 2. once the FUSE mount is up at the mount point (this uid's, read-only, no `allow_other`), the watcher
-   (`expcore_onedata.sandbox.mountwatch`) is started on the token file, its directory and the mount, with the four
+   (`expcore_onedata.sandbox.mountwatch`) is started on the token file, its directory and the mount, with the five
    private directories as the protected ones; then the token file is removed (verified) and the watcher, seeing the
    removal, opens the agent's window and says so: the start returns only then.
 
@@ -28,18 +31,19 @@ line), its log read once and judged (`expcore.mountguard`), and oneclient's I/O 
 
 **`stop()`**: the watch closed; the mount unmounted (`fusermount3 -u`, then oneclient stopped, then a lazy unmount if
 the mount is still in the table); oneclient shown gone; the token file shown gone; any file of oneclient's log that
-holds the token removed. Each step is tried and the stop raises `SandboxError` naming those that failed; a second call
-does only what is left.
+holds the token removed; the bundle's copy removed. Each step is tried and the stop raises `SandboxError` naming those
+that failed; a second call does only what is left.
 
 **What is refused:** a direct mount (its check needs a cell before the first exists, and a provider's storage is on
 another node), a run without the token or the provider, an extra argument that sets the port (the provider's is
-passed), and a binary that is not the pinned file.
+passed), a platform that declares no bundle, and a bundle that is not the pinned file.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import shutil
 import sys
 import threading
 import time
@@ -54,10 +58,10 @@ from expcore_onedata.sandbox import directio, iomode
 from expcore_onedata.sandbox import mountwatch as MW
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import helpers, layout
+from expcore_onedata.sandbox.apptainer import helpers
+from expcore_onedata.sandbox.apptainer import oneclient_bundle as OB
 from expcore_onedata.sandbox.apptainer.mounthook import MountHelperFactory
 from expcore_onedata.sandbox.apptainer.node import NodeOps
-from expcore_onedata.sandbox.apptainer.settings import Pinned
 from expcore_onedata.sandbox.containers import extra_args_record
 from expcore_onedata.sandbox.hostops import MountTableError, describe_error
 from expcore_onedata.sandbox.oneclient_args import (
@@ -92,6 +96,10 @@ DIRECT_REFUSED = (
     "before any cell exists, and the provider's storage is on another node"
 )
 PORT_REFUSED = "[sandbox.mount] extra_args must not set the port: the host mount passes the provider's"
+NO_BUNDLE = (
+    "a mount data path on the Apptainer backend needs [sandbox.apptainer] oneclient_bundle: the pinned oneclient the "
+    "host mount runs on the node (deploy/hpc-federation/README.md)"
+)
 NOT_COLLECTED = "not_collected"
 
 
@@ -126,6 +134,10 @@ class Layout:
         return self.guard / "watch"
 
     @property
+    def bundle_dir(self) -> Path:
+        return self.guard / "oneclient-bundle"
+
+    @property
     def watch_log(self) -> Path:
         return self.watch_dir / "mountwatch.jsonl"
 
@@ -134,8 +146,8 @@ class Layout:
         return self.run_dir / "mount"
 
     def protected(self) -> tuple[Path, ...]:
-        """The directories no cell may reach: the token's, oneclient's log and home, the watcher's."""
-        return (self.token_dir, self.log_dir, self.home_dir, self.watch_dir)
+        """The directories no cell may reach: the token's, oneclient's log, home and bundle, the watcher's."""
+        return (self.token_dir, self.log_dir, self.home_dir, self.watch_dir, self.bundle_dir)
 
 
 def host_options(settings: Any) -> list[str]:
@@ -149,15 +161,19 @@ def host_options(settings: Any) -> list[str]:
     ]
 
 
-def oneclient_argv(settings: Any, provider: Any, where: Layout, binary: Path, ca: Path | None) -> list[str]:
-    """The wrapper's command line (the module's docstring, step 1)."""
+def clean_env(where: Layout) -> list[str]:
+    """`env`'s words before oneclient: the variables that could set an option unset, `HOME` oneclient's own."""
+    return [*(word for name in UNSET_ENV for word in ("-u", name)), f"HOME={where.home_dir}"]
+
+
+def oneclient_argv(settings: Any, provider: Any, where: Layout, launcher: Sequence[str], ca: Path | None) -> list[str]:
+    """The wrapper's command line (the module's docstring, step 1); `launcher` runs the bundle's oneclient."""
     trust = [f"SSL_CERT_FILE={ca}"] if ca is not None else []
     return [
         *("sh", "-c", HOST_START, SHELL_NAME, str(where.token_file)),
-        *(word for name in UNSET_ENV for word in ("-u", name)),
-        f"HOME={where.home_dir}",
+        *clean_env(where),
         *trust,
-        *(str(binary), "-f", "-H", provider.host, "--port", str(provider.port)),
+        *(*launcher, "-f", "-H", provider.host, "--port", str(provider.port)),
         *host_options(settings),
         *(LOG_DIR_OPTION, str(where.log_dir)),
         *settings.mount.extra_args,
@@ -202,25 +218,9 @@ def _own_mountinfo() -> str:
         return stream.read()
 
 
-_PINNED: dict[layout.Identity, str] = {}
-_PINNED_LOCK = threading.Lock()
-
-
-def pin_binary(pin: Pinned) -> layout.Identity:
-    """oneclient's binary by its identity once its SHA-256 is the pinned one (O13); `StartRefused` otherwise."""
-    try:
-        before = layout.identity(pin.path)
-        with _PINNED_LOCK:
-            digest = _PINNED.get(before) or layout.sha256_of(pin.path)
-        if layout.identity(pin.path) != before:
-            raise StartRefused("oneclient's binary changed while it was hashed")
-    except OSError:
-        raise StartRefused("oneclient's binary could not be read on this node") from None
-    if digest != pin.sha256:
-        raise StartRefused("oneclient's binary is not the file it is pinned to (its SHA-256 differs)")
-    with _PINNED_LOCK:
-        _PINNED[before] = digest
-    return before
+def bundle_pin(settings: Any) -> Any:
+    """The platform's pin of oneclient's bundle, None when it declares none."""
+    return getattr(getattr(settings, "apptainer", None), "oneclient_bundle", None)
 
 
 class HostMount:
@@ -233,7 +233,6 @@ class HostMount:
         spec: Any,
         run_dir: Path,
         *,
-        oneclient: Pinned,
         python: str | None = None,
         unmount: Sequence[str] = UNMOUNT,
         poll_s: float = MW.POLL_S,
@@ -242,17 +241,14 @@ class HostMount:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.node, self.s, self.spec, self.where = node, settings, spec, Layout(Path(run_dir))
-        self._pin, self._python, self._unmount, self._poll_s = (
-            oneclient,
-            python or sys.executable,
-            tuple(unmount),
-            poll_s,
-        )
+        self._python, self._unmount, self._poll_s = python or sys.executable, tuple(unmount), poll_s
         self._mountinfo, self._sleep, self._clock = mountinfo, sleep, clock
         self.nonce = secrets.token_hex(16)
         # The run's tag (the run directory is named by the sandbox's id): a reaper of a driver killed outright finds
         # oneclient and the watcher by it, as it finds the gate and the collector (`runs.reap`).
         self._tag = {AV.RUN_TAG: self.where.run_dir.name}
+        self.bundle: OB.Bundle | None = None
+        self._build: dict[str, Any] | None = None  # the oneclient that serves the run: version, build id, pin
         self.oneclient: helpers.Helper | None = None
         self.watch: helpers.Helper | None = None
         self._closed = False
@@ -276,7 +272,8 @@ class HostMount:
             raise StartRefused(PORT_REFUSED)
         if spec.token is None or spec.provider is None:
             raise StartRefused("a mount data path needs the data-path token and the agent's local provider")
-        pin_binary(self._pin)
+        if bundle_pin(self.s) is None:
+            raise StartRefused(NO_BUNDLE)
 
     def start(self) -> Path:
         self._validate()
@@ -284,10 +281,12 @@ class HostMount:
         for directory in (where.guard, *where.protected(), where.mountpoint):
             directory.mkdir(mode=0o700)
             directory.chmod(0o700)  # whatever the driver's umask
+        self.bundle = OB.unpack(bundle_pin(self.s), where.bundle_dir)
+        self._build = self._read_build(self.bundle)
         self._write_token()
         ca = TLS.write_private_copy(self.s.tls.bundle(), where.home_dir) if self.s.tls.ca_file is not None else None
         t0 = self._clock()
-        argv = oneclient_argv(self.s, self.spec.provider, where, self._pin.path, ca)
+        argv = oneclient_argv(self.s, self.spec.provider, where, self.bundle.launcher(), ca)
         out, err = where.guard / "oneclient.stdout", where.guard / "oneclient.stderr"
         spawned = self.node.spawn(argv, stdout=out, stderr=err, env=self._tag)
         self.oneclient = helpers.Helper("oneclient", spawned, out, err)
@@ -299,6 +298,15 @@ class HostMount:
         self._remove_token()
         self._wait_armed()
         return where.mountpoint
+
+    def _read_build(self, bundle: OB.Bundle) -> dict[str, Any]:
+        """What the run records of its oneclient: its own `--version`, run here, the binary's build id, and the pin."""
+        ran = self.node.run(["env", *clean_env(self.where), *bundle.launcher(), "--version"], STEP_S)
+        return {
+            **OB.version_of(ran.returncode, ran.stdout),
+            "build_id": OB.build_id(bundle.binary),
+            "bundle_sha256": bundle_pin(self.s).sha256,
+        }
 
     def token_paths(self) -> list[Path]:
         """The token's file, which the sandbox lists in the run's record before the start writes it (O60)."""
@@ -376,7 +384,8 @@ class HostMount:
         errors: list[str] = []
         for what, step in (("watch", self.close_watch), ("unmount", self._unmount_once),
                            ("oneclient", self._stop_oneclient), ("mount", self._mount_gone),
-                           ("token file", self._remove_token), ("oneclient log", self._scrub)):  # fmt: skip
+                           ("token file", self._remove_token), ("oneclient log", self._scrub),
+                           ("bundle", self._remove_bundle)):  # fmt: skip
             try:
                 step()
             except Exception as error:  # every step is tried: the stop names each one that failed
@@ -404,6 +413,14 @@ class HostMount:
             self.node.run([self._unmount[0], LAZY, str(self.where.mountpoint)], STEP_S)
         if self._mounted():
             raise SandboxError("the oneclient mount is still in the mount table")
+
+    def _remove_bundle(self) -> None:
+        """The bundle's copy, once oneclient is shown gone: 100 MB of a run's directory that is no evidence."""
+        process = None if self.oneclient is None else self.oneclient.process
+        if process is not None and self.node.alive(process.pid, process.start) is not False:
+            raise SandboxError("oneclient is not shown gone, so its bundle is kept")
+        if self.where.bundle_dir.is_dir():
+            shutil.rmtree(self.where.bundle_dir)
 
     def _scrub(self) -> None:
         """Remove any file of oneclient's log that holds the token: a secret is never evidence (O05)."""
@@ -434,6 +451,7 @@ class HostMount:
         return {
             "io_mode": taken or iomode.judge(declared, None, why_unread=iomode.NOT_COLLECTED),
             "oneclient": "node",
+            "oneclient_build": dict(self._build) if self._build is not None else None,
             "options": host_options(self.s) if declared in IO_MODE_FLAGS else [],
             "extra_args": extra_args_record(extra),
             "log_dir_from": "sandbox",
@@ -467,13 +485,20 @@ def _read_log_link(directory: Path, name: str) -> bytes | None:
     return _read(target)
 
 
-def host_mount_factory(oneclient: Pinned, **options: Any) -> MountHelperFactory:
-    """The factory the Apptainer sandbox takes (`mount_helper=`), for oneclient's pinned binary on the node."""
+def host_mount_factory(*binary: Any, **options: Any) -> MountHelperFactory:
+    """The factory the Apptainer sandbox takes (`mount_helper=`). Its oneclient is the platform's bundle,
+    `[sandbox.apptainer] oneclient_bundle`, whose SHA-256 the campaign fingerprint holds: a binary given here is
+    refused, since it would serve runs the fingerprint does not tell apart."""
+    if binary or "oneclient" in options:
+        raise TypeError(
+            "host_mount_factory() takes no oneclient: declare its bundle as [sandbox.apptainer] oneclient_bundle and "
+            "oneclient_bundle_sha256 (deploy/hpc-federation/README.md), so the fingerprint holds it"
+        )
 
     def factory(node: NodeOps, settings: Any, spec: Any, run_dir: Path) -> HostMount:
-        return HostMount(node, settings, spec, run_dir, oneclient=oneclient, **options)
+        return HostMount(node, settings, spec, run_dir, **options)
 
     return factory
 
 
-__all__ = ["HostMount", "Layout", "fuse_state", "host_mount_factory", "host_options", "oneclient_argv"]
+__all__ = ["HostMount", "Layout", "clean_env", "fuse_state", "host_mount_factory", "host_options", "oneclient_argv"]

@@ -27,8 +27,11 @@ VARIABLES = (
     "HPC_AGENT_SIF_SHA256",
     "HPC_EGRESS_SHIM",
     "HPC_EGRESS_SHIM_SHA256",
+    "HPC_ONECLIENT_BUNDLE",
+    "HPC_ONECLIENT_BUNDLE_SHA256",
     "HPC_AGENT_WORK_ROOT",
 )
+FILES = ("HPC_AGENT_SIF", "HPC_EGRESS_SHIM", "HPC_ONECLIENT_BUNDLE")
 
 
 @pytest.fixture(scope="module")
@@ -125,6 +128,8 @@ def test_o63_up_hands_the_core_the_sites_declared_pins_paths_and_work_root_and_t
     assert values["hpc_agent_sif_sha"] == site["HPC_AGENT_SIF_SHA256"]
     assert values["hpc_egress_shim"] == site["HPC_EGRESS_SHIM"]
     assert values["hpc_egress_shim_sha"] == site["HPC_EGRESS_SHIM_SHA256"]
+    assert values["hpc_oneclient_bundle"] == site["HPC_ONECLIENT_BUNDLE"]
+    assert values["hpc_oneclient_bundle_sha"] == site["HPC_ONECLIENT_BUNDLE_SHA256"]
     assert values["hpc_agent_work_root"] == site["HPC_AGENT_WORK_ROOT"]
     assert values["hpc_egress_collector"] == str(pins.COLLECTOR)
     assert values["hpc_egress_collector_sha"] == pins.sha256_of(pins.COLLECTOR)
@@ -144,6 +149,10 @@ def test_o63_the_rendered_platform_file_runs_the_apptainer_sandbox_on_the_declar
         site["HPC_EGRESS_SHIM_SHA256"],
     )
     assert app.egress_collector.sha256 == pins.sha256_of(pins.COLLECTOR)
+    assert (str(app.oneclient_bundle.path), app.oneclient_bundle.sha256) == (
+        site["HPC_ONECLIENT_BUNDLE"],
+        site["HPC_ONECLIENT_BUNDLE_SHA256"],
+    )  # the mount level's oneclient
     assert sandbox.mode_of("mounted").value == "mount"
 
 
@@ -161,7 +170,7 @@ def test_o63_up_refuses_a_site_that_leaves_a_placeholder_of_the_sandbox_unfilled
     assert not (rig.root / "hpc-federation.json").exists()
 
 
-@pytest.mark.parametrize("variable", ["HPC_AGENT_SIF", "HPC_EGRESS_SHIM"])
+@pytest.mark.parametrize("variable", FILES)
 def test_o63_up_refuses_a_declared_file_that_is_missing_naming_the_variable_never_the_path(
     hpc, tmp_path, site, variable
 ):
@@ -174,7 +183,7 @@ def test_o63_up_refuses_a_declared_file_that_is_missing_naming_the_variable_neve
     assert not [c for c in rig.fake.calls if c[0] == "sbatch"]
 
 
-@pytest.mark.parametrize("variable", ["HPC_AGENT_SIF", "HPC_EGRESS_SHIM"])
+@pytest.mark.parametrize("variable", FILES)
 def test_o63_up_refuses_a_file_whose_sha256_is_not_the_declared_one(hpc, tmp_path, site, variable):
     """O63: a pin is a declaration: a file changed since it was declared (one byte here) fails up, naming the pin."""
     rig = Rig(hpc, tmp_path)
@@ -226,7 +235,12 @@ def other_file(site: dict, variable: str, directory: Path) -> dict:
 
 
 @pytest.mark.parametrize(
-    ("variable", "key"), [("HPC_AGENT_SIF", "image_sha256"), ("HPC_EGRESS_SHIM", "egress_shim_sha256")]
+    ("variable", "key"),
+    [
+        ("HPC_AGENT_SIF", "image_sha256"),
+        ("HPC_EGRESS_SHIM", "egress_shim_sha256"),
+        ("HPC_ONECLIENT_BUNDLE", "oneclient_bundle_sha256"),
+    ],
 )
 def test_o63_two_renders_differing_only_in_a_pin_are_two_campaigns_by_that_pin_alone(
     hpc, pins, tmp_path, site, ca, variable, key
@@ -245,17 +259,18 @@ def test_o63_two_renders_differing_only_in_a_pin_are_two_campaigns_by_that_pin_a
 
 
 def test_o63_the_fingerprint_holds_no_site_value_but_the_pins_of_the_rendered_file(hpc, pins, tmp_path, site, ca):
-    """O63: of everything site.env gives, only the two declared SHA-256s reach the fingerprint, under the sandbox's
-    pins, as the rendered file holds them: no path (SIF, shim, work root, SH, L), account or partition."""
+    """O63: of everything site.env gives, only the declared SHA-256s reach the fingerprint, under the sandbox's
+    pins, as the rendered file holds them: no path (SIF, shim, bundle, work root, SH, L), account or partition."""
     fingerprint = load_platform(render(hpc, pins, tmp_path / "root", site, ca)).fingerprint()
     text = json.dumps(fingerprint, sort_keys=True)
-    pinned = {site["HPC_AGENT_SIF_SHA256"], site["HPC_EGRESS_SHIM_SHA256"]}
+    pinned = {site["HPC_AGENT_SIF_SHA256"], site["HPC_EGRESS_SHIM_SHA256"], site["HPC_ONECLIENT_BUNDLE_SHA256"]}
     for variable, value in site.items():
         if value in pinned:
             assert text.count(value) == 1, variable
         elif variable not in ("HPC_STEP_PATH", "HPC_NODE_TMP"):  # "/usr/bin:/bin" and "/tmp": no site's own words
             assert value not in text, variable
-    assert {fingerprint["sandbox_backend"][k] for k in ("image_sha256", "egress_shim_sha256")} == pinned
+    keys = ("image_sha256", "egress_shim_sha256", "oneclient_bundle_sha256")
+    assert {fingerprint["sandbox_backend"][k] for k in keys} == pinned
 
 
 def test_o63_a_copy_of_the_rendered_file_beside_a_study_reads_the_roots_secrets_ca_and_journal(

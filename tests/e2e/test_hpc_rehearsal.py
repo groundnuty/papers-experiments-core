@@ -48,7 +48,6 @@ from hpc_rehearsal_support import (
     link_check_stand_in,
     make_ca,
     make_study,
-    pinned_file,
     wait_for,
     wait_step,
     write_manifest,
@@ -82,14 +81,13 @@ def deploy():
 
 @pytest.fixture(scope="module")
 def shared(tmp_path_factory):
-    """The filesystem the login node and the nodes see (the control directory, the mount helper's pinned oneclient),
-    and the agents' nodes' tmpfs, a directory of this host both nodes stand for here."""
+    """The filesystem the login node and the nodes see (the control directory), and the agents' nodes' tmpfs, a
+    directory of this host both nodes stand for here. The mount helper's oneclient is each federation's pinned bundle
+    (`agent_site`), as its rendered platform file names it."""
     base = tmp_path_factory.mktemp("shared")
     for name in ("control", "node-tmpfs"):
         (base / name).mkdir()
-    oneclient = pinned_file(base / "agent-files" / "oneclient", b"an invented oneclient\n")
-    return SimpleNamespace(base=base, control=Control(base / "control"), node_tmp=base / "node-tmpfs",
-                           oneclient=oneclient)  # fmt: skip
+    return SimpleNamespace(base=base, control=Control(base / "control"), node_tmp=base / "node-tmpfs")
 
 
 @pytest.fixture(scope="module")
@@ -167,7 +165,7 @@ def test_up_starts_the_login_nodes_fault_relay_last_and_records_it(federations, 
 def plan(deploy, federations, shared):
     """The study, the manifest over the roots `up` wrote, and each shard's line as `shards.py plan` prints it."""
     base = shared.base
-    study = make_study(base / "studies", shared.oneclient, shared.control.path)
+    study = make_study(base / "studies", shared.control.path)
     for name in ("results", "logs"):
         (base / name).mkdir()
     manifest = write_manifest(base / "shards.toml", study, base / "results", shared.node_tmp, federations)
@@ -381,7 +379,7 @@ def other_build(deploy, plan, shards, merged, federations, shared, tmp_path_fact
         patch.setattr(deploy.fedlinks, "check_links", link_check_stand_in([]))
         hpcfed(deploy, fed, "up", fed.site())
     base = shared.base / "other"
-    study = make_study(base / "studies", shared.oneclient, shared.control.path)
+    study = make_study(base / "studies", shared.control.path)
     (base / "results").mkdir()
     for kind in ("tar", "json"):  # fed-a's shard as it came back, shard 1 of the second manifest too
         shutil.copyfile(plan.results / f"{KILLED}.out.{kind}", base / "results" / f"{KILLED}.out.{kind}")

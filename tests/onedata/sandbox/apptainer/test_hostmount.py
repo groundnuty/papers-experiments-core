@@ -8,7 +8,7 @@ import signal
 import stat
 
 import pytest
-from apptainer_support import TOKEN, make_settings, make_spec, options, pinned
+from apptainer_support import TOKEN, make_settings, make_spec, options, pinned_bundle
 from fake_mount_node import FakeMountNode
 from sandbox_support import SleptClock
 
@@ -25,20 +25,21 @@ def node() -> FakeMountNode:
 
 
 @pytest.fixture
-def settings(tmp_path):
-    return make_settings(tmp_path)
+def bundle(tmp_path):
+    """oneclient's bundle as the platform pins it (`[sandbox.apptainer] oneclient_bundle`): an invented tar."""
+    return pinned_bundle(tmp_path / "files")
 
 
 @pytest.fixture
-def binary(tmp_path):
-    return pinned(tmp_path / "files", "oneclient", b"an invented oneclient\n")
+def settings(tmp_path, bundle):
+    return make_settings(tmp_path, oneclient_bundle=bundle)
 
 
-def helper(node, settings, binary, *, spec=None, **more) -> HM.HostMount:
+def helper(node, settings, *, spec=None, **more) -> HM.HostMount:
     run = settings.work_root / "run-1"
     run.mkdir(mode=0o700)
     clock = SleptClock()
-    return HM.HostMount(node, settings, spec or make_spec("mounted"), run, oneclient=binary, mountinfo=node.mountinfo,
+    return HM.HostMount(node, settings, spec or make_spec("mounted"), run, mountinfo=node.mountinfo,
                         sleep=clock.sleep, clock=clock, **more)  # fmt: skip
 
 
@@ -46,8 +47,8 @@ def mode(path) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
 
 
-def test_start_returns_the_mount_point_with_oneclient_mounted_and_the_window_open(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_start_returns_the_mount_point_with_oneclient_mounted_and_the_window_open(node, settings):
+    mount = helper(node, settings)
     try:
         assert mount.start() == mount.where.mountpoint
         assert node.mounted_at == str(mount.where.mountpoint)
@@ -56,9 +57,9 @@ def test_start_returns_the_mount_point_with_oneclient_mounted_and_the_window_ope
         mount.stop()
 
 
-def test_oneclient_reads_the_token_from_a_private_file_that_is_gone_when_start_returns(node, settings, binary):
+def test_oneclient_reads_the_token_from_a_private_file_that_is_gone_when_start_returns(node, settings):
     """O60: the token reaches oneclient through a 0600 file in a 0700 directory, removed before any cell starts."""
-    mount = helper(node, settings, binary)
+    mount = helper(node, settings)
     try:
         mount.start()
         assert node.oneclient_tokens == [TOKEN]
@@ -69,8 +70,8 @@ def test_oneclient_reads_the_token_from_a_private_file_that_is_gone_when_start_r
         mount.stop()
 
 
-def test_oneclient_and_the_watcher_carry_the_runs_tag_so_a_reaper_finds_them(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_oneclient_and_the_watcher_carry_the_runs_tag_so_a_reaper_finds_them(node, settings):
+    mount = helper(node, settings)
     try:
         mount.start()
         assert node.spawn_env == [{"EXPCORE_SANDBOX": "run-1"}] * 2
@@ -78,8 +79,8 @@ def test_oneclient_and_the_watcher_carry_the_runs_tag_so_a_reaper_finds_them(nod
         mount.stop()
 
 
-def test_no_argument_of_any_process_holds_the_token(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_no_argument_of_any_process_holds_the_token(node, settings):
+    mount = helper(node, settings)
     try:
         mount.start()
         for argv in node.spawned:
@@ -88,9 +89,9 @@ def test_no_argument_of_any_process_holds_the_token(node, settings, binary):
         mount.stop()
 
 
-def test_oneclient_runs_read_only_without_allow_other_with_every_option_the_core_declares(node, settings, binary):
+def test_oneclient_runs_read_only_without_allow_other_with_every_option_the_core_declares(node, settings):
     """The node has no `user_allow_other`: the mount is this uid's alone, which is every cell's uid."""
-    mount = helper(node, settings, binary)
+    mount = helper(node, settings)
     try:
         mount.start()
         argv = node.oneclient_argv
@@ -106,15 +107,14 @@ def test_oneclient_runs_read_only_without_allow_other_with_every_option_the_core
         assert "--force-proxy-io" in argv
         assert "--disable-log-buffering" in argv
         assert argv[-1] == str(where.mountpoint)
-        assert argv[argv.index("-f") - 1] == str(binary.path)
+        at = argv.index("-f")
+        assert argv[at - len(mount.bundle.launcher()) : at] == mount.bundle.launcher()  # the bundle's, from its copy
     finally:
         mount.stop()
 
 
-def test_the_watcher_starts_after_the_mount_and_watches_the_token_and_the_four_private_directories(
-    node, settings, binary
-):
-    mount = helper(node, settings, binary)
+def test_the_watcher_starts_after_the_mount_and_watches_the_token_and_the_five_private_directories(node, settings):
+    mount = helper(node, settings)
     try:
         mount.start()
         watch = node.watch()
@@ -125,56 +125,106 @@ def test_the_watcher_starts_after_the_mount_and_watches_the_token_and_the_four_p
         mount.stop()
 
 
-def test_no_protected_directory_lies_under_the_mount_point_or_holds_it(node, settings, binary):
-    where = helper(node, settings, binary).where
+def test_no_protected_directory_lies_under_the_mount_point_or_holds_it(node, settings):
+    where = helper(node, settings).where
     for path in where.protected():
         assert not str(path).startswith(str(where.mountpoint) + "/")
         assert not str(where.mountpoint).startswith(str(path) + "/")
 
 
-def test_a_direct_mount_is_refused(node, tmp_path, binary):
+def test_a_direct_mount_is_refused(node, tmp_path):
     settings = make_settings(tmp_path)
     direct = MountSettings("/data", "direct", storages=(("st1", "/invented/storage"),), direct_check_file="sp/f")
-    mount = helper(node, dataclasses.replace(settings, mount=direct), binary)
+    mount = helper(node, dataclasses.replace(settings, mount=direct))
     with pytest.raises(StartRefused, match="direct"):
         mount.start()
     assert node.spawned == []
 
 
-def test_an_extra_argument_that_sets_the_port_is_refused(node, tmp_path, binary):
+def test_an_extra_argument_that_sets_the_port_is_refused(node, tmp_path):
     settings = make_settings(tmp_path)
     extra = MountSettings("/data", "proxy", extra_args=("-P", "1"))
     with pytest.raises(StartRefused, match="port"):
-        helper(node, dataclasses.replace(settings, mount=extra), binary).start()
+        helper(node, dataclasses.replace(settings, mount=extra)).start()
 
 
-def test_a_binary_that_is_not_the_pinned_file_is_refused(node, settings, tmp_path):
-    other = pinned(tmp_path / "files", "oneclient-other", b"x\n")
-    other.path.write_bytes(b"changed\n")
+def test_a_bundle_that_is_not_the_pinned_file_is_refused_before_the_token_is_written(node, settings, bundle):
+    with open(bundle.path, "ab") as handle:
+        handle.write(b"changed\n")
+    mount = helper(node, settings)
     with pytest.raises(StartRefused, match="pinned"):
-        helper(node, settings, other).start()
+        mount.start()
+    assert node.spawned == []
+    assert not os.path.lexists(mount.where.token_file)
+    assert os.listdir(mount.where.bundle_dir) == []
+
+
+def test_a_platform_that_declares_no_bundle_is_refused(node, settings):
+    """O64: oneclient is the platform's declared bundle, never a binary found on the node."""
+    bare = dataclasses.replace(settings, apptainer=dataclasses.replace(settings.apptainer, oneclient_bundle=None))
+    with pytest.raises(StartRefused, match="oneclient_bundle"):
+        helper(node, bare).start()
     assert node.spawned == []
 
 
-def test_oneclient_that_ends_before_its_mount_fails_the_start_and_the_stop_removes_the_token(node, settings, binary):
+def test_the_run_records_the_oneclient_that_served_it(node, settings, bundle):
+    """O64: its own --version, run on the node through the bundle's launcher, the binary's GNU build id, the pin."""
+    mount = helper(node, settings)
+    try:
+        mount.start()
+        assert node.version_runs[-1][-1] == "--version"
+        assert node.version_runs[-1][-2] == str(mount.bundle.binary)
+        assert mount.metadata()["oneclient_build"] == {
+            "version": "25.0", "fuse": "3.2", "build_id": "ab" * 20, "bundle_sha256": bundle.sha256,
+        }  # fmt: skip
+    finally:
+        mount.stop()
+
+
+def test_a_bundle_whose_oneclient_does_not_name_its_version_fails_the_start_before_the_token_is_written(node, settings):
+    node.oneclient_version = "Segmentation fault\n"
+    mount = helper(node, settings)
+    with pytest.raises(SandboxError, match="version"):
+        mount.start()
+    assert node.spawned == []
+    assert not os.path.lexists(mount.where.token_file)
+
+
+def test_the_stop_removes_the_bundle_s_copy_once_oneclient_is_gone(node, settings):
+    mount = helper(node, settings)
+    mount.start()
+    assert (mount.where.bundle_dir / "bin" / "oneclient").exists()
+    mount.stop()
+    assert not mount.where.bundle_dir.exists()
+
+
+def test_the_factory_refuses_a_oneclient_given_in_code():
+    """O64: a binary given to the factory would serve runs the campaign fingerprint does not tell apart."""
+    with pytest.raises(TypeError, match="oneclient_bundle"):
+        HM.host_mount_factory(object())
+    with pytest.raises(TypeError, match="oneclient_bundle"):
+        HM.host_mount_factory(oneclient=object())
+
+
+def test_oneclient_that_ends_before_its_mount_fails_the_start_and_the_stop_removes_the_token(node, settings):
     node.oneclient_fails = True
-    mount = helper(node, settings, binary)
+    mount = helper(node, settings)
     with pytest.raises(SandboxError, match="ended before its mount"):
         mount.start()
     mount.stop()
     assert not os.path.lexists(mount.where.token_file)
 
 
-def test_a_mount_that_never_appears_fails_the_start(node, settings, binary):
+def test_a_mount_that_never_appears_fails_the_start(node, settings):
     node.mount_never = True
-    mount = helper(node, settings, binary)
+    mount = helper(node, settings)
     with pytest.raises(SandboxError, match="did not appear"):
         mount.start()
     mount.stop()
 
 
-def test_stop_closes_the_window_unmounts_and_shows_oneclient_gone_and_is_safe_to_call_again(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_stop_closes_the_window_unmounts_and_shows_oneclient_gone_and_is_safe_to_call_again(node, settings):
+    mount = helper(node, settings)
     mount.start()
     mount.stop()
     assert node.mounted_at is None
@@ -184,16 +234,16 @@ def test_stop_closes_the_window_unmounts_and_shows_oneclient_gone_and_is_safe_to
     mount.stop()
 
 
-def test_a_mount_that_stays_in_the_table_fails_the_stop_naming_it(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_a_mount_that_stays_in_the_table_fails_the_stop_naming_it(node, settings):
+    mount = helper(node, settings)
     mount.start()
     node.stuck_mount = True
     with pytest.raises(SandboxError, match="mount"):
         mount.stop()
 
 
-def test_a_run_without_access_and_with_a_proved_cell_is_clean_in_the_metadata(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_a_run_without_access_and_with_a_proved_cell_is_clean_in_the_metadata(node, settings):
+    mount = helper(node, settings)
     try:
         mount.start()
         before = mount.metadata()
@@ -208,9 +258,9 @@ def test_a_run_without_access_and_with_a_proved_cell_is_clean_in_the_metadata(no
         mount.stop()
 
 
-def test_the_io_mode_is_read_through_glogs_link_to_oneclients_log(node, settings, binary):
+def test_the_io_mode_is_read_through_glogs_link_to_oneclients_log(node, settings):
     """oneclient.INFO is glog's link to the current log file of the same directory: followed there, never elsewhere."""
-    mount = helper(node, settings, binary)
+    mount = helper(node, settings)
     try:
         mount.start()
         lines = "I1116 10:00:00.000000  1 logging.cc:1] Forced direct IO: 0\n"
@@ -224,10 +274,10 @@ def test_the_io_mode_is_read_through_glogs_link_to_oneclients_log(node, settings
         mount.stop()
 
 
-def test_a_log_link_that_leaves_the_log_directory_is_not_followed(node, settings, binary, tmp_path):
+def test_a_log_link_that_leaves_the_log_directory_is_not_followed(node, settings, tmp_path):
     outside = tmp_path / "elsewhere.INFO"
     outside.write_text("I1116 10:00:00.000000  1 logging.cc:1] Forced proxy IO: 1\n")
-    mount = helper(node, settings, binary)
+    mount = helper(node, settings)
     try:
         mount.start()
         (mount.where.log_dir / "oneclient.INFO").symlink_to(outside)
@@ -237,8 +287,8 @@ def test_a_log_link_that_leaves_the_log_directory_is_not_followed(node, settings
         mount.stop()
 
 
-def test_a_touch_of_the_token_directory_flags_the_run(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_a_touch_of_the_token_directory_flags_the_run(node, settings):
+    mount = helper(node, settings)
     try:
         mount.start()
         node.cell()
@@ -249,8 +299,8 @@ def test_a_touch_of_the_token_directory_flags_the_run(node, settings, binary):
         mount.stop()
 
 
-def test_a_run_whose_cells_were_never_proved_is_unknown(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_a_run_whose_cells_were_never_proved_is_unknown(node, settings):
+    mount = helper(node, settings)
     try:
         mount.start()
         mount.close_watch()
@@ -259,8 +309,8 @@ def test_a_run_whose_cells_were_never_proved_is_unknown(node, settings, binary):
         mount.stop()
 
 
-def test_the_metadata_holds_no_token_and_no_path(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_the_metadata_holds_no_token_and_no_path(node, settings, bundle):
+    mount = helper(node, settings)
     try:
         mount.start()
         node.cell()
@@ -268,13 +318,13 @@ def test_the_metadata_holds_no_token_and_no_path(node, settings, binary):
         text = json.dumps(mount.metadata())
         assert TOKEN not in text
         assert str(settings.work_root) not in text
-        assert str(binary.path) not in text
+        assert str(bundle.path) not in text
     finally:
         mount.stop()
 
 
-def test_a_log_file_of_oneclient_that_holds_the_token_is_removed_at_the_stop(node, settings, binary):
-    mount = helper(node, settings, binary)
+def test_a_log_file_of_oneclient_that_holds_the_token_is_removed_at_the_stop(node, settings):
+    mount = helper(node, settings)
     mount.start()
     leaked = mount.where.log_dir / "oneclient.INFO"
     leaked.write_text(f"a line with {TOKEN}\n")
@@ -284,9 +334,9 @@ def test_a_log_file_of_oneclient_that_holds_the_token_is_removed_at_the_stop(nod
 
 
 def test_through_the_sandbox_every_cell_binds_the_mount_point_alone_and_the_collection_closes_the_window(
-    node, settings, binary, tmp_path
+    node, settings, tmp_path
 ):
-    factory = HM.host_mount_factory(binary, mountinfo=node.mountinfo)
+    factory = HM.host_mount_factory(mountinfo=node.mountinfo)
     box = ApptainerSandbox.start(node, settings, make_spec("mounted"), **options(mount_helper=factory))
     try:
         mount = box._mount
@@ -307,11 +357,11 @@ def test_through_the_sandbox_every_cell_binds_the_mount_point_alone_and_the_coll
     assert node.mounted_at is None
 
 
-def test_the_run_record_lists_the_mounts_token_file_before_the_start_writes_it(node, settings, binary):
+def test_the_run_record_lists_the_mounts_token_file_before_the_start_writes_it(node, settings):
     """O60 (M5's review): the reaper removes the token files the record lists before anything else it does."""
     from expcore_onedata.sandbox.apptainer import runs
 
-    factory = HM.host_mount_factory(binary, mountinfo=node.mountinfo)
+    factory = HM.host_mount_factory(mountinfo=node.mountinfo)
     box = ApptainerSandbox.start(node, settings, make_spec("mounted"), **options(mount_helper=factory))
     try:
         document = json.loads(runs.record_path(settings.work_root, box.sid).read_text())
@@ -320,16 +370,14 @@ def test_the_run_record_lists_the_mounts_token_file_before_the_start_writes_it(n
         box.stop()
 
 
-def test_a_dead_drivers_mount_run_whose_unmount_fails_still_has_its_token_file_removed_by_the_reaper(
-    node, settings, binary
-):
+def test_a_dead_drivers_mount_run_whose_unmount_fails_still_has_its_token_file_removed_by_the_reaper(node, settings):
     """O60 (M5's review): a driver killed outright while the token file was on disk, and a mount no unmount takes:
     the next start's reaper removes the token file first, kills oneclient and the watcher by the run's tag, and keeps
     the run for a later reap since its mount stays."""
     from expcore_onedata.sandbox.apptainer import runs
     from expcore_onedata.sandbox.apptainer.node import Spawned
 
-    factory = HM.host_mount_factory(binary, mountinfo=node.mountinfo)
+    factory = HM.host_mount_factory(mountinfo=node.mountinfo)
     old = ApptainerSandbox.start(
         node, settings, make_spec("mounted", lease_key="slot-a"), **options(mount_helper=factory)
     )
@@ -355,9 +403,9 @@ def start_box(node, settings):
     return start(node, settings)
 
 
-def _dead_mount_run(node, settings, binary):
+def _dead_mount_run(node, settings):
     """A mount run whose driver was killed outright while the token file was on disk."""
-    factory = HM.host_mount_factory(binary, mountinfo=node.mountinfo)
+    factory = HM.host_mount_factory(mountinfo=node.mountinfo)
     old = ApptainerSandbox.start(
         node, settings, make_spec("mounted", lease_key="slot-a"), **options(mount_helper=factory)
     )
@@ -367,11 +415,11 @@ def _dead_mount_run(node, settings, binary):
     return old, token
 
 
-def test_the_reaper_removes_the_token_file_even_when_it_cannot_list_the_processes(node, settings, binary):
+def test_the_reaper_removes_the_token_file_even_when_it_cannot_list_the_processes(node, settings):
     """O60 (Codex, delta round 1): the token files are removed before any step of the reap that can fail."""
     from expcore_onedata.sandbox.apptainer import runs
 
-    old, token = _dead_mount_run(node, settings, binary)
+    old, token = _dead_mount_run(node, settings)
     node.proc_unreadable = True
     done = runs.reap(node, settings.work_root, own="another-run")
     assert done["left"] == 1  # the run itself waits for a later reap
@@ -379,10 +427,10 @@ def test_the_reaper_removes_the_token_file_even_when_it_cannot_list_the_processe
     assert runs.record_path(settings.work_root, old.sid).exists()
 
 
-def test_the_reaper_never_removes_a_path_a_record_names_outside_the_run(node, settings, binary, tmp_path):
+def test_the_reaper_never_removes_a_path_a_record_names_outside_the_run(node, settings, tmp_path):
     from expcore_onedata.sandbox.apptainer import runs
 
-    old, _ = _dead_mount_run(node, settings, binary)
+    old, _ = _dead_mount_run(node, settings)
     outside = settings.work_root / "not-the-runs"
     outside.write_text("kept")
     record = runs.record_path(settings.work_root, old.sid)
@@ -424,12 +472,12 @@ def test_a_mount_helper_that_names_a_token_file_outside_the_run_is_refused_befor
     assert not Escaping.started
 
 
-def test_the_reaper_never_follows_a_link_inside_the_run_to_a_file_outside_it(node, settings, binary):
+def test_the_reaper_never_follows_a_link_inside_the_run_to_a_file_outside_it(node, settings):
     """O60 (Codex, delta round 2): a recorded token path under a directory that is a link leaves the run; the reaper
     walks without following links, so the file outside stays."""
     from expcore_onedata.sandbox.apptainer import runs
 
-    old, _ = _dead_mount_run(node, settings, binary)
+    old, _ = _dead_mount_run(node, settings)
     elsewhere = settings.work_root / "elsewhere"
     elsewhere.mkdir()
     (elsewhere / "token").write_text("kept")

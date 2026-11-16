@@ -9,6 +9,7 @@ from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.settings import load_sandbox
 
 SHA = "a" * 64
+BUNDLE = {"oneclient_bundle": "files/oneclient-bundle.tar", "oneclient_bundle_sha256": "d" * 64}
 LIMITS = {"cpus": 2.0, "memory_bytes": 1 << 30, "pids": 64, "nofile": 64, "tmp_bytes": 1 << 20}
 LIMITS |= {"shm_bytes": 1 << 20, "work_disk_bytes": 1 << 22}
 
@@ -101,6 +102,7 @@ def test_a_mount_level_needs_the_mount_s_path(tmp_path):
     with pytest.raises(ConfigError, match="mount"):
         _load(tmp_path, document)
     document["mount"] = {"path": "/data", "io_mode": "proxy"}
+    document["apptainer"] |= BUNDLE
     assert _load(tmp_path, document).mount.path == "/data"
 
 
@@ -142,3 +144,62 @@ def test_the_platform_builds_the_apptainer_sandbox_and_its_probe(tmp_path, fake)
     platform = SandboxPlatform(config, issuer=None, host=FakeNode(), events=lambda *a, **k: None)
     assert isinstance(platform.sandbox_probe(), ApptainerProbe)
     assert isinstance(platform._prepare("run-key-1", "isolated", None, None, None, 600.0), ApptainerSandbox)
+
+
+def _mounting(**apptainer_changes):
+    document = _document(**apptainer_changes)
+    document["data_paths"]["mounted"] = "mount"
+    document["mount"] = {"path": "/data", "io_mode": "proxy"}
+    return document
+
+
+def test_oneclient_s_bundle_is_a_pin_of_the_backend_resolved_like_the_others(tmp_path):
+    """The host mount's oneclient is declared beside the SIF and the shim, pinned, never found on the node."""
+    loaded = _load(tmp_path, _mounting(**BUNDLE))
+    assert loaded.apptainer.oneclient_bundle.path == tmp_path / "files" / "oneclient-bundle.tar"
+    assert loaded.apptainer.oneclient_bundle.sha256 == "d" * 64
+    record = loaded.apptainer.record()
+    assert record["oneclient_bundle_sha256"] == "d" * 64
+    assert str(tmp_path) not in str(record)
+
+
+def test_a_mount_level_on_the_apptainer_backend_without_the_bundle_is_refused_at_load(tmp_path):
+    """O64: a mount level's oneclient is declared and pinned, or the platform does not load."""
+    with pytest.raises(ConfigError, match="oneclient_bundle"):
+        _load(tmp_path, _mounting())
+
+
+@pytest.mark.parametrize("key", ["oneclient_bundle", "oneclient_bundle_sha256"])
+def test_a_bundle_declared_by_half_is_refused_naming_the_missing_key(tmp_path, key):
+    with pytest.raises(ConfigError, match=key):
+        _load(tmp_path, _mounting(**{k: v for k, v in BUNDLE.items() if k != key}))
+
+
+def test_a_platform_without_the_bundle_keeps_the_record_it_had(tmp_path):
+    """O64: a REST-only Apptainer platform declares no bundle: its fingerprint is the one it had before the key."""
+    record = _load(tmp_path, _document()).apptainer.record()
+    assert "oneclient_bundle_sha256" not in record
+    assert set(record) == {"backend", "image_sha256", "egress_shim_sha256", "egress_collector_sha256",
+                           "memory_poll_s", "disk_poll_s", "preload_sha256", "binds", "gate_options"}  # fmt: skip
+
+
+def test_two_oneclient_bundles_give_two_campaign_fingerprints(tmp_path, fake):
+    """O64: HPC mount runs on another oneclient are another experiment: a resume or a merge across them is refused."""
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.testing import write_platform
+
+    prints = []
+    for digest in ("d" * 64, "e" * 64):
+        directory = tmp_path / digest[0]
+        directory.mkdir()
+
+        def apptainer(data, digest=digest):
+            data["sandbox"] = _mounting(**{**BUNDLE, "oneclient_bundle_sha256": digest})
+
+        prints.append(load_platform(write_platform(directory, apptainer)).fingerprint())
+    assert prints[0] != prints[1]
+    assert prints[0]["sandbox_backend"]["oneclient_bundle_sha256"] == "d" * 64
+    assert prints[1]["sandbox_backend"]["oneclient_bundle_sha256"] == "e" * 64
+    assert {**prints[1], "sandbox_backend": {**prints[1]["sandbox_backend"], "oneclient_bundle_sha256": "d" * 64}} == (
+        prints[0]
+    )

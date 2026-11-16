@@ -211,12 +211,12 @@ def make_ca(directory: Path) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ the study
-def make_study(base: Path, oneclient: Mapping[str, str], control: Path) -> Path:
+def make_study(base: Path, control: Path) -> Path:
     """The example study with caps two shards can share (`shard_support.make_study`), its plugin the rehearsal's
     (`hpc_rehearsal_plugin.py`), stamped: one copy on the filesystem the nodes see, which every step copies."""
     root = shard_support.make_study(base, "study")
     shutil.copyfile(SUPPORT / "hpc_rehearsal_plugin.py", root / PLUGIN)
-    settings = {"support": str(SUPPORT), "control": str(control), "oneclient": dict(oneclient)}
+    settings = {"support": str(SUPPORT), "control": str(control)}
     (root / PLUGIN_SETTINGS).write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     text = (root / "study.toml").read_text(encoding="utf-8")
     for old, new in (
