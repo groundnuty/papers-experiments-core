@@ -15,10 +15,11 @@ import pytest
 from expcore.provenance import core_identity
 from expcore.provenance.core_check import CoreVersionUnknown, recorded_core_problem, require_core
 from expcore.provenance.core_identity import (
+    BUILD_DIRS,
     BUILD_FILE,
-    SHIPPED,
     build_bytes,
     build_identity,
+    builds_from,
     from_build,
     from_checkout,
     identity_of,
@@ -60,20 +61,28 @@ def test_c06_a_clean_checkout_is_named_by_its_commit_and_tree(repo):
     assert identity_of(root / "src" / "expcore") == found
 
 
-def test_p01_a_tracked_change_anywhere_or_an_untracked_file_a_wheel_ships_is_dirt_and_a_marker_at_the_top_is_not(repo):
-    """P01: a tracked file edited anywhere (a note) is dirt, and so is a file git does not track under what a wheel
-    ships, and a Python file git ignores in the packages; an untracked file elsewhere, like the `.ok` uv leaves at the
-    top of its git checkouts, ships nothing and is not, and neither is an ignored cache."""
+def test_p01_a_change_to_what_a_build_reads_is_dirt_and_one_elsewhere_or_a_marker_at_the_top_is_not(repo):
+    """P01: a tracked file a build reads (the code, the project file) edited or renamed is dirt, and so is a file git
+    does not track under what a wheel ships, and a Python file git ignores in the packages; a change elsewhere (a note,
+    the session log this project's hooks keep writing), an untracked file elsewhere like the `.ok` uv leaves at the top
+    of its git checkouts, and an ignored cache reach no build and no import, and are not."""
     root = core_project(repo)
     (root / ".ok").write_text("", encoding="utf-8")
     (root / "src" / "expcore" / "__pycache__").mkdir()
     (root / "src" / "expcore" / "__pycache__" / "cli.cpython-312.pyc").write_bytes(b"compiled")
-    assert from_checkout(root).dirty is False
     (root / "docs" / "notes.md").write_text("edited\n", encoding="utf-8")
-    edited = from_checkout(root)
-    assert edited.dirty
-    assert "uncommitted changes to 1 tracked file" in str(edited.why)
+    assert from_checkout(root).dirty is False
     repo.git("checkout", "--", "docs/notes.md")
+    for edited, content in (("src/expcore/cli.py", "WIRE = 'red'\n"), ("pyproject.toml", PROJECT + "# edited\n")):
+        (root / edited).write_text(content, encoding="utf-8")
+        found = from_checkout(root)
+        assert found.dirty
+        assert f"uncommitted changes to what a build reads: {edited}" in str(found.why)
+        repo.git("checkout", "--", edited)
+    repo.git("mv", "src/expcore/cli.py", "src/expcore/main.py")
+    assert "src/expcore/main.py" in str(from_checkout(root).why)
+    repo.git("mv", "src/expcore/main.py", "src/expcore/cli.py")
+    assert from_checkout(root).dirty is False
     (root / "src" / "expcore" / "new.py").write_text("NEW = 1\n", encoding="utf-8")
     untracked = from_checkout(root)
     assert untracked.dirty
@@ -223,7 +232,8 @@ def test_c06_a_repository_around_the_core_is_never_taken_for_the_cores_own(make_
 def test_c06_what_counts_as_shipped_covers_every_path_the_wheel_includes():
     """C06: an untracked file is dirt where a wheel would ship it: under every path `only-include` names."""
     wheel = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["hatch"]["build"]["targets"]
-    assert all(f"{path}/".startswith(SHIPPED) for path in wheel["wheel"]["only-include"])
+    assert all(f"{path}/".startswith(BUILD_DIRS) for path in wheel["wheel"]["only-include"])
+    assert all(builds_from(path) for path in wheel["wheel"]["force-include"])
 
 
 def test_p01_the_gate_refuses_an_unknown_or_stale_core_always_and_a_dirty_one_unless_allowed(repo, monkeypatch):

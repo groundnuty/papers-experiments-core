@@ -133,7 +133,7 @@ from expcore.study.config import (
     read_study_identity,
     shard_budgets_of,
 )
-from expcore.study.core_legacy import earlier_core_fingerprint
+from expcore.study.core_legacy import earlier_core_fingerprint, earlier_core_hint
 from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
 from expcore.study.platform_deferral import platform_deferrals
@@ -378,7 +378,8 @@ def _run_campaign(
             _say_lost(scheduler.lost_counted)
             return scheduler.run()
     except FingerprintMismatch as refused:
-        hint = _counted_key_locations(study, read_fingerprint(out / STATE_FILE))
+        recorded = read_fingerprint(out / STATE_FILE)
+        hint = _counted_key_locations(study, recorded) + earlier_core_hint(recorded, refused.differences)
         if not hint:
             raise
         raise FingerprintMismatch(refused.differences, hint=hint) from None

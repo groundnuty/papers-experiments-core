@@ -175,6 +175,7 @@ def test_c06_an_earlier_store_whose_install_differs_from_the_cores_now_is_refuse
     code, errors = cli(clean_environment, "run", str(campaign.root))
     assert code == 1
     assert f"sources.{CORE_DISTRIBUTION}" in errors
+    assert "the core in use is not the code the store names; finish the campaign with that core" in errors
 
 
 def test_c29_a_merge_refuses_the_earlier_form_mixed_or_not_and_a_batch_an_earlier_core_merged_still_checks(

@@ -9,11 +9,12 @@ same way however one commit is installed, and the campaign's environment records
 
 - **From a checkout** (an editable install, or `src/` on the path): when the imported `expcore` package is the
   `src/expcore` of a project named `papers-experiments-core` whose directory is the top of a git work tree, the entry
-  is read live from git there: `HEAD`, `HEAD^{tree}`, and dirty when a tracked file differs from `HEAD` anywhere in
-  the repository, a file git does not track (and does not ignore) lies under what the wheel ships (`SHIPPED`), or a
-  Python file git ignores lies in the packages (it is imported, and no commit or wheel holds it). An untracked file
-  elsewhere, such as the marker uv leaves at the top of its git checkouts, ships nothing and is not dirt. A checkout
-  git cannot read is dirty.
+  is read live from git there: `HEAD`, `HEAD^{tree}`, and dirty when a file a build reads (`builds_from`: `src/`,
+  the example, the project and build files, the token hashes) differs from `HEAD` or is new and not ignored, or a
+  Python file git ignores lies in the packages (it is imported, and no commit or wheel holds it), or the packages
+  hold a link. A change elsewhere in the repository (a note, a test, the session log this project's hooks keep
+  writing, the marker uv leaves at the top of its git checkouts) reaches no build and no import, and is not dirt. A
+  checkout git cannot read is dirty.
 - **From a build** (a wheel, a git-URL or directory install, a wheel built from an sdist): the build hook
   (`hatch_build.py`) writes `expcore/_build_identity.json` (`BUILD_FILE`) into the wheel and the sdist, read the same
   way from the checkout it builds from, or taken from the sdist it builds from. The installed Python source is hashed
@@ -49,7 +50,10 @@ KIND = "core"
 UNKNOWN = "unknown"
 PACKAGES = ("expcore", "expcore_onedata")
 EXAMPLES = "expcore/examples/"  # the example study the wheel carries: data the core writes out, not its code
-SHIPPED = ("src/", "examples/tiny_study/")  # an untracked file here would be shipped by a wheel built from the tree
+BUILD_DIRS = ("src/", "examples/tiny_study/")  # what a wheel ships from, and what an editable core imports
+BUILD_FILES = frozenset(
+    {"pyproject.toml", "hatch_build.py", "README.md", ".gitignore", "tests/data/study_tokens.sha256"}
+)
 _HEX = frozenset("0123456789abcdef")
 _SHA_CHARS = 40
 _SKIPPED_DIRS = frozenset({"__pycache__"})
@@ -187,29 +191,34 @@ def _ignored(root: Path) -> set[str] | None:
     return None if listing is None else {item for item in listing.split("\0") if item}
 
 
+def builds_from(path: str) -> bool:
+    """Whether a file, by its path from the top of a checkout, is one a build of the core reads or an editable core
+    imports: below `BUILD_DIRS`, or one of `BUILD_FILES` (the project, the build hook, the readme the metadata holds,
+    the ignore rules that decide what a wheel ships, the token hashes it carries)."""
+    return path.startswith(BUILD_DIRS) or path in BUILD_FILES
+
+
 def _dirt(root: Path) -> str | None:
-    """Why a checkout is dirty, else None: a tracked file differs from HEAD, an untracked file that git does not
-    ignore lies under what a wheel ships, a Python file git ignores lies in the packages, the packages hold a link
-    (git holds a link's target path, never what it leads to), or git cannot say."""
+    """Why a checkout is dirty, else None: a file a build reads differs from HEAD, or is new and git does not ignore
+    it; a Python file git ignores lies in the packages; the packages hold a link (git holds a link's target path,
+    never what it leads to); or git cannot say."""
     status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", raw=True)
     ignored = _ignored(root)
     if status is None or ignored is None:
         return "git status could not be read"
     entries = [item for item in status.split("\0") if item]
-    changed, untracked, skip = 0, [], False
-    for item in entries:
-        if skip:  # the source path of a rename or a copy, which --porcelain -z writes as the next field
-            skip = False
-            continue
-        code, path = item[:2], item[3:]
-        if code == "??":
-            if path.startswith(SHIPPED):
-                untracked.append(path)
-            continue
-        changed += 1
-        skip = "R" in code or "C" in code
+    changed, untracked, index = [], [], 0
+    while index < len(entries):
+        code, paths = entries[index][:2], [entries[index][3:]]
+        if "R" in code or "C" in code:  # --porcelain -z writes a rename's or a copy's source path as the next field
+            index += 1
+            paths += entries[index : index + 1]
+        index += 1
+        if any(builds_from(path) for path in paths):
+            (untracked if code == "??" else changed).append(paths[0])
     if changed:
-        return f"uncommitted changes to {changed} tracked file(s)"
+        more = f" and {len(changed) - 3} more" if len(changed) > 3 else ""
+        return f"uncommitted changes to what a build reads: {', '.join(changed[:3])}{more}"
     if untracked:
         more = f" and {len(untracked) - 3} more" if len(untracked) > 3 else ""
         return f"files a build would ship that git does not track: {', '.join(untracked[:3])}{more}"

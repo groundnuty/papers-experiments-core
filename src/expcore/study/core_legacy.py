@@ -19,9 +19,22 @@ import sys
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from expcore.provenance.environment import is_earlier_form
+from expcore.provenance.environment import CORE_DISTRIBUTION, is_earlier_form
 
 EARLIER_NOTE = "the store recorded the core in its earlier form, by how it was installed"
+
+
+def earlier_core_hint(recorded: Mapping[str, Any] | None, differences: tuple[str, ...]) -> str:
+    """What a refused resume of a store of the earlier form adds, when the core's entry is among what differs: the
+    earlier form is compared as the earlier core compared it, so the core in use is not the one the store names."""
+    if recorded is None or not is_earlier_form(recorded.get("environment")):
+        return ""
+    if not any(line.startswith(f"environment.sources.{CORE_DISTRIBUTION}") for line in differences):
+        return ""
+    return (
+        f" ({EARLIER_NOTE}, and that form is compared as the core that recorded it compared it: the core in use is "
+        "not the code the store names; finish the campaign with that core, or start a new store)"
+    )
 
 
 def earlier_core_fingerprint(
@@ -35,4 +48,4 @@ def earlier_core_fingerprint(
     return {**fingerprint, "environment": earlier()}
 
 
-__all__ = ["EARLIER_NOTE", "earlier_core_fingerprint"]
+__all__ = ["EARLIER_NOTE", "earlier_core_fingerprint", "earlier_core_hint"]
