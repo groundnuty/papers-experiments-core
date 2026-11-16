@@ -402,9 +402,7 @@ def test_every_step_on_the_agents_node_runs_in_its_component_and_no_service_runs
 def test_the_fake_refuses_a_het_jobs_step_that_names_no_component_as_the_site_does(hpc, tmp_path, site):
     """O57: on the site's Slurm a step of a heterogeneous job with no --het-group fails ("No directives to start
     application on any available hetjob components"), component 0 included; the fake answers so, and up fails at its
-    first step instead of placing anything."""
-    from hpc_fed_support import HET_REFUSAL
-
+    first step instead of placing anything, its message carrying srun's error."""
     rig = Rig(hpc, tmp_path, site)
     where = rig.driver.launcher._where
 
@@ -413,11 +411,11 @@ def test_the_fake_refuses_a_het_jobs_step_that_names_no_component_as_the_site_do
         return job, (None if group == 0 else group), component, at
 
     rig.driver.launcher._where = no_group
-    with pytest.raises(RuntimeError, match="node facts of zone"):
+    with pytest.raises(RuntimeError, match="node facts of zone") as raised:
         rig.up()
+    assert "status 1; its stderr: srun: error: No directives to start application" in str(raised.value)
     (facts,) = rig.fake.sruns
     assert facts.refused
-    assert "No directives to start application" in HET_REFUSAL
     assert rig.fake.spawned == []
 
 

@@ -10,7 +10,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, PEM, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path, pin_values
+from hpc_fed_support import (
+    LAYOUT,
+    PEM,
+    SITE,
+    FakeProcess,
+    FakeSlurm,
+    agent_site,
+    data_stand_in,
+    hpc_on_path,
+    pin_values,
+)
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
 from expcore_onedata.linksettings import link_pairs
@@ -282,6 +292,41 @@ def test_up_refuses_a_root_that_holds_a_state_file(hpc, tmp_path, site):
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     with pytest.raises(RuntimeError, match="run down first"):
+        rig.up()
+
+
+def test_a_node_facts_step_that_fails_is_named_with_its_status_and_the_end_of_its_stderr(hpc, tmp_path, site):
+    """O57: a failed node facts step fails up with its status and the last of its stderr on one line, bounded, so a
+    failure like the site's refusal of a het job's step with no group is diagnosable from the message alone."""
+    from hpcslurm import Completed
+
+    noise = "".join(f"line {i} of a long traceback\n" for i in range(200))
+    said = noise + "srun: error: the step could not start\x07\n"
+
+    def failing(srun):
+        return FakeProcess(Completed(1, "", said)) if srun.name.endswith("-facts") else None
+
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(on_control=failing))
+    with pytest.raises(RuntimeError) as raised:
+        rig.up()
+    message = str(raised.value)
+    assert message.startswith("the node facts of zone are not a name")
+    assert "(the step's status 1; its stderr: " in message
+    assert message.endswith("srun: error: the step could not start?)")
+    assert "\n" not in message
+    assert len(message) < 500
+    assert "line 0 of" not in message
+
+
+def test_a_node_facts_step_that_says_nothing_is_named_so(hpc, tmp_path, site):
+    """O57: a node facts step that printed nothing usable and nothing on stderr says so in up's message."""
+    from hpcslurm import Completed
+
+    def silent(srun):
+        return FakeProcess(Completed(0, "not json\n", "")) if srun.name.endswith("-facts") else None
+
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(on_control=silent))
+    with pytest.raises(RuntimeError, match=r"\(the step's status 0; nothing on its stderr\)$"):
         rig.up()
 
 

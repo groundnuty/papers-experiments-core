@@ -44,10 +44,20 @@ FQDN = re.compile(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
 IPV4 = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}")
 PASSPHRASE = re.compile(r"[A-Za-z0-9]{16,128}")
 GONE_POLLS = 3
+STDERR_TAIL = 300  # the most of a step's stderr a message repeats
 
 
 class CoreMismatch(RuntimeError):
     """The core an interpreter imports is not this checkout's."""
+
+
+def stderr_tail(text: str, limit: int = STDERR_TAIL) -> str:
+    """What a failed step said on stderr, for a message: its last `limit` characters on one line (its lines joined by
+    " | "), each character that does not print replaced; a step that said nothing is named so. Only for a step whose
+    stderr carries no secret (the node facts' does not: nodefacts.py prints none, and srun's own errors name none)."""
+    said = " | ".join(line.strip() for line in text.splitlines() if line.strip())[-limit:]
+    said = "".join(c if c.isprintable() else "?" for c in said)
+    return f"its stderr: {said}" if said else "nothing on its stderr"
 
 
 def _say(line: str) -> None:
@@ -382,10 +392,16 @@ class Driver(Down):
             argv = [site.node_python, "-I", "-B", str(BUNDLE / "nodefacts.py")]
             node = state["services"][role]["node"]
             done = self.launcher.control(node, argv, name=f"{prefix}-{role}-facts", timeout_s=self.timeouts["step"])
-            owner = load_owner(done.stdout) if done.returncode == 0 else None
+            try:
+                owner = load_owner(done.stdout) if done.returncode == 0 else None
+            except (ValueError, AttributeError):  # not a JSON object: refused below, with what the step said
+                owner = None
             facts = json.loads(done.stdout) if owner else {}
             if not FQDN.fullmatch(str(facts.get("fqdn"))) or not IPV4.fullmatch(str(facts.get("address"))):
-                raise RuntimeError(f"the node facts of {role} are not a name, an IPv4 address, a uid and a gid")
+                raise RuntimeError(
+                    f"the node facts of {role} are not a name, an IPv4 address, a uid and a gid (the step's status "
+                    f"{done.returncode}; {stderr_tail(done.stderr)})"
+                )
             self.set(
                 lambda s, r=role, f=facts, o=owner: (
                     s["services"][r].update(fqdn=f["fqdn"], address=f["address"]),
