@@ -437,8 +437,10 @@ def test_o11_a_failed_recovery_keeps_every_run_blocked_naming_the_target(tmp_pat
 
 
 def matched_design(tmp_path):
-    """A study file with an outage condition and a control that declares `exclusive = true`, and its schema."""
-    path = tmp_path / "study.toml"
+    """A study file with an outage condition and a control that declares `exclusive = true`, and its schema. The study
+    directory is its own, not the platform's: a platform file beside a `study.toml` must state its journal in full."""
+    (tmp_path / "design").mkdir(exist_ok=True)
+    path = tmp_path / "design" / "study.toml"
     path.write_text(
         "[factors.fault]\nlevels = ['outage', 'none', 'baseline']\n\n"
         "[identity]\norder = ['task', 'fault', 'model', 'seed']\n\n"
