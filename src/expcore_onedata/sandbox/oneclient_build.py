@@ -95,7 +95,7 @@ def build_id_from(read_at: ReadAt) -> str | None:
             return None
         phoff = struct.unpack_from("<Q", head, 32)[0]
         phentsize, phnum = struct.unpack_from("<HH", head, 54)
-        if phentsize < PROGRAM_HEADER_BYTES or phentsize * phnum > MAX_TABLE_BYTES:
+        if phnum == 0 or phentsize < PROGRAM_HEADER_BYTES or phentsize * phnum > MAX_TABLE_BYTES:
             return None
         table = read_at(phoff, phentsize * phnum)
         if len(table) != phentsize * phnum:
@@ -119,6 +119,8 @@ def _note(notes: bytes, align: int) -> str | None:
         name_at = at + 12
         desc_at = name_at + (namesz + align - 1) // align * align
         if kind == 3 and notes[name_at : name_at + namesz] == b"GNU\0":  # NT_GNU_BUILD_ID
+            if desc_at + descsz > len(notes):  # a descriptor the segment does not hold whole is no id
+                return None
             return notes[desc_at : desc_at + descsz].hex() or None
         at = desc_at + (descsz + align - 1) // align * align
     return None

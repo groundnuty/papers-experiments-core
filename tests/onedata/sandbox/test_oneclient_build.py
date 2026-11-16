@@ -72,6 +72,19 @@ def test_o65_a_binary_that_shows_no_whole_note_has_no_build_id(data):
     assert OB.build_id_from(reader(data)) is None
 
 
+def test_o65_a_note_whose_descriptor_the_segment_does_not_hold_whole_is_no_build_id(tmp_path):
+    """O65: a whole segment can still declare a descriptor longer than it holds (a note declaring 32 bytes and holding
+    20); the slice that would come back short is no id."""
+    declared = bytearray(BINARY)
+    note_at = len(BINARY) - (12 + 4 + len(BUILD_ID))
+    assert struct.unpack_from("<III", declared, note_at) == (4, len(BUILD_ID), 3)
+    struct.pack_into("<I", declared, note_at + 4, 32)
+    path = tmp_path / "oneclient"
+    path.write_bytes(bytes(declared))
+    assert OB.build_id_from(reader(bytes(declared))) is None
+    assert OB.build_id(path) is None
+
+
 def test_o65_a_reader_that_fails_gives_no_build_id():
     def failing(offset: int, size: int) -> bytes:
         raise OSError("the window could not be read")
@@ -91,6 +104,20 @@ def test_o65_a_header_that_claims_a_huge_table_is_not_read():
 
     assert OB.build_id_from(counting) is None
     assert max(asked) <= OB.MAX_TABLE_BYTES
+
+
+def test_o65_a_header_with_no_program_headers_asks_for_nothing_more():
+    """O65: no table to read means no second window (on the Docker sandbox, no second exec)."""
+    bare = bytearray(BINARY)
+    struct.pack_into("<H", bare, 56, 0)
+    asked: list[tuple[int, int]] = []
+
+    def counting(offset: int, size: int) -> bytes:
+        asked.append((offset, size))
+        return bytes(bare[offset : offset + size])
+
+    assert OB.build_id_from(counting) is None
+    assert asked == [(0, 64)]
 
 
 def test_o65_a_note_segment_claiming_more_than_a_bound_is_not_read():
