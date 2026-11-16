@@ -23,7 +23,7 @@ GUARD = '''
 
 import json as _json
 
-from expcore.mountguard import MountGuard
+from expcore.mountguard import MountGuard, NoMount
 
 _NONCE = "00112233445566778899aabbccddeeff"
 
@@ -81,7 +81,7 @@ class _StubEgress:
 '''  # fmt: skip
 
 
-def prepared(tmp_path: Path, *, guard: bool, egress: bool = False) -> Path:
+def prepared(tmp_path: Path, *, guard: bool, egress: bool = False, rest_task: str | None = None) -> Path:
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
     if guard:
@@ -89,6 +89,11 @@ def prepared(tmp_path: Path, *, guard: bool, egress: bool = False) -> Path:
         text = plugin.read_text(encoding="utf-8")
         assert INSTRUMENTS in text
         added = "instruments = [FactsServed(shelf), MountGuard(_StubWatch(factors['task']), _NONCE)]"
+        if rest_task is not None:  # a campaign that mixes data paths: this task's runs are REST runs, with no mount
+            added = (
+                f"instruments = [FactsServed(shelf), NoMount('rest') if factors['task'] == {rest_task!r} "
+                "else MountGuard(_StubWatch(factors['task']), _NONCE)]"
+            )
         if egress:
             added = added[:-1] + ", EgressLog(_StubEgress(factors['task']), declaration([_GATE], _GATE), _NONCE)]"
         plugin.write_text(text.replace(INSTRUMENTS, added) + GUARD + (EGRESS if egress else ""), encoding="utf-8")
@@ -98,8 +103,8 @@ def prepared(tmp_path: Path, *, guard: bool, egress: bool = False) -> Path:
     return study
 
 
-def checked_study(tmp_path, environment, *, guard: bool, egress: bool = False):
-    study = prepared(tmp_path, guard=guard, egress=egress)
+def checked_study(tmp_path, environment, *, guard: bool, egress: bool = False, rest_task: str | None = None):
+    study = prepared(tmp_path, guard=guard, egress=egress, rest_task=rest_task)
     code, stderr = cli(environment, "check", str(study / "out" / "runs"), process=True)
     assert code == 0, stderr
     return analyse_study(study)
@@ -170,3 +175,25 @@ def test_a_study_checked_by_both_guards_reruns_without_the_runs_either_leaves_ou
         report.index("## Egress (detected") < report.index("## Mount isolation") < report.index("## Egress and mount")
     )
     assert "#### Preregistered contrasts without the runs either guard leaves out" in report
+
+
+def test_o69_a_campaign_that_mixes_data_paths_keeps_its_rest_runs_in_the_mount_guards_rerun(
+    tmp_path, clean_environment
+):
+    """O69: `river`'s runs are REST runs whose record says they had no mount, `lake`'s mount runs touched the token's
+    directory, `hill`'s logs were never closed and the rest are clean: the REST runs are not applicable, are kept in the
+    rerun and are shown so."""
+    analysis = checked_study(tmp_path, clean_environment, guard=True, rest_task="river")
+    runs = {row.run_key: row for row in analysis.rows}
+    verdicts = {run.run_key: run.verdict for run in analysis.mount_guard.runs}
+    river = {key for key, row in runs.items() if row.factors["task"] == "river"}
+    assert river
+    assert {verdicts[key] for key in river} == {"not_applicable"}
+    assert {verdicts[key] for key in set(runs) - river} == {"clean", "flagged", "unknown"}  # the mount runs
+    assert not river & {run.run_key for run in analysis.mount_guard.left_out}
+    assert analysis.mount_guard.sensitivity is not None
+    made = output_bytes(analysis)
+    summary = json.loads(made[ANALYSIS_FILE])["mount_guard"]
+    assert summary["counts"]["not_applicable"] == len(river)
+    assert not river & set(summary["sensitivity"]["left_out"])
+    assert "Not applicable" in made[REPORT_FILE].decode()

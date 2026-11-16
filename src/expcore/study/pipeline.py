@@ -977,8 +977,8 @@ def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
 
 def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds of a batch whose mount was guarded (O60): each analysed run's verdict (its flags, its
-    log's and its isolation's state and reasons, its accesses and tracers) and the sensitivity analysis without the
-    runs that are not clean, or why there is none."""
+    log's and its isolation's state and reasons, its accesses and tracers; `not_applicable` with its `data_path` for a
+    run that had no mount) and the sensitivity analysis without the runs that are not clean, or why there is none."""
     sensitivity = guard.sensitivity
     return {
         "counts": guard.counts(),
@@ -987,6 +987,7 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
                 "run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "verdict": run.verdict,
                 "flags": list(run.flags), "log": run.log, "unknown": list(run.unknown), "isolation": run.isolation,
                 "unproven": list(run.unproven), "accesses": dict(run.accesses), "traced": run.traced,
+                "data_path": run.not_applicable,  # `rest` or `none` for a run the guard does not apply to, else None
             }
             for run in guard.runs
         ],

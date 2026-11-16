@@ -348,6 +348,13 @@ MOUNT_SENSITIVITY_NOTES = [
     "both guards also gets a rerun without the runs either leaves out.",
 ]
 
+MOUNT_NOT_APPLICABLE_NOTES = [
+    "A run with no mount (a REST run, or a run with no data path) is `not_applicable`: its record carries the",
+    "sandbox's statement that the run had none, so it had no mount exposure to be left out for and it stays in this",
+    "rerun. It is never counted as clean, and the egress check, if any, still judges it. A mount run whose record has",
+    "no mount-guard snapshot is `unknown`, and left out, whatever it did.",
+]
+
 VISIBILITY_NOTES = [
     "This batch's sandbox kept the agent's memory limit with a watch of the harness's over the cell's processes in",
     "`/proc` (an HPC batch node, with no cgroup per container), where `/proc` hides a process of the agent's that",

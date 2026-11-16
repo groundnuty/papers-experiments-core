@@ -8,9 +8,12 @@ the preregistration, and the two guards' analyses (`expcore.egress.sensitivity.e
 both guards checked the batch: with one alone, its own rerun is the combined one.
 
 Each run is described by what each guard found: `clean`, `flagged` or `unknown` (for egress, a run flagged for an
-unknown log alone is `unknown`; one with an outside connection or a static-scan hit is `flagged`). A run is left out
-when either guard leaves it out: flagged or unknown to either, so a run unknown to one guard and clean to the other is
-left out. `by` says which: `egress`, `mount` or `both`. The rerun is `stats.analysis.analyse` over the other rows, with
+unknown log alone is `unknown`; one with an outside connection or a static-scan hit is `flagged`), and for the mount
+guard also `not_applicable` (a run with no mount, such as a REST run). A run is left out when either guard leaves it
+out: flagged or unknown to either, so a run unknown to one guard and clean to the other is left out; **a guard that does
+not apply to a run leaves it out for nothing**, so a run not applicable to the mount guard is left out only for
+egress. Only `clean` and `not_applicable` keep a run, so a state this code does not know leaves it out. `by` says which
+guard: `egress`, `mount` or `both`. The rerun is `stats.analysis.analyse` over the other rows, with
 each left-out run passed as an absent run of reason `excluded`, as each guard's own rerun is; a rerun the kernel
 refuses keeps the primary analysis and records why. With no run left out there is no second analysis.
 """
@@ -28,7 +31,8 @@ from expcore.stats.rows import AbsentRun, Row
 
 LEFT_OUT_AS = "excluded"  # the reason a left-out run is passed to the rerun with, as each guard's own rerun does
 EGRESS, MOUNT, BOTH = "egress", "mount", "both"
-CLEAN, FLAGGED, UNKNOWN = "clean", "flagged", "unknown"
+CLEAN, FLAGGED, UNKNOWN, NOT_APPLICABLE = "clean", "flagged", "unknown", "not_applicable"
+KEPT = (CLEAN, NOT_APPLICABLE)  # what a guard may say of a run it leaves in: any other state leaves the run out
 COUNT_KEYS = ("analysed", "left_out", "egress_only", "mount_only", "both")
 
 
@@ -45,7 +49,7 @@ class GuardedRun:
     @property
     def by(self) -> str | None:
         """Which guard leaves the run out: `egress`, `mount`, `both`, or None for a run clean to both."""
-        egress, mount = self.egress != CLEAN, self.mount != CLEAN
+        egress, mount = self.egress not in KEPT, self.mount not in KEPT
         return BOTH if egress and mount else EGRESS if egress else MOUNT if mount else None
 
     @property

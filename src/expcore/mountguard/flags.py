@@ -1,5 +1,5 @@
 # Provenance: new
-"""One run's mount-guard verdict, from its record alone: `clean`, `flagged` or `unknown`.
+"""One run's mount-guard verdict, from its record alone: `clean`, `flagged`, `unknown` or `not_applicable`.
 
 `judge(record, condition)` reads `record.instruments["mount_guard"]`. A run gets each flag that holds:
 
@@ -15,21 +15,36 @@ The verdict is `flagged` when a run has an access flag, whatever else it has (a 
 says both); otherwise `unknown` when it has any flag; otherwise `clean`. **A missing or damaged log, or an unproven
 isolation, is never clean.** Every run that is not clean is listed in the report and left out of the sensitivity
 analysis, as the egress check leaves out a run whose log is unknown.
+
+A run whose record carries the statement that it had no mount (`expcore.mountguard.instrument.NoMount`: a REST run or a
+run with no data path) is `not_applicable`: the guard has nothing to say of it, it has no flag, it is kept in the
+sensitivity analysis (it had no mount exposure to leave it out for), and it is shown as such, never as clean. **Only
+that exact statement makes a run not applicable.** A record without the snapshot is `unknown` (`not_recorded`) whatever
+the run's data path was, and any other shape under the namespace is `unknown` (`not_a_snapshot`).
 """
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from expcore.mountguard.instrument import INTACT, NAMESPACE, PROVEN, UNKNOWN, UNPROVEN, VERSION
+from expcore.mountguard.instrument import (
+    INTACT,
+    NAMESPACE,
+    NO_MOUNT_PATHS,
+    NOT_APPLICABLE_KEYS,
+    PROVEN,
+    UNKNOWN,
+    UNPROVEN,
+    VERSION,
+)
 from expcore.mountguard.log import ACCESS_KEYS
 
 TOKEN_ACCESS, PROCESS_ACCESS = "token_access", "process_access"
 LOG_UNKNOWN, ISOLATION_UNPROVEN = "log_unknown", "isolation_unproven"
 FLAGS = (TOKEN_ACCESS, PROCESS_ACCESS, LOG_UNKNOWN, ISOLATION_UNPROVEN)
 ACCESS_FLAGS = (TOKEN_ACCESS, PROCESS_ACCESS)
-CLEAN, FLAGGED, UNKNOWN_VERDICT = "clean", "flagged", "unknown"
-VERDICTS = (CLEAN, FLAGGED, UNKNOWN_VERDICT)
+CLEAN, FLAGGED, UNKNOWN_VERDICT, NOT_APPLICABLE = "clean", "flagged", "unknown", "not_applicable"
+VERDICTS = (CLEAN, FLAGGED, UNKNOWN_VERDICT)  # what a run with a mount can be; NOT_APPLICABLE is a run with none
 NOT_RECORDED, INSTRUMENT_FAILED, NOT_A_SNAPSHOT = "not_recorded", "instrument_failed", "not_a_snapshot"
 SNAPSHOT_KEYS = {"version", "log", "unknown", "isolation", "unproven", "accesses", "traced", "proofs", "ptrace_scope"}
 
@@ -37,7 +52,9 @@ SNAPSHOT_KEYS = {"version", "log", "unknown", "isolation", "unproven", "accesses
 @dataclass(frozen=True)
 class RunMountGuard:
     """One run's mount-guard verdict: its log's state and why it is unknown, its isolation and why it is unproven,
-    the accesses and tracers its log shows, and its flags (empty for a clean run)."""
+    the accesses and tracers its log shows, and its flags (empty for a clean run). `not_applicable` is the data path a
+    run's record says had no mount (`rest` or `none`), None for every other run; a run with it has no flags, and its log
+    and isolation say `not_applicable`, never `intact` or `proven`."""
 
     run_key: str
     attempt: int
@@ -49,16 +66,20 @@ class RunMountGuard:
     accesses: Mapping[str, int]
     traced: int
     flags: tuple[str, ...]
+    not_applicable: str | None = None
 
     @property
     def verdict(self) -> str:
+        if self.not_applicable is not None:
+            return NOT_APPLICABLE
         if any(flag in ACCESS_FLAGS for flag in self.flags):
             return FLAGGED
         return UNKNOWN_VERDICT if self.flags else CLEAN
 
     @property
     def left_out(self) -> bool:
-        """Whether the sensitivity analysis leaves the run out: every run that is not clean."""
+        """Whether the sensitivity analysis leaves the run out: every run that is not clean. A run the guard does not
+        apply to has no flag and stays in."""
         return bool(self.flags)
 
 
@@ -106,8 +127,24 @@ def verdict_of(snapshot: Any) -> str:
     return RunMountGuard("", 0, "", *_assessed(snapshot)).verdict
 
 
+def _no_mount(data: Any) -> str | None:
+    """The data path a run's statement of no mount names, when `data` is exactly that statement
+    (`instrument.not_applicable_snapshot`): its three keys and no other, this version, `mount` the boolean False, and
+    a data path that has no mount. Anything else is None."""
+    if not isinstance(data, Mapping) or set(data) != NOT_APPLICABLE_KEYS:
+        return None
+    version, mount, path = data["version"], data["mount"], data["data_path"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != VERSION or mount is not False:
+        return None
+    return path if isinstance(path, str) and path in NO_MOUNT_PATHS else None
+
+
 def _assessed(snapshot: Any) -> tuple[Any, ...]:
-    """A snapshot's log state and reasons, isolation and reasons, accesses, tracers and flags."""
+    """A snapshot's log state and reasons, isolation and reasons, accesses, tracers, flags and, for a run with no
+    mount, its data path."""
+    data_path = _no_mount(snapshot)
+    if data_path is not None:
+        return NOT_APPLICABLE, (), NOT_APPLICABLE, (), dict.fromkeys(ACCESS_KEYS.values(), 0), 0, (), data_path
     data, why = _readable(snapshot)
     if data is None:
         reasons = (str(why),)

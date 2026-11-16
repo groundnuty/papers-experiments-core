@@ -300,3 +300,23 @@ def test_this_core_s_gate_has_the_peer_uid_check_so_the_apptainer_gate_asks_for_
         assert box.metadata()["gate"]["peer_uid_check"] is True
     finally:
         box.stop()
+
+
+@pytest.mark.parametrize(("level", "kind"), [("via-gate", "rest"), ("isolated", "none")])
+def test_o69_a_run_without_a_mount_has_the_statement_that_the_mount_guard_does_not_apply(node, settings, level, kind):
+    """O69: the sandbox's own data path, not a missing watcher, makes the guard not apply; the instrument built from the
+    sandbox records it, and the core judges it `not_applicable`."""
+    from types import SimpleNamespace
+
+    from expcore.mountguard import NAMESPACE, NoMount, judge, mount_guard_for
+
+    box = start(node, settings, make_spec(level))
+    try:
+        assert box.data_path_kind == kind
+        assert box.mount_guard_nonce is None  # no helper: which alone would say nothing of the data path
+        instrument = mount_guard_for(box)
+        assert isinstance(instrument, NoMount)
+        run = SimpleNamespace(run_key="k", attempt=1, instruments={NAMESPACE: instrument.finish()})
+        assert (judge(run, "c").verdict, judge(run, "c").not_applicable) == ("not_applicable", kind)
+    finally:
+        box.stop()

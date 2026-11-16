@@ -10,6 +10,7 @@ from expcore.mountguard import (
     ISOLATION_UNPROVEN,
     LOG_UNKNOWN,
     NAMESPACE,
+    NOT_APPLICABLE,
     PROCESS_ACCESS,
     TOKEN_ACCESS,
     UNKNOWN_VERDICT,
@@ -147,3 +148,58 @@ def test_the_verdict_of_a_snapshot_alone_is_the_runs():
 def test_the_instrument_refuses_an_empty_nonce():
     with pytest.raises(ValueError, match="nonce"):
         MountGuard(Source(None), "")
+
+
+# --- a run with no mount: not applicable (never from an absent snapshot) -------------------------------------------
+
+
+def no_mount(kind: str = "rest") -> dict:
+    return {"version": 1, "mount": False, "data_path": kind}
+
+
+@pytest.mark.parametrize("kind", ["rest", "none"])
+def test_a_run_whose_record_says_it_had_no_mount_is_not_applicable_and_stays_in_the_rerun(kind):
+    """O69: the sandbox's own statement that the run's data path has no mount; no flag, kept."""
+    run = judge(record(instruments={NAMESPACE: no_mount(kind)}), "rest-arm")
+    assert run.verdict == NOT_APPLICABLE
+    assert run.not_applicable == kind
+    assert run.flags == ()
+    assert not run.left_out
+    assert (run.log, run.isolation) == (NOT_APPLICABLE, NOT_APPLICABLE)  # never `intact` or `proven`
+
+
+def test_the_statement_is_what_the_instrument_for_a_run_without_a_mount_records():
+    from expcore.mountguard import NoMount
+
+    assert NoMount("none").finish() == no_mount("none")
+    assert guard_flags.verdict_of(no_mount("rest")) == NOT_APPLICABLE
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"version": 1, "mount": False},  # no data path named
+        {"version": 1, "mount": False, "data_path": "mount"},  # a mount is never not applicable
+        {"version": 1, "mount": True, "data_path": "rest"},
+        {"version": 1, "mount": 0, "data_path": "rest"},  # falsy is not False
+        {"version": 2, "mount": False, "data_path": "rest"},
+        {"version": True, "mount": False, "data_path": "rest"},
+        {"version": 1, "mount": False, "data_path": "rest", "log": "intact"},  # nothing beside the statement
+        {"version": 1, "mount": False, "data_path": ["rest"]},
+        {"version": 1, "mount": False, "data_path": "REST"},
+        {"mount": False, "data_path": "rest"},
+        {"ok": False, "error": "OSError", "mount": False, "data_path": "rest"},
+    ],
+)
+def test_a_statement_that_is_not_exactly_the_one_this_code_reads_is_unknown_never_not_applicable(data):
+    """O69: only the exact statement makes a run not applicable; any other shape is unknown and left out."""
+    run = judge(record(instruments={NAMESPACE: data}), "rest-arm")
+    assert run.verdict == UNKNOWN_VERDICT
+    assert run.not_applicable is None
+    assert run.left_out
+
+
+def test_no_snapshot_is_never_not_applicable_even_where_the_run_may_have_had_no_mount():
+    """O69: the absence of a snapshot is `not_recorded`: a mount run whose guard was not listed reads the same."""
+    run = judge(record(), "rest-arm")
+    assert (run.verdict, run.not_applicable, run.unknown) == (UNKNOWN_VERDICT, None, (guard_flags.NOT_RECORDED,))

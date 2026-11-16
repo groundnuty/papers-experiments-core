@@ -9,6 +9,11 @@ rows in the same order, the absent runs and the preregistration. It returns None
 and its report is the text it always was. Once one record carries it, every analysed run is judged
 (`expcore.mountguard.flags.judge`): a run whose record lacks the snapshot is unknown (`not_recorded`), never clean.
 
+A campaign may mix data paths. A run whose record says it had no mount (`NoMount`: a REST run, a run with no data path)
+is `not_applicable`: it had no mount exposure, so it stays in the rerun and is counted and shown as such; the guard is
+listed for it with `expcore.mountguard.mount_guard_for`. Only that statement makes a run not applicable: a mount run
+whose record lacks its snapshot is unknown and left out, as before.
+
 The sensitivity analysis is `stats.analysis.analyse` over the rows of the clean runs, with each other run (flagged, or
 unknown) passed as an absent run of reason `excluded`, so its pairs are counted as missing and its arm's runs as left
 out. The bootstrap seed of each contrast is the preregistered one, so the rerun is as deterministic as the primary
@@ -21,7 +26,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from expcore.mountguard.flags import FLAGS, VERDICTS, RunMountGuard, judge
+from expcore.mountguard.flags import FLAGS, NOT_APPLICABLE, VERDICTS, RunMountGuard, judge
 from expcore.mountguard.instrument import NAMESPACE
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
@@ -32,7 +37,8 @@ LEFT_OUT_AS = "excluded"  # the reason a run that is not clean is passed to the 
 @dataclass(frozen=True)
 class MountGuardAnalysis:
     """Every analysed run's mount-guard verdict, in the export's order; the sensitivity analysis without the runs that
-    are not clean (None when every run is clean or when it was refused); and why it was refused, if it was."""
+    are not clean (None when no run is left out or when it was refused); and why it was refused, if it was. A run the
+    guard does not apply to is not left out."""
 
     runs: tuple[RunMountGuard, ...]
     sensitivity: AnalysisResult | None
@@ -43,18 +49,19 @@ class MountGuardAnalysis:
         return tuple(run for run in self.runs if run.left_out)
 
     def counts(self) -> dict[str, int]:
-        """The analysed runs, the left-out ones, each verdict's runs, and the left-out ones by each flag (a run may
-        have several)."""
-        left = self.left_out
+        """The analysed runs, the left-out ones, each verdict's runs (the runs with no mount, `not_applicable`, kept
+        apart from `clean`), and the left-out ones by each flag (a run may have several)."""
+        left, verdicts = self.left_out, (*VERDICTS, NOT_APPLICABLE)
         return (
             {"analysed": len(self.runs), "left_out": len(left)}
-            | {verdict: sum(1 for run in self.runs if run.verdict == verdict) for verdict in VERDICTS}
+            | {verdict: sum(1 for run in self.runs if run.verdict == verdict) for verdict in verdicts}
             | {flag: sum(1 for run in left if flag in run.flags) for flag in FLAGS}
         )
 
 
 def checked(records: Sequence[Any]) -> bool:
-    """True when one record carries the mount-guard instrument: the batch's runs were checked."""
+    """True when one record carries the mount-guard instrument, a statement of no mount included: the batch's runs were
+    checked, and a record without it is judged."""
     return any(NAMESPACE in record.instruments for record in records)
 
 

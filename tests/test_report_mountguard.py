@@ -136,6 +136,78 @@ def test_a_refused_rerun_is_said_and_no_table_is_shown():
     assert SENSITIVITY not in report
 
 
+def no_mount(key: str, condition: str = "cond-a", kind: str = "rest") -> RunMountGuard:
+    """A run whose record says it had no mount: the guard does not apply."""
+    return RunMountGuard(key, 1, condition, "not_applicable", (), "not_applicable", (),
+                         {"token_file": 0, "token_dir": 0}, 0, (), kind)  # fmt: skip
+
+
+def mixed(**changes) -> MountGuardAnalysis:
+    """k1 touched the token's directory (a mount run), k2 and k3 are REST runs, k4 is a clean mount run; the rerun keeps
+    39 of the primary's 40 pairs, the runs with no mount among them."""
+    runs = (
+        run("k1", flags=("token_access",), accesses={"token_file": 0, "token_dir": 3}),
+        no_mount("k2", "cond-b"),
+        no_mount("k3", "cond-b", "none"),
+        run("k4"),
+    )
+    again = analysis(contrast("a-vs-b", "difference", n_pairs=39, estimate=0.21))
+    return dataclasses.replace(MountGuardAnalysis(runs, again), **changes)
+
+
+def test_o69_the_runs_with_no_mount_are_counted_and_shown_as_not_applicable_and_never_as_clean():
+    """O69: the report counts them apart, lists none of them as not clean, and the rerun keeps them."""
+    report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=mixed())
+    assert "1 of 4 analysed run(s) not clean: 1 flagged for an access" in report
+    assert "2 run(s) had no mount, so the guard does not apply to them" in report
+    by_condition = table_of(report, "### Mount isolation by condition")
+    assert by_condition["Condition"][1:6] == ["Analysed", "Clean", "Flagged", "Unknown", "Not applicable"]
+    assert by_condition["cond-a"][1:6] == ["2", "1", "1", "0", "0"]
+    assert by_condition["cond-b"][1:6] == ["2", "0", "0", "0", "2"]
+    assert set(table_of(report, "### Runs that are not clean")) == {"Run key", "k1"}  # k2 and k3 are not listed
+    assert "Left out: 1 run(s)." in report
+    assert table_of(report, "#### Pairs without the runs that are not clean")["a-vs-b"][1] == "39"
+
+
+def test_a_batch_with_no_run_without_a_mount_has_no_column_and_no_sentence_for_them():
+    """O60: the section of a batch whose every run had a mount is the text it was."""
+    report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=guarded())
+    assert "Not applicable" not in report
+    assert "had no mount" not in report
+
+
+def test_with_every_run_applicable_clean_or_not_applicable_the_rerun_is_the_primary_analysis():
+    guard = MountGuardAnalysis((run("k1"), no_mount("k2")), None)
+    report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=guard)
+    assert "No run is left out (the runs with no mount stay in)" in report
+    assert "Every run is clean," not in report
+
+
+def test_a_batch_where_the_guard_applies_to_no_run_says_so():
+    guard = MountGuardAnalysis((no_mount("k1"), no_mount("k2", "cond-b")), None)
+    report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=guard)
+    assert "None: the guard applies to no analysed run" in report
+
+
+def test_the_terminal_summary_counts_the_runs_with_no_mount_apart():
+    lines = summary_lines(analysis(contrast("a-vs-b", "difference")), None, mixed())
+    assert lines[1].startswith("mount guard: 1 of 4 analysed run(s) not clean (1 flagged:")
+    assert lines[1].endswith("; 2 not applicable (no mount)")
+    assert lines[-1].startswith("mount sensitivity a-vs-b:")
+    quiet = summary_lines(analysis(contrast("a-vs-b", "difference")), None, MountGuardAnalysis((no_mount("k1"),), None))
+    assert quiet[-1] == "mount sensitivity: no run left out, the same as the analysis above"
+
+
+def test_analysis_json_names_a_run_with_no_mount_not_applicable_with_its_data_path():
+    summary = _mount_guard_summary(mixed())
+    by_key = {entry["run_key"]: entry for entry in summary["runs"]}
+    assert (by_key["k2"]["verdict"], by_key["k2"]["data_path"], by_key["k2"]["flags"]) == ("not_applicable", "rest", [])
+    assert by_key["k3"]["data_path"] == "none"
+    assert by_key["k4"]["data_path"] is None  # a run with a mount
+    assert summary["counts"]["not_applicable"] == 2
+    assert summary["sensitivity"]["left_out"] == ["k1"]
+
+
 def test_the_egress_section_keeps_its_own_titles_beside_the_mount_section():
     egress = EgressAnalysis((), None)
     report = render(analysis(contrast("a-vs-b", "difference")), egress=egress, mount_guard=guarded())

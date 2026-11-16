@@ -8,7 +8,7 @@ from mountguard_logs import NONCE, inotify, log, proof, record
 from stats_support import both_arms
 
 from expcore.campaign.factors import FactorSchema
-from expcore.mountguard import NAMESPACE, MountGuard
+from expcore.mountguard import NAMESPACE, MountGuard, NoMount
 from expcore.mountguard.sensitivity import LEFT_OUT_AS, mount_guard_analysis
 from expcore.stats.analysis import analyse
 from expcore.stats.prereg import parse
@@ -144,3 +144,54 @@ def test_a_rerun_the_kernel_refuses_keeps_the_primary_and_says_why(prereg, monke
     done = mount_guard_analysis(runs_for(rows, lambda i: touched() if i == 0 else clean()), rows, [], prereg)
     assert done.sensitivity is None
     assert done.refused == "a treatment attempt's outcome is None"
+
+
+# --- a campaign that mixes mount runs and REST runs (O60: not applicable) -------------------------------------------
+
+
+def rest():
+    return {NAMESPACE: NoMount("rest").finish()}
+
+
+def mixed_instruments(i: int) -> dict:
+    """Rows 0-3 are mount runs (0 touched the token's directory, 1 has no snapshot, 2 is clean, 3 is unproven), rows
+    4-15 are REST runs, whose record says the guard does not apply."""
+    if i >= 4:
+        return rest()
+    return {0: touched, 1: dict, 2: clean, 3: unproven}[i]()
+
+
+def test_a_rest_run_is_not_applicable_and_stays_in_the_mount_guards_rerun(prereg):
+    """O69: the REST runs had no mount exposure, so the rerun leaves out only the mount runs that are not clean."""
+    rows = rows_of_pairs(8)  # 16 runs: pairs 0-1 are mount runs, pairs 2-7 REST runs
+    done = mount_guard_analysis(runs_for(rows, mixed_instruments), rows, [], prereg)
+    counts = done.counts()
+    assert (counts["flagged"], counts["unknown"], counts["clean"], counts["not_applicable"]) == (1, 2, 1, 12)
+    assert counts["left_out"] == 3
+    out = {run.run_key for run in done.left_out}
+    assert out == {rows[i].run_key for i in (0, 1, 3)}  # flagged, unrecorded and unproven mount runs; no REST run
+    assert all(run.verdict == "not_applicable" for run in done.runs[4:])
+    again = done.sensitivity.contrast("a-vs-b")
+    assert again.n_pairs == 8 - 2  # rows 0, 1, 2, 3 sit in pairs 0 and 1: both pairs lose a run, six REST pairs stay
+    assert sum(a.lost[LEFT_OUT_AS] for a in again.arm_runs) == 3
+
+
+def test_a_mount_run_without_its_snapshot_is_still_unknown_and_excluded_beside_not_applicable_runs(prereg):
+    """O69: not applicable is the run's own statement: the absence of a snapshot does not make a mount run one."""
+    rows = rows_of_pairs(4)
+    done = mount_guard_analysis(runs_for(rows, lambda i: {} if i == 0 else rest()), rows, [], prereg)
+    assert [(run.run_key, run.verdict, run.unknown) for run in done.left_out] == [
+        (rows[0].run_key, "unknown", ("not_recorded",))
+    ]
+    assert done.counts()["not_applicable"] == 7
+
+
+def test_a_batch_of_not_applicable_runs_alone_is_checked_and_has_no_second_analysis(prereg):
+    """O69: every run had no mount: the guard says so, nothing is left out, and a rerun would be the primary one."""
+    rows = rows_of_pairs(3)
+    done = mount_guard_analysis(runs_for(rows, lambda i: rest()), rows, [], prereg)
+    assert done is not None
+    assert done.left_out == ()
+    assert (done.sensitivity, done.refused) == (None, None)
+    assert done.counts()["not_applicable"] == 6
+    assert done.counts()["clean"] == 0  # never clean: the guard did not apply

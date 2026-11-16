@@ -14,7 +14,7 @@ from expcore.egress import EgressLog, declaration
 from expcore.egress.sensitivity import egress_analysis
 from expcore.guards import LEFT_OUT_AS, guards_analysis
 from expcore.mountguard import NAMESPACE as MOUNT_NS
-from expcore.mountguard import MountGuard
+from expcore.mountguard import MountGuard, NoMount
 from expcore.mountguard.sensitivity import mount_guard_analysis
 from expcore.stats.analysis import analyse
 from expcore.stats.prereg import parse
@@ -79,6 +79,7 @@ MOUNT = {
     "clean": lambda: MountGuard(MountSource(ML.log()), ML.NONCE).finish(),
     "flagged": lambda: MountGuard(MountSource(ML.log([ML.inotify("dir", "IN_OPEN")])), ML.NONCE).finish(),
     "unknown": lambda: MountGuard(MountSource(None), ML.NONCE).finish(),
+    "not_applicable": lambda: NoMount("rest").finish(),  # a REST run: no mount, the guard does not apply
 }
 # row index -> (egress, mount); every other row is clean to both
 CASES = {
@@ -192,3 +193,51 @@ def test_a_rerun_the_kernel_refuses_keeps_the_primary_and_says_why(prereg, monke
     both = guards_analysis(rows, [], prereg, egress, mount)
     assert both.sensitivity is None
     assert both.refused == "a treatment attempt's outcome is None"
+
+
+# --- a campaign that mixes mount and REST runs: the combined rerun leaves a run out only for a guard that applies ----
+
+
+def test_o69_a_run_the_mount_guard_does_not_apply_to_is_left_out_only_for_egress(prereg):
+    """O69: not applicable to the mount guard and clean to egress: kept. Not applicable and flagged or unknown to
+    egress: left out, by egress alone. A mount run unknown to the mount guard is left out, by the mount guard."""
+    rows = rows_of_pairs(8)
+    cases = {
+        0: ("clean", "not_applicable"),
+        1: ("flagged", "not_applicable"),
+        2: ("unknown", "not_applicable"),
+        3: ("clean", "unknown"),  # a mount run whose record has no usable snapshot
+        4: ("flagged", "flagged"),
+    }
+    _, mount, both = analysed(rows, prereg, cases)
+    by_index = {i: both.runs[i] for i in range(5)}
+    assert [by_index[i].by for i in range(5)] == [None, "egress", "egress", "mount", "both"]
+    assert [by_index[i].mount for i in range(5)] == [
+        "not_applicable",
+        "not_applicable",
+        "not_applicable",
+        "unknown",
+        "flagged",
+    ]
+    assert {run.run_key for run in both.left_out} == {rows[i].run_key for i in (1, 2, 3, 4)}
+    assert both.counts() == {"analysed": 16, "left_out": 4, "egress_only": 2, "mount_only": 1, "both": 1}
+    assert mount.sensitivity is not None
+    assert {run.run_key for run in mount.left_out} == {rows[3].run_key, rows[4].run_key}  # not the REST runs
+
+
+def test_o69_a_run_not_applicable_to_the_mount_guard_and_clean_to_egress_stays_in_the_combined_rerun(prereg):
+    """O69: nothing is left out, so there is no combined rerun."""
+    rows = rows_of_pairs(4)
+    _, mount, both = analysed(rows, prereg, dict.fromkeys(range(8), ("clean", "not_applicable")))
+    assert both.left_out == ()
+    assert (both.sensitivity, both.refused) == (None, None)
+    assert mount.counts()["not_applicable"] == 8
+
+
+def test_a_guard_state_this_code_does_not_know_leaves_the_run_out():
+    """O69: only `clean` and `not_applicable` keep a run: an unknown word is never read as a pass."""
+    from expcore.guards import GuardedRun
+
+    assert GuardedRun("k", 1, "c", "clean", "not_applicable").by is None
+    assert GuardedRun("k", 1, "c", "clean", "fine").by == "mount"
+    assert GuardedRun("k", 1, "c", "", "clean").by == "egress"

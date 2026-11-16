@@ -713,6 +713,13 @@ class ApptainerSandbox:
         """The nonce of the mount guard's watcher (`expcore.mountguard.MountGuard`), once the helper exists."""
         return getattr(self._mount, "nonce", None)
 
+    @property
+    def data_path_kind(self) -> str:
+        """The run's data path, `mount`, `rest` or `none`, from the spec it was started with: what
+        `expcore.mountguard.mount_guard_for` decides on. It is the spec's and never read from the helper, so a mount run
+        whose helper keeps no watcher is still a mount run (O60)."""
+        return self.spec.mode.value
+
     def mount_io_mode(self) -> dict[str, Any]:
         if self.spec.mode is not DataPathMode.MOUNT or self._mount is None:
             return {"mount": False}

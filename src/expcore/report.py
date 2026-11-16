@@ -832,8 +832,12 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> list[str]:
         f"{n['token_access']} token access, {n['process_access']} process access; {n['unknown']} unknown: "
         f"{n['log_unknown']} log unknown, {n['isolation_unproven']} isolation unproven)"
     ]
+    if n["not_applicable"]:  # runs with no mount (a REST run), kept in the rerun and never counted as clean
+        lines[0] += f"; {n['not_applicable']} not applicable (no mount)"
     if guard.refused is not None:
         return [*lines, f"mount sensitivity: not computed ({guard.refused})"]
+    if guard.sensitivity is None and n["not_applicable"]:
+        return [*lines, "mount sensitivity: no run left out, the same as the analysis above"]
     if guard.sensitivity is None:
         return [*lines, "mount sensitivity: every run clean, the same as the analysis above"]
     return lines + _rerun_lines(guard.sensitivity, "mount sensitivity")

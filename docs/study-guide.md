@@ -1272,7 +1272,7 @@ Report the primary analysis as it stands and the sensitivity analysis beside it.
 
 ### The mount on HPC: guarded and reported, not isolated
 
-On an HPC batch node your agent's cells and the oneclient that holds the mount's token run as one user, so the token cannot be kept from the agent as the Docker sidecar keeps it. The study's PI ruled (16 Nov 2026) that mount runs stay on HPC with detection and report, as for egress. Declare oneclient's bundle in `[sandbox.apptainer]` (`oneclient_bundle` and `oneclient_bundle_sha256`: the tar `deploy/hpc-federation/oneclient_bundle.py` builds from the Compose sidecar's pinned image, so both backends run one oneclient build; its SHA-256 is in the campaign fingerprint, and each run records oneclient's version and build id), and give the Apptainer backend its mount helper, `host_mount_factory()` from `expcore_onedata.sandbox.apptainer.hostmount`, as `sandbox_options={"mount_helper": ...}`: oneclient then runs on the node outside every cell, from the bundle's own loader and libraries, its token in a private file no cell binds and removed once the mount is up, and a watcher outside the cells logs every access to that file and its directory, watches oneclient for a tracer, and proves from the node's `/proc` that each cell runs in a PID namespace of its own, with no view of the node's processes or of the private files. The helper takes `io_mode = "proxy"` only: a direct mount is refused at the run's start ("Direct I/O: declare the storage, and keep proxy unless placement is shown the same", above), so HPC mounts are proxy-only until the direct-I/O comparison passes. Record it with `expcore.mountguard.MountGuard(sandbox, sandbox.mount_guard_nonce)` beside the run's other instruments:
+On an HPC batch node your agent's cells and the oneclient that holds the mount's token run as one user, so the token cannot be kept from the agent as the Docker sidecar keeps it. The study's PI ruled (16 Nov 2026) that mount runs stay on HPC with detection and report, as for egress. Declare oneclient's bundle in `[sandbox.apptainer]` (`oneclient_bundle` and `oneclient_bundle_sha256`: the tar `deploy/hpc-federation/oneclient_bundle.py` builds from the Compose sidecar's pinned image, so both backends run one oneclient build; its SHA-256 is in the campaign fingerprint, and each run records oneclient's version and build id), and give the Apptainer backend its mount helper, `host_mount_factory()` from `expcore_onedata.sandbox.apptainer.hostmount`, as `sandbox_options={"mount_helper": ...}`: oneclient then runs on the node outside every cell, from the bundle's own loader and libraries, its token in a private file no cell binds and removed once the mount is up, and a watcher outside the cells logs every access to that file and its directory, watches oneclient for a tracer, and proves from the node's `/proc` that each cell runs in a PID namespace of its own, with no view of the node's processes or of the private files. The helper takes `io_mode = "proxy"` only: a direct mount is refused at the run's start ("Direct I/O: declare the storage, and keep proxy unless placement is shown the same", above), so HPC mounts are proxy-only until the direct-I/O comparison passes. Record it with `expcore.mountguard.mount_guard_for(sandbox)` beside the run's other instruments, **for every run**: it is the guard of a mount run, and, for a REST run or a run with no data path, which have no mount to guard, a statement that the guard does not apply (below). It is built over `MountGuard(sandbox, sandbox.mount_guard_nonce)`:
 
 ```python
 from expcore.mountguard import MountGuard
@@ -1289,7 +1289,36 @@ guard = MountGuard(UnguardedMount(), "00112233445566778899aabbccddeeff")
 assert guard.finish()["log"] == "unknown"  # no log: unknown, never a clean run
 ```
 
-What you get, with nothing else to call: once one analysed record carries the `mount_guard` instrument, `analyze` judges every analysed run `clean`, `flagged` (an access to the token's file or directory while cells could run, or a tracer on oneclient) or `unknown` (a missing or damaged log, or a cell isolation that was not proven), and runs the preregistered analysis again without every run that is not clean. `report.md` gains `## Mount isolation (detected, not prevented)` after the egress section, `analysis.json` gains `mount_guard`, and `analyze` prints a line per contrast. A batch checked by both guards also gets `## Egress and mount isolation together`: the analysis again without every run either guard leaves out (flagged or unknown to either, so a run unknown to one and clean to the other is left out), with the runs left out per condition and by which guard, in `analysis.json` (`guards`) and the terminal too. **A run whose guard log is missing or damaged, or whose isolation was not proven, is unknown, never counted clean.** What each field and reason means is in [`interfaces.md`](interfaces.md#the-mount-on-hpc-guarded-the-mount_guard-instrument).
+**A campaign that mixes data paths** (REST runs beside mount runs) lists the guard for every run. A run with no mount had no mount exposure, so the guard does not apply to it: `mount_guard_for` gives it `NoMount`, whose record says so, `analyze` judges it `not_applicable`, and it stays in the mount guard's rerun (and in the combined one, unless another guard leaves it out) instead of being left out as `unknown`. It is counted apart from `clean`, and shown as such in the report, `analysis.json` and the terminal. Only that statement makes a run not applicable, and the sandbox's own data path writes it:
+
+```python
+from expcore.mountguard import NoMount, judge, mount_guard_for
+
+
+class Box:
+    """A sandbox as `mount_guard_for` reads it."""
+
+    data_path_kind = "rest"  # the run's data path, from its spec
+    mount_guard_nonce = None  # no mount, so no watcher
+
+    def mount_watch_log(self):
+        return None
+
+
+class Record:
+    run_key, attempt = "run-1", 1
+    instruments = {"mount_guard": mount_guard_for(Box()).finish()}
+
+
+assert isinstance(mount_guard_for(Box()), NoMount)
+assert judge(Record, "rest-arm").verdict == "not_applicable"  # kept in the rerun, never counted as clean
+Record.instruments = {}  # a record without the snapshot, whatever the run's data path was
+assert judge(Record, "rest-arm").verdict == "unknown"  # unknown is never clean, and the run is left out
+```
+
+A mount run whose record lacks the snapshot is `unknown` and left out as before, and a mount run whose helper keeps no watcher raises `ValueError` at `mount_guard_for` rather than reading as not applicable. A record written before a study listed the guard for every run has no statement for its REST runs, which stay `unknown`.
+
+What you get, with nothing else to call: once one analysed record carries the `mount_guard` instrument, `analyze` judges every analysed run `clean`, `flagged` (an access to the token's file or directory while cells could run, or a tracer on oneclient), `unknown` (a missing or damaged log, or a cell isolation that was not proven) or `not_applicable` (a run with no mount), and runs the preregistered analysis again without every run that is not clean (a run the guard does not apply to is not left out). `report.md` gains `## Mount isolation (detected, not prevented)` after the egress section, `analysis.json` gains `mount_guard`, and `analyze` prints a line per contrast. A batch checked by both guards also gets `## Egress and mount isolation together`: the analysis again without every run either guard leaves out (flagged or unknown to either, so a run unknown to one and clean to the other is left out), with the runs left out per condition and by which guard, in `analysis.json` (`guards`) and the terminal too. **A run whose guard log is missing or damaged, or whose isolation was not proven, is unknown, never counted clean.** What each field and reason means is in [`interfaces.md`](interfaces.md#the-mount-on-hpc-guarded-the-mount_guard-instrument).
 
 Report the primary analysis as it stands and the sensitivity analysis beside it. The guard detects, it does not prevent: inotify does not say which process touched the file, so every touch while cells can run counts as the agent's; a tracer is sampled, so a short one is missed; oneclient's environment and memory are covered only by the proof that no cell can see its process; and a process of your user outside the cells (an ssh login into the node) is outside every check.
 
