@@ -24,10 +24,10 @@ same way however one commit is installed, and the campaign's environment records
 `python_sha256` is over every `*.py` file of the packages `expcore` and `expcore_onedata`, by its path below the
 directory holding them (`expcore/cli.py`) and its content, without the example study the wheel carries under
 `expcore/examples/` (the study's own code once written out). A running core walks its directories, a checkout's
-`src/` as an installed core's site directory: the digest is of what is imported. A build lists the checkout's files
-with git instead (tracked, and untracked but not ignored: what the wheel ships, which is what its install will walk).
-The two agree on every checkout that is not dirty. Two dirty trees at one commit therefore differ when their code
-does.
+`src/` as an installed core's site directory, following links (once each): the digest is of what is imported. A build
+leaves out the files git ignores there, as the wheel does, so it records what its install will walk. The two agree on
+every checkout that is not dirty, and a link in a checkout's packages is dirt, since git holds where it points and not
+what it leads to. Two dirty trees at one commit therefore differ when their code does.
 
 This module imports nothing of the core, so the build hook loads it by its path, without installing anything.
 """
@@ -122,41 +122,60 @@ def _counted(name: str) -> bool:
     return name.endswith(".py") and name.split("/", 1)[0] in PACKAGES and not name.startswith(EXAMPLES)
 
 
-def installed_digest(parent: Path) -> str:
-    """`python_sha256` of the packages below `parent` (a site directory, or a checkout's `src/`), by walking them."""
-    files = []
+def package_files(parent: Path) -> tuple[list[tuple[str, Path]], list[str]]:
+    """The Python files of the packages below `parent` (a site directory, or a checkout's `src/`), each by its name
+    below `parent`, and the links among them, files or directories, by the same names.
+
+    A linked directory is walked like any other, since its code is imported like any other; one reached again (a link
+    back up the tree) is walked once, by its resolved path, so a cycle ends.
+    """
+    files: list[tuple[str, Path]] = []
+    links: list[str] = []
+    walked: set[Path] = set()
     for package in PACKAGES:
-        for here, dirs, names in os.walk(parent / package):
+        for here, dirs, names in os.walk(parent / package, followlinks=True):
+            real = Path(here).resolve()
+            if real in walked:
+                dirs[:] = []
+                continue
+            walked.add(real)
             dirs[:] = sorted(d for d in dirs if d not in _SKIPPED_DIRS)
-            for file in names:
-                path = Path(here) / file
+            for entry in [*dirs, *names]:
+                path = Path(here) / entry
                 name = path.relative_to(parent).as_posix()
-                if _counted(name) and path.is_file():
+                if path.is_symlink() and not name.startswith(EXAMPLES):
+                    links.append(name)
+                if entry in names and _counted(name) and path.is_file():
                     files.append((name, path))
-    return _digest(files)
+    return files, sorted(links)
+
+
+def installed_digest(parent: Path) -> str:
+    """`python_sha256` of the packages below `parent`, as they are imported: by walking them, links followed."""
+    return _digest(package_files(parent)[0])
 
 
 def checkout_digest(root: Path) -> str | None:
-    """`python_sha256` of a checkout's `src/`, over the files git lists there (tracked, or untracked and not ignored:
-    what a wheel built from it ships); None when git cannot list them."""
-    listing = _git(root, "ls-files", "-z", "-co", "--exclude-standard", "--", *(f"src/{p}" for p in PACKAGES), raw=True)
-    if listing is None:
+    """`python_sha256` of what a wheel built from a checkout ships: its packages walked, without the files git ignores
+    there, which a build leaves out; None when git cannot list them."""
+    ignored = _ignored(root)
+    if ignored is None:
         return None
-    files = []
-    for relative in sorted({item for item in listing.split("\0") if item}):
-        name = relative.removeprefix("src/")
-        path = root / relative
-        if _counted(name) and path.is_file():
-            files.append((name, path))
-    return _digest(files)
+    return _digest([(name, path) for name, path in package_files(root / "src")[0] if f"src/{name}" not in ignored])
+
+
+def _ignored(root: Path) -> set[str] | None:
+    """The files git ignores in a checkout's packages, by path from its top; None when git cannot list them."""
+    listing = _git(root, "ls-files", "-z", "-oi", "--exclude-standard", "--", *(f"src/{p}" for p in PACKAGES), raw=True)
+    return None if listing is None else {item for item in listing.split("\0") if item}
 
 
 def _dirt(root: Path) -> str | None:
     """Why a checkout is dirty, else None: a tracked file differs from HEAD, an untracked file that git does not
-    ignore lies under what a wheel ships, a Python file git ignores lies in the packages, or git cannot say."""
+    ignore lies under what a wheel ships, a Python file git ignores lies in the packages, the packages hold a link
+    (git holds a link's target path, never what it leads to), or git cannot say."""
     status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", raw=True)
-    packages = [f"src/{package}" for package in PACKAGES]
-    ignored = _git(root, "ls-files", "-z", "-oi", "--exclude-standard", "--", *packages, raw=True)
+    ignored = _ignored(root)
     if status is None or ignored is None:
         return "git status could not be read"
     entries = [item for item in status.split("\0") if item]
@@ -177,10 +196,14 @@ def _dirt(root: Path) -> str | None:
     if untracked:
         more = f" and {len(untracked) - 3} more" if len(untracked) > 3 else ""
         return f"files a build would ship that git does not track: {', '.join(untracked[:3])}{more}"
-    hidden = sorted(item for item in ignored.split("\0") if _counted(item.removeprefix("src/")))
+    hidden = sorted(item for item in ignored if _counted(item.removeprefix("src/")))
     if hidden:
         more = f" and {len(hidden) - 3} more" if len(hidden) > 3 else ""
         return f"Python files in the packages that git ignores: {', '.join(hidden[:3])}{more}"
+    links = [f"src/{name}" for name in package_files(root / "src")[1]]
+    if links:
+        more = f" and {len(links) - 3} more" if len(links) > 3 else ""
+        return f"links in the packages, whose targets no commit holds: {', '.join(links[:3])}{more}"
     return None
 
 

@@ -1,11 +1,13 @@
-"""One commit of the core installed five real ways records one entry, and another commit at the same version another
-(C06): editable, from a git URL, from a directory, from a wheel, and from the wheel built out of the sdist.
+"""One commit of the core installed every real way records one entry, and another commit at the same version another
+(C06): editable, from a git URL and from a directory with uv and with pip, from a wheel, and from the wheel built out
+of the sdist.
 
 The core's project (its sources, the example, the token hashes and the build hook) is copied into a throwaway
 repository and committed, so nothing depends on whether the checkout the suite runs from is committed. Each install
-goes into a fresh environment with uv, offline and without dependencies: the identity module imports nothing beyond
-the standard library, and hatchling, the build backend, is in uv's cache once the project is synced. Nothing the
-suite pins (`core_pin`) reaches these processes: each reads its own core.
+goes into a fresh environment, offline and without dependencies: the identity module imports nothing beyond the
+standard library, and hatchling, the build backend, is in uv's cache once the project is synced. pip builds without
+isolation, with hatchling put beside it from that cache, since it has no index to fetch it from. Nothing the suite
+pins (`core_pin`) reaches these processes: each reads its own core.
 """
 
 import json
@@ -80,6 +82,19 @@ def install(python: Path, *what: str) -> None:
     run(str(UV), "pip", "install", "--quiet", "--no-deps", "--python", str(python), *what)
 
 
+def pip_venv(where: Path) -> Path:
+    """An environment with pip (from the standard library's ensurepip) and the build backend beside it."""
+    run(sys.executable, "-m", "venv", str(where))
+    python = where / "bin" / "python"
+    run(str(UV), "pip", "install", "--quiet", "--python", str(python), "hatchling")  # with what it requires
+    return python
+
+
+def pip_install(python: Path, *what: str) -> None:
+    quiet = ("--quiet", "--disable-pip-version-check", "--no-cache-dir", "--no-index")
+    run(str(python), "-m", "pip", "install", *quiet, "--no-deps", "--no-build-isolation", *what)
+
+
 def wheel_of(repo: Path, out: Path, *, through_sdist: bool = False) -> Path:
     run(str(UV), "build", "--quiet", *(() if through_sdist else ("--wheel",)), "--out-dir", str(out), str(repo))
     [wheel] = out.glob("*.whl")
@@ -95,9 +110,10 @@ def core_repo(tmp_path_factory) -> Path:
     return core_repository(tmp_path_factory.mktemp("core") / "repo")
 
 
-def test_c06_one_commit_installed_five_ways_records_one_entry_naming_it(core_repo, tmp_path):
-    """C06: editable, a git URL, a directory, a wheel and the wheel built from the sdist give the core one entry: the
-    repository's HEAD and its tree, clean, with one digest of the source; the earlier form (by direct URL) gave five."""
+def test_c06_one_commit_installed_every_way_records_one_entry_naming_it(core_repo, tmp_path):
+    """C06: editable, a git URL and a directory (each with uv and with pip), a wheel and the wheel built from the sdist
+    give the core one entry: the repository's HEAD and its tree, clean, with one digest of the source; the earlier form
+    (by direct URL) gave one entry per way."""
     head, tree = git(core_repo, "rev-parse", "HEAD"), git(core_repo, "rev-parse", "HEAD^{tree}")
     ways = {
         "editable": ("-e", str(core_repo)),
@@ -111,6 +127,10 @@ def test_c06_one_commit_installed_five_ways_records_one_entry_naming_it(core_rep
         python = venv(tmp_path / "venvs" / name.replace(" ", "-"))
         install(python, *what)
         found[name] = identity_in(python)
+    for name, what in {"pip git URL": ways["git URL"], "pip directory": ways["directory"]}.items():
+        python = pip_venv(tmp_path / "venvs" / name.replace(" ", "-"))
+        pip_install(python, *what)
+        found[name] = identity_in(python)
     entries = {name: json.dumps(read["entry"], sort_keys=True) for name, read in found.items()}
     assert len(set(entries.values())) == 1, entries
     entry = found["wheel"]["entry"]
@@ -123,6 +143,8 @@ def test_c06_one_commit_installed_five_ways_records_one_entry_naming_it(core_rep
         "directory": "build",
         "wheel": "build",
         "sdist": "build",
+        "pip git URL": "build",
+        "pip directory": "build",
     }
     assert git(core_repo, "status", "--porcelain") == ""  # no install wrote into the checkout
 

@@ -85,6 +85,32 @@ def test_p01_a_tracked_change_anywhere_or_an_untracked_file_a_wheel_ships_is_dir
     assert "Python files in the packages that git ignores: src/expcore/build/hidden.py" in str(ignored.why)
 
 
+def test_c06_a_linked_subpackage_is_walked_and_its_link_is_dirt(repo, tmp_path):
+    """C06: a subpackage that is a link to a directory outside the tree is imported like any other, so its code is in
+    the digest and a change to it changes the digest; in a checkout the link is dirt (git holds where it points, not
+    what it leads to), and an installed core whose linked code changed since its build is stale."""
+    root = core_project(repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "__init__.py").write_text("RATE = 1\n", encoding="utf-8")
+    (root / "src" / "expcore" / "stats").symlink_to(outside, target_is_directory=True)
+    (root / "src" / "expcore" / "loop").symlink_to(root / "src" / "expcore", target_is_directory=True)  # a cycle
+    repo.commit("two subpackages by link")  # git holds each link's target path; the status is clean
+    linked = from_checkout(root)
+    assert linked.dirty
+    assert "whose targets no commit holds: src/expcore/loop, src/expcore/stats" in str(linked.why)
+    (outside / "__init__.py").write_text("RATE = 2\n", encoding="utf-8")
+    assert from_checkout(root).python_sha256 != linked.python_sha256
+    (root / "src" / "expcore" / "loop").unlink()
+    site = tmp_path / "site"
+    package = installed(site, root)  # the copy follows the link: its files, as a wheel ships them
+    shutil.rmtree(site / "expcore" / "stats")
+    (site / "expcore" / "stats").symlink_to(outside, target_is_directory=True)
+    assert not identity_of(package).stale  # the link leads to the code the build hashed
+    (outside / "__init__.py").write_text("RATE = 3\n", encoding="utf-8")
+    assert identity_of(package).stale
+
+
 def test_c06_two_dirty_trees_at_one_commit_are_told_apart_by_their_python_digest(repo):
     """C06: dirt does not make two codes one: each dirty tree's digest is its own source's, and the clean tree's
     digest comes back when the edit is undone."""
