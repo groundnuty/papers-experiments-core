@@ -341,8 +341,9 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 10. **The fault relay** (M4's `expcore_onedata.fault_relay`), when the core has it: started detached on the login node
     (`env -i PATH HOME LC_ALL [SLURM_CONF] <python> -I -B -m expcore_onedata.fault_relay serve --root <root> --
     <this driver's argv prefix>`, its output appended to `<L>/<allocation name>-fault-relay.log`), in the root as its
-    working directory (a 0700 directory of ours, or the relay is not started), never the directory `up` was launched
-    from, since every verb it runs inherits it; then `fault_relay alive` (`-I -B` too) polled until it beats (30 s at
+    working directory (a 0700 directory of ours that no symbolic link reaches, or the relay is not started: `up`'s
+    preflight refuses such a root before anything is submitted), never the directory `up` was launched from, since
+    every verb it runs inherits it; then `fault_relay alive` (`-I -B` too) polled until it beats (30 s at
     most; a relay that never beats fails `up` and is ended). It is recorded in the state file as `relay`. One relay
     per root: it takes a lock.
 

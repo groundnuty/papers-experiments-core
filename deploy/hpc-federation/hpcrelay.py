@@ -47,13 +47,24 @@ def relay_environment(environ: Mapping[str, str]) -> list:
     return [f"{key}={value}" for key, value in pairs.items()]
 
 
+def linked(root: Path) -> bool:
+    """Whether a symbolic link reaches the root: its own name or any directory above it."""
+    return os.path.realpath(root) != os.path.abspath(root)
+
+
 def private_root(root: Path) -> str:
-    """The relay's working directory: the federation's root, a directory of this user that no one else may enter,
-    reached through no link; RuntimeError otherwise."""
-    seen = os.lstat(root)
+    """The relay's working directory: the federation's root, an absolute path that no link reaches (neither its own
+    name nor any directory above it) to a directory of this user that no one else may enter; RuntimeError otherwise."""
+    given = os.path.abspath(root)
+    if linked(root):
+        raise RuntimeError(
+            "the federation's root is reached through a symbolic link (name it by its resolved path): the relay does "
+            "not start there"
+        )
+    seen = os.lstat(given)
     if not stat.S_ISDIR(seen.st_mode) or seen.st_uid != os.getuid() or seen.st_mode & 0o077:
         raise RuntimeError("the federation's root is not a private directory of this user: the relay does not start")
-    return str(root)
+    return given
 
 
 def relay_argv(python: str, verb: str, root: Path) -> list:

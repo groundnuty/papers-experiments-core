@@ -671,6 +671,21 @@ def test_up_starts_the_fault_relay_last_with_no_environment_but_its_own_and_wait
     assert rig.state()["relay"]["pid"] == 9999
 
 
+def test_o58_an_up_whose_root_a_link_reaches_is_refused_before_anything_is_submitted(hpc, tmp_path, site):
+    """O58: the relay works in the root and never starts in one a symbolic link reaches (the root's own name or a
+    directory above it), so up refuses such a root in its preflight, before any job is submitted, rather than once
+    the federation is up."""
+    (tmp_path / "real" / "fed").mkdir(parents=True)  # the root's parent is no link: one above it is
+    (tmp_path / "linked").symlink_to(tmp_path / "real")
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver = hpc.cli.make_driver(LAYOUT, str(tmp_path / "linked" / "fed" / "root"), runner=rig.fake)
+    rig.driver.relay_available = lambda: True
+    with pytest.raises(RuntimeError, match="reached through a symbolic link"):
+        rig.up()
+    assert rig.fake.submitted == {}
+    assert not (tmp_path / "real" / "fed" / "root").exists()
+
+
 def test_an_up_whose_relay_never_beats_fails_and_ends_the_relay(hpc, tmp_path, site):
     """O57: a relay whose heartbeat never comes fails up, and its process is ended."""
     rig = Rig(hpc, tmp_path, site)

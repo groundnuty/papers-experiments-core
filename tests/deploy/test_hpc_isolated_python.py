@@ -155,19 +155,24 @@ def test_o58_the_relay_works_in_the_federations_root_never_where_up_was_launched
         assert stopped(hpc, runner, client, root)
 
 
-@pytest.mark.parametrize("kind", ["group-readable", "open-to-all", "a-link"])
+@pytest.mark.parametrize("kind", ["group-readable", "open-to-all", "a-link", "an-ancestor-link"])
 def test_o58_the_relay_never_starts_in_a_root_that_is_not_a_private_directory_of_ours(hpc, tmp_path, kind):
-    """O58: a root open to others, or reached through a link, is refused before the relay is spawned."""
+    """O58: a root open to others, or reached through a link (its own name or any directory above it), is refused
+    before the relay is spawned."""
     target = private(tmp_path / "target")
     root = tmp_path / "root"
     if kind == "a-link":
         root.symlink_to(target)
+    elif kind == "an-ancestor-link":
+        private(target / "fed")
+        (tmp_path / "above").symlink_to(target)
+        root = tmp_path / "above" / "fed"
     else:
         root.mkdir()
         root.chmod(0o750 if kind == "group-readable" else 0o777)
     spawned = []
     runner = SimpleNamespace(spawn=lambda *args, **kwargs: spawned.append(args), run=None, end_client=None)
-    with pytest.raises(RuntimeError, match="not a private directory"):
+    with pytest.raises(RuntimeError, match=r"not a private directory|reached through a symbolic link"):
         hpc.relay.start(
             runner, sys.executable, root, ["x"], tmp_path / "relay.log", base_environment(tmp_path),
             record=lambda client: None, clock=time.monotonic, sleep=lambda seconds: None,
@@ -196,25 +201,25 @@ def test_o58_the_verbs_argv_prefix_runs_isolated_from_a_planted_directory(tmp_pa
 # -- every argv the driver builds, scanned -------------------------------------------------------------------------
 
 INTERPRETER = re.compile(r"python[0-9.]*")  # a file name: python, python3, python3.11
-VERSIONED = re.compile(r"python3(\.\d+)?")  # a bare command name; a bare "python" is a word (a manifest key) too
 NAMED_PYTHON = re.compile(r"(^|_)python$")  # a variable or attribute holding one: python, node_python, plan.python
-LAUNCHERS = ("srun", "sbatch")  # Slurm's: each must name the working directory it starts in
+LAUNCHERS = ("srun", "sbatch")  # Slurm's: each must start in `/`
+IN_ROOT = "--chdir=/"
 
 
 def interpreter(node: ast.expr) -> bool:
+    """`sys.executable`, a string whose file name is a Python's, or a name or attribute holding one. A list of words
+    that holds the word "python" (a manifest's keys) is written as a set, which no argv is."""
     if isinstance(node, ast.Attribute) and node.attr == "executable":
         return isinstance(node.value, ast.Name) and node.value.id == "sys"
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        if "/" in node.value:
-            return INTERPRETER.fullmatch(node.value.rsplit("/", 1)[-1]) is not None
-        return VERSIONED.fullmatch(node.value) is not None
+        return INTERPRETER.fullmatch(node.value.rsplit("/", 1)[-1]) is not None
     name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
     return name is not None and NAMED_PYTHON.search(name) is not None
 
 
 def python_findings(source: str) -> list[str]:
     """Each list or tuple display in Python source that names an interpreter not followed by `-I`, or starts a Slurm
-    launch with no `--chdir=`: `<line>: <the display>`."""
+    launch that does not name `--chdir=/`: `<line>: <the display>`."""
     found = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.List | ast.Tuple):
@@ -225,25 +230,27 @@ def python_findings(source: str) -> list[str]:
             if interpreter(word) and not (isinstance(after, ast.Constant) and after.value == "-I"):
                 found.append(f"{node.lineno}: {ast.unparse(node)}")
         first = words[0] if words else None
-        if isinstance(first, ast.Constant) and first.value in LAUNCHERS:
-            chdir = [w for w in words if isinstance(w, ast.Constant) and str(w.value).startswith("--chdir=")]
-            if not chdir:
-                found.append(f"{node.lineno}: {ast.unparse(node)}")
+        launch = isinstance(first, ast.Constant) and first.value in LAUNCHERS
+        if launch and not any(isinstance(w, ast.Constant) and w.value == IN_ROOT for w in words):
+            found.append(f"{node.lineno}: {ast.unparse(node)}")
     return found
 
 
-# An interpreter as a command word: `$HPCOP_PY` or `$HPCT_PYTHON`, bare or quoted, `python3` or `python3.x`, or a
-# path to one in a `bin/` (`"$dir/venv/bin/python"`). A bare `python` is a word too (uv's subcommand, a directory).
+# An interpreter as a word: `$HPCOP_PY` or `$HPCT_PYTHON`, bare or quoted, `python`, `python3` or `python3.x`, or a
+# path to one in a `bin/` (`"$dir/venv/bin/python"`), followed by the next word.
 SHELL_PYTHON = re.compile(
     r"""(?:^|[\s;|&(`]|\$\()(?:exec\s+)?("\$\{?HPC(?:OP_PY|T_PYTHON)\}?"|\$\{?HPC(?:OP_PY|T_PYTHON)\}?|"""
-    r""""?(?:[^\s"'=;|&()]*/bin/python(?:3(?:\.\d+)?)?|python3(?:\.\d+)?)"?)\s+(\S+)"""
+    r""""?(?:[^\s"'=;|&()]*/bin/)?python(?:3(?:\.\d+)?)?"?)\s+(\S+)"""
 )
+MESSAGE = re.compile(r"""\b(?:echo|printf|say|die|ok|fail|warn)\s+("[^"]*"|'[^']*')""")  # words, never a command
+UV_SUBCOMMAND = re.compile(r"""(?:\buv|UV\}?)"?\s*$""")  # `uv python install ...`: uv's, no interpreter run
 SHELL_SLURM = re.compile(r"(?:^|[\s;|&(`]|\$\()(srun|sbatch)\s+-")
+SHELL_IN_ROOT = re.compile(r"""(?:^|\s)--chdir=/(?=[\s"']|$)""")
 
 
 def shell_findings(source: str) -> list[str]:
-    """Each command of a shell script that runs a Python without `-I`, or an `srun` or `sbatch` with no `--chdir=`,
-    on its logical line (continuations joined, comments dropped): `<line>: <the command>`."""
+    """Each command of a shell script that runs a Python without `-I`, or an `srun` or `sbatch` that does not name
+    `--chdir=/`, on its logical line (continuations joined, comments and message strings dropped): `<line>: <it>`."""
     found, logical, start = [], "", 0
     for number, line in enumerate(source.splitlines(), 1):
         code = "" if line.lstrip().startswith("#") else re.split(r"\s#\s", line, maxsplit=1)[0]
@@ -253,9 +260,13 @@ def shell_findings(source: str) -> list[str]:
         if code.endswith("\\"):
             logical = logical[:-1] + " "
             continue
+        text = MESSAGE.sub("", logical)
         # an interpreter followed by an operator is an argument (`uv python install "$HPCT_PYTHON" || ...`)
-        bad = [m for m in SHELL_PYTHON.finditer(logical) if m.group(2) != "-I" and m.group(2)[0] not in "|&;)"]
-        bad += [m for m in SHELL_SLURM.finditer(logical) if "--chdir=" not in logical[m.start() :]]
+        bad = [
+            m for m in SHELL_PYTHON.finditer(text)
+            if m.group(2) != "-I" and m.group(2)[0] not in "|&;)" and not UV_SUBCOMMAND.search(text[: m.start(1)])
+        ]  # fmt: skip
+        bad += [m for m in SHELL_SLURM.finditer(text) if not SHELL_IN_ROOT.search(text[m.start() :])]
         found += [f"{start}: {logical.strip()}" for _ in bad[:1]]
         logical = ""
     return found
@@ -268,27 +279,30 @@ def deploy_files(*patterns: str) -> list[Path]:
 
 def test_o58_the_scans_find_a_python_without_isolation_and_a_launch_that_names_no_working_directory():
     """O58, O57: the scans below catch what they guard against, so their silence on the driver means something."""
-    python_bad = (
-        '[python, "-B", "-m", "x"]\n[sys.executable, "x.py"]\n("python3.11", "-c", "y")\n[site.node_python, "z"]\n'
-        '[plan.python, "-m", "expcore"]\n["srun", "--exact", "-N1"]\n["sbatch", "--wrap=x"]\n["/v/bin/python", "a"]\n'
-    )
-    python_good = (
-        '[python, "-I", "-B", "-m", "x"]\n["srun", "--chdir=/", "x"]\n{"python", "x"}\n("study", "python", "tmpfs")\n'
-    )
-    shell_bad = (
-        'python3 -c "x"\nx=$(python3.11 y.py)\n"$HPCOP_PY" --version\nexec $HPCOP_PY -B z.py\n'
-        "srun --jobid=1 \\\n  -w n bash x.sh\nsbatch --wrap=x\n"
-        '  "$dir/venv/bin/python" -m pytest\n$HPCT_PYTHON -c x\n'
-    )
+    python_bad = [
+        '[python, "-B", "-m", "x"]', '[sys.executable, "x.py"]', '("python3.11", "-c", "y")', '[site.node_python, "z"]',
+        '[plan.python, "-m", "expcore"]', '["srun", "--exact", "-N1"]', '["sbatch", "--wrap=x"]',
+        '["/v/bin/python", "a"]', '["python", "-m", "expcore"]', '["srun", "--chdir=/tmp", "x"]',
+        '["sbatch", "--chdir=/scratch", "--wrap=x"]',
+    ]  # fmt: skip
+    python_good = '[python, "-I", "-B", "-m", "x"]\n["srun", "--chdir=/", "x"]\n{"study", "python", "tmpfs"}\n'
+    shell_bad = [
+        'python3 -c "x"', "x=$(python3.11 y.py)", '"$HPCOP_PY" --version', "exec $HPCOP_PY -B z.py",
+        "srun --jobid=1 \\\n  -w n bash x.sh", "sbatch --wrap=x", '  "$dir/venv/bin/python" -m pytest',
+        "$HPCT_PYTHON -c x", "python -m expcore run s", "out=$(python -c 'import x')", 'bash -c "python -m x"',
+        "srun --jobid=1 --chdir=/tmp bash x.sh", 'srun --jobid=1 --chdir="$PWD" bash x.sh',
+        "sbatch --chdir=/scratch --wrap=x",
+    ]  # fmt: skip
     shell_good = (
         'python3 -I -c "x"\n"$HPCOP_PY" -I z.py  # python3 x\n# python3 y.py\n'
         'srun --jobid=1 \\\n  --chdir=/ bash x.sh\ndie "$HPCOP_PY cannot run"\nHPCOP_PY=${HPCOP_PY:-python3.11}\n'
         'echo "uv $v, python $HPCT_PYTHON"\n"$HPCT_UV" python install x\nforce_rm "$root/python" "$root/x"\n'
-        '"$dir/venv/bin/python" -I -c x\nuv python install "$HPCT_PYTHON" || return 1\n'
+        '"$dir/venv/bin/python" -I -c x\nuv python install "$HPCT_PYTHON" || return 1\npython -I -m expcore\n'
+        "sbatch --chdir=/ --wrap=x\n"
     )
-    assert len(python_findings(python_bad)) == 8
+    assert [len(python_findings(text)) for text in python_bad] == [1] * len(python_bad)
     assert python_findings(python_good) == []
-    assert len(shell_findings(shell_bad)) == 8
+    assert [len(shell_findings(text)) for text in shell_bad] == [1] * len(shell_bad)
     assert shell_findings(shell_good) == []
 
 

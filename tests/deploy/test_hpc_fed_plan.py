@@ -107,6 +107,17 @@ def test_the_site_comes_from_the_environment_and_a_missing_value_is_named(hpc):
         hpc.settings.site_from_environment({**environ, "HPC_NODE_TMP": "tmp"})
 
 
+@pytest.mark.parametrize("python", ["venv/bin/python", "./python3.11", "bin/python3"])
+def test_o57_a_node_python_that_is_a_relative_path_is_refused(hpc, python):
+    """O57: every step starts in `/` (`--chdir=/`), so a relative HPCOP_PY would name another interpreter than the
+    one meant: it must be a command name, found on the step's PATH, or an absolute path."""
+    environ = {"HPC_ACCOUNT": "a", "HPC_PARTITION": "p", "SH": "/site/images", "L": "/site/logs"}
+    assert hpc.settings.site_from_environment({**environ, "HPCOP_PY": "python3.11"}).node_python == "python3.11"
+    assert hpc.settings.site_from_environment({**environ, "HPCOP_PY": "/opt/py/bin/python3"}).node_python
+    with pytest.raises(hpc.settings.SettingsError, match="HPCOP_PY: must be a command name or an absolute path"):
+        hpc.settings.site_from_environment({**environ, "HPCOP_PY": python})
+
+
 def test_the_default_step_path_holds_the_sbin_directories_where_the_sites_nodes_keep_ss(hpc):
     """O57: under env -i a step finds its tools on the allowlist's PATH alone; the site's nodes keep ss (the bundle's
     port checks) in /usr/sbin, and the first live zone step failed in its first second without it."""
