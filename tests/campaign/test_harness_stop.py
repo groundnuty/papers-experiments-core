@@ -1,7 +1,5 @@
 """Harness errors are neither infrastructure nor outcomes: they requeue, and enough of a kind stop dispatch (C10)."""
 
-import os
-
 import pytest
 from campaign_support import LATER, NOW, defect, planned_store, run_one
 
@@ -15,7 +13,6 @@ from expcore.campaign.harness_stop import (
 )
 from expcore.campaign.markers import AttemptResult
 from expcore.campaign.recovery import recover
-from expcore.campaign.release import epoch_of
 from expcore.loop.outcomes import HarnessDefect, Outcome
 
 MODELS = ("m1", "m2", "m3")
@@ -105,14 +102,13 @@ def test_c10_a_record_of_stops_that_cannot_be_read_stops_everything(tmp_path):
     assert stops.stopped()[1]
 
 
-def test_c10_a_release_written_after_the_stop_ends_it_once_and_the_old_errors_stop_counting(tmp_path):
-    """C10: a model's name in the release file ends that model's stop; the errors up to then no longer count."""
+def test_c10_a_release_of_the_stop_ends_it_once_and_the_old_errors_stop_counting(tmp_path):
+    """C10: the stop's line in the release file ends that model's stop; the errors up to then no longer count."""
     path = tmp_path / "release"
     store, stops = setup(tmp_path, release_file=path)
     for index in range(3):
         fail(store, stops, "m1", index)
-    path.write_text("m1\n", encoding="utf-8")
-    os.utime(path, (epoch_of(LATER) + 5, epoch_of(LATER) + 5))
+    path.write_text(f"m1 {stops.status()['serials']['m1']}\n", encoding="utf-8")
     released = stops.take_releases("2026-01-01T00:20:00Z")
     assert set(released) == {"m1"}
     assert not path.exists()
@@ -125,31 +121,31 @@ def test_c10_a_release_written_after_the_stop_ends_it_once_and_the_old_errors_st
     assert stops.stopped()[0] == frozenset({"m1"})
 
 
-def test_c10_a_release_older_than_its_stop_or_for_a_stop_not_in_force_ends_nothing(tmp_path):
-    """C10: a stale file does not end the stop, and a name with no stop in force is left in the file."""
+def test_c10_a_release_of_another_stop_or_for_a_stop_not_in_force_ends_nothing(tmp_path):
+    """C10: a bare name or another stop's serial does not end the stop, and a name with no stop in force is left in the
+    file."""
     path = tmp_path / "release"
     store, stops = setup(tmp_path, release_file=path)
     for index in range(3):
         fail(store, stops, "m1", index)
-    path.write_text("m1\nm2\n", encoding="utf-8")
-    os.utime(path, (epoch_of(LATER) - 3600, epoch_of(LATER) - 3600))
+    path.write_text("m1\nm1 9.abcdefgh\nm2 1.abcdefgh\n", encoding="utf-8")
     assert stops.take_releases("2026-01-01T00:20:00Z") == {}
     assert stops.stopped()[0] == frozenset({"m1"})
     assert path.exists()
-    os.utime(path, (epoch_of(LATER) + 5, epoch_of(LATER) + 5))
+    with path.open("a", encoding="utf-8") as file:
+        file.write(f"m1 {stops.status()['serials']['m1']}\n")
     assert set(stops.take_releases("2026-01-01T00:20:00Z")) == {"m1"}
-    assert path.read_text(encoding="utf-8").split() == ["m2"]  # m2 has no stop: its line stays
+    assert path.read_text(encoding="utf-8").splitlines() == ["m1", "m1 9.abcdefgh", "m2 1.abcdefgh"]
 
 
 def test_c10_the_word_all_ends_the_all_stop(tmp_path):
-    """C10: ALL ends the stop on all dispatch, and it is recorded as an event."""
+    """C10: ALL with the all-stop's serial ends the stop on all dispatch, and it is recorded as an event."""
     path = tmp_path / "release"
     store, stops = setup(tmp_path, release_file=path)
     for model in MODELS:
         fail(store, stops, model, 0)
     assert stops.stopped()[1]
-    path.write_text(f"{ALL}\n", encoding="utf-8")
-    os.utime(path, (epoch_of(LATER) + 5, epoch_of(LATER) + 5))
+    path.write_text(f"{ALL} {stops.status()['serials'][ALL]}\n", encoding="utf-8")
     assert set(stops.take_releases("2026-01-01T00:20:00Z")) == {ALL}
     assert stops.stopped() == (frozenset(), False)
     assert store.q("SELECT kind FROM events WHERE kind='harness_error_released_all'")
@@ -241,8 +237,7 @@ def test_c10_the_derivation_leaves_a_released_stop_released(tmp_path):
     store, stops = setup(tmp_path, release_file=path)
     for index in range(3):
         fail(store, stops, "m1", index)
-    path.write_text("m1\n", encoding="utf-8")
-    os.utime(path, (epoch_of(LATER) + 5, epoch_of(LATER) + 5))
+    path.write_text(f"m1 {stops.status()['serials']['m1']}\n", encoding="utf-8")
     assert set(stops.take_releases("2026-01-01T00:20:00Z")) == {"m1"}
     assert stops.reconcile("2026-01-01T00:25:00Z") == []
     assert stops.stopped() == (frozenset(), False)
@@ -278,34 +273,3 @@ def test_c10_the_derivation_fires_the_stop_at_the_third_error_to_end_whatever_or
     [reason] = stops.reconcile("2026-01-01T11:00:00Z")
     assert "3 harness errors of kind ValueError on m1" in reason
     assert stops.load()["models"]["m1"]["utc"] == "2026-01-01T03:00:00Z"
-
-
-def test_c13_a_release_written_earlier_in_the_second_than_the_stop_does_not_end_it(tmp_path):
-    """C13: the stop is dated at full precision: a release at .200 of the second does not pass for a stop at .800."""
-    path = tmp_path / "release"
-    store, stops = setup(tmp_path, release_file=path)
-    for index in range(2):
-        fail(store, stops, "m1", index)
-    run_one(store, keys_by_model(store)["m1"][2], error_of())
-    second = "2026-01-01T00:10:05Z"
-    stops.note("m1", "ValueError", second, exact="2026-01-01T00:10:05.800000Z")
-    assert stops.load()["models"]["m1"]["epoch"] == pytest.approx(epoch_of(second) + 0.8)
-    path.write_text("m1\n", encoding="utf-8")
-    os.utime(path, (epoch_of(second) + 0.2, epoch_of(second) + 0.2))
-    assert stops.take_releases("2026-01-01T00:10:06Z") == {}  # older than the stop, though in the same second
-    assert path.exists()
-    assert stops.stopped()[0] == frozenset({"m1"})
-    os.utime(path, (epoch_of(second) + 0.9, epoch_of(second) + 0.9))
-    assert set(stops.take_releases("2026-01-01T00:10:06Z")) == {"m1"}
-
-
-def test_c13_a_stop_derived_at_the_start_is_dated_at_the_end_of_the_second_its_error_ended_in(tmp_path):
-    """C13: the error's time is known to the second, so the derived stop is the latest it can have been."""
-    path = tmp_path / "release"
-    store, stops = setup(tmp_path, release_file=path)
-    stored_errors_without_notes(store, "m1", 3)
-    stops.reconcile("2026-01-01T00:30:00Z")
-    assert stops.load()["models"]["m1"]["epoch"] == pytest.approx(epoch_of(LATER) + 1.0)
-    path.write_text("m1\n", encoding="utf-8")
-    os.utime(path, (epoch_of(LATER) + 0.5, epoch_of(LATER) + 0.5))
-    assert stops.take_releases("2026-01-01T00:30:01Z") == {}

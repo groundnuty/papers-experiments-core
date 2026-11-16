@@ -86,6 +86,60 @@ def test_a_cell_over_its_memory_limit_is_killed_by_the_watch_as_a_memory_limit(n
     assert result.kill["watch_kills"][0]["what"] == "memory"
 
 
+def test_o56_a_cell_whose_hidden_process_holds_memory_is_killed_as_over_its_limit(node, box):
+    """O56: the HPC probe's E3: a cell process that makes itself non-dumpable and grows to 768 MiB is not in /proc,
+    so the visible sum stays small; the cgroup charges it, and the run's record never reads it within its limit: the
+    cell is killed as `memory_limit` (`memory_hidden`), its memory reading `over`, the run flagged as hiding."""
+
+    def hiding(cell):
+        node._new_proc(cell.pidns, "python3", hidden=True, anon=768 << 20, parent=cell.procs[1].pid)
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "", "")
+
+    node.cell_handler = hiding
+    result = box.exec("import ctypes; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); x = bytearray(768 << 20)", 30)
+    assert result.kill["reason"] == "memory_limit"
+    assert result.kill["category"] == "agent"
+    assert result.kill["watch_kills"][0]["what"] == "memory_hidden"
+    assert "than any process /proc shows explains" in result.kill["basis"]
+    assert box.metadata()["infrastructure_facts"]["memory"]["reading"] == "over"
+    seen = box.process_visibility()
+    assert (seen["memory"], seen["hidden_memory"], seen["hidden_process"]) == ("over", 1, 1)
+
+
+def test_o56_a_hidden_process_no_visible_parent_names_is_still_killed_by_the_cgroup_s_check(node, box):
+    """O56: a process forked twice under the cell's hidden init escapes the children signal; the cgroup's check does
+    not depend on it."""
+
+    def double_fork(cell):
+        node._new_proc(cell.pidns, "python3", hidden=True, anon=768 << 20)
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "", "")
+
+    node.cell_handler = double_fork
+    result = box.exec("x = 1", 30)
+    assert result.kill["watch_kills"][0]["what"] == "memory_hidden"
+    assert box.process_visibility()["hidden_process"] == 0
+
+
+def test_o56_a_normal_cell_with_the_node_s_hidden_share_under_the_margin_is_untouched(node, box):
+    """O56: Apptainer's own hidden starter adds memory during every cell; under the margin, it is no kill and the
+    reading stays within."""
+
+    def ordinary(cell):
+        node.cgroup_slack = 40 << 20
+        cell.procs[1].rss = 30 << 20
+        time.sleep(0.2)
+        node.cgroup_slack = 0
+        return CmdResult(0, "done\n", "")
+
+    node.cell_handler = ordinary
+    result = box.exec("print('done')", 30)
+    assert result.kill is None
+    assert result.exit_code == 0
+    assert box.metadata()["infrastructure_facts"]["memory"]["reading"] == "within"
+
+
 def test_a_cell_that_fills_work_past_its_size_is_killed_by_the_watch_as_a_disk_limit(node, box):
     """O56: /work is a directory on the node's tmpfs; past `work_disk_bytes` the watch kills the run's processes."""
 
