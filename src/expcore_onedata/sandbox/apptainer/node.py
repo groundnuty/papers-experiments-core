@@ -26,8 +26,9 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from expcore_onedata.sandbox import killcause as KC
+from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import procs as P
-from expcore_onedata.sandbox.hostops import CmdResult, DockerHost, run_bounded
+from expcore_onedata.sandbox.hostops import CmdResult, DockerHost, mounts_under, run_bounded
 
 SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434
 PROC = Path("/proc")
@@ -69,6 +70,11 @@ class NodeOps(Protocol):
 
     def exists(self, path: str | Path) -> bool:
         """Whether a path exists on the node (the shared copy helper asks it of the run's working directory)."""
+        ...
+
+    def mounts_under(self, root: Path) -> list[str] | None:
+        """The mount points inside `root` in this process's mount table, deepest first; None when the table cannot be
+        shown whole (unknown, never "no mount")."""
         ...
 
     def spawn(
@@ -201,6 +207,12 @@ class LocalNode:
 
     def exists(self, path: str | Path) -> bool:
         return Path(path).exists()
+
+    def mounts_under(self, root: Path) -> list[str] | None:
+        try:
+            return mounts_under(_read(PROC / "self" / "mountinfo"), root)
+        except (OSError, SandboxError):
+            return None
 
     def spawn(
         self, argv: Sequence[str], *, stdout: Path, stderr: Path, env: Mapping[str, str] | None = None

@@ -191,3 +191,52 @@ def test_a_teardown_never_takes_a_process_left_in_the_kernel_for_gone(node, sett
     stuck.unkillable, stuck.alive = False, False
     box.stop(force=True)
     assert not runs.record_path(settings.work_root, box.sid).exists()
+
+
+def _with_a_mount(node, settings, busy=False):
+    old, _ = _abandoned(node, settings)
+    mountpoint = str(old.dir / "mount")
+    node.mounts.add(mountpoint)
+    if busy:
+        node.busy_mounts.add(mountpoint)
+    node.owner = Spawned(1001, "5151")
+    node.procs[1001] = type(node.procs[999])(1001, "5151", "pid:[4026531836]", "driver", role="driver")
+    return old, mountpoint
+
+
+def test_the_reaper_unmounts_a_dead_run_s_fuse_mount_before_removing_its_directory(node, settings):
+    """O56: a dead driver's oneclient leaves its FUSE mount: the reaper unmounts it (`fusermount3 -u`), then removes
+    the directory and the record."""
+    old, mountpoint = _with_a_mount(node, settings)
+    fresh = start(node, settings)
+    try:
+        assert node.unmounts == [["fusermount3", "-u", mountpoint]]
+        assert mountpoint not in node.mounts
+        assert not old.dir.exists()
+        assert not runs.record_path(settings.work_root, old.sid).exists()
+    finally:
+        fresh.stop()
+
+
+def test_a_mount_a_plain_unmount_cannot_take_goes_lazily(node, settings):
+    old, mountpoint = _with_a_mount(node, settings, busy=True)
+    fresh = start(node, settings)
+    try:
+        assert node.unmounts == [["fusermount3", "-u", mountpoint], ["fusermount3", "-uz", mountpoint]]
+        assert not old.dir.exists()
+    finally:
+        fresh.stop()
+
+
+def test_a_mount_table_that_cannot_be_read_keeps_the_dead_run(node, settings):
+    """O56: unknown is never "no mount": the directory and the record stay for a later reap."""
+    old, _ = _with_a_mount(node, settings)
+    node.mount_table_unreadable = True
+    fresh = start(node, settings)
+    try:
+        assert fresh.metadata()["reaped_orphans"]["left"] == 1
+        assert old.dir.exists()
+        assert runs.record_path(settings.work_root, old.sid).exists()
+    finally:
+        node.mount_table_unreadable = False
+        fresh.stop()

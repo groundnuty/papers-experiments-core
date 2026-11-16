@@ -86,3 +86,8 @@ def test_a_pid_an_ended_helper_held_is_not_taken_for_that_helper_once_another_pr
     monkeypatch.setattr(N, "_start_of", lambda pid: other if pid == process.pid else None)
     assert node.alive(process.pid, other) is True
     assert node.alive(process.pid, process.start) is False
+
+
+def test_the_node_reads_its_own_mount_table_for_mounts_under_a_directory(tmp_path):
+    """O56: what the reaper unmounts is read from this process's mount table; a directory with none has none."""
+    assert LocalNode().mounts_under(tmp_path) == []
