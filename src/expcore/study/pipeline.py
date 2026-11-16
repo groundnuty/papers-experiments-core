@@ -132,6 +132,7 @@ from expcore.study.config import (
 )
 from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
+from expcore.study.platform_deferral import platform_deferrals
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
@@ -321,6 +322,7 @@ def _run_campaign(
     whose threads refuse the study's own `InfraError` kinds as unknown ones, and a config no one has checked.
     """
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
+    declared = platform_deferrals(study)  # from each platform's own configuration, before any study code runs (C11)
     plugin = load_plugin(StudyContext(study, code))
     out = out_dir(study)
     leases = None if plugin.probe is None else LeasePool(out / "leases", plugin.lease_keys, plugin.probe)
@@ -360,6 +362,8 @@ def _run_campaign(
             on_hold=_say_hold,
             shard=started,
             reset_settings=plugin.reset_settings,
+            platform_deferrals=declared,
+            listed_platforms=study.platforms,
             **options,
         ) as scheduler:
             _say_lost(scheduler.lost_counted)
@@ -880,7 +884,8 @@ def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
     only for several named families (S17), `holm_families`, each family's name, members, steps and equivalence
     decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named.
     Only for declared equivalence families (S18), `equivalence_families`: each one's name, members and steps over
-    their TOST p-values; a study that declares none keeps its analysis.json byte for byte."""
+    their TOST p-values; a study that declares none keeps its analysis.json byte for byte. A sensitivity analysis
+    (egress, the mount guard, both) holds the same entries of its own result beside its `left_out` and `contrasts`."""
     entries: dict[str, Any] = {"holm": result.holm}
     if result.holm_families:
         entries["holm_families"] = result.holm_families
@@ -919,7 +924,8 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
 def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds of a batch checked for egress (#179): each analysed run's verdict (its flags, its
     log's state and reasons, its outside destinations by address and port, its static-scan hits) and the sensitivity
-    analysis without the flagged runs, or why there is none."""
+    analysis without the flagged runs (its Holm decisions and, as the primary analysis's, its named and equivalence
+    families, S17 and S18), or why there is none."""
     sensitivity = egress.sensitivity
     return {
         "counts": egress.counts(),
@@ -941,7 +947,7 @@ def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in egress.flagged], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": egress.refused,
     }  # fmt: skip
 
@@ -964,7 +970,7 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in guard.left_out], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": guard.refused,
     }  # fmt: skip
 
@@ -984,7 +990,7 @@ def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in guards.left_out], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": guards.refused,
     }  # fmt: skip
 

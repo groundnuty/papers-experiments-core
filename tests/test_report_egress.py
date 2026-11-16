@@ -2,11 +2,16 @@
 them, and nothing new for a batch that was not checked."""
 
 import dataclasses
+import json
+
+import pytest
+from family_support import declared_equivalence, flat_equivalence, named_families
 
 from expcore.egress.flags import RunEgress
 from expcore.egress.sensitivity import EgressAnalysis
 from expcore.report import render_report, summary_lines
 from expcore.stats.analysis import AnalysisResult, ContrastResult, HolmDecision
+from expcore.study.pipeline import _egress_summary, _json_text
 
 CODE = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
 CAUSES = ("treatment_outcome_none", "treatment_excluded", "exhausted", "unpaired_or_left_out", "outcome_none")
@@ -197,3 +202,143 @@ def test_the_report_is_a_pure_function_of_its_inputs():
     result = analysis(contrast("a-vs-b", "difference"))
     assert render(result, export(), egress=checked()) == render(result, export(), egress=checked())
     assert CODE["commit"] in render(result, egress=checked())
+
+
+# --- the families of the sensitivity analysis (S15, S17, S18) -------------------------------------------------------
+
+AFTER = "### Sensitivity analysis"
+FAMILIES = {"first": ("gain-x", "gain-y"), "second": ("loss-x", "loss-y")}
+DECLARED = "#### Equivalence families (Holm over two one-sided tests, within each declared equivalence family)"
+
+
+def four(*extra: ContrastResult) -> AnalysisResult:
+    """Four confirmatory contrasts (two gains, two losses) and any `extra`, each with the Holm decision 0.01 / 0.02."""
+    return analysis(
+        contrast("gain-x", "difference"),
+        contrast("gain-y", "difference"),
+        contrast("loss-x", "not_detected"),
+        contrast("loss-y", "not_detected"),
+        *extra,
+    )
+
+
+def sensitivity_of(result: AnalysisResult) -> EgressAnalysis:
+    """`checked()` with `result` as its sensitivity analysis."""
+    return dataclasses.replace(checked(), sensitivity=result)
+
+
+def sensitivity_section(result: AnalysisResult) -> str:
+    """The report's sensitivity analysis part, for a batch whose rerun is `result` (its primary one flat family)."""
+    return render(analysis(contrast("a-vs-b", "difference")), egress=sensitivity_of(result)).split(AFTER, 1)[1]
+
+
+def test_s17_the_sensitivity_analysis_shows_each_named_family_in_a_table_with_its_steps():
+    """S17: a rerun of several named Holm families is shown family by family, each member's Holm p within its own
+    family and each family's steps, as the primary analysis shows them, and is never titled as one Holm family."""
+    section = sensitivity_section(named_families(four(), FAMILIES))
+    title = "#### Preregistered contrasts without the flagged runs (2 Holm families, each adjusted on its own"
+    assert f"{title} at alpha = 0.05)" in section
+    first = table_of(section, "##### Holm family first (2 contrasts)")
+    second = table_of(section, "##### Holm family second (2 contrasts)")
+    assert set(first) - {"Contrast"} == {"gain-x", "gain-y"}
+    assert set(second) - {"Contrast"} == {"loss-x", "loss-y"}
+    assert first["gain-x"][7:10] == ["0.0120", "0.0200", "difference"]
+    assert table_of(section, "Holm steps of first:")["2"][1:] == [
+        "gain-y",
+        "0.0100",
+        "0.025 (alpha/1)",
+        "0.0200",
+        "yes",
+    ]
+    assert table_of(section, "Holm steps of second:")["1"][1] == "loss-x"
+    assert "Holm family of" not in section
+    assert table_of(section, "#### Pairs without the flagged runs").keys() >= {"gain-x", "loss-y"}
+
+
+def test_s17_a_flat_family_sensitivity_analysis_keeps_its_title_and_has_no_steps_or_equivalence_table():
+    """S17: one flat Holm family's rerun is the text it was: one table titled with the family's size, and no family
+    steps or equivalence table."""
+    section = sensitivity_section(four())
+    assert "#### Preregistered contrasts without the flagged runs (Holm family of 4)" in section
+    for absent in ("Holm steps of", "##### Holm family", "Equivalence famil", "each adjusted on its own"):
+        assert absent not in section
+
+
+def test_s17_the_terminal_summary_names_each_sensitivity_members_family():
+    """S17: a member's adjusted p of the rerun is its own family's, and the line says which family that is, as the
+    primary analysis's line does."""
+    lines = summary_lines(analysis(contrast("a-vs-b", "difference")), sensitivity_of(named_families(four(), FAMILIES)))
+    rerun = {line.split(":")[0]: line for line in lines if line.startswith("sensitivity ")}
+    assert rerun["sensitivity gain-x"] == (
+        "sensitivity gain-x: estimate 0.25, p 0.0120, Holm p 0.0200 (family first), difference"
+    )
+    assert rerun["sensitivity loss-y"].endswith("Holm p 0.0200 (family second), not_detected")
+
+
+def test_s17_a_rerun_whose_families_disagree_with_its_decisions_is_refused():
+    """S17: the report refuses the rerun as it refuses the primary analysis (`check_families`): a family whose step is
+    not its member's decision would show it adjusted in another family than its own."""
+    result = named_families(four(), FAMILIES)
+    family = result.holm_families[0]
+    step = dataclasses.replace(family.steps[0], p_holm=0.5)
+    broken = dataclasses.replace(result, holm_families=(dataclasses.replace(family, steps=(step, family.steps[1])),))
+    with pytest.raises(ValueError, match="its step in Holm family 'first' is not its Holm decision"):
+        sensitivity_section(broken)
+
+
+def test_s18_the_sensitivity_analysis_shows_each_declared_equivalence_family_with_its_tost_steps():
+    """S18: a rerun with a declared equivalence family shows each claim beside its equivalence family and, with named
+    Holm families, its Holm family, then the family's TOST steps over its own claims, as the primary shows them."""
+    result = declared_equivalence(
+        named_families(four(), FAMILIES), "same", {"gain-x": 0.004, "loss-x": 0.02, "gain-y": 0.3}
+    )
+    section = sensitivity_section(result)
+    claims = table_of(section, DECLARED)
+    assert claims["Contrast"][:3] == ["Contrast", "Equivalence family", "Holm family"]
+    assert claims["gain-x"][1:3] == ["same", "first"]
+    assert claims["loss-x"][1:3] == ["same", "second"]
+    steps = table_of(section, "TOST steps of equivalence family same:")
+    assert [steps[n][1] for n in ("1", "2", "3")] == ["gain-x", "loss-x", "gain-y"]
+    assert steps["1"][4:] == ["0.0120", "yes"]
+    assert section.index("##### Holm family first") < section.index(DECLARED)
+
+
+def test_s15_the_sensitivity_analysis_shows_the_flat_equivalence_family_with_its_tost_p_values():
+    """S15: a rerun with one flat equivalence family shows each claim's TOST p, Holm TOST p and verdict in the table the
+    primary analysis uses, under the sensitivity analysis's own heading level."""
+    section = sensitivity_section(flat_equivalence(four(), {"gain-x": 0.002, "loss-x": 0.04}))
+    claims = table_of(section, "#### Equivalence family (Holm over two one-sided tests)")
+    assert claims["Contrast"] == [
+        "Contrast", "Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval", "Equivalent"
+    ]  # fmt: skip
+    assert claims["gain-x"][2:4] == ["0.0020", "0.0040"]
+    assert claims["loss-x"][2:4] == ["0.0400", "0.0400"]
+    assert "Holm family |" not in section  # one flat Holm family: no family column
+
+
+def test_s17_analysis_json_gives_the_sensitivity_analysis_its_named_families_and_their_steps():
+    """S17: `analysis.json`'s egress sensitivity holds each named family's members and steps beside its Holm
+    decisions, as the primary analysis does."""
+    egress = sensitivity_of(named_families(four(), FAMILIES))
+    sensitivity = json.loads(_json_text(_egress_summary(egress)))["sensitivity"]
+    assert [f["name"] for f in sensitivity["holm_families"]] == ["first", "second"]
+    assert sensitivity["holm_families"][0]["members"] == ["gain-x", "gain-y"]
+    assert [s["name"] for s in sensitivity["holm_families"][1]["steps"]] == ["loss-x", "loss-y"]
+    assert {d["name"] for d in sensitivity["holm"]} == {"gain-x", "gain-y", "loss-x", "loss-y"}
+    assert "equivalence_families" not in sensitivity
+
+
+def test_s18_analysis_json_gives_the_sensitivity_analysis_its_declared_equivalence_families():
+    """S18: `analysis.json`'s egress sensitivity holds each declared equivalence family's members and steps."""
+    result = declared_equivalence(four(), "same", {"gain-x": 0.004, "loss-x": 0.02, "gain-y": 0.3})
+    sensitivity = json.loads(_json_text(_egress_summary(sensitivity_of(result))))["sensitivity"]
+    (family,) = sensitivity["equivalence_families"]
+    assert (family["name"], family["members"]) == ("same", ["gain-x", "loss-x", "gain-y"])
+    assert [s["name"] for s in family["steps"]] == ["gain-x", "loss-x", "gain-y"]
+    assert "holm_families" not in sensitivity
+
+
+def test_s17_a_flat_family_sensitivity_analysis_keeps_its_analysis_json_keys():
+    """S17: one flat family, and no equivalence family, gives the sensitivity analysis the keys it had before families
+    were named: `left_out`, `contrasts`, `holm`."""
+    assert list(_egress_summary(checked())["sensitivity"]) == ["left_out", "contrasts", "holm"]
