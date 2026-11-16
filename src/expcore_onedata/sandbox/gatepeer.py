@@ -23,11 +23,12 @@ check is on: it imports the standard library only, and nothing of the platform l
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
-import socket
 import sys
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 PROC_NET_TCP = "/proc/net/tcp"
 PROC_NET_TCP6 = "/proc/net/tcp6"
@@ -48,12 +49,20 @@ _ROW = re.compile(
 
 def endpoint(address: str, port: int) -> Endpoint:
     """An address as text and a port, in the one form every comparison here uses: IPv4 maps into IPv6, so a v4-mapped
-    peer of a dual-stack listener equals the IPv4 row of its own socket. A scope (`fe80::1%lo`) is dropped."""
-    address = address.partition("%")[0]
-    try:
-        return _V4_PREFIX + socket.inet_pton(socket.AF_INET, address), port
-    except (OSError, ValueError):
-        return socket.inet_pton(socket.AF_INET6, address), port
+    peer of a dual-stack listener equals the IPv4 row of its own socket. A scope (`fe80::1%lo`) is dropped. `ValueError`
+    for an address that is neither."""
+    packed = ipaddress.ip_address(address.partition("%")[0]).packed  # 4 bytes for IPv4, 16 for IPv6 (v4-mapped too)
+    return (_V4_PREFIX + packed if len(packed) == 4 else packed), port
+
+
+class Connection(Protocol):
+    """What the check asks of an accepted connection: its two ends, as `socket.getpeername()` and `getsockname()` give
+    them (a tuple whose first two items are the address and the port). A socket is one, and this module imports no
+    socket."""
+
+    def getpeername(self) -> Any: ...
+
+    def getsockname(self) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -170,7 +179,7 @@ class OwnerCheck:
                 return row, unreadable
         return None, unreadable
 
-    def decide(self, conn: socket.socket) -> Verdict:
+    def decide(self, conn: Connection) -> Verdict:
         """Serve `conn`, just accepted and not yet read or written, only if its peer's socket is this uid's."""
         try:
             host, port = conn.getpeername()[:2]

@@ -308,6 +308,31 @@ def test_the_peer_check_imports_nothing_but_the_standard_library():
     names = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     names |= {(n.module or "").split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.level == 0}
     assert names - set(sys.stdlib_module_names) == set()
+    assert "socket" not in names  # the platform layer imports it nowhere but client.py and the gate (O09)
+
+
+def test_addresses_are_compared_by_these_exact_bytes():
+    """O61: an address is 16 bytes, an IPv4 one as ::ffff:a.b.c.d, a scope dropped, and the port beside it."""
+    v4 = bytes(10) + b"\xff\xff" + bytes([127, 0, 0, 1])
+    assert gatepeer.endpoint("127.0.0.1", 1) == (v4, 1)
+    assert gatepeer.endpoint("::ffff:127.0.0.1", 1) == (v4, 1)
+    assert gatepeer.endpoint("::ffff:7f00:1", 1) == (v4, 1)
+    assert gatepeer.endpoint("::1", 2) == (bytes(15) + b"\x01", 2)
+    assert gatepeer.endpoint("0.0.0.0", 3) == (bytes(10) + b"\xff\xff" + bytes(4), 3)
+    assert gatepeer.endpoint("::", 3) == (bytes(16), 3)
+    assert gatepeer.endpoint("2001:db8::ff00:42:8329", 4) == (bytes.fromhex("20010db8000000000000ff0000428329"), 4)
+    link_local = (bytes([0xFE, 0x80]) + bytes(13) + b"\x01", 5)
+    assert gatepeer.endpoint("fe80::1", 5) == link_local
+    assert gatepeer.endpoint("fe80::1%lo", 5) == link_local
+    assert gatepeer.endpoint("fe80::1%eth0", 5) == link_local
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "not-an-address", "127.0.0", "1.2.3.4.5", "999.0.0.1", "::g", "127.0.0.1 ", " ::1", "1::2::3", "%lo"]
+)
+def test_an_address_that_is_neither_ipv4_nor_ipv6_is_a_value_error(bad):
+    with pytest.raises(ValueError, match="does not appear to be"):
+        gatepeer.endpoint(bad, 1)
 
 
 def test_a_peer_with_no_address_is_refused():
