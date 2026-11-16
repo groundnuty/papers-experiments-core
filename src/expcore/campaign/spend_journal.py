@@ -12,10 +12,12 @@ every change of what was spent, once the store has committed it and before the s
   counts, its top-ups, and how many `call` lines of it the journal holds so far (`calls_sent`, `calls_closed`; None
   for an attempt that keeps no call log), which the reader checks the call lines against;
 - `call` (C05, `campaign.interrupted_spend`): one line per request an attempt sends, before it goes out
-  (`phase` `sent`), and one per request it closes (`phase` `closed`, its `entry`: the reply's counts `[input, output,
-  cache writes, cache reads]`, null for a reply billed and not read, or `"failed"` for a request whose last send
-  failed, after the line of that send's top-up), each with the attempt's `id` and `run_key`. Each is a line of its
-  own, so the journal grows linearly in the calls; the reader sums them by attempt id into the attempt's call log;
+  (`phase` `sent`), and one per reply that closes a request (`phase` `closed`, its `entry`: the reply's counts
+  `[input, output, cache writes, cache reads]`, or null for a reply billed and not read), each with the attempt's `id`
+  and `run_key`. A request whose last send failed is closed by the `attempt` line of that send's top-up itself
+  (`closes`: `"failed"`), so a write cut short loses the top-up and the close together, never one without the
+  other. Each call is a line of its own, so the journal grows linearly in the calls; the reader sums them by attempt
+  id into the attempt's call log;
 - `probe`: a charge of admission's probes (C26): the id of the event the store wrote with it, the model and the
   dollars (a settlement is below 0);
 - `unheld`: a model taken off the reply maximum (C27), which raises the bound its attempts are charged.
@@ -227,6 +229,9 @@ def read_journal(path: Path, campaign: str, shard: str | None) -> Journal:
             if attempt_id not in attempts and entry.get("calls_sent") is not None:
                 calls[attempt_id] = CallLines()  # the attempt keeps a call log
             attempts[attempt_id] = entry
+            if "closes" in entry:  # a top-up's line that closes its request too: never one without the other
+                closing = {"phase": CLOSED, "entry": entry["closes"]}
+                calls[attempt_id] = _called(path, number, calls.get(attempt_id), closing)
             if attempt_id in calls:
                 calls[attempt_id] = _referenced(calls[attempt_id], entry)
         elif kind == CALL:

@@ -304,13 +304,15 @@ class Store:
         mark raises what its attempts are charged, so a store copied back from before it takes it from the journal."""
         self._note_spend(lambda: {"kind": UNHELD, "model": model})
 
-    def _attempt_line(self, attempt_id: int) -> dict[str, Any]:
-        """The journal's `attempt` line of an attempt's row as the open transaction holds it."""
+    def _attempt_line(self, attempt_id: int, closes: str | None = None) -> dict[str, Any]:
+        """The journal's `attempt` line of an attempt's row as the open transaction holds it; with `closes`, the line
+        also closes the attempt's request in flight (C05: a top-up's line that pays for its last failed send)."""
         row = self.db.execute(
             f"SELECT a.*, r.{column_for('model')} AS model FROM attempts a JOIN runs r USING(run_key) WHERE a.id=?",
             (attempt_id,),
         ).fetchone()
-        return attempt_entry(row)
+        line = attempt_entry(row)
+        return line if closes is None else {**line, "closes": closes}
 
     def q(self, sql: str, args: Iterable[Any] = ()) -> list[sqlite3.Row]:
         """Run a read and return all rows."""
@@ -556,10 +558,9 @@ class Store:
             if cursor.rowcount != 1:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so it takes no top-up")
             self.db.execute("INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)", (now, *event))
-            self._note_spend(lambda: self._attempt_line(attempt_id))  # written before the send it pays for (O62)
-            # the close after the top-up's line: a write cut between them leaves the request in flight, never unpaid
-            if close_call and self._close_call(attempt_id, FAILED):
-                self._note_spend(lambda: self._call_line(attempt_id, CLOSED, FAILED))
+            # the close rides on the top-up's own line, so a write cut short loses both or neither (C05)
+            closes = FAILED if close_call and self._close_call(attempt_id, FAILED) else None
+            self._note_spend(lambda: self._attempt_line(attempt_id, closes))  # before the send it pays for (O62)
 
         self.transact(go)
 

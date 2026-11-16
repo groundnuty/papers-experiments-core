@@ -152,17 +152,30 @@ def test_c05_an_attempt_line_that_disagrees_with_its_call_lines_charges_the_boun
     assert (lost["basis"], lost["usd"]) == (BOUND, pytest.approx(BOUND_USD + 0.24))
 
 
-def test_c05_a_failed_last_sends_close_follows_its_top_up_in_the_journal(tmp_path):
-    """C05, C26: the top-up of a request's last failed send is journaled before the line that closes the request, so
-    a write cut between them leaves the request in flight (charged once more, never less), never closed and unpaid."""
+@pytest.mark.parametrize("cut", [False, True])
+def test_c05_a_failed_last_sends_top_up_and_close_are_one_journal_line_so_it_is_charged_once(tmp_path, cut):
+    """C05, C26: the top-up of a request's last failed send and the close of that request are one `attempt` line
+    (`closes`), so a write cut short loses both or neither: whole, the request costs its top-up; cut, it is in flight
+    and costs one request's bound; once either way, never twice and never nothing."""
     live, _, manifest = planned_store(tmp_path / "live")
     start(live, tmp_path, "j1.jsonl")
+    snapshot = copy_of(live, tmp_path, "snapshot")
     begun = live.begin_attempt(manifest.rows[0].key.text, NOW, 4321, "try1", calls_logged=True)
     calls(live, begun.id, "sent")
     live.add_topup(begun.id, REQUEST_USD, NOW, ("topup", MODEL, "the last failed send"), close_call=True)
     mine = [line for line in journal_lines(tmp_path) if line["id"] == begun.id]
-    assert [(line["kind"], line.get("entry")) for line in mine[-2:]] == [("attempt", None), ("call", "failed")]
-    assert (mine[-2]["topups"], mine[-2]["calls_closed"]) == (1, 0)
+    assert [(line["kind"], line.get("closes")) for line in mine[-2:]] == [("call", None), ("attempt", "failed")]
+    assert (mine[-1]["topups"], mine[-1]["calls_sent"], mine[-1]["calls_closed"]) == (1, 1, 1)
+    if cut:
+        path = tmp_path / "journals" / "j1.jsonl"
+        path.write_bytes(path.read_bytes()[:-40])
+    start(snapshot, tmp_path, "j2.jsonl")
+    [lost] = read(snapshot).counted["j1.jsonl"]["attempts"]
+    assert (lost["basis"], lost["usd"], lost["topup_usd"]) == (
+        INFLIGHT if cut else MEASURED,
+        pytest.approx(REQUEST_USD),
+        pytest.approx(0.0 if cut else REQUEST_USD),
+    )
 
 
 def test_c05_a_restored_snapshots_attempt_is_charged_by_its_own_journals_log_not_the_snapshots(tmp_path):
