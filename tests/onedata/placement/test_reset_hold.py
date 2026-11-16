@@ -9,6 +9,7 @@ locks are real, on the fixture's journal directory, and their waits are real sec
 """
 
 import contextlib
+import contextvars
 import dataclasses
 import fcntl
 import multiprocessing
@@ -30,7 +31,7 @@ from expcore_onedata.config import load_platform
 from expcore_onedata.faults import load_faults
 from expcore_onedata.provision import Provisioner, resolve_provider_ids
 from expcore_onedata.rangemap import load_placement
-from expcore_onedata.reset import ResetFailed, SpaceReset
+from expcore_onedata.reset import STAGES, ResetFailed, SpaceReset
 from expcore_onedata.resetlock import FEDERATION_RESET
 from expcore_onedata.resetspaces import ResetPlan, SpacesReset
 from expcore_onedata.testing import DATA, write_platform
@@ -399,25 +400,121 @@ def test_o66_a_worker_holding_a_share_refuses_the_shortcut_but_the_reset_takes_t
     assert (record["reset_lock"]["mode"], record["reset_lock"]["why"]) == ("exclusive", "shares_retained")
 
 
-def test_o66_a_hold_that_lapses_during_the_reset_fails_its_next_stage(
-    client, config, platform_file, ticker, tmp_path, fake, lock, monkeypatch
+@pytest.mark.parametrize(("method", "stage"), [("_qos_settle", "qos_settle"), ("_history", "history")])
+def test_o66_a_hold_that_lapses_during_a_stage_fails_that_stage_and_begins_no_later_one(
+    client, config, platform_file, ticker, tmp_path, fake, lock, monkeypatch, method, stage
 ):
-    """O66: the run's admission let go while its reset runs (an attempt cancelled while its reset is in a thread)
-    lets the exclusive hold go with it, and another holder may then act: the reset begins no later stage, failing
-    the next one, naming the lapse, and the caller must not start the next run."""
+    """O66: a hold whose lock is let go under the reset (here, the share's descriptor closed during a stage) means
+    another holder may have acted: the stage it lapsed in fails, naming the lapse, the last stage included (it used to
+    end the reset `ok`), no later stage begins, and the caller must not start the next run."""
     p = provisioner(client, config, platform_file, ticker, tmp_path)
-    settle = SpaceReset._qos_settle
+    original = getattr(SpaceReset, method)
 
     def and_let_go(self, *args, **kwargs):
-        facts = settle(self, *args, **kwargs)
-        admission.reset.close(record=True)  # what the admission's last share lets go
+        facts = original(self, *args, **kwargs)
+        admission.reset.close(record=True)  # the kernel's view: the exclusive descriptor is gone
         return facts
 
-    monkeypatch.setattr(SpaceReset, "_qos_settle", and_let_go)
+    monkeypatch.setattr(SpaceReset, method, and_let_go)
     with lock.held(exclusive=False, timeout_s=1.0) as admission, pytest.raises(ResetFailed, match="lapsed") as failed:
         SpaceReset(p, now=ticker.clock).run(allowed=ALLOWED, qos_rights=True)
-    assert failed.value.stage == "transfers"
-    assert "eviction" not in failed.value.record["stages"]
+    assert failed.value.stage == stage
+    assert failed.value.record["stages"][stage]["ok"] is False
+    assert failed.value.record["ok"] is False
+    later = list(STAGES)[list(STAGES).index(stage) + 1 :]
+    assert not any(name in failed.value.record["stages"] for name in later)
+
+
+def in_context_thread(work):
+    """Run `work` in a thread that inherits this context (its admission and its section), as asyncio.to_thread does;
+    return the thread and where its result or error lands."""
+    landed: list = []
+    context = contextvars.copy_context()
+
+    def run():
+        try:
+            landed.append(context.run(work))
+        except BaseException as error:
+            landed.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, landed
+
+
+def paused_at_qos_settle(monkeypatch, journal: Path):
+    """Pause the reset after its qos_settle stage until `go` is set (`paused` is set then), and record at its history
+    stage whether a reader could take `federation.reset` shared."""
+    paused, go, seen = threading.Event(), threading.Event(), []
+    settle, history = SpaceReset._qos_settle, SpaceReset._history
+
+    def pausing(self, *args, **kwargs):
+        facts = settle(self, *args, **kwargs)
+        paused.set()
+        assert go.wait(LONG_S)
+        return facts
+
+    def probed(self, *args, **kwargs):
+        seen.append(shared_free(journal))
+        return history(self, *args, **kwargs)
+
+    monkeypatch.setattr(SpaceReset, "_qos_settle", pausing)
+    monkeypatch.setattr(SpaceReset, "_history", probed)
+    return paused, go, seen
+
+
+def test_o66_a_run_whose_owner_lets_its_admission_go_keeps_the_hold_until_its_reset_in_a_thread_ends(
+    client, config, platform_file, ticker, tmp_path, fake, lock, journal, monkeypatch
+):
+    """O66: an attempt cancelled while its reset runs in a thread lets its admission go, but the reset's hold keeps a
+    share of it: neither the reset lock nor `federation.lock` is let go until the reset ends, so no other holder gets
+    in during it, and the reset passes; both are free once it has ended."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path)
+    paused, go, seen = paused_at_qos_settle(monkeypatch, journal)
+    try:
+        with lock.held(exclusive=False, timeout_s=1.0):
+            thread, landed = in_context_thread(
+                lambda: SpaceReset(p, now=ticker.clock).run(allowed=ALLOWED, qos_rights=True)
+            )
+            assert paused.wait(LONG_S)
+        assert not shared_free(journal), "the owner's leaving let the reset lock go under its reset"
+        with pytest.raises(FederationBusy):
+            lock.acquire(exclusive=False, timeout_s=0.2)  # another run is kept out
+    finally:
+        go.set()
+        thread.join(LONG_S)
+    (record,) = landed
+    assert not isinstance(record, BaseException), record
+    assert record["ok"] is True
+    assert seen == [False]
+    assert shared_free(journal)
+    lock.acquire(exclusive=True, timeout_s=1.0).close()  # federation.lock is free too
+
+
+def test_o66_an_outer_section_that_ends_while_its_nested_reset_runs_leaves_the_hold_to_it(
+    client, config, platform_file, ticker, tmp_path, fake, lock, journal, monkeypatch
+):
+    """O66: a reset in a thread that inherited the caller's section uses its hold; when the caller's section ends first
+    (its task cancelled), the hold is not let go until the reset has ended, and the run then has its share back."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path)
+    reset = SpaceReset(p, now=ticker.clock)
+    paused, go, seen = paused_at_qos_settle(monkeypatch, journal)
+    with lock.held(exclusive=False, timeout_s=1.0) as admission:
+        try:
+            with reset.exclusive() as grant:
+                thread, landed = in_context_thread(lambda: reset.run(allowed=ALLOWED, qos_rights=True))
+                assert paused.wait(LONG_S)
+            assert grant.held, "the caller's section let the hold go under its nested reset"
+            assert not shared_free(journal)
+        finally:
+            go.set()
+            thread.join(LONG_S)
+        (record,) = landed
+        assert not isinstance(record, BaseException), record
+        assert record["ok"] is True
+        assert seen == [False]
+        assert not grant.held
+        assert admission.reset.shared
 
 
 # --- no reset without the federation's admission --------------------------------------------------------------------

@@ -311,6 +311,21 @@ class Admission:
             if not self.held or self.shares.count == 0 or self.shares.sealed:
                 return None
             self.shares.count += 1
+        return self._giving_up()
+
+    def retain_for_reset(self) -> Callable[[], None] | None:
+        """A share of the admission for its own reset's exclusive hold (`resetgrant.py`), taken whether or not the
+        reset's section has sealed it, so that neither the admission nor its locks are let go while the hold stands,
+        even when the owner leaves meanwhile (a cancelled attempt whose reset runs on in a thread); the call that gives
+        it up, or None when the admission is no longer held or its release is under way."""
+        with self.shares.lock:
+            if not self.held or self.shares.count == 0:
+                return None
+            self.shares.count += 1
+        return self._giving_up()
+
+    def _giving_up(self) -> Callable[[], None]:
+        """The call that gives up a share just taken: only the first call counts, in any thread."""
         once = threading.Lock()  # never released: the first non-blocking acquire, in any thread, is the one that counts
 
         def give_up() -> None:

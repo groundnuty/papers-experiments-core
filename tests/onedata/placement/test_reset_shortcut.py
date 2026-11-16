@@ -275,6 +275,7 @@ def test_o51_a_shortcut_declared_without_faults_or_not_as_a_flag_or_a_negative_w
 
 
 def test_o51_the_shortcut_is_off_by_default_with_a_wait_of_a_minute(tmp_path):
-    """O51: a platform that declares neither key has the full reads, and a wait of 60 s if the shortcut is declared."""
+    """O51: a platform that declares neither key has the full reads, and `reset_exclusive_wait_s` defaults to 60 s,
+    a value that no longer bounds the wait (O66: every reset waits within `admission_timeout_s`)."""
     settings = placement_of(tmp_path, with_faults)
     assert (settings.reset_shortcut, settings.reset_exclusive_wait_s) == (False, 60.0)

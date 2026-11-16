@@ -46,7 +46,9 @@ be placing bytes, and a tool server it started may still run, since the MCP clie
 its own; the dead holder's line is ended, and every section refuses the shortcut for `DEAD_HOLDER_QUIET_S` after that,
 naming it); the record cannot be read (`holders_unread`); or a worker of the run holds a share of its admission
 (`shares_retained`: a sandbox's start thread, a task reusing the admission through a tool's hold, either of which may
-be reading; the admission is not sealed then). `shortcut_unavailable` (`UNAVAILABLE`), the old fallback of a wait that
+be reading; the admission is not sealed then, and such a worker of the run's own already at work goes on, as it did
+beside a full reset before: only other holders are excluded, and waiting for the run's own workers could keep its
+reset out for good). `shortcut_unavailable` (`UNAVAILABLE`), the old fallback of a wait that
 ran out, is no longer given: such a wait refuses.
 
 **The seal.** A section first seals the run's admission (`Admission.seal`, granted only while the owner's is its one
@@ -56,14 +58,19 @@ A section belongs to its federation (`ResetGrant.federation`): a nested section 
 is refused rather than given the outer grant, and a reading made in one federation's section gives the full reads to a
 reset of another (`resetshortcut.OTHER_FEDERATION`).
 
-**A hold that lapses** (the run's admission let go while its reset runs, which closes the share) is `ResetGrant.lapsed`:
-the reset begins no later stage (`resetspaces.py`), and the shortcut's narrowed reads fail the stage that finds it.
+**The hold lasts as long as its last user.** The grant keeps a share of the admission (`Admission.retain_for_reset`),
+so an owner that leaves while its reset still runs in a thread (a cancelled attempt) lets neither the admission nor its
+locks go until the reset ends; and a nested section (`ResetGrant.join`, a reset in a thread that inherited its
+caller's section) keeps the hold after the outer one has ended, the last to leave ending it. **A hold that lapses**
+all the same (its lock let go under it, or its grant ended while a reset still uses it) is `ResetGrant.lapsed`: the
+stage it lapsed in fails, the last included, and no later one begins (`resetspaces.py`); the shortcut's narrowed reads
+fail the stage that finds it too.
 """
 
 import contextlib
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -128,6 +135,9 @@ class ResetGrant:
     _epoch: int | None = field(default=None, repr=False)
     _admission: Admission | None = field(default=None, repr=False)
     _sealed: bool = field(default=False, repr=False)  # it sealed the admission, and unseals it at its end
+    _keep: Callable[[], None] | None = field(default=None, repr=False)  # gives up its share of the admission
+    _users: int = field(default=1, repr=False)  # the sections using it: its own, and every nested one still running
+    _guard: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _ended: bool = field(default=False, repr=False)
 
     def is_for(self, federation: Federation | None) -> bool:
@@ -146,8 +156,27 @@ class ResetGrant:
 
     @property
     def lapsed(self) -> bool:
-        """Whether the hold was had and is no longer in force before the grant ended: another holder may act now."""
-        return self.granted and not self._ended and not self.held
+        """Whether the hold was had and is no longer in force, ended or let go: another holder may act now, so a reset
+        still using it certifies nothing from here."""
+        return self.granted and not self.held
+
+    def join(self) -> bool:
+        """Count one more section using this grant (a nested one, maybe in a thread that inherited the context), while
+        its hold is in force; False, counting nothing, once it is not."""
+        with self._guard:
+            if self._ended or not self.held:
+                return False
+            self._users += 1
+            return True
+
+    def leave(self) -> None:
+        """A section using this grant has ended; the last one ends the grant (`end`), so the hold is never let go
+        while a reset still runs under it."""
+        with self._guard:
+            self._users -= 1
+            last = self._users == 0
+        if last:
+            self.end()
 
     @property
     def shortcut(self) -> bool:
@@ -176,8 +205,12 @@ class ResetGrant:
                 self._share.end_exclusive()
                 self._share.take_shared()
         finally:
-            if self._admission is not None and self._sealed:
-                self._admission.unseal()
+            try:
+                if self._admission is not None and self._sealed:
+                    self._admission.unseal()
+            finally:
+                if self._keep is not None:  # the last share lets the admission, and its locks, go (`Admission.close`)
+                    self._keep()
 
 
 def current_grant() -> "ResetGrant | None":
@@ -188,29 +221,40 @@ def current_grant() -> "ResetGrant | None":
 @contextlib.contextmanager
 def exclusive(config: PlatformConfig, settings: PlacementSettings) -> Iterator[ResetGrant]:
     """The exclusive hold of the reset lock (the module docstring) for the body of a `with`: yield the grant, and on
-    leaving let the hold go and take the run's share back. A hold inside a live one of the same federation uses the
-    outer grant. Raise `AdmissionRefused` on a platform with `[faults]` and no admission in the context, or one of
-    another federation, or one whose share is not held or whose owner has left; `ResetLockBusy` when the wait ran out
-    or was cancelled; and `FederationBusy` when the share cannot be taken back; when the body raised, its exception is
-    the one raised, with the failure to take the share back noted on it (the share then stays given up, and the run's
-    infrastructure refused)."""
+    leaving let the hold go and take the run's share back, once the last section using it has left. A hold inside a
+    live one of the same federation uses the outer grant (`ResetGrant.join`), so an outer section that ends while a
+    nested one still runs in a thread that inherited it leaves the hold to that one. Raise `AdmissionRefused` on a
+    platform with `[faults]` and no admission in the context, or one of another federation, or one whose share is not
+    held or whose owner has left; `ResetLockBusy` when the wait ran out or was cancelled; and `FederationBusy` when the
+    share cannot be taken back; when the body raised, its exception is the one raised, with the failure to take the
+    share back noted on it (the share then stays given up, and the run's infrastructure refused)."""
     outer = _GRANT.get()
-    if outer is not None and outer.held and outer.is_for(federation_for(config)):
-        yield outer
+    if outer is not None and outer.is_for(federation_for(config)) and outer.join():
+        with _using(outer):
+            yield outer
         return
     grant = _take(config, settings)
     token = _GRANT.set(grant)
     try:
-        yield grant
-    except BaseException as error:  # the body's failure stays the one raised: it says why the reset failed
+        with _using(grant):
+            yield grant
+    finally:
         _GRANT.reset(token)
+
+
+@contextlib.contextmanager
+def _using(grant: ResetGrant) -> Iterator[None]:
+    """One section's use of a grant, left however its body ends (`ResetGrant.leave`); the body's failure stays the
+    one raised, since it says why the reset failed, with a failure to end the grant noted on it."""
+    try:
+        yield
+    except BaseException as error:
         try:
-            grant.end()
+            grant.leave()
         except Exception as ending:  # the share is still given up, so the run's infrastructure stays refused
             error.add_note(f"and the share of the reset lock was not taken back: {type(ending).__name__}: {ending}")
         raise
-    _GRANT.reset(token)
-    grant.end()
+    grant.leave()
 
 
 def federation_for(config: PlatformConfig) -> Federation | None:
@@ -241,24 +285,39 @@ def _take(config: PlatformConfig, settings: PlacementSettings) -> ResetGrant:
     if admission.reset is not None and not admission.reset.shared:
         raise AdmissionRefused("a reset needs the run's share of the reset lock, held, to give up")
     sealed = admission.seal()  # refused while a worker holds a share: it may be reading, so no shortcut
-    try:
-        return _hold(admission, federation, faults, settings, sealed)
-    except BaseException:
+    keep = admission.retain_for_reset()  # the admission, and its locks, stay held for as long as the hold does
+    if keep is None:
         if sealed:
             admission.unseal()
+        raise AdmissionRefused("the run's admission was let go before its reset could hold the reset lock")
+    try:
+        return _hold(admission, federation, faults, settings, sealed, keep)
+    except BaseException:
+        try:
+            if sealed:
+                admission.unseal()
+        finally:
+            keep()
         raise
 
 
 def _hold(
-    admission: Admission, federation: Federation, faults: FaultSettings, settings: PlacementSettings, sealed: bool
+    admission: Admission,
+    federation: Federation,
+    faults: FaultSettings,
+    settings: PlacementSettings,
+    sealed: bool,
+    keep: Callable[[], None],
 ) -> ResetGrant:
-    """`_take` once the admission is checked (and `sealed`, when no worker held a share): the exclusive hold, or the
-    refusal."""
+    """`_take` once the admission is checked (and `sealed`, when no worker held a share) and a share of it kept for
+    the hold (`keep`): the exclusive hold, or the refusal."""
     holds = SharedHolds(faults.journal, name=RESET_HOLDS)
     if admission.exclusive:  # no shared admission can hold the federation, nor so the reset lock
         why, gone = _settled(holds)
         why = _why(settings, sealed, why)
-        return ResetGrant(why, FEDERATION_EXCLUSIVE, 0.0, gone, True, federation, _admission=admission, _sealed=sealed)
+        return ResetGrant(
+            why, FEDERATION_EXCLUSIVE, 0.0, gone, True, federation, _admission=admission, _sealed=sealed, _keep=keep
+        )
     share = admission.reset
     assert share is not None  # a shared admission's, checked by `_take`
     began = time.monotonic()
@@ -286,7 +345,17 @@ def _hold(
         raise refused
     why = _why(settings, sealed, why)
     return ResetGrant(
-        why, EXCLUSIVE, waited, gone, True, federation, _share=share, _epoch=epoch, _admission=admission, _sealed=sealed
+        why,
+        EXCLUSIVE,
+        waited,
+        gone,
+        True,
+        federation,
+        _share=share,
+        _epoch=epoch,
+        _admission=admission,
+        _sealed=sealed,
+        _keep=keep,
     )
 
 

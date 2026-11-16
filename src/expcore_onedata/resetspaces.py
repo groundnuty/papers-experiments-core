@@ -73,8 +73,8 @@ from expcore_onedata.resetgrant import ResetGrant, federation_for
 from expcore_onedata.resetplan import Holdings, given_scan
 
 LAPSED = (
-    "the reset lock's exclusive hold lapsed during the reset (the run's admission was let go): another holder may "
-    "have acted since, so the reset certifies nothing from here"
+    "the reset lock's exclusive hold lapsed during the reset: another holder may have acted since, so the reset "
+    "certifies nothing from here"
 )
 
 
@@ -182,6 +182,12 @@ class _Space:
     def begin(self, stage: str) -> None:
         self._started[stage] = self.p.clock()
         self._reads[stage] = self.reset.stage_reads()
+
+    def void(self, stage: str) -> None:
+        """Fail the space at `stage` because the reset lock's hold lapsed (`LAPSED`), whether or not it began it."""
+        if stage not in self._started:
+            self.begin(stage)
+        self.fail(stage, ProvisionError(LAPSED))
 
     def _transfer_reads(self, stage: str) -> dict[str, Any]:
         """The stage's own transfer reads' tally, for its record, when it made any (`transfer_read_retry`)."""
@@ -348,10 +354,10 @@ class SpacesReset:
         }
         for index, stage in enumerate(STAGES):
             started = self._clock()
-            if grant.lapsed:
-                self._lapsed(spaces, stage)
-            else:
+            if not grant.lapsed:
                 stages[stage](spaces)
+            if grant.lapsed:  # before the stage, or during it: what it did and read certifies nothing
+                self._lapsed(spaces, stage)
             self._walls[stage] = round(self._clock() - started, 3)
             if any(not space.live for space in spaces):
                 following = STAGES[index + 1] if index + 1 < len(STAGES) else None
@@ -364,12 +370,11 @@ class SpacesReset:
 
     @staticmethod
     def _lapsed(spaces: list[_Space], stage: str) -> None:
-        """The hold has lapsed (the run's admission was let go): another holder may act, so every space fails the stage
-        it would begin, and none begins a later one."""
+        """The hold has lapsed: another holder may act, so every space still live fails the stage it began or would
+        have begun, the last one included, and none begins a later one."""
         for space in spaces:
             if space.live:
-                space.begin(stage)
-                space.fail(stage, ProvisionError(LAPSED))
+                space.void(stage)
 
     def _record(self, spaces: list[_Space], began: float) -> dict[str, Any]:
         return {
