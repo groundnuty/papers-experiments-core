@@ -90,9 +90,18 @@ def test_p01_a_change_to_what_a_build_reads_is_dirt_and_one_elsewhere_or_a_marke
     (root / "src" / "expcore" / "new.py").unlink()
     (root / "src" / "expcore" / "build").mkdir()
     (root / "src" / "expcore" / "build" / "hidden.py").write_text("HIDDEN = 1\n", encoding="utf-8")
-    ignored = from_checkout(root)  # imported, and in no commit or wheel: git ignores build/ here
+    ignored = from_checkout(root)  # imported, and in no commit: git ignores build/ here
     assert ignored.dirty
-    assert "Python files in the packages that git ignores: src/expcore/build/hidden.py" in str(ignored.why)
+    assert "files under what a build reads that git ignores: src/expcore/build/hidden.py" in str(ignored.why)
+    shutil.rmtree(root / "src" / "expcore" / "build")
+    (root / "examples" / "tiny_study" / "out").mkdir(parents=True)
+    (root / ".git" / "info" / "exclude").write_text("out/\n", encoding="utf-8")  # hidden from git, not from hatchling
+    (root / "examples" / "tiny_study" / "out" / "state.json").write_text("{}\n", encoding="utf-8")
+    assert "examples/tiny_study/out/state.json" in str(from_checkout(root).why)
+    shutil.rmtree(root / "examples" / "tiny_study" / "out")
+    assert from_checkout(root).dirty is False
+    (root / ".hgignore").write_text("syntax: glob\nexamples/tiny_study/plugin.py\n", encoding="utf-8")
+    assert "files a build would ship that git does not track: .hgignore" in str(from_checkout(root).why)
 
 
 def test_c06_a_linked_subpackage_is_walked_and_its_link_is_dirt(repo, tmp_path):

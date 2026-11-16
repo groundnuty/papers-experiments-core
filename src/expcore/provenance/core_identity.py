@@ -10,9 +10,10 @@ same way however one commit is installed, and the campaign's environment records
 - **From a checkout** (an editable install, or `src/` on the path): when the imported `expcore` package is the
   `src/expcore` of a project named `papers-experiments-core` whose directory is the top of a git work tree, the entry
   is read live from git there: `HEAD`, `HEAD^{tree}`, and dirty when a file a build reads (`builds_from`: `src/`,
-  the example, the project and build files, the token hashes) differs from `HEAD` or is new and not ignored, or a
-  Python file git ignores lies in the packages (it is imported, and no commit or wheel holds it), or the packages
-  hold a link. A change elsewhere in the repository (a note, a test, the session log this project's hooks keep
+  the example, the project and build files, the ignore rules, the token hashes) differs from `HEAD` or is new, a file
+  git ignores lies under `BUILD_DIRS` (bytecode caches aside: hatchling reads only the top's ignore files, so a file
+  another rule hides can still be shipped, and a Python file there is imported though no commit holds it), or the
+  packages hold a link. A change elsewhere in the repository (a note, a test, the session log this project's hooks keep
   writing, the marker uv leaves at the top of its git checkouts) reaches no build and no import, and is not dirt. A
   checkout git cannot read is dirty.
 - **From a build** (a wheel, a git-URL or directory install, a wheel built from an sdist): the build hook
@@ -51,8 +52,16 @@ UNKNOWN = "unknown"
 PACKAGES = ("expcore", "expcore_onedata")
 EXAMPLES = "expcore/examples/"  # the example study the wheel carries: data the core writes out, not its code
 BUILD_DIRS = ("src/", "examples/tiny_study/")  # what a wheel ships from, and what an editable core imports
-BUILD_FILES = frozenset(
-    {"pyproject.toml", "hatch_build.py", "README.md", ".gitignore", "tests/data/study_tokens.sha256"}
+BUILD_FILES = frozenset(  # the project and build files, the ignore rules hatchling reads, what the wheel carries
+    {
+        "pyproject.toml",
+        "hatch.toml",
+        "hatch_build.py",
+        "README.md",
+        ".gitignore",
+        ".hgignore",
+        "tests/data/study_tokens.sha256",
+    }
 )
 _HEX = frozenset("0123456789abcdef")
 _SHA_CHARS = 40
@@ -186,22 +195,22 @@ def _tracked_links(root: Path) -> set[str] | None:
 
 
 def _ignored(root: Path) -> set[str] | None:
-    """The files git ignores in a checkout's packages, by path from its top; None when git cannot list them."""
-    listing = _git(root, "ls-files", "-z", "-oi", "--exclude-standard", "--", *(f"src/{p}" for p in PACKAGES), raw=True)
+    """The files git ignores under `BUILD_DIRS` of a checkout, by path from its top; None when git cannot list them."""
+    listing = _git(root, "ls-files", "-z", "-oi", "--exclude-standard", "--", *BUILD_DIRS, raw=True)
     return None if listing is None else {item for item in listing.split("\0") if item}
 
 
 def builds_from(path: str) -> bool:
     """Whether a file, by its path from the top of a checkout, is one a build of the core reads or an editable core
-    imports: below `BUILD_DIRS`, or one of `BUILD_FILES` (the project, the build hook, the readme the metadata holds,
-    the ignore rules that decide what a wheel ships, the token hashes it carries)."""
+    imports: below `BUILD_DIRS`, or one of `BUILD_FILES` (the project and hatch's configuration, the build hook, the
+    readme the metadata holds, the ignore rules that decide what a wheel ships, the token hashes it carries)."""
     return path.startswith(BUILD_DIRS) or path in BUILD_FILES
 
 
 def _dirt(root: Path) -> str | None:
-    """Why a checkout is dirty, else None: a file a build reads differs from HEAD, or is new and git does not ignore
-    it; a Python file git ignores lies in the packages; the packages hold a link (git holds a link's target path,
-    never what it leads to); or git cannot say."""
+    """Why a checkout is dirty, else None: a file a build reads differs from HEAD, or is new; a file git ignores lies
+    under `BUILD_DIRS`, bytecode caches aside (no commit holds it, and a wheel may ship it); the packages hold a link
+    (git holds a link's target path, never what it leads to); or git cannot say."""
     status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", raw=True)
     ignored = _ignored(root)
     if status is None or ignored is None:
@@ -222,10 +231,10 @@ def _dirt(root: Path) -> str | None:
     if untracked:
         more = f" and {len(untracked) - 3} more" if len(untracked) > 3 else ""
         return f"files a build would ship that git does not track: {', '.join(untracked[:3])}{more}"
-    hidden = sorted(item for item in ignored if _counted(item.removeprefix("src/")))
+    hidden = sorted(item for item in ignored if "__pycache__" not in item.split("/"))
     if hidden:
         more = f" and {len(hidden) - 3} more" if len(hidden) > 3 else ""
-        return f"Python files in the packages that git ignores: {', '.join(hidden[:3])}{more}"
+        return f"files under what a build reads that git ignores: {', '.join(hidden[:3])}{more}"
     links = sorted(
         {f"src/{name}" for name in package_files(root / "src")[1]}  # walked: what the packages import through
         | (_tracked_links(root) or set())  # held by git, under the example's place too
