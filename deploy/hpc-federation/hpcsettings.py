@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
 
 import tomllib
-from hpcslurm import NETWORK
+from hpcslurm import valid_network
 
 SIZE = re.compile(r"([1-9][0-9]{0,6})([mg])")
 TIME = re.compile(r"(?:([0-9]{1,2})-)?([0-9]{1,2}):([0-9]{2}):([0-9]{2})")
@@ -386,7 +386,7 @@ def checked_site(site: Site) -> Site:
     weight = site.billing_weight
     if weight is not None and (isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0):
         raise SettingsError("HPC_BILLING_MEM_WEIGHT: must be a positive number")
-    if site.step_network and not NETWORK.fullmatch(site.step_network):
+    if not valid_network(site.step_network):
         raise SettingsError(
             "HPC_STEP_NETWORK: must be an option of srun's --network (for example 'no_vni'): up to 128 letters, "
             "digits and _ . , = : + -, with no space"

@@ -163,7 +163,8 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   ran.
   The value is one option string of letters, digits and `_ . , = : + -` (at most 128, led by a letter or digit), checked
   when `site.env` is read, again when the state file's `site` record is read, and again when the argv is made, so it
-  never carries a space or a shell character; a refusal names `HPC_STEP_NETWORK` and not the value. It is recorded in
+  never carries a space or a shell character, and a record's value that is no string (a null, a false, a list) is refused
+  too, never read as none; a refusal names `HPC_STEP_NETWORK` and not the value. It is recorded in
   the state file with the rest of the site, so `down` and the service verbs use it with no environment. The services
   talk over TCP and need no virtual network identifier, which `no_vni` withholds; it is the value that ran live on
   component 0 (section 9, item 6), and its effect on a whole `up` and on component 1 was not seen. The step line that

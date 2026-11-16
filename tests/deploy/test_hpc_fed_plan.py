@@ -146,6 +146,19 @@ def test_a_step_network_with_a_space_or_a_shell_character_is_refused_naming_the_
         hpc.settings.Site.from_json({**recorded, "step_network": value})
 
 
+@pytest.mark.parametrize("value", [None, False, True, 0, 5, [], ["no_vni"], {}, {"no_vni": 1}, b"no_vni"], ids=repr)
+def test_a_step_network_in_the_state_that_is_not_a_string_is_refused_naming_the_variable(hpc, value):
+    """O57: a state record is read back as data, so `step_network` must be a string: a false, a null, a number or a
+    list is no option and no empty one, and is refused naming HPC_STEP_NETWORK (never read as none, never a TypeError);
+    a step handed one refuses it too."""
+    recorded = hpc.settings.site_from_environment(SITE_ENVIRON).to_json()
+    with pytest.raises(hpc.settings.SettingsError, match="HPC_STEP_NETWORK"):
+        hpc.settings.Site.from_json({**recorded, "step_network": value})
+    step = hpc.slurm.Step("4242", "node01", "hpcop-x-zone-facts", 1, 1024, (), ("true",), het_group=0, network=value)
+    with pytest.raises(hpc.slurm.SlurmError, match="HPC_STEP_NETWORK"):  # a falsy one is no "no option" to its guard
+        step.argv()
+
+
 def test_a_step_names_a_network_option_only_when_it_has_one(hpc):
     """O57: without one the step's whole srun line is what it was before the setting existed (an empty value is none);
     with one, that line plus `--network=<value>` after `--export=PATH`, so the prefix every test and tool slices
@@ -163,7 +176,7 @@ def test_a_step_names_a_network_option_only_when_it_has_one(hpc):
     assert parse_srun(named).network == "no_vni"
     assert parse_srun(wanted).network is None
     for bad in ("no vni", "a;b", "$x", "-x"):
-        with pytest.raises(hpc.slurm.SlurmError, match="network"):
+        with pytest.raises(hpc.slurm.SlurmError, match="HPC_STEP_NETWORK"):
             replace(plain, network=bad).argv()
 
 

@@ -42,6 +42,12 @@ OFFSET = re.compile(r"[0-9]{1,6}")
 NETWORK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.,=:+-]{0,127}")
 
 
+def valid_network(value: object) -> bool:
+    """Whether a step's network option can be used: the empty string (no option), or a string `NETWORK` matches. Any
+    other type is no option: a state record is data, and a false or a null must not read as none."""
+    return isinstance(value, str) and (value == "" or NETWORK.fullmatch(value) is not None)
+
+
 class SlurmError(RuntimeError):
     """A Slurm command that failed, or a job or step that is not what was asked for."""
 
@@ -280,8 +286,8 @@ class Step:
     def argv(self) -> List[str]:
         out = [f"--output={self.output}"] if self.output else []
         group = [] if self.het_group is None else [f"--het-group={self.het_group}"]
-        if self.network and not NETWORK.fullmatch(self.network):
-            raise SlurmError("the step's network option holds a character a step's argv must not carry")
+        if not valid_network(self.network):
+            raise SlurmError("HPC_STEP_NETWORK: the step's network option is not one an srun argv may carry")
         network = [f"--network={self.network}"] if self.network else []
         return [
             "srun",
