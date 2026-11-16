@@ -132,6 +132,7 @@ from expcore.study.config import (
 )
 from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
+from expcore.study.platform_deferral import platform_deferrals
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
@@ -321,6 +322,7 @@ def _run_campaign(
     whose threads refuse the study's own `InfraError` kinds as unknown ones, and a config no one has checked.
     """
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
+    declared = platform_deferrals(study)  # from each platform's own configuration, before any study code runs (C11)
     plugin = load_plugin(StudyContext(study, code))
     out = out_dir(study)
     leases = None if plugin.probe is None else LeasePool(out / "leases", plugin.lease_keys, plugin.probe)
@@ -360,6 +362,8 @@ def _run_campaign(
             on_hold=_say_hold,
             shard=started,
             reset_settings=plugin.reset_settings,
+            platform_deferrals=declared,
+            listed_platforms=study.platforms,
             **options,
         ) as scheduler:
             _say_lost(scheduler.lost_counted)
