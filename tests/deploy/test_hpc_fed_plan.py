@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import LAYOUT, FakeProcess, FakeSlurm, import_hpc, parse_srun
+from hpc_fed_support import LAYOUT, FakeProcess, FakeSlurm, hpc_on_path, parse_srun
 
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
@@ -18,7 +18,8 @@ from expcore_onedata.linksettings import link_pairs
 
 @pytest.fixture(scope="module")
 def hpc():
-    return import_hpc()
+    with hpc_on_path() as modules:
+        yield modules
 
 
 # -- the [hpc] table ------------------------------------------------------------------------------------------------

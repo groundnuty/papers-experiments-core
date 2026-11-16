@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeSlurm, import_hpc
+from hpc_fed_support import LAYOUT, SITE, FakeSlurm, hpc_on_path
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
 from expcore_onedata.linksettings import link_pairs
@@ -20,7 +20,8 @@ PROVIDERS = ["aspen", "larch", "rowan", "alder", "hazel"]
 
 @pytest.fixture(scope="module")
 def hpc():
-    return import_hpc()
+    with hpc_on_path() as modules:
+        yield modules
 
 
 @pytest.fixture

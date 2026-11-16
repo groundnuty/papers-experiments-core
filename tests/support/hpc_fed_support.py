@@ -10,10 +10,12 @@ directory, then the zone's verdict, or the provider's wait for its token and, on
 
 import json
 import re
-import sys
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import pytest
 
 HPC = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation"
 LAYOUT = HPC / "layouts" / "pilot-shape.toml"
@@ -26,11 +28,21 @@ SITE = {
 PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
 
 
-def import_hpc():
-    """The driver's modules, imported by their plain names as hpcfed.py imports them."""
-    for path in (HPC, HPC.parent / "compose-federation"):
-        if str(path) not in sys.path:
-            sys.path.insert(0, str(path))
+@contextmanager
+def hpc_on_path():
+    """The driver's modules, imported by their plain names as hpcfed.py imports them, with both deploy directories on
+    `sys.path` only for as long as the context lasts (the driver imports some modules lazily, by plain name).
+
+    `sys.path` is restored when the context ends: `deploy/hpc-federation` holds a `facts/` directory, and left on the
+    path it would be found as a namespace package `facts` by every later test that imports a module of that name (the
+    plugin-module tests do)."""
+    with pytest.MonkeyPatch.context() as patch:
+        for path in (HPC.parent / "compose-federation", HPC):
+            patch.syspath_prepend(str(path))
+        yield _import_hpc()
+
+
+def _import_hpc():
     import hpcboot
     import hpcdriver
     import hpcfed
