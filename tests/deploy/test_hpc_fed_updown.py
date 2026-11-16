@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path, pin_values
+from hpc_fed_support import LAYOUT, PEM, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path, pin_values
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
 from expcore_onedata.linksettings import link_pairs
@@ -158,6 +158,28 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_r
     command = json.loads(values["hpc_command"])
     assert command[1] == "-B"
     assert command[2:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
+
+
+KEY_BLOCK = "-----BEGIN RSA " + "PRIVATE KEY-----\nTUlJQg==\n-----END RSA " + "PRIVATE KEY-----\n"  # a stand-in
+
+
+def test_the_root_keeps_only_the_certificate_of_a_ca_export_that_holds_its_key_first(hpc, tmp_path, site):
+    """O57: the image's CA file holds the CA's private key before its certificate (seen live: the core's phase refused
+    the root's ca_file, so every up failed before the link check); the root keeps the certificate alone."""
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(ca_pem=KEY_BLOCK + "\n" + PEM))
+    rig.up()
+    kept = (rig.root / "ca" / "federation-ca.pem").read_text(encoding="utf-8")
+    assert kept == PEM
+    assert "PRIVATE KEY" not in kept
+
+
+def test_an_up_whose_ca_export_holds_no_certificate_fails_and_writes_no_ca(hpc, tmp_path, site):
+    """O57: a CA export with a key and no certificate fails up, and the root holds no CA file."""
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(ca_pem=KEY_BLOCK))
+    with pytest.raises(RuntimeError, match="holds no certificate"):
+        rig.up()
+    assert not (rig.root / "ca" / "federation-ca.pem").exists()
+    assert rig.core_calls == []
 
 
 def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancels_only_its_job(hpc, tmp_path, site):

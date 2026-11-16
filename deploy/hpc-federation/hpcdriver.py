@@ -22,6 +22,7 @@ from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
 from hpcboot import core_phase, hpc_spec, hpc_values, load_owner
+from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
 from hpclaunch import Launcher, StateStore
 from hpcsettings import HpcSettings, Site
@@ -536,7 +537,8 @@ class Driver(Down):
             )
 
     def export_zone(self) -> None:
-        """The zone's passphrase into the root's secrets (0600), where the Compose root holds it, and its CA."""
+        """The zone's passphrase into the root's secrets (0600), where the Compose root holds it, and its CA: the
+        certificates alone (`hpcca`), since the image's CA file holds the CA's private key before its certificate."""
         state = self.store.read()
         zone, prefix = state["services"]["zone"], state["allocation"]["name"]
 
@@ -552,10 +554,7 @@ class Driver(Down):
         if not PASSPHRASE.fullmatch(passphrase):
             raise RuntimeError("the zone's exported passphrase is not one line of letters and digits")
         write_secret(self.layout.passphrase(self.spec.zone.name), passphrase)
-        ca = export("ca")
-        if "-----BEGIN CERTIFICATE-----" not in ca:
-            raise RuntimeError("the zone's exported CA holds no certificate")
-        self.layout.ca_pem.write_text(ca, encoding="utf-8")
+        self.layout.ca_pem.write_text(ca_certificates(export("ca")), encoding="utf-8")
 
     def placed_layout(self, state: Mapping[str, Any]) -> Layout:
         hosts = {name: record["fqdn"] for name, record in state["services"].items() if record["kind"] in ("oz", "op")}

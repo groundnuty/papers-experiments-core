@@ -289,7 +289,13 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    its node proves the tree read-only (section 8).
 7. **The root's secrets and CA**: the zone's admin passphrase through a control step's stdout into
    `secrets/zone.passphrase` (0600), as the registration tokens travel; the Onedata test CA of the zone's rootfs (public)
-   into `ca/federation-ca.pem`.
+   into `ca/federation-ca.pem`, **its `CERTIFICATE` blocks alone** (`hpcca.py`): the image's file holds the CA's
+   private key before its certificate (seen live), and a key block of any kind is left out, so the root never holds a
+   key; an export with no certificate, or a block that is not whole, fails `up`. The core's refusal of a key in
+   `ca_file` stays as the backstop. **The CA stays the image's own**, the same for every federation of one image: its
+   digest is in the campaign fingerprint (`PlatformConfig.fingerprint()`), so a CA made per federation would stop
+   shards of different federations merging, as a Onezone id did. If one is ever wanted, its digest must leave the
+   fingerprint first.
 8. **The core's phase** (`hpcboot.core_phase`), on the login node or in a control step on the zone's node, as `[hpc]
    core` says (section 9). **The bootstrap** is the Compose federation's own `fedboot.Bootstrap` over a layout whose
    services' URLs are `https://<node FQDN>:8443`: the admin's token, the users, the spaces, the support (on each

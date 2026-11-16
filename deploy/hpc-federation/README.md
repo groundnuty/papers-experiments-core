@@ -303,7 +303,8 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
   with every peer address, and pipes a registration token from the zone into each provider; copies the zone's
-  passphrase (0600) and the Onedata test CA into the root (`bundle/zone-export.sh`); then bootstraps the federation
+  passphrase (0600) and the Onedata test CA's certificates, never its key, into the root (`bundle/zone-export.sh`,
+  `hpcca.py`); then bootstraps the federation
   through the Compose bootstrap over `https://<node FQDN>:8443`, writes its baseline, `facts.json` and
   `platform.toml`, and runs the platform layer's link check, which writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.

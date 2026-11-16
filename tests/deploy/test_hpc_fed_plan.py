@@ -168,6 +168,24 @@ def test_the_pilot_shape_has_five_providers_four_data_spaces_and_ten_link_pairs(
     assert len(link_pairs(config.spaces, list(config.providers))) == 10
 
 
+def test_the_ca_kept_from_an_export_that_holds_its_key_first_loads_as_the_platforms_ca_file(hpc, tmp_path, make_ca):
+    """O57: a real CA exported as the image's file holds it, its private key before its certificate: the core refuses
+    the export whole as `ca_file` (its backstop), and loads the certificates `up` keeps of it."""
+    import hpcca
+
+    from expcore.config.loading import ConfigError
+
+    path = rendered_pilot(hpc, tmp_path, make_ca)
+    made, kept = tmp_path / "made", tmp_path / "ca" / "federation-ca.pem"
+    exported = (made / "ca.key").read_text(encoding="utf-8") + (made / "ca.pem").read_text(encoding="utf-8")
+    assert "PRIVATE KEY" in exported
+    kept.write_text(exported, encoding="utf-8")
+    with pytest.raises(ConfigError, match="private key"):
+        load_platform(path)
+    kept.write_text(hpcca.ca_certificates(exported), encoding="utf-8")
+    assert load_platform(path).tls.ca_file == kept.resolve()
+
+
 def test_the_platform_declares_the_hpc_backend_and_its_stop_bound_and_no_compose_keys(hpc, tmp_path, make_ca):
     """O57: up renders [faults] for the HPC backend (M4): backend "hpc", stop_bound_s from the layout (stop_seconds +
     90 s), the journal in the root and every provider as a service, with none of the Compose keys it refuses."""
