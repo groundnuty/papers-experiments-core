@@ -107,6 +107,34 @@ run's outbound connections are logged and reported, and the analysis is run agai
 `tests/egress_probe.c`, which connects to a loopback listener and, non-blocking, to 192.0.2.1 (TEST-NET-1, never
 routed), so no test sends outside traffic. It needs Unix sockets, which some sandboxes forbid; it skips there.
 
+## The agent's gate on a shared loopback
+
+The data gate has no network of its own on these nodes either: it listens on the loopback every user of the node
+shares, on a port above 1023. Two pieces, neither run live yet:
+
+- **The gate's owner check** (`peer_uid_check: true` in the gate's configuration, `src/expcore_onedata/sandbox/gatepeer.py`).
+  The gate serves a connection only if the peer's socket belongs to its own uid, by the same `/proc/net/tcp` and
+  `tcp6` rows `portshim-owner.h` reads, and closes any other, one it cannot attribute and every one when the tables
+  cannot be read, before a byte is read or written, logging one `peer_refused` line with the reason. It is off by
+  default (Docker's gate is on its own network); the gate directory then needs `gate.py`, `gatepolicy.py` and
+  `gateboundary.py` as before, and `gatepeer.py` beside them when it is on. The gate does not start with it on if it
+  runs as uid 0 or cannot read the table.
+- **`gateport.c`**, the cell's connect-side mapper: an `LD_PRELOAD` shim that sends a TCP `connect()` to
+  `127.0.0.1:443` to the gate's port, because the published REST client dials 443 only, and touches no
+  other connection. The port is read once at load from the cell's `/etc/expcore/gate.json`
+  (`{"address": "127.0.0.1", "port": P, ...}`), which decides whenever it exists, and otherwise from
+  `EXPCORE_GATE_PORT`; a malformed file or variable makes the process redirect nothing and say so once on stderr. It
+  calls the next `connect()` by `dlsym(RTLD_NEXT)` and goes **before `egresslog.so`** in the preload list, so the
+  egress log records the gate's port; after it, it is never reached. Build: `gcc -shared -fPIC -O2
+  -fno-stack-protector -Wall -Wextra -Werror -o gateport.so gateport.c -ldl`, in the cell's image. The bundle hashes
+  tarballs (`.provenance`), not shims: whoever loads the built shim into a cell pins it by the hash of the file it
+  built. No IPv6 destination is rewritten, `[::1]:443` included: the core's gate listens on 127.0.0.1 only, and a rewrite to `[::1]:<gate port>` could reach another user's listener (see the header of the file).
+
+`tests/deploy/test_hpc_gate_port_shim.py` builds the shim with the host's gcc and drives it with a Python client
+against listeners of its own, a stand-in for the next `connect()` (`tests/fake_next_connect.c`) and the egress shim;
+`tests/onedata/sandbox/test_gatepeer.py` and `test_gate_peer_owner.py` read the kernel's own tables for a real
+connection and write another uid's rows from its address pair.
+
 ## The Couchbase administrator and its guard
 
 Couchbase 4.5 lets any REST caller act as its administrator until one exists. onepanel creates it, as the image
@@ -260,6 +288,7 @@ space (M3) and the agent's node's step (M5) are not built here.
 | `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, the archives the merge takes |
 | `nodefacts.py` | control step | a node's FQDN, its IPv4 address, and the job's uid and gid, as JSON (`hpcfed.py up`) |
 | `zone-export.sh` | control step on the zone's node | the zone's passphrase or the Onedata test CA on stdout, for the federation's root (`hpcfed.py up`) |
+| `gateport.c` | agent's cell | the connect-side mapper: a TCP connect to 127.0.0.1:443 goes to the gate's port; nothing else is touched |
 
 ## A campaign's shards: one per federation (`shards.py`)
 
