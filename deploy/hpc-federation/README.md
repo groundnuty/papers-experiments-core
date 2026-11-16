@@ -9,6 +9,9 @@ below 1024, and where the node's `/tmp` may be shared with other users. The imag
 Status: what has run live, and what has not, is in the dated facts files under `facts/` (the live-run notes
 themselves are kept privately, since they name the site). The agent's egress detection (below) has not run live.
 `hpcfed.py` ("The driver", below), which brings a whole federation up and down from a layout file, has not run live.
+The dated facts files so far: [`facts/2026-11-14-standing-1.md`](facts/2026-11-14-standing-1.md) (the first standing
+allocation) and [`facts/2026-11-16-slot-7-proxy-equivalence.md`](facts/2026-11-16-slot-7-proxy-equivalence.md) (the host
+mount against the Compose sidecar in forced proxy, with its record beside it).
 
 **This file names no site.** Everything site-specific comes from `site.env`, a local file that is never committed
 (see "Site configuration").

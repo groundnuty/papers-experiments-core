@@ -260,7 +260,7 @@ For readers of the commits before this release:
 
 ### Documentation
 
-- The first live comparison of the HPC host mount with the Compose mount sidecar, in forced proxy (#179, O60; `deploy/hpc-federation/facts/2026-11-16-slot-7-proxy-equivalence.md`, with its record `2026-11-16-slot-7-proxy-equivalence.json`). The same six files, read by the same script from the same before-maps, came out equal on both halves in bytes, SHA-256 and every provider's block maps before and after, with the same effective I/O mode and the same oneclient build; the file states the differences it explains (the Compose mount's `allow_other`, the token lifetime's margin, read and start times) and what it does not show (direct I/O, timing, files beyond six small ones).
+- A live comparison of the HPC host mount with the Compose mount sidecar, in forced proxy (#179, O60; `deploy/hpc-federation/facts/2026-11-16-slot-7-proxy-equivalence.md`, with its record `2026-11-16-slot-7-proxy-equivalence.json`). The same six files, read by the same script from the same before-maps, came out equal on both halves in bytes, SHA-256 and every provider's block maps before and after, with the same effective I/O mode and the same oneclient build; the file states the differences it explains (the Compose mount's `allow_other`, the token lifetime's margin, read and start times) and what it does not show (direct I/O, timing, files beyond six small ones).
 
 ### Known limits
 
