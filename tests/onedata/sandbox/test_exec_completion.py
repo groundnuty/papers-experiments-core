@@ -169,6 +169,23 @@ def test_o55_a_status_docker_reports_other_than_the_recorded_one_is_an_exit_not_
     assert check.facts["exit_status"] == 1
 
 
+def test_o56_a_cause_names_the_exec_of_the_backend_that_ran_it():
+    """O56: on the Apptainer backend every cause names `apptainer exec`, never `docker exec` (the HPC probe's C5)."""
+    done = Completion.for_source("print(1)\n", runner="apptainer exec")
+    line = payload(done, 1)
+    causes = [
+        done.check(CmdResult(137, "", "", stdout_marks=(), stderr_marks=())).cause,
+        done.check(CmdResult(0, "", "", stdout_marks=(line,), stderr_marks=(line,))).cause,
+        done.check(CmdResult(0, "", "", stdout_marks=(), stderr_marks=(), input_error="0 of 9 bytes written")).cause,
+    ]
+    assert causes[0].startswith("the exec's exit was not recorded: apptainer exec reported exit 137 ")
+    assert causes[1] == (
+        "the exec's exit was not recorded: apptainer exec reported exit 0 and the container recorded exit 1"
+    )
+    assert causes[2].startswith("the cell's source was not written whole to apptainer exec ")
+    assert not any("docker" in cause for cause in causes)
+
+
 def test_o55_an_input_not_written_whole_is_said_when_no_record_came():
     done = Completion.for_source("print(1)\n")
     got = CmdResult(0, "", "", stdout_marks=(), stderr_marks=(), input_error="0 of 9 bytes written (BrokenPipeError)")

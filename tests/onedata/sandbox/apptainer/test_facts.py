@@ -34,8 +34,10 @@ def recorded(box) -> list[str]:
 
 def test_o56_the_record_lists_every_departure_and_the_mount_refusal_only_when_asked():
     """O56: the key is stable and its text is looked up in `FACTS`; the list is sorted, with or without the key."""
-    assert facts.record(mount_refused=True) == {"backend": "apptainer", "facts": sorted(facts.FACTS)}
-    assert facts.record(mount_refused=False) == {"backend": "apptainer", "facts": OTHERS}
+    refused, accepted = facts.record(mount_refused=True), facts.record(mount_refused=False)
+    assert refused["facts"] == sorted(facts.FACTS)
+    assert accepted["facts"] == OTHERS
+    assert {**refused, "facts": None} == {**accepted, "facts": None}  # the rest of the record does not depend on it
     assert KEY in facts.FACTS
 
 
