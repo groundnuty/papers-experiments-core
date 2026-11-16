@@ -38,6 +38,12 @@ space's Onezone id, which every federation's `up` makes anew, and the shards nev
 a manifest of more than one federation whose platform files leave a space's data undeclared, naming each shard and
 space, before anything runs.
 
+**The study's own data is verified before a shard is planned (O57).** A space whose data comes from the study's ingest,
+after `up`, is checked by `hpcfed.py verify-data` (every file's path, size and SHA-256 read back through its owner and
+compared with the manifest it declares), which records a marker in the federation's state file. `plan` and `lines`
+refuse a federation whose ingested spaces have no marker, or whose marker is for another manifest than the one `up`
+recorded or the platform file names now, naming the shard and the spaces; so does a state with no record of them.
+
 **The node's tmpfs is the node's, not the job's.** Each step's directory there (`expcore-shard-<label>.<random>`)
 records its step (`step.json`: its pid and start time, its shard, its federation's root, its results directory, the
 archive it started from, and its phase): `running` while its dispatcher runs, `archiving` from the moment it ends
@@ -273,6 +279,7 @@ def federation(shard: Shard) -> dict[str, Any]:
         raise ShardsError(f"shard {shard.label}: its federation has no held job on record")
     if state.get("phase") != LINKED:  # an up that failed (its data check, its link check) left a federation not ready
         raise ShardsError(f"shard {shard.label}: its federation's up has not finished (phase {state.get('phase')})")
+    check_ingested(shard, state)
     record = state.get("sandbox")
     placement, group = "allocation", None
     if record is not None:
@@ -297,6 +304,62 @@ def federation(shard: Shard) -> dict[str, Any]:
     if shard.node and node != shard.node:
         raise ShardsError(f"shard {shard.label}: the manifest's sandbox_node is not the one its state file names")
     return {"job": job, "name": name, "node": node, "placement": placement, "het_group": group}
+
+
+def platform_data(root: Path) -> dict[str, str | None]:
+    """For each space of the federation's `platform.toml` that declares its data (`data_manifest`), the content hash of
+    the manifest it names, as the dispatcher's fingerprint will take it (`Manifest.digest()`), None for a file that
+    cannot be read or is no manifest. A relative path is the root's, where the file lies."""
+    from expcore.config.loading import ConfigError
+    from expcore_onedata.importmanifest import load_manifest
+
+    data = tomllib.loads((root / PLATFORM).read_text(encoding="utf-8"))
+    entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
+    found: dict[str, str | None] = {}
+    for entry in entries:
+        if not (isinstance(entry, Mapping) and isinstance(entry.get("name"), str) and entry.get("data_manifest")):
+            continue
+        try:
+            found[entry["name"]] = load_manifest(root / str(entry["data_manifest"])).digest()
+        except (ConfigError, OSError, ValueError):
+            found[entry["name"]] = None
+    return found
+
+
+def check_ingested(shard: Shard, state: Mapping[str, Any]) -> None:
+    """Refuse a federation whose ingested spaces (those the study fills after `up`, which its state records) have no
+    verified marker (O57): data nothing has shown to be the declared data is data a shard would spend on under a
+    fingerprint that says otherwise. A marker is `hpcfed.py verify-data`'s pass, bound to the digest of the manifest it
+    compared with; it counts only while that is the manifest `up` recorded and the one the platform file names now (a
+    manifest edited after the verification changes the fingerprint and leaves the pass for another experiment). A state
+    with no record at all, from an `up` that predates it, cannot be shown verified."""
+    data = state.get("data")
+    ingested = data.get("ingested") if isinstance(data, Mapping) else None
+    if not isinstance(ingested, Mapping):
+        raise ShardsError(
+            f"shard {shard.label}: its federation's state has no record of its ingested spaces (its up predates it): "
+            "down, then up again"
+        )
+    if not ingested:
+        return
+    try:
+        declared = platform_data(shard.root)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        raise ShardsError(f"shard {shard.label}: its federation's {PLATFORM} could not be read") from None
+    unverified = []
+    for space, record in ingested.items():
+        record = record if isinstance(record, Mapping) else {}
+        verified = record.get("verified")
+        marker = verified.get("manifest") if isinstance(verified, Mapping) else None
+        recorded = record.get("manifest")
+        if not (isinstance(marker, str) and marker == recorded and declared.get(space, recorded) == recorded):
+            unverified.append(str(space))
+    if unverified:
+        spaces = ", ".join(sorted(unverified))
+        raise ShardsError(
+            f"shard {shard.label}: its federation's ingested space(s) have no verified data: {spaces} "
+            "(run `hpcfed.py verify-data` once the ingest is done)"
+        )
 
 
 def undeclared_data(plan: Plan) -> list[str]:

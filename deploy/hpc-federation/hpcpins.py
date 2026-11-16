@@ -1,5 +1,5 @@
-"""The agent's Apptainer sandbox in a platform template (M5): what `up` fills into its `[sandbox]` from `site.env`, and
-the check of every pinned file before the cluster is touched.
+"""The site's values in a platform template: what `up` fills into the agent's Apptainer sandbox (M5) and the study's
+own paths from `site.env`, and the check of every pinned file before the cluster is touched.
 
 A template that declares the Apptainer sandbox names its site values as placeholders (`PLACEHOLDERS`): the agent's SIF
 and the egress shim built for it, and oneclient's bundle for a mount level (`oneclient_bundle.py`), each with the
@@ -9,11 +9,16 @@ missing or its SHA-256 is not the one declared, naming the variable and never th
 the declared SHA-256s, which the sandbox checks at every start (O13) and the campaign fingerprint holds
 (`PlatformConfig.fingerprint`, `sandbox_backend`), never a path. The egress collector is the
 bundle's own, so `values` hashes this checkout's copy.
+
+`@study_artifacts@` (`HPC_STUDY_ARTIFACTS`) is the directory of the study's own artifacts on the nodes (its tool
+server's venv, clone and manifests), so a study's template names its paths under it and a public replication package
+carries no site path. It is a path, not a pin: a template or a space's `data_manifest` that names it needs the
+variable, and an unset one is no value (the renderer then refuses the placeholder, rather than write an empty path).
 """
 
 import hashlib
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 from hpcsettings import Site
 
@@ -29,6 +34,10 @@ PLACEHOLDERS = {
     "hpc_oneclient_bundle": ("HPC_ONECLIENT_BUNDLE", "oneclient_bundle"),
     "hpc_oneclient_bundle_sha": ("HPC_ONECLIENT_BUNDLE_SHA256", "oneclient_bundle_sha256"),
     "hpc_agent_work_root": ("HPC_AGENT_WORK_ROOT", "agent_work_root"),
+    "study_artifacts": ("HPC_STUDY_ARTIFACTS", "study_artifacts"),
+}
+WHY = {  # what names a placeholder, where the default (the template's [sandbox]) is not it
+    "study_artifacts": "a platform template or a space's data_manifest names @study_artifacts@ (site.env)",
 }
 FILES = {  # file -> its pin
     "hpc_agent_sif": "hpc_agent_sif_sha",
@@ -53,16 +62,16 @@ def named(template: str) -> list:
     return [name for name in PLACEHOLDERS if name in found]
 
 
-def check(site: Site, template: Optional[str]) -> None:
-    """Refuse a site that leaves a placeholder of the template unfilled, or whose declared file is missing or has
-    another SHA-256 than the one declared; the message names the variable, never the path."""
-    wanted = named(template or "")
+def check(site: Site, template: Optional[str], also: Sequence[str] = ()) -> None:
+    """Refuse a site that leaves a placeholder of the template (or of `also`, other text that names them: a space's
+    declared `data_manifest`) unfilled, or whose declared file is missing or has another SHA-256 than the one declared;
+    the message names the variable, never the path."""
+    wanted = named("\n".join([template or "", *also]))
     for name in wanted:
         variable, attribute = PLACEHOLDERS[name]
         if not getattr(site, attribute):
-            raise RuntimeError(
-                f"{variable} is not set: the platform template's [sandbox] names it (site.env, the agent's sandbox)"
-            )
+            why = WHY.get(name, "the platform template's [sandbox] names it (site.env, the agent's sandbox)")
+            raise RuntimeError(f"{variable} is not set: {why}")
     for name, pin in FILES.items():
         if name not in wanted:
             continue
@@ -76,6 +85,7 @@ def check(site: Site, template: Optional[str]) -> None:
 
 
 def values(site: Site) -> Dict[str, str]:
-    """The placeholders' values: the site's, as declared, and the bundle's collector with its SHA-256."""
-    found = {name: getattr(site, attribute) for name, (_, attribute) in PLACEHOLDERS.items()}
+    """The placeholders' values: the site's, as declared (one it does not declare is no value, so the renderer refuses a
+    placeholder nothing filled), and the bundle's collector with its SHA-256."""
+    found = {name: getattr(site, attr) for name, (_, attr) in PLACEHOLDERS.items() if getattr(site, attr)}
     return {**found, OWN[0]: str(COLLECTOR), OWN[1]: sha256_of(COLLECTOR)}
