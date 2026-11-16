@@ -41,6 +41,14 @@ no_baked() {  # <dir>
 die() { printf 'hpcop: ERROR: %s\n' "$*" >&2; exit 1; }
 say() { printf 'hpcop: %s\n' "$*" >&2; }
 ok() { printf 'ok: %s\n' "$*" >&2; }
+# <tool>...: every one is a command on PATH, or die naming each missing one. A step's PATH is the driver's allowlist
+# alone (HPC_STEP_PATH, under env -i): the first live zone step found no ss there and failed. A script calls it up
+# front for the tools it needs, so it fails at once, naming them, rather than halfway or with an empty reading.
+need_tools() {
+  local t missing=()
+  for t in "$@"; do command -v -- "$t" > /dev/null 2>&1 || missing+=("$t"); done
+  (( ${#missing[@]} == 0 )) || die "not found on PATH ($PATH): ${missing[*]}; HPC_STEP_PATH must name the directories that hold them"
+}
 
 # The job's TMPDIR, decided once, here, in the shell that sources this file, before any work directory is
 # made or removed. Some sites set the per-job TMPDIR to a link into a shared parallel filesystem (seen live:
