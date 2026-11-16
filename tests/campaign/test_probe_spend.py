@@ -14,7 +14,7 @@ from openai.types.chat import ChatCompletion
 from scheduler_support import build, event_kinds, settings_for
 
 from expcore.campaign.executor import default_backend_factory
-from expcore.campaign.gate import Budget, BudgetGate
+from expcore.campaign.gate import HOLDS_KEY, Budget, BudgetGate
 from expcore.campaign.identity import ACCEPTED_META
 from expcore.campaign.probe_spend import MeteredProbes, charged
 from expcore.campaign.topup import Ledger
@@ -147,7 +147,8 @@ def test_c26_a_release_written_for_a_stopped_campaign_is_taken_before_its_probes
     with opened(tmp_path, budget) as scheduler:
         scheduler.run()  # the stop on the whole campaign begins
         assert MODEL in scheduler.not_admitted
-    release.write_text("ALL\n", encoding="utf-8")
+        serial = json.loads(scheduler.store.get_meta(HOLDS_KEY))["ALL"]["serial"]
+    release.write_text(f"ALL {serial}\n", encoding="utf-8")
     with opened(tmp_path, budget) as scheduler:
         assert not release.exists()  # used up at the start
         assert scheduler.not_admitted == {}
