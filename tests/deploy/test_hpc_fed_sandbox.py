@@ -6,10 +6,20 @@ file records where the agent's node is (`sandbox.node`, M5's shard driver reads 
 whole or a partial up, never a job that is not ours. Slurm is the fake of hpc_fed_support."""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeProcess, FakeSlurm, hpc_on_path
+from hpc_fed_support import (
+    LAYOUT,
+    PILOT_TEMPLATE,
+    SITE,
+    FakeProcess,
+    FakeSlurm,
+    agent_site,
+    hpc_on_path,
+    without_sandbox,
+)
 
 PROVIDERS = ["aspen", "larch", "rowan", "alder", "hazel"]
 CONTROL = 'control = { cpus = 1, memory = "1g" }'
@@ -33,7 +43,7 @@ def site(tmp_path):
         (images / name).write_bytes(b"tar")
         (images / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
     (tmp_path / "fed").mkdir()
-    return {**SITE, "SH": str(images), "L": str(logs)}
+    return {**SITE, **agent_site(tmp_path / "agent"), "SH": str(images), "L": str(logs)}
 
 
 def agent_layout(
@@ -48,7 +58,8 @@ def agent_layout(
     text = text.replace(PLACEMENT, f'sandbox_placement = "{placement}"')
     text = text.replace(CONTROL, f"{CONTROL}\n{hpc_extra}") if hpc_extra else text
     template = LAYOUT.parent / "pilot-shape.platform.toml.template"
-    plate = template.read_text(encoding="utf-8") + template_extra
+    plate = template.read_text(encoding="utf-8")
+    plate = without_sandbox(plate) + template_extra if template_extra else plate  # the extra's [sandbox] in its place
     if rename[0]:
         text, plate = text.replace(*rename), plate.replace(*rename)
     (folder / LAYOUT.name).write_text(text, encoding="utf-8")
@@ -138,22 +149,28 @@ def test_a_declared_agents_node_below_the_agents_limits_is_refused(hpc):
 
 
 def test_a_template_without_the_apptainer_sandbox_gives_no_agents_limits(hpc, tmp_path):
-    """O57: the pilot's template, or one whose sandbox is Docker's, declares no agent's node on HPC."""
-    assert hpc.settings.agent_limits(LAYOUT.parent / "pilot-shape.platform.toml.template") is None
+    """O57: a template with no [sandbox], or one whose sandbox is Docker's, declares no agent's node on HPC."""
+    bare = tmp_path / "bare.toml.template"
+    bare.write_text(without_sandbox(PILOT_TEMPLATE.read_text(encoding="utf-8")), encoding="utf-8")
+    assert hpc.settings.agent_limits(bare) is None
     docker = tmp_path / "docker.toml.template"
     docker.write_text(apptainer_limits().replace('"apptainer"', '"docker"'), encoding="utf-8")
     assert hpc.settings.agent_limits(docker) is None
 
 
-def test_the_pilot_layout_records_the_coordinators_choice_and_declares_no_agents_node_yet(hpc):
-    """O57: the pilot's layout records sandbox_placement = "het" in its [hpc] table; its template declares no
-    Apptainer sandbox, so it holds no agent's node until M5's lane declares one."""
+def test_the_pilot_layout_holds_the_agents_node_its_template_sizes_as_a_het_component(hpc):
+    """O57, O63: the pilot's layout records sandbox_placement = "het" in its [hpc] table, and its template declares the
+    Apptainer sandbox (6 cores and 8 + 4 + 1 GiB), so it holds the agent's node at the least step for those limits: 8
+    cores and 17 GiB, the 18 GB node the billing is reckoned with."""
     import fedspec
 
     spec = fedspec.load_spec(LAYOUT)
     assert spec.hpc["sandbox_placement"] == "het"
-    settings = hpc.settings.load_settings(spec.hpc, hpc.settings.agent_limits(spec.platform_template))
-    assert (settings.sandbox_placement, settings.sandbox) == ("het", None)
+    agent = hpc.settings.agent_limits(spec.platform_template)
+    assert agent == hpc.settings.AgentLimits(6.0, 8 * GIB, 4 * GIB, GIB)
+    settings = hpc.settings.load_settings(spec.hpc, agent)
+    assert (settings.sandbox_placement, settings.sandbox) == ("het", hpc.settings.Size(8, 17 * 1024))
+    assert settings.sandbox_node() == hpc.settings.Size(9, 18 * 1024)
 
 
 def test_the_layouts_template_gives_the_driver_the_agents_node(hpc, tmp_path):
@@ -175,7 +192,7 @@ def test_down_never_reads_the_agents_limits_so_an_edited_template_cannot_keep_a_
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     template = rig.layout.parent / "pilot-shape.platform.toml.template"
-    template.write_text(template.read_text(encoding="utf-8") + tail, encoding="utf-8")
+    template.write_text(without_sandbox(template.read_text(encoding="utf-8")) + tail, encoding="utf-8")
     words = ["--layout", str(rig.layout), "--root", str(rig.root)]
     assert hpc.cli.main([*words, "describe"], {}, runner=rig.fake) == 2
     assert hpc.cli.main([*words, "down"], {}, runner=rig.fake) == 0
@@ -360,7 +377,7 @@ def test_het_up_holds_the_services_and_the_agents_node_as_two_components_of_one_
 
 def test_every_step_on_the_agents_node_runs_in_its_component_and_no_service_runs_there(hpc, tmp_path, site):
     """O57: the agent's node facts step runs with --het-group=1; every other step names no het group (component 0);
-    no service step runs on the agent's node, and down runs nothing there."""
+    no service step runs on the agent's node, and down runs one step there, its sweep (O63), in the same component."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     on_agent = [s for s in rig.fake.sruns if s.node == "node07"]
@@ -370,7 +387,9 @@ def test_every_step_on_the_agents_node_runs_in_its_component_and_no_service_runs
     assert all(s.node != "node07" for s in rig.fake.spawned)
     rig.fake.sruns.clear()
     rig.driver.down()
-    assert [s for s in rig.fake.sruns if s.node == "node07"] == []
+    (swept,) = [s for s in rig.fake.sruns if s.node == "node07"]
+    assert swept in rig.fake.sweeps
+    assert (swept.het_group, swept.job) == (1, "4242")
 
 
 def test_het_up_whose_agents_component_is_recorded_otherwise_cancels_the_job_and_down_removes_the_root(
@@ -571,3 +590,67 @@ def test_a_state_whose_agents_job_is_not_a_job_id_is_refused(hpc, tmp_path, site
     path.write_text(json.dumps(state), encoding="utf-8")
     with pytest.raises(hpc.state.StateError, match=r"sandbox\.job"):
         hpc.state.load(rig.root)
+
+
+# -- down's sweep of the agent's node (O63) ------------------------------------------------------------------------
+
+
+def step_directory(node_tmp: Path, name: str, root: Path, *, start: str = "0", failed: bool = False) -> Path:
+    """A shard step's directory on the agent's node's tmpfs, as shards.py step makes it: its owner record (by default
+    of a step killed while its dispatcher ran: this process's pid with another start time) and, with `failed`, the
+    record of a dispatcher that ended and its archive-failed mark."""
+    path = node_tmp / f"expcore-shard-fed-a.{name}"
+    (path / "study" / "out").mkdir(parents=True)
+    shard = {"index": 1, "count": 2, "label": "fed-a"}
+    record = {"shard": shard, "pid": os.getpid(), "start": start, "root": str(root),
+              "phase": "archiving" if failed else "running"}  # fmt: skip
+    (path / "step.json").write_text(json.dumps(record), encoding="utf-8")
+    if failed:
+        (path / "ARCHIVE-FAILED.json").write_text(json.dumps({"shard": shard, "exit_status": 0}), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(("placement", "job", "group"), [("het", "4242", 1), ("separate", "4343", None)])
+def test_o63_down_sweeps_the_agents_node_removing_gone_steps_and_naming_a_kept_out(
+    hpc, tmp_path, site, placement, job, group
+):
+    """O63: down runs shards.py's sweep as a control step on the agent's node (its component, or its own job), with
+    the nodes' Python, the node's tmpfs and this root: a step directory of this federation whose step is gone is
+    removed, one whose out/ could not be archived is kept and named in down's report, and the root goes."""
+    node_tmp = tmp_path / "node-tmp"
+    node_tmp.mkdir()
+    fake = FakeSlurm(sweep_here=True, node_tmp=str(node_tmp))
+    rig = Rig(hpc, tmp_path, {**site, "HPC_NODE_TMP": str(node_tmp)}, placement, fake)
+    rig.up()
+    gone = step_directory(node_tmp, "gone", rig.root)
+    kept = step_directory(node_tmp, "kept", rig.root, failed=True)
+    printed = rig.driver.down()
+    (swept,) = rig.fake.sweeps
+    assert (swept.node, swept.job, swept.het_group) == ("node07", job, group)
+    assert swept.command[0] == "python3.11"
+    assert swept.command[swept.command.index("--tmpfs") + 1] == str(node_tmp)
+    assert swept.command[swept.command.index("--root") + 1] == str(rig.root)
+    assert not gone.exists()
+    assert kept.is_dir()
+    assert f"{kept.name} (its out/ was not archived" in printed
+    assert not rig.root.exists()
+
+
+def test_o63_a_sweep_that_fails_leaves_the_root_but_never_the_job_billing(hpc, tmp_path, site):
+    """O63: the agent's node could not be swept: the held job is cancelled all the same, and down reports the node
+    unverified, keeping the root for a second down."""
+
+    def failing(srun):
+        if "sweep" in srun.command:
+            from hpcslurm import Completed
+
+            return FakeProcess(Completed(1, "", "Traceback ...\n"))
+        return None
+
+    fake = FakeSlurm(on_control=failing)
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    rig.up()
+    with pytest.raises(RuntimeError, match="the agent's node could not be verified clean"):
+        rig.driver.down()
+    assert fake.cancelled == ["4242"]
+    assert rig.root.exists()

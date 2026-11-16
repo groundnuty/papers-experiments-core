@@ -188,3 +188,43 @@ def test_c06_a_store_of_the_earlier_form_resumes_unchanged_and_nothing_else_does
     assert legacy_fingerprint_of(read_fingerprint(path), later, other_tls) == later
     assert legacy_fingerprint_of(read_fingerprint(path), later, None) == later
     assert legacy_fingerprint_of(None, later, config.legacy_fingerprint()) == later
+
+
+# -- the one-space form -------------------------------------------------------------------------------------------
+
+
+def one_space(tmp_path, name, *, data=None, space_id="sp-1", declare=True):
+    """One federation's platform file in the one-space form ([space] and [support]), its space's id the one its up
+    made, `[space]` naming its data manifest when `declare`."""
+    directory = tmp_path / name
+    directory.mkdir(parents=True)
+    write_manifest(data or manifest(), directory / "data-manifest.json")
+
+    def edit(document):
+        document["space"]["id"] = space_id
+        if declare:
+            document["space"]["data_manifest"] = "data-manifest.json"
+
+    return load_platform(write_platform(directory, edit))
+
+
+def test_c06_the_one_space_form_without_a_manifest_keeps_its_fingerprint_exactly(tmp_path):
+    """C06: `[space]` without `data_manifest`: the fingerprint is the one it always was, so every one-space store
+    resumes unchanged and no earlier form is needed."""
+    config = one_space(tmp_path, "one", declare=False)
+    assert config.fingerprint() == {"tls": {"mode": "verify"}}
+    assert config.legacy_fingerprint() is None
+
+
+def test_c06_one_space_federations_with_the_same_data_merge_and_one_file_different_does_not(tmp_path):
+    """C06: the one-space form held nothing of its space, so its shards on two federations merged whatever data they
+    held (only a plugin's environment identity caught it); with `data_manifest` its data identity is in the
+    fingerprint: the same data on two federations merges, one file different is refused."""
+    one = one_space(tmp_path, "one")
+    same = one_space(tmp_path, "same", space_id="sp-9")
+    other = one_space(tmp_path, "other", data=manifest(((FILES[0][0], b"x"), FILES[1])), space_id="sp-7")
+    assert one.fingerprint() == {"tls": {"mode": "verify"}, "space_data": manifest().digest()}
+    assert leaked_values(json.dumps(one.fingerprint()), tmp_path / "one") == []
+    check_fingerprints([shard(1, campaign(one.fingerprint())), shard(2, campaign(same.fingerprint()))])
+    with pytest.raises(MergeRefused, match=r"ran another campaign .*\n  platform\.space_data"):
+        check_fingerprints([shard(1, campaign(one.fingerprint())), shard(2, campaign(other.fingerprint()))])

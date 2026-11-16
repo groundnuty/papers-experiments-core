@@ -529,10 +529,14 @@ step here; the gate is on S's loopback and every cell a local `apptainer exec` o
 `[hpc] sandbox = { cpus, memory }`, or the agent's limits in the layout's template, makes S one more role, placed
 last, recorded in the state file as the service `sandbox` (kind `sandbox`, no work directory) and as the top-level
 `sandbox` record (section 4). S is held at its own shape (section 2), as component 1 of the held job
-(`sandbox_placement = "het"`) or as a held job of its own (`"separate"`; section 1). M5 renders `[sandbox]` into
-`platform.toml` through the layout's template and launches its shard's step on `sandbox.node` with
-`--jobid=<sandbox.job>`, plus `--het-group=<sandbox.het_group>` when that is not `null`; the driver holds, reads back
-and places S, runs only its node facts step there, and releases it in `down`.
+(`sandbox_placement = "het"`) or as a held job of its own (`"separate"`; section 1). `[sandbox]` is in the pilot's
+template (O63), with placeholders `up` fills from `site.env` (`hpcpins`: the SIF and the egress shim, each checked
+against its declared SHA-256 before the cluster is touched, the work root, and the bundle's collector), and every path
+into the root is rendered absolute. M5 launches its shard's step on `sandbox.node` with `--jobid=<sandbox.job>`, plus
+`--het-group=<sandbox.het_group>` when that is not `null`; the step makes the sandbox's work root on S's tmpfs and copies
+the root's `platform.toml` beside the study's `study.toml`. The driver holds, reads back and places S, runs its node
+facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`: each shard step's directory of this
+federation whose step is gone), then releases it.
 
 ## 9. Assumptions a live slot verifies first
 
@@ -567,4 +571,4 @@ and places S, runs only its node facts step there, and releases it in `down`.
 | M1 (this) | `hpcfed.py` (`up`, `down`, `describe`, `core`, the hook); the state file and its store; placement; sizing; the submit read-back; the step launcher (allowlist, names, client handling); the bootstrap and `platform.toml`; the link check; `bundle/nodefacts.py`, `bundle/zone-export.sh` | the bundle as it is |
 | M3 | the imported storage on the shared filesystem, read-only, in the provider's step | section 8 |
 | M4 | `hpcfed_control.py` (`stop`, `start`, `status`, `exec`, behind the hook); `teardown.sh --keep`, `restart.sh`, `exec.sh`, `status.sh`; the sweep's kept mark; the `"hpc"` backend of `[faults]` | sections 4 and 7 |
-| M5 | the agent's node's step and `[sandbox]` in the template; its node held by M1 as a heterogeneous job's component or a job of its own | sections 1, 4 and 8 |
+| M5 | the agent's node's step and `[sandbox]` in the template (built: `hpcpins`, `shards.py`, O63); its node held by M1 as a heterogeneous job's component or a job of its own | sections 1, 4 and 8 |

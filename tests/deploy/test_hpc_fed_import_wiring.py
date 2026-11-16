@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import SITE, FakeProcess, FakeSlurm, hpc_on_path
+from hpc_fed_support import SITE, FakeProcess, FakeSlurm, agent_site, hpc_on_path
 from hpc_import_support import (
     IMPORT_LAYOUT,
     INGEST_LAYOUT,
@@ -41,7 +41,7 @@ def site(tmp_path):
         (images / name).write_bytes(b"tar")
         (images / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
     (tmp_path / "fed").mkdir()
-    return {**SITE, "SH": str(images), "L": str(logs)}
+    return {**SITE, **agent_site(tmp_path / "agent"), "SH": str(images), "L": str(logs)}
 
 
 @pytest.fixture

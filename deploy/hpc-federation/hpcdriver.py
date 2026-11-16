@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import hpcimport
+import hpcpins
 import hpcrelay
 import hpcstate
 from fedlayout import ROOT_MARKER, Layout
@@ -165,6 +166,8 @@ class Driver(Down):
             raise RuntimeError("L is not a directory")
         if self.settings.core == "step" and not site.core_python:
             raise RuntimeError('[hpc] core = "step" needs HPC_CORE_PYTHON, the core\'s Python on the nodes')
+        template = self.spec.platform_template
+        hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None)
         if self.settings.sandbox is not None:
             self.say(
                 f"the layout declares the agent's node ({self.settings.sandbox_placement}): it is held and placed, and "
@@ -565,8 +568,9 @@ class Driver(Down):
         if len(owner) != 2:
             raise RuntimeError("the state names no owner of the providers' storage: the node facts did not run")
         self.require_mount_proofs(state)
-        s = self.settings
-        values = hpc_values(state["command"], s.stop_bound_s, s.settle_timeout_s)
+        s, site = self.settings, Site.from_json(state["site"])
+        # the agent's sandbox's values, as up recorded the site (its files' pins checked in the preflight)
+        values = {**hpc_values(state["command"], s.stop_bound_s, s.settle_timeout_s, self.root), **hpcpins.values(site)}
         out = self.core(self.placed_layout(state), owner, values, environ=self.environ)
         self.set(lambda s: s.update(phase="bootstrapped"))
         return out

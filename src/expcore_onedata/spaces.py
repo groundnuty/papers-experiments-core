@@ -36,17 +36,18 @@ without the key.
 nothing of this one may write to it: a shared import must be read-only, and `readonly = false` beside `shared = true`
 is refused at load. It enters the fingerprint only when true, so no earlier declaration's fingerprint changes.
 
-**The space's data identity** (`data_manifest`, an entry of `[[spaces]]`; C06). A space is the same experimental
-condition across federations when its declared identity and its data identity match. `data_manifest` names the manifest
-of the data the space holds (`importmanifest`: every file with its size and SHA-256, every directory), relative to the
-platform file or absolute; the loader reads and checks it, and the entry keeps its content hash (`Manifest.digest()`),
-never the path. An entry that declares it has a digest of its declared identity (label, name, prefixes, support,
-holder, token planes, import) and that hash, without the space's Onezone id, a deployment's handle that every
-federation's `up` makes anew: two federations holding the same data give one digest, and one file different gives
-another. An entry without it keeps the digest it always had, which holds the Onezone id, so its data being unknown,
-two federations never give one digest, and a store started before the key existed resumes as it was.
-`legacy_digest()` is that id-bearing form of any entry, which a store started before the entry declared its data may
-have recorded (`PlatformConfig.legacy_fingerprint`).
+**The space's data identity** (`data_manifest`, in `[space]` or an entry of `[[spaces]]`; C06). A space is the same
+experimental condition across federations when its declared identity and its data identity match. `data_manifest` names
+the manifest of the data the space holds (`importmanifest`: every file with its size and SHA-256, every directory),
+relative to the platform file or absolute; the loader reads and checks it, and the entry keeps its content hash
+(`Manifest.digest()`), never the path. An entry that declares it has a digest of its declared identity (label, name,
+prefixes, support, holder, token planes, import) and that hash, without the space's Onezone id, a deployment's handle
+that every federation's `up` makes anew: two federations holding the same data give one digest, and one file different
+gives another. An entry without it keeps the digest it always had, which holds the Onezone id, so its data being
+unknown, two federations never give one digest, and a store started before the key existed resumes as it was. In the
+one-space form, whose fingerprint holds nothing of its space, a declared manifest adds its content hash (`space_data`),
+and without one that fingerprint is as it was. `legacy_digest()` is that id-bearing form of any entry, which a store
+started before the entry declared its data may have recorded (`PlatformConfig.legacy_fingerprint`).
 """
 
 import hashlib
@@ -62,9 +63,9 @@ from expcore.config.loading import ConfigError, Section
 PLANES = ("data_path", "tool_server")  # the token planes (`tokens.Plane`), by the values a space's `tokens` names
 ONE_SPACE_LABEL = "space"  # the label of the one-space form's space: its table's name
 LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
-SPACE_KEYS = ("name", "id", "prefixes", "import")
+SPACE_KEYS = ("name", "id", "prefixes", "import", "data_manifest")
 SUPPORT_KEYS = ("providers", "local")
-SPACES_KEYS = ("label", *SPACE_KEYS, *SUPPORT_KEYS, "holder", "tokens", "data_manifest")
+SPACES_KEYS = ("label", *SPACE_KEYS, *SUPPORT_KEYS, "holder", "tokens")
 
 
 @dataclass(frozen=True)
@@ -200,7 +201,8 @@ def _one_space(root: Section, providers: Collection[str]) -> tuple[StudySpace, .
     support_table = root.section("support")
     support_table.reject_unknown(SUPPORT_KEYS)
     support = parse_support(support_table, providers)
-    return (StudySpace(ONE_SPACE_LABEL, "spaces[0]", space, support, imported=parse_import(space_table)),)
+    imported, data = parse_import(space_table), parse_data(space_table)
+    return (StudySpace(ONE_SPACE_LABEL, "spaces[0]", space, support, imported=imported, data=data),)
 
 
 def _entry(entry: Section, position: str, providers: Collection[str]) -> StudySpace:

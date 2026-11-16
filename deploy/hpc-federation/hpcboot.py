@@ -11,8 +11,9 @@ real addresses (DESIGN.md, sections 5 and 6).
   with the same ids (`hpcimport.import_storage_extra`) and mapped the same way, on the storage its support names; the
   core's phase waits for the scan, and verifies each space against its manifest (`fedimport.verify_imports`) over the
   rendered `platform.toml`, before the link check.
-- **`platform.toml`** is rendered from the layout's own template by the Compose renderer, plus the HPC values a
-  template may name: `@hpc_stop_bound_s@` (a stop's whole bound, `[hpc] stop_seconds` + 90 s), `@hpc_settle_timeout_s@`
+- **`platform.toml`** is rendered from the layout's own template by the Compose renderer, plus the HPC values a template
+  may name: `@hpc_root@` (the root, so every path into it is absolute and a copy of the file beside a study reads the
+  root's files), `@hpc_stop_bound_s@` (a stop's whole bound, `[hpc] stop_seconds` + 90 s), `@hpc_settle_timeout_s@`
   (above it), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of each direct-I/O
   import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and `@hpc_token_margin_s@`: the
   least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
@@ -27,6 +28,7 @@ from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
+import hpcdata
 import hpcimport
 import tomllib
 from fedboot import Bootstrap
@@ -194,12 +196,19 @@ def least_margin_s(path: Path, rendered: str, settle_timeout_s: float) -> int:
     return math.ceil(restore_token_margin_s(load_faults(path, load_platform(path))))
 
 
-def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int) -> Dict[str, str]:
-    """The HPC values a platform template may name, but the token margin (`write_platform` derives it)."""
+def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int, root: Path) -> Dict[str, str]:
+    """The HPC values a platform template may name, but the token margin (`write_platform` derives it). `root` is the
+    federation's root, as an absolute path in a basic string of TOML: the template's paths into the root are written
+    with it (`@hpc_root@/secrets/...`), so a copy of the file elsewhere (beside a study, `shards.py step`) reads the
+    root's own files."""
+    text = str(root)
+    if not os.path.isabs(text) or any(c in text for c in '"\\') or not text.isprintable():
+        raise ValueError("the federation's root is no absolute path a TOML string can hold as it is")
     return {
         "hpc_command": json.dumps(list(command)),  # a TOML array of basic strings is JSON's
         "hpc_stop_bound_s": str(stop_bound_s),
         "hpc_settle_timeout_s": str(settle_timeout_s),
+        "hpc_root": text,
     }
 
 
@@ -251,11 +260,13 @@ def core_phase(
     content: Callable[[Bootstrap], Any] = Content,
     links: Callable[[Layout, Dict[str, str]], str] = check_after_up,
     verify: Callable[..., Any] = verify_imports,
+    data: Callable[[Bootstrap], Callable[[str], Any]] = hpcdata.content_reader,
 ) -> str:
-    """Bootstrap the federation, write its baseline, its facts and platform.toml, verify every shared import against
-    its manifest over the rendered file, and run the link check; return what up prints, or raise naming the step that
-    failed. The services must be up, and the root must hold the zone's passphrase and the CA. `environ` is where the
-    imports' variables are read (this process's when None): a core step's own is an allowlist that carries none."""
+    """Bootstrap the federation, write its baseline, each space's data manifest, its facts and platform.toml, verify
+    every shared import against its manifest over the rendered file and every other space's data against its own (read
+    back through `data`, O63), and run the link check; return what up prints, or raise naming the step that failed. The
+    services must be up, and the root must hold the zone's passphrase and the CA. `environ` is where the imports'
+    variables are read (this process's when None): a core step's own is an allowlist that carries none."""
     passphrase = layout.passphrase(layout.spec.zone.name)
     if not passphrase.is_file() or not layout.ca_pem.is_file():
         raise RuntimeError("the root holds no zone passphrase or no CA: the zone's export did not run")
@@ -266,14 +277,17 @@ def core_phase(
         steps(boot)
         if not layout.facts.exists():
             content(boot).reset(TRANSFER_TIMEOUT_S)
-        filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env)}
+        manifests = hpcdata.data_manifests(layout, env)
+        filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env),
+                  **hpcdata.values(manifests)}  # fmt: skip
         written = write_facts(layout, boot, filled)
         # before the link check, so a platform file that leaves the sharing out fails up with no link record written
         verify(layout, env, timeout_s=VERIFY_TIMEOUT_S)
+        held = hpcdata.check(layout, manifests, data(boot))  # no space is ready on a claim: its data is read back
         checked = links(layout, dict(boot.ids.spaces))
     finally:
         client.close()
-    return f"{written}\n{checked}"
+    return f"{written}\n{held}\n{checked}"
 
 
 def load_owner(text: str) -> Optional[Tuple[int, int]]:
