@@ -12,8 +12,9 @@ explains.
 
 Some of it is no agent's: Apptainer's setuid starter and the cell's `appinit` are hidden by the same rule, and the
 kernel's counters are kept in per-CPU batches. So a cell is judged by how much the unexplained memory grew, from the
-last reading taken with no cell running (never below nothing) to each poll during the cell, against `margin_bytes` for
-each PID namespace of a cell in the cgroup. The start's own cells (the egress canary and the read-only probe, the
+last reading taken with no cell's namespace in the cgroup (never below nothing) to each poll during the cell, against
+`margin_bytes` for the running cell and for each other run's cell in the cgroup (a namespace of the run's own never
+adds one). The start's own cells (the egress canary and the read-only probe, the
 harness's code) calibrate it: one that grew past the margin means this node's own share is too large to tell an agent's
 from, and the run's memory reading is then unknown (`margin_exceeded_at_start`), never a kill.
 
@@ -143,12 +144,14 @@ class HiddenCheck:
         inside = [p for p in found if P.in_cgroup(p.cgroup, self.cgroup)]
         charged, visible = min(before, after), sum(p.anon or 0 for p in inside)
         unexplained = charged - visible
+        cells = {p.pidns for p in inside if p.pidns is not None and p.pidns != self._own}
         if self._cell is None:
-            self._idle = unexplained
+            if not cells:  # another run's cell, hidden memory and all, is never this run's baseline
+                self._idle = unexplained
             return None
         grown = unexplained - self._baseline
-        cells = {p.pidns for p in inside if p.pidns is not None and p.pidns != self._own}
-        allowance = self.margin * max(1, len(cells))
+        foreign = cells - run_namespaces
+        allowance = self.margin * (1 + len(foreign))  # the running cell's share, and each other run's cell's
         if self._cell_peak is None or grown > self._cell_peak:
             self._cell_peak = grown
             if self._peak is None or grown > self._peak["unexplained_bytes"]:
@@ -163,7 +166,7 @@ class HiddenCheck:
         self._passed = True
         if self._calibrating or self._acted:
             return None
-        if cells - run_namespaces:
+        if foreign:
             self._cell_reasons.add(UNATTRIBUTED)
             return None
         if self._uncalibrated:

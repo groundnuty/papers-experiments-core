@@ -143,6 +143,38 @@ def test_o56_memory_unexplained_before_the_cell_is_its_baseline(node, tmp_path):
     assert watch.end_cell()["memory"]["reading"] == "within"
 
 
+def test_o56_another_run_s_cell_between_cells_is_never_the_baseline(node, tmp_path):
+    """O56: a reading taken while another run's cell (its hidden memory too) is in the cgroup is not this run's
+    baseline: once that cell is gone, this run's own hidden memory is not masked by it."""
+    watch = _watch(node, tmp_path)
+    watch.poll()
+    other = node.new_namespace()
+    theirs = [node._new_proc(other, "python3"), node._new_proc(other, "python3", hidden=True, anon=500 * MIB)]
+    watch.poll()
+    for proc in theirs:
+        proc.alive = False
+    watch.begin_cell(1, "n")
+    ns, top, _agent = _cell(node)
+    node._new_proc(ns, "python3", hidden=True, anon=300 * MIB)
+    _polls(watch, 2)
+    assert not top.alive
+    assert watch.end_cell()["kills"][0]["what"] == "memory_hidden"
+
+
+def test_o56_a_second_namespace_of_the_run_s_own_never_widens_the_margin(node, tmp_path):
+    """O56: the margin grows only for another run's cell; a namespace the run's own processes are in (tagged) adds
+    none, so 150 MiB hidden under a 100 MiB margin is a kill however many the run has."""
+    watch = _watch(node, tmp_path)
+    watch.poll()
+    watch.begin_cell(1, "n")
+    ns, top, _agent = _cell(node)
+    node._new_proc(node.new_namespace(), "python3", environ=(TAG,))
+    node._new_proc(ns, "python3", hidden=True, anon=150 * MIB)
+    _polls(watch, 2)
+    assert not top.alive
+    assert watch.end_cell()["kills"][0]["limit"] == MARGIN
+
+
 def test_o56_hidden_memory_with_another_run_s_cell_in_the_cgroup_is_unknown_never_a_kill(node, tmp_path):
     """O56: with another run's cell charged to the same cgroup, the memory cannot be told whose it is: the reading is
     `unknown` (`unattributed`), and nothing is killed."""
