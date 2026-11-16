@@ -485,7 +485,7 @@ each time: size `snapshot_every_s` to what the shared filesystem can take.
 
 ## A fleet of federations (`fleet.py`)
 
-A campaign's shards run in parallel, one shard per federation and one federation per held job (O67; DESIGN.md,
+A campaign's shards run in parallel, one shard per federation and one federation per held job (O68; DESIGN.md,
 section 1, "A fleet"). `fleet.py` brings N federations up from one layout, gives each a shard, launches each shard's
 step and takes them all down. Run it on the login node, from a private 0700 directory of yours, with `-I`. Its
 layout holds each agent's node as a job of its own, `[hpc] sandbox_placement = "separate"`: on the site's Slurm, steps
