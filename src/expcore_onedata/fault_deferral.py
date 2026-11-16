@@ -9,10 +9,33 @@ learn the figure twice, from two objects that do not depend on each other. The h
 between. A study's own check around the platform's that leaves `max_deferral_s` out, or answers less, then disagrees
 with the admission and the scheduler refuses the campaign (`SchedulerConfig.check_declared_deferral`), where it would
 otherwise hold `max_defer_s` to nothing. Both declarations are built here, so they agree by construction.
+
+A study's plugin can wrap the admission too, so the platform declares the bound a third time, through the module the
+study lists in `[study] platforms` (`sandbox.kinds.declared_deferral_from_config`, read by the core, with no object of
+the study's plugin between): `declared_from_file` loads the study's platform.toml as the platform layer does and answers
+the same figure from its `[faults]`. Loading it holds the file to every check the platform makes of its own
+configuration, the least `[tokens] margin_s` of its backend included.
 """
 
+import os
+
 from expcore.campaign.healthgate import DeferralBound
-from expcore_onedata.fault_settings import FaultSettings, heal_deferral_s
+from expcore.config.loading import load_toml
+from expcore_onedata.config import load_platform
+from expcore_onedata.fault_settings import FaultSettings, heal_deferral_s, load_faults
+
+PLATFORM_MODULE = "expcore_onedata.sandbox.kinds"  # the module a study lists in `[study] platforms` for this platform
+
+
+def declared_from_file(path: str | os.PathLike[str]) -> DeferralBound | None:
+    """The longest the platform's health check may stay deferred under the `[faults]` of the platform.toml at `path`
+    (`heal_deferral_bound`); None when the file has no `[faults]`, or the heal is off. The file is loaded as a run loads
+    it, with no secret read, so a refusal names the file and the key as the platform layer words it (a `[tokens]
+    margin_s` below its backend's least, say)."""
+    config = load_platform(path, require_secrets=False)
+    if "faults" not in load_toml(config.file):
+        return None
+    return heal_deferral_bound(load_faults(config.file, config))
 
 
 def heal_deferral_bound(settings: FaultSettings) -> DeferralBound | None:
@@ -41,4 +64,10 @@ def heal_deferral_bound(settings: FaultSettings) -> DeferralBound | None:
         "counted; lower heal_timeout_s or session_drain_s, or set "
         'heal = "off", to shorten it'
     )
-    return DeferralBound(heal_deferral_s(settings), detail, rechecks=2 if drained else 1, checks=2 if drained else 1)
+    return DeferralBound(
+        heal_deferral_s(settings),
+        detail,
+        rechecks=2 if drained else 1,
+        checks=2 if drained else 1,
+        platform=PLATFORM_MODULE,
+    )

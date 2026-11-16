@@ -83,7 +83,9 @@ class StudyPlugin:
       an attempt starts and left after its post-run check, so the check sees what the run left; None when it has none.
       It may also have a method `declared_deferral_s()` answering the longest the platform's health check may stay
       deferred (a `DeferralBound` or None, read from the platform's settings), which the core holds `health` to: a
-      health check that exposes no `max_deferral_s`, or a smaller bound, is refused when the campaign starts.
+      health check that exposes no `max_deferral_s`, or a smaller bound, is refused when the campaign starts. The core
+      also reads the declaration itself, from the platform's own configuration through the module `[study] platforms`
+      names (`study.platform_deferral`), so wrapping `admission` hides nothing.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
       Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, each level's data path and
       listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign
