@@ -311,9 +311,10 @@ class ApptainerSandbox:
         paths = [Path(os.path.normpath(path)) for path in self._mount.token_paths()]
         real = Path(os.path.realpath(self.dir))
         outside = [p for p in paths if p == self.dir or not p.is_relative_to(self.dir)]
-        outside += [p for p in paths if not Path(os.path.realpath(p)).is_relative_to(real)]  # through a link
-        if outside:
-            raise SandboxError("the mount helper named a token file outside the run's directory")
+        # through a link, even one that stays in the run: the reaper never follows one (`runs.remove_inside`)
+        linked = [p for p in paths if p not in outside and Path(os.path.realpath(p)) != real / p.relative_to(self.dir)]
+        if outside or linked:
+            raise SandboxError("the mount helper named a token file outside the run's directory or through a link")
         self._token_files = [*self._token_files, *paths]
         self.run_record()
         return self._mount.start()

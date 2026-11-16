@@ -469,3 +469,31 @@ def test_a_helpers_token_path_through_a_link_out_of_the_run_is_refused(node, set
         ApptainerSandbox.start(
             node, settings, make_spec("mounted"), **options(mount_helper=lambda n, s, sp, run_dir: Linked(run_dir))
         )
+
+
+def test_a_helpers_token_path_through_a_link_that_stays_in_the_run_is_refused_too(node, settings):
+    """O60 (Codex, delta round 3): the reaper never follows a link, so a token file it could not remove is never
+    accepted, whichever way the link points."""
+
+    class Linked:
+        def __init__(self, run_dir):
+            self.run_dir = run_dir
+
+        def token_paths(self):
+            (self.run_dir / "real").mkdir()
+            (self.run_dir / "link").symlink_to(self.run_dir / "real")
+            return [self.run_dir / "link" / "token"]
+
+        def start(self):
+            raise AssertionError("never started")
+
+        def stop(self):
+            pass
+
+        def metadata(self):
+            return {}
+
+    with pytest.raises(SandboxError, match="through a link"):
+        ApptainerSandbox.start(
+            node, settings, make_spec("mounted"), **options(mount_helper=lambda n, s, sp, run_dir: Linked(run_dir))
+        )
