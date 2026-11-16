@@ -285,8 +285,8 @@ def _dirt(root: Path) -> str | None:
     if head is None or disk is None:
         return "git could not compare the files a build reads with HEAD's"
     if _git(root, "config", "--bool", "core.fileMode") == "false":  # git itself does not trust the exec bit here
-        head = {name: blob.split()[-1] for name, blob in head.items()}
-        disk = {name: blob.split()[-1] for name, blob in disk.items()}
+        head = {name: blob.replace("100755 ", "100644 ", 1) for name, blob in head.items()}  # the bit alone: a
+        disk = {name: blob.replace("100755 ", "100644 ", 1) for name, blob in disk.items()}  # link stays a link
     changed = sorted(name for name in set(head) | set(disk) if head.get(name) != disk.get(name) and name not in links)
     if links:  # first: what lies below a linked directory reads as missing, and the link is why
         more = f" and {len(links) - 3} more" if len(links) > 3 else ""

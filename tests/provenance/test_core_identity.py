@@ -128,8 +128,16 @@ def test_p01_nothing_git_can_be_told_to_hide_takes_a_change_to_what_a_build_read
     assert "src/expcore/cli.py" in str(from_checkout(root).why)
     repo.git("config", "core.fileMode", "false")  # a filesystem git does not trust the exec bit on
     assert from_checkout(root).dirty is False
-    repo.git("config", "core.fileMode", "true")
     (root / "src" / "expcore" / "cli.py").chmod(0o644)
+    (root / "src" / "expcore" / "wire.py").symlink_to("WIRE = 1")  # a link whose target path is the text
+    repo.commit("a module tracked as a link")
+    (root / "src" / "expcore" / "wire.py").unlink()
+    (root / "src" / "expcore" / "wire.py").write_text("WIRE = 1", encoding="utf-8")  # one blob id, another type
+    assert "src/expcore/wire.py" in str(from_checkout(root).why)
+    repo.git("config", "core.fileMode", "true")
+    repo.git("rm", "--quiet", "--cached", "src/expcore/wire.py")
+    (root / "src" / "expcore" / "wire.py").unlink()
+    repo.commit("no module tracked as a link")
     assert from_checkout(root).dirty is False
 
 
