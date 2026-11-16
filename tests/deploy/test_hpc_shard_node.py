@@ -7,9 +7,11 @@ import argparse
 import importlib.util
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -265,6 +267,7 @@ def test_o63_an_out_that_could_not_be_archived_is_kept_and_archived_by_archive_l
     owner = json.loads((kept / "step.json").read_text())
     assert (owner["phase"], owner["exit_status"]) == ("archiving", 3)
     assert json.loads((kept / "ARCHIVE-FAILED.json").read_text())["exit_status"] == 3
+    (kept / "step.json").write_text(json.dumps({**owner, "start": "0"}))  # the step ran here, in this process: gone
     with pytest.raises(shards.ShardsError, match=f"was not archived and is kept on this node in {kept.name}"):
         resume(shards, tmp_path, monkeypatch)
     assert shards.archive_left(step_args(tmp_path, archive_left=True)) == 0
@@ -363,3 +366,60 @@ def test_o63_a_study_that_holds_a_platform_file_of_its_own_is_refused(shards, tm
     with pytest.raises(shards.ShardsError, match=r"holds a platform\.toml of its own"):
         shards.step(args, runner=run, core_found=lambda path: True)
     assert not seen
+
+
+# -- a step killed alone, and a full tmpfs at the dispatcher's end -------------------------------------------------
+
+
+def test_o63_a_dispatcher_dies_with_its_step_killed_alone(shards, tmp_path):
+    """O63: the step's dispatcher asks to be killed when its step dies (PR_SET_PDEATHSIG): a step killed alone never
+    leaves it running on, to end later with a whole out/ that its record, still `running`, would let a cleanup take."""
+    mark = tmp_path / "work" / "study"
+    wrapper = subprocess.Popen([
+        sys.executable, "-c",
+        "import importlib.util, os, sys; spec = importlib.util.spec_from_file_location('s', sys.argv[1]);"
+        " s = importlib.util.module_from_spec(spec); sys.modules['s'] = s; spec.loader.exec_module(s);"
+        " s.run_dispatcher([sys.executable, '-c', 'import time; time.sleep(120)', sys.argv[2]], dict(os.environ), '/')",
+        str(SCRIPT), str(mark),
+    ])  # fmt: skip
+    try:
+        deadline = time.monotonic() + 30
+        while shards.naming(mark.parent) is not True:
+            assert time.monotonic() < deadline, "the dispatcher never started"
+            time.sleep(0.05)
+        os.kill(wrapper.pid, signal.SIGKILL)
+        wrapper.wait()
+        deadline = time.monotonic() + 30
+        while shards.naming(mark.parent) is not False:
+            assert time.monotonic() < deadline, "the dispatcher outlived its step"
+            time.sleep(0.05)
+    finally:
+        if wrapper.poll() is None:
+            wrapper.kill()
+
+
+def test_o63_archive_left_never_takes_the_directory_of_a_step_that_still_runs(shards, tmp_path, monkeypatch):
+    """O63: between its dispatcher's end and its own archive a step's record says `archiving`: `--archive-left`
+    refuses while that step (or a process naming its directory) lives, since the step archives it itself."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    live = left(tmp_path, "live", phase="archiving", start=shards._start_of(os.getpid()))
+    with pytest.raises(shards.ShardsError, match="still runs"):
+        shards.archive_left(step_args(tmp_path, archive_left=True))
+    assert live.is_dir()
+
+
+def test_o63_a_full_tmpfs_at_the_dispatchers_end_still_leaves_a_whole_record(shards, tmp_path):
+    """O63: the end's record with its exit status is written to a file of its own and read back; when that cannot be
+    written (here a directory stands in its place, as a full tmpfs refuses the write), the record written at the start
+    is swapped in whole, `archiving`, and the step's out/ is kept and can be archived."""
+    work = tmp_path / "work"
+    work.mkdir()
+    record = {"shard": SPEC, "phase": "archiving", "pid": 1, "start": "0"}
+    (work / ".step.ended.json").write_text(json.dumps(record))
+    (work / ".step.status.json").mkdir()
+    assert shards._ended(work, 3) is True
+    assert json.loads((work / "step.json").read_text()) == record
+    (work / ".step.status.json").rmdir()
+    (work / ".step.ended.json").write_text(json.dumps(record))
+    assert shards._ended(work, 3) is True
+    assert json.loads((work / "step.json").read_text()) == {**record, "exit_status": 3}

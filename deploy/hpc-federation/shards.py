@@ -41,12 +41,13 @@ archive it started from, and its phase): `running` while its dispatcher runs, `a
 (swapped in by rename from a record written at the start, so a full tmpfs cannot stop it), when its out/ is whole and
 the only one until archived. A step killed outright leaves its directory. Only one killed while `running` is ever
 removed, and only once its process and every process naming the directory (its dispatcher, which outlives a wrapper
-killed alone) are shown gone: `--resume` removes its own shard's of its own campaign (spec, root and results) and
-refuses while one runs, and `sweep`, which `hpcfed.py down` runs on the agent's node, removes its federation's. A
-directory whose dispatcher ended and that was not archived (`archiving`; marked `ARCHIVE-FAILED.json` when the mark
-could be written), or whose record cannot be read, is never removed: `--resume` refuses while one of its own is there,
-`sweep` names it, and `step --archive-left` archives it with the same manifest and that step's exit status, then removes
-it, but only while the published archive is still the one that step started from.
+killed alone) are shown gone (the dispatcher dies with its step, `PDEATHSIG`, so it never ends after it): `--resume`
+removes its own shard's of its own campaign (spec, root and results) and refuses while one runs, and `sweep`, which
+`hpcfed.py down` runs on the agent's node, removes its federation's. A directory whose dispatcher ended and that was not
+archived (`archiving`; marked `ARCHIVE-FAILED.json` when the mark could be written), or whose record cannot be read, is
+never removed: `--resume` refuses while one of its own is there, `sweep` names it, and `step --archive-left` archives it
+with the same manifest and that step's exit status, then removes it, but only once that step is gone and while the
+published archive is still the one it started from.
 
 **The study and its store.** The study is one stamped copy at the pinned commit on the shared filesystem. `step` copies
 it to the node's tmpfs and runs it there, since the campaign's store (SQLite, and its `campaign.lock`) must not live on
@@ -140,6 +141,7 @@ SNAPSHOTS, JOURNALS = "snapshots", "journals"  # under <results>/<label>/
 WORK_PREFIX = "expcore-shard-"  # a step's directory on the node's tmpfs: <tmpfs>/expcore-shard-<label>.<random>
 OWNER, OWNER_FORMAT = "step.json", "expcore-hpc-shard-step/1"  # in it: the step's process, campaign and federation
 OWNER_ENDING = ".step.ended.json"  # written at the start, renamed over step.json when the dispatcher ends
+OWNER_STATUS = ".step.status.json"  # the same with the dispatcher's exit status, written when it ends, if it can be
 RUNNING, ARCHIVING = "running", "archiving"  # the step's phase: its dispatcher runs; it ended and out/ is whole
 ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not be archived, so it is kept
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
@@ -464,9 +466,27 @@ def imports_core_from(core_src: Path, find: Callable[[], str] | None = None) -> 
         return False
 
 
+# The dispatcher's first words: it asks the kernel to kill it when its step dies (PR_SET_PDEATHSIG, kept across the
+# exec), then becomes the dispatcher. So a step killed alone never leaves its dispatcher running on, to end later with
+# a whole out/ that the step's record, still `running`, would let a cleanup remove. A step that died before the ask
+# took hold is seen (its parent is no longer the step), and the dispatcher never starts.
+PDEATHSIG = (
+    "import ctypes, os, signal, sys\n"
+    "try:\n"
+    "    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL)\n"
+    "except (AttributeError, OSError):\n"
+    "    pass\n"
+    "if os.getppid() != int(sys.argv[1]):\n"
+    "    os._exit(70)\n"
+    "os.execv(sys.argv[2], sys.argv[2:])\n"
+)
+
+
 def run_dispatcher(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int:
-    """Run the dispatcher, relaying SIGTERM and SIGINT to it, and return its exit status (128 + N for a signal N)."""
-    child = subprocess.Popen(list(argv), env=dict(env), cwd=cwd, stdin=subprocess.DEVNULL)
+    """Run the dispatcher, relaying SIGTERM and SIGINT to it, and return its exit status (128 + N for a signal N). It
+    dies with this step (`PDEATHSIG`)."""
+    words = [sys.executable, "-I", "-c", PDEATHSIG, str(os.getpid()), *argv]
+    child = subprocess.Popen(words, env=dict(env), cwd=cwd, stdin=subprocess.DEVNULL)
 
     def relay(signum: int, _frame: Any) -> None:
         child.send_signal(signum)
@@ -802,6 +822,8 @@ def archive_left(args: argparse.Namespace) -> int:
             f"shard {args.label}: no out/ of this shard of this campaign waits on this node to be archived"
         )
     left = found[0]
+    if alive(left.owner.get("pid"), left.owner.get("start")) is not False or naming(left.path) is not False:
+        raise ShardsError(f"shard {args.label}: the step of {left.path.name} still runs (it archives it itself)")
     if archive_named(args.results, args.label) != left.owner.get("base"):
         raise ShardsError(
             f"shard {args.label}: an archive was published after the step of {left.path.name} started; its out/ is "
@@ -838,19 +860,22 @@ def sweep(tmpfs: Path, root: str) -> int:
 
 
 def _ended(work: Path, status: int) -> bool:
-    """Record that the step's dispatcher ended (`archiving`, with its exit status): from here its out/ is whole and
-    the only one until archived, so no cleanup removes it. The record is swapped in by rename from one written at the
-    start, so it needs no space a full tmpfs would refuse. False when even that failed, said."""
-    record = _record(work / OWNER_ENDING)
+    """Record that the step's dispatcher ended (`archiving`): from here its out/ is whole and the only one until
+    archived, so no cleanup removes it. The record, with the exit status, is written whole into a file of its own and
+    read back; should that fail (a full tmpfs), the one written at the start (without the status) is used: either is
+    swapped in by rename, which needs no space. False when even that failed, said."""
+    prepared = _record(work / OWNER_ENDING)
+    chosen = OWNER_ENDING
+    if prepared is not None:
+        record = {**prepared, "exit_status": status}
+        try:
+            (work / OWNER_STATUS).write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+            if _record(work / OWNER_STATUS) == record:
+                chosen = OWNER_STATUS
+        except OSError:
+            pass  # the prepared record stands, whole: written at the start
     try:
-        if record is None:
-            raise OSError("no record of the step's end was prepared")
-        (work / OWNER_ENDING).write_text(json.dumps({**record, "exit_status": status}, sort_keys=True) + "\n",
-                                         encoding="utf-8")  # fmt: skip
-    except OSError:
-        pass  # the prepared one, without the status, still says the dispatcher ended
-    try:
-        os.replace(work / OWNER_ENDING, work / OWNER)
+        os.replace(work / chosen, work / OWNER)
         return True
     except OSError as error:
         print(f"shards: ERROR: the step's end could not be recorded ({type(error).__name__})", file=sys.stderr)
