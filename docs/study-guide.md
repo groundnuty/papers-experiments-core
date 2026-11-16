@@ -461,12 +461,13 @@ How a run works there:
 - The harness keeps the memory limit and the sizes of `/work`, `/tmp` and `/dev/shm`. A cell past one of them is killed as `memory_limit` or `disk_limit`, the agent's own outcome.
 - A process your agent's code hides from the harness (one that makes itself non-dumpable, which the node's `/proc` then hides) is still caught from the cgroup that charges its memory. Its memory, past a margin, kills the cell as `memory_limit`; a hidden child is recorded. Declare the `process_visibility` instrument (below) so the report says so.
 
-Five things differ from Docker, and the record says so (`infrastructure_facts`):
+Four things differ from Docker, and the record says so (`infrastructure_facts`):
 - **Detached workers end with their cell.** A process a cell starts in the background is killed when that cell ends, where Docker's container keeps it until the next cap.
 - **The network is the node's.** The agent can reach the internet, so declare the `egress` instrument (below).
-- **A cell has no name server** (`dns: none`). The federation's names resolve from `/etc/hosts`, as on Docker, and no other name resolves.
 - **The memory reading can be unknown** (`infrastructure_facts.memory`): `within` only when the harness could show it, `unknown` with its reasons when it could not, and never `within` for a run whose code hid memory from it.
 - **A mount data path is refused at its start** until its helper lands.
+
+Names resolve as on Docker (`dns: none` in the record): the federation's names resolve from `/etc/hosts` and no other name resolves. A Docker agent's network is `--internal` with `--add-host` entries and no `--dns`, and measured on engine 29.2.1 the engine's embedded resolver answers every outside name with SERVFAIL at once. So the name lookup is no departure; the connect to an outside address is, as the network bullet says (on Docker it fails at once with ENETUNREACH).
 
 Run the campaign's driver on the node that runs the cells, since the gate listens on that node's loopback. The campaign fingerprint holds the backend's pins, so a Docker run and an Apptainer run are never one experiment.
 

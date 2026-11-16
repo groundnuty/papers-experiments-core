@@ -3,7 +3,8 @@
 
 Every run's metadata holds `infrastructure_facts` (this list, by key) so a reader of a record knows which bounds held
 on the node it ran on. A key is stable; its text explains it. Each departure is the node's (an HPC batch node gives an
-unprivileged user no namespace but setuid Apptainer's and no cgroup of its own), never a choice of the study's.
+unprivileged user no namespace but setuid Apptainer's and no cgroup of its own), never a choice of the study's. One
+key, `dns_none`, records what a cell resolves and is no departure: a Docker cell resolves the same (measured).
 """
 
 from __future__ import annotations
@@ -56,9 +57,11 @@ FACTS: dict[str, str] = {
     "dns_none": (
         "a cell has no name server: its /etc/resolv.conf names none and its /etc/nsswitch.conf looks hosts up in "
         "files alone, so the C library resolves the names of /etc/hosts (the federation's, on the loopback) and no "
-        "other; a program with a resolver of its own can still send a query, which is egress like any other. On "
-        "Docker the federation's names come from --add-host too, but the container's resolver is the engine's "
-        "embedded one on the internal network, which may answer an outside name with an address it gives no route to"
+        "other; a program with a resolver of its own can still send a query, which is egress like any other. This "
+        "is no departure from Docker: the agent's network there is --internal with --add-host entries and no --dns; "
+        "the engine's embedded resolver (127.0.0.11) answers every outside name with SERVFAIL at once (no addresses, "
+        "no timeout), the --add-host names resolve only through /etc/hosts, and a connect to an outside address "
+        "fails at once with ENETUNREACH (no default route); measured on engine 29.2.1"
     ),
     "disk_watch": (
         "/work, /tmp and /dev/shm are directories on the node's tmpfs, charged to the step's memory: the watch "

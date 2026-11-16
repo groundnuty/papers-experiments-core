@@ -1179,15 +1179,15 @@ hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: the defaul
   - `unknown`, `margin_bytes`, `start_unexplained_bytes`, `peak` (`unexplained_bytes`, `cgroup_anon_bytes`, `visible_anon_bytes`, `baseline_bytes`, `allowance_bytes`), `hidden_processes`, `hidden_memory_cells`, `children_unreadable_polls` and `cgroup_unreadable_polls`.
 
   Each cell's record has its own (`watched.memory`). `process_visibility()` gives the same reading to the `process_visibility` instrument. A hidden process's shared memory (a memfd, a shared anonymous mapping) is not compared, since the cgroup counts it with the run's tmpfs files.
-- **No name server:** every cell binds a `/etc/resolv.conf` that names none and a `/etc/nsswitch.conf` whose databases are `files`, read-only (`argv.RESOLV_TEXT`, `argv.NSSWITCH_TEXT`; a hook (b) bind onto either is refused). So the C library resolves the names of `/etc/hosts` alone, and `infrastructure_facts.dns` is `"none"`. A program with a resolver of its own can still send a query, which is egress like any other. On Docker the federation's names come from `--add-host` too, but the container's resolver is the engine's embedded one on the sandbox's internal network: whether it answers an outside name (with an address the network gives no route to) is the engine's behaviour, not the code's.
+- **No name server:** every cell binds a `/etc/resolv.conf` that names none and a `/etc/nsswitch.conf` whose databases are `files`, read-only (`argv.RESOLV_TEXT`, `argv.NSSWITCH_TEXT`; a hook (b) bind onto either is refused). So the C library resolves the names of `/etc/hosts` alone, and `infrastructure_facts.dns` is `"none"`. A program with a resolver of its own can still send a query, which is egress like any other. This is no departure from Docker: the agent's network is `--internal` with `--add-host` entries and no `--dns`; the engine's embedded resolver (127.0.0.11) answers every outside name with SERVFAIL at once (no addresses, no timeout), the `--add-host` names resolve only through `/etc/hosts`, and a connect to an outside address fails at once with ENETUNREACH (no default route); measured on engine 29.2.1.
 - **Completion causes** name `apptainer exec` (`Completion.for_source(code, runner="apptainer exec")`).
-- **Departures** from the Docker sandbox are listed by key in every run's `metadata()["infrastructure_facts"]` (`apptainer.facts.FACTS`):
+- **Facts** are listed by key in every run's `metadata()["infrastructure_facts"]` (`apptainer.facts.FACTS`): the departures from the Docker sandbox, and one fact that is no departure (`dns_none`):
   - the network is shared;
   - the gate is on the node's loopback;
   - the cell runs as the driver's uid;
   - memory and disks are kept by a watch;
   - what `/proc` hides is checked from the cgroup (`hidden_memory`);
-  - a cell has no name server (`dns_none`);
+  - a cell has no name server (`dns_none`; a Docker cell resolves the same, so no departure);
   - cpus, pids and nofile are not enforced;
   - a cell's processes end with its exec;
   - no freezer;
