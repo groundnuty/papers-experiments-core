@@ -30,6 +30,7 @@ def site(tmp_path):
     images, logs, scratch = tmp_path / "images", tmp_path / "logs", tmp_path / "scratch"
     for directory in (images, logs, scratch, tmp_path / "fed"):
         directory.mkdir()
+    scratch.chmod(0o755)  # this user's alone to write, whatever the umask: the guard refuses a root others can write
     for name in ("onezone.tar", "oneprovider.tar"):
         (images / name).write_bytes(b"tar")
         (images / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
@@ -293,6 +294,7 @@ def test_a_scratch_root_that_is_the_federations_root_even_through_a_link_is_refu
     emptied too: refused, naming the variable, before anything is made."""
     rig = Rig(hpc, tmp_path, site)
     rig.root.mkdir()
+    rig.root.chmod(0o755)  # private, so the refusal below is for what it is, not for a umask's group bit
     (tmp_path / "root-link").symlink_to(rig.root)
     for named in (rig.root, tmp_path / "root-link"):
         rig.site = {**site, "HPC_STORAGE_ROOT": str(named)}
@@ -526,6 +528,55 @@ def test_a_directory_swapped_for_a_link_after_it_was_proved_is_never_followed(hp
     assert untouched(outside)
     assert swapped[0].is_symlink()
     assert swapped[0].with_name(swapped[0].name + "-moved").is_dir()
+
+
+def test_a_scratch_root_that_others_can_write_is_refused_at_up_and_again_at_down(hpc, tmp_path, site):
+    """O57: `rmdir` takes a name, so another user who could rename an entry of the scratch root could put an unrelated
+    empty directory where one was proved. The root must be this user's alone to write: a group or other write bit is
+    refused by `up`, and by `down` too, which then removes nothing, if the mode changed after `up`."""
+    scratch = Path(site["HPC_STORAGE_ROOT"])
+    for mode in (0o775, 0o757, 0o777):
+        scratch.chmod(mode)
+        rig = Rig(hpc, tmp_path, site)
+        with pytest.raises(RuntimeError, match="HPC_STORAGE_ROOT must be a directory only this user can write"):
+            rig.up()
+        assert not rig.root.exists()
+    scratch.chmod(0o755)
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    scratch.chmod(0o770)
+    with pytest.raises(RuntimeError, match="no longer this user's alone to write"):
+        rig.driver.down()
+    assert all((d / ".hpcop-storage-owner").is_file() for d in rig.provider_dirs().values())
+    scratch.chmod(0o700)
+    rig.fake.state = "GONE"
+    assert "0 entries remain" in rig.driver.down()
+
+
+def test_a_name_that_now_names_another_directory_is_never_the_one_retired(hpc, tmp_path, site):
+    """O57: between the proof and the `rmdir` of a directory, its name may come to name another (renamed away, and an
+    unrelated empty directory put in its place). `rmdir` resolves the name, so the directory is checked to be the one
+    held before it is removed: the replacement is left whole, the proved directory gets its marker back, and `down`
+    fails saying it could not be removed."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    real, replaced = os.unlink, []
+
+    def unlink(path, **kwargs):
+        real(path, **kwargs)  # the marker of a provider's directory, the last thing taken out of it
+        if not replaced and kwargs.get("dir_fd") is not None:
+            target = rig.provider_dirs()[sorted(rig.provider_dirs())[0]]
+            replaced.append(target)
+            target.rename(target.with_name(target.name + "-moved"))
+            target.mkdir()
+
+    rig.driver.removal = {"unlink": unlink}
+    with pytest.raises(RuntimeError, match=r"replaced while it was removed.*its owner marker is kept"):
+        rig.driver.down()
+    target = replaced[0]
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
+    assert listing(target.with_name(target.name + "-moved")) == {".hpcop-storage-owner"}  # the proved one, marked again
 
 
 def test_a_directory_that_cannot_be_retired_gets_its_marker_back_and_the_second_down_finishes(hpc, tmp_path, site):

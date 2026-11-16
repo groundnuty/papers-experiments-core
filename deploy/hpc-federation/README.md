@@ -233,7 +233,7 @@ the full contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
 
 | Key | What |
 |---|---|
-| `HPC_STORAGE_ROOT` | an existing directory you can write on the scratch filesystem (`<scratch_root>/hpcop-storage`), neither inside the federation's root nor a shared tree. With none, nothing below runs |
+| `HPC_STORAGE_ROOT` | an existing directory on the scratch filesystem that only you can write (`<scratch_root>/hpcop-storage`, `mkdir -m 700`: owned by you, no group or other write bit, which `up` and `down` both check), neither inside the federation's root nor a shared tree. With none, nothing below runs |
 | `HPC_QUOTA_CMD` | the site's command that prints the account's inode usage and quota (`<quota tool> --inodes <scratch_root>`), split as a shell would split it and **run without a shell** on the login node |
 | `HPC_QUOTA_PATTERN` | a regular expression with the named groups `used` and `quota` that reads its output and matches **exactly once** (`inodes used (?P<used>[0-9,]+) of (?P<quota>[0-9,]+)` reads an invented line); you write it for the real output, which this repository never holds |
 | `HPC_QUOTA_CHECK` | `off` skips the check, and `up` says so; the only value, and unset is not off |

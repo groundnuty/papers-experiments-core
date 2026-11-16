@@ -662,7 +662,8 @@ Only `HPC_QUOTA_CHECK=off` skips the check (the one value; any other, `OFF` and 
 start; unset is not off), and `up` says it was skipped. A site that sets `HPC_STORAGE_ROOT` and neither names a
 command nor turns the check off cannot `up`.
 
-**The directories** (`hpcstorage.py`): below `HPC_STORAGE_ROOT` (a directory this user writes, which is neither the
+**The directories** (`hpcstorage.py`): below `HPC_STORAGE_ROOT` (a directory only this user can write, owned by this user
+with no group or other write bit, which is neither the
 federation's root nor inside it, and is no shared tree and holds or lies inside none, since `down` removes below it and
 nothing may be written to a shared tree) `up` makes `<root>/<allocation name>` (0700; the name's random part is the
 allocation's) and in it one directory per provider (0700), each by an exclusive `mkdir`: anything already there refuses
@@ -686,7 +687,10 @@ directories are made after the state exists and before the job is submitted, so 
   through a link, a link inside is removed and its target never touched, a read-only directory made writable first), then
   retired (its marker, then the directory by `rmdir` through its parent's descriptor; a failed `rmdir` puts the marker
   back), then the storage's own directory the same way. A path swapped for a link or another directory after the proof is
-  never followed: the proved directory is the one emptied, and the `rmdir` of the swapped name fails. A concurrent change
+  never followed: the proved directory is the one emptied, and before each `rmdir` (which takes a name) the name is checked to be
+  the directory held (the same device and inode), else the directory keeps its marker, the replacement is left whole and `down` fails.
+  The scratch root must be this user's alone to write (`up` refuses one that is not, and `down` checks it again before removing
+  anything), since another user who could rename its entries could otherwise swap a directory in the instant before an `rmdir`. A concurrent change
   inside the 0700 tree by this same user is not defended against. An entry in the storage's directory that `up` did not
   make is kept with the marker, and fails `down` naming how many;
 - **what remains of the recorded paths is then counted** and any entry fails `down` loudly, naming the count (a removal

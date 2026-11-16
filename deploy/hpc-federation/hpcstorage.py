@@ -28,6 +28,7 @@ concurrent change inside the 0700 tree by this same user is not defended against
 """
 
 import contextlib
+import errno
 import json
 import os
 import re
@@ -44,6 +45,7 @@ PARENT_NAME = re.compile(r"hpcop-[a-z0-9][a-z0-9_-]{0,39}-[0-9a-f]{8}")  # the a
 PROVIDER_NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?")  # a Compose service name (fedspec.SERVICE_NAME)
 TOKEN = re.compile(r"[0-9a-f]{32}")
 OWNER_BYTES = 4096  # the most of the marker that is read
+WRITABLE_BY_OTHERS = stat.S_IWGRP | stat.S_IWOTH  # a scratch root with either could have its entries swapped by another
 
 
 class StorageRefused(RuntimeError):
@@ -75,6 +77,12 @@ def check_root(site: Site, federation_root: Path) -> None:
         raise StorageRefused("HPC_STORAGE_ROOT is not a directory")
     if not os.access(where, os.W_OK | os.X_OK):
         raise StorageRefused("HPC_STORAGE_ROOT is not a directory this user can write")
+    info = os.stat(where)
+    if info.st_uid != os.getuid() or info.st_mode & WRITABLE_BY_OTHERS:
+        raise StorageRefused(
+            "HPC_STORAGE_ROOT must be a directory only this user can write (owned by this user, with no group or "
+            "other write bit): another user who could rename its entries could swap a directory `down` removes"
+        )
     real, root = Path(os.path.realpath(where)), Path(os.path.realpath(federation_root))
     if real == root or root in real.parents:
         raise StorageRefused("HPC_STORAGE_ROOT is, or lies inside, the federation's root, which down empties")
@@ -226,6 +234,27 @@ def _prove(descriptor: int, what: str, content: bytes, uid: int) -> None:
         )
 
 
+def _require_private(root: int, uid: int) -> None:
+    """The scratch root held open is this user's alone to write: `rmdir` resolves a name, so another user who could
+    rename an entry of the root could put an unrelated empty directory where one was proved, and have it removed."""
+    info = os.fstat(root)
+    if info.st_uid != uid or info.st_mode & WRITABLE_BY_OTHERS:
+        raise StorageRefused(
+            "the scratch root is no longer this user's alone to write (its owner or a group or other write bit "
+            "changed): nothing was removed"
+        )
+
+
+def _is(descriptor: int, name: str, container: int) -> bool:
+    """Whether `name` below `container` is the directory held open as `descriptor` (the same device and inode)."""
+    try:
+        seen = os.stat(name, dir_fd=container, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    held = os.fstat(descriptor)
+    return (seen.st_dev, seen.st_ino) == (held.st_dev, held.st_ino)
+
+
 def _retire(directory: int, name: str, container: int, content: bytes, calls: Mapping[str, Any]) -> None:
     """The directory held open (`directory`, `name` below `container`) holds nothing but its marker: remove the marker,
     then the directory by `rmdir`, which removes only an empty one. A failed `rmdir` puts the marker back, so a second
@@ -233,6 +262,8 @@ def _retire(directory: int, name: str, container: int, content: bytes, calls: Ma
     unlink, rmdir = calls.get("unlink", os.unlink), calls.get("rmdir", os.rmdir)
     unlink(OWNER, dir_fd=directory)
     try:
+        if not _is(directory, name, container):  # `rmdir` takes a name: never remove what that name now names
+            raise OSError(errno.ESTALE, "the directory was replaced while it was removed")
         rmdir(name, dir_fd=container)
     except OSError as error:
         kept = "its owner marker is kept"
@@ -261,6 +292,7 @@ def remove(record: Any, state: Mapping[str, Any], *, uid: Optional[int] = None, 
         parent = None
         if root is not None:
             held.callback(os.close, root)
+            _require_private(root, uid)
             parent = _open(parent_name, "the provider storage's own directory", dir_fd=root)
         if parent is not None:
             held.callback(os.close, parent)

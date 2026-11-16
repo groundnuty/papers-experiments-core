@@ -28,6 +28,7 @@ def site(tmp_path):
     images, logs, scratch = tmp_path / "images", tmp_path / "logs", tmp_path / "scratch"
     for directory in (images, logs, scratch, tmp_path / "fed"):
         directory.mkdir()
+    scratch.chmod(0o755)  # this user's alone to write, whatever the umask: the guard refuses a root others can write
     for name in ("onezone.tar", "oneprovider.tar"):
         (images / name).write_bytes(b"tar")
         (images / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
