@@ -91,32 +91,42 @@ def test_c11_a_loader_run_again_on_the_same_file_is_one_record(tmp_path):
     assert len(loads) == 1
 
 
-def test_c11_builds_in_two_threads_do_not_receive_each_others_records(tmp_path):
-    """C11: a study build that loads nothing is not refused for another build's platform: a loader records into the
-    watches its own thread opened, so two builds in one process, each in its own thread, keep their own record."""
-    loaded, done, kept = threading.Event(), threading.Event(), {}
+def test_c11_builds_in_two_threads_run_one_at_a_time_and_do_not_receive_each_others_records(tmp_path):
+    """C11: a study build that loads nothing is not refused for another build's platform. One build is open in a
+    process at a time: a second thread's build waits until the first's ends, so every loader, a worker thread of the
+    plugin's included, records into the one build that is open, and each keeps its own record."""
+    opened, kept = [], {}
 
     def other_build():
         with watching_platform_loads() as loads:
+            opened.append("the other build")
             record_platform_load(OTHER, tmp_path / "other.toml")
             kept["other"] = loads
-            loaded.set()
-            done.wait(10)
 
     with watching_platform_loads() as mine:
         worker = threading.Thread(target=other_build)
         worker.start()
-        assert loaded.wait(10)
+        worker.join(0.5)  # it waits for this build, which is open
+        assert worker.is_alive()
+        assert opened == []
         record_platform_load(MODULE, tmp_path / "mine.toml")
-        done.set()
-        worker.join()
+    worker.join(10)
+    assert not worker.is_alive()
     assert mine == [PlatformLoad(MODULE, tmp_path / "mine.toml")]
     assert kept["other"] == [PlatformLoad(OTHER, tmp_path / "other.toml")]
 
 
+def test_c11_a_build_opened_again_by_its_own_thread_is_not_waited_for(tmp_path):
+    """C11: the core's reading of a listed platform opens a watch inside the build's: the same thread passes, and the
+    outer build sees what ran inside."""
+    with watching_platform_loads() as outer, watching_platform_loads() as inner:
+        record_platform_load(MODULE, tmp_path / "platform.toml")
+    assert outer == inner == [PlatformLoad(MODULE, tmp_path / "platform.toml")]
+
+
 def test_c11_a_loader_in_another_thread_is_recorded_too(tmp_path):
-    """C11: a plugin that builds its platform in a worker thread of its own is seen: a thread with no watch of its own
-    records into every build now open."""
+    """C11: a plugin that builds its platform in a worker thread of its own is seen: a loader of any thread records
+    into the one build that is open."""
     with watching_platform_loads() as loads:
         worker = threading.Thread(target=record_platform_load, args=(MODULE, tmp_path / "platform.toml"))
         worker.start()

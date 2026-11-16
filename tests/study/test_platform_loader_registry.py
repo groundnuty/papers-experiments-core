@@ -210,3 +210,39 @@ def test_c11_the_core_names_what_each_platforms_function_loaded_beside_its_answe
     (study / "platform.toml").write_text("# the toy platform's own settings\n", encoding="utf-8")
     declared = platform_deferrals(load_study(study))
     assert declared == (PlatformDeferral(loading, None, (ORIGINAL,)), PlatformDeferral(silent, None, ()))
+
+
+PROBING = """
+
+import dataclasses as _dataclasses
+import threading as _threading
+
+from expcore.config.platform_loads import watching_platform_loads as _watching
+
+_build_before_probing = build
+
+
+def build(context):
+    plugin = _build_before_probing(context)
+    inner = plugin.health
+
+    def probing():  # during the run, another thread opens a study build: it must not wait for this campaign
+        def open_a_build():
+            with _watching():
+                (context.study.root / "build-was-free").write_text("yes", encoding="utf-8")
+
+        worker = _threading.Thread(target=open_a_build)
+        worker.start()
+        worker.join(10)
+        return inner()
+
+    return _dataclasses.replace(plugin, health=probing)
+"""
+
+
+def test_c11_the_watch_of_the_build_ends_before_the_campaign_runs(tmp_path):
+    """C11: one study build is open in a process at a time, so the pipeline's watch must end when the scheduler starts:
+    while the campaign runs, another thread's build opens at once instead of waiting for the whole campaign."""
+    study = with_plugin(study_with(tmp_path), PROBING)
+    assert set(run_study(study).statuses) == {"done"}
+    assert (study / "build-was-free").read_text(encoding="utf-8") == "yes"
