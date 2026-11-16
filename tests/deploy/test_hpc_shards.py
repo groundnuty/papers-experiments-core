@@ -32,7 +32,12 @@ def _manifest(tmp_path, **changes):
     for n, root in enumerate(roots, 1):
         root.mkdir(parents=True)
         state = {"format": "expcore-hpc-federation/1", "allocation": {"job": str(100 + n), "name": f"hpcop-x-{n}"},
-                 "sandbox": {"node": f"node-s{n}"}}  # fmt: skip
+                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}}  # fmt: skip
+        if changes.get("placement") == "separate":
+            state["sandbox"] = {"placement": "separate", "node": f"node-s{n}", "job": str(200 + n),
+                                "name": f"hpcop-sbx-{n}"}  # fmt: skip
+        elif changes.get("placement") == "none":
+            del state["sandbox"]
         (root / "hpc-federation.json").write_text(json.dumps(state))
     lines = [
         f'study = "{tmp_path / "study"}"',
@@ -70,7 +75,7 @@ def test_the_step_line_is_an_exact_step_on_the_sandbox_node_with_the_allowlist_a
     plan = shards.load_plan(_manifest(tmp_path))
     shard = plan.shards[1]
     line = shards.step_argv(plan, shard, shards.federation(shard), SCRIPT)
-    assert line[:3] == ["srun", "--jobid=102", "--exact"]
+    assert line[:4] == ["srun", "--jobid=102", "--het-group=1", "--exact"]
     assert "--overlap" not in line
     assert line[line.index("-w") + 1] == "node-s2"
     at = line.index("-i") + 1
@@ -260,3 +265,51 @@ def test_collect_unpacks_the_private_copy_it_verified_and_leaves_none_behind(sha
     copy.unlink()
     shards.collect(plan, tmp_path / "merge")
     assert not list((tmp_path / "merge").glob(".*.tar"))
+
+
+def test_a_separate_sandbox_s_step_goes_to_its_own_held_job(shards, tmp_path):
+    """O56: `placement = "separate"`: the sandbox's own job, no het group, its name in the step's."""
+    plan = shards.load_plan(_manifest(tmp_path, placement="separate"))
+    line = shards.step_argv(plan, plan.shards[0], shards.federation(plan.shards[0]), SCRIPT)
+    assert line[:3] == ["srun", "--jobid=201", "--exact"]
+    assert not [a for a in line if a.startswith("--het-group")]
+    assert line[line.index("-J") + 1] == "hpcop-sbx-1-shard-1"
+
+
+def test_a_het_sandbox_without_its_group_is_refused(shards, tmp_path):
+    """O56: a step with no `--het-group` would land in component 0, the services' node shape."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    state_file = plan.shards[0].root / "hpc-federation.json"
+    state = json.loads(state_file.read_text())
+    del state["sandbox"]["het_group"]
+    state_file.write_text(json.dumps(state))
+    with pytest.raises(shards.ShardsError, match="het_group"):
+        shards.federation(plan.shards[0])
+
+
+def test_a_state_with_no_sandbox_record_takes_the_manifest_s_node_in_the_federation_s_job(shards, tmp_path):
+    path = _manifest(tmp_path, placement="none")
+    path.write_text(
+        path.read_text().replace(
+            'root = "' + str(tmp_path / "fed" / "a") + '"',
+            'root = "' + str(tmp_path / "fed" / "a") + '"\nsandbox_node = "node-m1"',
+        )
+    )
+    plan = shards.load_plan(path)
+    found = shards.federation(plan.shards[0])
+    assert (found["job"], found["node"], found["het_group"]) == ("101", "node-m1", None)
+    with pytest.raises(shards.ShardsError, match="no sandbox node"):
+        shards.federation(plan.shards[1])
+
+
+def test_a_manifest_node_that_is_not_the_state_s_is_refused(shards, tmp_path):
+    path = _manifest(tmp_path)
+    path.write_text(
+        path.read_text().replace(
+            'root = "' + str(tmp_path / "fed" / "a") + '"',
+            'root = "' + str(tmp_path / "fed" / "a") + '"\nsandbox_node = "node-other"',
+        )
+    )
+    plan = shards.load_plan(path)
+    with pytest.raises(shards.ShardsError, match="not the one its state file names"):
+        shards.federation(plan.shards[0])
