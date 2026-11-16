@@ -191,18 +191,40 @@ def test_o58_serves_asks_the_probe_only_of_a_running_ready_service_and_raises_wh
 
 
 def test_o58_the_stops_evidence_is_kept_checked_and_nothing_else_of_its_answer():
-    """O58: the stop's answer says how it ended and how long it took from the request to the stop confirmed; the
-    driver keeps those two, checked, for the journal, and nothing else (the answer may name a node)."""
+    """O58: the stop's answer says whether it was confirmed, how it ended, how long the verb took to its verdict and
+    how long the service took to end after its SIGTERM; the driver keeps those, checked, for the journal, and nothing
+    else (the answer may name a node)."""
     fake, driver = federation()
     fake.exit_after_s = 4.5
     driver.stop(SERVICE)
-    assert driver.last_stop == {"ended": "exit", "seconds": 4.5}
-    assert stop_evidence('{"ended": "kill", "seconds": 691.25, "node": "n-1"}') == {"ended": "kill", "seconds": 691.25}
-    assert stop_evidence('{"ended": "melted", "seconds": -1}') is None
-    assert stop_evidence('{"ended": "none", "seconds": true}') == {"ended": "none", "seconds": None}
+    assert driver.last_stop == {"stopped": True, "ended": "exit", "seconds": 4.5, "service_seconds": 4.5}
+    answer = '{"stopped": true, "ended": "kill", "seconds": 691.25, "service_seconds": 630.5, "node": "n-1"}'
+    assert stop_evidence(answer) == {"stopped": True, "ended": "kill", "seconds": 691.25, "service_seconds": 630.5}
+    assert stop_evidence('{"ended": "melted", "seconds": -1, "stopped": "yes", "service_seconds": NaN}') is None
+    assert stop_evidence('{"ended": "none", "seconds": true}') == {
+        "stopped": None,
+        "ended": "none",
+        "seconds": None,
+        "service_seconds": None,
+    }
     assert stop_evidence("") is None
     driver, _ = answering(CommandResult(0, ""))
     driver.stop(SERVICE)
+    assert driver.last_stop is None
+
+
+def test_o58_a_stop_answered_unconfirmed_keeps_its_evidence_and_fails():
+    """O58: a stop the verb could not confirm (exit 1) still says how long it took: the driver keeps that evidence,
+    then raises DriverError as for any failed command, so the injector journals the stop of unknown outcome with its
+    duration; a stop with no answer keeps none."""
+    fake, driver = federation()
+    fake.exit_after_s, fake.stop_unconfirmed = 4.5, True
+    with pytest.raises(DriverError, match="exit code 1"):
+        driver.stop(SERVICE)
+    assert driver.last_stop == {"stopped": False, "ended": "exit", "seconds": 74.5, "service_seconds": 4.5}
+    driver, _ = answering(subprocess.TimeoutExpired(["hpc-service"], 1.0))
+    with pytest.raises(DriverError, match="did not finish"):
+        driver.stop(SERVICE)
     assert driver.last_stop is None
 
 

@@ -306,9 +306,10 @@ cannot launch a step: its fault injector asks the login node's **fault relay** (
 argv prefix and `down` stops first; section 5), which runs the verb and answers.
 
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
-`hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds)` for a verb in
+`hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` for a verb in
 `hpcfed_control.VERBS = ("stop", "start", "status", "exec")` and exits with its status; `argv` is what follows `--`
-(for `exec`), else `[]`; `stop_seconds` is the layout's. What it is given:
+(for `exec`), else `[]`; `stop_seconds` is the layout's; `mounts` is the read-only proof of a shared import's owner
+(`hpcfed.mount_check`: None in a core without `hpcimport`, section 8). What it is given:
 
 - `launcher` (`hpclaunch.Launcher`): `control(node, argv, *, name, timeout_s)` runs a bounded control step (`--exact
   -c <control cpus> --mem <control memory>`, the allowlist, stdin `/dev/null`) and returns `returncode`, `stdout` and
@@ -320,17 +321,34 @@ argv prefix and `down` stops first; section 5), which runs the verb and answers.
   the held job. Every step runs on one of the held job's own nodes, or is refused.
 - `state` (`hpclaunch.StateStore`): `read()` and `update(fn)` (section 4).
 
+The verbs read a work directory only as `hpcstate.checked_workdir` accepts it, name every step as the launcher's
+`STEP_NAME` allows, and read a `returncode` of None (an end not known) as a failure, never a success.
+
 **(a) STOP** `hpcfed.py stop <service>`: a control step on the service's node runs `teardown.sh <oz|op> --workdir W
 --keep --timeout <stop_seconds>`: `stop-requested` is written with `keep` in it, SIGTERM goes to the recorded service
 process (`service.pid`: PID and start tick, through a pidfd, as today), and the service step's script, seeing `keep`,
 **removes nothing**: not the work directory, the secrets directory, the Couchbase data, the registration, the storage.
 Its step then ends, which frees the service's CPUs and memory; the node stays in the job. `hpcfed.py` waits for the
-step to leave `squeue -s`, records `stopped`, and returns. On a stopped service it returns at once (idempotent).
+step to leave `squeue -s`, records `stopped`, and returns. On a stopped service it returns at once (idempotent). The
+stop is confirmed only once teardown exited 0 and the step is gone (for a step never seen listed, once its srun
+client has ended too: a pending step is not in the list and could still be made), and its `stopped` is recorded only
+for the launch it stopped. `--keep-until` is the allocation's end: Slurm's `EndTime` as `up` recorded it, in the login
+node's local time, as `scontrol` printed it. **Every stop's evidence** is printed and appended to `stops` in the
+state, confirmed or not: `stopped`, `ended` (`exit`, `kill`, `none`), `seconds` (from the request to the verb's
+verdict) and `service_seconds` (the service's own end after its SIGTERM, as teardown measured it on the node); the
+core journals it (section (e)).
 
 **(b) START** `hpcfed.py start <service>`: a new detached service step, the same size, on the same node, running
 `restart.sh <oz|op> --workdir W`: no `node-init.sh`, no `configure.sh`, no token wait; `run_service` again on the same
 rootfs, so the same config, cookie, epmd port, ports, address and registration. `launch` is incremented. A start of a
-running service does nothing.
+running service does nothing. A start follows a recorded `stopped`, and also `stopping`, `starting` or `running` once
+`status.sh` finds the process not alive and its step is not listed (a stop whose verdict never reached the state, its
+verb killed at the relay's bound; a start whose step ended), so a restore is never refused for a provider that is
+down; it never launches beside a live process, nor while an earlier start's step was never listed and its srun client
+still runs. **A restarted owner of shared imported trees (O59)** has `mounts_proven` cleared in the state change that
+claims its launch, and is `ready` only once a status has run `hpcimport.mount_check_argv` on its node and read the
+report against the spaces it owns: the start returns once its step is listed, before the service holds its mounts, so
+the proof is taken by the first status that finds it otherwise ready, and recorded for that launch alone.
 
 **(c) STATUS** `hpcfed.py status <service>`: one JSON line, no secret: `{"service", "state", "running", "ready",
 "identity", "launch", "node", "step"}`. `running` is true only when the service step is listed in `squeue -s` **and**
@@ -357,7 +375,9 @@ provider stopped in about 30 s live. For backend `"hpc"` (M4's loader): the core
 start's stop entering it as its own term (5,340 s with the defaults); `poll_s` defaults to 10 s (every status is a
 step on the one control core);
 `restart_link`'s bound gets 60 s more (the step's launch and the client's end polling), and the heal's reserves count
-it.
+it. **`stop_seconds` is to be set from live measurement**: the core journals every stop's evidence, confirmed or not
+(the injection's `injected` line, or its `stop_unknown` line for a stop that answered unconfirmed, key `stop`), so a
+live slot's journal gives each stop's `seconds` and the service's own `service_seconds`.
 
 **(f) The state file**: section 4. `services.<name>` gives the job, the step, the node, the work directory and the
 identity; it holds no secret.

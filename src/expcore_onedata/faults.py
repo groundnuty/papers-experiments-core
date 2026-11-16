@@ -438,7 +438,14 @@ class FaultInjector:
             self._journal.append({"event": "injected", "id": entry, **stop_record(self._driver)})
         except BaseException as error:  # whatever broke after the stop, the target is brought back before it is raised
             why = type(error).__name__
-            self._step("injected", False, identity_before_sha256=digest, seen_down=self._went_down, error=why)
+            self._step(
+                "injected",
+                False,
+                identity_before_sha256=digest,
+                seen_down=self._went_down,
+                error=why,
+                **stop_record(self._driver),
+            )
             if self._stop_unknown:
                 self._journal_stop_unknown(entry)
             self._clear()
@@ -480,9 +487,9 @@ class FaultInjector:
     def _journal_stop_unknown(self, entry: str) -> None:
         """Journal that the stop command raised, so that a later process settling the injection waits for the target
         to show down too. The journal may be what failed: the injection stays open all the same, and this injector's
-        own clear still knows."""
+        own clear still knows. A stop that answered unconfirmed carries its evidence (`stop_record`), as `injected` does."""
         with contextlib.suppress(OSError):
-            self._journal.append({"event": "stop_unknown", "id": entry})
+            self._journal.append({"event": "stop_unknown", "id": entry, **stop_record(self._driver)})
 
     def _admit(self) -> None:
         """Hold the federation exclusively for the whole injection: the run's own admission, which must then be

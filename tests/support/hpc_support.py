@@ -78,6 +78,7 @@ class FakeHpc:
         self.exit_after_s: float | None = 0.0
         self.stop_hangs = False
         self.stop_noop = False
+        self.stop_unconfirmed = False  # the stop answers exit 1, stopped false, while the service goes on stopping
         self.start_fails: set[str] = set()
         self.never_serving: set[str] = set()
         self.serves_after = 0
@@ -157,7 +158,11 @@ class FakeHpc:
             self.clock.sleep(timeout_s)  # the command is killed here; the service goes on stopping
             raise subprocess.TimeoutExpired(list(argv), timeout_s)
         ended = "exit" if entry["exit_at"] is not None else "none"
-        record = {"service": service, "stopped": True, "ended": ended, "seconds": self.exit_after_s or 0.0}
+        took = self.exit_after_s or 0.0
+        if self.stop_unconfirmed:  # the step did not leave the list in time: the verb's verdict is not stopped
+            record = {"service": service, "stopped": False, "ended": ended, "seconds": took + 70.0}
+            return CommandResult(1, json.dumps({**record, "service_seconds": took}) + "\n")
+        record = {"service": service, "stopped": True, "ended": ended, "seconds": took, "service_seconds": took}
         return CommandResult(0, json.dumps(record) + "\n")
 
     def _start(self, service: str) -> CommandResult:

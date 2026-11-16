@@ -84,7 +84,8 @@ def test_o58_an_outage_on_hpc_journals_restores_and_settles_exactly_as_on_compos
     (compose_lines, compose_shot), (hpc_lines, hpc_shot) = runs["compose"], runs["hpc"]
     shape = [(line["event"], line.get("how"), sorted(set(line) - {"stop"})) for line in hpc_lines]
     assert shape == [(line["event"], line.get("how"), sorted(line)) for line in compose_lines]
-    assert [line.get("stop") for line in hpc_lines] == [None, None, {"ended": "exit", "seconds": 0.0}, None]
+    evidence = {"stopped": True, "ended": "exit", "seconds": 0.0, "service_seconds": 0.0}
+    assert [line.get("stop") for line in hpc_lines] == [None, None, evidence, None]
     assert [event for event, _, _ in shape] == ["injecting", "stopping", "injected", "cleared"]
     assert hpc_lines[0]["gate_probe"] == "gate-probe-1"
     words = [(s["step"], s["ok"], s.get("how")) for s in hpc_shot["steps"]]
@@ -186,6 +187,23 @@ def test_o58_a_stop_killed_at_its_timeout_while_the_service_goes_on_stopping_is_
     assert open_injections(tmp_path) == []
     restore = [step for step in steps(injector) if step[0] in ("injected", "cleared", "verified")]
     assert restore == [("injected", False, None), ("cleared", True, "restored"), ("verified", True, None)]
+
+
+def test_o58_a_stop_answered_unconfirmed_journals_its_duration_with_the_stop_of_unknown_outcome(tmp_path):
+    """O58: the stop verb could not confirm the stop (its step was still listed at the bound) and exits 1: the journal's
+    `stop_unknown` line carries the stop's evidence, so every stop's real duration is in the journal, and the restore
+    waits for the service to show down and brings it back as for any stop of unknown outcome."""
+    injector, federation = hpc(tmp_path)
+    federation.stop_unconfirmed, federation.exit_after_s = True, 5
+    with pytest.raises(InfraError):
+        injector.start(RUN)
+    lines = journal(tmp_path)
+    assert [line["event"] for line in lines][:4] == ["injecting", "stopping", "stop_unknown", "cleared"]
+    assert lines[2]["stop"] == {"stopped": False, "ended": "exit", "seconds": 75.0, "service_seconds": 5.0}
+    assert federation.launches(SERVICE) == 2
+    assert open_injections(tmp_path) == []
+    [failed] = [step for step in injector.snapshot()["steps"] if step["step"] == "injected"]
+    assert failed["stop"] == lines[2]["stop"]
 
 
 def test_o58_a_restore_that_does_not_serve_stays_open_and_a_later_clear_verifies_it_without_a_second_start(tmp_path):

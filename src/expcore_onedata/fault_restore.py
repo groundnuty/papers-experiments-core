@@ -88,8 +88,9 @@ def digest(identity: str) -> str:
 
 
 def stop_record(driver: Any) -> dict[str, Any]:
-    """What a driver kept of the stop it just made (`fault_hpc.HpcDriver.last_stop`: how it ended and its seconds), as
-    the `stop` key of the injection's `injected` line and step; nothing for a driver that keeps none (Compose)."""
+    """What a driver kept of the stop it just made (`fault_hpc.HpcDriver.last_stop`: whether it was confirmed, how it
+    ended and its seconds), as the `stop` key of the injection's `injected` or `stop_unknown` line and step; nothing
+    for a driver that keeps none (Compose), or for a stop that did not answer."""
     found = getattr(driver, "last_stop", None)
     return {"stop": dict(found)} if isinstance(found, Mapping) else {}
 
@@ -398,7 +399,7 @@ class LinkSettling:
                 unknown = True
             down = not unknown and self.wait(lambda s: not s.running, service, unreadable_ok=True) is not None
             with contextlib.suppress(OSError):  # the `stopping` line already makes recovery wait for it to show down
-                evidence = stop_record(self._driver) if down else {}
+                evidence = stop_record(self._driver)  # a stop that answered, confirmed or not, keeps its duration
                 self.journal.append({"event": "injected" if down else "stop_unknown", "id": entry, **evidence})
             plain = {"id": entry, "service": service, "identity_sha256": before, "injected": down}
             done, how, _, ready_after_s = self.settle({**plain, "stop_unknown": unknown}, links=False, clear=False)

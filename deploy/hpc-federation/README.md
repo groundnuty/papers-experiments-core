@@ -261,8 +261,12 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
 with `[hpc] core = "step"`, that the core's Python from a venv on the shared filesystem runs on a node); the two
 batch scripts as `--exact` steps of a multi-node job; the bootstrap's panel calls through 8443 with the LUMA local
 feed's mappings; the submit read-back's fields as the site's Slurm prints them; and the ten pairs passing over the
-cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`); an imported
-space (M3) and the agent's node's step (M5) are not built here.
+cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`, over this
+driver's launcher and state file; DESIGN.md section 7), and `up` starts the core's fault relay
+(`expcore_onedata.fault_relay`) and `down` stops it; tested offline, none of it run live: a kept stop and a start
+again over the same work directory, `exec.sh` beside a running service, and every stop's real duration (from which
+`[hpc] stop_seconds` is to be set) are the live slot's. An imported space (M3) and the agent's node's step (M5) are
+not built here.
 
 ## The scripts
 
@@ -304,7 +308,8 @@ exited writes the copy's `out/` whole to `<results>/<label>.out.tar` with a mani
 shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only and prints the `python -m expcore merge`
 line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's docstring
 has its form). A step killed outright loses its shard's work since its last archive: the periodic snapshot is still to
-be built (`Snapshots`, the hook). Outage runs (`[faults]`) depend on the fault relay of milestone M4.
+be built (`Snapshots`, the hook). Outage runs (`[faults]`) go through the login node's fault relay (M4), which `up`
+starts.
 
 ## What the repository's tests cover
 

@@ -33,10 +33,13 @@ command timeout: a stop that runs past the command timeout would otherwise alway
 that does time out is the Compose case: the injector journals it `stop_unknown` and the restore waits for it to show
 down (`faults.py`, "A stop of unknown outcome").
 
-**The stop's evidence.** The `stop` verb prints how the stop ended (`ended`: the service's own exit, the kill at the
-bound, or none, nothing to stop) and how long it took from the request to the stop confirmed; the driver keeps the two,
-checked, as `last_stop`, which the injector journals with the injection (`injected`) and records in its snapshot, so a
-live slot's journal holds every stop's real duration.
+**The stop's evidence.** The `stop` verb prints whether the stop was confirmed (`stopped`), how it ended (`ended`: the
+service's own exit, the kill at the bound, or none, nothing to stop), how long the verb took from the request to its
+verdict (`seconds`) and how long the service took to end after its SIGTERM, as the node measured it
+(`service_seconds`). The driver keeps them, checked, as `last_stop`, from every stop that answered, confirmed or not,
+and the injector journals them with the stop's outcome (`injected`, or `stop_unknown` for a stop that answered
+unconfirmed) and records them in its snapshot, so a live slot's journal holds every stop's real duration, which a
+measured `[hpc] stop_seconds` comes from. A stop with no answer has none.
 
 **The heal (O35).** `ping` runs op-worker's runner (`/usr/sbin/op_worker ping`) inside the provider's service, and
 `restart_link` runs the Compose driver's very command, `compose.RESTART_LINK_SCRIPT` (rtransfer_config's restart_link
@@ -173,11 +176,20 @@ class HpcDriver:
         return done
 
     def stop(self, service: str) -> None:
-        """Stop the provider's service, keeping its work directory, data and registration; keep how it ended and how
-        long it took (`last_stop`), None when the answer does not say."""
+        """Stop the provider's service, keeping its work directory, data and registration; keep the stop's evidence
+        (`last_stop`) from its answer whether or not it was confirmed, None when there is no answer or it does not
+        say. An answer that is not a success raises DriverError as before: the evidence is kept first."""
         self.last_stop = None
-        done = self._ask(Request("stop", service), "stop the service", self._stop_timeout_s)
+        step, request = "stop the service", Request("stop", service)
+        try:
+            done = self._transport(request, timeout_s=self._stop_timeout_s)
+        except subprocess.TimeoutExpired:
+            raise DriverError(f"the command to {step} did not finish within {self._stop_timeout_s:g} s") from None
+        except OSError as error:
+            raise DriverError(f"the command to {step} could not run ({type(error).__name__})") from None
         self.last_stop = stop_evidence(done.stdout)
+        if done.returncode != 0:
+            raise DriverError(f"the command to {step} failed with exit code {done.returncode}")
 
     def start(self, service: str) -> None:
         """Start the provider's stopped service again."""
@@ -286,17 +298,25 @@ def parse_status(stdout: str) -> Observation:
     return Observation(record["running"], identity, health)
 
 
+def _duration(value: Any) -> float | None:
+    """A finite number of at least 0, rounded to the millisecond; None for anything else."""
+    numeric = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    return round(float(value), 3) if numeric and value >= 0 else None
+
+
 def stop_evidence(stdout: str) -> dict[str, Any] | None:
-    """How a stop ended, from the stop verb's answer: `ended` (a word of `STOP_ENDS`, or None) and `seconds` (from the
-    request to the stop confirmed: a finite number of at least 0, or None); None when the answer holds neither. Nothing
-    else the answer holds is kept (it can name a node)."""
+    """A stop's evidence, from the stop verb's answer: `stopped` (a bool, or None), `ended` (a word of `STOP_ENDS`, or
+    None), `seconds` (from the request to the verb's verdict) and `service_seconds` (the service's own end after its
+    SIGTERM, as the node measured it), each a finite number of at least 0 or None; None when the answer holds none of
+    them. Nothing else the answer holds is kept (it can name a node)."""
     record = _record(stdout)
     if record is None:
         return None
-    ended, seconds = record.get("ended"), record.get("seconds")
-    ended = ended if ended in STOP_ENDS else None
-    numeric = isinstance(seconds, int | float) and not isinstance(seconds, bool) and math.isfinite(seconds)
-    seconds = round(float(seconds), 3) if numeric and seconds >= 0 else None
-    if ended is None and seconds is None:
-        return None
-    return {"ended": ended, "seconds": seconds}
+    stopped, ended = record.get("stopped"), record.get("ended")
+    evidence = {
+        "stopped": stopped if isinstance(stopped, bool) else None,
+        "ended": ended if ended in STOP_ENDS else None,
+        "seconds": _duration(record.get("seconds")),
+        "service_seconds": _duration(record.get("service_seconds")),
+    }
+    return None if all(value is None for value in evidence.values()) else evidence
