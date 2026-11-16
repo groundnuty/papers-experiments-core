@@ -349,16 +349,30 @@ WITH_VALUE = frozenset(
     {"-k", "-m", "-W", "--deselect", "--ignore", "--ignore-glob", "--maxfail", "--durations", "--tb"}
 )
 REPORT_CHARS = re.compile(r"-r[fEsxXpPaAN]+")
+PLUGIN_OFF = re.compile(r"no:[A-Za-z0-9_.-]+")
 TEST_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*(?:::[A-Za-z0-9_.\[\]\-:, ]+)?")
 
 
 def check_pytest_args(args: Sequence[str]) -> list[str]:
-    """The arguments, refused unless each is a FLAGS flag, a `-r<chars>` report option, a WITH_VALUE option with its
-    value (next, or after `=`), or a test path or node id relative to the clone (no `..`; no leading `/`, `-`, `@`)."""
+    """The arguments, refused unless each is a FLAGS flag, a `-r<chars>` report option, `-p no:<plugin>`, a
+    WITH_VALUE option with its value (next, or after `=`), or a test path or node id relative to the clone (no `..`;
+    no leading `/`, `-`, `@`)."""
     out, pending = list(args), None
     for arg in out:
+        if pending == "-p":
+            if not PLUGIN_OFF.fullmatch(arg):
+                raise HpcTestsError(
+                    f"-p takes only no:<plugin> in a run (a plugin is disabled, never loaded), not {arg!r}"
+                )
+            pending = None
+            continue
         if pending is not None:
             pending = None
+            continue
+        if arg == "-p":
+            pending = "-p"
+            continue
+        if arg.startswith("-p") and PLUGIN_OFF.fullmatch(arg[2:]):
             continue
         name = arg.split("=", 1)[0]
         if arg in FLAGS or REPORT_CHARS.fullmatch(arg):

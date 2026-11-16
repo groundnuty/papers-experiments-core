@@ -53,7 +53,7 @@ standard library, so `python3 deploy/hpc-tests/hpctests.py` works too.
 A run's pytest arguments are an allowlist, since pytest also reads clustered short options (`-qo ...`) and argument
 files (`@file`): test paths and node ids relative to the clone (no `..`, nothing absolute), `-q`, `-v`, `-x`, `-s`,
 `-l`, `-r<chars>`, `--exitfirst`, `--showlocals`, `--strict-markers`, `--runxfail`, `--no-header`, `--no-summary`,
-`--disable-warnings`, and `-k`, `-m`, `-W`, `--deselect`, `--ignore`, `--ignore-glob`, `--maxfail`, `--durations`,
+`--disable-warnings`, `-p no:<plugin>` (disabling a plugin, never loading one), and `-k`, `-m`, `-W`, `--deselect`, `--ignore`, `--ignore-glob`, `--maxfail`, `--durations`,
 `--tb` with a value. Anything else is refused before a step starts (exit 64): an option that could write outside the
 run directory, move where the step's results go, or run no test. A zero from pytest counts as a pass only when its
 JUnit XML records a test (exit 5 otherwise).

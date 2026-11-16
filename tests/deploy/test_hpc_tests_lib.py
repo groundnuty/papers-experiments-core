@@ -294,7 +294,8 @@ def test_o64_a_run_s_remote_command_holds_the_use_lock_shared_and_is_bounded_on_
 @pytest.mark.parametrize(
     "args",
     [["tests", "-q"], ["tests/x.py::test_a[1-2]", "-k", "a and not b", "-m", "not benchmark"],
-     ["-x", "--tb=short", "-ra", "--maxfail=2", "-W", "error::DeprecationWarning"], ["--deselect", "tests/x.py::t"]],
+     ["-x", "--tb=short", "-ra", "--maxfail=2", "-W", "error::DeprecationWarning"], ["--deselect", "tests/x.py::t"],
+     ["-q", "-p", "no:cacheprovider", "-pno:randomly", "tests"]],
 )  # fmt: skip
 def test_the_pytest_arguments_a_run_takes(hpct, args):
     assert hpct.lib.check_pytest_args(args) == args
@@ -303,7 +304,8 @@ def test_the_pytest_arguments_a_run_takes(hpct, args):
 @pytest.mark.parametrize(
     "args",
     [["-qo", "log_file=/x"], ["@args.txt"], ["--basetemp=/x"], ["--setup-only"], ["/abs/tests"], ["../x"],
-     ["tests/../../x"], ["-k"], ["--co"], ["-o", "x=y"], ["-p", "myplugin"], ["--junitxml=/x"], ["-c", "x.ini"]],
+     ["tests/../../x"], ["-k"], ["--co"], ["-o", "x=y"], ["-p", "myplugin"], ["-pmyplugin"], ["--junitxml=/x"],
+     ["-c", "x.ini"], ["-p"]],
 )  # fmt: skip
 def test_o64_any_other_pytest_argument_is_refused(hpct, args):
     """O64: pytest reads clustered short options (`-qo ...`) and argument files (`@file`), so a run's arguments are an
