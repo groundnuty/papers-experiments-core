@@ -29,20 +29,23 @@ gap and `mono` never goes back; the last line is the end line, its count is the 
 unwritten; the canary is there (before `armed`, the token file's watch saw it removed and the directory's watch saw
 its entry removed: the host's removal once the mount was up, which shows both watches live); oneclient was named and
 seen before `armed`; `armed` and `disarmed` are each there once, in that order; no overflow; no proof outside the
-window; and oneclient's sampling never became unreadable before the window closed. Otherwise it is unknown, with
-every reason found. **A missing or damaged log is never read as one without accesses**: what it shows is kept as a
-lower bound.
+window; nothing but the end line after `disarmed`; the end line's polls and samples agree with the lines (a proof
+needs a poll, a tracer change a sample, and a window a sample of oneclient or the line saying its sampling stopped);
+and oneclient's sampling never became unreadable before the window closed. Otherwise it is unknown, with every reason
+found. **A missing or damaged log is never read as one without accesses**: what it shows is kept as a lower bound.
 
-**An access** is any inotify event inside the window (between `armed` and `disarmed`, or the log's end when it never
-closed): nothing of the host's touches the token's directory then, and inotify does not say which process caused an
-event, so every one counts as the agent's. A tracer is counted each time one attaches to oneclient inside the window,
-and once more when one was already attached as it opened.
+**An access** is any inotify event after `armed`: inside the window, nothing of the host's touches the token's
+directory, and inotify does not say which process caused an event, so every one counts as the agent's; after
+`disarmed` the watcher writes nothing but its end line, so a line there is damage (`lines_after_window`) and its
+access still counts. A tracer is counted each time one attaches to oneclient after `armed`, and once more when one was
+already attached as the window opened.
 
 **The isolation is proven** when the watcher found the run's mount, every poll of the node's processes could list
-them, the window holds at least one proof, and every proof in it passes. Each cell is its own `apptainer exec` with a
-PID namespace of its own; the watcher proves every one it finds alive at a poll, so the run's proof rests on the cells
-it caught (at least the start's canary cell, which holds on for a second) and on every cell being started by the same
-command line. A proof passes only when it says `ok` and lists no problem.
+them, the window holds at least one proof, and every proof in it passes: it says `ok`, lists no problem and names a
+cell deeper in PID namespaces than the watcher (`cell_not_nested` otherwise). Each cell is its own `apptainer exec`
+with a PID namespace of its own; the watcher proves every one it finds alive at a poll, so the run's proof rests on the
+cells it caught (at least the start's canary cell, which holds on for a second) and on every cell being started by the
+same command line.
 """
 
 import json
@@ -90,12 +93,15 @@ EVENTS_LOST = "events_lost"
 ONECLIENT_UNWATCHED = "oneclient_unwatched"
 SAMPLING_FAILED = "sampling_failed"
 PROOF_OUTSIDE_WINDOW = "proof_outside_window"
+LINES_AFTER_WINDOW = "lines_after_window"  # the watcher writes only its end line after `disarmed`
+NOT_SAMPLED = "not_sampled"  # a window opened and oneclient was never sampled, nor its sampling stopped
 
 # Why the isolation is not proven; each is a reason in the snapshot's `unproven`, with the failed proofs' own problems.
 NO_PROOF = "no_proof"
 PROOF_FAILED = "proof_failed"
 MOUNT_UNSEEN = "mount_unseen"
 POLL_FAILED = "cell_poll_failed"
+CELL_NOT_NESTED = "cell_not_nested"  # a cell proof of a process no deeper than the watcher proves nothing
 LOG_INCOMPLETE = "log_incomplete"  # the log was cut, damaged or never closed: what it lacks may be a failed proof
 
 
@@ -250,16 +256,20 @@ def _window(lines: list[dict[str, Any]], problems: list[str]) -> tuple[int, int]
     return opened, disarmed[0]
 
 
-def _isolation(proofs: list[dict[str, Any]], mount_seen: bool, polls_failed: int) -> tuple[str, ...]:
-    """Why the proofs in the window do not prove the isolation; empty when they do."""
+def _isolation(proofs: list[dict[str, Any]], mount_seen: bool, polls_failed: int, depth: int) -> tuple[str, ...]:
+    """Why the proofs in the window do not prove the isolation; empty when they do. `depth` is the watcher's own: a
+    cell proof of a process no deeper proves nothing."""
     found: list[str] = []
+    flat = [p for p in proofs if p["cell"] is not None and p["cell"]["nspid_depth"] <= depth]
+    if flat:
+        found += [PROOF_FAILED, CELL_NOT_NESTED]
     if not mount_seen:
         found.append(MOUNT_UNSEEN)
     if polls_failed:
         found.append(POLL_FAILED)
     if not proofs:
         found.append(NO_PROOF)
-    failed = [p for p in proofs if not p["ok"] or p["problems"] or p["cell"] is None]
+    failed = [p for p in proofs if not p["ok"] or p["problems"] or p["cell"] is None or p in flat]
     if failed:
         found.append(PROOF_FAILED)
         found += [problem for p in failed for problem in p["problems"]]
@@ -275,19 +285,32 @@ def _body(lines: list[dict[str, Any]], problems: list[str]) -> list[dict[str, An
     return lines
 
 
-def _end(lines: list[dict[str, Any]], problems: list[str]) -> tuple[list[dict[str, Any]], int]:
-    """The lines before the end line and its failed polls, recording what is wrong with the end. A log that was not
-    closed counts none, as the isolation is not proven from it anyway (`not_closed`)."""
+def _end(lines: list[dict[str, Any]], problems: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """The lines before the end line and the end line, recording what is wrong with the end; no end line for a log
+    that was not closed, from which the isolation is not proven anyway (`not_closed`)."""
     ends = [i for i, line in enumerate(lines) if line["event"] == "end"]
     last = lines[-1]
     if ends != [len(lines) - 1] or len(lines) < 2 or not _well_formed(last):
         problems.append(NOT_CLOSED)
-        return [line for line in lines if line["event"] != "end"], 0
+        return [line for line in lines if line["event"] != "end"], None
     if last["lines"] != len(lines) - 1:
         problems.append(COUNTS_DIFFER)
     if last["unwritten"] != 0:
         problems.append(UNWRITTEN)
-    return lines[:-1], last["polls_failed"]
+    return lines[:-1], last
+
+
+def _counts(end: dict[str, Any] | None, body: list[dict[str, Any]], armed: bool, problems: list[str]) -> None:
+    """The end line's polls and samples against the lines: a proof needs a poll, a tracer change a sample, and a
+    window that opened a sample of oneclient (or the line saying its sampling stopped)."""
+    if end is None:
+        return
+    proofs = sum(1 for x in body if x["event"] == "proof")
+    tracers = sum(1 for x in body if x["event"] == "tracer")
+    if (proofs and end["polls"] < 1) or end["samples"] < tracers:
+        problems.append(COUNTS_DIFFER)
+    if armed and end["samples"] < 1 and not any(x["event"] == "sampling" for x in body):
+        problems.append(NOT_SAMPLED)
 
 
 def read_log(data: bytes | None, nonce: str, *, max_bytes: int = MAX_BYTES) -> Reading:
@@ -305,10 +328,15 @@ def read_log(data: bytes | None, nonce: str, *, max_bytes: int = MAX_BYTES) -> R
     if not _sequence(decoded):
         problems.append(NOT_MONOTONIC)
     scope, mount_seen = _start(decoded[0], nonce, problems)
-    whole, polls_failed = _end(decoded, problems)
+    depth = decoded[0].get("nspid_depth") if NO_START not in problems else 64
+    whole, end = _end(decoded, problems)
     body = _body(whole[1:], problems)
     opened, closed = _window(body, problems)
     setup, inside = body[:opened], body[opened + 1 : closed]
+    after = body[opened + 1 :]  # what came after `armed`, the window's close included: every access in it counts
+    if body[closed + 1 :]:
+        problems.append(LINES_AFTER_WINDOW)
+    _counts(end, body, opened < len(body), problems)
     if not _canary(setup):
         problems.append(NO_CANARY)
     if not any(x["event"] == "oneclient" and x["seen"] for x in setup):
@@ -320,13 +348,13 @@ def read_log(data: bytes | None, nonce: str, *, max_bytes: int = MAX_BYTES) -> R
     if any(x["event"] == "proof" for x in setup + body[closed:]):
         problems.append(PROOF_OUTSIDE_WINDOW)
     accesses = dict.fromkeys(ACCESS_KEYS.values(), 0)
-    for x in inside:
+    for x in after:
         if x["event"] == "inotify":
             accesses[ACCESS_KEYS[x["target"]]] += 1
     tracers = [x["attached"] for x in setup if x["event"] == "tracer"]
-    traced = int(bool(tracers) and tracers[-1]) + sum(1 for x in inside if x["event"] == "tracer" and x["attached"])
+    traced = int(bool(tracers) and tracers[-1]) + sum(1 for x in after if x["event"] == "tracer" and x["attached"])
     proofs = [x for x in inside if x["event"] == "proof"]
-    isolation = _isolation(proofs, mount_seen, polls_failed)
+    isolation = _isolation(proofs, mount_seen, end["polls_failed"] if end else 0, depth)
     if not isolation and set(problems) & {NOT_CLOSED, UNPARSEABLE, NOT_DISARMED}:
         isolation = (LOG_INCOMPLETE,)  # lines may be missing, a failed proof among them: never proven from it
     return Reading(tuple(dict.fromkeys(problems)), accesses, traced, len(proofs), isolation, scope)

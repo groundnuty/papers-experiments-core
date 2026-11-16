@@ -38,10 +38,18 @@ def test_an_event_on_the_token_file_inside_the_window_is_an_access():
     assert reading.accesses == {"token_file": 1, "token_dir": 0}
 
 
-def test_events_after_the_window_closes_are_the_hosts_teardown_and_not_accesses():
-    reading = read_log(log(after=[inotify("dir", "IN_DELETE_SELF"), inotify("dir", "IN_IGNORED")]), NONCE)
-    assert reading.intact
-    assert reading.accesses == {"token_file": 0, "token_dir": 0}
+def test_a_line_after_the_window_closed_makes_the_log_unknown_and_its_access_still_counts():
+    """O60 (Codex, round 1): the watcher writes only its end line after `disarmed`; an access after it is a window
+    closed too early or a damaged log, never one to leave out."""
+    reading = read_log(log(after=[TOUCH]), NONCE)
+    assert guard_log.LINES_AFTER_WINDOW in reading.problems
+    assert reading.accesses == {"token_file": 0, "token_dir": 1}
+
+
+def test_a_tracer_after_the_window_closed_still_counts():
+    reading = read_log(log(after=[{"event": "tracer", "attached": True}]), NONCE)
+    assert reading.traced == 1
+    assert guard_log.LINES_AFTER_WINDOW in reading.problems
 
 
 def test_a_tracer_attached_to_oneclient_inside_the_window_is_counted():
@@ -223,6 +231,32 @@ def test_one_failed_proof_among_passing_ones_leaves_the_isolation_unproven_with_
 def test_a_proof_with_problems_is_failed_whatever_its_ok_says():
     forged = proof(ok=True, problems=["host_proc_in_cell"])
     assert guard_log.PROOF_FAILED in read_log(log(proofs=[forged]), NONCE).isolation_problems
+
+
+def test_a_passing_proof_of_a_cell_no_deeper_than_the_watcher_is_failed():
+    """O60 (Codex, round 1): a cell proof is of a process in a nested PID namespace, or it proves nothing."""
+    flat = proof(cell={"pid": 4242, "start_time": 777, "nspid_depth": 1})
+    reading = read_log(log(proofs=[flat]), NONCE)
+    assert guard_log.PROOF_FAILED in reading.isolation_problems
+    assert guard_log.CELL_NOT_NESTED in reading.isolation_problems
+
+
+def test_proofs_without_a_poll_contradict_the_end_line():
+    assert guard_log.COUNTS_DIFFER in read_log(log(polls=0), NONCE).problems
+
+
+def test_more_tracer_changes_than_samples_contradict_the_end_line():
+    reading = read_log(log([{"event": "tracer", "attached": True}], samples=0), NONCE)
+    assert guard_log.COUNTS_DIFFER in reading.problems
+
+
+def test_a_window_in_which_oneclient_was_never_sampled_is_unknown():
+    assert guard_log.NOT_SAMPLED in read_log(log(samples=0), NONCE).problems
+
+
+def test_a_window_whose_sampling_stopped_because_oneclient_ended_needs_no_sample():
+    reading = read_log(log([{"event": "sampling", "state": "stopped", "why": "gone"}], samples=0), NONCE)
+    assert reading.intact
 
 
 def test_a_proof_that_found_no_cell_is_failed():

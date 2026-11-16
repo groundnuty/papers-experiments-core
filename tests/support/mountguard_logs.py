@@ -50,6 +50,8 @@ def lines(
     after=(),
     unwritten: int = 0,
     polls_failed: int = 0,
+    polls: int = 40,
+    samples: int = 12,
     ptrace_scope: int | None = 1,
     watches=None,
     mount_seen: bool = True,
@@ -84,8 +86,8 @@ def lines(
             {
                 "event": "end",
                 "lines": len(out),
-                "samples": 12,
-                "polls": 40,
+                "samples": samples,
+                "polls": polls,
                 "polls_failed": polls_failed,
                 "unwritten": unwritten,
             }

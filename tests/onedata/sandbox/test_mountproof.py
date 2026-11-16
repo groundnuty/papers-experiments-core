@@ -193,3 +193,33 @@ def test_a_protected_directory_resolves_to_its_device_and_its_path_in_its_file_s
 
 def test_a_directory_on_no_mount_of_the_table_is_unresolved(tmp_path):
     assert MP.resolve(str(tmp_path), table(("9:9", "/", "/", "ext4"))) == MP.Protected(None, None)
+
+
+def test_a_cell_first_seen_before_its_mounts_are_made_is_proved_once_they_are():
+    """O60 (Codex, round 1): Apptainer may still be binding when a cell's process is first seen; a later poll finds the
+    run's mount, and the host's `/proc` beside it, and fails the proof."""
+    proc = node(cell_process(500, mountinfo=table(("0:70", "/", "/", "overlay"))))
+    poll, proofs = polled(proc)
+    assert proofs == []
+    proc.procs[500].mountinfo = cell_table(("0:20", "/", "/hostproc", "proc"))
+    poll.poll()
+    assert [(label, ok, problems) for label, ok, problems, _ in proofs] == [("cell", False, [MP.HOST_PROC_IN_CELL])]
+
+
+def test_a_problem_a_later_look_finds_in_a_proved_namespace_is_a_failed_proof():
+    proc = node(cell_process(500))
+    poll, proofs = polled(proc)
+    proc.procs[500].mountinfo = cell_table(("0:30", "/run", "/x", "tmpfs"))
+    poll.poll()
+    poll.poll()  # written once, not at every look
+    assert [(ok, problems) for _, ok, problems, _ in proofs] == [(True, []), (False, [MP.PROTECTED_REACHABLE])]
+
+
+def test_a_process_is_looked_at_again_only_while_it_is_young(monkeypatch):
+    monkeypatch.setattr(MP, "RECHECK_POLLS", 2)
+    proc = node(cell_process(500, mountinfo=table(("0:70", "/", "/", "overlay"))))
+    poll, proofs = polled(proc)
+    poll.poll()
+    proc.procs[500].mountinfo = cell_table()
+    poll.poll()
+    assert proofs == []  # settled before the change, which a cell's own privileges could not make

@@ -21,6 +21,9 @@ host, through the host's `/proc`, which no cell can see or write. Everything is 
     the host's `/proc` would be;
   - no mount of the cell is on a protected directory's device with a root that is, holds or lies under it
     (`protected_reachable`; one that could not be resolved at the start is `protected_unresolved`).
+  Apptainer may still be making a cell's mounts when its first process is seen, so each process of this uid is looked
+  at again at every poll for `RECHECK_POLLS` polls: a cell's namespace found later, or a problem a later look finds,
+  is written then (a failed proof). After that a process's mount table no longer changes: a cell cannot mount.
 - **A process of the node's PID namespace** whose mount table holds the run's FUSE mount anywhere but at the host's
   own mount point is a cell started without a PID namespace of its own: a failed proof, label `host_process`,
   `same_pid_namespace`.
@@ -51,6 +54,7 @@ PROTECTED_UNRESOLVED = "protected_unresolved"
 SAME_PID_NAMESPACE = "same_pid_namespace"
 CELL_ALIVE_AT_CLOSE = "cell_alive_at_close"
 CELL, HOST_PROCESS, CLOSE = "cell", "host_process", "close"
+RECHECK_POLLS = 200  # a process of ours is looked at again for this many polls (10 s at the watcher's 50 ms)
 
 
 class ProcView(Protocol):
@@ -211,7 +215,8 @@ class CellPoll:
     def __init__(self, proc: ProcView, host: Host, emit: Callable[[str, bool, list[str], dict[str, int]], None]):
         self._proc, self._host, self._emit = proc, host, emit
         self._seen: set[Seen] = set()
-        self._proved: set[Any] = set()
+        self._proved: dict[Any, set[str]] = {}  # each namespace proved, with the problems written for it
+        self._young: dict[Seen, int] = {}  # processes of ours still looked at again, with the polls left
         self.cells: dict[Seen, int] = {}  # the processes found to be this run's cells, with their depth
         self.polls = 0
         self.failed = 0
@@ -245,7 +250,10 @@ class CellPoll:
             return None
 
     def _look(self, pid: int) -> bool | None:
-        """Look at one process: False when it is one of ours that could not be read whole, else None."""
+        """Look at one process: False when it is one of ours that could not be read whole, else None. A process of
+        ours is looked at again at each of the `RECHECK_POLLS` polls after it is first seen, as Apptainer may still be
+        making its mounts when it is first seen; after that its mount table no longer changes (a cell has no privilege
+        to mount)."""
         started = self._started(pid)
         if started is None or (pid, started) in self._seen:
             return None
@@ -266,24 +274,37 @@ class CellPoll:
                 return False  # a nested process of ours we cannot read: it may be a cell; looked at again next poll
             self._seen.add((pid, started))
             return None
-        self._seen.add((pid, started))
+        left = self._young.get((pid, started), RECHECK_POLLS) - 1
+        if left <= 0:
+            self._young.pop((pid, started), None)
+            self._seen.add((pid, started))
+        else:
+            self._young[(pid, started)] = left
+        self._judge(pid, started, values, mounts)
+        return None
+
+    def _judge(self, pid: int, started: int, values: tuple[int, ...], mounts: list[dict[str, str]]) -> None:
+        """A proof line for a cell of the run's the first time its namespace is seen, and a failed one whenever a later
+        look finds a problem not written yet; a failed one for a process of the node's namespace holding the run's
+        mount elsewhere."""
         ours = [m for m in mounts if self._host.fuse_dev is not None and m["dev"] == self._host.fuse_dev]
         if not ours:
-            return None
+            return
         cell = {"pid": pid, "start_time": started, "nspid_depth": len(values)}
         if len(values) <= self._host.depth:
-            if any(m["mountpoint"] != self._host.mountpoint for m in ours):
+            if any(m["mountpoint"] != self._host.mountpoint for m in ours) and (pid, started) not in self.cells:
                 self.cells[(pid, started)] = len(values)
                 self._emit(HOST_PROCESS, False, [SAME_PID_NAMESPACE], cell)
-            return None
+            return
         self.cells[(pid, started)] = len(values)
         key = self._namespace(pid) or (pid, started)
-        if key in self._proved:
-            return None
-        self._proved.add(key)
         problems = oneclient_problems(self._proc, self._host) + mount_problems(mounts, self._host)
-        self._emit(CELL, not problems, problems, cell)
-        return None
+        if key not in self._proved:
+            self._proved[key] = set(problems)
+            self._emit(CELL, not problems, problems, cell)
+        elif set(problems) - self._proved[key]:
+            self._proved[key] |= set(problems)
+            self._emit(CELL, False, problems, cell)
 
     def _namespace(self, pid: int) -> str | None:
         try:
