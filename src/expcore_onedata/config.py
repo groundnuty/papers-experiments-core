@@ -76,6 +76,11 @@ pre-campaign link check, never a study space, and its bounds; `linksettings.load
 file is loaded, into `link_check`, and kept out of the fingerprint: it says what is checked before a campaign, not what
 a run measures.
 
+**Loading is recorded for the study's build** (C11, O35). `load_platform` and `fault_settings.load_faults` record that
+they ran, with `PLATFORM_MODULE` and the file (`expcore.config.platform_loads`), while a study's build is open, and the
+scheduler refuses a study whose build loaded this platform without listing the module in `[study] platforms`, whatever
+its plugin wraps. The record is the module and the path only, and no value or fingerprint depends on it.
+
 **Several spaces** (`spaces.py`). The one-space form's single space is `spaces[0]`, labelled `space`, and its
 fingerprint is unchanged. With several spaces, `space` and `support` refuse (there is no one space to give), and each
 consumer names the space it acts on by its label: provisioning, placement, eviction and the probes are bound to one
@@ -96,6 +101,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
+from expcore.config.platform_loads import record_platform_load
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.linksettings import LinkCheckSettings, load_link_check
 from expcore_onedata.rights import declares_qos, declares_write, rights_problem
@@ -103,6 +109,7 @@ from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
 
+PLATFORM_MODULE = "expcore_onedata.sandbox.kinds"  # the module a study lists in `[study] platforms` for this platform
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 HOSTNAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
@@ -278,6 +285,10 @@ class PlatformConfig:
         It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12), and,
         whenever the `[[spaces]]` form is used (one entry or several), each entry's SHA-256 in the file's order
         (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
+        An entry that declares its data (`data_manifest`) is there by its declared identity and its data's content hash,
+        without its Onezone id: a space is the same experimental condition across federations when its declared
+        identity and its data identity match (C06); one that does not is there with its id, as it always was. The
+        one-space form holds its space's data identity (`space_data`) only when `[space]` declares `data_manifest`.
         The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was, unless `[space]`
         declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly` (and `shared`,
         when true: O59).
@@ -298,8 +309,11 @@ class PlatformConfig:
         out: dict[str, Any] = {"tls": self.tls.record()}
         if self.spaces_table:
             out["spaces"] = [entry.digest() for entry in self.spaces]
-        elif self.spaces[0].imported is not None:  # the one-space form's: only when declared, so the old one stands
-            out["storage_import"] = self.spaces[0].imported.record()
+        else:  # the one-space form's: each only when declared, so the old one stands
+            if self.spaces[0].imported is not None:
+                out["storage_import"] = self.spaces[0].imported.record()
+            if self.spaces[0].data is not None:  # its data identity (C06): two federations agree only on the same data
+                out["space_data"] = self.spaces[0].data
         if self.sandbox is not None:
             out["data_paths"] = self.sandbox.data_path_record()
             if self.sandbox.served_caps_declared:
@@ -310,6 +324,14 @@ class PlatformConfig:
         if faults is not None:
             out["faults"] = faults
         return out
+
+    def legacy_fingerprint(self) -> dict[str, Any] | None:
+        """The platform's half of the fingerprint as a store started before its spaces declared their data recorded
+        it (`StudyPlugin.platform_legacy`): every `[[spaces]]` entry by its id-bearing digest (`legacy_digest`). None
+        when no entry declares its data, since then the two are one."""
+        if not any(entry.data is not None for entry in self.spaces) or not self.spaces_table:
+            return None
+        return {**self.fingerprint(), "spaces": [entry.legacy_digest() for entry in self.spaces]}
 
     def condition_label(self, name: str) -> str:
         """Name a declared condition for a message by its position in the file, `conditions[i]`, never by its name."""
@@ -533,8 +555,11 @@ def load_platform(
     With `require_secrets` (the default, for a run) the admin credential's source must exist and hold something, and
     each fixed principal must have a credential file that others cannot read, so a missing variable or file fails here
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
+
+    While a study's build is open it records that it ran, with `PLATFORM_MODULE` and the file (`platform_loads`).
     """
     file = Path(path).resolve()
+    record_platform_load(PLATFORM_MODULE, file)  # at the entry: a load that then refuses its file still ran
     try:  # the same errors load_toml gives, so a missing file is a configuration error, not a crash
         digest = hashlib.sha256(file.read_bytes()).hexdigest()
     except FileNotFoundError:

@@ -93,6 +93,7 @@ from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapsho
 from expcore.campaign.storecopy import StoreChanged
 from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
+from expcore.config.platform_loads import watching_platform_loads
 from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
 from expcore.errors import study_kinds
 from expcore.guards import GuardsAnalysis, guards_analysis
@@ -132,6 +133,8 @@ from expcore.study.config import (
 )
 from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
+from expcore.study.platform_deferral import platform_deferrals
+from expcore.study.platform_legacy import legacy_fingerprint_of
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
@@ -321,23 +324,12 @@ def _run_campaign(
     whose threads refuse the study's own `InfraError` kinds as unknown ones, and a config no one has checked.
     """
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
-    plugin = load_plugin(StudyContext(study, code))
+    declared = platform_deferrals(study)  # from each platform's own configuration, before any study code runs (C11)
+    # the study's build, from its plugin's import to what the pipeline derives from it, is watched for the platform
+    # loaders it runs, and the watch ends before the scheduler starts: it holds no build open for the campaign's length
+    with watching_platform_loads() as loaded:
+        plugin, leases, settings, fingerprint, manifest, started = _build(study, code, shard, after)
     out = out_dir(study)
-    leases = None if plugin.probe is None else LeasePool(out / "leases", plugin.lease_keys, plugin.probe)
-    settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
-    fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
-    manifest, started = study.manifest, None
-    if isinstance(shard, SelectionSpec):
-        try:
-            manifest, settings, started = selection_start(
-                study, settings, shard, fingerprint=fingerprint, environment=_identity_of(study, plugin), after=after
-            )
-        except ShardError as error:
-            raise Refused(str(error)) from None
-        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
-    elif shard is not None:
-        manifest, settings, started = _shard_of(study, plugin, settings, shard)
-        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
     options: dict[str, Any] = {} if crash_hook is None else {"crash_hook": crash_hook}
     if spend_journal is not None:
         options["spend_journal"] = spend_journal
@@ -360,6 +352,9 @@ def _run_campaign(
             on_hold=_say_hold,
             shard=started,
             reset_settings=plugin.reset_settings,
+            platform_deferrals=declared,
+            listed_platforms=study.platforms,
+            platform_loads=tuple(loaded),  # what the build loaded through the core's loaders, whatever the plugin hides
             **options,
         ) as scheduler:
             _say_lost(scheduler.lost_counted)
@@ -369,6 +364,34 @@ def _run_campaign(
         if not hint:
             raise
         raise FingerprintMismatch(refused.differences, hint=hint) from None
+
+
+def _build(
+    study: StudyConfig, code: Mapping[str, Any], shard: Spec | None, after: Sequence[Path]
+) -> tuple[StudyPlugin, LeasePool | None, SchedulerConfig, dict[str, Any], Manifest, ShardStart | None]:
+    """The study's plugin and what the pipeline derives from it before a scheduler starts: the lease pool, the
+    scheduler's settings, the campaign's fingerprint, and the manifest and the start of a shard or a selection. This is
+    the study's build, which runs the study's own code (`run_built_study` watches it for platform loaders)."""
+    plugin = load_plugin(StudyContext(study, code))
+    leases = None if plugin.probe is None else LeasePool(out_dir(study) / "leases", plugin.lease_keys, plugin.probe)
+    settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
+    fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
+    store = out_dir(study) / STATE_FILE
+    if plugin.platform_legacy is not None and store.is_file():  # C06: a store of the earlier form
+        fingerprint = legacy_fingerprint_of(read_fingerprint(store), fingerprint, plugin.platform_legacy)
+    manifest, started = study.manifest, None
+    if isinstance(shard, SelectionSpec):
+        try:
+            manifest, settings, started = selection_start(
+                study, settings, shard, fingerprint=fingerprint, environment=_identity_of(study, plugin), after=after
+            )
+        except ShardError as error:
+            raise Refused(str(error)) from None
+        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
+    elif shard is not None:
+        manifest, settings, started = _shard_of(study, plugin, settings, shard)
+        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
+    return plugin, leases, settings, fingerprint, manifest, started
 
 
 def _say_lost(counted: Mapping[str, Any] | None) -> None:
@@ -600,6 +623,21 @@ def _settle_side_files(study: StudyIdentity, batch: Path) -> None:
         lock.release()
 
 
+def _settle_merged_side_files(study: StudyIdentity, batch: Path) -> None:
+    """Finish what a kill left of the placement of a declared side file in a merged batch (R15, #304), and say so.
+
+    Only a rename that a record names is finished (the hash is the record's, so it is safe whenever it is made), and
+    only a copy of a file already in place is removed. A file no record names is left: removing it needs the campaign's
+    lock as a proof that no attempt is staging, and a merged batch has none to take (it holds no store, `check` makes
+    no `campaign.lock` beside it, R16, and nothing prevents a campaign from being started in its out/ later); the
+    merge that wrote the batch dropped such files from its copy. Only `batch`, the merged batch's `runs/`, is walked:
+    merge.json, the shards' snapshots and the shards themselves are never touched. A directory that cannot be written
+    is reported as left, and the pairing of the check then says what is missing.
+    """
+    for settled in settle_side_files(batch, study.side_files):
+        print(f"check: {settled}", file=sys.stderr)
+
+
 def _check_merged(
     study: StudyIdentity, directory: Path, code: Mapping[str, Any], env: Mapping[str, Any], partial: bool
 ) -> dict[str, Any]:
@@ -632,6 +670,7 @@ def _check_merged(
     except MergeRefused as error:
         raise Refused(str(error)) from None
     import_what_the_records_need(study, directory)
+    _settle_merged_side_files(study, directory)
     check = verify_batch(
         directory, code=code, hashed_only=[MARKER_PATTERN], environment=env, side_files=study.side_files
     )
@@ -864,7 +903,8 @@ def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
     only for several named families (S17), `holm_families`, each family's name, members, steps and equivalence
     decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named.
     Only for declared equivalence families (S18), `equivalence_families`: each one's name, members and steps over
-    their TOST p-values; a study that declares none keeps its analysis.json byte for byte."""
+    their TOST p-values; a study that declares none keeps its analysis.json byte for byte. A sensitivity analysis
+    (egress, the mount guard, both) holds the same entries of its own result beside its `left_out` and `contrasts`."""
     entries: dict[str, Any] = {"holm": result.holm}
     if result.holm_families:
         entries["holm_families"] = result.holm_families
@@ -903,7 +943,8 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
 def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds of a batch checked for egress (#179): each analysed run's verdict (its flags, its
     log's state and reasons, its outside destinations by address and port, its static-scan hits) and the sensitivity
-    analysis without the flagged runs, or why there is none."""
+    analysis without the flagged runs (its Holm decisions and, as the primary analysis's, its named and equivalence
+    families, S17 and S18), or why there is none."""
     sensitivity = egress.sensitivity
     return {
         "counts": egress.counts(),
@@ -925,7 +966,7 @@ def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in egress.flagged], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": egress.refused,
     }  # fmt: skip
 
@@ -948,7 +989,7 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in guard.left_out], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": guard.refused,
     }  # fmt: skip
 
@@ -968,7 +1009,7 @@ def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in guards.left_out], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": guards.refused,
     }  # fmt: skip
 

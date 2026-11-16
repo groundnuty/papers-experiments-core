@@ -13,9 +13,11 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import hpcrelay
 from fedlayout import ROOT_MARKER
+from hpcsettings import Site
 from hpcslurm import Client
 
 BUNDLE = Path(__file__).resolve().parent / "bundle"
+SHARDS = BUNDLE.parent / "shards.py"  # its `sweep`, on the agent's node at down
 WORKDIR_LINE = re.compile(r"^hpcop: work directory (/\S+)$", re.M)  # the batch scripts' own line (zone.sbatch)
 
 
@@ -68,6 +70,13 @@ class Down:
                 unverified.append("the services")
         elif any(r.get("workdir") and r.get("state") != "removed" for r in state["services"].values()):
             self.say("the held job had ended: its nodes could not be checked (the next job's sweep removes leftovers)")
+        swept = ""
+        if ((agent_info if self.separate(state) else info) or {}).get("JobState") == "RUNNING":
+            try:
+                swept = self.sweep_agent_node(state)
+            except (RuntimeError, OSError, TimeoutError) as error:
+                self.say(f"the agent's node could not be swept ({error}); the held job is cancelled all the same")
+                unverified.append("the agent's node")
         self.cancel_all([j for j, i in ((job, info), (agent, agent_info)) if i is not None], lost)
         unverified += self.end_clients([j for j in (job, agent) if j is not None])
         if unverified:
@@ -78,7 +87,23 @@ class Down:
             )
         remove_tree(self.root)
         gone = " and ".join(j for j in (job, agent) if j) or "(never submitted, or no longer ours)"
-        return f"down: the held job {gone} is gone, and so is the root"
+        return f"down: the held job {gone} is gone, and so is the root" + (f"\n{swept}" if swept else "")
+
+    def sweep_agent_node(self, state: Mapping[str, Any]) -> str:
+        """`shards.py sweep` in a control step on the agent's node: every shard step's directory of this federation on
+        its tmpfs whose step is shown gone is removed, and one holding an out/ that could not be archived is kept and
+        named (the node's tmpfs is the node's, not the job's: no job end removes it). What the sweep printed; nothing
+        without an agent's node. RuntimeError when the sweep fails."""
+        record = state.get("sandbox") or {}
+        if not record.get("node"):
+            return ""
+        site = Site.from_json(state["site"])
+        argv = [site.node_python, "-I", "-B", str(SHARDS), "sweep", "--tmpfs", site.node_tmp, "--root", str(self.root)]
+        name = f"{state['allocation']['name']}-sandbox-sweep"
+        done = self.launcher.control(record["node"], argv, name=name, timeout_s=self.timeouts["step"])
+        if done.returncode != 0:
+            raise RuntimeError(f"its sweep ended with status {done.returncode}")
+        return done.stdout.strip()
 
     @staticmethod
     def separate(state: Mapping[str, Any]) -> bool:

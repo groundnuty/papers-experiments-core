@@ -54,10 +54,12 @@ by itself (a repair it runs) is never cut off by that bound: a campaign whose `m
 its start, before its store is opened (`deferral_bound`, `SchedulerConfig.check_deferral_bound`). The bound is the
 platform's own seconds and the core's waits its wait includes: between two checks (`recheck_s`, `poll_interval_s`)
 and a check's own time (`health_timeout_s`), which only the core's settings give, each named in the refusal. **The
-platform declares it twice**, so a study's own check around the platform's, which hides the method, cannot hold the
-campaign to nothing: its run admission may also declare it (`declared_deferral_s`, the same `DeferralBound`, read from
-the platform's settings), and a health check that exposes no `max_deferral_s`, or a smaller bound than the platform's
-declared one, refuses the campaign at its start (`SchedulerConfig.check_declared_deferral`).
+platform declares it three times**, so a study's own check around the platform's, which hides the method, cannot hold
+the campaign to nothing: its run admission may also declare it (`declared_deferral_s`, the same `DeferralBound`, read
+from the platform's settings), and so may its module, which the core reads itself from the platform's own configuration
+(`declared_deferral_from_config`, `PlatformDeferral`, `expcore.study.platform_deferral`), where a study that wraps the
+admission as well hides nothing. A health check that exposes no `max_deferral_s`, or a smaller bound than any declared
+one, refuses the campaign at its start (`SchedulerConfig.check_declared_deferral`).
 
 **A failure an earlier attempt left charges no one.** A platform answers `Health(False, detail, charge=False)` for a
 failure it knows another attempt left behind (a progressive ingest's baseline that a failed reset, or an attempt
@@ -129,12 +131,19 @@ class DeferralBound(NamedTuple):
     `seconds` is the platform's own time. A wait that only a later check can start (a repair that begins at a check)
     also holds waits whose lengths are the core's settings, which the platform cannot know: `rechecks` counts the waits
     between two of the core's checks (`recheck_s` and up to `poll_interval_s` each) and `checks` the checks' own time
-    (`health_timeout_s` each) the wait includes beyond `seconds`; the core adds them with its figures and names each."""
+    (`health_timeout_s` each) the wait includes beyond `seconds`; the core adds them with its figures and names each.
+
+    `platform` names the platform module the bound comes from, as `[study] platforms` lists it (the Onedata layer's is
+    `expcore_onedata.sandbox.kinds`; empty when the platform does not say). The core reads a platform's declared
+    deferral from its configuration through the modules a study lists, so when a bound that a health check or a run
+    admission declares names a module the study does not list, the campaign is refused at its start (`Scheduler(
+    listed_platforms=...)`): listing the module is required whenever a platform with a deferral is used."""
 
     seconds: float
     detail: str
     rechecks: int = 0
     checks: int = 0
+    platform: str = ""
 
 
 DEFERRAL_HOOK = "max_deferral_s"
@@ -158,7 +167,30 @@ def deferral_bound(check: Any, hook: str = DEFERRAL_HOOK, owner: str = HEALTH_OW
         return None
     if not callable(method):
         raise ConfigError(f"{owner} has a {hook} that is not a method")
-    answer = method()
+    return checked_bound(method(), hook, owner)
+
+
+class PlatformDeferral(NamedTuple):
+    """What one platform of `[study] platforms` declares of its own longest deferral, read by the core from the
+    platform's configuration through the platform's module (`expcore.study.platform_deferral`, with no object of the
+    study's plugin between): the module's name and its `DeferralBound`, None for a platform whose configuration declares
+    none. The scheduler holds the health check to each (`Scheduler(platform_deferrals=...)`,
+    `SchedulerConfig.check_declared_deferral`).
+
+    `loaded` names the platform modules whose loader the module's function ran to answer (`expcore.config.platform_loads`):
+    a module of the study's own that re-exports a platform's function loads that platform's configuration, so it speaks
+    for the platform even when it answers None, and what the study's build loaded of that platform is covered by listing
+    the study's module (`Scheduler(platform_loads=...)`)."""
+
+    platform: str
+    bound: DeferralBound | None
+    loaded: tuple[str, ...] = ()
+
+
+def checked_bound(answer: Any, hook: str, owner: str) -> DeferralBound | None:
+    """What `owner` answered to `hook`, validated at the boundary: None, or a `DeferralBound` of a finite, non-negative
+    number of seconds, a detail and non-negative whole counts of the core's own waits; ConfigError, naming `owner` and
+    `hook`, for anything else."""
     if answer is None:
         return None
     seconds = answer.seconds if isinstance(answer, DeferralBound) else None
@@ -168,12 +200,13 @@ def deferral_bound(check: Any, hook: str = DEFERRAL_HOOK, owner: str = HEALTH_OW
         or not math.isfinite(seconds)
         or seconds < 0
         or not isinstance(answer.detail, str)
-        or not all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in answer[2:])
+        or not all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in answer[2:4])
+        or not isinstance(answer.platform, str)
     ):
         raise ConfigError(
             f"{owner} answered {hook}() with {answer!r:.120}, not None or a "
-            "DeferralBound of a finite, non-negative number of seconds, a detail and non-negative whole counts of "
-            "the core's own waits"
+            "DeferralBound of a finite, non-negative number of seconds, a detail, non-negative whole counts of "
+            "the core's own waits and the platform's module name as text"
         )
     return answer
 

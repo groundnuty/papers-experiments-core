@@ -1,0 +1,97 @@
+# Provenance: new
+"""What each platform a study lists declares of its own longest deferral, read from the platform's own configuration.
+
+A platform whose health check can stay deferred (a heal it runs between runs) declares the longest in its configuration,
+and the core holds the campaign's `max_defer_s` to it (C11, O35). The health check and the run admission the study's
+plugin passes can both declare it, but both are objects the plugin may wrap, and a wrapper that leaves the method out
+hides the declaration: the campaign would then be held to nothing. So the core also asks the platform itself, through
+the module `[study] platforms` names (the one `study.config.import_platforms` imports), with no object of the study's
+plugin between the platform's settings and the comparison.
+
+A platform module opts in with one function, and a platform without it declares nothing:
+
+    def declared_deferral_from_config(path: Path) -> DeferralBound | None: ...
+
+`path` is the platform configuration the study points at (`StudyConfig.platform_config`: `[study] platform_config`, by
+default the `platform.toml` beside study.toml). The function loads the file as the platform loads it for a run, so every
+check of the platform's own configuration (a `[tokens] margin_s` too small for its backend, a key it does not know)
+holds on this path too, and answers a `DeferralBound` or None. A refusal is a `ConfigError` naming the file and the key,
+which reaches the study as the platform worded it.
+
+A study that lists such a platform but points at no configuration is refused, naming the key: the guard would otherwise
+be skipped by leaving the pointer out. The file must lie inside the study directory, links followed: the core resolves
+the path once, checks that path, and hands it over as resolved. A file swapped between that and the platform's own open
+is outside what a path can guard; whoever can write the study directory can edit its plugin, which runs in this process.
+
+The function's own loads are noted (`PlatformDeferral.loaded`, `expcore.config.platform_loads`): the platform modules
+whose loader it ran to answer. A module of the study's own that re-exports a platform's function runs that platform's
+loader, so it speaks for that platform, and the scheduler counts what the study's build loaded of it as listed, whatever
+the function answers (a heal that is off answers None, which names no module).
+"""
+
+import importlib
+
+from expcore.campaign.healthgate import PlatformDeferral, checked_bound
+from expcore.config.loading import ConfigError
+from expcore.config.platform_loads import watching_platform_loads
+from expcore.study.config import (
+    PLATFORM_CONFIG_KEY,
+    PLATFORM_FILE,
+    PLATFORMS_KEY,
+    STUDY_FILE,
+    StudyConfig,
+    import_platforms,
+    inside_study,
+)
+
+PLATFORM_HOOK = "declared_deferral_from_config"  # a platform module's optional function, read by name
+
+
+def platform_deferrals(study: StudyConfig) -> tuple[PlatformDeferral, ...]:
+    """What each platform the study lists declares of its deferral, in the order `[study] platforms` lists them: only
+    those whose module has `declared_deferral_from_config`, each with the answer (None when its configuration declares
+    none). Raise ConfigError when a module cannot be imported, has a hook that is not a function, answers anything but
+    None or a `DeferralBound`, fails, or when the study points at no platform configuration for a platform that
+    declares from one."""
+    found = []
+    study_file = study.root / STUDY_FILE
+    for name in study.platforms:
+        import_platforms(study_file, [name])  # imported already by the load; this names the study's key if it fails
+        hook = getattr(importlib.import_module(name), PLATFORM_HOOK, None)
+        if hook is None:
+            continue
+        if not callable(hook):
+            raise ConfigError(
+                f"{study_file}: [study] {PLATFORMS_KEY}: module {name!r} has a {PLATFORM_HOOK} that is not a function"
+            )
+        if study.platform_config is None:
+            raise ConfigError(
+                f"{study_file}: [study] {PLATFORMS_KEY}: platform {name!r} declares its longest deferral from its "
+                f"configuration, and this study points at none: name the file in [study] {PLATFORM_CONFIG_KEY}, or "
+                f"keep it as {PLATFORM_FILE} beside {STUDY_FILE}"
+            )
+        config = study.platform_config.resolve()  # resolved once: the path checked below is the path handed over
+        if not inside_study(config, study.root):  # a study built in code, or a link, can name another
+            raise ConfigError(
+                f"{study_file}: [study] {PLATFORM_CONFIG_KEY}: must name a file inside the study directory, and "
+                f"{study.platform_config.name!r} is not in it (a link that leaves the directory is not inside it); "
+                f"platform {name!r} is not asked to read it"
+            )
+        if not config.is_file():
+            raise ConfigError(
+                f"{study_file}: [study] {PLATFORM_CONFIG_KEY}: names {study.platform_config.name!r}, which is not a "
+                f"file, and platform {name!r} declares its longest deferral from it"
+            )
+        try:
+            with watching_platform_loads() as ran:  # what its function loads is what the module speaks for
+                answer = hook(config)
+        except ConfigError:
+            raise  # the platform's own words: they name the file and the key
+        except Exception as error:  # its text may hold a credential, so the refusal names the type only
+            raise ConfigError(
+                f"{study_file}: [study] {PLATFORMS_KEY}: platform {name!r} failed reading its configuration in "
+                f"{PLATFORM_HOOK} ({type(error).__name__})"
+            ) from None
+        loaded = tuple(dict.fromkeys(load.module for load in ran))
+        found.append(PlatformDeferral(name, checked_bound(answer, PLATFORM_HOOK, f"platform {name!r}"), loaded))
+    return tuple(found)

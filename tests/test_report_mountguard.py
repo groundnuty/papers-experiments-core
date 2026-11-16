@@ -2,12 +2,16 @@
 sensitivity analysis without them, read like the egress section; and nothing new for a batch that was not guarded."""
 
 import dataclasses
+import json
+
+from family_support import named_families
 
 from expcore.egress.sensitivity import EgressAnalysis
 from expcore.mountguard.flags import RunMountGuard
 from expcore.mountguard.sensitivity import MountGuardAnalysis
 from expcore.report import render_report, summary_lines
 from expcore.stats.analysis import AnalysisResult, ContrastResult, HolmDecision
+from expcore.study.pipeline import _guards_summary, _json_text, _mount_guard_summary
 
 CODE = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
 CAUSES = ("treatment_outcome_none", "treatment_excluded", "exhausted", "unpaired_or_left_out", "outcome_none")
@@ -221,3 +225,50 @@ def test_the_terminal_summary_gives_the_runs_either_guard_leaves_out_per_conditi
     lines = summary_lines(analysis(contrast("a-vs-b", "difference")), None, None, combined())
     assert "both guards, cond-a: 1 of 2 left out (1 by egress alone, 0 by the mount guard alone, 0 by both)" in lines
     assert "both guards, cond-b: 2 of 2 left out (0 by egress alone, 1 by the mount guard alone, 1 by both)" in lines
+
+
+# --- the families of the reruns (S17) ---------------------------------------------------------------------------------
+
+FAMILIES = {"first": ("gain-x", "gain-y"), "second": ("loss-x", "loss-y")}
+IN_FAMILIES = "(2 Holm families, each adjusted on its own at alpha = 0.05)"
+
+
+def two_families() -> AnalysisResult:
+    """A rerun of four confirmatory contrasts in two named Holm families."""
+    result = analysis(
+        contrast("gain-x", "difference"),
+        contrast("gain-y", "difference"),
+        contrast("loss-x", "not_detected"),
+        contrast("loss-y", "not_detected"),
+    )
+    return named_families(result, FAMILIES)
+
+
+def test_s17_the_mount_guards_rerun_shows_each_named_family_and_analysis_json_carries_them():
+    """S17: the rerun without the runs that are not clean shows each named Holm family in a table with its steps, as the
+    primary analysis does and as the egress rerun does, and `analysis.json` holds the families and their steps."""
+    guard = guarded(sensitivity=two_families())
+    report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=guard)
+    assert f"{SENSITIVITY} {IN_FAMILIES}" in report
+    assert set(table_of(report, "##### Holm family first (2 contrasts)")) - {"Contrast"} == {"gain-x", "gain-y"}
+    assert table_of(report, "Holm steps of second:")["2"][1] == "loss-y"
+    assert "Holm family of" not in report.split(SENSITIVITY)[1].split("\n## ")[0]
+    kept = json.loads(_json_text(_mount_guard_summary(guard)))["sensitivity"]
+    assert [f["name"] for f in kept["holm_families"]] == ["first", "second"]
+    assert [s["name"] for s in kept["holm_families"][0]["steps"]] == ["gain-x", "gain-y"]
+
+
+def test_s17_the_combined_rerun_shows_each_named_family_and_analysis_json_carries_them():
+    """S17: the rerun without the runs either guard leaves out is shown and written as the others are."""
+    both = combined(sensitivity=two_families())
+    report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=guarded(), guards=both)
+    assert f"{BOTH_SENSITIVITY} {IN_FAMILIES}" in report
+    assert set(table_of(report, "##### Holm family second (2 contrasts)")) - {"Contrast"} == {"loss-x", "loss-y"}
+    kept = json.loads(_json_text(_guards_summary(both)))["sensitivity"]
+    assert [f["name"] for f in kept["holm_families"]] == ["first", "second"]
+
+
+def test_s17_a_flat_family_rerun_keeps_its_analysis_json_keys_in_both_guards():
+    """S17: one flat family gives each guard's rerun the keys it had before families were named."""
+    assert list(_mount_guard_summary(guarded())["sensitivity"]) == ["left_out", "contrasts", "holm"]
+    assert list(_guards_summary(combined())["sensitivity"]) == ["left_out", "contrasts", "holm"]

@@ -308,6 +308,17 @@ def test_c35_the_plugins_reset_settings_are_no_part_of_the_fingerprint_and_a_bad
             load_plugin(context(study_dir))
 
 
+def test_c06_the_plugins_platform_legacy_is_none_by_default_and_no_mapping_is_refused_at_load(study_dir):
+    """C06: the earlier form of the platform's half (`platform_legacy`) is None unless the plugin gives one, and one
+    that is no mapping is refused when the plugin is loaded, naming the file and the key."""
+    assert load_plugin(context(study_dir)).platform_legacy is None
+    source = STUB_PLUGIN.replace("SCORERS", "[Scorer()]").replace("PROMPTS", "None")
+    source = source.replace("tools=hashes)", 'tools=hashes, platform_legacy=["tls"])')
+    (study_dir / "plugin.py").write_text(source, encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"plugin\.py: the plugin's platform_legacy must be a mapping"):
+        load_plugin(context(study_dir))
+
+
 def test_a_tool_set_hashes_by_what_the_model_sees_and_not_by_the_order_it_was_listed_in():
     a = ToolSpec("a", "first")
     b = ToolSpec("b", "second", terminal=True)

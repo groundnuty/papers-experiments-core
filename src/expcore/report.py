@@ -448,12 +448,14 @@ def _descriptives(result: AnalysisResult, level: float | None) -> list[str]:
 CLAIM_HEADER = ["Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval", "Equivalent"]
 
 
-def _equivalence_family(result: AnalysisResult) -> list[str]:
+def _equivalence_family(result: AnalysisResult, level: str = "###", notes: bool = True) -> list[str]:
     """The equivalence family's members (S15): each one's TOST p-value, its Holm-adjusted one, and the interval at the
     level Holm compared it with; nothing when the preregistration declares no equivalence family. Declared
-    equivalence families (S18) have a table and steps of their own (`_declared_equivalence_families`)."""
+    equivalence families (S18) have a table and steps of their own (`_declared_equivalence_families`). `level` is the
+    heading's marks, `###` under the primary analysis's sections and `####` under a sensitivity analysis's, which
+    leaves out the notes (`notes`): the primary analysis's say what the table means."""
     if result.equivalence_families:
-        return _declared_equivalence_families(result)
+        return _declared_equivalence_families(result, level, notes)
     members = [r for r in result.contrasts if r.in_equivalence_family]
     if not members:
         return []
@@ -465,9 +467,9 @@ def _equivalence_family(result: AnalysisResult) -> list[str]:
     column = ["Holm family"] if family_of else []
     header = ["Contrast", *column, *CLAIM_HEADER]
     within = ", within each Holm family" if family_of else ""
-    heading = f"### Equivalence family (Holm over two one-sided tests{within})"
-    notes = equivalence_family_notes(result.alpha, by_family=bool(family_of))
-    return ["", heading, "", *_table(header, rows), "", *notes]
+    heading = f"{level} Equivalence family (Holm over two one-sided tests{within})"
+    lines = ["", heading, "", *_table(header, rows), ""]
+    return [*lines, *equivalence_family_notes(result.alpha, by_family=bool(family_of))] if notes else lines
 
 
 def _claim_cells(result: ContrastResult) -> list[str]:
@@ -478,10 +480,11 @@ def _claim_cells(result: ContrastResult) -> list[str]:
     return [_margin(result), _p(result.tost_p), _p(result.tost_p_holm), level, interval, _yes(result.equivalent)]
 
 
-def _declared_equivalence_families(result: AnalysisResult) -> list[str]:
+def _declared_equivalence_families(result: AnalysisResult, level: str = "###", notes: bool = True) -> list[str]:
     """Each declared equivalence family's claims (S18), each beside its family and, with named Holm families, the
     Holm family of its significance test, then each family's steps over its own claims' TOST p-values; after the check
-    that every claim's decision is its own equivalence family's."""
+    that every claim's decision is its own equivalence family's. `level` and `notes` are the heading's marks and
+    whether the notes follow (`_equivalence_family`)."""
     equivalence_of = check_equivalence_families(result)
     holm_of = check_families(result)
     by_name = {r.name: r for r in result.contrasts}
@@ -491,11 +494,11 @@ def _declared_equivalence_families(result: AnalysisResult) -> list[str]:
             holm = [holm_of.get(name, UNKNOWN)] if holm_of else []
             rows.append([name, one_line(equivalence_of[name]), *holm, *_claim_cells(by_name[name])])
     header = ["Contrast", "Equivalence family", *(["Holm family"] if holm_of else []), *CLAIM_HEADER]
-    heading = "### Equivalence families (Holm over two one-sided tests, within each declared equivalence family)"
+    heading = f"{level} Equivalence families (Holm over two one-sided tests, within each declared equivalence family)"
     lines = ["", heading, "", *_table(header, rows), ""]
     for family in result.equivalence_families:
         lines += [*equivalence_steps_lines(family, _table, _p, _num), ""]
-    return [*lines, *equivalence_family_notes(result.alpha, declared=True)]
+    return [*lines, *equivalence_family_notes(result.alpha, declared=True)] if notes else lines
 
 
 def _yes(value: bool) -> str:
@@ -743,8 +746,10 @@ def _budget_holds(export: Mapping[str, Any]) -> list[str]:
 
 def _sensitivity(result: AnalysisResult, level: float | None, left_out: str = "the flagged runs") -> list[str]:
     """The confirmatory contrasts of a sensitivity analysis in the primary analysis's own tables (#179): the Holm
-    family's, or every contrast for a preregistration with no family (S12), each with its pairs. `left_out` names the
-    runs the rerun leaves out, in its titles."""
+    family's, or every contrast for a preregistration with no family (S12), each with its pairs. With several named
+    Holm families (S17) each has a table and its steps, and with equivalence families (S15, S18) their claims and
+    steps follow, after the same checks the primary analysis's report makes. `left_out` names the runs the rerun leaves
+    out, in its titles."""
     for r in result.contrasts:
         _check_conclusion(r)
     _check_no_claim(result)
@@ -758,8 +763,31 @@ def _sensitivity(result: AnalysisResult, level: float | None, left_out: str = "t
     if not shown:
         return [title, "", "No contrast in the family."]
     with_mde = any(r.minimum_detectable_effect is not None for r in shown)
-    table = _contrast_table(shown, adjusted, level, result.alpha, with_mde=with_mde)
-    return [title, "", *table, "", *_pairs(shown, f"#### Pairs without {left_out}")]
+    if result.holm_families:  # several named families (S17): a table and the steps for each, never one merged family
+        tables = _named_sensitivity(result, adjusted, level, with_mde, left_out)
+    else:
+        tables = [title, "", *_contrast_table(shown, adjusted, level, result.alpha, with_mde=with_mde)]
+    pairs = _pairs(shown, f"#### Pairs without {left_out}")
+    return [*tables, "", *pairs, *_equivalence_family(result, "####", notes=False)]
+
+
+def _named_sensitivity(
+    result: AnalysisResult, adjusted: Mapping[str, float], level: float | None, with_mde: bool, left_out: str
+) -> list[str]:
+    """Each named Holm family's contrasts of a sensitivity analysis in a table of their own, then its steps (S17), as
+    `_named_families` shows the primary analysis's, after the check that every member's decision is its own family's."""
+    check_families(result)
+    by_name = {r.name: r for r in result.contrasts}
+    count = len(result.holm_families)
+    noun = "Holm family, adjusted" if count == 1 else "Holm families, each adjusted"
+    lines = [f"#### Preregistered contrasts without {left_out} ({count} {noun} on its own at alpha = {result.alpha:g})"]
+    for family in result.holm_families:
+        members = [by_name[name] for name in family.members]
+        size = f"{len(members)} contrast{'' if len(members) == 1 else 's'}"
+        lines += ["", f"##### Holm family {one_line(family.name)} ({size})", ""]
+        lines += _contrast_table(members, adjusted, level, result.alpha, with_mde=with_mde)
+        lines += ["", *steps_lines(family, _table, _p, _num)]
+    return lines
 
 
 def _egress_summary(egress: EgressAnalysis) -> list[str]:
@@ -777,12 +805,16 @@ def _egress_summary(egress: EgressAnalysis) -> list[str]:
 
 
 def _rerun_lines(result: AnalysisResult, prefix: str) -> list[str]:
-    """One terminal line per confirmatory contrast of a sensitivity analysis."""
+    """One terminal line per confirmatory contrast of a sensitivity analysis, naming each member's Holm family when the
+    preregistration has several (S17), as the primary analysis's lines do."""
     lines = []
+    family_of = check_families(result)  # empty for one flat family, whose lines are as they were
     adjusted = {d.name: d.p_holm for d in result.holm}
     for r in result.contrasts:
         if result.exploratory_only or not _exploratory(r, adjusted):
             holm = EXPLORATORY if result.exploratory_only else _p(adjusted[r.name])
+            if family_of and not result.exploratory_only:
+                holm += f" (family {one_line(family_of[r.name])})"
             estimate = f"estimate {_num(r.estimate)}, p {_p(r.p_value)}, Holm p {holm}"
             lines.append(f"{prefix} {r.name}: {estimate}, {r.conclusion}")
     return lines

@@ -858,6 +858,33 @@ def test_r04_a_shard_holding_a_file_that_is_neither_a_record_nor_declared_is_ref
     assert "[load]" not in errors
 
 
+def test_r04_a_shard_holding_a_link_to_a_directory_is_refused_and_what_it_points_at_never_copied(
+    base, clean_environment, whole, shard1, shard2
+):
+    """R04, C29 and #304: the merge replays a private copy of each shard's runs/ (copy_runs), and that copy keeps a link
+    as a link: following it would copy a directory outside the shard into the copy, where the check would see an
+    ordinary directory and the link would go unseen. So a shard holding a link to a directory is refused, naming it,
+    and nothing it points at reaches the merged batch."""
+    other = copy_out(shard2, base / "linked")
+    outside = base / "outside-the-shard"
+    outside.mkdir()
+    (outside / "planted.json").write_text('{"not": "a record"}', encoding="utf-8")
+    attempt = next(p for p in sorted((other / "runs").rglob("*.json")) if RECORD.fullmatch(p.name)).parent
+    link = attempt / "evidence"
+    link.symlink_to(outside, target_is_directory=True)
+    target = base / "refused-link" / "out"
+    errors = refused(
+        clean_environment,
+        whole,
+        target,
+        shard1.root / "out",
+        other,
+        fragments=("shard 2 (shard-2):", "unexpected", link.relative_to(other / "runs").as_posix()),
+    )
+    assert "planted.json" not in errors
+    assert not target.exists() or not any(target.rglob("planted.json"))
+
+
 def test_r04_a_merged_batchs_own_files_are_neither_records_nor_unexpected(merged):
     """R04 and C29: merge.json and the shards' snapshots lie beside the batch, not in it, and the batch holds the
     records, their markers and the check alone: its check found nothing unexpected."""

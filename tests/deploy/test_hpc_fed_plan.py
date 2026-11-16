@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import LAYOUT, FakeProcess, FakeSlurm, hpc_on_path, parse_srun
+from hpc_fed_support import LAYOUT, FakeProcess, FakeSlurm, hpc_on_path, manifest_values, parse_srun, pin_values
 
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
@@ -135,7 +135,11 @@ def rendered_pilot(hpc, root: Path, make_ca) -> Path:
     (root / "ca" / "federation-ca.pem").write_bytes(make_ca(root / "made").ca.read_bytes())
     (root / "fault-journal").mkdir()
     command = ["/venv/python", "/repo/hpcfed.py", "--layout", str(LAYOUT), "--root", str(root)]
-    values = hpc.boot.hpc_values(command, settings.stop_bound_s, settings.settle_timeout_s)
+    values = {
+        **hpc.boot.hpc_values(command, settings.stop_bound_s, settings.settle_timeout_s, root),
+        **pin_values(root / "agent"),
+        **manifest_values(root),
+    }
     hpc.boot.write_platform(root / "platform.toml", spec.platform_template.read_text(encoding="utf-8"), facts, values)
     return root / "platform.toml"
 
@@ -172,7 +176,7 @@ def test_the_platform_declares_the_hpc_backend_and_its_stop_bound_and_no_compose
     faults = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))["faults"]
     assert faults["backend"] == "hpc"
     assert faults["stop_bound_s"] == 690
-    assert faults["journal"] == "fault-journal"
+    assert faults["journal"] == str(tmp_path / "fault-journal")  # absolute: a copy beside a study names the root's
     assert set(faults["services"]) == {"aspen", "larch", "rowan", "alder", "hazel"}
     assert not {"compose_file", "project", "command", "docker"} & set(faults)
 

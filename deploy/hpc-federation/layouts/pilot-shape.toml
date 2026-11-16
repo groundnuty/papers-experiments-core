@@ -24,9 +24,10 @@ core = "login"                           # where the bootstrap and the link chec
 zone = { cpus = 4, memory = "8g" }       # live peaks: about 4.0 GB of RSS and the 1.9 GB rootfs on tmpfs
 provider = { cpus = 4, memory = "10g" }  # about 4.8 GB of RSS, the 2.5 GB rootfs and the posix storage on tmpfs
 control = { cpus = 1, memory = "1g" }    # every node's reserve for control steps (a token's delivery peaked at 180 MB)
-sandbox_placement = "het"                # the agent's node, once declared: its own component of the held job, or
-                                         # "separate", a held job of its own (DESIGN.md 1)
-# sandbox = { cpus = 8, memory = "17g" } # the agent's node (M5): its own shape, or derived from the template's limits
+sandbox_placement = "het"                # the agent's node: its own component of the held job, or "separate", a
+                                         # held job of its own (DESIGN.md 1)
+# The agent's node (M5) is sized by the template's [sandbox.limits]: an 8-core, 17 GiB step (the least for those
+# limits) plus the control reserve. `sandbox = { cpus = ..., memory = ... }` here may size it larger, never smaller.
 
 [zone]
 port = 29743
