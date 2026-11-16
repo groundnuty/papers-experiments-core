@@ -423,3 +423,29 @@ def test_o63_a_full_tmpfs_at_the_dispatchers_end_still_leaves_a_whole_record(sha
     (work / ".step.ended.json").write_text(json.dumps(record))
     assert shards._ended(work, 3) is True
     assert json.loads((work / "step.json").read_text()) == {**record, "exit_status": 3}
+
+
+def test_o63_the_dispatcher_records_its_own_end_before_it_exits(shards, tmp_path):
+    """O63: the dispatcher swaps in the record written at the start (`archiving`) as its own last act, by any end but
+    a kill, so a step killed between its dispatcher's end and its own `_ended` never leaves a whole out/ under a record
+    saying `running`; the step then adds the exit status."""
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "step.json").write_text(json.dumps({"shard": SPEC, "phase": "running"}))
+    (work / ".step.ended.json").write_text(json.dumps({"shard": SPEC, "phase": "archiving"}))
+    code = shards.run_dispatcher([sys.executable, "-I", "-m", "expcore", "--version"], dict(os.environ), work)
+    assert json.loads((work / "step.json").read_text()) == {"shard": SPEC, "phase": "archiving"}
+    assert shards._ended(work, code) is True
+    assert json.loads((work / "step.json").read_text()) == {"shard": SPEC, "phase": "archiving", "exit_status": code}
+
+
+def test_o63_a_dispatcher_that_cannot_be_tied_to_its_step_never_starts(shards, tmp_path):
+    """O63: the dispatcher's first words find their step gone (here, a parent other than the one named), and it exits
+    71 without running anything."""
+    mark = tmp_path / "ran"
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", shards.DISPATCHER, "1", sys.executable, "-c", f"open({str(mark)!r}, 'w')"],
+        capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    assert (done.returncode, mark.exists()) == (shards.NOT_TIED, False)
+    assert "could not be tied to its step" in done.stderr

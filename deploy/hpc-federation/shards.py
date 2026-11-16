@@ -41,7 +41,7 @@ archive it started from, and its phase): `running` while its dispatcher runs, `a
 (swapped in by rename from a record written at the start, so a full tmpfs cannot stop it), when its out/ is whole and
 the only one until archived. A step killed outright leaves its directory. Only one killed while `running` is ever
 removed, and only once its process and every process naming the directory (its dispatcher, which outlives a wrapper
-killed alone) are shown gone (the dispatcher dies with its step, `PDEATHSIG`, so it never ends after it): `--resume`
+killed alone) are shown gone (the dispatcher dies with its step and records its own end, `DISPATCHER`): `--resume`
 removes its own shard's of its own campaign (spec, root and results) and refuses while one runs, and `sweep`, which
 `hpcfed.py down` runs on the agent's node, removes its federation's. A directory whose dispatcher ended and that was not
 archived (`archiving`; marked `ARCHIVE-FAILED.json` when the mark could be written), or whose record cannot be read, is
@@ -466,26 +466,43 @@ def imports_core_from(core_src: Path, find: Callable[[], str] | None = None) -> 
         return False
 
 
-# The dispatcher's first words: it asks the kernel to kill it when its step dies (PR_SET_PDEATHSIG, kept across the
-# exec), then becomes the dispatcher. So a step killed alone never leaves its dispatcher running on, to end later with
-# a whole out/ that the step's record, still `running`, would let a cleanup remove. A step that died before the ask
-# took hold is seen (its parent is no longer the step), and the dispatcher never starts.
-PDEATHSIG = (
-    "import ctypes, os, signal, sys\n"
-    "try:\n"
-    "    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL)\n"
-    "except (AttributeError, OSError):\n"
-    "    pass\n"
-    "if os.getppid() != int(sys.argv[1]):\n"
-    "    os._exit(70)\n"
-    "os.execv(sys.argv[2], sys.argv[2:])\n"
-)
+# The dispatcher's first words, in its own process. It asks the kernel to kill it when its step dies
+# (PR_SET_PDEATHSIG) and, when that cannot be asked or the step is already gone, it never starts (exit 71): a step
+# killed alone never leaves it running on. It then runs `expcore` itself (as `python -m expcore` would) and, when that
+# ends by any path but a kill, swaps the step's record to `archiving` before the process exits, in its working
+# directory, the step's: so a dispatcher that ended is never under a record saying `running`, which a cleanup would
+# take for a step killed mid-run. Any other command is exec'd as it is.
+DISPATCHER = f"""import ctypes, os, runpy, signal, sys
+try:
+    tied = ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL) == 0
+except (AttributeError, OSError):
+    tied = False
+if not tied or os.getppid() != int(sys.argv[1]):
+    sys.stderr.write("shards: ERROR: the dispatcher could not be tied to its step, so it does not start\\n")
+    os._exit(71)
+argv = sys.argv[2:]
+if argv[1:4] != ["-I", "-m", "expcore"]:
+    os.execv(argv[0], argv)
+sys.argv, code = ["expcore", *argv[4:]], 1
+try:
+    runpy.run_module("expcore", run_name="__main__", alter_sys=True)
+    code = 0
+except SystemExit as end:
+    code = end.code if isinstance(end.code, int) else (0 if end.code is None else 1)
+finally:
+    try:
+        os.replace("{OWNER_ENDING}", "{OWNER}")
+    except OSError:
+        pass
+sys.exit(code)
+"""
+NOT_TIED = 71  # the dispatcher could not be tied to its step: it never started
 
 
 def run_dispatcher(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int:
     """Run the dispatcher, relaying SIGTERM and SIGINT to it, and return its exit status (128 + N for a signal N). It
-    dies with this step (`PDEATHSIG`)."""
-    words = [sys.executable, "-I", "-c", PDEATHSIG, str(os.getpid()), *argv]
+    dies with this step, and records its own end in the step's record (`DISPATCHER`); `cwd` is the step's directory."""
+    words = [sys.executable, "-I", "-c", DISPATCHER, str(os.getpid()), *argv]
     child = subprocess.Popen(words, env=dict(env), cwd=cwd, stdin=subprocess.DEVNULL)
 
     def relay(signum: int, _frame: Any) -> None:
@@ -860,26 +877,29 @@ def sweep(tmpfs: Path, root: str) -> int:
 
 
 def _ended(work: Path, status: int) -> bool:
-    """Record that the step's dispatcher ended (`archiving`): from here its out/ is whole and the only one until
-    archived, so no cleanup removes it. The record, with the exit status, is written whole into a file of its own and
-    read back; should that fail (a full tmpfs), the one written at the start (without the status) is used: either is
-    swapped in by rename, which needs no space. False when even that failed, said."""
-    prepared = _record(work / OWNER_ENDING)
-    chosen = OWNER_ENDING
-    if prepared is not None:
-        record = {**prepared, "exit_status": status}
+    """Record that the step's dispatcher ended (`archiving`), with its exit status: from here its out/ is whole and the
+    only one until archived, so no cleanup removes it. The dispatcher swapped in the record written at the start as
+    it ended (`DISPATCHER`); a runner of another kind did not, and it is swapped in here. The record with the status is
+    written whole into a file of its own, read back, and swapped in by rename, which needs no space; should that fail
+    (a full tmpfs), the record without the status stands. False when no record says the dispatcher ended, said."""
+    if (work / OWNER_ENDING).exists():
         try:
-            (work / OWNER_STATUS).write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
-            if _record(work / OWNER_STATUS) == record:
-                chosen = OWNER_STATUS
-        except OSError:
-            pass  # the prepared record stands, whole: written at the start
-    try:
-        os.replace(work / chosen, work / OWNER)
-        return True
-    except OSError as error:
-        print(f"shards: ERROR: the step's end could not be recorded ({type(error).__name__})", file=sys.stderr)
+            os.replace(work / OWNER_ENDING, work / OWNER)
+        except OSError as error:
+            print(f"shards: ERROR: the step's end could not be recorded ({type(error).__name__})", file=sys.stderr)
+            return False
+    current = _record(work / OWNER)
+    if current is None or current.get("phase") != ARCHIVING:
+        print("shards: ERROR: the step's record does not say its dispatcher ended", file=sys.stderr)
         return False
+    record = {**current, "exit_status": status}
+    try:
+        (work / OWNER_STATUS).write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+        if _record(work / OWNER_STATUS) == record:
+            os.replace(work / OWNER_STATUS, work / OWNER)
+    except OSError:
+        pass  # the record without the status stands, whole
+    return True
 
 
 def step(
