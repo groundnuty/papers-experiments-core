@@ -179,9 +179,9 @@ class Watch:
             self._kill(members, "memory_limit", "memory", total, self._limit)
             return
         if self._clock() >= self._next_walk:
-            self._walk(members)
+            self._measure_spaces(members)
 
-    def _walk(self, members: list[Proc]) -> None:
+    def _measure_spaces(self, members: list[Proc]) -> None:
         began = self._clock()
         over: tuple[str, int, int] | None = None
         for space in self._spaces:

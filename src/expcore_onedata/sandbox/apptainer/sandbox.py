@@ -34,7 +34,6 @@ import os
 import re
 import secrets
 import signal
-import socket
 import stat
 import sys
 import threading
@@ -53,7 +52,7 @@ from expcore_onedata.sandbox import gatelog, gatepolicy, inputs, kinds, tokenfil
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, runs
+from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs
 from expcore_onedata.sandbox.apptainer.cells import AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
@@ -465,10 +464,8 @@ class ApptainerSandbox:
         first record of the collector's log, so a shim that never loaded leaves a log that reads as unknown. The cell
         holds on long enough for the watch to find its namespace: a cell whose processes the harness cannot see could
         not be bounded, and the start fails."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-            listener.bind((AV.LOOPBACK, 0))
-            listener.listen(4)
-            self._canary_port = int(listener.getsockname()[1])
+        with loopback.listener() as port:
+            self._canary_port = port
             hold = max(1.0, 5 * self.app.memory_poll_s)
             done = self._cells.run(CANARY.format(port=self._canary_port, hold=hold), PROBE_S, record=False)
         said = done.stdout.strip()

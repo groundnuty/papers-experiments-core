@@ -10,8 +10,10 @@
 Apptainer sandbox's data gate listens on that node's loopback and its cells are that node's `apptainer exec`s, so the
 dispatcher (`python -m expcore run STUDY --shard i/N --shard-label L`) must run there, never on the login node. A step
 is launched from the login node alone (srun cannot start one on a compute node), as the federation's own services are
-(`DESIGN.md`): `lines` prints each shard's `srun --jobid=<the federation's job> --exact ... /usr/bin/env -i <allowlist>
-<python> -I shards.py step ...`, to run detached (`setsid nohup ... &`). Nothing here runs srun.
+(`DESIGN.md`): `lines` prints each shard's `srun --jobid=<job> [--het-group=<g>] --exact ... /usr/bin/env -i
+<allowlist> <python> -I shards.py step ...`, to run detached (`setsid nohup ... &`). The job and the component are the
+state file's `sandbox` record's: a component of the federation's heterogeneous job (`het`) or a job of its own
+(`separate`). Nothing here runs srun.
 
 **How it reaches its federation.** The step's environment is an allowlist: `PATH`, `LC_ALL`, and the federation's
 `EXPCORE_FED_ROOT_PARENT` and `EXPCORE_FED_ROOT`. The study's plugin loads `<root>/platform.toml`, where the
@@ -82,6 +84,7 @@ import tomllib
 FORMAT = "expcore-hpc-shard/1"
 STATE_FORMAT = "expcore-hpc-federation/1"
 STATE_FILE = "hpc-federation.json"
+PLACEMENTS = ("het", "separate")  # the sandbox record's placements: a het component, or a held job of its own
 LOCK_NAME = "campaign.lock"  # expcore.campaign.lock.LOCK_NAME: the merge refuses a shard without it
 ALLOWLIST = ("PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT")
 CORE_MISMATCH = 97  # the step's interpreter imports another core than the one it was given
@@ -161,7 +164,13 @@ def load_plan(path: Path) -> Plan:
 
 
 def federation(shard: Shard) -> dict[str, Any]:
-    """The federation's state as its `up` wrote it: its held job, the allocation's name, and the sandbox's node."""
+    """Where the shard's step goes, from the federation's state as its `up` wrote it: the job, the heterogeneous
+    component, the step name's prefix and the sandbox's node.
+
+    The state's `sandbox` record says how the sandbox node was placed: `het`, a component of the federation's own
+    heterogeneous job (the step needs `--het-group`, or it lands in component 0, the services' node shape), or
+    `separate`, a held job of its own (its `job`). A state with no `sandbox` record is the federation's job alone, its
+    node named by the manifest. Either way the manifest's `sandbox_node`, when given, must be the record's."""
     try:
         state = json.loads((shard.root / STATE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -170,12 +179,32 @@ def federation(shard: Shard) -> dict[str, Any]:
         raise ShardsError(f"shard {shard.label}: its federation's state file is not {STATE_FORMAT}")
     allocation = state.get("allocation") or {}
     job, name = allocation.get("job"), allocation.get("name")
-    node = shard.node or (state.get("sandbox") or {}).get("node")
-    if not (isinstance(job, str) and job.isdigit() and isinstance(name, str) and name):
+    if not (_job_id(job) and isinstance(name, str) and name):
         raise ShardsError(f"shard {shard.label}: its federation has no held job on record")
+    record = state.get("sandbox")
+    placement, group = "allocation", None
+    if record is not None:
+        if not isinstance(record, Mapping) or record.get("placement") not in PLACEMENTS:
+            raise ShardsError(f"shard {shard.label}: its sandbox record names no placement of {', '.join(PLACEMENTS)}")
+        placement = record["placement"]
+        if placement == "het":
+            group = record.get("het_group")
+            if isinstance(group, bool) or not isinstance(group, int) or group < 1:
+                raise ShardsError(f"shard {shard.label}: its sandbox is a het component with no het_group above 0")
+        else:
+            job, name = record.get("job"), record.get("name") or name
+            if not _job_id(job):
+                raise ShardsError(f"shard {shard.label}: its separate sandbox has no held job on record")
+    node = (record or {}).get("node") or shard.node
     if not isinstance(node, str) or not node:
         raise ShardsError(f"shard {shard.label}: no sandbox node: the state file names none and the manifest neither")
-    return {"job": job, "name": name, "node": node}
+    if shard.node and node != shard.node:
+        raise ShardsError(f"shard {shard.label}: the manifest's sandbox_node is not the one its state file names")
+    return {"job": job, "name": name, "node": node, "placement": placement, "het_group": group}
+
+
+def _job_id(job: Any) -> bool:
+    return isinstance(job, str) and job.isdigit()
 
 
 def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) -> list[str]:
@@ -187,7 +216,8 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
             "--results", str(plan.results), "--core-src", str(plan.core_src)]  # fmt: skip
     return [
-        "srun", f"--jobid={fed['job']}", "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
+        "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
+        "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
         f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH",
         "/usr/bin/env", "-i", *env, *step,
     ]  # fmt: skip
