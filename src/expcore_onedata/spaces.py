@@ -30,6 +30,10 @@ to; `readonly` (required) says whether that storage is read-only, so that Onedat
 from it. A space without the key is a regular one, as every space was. The declaration is in the fingerprint: in an
 entry's digest with `[[spaces]]`, and as `storage_import` in the one-space form, whose fingerprint stays as it was
 without the key.
+
+`shared` (optional, false by default; O56) says the storage's directory is imported by other federations too, so
+nothing of this one may write to it: a shared import must be read-only, and `readonly = false` beside `shared = true`
+is refused at load. It enters the fingerprint only when true, so no earlier declaration's fingerprint changes.
 """
 
 import hashlib
@@ -68,9 +72,16 @@ class Support:
 
 @dataclass(frozen=True)
 class ImportedStorage:
-    """How the data provider holds an imported space: on a storage Onedata imported the files from, read-only or not."""
+    """How the data provider holds an imported space: on a storage Onedata imported the files from, read-only or not,
+    and whether other federations import the same directory (`shared`, O56), in which case it is read-only."""
 
     readonly: bool
+    shared: bool = False
+
+    def record(self) -> dict[str, bool]:
+        """What the fingerprint holds of it: `readonly`, and `shared` only when true, so that the digest of every
+        declaration made before the key existed is what it was."""
+        return {"readonly": self.readonly, **({"shared": True} if self.shared else {})}
 
 
 @dataclass(frozen=True)
@@ -98,7 +109,7 @@ class StudySpace:
             "tokens": list(self.tokens),
         }
         if self.imported is not None:
-            facts["import"] = {"readonly": self.imported.readonly}
+            facts["import"] = self.imported.record()
         text = json.dumps(facts, sort_keys=True)
         return hashlib.sha256(text.encode()).hexdigest()
 
@@ -122,12 +133,21 @@ def parse_import(section: Section) -> ImportedStorage | None:
     if not isinstance(value, Mapping):
         raise section.fail("import", "must be a table, written import = { readonly = true }")
     table = Section(value, section.file, f"{section.where}.import")
-    table.reject_unknown(("readonly",))
+    table.reject_unknown(("readonly", "shared"))
     if "readonly" not in table.data:
         raise table.fail("readonly", "is required: say whether the imported storage is read-only")
     if not isinstance(table.data["readonly"], bool):
         raise table.fail("readonly", "must be true or false")
-    return ImportedStorage(readonly=table.data["readonly"])
+    shared = table.data.get("shared", False)
+    if not isinstance(shared, bool):
+        raise table.fail("shared", "must be true or false")
+    if shared and not table.data["readonly"]:
+        raise table.fail(
+            "readonly",
+            "must be true when 'shared' is true: other federations import this directory too, and nothing of this one "
+            "may write to it",
+        )
+    return ImportedStorage(readonly=table.data["readonly"], shared=shared)
 
 
 def parse_support(section: Section, providers: Collection[str]) -> Support:
