@@ -208,6 +208,35 @@ def test_a_run_without_access_and_with_a_proved_cell_is_clean_in_the_metadata(no
         mount.stop()
 
 
+def test_the_io_mode_is_read_through_glogs_link_to_oneclients_log(node, settings, binary):
+    """oneclient.INFO is glog's link to the current log file of the same directory: followed there, never elsewhere."""
+    mount = helper(node, settings, binary)
+    try:
+        mount.start()
+        lines = "I1116 10:00:00.000000  1 logging.cc:1] Forced direct IO: 0\n"
+        lines += "I1116 10:00:00.000000  1 logging.cc:1] Forced proxy IO: 1\n"
+        (mount.where.log_dir / "oneclient.host.log.INFO.1").write_text(lines)
+        (mount.where.log_dir / "oneclient.INFO").symlink_to("oneclient.host.log.INFO.1")
+        node.cell()
+        mount.close_watch()
+        assert mount.metadata()["io_mode"]["effective"] == "proxy"
+    finally:
+        mount.stop()
+
+
+def test_a_log_link_that_leaves_the_log_directory_is_not_followed(node, settings, binary, tmp_path):
+    outside = tmp_path / "elsewhere.INFO"
+    outside.write_text("I1116 10:00:00.000000  1 logging.cc:1] Forced proxy IO: 1\n")
+    mount = helper(node, settings, binary)
+    try:
+        mount.start()
+        (mount.where.log_dir / "oneclient.INFO").symlink_to(outside)
+        mount.close_watch()
+        assert mount.metadata()["io_mode"]["effective"] == "unknown"
+    finally:
+        mount.stop()
+
+
 def test_a_touch_of_the_token_directory_flags_the_run(node, settings, binary):
     mount = helper(node, settings, binary)
     try:

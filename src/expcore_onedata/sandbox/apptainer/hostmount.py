@@ -356,7 +356,7 @@ class HostMount:
             finally:
                 self._log = _read(self.where.watch_log) if self.watch is not None else None
                 self._snapshot = snapshot(read_log(self._log, self.nonce))
-                text = _read(self.where.log_dir / directio.LOG_FILE)
+                text = _read_log_link(self.where.log_dir, directio.LOG_FILE)
                 declared = getattr(self.s.mount, "io_mode", None)
                 self._io_mode = iomode.judge(declared, None if text is None else text.decode("utf-8", "replace"))
 
@@ -448,6 +448,18 @@ def _read(path: Path) -> bytes | None:
             return handle.read()
         except OSError:
             return None
+
+
+def _read_log_link(directory: Path, name: str) -> bytes | None:
+    """oneclient's INFO log through glog's link to it: followed only to a regular file of the same directory, then read
+    without following anything further; None otherwise."""
+    try:
+        target = (directory / name).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if target.parent != directory.resolve():
+        return None
+    return _read(target)
 
 
 def host_mount_factory(oneclient: Pinned, **options: Any) -> MountHelperFactory:
