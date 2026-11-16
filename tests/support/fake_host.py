@@ -10,6 +10,14 @@ freezes a container: its cgroup says `frozen 1` until `unpause`, and nothing can
 and addresses are invented. The fake knows only the docker
 commands the package uses; anything else fails loudly, so a new command shows up as a test failure and not as a silent
 pass.
+
+A cell runs under the completion bootstrap (`completion.py`, O55), and the fake plays its part: it checks the program it
+was given against the size and hash the argv names, hands the test's `exec_handler` the program as the cell's stdin,
+and adds the completion record to both streams of what the handler returns, with its exit status, as the bootstrap
+would after the program's exit. `exec_delivers` stands for a stdin that loses bytes on the way (the bootstrap then
+records a source that is not whole, and runs nothing); `exec_input_error` for a write of the program that `docker exec`
+cut short; a handler that returns `Unrecorded` stands for an exec whose record never came (the stream ended first, or
+docker reported an exit it never saw).
 """
 
 import hashlib
@@ -24,8 +32,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from expcore_onedata.sandbox import completion
 from expcore_onedata.sandbox.api import SandboxError
-from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap
+from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_input
 from expcore_onedata.sandbox.inputs import PROBE_MARK
 
 VALUED = {
@@ -39,6 +48,25 @@ CERTIFI_BUNDLE = "/usr/lib/python3/site-packages/certifi/cacert.pem"  # where th
 PID_NS = "pid:[4026531836]"
 ONECLIENT_CONFIG_PATH = "/etc/invented/oneclient.conf"  # where the fake oneclient image keeps the file its help names
 ONECLIENT_CONFIG_SHA256 = hashlib.sha256(b"an invented oneclient configuration file\n").hexdigest()
+
+
+class Unrecorded(CmdResult):
+    """What `docker exec` returned for a cell, as it is: no completion record is added (O55)."""
+
+
+def bootstrap_of(argv: Sequence[str]) -> tuple[str, int, str, str] | None:
+    """The nonce, size, hash and interpreter of a cell's bootstrap argv (`completion.Completion.argv`), or None."""
+    if completion.BOOTSTRAP not in argv:
+        return None
+    at = list(argv).index(completion.BOOTSTRAP)
+    nonce, size, digest, python = argv[at + 1 : at + 5]
+    return nonce, int(size), digest, python
+
+
+def recorded(result: CmdResult, nonce: str, record: dict[str, Any]) -> CmdResult:
+    """`result` with the completion record the bootstrap writes on both streams after the program's exit."""
+    line = completion.record_line(nonce, record)
+    return CmdResult(result.returncode, result.stdout + line, result.stderr + line, input_error=result.input_error)
 
 
 @dataclass
@@ -176,6 +204,8 @@ class FakeHost:
         self.next_pid = 5000
         self.sudo_commands: list[list[str]] = []
         self.exec_handler: Callable[[FakeContainer, list[str], str | None], CmdResult] = self._default_exec
+        self.exec_delivers: Callable[[bytes], bytes] | None = None  # what of a cell's program reaches the container
+        self.exec_input_error: str | None = None  # a write of a cell's program that docker exec cut short
         self.journal = ""
         self.run_handlers: dict[str, Callable[[list[str]], CmdResult]] = {}
         self.fail_remove: set[str] = set()
@@ -398,11 +428,12 @@ class FakeHost:
         env: Mapping[str, str] | None = None,
         input: str | None = None,
         output_cap: int | None = None,
+        marker: bytes | None = None,
     ) -> CmdResult:
         with self.lock:
             self.calls.append(("docker", args[0], args[1:] if args[0] not in ("exec", "run") else ()))
             # a result is cut as the real host's runner cuts it, so a test sees what a cell's caller would
-            result = apply_output_cap(self._docker(list(args), env, input), output_cap)
+            result = apply_output_cap(self._docker(list(args), env, input), output_cap, marker)
         if check and result.returncode != 0:
             raise SandboxError(f"docker {args[0]} failed ({result.returncode}): {result.stderr.strip()[-300:]}")
         return result
@@ -496,7 +527,30 @@ class FakeHost:
             return CmdResult(126, "", f"Error response from daemon: container {args[i]} is not running")
         if container.paused:
             return CmdResult(126, "", f"Error response from daemon: container {args[i]} is paused")
-        return self.exec_handler(container, args[i + 1 :], stdin)
+        boot = bootstrap_of(args[i + 1 :])
+        if boot is None:
+            return self.exec_handler(container, args[i + 1 :], stdin)
+        return self._run_cell(container, args[i + 1 :], stdin or "", *boot)
+
+    def _run_cell(self, container: FakeContainer, argv: list[str], stdin: str, nonce: str, size: int, digest: str,
+                  python: str) -> CmdResult:  # fmt: skip
+        """A cell under the completion bootstrap (O55): the program checked whole, run by the handler, and recorded."""
+        sent = encode_input(stdin)
+        got = self.exec_delivers(sent) if self.exec_delivers is not None else sent
+        whole = len(got) == size and hashlib.sha256(got).hexdigest() == digest
+        if not whole:  # the bootstrap runs nothing and says what arrived
+            record = {"source_bytes": len(got), "source_whole": False, "exit_status": None}
+            result = recorded(CmdResult(completion.NOT_RUN_EXIT), nonce, record)
+        else:
+            ran = self.exec_handler(container, argv, got.decode("utf-8", "replace"))
+            if isinstance(ran, Unrecorded):
+                result = CmdResult(ran.returncode, ran.stdout, ran.stderr, input_error=ran.input_error)
+            else:
+                status = 128 - ran.returncode if ran.returncode < 0 else ran.returncode
+                result = recorded(ran, nonce, {"source_bytes": size, "source_whole": True, "exit_status": status})
+        if self.exec_input_error is not None:
+            result = CmdResult(result.returncode, result.stdout, result.stderr, input_error=self.exec_input_error)
+        return result
 
     def _cgroup_events(self, container: FakeContainer, frozen: bool) -> None:
         self.files[f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope/cgroup.events"] = (

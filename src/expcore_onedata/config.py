@@ -285,7 +285,8 @@ class PlatformConfig:
         (O21), so a resume after a level changed its data path or its listing is refused. A declared
         `[sandbox.served_bytes]` puts the caps of the tables of the bytes served there too (O22), since they decide what
         a run's evidence can show; without the table the fingerprint keeps the shape it had before the caps could be
-        declared, so a campaign that ran under the defaults still resumes.
+        declared, so a campaign that ran under the defaults still resumes. On the Apptainer backend it holds that
+        backend's pins too (`sandbox_backend`, O56); the Docker backend's fingerprint is unchanged.
 
         When the file has `[faults]`, it holds the fault injector's sanction and targets too
         (`fault_settings.faults_fingerprint`), never a path, a name or a value (O12). A file without `[faults]` keeps
@@ -302,6 +303,8 @@ class PlatformConfig:
             out["data_paths"] = self.sandbox.data_path_record()
             if self.sandbox.served_caps_declared:
                 out["served_bytes"] = self.sandbox.served_caps.record()
+            if self.sandbox.apptainer is not None:  # O56: a Docker and an Apptainer run are never one experiment
+                out["sandbox_backend"] = self.sandbox.apptainer.record()
         faults = faults_fingerprint(self)
         if faults is not None:
             out["faults"] = faults

@@ -8,6 +8,7 @@ below 1024, and where the node's `/tmp` may be shared with other users. The imag
 
 Status: what has run live, and what has not, is in the dated facts files under `facts/` (the live-run notes
 themselves are kept privately, since they name the site). The agent's egress detection (below) has not run live.
+`hpcfed.py` ("The driver", below), which brings a whole federation up and down from a layout file, has not run live.
 
 **This file names no site.** Everything site-specific comes from `site.env`, a local file that is never committed
 (see "Site configuration").
@@ -106,6 +107,34 @@ run's outbound connections are logged and reported, and the analysis is run agai
 `tests/egress_probe.c`, which connects to a loopback listener and, non-blocking, to 192.0.2.1 (TEST-NET-1, never
 routed), so no test sends outside traffic. It needs Unix sockets, which some sandboxes forbid; it skips there.
 
+## The agent's gate on a shared loopback
+
+The data gate has no network of its own on these nodes either: it listens on the loopback every user of the node
+shares, on a port above 1023. Two pieces, neither run live yet:
+
+- **The gate's owner check** (`peer_uid_check: true` in the gate's configuration, `src/expcore_onedata/sandbox/gatepeer.py`).
+  The gate serves a connection only if the peer's socket belongs to its own uid, by the same `/proc/net/tcp` and
+  `tcp6` rows `portshim-owner.h` reads, and closes any other, one it cannot attribute and every one when the tables
+  cannot be read, before a byte is read or written, logging one `peer_refused` line with the reason. It is off by
+  default (Docker's gate is on its own network); the gate directory then needs `gate.py`, `gatepolicy.py` and
+  `gateboundary.py` as before, and `gatepeer.py` beside them when it is on. The gate does not start with it on if it
+  runs as uid 0 or cannot read the table.
+- **`gateport.c`**, the cell's connect-side mapper: an `LD_PRELOAD` shim that sends a TCP `connect()` to
+  `127.0.0.1:443` to the gate's port, because the published REST client dials 443 only, and touches no
+  other connection. The port is read once at load from the cell's `/etc/expcore/gate.json`
+  (`{"address": "127.0.0.1", "port": P, ...}`), which decides whenever it exists, and otherwise from
+  `EXPCORE_GATE_PORT`; a malformed file or variable makes the process redirect nothing and say so once on stderr. It
+  calls the next `connect()` by `dlsym(RTLD_NEXT)` and goes **before `egresslog.so`** in the preload list, so the
+  egress log records the gate's port; after it, it is never reached. Build: `gcc -shared -fPIC -O2
+  -fno-stack-protector -Wall -Wextra -Werror -o gateport.so gateport.c -ldl`, in the cell's image. The bundle hashes
+  tarballs (`.provenance`), not shims: whoever loads the built shim into a cell pins it by the hash of the file it
+  built. No IPv6 destination is rewritten, `[::1]:443` included: the core's gate listens on 127.0.0.1 only, and a rewrite to `[::1]:<gate port>` could reach another user's listener (see the header of the file).
+
+`tests/deploy/test_hpc_gate_port_shim.py` builds the shim with the host's gcc and drives it with a Python client
+against listeners of its own, a stand-in for the next `connect()` (`tests/fake_next_connect.c`) and the egress shim;
+`tests/onedata/sandbox/test_gatepeer.py` and `test_gate_peer_owner.py` read the kernel's own tables for a real
+connection and write another uid's rows from its address pair.
+
 ## The Couchbase administrator and its guard
 
 Couchbase 4.5 lets any REST caller act as its administrator until one exists. onepanel creates it, as the image
@@ -187,6 +216,54 @@ script stops the service, deletes and redacts every secret (`scrub.py`) and keep
 ends any other way fails the job, with its own status. `--exclusive` keeps other users off a node, at the price of
 the whole node for the job.
 
+## The driver: `hpcfed.py`
+
+`hpcfed.py` brings a zone and the layout's providers up on batch nodes, and takes them down, from the Compose
+federation's own layout file; `DESIGN.md` is its process model (one held job, every service and control action an
+`srun --exact` step from the login node, the state file, the service verbs). **Written and tested offline against a
+fake Slurm; not run live.**
+
+```bash
+set -a; . deploy/hpc-federation/site.env; set +a
+uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
+  --root <a directory on a filesystem the login node and the nodes see> describe   # the plan and what it bills
+uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> up
+uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> down
+```
+
+- **The layout** is a `deploy/compose-federation` layout (its providers, spaces, principals, probe space and platform
+  template) with an `[hpc]` table of sizes, which Compose ignores: the held job's `--time`, each service step's cores
+  and memory, every node's control reserve, `stop_seconds`, and where the core's phase runs (`core = "login"` or
+  `"step"`). `layouts/pilot-shape.toml` has the pilot's shape with invented names: a zone, five providers, four data
+  spaces and the probe space; its link check covers ten ordered pairs.
+- **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
+  any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
+  address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
+  with every peer address, and pipes a registration token from the zone into each provider; copies the zone's
+  passphrase (0600) and the Onedata test CA into the root (`bundle/zone-export.sh`); then bootstraps the federation
+  through the Compose bootstrap over `https://<node FQDN>:8443`, writes its baseline, `facts.json` and
+  `platform.toml`, and runs the platform layer's link check, which writes `link-check.json` in the root; last, when
+  the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
+- **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, checks each node
+  for the recorded work directory, cancels the held job by its id (never by user or name), ends the srun clients (run it on the login node that ran
+  `up`: it finds them there), and
+  removes the root. After a partial `up` it finds the job by its recorded id, or by its allocation's exact name.
+- **Every step** is `srun --jobid --exact` with a name, its size and `/usr/bin/env -i PATH=... LC_ALL=C TMPDIR=<node
+  tmpfs>`; no step uses `--overlap`; a control step's srun client is ended only once its step is gone from `squeue
+  -s`, and one still listed at its bound is cancelled by its own id.
+- **The site** comes from `site.env` (`HPC_ACCOUNT`, `HPC_PARTITION`, `SH`, `L`, and optionally `HPC_STEP_PATH`,
+  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`), recorded in the state file
+  at `up`, so `down` and the service verbs need no environment. The bundle is this checkout's own, which must lie on a
+  filesystem the nodes see. The first `python3.11` on `HPC_STEP_PATH` must be the node's own, not a uv-installed one:
+  the bundle's `supervise.py` needs `os.pidfd_open`.
+
+**What has not run, and what the first live slot checks first:** that the login node reaches the services' 8443 (or,
+with `[hpc] core = "step"`, that the core's Python from a venv on the shared filesystem runs on a node); the two
+batch scripts as `--exact` steps of a multi-node job; the bootstrap's panel calls through 8443 with the LUMA local
+feed's mappings; the submit read-back's fields as the site's Slurm prints them; and the ten pairs passing over the
+cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`); an imported
+space (M3) and the agent's node's step (M5) are not built here.
+
 ## The scripts
 
 | Script | Where | Purpose |
@@ -208,6 +285,26 @@ the whole node for the job.
 | `baked.py` | node | finds the Couchbase cookies and memcached password the images ship, by the SHA-256 that `lib.sh` lists (never the values) |
 | `egresslog.c` | agent's cell | the agent's egress shim: logs each destination, never a payload |
 | `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
+| `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, the archives the merge takes |
+| `nodefacts.py` | control step | a node's FQDN, its IPv4 address, and the job's uid and gid, as JSON (`hpcfed.py up`) |
+| `zone-export.sh` | control step on the zone's node | the zone's passphrase or the Onedata test CA on stdout, for the federation's root (`hpcfed.py up`) |
+| `gateport.c` | agent's cell | the connect-side mapper: a TCP connect to 127.0.0.1:443 goes to the gate's port; nothing else is touched |
+
+## A campaign's shards: one per federation (`shards.py`)
+
+A campaign whose agent runs in the core's Apptainer sandbox (`[sandbox] backend = "apptainer"`, O56) runs as #154
+shards, one per federation. The sandbox's data gate listens on its node's loopback and its cells are that node's
+`apptainer exec`s, so each shard's dispatcher runs as one job step on its federation's sandbox node, launched from the
+login node like every other step. `shards.py lines --manifest shards.toml` prints each shard's `srun --jobid --exact`
+line, whose environment is an allowlist (`PATH`, `LC_ALL` and the federation's root, where the study's plugin finds
+`platform.toml` and the platform layer finds the fault relay), to run detached. In the step, `shards.py step` copies
+the stamped study to the node's tmpfs (the store's lock refuses a network filesystem), checks the interpreter imports
+the core it was given, runs `python -m expcore run STUDY --shard i/N --shard-label L`, and once the dispatcher has
+exited writes the copy's `out/` whole to `<results>/<label>.out.tar` with a manifest. `shards.py collect --manifest
+shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only and prints the `python -m expcore merge`
+line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's docstring
+has its form). A step killed outright loses its shard's work since its last archive: the periodic snapshot is still to
+be built (`Snapshots`, the hook). Outage runs (`[faults]`) depend on the fault relay of milestone M4.
 
 ## What the repository's tests cover
 
@@ -215,5 +312,9 @@ the whole node for the job.
 Python file (the guard runs on the images' Python 3.8), the batch jobs' `--no-requeue` and `--time`, the shim's
 public ports against `ports.sh`, the hash check for the images' shipped Couchbase values (on a stand-in value), and, where `gcc` exists, the shim's build with every warning an error and its unit
 test (`tests/shim_unit.c`), and the egress shim and collector against `tests/egress_probe.c` (where Unix sockets are
-allowed). The bundle's wider offline suite reads files copied out of the two pinned images
+allowed). `tests/deploy/test_hpc_fed_plan.py`, `test_hpc_fed_updown.py` and `test_hpc_fed_bundle.py` run the driver
+against a fake Slurm (O57): the layout's sizes and the held job's shape, the submit read-back, every step's form and
+allowlist, a hung client and a step past its bound, the state file, `up`'s placement, peers and token pipes, `down`
+after a whole or a partial `up`, the core's phase writing `platform.toml` and the ten-pair link-check record, and
+`zone-export.sh` on a stand-in work directory. The bundle's wider offline suite reads files copied out of the two pinned images
 (patch drift, the images' binaries under the shim) and is not in the repository; neither are those files.

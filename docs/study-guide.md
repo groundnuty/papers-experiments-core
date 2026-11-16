@@ -367,6 +367,22 @@ Direct I/O changes what the provider sees. It no longer serves the reads of data
 
 The sandbox never creates, changes or removes the federation's network: a mount or REST run whose network is not on the host is refused before anything exists, and removing the sidecar or the gate at teardown takes it off the network. The agent never joins it. Each mount run's metadata records the kind of network the sidecar was on (`mount.network`: `default bridge` or `federation`), never its name.
 
+### The sandbox on an HPC batch node
+
+On an HPC batch node there is no Docker and no namespace of your own, so set `[sandbox] backend = "apptainer"`. Pin the agent's SIF and the HPC bundle's egress shim and collector in `[sandbox.apptainer]` (`docs/interfaces.md`, "The Apptainer backend on an HPC batch node"), and give the platform the node (`expcore_onedata.sandbox.apptainer.node.LocalNode()`) as its host.
+
+How a run works there:
+- Your agent's code runs as one `apptainer exec` per cell.
+- The data gate runs on the node's loopback and holds the token; the agent never sees it.
+- The harness keeps the memory limit and the sizes of `/work`, `/tmp` and `/dev/shm`. A cell past one of them is killed as `memory_limit` or `disk_limit`, the agent's own outcome.
+
+Three things differ from Docker, and the record says so (`infrastructure_facts`):
+- **Detached workers end with their cell.** A process a cell starts in the background is killed when that cell ends, where Docker's container keeps it until the next cap.
+- **The network is the node's.** The agent can reach the internet, so declare the `egress` instrument (below).
+- **A mount data path is refused at its start** until its helper lands.
+
+Run the campaign's driver on the node that runs the cells, since the gate listens on that node's loopback. The campaign fingerprint holds the backend's pins, so a Docker run and an Apptainer run are never one experiment.
+
 ### What the code tool tells the agent of its output
 
 A model reads these strings, and a study freezes them, so they are given exactly. The Onedata layer's code tool keeps the first 1 MiB (1,048,576 bytes, cut at a whole character) of each of a cell's stdout and stderr and drops the rest. When it cut a stream, the text the tool returns ends with a line after a newline, `[output cut by the sandbox: the first K of the P bytes of stdout were kept]`, where P is what the cell wrote and K what was kept, both plain digits; when both streams were cut, the line has the clause for stdout, then `; `, then the same clause with `stderr`. The call's `source_truncated` is then `True`, and the run's record keeps the same numbers (`output_cut` on the cell, `cell_output_cuts` in the sandbox's metadata). A cell that prints 3 MiB gives a text of 1 MiB of its output followed by `[output cut by the sandbox: the first 1048576 of the 3145728 bytes of stdout were kept]`.
@@ -378,6 +394,8 @@ Your `output_cap_chars` (`[agent]` in `campaign.toml`) then applies to that whol
 - A cap only a few characters below the whole text leaves a piece of the sandbox's line before the cap's, because the cap's own line takes room from the cap as well: for this print the caps from 1,048,650 to 1,048,663 (1 to 14 characters below the whole text of 1,048,664) do it, and 1,048,649 does not. Keep `output_cap_chars` under 1 MiB or at 2 MiB and 1 KiB or more, and what the model reads between them depends on how much the cell wrote.
 
 The same text, the same cap and the same cut give the same text for the model every time.
+
+A cell whose exec did not complete never reaches the model as an empty success (O55). The code tool checks each cell's completion record, which the sandbox takes out of the output before anything is counted, cut or shown: the program arrived whole, and its exit was recorded with the status `docker exec` reported. A cell that fails the check, with no timeout or kill to explain it, ends the attempt as `sandbox` infrastructure, retried within the attempt limit, with the cause in the outcome's detail ("the exec's exit was not recorded: ...", "the cell's source did not arrive whole in the container ...: its program did not run"). Each code call in the run record carries `exec_check` (`source_whole`, `exit_status`, `nonce_matched`), so a report can show that every scored cell was verified. What the model reads is unchanged.
 
 ### Collecting a run's evidence
 
@@ -1136,7 +1154,7 @@ egress = EgressLog(CollectorLog(Path("egress.jsonl")), declared, nonce)  # liste
 assert egress.finish()["log"] == "unknown"  # no log was written here: unknown, never a run that connected nowhere
 ```
 
-Stop the run's collector after the agent's cell and before `finish_instruments`, as the gate is stopped before the bytes served are counted: a log without its end line is unknown. Declare `network_calls=True` only for a REST data path; otherwise every `requests`, `urllib` or `socket` in the agent's code flags its run.
+Stop the run's collector after the agent's cell and before `finish_instruments`, as the gate is stopped before the bytes served are counted: a log without its end line is unknown. On the Apptainer backend the sandbox is the source and gives the declaration and the nonce, and its `collect` stops the collector: `EgressLog(sandbox, sandbox.egress_declaration(), sandbox.egress_nonce)`. Declare `network_calls=True` only for a REST data path; otherwise every `requests`, `urllib` or `socket` in the agent's code flags its run.
 
 What you get, with nothing else to call: once one analysed record carries the `egress` instrument, `analyze` judges every analysed run, flagged for an outside connection, an unknown log or a static-scan hit, and runs the preregistered analysis again without the flagged runs. `report.md` gains a section `## Egress (detected, not prevented)` listing them, by condition and run, with that sensitivity analysis in the tables of the primary one; `analysis.json` gains `egress`; `analyze` prints a line per contrast. **A run whose log is missing or damaged, or whose record has no egress snapshot, is flagged as unknown, never counted clean.** A report without the section is a batch in which no run carried the instrument: egress was not checked, which is right on Docker hosts, whose agents have no route out, and wrong on HPC. What each field and reason means is in [`interfaces.md`](interfaces.md#egress-where-it-cannot-be-blocked-the-egress-instrument).
 
