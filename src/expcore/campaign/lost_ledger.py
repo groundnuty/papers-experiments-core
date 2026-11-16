@@ -7,7 +7,9 @@ read it without the cost code. The record is one JSON object in the store's meta
     {"campaign": <the campaign's fingerprint hash when its first journal was opened: every journal's campaign>,
      "journal": <the journal of the start that last opened the store, or null>,
      "counted": {<journal name>: {"counted_utc": ...,
-                                  "attempts": [<an attempt's last journaled row, with "usd": its charge when counted>],
+                                  "attempts": [<an attempt's last journaled row, with "usd": its charge when counted,
+                                                its call log ("calls_sent", "calls_usage") when the journal kept one,
+                                                and "basis" for one whose end was not journaled (C05)>],
                                   "charges": [{"kind": "topup" | "probe", "model": ..., "usd": ..., "run_key"?}]}}}
 
 `campaign` is kept from the first start that journaled, so a plan that grows (which records a new fingerprint, C06)
@@ -38,6 +40,9 @@ ATTEMPT_KEYS = (
     "topups",
     "topup_usd",
 )
+# A lost attempt's call log (C05), kept when its journal has one: what it is charged by when its end was not journaled
+CALL_KEYS = ("calls_sent", "calls_usage")
+BASES = ("measured", "measured_plus_inflight", "bound")  # `interrupted_spend.BASES`, without the cost code
 CHARGE_KINDS = ("topup", "probe")
 
 
@@ -92,6 +97,8 @@ def _counted_ok(entry: Any) -> bool:
             return False
         if not dollars(attempt["topup_usd"]) or not (attempt.get("usd") is None or dollars(attempt["usd"])):
             return False
+        if "basis" in attempt and attempt["basis"] not in BASES:
+            return False
     for charge in entry["charges"]:
         if not isinstance(charge, dict) or charge.get("kind") not in CHARGE_KINDS:
             return False
@@ -121,6 +128,9 @@ def exported(store: Any) -> list[dict[str, Any]] | None:
         for attempt in lost["attempts"]:
             fields = {key: attempt[key] for key in ATTEMPT_KEYS if key not in ("id", "turn_usage")}
             entry = {"journal": name, "kind": "attempt", "attempt_id": attempt["id"], **fields}
-            entries.append({**entry, "ended": attempt["state"] != "running", "usd": attempt.get("usd")})
+            entry.update(ended=attempt["state"] != "running", usd=attempt.get("usd"))
+            if "basis" in attempt:  # how one whose end was not journaled was charged (C05); absent before the log
+                entry["basis"] = attempt["basis"]
+            entries.append(entry)
         entries += [{"journal": name, **charge} for charge in lost["charges"]]
     return entries or None

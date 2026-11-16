@@ -5,8 +5,8 @@
 """The budget gate: budgets are enforced, not only estimated (C12), and a hold is lifted by a release file (C13).
 
 Before a run starts, the gate asks whether the campaign can afford one more of its model. The answer is the dollars
-spent so far (attempts counted by their counts, an interrupted one by the bound its run was reserved, which its row
-records, C05, C27), plus what the runs in flight can cost, plus what this run can cost, against a ceiling. **What a
+spent so far (attempts counted by their counts, an interrupted one by its call log, plus one request's bound for a
+request in flight, or else by the bound its run was reserved, which its row records, C05, C27), plus what the runs in flight can cost, plus what this run can cost, against a ceiling. **What a
 run can cost is always its bound**, the most one attempt's caps let it cost, the request it can make past its token
 cap included (`attempt_bounds.bound_usd`, C25), by the reply maximum only for a model the campaign holds to it (C27),
 never the mean of the runs that finished: a reservation for a

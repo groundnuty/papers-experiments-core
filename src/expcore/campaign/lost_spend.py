@@ -28,12 +28,17 @@ journal is not in the directory, since what its start spent after the copy would
 leaves no journal of its own behind.
 
 **What is charged** (`costs`): a lost attempt as `attempt_bounds.attempt_costs` charges a row, at the budget gate's
-every assessment: one whose end the journal did not see at its reserved bound (R, C27, by the window once its model
-is taken off the reply maximum), one that ended at its measured cost (the provider's counts) or, when they are not
-complete, its bound; its top-ups on top. A lost top-up or probe charge at its dollars. Each is an `AttemptCost` of
-state `lost_in_kill`, so the gate counts it against the store's ceilings (a shard's are its shares, #154) and
-`selection_ledger.spend_of` in what the store spent. A ledger that cannot be read holds every model, as the probes'
-record does.
+every assessment: one whose end the journal did not see by the call log its `call` lines sum to, complete up to the
+kill, measured plus one request's bound for a request in flight (C05, `attempt_bounds.journaled_cost`), or at its
+reserved bound when it has none that can be read (R, C27, by the window once its model is taken off the reply
+maximum); one that ended at its measured cost (the provider's counts) or, when they are not complete, its bound; its
+top-ups on top. A lost top-up or probe charge at its dollars. Each is an `AttemptCost` of state `lost_in_kill`, so the
+gate counts it against the store's ceilings (a shard's are its shares, #154) and `selection_ledger.spend_of` in what
+the store spent. A ledger that cannot be read holds every model, as the probes' record does.
+
+**The store's own journal confirms its interrupted attempts' logs** (C05): an interrupted row it lists gets the longer
+of the two logs when one extends the other (a snapshot's store lags the journal), else keeps its own at `bound`, and
+the basis that log says, in the same transaction as the ledger, with a `spend_basis_confirmed` event.
 """
 
 import json
@@ -43,8 +48,9 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign import reply_cap
-from expcore.campaign.attempt_bounds import LOST_STATE, AttemptCost, row_cost
-from expcore.campaign.lost_ledger import ATTEMPT_KEYS, KEY, Ledger, LostSpendError, dollars, parse, read
+from expcore.campaign.attempt_bounds import LOST_STATE, AttemptCost, journaled_cost, row_cost
+from expcore.campaign.interrupted_spend import BOUND, CallLog, basis_of, log_of, merged, read_log
+from expcore.campaign.lost_ledger import ATTEMPT_KEYS, CALL_KEYS, KEY, Ledger, LostSpendError, dollars, parse, read
 from expcore.campaign.spend_journal import Journal, SpendJournal, SpendJournalError, journals_in, read_journal
 from expcore.campaign.store import Store
 from expcore.config.models import Limits, ModelSpec
@@ -108,10 +114,15 @@ def reconcile(store: Store, journal: SpendJournal, now: str, pricing: Pricing) -
     marks = reply_cap.unheld(store)
     taken_off = frozenset(m for m in pricing.models if reply_cap.is_unheld(marks, m) or m in unheld)
     found: dict[str, dict[str, Any]] = {}
+    confirmed: list[tuple[int, int | None, str | None, str]] = []  # interrupted rows the own journal's call log settles
     for journaled in uncounted:
         lost = _lost(store, journaled, own=journaled.name == ledger.journal, now=now)
+        confirmed += lost.pop("confirmed")
         for attempt in lost["attempts"]:
-            attempt["usd"] = _attempt_cost(attempt, pricing.models, pricing.limits, (), taken_off)[0]
+            usd, _, basis = _attempt_cost(attempt, pricing.models, pricing.limits, (), taken_off)
+            attempt["usd"] = usd
+            if basis is not None:
+                attempt["basis"] = basis
         found[journaled.name] = lost
 
     def change(current: str | None) -> tuple[str, list[tuple[str, str | None, str]], None]:
@@ -122,8 +133,25 @@ def reconcile(store: Store, journal: SpendJournal, now: str, pricing: Pricing) -
         events = [("lost_in_kill", None, _detail(name, lost)) for name, lost in found.items() if _any(lost)]
         return json.dumps(value, sort_keys=True), events, None
 
-    def record() -> None:  # the ledger and every mark the journals hold, in one transaction
+    def record() -> None:  # the ledger, the call logs and every mark the journals hold, in one transaction
         store.update_meta(KEY, change, now)
+        for attempt_id, sent, usage, basis in confirmed:
+            store.db.execute(
+                "UPDATE attempts SET calls_sent=?, calls_usage=?, spend_basis=? WHERE id=? AND state='interrupted'",
+                (sent, usage, basis, attempt_id),
+            )
+        if confirmed:
+            counts = {b: sum(1 for c in confirmed if c[3] == b) for b in {c[3] for c in confirmed}}
+            store.db.execute(
+                "INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)",
+                (
+                    now,
+                    "spend_basis_confirmed",
+                    None,
+                    f"{len(confirmed)} interrupted attempt(s) charged by the store's own spend journal's call log: "
+                    + ", ".join(f"{b} {n}" for b, n in sorted(counts.items())),
+                ),
+            )
         for model in unheld:
             if not reply_cap.is_unheld(reply_cap.unheld(store), model):
                 detail = f"{model}: taken off the reply maximum by a start whose store a kill lost (the spend journal)"
@@ -143,13 +171,19 @@ def reconcile(store: Store, journal: SpendJournal, now: str, pricing: Pricing) -
 
 def _lost(store: Store, journal: Journal, *, own: bool, now: str) -> dict[str, Any]:
     """What one journal lists that the store lacks: every attempt and probe charge of a journal not the store's own,
-    and of its own those the store's rows and events do not hold."""
-    rows = {r["id"]: r for r in store.q("SELECT id, run_key, started_utc, pid, topups, topup_usd FROM attempts")}
+    and of its own those the store's rows and events do not hold; and (`confirmed`) the call log and basis of each
+    interrupted attempt of its own the store holds (`_confirmed`)."""
+    rows = {
+        r["id"]: r
+        for r in store.q(
+            "SELECT id, run_key, started_utc, pid, topups, topup_usd, state, calls_sent, calls_usage FROM attempts"
+        )
+    }
     marks = ",".join("?" * len(PROBE_EVENTS))
     events = {
         r["id"]: r["model"] for r in store.q(f"SELECT id, model FROM events WHERE kind IN ({marks})", PROBE_EVENTS)
     }
-    attempts, charges = [], []
+    attempts, charges, confirmed = [], [], []
     for attempt_id, entry in journal.attempts.items():
         _check_attempt(journal.name, entry)
         row = rows.get(attempt_id) if own else None
@@ -158,9 +192,14 @@ def _lost(store: Store, journal: Journal, *, own: bool, now: str) -> dict[str, A
             entry["started_utc"],
             entry["pid"],
         )
+        journaled = _journaled_log(journal, attempt_id)
         if not same:
-            attempts.append({name: entry[name] for name in ATTEMPT_KEYS})
-        elif entry["topups"] > row["topups"] and entry["topup_usd"] > row["topup_usd"]:
+            calls = dict(zip(CALL_KEYS, journaled.as_columns(), strict=True)) if journaled is not None else {}
+            attempts.append({**{name: entry[name] for name in ATTEMPT_KEYS}, **calls})
+            continue
+        if row["state"] == "interrupted" and row["calls_sent"] is not None:
+            confirmed.append(_confirmed(attempt_id, row, journaled))
+        if entry["topups"] > row["topups"] and entry["topup_usd"] > row["topup_usd"]:
             usd = float(entry["topup_usd"]) - float(row["topup_usd"])
             charges.append({"kind": "topup", "model": entry["model"], "run_key": entry["run_key"], "usd": usd})
     probes: dict[str, float] = {}
@@ -172,7 +211,29 @@ def _lost(store: Store, journal: Journal, *, own: bool, now: str) -> dict[str, A
             continue
         probes[model] = probes.get(model, 0.0) + float(usd)
     charges += [{"kind": "probe", "model": m, "usd": usd} for m, usd in sorted(probes.items()) if usd > 0]
-    return {"counted_utc": now, "attempts": attempts, "charges": charges}
+    return {"counted_utc": now, "attempts": attempts, "charges": charges, "confirmed": confirmed}
+
+
+def _journaled_log(journal: Journal, attempt_id: int) -> CallLog | None:
+    """The attempt's call log from its call lines, summed in the journal's order (C05); None when it keeps none, or
+    its lines are not consistent with its attempt lines or cannot be read as a log: then it is charged its bound."""
+    lines = journal.calls.get(attempt_id)
+    if lines is None or not lines.consistent:
+        return None
+    return log_of(lines.sent, list(lines.closed))
+
+
+def _confirmed(attempt_id: int, row: Mapping[str, Any], journaled: CallLog | None) -> tuple[int, int | None, Any, str]:
+    """The call log and basis of an interrupted attempt the store holds, as its own journal confirms them (C05): the
+    store may be a snapshot whose log the attempt outgrew, and the journal holds every request and reply up to the
+    kill. The longer log stands when one extends the other; a log either side cannot read, or two that disagree,
+    leave the row's log as it is and charge its bound. Top-ups are not touched: those past the row's are charges."""
+    stored = read_log(row["calls_sent"], row["calls_usage"])
+    log = merged(stored, journaled)
+    if log is None:
+        return attempt_id, row["calls_sent"], row["calls_usage"], BOUND
+    sent, usage = log.as_columns()
+    return attempt_id, sent, usage, basis_of(log)
 
 
 def _check_attempt(name: str, entry: Mapping[str, Any]) -> None:
@@ -213,8 +274,9 @@ def costs(
     for name in sorted(ledger.counted):
         lost = ledger.counted[name]
         for attempt in lost["attempts"]:
-            usd, bounded = _attempt_cost(attempt, models, limits, reply_capped, taken_off)
-            out.append(AttemptCost(attempt["id"], attempt["run_key"], attempt["model"], LOST_STATE, usd, bounded))
+            usd, bounded, basis = _attempt_cost(attempt, models, limits, reply_capped, taken_off)
+            cost = AttemptCost(attempt["id"], attempt["run_key"], attempt["model"], LOST_STATE, usd, bounded, basis)
+            out.append(cost)
         for charge in lost["charges"]:
             run_key = str(charge.get("run_key", ""))
             out.append(AttemptCost(0, run_key, charge["model"], LOST_STATE, float(charge["usd"]), True))
@@ -227,16 +289,15 @@ def _attempt_cost(
     limits: Limits,
     reply_capped: Collection[str],
     taken_off: Collection[str],
-) -> tuple[float | None, bool]:
-    """A lost attempt's cost, its top-ups included, as its row would be charged; None for an unpriced model."""
+) -> tuple[float | None, bool, str | None]:
+    """A lost attempt's cost, its top-ups included, as its row would be charged, and whether it holds a bound: one
+    the journal never saw end by its journaled call log, else its bound (C05), with the basis; one that ended measured
+    or at its bound, with no basis. None for an unpriced model."""
     row = {**attempt, "complete": 1 if attempt["usage_complete"] is None else attempt["usage_complete"]}
-    usd, bounded = row_cost(
-        models.get(attempt["model"]),
-        row,
-        limits,
-        running=attempt["state"] == "running",
-        reply_capped=reply_capped,
-        taken_off=taken_off,
-    )
+    spec, basis = models.get(attempt["model"]), None
+    if attempt["state"] == "running":
+        usd, bounded, basis = journaled_cost(spec, row, limits, reply_capped=reply_capped, taken_off=taken_off)
+    else:
+        usd, bounded = row_cost(spec, row, limits, running=False, reply_capped=reply_capped, taken_off=taken_off)
     topped = float(attempt["topup_usd"])
-    return (None if usd is None else usd + topped), bounded or topped > 0
+    return (None if usd is None else usd + topped), bounded or topped > 0, basis

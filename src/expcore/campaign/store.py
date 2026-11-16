@@ -52,7 +52,17 @@ from expcore.campaign.attempts import (
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ManifestRow, relative_order_problem
 from expcore.campaign.markers import AttemptResult
-from expcore.campaign.spend_journal import PROBE, UNHELD, SpendJournal, attempt_entry
+from expcore.campaign.spend_journal import (
+    CLOSED,
+    PROBE,
+    SENT,
+    UNHELD,
+    SpendJournal,
+    attempt_entry,
+    call_entry,
+)
+
+FAILED = "failed"  # `interrupted_spend.FAILED`: a request closed by its last failed send, which its top-up paid for
 
 _FIXED_SQL = """
 CREATE TABLE IF NOT EXISTS attempts(
@@ -90,6 +100,12 @@ _ADDED_COLUMNS = (
     ("attempts", "deployments", "TEXT"),
     # what of the run admission the attempt held (attempts.ADMISSION_MODES); NULL: unknown
     ("attempts", "admission", "TEXT"),
+    # the call log (C05, `interrupted_spend`): the requests sent, each counted before it went out; NULL: none kept
+    ("attempts", "calls_sent", "INTEGER"),
+    # JSON: each answered request's [input, output, cache writes, cache reads], null for a reply that was not read
+    ("attempts", "calls_usage", "TEXT"),
+    # how an interrupted attempt is charged: measured | measured_plus_inflight | bound; NULL: no log was kept
+    ("attempts", "spend_basis", "TEXT"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -288,13 +304,15 @@ class Store:
         mark raises what its attempts are charged, so a store copied back from before it takes it from the journal."""
         self._note_spend(lambda: {"kind": UNHELD, "model": model})
 
-    def _attempt_line(self, attempt_id: int) -> dict[str, Any]:
-        """The journal's `attempt` line of an attempt's row as the open transaction holds it."""
+    def _attempt_line(self, attempt_id: int, closes: str | None = None) -> dict[str, Any]:
+        """The journal's `attempt` line of an attempt's row as the open transaction holds it; with `closes`, the line
+        also closes the attempt's request in flight (C05: a top-up's line that pays for its last failed send)."""
         row = self.db.execute(
             f"SELECT a.*, r.{column_for('model')} AS model FROM attempts a JOIN runs r USING(run_key) WHERE a.id=?",
             (attempt_id,),
         ).fetchone()
-        return attempt_entry(row)
+        line = attempt_entry(row)
+        return line if closes is None else {**line, "closes": closes}
 
     def q(self, sql: str, args: Iterable[Any] = ()) -> list[sqlite3.Row]:
         """Run a read and return all rows."""
@@ -459,6 +477,7 @@ class Store:
         lease_outcome: str = "none",
         reserved_capped: bool | None = None,
         admission: str = "none",
+        calls_logged: bool = False,
     ) -> BegunAttempt:
         """Insert the 'running' row before the run starts; refuse in the transaction a run that is not pending.
 
@@ -469,7 +488,8 @@ class Store:
         how it was obtained (`LEASE_OUTCOMES`), the bound the budget gate reserved the run when it let it start:
         by the reply maximum or by the window (`reserved_capped`, C27; None when no gate decided it), and what it held
         of the platform's run admission (`ADMISSION_MODES`). An attempt whose usage turns out unknown is charged that
-        bound, at this start or any later one (`attempt_bounds`).
+        bound, at this start or any later one (`attempt_bounds`). With `calls_logged` (a budget, whose spend guard
+        keeps it) the row starts an empty call log, which `note_call_sent` and `note_call_answered` fill (C05).
         """
         if lease_outcome not in LEASE_OUTCOMES:
             raise ValueError(f"lease_outcome {lease_outcome!r} must be one of: {', '.join(LEASE_OUTCOMES)}")
@@ -493,7 +513,7 @@ class Store:
             capped = None if reserved_capped is None else int(reserved_capped)
             cursor = self.db.execute(
                 "INSERT INTO attempts(run_key,attempt,state,started_utc,pid,run_dir,dispatch_seq,lease_wait_s,"
-                "lease_outcome,reserved_capped,admission) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "lease_outcome,reserved_capped,admission,calls_sent,calls_usage) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_key,
                     number,
@@ -506,6 +526,8 @@ class Store:
                     lease_outcome,
                     capped,
                     admission,
+                    0 if calls_logged else None,
+                    "[]" if calls_logged else None,
                 ),
             )
             attempt_id = int(cursor.lastrowid)
@@ -514,11 +536,16 @@ class Store:
 
         return self.transact(go)
 
-    def add_topup(self, attempt_id: int, usd: float, now: str, event: tuple[str, str | None, str]) -> None:
+    def add_topup(
+        self, attempt_id: int, usd: float, now: str, event: tuple[str, str | None, str], *, close_call: bool = False
+    ) -> None:
         """Charge a running attempt one top-up of `usd` dollars and append its event, in one transaction (C26).
 
         A top-up is charged when it is reserved and never refunded, so it is part of what was spent from that moment,
         whatever comes of the attempt; `finish_attempt` leaves it as it is. An attempt that is not running is refused.
+        With `close_call` (the top-up of a request's last failed send, nothing sent after it), the request is closed
+        in the attempt's call log in the same transaction (`"failed"`, C05), so a kill never charges it again as a
+        request in flight.
         """
         if isinstance(usd, bool) or not isinstance(usd, int | float) or not usd >= 0 or usd == float("inf"):
             raise ValueError(f"a top-up is a finite number of dollars, not below zero, not {usd!r}")
@@ -531,7 +558,69 @@ class Store:
             if cursor.rowcount != 1:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so it takes no top-up")
             self.db.execute("INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)", (now, *event))
-            self._note_spend(lambda: self._attempt_line(attempt_id))  # written before the send it pays for (O62)
+            # the close rides on the top-up's own line, so a write cut short loses both or neither (C05)
+            closes = FAILED if close_call and self._close_call(attempt_id, FAILED) else None
+            self._note_spend(lambda: self._attempt_line(attempt_id, closes))  # before the send it pays for (O62)
+
+        self.transact(go)
+
+    def _call_line(self, attempt_id: int, phase: str, entry: Any = None) -> dict[str, Any]:
+        """The journal's `call` line of a request of an attempt, inside the open transaction (C05)."""
+        row = self.db.execute("SELECT run_key FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        return call_entry(attempt_id, row["run_key"], phase, entry)
+
+    def _close_call(self, attempt_id: int, entry: Any) -> bool:
+        """Append how a request of a running attempt closed to its call log, inside the open transaction; False when
+        the attempt keeps no log, or one that cannot be read (it stays so, and charges the bound)."""
+        row = self.db.execute(
+            "SELECT calls_usage FROM attempts WHERE id=? AND state='running' AND calls_usage IS NOT NULL",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            usage = json.loads(row["calls_usage"])
+        except ValueError:
+            return False
+        if not isinstance(usage, list):
+            return False
+        usage.append(entry)
+        self.db.execute("UPDATE attempts SET calls_usage=? WHERE id=?", (json.dumps(usage), attempt_id))
+        return True
+
+    def note_call_sent(self, attempt_id: int) -> None:
+        """Count a request of a running attempt in its call log before it goes out (C05): committed, and journaled
+        (O62), before the send, so a kill after it charges the request at its bound until its reply is noted. An
+        attempt that is not running, or keeps no log, is refused."""
+
+        def go() -> None:
+            cursor = self.db.execute(
+                "UPDATE attempts SET calls_sent = calls_sent + 1 WHERE id=? AND state='running' AND calls_sent IS NOT "
+                "NULL AND calls_usage IS NOT NULL",
+                (attempt_id,),
+            )
+            if cursor.rowcount != 1:
+                raise AttemptRefused(f"attempt {attempt_id} is not running with a call log, so no request is noted")
+            self._note_spend(lambda: self._call_line(attempt_id, SENT))
+
+        self.transact(go)
+
+    def note_call_answered(self, attempt_id: int, counts: Sequence[int | None] | None) -> None:
+        """Add a reply's counts (input, output, cache writes, cache reads; None for a reply that was billed and could
+        not be read) to a running attempt's call log, and journal it (C05, O62). A log that cannot be read is left as
+        it is, and charges the bound."""
+        entry = None if counts is None else [None if c is None else int(c) for c in counts]
+        if entry is not None and len(entry) != 4:
+            raise ValueError(f"a reply's counts are input, output, cache writes and cache reads, not {counts!r}")
+
+        def go() -> None:
+            running = self.db.execute(
+                "SELECT 1 FROM attempts WHERE id=? AND state='running' AND calls_usage IS NOT NULL", (attempt_id,)
+            ).fetchone()
+            if running is None:
+                raise AttemptRefused(f"attempt {attempt_id} is not running with a call log, so no reply is noted")
+            if self._close_call(attempt_id, entry):  # a log that cannot be read stays so, and charges the bound
+                self._note_spend(lambda: self._call_line(attempt_id, CLOSED, entry))
 
         self.transact(go)
 

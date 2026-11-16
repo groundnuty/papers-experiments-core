@@ -100,7 +100,7 @@ class ProbeSpend:
     async def before_request(self) -> None:
         """Nothing: a probe is no request of a run, and no recording sees it."""
 
-    async def after_reply(self, input_tokens: int | None, output_tokens: int | None) -> None:
+    async def after_reply(self, input_tokens: int | None, output_tokens: int | None, **parts: Any) -> None:
         """Nothing: the probe's reply is settled by `settle`."""
 
     async def after_failed_send(self, kind: str, *, resend: bool) -> None:
