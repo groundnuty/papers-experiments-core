@@ -1,0 +1,394 @@
+"""A fake HPC node for the Apptainer sandbox: `apptainer`, the helper processes and `/proc`, all in memory.
+
+It implements `NodeOps` (expcore_onedata.sandbox.apptainer.node). Every `apptainer exec` is parsed back into its binds,
+its environment, its image and its command, and kept in `execs`, so a test reads exactly what a cell was given. A cell
+runs under the completion bootstrap (O55) as on the fake docker host (`fake_host`): the program is checked against the
+size and hash its argv names, handed to `cell_handler`, and the record added to both streams; `exec_delivers` stands
+for a stdin that loses bytes and a handler that returns `Unrecorded` for an exec whose record never came.
+
+While a cell runs, its processes are in the process table in a PID namespace of their own, carrying the run's tag in
+their environment and the nonce in their command line, as `apptainer exec --containall` would make them; the cell waits
+until the watch has listed the table twice (`wait_for_watch`), so a watch's thread sees every cell without timing.
+
+The helpers are emulated by what they do: the gate reads its token file when it starts (`gate_tokens`), says it is
+ready, writes its run-start mark on SIGUSR1 and its teardown line on SIGTERM; the collector writes its start line, a
+record for each connect a cell makes through `connect`, and its end line on SIGTERM. Everything else a test needs to
+break (a gate that never gets ready, a helper that ignores its signals, an unreadable /proc) is a flag here. Every
+name and address is invented.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import signal
+import threading
+import time
+from collections.abc import Callable, Collection, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from fake_host import Unrecorded, bootstrap_of, recorded
+
+from expcore_onedata.sandbox import completion
+from expcore_onedata.sandbox.apptainer import argv as AV
+from expcore_onedata.sandbox.apptainer.node import Spawned
+from expcore_onedata.sandbox.apptainer.procs import Proc
+from expcore_onedata.sandbox.containers import CERTIFI_PROBE
+from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_input, run_bounded
+from expcore_onedata.sandbox.sandbox import READ_ONLY_PROBE
+
+OWN_NS = "pid:[4026531836]"
+CERTIFI = "/usr/lib/invented/certifi/cacert.pem"
+IMAGE_BUNDLE = "-----BEGIN CERTIFICATE-----\ninvented image bundle\n-----END CERTIFICATE-----\n"
+CANARY_MARK = "canary open"
+
+
+@dataclass
+class FakeProc:
+    pid: int
+    start: str
+    pidns: str
+    comm: str
+    environ: tuple[str, ...] = ()
+    cmdline: tuple[str, ...] = ()
+    rss: int | None = 1 << 20
+    state: str = "S"
+    alive: bool = True
+    role: str = "cell"
+    exit_status: int | None = None
+    ignores: frozenset[int] = frozenset()  # signals it does not end on
+
+    def proc(self, tags: Collection[str]) -> Proc:
+        found = frozenset(
+            t for t in tags if any(e.startswith(t) for e in self.environ) or any(t in a for a in self.cmdline)
+        )
+        return Proc(self.pid, self.start, 1, self.state, self.comm, self.pidns, self.rss, found)
+
+
+@dataclass
+class Exec:
+    """One `apptainer exec`, parsed back."""
+
+    argv: list[str]
+    flags: list[str]
+    binds: dict[str, tuple[str, bool]]  # target -> (source, writable)
+    env: dict[str, str]
+    image: str
+    command: list[str]
+    stdin: str | None
+
+
+@dataclass
+class Cell:
+    """What a cell's handler is given: the node, the exec, the program that arrived and the cell's processes."""
+
+    node: FakeNode
+    exec: Exec
+    program: str
+    nonce: str
+    pidns: str
+    procs: list[FakeProc] = field(default_factory=list)
+
+    def source(self, target: str) -> Path | None:
+        found = self.exec.binds.get(target)
+        return None if found is None else Path(found[0])
+
+
+@dataclass
+class Collector:
+    log: Path
+    nonce: str
+    proc: FakeProc
+    seq: int = 0
+    records: int = 0
+    lines: list[str] = field(default_factory=list)
+
+    def write(self, event: str, **fields: Any) -> None:
+        line = dict(fields, event=event, seq=self.seq, wall=time.time(), mono=time.monotonic())
+        with open(self.log, "a", encoding="ascii") as handle:
+            handle.write(json.dumps(line, sort_keys=True, separators=(",", ":")) + "\n")
+        self.seq += 1
+
+    def connect(self, address: str, port: int, *, pid: int = 77, result: int = 0) -> None:
+        base = {"pid": pid, "fd": 3, "time": "1.000000000", "type": "tcp", "family": "inet", "address": address,
+                "port": port, "dropped": 0}  # fmt: skip
+        peer = {"pid": pid, "uid": os.getuid()}
+        self.write("record", peer=peer, rec={**base, "op": "connect", "result": None})
+        self.write("record", peer=peer, rec={**base, "op": "result", "result": result})
+        self.records += 2
+
+
+@dataclass
+class Gate:
+    config: dict[str, Any]
+    proc: FakeProc
+
+
+class FakeNode:
+    """The fake node (the module's docstring)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.procs: dict[int, FakeProc] = {}
+        self._pid, self._ns, self._port = 7000, 4026532000, 41000
+        self.execs: list[Exec] = []
+        self.spawned: list[list[str]] = []
+        self.cell_handler: Callable[[Cell], CmdResult] = self.default_cell
+        self.exec_delivers: Callable[[bytes], bytes] | None = None
+        self.exec_input_error: str | None = None
+        self.wait_for_watch = True
+        self.listed = 0
+        self.proc_unreadable = False
+        self.gate_tokens: list[str] = []
+        self.gates: list[Gate] = []
+        self.collectors: list[Collector] = []
+        self.gate_busy = 0  # this many gate starts fail as if their port were taken
+        self.gate_never_ready = False
+        self.helpers_ignore: frozenset[int] = frozenset()
+        self.cell_left: list[FakeProc] = []  # processes a cell leaves behind (set by a handler)
+        self.cgroup: dict[str, Any] = {"depth": 0, "max_bytes": 1 << 34, "events": {"oom": 0, "oom_kill": 0},
+                                       "peak_bytes": 0}  # fmt: skip
+        self.owner = Spawned(999, "4242")
+        self.procs[999] = FakeProc(999, "4242", OWN_NS, "driver", role="driver")
+        self.signals: list[tuple[int, int]] = []
+
+    # ------------------------------------------------------------------------------------------------ processes
+    def _new_proc(self, pidns: str, comm: str, **kw: Any) -> FakeProc:
+        with self.lock:
+            self._pid += 1
+            proc = FakeProc(self._pid, str(100000 + self._pid), pidns, comm, **kw)
+            self.procs[proc.pid] = proc
+            return proc
+
+    def new_namespace(self) -> str:
+        with self.lock:
+            self._ns += 1
+            return f"pid:[{self._ns}]"
+
+    def processes(self, tags: Collection[str] = ()) -> list[Proc] | None:
+        with self.lock:
+            self.listed += 1
+            if self.proc_unreadable:
+                return None
+            return [p.proc(tags) for p in self.procs.values() if p.alive]
+
+    def _find(self, pid: int, start: str) -> FakeProc | None:
+        proc = self.procs.get(pid)
+        return proc if proc is not None and proc.start == start else None
+
+    def signal(self, pid: int, start: str, sig: int) -> bool | None:
+        with self.lock:
+            proc = self._find(pid, start)
+            if proc is None or not proc.alive:
+                return False
+            self.signals.append((pid, sig))
+        if proc.role == "gate":
+            self._gate_signal(proc, sig)
+        elif proc.role == "collector":
+            self._collector_signal(proc, sig)
+        elif sig == signal.SIGKILL or sig not in proc.ignores:
+            proc.alive, proc.exit_status = False, 128 + sig
+        return True
+
+    def alive(self, pid: int, start: str) -> bool | None:
+        with self.lock:
+            proc = self._find(pid, start)
+            return proc is not None and proc.alive
+
+    def exit_status(self, process: Spawned) -> int | None:
+        proc = self._find(process.pid, process.start)
+        return None if proc is None or proc.alive else proc.exit_status
+
+    def identity(self) -> Spawned:
+        return self.owner
+
+    def own_pidns(self) -> str | None:
+        return OWN_NS
+
+    def free_port(self) -> int:
+        with self.lock:
+            self._port += 1
+            return self._port
+
+    def make_ca(self, directory: Path, names: Sequence[str]) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "ca.pem").write_text("-----BEGIN CERTIFICATE-----\ninvented run CA\n-----END CERTIFICATE-----\n")
+        (directory / "ca.key").write_text("invented CA key\n")
+        for name in names:
+            (directory / f"{name}.pem").write_text(f"invented leaf of {name}\n")
+            (directory / f"{name}.key").write_text(f"invented key of {name}\n")
+
+    def cgroup_memory(self) -> dict[str, Any] | None:
+        return json.loads(json.dumps(self.cgroup))
+
+    def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
+        return {"kernel": "invented", "apptainer": "apptainer version invented"}
+
+    def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
+        return run_bounded(argv, timeout_s, input=input)
+
+    # ------------------------------------------------------------------------------------------------ helpers
+    def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path) -> Spawned:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        os.close(os.open(stdout, flags, 0o600))
+        os.close(os.open(stderr, flags, 0o600))
+        self.spawned.append(list(argv))
+        if any(a.endswith("gate.py") for a in argv):
+            return self._spawn_gate(list(argv), stdout, stderr)
+        if any(a.endswith("egress-collector.py") for a in argv):
+            return self._spawn_collector(list(argv), stdout)
+        raise AssertionError(f"the fake node spawns only the gate and the collector, not {argv[:3]}")
+
+    def _spawn_gate(self, argv: list[str], stdout: Path, stderr: Path) -> Spawned:
+        config = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        proc = self._new_proc(OWN_NS, "python3", cmdline=tuple(argv), role="gate", ignores=self.helpers_ignore)
+        self.gates.append(Gate(config, proc))
+        if self.gate_busy:
+            self.gate_busy -= 1
+            stderr.write_text("OSError: [Errno 98] Address already in use\n")
+            proc.alive, proc.exit_status = False, 1
+            return Spawned(proc.pid, proc.start)
+        self.gate_tokens.append(Path(config["token_file"]).read_text(encoding="utf-8"))
+        if not self.gate_never_ready:
+            stdout.write_text("gate ready\n")
+        return Spawned(proc.pid, proc.start)
+
+    def _gate_signal(self, proc: FakeProc, sig: int) -> None:
+        gate = next(g for g in self.gates if g.proc is proc)
+        if sig == signal.SIGUSR1:
+            with open(gate.config["log"], "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"event": "run_start", "before": []}) + "\n")
+            return
+        if sig in proc.ignores and sig != signal.SIGKILL:
+            return
+        if sig == signal.SIGTERM:
+            with open(gate.config["log"], "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"event": "teardown_complete"}) + "\n")
+        proc.alive, proc.exit_status = False, 0 if sig == signal.SIGTERM else 128 + sig
+
+    def _spawn_collector(self, argv: list[str], stdout: Path) -> Spawned:
+        sock_dir, log, nonce = Path(argv[-3]), Path(argv[-2]), argv[-1]
+        info = os.lstat(sock_dir)
+        assert info.st_mode & 0o777 == 0o700, "the collector's socket directory is owner-only"
+        assert not os.listdir(sock_dir), "the collector's socket directory is empty"
+        assert not log.exists(), "the collector's log exists before it starts"
+        proc = self._new_proc(OWN_NS, "python3", cmdline=tuple(argv), role="collector", ignores=self.helpers_ignore)
+        collector = Collector(log, nonce, proc)
+        collector.write("start", format="hpcop-egress/1", nonce=nonce, pid=proc.pid, uid=os.getuid())
+        self.collectors.append(collector)
+        stdout.write_text("egress collector ready\n")
+        return Spawned(proc.pid, proc.start)
+
+    def _collector_signal(self, proc: FakeProc, sig: int) -> None:
+        if sig in proc.ignores and sig != signal.SIGKILL:
+            return
+        collector = next(c for c in self.collectors if c.proc is proc)
+        if sig == signal.SIGTERM:
+            collector.write("end", records=collector.records, malformed=0, unwritten=0)
+        proc.alive, proc.exit_status = False, 0 if sig == signal.SIGTERM else 128 + sig
+
+    def collector(self) -> Collector:
+        return self.collectors[-1]
+
+    # ------------------------------------------------------------------------------------------------ apptainer
+    def apptainer(
+        self,
+        argv: Sequence[str],
+        timeout_s: float,
+        *,
+        input: str | None = None,
+        output_cap: int | None = None,
+        marker: bytes | None = None,
+    ) -> CmdResult:
+        parsed = parse_exec(list(argv), input)
+        self.execs.append(parsed)
+        boot = bootstrap_of(parsed.command)
+        result = self._one_shot(parsed) if boot is None else self._run_cell(parsed, input or "", *boot)
+        return apply_output_cap(result, output_cap, marker)
+
+    def _one_shot(self, parsed: Exec) -> CmdResult:
+        if parsed.command[-1] == CERTIFI_PROBE:
+            return CmdResult(0, f"certifi:{CERTIFI}\n")
+        if parsed.command[0] == "cat":
+            return CmdResult(0, IMAGE_BUNDLE) if parsed.command[1] == CERTIFI else CmdResult(1, "", "no such file")
+        raise AssertionError(f"the fake node runs no one-shot {parsed.command[:2]}")
+
+    def _run_cell(self, parsed: Exec, stdin: str, nonce: str, size: int, digest: str, python: str) -> CmdResult:
+        sent = encode_input(stdin)
+        got = self.exec_delivers(sent) if self.exec_delivers is not None else sent
+        if not (len(got) == size and hashlib.sha256(got).hexdigest() == digest):
+            record = {"source_bytes": len(got), "source_whole": False, "exit_status": None}
+            result = recorded(CmdResult(completion.NOT_RUN_EXIT), nonce, record)
+        else:
+            cell = self._enter(parsed, got.decode("utf-8", "replace"), nonce)
+            try:
+                ran = self.cell_handler(cell)
+            finally:
+                self._leave(cell)
+            if isinstance(ran, Unrecorded):
+                result = CmdResult(ran.returncode, ran.stdout, ran.stderr, input_error=ran.input_error)
+            else:
+                status = 128 - ran.returncode if ran.returncode < 0 else ran.returncode
+                result = recorded(ran, nonce, {"source_bytes": size, "source_whole": True, "exit_status": status})
+        if self.exec_input_error is not None:
+            result = CmdResult(result.returncode, result.stdout, result.stderr, input_error=self.exec_input_error)
+        return result
+
+    def _enter(self, parsed: Exec, program: str, nonce: str) -> Cell:
+        """The cell's processes appear in a namespace of their own; the watch lists them twice before it goes on."""
+        pidns = self.new_namespace()
+        env = tuple(f"{k}={v}" for k, v in parsed.env.items())
+        top = self._new_proc(pidns, "timeout", environ=env, cmdline=tuple(parsed.command))
+        worker = self._new_proc(pidns, "python3", environ=env, cmdline=(parsed.command[4], "-"))
+        cell = Cell(self, parsed, program, nonce, pidns, [top, worker])
+        if self.wait_for_watch:
+            seen, until = self.listed, time.monotonic() + 5.0
+            while self.listed < seen + 2 and time.monotonic() < until:
+                time.sleep(0.005)
+        return cell
+
+    def _leave(self, cell: Cell) -> None:
+        """The exec returns: its processes end, but for those a handler left behind (`cell_left`)."""
+        with self.lock:
+            for proc in cell.procs:
+                if proc not in self.cell_left:
+                    proc.alive = False
+
+    def default_cell(self, cell: Cell) -> CmdResult:
+        """The harness's own programs, as a cell would answer them; any other program prints nothing and exits 0."""
+        if cell.program.startswith("import socket, time"):  # the egress canary
+            port = int(cell.program.split("'127.0.0.1', ")[1].split(")")[0])
+            self.collector().connect("127.0.0.1", port)
+            return CmdResult(0, CANARY_MARK + "\n")
+        if cell.program == READ_ONLY_PROBE.format(path="/ro-probe"):
+            return CmdResult(0, "blocked 30\n")
+        return CmdResult(0, "")
+
+
+def parse_exec(argv: list[str], stdin: str | None) -> Exec:
+    """An `apptainer exec` command line back into its parts; anything the backend does not write fails loudly."""
+    at = argv.index("exec")
+    flags, rest = argv[: at + 1], argv[at + 1 :]
+    expected = ["--containall", "--cleanenv", "--no-home", "--no-mount", AV.NO_MOUNT, "--pwd", "/work"]
+    assert rest[: len(expected)] == expected, f"the exec's flags: {rest[: len(expected)]}"
+    rest = rest[len(expected) :]
+    binds: dict[str, tuple[str, bool]] = {}
+    env: dict[str, str] = {}
+    while rest and rest[0] in ("-B", "--env"):
+        option, value, rest = rest[0], rest[1], rest[2:]
+        if option == "-B":
+            parts = value.split(":")
+            assert len(parts) in (2, 3), f"a bind: {value}"
+            assert len(parts) == 2 or parts[2] == "ro", f"a bind's option: {value}"
+            assert parts[1] not in binds, f"a target bound twice: {parts[1]}"
+            binds[parts[1]] = (parts[0], len(parts) == 2)
+        else:
+            name, _, text = value.partition("=")
+            env[name] = text
+    return Exec(argv, flags, binds, env, rest[0], rest[1:], stdin)
+
+
+__all__ = ["CANARY_MARK", "Cell", "Exec", "FakeNode", "FakeProc", "Unrecorded", "parse_exec"]

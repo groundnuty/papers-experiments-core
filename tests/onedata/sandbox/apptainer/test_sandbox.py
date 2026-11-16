@@ -1,0 +1,197 @@
+"""O56: the Apptainer sandbox on a fake node: the token stays with the gate, every exec is checked whole, and the
+teardown leaves nothing."""
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+from apptainer_support import PLACEHOLDER, TOKEN, make_settings, make_spec, start
+from fake_node import FakeNode, Unrecorded
+
+from expcore_onedata.sandbox import completion
+from expcore_onedata.sandbox.api import SandboxError, StartRefused
+from expcore_onedata.sandbox.apptainer import argv as AV
+from expcore_onedata.sandbox.apptainer import runs
+from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED
+from expcore_onedata.sandbox.hostops import CmdResult
+
+
+@pytest.fixture
+def node() -> FakeNode:
+    return FakeNode()
+
+
+@pytest.fixture
+def settings(tmp_path):
+    return make_settings(tmp_path)
+
+
+def _files_under(root: Path):
+    if root.is_file():
+        yield root
+    for base, _, names in os.walk(root):
+        for name in names:
+            yield Path(base, name)
+
+
+def test_the_cell_holds_no_token_in_its_environment_its_argv_or_any_file_it_binds(node, settings):
+    """O56, O05: the token reaches the gate's file alone; no exec's argv or environment holds it, no file under any
+    bind of any exec does, nor any file left in the run's directory, and the cell's ONEDATA_TOKEN is the placeholder."""
+    box = start(node, settings)
+    try:
+        box.exec("print('hello')", 30)
+        assert node.gate_tokens == [TOKEN]
+        for done in node.execs:
+            assert TOKEN not in " ".join(done.argv)
+            assert TOKEN not in json.dumps(done.env)
+            for source, _ in done.binds.values():
+                for path in _files_under(Path(source)):
+                    assert TOKEN.encode() not in path.read_bytes(), path
+        for path in _files_under(box.dir):
+            assert TOKEN.encode() not in path.read_bytes(), path
+        cell = node.execs[-1]
+        assert cell.env["ONEDATA_TOKEN"] == PLACEHOLDER
+        assert cell.env[AV.RUN_TAG] == box.sid
+    finally:
+        box.stop()
+
+
+def test_the_gate_s_token_file_is_gone_once_it_is_ready(node, settings):
+    """O56, O05: the run's file of the token is removed as soon as the gate said it is ready, before any cell."""
+    box = start(node, settings)
+    try:
+        assert not (box.dir / "gate-secret" / "gate-token").exists()
+        gate = node.gates[-1]
+        assert gate.config["listen_host"] == "127.0.0.1"
+        assert gate.config["token_file"].endswith("gate-token")
+        assert "token" not in gate.config
+    finally:
+        box.stop()
+
+
+def test_a_cell_runs_under_the_completion_bootstrap_in_the_apptainer_exec_argv(node, settings):
+    """O56, O55: the cell's command is `timeout -s KILL <limit>` and the bootstrap, with the program's size and hash."""
+    box = start(node, settings)
+    try:
+        result = box.exec("print('hi')", 30)
+        command = node.execs[-1].command
+        assert command[:3] == ["timeout", "-s", "KILL"]
+        assert float(command[3]) > 30
+        assert command[4:8] == ["python3", "-I", "-c", completion.BOOTSTRAP]
+        assert command[9:] == [str(len(b"print('hi')")), command[10], "python3"]
+        assert result.exec_check == {"source_whole": True, "exit_status": 0, "nonce_matched": True}
+        assert node.execs[-1].flags[-2:] == ["-q", "exec"]
+    finally:
+        box.stop()
+
+
+def test_a_cell_whose_program_arrived_in_part_raises_and_never_reads_as_a_success(node, settings):
+    """O56, O55: a program the container's stdin got in part is never run; the exec raises, naming it."""
+    box = start(node, settings)
+    try:
+        node.exec_delivers = lambda data: data[: len(data) // 2]
+        with pytest.raises(completion.ExecIncomplete) as raised:
+            box.exec("print('a longer program')", 30)
+        assert "did not arrive whole" in raised.value.cause
+    finally:
+        box.stop()
+
+
+def test_a_cell_with_no_completion_record_raises_the_exit_not_recorded(node, settings):
+    """O56, O55: an exec whose record never came (apptainer reported exit 0 and nothing else) raises."""
+    box = start(node, settings)
+    try:
+        node.cell_handler = lambda cell: Unrecorded(0, "", "")
+        with pytest.raises(completion.ExecIncomplete) as raised:
+            box.exec("print('x')", 30)
+        assert "exit was not recorded" in raised.value.cause
+    finally:
+        box.stop()
+
+
+def test_a_cell_apptainer_could_not_start_raises_naming_apptainer(node, settings):
+    """O56: apptainer's own FATAL exit is never a cell's exit: the exec raises, saying its program did not run."""
+    box = start(node, settings)
+    try:
+        node.cell_handler = lambda cell: Unrecorded(255, "", "FATAL:   container creation failed\n")
+        with pytest.raises(completion.ExecIncomplete) as raised:
+            box.exec("print('x')", 30)
+        assert raised.value.cause.startswith("apptainer could not run the cell's container")
+    finally:
+        box.stop()
+
+
+def test_teardown_leaves_no_process_no_directory_and_no_record(node, settings):
+    """O56, O15: the stop ends the gate and the collector, every cell's process, the run's directory and its record."""
+    box = start(node, settings)
+    box.exec("print('x')", 30)
+    run_dir = box.dir
+    box.stop()
+    assert not run_dir.exists()
+    assert not runs.record_path(settings.work_root, box.sid).exists()
+    assert not [p for p in node.procs.values() if p.alive and p.role != "driver"]
+    box.stop()  # idempotent
+    assert box.stopped
+
+
+def test_a_stop_that_cannot_show_the_gate_gone_raises_and_keeps_the_record(node, settings):
+    """O56: a helper that outlives its kill fails the teardown, which keeps the run's record and directory."""
+    box = start(node, settings)
+    gate = node.gates[-1].proc
+    gate.ignores = frozenset({15, 9})
+    real = node.signal
+
+    def deaf(pid, start_, sig):
+        if pid == gate.pid:
+            return True  # sent, and nothing happens: a process the kernel does not end
+        return real(pid, start_, sig)
+
+    node.signal = deaf
+    with pytest.raises(SandboxError, match="gate could not be shown gone"):
+        box.stop()
+    assert runs.record_path(settings.work_root, box.sid).exists()
+    assert box.dir.exists()
+    assert not box.stopped
+
+
+def test_a_mount_run_is_refused_before_anything_exists(node, settings):
+    """O56: the mount data path is refused at the start until hook (c)'s helper is given, naming why."""
+    with pytest.raises(StartRefused) as refused:
+        start(node, settings, make_spec("mounted"))
+    assert str(refused.value) == MOUNT_REFUSED
+    assert not node.execs
+    assert not node.spawned
+    assert not list(settings.work_root.iterdir())
+
+
+def test_an_image_that_is_not_the_pinned_file_refuses_the_start(node, settings):
+    """O56, O13: the SIF's SHA-256 must be the pinned one, before anything exists."""
+    settings.apptainer.image.path.write_bytes(b"another image\n")
+    with pytest.raises(StartRefused, match="not the file it is pinned to"):
+        start(node, settings)
+    assert not node.spawned
+
+
+def test_an_image_changed_after_its_pin_refuses_the_next_exec(node, settings):
+    """O56, O13: the image's identity is checked before every exec; a file written since is never run."""
+    box = start(node, settings)
+    try:
+        settings.apptainer.image.path.write_bytes(b"an invented SIF image, changed\n")
+        with pytest.raises(SandboxError, match="changed on the node"):
+            box.exec("print('x')", 30)
+    finally:
+        box.stop()
+
+
+def test_a_cell_s_output_is_capped_and_the_cut_recorded(node, settings):
+    """O56, O43: the streams are capped as on Docker, and the cut is on the result and the cell's record."""
+    box = start(node, settings, output_cap_bytes=16)
+    try:
+        node.cell_handler = lambda cell: CmdResult(0, "x" * 100, "")
+        result = box.exec("print('x' * 100)", 30)
+        assert result.stdout == "x" * 16
+        assert result.output_cut == {"stdout": {"produced": 100, "kept": 16}}
+        assert box.metadata()["cell_output_cuts"] == [{"cell": 1, "stdout": {"produced": 100, "kept": 16}}]
+    finally:
+        box.stop()
