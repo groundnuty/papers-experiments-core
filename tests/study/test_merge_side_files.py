@@ -287,18 +287,26 @@ def test_r15_merge_refuses_an_out_inside_a_shard_whatever_the_path_to_it(
     clean_environment, shard1, shard2, target, tmp_path
 ):
     """R15 (#304): the merge writes a staging directory and the batch beside OUT, so an OUT that lies in a shard's
-    out/, by its own path or through a link, is refused before anything is made: no directory is added to the shard."""
+    out/, by its own path, through a link or as a link out of the shard, is refused before anything is made: nothing is
+    added to the shard, and the directory the link leads to stays empty."""
     inside = copy_campaign(shard1, tmp_path, "inside")
     link = tmp_path / "link-to-out"
     link.symlink_to(inside.root / "out", target_is_directory=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (inside.root / "out" / "merged-link").symlink_to(
+        elsewhere, target_is_directory=True
+    )  # OUT, a link out of the shard
     before = state_of(inside.root / "out")
-    for out in (inside.root / "out" / "merged", inside.root / "out" / "new" / "merged", link / "merged"):
+    outs = (inside.root / "out" / "merged", inside.root / "out" / "new" / "merged", link / "merged")
+    for out in (*outs, inside.root / "out" / "merged-link"):
         shards = [str(inside.root / "out"), str(shard2.root / "out")]
         code, errors = cli(clean_environment, "merge", str(out), *shards, "--study", str(target.root))
         assert code == 1, errors
         assert errors.splitlines()[-1].startswith("merge refused: "), errors
         assert "the out/ of a shard" in errors
         assert state_of(inside.root / "out") == before
+        assert not list(elsewhere.iterdir())
 
 
 # --- the merged batch ------------------------------------------------------------------------------------------------

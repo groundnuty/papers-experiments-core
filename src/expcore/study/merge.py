@@ -82,12 +82,14 @@ def merge_shards(
 
 
 def _refuse_inside_a_shard(out: Path, shard_outs: Sequence[Path]) -> None:
-    """The merge writes its staging directory and the batch beside `OUT`, so `OUT` may not be a shard's `out/` or lie
-    below one (#304): compared as resolved paths, symlinked parents included, before anything is made."""
-    target = out.resolve()
+    """The merge writes its staging directory beside `OUT` and the batch at `OUT`, so neither may be a shard's `out/`
+    or lie below one (#304). Both are compared as resolved paths, symlinks included (`OUT` may itself be a link to a
+    directory elsewhere, whose staging directory still lies in the directory the link is in), before anything is
+    made."""
+    places = (out.resolve(), out.parent.resolve())
     for shard_out in shard_outs:
         held = shard_out.resolve()
-        if target == held or held in target.parents:
+        if any(place == held or held in place.parents for place in places):
             raise MergeRefused(
                 f"{out}: lies in {shard_out}, the out/ of a shard: a merge writes beside OUT, and never into a shard"
             )
