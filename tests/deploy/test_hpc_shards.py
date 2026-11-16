@@ -85,7 +85,7 @@ def test_the_step_line_is_an_exact_step_on_the_sandbox_node_with_the_allowlist_a
     assert [e.split("=")[0] for e in env[:4]] == ["PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT"]
     assert env[3] == f"EXPCORE_FED_ROOT={shard.root}"
     assert env[4:] == homeless
-    assert line[at + len(env) : at + len(env) + 3] == [plan.python, "-I", str(SCRIPT)]
+    assert line[at + len(env) : at + len(env) + 4] == [plan.python, "-I", "-B", str(SCRIPT)]
     assert line[line.index("--index") + 1 : line.index("--index") + 2] == ["2"]
     assert line[line.index("--label") + 1] == "fed-b"
 
@@ -255,8 +255,8 @@ def test_collect_verifies_and_unpacks_every_shard_read_only_and_names_the_merge(
     assert (outs[0] / "campaign.lock").is_file()
     assert not os.access(outs[0] / "runs" / "r.json", os.W_OK)
     line = shards.merge_argv(plan, outs)
-    assert line[1:4] == ["-m", "expcore", "merge"]
-    assert line[5:] == [str(o) for o in outs]
+    assert line[1:6] == ["-I", "-B", "-m", "expcore", "merge"]
+    assert line[7:] == [str(o) for o in outs]
 
 
 def test_collect_refuses_a_shard_without_its_lock(shards, tmp_path):

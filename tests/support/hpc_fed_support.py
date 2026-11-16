@@ -252,9 +252,32 @@ def parse_srun(argv: list) -> Srun:
     return Srun(argv, env=env, command=command, **found)
 
 
+PYTHON = re.compile(r"python[0-9.]*")  # an interpreter by its file name: python, python3, python3.11
+NO_BYTECODE = ["-I", "-B"]  # what every Python the driver launches is given first (B1, O57)
+
+
+def unflagged(argv) -> list:
+    """Each Python in an argv not followed by `-I -B`: isolated (no launch directory, PYTHON* variable or user site on
+    `sys.path`) and writing no bytecode, which a node step otherwise writes into the core's interpreter in the account's
+    shared home (B1, live slot 5). `-I` ignores PYTHONDONTWRITEBYTECODE, so only the flag stops it."""
+    words = [str(word) for word in argv]
+    return [
+        w
+        for i, w in enumerate(words)
+        if PYTHON.fullmatch(PurePosixPath(w).name) and words[i + 1 : i + 3] != NO_BYTECODE
+    ]
+
+
+def flagged(argv) -> list:
+    """The argv, once every Python in it runs with `-I -B`; any other fails the test, whatever it tests."""
+    assert not unflagged(argv), f"a Python launched without -I -B (B1): {list(argv)}"
+    return list(argv)
+
+
 @dataclass
 class FakeSlurm:
-    """The login node's view of a cluster with one user's held job."""
+    """The login node's view of a cluster with one user's held job. Every command the driver gives it must run each
+    Python with `-I -B` (`flagged`), or the fake fails the test."""
 
     nodes: list = field(default_factory=lambda: [f"node{i:02d}" for i in range(1, 9)])
     job_id: str = "4242"
@@ -297,7 +320,7 @@ class FakeSlurm:
     def run(self, argv, timeout):
         from hpcslurm import Completed
 
-        argv = list(argv)
+        argv = flagged(argv)
         self.calls.append(argv)
         tool = argv[0]
         if tool == "sbatch":
@@ -342,9 +365,9 @@ class FakeSlurm:
             return Completed(0, "", "")
         if tool == "sacct":
             return Completed(0, "", "")
-        if argv[1:4] == ["-B", "-m", "expcore_onedata.fault_relay"]:
-            self.relay_calls.append(argv[4])
-            return Completed(self.relay_rc.get(argv[4], 0), "", "")
+        if argv[1:5] == ["-I", "-B", "-m", "expcore_onedata.fault_relay"]:
+            self.relay_calls.append(argv[5])
+            return Completed(self.relay_rc.get(argv[5], 0), "", "")
         raise AssertionError(f"an unexpected command: {argv}")
 
     @staticmethod
@@ -436,7 +459,7 @@ class FakeSlurm:
         return "\n".join(lines) + "\n"
 
     def _step(self, argv) -> Srun:
-        srun = parse_srun(list(argv))
+        srun = parse_srun(flagged(argv))
         self.calls.append(list(argv))
         self.sruns.append(srun)
         if self.submitted:  # Slurm places a step only on a node of the job and the component it names
@@ -517,7 +540,7 @@ class FakeSlurm:
         from hpcslurm import Client
 
         if argv[0] == "/usr/bin/env":  # the login node's fault relay, not a step
-            self.relays.append(list(argv))
+            self.relays.append(flagged(argv))
             self.relay_calls.append("serve")
             return Client(9999, 1)
         srun = self._step(argv)

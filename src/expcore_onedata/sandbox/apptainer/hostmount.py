@@ -189,7 +189,7 @@ def oneclient_argv(settings: Any, provider: Any, where: Layout, launcher: Sequen
 
 def watcher_argv(python: str, where: Layout, nonce: str, oneclient: Any, poll_s: float) -> list[str]:
     return [
-        *(python, "-I", "-m", "expcore_onedata.sandbox.mountwatch", "--log", str(where.watch_log)),
+        *(python, "-I", "-B", "-m", "expcore_onedata.sandbox.mountwatch", "--log", str(where.watch_log)),
         *("--nonce", nonce, "--token", str(where.token_file), "--mountpoint", str(where.mountpoint)),
         *("--oneclient", f"{oneclient.pid}:{oneclient.start}", "--poll-s", str(poll_s)),
         *(word for path in where.protected() for word in ("--protect", str(path))),

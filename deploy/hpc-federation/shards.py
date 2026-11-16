@@ -330,14 +330,14 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
     environment of the allowlist alone, set on the node by `env -i`, with no secret in it."""
     env = [f"PATH={plan.step_path}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={shard.root.parent}",
            f"EXPCORE_FED_ROOT={shard.root}", *(f"{k}={v}" for k, v in home_env(NO_HOME).items())]  # fmt: skip
-    step = [plan.python, "-I", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
+    step = [plan.python, "-I", "-B", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
             "--results", str(plan.results), "--core-src", str(plan.core_src),
             "--snapshot-every", f"{plan.snapshot_every_s:g}"]  # fmt: skip
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
-        f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH",
+        f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH", "--chdir=/",
         "/usr/bin/env", "-i", *env, *step,
     ]  # fmt: skip
 
@@ -466,7 +466,7 @@ def collect(plan: Plan, into: Path) -> list[Path]:
 
 
 def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
-    return [plan.python, "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
+    return [plan.python, "-I", "-B", "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
 
 
 # ------------------------------------------------------------------------------------------------ the step
@@ -510,9 +510,9 @@ if not tied or os.getppid() != int(sys.argv[1]):
     sys.stderr.write("shards: ERROR: the dispatcher could not be tied to its step, so it does not start\\n")
     os._exit(71)
 argv = sys.argv[2:]
-if argv[1:4] != ["-I", "-m", "expcore"]:
+if argv[1:5] != ["-I", "-B", "-m", "expcore"]:
     os.execv(argv[0], argv)
-sys.argv = ["expcore", *argv[4:]]
+sys.argv = ["expcore", *argv[5:]]
 try:  # its SystemExit, its message and its exit status pass as `python -m expcore`'s own
     runpy.run_module("expcore", run_name="__main__", alter_sys=True)
 finally:
@@ -527,7 +527,7 @@ NOT_TIED = 71  # the dispatcher could not be tied to its step: it never started
 def run_dispatcher(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int:
     """Run the dispatcher, relaying SIGTERM and SIGINT to it, and return its exit status (128 + N for a signal N). It
     dies with this step, and records its own end in the step's record (`DISPATCHER`); `cwd` is the step's directory."""
-    words = [sys.executable, "-I", "-c", DISPATCHER, str(os.getpid()), *argv]
+    words = [sys.executable, "-I", "-B", "-c", DISPATCHER, str(os.getpid()), *argv]
     child = subprocess.Popen(words, env=dict(env), cwd=cwd, stdin=subprocess.DEVNULL)
 
     def relay(signum: int, _frame: Any) -> None:
@@ -988,7 +988,7 @@ def step(
         journals = args.results / args.label / JOURNALS
         journals.mkdir(parents=True, exist_ok=True)
         journal = journals / f"{_stamp()}-{os.getpid()}-{secrets.token_hex(4)}.jsonl"
-        argv = [sys.executable, "-I", "-m", "expcore", "run", str(copy), "--spend-journal", str(journal),
+        argv = [sys.executable, "-I", "-B", "-m", "expcore", "run", str(copy), "--spend-journal", str(journal),
                 "--shard", f"{args.index}/{args.count}", "--shard-label", args.label]  # fmt: skip
         out = copy / "out"
         live = threading.Event()

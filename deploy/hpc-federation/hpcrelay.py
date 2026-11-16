@@ -54,12 +54,12 @@ def start(
 ) -> object:
     """Start the relay detached (one per root: it takes a lock), `record` its client at once (so `down` can end it
     whatever happens next), and wait for its heartbeat; return its client."""
-    serve = [python, "-B", "-m", RELAY, "serve", "--root", str(root), "--", *command]
+    serve = [python, "-I", "-B", "-m", RELAY, "serve", "--root", str(root), "--", *command]
     client = runner.spawn([ENV, "-i", *relay_environment(environ), *serve], str(log))
     record(client)
     deadline = clock() + ALIVE_TIMEOUT_S
     while True:
-        if runner.run([python, "-B", "-m", RELAY, "alive", "--root", str(root)], ALIVE_TIMEOUT_S).returncode == 0:
+        if runner.run([python, "-I", "-B", "-m", RELAY, "alive", "--root", str(root)], ALIVE_TIMEOUT_S).returncode == 0:
             return client
         if clock() >= deadline:
             ended = runner.end_client(client)
@@ -72,4 +72,4 @@ def start(
 
 def stop(runner: Runner, python: str, root: Path) -> bool:
     """Stop the relay of this root; True once no heartbeat beats (or none ever did)."""
-    return runner.run([python, "-B", "-m", RELAY, "stop", "--root", str(root)], STOP_TIMEOUT_S).returncode == 0
+    return runner.run([python, "-I", "-B", "-m", RELAY, "stop", "--root", str(root)], STOP_TIMEOUT_S).returncode == 0

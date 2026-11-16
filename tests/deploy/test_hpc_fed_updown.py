@@ -189,8 +189,8 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_r
     assert owner == (5001, 5001)
     assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("690", "750")
     command = json.loads(values["hpc_command"])
-    assert command[1] == "-B"
-    assert command[2:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
+    assert command[1:3] == ["-I", "-B"]
+    assert command[3:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
 
 
 KEY_BLOCK = "-----BEGIN RSA " + "PRIVATE KEY-----\nTUlJQg==\n-----END RSA " + "PRIVATE KEY-----\n"  # a stand-in
@@ -663,7 +663,7 @@ def test_up_starts_the_fault_relay_last_with_no_environment_but_its_own_and_wait
     (argv,) = rig.fake.relays
     cut = argv.index("-m")
     environment = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "HOME=/home/someone", "LC_ALL=C"]
-    assert argv[:cut] == [*environment, sys.executable, "-B"]
+    assert argv[:cut] == [*environment, sys.executable, "-I", "-B"]
     command = rig.state()["command"]
     assert argv[cut:] == ["-m", "expcore_onedata.fault_relay", "serve", "--root", str(rig.root), "--", *command]
     assert rig.fake.relay_calls[:2] == ["serve", "alive"]
@@ -694,7 +694,7 @@ def test_down_stops_the_fault_relay_before_anything_else(hpc, tmp_path, site):
     with pytest.raises(RuntimeError, match="the fault relay"):
         rig.driver.down()
     first = rig.fake.calls[0]
-    assert first[1:5] == ["-B", "-m", "expcore_onedata.fault_relay", "stop"]
+    assert first[1:6] == ["-I", "-B", "-m", "expcore_onedata.fault_relay", "stop"]
     assert rig.fake.cancelled == ["4242"]
 
 
