@@ -316,8 +316,12 @@ def test_o09_no_other_module_of_the_platform_layer_imports_httpx():
         # imports nothing of this package, which test_gate checks. It is the one file besides the client with HTTP.
         # The testing package answers HTTP, as the federation does, and no runtime module imports it (the import
         # boundary test), so it is no caller that could bypass the wrapper.
+        # The Apptainer backend's loopback helper binds a port on 127.0.0.1 and listens for the egress canary's
+        # connect; it connects nowhere and sends nothing (O56).
         relative = path.relative_to(SRC).as_posix()
         if path.name == "client.py" or relative == "sandbox/gate.py" or relative.startswith("testing/"):
+            continue
+        if relative == "sandbox/apptainer/loopback.py":
             continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             names = [a.name for a in node.names] if isinstance(node, ast.Import) else []

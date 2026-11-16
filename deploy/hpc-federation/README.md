@@ -285,9 +285,26 @@ space (M3) and the agent's node's step (M5) are not built here.
 | `baked.py` | node | finds the Couchbase cookies and memcached password the images ship, by the SHA-256 that `lib.sh` lists (never the values) |
 | `egresslog.c` | agent's cell | the agent's egress shim: logs each destination, never a payload |
 | `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
+| `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, the archives the merge takes |
 | `nodefacts.py` | control step | a node's FQDN, its IPv4 address, and the job's uid and gid, as JSON (`hpcfed.py up`) |
 | `zone-export.sh` | control step on the zone's node | the zone's passphrase or the Onedata test CA on stdout, for the federation's root (`hpcfed.py up`) |
 | `gateport.c` | agent's cell | the connect-side mapper: a TCP connect to 127.0.0.1:443 goes to the gate's port; nothing else is touched |
+
+## A campaign's shards: one per federation (`shards.py`)
+
+A campaign whose agent runs in the core's Apptainer sandbox (`[sandbox] backend = "apptainer"`, O56) runs as #154
+shards, one per federation. The sandbox's data gate listens on its node's loopback and its cells are that node's
+`apptainer exec`s, so each shard's dispatcher runs as one job step on its federation's sandbox node, launched from the
+login node like every other step. `shards.py lines --manifest shards.toml` prints each shard's `srun --jobid --exact`
+line, whose environment is an allowlist (`PATH`, `LC_ALL` and the federation's root, where the study's plugin finds
+`platform.toml` and the platform layer finds the fault relay), to run detached. In the step, `shards.py step` copies
+the stamped study to the node's tmpfs (the store's lock refuses a network filesystem), checks the interpreter imports
+the core it was given, runs `python -m expcore run STUDY --shard i/N --shard-label L`, and once the dispatcher has
+exited writes the copy's `out/` whole to `<results>/<label>.out.tar` with a manifest. `shards.py collect --manifest
+shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only and prints the `python -m expcore merge`
+line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's docstring
+has its form). A step killed outright loses its shard's work since its last archive: the periodic snapshot is still to
+be built (`Snapshots`, the hook). Outage runs (`[faults]`) depend on the fault relay of milestone M4.
 
 ## What the repository's tests cover
 
