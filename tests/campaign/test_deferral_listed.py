@@ -126,6 +126,15 @@ def test_c11_a_listed_module_that_answers_for_another_platform_covers_that_platf
             settings=ENOUGH,
             plan=SMALL,
         )
+    with pytest.raises(ConfigError, match=PLATFORM):  # an answer of a module the study does not list covers nothing
+        build(
+            tmp_path / "unlisted",
+            health=Declaring(BOUND),
+            platform_deferrals=registry,
+            listed_platforms=("another_platform",),
+            settings=ENOUGH,
+            plan=SMALL,
+        )
 
 
 @pytest.mark.parametrize(
