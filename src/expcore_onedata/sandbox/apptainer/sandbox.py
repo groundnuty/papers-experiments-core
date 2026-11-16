@@ -309,7 +309,10 @@ class ApptainerSandbox:
         # before they exist: the record lists them, so a reaper removes them first, and every teardown too (O60); each
         # must be a file of the run's directory, as the record names it relative to it and a reaper removes it there
         paths = [Path(os.path.normpath(path)) for path in self._mount.token_paths()]
-        if any(path == self.dir or not path.is_relative_to(self.dir) for path in paths):
+        real = Path(os.path.realpath(self.dir))
+        outside = [p for p in paths if p == self.dir or not p.is_relative_to(self.dir)]
+        outside += [p for p in paths if not Path(os.path.realpath(p)).is_relative_to(real)]  # through a link
+        if outside:
             raise SandboxError("the mount helper named a token file outside the run's directory")
         self._token_files = [*self._token_files, *paths]
         self.run_record()

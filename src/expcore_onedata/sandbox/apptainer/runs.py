@@ -152,13 +152,41 @@ def inside(run_dir: Path, relative: object) -> Path | None:
     return path if path != run_dir and path.is_relative_to(run_dir) else None
 
 
+def remove_inside(run_dir: Path, path: Path) -> bool:
+    """Remove a file of the run's directory without following a link anywhere: each directory from the run's down is
+    opened with `O_NOFOLLOW`, and the file is unlinked in the last one (an unlink never follows its last name). False
+    when a directory on the way is a link or not a directory, so nothing outside the run is ever removed; True when
+    the file is gone or was never there."""
+    names = path.relative_to(run_dir).parts
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(run_dir, flags)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        for name in names[:-1]:
+            inner = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = inner
+        os.unlink(names[-1], dir_fd=fd)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
 def _reap_one(node: NodeOps, work_root: Path, document: Mapping[str, Any]) -> int:
     sid, killed = str(document["sid"]), 0
     run_dir = work_root / sid
     for relative in document.get("token_files", []):  # first, before any step that can fail: a secret is never left
         path = inside(run_dir, relative)  # for a later reap (O60: the mount's token, when the unmount fails)
-        if path is not None:
-            path.unlink(missing_ok=True)
+        if path is not None and not remove_inside(run_dir, path):
+            log.error("a token file of a dead driver's run is under a link or no directory: not removed")
     for helper in document.get("helpers", []):
         if node.signal(int(helper["pid"]), str(helper["start"]), signal.SIGKILL) is True:
             killed += 1

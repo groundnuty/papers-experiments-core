@@ -422,3 +422,50 @@ def test_a_mount_helper_that_names_a_token_file_outside_the_run_is_refused_befor
     with pytest.raises(SandboxError, match="outside the run's directory"):
         ApptainerSandbox.start(node, settings, make_spec("mounted"), **options(mount_helper=factory))
     assert not Escaping.started
+
+
+def test_the_reaper_never_follows_a_link_inside_the_run_to_a_file_outside_it(node, settings, binary):
+    """O60 (Codex, delta round 2): a recorded token path under a directory that is a link leaves the run; the reaper
+    walks without following links, so the file outside stays."""
+    from expcore_onedata.sandbox.apptainer import runs
+
+    old, _ = _dead_mount_run(node, settings, binary)
+    elsewhere = settings.work_root / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "token").write_text("kept")
+    (old.dir / "link").symlink_to(elsewhere)
+    record = runs.record_path(settings.work_root, old.sid)
+    document = json.loads(record.read_text())
+    document["token_files"] += ["link/token"]
+    record.write_text(json.dumps(document))
+    node.proc_unreadable = True
+    runs.reap(node, settings.work_root, own="another-run")
+    assert (elsewhere / "token").read_text() == "kept"
+    assert not os.path.lexists(old._mount.where.token_file)  # the run's own is still removed
+
+
+def test_a_helpers_token_path_through_a_link_out_of_the_run_is_refused(node, settings, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    class Linked:
+        def __init__(self, run_dir):
+            self.run_dir = run_dir
+
+        def token_paths(self):
+            (self.run_dir / "link").symlink_to(elsewhere)
+            return [self.run_dir / "link" / "token"]
+
+        def start(self):
+            raise AssertionError("never started")
+
+        def stop(self):
+            pass
+
+        def metadata(self):
+            return {}
+
+    with pytest.raises(SandboxError, match="outside the run's directory"):
+        ApptainerSandbox.start(
+            node, settings, make_spec("mounted"), **options(mount_helper=lambda n, s, sp, run_dir: Linked(run_dir))
+        )
