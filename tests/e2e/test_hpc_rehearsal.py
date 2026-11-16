@@ -186,12 +186,16 @@ def test_plan_puts_each_shards_step_on_its_federations_agent_node_in_component_1
         line, fed = plan.lines[label], federations[label]
         assert line.srun[1:4] == [f"--jobid={JOBS[label][0]}", "--het-group=1", "--exact"]
         assert line.option("-w") == "node07"
+        homeless = {k: v for k, v in line.env.items() if k not in ("PATH", "LC_ALL") and not k.startswith("EXPCORE")}
         assert line.env == {
             "PATH": "/usr/bin:/bin",
             "LC_ALL": "C",
             "EXPCORE_FED_ROOT_PARENT": str(fed.root.parent),
             "EXPCORE_FED_ROOT": str(fed.root),
+            **homeless,
         }
+        assert homeless["HOME"] == "/dev/null/hpcop-home"  # no home of the account's, nor any (O57)
+        assert homeless["PYTHONNOUSERSITE"] == "1"
         assert line.command[2:4] == [str(Path(line.command[2])), "step"]
         assert line.command[line.command.index("--index") + 1] == str(index)
         fed.fake._step([*line.srun, "/usr/bin/env", "-i", *(f"{k}={v}" for k, v in line.env.items()), *line.command])

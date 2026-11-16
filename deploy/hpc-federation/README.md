@@ -336,7 +336,9 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   spaces and the probe space; its link check covers ten ordered pairs.
 - **The agent's node** (M5), when `[hpc] sandbox` declares it or the layout's platform template declares the
   Apptainer sandbox's limits, is held at its own shape: by default (`sandbox_placement = "het"`) as component 1 of a
-  heterogeneous job, every step there with `--het-group=1`; or (`"separate"`) as a held job of its own. Either is read
+  heterogeneous job, every step there with `--het-group=1` and every step on a service node with `--het-group=0`
+  (the site's Slurm refuses a heterogeneous job's step that names no component); or (`"separate"`) as a held job of
+  its own, whose steps name none. Either is read
   back as the services' job is, and `down` releases both. The state file's `sandbox` record names its node, its job
   and its het group, which M5's shard step takes. With the pilot's shape and a memory weight of 0.5 this bills about
   42 units per hour, against 63 for one uniform 18 GB shape (`DESIGN.md`, section 1).
@@ -354,7 +356,8 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
   with every peer address, and pipes a registration token from the zone into each provider; copies the zone's
-  passphrase (0600) and the Onedata test CA into the root (`bundle/zone-export.sh`); then bootstraps the federation
+  passphrase (0600) and the Onedata test CA's certificates, never its key, into the root (`bundle/zone-export.sh`,
+  `hpcca.py`); then bootstraps the federation
   through the Compose bootstrap over `https://<node FQDN>:8443`, writes its baseline, `facts.json` and
   `platform.toml`, and runs the platform layer's link check, which writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
@@ -409,6 +412,7 @@ import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs
 | `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
 | `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, its snapshots, the archives the merge takes |
 | `nodefacts.py` | control step | a node's FQDN, its IPv4 address, and the job's uid and gid, as JSON (`hpcfed.py up`) |
+| `leftovers.py` | control step | how many work directories of ours of one kind the node's tmpfs holds, as JSON (`hpcfed.py down`, for a service whose step ended before naming one) |
 | `zone-export.sh` | control step on the zone's node | the zone's passphrase or the Onedata test CA on stdout, for the federation's root (`hpcfed.py up`) |
 | `gateport.c` | agent's cell | the connect-side mapper: a TCP connect to 127.0.0.1:443 goes to the gate's port; nothing else is touched |
 | `oneclient_bundle.py` | build host | the host mount's oneclient: a relocatable bundle of the sidecar's pinned image, its SHA-256 and provenance |

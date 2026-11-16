@@ -20,6 +20,10 @@
 source "$(dirname "$0")/lib.sh"
 component "${1:-}"
 TAR=${2:?usage: node-init.sh <op|oz> <rootfs.tar>}
+# Every tool this start needs from the node, up front: one missing fails it now, named, before anything is made.
+tools=(findmnt sha256sum tar df stat install mktemp od "$HPCOP_PY")
+if [[ ${HPCOP_SKIP_PORTCHECK:-0} != 1 ]]; then tools+=(ss); fi
+need_tools "${tools[@]}"
 
 hidepid_ok() {  # the effective /proc mount hides other users' processes (hidepid=1, 2 or 4)
   local o
