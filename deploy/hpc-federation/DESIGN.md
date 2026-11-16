@@ -149,14 +149,14 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
      [--output=<log>] /usr/bin/env -i <allowlist> <argv>        # stdin </dev/null unless it is the payload
 ```
 
-- **Every step starts in `/`** (`--chdir=/`), never in the directory srun was called from: where that directory does
-  not exist on the node, slurmstepd starts the step in the node's `/tmp` instead, which other users share (another
-  study's audit, 16 Nov 2026). `/` exists on every node and nobody but root writes it; a step's own work directory
-  does not exist yet when a service step starts, and a control step's is checked by the script it runs before it is
-  used. Every script then works by absolute paths: the bundle's from `$(dirname "$0")`, its work directory from
-  `--workdir`. The shards' steps (`shards.py lines`), the test runner's (`deploy/hpc-tests`) and the run harness's
-  (`run/common.sh`) are launched the same way, and the held job's `sbatch` takes `--chdir=/` too.
-
+- **Every step starts in `/`** (`--chdir=/`), never in the directory srun was called from: where that directory does not
+  exist on the node, slurmstepd starts the step in the node's `/tmp` instead, which other users share (another study's
+  audit, 16 Nov 2026). `/` exists on every node and nobody but root writes it; a service step's own work directory does
+  not exist yet when it starts, and a control step names its work directory by `--workdir`, never by where it starts.
+  Every script then works by absolute paths: the bundle's from `$(dirname "$0")`, its work directory from `--workdir`; a
+  shard manifest's paths and the run harness's `B`, `SH`, `L` and `GATE_DIR` must be absolute. The shards' steps
+  (`shards.py lines`), the test runner's (`deploy/hpc-tests`) and the run harness's (`run/common.sh`) are launched the
+  same way, and the held job's `sbatch` takes `--chdir=/` too.
 - **The environment is an allowlist**, set on the node by `env -i`, so neither the login environment (srun passes it
   otherwise) nor a site task prolog decides it: `PATH` (`HPC_STEP_PATH` from `site.env`, by default
   `/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin`: the site's nodes keep `ss` in `/usr/sbin`, and the first
@@ -190,13 +190,13 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   pid still has its recorded start tick), and `down` also ends any `srun --jobid=<job>` of ours on the same login node (run `down` where `up` ran) that
   no record names (one spawned just before a crash).
 - **Every Python the driver launches runs isolated** (`-I`, O58): on a node, on the login node (the fault relay's
-  `serve`, `alive` and `stop`, and the verbs' argv prefix, section 7), in a container and in `shards.py` (its step,
-  its dispatcher, the merge `collect --run` runs). Without it `python -m` and `python -c` put the directory they were
-  launched from first on `sys.path`, and every `PYTHON*` variable is read: on 16 Nov 2026 (F2) a `down` launched from
-  the login node's `/tmp`, which held 49 `.py` files of other users, had the relay's `stop` import another user's
-  `/tmp/inspect.py` in place of the standard library's. Launch `up`, `down` and the verbs from a directory of ours
-  (the checkout) all the same, never a shared one: `uv run` takes the project of the working directory when it has a
-  `pyproject.toml`, and builds it.
+  `serve`, `alive` and `stop`, and the verbs' argv prefix, section 7), in a container and in `shards.py` (its step, its
+  dispatcher, the merge `collect --run` runs), and so does the test runner's pytest (`deploy/hpc-tests`). Without it
+  `python -m` and `python -c` put the directory they were launched from first on `sys.path`, and every `PYTHON*`
+  variable is read: on 16 Nov 2026 (F2) a `down` launched from the login node's `/tmp`, which held 49 `.py` files of
+  other users, had the relay's `stop` import another user's `/tmp/inspect.py` in place of the standard library's. Launch
+  `up`, `down` and the verbs from a directory of ours (the checkout) all the same, never a shared one: `uv run` takes
+  the project of the working directory when it has a `pyproject.toml`, and builds it.
 - **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python a
   step runs takes `-I -B`.
 - **The core the driver imports is recorded**: `up` writes the resolved paths of `expcore_onedata`, `fedlayout` and

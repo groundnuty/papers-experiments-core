@@ -297,11 +297,12 @@ sbatch --account="$HPC_ACCOUNT" --partition="$HPC_PARTITION" --no-requeue --time
   --mem=24G --output="$L/build-oz-%j.log" --wrap "bash $B/build-rootfs.sh oz $SH/onezone.tar"
 # 1. The zone on node A, listing every provider's address as a peer.
 ZJ=$(sbatch --parsable --account="$HPC_ACCOUNT" --partition="$HPC_PARTITION" --nodelist=<node-A> --time=03:30:00 \
-  --mem=32G --output="$L/hpcop-zone-%j.log" "$B/zone.sbatch" "$B" "$SH/onezone.tar" <zone-name> <provider-address>)
+  --mem=32G --chdir=/ --output="$L/hpcop-zone-%j.log" "$B/zone.sbatch" "$B" "$SH/onezone.tar" <zone-name> \
+  <provider-address>)
 # 2. A provider on node B, registered to the zone with a single-use token that travels only through the pipe.
 PJ=$(sbatch --parsable --account="$HPC_ACCOUNT" --partition="$HPC_PARTITION" --nodelist=<node-B> --time=03:00:00 \
-  --mem=32G --output="$L/hpcop-provider-%j.log" "$B/provider.sbatch" "$B" "$SH/oneprovider.tar" <provider-name> \
-  <zone-fqdn> <admin-email> <zone-address>)
+  --mem=32G --chdir=/ --output="$L/hpcop-provider-%j.log" "$B/provider.sbatch" "$B" "$SH/oneprovider.tar" \
+  <provider-name> <zone-fqdn> <admin-email> <zone-address>)
 srun --jobid="$ZJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=200M bash "$B/mint-registration-token.sh" \
   <provider-name> </dev/null | srun --jobid="$PJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=1G \
   bash "$B/deliver-token.sh"
@@ -314,9 +315,9 @@ scancel "$PJ" "$ZJ"
 The token delivery step needs about 1 GB: the seventh live run's step was killed for memory under `--mem=100M`.
 Each batch job runs its service from the batch step itself (`node-init.sh`, `configure.sh`, `run-*.sh`,
 `finish*.sh`), so polling costs no job steps; read a work directory's `run.log` with
-`srun --jobid=<job> --overlap --export=PATH --chdir=/ -n1 cat <workdir>/run.log </dev/null`. Give every `srun` a
-`--chdir=/`: a step otherwise starts in the directory srun was called from, or, where that does not exist on the node,
-in the node's shared `/tmp`. On a failed start the batch
+`srun --jobid=<job> --overlap --export=PATH --chdir=/ -n1 cat <workdir>/run.log </dev/null`. Give every `srun` and
+`sbatch` a `--chdir=/`: a step or job otherwise starts in the directory it was called from, or, where that does not
+exist on the node, in the node's shared `/tmp`. On a failed start the batch
 script stops the service, deletes and redacts every secret (`scrub.py`) and keeps the logs for
 `HPCOP_INSPECT_SECONDS`. A job whose service stopped at `teardown.sh`'s request ends with status 0; a service that
 ends any other way fails the job, with its own status. `--exclusive` keeps other users off a node, at the price of

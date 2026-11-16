@@ -196,6 +196,7 @@ def test_o58_the_verbs_argv_prefix_runs_isolated_from_a_planted_directory(tmp_pa
 # -- every argv the driver builds, scanned -------------------------------------------------------------------------
 
 INTERPRETER = re.compile(r"python[0-9.]*")  # a file name: python, python3, python3.11
+VERSIONED = re.compile(r"python3(\.\d+)?")  # a bare command name; a bare "python" is a word (a manifest key) too
 NAMED_PYTHON = re.compile(r"(^|_)python$")  # a variable or attribute holding one: python, node_python, plan.python
 LAUNCHERS = ("srun", "sbatch")  # Slurm's: each must name the working directory it starts in
 
@@ -204,7 +205,9 @@ def interpreter(node: ast.expr) -> bool:
     if isinstance(node, ast.Attribute) and node.attr == "executable":
         return isinstance(node.value, ast.Name) and node.value.id == "sys"
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return INTERPRETER.fullmatch(node.value.rsplit("/", 1)[-1]) is not None
+        if "/" in node.value:
+            return INTERPRETER.fullmatch(node.value.rsplit("/", 1)[-1]) is not None
+        return VERSIONED.fullmatch(node.value) is not None
     name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
     return name is not None and NAMED_PYTHON.search(name) is not None
 
@@ -229,7 +232,12 @@ def python_findings(source: str) -> list[str]:
     return found
 
 
-SHELL_PYTHON = re.compile(r"""(?:^|[\s;|&(`]|\$\()(?:exec\s+)?("\$HPCOP_PY"|\$HPCOP_PY|python3(?:\.\d+)?)\s+(\S+)""")
+# An interpreter as a command word: `$HPCOP_PY` or `$HPCT_PYTHON`, bare or quoted, `python3` or `python3.x`, or a
+# path to one in a `bin/` (`"$dir/venv/bin/python"`). A bare `python` is a word too (uv's subcommand, a directory).
+SHELL_PYTHON = re.compile(
+    r"""(?:^|[\s;|&(`]|\$\()(?:exec\s+)?("\$\{?HPC(?:OP_PY|T_PYTHON)\}?"|\$\{?HPC(?:OP_PY|T_PYTHON)\}?|"""
+    r""""?(?:[^\s"'=;|&()]*/bin/python(?:3(?:\.\d+)?)?|python3(?:\.\d+)?)"?)\s+(\S+)"""
+)
 SHELL_SLURM = re.compile(r"(?:^|[\s;|&(`]|\$\()(srun|sbatch)\s+-")
 
 
@@ -245,7 +253,8 @@ def shell_findings(source: str) -> list[str]:
         if code.endswith("\\"):
             logical = logical[:-1] + " "
             continue
-        bad = [m for m in SHELL_PYTHON.finditer(logical) if m.group(2) != "-I"]
+        # an interpreter followed by an operator is an argument (`uv python install "$HPCT_PYTHON" || ...`)
+        bad = [m for m in SHELL_PYTHON.finditer(logical) if m.group(2) != "-I" and m.group(2)[0] not in "|&;)"]
         bad += [m for m in SHELL_SLURM.finditer(logical) if "--chdir=" not in logical[m.start() :]]
         found += [f"{start}: {logical.strip()}" for _ in bad[:1]]
         logical = ""
@@ -253,27 +262,33 @@ def shell_findings(source: str) -> list[str]:
 
 
 def deploy_files(*patterns: str) -> list[Path]:
-    return sorted(p for pattern in patterns for p in (DEPLOY / "hpc-federation").rglob(pattern))
+    trees = (DEPLOY / "hpc-federation", DEPLOY / "hpc-tests")
+    return sorted(p for tree in trees for pattern in patterns for p in tree.rglob(pattern))
 
 
 def test_o58_the_scans_find_a_python_without_isolation_and_a_launch_that_names_no_working_directory():
     """O58, O57: the scans below catch what they guard against, so their silence on the driver means something."""
     python_bad = (
         '[python, "-B", "-m", "x"]\n[sys.executable, "x.py"]\n("python3.11", "-c", "y")\n[site.node_python, "z"]\n'
-        '[plan.python, "-m", "expcore"]\n["srun", "--exact", "-N1"]\n["sbatch", "--wrap=x"]\n'
+        '[plan.python, "-m", "expcore"]\n["srun", "--exact", "-N1"]\n["sbatch", "--wrap=x"]\n["/v/bin/python", "a"]\n'
     )
-    python_good = '[python, "-I", "-B", "-m", "x"]\n["srun", "--chdir=/", "x"]\n{"python", "x"}\n'
+    python_good = (
+        '[python, "-I", "-B", "-m", "x"]\n["srun", "--chdir=/", "x"]\n{"python", "x"}\n("study", "python", "tmpfs")\n'
+    )
     shell_bad = (
         'python3 -c "x"\nx=$(python3.11 y.py)\n"$HPCOP_PY" --version\nexec $HPCOP_PY -B z.py\n'
         "srun --jobid=1 \\\n  -w n bash x.sh\nsbatch --wrap=x\n"
+        '  "$dir/venv/bin/python" -m pytest\n$HPCT_PYTHON -c x\n'
     )
     shell_good = (
         'python3 -I -c "x"\n"$HPCOP_PY" -I z.py  # python3 x\n# python3 y.py\n'
         'srun --jobid=1 \\\n  --chdir=/ bash x.sh\ndie "$HPCOP_PY cannot run"\nHPCOP_PY=${HPCOP_PY:-python3.11}\n'
+        'echo "uv $v, python $HPCT_PYTHON"\n"$HPCT_UV" python install x\nforce_rm "$root/python" "$root/x"\n'
+        '"$dir/venv/bin/python" -I -c x\nuv python install "$HPCT_PYTHON" || return 1\n'
     )
-    assert len(python_findings(python_bad)) == 7
+    assert len(python_findings(python_bad)) == 8
     assert python_findings(python_good) == []
-    assert len(shell_findings(shell_bad)) == 6
+    assert len(shell_findings(shell_bad)) == 8
     assert shell_findings(shell_good) == []
 
 
@@ -291,7 +306,8 @@ def test_o58_every_python_argv_the_driver_builds_runs_isolated_and_every_slurm_l
 
 @pytest.mark.parametrize("path", deploy_files("*.sh", "*.sbatch"), ids=lambda p: p.relative_to(DEPLOY).as_posix())
 def test_o57_every_python_and_every_step_a_script_of_the_driver_launches_is_isolated_and_names_its_directory(path):
-    """O57: every script of the bundle and the run harness runs each Python (`$HPCOP_PY`, `python3`, `python3.x`)
-    with `-I`, inside a container too, and every `srun` it launches names its working directory (`--chdir=/`), so no
-    step starts in the directory srun was called from, or in the node's shared /tmp when that does not exist there."""
+    """O57: every script of the bundle, the run harness and the test runner's tool runs each Python (`$HPCOP_PY`,
+    `$HPCT_PYTHON`, or any path named `python`, `python3`, `python3.x`) with `-I`, inside a container too, and every
+    `srun` or `sbatch` it launches names its working directory (`--chdir=/`), so no step starts in the directory srun
+    was called from, or in the node's shared /tmp when that does not exist there."""
     assert shell_findings(path.read_text(encoding="utf-8")) == []

@@ -394,3 +394,22 @@ def test_a_sandbox_record_without_its_node_is_refused_whatever_else_names_one(sh
     state_file.write_text(json.dumps(state))
     with pytest.raises(shards.ShardsError, match="no sandbox node"):
         shards.federation(plan.shards[0])
+
+
+@pytest.mark.parametrize("python", ["venv/bin/python", "./python"])
+def test_o57_a_manifest_whose_python_is_a_relative_path_is_refused(shards, tmp_path, python):
+    """O57: a shard's step starts in `/` (`--chdir=/`); a relative interpreter would resolve there, or, launched
+    without it, in the node's shared /tmp: only an absolute one, on the filesystem the nodes see, is taken."""
+    manifest = _manifest(tmp_path)
+    text = manifest.read_text().replace(f'python = "{tmp_path / "venv" / "python"}"', f'python = "{python}"')
+    manifest.write_text(text)
+    with pytest.raises(shards.ShardsError, match="python must be an absolute path"):
+        shards.load_plan(manifest)
+
+
+def test_o57_the_step_line_starts_the_step_in_the_root_directory(shards, tmp_path):
+    """O57: the shard's step names its working directory, `/`, before its environment, so it never starts in the
+    login node's directory or the node's shared /tmp."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    line = shards.step_argv(plan, plan.shards[0], shards.federation(plan.shards[0]), SCRIPT)
+    assert "--chdir=/" in line[: line.index("/usr/bin/env")]

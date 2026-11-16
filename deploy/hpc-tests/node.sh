@@ -120,7 +120,7 @@ do_pytest() {
       "OMP_NUM_THREADS=$HPCT_CORES" "OPENBLAS_NUM_THREADS=$HPCT_CORES" "MKL_NUM_THREADS=$HPCT_CORES" \
       GIT_AUTHOR_NAME=hpct GIT_AUTHOR_EMAIL=hpct@invalid GIT_COMMITTER_NAME=hpct GIT_COMMITTER_EMAIL=hpct@invalid
     exec timeout --signal=TERM --kill-after=30 "$HPCT_TIMEOUT_S" \
-      "$dir/venv/bin/python" -m pytest "${args[@]}" -p no:cacheprovider -ra "--junitxml=$res/junit.xml" \
+      "$dir/venv/bin/python" -I -B -m pytest "${args[@]}" -p no:cacheprovider -ra "--junitxml=$res/junit.xml" \
       "--basetemp=$dir/tmp/pytest"
   ) > "$res/pytest.log" 2>&1 &
   child=$!

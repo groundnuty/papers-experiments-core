@@ -226,7 +226,7 @@ def load_plan(path: Path) -> Plan:
     every = data.get("snapshot_every_s", SNAPSHOT_EVERY_S)
     if isinstance(every, bool) or not isinstance(every, int | float) or not 60 <= every < float("inf"):
         raise ShardsError("snapshot_every_s must be a number of seconds, at least 60")
-    for key in ("study", "core_src", "results", "tmpfs"):
+    for key in ("study", "python", "core_src", "results", "tmpfs"):  # a step starts in / (`--chdir=/`)
         if not isinstance(data[key], str) or not data[key].startswith("/"):
             raise ShardsError(f"{key} must be an absolute path")
     if not isinstance(data["cpus"], int) or isinstance(data["cpus"], bool) or data["cpus"] < 1:

@@ -838,3 +838,16 @@ def test_a_canary_output_that_was_not_a_connect_result_fails_the_egress_item(run
     said.write_text("garbled\n", encoding="utf-8")
     record("canary", str(run_dir / "sandbox" / "canary.json"), "127.0.0.1", "41234", "0", str(said))
     assert failed(evidence.summary(run_dir)) == {"egress"}
+
+
+@pytest.mark.parametrize("key", ["B", "SH", "L", "GATE_DIR"])
+def test_o57_the_run_refuses_a_site_path_that_is_not_absolute(site, key, tmp_path):
+    """O57: every step of the run starts in `/` (`--chdir=/`), where a relative bundle, image, log or gate directory
+    would resolve to another place than the login node's: each must be an absolute path."""
+    env_file = Path(site.env["SITE_ENV"])
+    lines = [line for line in env_file.read_text(encoding="utf-8").splitlines() if not line.startswith(f"{key}=")]
+    other = tmp_path / "site-relative.env"
+    other.write_text("\n".join([*lines, f"{key}='relative/{key.lower()}'"]) + "\n", encoding="utf-8")
+    done = sh_status(site, "true", SITE_ENV=str(other))
+    assert done.returncode != 0
+    assert f"site.env: {key} must be an absolute path" in done.stderr

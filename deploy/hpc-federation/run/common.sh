@@ -23,6 +23,9 @@ source "$SITE_ENV"
 for key in HPC_JOB B SH L GATE_DIR NODE_Z NODE_P1 NODE_P2 NODE_P3 NODE_S ADDR_Z ADDR_P1 ADDR_P2 ADDR_P3; do
   [[ -n ${!key:-} && ${!key} != *'<'* ]] || die "site.env: $key is not filled in (see site.env.example)"
 done
+for key in B SH L GATE_DIR; do  # every step starts in / (st's --chdir=/): a relative path would resolve there
+  [[ ${!key} == /* ]] || die "site.env: $key must be an absolute path"
+done
 SVC_CPUS=${SVC_CPUS:-8}        # a service step: its cores and memory (overlap steps may sum past the job's memory)
 SVC_MEM=${SVC_MEM:-19G}
 ZONE_NAME=${ZONE_NAME:-expcore-zone}
