@@ -21,6 +21,7 @@ SERVICE_STATES = ("planned", "starting", "running", "stopping", "stopped", "fail
 WORKDIR_NAME = re.compile(r"hpcop-o[pz]\.[A-Za-z0-9]{6}")  # the bundle's mktemp -d name (lib.sh, make_workdir)
 JOB_ID = re.compile(r"[0-9]{1,12}")
 STEP_ID = re.compile(r"[0-9]{1,12}\.[0-9]{1,9}")
+PLACEMENTS = ("het", "separate")  # where the agent's node is held (hpcsettings.SANDBOX_PLACEMENTS)
 
 
 class StateError(RuntimeError):
@@ -86,7 +87,25 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
     job = state["allocation"].get("job")
     if job is not None and not (isinstance(job, str) and JOB_ID.fullmatch(job)):
         raise StateError(f"{STATE}: allocation.job is not a Slurm job id")
+    sandbox = state.get("sandbox")
+    if sandbox is not None:
+        checked_sandbox(sandbox)
     return state
+
+
+def checked_sandbox(sandbox: Any) -> None:
+    """The agent's node's record: down cancels the job it names and steps take its het group, so each must be what
+    Slurm gives (DESIGN.md, section 4)."""
+    if not isinstance(sandbox, dict) or sandbox.get("placement") not in PLACEMENTS:
+        raise StateError(f"{STATE}: sandbox is not the record of the agent's node")
+    for key in ("job", "component_job"):
+        value = sandbox.get(key)
+        if value is not None and not (isinstance(value, str) and JOB_ID.fullmatch(value)):
+            raise StateError(f"{STATE}: sandbox.{key} is not a Slurm job id")
+    if sandbox.get("het_group") != (1 if sandbox["placement"] == "het" else None):
+        raise StateError(f"{STATE}: sandbox.het_group is not the agent's component")
+    if not isinstance(sandbox.get("name"), str) or not sandbox["name"]:
+        raise StateError(f"{STATE}: sandbox.name is not a job name")
 
 
 def save(root: Path, state: Dict[str, Any]) -> None:
