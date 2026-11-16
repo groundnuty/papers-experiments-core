@@ -222,7 +222,7 @@ A versioned Python package (`expcore`, with the Onedata platform layer `expcore_
 - Before pushing: `uv run python -m expcore.provenance.study_tokens check-commits <base>..HEAD` (commit messages are scanned too).
 - After changing the private list: `uv run python -m expcore.provenance.study_tokens hash "$EXPCORE_STUDY_TOKENS" > tests/data/study_tokens.sha256`.
 - CI runs on pull requests (testing the merge with `main`) and on pushes to `main`. To test one branch tip exactly, such as a pin built on an older commit, run `gh workflow run ci.yml --ref <branch>`.
-- CI also enforces repository-wide guards that local per-file test runs miss: O09 (nothing in `src/expcore_onedata` imports `socket`, `http`, `httpx`, `requests` or `urllib3` but `client.py`, `sandbox/gate.py` and `sandbox/apptainer/loopback.py`; parse addresses with `ipaddress`), and O29's read-site scan (don't name a method like the client's retrying helpers). Run `tests/onedata/test_client.py` and `tests/onedata/test_read_retry_sites.py` before pushing platform-layer code.
+- CI also enforces repository-wide guards that local per-file test runs miss: O09 (nothing in `src/expcore_onedata` imports `socket`, `http`, `httpx`, `requests` or `urllib3` but a module named `client.py`, `sandbox/gate.py`, `sandbox/apptainer/loopback.py` and the `testing/` package; parse addresses with `ipaddress`), and O29's read-site scan (don't name a method like the client's retrying helpers). Run `tests/onedata/test_client.py` and `tests/onedata/test_read_retry_sites.py` before pushing platform-layer code.
 - Tests never leave a path on `sys.path` after their fixture (use `pytest.MonkeyPatch.context().syspath_prepend`): a deploy directory left there shadowed modules of later tests.
 
 ## Conventions
