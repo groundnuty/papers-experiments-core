@@ -104,7 +104,8 @@ def make_driver(
     settings = load_settings(spec.hpc, agent_limits(spec.platform_template) if agent else None)
     slurm = Slurm(runner or Runner())
     store = StateStore(layout.root)
-    command = [sys.executable, "-B", str(HERE / "hpcfed.py"), "--layout", str(layout_path), "--root", str(layout.root)]
+    command = [sys.executable, "-I", "-B", str(HERE / "hpcfed.py"), "--layout", str(layout_path), "--root",
+               str(layout.root)]  # fmt: skip
     given = {} if environ is None else {"environ": dict(environ)}
     return Driver(
         layout_path=layout_path,

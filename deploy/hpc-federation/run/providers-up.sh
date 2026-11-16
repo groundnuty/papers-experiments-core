@@ -20,7 +20,7 @@ for n in 1 2 3; do
   peers=()
   for other in P1 P2 P3; do [[ $other == "$role" ]] || peers+=("$(addr_of "$other")"); done
   detached "$E/$role/service-step.rc.json" service_step \
-    srun --jobid="$HPC_JOB" --overlap --export=PATH -w "$(node_of "$role")" -N1 -n1 -c"$SVC_CPUS" --mem="$SVC_MEM" --output="$(svc_log "$role")" \
+    srun --jobid="$HPC_JOB" --overlap --export=PATH --chdir=/ -w "$(node_of "$role")" -N1 -n1 -c"$SVC_CPUS" --mem="$SVC_MEM" --output="$(svc_log "$role")" \
     bash "$B/provider.sbatch" "$B" "$SH/oneprovider.tar" "prov$n" "$ZF" "$ADMIN_MAIL" "$ADDR_Z" "${peers[@]}"
 done
 say "provider steps launched $(date -u +%T)"

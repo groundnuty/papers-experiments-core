@@ -12,9 +12,9 @@
 Apptainer sandbox's data gate listens on that node's loopback and its cells are that node's `apptainer exec`s, so the
 dispatcher (`python -m expcore run STUDY --shard i/N --shard-label L`) must run there, never on the login node. A step
 is launched from the login node alone (srun cannot start one on a compute node), as the federation's own services are
-(`DESIGN.md`): `lines` prints each shard's `srun --jobid=<job> [--het-group=<g>] --exact ... /usr/bin/env -i
-<allowlist> <python> -I shards.py step ...`, to run detached (`setsid nohup ... &`). The job and the component are the
-state file's `sandbox` record's: a component of the federation's heterogeneous job (`het`) or a job of its own
+(`DESIGN.md`): `lines` prints each shard's `srun --jobid=<job> [--het-group=<g>] --exact ... --chdir=/ /usr/bin/env
+-i <allowlist> <python> -I shards.py step ...`, to run detached (`setsid nohup ... &`). The job and the component are
+the state file's `sandbox` record's: a component of the federation's heterogeneous job (`het`) or a job of its own
 (`separate`). Nothing here runs srun.
 
 **How it reaches its federation.** The step's environment is an allowlist: `PATH`, `LC_ALL`, and the federation's
@@ -64,8 +64,8 @@ its tmpfs directory; an archive that cannot be written leaves that directory in 
 the only whole `out/`. A start of a shard that has results is refused unless it is `--resume`, which unpacks that
 archive into its copy first, so a repeated launch line never replaces a finished shard. `collect` verifies a private
 copy of every shard's archive against its manifest and the manifest against the plan, unpacks that copy into
-`<into>/<label>/out`, read-only, and prints (or with `--run` runs) `python -m expcore merge`. A shard whose archive has
-no `campaign.lock`, does not verify, or is missing is refused, naming its label: the merge would refuse it too.
+`<into>/<label>/out`, read-only, and prints (or with `--run` runs) `<python> -I -m expcore merge`. A shard whose archive
+has no `campaign.lock`, does not verify, or is missing is refused, naming its label: the merge would refuse it too.
 
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
@@ -337,7 +337,7 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
-        f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH",
+        f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH", "--chdir=/",
         "/usr/bin/env", "-i", *env, *step,
     ]  # fmt: skip
 
@@ -466,7 +466,7 @@ def collect(plan: Plan, into: Path) -> list[Path]:
 
 
 def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
-    return [plan.python, "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
+    return [plan.python, "-I", "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
 
 
 # ------------------------------------------------------------------------------------------------ the step

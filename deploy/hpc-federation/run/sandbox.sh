@@ -137,7 +137,7 @@ echo "sandbox: the egress canary (a connect to the gate) exited $canary" >&2
 t1=$SECONDS
 agent=0
 apptainer exec --containall --cleanenv --no-home --pwd / "${BINDS[@]}" "$D/cell.sif" \
-  python3 /cell/agent.py "$port" "$lc" "$SNAME" "$SID" "$ROOT" "$FID" "$SHA" "$ZF" "$@" \
+  python3 -I /cell/agent.py "$port" "$lc" "$SNAME" "$SID" "$ROOT" "$FID" "$SHA" "$ZF" "$@" \
   < /dev/null > "$D/agent.json" 2> "$D/agent.err" || agent=$?
 echo "sandbox: the cell ran $((SECONDS - t1)) s, exit status $agent" >&2
 rec rc "$E/sandbox/agent.rc.json" agent "$agent"

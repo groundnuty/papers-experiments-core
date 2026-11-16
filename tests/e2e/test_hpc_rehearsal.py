@@ -428,7 +428,7 @@ def downed(deploy, federations, merged, other_build) -> dict[str, Federation]:
 def test_down_stops_the_relay_first_cancels_the_held_job_and_removes_the_root(downed, label):
     fed = downed[label]
     assert fed.codes["down"] == 0, fed.printed["down"]
-    assert fed.fake.calls[0][1:5] == ["-B", "-m", "expcore_onedata.fault_relay", "stop"]
+    assert fed.fake.calls[0][1:6] == ["-I", "-B", "-m", "expcore_onedata.fault_relay", "stop"]
     assert fed.fake.cancelled == [JOBS[label][0]]
     assert fed.fake.steps == {}
     assert not fed.root.exists()
