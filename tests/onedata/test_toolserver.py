@@ -28,6 +28,9 @@ from expcore.tools.manifest import FrozenManifest, ManifestError, live_manifest
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.pin import PinError
+from expcore_onedata.sandbox import deadline
+from expcore_onedata.sandbox.cells import SETTLE_SLACK_S
+from expcore_onedata.sandbox.settings import KILL_GRACE_MAX_S
 from expcore_onedata.testing import ALPHA_ID, BASELINE, CEILING_S, MANAGE, NOW, TOOL_SERVER_ARGS, write_platform
 from expcore_onedata.testing import DATA_PATH_USER as DATA
 from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
@@ -460,6 +463,37 @@ def test_o06_the_token_at_teardown_only_has_to_be_unexpired(three_conditions, tm
     with pytest.raises(InfraError, match="failed its check at teardown") as caught:
         run_with(launcher, RecordingContext(), "read", token, lambda: now.__setitem__(0, token.expires_at + 1))
     assert caught.value.kind == "tool_plane_integrity"
+
+
+def test_o06_a_token_minted_for_the_runs_ceiling_lasts_its_start_up_its_whole_time_and_its_teardown(
+    three_conditions,
+):
+    """O06: the phases that use the tool-server token, on the issuer's clock. Minted for a 600 s ceiling, it lives
+    600 + 900 + 300 s. The server's start-time check still passes after the whole headroom of 300 s (the sandbox's
+    start-up between the mint and the server's start); the loop then runs to its ceiling, waits on infrastructure
+    included; and the stop and its check of the plane (which needs the token unexpired) pass at the last second of
+    the 900 s margin, which also holds a cell's deadline escalation at its longest grace and the wait for its outcome.
+    One second past the token's expiry the same check fails, so nothing later than that may need it."""
+    config, issuer, _ = three_conditions
+    ceiling = 600.0
+    now = [NOW]
+    ticking = TokenIssuer(issuer._client, config, clock=lambda: now[0])
+    token = ticking.mint(tool_server_spec(config.space.id, config.condition("read")), TOOLS, ceiling_s=ceiling)
+    settings = config.tokens
+    assert token.expires_at == int(NOW) + ceiling + settings.margin_s + settings.mint_headroom_s == int(NOW) + 1800
+    assert deadline.margin_s(KILL_GRACE_MAX_S) + SETTLE_SLACK_S < settings.margin_s  # the escalation fits the margin
+    loop_starts = NOW + settings.mint_headroom_s
+    launcher = ToolServerLauncher(config, ticking, events=lambda kind, detail: None)
+
+    def phases(teardown_at):
+        now[0] = loop_starts  # the sandbox has started: the server's check before its spawn
+        run_with(
+            launcher, RecordingContext(), "read", token, lambda: now.__setitem__(0, teardown_at), ceiling_s=ceiling
+        )
+
+    phases(loop_starts + ceiling + settings.margin_s - 1)  # the loop ran to its ceiling; teardown at the margin's end
+    with pytest.raises(InfraError, match="failed its check at teardown"):
+        phases(token.expires_at + 1)
 
 
 def test_o05_every_failure_of_the_launch_time_check_is_of_the_integrity_kind_and_spawns_nothing(

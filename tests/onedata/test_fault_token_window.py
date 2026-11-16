@@ -243,6 +243,21 @@ def test_o35_a_platform_without_faults_needs_no_token_margin_declared(tmp_path):
     assert fault_settings_of(config) is None
 
 
+@pytest.mark.parametrize("ceiling", [3 * CEILING_S, CEILING_S, CEILING_S / 4], ids=["3x", "1x", "lowered"])
+def test_o06_o35_a_lowered_ceiling_shortens_the_token_and_never_the_margin_the_restore_needs(tmp_path, fake, ceiling):
+    """O06 with O35: a study may lower the run's whole-time ceiling in `[agent]`, and the token is minted for it plus
+    the declared `[tokens] margin_s` plus the headroom, so whatever the ceiling, the token outlives the loop's end by
+    the whole margin: at least the least the restore needs, which the platform's load enforces without knowing the
+    ceiling. A lower ceiling shortens the token by exactly what it takes off the loop, and nothing of the margin."""
+    platform = write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 2134))
+    settings, config = settings_of(platform), load_platform(platform)
+    issuer = TokenIssuer(OnezoneClient(config, http=fake.client_http()), config, clock=lambda: WALL_START)
+    token = issuer.mint(tool_server_spec(config.space.id, config.condition("read")), TOOLS, ceiling_s=ceiling)
+    past_the_loop = token.expires_at - (WALL_START + ceiling)  # the loop ends at the ceiling at the latest
+    assert past_the_loop == config.tokens.margin_s + config.tokens.mint_headroom_s == 2134 + 300
+    assert past_the_loop - config.tokens.mint_headroom_s >= restore_token_margin_s(settings) == 2134
+
+
 def test_o35_a_long_pause_counts_against_the_token_margin_since_each_wait_ends_one_pause_past_its_bound(tmp_path):
     """O35, O06: each wait checks its bound only after a reading, so a restore can end one pause past each bound: with
     `poll_s` of 2,000 s, a margin of 2,134 s, enough for the default pause, is refused, and the figure counts the pause
