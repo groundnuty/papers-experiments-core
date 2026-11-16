@@ -10,7 +10,7 @@ import json
 import shutil
 
 import pytest
-from fake_host import FakeHost
+from fake_host import FakeHost, Unrecorded
 from fake_reset import FakeReset
 from fault_support import faults_table
 from outage_support import (
@@ -1097,6 +1097,31 @@ def test_o28_the_sandbox_and_the_tool_plane_are_stopped_when_the_run_itself_rais
     assert left == ["the tool plane's check at its stop", "the sandbox's teardown"]
     assert host.containers == {}
     assert world.down == set()
+
+
+def test_o55_a_mount_cell_whose_exec_did_not_complete_is_a_gap_never_a_read(context, platform, agent):
+    """O55: during the outage the mount cell's exec came back as exit 0 with nothing on either stream and no completion
+    record (a live run saw that): it is no read of any outcome, the mount says nothing of the outage, and the check is
+    unknown, with the cause, never passed on reads that were not made."""
+    host = agent_host(platform, agent)
+    real, cells = host.exec_handler, []
+
+    def lost_during_the_outage(container, argv, stdin):
+        if stdin and "REQUEST = json.loads(" in stdin:
+            cells.append(stdin)
+            if len(cells) == 2:  # the baseline's cell reads; the first cell during the outage loses its exit
+                return Unrecorded(0, "", "")
+        return real(container, argv, stdin)
+
+    host.exec_handler = lost_during_the_outage
+    entry = outage_check(context, agent_host=host)
+    assert entry.ok is None
+    assert "the sandbox did not run the mount cell (ExecIncomplete)" in entry.summary
+    during = entry.facts["during"]["mount"]
+    assert during["owner_only"] is None
+    assert during["replicated"] is None
+    assert entry.facts["baseline"]["mount"]["owner_only"]["outcome"] == "served"
+    assert entry.facts["restore"]["verified"] is True
 
 
 def test_o28_a_declared_mount_left_unmeasured_makes_the_check_unknown_never_passed(context):

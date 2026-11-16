@@ -119,7 +119,12 @@ class ExecResult:
     cell gave itself (`os.kill(os.getpid(), 9)`) before that limit as its own exit, not a timeout (`bounds`, O39).
 
     `output_cut` is what the sandbox cut of the cell's output, which it keeps up to a cap per stream: for each stream it
-    cut, the bytes the cell wrote (`produced`) and the bytes kept (`kept`); None when nothing was cut (O43)."""
+    cut, the bytes the cell wrote (`produced`) and the bytes kept (`kept`); None when nothing was cut (O43).
+
+    `exec_check` is what the cell's completion record showed (O55, `completion.py`): `source_whole`, whether its program
+    arrived whole in the container; `exit_status`, the status the record saw; `nonce_matched`, whether a record of this
+    exec came on both streams. An exec not known to have completed that no timeout or kill explains is never a result:
+    `exec` raises `completion.ExecIncomplete`. None for a cell that was not started."""
 
     stdout: str
     stderr: str
@@ -132,6 +137,8 @@ class ExecResult:
     bound: str | None = None  # the sandbox's bound that ended the cell, when `timed_out` (bounds.py)
     # the streams of the cell the sandbox cut (O43): `{"stdout": {"produced": n, "kept": m}, ...}`, only those it cut
     output_cut: dict[str, dict[str, int]] | None = None
+    # what the cell's completion record showed (O55): `{"source_whole": ..., "exit_status": ..., "nonce_matched": ...}`
+    exec_check: dict[str, Any] | None = None
 
 
 @runtime_checkable

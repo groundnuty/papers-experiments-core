@@ -349,9 +349,12 @@ class RecordedToolProvider:
             await asyncio.Event().wait()  # the loop's watch cuts it, at the recorded reading
         if status == "failed":
             self._raise_recorded_failure(j)
+        checked = call.get("exec_check")  # served as recorded, so the replay's call holds it where the stored one does
         if status == "ok":
-            return ToolOutput(call["raw_text"], source_truncated=call["source_truncated"])
-        return ToolOutput(self._error_message(call), True, call["error_class"], call["source_truncated"])
+            return ToolOutput(call["raw_text"], source_truncated=call["source_truncated"], exec_check=checked)
+        return ToolOutput(
+            self._error_message(call), True, call["error_class"], call["source_truncated"], exec_check=checked
+        )
 
     def _raise_recorded_failure(self, j: int) -> None:
         """Raise what the provider raised: an infrastructure failure of the recorded kind, or a crash by class name."""

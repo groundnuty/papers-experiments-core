@@ -45,6 +45,10 @@ started, the wall seconds from the reading before the call to the one that ended
 started. A replay writes `elapsed_s` only when the stored record holds it. The bound was first merged as
 `tool_call_bound_s`, capping every call; it was renamed before any release, and the old name is unknown to every
 version.
+Version 3 also carries, as the last field of a tool call, the optional `exec_check` (O55): what a code tool verified of
+the exec that ran the call's program (`source_whole`, `exit_status`, `nonce_matched`, a section of its own whose keys
+are each optional), as the tool gave it. A call whose tool gives none has none, never a null; a replay serves it as
+recorded.
 Until v0.1.0 is tagged every extension of version 3 is strictly additive: optional fields only, no existing field
 changes meaning or validation, the fields version 3 had at its first merge point keep the shape frozen in
 `tests/data/record-v3-fields.json`, and the fixtures in `tests/data/record-v3/`, one per merge point, keep validating
@@ -162,7 +166,9 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "infra_wait_by_kind": (dict,),
         "rendering_verified": (bool,),
         "elapsed_s": NUM,
+        "exec_check": (dict,),
     },
+    "exec_check": {"source_whole": (bool, NONE), "exit_status": (int, NONE), "nonce_matched": (bool,)},
     "failed_request": {
         "kind": (str,),
         "infra_kind": (str, NONE),
@@ -267,14 +273,16 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
             "record": ("treatment_targets", "instrument_refusal"),
             "outcome": ("infra_target",),
             "totals": ("reserved_capped", "reply_cap_unheld"),
-            "tool_call": ("elapsed_s",),
+            "tool_call": ("elapsed_s", "exec_check"),
+            "exec_check": ("source_whole", "exit_status", "nonce_matched"),
         },
         optional={
             "usage": ("extra", "extra_cut"),
             "record": ("treatment_targets", "instrument_refusal"),
             "outcome": ("infra_target",),
             "totals": ("reserved_capped", "reply_cap_unheld"),
-            "tool_call": ("elapsed_s",),
+            "tool_call": ("elapsed_s", "exec_check"),
+            "exec_check": ("source_whole", "exit_status", "nonce_matched"),
         },
         first_turn_rule=True,
         target_rule=True,
@@ -660,6 +668,8 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
         _check_waited(entry["infra_wait_by_kind"], f"tool_calls[{i}].infra_wait_by_kind")
         if "elapsed_s" in entry and entry["elapsed_s"] < 0:  # optional, from version 3
             raise RecordError(f"tool_calls[{i}].elapsed_s: {entry['elapsed_s']} is not a number of seconds")
+        if "exec_check" in entry:  # optional, from version 3 (O55)
+            check_section("exec_check", entry["exec_check"], version, f"tool_calls[{i}].exec_check", schemas)
     for i, reading in enumerate(body["clock"]):
         ok = isinstance(reading, list) and len(reading) == 2 and isinstance(reading[0], str) and _fits(reading[1], NUM)
         if not ok:
