@@ -3,34 +3,23 @@ then the zone), every step gone, each node checked, the held job cancelled by it
 the root removed. Mixed into `hpcdriver.Driver`, whose state store, launcher and Slurm it uses.
 """
 
+import json
 import os
 import re
-import shutil
-import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import hpcrelay
 from fedlayout import ROOT_MARKER
+from hpcremove import SETTLE_S, only_silly, remove_tree, settle_rmdir
 from hpcsettings import Site
 from hpcslurm import Client
 
 BUNDLE = Path(__file__).resolve().parent / "bundle"
 SHARDS = BUNDLE.parent / "shards.py"  # its `sweep`, on the agent's node at down
 WORKDIR_LINE = re.compile(r"^hpcop: work directory (/\S+)$", re.M)  # the batch scripts' own line (zone.sbatch)
-
-
-def remove_tree(root: Path) -> None:
-    """Remove a tree that may hold read-only directories: each directory (never a link, never through one) is made
-    writable by its owner first; `chmod -R` would follow a link given as an argument."""
-    for directory, subdirectories, _ in os.walk(root, followlinks=False):
-        for name in subdirectories:
-            path = Path(directory) / name
-            if not path.is_symlink():
-                os.chmod(path, stat.S_IMODE(path.lstat().st_mode) | stat.S_IRWXU)
-    os.chmod(root, stat.S_IRWXU)
-    shutil.rmtree(root)
 
 
 class Down:
@@ -40,16 +29,45 @@ class Down:
         if not self.root.exists():
             return "down: the root is gone already"
         if not self.layout.owned:
-            raise RuntimeError(f"the root is not marked as this federation's ({ROOT_MARKER}); nothing stopped")
+            unmarked = f"the root is not marked as this federation's ({ROOT_MARKER}); nothing stopped"
+            if not self.removal_remains():
+                raise RuntimeError(unmarked)
+            with self.store.lifecycle("down"):
+                if not self.removal_remains():  # looked at again under the lock: an up may have made it its own
+                    raise RuntimeError(unmarked)
+                ops = self.removal_ops()
+                settle_rmdir(self.root, ops["rmdir"], ops["sleep"], ops["clock"]() + SETTLE_S, ops["clock"])
+            return "down: the root an earlier down's removal left (cut short by files held open) is removed"
         with self.store.lifecycle("down"):  # never beside an up that may be between its state and its sbatch
             return self.take_down()
+
+    def removal_remains(self) -> bool:
+        """Whether the root is what a removal cut short after its marker leaves: empty, or holding nothing but NFS
+        silly-rename files, never a link, with the lifecycle lock beside it (which only an `up` of a root it marked,
+        or a `down` of a marked root, makes). Such a root is only ever `rmdir`ed, once its silly files are gone:
+        nothing in it is removed."""
+        root = self.root
+        return self.store.lifecycle_path.is_file() and root.is_dir() and not root.is_symlink() and only_silly(root)
+
+    def removal_ops(self) -> Dict[str, Any]:
+        """The file calls the root's removal makes (`remove_tree`), the tests' NFS stand-in's in place of any."""
+        return {"unlink": os.unlink, "rmdir": os.rmdir, "sleep": time.sleep, "clock": time.monotonic, **self.removal}
+
+    def remove_root(self, gone: str) -> None:
+        """The root removed (`remove_tree`); a removal cut short says the job is gone, and that down finishes it."""
+        try:
+            remove_tree(self.root, **self.removal_ops())
+        except (RuntimeError, OSError) as error:
+            raise RuntimeError(
+                f"{gone}, but the root could not be removed ({error}); run down again to finish its removal"
+            ) from None
 
     def take_down(self) -> str:
         """Whatever fails on the way, the held job is cancelled and every client ended before down returns or raises:
         a failure is reported as unverified, never a reason to leave the job billing."""
         if not self.store.exists():
-            remove_tree(self.root)
-            return "down: no state file, so up never submitted a job; the root removed"
+            self.remove_root("no state file is left (up never submitted a job, or an earlier down removed it)")
+            return "down: no state file, so no job of up's is left to cancel; the root removed"
         state = self.set(lambda s: s.update(phase="stopping"))
         unverified: List[str] = []
         if self.relay_available():  # first: no verb may launch a step while the federation goes down
@@ -85,8 +103,8 @@ class Down:
                 f"the held job is gone, but {', '.join(unverified)} could not be verified clean; the root and its "
                 "state are kept: run down again to remove them"
             )
-        remove_tree(self.root)
         gone = " and ".join(j for j in (job, agent) if j) or "(never submitted, or no longer ours)"
+        self.remove_root(f"the held job {gone} is gone" + (f" ({swept})" if swept else ""))
         return f"down: the held job {gone} is gone, and so is the root" + (f"\n{swept}" if swept else "")
 
     def sweep_agent_node(self, state: Mapping[str, Any]) -> str:
@@ -162,12 +180,21 @@ class Down:
         node; return the services that could not be verified."""
         order = [p.name for p in self.spec.providers] + ["zone"]
         unverified = [service for service in order if not self.teardown(service)]
-        self.wait_steps(job)
+        self.wait_steps(self.listed_under(job))
         return unverified + [s for s in order if s not in unverified and not self.node_clean(s)]
+
+    def listed_under(self, job: str) -> List[str]:
+        """The ids `squeue -s` lists the held job's steps under: its own, and under `het` its agent's component's own,
+        under which alone a step on the agent's node is listed (seen live). The agent's own job under `separate` is
+        cancelled whole, and its id is never asked here: it may name another job by now (`ours`)."""
+        record = self.store.read().get("sandbox") or {}
+        component = record.get("component_job") if record.get("placement") == "het" else None
+        return [job] + ([component] if component and component != job else [])
 
     def teardown(self, service: str) -> bool:
         """teardown.sh in a control step on the service's node; a service whose work directory never reached the state
-        or its log has its step cancelled (its batch script's trap stops it and removes the directory), unverified."""
+        or its log has its step cancelled, if it is still listed (its batch script's trap stops it and removes the
+        directory), and its node is checked once every step has left (`node_clean`)."""
         state = self.store.read()
         record, prefix = state["services"][service], state["allocation"]["name"]
         if record["workdir"] is None and record["log"] and Path(record["log"]).is_file():
@@ -180,9 +207,10 @@ class Down:
                 record = self.store.read()["services"][service]
         if record["workdir"] is None:
             listed = self.launcher.listed(record["step"]["name"]) if record["step"] else None
-            if listed is not None:
+            if listed is not None:  # seen, so its end can be shown once it leaves
+                self.set(lambda s: s["services"][service]["step"].update(id=listed))
                 self.launcher.cancel(listed)
-            return record["step"] is None
+            return True
         argv = ["bash", str(BUNDLE / "teardown.sh"), record["kind"], "--workdir", record["workdir"]]
         argv += ["--timeout", str(self.settings.stop_seconds)]
         name = f"{prefix}-{service}-teardown-{record['launch']}"
@@ -194,21 +222,23 @@ class Down:
         self.set(lambda s: s["services"][service].update(state="removed" if ok else "failed"))
         return ok
 
-    def wait_steps(self, job: str) -> None:
-        """Until no step but the batch and extern steps is listed, within the stop's whole bound; a step still listed
-        then is cancelled by its own id."""
+    def wait_steps(self, jobs: List[str]) -> None:
+        """Until no step but the batch and extern steps is listed under any of the ids, within the stop's whole bound
+        (one deadline for them all); a step still listed then is cancelled by its own id."""
         deadline = self.clock() + self.settings.stop_bound_s
-        while self.slurm.steps(job) and self.clock() < deadline:
+        while any(self.slurm.steps(job) for job in jobs) and self.clock() < deadline:
             self.sleep(self.poll_s)
-        for step_id in self.slurm.steps(job).values():
-            self.slurm.cancel_step(step_id)
+        for job in jobs:
+            for step_id in self.slurm.steps(job).values():
+                self.slurm.cancel_step(step_id)
 
     def node_clean(self, service: str) -> bool:
-        """A read-only control step: the service's work directory is gone from its node."""
+        """A read-only control step: the service's work directory is gone from its node. A service never launched is
+        clean; one launched whose log never named a work directory is checked by `no_workdir_left`."""
         state = self.store.read()
         record = state["services"][service]
         if record["workdir"] is None:
-            return True
+            return record["step"] is None or self.no_workdir_left(service)
         name = f"{state['allocation']['name']}-{service}-check"
         try:
             done = self.launcher.control(
@@ -217,6 +247,47 @@ class Down:
         except TimeoutError:
             return False
         return done.returncode == 0
+
+    def no_workdir_left(self, service: str) -> bool:
+        """A service whose step was launched but whose log never named a work directory (seen live: a zone that failed
+        in node-init before making one) is clean only when both are shown: its step has ended (listed no more, once
+        it was seen listed or its srun client of this host has ended: a step never listed whose client still runs may
+        yet start), and a read-only check on its node (`bundle/leftovers.py`) counts no work directory of ours of its
+        kind there. A check that fails, or prints anything but such a count, is no proof."""
+        state = self.store.read()
+        record, site = state["services"][service], Site.from_json(state["site"])
+        log = Path(record["log"]) if record.get("log") else None
+        if log is None or not log.is_file() or WORKDIR_LINE.search(log.read_text(encoding="utf-8", errors="replace")):
+            # its log is gone, or it named a directory the driver refused (outside the tmpfs, say): never shown clean
+            self.say(f"{service}: its log cannot show that its step never made a work directory")
+            return False
+        name = record["step"]["name"]
+        client = state.get("clients", {}).get(name)
+        seen = record["step"].get("id") is not None
+        recorded = Client(int(client["pid"]), int(client["start"])) if client is not None else None
+        ended = recorded is not None and not self.slurm.runner.client_alive(recorded)
+        if self.launcher.listed(name) is not None or not (seen or ended):
+            self.say(f"{service}: its step named no work directory and its end cannot be shown")
+            return False
+        argv = [site.node_python, "-I", "-B", str(BUNDLE / "leftovers.py"), record["kind"], site.node_tmp]
+        try:
+            done = self.launcher.control(
+                record["node"], argv, name=f"{state['allocation']['name']}-{service}-leftovers",
+                timeout_s=self.timeouts["step"],
+            )  # fmt: skip
+        except TimeoutError:
+            return False
+        try:
+            found = json.loads(done.stdout) if done.returncode == 0 else None
+        except ValueError:
+            found = None
+        count = found.get("count") if isinstance(found, dict) and found.get("kind") == record["kind"] else None
+        if isinstance(count, bool) or count != 0:
+            self.say(f"{service}: its node's check found {count if isinstance(count, int) else 'no count of'} "
+                     "work directories of ours")  # fmt: skip
+            return False
+        self.say(f"{service}: its step ended before naming a work directory, and its node holds none of ours")
+        return True
 
     def wait_gone(self, job: str) -> None:
         deadline = self.clock() + self.timeouts["cancel"]

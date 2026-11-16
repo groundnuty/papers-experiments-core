@@ -831,6 +831,72 @@ def test_c29_a_shard_whose_replay_check_fails_is_refused_naming_the_record(
     )
 
 
+def test_r04_a_shard_holding_a_file_that_is_neither_a_record_nor_declared_is_refused_naming_it(
+    base, clean_environment, whole, shard1, shard2
+):
+    """R04 and C29: a study's evidence left in a run directory of a shard (a `.json` file the merge once replayed as a
+    record, and a file of any other kind it once passed over) is no record: the merge refuses the shard, naming each
+    file as unexpected and saying how to declare it, and does not count it among the records that fail."""
+    other = copy_out(shard2, base / "stray")
+    attempt = next(p for p in sorted((other / "runs").rglob("*.json")) if RECORD.fullmatch(p.name)).parent
+    strays = [attempt / "sandbox.json", attempt / "sandbox.log"]
+    strays[0].write_text('{"backend": "apptainer"}', encoding="utf-8")
+    strays[1].write_text("what the sandbox saw", encoding="utf-8")
+    errors = refused(
+        clean_environment,
+        whole,
+        base / "refused-stray" / "out",
+        shard1.root / "out",
+        other,
+        fragments=(
+            "shard 2 (shard-2): 2 unexpected files in the batch",
+            *(path.relative_to(other / "runs").as_posix() for path in strays),
+            "[[study.side_files]]",
+        ),
+    )
+    assert "records fail the replay check" not in errors
+    assert "[load]" not in errors
+
+
+def test_r04_a_shard_holding_a_link_to_a_directory_is_refused_and_what_it_points_at_never_copied(
+    base, clean_environment, whole, shard1, shard2
+):
+    """R04, C29 and #304: the merge replays a private copy of each shard's runs/ (copy_runs), and that copy keeps a link
+    as a link: following it would copy a directory outside the shard into the copy, where the check would see an
+    ordinary directory and the link would go unseen. So a shard holding a link to a directory is refused, naming it,
+    and nothing it points at reaches the merged batch."""
+    other = copy_out(shard2, base / "linked")
+    outside = base / "outside-the-shard"
+    outside.mkdir()
+    (outside / "planted.json").write_text('{"not": "a record"}', encoding="utf-8")
+    attempt = next(p for p in sorted((other / "runs").rglob("*.json")) if RECORD.fullmatch(p.name)).parent
+    link = attempt / "evidence"
+    link.symlink_to(outside, target_is_directory=True)
+    target = base / "refused-link" / "out"
+    errors = refused(
+        clean_environment,
+        whole,
+        target,
+        shard1.root / "out",
+        other,
+        fragments=("shard 2 (shard-2):", "unexpected", link.relative_to(other / "runs").as_posix()),
+    )
+    assert "planted.json" not in errors
+    assert not target.exists() or not any(target.rglob("planted.json"))
+
+
+def test_r04_a_merged_batchs_own_files_are_neither_records_nor_unexpected(merged):
+    """R04 and C29: merge.json and the shards' snapshots lie beside the batch, not in it, and the batch holds the
+    records, their markers and the check alone: its check found nothing unexpected."""
+    out = merged.root / "out"
+    check = json.loads((out / "runs" / "replay-check.json").read_text(encoding="utf-8"))
+    assert check["failures"] == []
+    assert (out / MERGE_FILE).is_file()
+    assert (out / SHARDS_DIR).is_dir()
+    assert all(RECORD.fullmatch(Path(rel).name) for rel in check["replayed"])
+    assert {Path(rel).name for rel in check["hashed_only"]} == {"attempt-marker.json"}
+
+
 def test_c29_shards_run_against_different_environments_are_refused(
     base, clean_environment, whole, shard1, shard2_elsewhere
 ):

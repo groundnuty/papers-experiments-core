@@ -22,6 +22,7 @@ while (( $# )); do
   esac
 done
 W=$(find_workdir oz "$WD"); R=$W/rootfs; S=$(secrets_dir "$W")
+home_in "$W"   # curl's HOME (its ~/.curlrc) and every other tool's in the work directory, never the account's ~
 CA=${CA:-$R/volumes/persistence_backup/etc/oz_panel/OnedataTestWebServerCa.pem}
 [[ -f $CA && -r $CA ]] || die "cannot read the CA file $CA"
 [[ -e $R/root/service-ready.lock ]] || die "the zone in $W is not ready yet"

@@ -22,12 +22,18 @@ A study that lists such a platform but points at no configuration is refused, na
 be skipped by leaving the pointer out. The file must lie inside the study directory, links followed: the core resolves
 the path once, checks that path, and hands it over as resolved. A file swapped between that and the platform's own open
 is outside what a path can guard; whoever can write the study directory can edit its plugin, which runs in this process.
+
+The function's own loads are noted (`PlatformDeferral.loaded`, `expcore.config.platform_loads`): the platform modules
+whose loader it ran to answer. A module of the study's own that re-exports a platform's function runs that platform's
+loader, so it speaks for that platform, and the scheduler counts what the study's build loaded of it as listed, whatever
+the function answers (a heal that is off answers None, which names no module).
 """
 
 import importlib
 
 from expcore.campaign.healthgate import PlatformDeferral, checked_bound
 from expcore.config.loading import ConfigError
+from expcore.config.platform_loads import watching_platform_loads
 from expcore.study.config import (
     PLATFORM_CONFIG_KEY,
     PLATFORM_FILE,
@@ -77,7 +83,8 @@ def platform_deferrals(study: StudyConfig) -> tuple[PlatformDeferral, ...]:
                 f"file, and platform {name!r} declares its longest deferral from it"
             )
         try:
-            answer = hook(config)
+            with watching_platform_loads() as ran:  # what its function loads is what the module speaks for
+                answer = hook(config)
         except ConfigError:
             raise  # the platform's own words: they name the file and the key
         except Exception as error:  # its text may hold a credential, so the refusal names the type only
@@ -85,5 +92,6 @@ def platform_deferrals(study: StudyConfig) -> tuple[PlatformDeferral, ...]:
                 f"{study_file}: [study] {PLATFORMS_KEY}: platform {name!r} failed reading its configuration in "
                 f"{PLATFORM_HOOK} ({type(error).__name__})"
             ) from None
-        found.append(PlatformDeferral(name, checked_bound(answer, PLATFORM_HOOK, f"platform {name!r}")))
+        loaded = tuple(dict.fromkeys(load.module for load in ran))
+        found.append(PlatformDeferral(name, checked_bound(answer, PLATFORM_HOOK, f"platform {name!r}"), loaded))
     return tuple(found)
