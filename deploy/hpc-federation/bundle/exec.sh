@@ -13,9 +13,9 @@ component "${1:-}"; shift
 WD=$2; shift 3
 (( $# )) || die "no command given after --"
 W=$(find_workdir "$COMP" "$WD")
+home_in "$W"   # apptainer's configuration and cache in the work directory, never the account's ~
 recorded_service_runs "$W" || die "no running service of this launch in $W: nothing to exec into"
 command -v apptainer >/dev/null || die "apptainer not on PATH"
-home_in "$W"   # apptainer's configuration and cache in the work directory, never the account's ~
 [[ -e $W/rootfs.complete && -d $W/rootfs ]] || die "$W has no complete rootfs"
 D=$(mktemp -d "$W/exec.XXXXXX")
 cleanup() { chmod -R u+rwX -- "$D" 2>/dev/null || true; rm -rf --one-file-system -- "$D"; }

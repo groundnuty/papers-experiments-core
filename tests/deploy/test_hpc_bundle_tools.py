@@ -139,6 +139,36 @@ def test_o57_home_in_points_every_home_a_tool_uses_into_the_work_directory_made_
         assert stat.S_IMODE(path.stat().st_mode) == 0o700, name
 
 
+# Every script the driver runs as a step, or as the service step's own body, that knows its work directory.
+STEP_SCRIPTS = ("zone.sbatch", "provider.sbatch", "teardown.sh", "status.sh", "exec.sh", "restart.sh", "zone-export.sh",
+                "mint-registration-token.sh", "deliver-token.sh")  # fmt: skip
+# A command that may read HOME: Apptainer, curl (its ~/.curlrc, through lib.sh's http), Python, a child script.
+READS_HOME = re.compile(r'apptainer |curl |\bhttp |\bcb_status |\brun_service |"\$HPCOP_PY"|bash "\$(B|HPCOP_BUNDLE)/')
+
+
+@pytest.mark.parametrize("script", STEP_SCRIPTS)
+def test_o57_every_step_script_points_its_home_into_its_work_directory_before_any_tool(script):
+    """O57: a step's allowlist names no home at all (below /dev/null); each script that knows its work directory points
+    every home a tool reads into it (home_in) once it learns it and before any command that may read one, so no tool of
+    a step, Apptainer and curl included, reads or writes the account's home."""
+    code = [line for line in (BUNDLE / script).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]  # fmt: skip
+    learnt = next(i for i, line in enumerate(code) if line.startswith("W=$("))
+    pointed = next(i for i, line in enumerate(code) if line.startswith('home_in "$W"'))
+    reads = [i for i, line in enumerate(code) if i > learnt and READS_HOME.search(line)]
+    assert learnt < pointed, script
+    assert all(pointed < i for i in reads), (script, [code[i] for i in reads if i < pointed])
+
+
+def test_o57_the_service_itself_starts_with_its_home_in_its_work_directory():
+    """O57: run_service, which becomes the service through Apptainer, points every home into the work directory before
+    its apptainer exec, whichever script runs it."""
+    text = (BUNDLE / "lib.sh").read_text(encoding="utf-8")
+    body = text[text.index("run_service() {") :]
+    body = body[: body.index("\n}\n")]
+    assert body.index('home_in "$W"') < body.index("apptainer exec")
+
+
 def test_node_init_names_a_missing_ss_before_it_makes_anything(tmp_path, no_ss):
     """O57: node-init.sh checks its tools up front: without ss it dies naming it, before its sweep or a work
     directory, so a step fails in its first second saying why."""

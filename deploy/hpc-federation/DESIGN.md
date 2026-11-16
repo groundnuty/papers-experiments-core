@@ -157,9 +157,11 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   every job and agent of the account shares, so `HOME`, the XDG base directories, Apptainer's configuration and cache
   (`APPTAINER_CONFIGDIR`, `APPTAINER_CACHEDIR`) and uv's and pip's caches name a path below `/dev/null`, which nobody
   can make (a path on the shared tmpfs another user could make first, and fill), with `PYTHONNOUSERSITE=1`,
-  `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`. A service's scripts point every one of them into its own
-  work directory once they have it (`lib.sh`'s `home_in`, made 0700 there, gone with it), before Apptainer runs; a
-  shard step's dispatcher gets them in the step's own directory (`shards.py step`). Nothing else, and never a secret. The bundle's helpers
+  `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`: a tool then fails rather than read what another user
+  planted. Every bundle script that knows a service's work directory (the batch scripts, `teardown.sh`, `status.sh`,
+  `exec.sh`, `restart.sh`, `zone-export.sh`, the token's mint and delivery, and `run_service`) points every one of
+  them into it (`lib.sh`'s `home_in`, made 0700 there, gone with it) before any command that may read a home, Apptainer
+  and curl among them; a shard step's dispatcher gets them in the step's own directory (`shards.py step`). Nothing else, and never a secret. The bundle's helpers
   then run on the first `python3.11` on that `PATH` (`lib.sh`'s default `HPCOP_PY`), which must be the node's own:
   `supervise.py`, which holds every service, needs `os.pidfd_open`, which uv's standalone Python lacks. Only the core's
   step (`HPC_CORE_PYTHON`) runs a venv's Python.

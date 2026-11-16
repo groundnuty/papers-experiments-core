@@ -32,6 +32,7 @@ done
 [[ $TIMEOUT =~ ^[0-9]+$ ]] || die "--timeout takes seconds"
 [[ -z $UNTIL || ( $KEEP == 1 && $UNTIL =~ ^[0-9]{1,15}$ ) ]] || die "--keep-until takes an epoch in seconds, and only with --keep"
 W=$(find_workdir "$COMP" "$WD")
+home_in "$W"   # every tool's HOME, caches and Apptainer's directories in the work directory, never the account's ~
 pid='' start=''
 if [[ -s $W/service.pid ]]; then read -r pid start < "$W/service.pid" || true; fi
 ours() {  # the process run_service recorded (supervise.py): same PID, same start time (stat field 22), our uid, alive

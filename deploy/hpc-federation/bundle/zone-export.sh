@@ -15,6 +15,7 @@ what=${1:-}
 [[ $what == passphrase || $what == ca ]] || die "usage: zone-export.sh <passphrase|ca> --workdir W"
 [[ ${2:-} == --workdir && -n ${3:-} ]] || die "usage: zone-export.sh <passphrase|ca> --workdir W"
 W=$(find_workdir oz "$3"); R=$W/rootfs; S=$(secrets_dir "$W")
+home_in "$W"   # every tool's HOME, caches and Apptainer's directories in the work directory, never the account's ~
 [[ -e $R/root/service-ready.lock ]] || die "the zone in $W is not ready yet"
 if [[ $what == passphrase ]]; then
   read_secret PW "$S/passphrase"
