@@ -91,29 +91,41 @@ def test_c11_a_loader_run_again_on_the_same_file_is_one_record(tmp_path):
     assert len(loads) == 1
 
 
-def test_c11_builds_in_two_threads_run_one_at_a_time_and_do_not_receive_each_others_records(tmp_path):
-    """C11: a study build that loads nothing is not refused for another build's platform. One build is open in a
-    process at a time: a second thread's build waits until the first's ends, so every loader, a worker thread of the
-    plugin's included, records into the one build that is open, and each keeps its own record."""
-    opened, kept = [], {}
+def in_a_thread(work):
+    """Run `work` in a thread of its own, to the end, and return what it returned or the exception it raised."""
+    outcome = []
 
-    def other_build():
+    def run():
+        try:
+            outcome.append(work())
+        except Exception as error:  # the test reads it from the other thread
+            outcome.append(error)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), "the thread did not end: it waited for something"
+    return outcome[0]
+
+
+def test_c11_a_second_threads_build_is_refused_at_once_while_one_is_open(tmp_path):
+    """C11: a study build that loads nothing is never refused for another build's platform, because one build is open
+    in a process at a time: a second thread's build is refused at once, naming why (it never waits, which could
+    deadlock with a thread the first build is waiting for), so every loader that runs while a build is open, a worker
+    thread of the plugin's included, belongs to that build."""
+
+    def open_a_build():
         with watching_platform_loads() as loads:
-            opened.append("the other build")
             record_platform_load(OTHER, tmp_path / "other.toml")
-            kept["other"] = loads
+            return list(loads)
 
     with watching_platform_loads() as mine:
-        worker = threading.Thread(target=other_build)
-        worker.start()
-        worker.join(0.5)  # it waits for this build, which is open
-        assert worker.is_alive()
-        assert opened == []
+        refused = in_a_thread(open_a_build)
         record_platform_load(MODULE, tmp_path / "mine.toml")
-    worker.join(10)
-    assert not worker.is_alive()
+    assert isinstance(refused, RuntimeError), refused
+    assert "one at a time" in str(refused), refused
     assert mine == [PlatformLoad(MODULE, tmp_path / "mine.toml")]
-    assert kept["other"] == [PlatformLoad(OTHER, tmp_path / "other.toml")]
+    assert in_a_thread(open_a_build) == [PlatformLoad(OTHER, tmp_path / "other.toml")]  # free again once it ended
 
 
 def test_c11_a_build_opened_again_by_its_own_thread_is_not_waited_for(tmp_path):

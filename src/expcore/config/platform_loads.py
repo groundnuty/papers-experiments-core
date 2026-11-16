@@ -15,9 +15,10 @@ for the platform and the configuration file they read. The pipeline collects tho
 - **The module and the path only.** A record holds the module's name and the file's path: no value of the file, no
   secret. A refusal names the file's own name, never its directory.
 - **The process's, one build at a time.** A plugin that builds its platform in a worker thread of its own is seen: every
-  loader that runs while a build is open records into it. Builds in two threads of one process run one after the other
-  (the second waits for the first's end), so a build that loads nothing is never refused for another's platform. Watches
-  of one thread may nest, each keeping its own record, and a file loaded again in one watch is one record.
+  loader that runs while a build is open records into it. A second thread's build is refused at once (RuntimeError)
+  while one is open, so a build that loads nothing is never refused for another's platform, and nothing waits, which
+  could deadlock. Watches of one thread may nest, each keeping its own record, and a file loaded again in one watch is
+  one record.
 - **A record changes nothing.** No loader returns anything different, and no record, fingerprint or state file holds it.
 
 A platform layer other than the Onedata one calls `record_platform_load(module, path)` from its own loader, with the
@@ -74,12 +75,17 @@ def watching_platform_loads() -> Iterator[list[PlatformLoad]]:
     """Collect, in order, the loads of the platform loaders that run in the block: the study's build. Each watch starts
     empty and keeps its own record, a list that the block's loaders append to as they run.
 
-    One thread's build is open at a time: another thread's waits here until it ends, so every loader that runs while a
-    build is open, a worker thread of the plugin's included, belongs to that build, and a build that loads nothing is
-    never refused for another's platform. The same thread may open a watch inside its own (the core's reading of a
-    listed platform inside the build), and both then see what runs inside the inner one."""
+    One thread's build is open at a time, so every loader that runs while a build is open, a worker thread of the
+    plugin's included, belongs to that build, and a build that loads nothing is never refused for another's platform.
+    Another thread's watch is refused at once with a RuntimeError, never made to wait: a wait could deadlock with a
+    thread the open build is itself waiting for. The same thread may open a watch inside its own (the core's reading
+    of a listed platform inside the build), and both then see what runs inside the inner one."""
+    if not _BUILD.acquire(blocking=False):
+        raise RuntimeError(
+            "a study build is already open in another thread of this process: study builds run one at a time"
+        )
     token, loads = object(), []
-    with _BUILD:
+    try:
         with _LOCK:
             _WATCHES[token] = (loads, set())
         try:
@@ -87,6 +93,8 @@ def watching_platform_loads() -> Iterator[list[PlatformLoad]]:
         finally:
             with _LOCK:
                 del _WATCHES[token]
+    finally:
+        _BUILD.release()
 
 
 def check_loads_listed(loads: Collection[PlatformLoad], listed: Collection[str]) -> None:
