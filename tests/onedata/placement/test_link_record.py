@@ -8,6 +8,7 @@ in `tests/onedata/test_fault_link_record.py`.
 """
 
 import contextlib
+import errno
 import json
 import logging
 from functools import partial
@@ -189,6 +190,34 @@ def test_o35_a_check_that_cannot_take_the_lock_publishes_no_verdict_and_removes_
         yield False
 
     monkeypatch.setattr(fault_serves, "recording", unlocked)
+    with caplog.at_level(logging.WARNING, logger=fault_serves.__name__):
+        matrix = serves.matrix(SERVICE)
+    assert matrix is not None
+    assert matrix.ok
+    assert not (tmp_path / RECORD).exists()
+    assert any("lock could not be taken" in r.getMessage() for r in caplog.records)
+
+
+def test_o35_a_check_publishes_its_verdict_where_an_exclusive_flock_needs_a_write_descriptor(
+    tmp_path, serves, nfs_flock_rule
+):
+    """O35: through the real record lock, on a filesystem where an exclusive `flock` needs a write descriptor (NFS:
+    live, an HPC federation's NFSv4 root left the lock untaken, so no restore's, heal's or routine check left a
+    record), the check is serialized and publishes its verdict."""
+    matrix = serves.matrix(SERVICE)
+    assert matrix is not None
+    assert matrix.ok
+    assert json.loads((tmp_path / RECORD).read_text(encoding="utf-8"))["ok"] is True
+
+
+def test_o35_a_check_whose_lock_file_cannot_be_written_on_such_a_filesystem_publishes_no_verdict(
+    tmp_path, serves, nfs_flock_rule, refuse_lock_writes, caplog
+):
+    """O35: the one case left unserialized where an exclusive `flock` needs a write descriptor is a lock file this
+    process cannot write: the older record goes, a warning says why, and the check still answers as made."""
+    serves.matrix(SERVICE)
+    assert (tmp_path / RECORD).exists()
+    refuse_lock_writes(errno.EACCES)
     with caplog.at_level(logging.WARNING, logger=fault_serves.__name__):
         matrix = serves.matrix(SERVICE)
     assert matrix is not None
