@@ -34,7 +34,7 @@ from fake_host import Unrecorded, bootstrap_of, recorded
 
 from expcore_onedata.sandbox import completion
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer.node import Spawned
+from expcore_onedata.sandbox.apptainer.node import LocalNode, Spawned
 from expcore_onedata.sandbox.apptainer.procs import Proc
 from expcore_onedata.sandbox.containers import CERTIFI_PROBE
 from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_input, run_bounded
@@ -131,7 +131,11 @@ class Gate:
 class FakeNode:
     """The fake node (the module's docstring)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, own_process: bool = False) -> None:
+        """`own_process`: the driver is this process, by its pid and start time (`LocalNode.identity`), and a process
+        the fake did not make is answered from the host's /proc (`LocalNode.alive`), as on a real node; so a run record
+        left by a driver killed outright in another process names a driver that is gone, which the next start's reaper
+        takes. Otherwise the driver is one invented process, alive on every fake node."""
         self.lock = threading.RLock()
         self.procs: dict[int, FakeProc] = {}
         self._pid, self._ns, self._port = 7000, 4026532000, 41000
@@ -152,8 +156,9 @@ class FakeNode:
         self.cell_left: list[FakeProc] = []  # processes a cell leaves behind (set by a handler)
         self.cgroup: dict[str, Any] = {"depth": 0, "max_bytes": 1 << 34, "events": {"oom": 0, "oom_kill": 0},
                                        "peak_bytes": 0}  # fmt: skip
-        self.owner = Spawned(999, "4242")
-        self.procs[999] = FakeProc(999, "4242", OWN_NS, "driver", role="driver")
+        self.host = LocalNode() if own_process else None
+        self.owner = self.host.identity() if self.host is not None else Spawned(999, "4242")
+        self.procs[self.owner.pid] = FakeProc(self.owner.pid, self.owner.start, OWN_NS, "driver", role="driver")
         self.signals: list[tuple[int, int]] = []
         self.mounts: set[str] = set()  # mount points in the driver's mount table (a mount's oneclient, say)
         self.busy_mounts: set[str] = set()  # those only a lazy unmount takes
@@ -200,6 +205,8 @@ class FakeNode:
 
     def alive(self, pid: int, start: str) -> bool | None:
         with self.lock:
+            if self.host is not None and pid not in self.procs:
+                return self.host.alive(pid, start)
             proc = self._find(pid, start)
             return proc is not None and proc.alive
 

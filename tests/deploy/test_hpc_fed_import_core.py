@@ -9,7 +9,7 @@ import tomllib
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import hpc_on_path
+from hpc_fed_support import hpc_on_path, pin_values
 from hpc_import_support import (
     IMPORT_LAYOUT,
     IMPORT_TEMPLATE,
@@ -195,7 +195,10 @@ def run_core(hpc, layout, environ, events, storages=None, **replaced):
         "links": lambda lay, spaces: events.append("links") or "link check passed",
     }
     options.update(replaced)
-    values = hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750)
+    values = {
+        **hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, layout.root),
+        **pin_values(layout.root / "agent"),
+    }
     return hpc.boot.core_phase(layout, (5001, 5002), values, **options)
 
 
@@ -369,7 +372,12 @@ def rendered_import(hpc, root, make_ca):
     (root / "ca" / "federation-ca.pem").write_bytes(make_ca(root / "made").ca.read_bytes())
     (root / "fault-journal").mkdir()
     settings = hpc.settings.load_settings(spec.hpc)
-    values = hpc.boot.hpc_values(["/venv/python", "/repo/hpcfed.py"], settings.stop_bound_s, settings.settle_timeout_s)
+    values = {
+        **hpc.boot.hpc_values(
+            ["/venv/python", "/repo/hpcfed.py"], settings.stop_bound_s, settings.settle_timeout_s, root
+        ),
+        **pin_values(root / "agent"),
+    }
     template = spec.platform_template.read_text(encoding="utf-8")
     hpc.boot.write_platform(root / "platform.toml", template, facts, {**values, "hpc_direct_storages": "{}"})
     return root / "platform.toml"

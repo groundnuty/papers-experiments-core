@@ -290,6 +290,14 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   back as the services' job is, and `down` releases both. The state file's `sandbox` record names its node, its job
   and its het group, which M5's shard step takes. With the pilot's shape and a memory weight of 0.5 this bills about
   42 units per hour, against 63 for one uniform 18 GB shape (`DESIGN.md`, section 1).
+- **The agent's sandbox** (O63): the pilot's template declares the Apptainer sandbox, whose limits size the agent's
+  node (an 8-core, 17 GiB step), and names the site's values as placeholders `up` fills from `site.env`:
+  `HPC_AGENT_SIF` and `HPC_EGRESS_SHIM` with their `..._SHA256`, and `HPC_AGENT_WORK_ROOT` (`site.env.example`). A pin
+  is a declaration: `up` reads each file and refuses, before the cluster is touched, a variable not set, a file
+  missing or one whose SHA-256 is not the one declared, naming the variable and never the path. The egress collector
+  is the bundle's own, hashed from this checkout. The rendered file's pins are in the campaign fingerprint
+  (`sandbox_backend`), no path is. Every path `up` renders into the root is absolute (`@hpc_root@`), so a copy of the
+  file (the one a shard step places beside a study) reads the root's secrets, CA and journal.
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
@@ -299,7 +307,9 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   `platform.toml`, and runs the platform layer's link check, which writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, checks each node
-  for the recorded work directory, cancels the held job (and the agent's own job, under `"separate"`) by its id (never by user or name), ends the srun clients (run it on the login node that ran
+  for the recorded work directory, sweeps the agent's node (`shards.py sweep`, a control step there: every shard step's
+  directory of this federation on its tmpfs whose step is gone is removed, and one holding an `out/` that could not be
+  archived is kept and named in what `down` prints), cancels the held job (and the agent's own job, under `"separate"`) by its id (never by user or name), ends the srun clients (run it on the login node that ran
   `up`: it finds them there), and
   removes the root. After a partial `up` it finds the job by its recorded id, or by its allocation's exact name.
 - **Every step** is `srun --jobid --exact` with a name, its size and `/usr/bin/env -i PATH=... LC_ALL=C TMPDIR=<node
@@ -365,6 +375,16 @@ shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only an
 line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's docstring
 has its form). Outage runs (`[faults]`) go through the login node's fault relay (M4), which `up`
 starts.
+
+**What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the
+step makes its `work_root` (0700) before the dispatcher and refuses one that is a link, another user's, open to others
+or not under `--tmpfs`. It copies the federation's `platform.toml` beside the study's `study.toml` in its copy, where
+the study's plugin loads it, so no federation's path is ever in `study.toml`; a study that holds a `platform.toml` of
+its own is refused. The node's tmpfs is the node's, not the job's: each step's directory there records its process and
+its federation (`step.json`); `--resume` removes its shard's earlier ones whose step is shown gone (by pid and start
+time) and refuses while one still runs, and `down` sweeps the agent's node. One whose `out/` could not be archived
+(exit 75) is marked and kept: `--resume` refuses while it is there, and `shards.py step ... --archive-left` archives it
+with the same manifest and that step's exit status, then removes it.
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into

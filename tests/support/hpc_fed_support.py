@@ -3,9 +3,11 @@ driver runs on the login node is answered here, and nothing reaches a cluster, a
 
 `FakeSlurm` is a `hpcslurm.Runner`: `sbatch` gives a job id, `scontrol` reports the job as asked (or as a test
 changes it), `squeue -s` lists the steps still running, `scancel` ends a job or one step. A control step's command
-(behind `srun ... /usr/bin/env -i <allowlist>`) is answered by what it runs: the node facts, the zone's exports, a
-teardown, the node check, the core's step. A service step writes its log as the bundle's batch scripts do: the work
-directory, then the zone's verdict, or the provider's wait for its token and, once its token is delivered, its verdict.
+(behind `srun ... /usr/bin/env -i <allowlist>`) is answered by what it runs: the node facts, the zone's exports (its CA
+the fake's `ca_pem`: a real one where the core's real phase loads it), a teardown, the node check, the core's step,
+the agent's node's sweep (run on this host with `sweep_here`, whose tmpfs then stands for the node's). A service
+step writes its log as the bundle's batch scripts do: the work directory, then the zone's verdict, or the provider's
+wait for its token and, once its token is delivered, its verdict.
 
 A heterogeneous job (`sbatch <component 0> : <component 1>`) is kept as Slurm 24.11 documents one
 (heterogeneous_jobs.html): its leader's id is component 0's, component k's own id is the leader's plus k, `scontrol show
@@ -16,8 +18,11 @@ next while `--partition`, `--nodes`, `--ntasks-per-node` and `--cpus-per-task` f
 component (`--het-group`) it names, or the fake fails the test.
 """
 
+import hashlib
 import json
 import re
+import subprocess
+import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -27,13 +32,60 @@ import pytest
 
 HPC = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation"
 LAYOUT = HPC / "layouts" / "pilot-shape.toml"
+PILOT_TEMPLATE = LAYOUT.parent / "pilot-shape.platform.toml.template"
+
+
+def without_sandbox(template: str) -> str:
+    """A platform template without its `[sandbox]` (the pilot's last table and everything under it): a federation
+    with no agent's node, or one to give another `[sandbox]`."""
+    assert "\n[sandbox]" in template, "the template declares no [sandbox]"
+    return template.split("\n[sandbox]", 1)[0] + "\n"
+
+
+def services_only(folder: Path) -> Path:
+    """The pilot's layout and its template without `[sandbox]`, written into `folder`: the services alone."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / LAYOUT.name).write_text(LAYOUT.read_text(encoding="utf-8"), encoding="utf-8")
+    template = PILOT_TEMPLATE.read_text(encoding="utf-8")
+    (folder / PILOT_TEMPLATE.name).write_text(without_sandbox(template), encoding="utf-8")
+    return folder / LAYOUT.name
+
+
 SITE = {
     "HPC_ACCOUNT": "test-account",
     "HPC_PARTITION": "test-partition",
     "HPC_STEP_PATH": "/usr/bin:/bin",
     "HPC_NODE_TMP": "/tmp",
 }
-PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"  # no certificate: for a core's phase stood in
+
+
+def agent_site(directory: Path, sif: bytes = b"an invented SIF image\n", shim: bytes = b"an invented egress shim\n",
+               work_root: Path | None = None) -> dict:  # fmt: skip
+    """The site's variables of the agent's Apptainer sandbox (the pilot template's `[sandbox]`), its two files written
+    into `directory` and pinned by their SHA-256; the work root `work_root`, or one under `directory` (made by the
+    shard step on the agent's node, never here)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "agent.sif").write_bytes(sif)
+    (directory / "egresslog.so").write_bytes(shim)
+    return {
+        "HPC_AGENT_SIF": str(directory / "agent.sif"),
+        "HPC_AGENT_SIF_SHA256": hashlib.sha256(sif).hexdigest(),
+        "HPC_EGRESS_SHIM": str(directory / "egresslog.so"),
+        "HPC_EGRESS_SHIM_SHA256": hashlib.sha256(shim).hexdigest(),
+        "HPC_AGENT_WORK_ROOT": str(work_root or directory / "agent-work"),
+    }
+
+
+def pin_values(directory: Path) -> dict:
+    """The agent's sandbox's placeholders as `up` fills them (`hpcpins.values`), over `agent_site(directory)`."""
+    import hpcpins
+    import hpcsettings
+
+    site = {**SITE, **agent_site(directory), "SH": "/invented/images", "L": "/invented/logs"}
+    return hpcpins.values(hpcsettings.site_from_environment(site))
+
+
 # Options Slurm passes from one component of a heterogeneous job to the next (heterogeneous_jobs.html, those sbatch
 # takes that the driver uses); every other option of a later component falls back to Slurm's default.
 PROPAGATED = ("--job-name", "--account", "--time", "--mem", "--no-requeue", "--export", "--output", "--chdir")
@@ -178,6 +230,10 @@ class FakeSlurm:
     component_recorded: dict = field(default_factory=dict)  # (job id, component) -> fields reported otherwise
     job_states: dict = field(default_factory=dict)  # a job id other than job_id -> its state (else RUNNING)
     node_lists: dict = field(default_factory=dict)  # (job id, component) -> the nodes it got, when a test says
+    ca_pem: str = PEM  # what the zone's CA export prints: a real CA's PEM where the core's real phase loads it
+    node_tmp: str = "/tmp"  # the nodes' tmpfs, where a service's work directory is (the site's HPC_NODE_TMP)
+    sweep_here: bool = False  # run down's sweep of the agent's node on this host (its tmpfs is here), else answer it
+    sweeps: list = field(default_factory=list)  # each sweep step down launched
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -339,13 +395,20 @@ class FakeSlurm:
             }
             return 0, json.dumps(facts) + "\n", ""
         if script == "zone-export.sh":
-            return (0, "A1b2C3d4E5f6G7h8I9j0K1l2\n", "") if command[2] == "passphrase" else (0, PEM, "")
+            return (0, "A1b2C3d4E5f6G7h8I9j0K1l2\n", "") if command[2] == "passphrase" else (0, self.ca_pem, "")
         if script == "teardown.sh":
             workdir = command[command.index("--workdir") + 1]
             self.steps = {n: s for n, s in self.steps.items() if not n.endswith(self._service_of(workdir))}
             return self.teardown_rc, "", "ok: service stopped\n"
         if command[0] == "test":
             return 0, "", ""
+        if any(Path(word).name == "shards.py" for word in command) and "sweep" in command:
+            self.sweeps.append(srun)
+            if not self.sweep_here:
+                return 0, "shards: sweep: 0 step directory(ies) removed; kept: none\n", ""
+            env = dict(word.split("=", 1) for word in srun.env)  # this host stands for the agent's node: run it here
+            done = subprocess.run([sys.executable, *command[1:]], capture_output=True, text=True, env=env, check=False)
+            return done.returncode, done.stdout, done.stderr
         if "hpcfed.py" in " ".join(command):
             return 0, "core: the link check passed\n", ""
         raise AssertionError(f"an unexpected control step: {command}")
@@ -383,7 +446,7 @@ class FakeSlurm:
         kind = "oz" if script == "zone.sbatch" else "op"
         service = "zone" if kind == "oz" else srun.command[4]
         self.logs[service] = srun.output
-        workdir = f"/tmp/hpcop-{kind}.{'abcdef' if kind == 'oz' else service[:3] + 'xyz'}"
+        workdir = f"{self.node_tmp}/hpcop-{kind}.{'abcdef' if kind == 'oz' else service[:3] + 'xyz'}"
         lines = [f"hpcop: work directory {workdir}"]
         lines.append("hpcop: OK zone" if kind == "oz" else "hpcop: waiting for the registration token (mint | deliver)")
         Path(srun.output).write_text("\n".join(lines) + "\n", encoding="utf-8")

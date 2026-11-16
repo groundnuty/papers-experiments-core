@@ -5,6 +5,8 @@
     <python> -I deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
         --results DIR --core-src DIR                    # inside the step on the sandbox node; `lines` writes it
     uv run python deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
+    <python> -I deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
+    <node python> -I deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
 
 **Where the dispatcher runs.** One shard runs per federation, as one job step on that federation's sandbox node: the
 Apptainer sandbox's data gate listens on that node's loopback and its cells are that node's `apptainer exec`s, so the
@@ -16,9 +18,23 @@ state file's `sandbox` record's: a component of the federation's heterogeneous j
 (`separate`). Nothing here runs srun.
 
 **How it reaches its federation.** The step's environment is an allowlist: `PATH`, `LC_ALL`, and the federation's
-`EXPCORE_FED_ROOT_PARENT` and `EXPCORE_FED_ROOT`. The study's plugin loads `<root>/platform.toml`, where the
-federation's `up` rendered it, with every path in it relative to the root (secrets, CA, fault journal) on the
-filesystem the nodes see. No secret is in the environment: a model's key comes from its key file.
+`EXPCORE_FED_ROOT_PARENT` and `EXPCORE_FED_ROOT`. `step` copies the federation's `<root>/platform.toml`, where its
+`up` rendered it with every path absolute into the root (secrets, CA, fault journal) on the filesystem the nodes see,
+into its copy of the study beside `study.toml`, where the study's plugin loads it: a copy, never a link out of the
+study, and never a path of the federation's in `study.toml`, whose bytes and hash are every shard's. A study that holds
+a `platform.toml` of its own is refused. No secret is in the environment: a model's key comes from its key file. When
+that file
+declares the Apptainer sandbox, `step` makes its `work_root` (mode 0700) before the dispatcher, which the sandbox will
+not start without; it refuses one that is a link, not this user's, open to others, or not under `--tmpfs` (the node's
+tmpfs: never the shared filesystem).
+
+**The node's tmpfs is the node's, not the job's.** Each step's directory there (`expcore-shard-<label>.<random>`)
+holds a record of its step (`step.json`: its pid and start time, its shard and its federation's root). A step killed
+outright leaves its directory; `--resume` removes each earlier one of its shard whose step is shown gone (by pid and
+start time, as M5's reaper tells), and `sweep`, which `hpcfed.py down` runs on the agent's node, removes those of the
+federation it takes down. A directory whose out/ could not be archived (exit 75) is marked (`ARCHIVE-FAILED.json`) and
+never removed: `--resume` refuses while one is there, `sweep` names it, and `step --archive-left` archives it with the
+same manifest, its step's exit status, and then removes it.
 
 **The study and its store.** The study is one stamped copy at the pinned commit on the shared filesystem. `step` copies
 it to the node's tmpfs and runs it there, since the campaign's store (SQLite, and its `campaign.lock`) must not live on
@@ -28,10 +44,10 @@ to the dispatcher, and ends with the dispatcher's exit status.
 **How a shard comes back.** Once the dispatcher has exited (its lock released), `step` writes the copy's `out/` whole,
 `campaign.lock` included, to `<results>/<label>.out.tar` with a manifest beside it (`<label>.out.json`: its SHA-256,
 bytes, files, the shard's spec and the dispatcher's exit status), each written whole and renamed into place, and removes
-its tmpfs directory; an archive that cannot be written leaves that directory in place (exit 75), since it holds the
-only whole `out/`. A start of a shard that has results is refused unless it is `--resume`, which unpacks that archive
-into its copy first, so a repeated launch line never replaces a finished shard. `collect` verifies a private copy of
-every shard's archive against its manifest and the manifest against the plan, unpacks that copy into
+its tmpfs directory; an archive that cannot be written leaves that directory in place, marked (exit 75), since it holds
+the only whole `out/`. A start of a shard that has results is refused unless it is `--resume`, which unpacks that
+archive into its copy first, so a repeated launch line never replaces a finished shard. `collect` verifies a private
+copy of every shard's archive against its manifest and the manifest against the plan, unpacks that copy into
 `<into>/<label>/out`, read-only, and prints (or with `--run` runs) `python -m expcore merge`. A shard whose archive has
 no `campaign.lock`, does not verify, or is missing is refused, naming its label: the merge would refuse it too.
 
@@ -108,6 +124,10 @@ CHUNK = 1 << 20
 SNAPSHOT_EVERY_S = 900.0  # a running shard's out/ is snapshotted this often, and after each run's end
 POLL_S = 30.0  # how often the snapshot thread looks for a run's end in the store
 SNAPSHOTS, JOURNALS = "snapshots", "journals"  # under <results>/<label>/
+WORK_PREFIX = "expcore-shard-"  # a step's directory on the node's tmpfs: <tmpfs>/expcore-shard-<label>.<random>
+OWNER, OWNER_FORMAT = "step.json", "expcore-hpc-shard-step/1"  # in it: the step's process and its federation's root
+ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not be archived, so it is kept
+PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
 
 
 class ShardsError(Exception):
@@ -562,6 +582,175 @@ def resume_into(args: argparse.Namespace, spec: Mapping[str, Any], base: str | N
         print(f"shards: shard {args.label} resumes from its archive", file=sys.stderr)
 
 
+# ------------------------------------------------------------------------------------------------ the agent's node
+def sandbox_work_root(root: str | None) -> Path | None:
+    """The Apptainer sandbox's `work_root` that the federation's `platform.toml` names (relative to that file, as the
+    platform layer reads it), or None: no federation named, no platform file, or no Apptainer sandbox in it."""
+    if not root:
+        return None
+    platform = Path(root) / PLATFORM
+    try:
+        data = tomllib.loads(platform.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ShardsError(f"the federation's platform.toml could not be read ({type(error).__name__})") from None
+    sandbox = data.get("sandbox")
+    if not isinstance(sandbox, Mapping) or sandbox.get("backend") != "apptainer":
+        return None
+    value = sandbox.get("work_root")
+    if not isinstance(value, str) or not value:
+        raise ShardsError("the federation's platform.toml names no [sandbox] work_root")
+    return Path(os.path.normpath(platform.parent / value))
+
+
+def make_work_root(path: Path, tmpfs: Path) -> None:
+    """Make the sandbox's work root on this node, mode 0700, before the dispatcher (the sandbox refuses a start
+    without it); an existing one must be a directory of this user's, not a link, with no access for others. It must lie
+    under `--tmpfs`, the node's tmpfs: never on the shared filesystem, where the runs' private files would be seen
+    from every node. `ShardsError` names what is wrong, never the path."""
+    node_tmp = Path(os.path.realpath(tmpfs))
+    where = Path(os.path.realpath(path.parent)) / path.name
+    if where == node_tmp or not where.is_relative_to(node_tmp):
+        raise ShardsError("[sandbox] work_root is not on the node's tmpfs (under --tmpfs): it is never shared")
+    try:
+        os.mkdir(path, 0o700)
+        os.chmod(path, 0o700)
+    except FileExistsError:
+        pass
+    except FileNotFoundError:
+        raise ShardsError("[sandbox] work_root's parent is not a directory on this node") from None
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ShardsError("[sandbox] work_root is a link or not a directory")
+    if info.st_uid != os.getuid():
+        raise ShardsError("[sandbox] work_root is not this user's")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise ShardsError("[sandbox] work_root gives others access: it must be 0700")
+
+
+def _start_of(pid: int) -> str | None:
+    """A process's start time, field 22 of /proc/<pid>/stat (as `apptainer.node.LocalNode` reads it); None without."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    fields = text.rpartition(")")[2].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def alive(pid: Any, start: Any) -> bool | None:
+    """Whether the process that started at `start` still holds `pid`, as M5's reaper tells (`LocalNode.alive`): None
+    when that cannot be told, which is never gone."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1 or not isinstance(start, str):
+        return None
+    now = _start_of(pid)
+    if now is not None:
+        return now == start
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None
+    return None
+
+
+@dataclass(frozen=True)
+class Left:
+    """A step's directory on the node's tmpfs: its owner record (None when it has none) and its archive-failed mark."""
+
+    path: Path
+    owner: Mapping[str, Any] | None
+    failed: Mapping[str, Any] | None
+
+    @property
+    def gone(self) -> bool:
+        """Whether its step is shown gone: an owner record whose process is no longer there."""
+        return self.owner is not None and alive(self.owner.get("pid"), self.owner.get("start")) is False
+
+
+def _record(path: Path) -> Mapping[str, Any] | None:
+    try:
+        found = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return found if isinstance(found, Mapping) else None
+
+
+def leftovers(tmpfs: Path, label: str | None = None) -> list[Left]:
+    """The steps' directories under `tmpfs` (of one shard's label, or every one), never a link."""
+    prefix = f"{WORK_PREFIX}{label}." if label is not None else WORK_PREFIX
+    found = []
+    for path in sorted(tmpfs.glob(f"{prefix}*")):
+        if path.is_symlink() or not path.is_dir():
+            continue
+        owner = _record(path / OWNER)
+        named = owner.get("shard") if owner is not None else None
+        if label is not None and isinstance(named, Mapping) and named.get("label") != label:
+            continue  # another label that begins with this one, and a dot
+        found.append(Left(path, owner, _record(path / ARCHIVE_FAILED_MARK)))
+    return found
+
+
+def clear_leftovers(tmpfs: Path, label: str) -> None:
+    """Before a resume: remove each earlier step's directory of this shard whose step is shown gone; refuse while one
+    holds an out/ that could not be archived (`--archive-left` archives it), or while a step of the shard still runs
+    or cannot be shown gone. A directory with no owner record is kept, and said."""
+    for left in leftovers(tmpfs, label):
+        if left.failed is not None:
+            raise ShardsError(
+                f"shard {label}: an earlier step's out/ could not be archived and is kept on this node in "
+                f"{left.path.name}; archive it with `shards.py step --archive-left` before resuming"
+            )
+        if left.owner is None:
+            print(f"shards: {left.path.name} names no step, so it is kept", file=sys.stderr)
+            continue
+        if not left.gone:
+            raise ShardsError(f"shard {label}: a step of it still runs on this node, or cannot be shown gone")
+        remove_tree(left.path)
+        print(f"shards: shard {label}: an earlier step's directory on this node is removed", file=sys.stderr)
+
+
+def archive_left(args: argparse.Namespace) -> int:
+    """Archive the out/ an earlier step of this shard could not archive (`ARCHIVE_FAILED`), as that step would have:
+    `<results>/<label>.out.tar` and its manifest, with that step's exit status; then remove its directory."""
+    spec = {"index": args.index, "count": args.count, "label": args.label}
+    found = [left for left in leftovers(args.tmpfs, args.label) if left.failed is not None]
+    if not found:
+        raise ShardsError(f"shard {args.label}: no out/ of it waits on this node to be archived")
+    left = found[0]
+    if left.failed.get("shard") != spec:
+        raise ShardsError(f"shard {args.label}: {left.path.name} holds the out/ of {left.failed.get('shard')}")
+    out = left.path / "study" / "out"
+    if not out.is_dir():
+        raise ShardsError(f"shard {args.label}: {left.path.name} holds no out/")
+    settle_store(out)
+    manifest = archive(out, args.results, spec, int(left.failed.get("exit_status", 1)))
+    remove_tree(left.path)
+    print(f"shards: shard {args.label}'s kept out/ archived: {manifest['files']} files, sha256 {manifest['sha256']}")
+    return 0
+
+
+def sweep(tmpfs: Path, root: str) -> int:
+    """On the agent's node, at the federation's down: remove every step's directory of this federation (its owner
+    record names `root`) whose step is shown gone and whose out/ was archived; name each one kept. Stdlib alone: it
+    runs under the node's own Python."""
+    removed, kept = 0, []
+    for left in leftovers(tmpfs):
+        if left.owner is None or left.owner.get("root") != root:
+            continue  # not this federation's, or not to be told
+        if left.failed is not None:
+            kept.append(f"{left.path.name} (its out/ could not be archived: `shards.py step --archive-left`)")
+        elif not left.gone:
+            kept.append(f"{left.path.name} (its step still runs, or cannot be shown gone)")
+        else:
+            remove_tree(left.path)
+            removed += 1
+    print(f"shards: sweep: {removed} step directory(ies) removed; kept: {'; '.join(kept) or 'none'}")
+    return 0
+
+
 def step(
     args: argparse.Namespace,
     *,
@@ -583,6 +772,8 @@ def step(
     if (args.study / "out").exists():
         print("shards: ERROR: the study copy holds an out/ of its own", file=sys.stderr)
         return 2
+    if os.path.lexists(args.study / PLATFORM):  # the step places its federation's there
+        raise ShardsError(f"the study copy holds a {PLATFORM} of its own: the step places its federation's beside it")
     spec = {"index": args.index, "count": args.count, "label": args.label}
     _label_ok(args.index, args.count, args.label)
     published = [args.results / f"{args.label}.out.{kind}" for kind in ("tar", "json")]
@@ -591,13 +782,25 @@ def step(
         print(f"shards: ERROR: shard {args.label} has results or a snapshot already: --resume continues it",
               file=sys.stderr)  # fmt: skip
         return 2
+    if args.resume:  # an earlier step killed outright left its directory here: removed, or the resume refused
+        clear_leftovers(args.tmpfs, args.label)
+    work_root = sandbox_work_root(os.environ.get("EXPCORE_FED_ROOT"))
+    if work_root is not None:  # the Apptainer sandbox's, which it refuses to start without
+        make_work_root(work_root, args.tmpfs)
     base = archive_named(args.results, args.label)  # the archive this step starts from: its snapshots name it
-    work = Path(tempfile.mkdtemp(prefix=f"expcore-shard-{args.label}.", dir=args.tmpfs))
+    work = Path(tempfile.mkdtemp(prefix=f"{WORK_PREFIX}{args.label}.", dir=args.tmpfs))
     keep = False
     try:
         work.chmod(0o700)
+        owner = {"format": OWNER_FORMAT, "shard": spec, "pid": os.getpid(), "start": _start_of(os.getpid()),
+                 "root": os.environ.get("EXPCORE_FED_ROOT")}  # fmt: skip
+        (work / OWNER).write_text(json.dumps(owner, sort_keys=True) + "\n", encoding="utf-8")
         copy = work / "study"
         shutil.copytree(args.study, copy, symlinks=True)
+        platform = Path(os.environ.get("EXPCORE_FED_ROOT") or "/nonexistent") / PLATFORM
+        if platform.is_file():  # a copy, never a link out of the study; its paths are the root's, absolute (`up`)
+            shutil.copyfile(platform, copy / PLATFORM)
+            (copy / PLATFORM).chmod(0o600)
         if args.resume:
             resume_into(args, spec, base, work, copy / "out")
         for name in ("home", "tmp"):
@@ -633,8 +836,10 @@ def step(
             manifest = archive(out, args.results, spec, status)
         except (OSError, tarfile.TarError) as error:  # the only whole out/ is the tmpfs copy: kept, never removed
             keep = True
+            mark = {"shard": spec, "exit_status": status, "error": type(error).__name__}
+            (work / ARCHIVE_FAILED_MARK).write_text(json.dumps(mark, sort_keys=True) + "\n", encoding="utf-8")
             print(f"shards: ERROR: shard {args.label}'s out/ could not be archived ({type(error).__name__}); it is "
-                  f"kept at {out} until it is archived by hand", file=sys.stderr)  # fmt: skip
+                  f"kept at {out} until `shards.py step --archive-left` archives it", file=sys.stderr)  # fmt: skip
             return ARCHIVE_FAILED
         print(f"shards: shard {args.label} archived: {manifest['files']} files, sha256 {manifest['sha256']}")
         return status
@@ -660,11 +865,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--count", type=int, required=True)
     one.add_argument("--label", required=True)
     one.add_argument("--resume", action="store_true")
+    one.add_argument("--archive-left", dest="archive_left", action="store_true")
     one.add_argument("--snapshot-every", dest="snapshot_every", type=float, default=SNAPSHOT_EVERY_S)
+    left = sub.add_parser("sweep")
+    left.add_argument("--tmpfs", type=Path, required=True)
+    left.add_argument("--root", required=True)
     args = parser.parse_args(argv)
     try:
+        if args.command == "sweep":
+            return sweep(args.tmpfs, args.root)
         if args.command == "step":
-            return step(args)
+            return archive_left(args) if args.archive_left else step(args)
         plan = load_plan(args.manifest)
         if args.command == "collect":
             line = merge_argv(plan, collect(plan, args.into))

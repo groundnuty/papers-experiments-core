@@ -1,18 +1,20 @@
 """An offline rehearsal of the HPC path, end to end: what the live slots will do, on fakes, each stage reading only the
 files the stage before it wrote.
 
-1. `hpcfed.py up` over the pilot's layout (`sandbox_placement = "het"`, the agent's node sized by the Apptainer
-   sandbox's limits in its template), twice, each over a fake cluster of its own (`hpc_fed_support.FakeSlurm`), the
-   core's phase the real one over a bootstrap that answers as a live zone would: the state file, `platform.toml` and
-   `link-check.json` in each root, the login node's fault relay started.
+1. `hpcfed.py up` over the pilot's layout and template as committed (`sandbox_placement = "het"`, the agent's node
+   sized by the Apptainer sandbox's limits in the template, its pins and work root from `site.env`), twice, each over
+   a fake cluster of its own (`hpc_fed_support.FakeSlurm`), the core's phase the real one over a bootstrap that answers
+   as a live zone would: the state file, `platform.toml` and `link-check.json` in each root, the fault relay started.
 2. Two shards of the example study (stub models), one per federation: `shards.py plan` over the manifest that names
    the two roots, then each shard's `step`, run as its node would run the line `plan` printed (behind `env -i` and the
-   allowlist alone), its dispatcher `python -I -m expcore run`, every run in the Apptainer sandbox with `[sandbox]` as
-   the root's `platform.toml` has it, on a fake node (`fake_mount_node`), with a spend journal and snapshots.
+   allowlist alone): the step makes the sandbox's work root and copies the root's `platform.toml` beside the study's
+   `study.toml`; its dispatcher `python -I -m expcore run` runs every run in the Apptainer sandbox with `[sandbox]` as
+   that file has it, on a fake node (`fake_mount_node`), with a spend journal and snapshots.
 3. Shard fed-a killed outright after its first snapshot, with an attempt that began after it ended and one in flight,
-   then `step --resume`: the snapshot restored, what the journal holds that it lacks counted once as `lost_in_kill`.
+   then `step --resume`: the killed step's directory on the node removed, the snapshot restored, what the journal holds
+   that it lacks counted once as `lost_in_kill`.
 4. `shards.py collect --run` (which runs `expcore merge`), then `check`, `analyze` and `report` on the merge.
-5. `hpcfed.py down` on each: the relay stopped, the held job cancelled, the root gone.
+5. `hpcfed.py down` on each: the relay stopped, the agent's node swept, the held job cancelled, the root gone.
 
 Nothing here reaches a cluster, a container or a model. The kill is timed by holds the study's plugin reads
 (`hpc_rehearsal_plugin`), never by sleeping: the step's own snapshot thread looks for a run's end every 30 s
@@ -25,6 +27,7 @@ import contextlib
 import io
 import json
 import shlex
+import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,18 +37,17 @@ import pytest
 from hpc_rehearsal_support import (
     JOBS,
     LABELS,
-    AgentFiles,
     Control,
     Federation,
     StepLine,
     attempts_in,
     deploy_modules,
-    fake_cluster,
     hpcfed,
     kill_outright,
     link_check_stand_in,
     make_ca,
     make_study,
+    pinned_file,
     wait_for,
     wait_step,
     write_manifest,
@@ -78,10 +80,14 @@ def deploy():
 
 @pytest.fixture(scope="module")
 def shared(tmp_path_factory):
-    """The filesystem the login node and the nodes see: the agent's pinned files, the control directory."""
+    """The filesystem the login node and the nodes see (the control directory, the mount helper's pinned oneclient),
+    and the agents' nodes' tmpfs, a directory of this host both nodes stand for here."""
     base = tmp_path_factory.mktemp("shared")
-    (base / "control").mkdir()
-    return SimpleNamespace(base=base, files=AgentFiles.make(base / "agent-files"), control=Control(base / "control"))
+    for name in ("control", "node-tmpfs"):
+        (base / name).mkdir()
+    oneclient = pinned_file(base / "agent-files" / "oneclient", b"an invented oneclient\n")
+    return SimpleNamespace(base=base, control=Control(base / "control"), node_tmp=base / "node-tmpfs",
+                           oneclient=oneclient)  # fmt: skip
 
 
 @pytest.fixture(scope="module")
@@ -92,8 +98,7 @@ def federations(deploy, shared, tmp_path_factory) -> dict[str, Federation]:
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(deploy.fedlinks, "check_links", link_check_stand_in(pairs))
         for label in LABELS:
-            fed = Federation(label, tmp_path_factory.mktemp(label), fake_cluster(label, ca), ca)
-            fed.write(shared.files)
+            fed = Federation(label, tmp_path_factory.mktemp(label), shared.node_tmp, ca)
             hpcfed(deploy, fed, "up", fed.site())
             feds[label] = fed
     for fed in feds.values():
@@ -125,7 +130,7 @@ def test_up_brings_the_federation_up_and_holds_the_agents_node_as_component_1(fe
     assert (sandbox["placement"], sandbox["het_group"], sandbox["job"]) == ("het", 1, JOBS[label][0])
     assert sandbox["node"] == state["services"]["sandbox"]["node"] == "node07"
     agent = fed.fake.submitted[JOBS[label][0]][1]  # the held job's component 1: sized by the template's limits
-    assert (agent["--nodes"], agent["--cpus-per-task"]) == ("1", "5")
+    assert (agent["--nodes"], agent["--cpus-per-task"], agent["--mem"]) == ("1", "9", "18432M")
 
 
 @pytest.mark.parametrize("label", LABELS)
@@ -134,6 +139,8 @@ def test_up_renders_platform_toml_with_the_apptainer_sandbox_and_writes_the_ten_
     config = load_platform(fed.root / "platform.toml")
     assert config.sandbox.backend == "apptainer"
     assert config.sandbox.work_root == fed.work_root
+    assert config.sandbox.apptainer.image.sha256 == fed.agent["HPC_AGENT_SIF_SHA256"]
+    assert not fed.work_root.exists()  # the shard step makes it, on the agent's node
     assert config.zone.url == "https://node01.cluster.example.org:8443"
     record = json.loads((fed.root / "link-check.json").read_text(encoding="utf-8"))
     assert record["ok"] is True
@@ -158,10 +165,10 @@ def test_up_starts_the_login_nodes_fault_relay_last_and_records_it(federations, 
 def plan(deploy, federations, shared):
     """The study, the manifest over the roots `up` wrote, and each shard's line as `shards.py plan` prints it."""
     base = shared.base
-    study = make_study(base / "studies", shared.files, shared.control.path)
-    for name in ("results", "node-tmpfs", "logs"):
+    study = make_study(base / "studies", shared.oneclient, shared.control.path)
+    for name in ("results", "logs"):
         (base / name).mkdir()
-    manifest = write_manifest(base / "shards.toml", study, base / "results", base / "node-tmpfs", federations)
+    manifest = write_manifest(base / "shards.toml", study, base / "results", shared.node_tmp, federations)
     code, printed = printing(deploy.shards.main, ["plan", "--manifest", str(manifest)])
     assert code == 0, printed
     lines = {}
@@ -201,6 +208,8 @@ class Shards:
     snapshot_attempts: list[tuple[str, str]] = field(default_factory=list)
     journals_at_kill: list[str] = field(default_factory=list)
     archive_at_kill: bool = False
+    left_at_kill: list[str] = field(default_factory=list)  # the killed step's directory on the agent's node
+    left_after_resume: list[str] = field(default_factory=list)
 
     def printed(self, life: str) -> str:
         return self.logs[life].read_text(encoding="utf-8", errors="replace")
@@ -211,8 +220,6 @@ def shards(plan, federations, shared) -> Shards:
     """fed-b's step runs to its end while fed-a's first life is held at its third attempt until the step's first
     snapshot holds that attempt in flight, released, held again at its fifth, and killed outright; then fed-a's step is
     run again with `--resume`."""
-    for fed in federations.values():  # SEAM: nothing of the HPC path makes the sandbox's work_root on the agent's node
-        fed.work_root.mkdir(mode=0o700, parents=True)
     found, control = Shards(), shared.control
     snapdir = plan.results / KILLED / "snapshots"
     for n in (SNAPSHOT_AT, KILL_AT):
@@ -236,9 +243,11 @@ def shards(plan, federations, shared) -> Shards:
         found.codes[f"{KILLED}-1"] = killed.returncode
         found.archive_at_kill = (plan.results / f"{KILLED}.out.tar").exists()
         found.snapshot_attempts = attempts_in(found.snapshot_at_kill[-1])
+        found.left_at_kill = sorted(p.name for p in shared.node_tmp.glob(f"expcore-shard-{KILLED}.*"))
         control.clear()  # the second life holds nothing
         again = plan.lines[KILLED].start(found.logs[f"{KILLED}-2"], "--resume")
         found.codes[f"{KILLED}-2"] = wait_step(again)
+        found.left_after_resume = sorted(p.name for p in shared.node_tmp.glob(f"expcore-shard-{KILLED}.*"))
         found.codes[WHOLE] = wait_step(whole)
     finally:
         for process in (killed, whole):
@@ -260,6 +269,20 @@ def test_every_step_ends_and_fed_a_was_killed_outright_after_exactly_one_snapsho
     assert states[-1] == "running"
     assert shards.codes[f"{KILLED}-2"] == 0, shards.printed(f"{KILLED}-2")
     assert shards.codes[WHOLE] == 0, shards.printed(WHOLE)
+
+
+def test_each_step_made_its_federations_sandbox_work_root_on_the_nodes_tmpfs(shards, federations):
+    """O63: no work root existed after up; each shard's step made its own federation's, 0700, before its dispatcher."""
+    for fed in federations.values():
+        assert stat.S_IMODE(fed.work_root.stat().st_mode) == 0o700, fed.label
+
+
+def test_the_resume_removed_the_killed_steps_directory_on_the_agents_node(shards):
+    """O63: the step killed outright left its directory on the node's tmpfs; the resume removed it, its step shown
+    gone by pid and start time, before it made its own, which it removed when it ended."""
+    assert len(shards.left_at_kill) == 1
+    assert shards.left_after_resume == []
+    assert "an earlier step's directory on this node is removed" in shards.printed(f"{KILLED}-2")
 
 
 def test_the_resume_restores_the_snapshot_and_counts_what_the_journal_holds_beyond_it_once(shards):
@@ -335,6 +358,17 @@ def test_down_stops_the_relay_first_cancels_the_held_job_and_removes_the_root(do
     assert fed.fake.cancelled == [JOBS[label][0]]
     assert fed.fake.steps == {}
     assert not fed.root.exists()
+
+
+@pytest.mark.parametrize("label", LABELS)
+def test_down_swept_the_agents_node_and_left_no_step_directory_there(downed, shared, label):
+    """O63: down ran its sweep on the agent's node, in the held job's component 1: nothing of a step was left to
+    remove or to keep, and nothing of either federation's steps is on the node's tmpfs."""
+    fed = downed[label]
+    (swept,) = fed.fake.sweeps
+    assert (swept.node, swept.het_group) == ("node07", 1)
+    assert "shards: sweep: 0 step directory(ies) removed; kept: none" in fed.printed["down"]
+    assert not list(shared.node_tmp.glob("expcore-shard-*"))
 
 
 def test_the_sandbox_left_no_run_record_on_either_agent_node(downed):

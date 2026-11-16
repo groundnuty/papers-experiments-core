@@ -11,8 +11,9 @@ real addresses (DESIGN.md, sections 5 and 6).
   with the same ids (`hpcimport.import_storage_extra`) and mapped the same way, on the storage its support names; the
   core's phase waits for the scan, and verifies each space against its manifest (`fedimport.verify_imports`) over the
   rendered `platform.toml`, before the link check.
-- **`platform.toml`** is rendered from the layout's own template by the Compose renderer, plus the HPC values a
-  template may name: `@hpc_stop_bound_s@` (a stop's whole bound, `[hpc] stop_seconds` + 90 s), `@hpc_settle_timeout_s@`
+- **`platform.toml`** is rendered from the layout's own template by the Compose renderer, plus the HPC values a template
+  may name: `@hpc_root@` (the root, so every path into it is absolute and a copy of the file beside a study reads the
+  root's files), `@hpc_stop_bound_s@` (a stop's whole bound, `[hpc] stop_seconds` + 90 s), `@hpc_settle_timeout_s@`
   (above it), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of each direct-I/O
   import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and `@hpc_token_margin_s@`: the
   least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
@@ -194,12 +195,19 @@ def least_margin_s(path: Path, rendered: str, settle_timeout_s: float) -> int:
     return math.ceil(restore_token_margin_s(load_faults(path, load_platform(path))))
 
 
-def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int) -> Dict[str, str]:
-    """The HPC values a platform template may name, but the token margin (`write_platform` derives it)."""
+def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int, root: Path) -> Dict[str, str]:
+    """The HPC values a platform template may name, but the token margin (`write_platform` derives it). `root` is the
+    federation's root, as an absolute path in a basic string of TOML: the template's paths into the root are written
+    with it (`@hpc_root@/secrets/...`), so a copy of the file elsewhere (beside a study, `shards.py step`) reads the
+    root's own files."""
+    text = str(root)
+    if not os.path.isabs(text) or any(c in text for c in '"\\') or not text.isprintable():
+        raise ValueError("the federation's root is no absolute path a TOML string can hold as it is")
     return {
         "hpc_command": json.dumps(list(command)),  # a TOML array of basic strings is JSON's
         "hpc_stop_bound_s": str(stop_bound_s),
         "hpc_settle_timeout_s": str(settle_timeout_s),
+        "hpc_root": text,
     }
 
 

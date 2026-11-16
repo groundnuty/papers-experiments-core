@@ -6,8 +6,11 @@ Every stage reads only what the previous one wrote: `up` writes the state file, 
 in each root; `shards.py plan` reads the state files; each step runs the line `plan` printed, after its `srun` prefix,
 in that line's environment and nothing else; `collect` reads the archives the steps wrote; `down` reads the state file.
 
-Where a fake or this module stands in for something the HPC path does not do (yet), it says so with `SEAM`: those are
-the rehearsal's findings, listed in its pull request, and never a fake that hides a real mismatch.
+The federations run the pilot's layout and template as committed, the site's values those `site.env` holds. What
+stands in is what cannot run offline, each named where it is made: the cluster (`hpc_fed_support.FakeSlurm`, its zone
+exporting a real CA), the zone's and the providers' answers to the bootstrap (`BootStandIn`), the link check's
+transfers (`link_check_stand_in`), and each run's node (`fake_mount_node.FakeMountNode`, its driver the dispatcher
+itself). The seams the rehearsal found, and how each was closed, are in its pull request.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ from urllib.parse import quote
 
 import pytest
 import shard_support
-from hpc_fed_support import HPC, LAYOUT, SITE, FakeProcess, FakeSlurm, hpc_on_path
+from hpc_fed_support import HPC, LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
 from study_support import HEAD
 from tls_support import make_federation_ca
 
@@ -44,13 +47,10 @@ from expcore.study.config import load_study
 REPO = HPC.parents[1]
 SUPPORT = Path(__file__).resolve().parent
 SHARDS_SCRIPT = HPC / "shards.py"
-TEMPLATE = LAYOUT.parent / "pilot-shape.platform.toml.template"
-PLACEMENT = 'sandbox_placement = "het"'  # the pilot's layout records the coordinator's choice; the rehearsal keeps it
 LABELS = ("fed-a", "fed-b")  # one shard per federation, in the manifest's order
 JOBS = {"fed-a": ("4242", "4343"), "fed-b": ("5252", "5353")}  # each fake cluster's held job (and a second's) ids
 PLUGIN = "hpc_plugin.py"
 PLUGIN_SETTINGS = "hpc_rehearsal.json"
-GIB = 1 << 30
 SNAPSHOT_EVERY_S = 3600  # the manifest's: no clock snapshot within the rehearsal, so only a run's end takes one
 
 
@@ -81,130 +81,49 @@ def deploy_modules() -> Iterator[Deploy]:
             sys.modules.pop("hpc_shards_rehearsal", None)
 
 
-# ------------------------------------------------------------------------------------------------ the agent's files
+# ------------------------------------------------------------------------------------------------ one federation
 def pinned_file(path: Path, content: bytes) -> dict[str, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return {"path": str(path), "sha256": hashlib.sha256(content).hexdigest()}
 
 
-@dataclass(frozen=True)
-class AgentFiles:
-    """What `[sandbox.apptainer]` pins, on the filesystem the nodes see: an invented SIF and egress shim (the shim is
-    built from bundle/egresslog.c for the image, which needs the image), the bundle's own egress collector, and an
-    invented oneclient for the mount helper."""
-
-    image: dict[str, str]
-    shim: dict[str, str]
-    collector: dict[str, str]
-    oneclient: dict[str, str]
-
-    @classmethod
-    def make(cls, directory: Path) -> AgentFiles:
-        collector = HPC / "bundle" / "egress-collector.py"
-        return cls(
-            image=pinned_file(directory / "agent.sif", b"an invented SIF image\n"),
-            shim=pinned_file(directory / "egresslog.so", b"an invented egress shim\n"),
-            collector={"path": str(collector), "sha256": hashlib.sha256(collector.read_bytes()).hexdigest()},
-            oneclient=pinned_file(directory / "oneclient", b"an invented oneclient\n"),
-        )
-
-
-def sandbox_table(work_root: Path, files: AgentFiles) -> str:
-    """`[sandbox]` of the Apptainer backend, for the platform template: the agent's limits (which also size the agent's
-    node, `hpcsettings.agent_limits`), a mount data path, and the pins.
-
-    SEAM: the committed template (`layouts/pilot-shape.platform.toml.template`) has no `[sandbox]`, and `up` fills no
-    placeholder for `work_root` or the pins, which are a site's paths; so the rehearsal's copy of the template names
-    them itself."""
-    return f"""
-[sandbox]
-backend = "apptainer"
-work_root = "{work_root}"
-[sandbox.limits]
-cpus = 2
-memory_bytes = {GIB}
-pids = 256
-nofile = 1024
-tmp_bytes = {GIB // 4}
-shm_bytes = {GIB // 16}
-work_disk_bytes = {GIB}
-[sandbox.data_paths]
-mounted = "mount"
-[sandbox.mount]
-path = "/data"
-io_mode = "proxy"
-[sandbox.apptainer]
-image = "{files.image["path"]}"
-image_sha256 = "{files.image["sha256"]}"
-egress_shim = "{files.shim["path"]}"
-egress_shim_sha256 = "{files.shim["sha256"]}"
-egress_collector = "{files.collector["path"]}"
-egress_collector_sha256 = "{files.collector["sha256"]}"
-memory_poll_s = 0.02
-disk_poll_s = 0.1
-"""
-
-
-# ------------------------------------------------------------------------------------------------ one federation
 @dataclass
 class Federation:
-    """One federation of the rehearsal: its layout copy, its root, its fake cluster and the agent node's tmpfs."""
+    """One federation of the rehearsal, over the pilot's layout as committed: its root, its fake cluster, and its
+    agent's node, whose tmpfs (`node_tmp`, the manifest's `tmpfs` and the site's `HPC_NODE_TMP`) is a directory of this
+    host that both federations' agent nodes stand for here, each with a work root of its own in it."""
 
     label: str
     base: Path
-    fake: FakeSlurm
+    node_tmp: Path
     ca_pem: str
-    layout: Path = field(init=False)
+    fake: FakeSlurm = field(init=False)
     root: Path = field(init=False)
-    node_tmp: Path = field(init=False)
     printed: dict[str, str] = field(default_factory=dict)
     codes: dict[str, int] = field(default_factory=dict)
+    pairs: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.layout = self.base / "layout" / LAYOUT.name
         self.root = self.base / "fed" / "root"
-        self.node_tmp = self.base / "agent-node-tmp"  # the agent's node's tmpfs, as the step and the sandbox see it
-
-    @property
-    def work_root(self) -> Path:
-        return self.node_tmp / "agent"
-
-    def site(self) -> dict[str, str]:
-        return {**SITE, "SH": str(self.base / "images"), "L": str(self.base / "logs")}
-
-    def write(self, files: AgentFiles) -> None:
-        """The pilot's layout and its template, copied, the template with the Apptainer `[sandbox]`; the site's images
-        and log directory."""
-        for folder in ("images", "logs", "layout", "fed"):
+        job, second = JOBS[self.label]
+        self.fake = FakeSlurm(job_id=job, second_id=second, ca_pem=self.ca_pem, node_tmp=str(self.node_tmp),
+                              sweep_here=True)  # fmt: skip
+        for folder in ("images", "logs", "fed"):
             (self.base / folder).mkdir(parents=True)
         for name in ("onezone.tar", "oneprovider.tar"):
             (self.base / "images" / name).write_bytes(b"tar")
             (self.base / "images" / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
-        text = LAYOUT.read_text(encoding="utf-8")
-        assert PLACEMENT in text, "the pilot's layout no longer holds the agent's node as a het component"
-        self.layout.write_text(text, encoding="utf-8")
-        template = TEMPLATE.read_text(encoding="utf-8")
-        assert "[sandbox]" not in template, "the committed template declares [sandbox] now: use it as it is"
-        (self.layout.parent / TEMPLATE.name).write_text(template + sandbox_table(self.work_root, files), "utf-8")
+        self.agent = agent_site(self.base / "agent", work_root=self.work_root)  # the SIF and the shim, pinned
 
+    @property
+    def work_root(self) -> Path:
+        return self.node_tmp / f"agent-{self.label}"
 
-def fake_cluster(label: str, ca_pem: str) -> FakeSlurm:
-    """A fake cluster whose zone exports a real CA (SEAM, of the fakes: FakeSlurm's own is no certificate, which the
-    platform layer's loader refuses; a real zone exports the Onedata test CA)."""
-    job, second = JOBS[label]
-    fake = FakeSlurm(job_id=job, second_id=second)
-
-    def control(srun: Any) -> Any:
-        from hpcslurm import Completed
-
-        command = srun.command
-        if len(command) > 2 and Path(command[1]).name == "zone-export.sh" and command[2] == "ca":
-            return FakeProcess(Completed(0, ca_pem, ""))
-        return None
-
-    fake.on_control = control
-    return fake
+    def site(self) -> dict[str, str]:
+        """site.env, as `set -a; . site.env; set +a` exports it on the login node."""
+        return {**SITE, **self.agent, "SH": str(self.base / "images"), "L": str(self.base / "logs"),
+                "HPC_NODE_TMP": str(self.node_tmp)}  # fmt: skip
 
 
 class BootStandIn:
@@ -277,7 +196,7 @@ def hpcfed(deploy: Deploy, fed: Federation, command: str, environ: Mapping[str, 
         patch.setattr(deploy.hpc.cli, "make_driver", driver_maker(deploy, fed))
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
             code = deploy.hpc.cli.main(
-                ["--layout", str(fed.layout), "--root", str(fed.root), command], environ, runner=fed.fake
+                ["--layout", str(LAYOUT), "--root", str(fed.root), command], environ, runner=fed.fake
             )
     fed.codes[command], fed.printed[command] = code, printed.getvalue()
     return code
@@ -288,12 +207,12 @@ def make_ca(directory: Path) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ the study
-def make_study(base: Path, files: AgentFiles, control: Path) -> Path:
+def make_study(base: Path, oneclient: Mapping[str, str], control: Path) -> Path:
     """The example study with caps two shards can share (`shard_support.make_study`), its plugin the rehearsal's
     (`hpc_rehearsal_plugin.py`), stamped: one copy on the filesystem the nodes see, which every step copies."""
     root = shard_support.make_study(base, "study")
     shutil.copyfile(SUPPORT / "hpc_rehearsal_plugin.py", root / PLUGIN)
-    settings = {"support": str(SUPPORT), "control": str(control), "oneclient": files.oneclient}
+    settings = {"support": str(SUPPORT), "control": str(control), "oneclient": dict(oneclient)}
     (root / PLUGIN_SETTINGS).write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     text = (root / "study.toml").read_text(encoding="utf-8")
     for old, new in (
@@ -417,19 +336,18 @@ def attempts_in(snapshot: Path) -> list[tuple[str, str]]:
 
 __all__ = [
     "LABELS",
-    "AgentFiles",
     "Control",
     "Deploy",
     "Federation",
     "StepLine",
     "attempts_in",
     "deploy_modules",
-    "fake_cluster",
     "hpcfed",
     "kill_outright",
     "link_check_stand_in",
     "make_ca",
     "make_study",
+    "pinned_file",
     "wait_for",
     "wait_step",
     "write_manifest",

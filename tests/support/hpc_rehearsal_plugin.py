@@ -6,9 +6,10 @@ relatively. Its settings are `hpc_rehearsal.json` beside it, which the study's c
 dispatcher runs under `python -I`, so nothing of the test tree is on its path), the control directory, and the pinned
 oneclient the mount helper starts.
 
-**The platform** is read from `<EXPCORE_FED_ROOT>/platform.toml`, which the federation's `up` rendered, and only in the
-executor, at the first run: `EXPCORE_FED_ROOT` is in the shard step's allowlist, and `check`, `analyze` and `report`
-build this plugin on the login node, whose environment names no federation. Each run gets a fake node of its own
+**The platform** is the `platform.toml` beside `study.toml`: the shard step copies its federation's there (the file
+the federation's `up` rendered, its paths absolute into the root), so no path of a federation is in the study's own
+files. `check`, `analyze` and `report` build this plugin on the login node, over a study with no such file: none is
+read there. Each run gets a fake node of its own
 (`fake_mount_node.FakeMountNode`, a stand-in for `apptainer.node.LocalNode`), and the sandbox is the real
 `ApptainerSandbox` with `[sandbox]` as the platform file has it, its data path the mount (`mounted`), its zone and
 local provider the platform file's. The data-path token is invented: no token plane runs offline.
@@ -44,6 +45,7 @@ from .plugin import HINTS, FactsServed, Shelf, script_for, submit, tool_specs
 from .plugin import build as example_build
 
 HERE = Path(__file__).resolve().parent
+PLATFORM = HERE / "platform.toml"  # the federation's, which the shard step copies beside study.toml
 SETTINGS = json.loads((HERE / "hpc_rehearsal.json").read_text(encoding="utf-8"))
 DATA_PATH = "mounted"  # the level of [sandbox.data_paths] every run takes: a mount, so the mount guard has a run
 TOKEN = "an-invented-data-path-token"  # never a real one: no token plane runs offline
@@ -86,34 +88,6 @@ def cell_handler(node: Any) -> Callable[[Any], Any]:
     return handle
 
 
-def dispatcher_node() -> Any:
-    """A fake node (`fake_mount_node.FakeMountNode`) whose driver is this dispatcher process, as on a real node.
-
-    The fake's own driver is one invented process, alive on every fake node, so a run record left by a dispatcher
-    killed outright would name a driver that every later fake node shows alive, and the next start's reaper
-    (`apptainer.runs.reap`) would never take it. Here the driver is this process by its pid and start time
-    (`LocalNode.identity`), and a process the fake did not make is answered from the host's /proc (`LocalNode.alive`):
-    the killed dispatcher is gone there, as it would be on the node."""
-    from fake_mount_node import FakeMountNode
-    from fake_node import OWN_NS, FakeProc
-
-    from expcore_onedata.sandbox.apptainer.node import LocalNode
-
-    class DispatcherNode(FakeMountNode):
-        def __init__(self) -> None:
-            super().__init__()
-            self.host = LocalNode()
-            self.owner = self.host.identity()
-            self.procs[self.owner.pid] = FakeProc(self.owner.pid, self.owner.start, OWN_NS, "driver", role="driver")
-
-        def alive(self, pid: int, start: str) -> bool | None:
-            if pid in self.procs:
-                return super().alive(pid, start)
-            return self.host.alive(pid, start)
-
-    return DispatcherNode()
-
-
 class Sandboxes:
     """The platform file, loaded once, and a sandbox of the Apptainer backend on a fake node of its own per run."""
 
@@ -126,12 +100,14 @@ class Sandboxes:
             if self._config is None:
                 from expcore_onedata.config import load_platform
 
-                self._config = load_platform(Path(os.environ["EXPCORE_FED_ROOT"]) / "platform.toml")
+                self._config = load_platform(PLATFORM)
             return self._config
 
     def start(self, run_key: str) -> Any:
         if SETTINGS["support"] not in sys.path:
             sys.path.insert(0, SETTINGS["support"])
+        from fake_mount_node import FakeMountNode
+
         from expcore_onedata.sandbox.api import Endpoint, SandboxSpec
         from expcore_onedata.sandbox.apptainer.hostmount import host_mount_factory
         from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
@@ -139,7 +115,7 @@ class Sandboxes:
         from expcore_onedata.tokens import Secret
 
         config = self.config()
-        node = dispatcher_node()
+        node = FakeMountNode(own_process=True)  # its driver this dispatcher, so a killed one's record is reaped
         node.cell_handler = cell_handler(node)
         oneclient = Pinned(Path(SETTINGS["oneclient"]["path"]), SETTINGS["oneclient"]["sha256"])
         spec = SandboxSpec(
@@ -219,5 +195,9 @@ class HpcExecutor:
 
 
 def build(context: StudyContext) -> StudyPlugin:
-    """The example's plugin with this executor: its scorer, hashes and platform hooks unchanged."""
+    """The example's plugin with this executor, its scorer, hashes and hooks unchanged.
+
+    It declares no platform half of the campaign fingerprint yet: `PlatformConfig.fingerprint()` holds each space's
+    Onezone id, which every federation's `up` makes anew, so two shards on two federations would be two campaigns.
+    The fix of the space digest (its own pull request) lets the plugin declare it."""
     return dataclasses.replace(example_build(context), executor=HpcExecutor(context))
