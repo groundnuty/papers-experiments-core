@@ -109,6 +109,27 @@ def test_the_period_of_the_memory_watch_is_bounded(tmp_path):
         _load(tmp_path, _document(memory_poll_s=5))
 
 
+def test_o56_the_margin_of_hidden_memory_is_a_bounded_setting_with_a_default(tmp_path):
+    """O56: `hidden_memory_margin_bytes` defaults to 128 MiB and is left out of the record (so a fingerprint made
+    before it existed is unchanged); set, it is bounded and recorded."""
+    loaded = _load(tmp_path, _document())
+    assert loaded.apptainer.hidden_memory_margin_bytes == 128 << 20
+    assert "hidden_memory_margin_bytes" not in loaded.apptainer.record()
+    loaded = _load(tmp_path, _document(hidden_memory_margin_bytes=256 << 20))
+    assert loaded.apptainer.record()["hidden_memory_margin_bytes"] == 256 << 20
+    for bad in (0, 1024, 1 << 40, 1.5, True, "128MiB"):
+        with pytest.raises(ConfigError, match="hidden_memory_margin_bytes"):
+            _load(tmp_path, _document(hidden_memory_margin_bytes=bad))
+
+
+def test_o56_a_hook_bind_may_not_give_the_cell_a_name_server(tmp_path):
+    """O56: the cell's resolv.conf and nsswitch.conf are the sandbox's own (dns_none): a hook (b) bind onto either is
+    refused."""
+    for target in ("/etc/resolv.conf", "/etc/nsswitch.conf"):
+        with pytest.raises(ConfigError, match="entry 0"):
+            _load(tmp_path, _document(binds=[{"path": "f", "sha256": SHA, "target": target}]))
+
+
 def test_the_campaign_fingerprint_holds_the_backend_s_pins_and_docker_s_is_unchanged(tmp_path, fake):
     """O56: a Docker and an Apptainer run are never one experiment; a Docker platform's fingerprint keeps its shape."""
     from expcore_onedata.config import load_platform

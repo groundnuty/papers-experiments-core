@@ -15,6 +15,11 @@ ready, writes its run-start mark on SIGUSR1 and its teardown line on SIGTERM; th
 record for each connect a cell makes through `connect`, and its end line on SIGTERM. Everything else a test needs to
 break (a gate that never gets ready, a helper that ignores its signals, an unreadable /proc) is a flag here. Every
 name and address is invented.
+
+The driver's cgroup (`CGROUP`) charges the anonymous memory of every live process in it, hidden or not, plus
+`cgroup_slack` (Apptainer's own hidden starter, the kernel's batching). A process made with `hidden=True` is what a
+non-dumpable process is under `hidepid`: `/proc` never lists it, its memory is charged all the same, its `parent`'s
+children name it, and it ends when the last visible process of its namespace does (the namespace's init exits).
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_
 from expcore_onedata.sandbox.sandbox import READ_ONLY_PROBE
 
 OWN_NS = "pid:[4026531836]"
+CGROUP = "/invented.slice/job_1/step_0/user/task_0"  # the driver's own, where its cells are charged
 CERTIFI = "/usr/lib/invented/certifi/cacert.pem"
 IMAGE_BUNDLE = "-----BEGIN CERTIFICATE-----\ninvented image bundle\n-----END CERTIFICATE-----\n"
 CANARY_MARK = "canary open"
@@ -61,12 +67,21 @@ class FakeProc:
     exit_status: int | None = None
     ignores: frozenset[int] = frozenset()  # signals it does not end on
     unkillable: bool = False  # a process in the kernel that no signal ends (a read of a dead FUSE mount)
+    anon: int | None = None  # its RssAnon, the rss when None
+    cgroup: str | None = CGROUP
+    hidden: bool = False  # non-dumpable under hidepid: never listed, charged all the same
+    parent: int | None = None  # the pid whose children name it
+
+    @property
+    def anon_bytes(self) -> int:
+        return (self.rss or 0) if self.anon is None else self.anon
 
     def proc(self, tags: Collection[str]) -> Proc:
         found = frozenset(
             t for t in tags if any(e.startswith(t) for e in self.environ) or any(t in a for a in self.cmdline)
         )
-        return Proc(self.pid, self.start, 1, self.state, self.comm, self.pidns, self.rss, found)
+        return Proc(self.pid, self.start, 1, self.state, self.comm, self.pidns, self.rss, found, self.anon_bytes,
+                    self.cgroup)  # fmt: skip
 
 
 @dataclass
@@ -156,6 +171,10 @@ class FakeNode:
         self.cell_left: list[FakeProc] = []  # processes a cell leaves behind (set by a handler)
         self.cgroup: dict[str, Any] = {"depth": 0, "max_bytes": 1 << 34, "events": {"oom": 0, "oom_kill": 0},
                                        "peak_bytes": 0}  # fmt: skip
+        self.cgroup_path: str | None = CGROUP  # None: a v1 host
+        self.cgroup_slack = 0  # anonymous bytes the cgroup charges that no process holds
+        self.cgroup_unreadable = False
+        self.children_unreadable = False
         self.host = LocalNode() if own_process else None
         self.owner = self.host.identity() if self.host is not None else Spawned(999, "4242")
         self.procs[self.owner.pid] = FakeProc(self.owner.pid, self.owner.start, OWN_NS, "driver", role="driver")
@@ -183,7 +202,27 @@ class FakeNode:
             self.listed += 1
             if self.proc_unreadable:
                 return None
-            return [p.proc(tags) for p in self.procs.values() if p.alive]
+            return [p.proc(tags) for p in self.procs.values() if p.alive and not p.hidden]
+
+    def own_cgroup(self) -> str | None:
+        return self.cgroup_path
+
+    def cgroup_anon(self, path: str) -> int | None:
+        with self.lock:
+            if self.cgroup_unreadable:
+                return None
+            inside = [p for p in self.procs.values() if p.alive and p.cgroup is not None and
+                      (p.cgroup == path or p.cgroup.startswith(path + "/"))]  # fmt: skip
+            return sum(p.anon_bytes for p in inside) + self.cgroup_slack
+
+    def hidden_children(self, pid: int, start: str) -> list[int] | None:
+        with self.lock:
+            proc = self._find(pid, start)
+            if proc is None or not proc.alive or proc.hidden:
+                return []
+            if self.children_unreadable:
+                return None
+            return sorted(p.pid for p in self.procs.values() if p.alive and p.hidden and p.parent == pid)
 
     def _find(self, pid: int, start: str) -> FakeProc | None:
         proc = self.procs.get(pid)
@@ -201,7 +240,17 @@ class FakeNode:
             self._collector_signal(proc, sig)
         elif not proc.unkillable and (sig == signal.SIGKILL or sig not in proc.ignores):
             proc.alive, proc.exit_status = False, 128 + sig
+            self._end_namespace_if_empty(proc.pidns)
         return True
+
+    def _end_namespace_if_empty(self, pidns: str) -> None:
+        """A cell's namespace ends with its init, when its last visible process is gone: its hidden ones with it."""
+        with self.lock:
+            if pidns == OWN_NS or any(p.alive and not p.hidden and p.pidns == pidns for p in self.procs.values()):
+                return
+            for p in self.procs.values():
+                if p.pidns == pidns and p.hidden:
+                    p.alive = False
 
     def alive(self, pid: int, start: str) -> bool | None:
         with self.lock:
@@ -391,6 +440,7 @@ class FakeNode:
             for proc in cell.procs:
                 if proc not in self.cell_left and not proc.unkillable:
                     proc.alive = False
+            self._end_namespace_if_empty(cell.pidns)
 
     def default_cell(self, cell: Cell) -> CmdResult:
         """The harness's own programs, as a cell would answer them; any other program prints nothing and exits 0."""
@@ -426,4 +476,4 @@ def parse_exec(argv: list[str], stdin: str | None) -> Exec:
     return Exec(argv, flags, binds, env, rest[0], rest[1:], stdin)
 
 
-__all__ = ["CANARY_MARK", "Cell", "Exec", "FakeNode", "FakeProc", "Unrecorded", "parse_exec"]
+__all__ = ["CANARY_MARK", "CGROUP", "Cell", "Exec", "FakeNode", "FakeProc", "Unrecorded", "parse_exec"]

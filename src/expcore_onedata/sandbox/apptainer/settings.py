@@ -23,7 +23,9 @@ egress_collector = "egress-collector.py"   # the bundle's collector
 egress_collector_sha256 = "<64 hex>"
 memory_poll_s = 0.1              # optional, 0.02 to 1: the memory watch's period
 disk_poll_s = 1.0                # optional, 0.1 to 10: the period of its walk of /work, /tmp and /dev/shm
-preload = [{ path = "x.so", sha256 = "<64 hex>" }]   # optional (hook b): libraries the cell preloads BEFORE the egress
+hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: anonymous memory nothing visible explains that
+                                 # a cell may add before it is taken as past its limit (hidden.py)
+preload =[{ path = "x.so", sha256 = "<64 hex>" }]   # optional (hook b): libraries the cell preloads BEFORE the egress
                                  # shim, so a connect hook's rewrite reaches the shim through RTLD_NEXT
 binds = [{ path = "f", sha256 = "<64 hex>", target = "/etc/x" }]   # optional (hook b): files bound read-only
 [sandbox.apptainer.gate_options] # optional (hook a): further keys of the gate's configuration, never one it sets
@@ -48,13 +50,16 @@ from types import MappingProxyType
 from typing import Any
 
 from expcore.config.loading import ConfigError, Section
+from expcore_onedata.sandbox.apptainer.hidden import DEFAULT_MARGIN_BYTES
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
 CELL_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,1023}")
 # the targets the sandbox binds itself, and those under which it binds: an extra bind may be none of them
-OWN_TARGETS = ("/work", "/tmp", "/dev/shm", "/etc/hosts", "/etc/ld.so.preload", "/etc/sandbox", "/etc/expcore",
-               "/hpcop-egress", "/hpcop-shim", "/expcore-preload")  # fmt: skip
+OWN_TARGETS = ("/work", "/tmp", "/dev/shm", "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
+               "/etc/ld.so.preload", "/etc/sandbox", "/etc/expcore", "/hpcop-egress", "/hpcop-shim",
+               "/expcore-preload")  # fmt: skip
+MARGIN_BOUNDS = (1 << 20, 64 << 30)  # hidden_memory_margin_bytes, in bytes
 # the keys of the gate's configuration the sandbox writes itself (`gaterun.config`): gate_options may set none of them
 GATE_OWN_KEYS = frozenset(
     {"run_key", "verify_ssl", "log", "tls_dir", "hosts", "listing", "token_file", "token", "upstream_ca_file",
@@ -93,8 +98,13 @@ class ApptainerSettings:
     preload: tuple[Pinned, ...] = ()
     binds: tuple[PinnedBind, ...] = ()
     gate_options: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    hidden_memory_margin_bytes: int = DEFAULT_MARGIN_BYTES
 
     def __post_init__(self) -> None:
+        low, high = MARGIN_BOUNDS
+        margin = self.hidden_memory_margin_bytes
+        if isinstance(margin, bool) or not isinstance(margin, int) or not low <= margin <= high:
+            raise ValueError(f"hidden_memory_margin_bytes must be a whole number of bytes from {low} to {high}")
         clash = sorted(set(self.gate_options) & GATE_OWN_KEYS)
         if clash:
             raise ValueError(f"gate_options may not set {clash[0]!r}: the sandbox writes it itself")
@@ -116,7 +126,10 @@ class ApptainerSettings:
             "gate_options": hashlib.sha256(
                 json.dumps(dict(self.gate_options), sort_keys=True, default=str).encode()
             ).hexdigest(),  # by value, never shown: a changed option is another experiment
-        }
+            # a margin set away from its default only, so a fingerprint made before the key existed is unchanged
+            **({} if self.hidden_memory_margin_bytes == DEFAULT_MARGIN_BYTES else
+               {"hidden_memory_margin_bytes": self.hidden_memory_margin_bytes}),
+        }  # fmt: skip
 
 
 def _own_target(target: str) -> bool:
@@ -159,6 +172,13 @@ def _period(section: Section, key: str, default: float, low: float, high: float)
     return float(value)
 
 
+def _margin(section: Section) -> int:
+    value, (low, high) = section.data.get("hidden_memory_margin_bytes", DEFAULT_MARGIN_BYTES), MARGIN_BOUNDS
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise section.fail("hidden_memory_margin_bytes", f"must be a whole number of bytes from {low} to {high}")
+    return value
+
+
 def _gate_options(section: Section) -> Mapping[str, Any]:
     options = section.table("gate_options")
     clash = sorted(set(options) & GATE_OWN_KEYS)
@@ -172,7 +192,7 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
     section.reject_unknown(
         ("apptainer", "image", "image_sha256", "python", "host_python", "egress_shim", "egress_shim_sha256",
          "egress_collector", "egress_collector_sha256", "memory_poll_s", "disk_poll_s", "preload", "binds",
-         "gate_options")
+         "gate_options", "hidden_memory_margin_bytes")
     )  # fmt: skip
     words = section.strings("apptainer") or ("apptainer",)
     if any(not COMMAND_WORD.fullmatch(word) for word in words):
@@ -203,6 +223,7 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
             preload=tuple(b.file for b in lists["preload"]),
             binds=tuple(lists["binds"]),
             gate_options=_gate_options(section),
+            hidden_memory_margin_bytes=_margin(section),
         )
     except ValueError as error:  # the dataclass's own checks, which the loader already made: never a value
         raise ConfigError(f"{section.file}: {section.where}: {error}") from None

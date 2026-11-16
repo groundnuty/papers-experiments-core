@@ -137,6 +137,7 @@ from expcore.study.platform_legacy import legacy_fingerprint_of
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
+from expcore.visibility.sensitivity import VisibilityAnalysis, visibility_analysis
 
 RUNS_DIR = "runs"
 MARKER_PATTERN = "*attempt-marker.json"
@@ -168,6 +169,7 @@ class StudyAnalysis:
     egress: EgressAnalysis | None = None  # a batch checked for egress: the verdicts and the sensitivity analysis
     mount_guard: MountGuardAnalysis | None = None  # a batch whose mount was guarded: the same, of the mount (O60)
     guards: GuardsAnalysis | None = None  # a batch checked by both: the rerun without the runs either leaves out
+    visibility: VisibilityAnalysis | None = None  # a batch watched for hidden processes: the same, of those (O56)
 
 
 def out_dir(study: StudyConfig | StudyIdentity) -> Path:
@@ -848,9 +850,10 @@ def _analyse_loaded(
     egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
     guard = mount_guard_analysis(runs, rows, absent, study.prereg)  # None for a batch whose mount was not guarded
     both = guards_analysis(rows, absent, study.prereg, egress, guard)  # None unless both guards checked the batch
+    seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
-    return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both)
+    return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen)
 
 
 def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
@@ -921,6 +924,7 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         | ({} if analysis.egress is None else {"egress": _egress_summary(analysis.egress)})
         | ({} if analysis.mount_guard is None else {"mount_guard": _mount_guard_summary(analysis.mount_guard)})
         | ({} if analysis.guards is None else {"guards": _guards_summary(analysis.guards)})
+        | ({} if analysis.visibility is None else {"process_visibility": _visibility_summary(analysis.visibility)})
     )
 
 
@@ -998,6 +1002,29 @@ def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
     }  # fmt: skip
 
 
+def _visibility_summary(seen: VisibilityAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of a batch watched for hidden processes (O56): each analysed run's verdict (its flags,
+    its memory reading and why it is unknown, its hidden processes and cells killed for hidden memory, the watch's
+    figures) and the sensitivity analysis without the runs that are not clean, or why there is none."""
+    sensitivity = seen.sensitivity
+    return {
+        "counts": seen.counts(),
+        "runs": [
+            {
+                "run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "verdict": run.verdict,
+                "flags": list(run.flags), "memory": run.memory, "unknown": list(run.unknown),
+                "hidden_process": run.hidden_process, "hidden_memory": run.hidden_memory, "figures": dict(run.figures),
+            }
+            for run in seen.runs
+        ],
+        "sensitivity": None
+        if sensitivity is None
+        else {"left_out": [run.run_key for run in seen.left_out], "contrasts": sensitivity.contrasts,
+              **_holm_entries(sensitivity)},
+        "sensitivity_refused": seen.refused,
+    }  # fmt: skip
+
+
 def report_text(analysis: StudyAnalysis) -> str:
     """The Markdown report of an analysis (`expcore.report`)."""
     return render_report(
@@ -1011,6 +1038,7 @@ def report_text(analysis: StudyAnalysis) -> str:
         egress=analysis.egress,
         mount_guard=analysis.mount_guard,
         guards=analysis.guards,
+        visibility=analysis.visibility,
     )
 
 

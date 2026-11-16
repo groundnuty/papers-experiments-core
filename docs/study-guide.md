@@ -459,10 +459,13 @@ How a run works there:
 - Your agent's code runs as one `apptainer exec` per cell.
 - The data gate runs on the node's loopback and holds the token; the agent never sees it.
 - The harness keeps the memory limit and the sizes of `/work`, `/tmp` and `/dev/shm`. A cell past one of them is killed as `memory_limit` or `disk_limit`, the agent's own outcome.
+- A process your agent's code hides from the harness (one that makes itself non-dumpable, which the node's `/proc` then hides) is still caught from the cgroup that charges its memory. Its memory, past a margin, kills the cell as `memory_limit`; a hidden child is recorded. Declare the `process_visibility` instrument (below) so the report says so.
 
-Three things differ from Docker, and the record says so (`infrastructure_facts`):
+Five things differ from Docker, and the record says so (`infrastructure_facts`):
 - **Detached workers end with their cell.** A process a cell starts in the background is killed when that cell ends, where Docker's container keeps it until the next cap.
 - **The network is the node's.** The agent can reach the internet, so declare the `egress` instrument (below).
+- **A cell has no name server** (`dns: none`). The federation's names resolve from `/etc/hosts`, as on Docker, and no other name resolves.
+- **The memory reading can be unknown** (`infrastructure_facts.memory`): `within` only when the harness could show it, `unknown` with its reasons when it could not, and never `within` for a run whose code hid memory from it.
 - **A mount data path is refused at its start** until its helper lands.
 
 Run the campaign's driver on the node that runs the cells, since the gate listens on that node's loopback. The campaign fingerprint holds the backend's pins, so a Docker run and an Apptainer run are never one experiment.
@@ -1278,6 +1281,32 @@ What you get, with nothing else to call: once one analysed record carries the `m
 Report the primary analysis as it stands and the sensitivity analysis beside it. The guard detects, it does not prevent: inotify does not say which process touched the file, so every touch while cells can run counts as the agent's; a tracer is sampled, so a short one is missed; oneclient's environment and memory are covered only by the proof that no cell can see its process; and a process of your user outside the cells (an ssh login into the node) is outside every check.
 
 **Run nothing else of your account on a sandbox node while runs are live: no interactive login and no other job step.** A process of your user outside the cells is outside every check: the egress shim is loaded only in the cells, and the mount guard proves only the cells, so such a process could connect anywhere, or read oneclient's environment, which holds the token, without a line in either log.
+
+### Hidden processes on HPC: reported, never within the limit
+
+On an HPC batch node the harness keeps the memory limit by watching your agent's processes in `/proc`, and `/proc` hides a process that makes itself non-dumpable. The sandbox checks from outside: the memory the cgroup charges against what the visible processes hold, and a child of a cell's process that `/proc` does not show. Record what it found with `expcore.visibility.ProcessVisibility(sandbox)` beside the run's other instruments:
+
+```python
+from expcore.visibility import ProcessVisibility
+
+
+class Unwatched:
+    """A sandbox that kept no watch reading."""
+
+    def process_visibility(self):
+        return None
+
+
+seen = ProcessVisibility(Unwatched())
+assert seen.finish()["memory"] == "unknown"  # no reading: unknown, never within the limit
+```
+
+Once one analysed record carries it, `analyze` judges every analysed run:
+- `flagged` when its code hid a process or memory from the harness, a finding of its own;
+- `unknown` when its memory reading is unknown (memory not told its own, or a reading that failed), so its limit condition is unknown, never within its limit;
+- otherwise `clean`.
+
+The analysis then runs again without every run that is not clean. `report.md` gains `## Process visibility (detected, not prevented)`, `analysis.json` gains `process_visibility`, and `analyze` prints a line per contrast. The check detects, it does not prevent. Hidden memory under the margin (`hidden_memory_margin_bytes`, 128 MiB by default) and a hidden process's shared memory are not told apart from the node's own; the step's memory limit bounds them, and every hidden process ends with its cell. What each field means is in [`interfaces.md`](interfaces.md#processes-hidden-from-the-watch-the-process_visibility-instrument).
 
 ### The order instruments start and finish in
 

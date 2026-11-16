@@ -38,8 +38,26 @@ FACTS: dict[str, str] = {
         "RssShmem of the run's processes every memory_poll_s and kills them all over the limit (Docker's kernel "
         "kills the largest process alone); a spike shorter than the period is missed, and the kernel's limit is "
         "the step's, shared with the driver and the gate, so its OOM kill is infrastructure. A process that makes "
-        "itself non-dumpable is hidden by /proc's hidepid, so the watch neither counts nor kills it; the end of its "
-        "cell's PID namespace when the exec returns ends it"
+        "itself non-dumpable is hidden by /proc's hidepid, so this sum neither counts nor kills it (hidden_memory); "
+        "the end of its cell's PID namespace when the exec returns ends it"
+    ),
+    "hidden_memory": (
+        "a process /proc hides is checked from outside: at every poll the watch compares the anonymous memory of the "
+        "driver's own cgroup (memory.stat anon, which counts a hidden process) with the RssAnon of every process of "
+        "the uid /proc shows in it, and memory nothing visible explains that grew past hidden_memory_margin_bytes "
+        "during a cell for two polls kills the cell as memory_limit (memory_hidden); one that cannot be told the "
+        "cell's (another run's cell in the cgroup, or a margin the start's own cells passed) makes the run's memory "
+        "reading unknown, never within, as do a child of a cell process that /proc does not show (hidden_process, "
+        "which a process that forks twice under the cell's hidden init escapes) and a reading that failed; hidden "
+        "memory under the margin, and a hidden process's shared memory (a memfd, a shared anonymous mapping), which "
+        "the cgroup counts with the run's tmpfs files, are bounded by the step's limit alone"
+    ),
+    "dns_none": (
+        "a cell has no name server: its /etc/resolv.conf names none and its /etc/nsswitch.conf looks hosts up in "
+        "files alone, so the C library resolves the names of /etc/hosts (the federation's, on the loopback) and no "
+        "other; a program with a resolver of its own can still send a query, which is egress like any other. On "
+        "Docker the federation's names come from --add-host too, but the container's resolver is the engine's "
+        "embedded one on the internal network, which may answer an outside name with an address it gives no route to"
     ),
     "disk_watch": (
         "/work, /tmp and /dev/shm are directories on the node's tmpfs, charged to the step's memory: the watch "
@@ -65,9 +83,13 @@ FACTS: dict[str, str] = {
 }
 
 
+DNS = "none"  # what a cell's name lookups reach (dns_none)
+
+
 def record() -> dict[str, Any]:
-    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up."""
-    return {"backend": "apptainer", "facts": sorted(FACTS)}
+    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up, and its name service. The sandbox's
+    metadata adds the watch's memory reading (`memory`) once it exists."""
+    return {"backend": "apptainer", "facts": sorted(FACTS), "dns": DNS}
 
 
 __all__ = ["FACTS", "record"]
