@@ -161,6 +161,9 @@ _COMPRESSIONS = (
 )
 
 
+_COUNT = re.compile(r"[0-9]+")  # a pax numeric field as a count: decimal digits only, no sign, space or point
+
+
 def tar_members(archive: Path | str) -> dict[str, Slice]:
     """Every member of an uncompressed tar (ustar, pax or GNU) as the slice of the archive that holds its bytes, by its
     name, in the archive's order (O25). Only the headers are read; a member's bytes are read when its slice is.
@@ -169,8 +172,11 @@ def tar_members(archive: Path | str) -> dict[str, Slice]:
     uploaded as a file of a space: a compressed archive, or a file that is no tar; a sparse member, whose bytes in the
     archive are not its content; a link, hard or symbolic; any other entry that is not a regular file (a directory, a
     device, a FIFO); a name held twice, since which bytes are the file's is then not known; a name that is not a path
-    relative to a space's root with plain parts (`rangemap.safe_path`: no `/` first, no empty, `.` or `..` part); and a
-    member whose bytes reach past the archive's end.
+    relative to a space's root with plain parts (`rangemap.safe_path`: no `/` first, no empty, `.` or `..` part); a pax
+    size that is not a plain count (tarfile would read it as 0); a member whose bytes reach past the archive's end;
+    bytes up to where the reading stopped that no member returned holds (`_account`: tarfile can drop a member it
+    fails inside); and an archive that does not end in its end-of-archive blocks where its reading stopped
+    (`_check_end`), since tarfile ends its reading quietly at a damaged later header. A global pax header is read past.
     """
     path = Path(archive)
     with open(path, "rb") as handle:
@@ -182,12 +188,67 @@ def tar_members(archive: Path | str) -> dict[str, Slice]:
     held = path.stat().st_size
     members: dict[str, Slice] = {}
     try:
-        with tarfile.open(path, mode="r:") as tar:
+        with tarfile.open(path, mode="r:") as tar, open(path, "rb") as raw:
+            ended = 0  # where the bytes the members returned so far account for end
             for member in tar:
+                _account(raw, ended, member.offset)
                 members[_member_name(member, members)] = _member_slice(path, member, held)
+                ended = member.offset_data + _padded(member.size)
+            _account(raw, ended, tar.offset)
+            stopped = tar.offset
     except tarfile.ReadError as error:
         raise ArchiveRefused(f"the file is not an uncompressed tar, or one cut short ({error})") from None
+    _check_end(path, stopped, held)
     return members
+
+
+def _padded(size: int) -> int:
+    """A member's bytes in the archive: its size up to a whole number of blocks."""
+    return -(-size // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+
+
+def _account(raw: Any, ended: int, start: int) -> None:
+    """Refuse bytes between where the members returned so far end and where the next starts (or the reading stopped)
+    that no member returned holds. tarfile can read a member's headers, fail inside it and stop as if the archive had
+    ended past it (a pax size of -6 does), dropping the member without a word; so every byte up to where the reading
+    stopped must be a returned member's or a global pax header's, which tarfile applies to every member and returns as
+    none (its keys reach each member's `pax_headers`, so they are checked there)."""
+    at = ended
+    while at < start:
+        raw.seek(at)
+        try:
+            header = tarfile.TarInfo.frombuf(raw.read(tarfile.BLOCKSIZE), "utf-8", "surrogateescape")
+        except tarfile.HeaderError:
+            header = None
+        if header is None or header.type != tarfile.XGLTYPE:
+            break
+        at += tarfile.BLOCKSIZE + _padded(header.size)
+    if at != start:
+        raise ArchiveRefused(
+            f"no member returned holds bytes {ended} to {start} of the archive: tarfile skipped a member it could not "
+            "read, so members may be lost"
+        )
+
+
+def _check_end(path: Path, stopped: int, held: int) -> None:
+    """Refuse an archive that does not end where its reading stopped. `tarfile` ends its reading quietly at any header
+    it cannot parse after the first (a damaged checksum, a header cut short, a member's bytes read as a header after a
+    size that lied), so a damaged archive would read as a shorter one with every later member lost. A tar ends in two
+    zero blocks, padded with zeros; so from where the reading stopped to the file's end there must be at least two
+    blocks and nothing but zeros. The tail is read a block at a time and the first other byte refuses it."""
+    if held - stopped < 2 * tarfile.BLOCKSIZE:
+        raise ArchiveRefused(
+            f"the archive does not end in its end-of-archive blocks at byte {stopped}: it is cut short, or a header "
+            "that cannot be read stopped the reading"
+        )
+    with open(path, "rb") as handle:
+        handle.seek(stopped)
+        while block := handle.read(64 * tarfile.BLOCKSIZE):
+            if block.count(0) != len(block):
+                raise ArchiveRefused(
+                    f"the archive's reading stopped at byte {stopped} with bytes other than its end-of-archive blocks "
+                    "after it: a header that cannot be read, or data past the end, so members may be lost"
+                )
 
 
 def _is_tar_header(block: bytes) -> bool:
@@ -202,8 +263,12 @@ def _is_tar_header(block: bytes) -> bool:
 def _member_name(member: tarfile.TarInfo, seen: dict[str, Slice]) -> str:
     """A member's name, once it is shown to be a regular file's, a path in a space and the first of its name."""
     name = member.name
-    if member.issparse():
+    if member.issparse() or any(key.startswith("GNU.sparse.") for key in member.pax_headers):
         raise ArchiveRefused(f"member {name!r} is sparse: its bytes in the archive are not its content")
+    declared = member.pax_headers.get("size")
+    if declared is not None and (not _COUNT.fullmatch(declared) or int(declared) != member.size):
+        # tarfile reads a pax size it cannot parse as 0: the member would be empty and its bytes read as a header
+        raise ArchiveRefused(f"member {name!r} has a pax size that is not a plain count of its bytes")
     if member.islnk() or member.issym():
         raise ArchiveRefused(f"member {name!r} is a link: it holds no bytes of its own")
     if not member.isreg():

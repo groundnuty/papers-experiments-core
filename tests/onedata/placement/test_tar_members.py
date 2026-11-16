@@ -410,3 +410,103 @@ def test_o25_a_plain_tar_whose_first_name_looks_like_a_compression_is_read(tmp_p
     first bytes does not make a plain tar read as compressed: the magic counts only where no tar header is."""
     path = archive(tmp_path, [regular(first, BEFORE), regular("member.bin", MEMBER)])
     assert list(tar_members(path)) == [first, "member.bin"]
+
+
+def header_of(path, name):
+    """The byte offset of a member's header in an archive."""
+    with tarfile.open(path, "r:") as tar:
+        return tar.getmember(name).offset
+
+
+def test_o25_a_damaged_header_after_the_first_is_refused_never_read_as_the_archives_end(tmp_path):
+    """O25: tarfile ends its reading quietly at a header that does not parse anywhere but at the start, so a damaged
+    checksum on a later member would drop it and every member after it. The archive must end in its end-of-archive
+    blocks where the reading stopped, so a damaged header is refused, never taken for the end."""
+    path = three(tmp_path)
+    data = bytearray(path.read_bytes())
+    data[header_of(path, "member.bin") + 148] ^= 0x01  # one bit of the second member's checksum field
+    path.write_bytes(bytes(data))
+    with pytest.raises(ArchiveRefused, match="end-of-archive"):
+        tar_members(path)
+
+
+def test_o25_an_archive_cut_inside_a_later_header_is_refused(tmp_path):
+    path = three(tmp_path)
+    path.write_bytes(path.read_bytes()[: header_of(path, "after.bin") + 100])
+    with pytest.raises(ArchiveRefused, match="end-of-archive"):
+        tar_members(path)
+
+
+@pytest.mark.parametrize("keep", [0, 1])
+def test_o25_an_archive_without_both_end_blocks_is_refused(tmp_path, keep):
+    """O25: a tar ends with two zero blocks; one cut off before them, or after the first, may have lost members."""
+    path = three(tmp_path)
+    found = tar_members(path)
+    end = found["after.bin"].offset + math.ceil(found["after.bin"].size / tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+    path.write_bytes(path.read_bytes()[: end + keep * tarfile.BLOCKSIZE])
+    with pytest.raises(ArchiveRefused, match="end-of-archive"):
+        tar_members(path)
+
+
+def test_o25_bytes_after_the_end_blocks_are_refused(tmp_path):
+    """O25: nothing but zeros follows a tar's end, so data after it is a member the reading never reached."""
+    path = three(tmp_path)
+    path.write_bytes(path.read_bytes() + b"x" * 10)
+    with pytest.raises(ArchiveRefused, match="end-of-archive"):
+        tar_members(path)
+
+
+@pytest.mark.parametrize("size", ["invalid", "", "6.0", " 6", "0x6", "+6"])  # -6: tarfile drops the member (below)
+def test_o25_a_pax_size_that_is_no_count_is_refused(tmp_path, size):
+    """O25: tarfile reads a pax size it cannot parse as 0, so the member would be an empty file and its bytes would
+    be read as the next header. A pax size must be a plain count."""
+    info, data = regular("member.bin", b"secret")
+    info.pax_headers = {"size": size}
+    path = archive(tmp_path, [(info, data)])
+    with pytest.raises(ArchiveRefused, match="size"):
+        tar_members(path)
+
+
+def test_o25_a_member_with_any_gnu_sparse_pax_key_is_refused(tmp_path):
+    """O25: every GNU sparse form in a pax archive is named by a `GNU.sparse.` key; a member carrying one is refused,
+    whether or not tarfile reads it as sparse."""
+    info, data = regular("member.bin", MEMBER)
+    info.pax_headers = {"GNU.sparse.name": "member.bin"}
+    path = archive(tmp_path, [(info, data)])
+    with pytest.raises(ArchiveRefused, match="sparse"):
+        tar_members(path)
+
+
+def test_o25_a_member_tarfile_drops_without_a_word_is_refused(tmp_path):
+    """O25: a pax size of -6 makes tarfile fail inside the member after it has read its headers and stop as if the
+    archive had ended there, past the member, with only end blocks after it: no member is returned and the tail is
+    clean. Every byte up to where the reading stopped must belong to a member returned (or a global header), so the
+    member it dropped is a gap, refused."""
+    info, data = regular("member.bin", b"secret")
+    info.pax_headers = {"size": "-6"}
+    path = archive(tmp_path, [regular("before.bin", BEFORE), (info, data)])
+    with pytest.raises(ArchiveRefused, match="no member returned holds"):
+        tar_members(path)
+
+
+def test_o25_a_global_pax_header_before_the_members_is_read_past(tmp_path):
+    """O25: a pax archive may begin with a global header, which tarfile applies to every member and returns as none;
+    the bytes it takes are its own, so the members still account for the whole archive and are read."""
+    path = tmp_path / "archives" / "global.tar"
+    path.parent.mkdir()
+    with tarfile.open(path, "w", format=tarfile.PAX_FORMAT, pax_headers={"comment": "a global header"}) as tar:
+        for name, data in (("before.bin", BEFORE), ("member.bin", MEMBER)):
+            tar.addfile(*regular(name, data))
+    found = tar_members(path)
+    assert list(found) == ["before.bin", "member.bin"]
+    assert b"".join(block for _, block in chunks(found["member.bin"], CHUNK)) == MEMBER
+
+
+def test_o25_a_global_pax_size_is_refused_like_a_members_own(tmp_path):
+    """O25: tarfile applies a global header's keys to every member, so a global size that is no count is refused."""
+    path = tmp_path / "archives" / "global.tar"
+    path.parent.mkdir()
+    with tarfile.open(path, "w", format=tarfile.PAX_FORMAT, pax_headers={"size": "invalid"}) as tar:
+        tar.addfile(*regular("member.bin", MEMBER))
+    with pytest.raises(ArchiveRefused):
+        tar_members(path)
