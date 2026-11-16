@@ -240,7 +240,7 @@ def test_a_poll_that_could_not_list_the_processes_leaves_the_isolation_unproven(
 
 
 def test_a_proof_outside_the_window_does_not_count():
-    """A proof before `armed` was taken before the window opened: a cell ran before the window, so the log is unknown."""
+    """A proof before `armed` means a cell ran before the window opened: the log is unknown."""
     reading = read_log(log(setup=[*canary(), proof()], proofs=[]), NONCE)
     assert guard_log.PROOF_OUTSIDE_WINDOW in reading.problems
     assert guard_log.NO_PROOF in reading.isolation_problems

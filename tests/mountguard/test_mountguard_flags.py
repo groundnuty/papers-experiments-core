@@ -144,5 +144,5 @@ def test_the_verdict_of_a_snapshot_alone_is_the_runs():
 
 
 def test_the_instrument_refuses_an_empty_nonce():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="nonce"):
         MountGuard(Source(None), "")

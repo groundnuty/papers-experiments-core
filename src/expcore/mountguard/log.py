@@ -27,10 +27,11 @@ The log is JSON lines, each numbered by the watcher (`seq` 0, 1, 2, ...) with it
 object of its kind; the first is the start line of this run's nonce with both watches set; `seq` runs from 0 without a
 gap and `mono` never goes back; the last line is the end line, its count is the lines before it and nothing was left
 unwritten; the canary is there (before `armed`, the token file's watch saw it removed and the directory's watch saw
-its entry removed: the host's removal once the mount was up, which shows both watches live); oneclient was registered and seen before `armed`; `armed` and `disarmed` are each there
-once, in that order; no overflow; no proof outside the window; and oneclient's sampling never became unreadable
-before the window closed. Otherwise it is unknown, with every reason found. **A missing or damaged log is never read
-as one without accesses**: what it shows is kept as a lower bound.
+its entry removed: the host's removal once the mount was up, which shows both watches live); oneclient was named and
+seen before `armed`; `armed` and `disarmed` are each there once, in that order; no overflow; no proof outside the
+window; and oneclient's sampling never became unreadable before the window closed. Otherwise it is unknown, with
+every reason found. **A missing or damaged log is never read as one without accesses**: what it shows is kept as a
+lower bound.
 
 **An access** is any inotify event inside the window (between `armed` and `disarmed`, or the log's end when it never
 closed): nothing of the host's touches the token's directory then, and inotify does not say which process caused an
@@ -118,8 +119,10 @@ def _whole(value: Any, low: int, high: int) -> bool:
 
 
 def _cell(value: Any) -> bool:
-    return isinstance(value, Mapping) and set(value) == {"pid", "start_time", "nspid_depth"} and all(
-        _whole(value[k], 0, 2**63) for k in value
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"pid", "start_time", "nspid_depth"}
+        and all(_whole(value[k], 0, 2**63) for k in value)
     )
 
 
@@ -160,8 +163,10 @@ def _well_formed(line: Mapping[str, Any]) -> bool:
         return line.get("state") == "stopped" and line.get("why") in (STOPPED_GONE, STOPPED_UNREADABLE)
     if event == "oneclient":
         depth = line.get("nspid_depth")
-        return _whole(line.get("pid"), 1, 2**31) and isinstance(line.get("seen"), bool) and (
-            depth is None or _whole(depth, 1, 64)
+        return (
+            _whole(line.get("pid"), 1, 2**31)
+            and isinstance(line.get("seen"), bool)
+            and (depth is None or _whole(depth, 1, 64))
         )
     if event == "end":
         return all(_whole(line.get(k), 0, 2**63) for k in END_COUNTS)

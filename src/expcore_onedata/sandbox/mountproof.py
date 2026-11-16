@@ -1,0 +1,296 @@
+# Provenance: new
+"""The proof, read from outside the agent's cells, that they cannot see oneclient's process or reach the files that
+hold or record the mount's token (#179, milestone 2, O60).
+
+On an HPC node a cell (setuid Apptainer) and oneclient run as one uid, so the kernel's permission checks do not keep
+the agent from oneclient's `/proc` entries (its environment holds the token) or from a file the host wrote. What keeps
+it away is that each cell runs in a PID namespace of its own (`--containall`), whose `/proc` shows only the cell's
+processes, and that its mount namespace binds none of the host's private directories. This module checks both from the
+host, through the host's `/proc`, which no cell can see or write. Everything is read; nothing is taken from a cell.
+
+`CellPoll` lists this uid's processes at each poll and looks once at each one it has not seen:
+
+- **A cell of this run** is a process in a PID namespace nested in the watcher's (more `NSpid` entries in
+  `/proc/<pid>/status`, readable for one's own processes without ptrace) whose mount table holds the run's FUSE mount
+  (its device, which only this run's mount has). Each such namespace is proved once (`/proc/<pid>/ns/pid` names it,
+  as the backend's watch does; one that cannot be read is proved per process) with label `cell`:
+  - oneclient is as deep as the watcher (`oneclient_not_host`, `oneclient_unread`): a process in a nested namespace
+    cannot see one in the namespace above, so it cannot name oneclient's pid to read its `/proc` entries, trace it or
+    read its memory;
+  - no mount of the cell is on the device of a `proc` mount of the host's table (`host_proc_in_cell`), as a bind of
+    the host's `/proc` would be;
+  - no mount of the cell is on a protected directory's device with a root that is, holds or lies under it
+    (`protected_reachable`; one that could not be resolved at the start is `protected_unresolved`).
+- **A process of the node's PID namespace** whose mount table holds the run's FUSE mount anywhere but at the host's
+  own mount point is a cell started without a PID namespace of its own: a failed proof, label `host_process`,
+  `same_pid_namespace`.
+- **At the close** (`close`), a cell of this run still alive is a failed proof, label `close`, `cell_alive_at_close`:
+  the window was closed while the agent could still act, so nothing after is watched.
+
+A poll that cannot list `/proc`, or a nested process of this uid whose mount table cannot be read, counts as a failed
+poll: it may have hidden a cell. What this cannot see: a cell that starts and ends between two polls is never proved;
+the run's proof rests on the cells it caught (the backend's start holds its canary cell open for a second) and on every
+cell being started by the same command line.
+"""
+
+from __future__ import annotations
+
+import os
+import posixpath
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from expcore_onedata.sandbox.hostops import MountTableError, parse_mountinfo
+
+ONECLIENT_NOT_HOST = "oneclient_not_host"
+ONECLIENT_UNREAD = "oneclient_unread"
+HOST_PROC_IN_CELL = "host_proc_in_cell"
+PROTECTED_REACHABLE = "protected_reachable"
+PROTECTED_UNRESOLVED = "protected_unresolved"
+SAME_PID_NAMESPACE = "same_pid_namespace"
+CELL_ALIVE_AT_CLOSE = "cell_alive_at_close"
+CELL, HOST_PROCESS, CLOSE = "cell", "host_process", "close"
+
+
+class ProcView(Protocol):
+    """Reads of the host's `/proc` (a fake in tests). `read` and `readlink` raise `OSError`; `FileNotFoundError` and
+    `ProcessLookupError` mean the process is gone."""
+
+    def read(self, path: str) -> str: ...
+
+    def readlink(self, path: str) -> str: ...
+
+    def pids(self) -> Iterable[int]: ...
+
+
+class HostProc:
+    """The real `/proc` of the host, as the watcher sees it."""
+
+    def read(self, path: str) -> str:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            return stream.read()
+
+    def readlink(self, path: str) -> str:
+        return os.readlink(path)
+
+    def pids(self) -> Iterable[int]:
+        return [int(name) for name in os.listdir("/proc") if name.isdigit()]
+
+
+@dataclass(frozen=True)
+class Protected:
+    """A protected directory as a cell's mount table would show it: the device (`major:minor`) of the file system it
+    is on and its path inside that file system; both None when it could not be resolved."""
+
+    dev: str | None
+    fs_path: str | None
+
+
+@dataclass(frozen=True)
+class Host:
+    """What the watcher learns of the host at its start: its own depth, uid and mount table's `proc` devices, the run's
+    FUSE mount (its device and the host's mount point of it), the protected directories and oneclient."""
+
+    depth: int
+    uid: int
+    proc_devs: frozenset[str]
+    fuse_dev: str | None
+    mountpoint: str
+    protected: tuple[Protected, ...]
+    oneclient: int
+
+
+def status_field(text: str, name: str) -> str | None:
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key == name:
+            return value.strip()
+    return None
+
+
+def nspid(text: str) -> tuple[int, ...] | None:
+    """A process's pid in each PID namespace it is in, outermost first (`NSpid` of its status), or None."""
+    field = status_field(text, "NSpid")
+    try:
+        values = tuple(int(v) for v in (field or "").split())
+    except ValueError:
+        return None
+    return values or None
+
+
+def real_uid(text: str) -> int | None:
+    field = (status_field(text, "Uid") or "").split()
+    return int(field[0]) if field and field[0].isdigit() else None
+
+
+def start_time(stat_text: str) -> int | None:
+    """A process's start time in clock ticks after boot (`/proc/<pid>/stat`, field 22), or None. The command name may
+    hold spaces and parentheses, so the fields are read after the last `)`."""
+    fields = stat_text.rpartition(")")[2].split()
+    return int(fields[19]) if len(fields) > 19 and fields[19].isdigit() else None
+
+
+def resolve(path: str, host_mountinfo: str) -> Protected:
+    """A protected directory's device and its path inside its file system, from the host's mount table: the mount whose
+    point is the longest prefix of the real path, held to the device `stat` gives. Unresolved on any doubt."""
+    try:
+        real = os.path.realpath(path)
+        found = os.stat(real)
+        mounts = parse_mountinfo(host_mountinfo)
+    except (OSError, MountTableError):
+        return Protected(None, None)
+    dev = f"{os.major(found.st_dev)}:{os.minor(found.st_dev)}"
+    holding = [m for m in mounts if _under(real, m["mountpoint"])]
+    if not holding:
+        return Protected(None, None)
+    mount = max(holding, key=lambda m: len(m["mountpoint"]))
+    if mount["dev"] != dev:
+        return Protected(None, None)
+    inside = posixpath.relpath(real, mount["mountpoint"])
+    return Protected(dev, posixpath.normpath(posixpath.join(mount["root"], inside)))
+
+
+def _under(path: str, base: str) -> bool:
+    return base == "/" or path == base or path.startswith(base.rstrip("/") + "/")
+
+
+def _nested(one: str, other: str) -> bool:
+    """Whether one path is, holds or lies under the other."""
+    return _under(one, other) or _under(other, one)
+
+
+def fuse_dev(host_mountinfo: str, mountpoint: str) -> str | None:
+    """The device of the FUSE mount at `mountpoint` in the host's table (the last one mounted there), or None."""
+    try:
+        mounts = parse_mountinfo(host_mountinfo)
+    except MountTableError:
+        return None
+    found = [m["dev"] for m in mounts if m["mountpoint"] == mountpoint and m["fstype"].startswith("fuse")]
+    return found[-1] if found else None
+
+
+def proc_devs(host_mountinfo: str) -> frozenset[str]:
+    """The devices of every `proc` mount of the host's table; `MountTableError` when it cannot be read whole."""
+    return frozenset(m["dev"] for m in parse_mountinfo(host_mountinfo) if m["fstype"] == "proc")
+
+
+def mount_problems(cell_mounts: Sequence[Mapping[str, str]], host: Host) -> list[str]:
+    """What a cell's mount table shows that it must not: the host's `/proc`, a protected directory."""
+    found = []
+    if any(m["dev"] in host.proc_devs for m in cell_mounts):
+        found.append(HOST_PROC_IN_CELL)
+    if any(p.dev is None or p.fs_path is None for p in host.protected):
+        found.append(PROTECTED_UNRESOLVED)
+    if any(
+        m["dev"] == p.dev and p.fs_path is not None and _nested(m["root"], p.fs_path)
+        for m in cell_mounts
+        for p in host.protected
+    ):
+        found.append(PROTECTED_REACHABLE)
+    return found
+
+
+def oneclient_problems(proc: ProcView, host: Host) -> list[str]:
+    """Whether oneclient is in the watcher's own PID namespace, as deep as it."""
+    try:
+        values = nspid(proc.read(f"/proc/{host.oneclient}/status"))
+    except OSError:
+        values = None
+    if values is None:
+        return [ONECLIENT_UNREAD]
+    return [] if len(values) == host.depth else [ONECLIENT_NOT_HOST]
+
+
+Seen = tuple[int, int]  # a process by its pid and start time
+
+
+class CellPoll:
+    """The polls of one run (the module's docstring). `emit(label, ok, problems, cell)` writes a proof line."""
+
+    def __init__(self, proc: ProcView, host: Host, emit: Callable[[str, bool, list[str], dict[str, int]], None]):
+        self._proc, self._host, self._emit = proc, host, emit
+        self._seen: set[Seen] = set()
+        self._proved: set[Any] = set()
+        self.cells: dict[Seen, int] = {}  # the processes found to be this run's cells, with their depth
+        self.polls = 0
+        self.failed = 0
+
+    def poll(self) -> None:
+        """Look once at each process not seen before."""
+        self.polls += 1
+        try:
+            pids = list(self._proc.pids())
+        except OSError:
+            self.failed += 1
+            return
+        broken = False
+        for pid in pids:
+            broken = self._look(pid) is False or broken
+        if broken:
+            self.failed += 1
+
+    def close(self) -> None:
+        """The last poll, then a failed proof for each of the run's cells still alive."""
+        self.poll()
+        for (pid, started), depth in sorted(self.cells.items()):
+            if self._started(pid) == started:
+                cell = {"pid": pid, "start_time": started, "nspid_depth": depth}
+                self._emit(CLOSE, False, [CELL_ALIVE_AT_CLOSE], cell)
+
+    def _started(self, pid: int) -> int | None:
+        try:
+            return start_time(self._proc.read(f"/proc/{pid}/stat"))
+        except OSError:
+            return None
+
+    def _look(self, pid: int) -> bool | None:
+        """Look at one process: False when it is one of ours that could not be read whole, else None."""
+        started = self._started(pid)
+        if started is None or (pid, started) in self._seen:
+            return None
+        try:
+            status = self._proc.read(f"/proc/{pid}/status")
+        except OSError:
+            return None  # gone between the listing and the read
+        values = nspid(status)
+        if real_uid(status) != self._host.uid or values is None:
+            self._seen.add((pid, started))
+            return None
+        try:
+            mounts = parse_mountinfo(self._proc.read(f"/proc/{pid}/mountinfo"))
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except (OSError, MountTableError):
+            if len(values) > self._host.depth:
+                return False  # a nested process of ours we cannot read: it may be a cell; looked at again next poll
+            self._seen.add((pid, started))
+            return None
+        self._seen.add((pid, started))
+        ours = [m for m in mounts if self._host.fuse_dev is not None and m["dev"] == self._host.fuse_dev]
+        if not ours:
+            return None
+        cell = {"pid": pid, "start_time": started, "nspid_depth": len(values)}
+        if len(values) <= self._host.depth:
+            if any(m["mountpoint"] != self._host.mountpoint for m in ours):
+                self.cells[(pid, started)] = len(values)
+                self._emit(HOST_PROCESS, False, [SAME_PID_NAMESPACE], cell)
+            return None
+        self.cells[(pid, started)] = len(values)
+        key = self._namespace(pid) or (pid, started)
+        if key in self._proved:
+            return None
+        self._proved.add(key)
+        problems = oneclient_problems(self._proc, self._host) + mount_problems(mounts, self._host)
+        self._emit(CELL, not problems, problems, cell)
+        return None
+
+    def _namespace(self, pid: int) -> str | None:
+        try:
+            link = self._proc.readlink(f"/proc/{pid}/ns/pid")
+        except OSError:
+            return None
+        return link if link.startswith("pid:[") else None
+
+
+__all__ = ["CellPoll", "Host", "HostProc", "ProcView", "Protected", "fuse_dev", "proc_devs", "resolve"]
