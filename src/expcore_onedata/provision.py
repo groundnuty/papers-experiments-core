@@ -74,7 +74,7 @@ from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncove
 from expcore_onedata.rangemap import PlacementSettings, safe_path
 from expcore_onedata.readretry import ONE_ATTEMPT, TRANSPORT_ATTEMPTS, TRANSPORT_PAUSES_S, ReadRetry
 from expcore_onedata.readslots import slots
-from expcore_onedata.streamed import OCTET_STREAM, Digest, ReadOutcome, Upload, chunks, media_type
+from expcore_onedata.streamed import OCTET_STREAM, Digest, ReadOutcome, Slice, Upload, chunks, media_type
 
 LISTING_LIMIT = 1000
 _SEGMENT = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # the charset of a file id the client accepts
@@ -759,7 +759,7 @@ class Provisioner:
     def upload(
         self,
         path: str,
-        source: Path | str,
+        source: Path | str | Slice,
         *,
         content_type: str = OCTET_STREAM,
         stop: int | None = None,
@@ -768,6 +768,11 @@ class Provisioner:
         """Upload a local file to a path of the space on the data provider, never holding it whole; return what was
         done (O25). With `stop`, only the local file's first `stop` bytes are its content here: the target ends as
         that prefix, verified by its hash, and a later upload with a larger stop, or none, resumes from it.
+
+        The source may be a `Slice` of a local file (a member of an uncompressed tar, `streamed.tar_members`): it is
+        then the local file in everything below, its size its own and its bytes only those of its range, so a resume
+        compares the target with the member's first bytes and no read reaches outside it. A slice whose file does not
+        hold its whole range is refused before anything is asked.
 
         The file is read and sent `chunk_bytes` at a time, each chunk a PUT at its offset through the client's mutation
         gate (the space's name is checked first, and the file's space before every write), carrying `content_type`.
@@ -796,8 +801,8 @@ class Provisioner:
         file another writer made since the listing is outside the cache, so an operation that passes one holds the
         space alone (`bulkingest.ingest_files`, which also lists the result afresh and compares it with its manifest).
         """
-        media, source = media_type(content_type), Path(source)
-        size = source.stat().st_size  # a local file that is not there is refused before anything is asked
+        media = media_type(content_type)
+        source, size = self._source(source)  # a local file that is not there is refused before anything is asked
         if stop is not None:
             if isinstance(stop, bool) or not isinstance(stop, int) or not 1 <= stop <= size:
                 raise ProvisionError(f"{self._where}an upload's stop is a whole number of bytes within the local file")
@@ -829,7 +834,17 @@ class Provisioner:
             )
         return Upload(file_id, expected, action, sent)
 
-    def _compare(self, existing: Entry, source: Path, size: int) -> tuple[str, int, Any]:
+    def _source(self, source: Path | str | Slice) -> tuple[Path | Slice, int]:
+        """An upload's source and its size: a local file's by its stat, a slice's its own once its file is shown to
+        hold the whole range (a slice past its file's end is refused before anything is asked)."""
+        if not isinstance(source, Slice):
+            path = Path(source)
+            return path, path.stat().st_size
+        if source.path.stat().st_size < source.offset + source.size:
+            raise ProvisionError(f"{self._where}the slice reaches past the end of its file; nothing was sent")
+        return source, source.size
+
+    def _compare(self, existing: Entry, source: Path | Slice, size: int) -> tuple[str, int, Any]:
         """Decide how an upload treats a target that exists: return the action, the offset to send from, and the hash of
         the local bytes before that offset. Resuming or restarting writes into the file, so it needs the log to say
         this provisioner created it."""
@@ -896,7 +911,7 @@ class Provisioner:
         return file_id
 
     def write_range(
-        self, file_id: str, source: Path | str, start: int, stop: int, *, content_type: str = OCTET_STREAM
+        self, file_id: str, source: Path | str | Slice, start: int, stop: int, *, content_type: str = OCTET_STREAM
     ) -> Digest:
         """Write bytes `start` to `stop` of a local file into the same range of a file this provisioner made, chunk by
         chunk, each at its offset; return the size and SHA-256 of the bytes sent (O44, #107). Nothing else of the file
@@ -904,9 +919,9 @@ class Provisioner:
 
         A file the change log does not hold is refused, since writing into it adopts it (O09), and so is a range that
         is empty or outside the local file; a local file that ends before `stop` meanwhile is a ProvisionError. The
-        caller verifies what the file holds."""
-        media, source = media_type(content_type), Path(source)
-        whole = source.stat().st_size
+        caller verifies what the file holds. The source may be a `Slice`, as for `upload`: its offsets are its own."""
+        media = media_type(content_type)
+        source, whole = self._source(source)
         if any(isinstance(n, bool) or not isinstance(n, int) for n in (start, stop)) or not 0 <= start < stop <= whole:
             raise ProvisionError(f"{self._where}a written range lies within the local file and holds a byte at least")
         self._verified()
