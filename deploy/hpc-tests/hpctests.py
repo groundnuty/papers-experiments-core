@@ -369,6 +369,7 @@ def parser() -> argparse.ArgumentParser:
         "--until", help="ISO time (UTC): the loop's end (start, once), or until when lanes need it (want)"
     )
     renew.add_argument("--max", type=int, default=4, help="at most this many submits (start)")
+    renew.add_argument("--idle-hours", type=float, default=3.0, help="release an allocation idle this long (0: never)")
     run = sub.add_parser("run")
     run.add_argument("--repo", default=".", help="the repository or worktree whose commit is shipped")
     run.add_argument("--rev", default="HEAD", help="the commit (only committed work ships)")
@@ -407,7 +408,16 @@ def dispatch(args: argparse.Namespace) -> int:
             raise lib.HpcTestsError("renew start, once and want need --until")
         if args.action == "want":
             return passthrough(remote.alloc("want", "--until", str(epoch_of(args.until))))
-        words = ["--until", str(epoch_of(args.until)), "--max", str(args.max)]
+        if not 0 <= args.idle_hours <= 72:
+            raise lib.HpcTestsError("--idle-hours is 0 to 72")
+        words = [
+            "--until",
+            str(epoch_of(args.until)),
+            "--max",
+            str(args.max),
+            "--idle",
+            str(int(args.idle_hours * 3600)),
+        ]
         if args.action == "once":
             return passthrough(remote.alloc("renew", *words, "--once"))
         return passthrough(remote.alloc("renew-start", *words))

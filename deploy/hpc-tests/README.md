@@ -107,7 +107,13 @@ uv run python deploy/hpc-tests/hpctests.py renew once --until ...               
 ```
 
 Without the marker (`renew.wanted`), or once its time has passed, the loop submits nothing and the running
-allocation ends at its time limit; `release` ends it sooner, which is what to do when lanes are idle.
+allocation ends at its time limit; `release` ends it sooner.
+
+**The idle release:** every poll, the loop also releases a RUNNING allocation of ours that has run no test step for
+`--idle-hours` (3; from its start when it never ran one), by its id through `release`'s own ledger and name checks.
+It reads the job's steps from `sacct`, so a step shorter than a poll still counts, and a record it cannot read counts
+as busy. It clears `renew.wanted` with it, so the next poll does not submit another, and releases a successor of
+ours still queued.
 
 `renew start` runs `alloc.sh renew` with `setsid nohup` on the login node, from a frozen copy of `alloc.sh` (bash reads a
 script as it runs, so a later `install` never changes a running loop), so it outlives the ssh session and any agent

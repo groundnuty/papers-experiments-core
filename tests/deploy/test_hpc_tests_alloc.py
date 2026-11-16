@@ -157,10 +157,11 @@ def test_o64_every_cancel_in_the_script_is_of_one_job_id(login):
     assert all(re.search(r'scancel "\$id"', x) for x in calls), calls
 
 
-def renew_once(login, until=NOW + 86400, wanted=NOW + 86400):
+def renew_once(login, until=NOW + 86400, wanted=NOW + 86400, idle="0"):
+    """One decision; the idle release is off (--idle 0) unless a test asks for it."""
     if wanted is not None:
         (login.dir / "renew.wanted").write_text(f"{wanted}\n")
-    return login.alloc("renew", "--until", str(until), "--once", check=0)
+    return login.alloc("renew", "--until", str(until), "--idle", idle, "--once", check=0)
 
 
 def test_o64_the_successor_is_submitted_from_the_clock_to_begin_shortly_before_the_allocation_ends(login):
@@ -248,3 +249,56 @@ def test_renew_start_runs_a_frozen_copy_detached_and_removes_it_when_it_ends(log
     assert "renewer ended: until" in log
     assert not list(login.dir.glob(".renew-*.sh"))
     assert not (login.dir / "renew.lock").exists()
+
+
+def steps(login, job, *rows):
+    (login.fake / f"sacct-{job}").write_text("".join("|".join(map(str, row)) + "\n" for row in rows))
+
+
+def test_o64_an_allocation_of_ours_idle_for_three_hours_is_released_by_its_id_and_the_marker_cleared(login):
+    """O64: a RUNNING allocation of ours that has run no test step for 3 h (from its start, when it never ran one) is
+    released by its own id; renew.wanted is cleared so the loop does not submit another at once; an idle job of the
+    account outside the ledger is never touched."""
+    login.ledger(500)
+    login.queue(running(500, NOW + 8 * 3600), running(600, NOW + 60))  # 500 started 4 h ago and ran nothing
+    steps(login, 500, ("500.batch", slurm_time(NOW - 4 * 3600), "Unknown", "RUNNING"))
+    out = renew_once(login, wanted=NOW + 86400, idle="10800")
+    assert fakes.calls(login.fake / "scancel.jsonl") == [["500"]]
+    assert "RELEASED 500" in out.stdout
+    assert not (login.dir / "renew.wanted").exists()
+    assert fakes.calls(login.fake / "sbatch.jsonl") == []
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [
+            ("500.batch", "x", "Unknown", "RUNNING"),
+            ("500.0", slurm_time(NOW - 7200), slurm_time(NOW - 3600), "COMPLETED"),
+        ],
+        [("500.batch", "x", "Unknown", "RUNNING"), ("500.3", slurm_time(NOW - 600), "Unknown", "RUNNING")],
+    ],
+)
+def test_an_allocation_that_ran_a_step_within_three_hours_or_runs_one_now_is_kept(login, rows):
+    login.ledger(500)
+    login.queue(running(500, NOW + 8 * 3600))
+    steps(login, 500, *rows)
+    renew_once(login, wanted=None, idle="10800")
+    assert fakes.calls(login.fake / "scancel.jsonl") == []
+
+
+def test_no_idle_release_on_an_unreadable_record_or_with_idle_off(login):
+    login.ledger(500)
+    login.queue(running(500, NOW + 8 * 3600))
+    (login.fake / "sacct-fail").write_text("")
+    renew_once(login, wanted=None, idle="10800")
+    (login.fake / "sacct-fail").unlink()
+    login.alloc("renew", "--until", str(NOW + 86400), "--idle", "0", "--once", check=0)
+    assert fakes.calls(login.fake / "scancel.jsonl") == []
+
+
+def test_an_idle_release_also_releases_our_queued_successor(login):
+    login.ledger(500, 501)
+    login.queue(running(500, NOW + 8 * 3600), (501, "expcore-tests", "PENDING", "N/A", "N/A", 16, "30G"))
+    renew_once(login, wanted=None, idle="10800")
+    assert fakes.calls(login.fake / "scancel.jsonl") == [["500"], ["501"]]

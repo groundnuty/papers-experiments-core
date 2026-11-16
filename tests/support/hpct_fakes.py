@@ -29,8 +29,8 @@ def script(path: Path, text: str) -> Path:
 def slurm(bin_dir: Path, fake: Path) -> None:
     """squeue prints fake/squeue (exit 1 when fake/squeue-fail exists); sbatch logs its argv and the two input
     variables to fake/sbatch.jsonl and prints fake/next-id (700 at first, then one more each time); scontrol prints
-    fake/record (RECORD by default) for the id asked; scancel logs its argv to fake/scancel.jsonl; date +%s prints
-    fake/now."""
+    fake/record (RECORD by default) for the id asked; scancel logs its argv to fake/scancel.jsonl; sacct prints
+    fake/sacct-<id> (exit 1 when fake/sacct-fail exists); date +%s prints fake/now."""
     python = sys.executable
     script(
         bin_dir / "squeue",
@@ -51,6 +51,12 @@ def slurm(bin_dir: Path, fake: Path) -> None:
         f"#!{python}\nimport os, sys\njob = sys.argv[-1]\n"
         f"text = open('{fake}/record').read() if os.path.exists('{fake}/record') else {RECORD!r}\n"
         f"print(text.replace('{{id}}', job))\n",
+    )
+    script(
+        bin_dir / "sacct",
+        f'#!/bin/bash\n[ ! -e "{fake}/sacct-fail" ] || exit 1\nfor a in "$@"; do job=$a; done\n'
+        'while [ $# -gt 0 ]; do [ "$1" = -j ] && job=$2; shift; done\n'
+        f'[ ! -e "{fake}/sacct-$job" ] || cat "{fake}/sacct-$job"\n',
     )
     script(
         bin_dir / "scancel",

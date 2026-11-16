@@ -7,8 +7,8 @@
 #                                        Slurm recorded is read back, and exactly that job is cancelled if it differs
 #   alloc.sh list                        NOW <epoch>, a JOB line per ledger job alive under our name, a RENEWER line
 #   alloc.sh release <id>                cancel one allocation of ours: in the ledger and alive under our name
-#   alloc.sh renew --until <epoch> [--lead s] [--overlap s] [--poll s] [--max n] [--once]
-#                                        keep an allocation of ours alive until <epoch> (the loop; README, "Renewal")
+#   alloc.sh renew --until <epoch> [--lead s] [--overlap s] [--poll s] [--max n] [--idle s] [--once]
+#                                        renew while lanes want it, release when idle (the loop; README, "Renewal")
 #   alloc.sh renew-start <renew options> start that loop detached (setsid nohup), from a frozen copy of this script
 #   alloc.sh renew-stop                  ask the loop to stop at its next poll
 #   alloc.sh want --until <epoch>        lanes need the allocation until <epoch>: the loop may submit successors
@@ -188,7 +188,7 @@ cmd_release() {
 }
 
 # ---- renewal -------------------------------------------------------------------------------------------------------
-UNTIL="" LEAD=10800 OVERLAP=900 POLL=300 MAX=4 ONCE=0
+UNTIL="" LEAD=10800 OVERLAP=900 POLL=300 MAX=4 IDLE=10800 ONCE=0
 parse_renew() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -197,11 +197,12 @@ parse_renew() {
       --overlap) OVERLAP=${2:-}; shift 2 ;;
       --poll) POLL=${2:-}; shift 2 ;;
       --max) MAX=${2:-}; shift 2 ;;
+      --idle) IDLE=${2:-}; shift 2 ;;
       --once) ONCE=1; shift ;;
       *) die "renew: unknown argument $1" ;;
     esac
   done
-  for value in "$UNTIL" "$LEAD" "$OVERLAP" "$POLL" "$MAX"; do is_count "$value" || die "renew: bad number '$value'"; done
+  for value in "$UNTIL" "$LEAD" "$OVERLAP" "$POLL" "$MAX" "$IDLE"; do is_count "$value" || die "renew: bad number '$value'"; done
   [ "$POLL" -ge 1 ] && [ "$MAX" -ge 1 ] || die "renew: --poll and --max are at least 1"
   [ "$OVERLAP" -lt "$LEAD" ] || die "renew: --overlap must be shorter than --lead"
 }
@@ -266,6 +267,51 @@ renew_once() {
   esac
 }
 
+last_activity() { # last_activity <id> <start>: when a step of the job last ran (now while one runs), else its start
+  # sacct keeps every step, so a step shorter than a poll is not missed. A failed read counts as busy: a release is
+  # never decided on a record that could not be read.
+  local id=$1 last=$2 now rows step start end state
+  now=$(date +%s)
+  rows=$(sacct -n -P -j "$id" -o JobID,Start,End,State) || { echo "$now"; return 0; }
+  while IFS='|' read -r step start end state; do
+    case "$step" in "$id".[0-9]*) ;; *) continue ;; esac
+    case "${step#"$id".}" in *[!0-9]*) continue ;; esac
+    if [ "$state" = RUNNING ] || [ "$end" = Unknown ]; then echo "$now"; return 0; fi
+    end=$(to_epoch "$end")
+    if is_count "$end" && [ "$end" -gt "$last" ]; then last=$end; fi
+  done <<< "$rows"
+  echo "$last"
+}
+
+# The idle release: a RUNNING allocation of ours that has run no test step for --idle seconds (from its start when it
+# never ran one) is released, by its id, through release's own ledger and name checks; renew.wanted is cleared with it,
+# so the loop does not submit another at once, and a successor of ours still queued is released too (nobody needs it).
+idle_release() {
+  local now rows id name state start end cpus mem began last released=0
+  [ "$IDLE" -gt 0 ] || return 0
+  now=$(date +%s)
+  rows=$(alive) || { log "squeue failed: no idle decision this round"; return 0; }
+  while IFS='|' read -r id name state start end cpus mem; do
+    [ "$state" = RUNNING ] || continue
+    began=$(to_epoch "$start")
+    is_count "$began" || continue
+    last=$(last_activity "$id" "$began")
+    is_count "$last" || continue
+    [ $((now - last)) -ge "$IDLE" ] || continue
+    log "job $id has run no test step for $((now - last)) s (since $(date -u -d "@$last" +%FT%TZ)): releasing it"
+    (cmd_release "$id") 2>&1 | sed 's/^/  /'
+    released=1
+  done <<< "$rows"
+  [ "$released" = 1 ] || return 0
+  if [ -e "$WANTED" ]; then rm -f "$WANTED"; log "renew.wanted cleared: lanes ask again (renew want) when they need it"; fi
+  rows=$(alive) || return 0
+  while IFS='|' read -r id name state start end cpus mem; do
+    case "$state" in PENDING | CONFIGURING) ;; *) continue ;; esac
+    log "releasing the queued successor $id too"
+    (cmd_release "$id") 2>&1 | sed 's/^/  /'
+  done <<< "$rows"
+}
+
 NAP="" SUBMITTED_COUNT=0
 on_signal() {
   [ -z "$NAP" ] || kill "$NAP" 2> /dev/null
@@ -282,12 +328,13 @@ cmd_renew() {
     take_lock
     trap 'drop_lock' EXIT
     trap 'on_signal' TERM HUP INT
-    log "renewer started: until $(date -u -d "@$UNTIL" +%FT%TZ), lead $LEAD s, overlap $OVERLAP s, poll $POLL s, at most $MAX submits"
+    log "renewer started: until $(date -u -d "@$UNTIL" +%FT%TZ), lead $LEAD s, overlap $OVERLAP s, poll $POLL s, at most $MAX submits, idle release after $IDLE s"
   fi
   while :; do
     write_state running "$submitted"
     if [ -e "$STOP" ]; then reason=stop-file; break; fi
     if [ "$(date +%s)" -ge "$UNTIL" ]; then reason=until; break; fi
+    idle_release
     decision=$(renew_once)
     printf '%s\n' "$decision" | grep -v -E '^(SUBMITTED|SUBMIT-FAILED|STOP)$' | sed '/^$/d'
     case "$decision" in
