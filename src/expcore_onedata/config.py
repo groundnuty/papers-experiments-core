@@ -279,7 +279,8 @@ class PlatformConfig:
         whenever the `[[spaces]]` form is used (one entry or several), each entry's SHA-256 in the file's order
         (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
         The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was, unless `[space]`
-        declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly`.
+        declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly` (and `shared`,
+        when true: O59).
 
         With a `[sandbox]`, it also holds every level of the data path with its kind and a REST level's listing mode
         (O21), so a resume after a level changed its data path or its listing is refused. A declared
@@ -298,7 +299,7 @@ class PlatformConfig:
         if self.spaces_table:
             out["spaces"] = [entry.digest() for entry in self.spaces]
         elif self.spaces[0].imported is not None:  # the one-space form's: only when declared, so the old one stands
-            out["storage_import"] = {"readonly": self.spaces[0].imported.readonly}
+            out["storage_import"] = self.spaces[0].imported.record()
         if self.sandbox is not None:
             out["data_paths"] = self.sandbox.data_path_record()
             if self.sandbox.served_caps_declared:

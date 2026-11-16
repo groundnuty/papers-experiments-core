@@ -9,7 +9,7 @@ import shutil
 import stat
 import sys
 from pathlib import Path
-from typing import Any, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import hpcrelay
 from fedlayout import ROOT_MARKER
@@ -57,11 +57,9 @@ class Down:
             except (RuntimeError, OSError) as error:
                 self.say(f"the fault relay's stop failed: {error}")
                 unverified.append("the fault relay")
-        job = state["allocation"].get("job") or self.job_by_name(state)
-        info = self.slurm.job(job) if job is not None else None
-        if info is not None and info.get("JobName") != state["allocation"]["name"]:
-            self.say(f"job {job} now names another job: ours ended long ago, and that one is not touched")
-            job, info = None, None
+        lost: List[str] = []  # a job whose lookup failed: the other is still cancelled, then down fails
+        job, info = self.ours(state, "allocation", lost)
+        agent, agent_info = self.ours(state, "sandbox", lost) if self.separate(state) else (None, None)
         if info is not None and info.get("JobState") == "RUNNING":
             try:
                 unverified += self.stop_services(job)
@@ -70,10 +68,8 @@ class Down:
                 unverified.append("the services")
         elif any(r.get("workdir") and r.get("state") != "removed" for r in state["services"].values()):
             self.say("the held job had ended: its nodes could not be checked (the next job's sweep removes leftovers)")
-        if info is not None:
-            self.slurm.cancel(job)
-            self.wait_gone(job)
-        unverified += self.end_clients(job)
+        self.cancel_all([j for j, i in ((job, info), (agent, agent_info)) if i is not None], lost)
+        unverified += self.end_clients([j for j in (job, agent) if j is not None])
         if unverified:
             self.set(lambda s: s.update(phase="down"))
             raise RuntimeError(
@@ -81,16 +77,59 @@ class Down:
                 "state are kept: run down again to remove them"
             )
         remove_tree(self.root)
-        return f"down: the held job {job or '(never submitted, or no longer ours)'} is gone, and so is the root"
+        gone = " and ".join(j for j in (job, agent) if j) or "(never submitted, or no longer ours)"
+        return f"down: the held job {gone} is gone, and so is the root"
 
-    def job_by_name(self, state: Mapping[str, Any]) -> Optional[str]:
-        """The held job by its allocation's name, when its id never reached the state: an exact name holding up's
-        random part, among this user's jobs. Never more than one."""
-        found = self.slurm.jobs_named(self.user, state["allocation"]["name"])
+    @staticmethod
+    def separate(state: Mapping[str, Any]) -> bool:
+        """Whether the agent's node is a held job of its own (`sandbox_placement = "separate"`); under `het` it is a
+        component of the held job, and the leader's cancel ends it."""
+        return (state.get("sandbox") or {}).get("placement") == "separate"
+
+    def ours(
+        self, state: Mapping[str, Any], key: str, lost: List[str]
+    ) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
+        """One of up's held jobs (`key`: "allocation" or "sandbox"), by its recorded id or else its exact name, and what
+        Slurm records of it; (id, None) when Slurm no longer knows it, and (None, None) when its id now names another
+        job (Slurm reuses ids): that one is never touched. A lookup that fails is added to `lost`, never cancelled."""
+        try:
+            job = state[key].get("job") or self.job_by_name(state, key)
+            info = self.slurm.job(job) if job is not None else None
+        except RuntimeError as error:
+            lost.append(f"the {key} job could not be looked up ({error})")
+            return None, None
+        if info is not None and info.get("JobName") != state[key]["name"]:
+            self.say(f"job {job} now names another job: ours ended long ago, and that one is not touched")
+            return None, None
+        return job, info
+
+    def cancel_all(self, jobs: List[str], failed: List[str]) -> None:
+        """Cancel each job by its own id, then wait for each to leave the queue; a failure with one (or a job `failed`
+        names already, whose lookup failed) never spares another, and is raised once every job was tried, the srun
+        clients left as they are, since their steps may still run."""
+        cancelled = []
+        for job in jobs:
+            try:
+                self.slurm.cancel(job)
+                cancelled.append(job)
+            except RuntimeError as error:
+                failed.append(f"the cancel of job {job} failed ({error})")
+        for job in cancelled:
+            try:
+                self.wait_gone(job)
+            except RuntimeError as error:
+                failed.append(str(error))
+        if failed:
+            raise RuntimeError(f"{'; '.join(failed)}; the root and its state are kept: run down again")
+
+    def job_by_name(self, state: Mapping[str, Any], key: str = "allocation") -> Optional[str]:
+        """One of up's held jobs by its name, when its id never reached the state: an exact name holding up's random
+        part (the agent's own job's ends in -sandbox), among this user's jobs. Never more than one."""
+        found = self.slurm.jobs_named(self.user, state[key]["name"])
         if len(found) > 1:
             raise RuntimeError("more than one job carries this federation's allocation name; nothing cancelled")
         if found:
-            self.set(lambda s: s["allocation"].update(job=found[0]))
+            self.set(lambda s: s[key].update(job=found[0]))
         return found[0] if found else None
 
     def stop_services(self, job: str) -> List[str]:
@@ -163,13 +202,13 @@ class Down:
                 )
             self.sleep(self.poll_s)
 
-    def end_clients(self, job: Optional[str]) -> List[str]:
-        """End every srun client of the job still running on this host, verified: the recorded ones, the relay's when
+    def end_clients(self, jobs: List[str]) -> List[str]:
+        """End every srun client of the jobs still running on this host, verified: the recorded ones, the relay's when
         its stop failed, and any other `srun --jobid=<job>` of ours (one spawned just before a crash). Their steps are
         gone by now. Returns what could not be ended."""
         state = self.store.read()
         recorded = [*state.get("clients", {}).values(), *([state["relay"]] if state.get("relay") else [])]
         clients = {Client(int(c["pid"]), int(c["start"])) for c in recorded}
-        if job is not None:
+        for job in jobs:
             clients |= set(self.slurm.runner.clients_of(job))
         return [f"the client {c.pid}" for c in sorted(clients) if not self.slurm.runner.end_client(c)]

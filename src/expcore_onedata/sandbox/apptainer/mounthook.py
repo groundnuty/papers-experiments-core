@@ -3,14 +3,18 @@
 
 A mount run needs a host-side helper (oneclient, holding the mount's token) that the sandbox starts before the run's
 first cell and stops after its last. The mount's own lane builds it, with the detector of a cell's access to its
-process and its token file; until it lands, a mount run is refused at its start (`MOUNT_REFUSED`).
+process and its token file (`hostmount.host_mount_factory`); without one, a mount run is refused at its start
+(`MOUNT_REFUSED`).
 
 The sandbox calls, in this order: the factory `(node, settings, spec, run_dir)` once the run's directory exists and
-before the gate, the collector's canary or any cell; `start()`, which returns the node directory the sandbox binds
-read-only into every cell at `[sandbox.mount] path`; `metadata()` for the run's record (never a secret); and `stop()` in
-the teardown, after every process of the cells is shown gone and before the run's directory is removed. `stop` shows
-the helper and its mount gone or raises `SandboxError`; it is called on every path that ends a sandbox the factory was
-called for, a failed start included, and may be called again after a stop that raised.
+before the gate, the collector's canary or any cell; `token_paths()`, the files of the run's directory that will hold
+the token while the helper starts, which the sandbox lists in the run's record before they exist, so a reaper of a
+driver killed outright removes them before it unmounts or removes anything (O60); `start()`, which returns the node
+directory the sandbox binds read-only into every cell at `[sandbox.mount] path`; `metadata()` for the run's record
+(never a secret); and `stop()` in the teardown, after every process of the cells is shown gone and before the run's
+directory is removed. `stop` shows the helper and its mount gone or raises `SandboxError`; it is called on every path
+that ends a sandbox the factory was called for, a failed start included, and may be called again after a stop that
+raised.
 """
 
 from __future__ import annotations
@@ -26,6 +30,11 @@ MOUNT_REFUSED = (
 
 
 class MountHelper(Protocol):
+    def token_paths(self) -> list[Path]:
+        """The files of the run's directory that hold the token at some point of the start: listed in the run's record
+        before they exist, so the teardown and a reaper remove them first."""
+        ...
+
     def start(self) -> Path:
         """Start the helper and its mount; the node directory to bind read-only at the mount path in every cell."""
         ...

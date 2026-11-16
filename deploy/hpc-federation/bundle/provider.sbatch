@@ -16,8 +16,11 @@
 # --no-requeue: a requeued provider would restart with an empty /tmp and nothing would relaunch it.
 # No secret is on this command line: only paths, names, an email and peer addresses. The token arrives
 # later through a step's stdin.
+# Shared imported trees (O59): a provider that owns imported spaces is given one `--import=SPACE=PATH` per space after
+# the peers; configure.sh checks each tree and the service binds it read-only (importstorage.py).
 # Usage: sbatch --nodelist=<node-B> --time=<t> --mem=32G [--exclusive] provider.sbatch \
-#          <bundle-dir> <oneprovider.tar> <provider-name> <zone-fqdn> <admin-email> <zone-ip> [<peer-ip> ...]
+#          <bundle-dir> <oneprovider.tar> <provider-name> <zone-fqdn> <admin-email> <zone-ip> [<peer-ip> ...] \
+#          [--import=SPACE=PATH ...]
 set -euo pipefail
 B=${1:?usage: provider.sbatch <bundle-dir> <tar> <name> <zone-fqdn> <admin-email> <zone-ip> [peer-ip ...]}; shift
 [[ -f $B/lib.sh ]] || { echo "hpcop: no lib.sh in '$B'" >&2; exit 1; }

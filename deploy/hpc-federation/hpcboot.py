@@ -6,25 +6,33 @@ real addresses (DESIGN.md, sections 5 and 6).
   baseline (`fedcontent.Content`) and the facts (`fedfacts`) then run unchanged.
 - **The storage** is the one posix storage the bundle's `finish.sh` adds to each provider, owned by the job's uid on
   the node's tmpfs, with Onedata's LUMA local feed: each support also maps the space's default credentials, and every
-  user of the federation, to that uid (as `bundle/onboard.py` does), or the users could reach none of its files.
+  user of the federation, to that uid (as `bundle/onboard.py` does), or the users could reach none of its files. The
+  owner of a shared imported space (O59) has a second, `import-<space>`, on its tree on the shared filesystem, made
+  with the same ids (`hpcimport.import_storage_extra`) and mapped the same way, on the storage its support names; the
+  core's phase waits for the scan, and verifies each space against its manifest (`fedimport.verify_imports`) over the
+  rendered `platform.toml`, before the link check.
 - **`platform.toml`** is rendered from the layout's own template by the Compose renderer, plus the HPC values a
   template may name: `@hpc_stop_bound_s@` (a stop's whole bound, `[hpc] stop_seconds` + 90 s), `@hpc_settle_timeout_s@`
-  (above it), `@hpc_command@` (this driver's argv prefix) and `@hpc_token_margin_s@`: the least `[tokens] margin_s`
-  the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
+  (above it), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of each direct-I/O
+  import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and `@hpc_token_margin_s@`: the
+  least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
 
 import json
 import math
+import os
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
+import hpcimport
 import tomllib
 from fedboot import Bootstrap
 from fedcontent import Content
 from fedfacts import facts_of, placeholders, render, write_private
+from fedimport import verify_imports
 from fedlayout import Layout, import_storage_name
 from fedlinks import check_after_up
 from fedrest import Rest, RestError
@@ -38,7 +46,8 @@ ZONE_TIMEOUT_S = 900.0
 PROVIDER_TIMEOUT_S = 900.0
 SUPPORT_TIMEOUT_S = 600.0
 TRANSFER_TIMEOUT_S = 600.0
-LUMA = "/provider/storages/{storage}/luma/local_feed/storage_access"
+IMPORT_TIMEOUT_S = 1800.0  # in all, for every imported space's one scan to complete (the Compose federation's bound)
+VERIFY_TIMEOUT_S = 1800.0  # for each imported space's check against its manifest, once the scan has completed
 # The keys of [faults] that are no bound of the restore: every other key the platform layer's settings know (its
 # numbers, and the backend once it has one) enters the margin as the platform layer itself would read it.
 NOT_A_BOUND = {
@@ -78,12 +87,17 @@ def hpc_spec(spec: Spec, hosts: Mapping[str, str]) -> Spec:
 
 class HpcBootstrap(Bootstrap):
     """The Compose bootstrap over the bundle's providers: one posix storage each, owned by the job's uid, with LUMA's
-    local feed mapping each space and each user to that uid."""
+    local feed mapping each space and each user to that uid; an owner of a shared imported space has a second."""
 
     def __init__(self, rest: Rest, layout: Layout, owner: Tuple[int, int]) -> None:
         super().__init__(rest, layout)
         self.owner = owner  # the uid and gid the storage belongs to (finish.sh adds it as the job user)
         self._mapped: set = set()  # the (provider, storage) pairs whose users are mapped already
+
+    def import_storage_extra(self, service: Service) -> Dict[str, Any]:
+        """What an imported storage is made with beyond what the layout declares: the job user's ids, the local LUMA
+        feed the mappings below need, and the canonical path type (O59), as finish.sh makes the regular storage."""
+        return hpcimport.import_storage_extra(*self.owner)
 
     def storage_for(self, service: Service, space: Space) -> str:
         """The storage a provider supports a space on, found by its name, never by its place in a list (an owner of an
@@ -97,49 +111,48 @@ class HpcBootstrap(Bootstrap):
 
     def support(self, service: Service, space: Space, sid: str) -> None:
         """Support the space, then map its default credentials, and every user of the federation, to the job's uid on
-        the provider's storage."""
+        the storage the support names: the calls are `hpcimport.luma_requests`, and each storage of a provider maps the
+        users once."""
         super().support(service, space, sid)
         storage = self.storage_for(service, space)
-        uid, gid = self.owner
-        path = LUMA.format(storage=storage) + f"/posix_compatible/default_credentials/{sid}"
-        self.panel(service, "PUT", path, "space credentials", json={"uid": uid, "gid": gid})
-        if (service.name, storage) not in self._mapped:  # each storage of the provider maps the users itself
-            self.map_users(service, storage)
-            self._mapped.add((service.name, storage))
+        users = []
+        if (service.name, storage) not in self._mapped:
+            users = [self.ids.admin, *(self.ids.users[p.name] for p in self.spec.principals)]
+        for method, path, body in hpcimport.luma_requests(storage, sid, users, *self.owner):
+            self.luma(service, method, path, body)
+        self._mapped.add((service.name, storage))
 
-    def map_users(self, service: Service, storage: str) -> None:
-        """Map the admin and every principal to the job's uid on the storage; a mapping already there is read back and
-        must name that uid."""
-        uid = self.owner[0]
-        path = LUMA.format(storage=storage) + "/all/onedata_user_to_credentials"
-        for user in (self.ids.admin, *(self.ids.users[p.name] for p in self.spec.principals)):
-            body = {
-                "onedataUser": {"mappingScheme": "onedataUser", "onedataUserId": user},
-                "storageUser": {"storageCredentials": {"type": "posix", "uid": str(uid)}, "displayUid": uid},
-            }
-            try:
-                self.panel(service, "POST", path, "user mapping", json=body)
-            except RestError as error:
-                if error.status is None or error.status >= 500:
-                    raise
-                held = self.panel(service, "GET", f"{path}/{user}", "user mapping")
-                credentials = held.get("storageCredentials", {}) if isinstance(held, dict) else {}
-                if str(credentials.get("uid")) != str(uid):
-                    raise RuntimeError(f"a user of the federation is mapped to another uid on {service.name}") from None
+    def luma(self, service: Service, method: str, path: str, body: Dict[str, Any]) -> None:
+        """Send one LUMA request; a user mapping already there is read back and must name the job's uid."""
+        if method == "PUT":
+            self.panel(service, "PUT", path, "space credentials", json=body)
+            return
+        try:
+            self.panel(service, "POST", path, "user mapping", json=body)
+        except RestError as error:
+            if error.status is None or error.status >= 500:
+                raise
+            user, uid = body["onedataUser"]["onedataUserId"], body["storageUser"]["storageCredentials"]["uid"]
+            held = self.panel(service, "GET", f"{path}/{user}", "user mapping")
+            credentials = held.get("storageCredentials", {}) if isinstance(held, dict) else {}
+            if str(credentials.get("uid")) != uid:
+                raise RuntimeError(f"a user of the federation is mapped to another uid on {service.name}") from None
 
 
 def bring_up(boot: Bootstrap) -> None:
-    """The bootstrap after the services are up: the admin's token, the users, the providers online, the spaces, their
-    support and their members."""
+    """The bootstrap after the services are up: the admin's token, the users, the providers online, the spaces, the
+    owners' imported storages, their support, their members, and the scan of each imported space."""
     boot.wait_zone(ZONE_TIMEOUT_S)
     boot.ensure_admin_token()
     boot.ensure_users()
     boot.wait_providers(PROVIDER_TIMEOUT_S)
     boot.ensure_spaces()
+    boot.ensure_import_storages()  # an owner's imported storage, before any support names it (no-op with no import)
     boot.ensure_support(SUPPORT_TIMEOUT_S)
     for space in boot.spec.spaces:
         if boot.spec.members(space.name):
             boot.ensure_members(space.name)
+    boot.wait_import(IMPORT_TIMEOUT_S)  # each import's one scan complete (no-op with no import)
 
 
 def rule_margin_s(rendered: str, settle_timeout_s: float) -> int:
@@ -215,30 +228,48 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
     return "facts.json and platform.toml written"
 
 
+def direct_storages_value(layout: Layout, boot: Bootstrap, environ: Mapping[str, str]) -> str:
+    """The value of `@hpc_direct_storages@`: an inline TOML table of each direct-I/O import's storage id (the bootstrap
+    made it) to the tree's directory on the host, for a template's `[sandbox.mount]` (M5); `{}` when no import declares
+    a direct mount. Strings are JSON's, which a basic string of TOML is. The platform file that holds the paths is the
+    root's own, never committed."""
+    if not any(space.imported.direct_io for space in layout.shared_imports()):
+        return "{}"
+    mapping = hpcimport.direct_storages(layout, boot.ids.storages, environ)
+    return "{" + ", ".join(f"{json.dumps(key)} = {json.dumps(path)}" for key, path in mapping.items()) + "}"
+
+
 def core_phase(
     layout: Layout,
     owner: Tuple[int, int],
     values: Mapping[str, str],
     *,
+    environ: Optional[Mapping[str, str]] = None,
     rest: Callable[[Path], Any] = Rest,
     bootstrap: Callable[[Any, Layout, Tuple[int, int]], Bootstrap] = HpcBootstrap,
     steps: Callable[[Bootstrap], None] = bring_up,
     content: Callable[[Bootstrap], Any] = Content,
     links: Callable[[Layout, Dict[str, str]], str] = check_after_up,
+    verify: Callable[..., Any] = verify_imports,
 ) -> str:
-    """Bootstrap the federation, write its baseline, its facts and platform.toml, and run the link check; return what
-    up prints, or raise naming the step that failed. The services must be up, and the root must hold the zone's
-    passphrase and the CA."""
+    """Bootstrap the federation, write its baseline, its facts and platform.toml, verify every shared import against
+    its manifest over the rendered file, and run the link check; return what up prints, or raise naming the step that
+    failed. The services must be up, and the root must hold the zone's passphrase and the CA. `environ` is where the
+    imports' variables are read (this process's when None): a core step's own is an allowlist that carries none."""
     passphrase = layout.passphrase(layout.spec.zone.name)
     if not passphrase.is_file() or not layout.ca_pem.is_file():
         raise RuntimeError("the root holds no zone passphrase or no CA: the zone's export did not run")
+    env = os.environ if environ is None else environ
     client = rest(layout.ca_pem)
     try:
         boot = bootstrap(client, layout, owner)
         steps(boot)
         if not layout.facts.exists():
             content(boot).reset(TRANSFER_TIMEOUT_S)
-        written = write_facts(layout, boot, values)
+        filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env)}
+        written = write_facts(layout, boot, filled)
+        # before the link check, so a platform file that leaves the sharing out fails up with no link record written
+        verify(layout, env, timeout_s=VERIFY_TIMEOUT_S)
         checked = links(layout, dict(boot.ids.spaces))
     finally:
         client.close()
