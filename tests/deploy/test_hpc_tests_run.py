@@ -298,7 +298,8 @@ def test_o64_a_run_whose_pytest_exits_0_without_running_a_test_is_no_pass(cli, w
 @pytest.mark.parametrize(
     "args",
     [["--basetemp=/shared/x"], ["--junitxml", "/shared/j.xml"], ["-o", "cache_dir=/x"], ["-ocache_dir=/x"],
-     ["--collect-only"], ["--co"], ["--version"], ["--log-file=/x"], ["-c", "/x.ini"]],
+     ["--collect-only"], ["--co"], ["--version"], ["--log-file=/x"], ["-c", "/x.ini"], ["-qo", "log_file=/x"],
+     ["@args.txt"]],
 )  # fmt: skip
 def test_o64_a_pytest_option_that_writes_elsewhere_or_runs_nothing_is_refused_before_any_step(cli, world, args):
     """O64: options that write outside the run (basetemp, JUnit, logs, ini overrides) or run no test are refused

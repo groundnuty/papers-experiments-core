@@ -246,12 +246,22 @@ class Step:
         ]
 
 
-def remote_command(argv: Sequence[str]) -> str:
+USE_LOCK = "use.lock"  # in the login directory: every run holds it shared; the idle release needs it exclusive
+
+
+def remote_command(argv: Sequence[str], login_dir: str | None = None, bound_s: int | None = None) -> str:
     """The line the login node's shell runs: every word quoted (the boot's newlines stay inside its quotes), and
-    `exec`, so a dropped ssh reaches srun itself."""
+    `exec`. With `login_dir`, the step runs under a shared lock on its USE_LOCK, so the idle release never cancels an
+    allocation a run is using or about to use; with `bound_s`, under `timeout` on the login node, so an srun client
+    that never returns (seen on a site) cannot hold that lock past the run's own bound."""
     if any("\0" in word for word in argv):
         raise HpcTestsError("a remote word holds a NUL")
-    return "exec " + shlex.join(argv)
+    words: list[str] = []
+    if login_dir is not None:
+        words += ["flock", "-s", "-w", "600", f"{checked(LOGIN_DIR, login_dir, 'HPCT_LOGIN_DIR')}/{USE_LOCK}"]
+    if bound_s is not None:
+        words += ["timeout", "-k", "30", str(int(bound_s))]
+    return "exec " + shlex.join([*words, *argv])
 
 
 # The step's first program: read the payload from stdin into a fresh 0700 run directory under the node's tmpfs root,
@@ -325,39 +335,40 @@ def node_settings(
     return "".join(f"{k}={v}\n" for k, v in pairs.items())
 
 
-# pytest options a run may not pass: each either writes outside the run directory (the node's tmpfs) or overrides
-# where the step's results go, or runs no test at all, so a 0 from it would read as a pass.
-REFUSED_OPTIONS = (
-    "--basetemp",
-    "--junitxml",
-    "--junit-xml",
-    "--log-file",
-    "--report-log",
-    "--result-log",
-    "--resultlog",
-    "--override-ini",
-    "--config-file",
-    "--pastebin",
-    "--collect-only",
-    "--co",
-    "--help",
-    "--version",
-    "--fixtures",
-    "--fixtures-per-test",
-    "--markers",
-    "--setup-plan",
-    "--setup-only",
+# The pytest arguments a run may pass: an ALLOWLIST, since pytest also reads clustered short options (`-qo ...`) and
+# argument files (`@file`), which no list of refused tokens can see into. Anything else is refused before a step
+# starts: an option that could write outside the run directory, or move where the step's results go, or run no test.
+FLAGS = frozenset(
+    {"-q", "-qq", "-v", "-vv", "-vvv", "-x", "-s", "-l", "--exitfirst", "--showlocals", "--strict-markers",
+     "--runxfail", "--no-header", "--no-summary", "--disable-warnings"}
+)  # fmt: skip
+WITH_VALUE = frozenset(
+    {"-k", "-m", "-W", "--deselect", "--ignore", "--ignore-glob", "--maxfail", "--durations", "--tb"}
 )
-REFUSED_SHORT = ("-o", "-c", "-h", "-V")
+REPORT_CHARS = re.compile(r"-r[fEsxXpPaAN]+")
+TEST_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*(?:::[A-Za-z0-9_.\[\]\-:, ]+)?")
 
 
 def check_pytest_args(args: Sequence[str]) -> list[str]:
-    """The arguments, refused when one of them is an option of REFUSED_OPTIONS (with or without `=value`) or
-    REFUSED_SHORT (alone or with its value attached)."""
-    for arg in args:
+    """The arguments, refused unless each is a FLAGS flag, a `-r<chars>` report option, a WITH_VALUE option with its
+    value (next, or after `=`), or a test path or node id relative to the clone (no `..`; no leading `/`, `-`, `@`)."""
+    out, pending = list(args), None
+    for arg in out:
+        if pending is not None:
+            pending = None
+            continue
         name = arg.split("=", 1)[0]
-        if name in REFUSED_OPTIONS or any(arg == s or (arg.startswith(s) and s in ("-o", "-c")) for s in REFUSED_SHORT):
-            raise HpcTestsError(
-                f"the pytest option {name} is not allowed in a run (it writes outside the run, or runs no test)"
-            )
-    return list(args)
+        if arg in FLAGS or REPORT_CHARS.fullmatch(arg):
+            continue
+        if name in WITH_VALUE:
+            pending = None if "=" in arg else name
+            continue
+        if TEST_PATH.fullmatch(arg) and ".." not in arg.split("::", 1)[0].split("/"):
+            continue
+        raise HpcTestsError(
+            f"the pytest argument {arg!r} is not one a run takes: test paths, {', '.join(sorted(FLAGS))}, -r<chars>,"
+            f" and {', '.join(sorted(WITH_VALUE))} with a value (README, 'pytest arguments')"
+        )
+    if pending is not None:
+        raise HpcTestsError(f"the pytest option {pending} needs a value")
+    return out

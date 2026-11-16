@@ -5,6 +5,7 @@ every test here also checks what the script must never do: list, renew or cancel
 the account on a command line, or cancel anything but the one job id it means.
 """
 
+import fcntl
 import re
 import subprocess
 from datetime import UTC, datetime
@@ -316,3 +317,18 @@ def test_o64_no_idle_release_while_accounting_lags_or_a_step_has_just_started(lo
     (login.fake / "squeue-steps").write_text("500.batch\n500.7\n")
     renew_once(login, wanted=None, idle="10800")
     assert fakes.calls(login.fake / "scancel.jsonl") == []
+
+
+def test_o64_no_idle_release_while_a_run_holds_the_use_lock(login):
+    """O64: every run holds the login directory's use lock shared from before its step starts to after it ends; the
+    idle release takes it exclusively without waiting, so an allocation a run is using, or is about to use, is kept."""
+    login.ledger(500)
+    login.queue(running(500, NOW + 8 * 3600))
+    steps(login, 500, ("500.batch", slurm_time(NOW - 4 * 3600), "Unknown", "RUNNING"))
+    with (login.dir / "use.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_SH)
+        out = renew_once(login, wanted=None, idle="10800")
+    assert "is in use, not idle" in out.stdout
+    assert fakes.calls(login.fake / "scancel.jsonl") == []
+    renew_once(login, wanted=None, idle="10800")
+    assert fakes.calls(login.fake / "scancel.jsonl") == [["500"]]

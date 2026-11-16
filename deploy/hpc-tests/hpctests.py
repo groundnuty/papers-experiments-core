@@ -258,11 +258,12 @@ def cmd_run(site: lib.Site, remote: Remote, args: argparse.Namespace) -> int:
             lib.allowlist(lib.step_environment(site)),
             lib.boot_command(site.node_root, run_id, digest, "run"),
         )
-        command = lib.remote_command(step.argv())
+        bound = args.time * 60 + WAIT_FOR_CORES_S
+        command = lib.remote_command(step.argv(), site.login_dir, bound)
         meta: dict[str, object] = {"run": run_id, "commit": sha, "job": job.id, "cores": args.cores, "mem": args.mem}
         meta["pytest_args"] = args.pytest
         try:
-            streamed = stream_step(remote, command, payload, args.time * 60 + WAIT_FOR_CORES_S, out / "transport.log")
+            streamed = stream_step(remote, command, payload, bound + 120, out / "transport.log")
         except lib.HpcTestsError as error:
             print(f"the results did not verify: {error}")
             return 71
@@ -288,7 +289,8 @@ def cmd_clean(site: lib.Site, remote: Remote, args: argparse.Namespace) -> int:
             lib.allowlist(lib.step_environment(site)),
             lib.boot_command(site.node_root, run_id, digest, "clean", mode),
         )
-        streamed = stream_step(remote, lib.remote_command(step.argv()), payload, 1200, work / "transport.log")
+        command = lib.remote_command(step.argv(), site.login_dir, 1200)
+        streamed = stream_step(remote, command, payload, 1320, work / "transport.log")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     if streamed.failure:

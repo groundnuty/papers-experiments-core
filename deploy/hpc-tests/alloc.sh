@@ -294,7 +294,7 @@ last_activity() { # last_activity <id> <start>: when a step of the job last ran 
 # never ran one) is released, by its id, through release's own ledger and name checks; renew.wanted is cleared with it,
 # so the loop does not submit another at once, and a successor of ours still queued is released too (nobody needs it).
 idle_release() {
-  local now rows id name state start end cpus mem began last released=0
+  local now rows id name state start end cpus mem began last live released=0
   [ "$IDLE" -gt 0 ] || return 0
   now=$(date +%s)
   rows=$(alive) || { log "squeue failed: no idle decision this round"; return 0; }
@@ -305,12 +305,22 @@ idle_release() {
     last=$(last_activity "$id" "$began")
     is_count "$last" || continue
     [ $((now - last)) -ge "$IDLE" ] || continue
-    # Right before the release, the controller's own list of the job's live steps: a step a lane has just started is
-    # there before accounting has it.
-    if squeue -h -s -j "$id" -o '%i' 2> /dev/null | grep -q "^$id\.[0-9]"; then continue; fi
-    squeue -h -s -j "$id" -o '%i' > /dev/null 2>&1 || continue
+    # Every run holds the login directory's use lock shared from before its step starts to after it ends (hpctestlib's
+    # remote_command): held exclusively here, no run can start a step between the last check and the release. Then the
+    # controller's own list of the job's live steps, read once: a failed read or any step keeps the allocation.
+    exec 7> "$DIR/use.lock"
+    if ! flock -x -n 7; then
+      log "a run holds the use lock: job $id is in use, not idle"
+      exec 7>&-
+      continue
+    fi
+    if ! live=$(squeue -h -s -j "$id" -o '%i') || printf '%s\n' "$live" | grep -q "^$id\.[0-9]"; then
+      exec 7>&-
+      continue
+    fi
     log "job $id has run no test step for $((now - last)) s (since $(date -u -d "@$last" +%FT%TZ)): releasing it"
     (cmd_release "$id") 2>&1 | sed 's/^/  /'
+    exec 7>&-
     released=1
   done <<< "$rows"
   [ "$released" = 1 ] || return 0

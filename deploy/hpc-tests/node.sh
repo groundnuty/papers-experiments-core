@@ -112,11 +112,14 @@ do_pytest() {
   [ ! -s "$kit/pytest-args" ] || mapfile -d '' -t args < "$kit/pytest-args"
   (
     cd "$dir/repo" || exit 72
-    exec env -i PATH="$dir/venv/bin:$PATH" LC_ALL=C.UTF-8 LANG=C.UTF-8 "${RUN_ENV[@]}" \
-      PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS="$HPCT_CORES" OPENBLAS_NUM_THREADS="$HPCT_CORES" \
-      MKL_NUM_THREADS="$HPCT_CORES" GIT_AUTHOR_NAME=hpct GIT_AUTHOR_EMAIL=hpct@invalid \
-      GIT_COMMITTER_NAME=hpct GIT_COMMITTER_EMAIL=hpct@invalid \
-      timeout --signal=TERM --kill-after=30 "$HPCT_TIMEOUT_S" \
+    # pytest's whole environment, set with builtins (no variable's value is on any process's command line): everything
+    # this shell holds is dropped, then RUN_ENV and the few more pytest needs are exported.
+    local path="$dir/venv/bin:$PATH" v
+    for v in $(compgen -e); do unset "$v"; done
+    export "${RUN_ENV[@]}" "PATH=$path" LC_ALL=C.UTF-8 LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 \
+      "OMP_NUM_THREADS=$HPCT_CORES" "OPENBLAS_NUM_THREADS=$HPCT_CORES" "MKL_NUM_THREADS=$HPCT_CORES" \
+      GIT_AUTHOR_NAME=hpct GIT_AUTHOR_EMAIL=hpct@invalid GIT_COMMITTER_NAME=hpct GIT_COMMITTER_EMAIL=hpct@invalid
+    exec timeout --signal=TERM --kill-after=30 "$HPCT_TIMEOUT_S" \
       "$dir/venv/bin/python" -m pytest "${args[@]}" -p no:cacheprovider -ra "--junitxml=$res/junit.xml" \
       "--basetemp=$dir/tmp/pytest"
   ) > "$res/pytest.log" 2>&1 &

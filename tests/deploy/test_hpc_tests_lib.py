@@ -277,3 +277,36 @@ def test_o64_a_step_goes_to_the_running_allocation_of_ours_that_ends_last_and_fi
         hpct.parse.pick_job(jobs, now, 8001)
     with pytest.raises(hpct.lib.HpcTestsError, match="NOW"):
         hpct.parse.parse_listing("JOB 1 x RUNNING 1 2 3 4\n")
+
+
+def test_o64_a_run_s_remote_command_holds_the_use_lock_shared_and_is_bounded_on_the_login_node(hpct, site):
+    """O64: a run's step runs under a shared lock on the login directory's use.lock (which the idle release must take
+    exclusively) and under `timeout`, so a client that never returns cannot hold it past the run's bound."""
+    argv = step(hpct, site).argv()
+    words = shlex.split(hpct.lib.remote_command(argv, ".expcore-hpct", 3900))
+    assert words[:10] == ["exec", "flock", "-s", "-w", "600", ".expcore-hpct/use.lock", "timeout", "-k", "30", "3900"]
+    assert words[10:] == argv
+    with pytest.raises(hpct.lib.HpcTestsError):
+        hpct.lib.remote_command(argv, "../elsewhere", 60)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["tests", "-q"], ["tests/x.py::test_a[1-2]", "-k", "a and not b", "-m", "not benchmark"],
+     ["-x", "--tb=short", "-ra", "--maxfail=2", "-W", "error::DeprecationWarning"], ["--deselect", "tests/x.py::t"]],
+)  # fmt: skip
+def test_the_pytest_arguments_a_run_takes(hpct, args):
+    assert hpct.lib.check_pytest_args(args) == args
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["-qo", "log_file=/x"], ["@args.txt"], ["--basetemp=/x"], ["--setup-only"], ["/abs/tests"], ["../x"],
+     ["tests/../../x"], ["-k"], ["--co"], ["-o", "x=y"], ["-p", "myplugin"], ["--junitxml=/x"], ["-c", "x.ini"]],
+)  # fmt: skip
+def test_o64_any_other_pytest_argument_is_refused(hpct, args):
+    """O64: pytest reads clustered short options (`-qo ...`) and argument files (`@file`), so a run's arguments are an
+    allowlist: test paths relative to the clone and options that can neither write outside the run, move its results,
+    nor run no test; anything else is refused before a step starts."""
+    with pytest.raises(hpct.lib.HpcTestsError):
+        hpct.lib.check_pytest_args(args)

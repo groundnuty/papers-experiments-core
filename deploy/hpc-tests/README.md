@@ -6,8 +6,9 @@ for a development host that is too small or too busy for the suite. CI stays the
 where lanes run their selections in the meantime.
 
 Every site detail (the ssh destination, the account, the partition, the paths) comes from a local `site.env`
-(`site.env.example` lists the keys), which git ignores. Nothing of it is printed, and none of it but the job id, the
-node's tmpfs root and the step's PATH is on a step's command line.
+(`site.env.example` lists the keys), which git ignores. Nothing of it is printed, and none of it but the job id and
+the node's tmpfs root is on a step's command line: uv's path and the tests' PATH (`HPCT_UV`, `HPCT_STEP_PATH`)
+travel in the payload's settings, and pytest's environment is set with shell builtins, so no value is in any process's argv.
 
 ## How a run goes
 
@@ -47,6 +48,16 @@ the step's limit; pytest gets one minute less), `--job` (default: the running al
 `--out` (default `HPCT_OUT`), `--keep` (leave the run directory on the node). `hpctests.py` needs nothing beyond the
 standard library, so `python3 deploy/hpc-tests/hpctests.py` works too.
 
+### pytest arguments
+
+A run's pytest arguments are an allowlist, since pytest also reads clustered short options (`-qo ...`) and argument
+files (`@file`): test paths and node ids relative to the clone (no `..`, nothing absolute), `-q`, `-v`, `-x`, `-s`,
+`-l`, `-r<chars>`, `--exitfirst`, `--showlocals`, `--strict-markers`, `--runxfail`, `--no-header`, `--no-summary`,
+`--disable-warnings`, and `-k`, `-m`, `-W`, `--deselect`, `--ignore`, `--ignore-glob`, `--maxfail`, `--durations`,
+`--tb` with a value. Anything else is refused before a step starts (exit 64): an option that could write outside the
+run directory, move where the step's results go, or run no test. A zero from pytest counts as a pass only when its
+JUnit XML records a test (exit 5 otherwise).
+
 Exit statuses: pytest's own (0 to 5) when results came back; 64 a setting or an argument; 69 no allocation of ours
 fits the step; 70 no results came back; 71 the results failed their SHA-256 or size; 72 the step refused to start
 (the boot's reason is printed); 73 the clone failed; 74 the environment failed (`env.log` is printed); 97 the
@@ -74,7 +85,13 @@ Ask for what the selection needs: most of the suite is single-threaded, so 2 to 
   that removes every run directory of ours that no live `node.sh` holds and that is older than 60 minutes;
   `clean --all` also removes the uv cache and the Python when no run is live.
 - **The srun client of a finished step can hang** while the step's results are already out (seen on a site). The run
-  ends ssh 30 s after the end marker, and keeps the results.
+  ends ssh 30 s after the end marker, and keeps the results. On the login node the step runs under `timeout` (the
+  step's time limit plus an hour for waiting for cores), so a client left behind ends by then.
+- **The use lock:** each run's step runs under a shared `flock` on the login directory's `use.lock`, from before its
+  step starts to after it ends, which the idle release must take exclusively (below). A run that arrives while the
+  idle release holds it waits for it (up to 10 min) and then finds the allocation gone (exit 70). The lock is a file of
+  the login directory, so it coordinates the processes of one login node, and of several only where the home
+  filesystem's locks are cluster-wide.
 
 ## The allocation
 
@@ -119,7 +136,8 @@ allocation ends at its time limit; `release` ends it sooner.
 `--idle-hours` (3; from its start when it never ran one), by its id through `release`'s own ledger and name checks.
 It reads the job's steps from `sacct`, so a step shorter than a poll still counts; a record it cannot read, or one
 that does not list the job's batch step yet, counts as busy; and right before releasing it asks the controller for
-the job's live steps (`squeue -s`), so a step a lane has just started keeps the allocation. It clears `renew.wanted` with it, so the next poll does not submit another, and releases a successor of
+the job's live steps (`squeue -s`), once and while holding the use lock exclusively, so no run can start a step
+between that check and the release. It clears `renew.wanted` with it, so the next poll does not submit another, and releases a successor of
 ours still queued.
 
 `renew start` runs `alloc.sh renew` with `setsid nohup` on the login node, from a frozen copy of `alloc.sh` (bash reads a
