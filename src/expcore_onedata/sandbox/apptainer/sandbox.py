@@ -342,7 +342,8 @@ class ApptainerSandbox:
                 raise SandboxError("the gate did not start") from None
             break
         self._remove_token_files()  # the gate read it before it said ready; it keeps it in memory alone
-        self._meta["gate"] = {"port": self._gate_port, "hosts": len(served)}
+        peer_check = json.loads(config.read_text(encoding="utf-8")).get(gaterun.PEER_CHECK_KEY) is True
+        self._meta["gate"] = {"port": self._gate_port, "hosts": len(served), "peer_uid_check": peer_check}
 
     def _retire_gate(self) -> None:
         """A gate that failed to start: shown gone before another is tried (a stop that cannot show it raises)."""

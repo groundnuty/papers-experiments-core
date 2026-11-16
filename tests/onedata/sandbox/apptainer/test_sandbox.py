@@ -195,3 +195,26 @@ def test_a_cell_s_output_is_capped_and_the_cut_recorded(node, settings):
         assert box.metadata()["cell_output_cuts"] == [{"cell": 1, "stdout": {"produced": 100, "kept": 16}}]
     finally:
         box.stop()
+
+
+def test_the_gate_s_peer_uid_check_is_on_by_default_only_where_the_gate_has_it(node, settings, monkeypatch, tmp_path):
+    """O56: the check is asked of a gate that has it, never claimed for one that would not read it; the operator's
+    `gate_options` still decide when they name it."""
+    from expcore_onedata.sandbox.apptainer import gaterun
+
+    monkeypatch.setattr(gaterun, "PEER_CHECK", tmp_path / "absent" / "gatepeer.py")
+    box = start(node, settings)
+    try:
+        assert gaterun.PEER_CHECK_KEY not in node.gates[-1].config
+        assert box.metadata()["gate"]["peer_uid_check"] is False
+    finally:
+        box.stop()
+    present = tmp_path / "gatepeer.py"
+    present.write_text("# the check\n")
+    monkeypatch.setattr(gaterun, "PEER_CHECK", present)
+    box = start(node, settings)
+    try:
+        assert node.gates[-1].config[gaterun.PEER_CHECK_KEY] is True
+        assert box.metadata()["gate"]["peer_uid_check"] is True
+    finally:
+        box.stop()

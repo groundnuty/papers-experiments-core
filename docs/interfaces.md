@@ -1096,7 +1096,7 @@ egress_collector_sha256 = "<64 hex>"
 ```
 
 - **Its egress:** `EgressLog(sandbox, sandbox.egress_declaration(), sandbox.egress_nonce)`. The declaration names the gate at `127.0.0.1:<its port>`, the canary's listener, and the gate's names. `egress_log()` returns the collector's log once `collect` has stopped the collector, and None before that.
-- **Hook (a):** `[sandbox.apptainer.gate_options]` adds keys to the gate's configuration. A key the sandbox writes itself is refused.
+- **Hook (a):** `[sandbox.apptainer.gate_options]` adds keys to the gate's configuration. A key the sandbox writes itself is refused. The gate's peer-uid check (`peer_uid_check`, #317) is on by default whenever the gate's directory holds `gatepeer.py`, and `metadata()["gate"]["peer_uid_check"]` says whether it was asked for.
 - **Hook (b):** `preload = [{ path, sha256 }]` lists libraries each cell preloads before the egress shim. A connect hook rewrites first and calls the next `connect`, so the shim logs the destination actually dialled. `binds = [{ path, sha256, target }]` adds read-only files. A REST cell also gets `/etc/expcore/gate.json` (`{"address", "port", "names"}`) and `EXPCORE_GATE_PORT`.
 - **Hook (c):** `ApptainerSandbox(..., mount_helper=factory)` with `apptainer.mounthook.MountHelper` (`start() -> Path` bound read-only at `[sandbox.mount] path`, then `stop()`, then `metadata()`). Without a factory a mount run raises `StartRefused(MOUNT_REFUSED)` before anything exists.
 - **Departures** from the Docker sandbox are listed by key in every run's `metadata()["infrastructure_facts"]` (`apptainer.facts.FACTS`):
