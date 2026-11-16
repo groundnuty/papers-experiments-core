@@ -483,18 +483,14 @@ if not tied or os.getppid() != int(sys.argv[1]):
 argv = sys.argv[2:]
 if argv[1:4] != ["-I", "-m", "expcore"]:
     os.execv(argv[0], argv)
-sys.argv, code = ["expcore", *argv[4:]], 1
-try:
+sys.argv = ["expcore", *argv[4:]]
+try:  # its SystemExit, its message and its exit status pass as `python -m expcore`'s own
     runpy.run_module("expcore", run_name="__main__", alter_sys=True)
-    code = 0
-except SystemExit as end:
-    code = end.code if isinstance(end.code, int) else (0 if end.code is None else 1)
 finally:
     try:
         os.replace("{OWNER_ENDING}", "{OWNER}")
     except OSError:
         pass
-sys.exit(code)
 """
 NOT_TIED = 71  # the dispatcher could not be tied to its step: it never started
 

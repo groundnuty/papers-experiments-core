@@ -449,3 +449,25 @@ def test_o63_a_dispatcher_that_cannot_be_tied_to_its_step_never_starts(shards, t
     )  # fmt: skip
     assert (done.returncode, mark.exists()) == (shards.NOT_TIED, False)
     assert "could not be tied to its step" in done.stderr
+
+
+@pytest.mark.parametrize(
+    "words",
+    [["--version"], ["run", "/nonexistent/study"]],
+    ids=["refused arguments", "a study that is not there"],
+)
+def test_o63_the_dispatcher_ends_as_python_m_expcore_would(shards, tmp_path, words):
+    """O63: run through its first words, the dispatcher's exit status, stdout and stderr are `python -I -m expcore`'s
+    own (a SystemExit's message included), and its record is swapped all the same."""
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / ".step.ended.json").write_text(json.dumps({"phase": "archiving"}))
+    plain = subprocess.run([sys.executable, "-I", "-m", "expcore", *words], capture_output=True, text=True, cwd=work)
+    dispatcher = [sys.executable, "-I", "-m", "expcore", *words]
+    tied = subprocess.Popen(
+        [sys.executable, "-I", "-c", shards.DISPATCHER, str(os.getpid()), *dispatcher],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=work,
+    )  # fmt: skip
+    out, err = tied.communicate(timeout=120)
+    assert (tied.returncode, out, err) == (plain.returncode, plain.stdout, plain.stderr)
+    assert json.loads((work / "step.json").read_text()) == {"phase": "archiving"}
