@@ -29,6 +29,7 @@ import os
 import pwd
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Mapping, Optional, Sequence
 
 sys.dont_write_bytecode = True  # nothing of the checkout or the venv is written on the login node or a node
@@ -119,9 +120,27 @@ def make_driver(
     )
 
 
+def mount_check(driver: Driver) -> Optional[SimpleNamespace]:
+    """The read-only proof of an owner's shared imported trees (O59, `hpcimport`), as the service verbs take it: a
+    restarted owner is ready again only once its trees are proven read-only for that launch (`hpcfed_control`). None
+    in a core without the shared import, whose layouts declare none."""
+    try:
+        import hpcimport
+    except ImportError:
+        return None
+    from hpcdown import BUNDLE
+
+    return SimpleNamespace(
+        spaces=lambda service: [space.name for space in hpcimport.shared_imports_of(driver.layout, service)],
+        argv=lambda workdir, python: hpcimport.mount_check_argv(str(BUNDLE), workdir, python=python),
+        problems=hpcimport.mount_check_problems,
+    )
+
+
 def control_hook(driver: Driver, verb: str, service: Optional[str], rest: List[str]) -> int:
     """The service verbs (DESIGN.md, section 7), by `hpcfed_control.run` (M4). The hook is stable: the verb, the
-    service, what follows `--` (for exec), the launcher, the state store and the layout's stop bound."""
+    service, what follows `--` (for exec), the launcher, the state store, the layout's stop bound and the read-only
+    proof of a shared import's owner (`mount_check`)."""
     try:
         import hpcfed_control
     except ImportError:
@@ -131,7 +150,13 @@ def control_hook(driver: Driver, verb: str, service: Optional[str], rest: List[s
         print(f"error: {verb}: not a verb of hpcfed_control", file=sys.stderr)
         return 2
     return hpcfed_control.run(
-        verb, service, rest, launcher=driver.launcher, state=driver.store, stop_seconds=driver.settings.stop_seconds
+        verb,
+        service,
+        rest,
+        launcher=driver.launcher,
+        state=driver.store,
+        stop_seconds=driver.settings.stop_seconds,
+        mounts=mount_check(driver),
     )
 
 

@@ -34,6 +34,10 @@ export HPCOP_OWNER_PID=$$   # node-init.sh records this batch script as the owne
 W=$(bash "$B/node-init.sh" op "$TAR")
 svc='' svc_start=''
 cleanup() {
+  if kept_stop "$W"; then   # teardown.sh --keep (hpcfed.py stop): stop what still runs, remove nothing
+    if [[ -n $svc ]]; then stop_service "$svc" "${HPCOP_STOP_SECONDS:-600}" "$svc_start"; fi
+    return 0
+  fi
   rm -rf -- "$(secrets_dir "$W")"   # not needed to stop; gone even if SIGKILL cuts the stop short
   if [[ -n $svc ]]; then stop_service "$svc" "${HPCOP_STOP_SECONDS:-600}" "$svc_start"; fi
   remove_workdir "$W"
@@ -62,6 +66,9 @@ if ! bash "$B/finish.sh" --workdir "$W" "$svc"; then
   while [[ -e $W ]] && (( SECONDS < end )); do sleep 10; done
   exit 1
 fi
+# The ready marker, once finish.sh has passed every check: service-verified holds service.pid as it is now
+# (status.sh reads "ready" from it; a later launch has another service.pid, so a stale marker never matches).
+mark_verified "$W"
 say "provider up; holding until teardown or the end of the job"
 status=0; wait "$svc" || status=$?
 # The job's state says how the service ended: a stop teardown.sh asked for is a success, any other end a

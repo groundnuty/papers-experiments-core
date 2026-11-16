@@ -5,7 +5,8 @@
   signal PID START SIG     send SIG (TERM, USR1 or KILL) to PID only if it is still the process that started at clock
                            tick START (field 22 of /proc/PID/stat); exit 0 if sent, 1 if PID is gone or is another
                            process
-  check                    exit 0 if this Python and kernel have pidfd_open and pidfd_send_signal (Linux 5.3 and 5.1)
+  check                    exit 0 if pidfd_open and pidfd_send_signal work here (Linux 5.3 and 5.1): through os and
+                           signal where this Python has them, else the raw system calls through ctypes
 
 Why (live run 4): run_service used to exec apptainer, which execs the setuid-root starter under the same PID. On a node
 with hidepid=invisible that process is hidden from its own user: /proc/<pid> is absent while kill -0 succeeds. The
@@ -27,6 +28,12 @@ starter's real UID is ours, so the kernel allows it, as kill -0 showed live.
 time in /proc. If the start time is the recorded one, the process holding PID at that moment is the recorded one, and
 the pidfd refers to it (a PID taken over before the pidfd_open would show a later start time), so a reused PID is
 never signalled.
+
+A Python built without `os.pidfd_open` or `signal.pidfd_send_signal` (a standalone build, made against an old C
+library, on a node whose kernel has both) makes the system calls itself: `pidfd_open` is 434 and `pidfd_send_signal`
+424 in Linux's generic table, which every architecture shares for calls this new, through the C library's `syscall`
+(ctypes), as the platform layer's node code does (`expcore_onedata.sandbox.apptainer.node`). A failing call raises
+OSError with its errno, so ESRCH is ProcessLookupError and EPERM PermissionError, as from `os` and `signal`.
 """
 
 import os
@@ -34,6 +41,7 @@ import signal
 import sys
 
 SIGNALS = {"TERM": signal.SIGTERM, "USR1": signal.SIGUSR1, "KILL": signal.SIGKILL}
+SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434  # Linux's generic syscall table (x86_64 and aarch64 alike)
 
 
 def say(msg):
@@ -41,24 +49,43 @@ def say(msg):
     sys.stderr.flush()
 
 
-def pidfd_supported():
-    return hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+def _syscall(number, *args):
+    """A raw Linux system call through the C library's `syscall`, every argument a C long; OSError with the call's
+    errno when it fails (OSError's constructor gives ESRCH as ProcessLookupError, EPERM as PermissionError)."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    found = libc.syscall(ctypes.c_long(number), *(ctypes.c_long(arg) for arg in args))
+    if found < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return int(found)
+
+
+def pidfd_open(pid):
+    """pidfd_open(2): os.pidfd_open where this Python has it, else the system call itself."""
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    return _syscall(SYS_PIDFD_OPEN, pid, 0)
+
+
+def pidfd_send_signal(fd, sig):
+    """pidfd_send_signal(2), likewise: no siginfo, no flags."""
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(fd, sig)
+        return
+    _syscall(SYS_PIDFD_SEND_SIGNAL, fd, int(sig), 0, 0)
 
 
 def check():
-    if not pidfd_supported():
-        say(
-            "this Python has no os.pidfd_open or signal.pidfd_send_signal (Python 3.9 or later, built on Linux 5.3 "
-            "or later)"
-        )
-        return 2
     try:
-        fd = os.pidfd_open(os.getpid())
+        fd = pidfd_open(os.getpid())
         try:
-            signal.pidfd_send_signal(fd, 0)
+            pidfd_send_signal(fd, 0)
         finally:
             os.close(fd)
-    except OSError as e:
+    except (OSError, ImportError, AttributeError) as e:  # ImportError: a Python without ctypes, and no pidfd calls
         say("pidfd_open or pidfd_send_signal failed here: %s (Linux 5.3 or later is needed)" % e)
         return 2
     return 0
@@ -79,13 +106,13 @@ def signal_recorded(pid, start, sig):
     if pid < 1:
         return 1
     try:
-        fd = os.pidfd_open(pid)
+        fd = pidfd_open(pid)
     except ProcessLookupError:
         return 1
     try:
         if start_time(pid) != start:  # another process holds PID now (or none we may read): not ours to signal
             return 1
-        signal.pidfd_send_signal(fd, sig)
+        pidfd_send_signal(fd, sig)
     except (ProcessLookupError, PermissionError):
         return 1
     finally:
@@ -99,7 +126,7 @@ def run(cmd):
 
     def deliver(sig):
         try:
-            signal.pidfd_send_signal(state["pidfd"], sig)
+            pidfd_send_signal(state["pidfd"], sig)
             say("%s sent to the container's starter (pid %d)" % (signal.Signals(sig).name, state["pid"]))
         except ProcessLookupError:
             pass  # it has ended and been reaped: nothing to signal
@@ -122,7 +149,7 @@ def run(cmd):
     # ignored, as they were for the apptainer this process used to exec.
     pid = os.posix_spawnp(cmd[0], cmd, os.environ)
     state["pid"] = pid
-    state["pidfd"] = os.pidfd_open(pid)  # our unreaped child: PID not recycled before this
+    state["pidfd"] = pidfd_open(pid)  # our unreaped child: PID not recycled before this
     for sig in pending:
         deliver(sig)
     _, status = os.waitpid(pid, 0)  # reaps it; a signal arriving meanwhile is forwarded, then the wait resumes
@@ -137,7 +164,7 @@ def main(argv):
             return 2
         return run(argv[2:])
     if len(argv) == 4 and argv[0] == "signal" and argv[1].isdigit() and argv[2].isdigit() and argv[3] in SIGNALS:
-        if not pidfd_supported():
+        if check() != 0:
             say("no pidfd support here: not signalling")
             return 2
         return signal_recorded(int(argv[1]), argv[2], SIGNALS[argv[3]])

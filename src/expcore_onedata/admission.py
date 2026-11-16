@@ -149,7 +149,9 @@ from expcore_onedata.fault_deferral import heal_deferral_bound
 from expcore_onedata.fault_drain import SessionDrain
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, make_directories
 from expcore_onedata.fault_recovery import failure
+from expcore_onedata.fault_relay import relay_refusal
 from expcore_onedata.fault_settings import FaultSettings, load_faults
+from expcore_onedata.linkrecord import federation_root
 from expcore_onedata.resetlock import FEDERATION_RESET, ResetShare
 from expcore_onedata.sandbox.kinds import FEDERATION_BUSY, PROVIDER_OUTAGE
 from expcore_onedata.shared_holds import SharedHolds
@@ -867,6 +869,7 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
             )
         return None
     lock = FederationLock(settings)
+    hpc = settings.backend == "hpc"
 
     @contextlib.contextmanager
     def admit(
@@ -883,6 +886,9 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
                 "names the provider it takes down, and the federation is held for that provider's label"
             )
         purpose = OUTAGE_RUN if outage else EXCLUSIVE_RUN
+        relayed = relay_refusal(federation_root(settings.journal), prerun.current()) if outage and hpc else None
+        if relayed is not None:  # an outage run on HPC stops and restores through the fault relay: none, no run
+            raise FederationBusy(relayed)
         timeout_s = settings.admission_timeout_s
         with lock.held(
             exclusive=outage or exclusive, timeout_s=timeout_s, target=target, cancel=cancel, purpose=purpose

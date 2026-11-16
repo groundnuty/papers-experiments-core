@@ -316,8 +316,12 @@ with `[hpc] core = "step"`, that the core's Python from a venv on the shared fil
 batch scripts as `--exact` steps of a multi-node job; the bootstrap's panel calls through 8443 with the LUMA local
 feed's mappings; the submit read-back's fields as the site's Slurm prints them, for each component of a heterogeneous
 job too, and a step with `--het-group=1` from the login node (`DESIGN.md`, section 9); and the ten pairs passing over
-the cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`), which
-also repeats the mount check after a `start`; the agent's node's step (M5) is not built here. A layout with a shared
+the cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`, over this
+driver's launcher and state file; DESIGN.md section 7), which also repeat the mount check after a `start` (the first
+`status` that finds a restarted owner otherwise ready runs it); `up` starts the core's fault relay
+(`expcore_onedata.fault_relay`) and `down` stops it. Tested offline, none of it run live: a kept stop and a start again
+over the same work directory, `exec.sh` beside a running service, and every stop's real duration (from which `[hpc]
+stop_seconds` is to be set) are the live slot's. The agent's node's step (M5) is not built here. A layout with a shared
 import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
 
 ## The scripts
@@ -359,7 +363,8 @@ the core it was given, runs `python -m expcore run STUDY --shard i/N --shard-lab
 exited writes the copy's `out/` whole to `<results>/<label>.out.tar` with a manifest. `shards.py collect --manifest
 shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only and prints the `python -m expcore merge`
 line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's docstring
-has its form). Outage runs (`[faults]`) depend on the fault relay of milestone M4.
+has its form). Outage runs (`[faults]`) go through the login node's fault relay (M4), which `up`
+starts.
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into
