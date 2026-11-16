@@ -5,8 +5,9 @@ helper processes on the node, over an injectable `NodeOps` (O56).
 `ApptainerSandbox` is the platform layer's `Sandbox` (`api.py`), and also what `SandboxPlatform` (`provider.py`) and the
 code tool call of a sandbox beyond that protocol: `start`/`begin`/`abandon`, `exec`, `mark_run_start`, `collect`,
 `stop`, `metadata`, `record`, `read_only_inputs`, `settle_deadline`, `gate_refusals`, `served_bytes`,
-`mount_io_mode`, `session_kinds`, `session_ends`, `teardown_left`, `keep_evidence`, `stopped`; and for the egress
-instrument (`expcore.egress.EgressLog`) `egress_log`, `egress_declaration` and `egress_nonce`.
+`mount_io_mode`, `session_kinds`, `session_ends`, `teardown_left`, `keep_evidence`, `stopped`; for the egress
+instrument (`expcore.egress.EgressLog`) `egress_log`, `egress_declaration` and `egress_nonce`; and for the process
+visibility instrument (`expcore.visibility.ProcessVisibility`) `process_visibility`.
 
 Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded first in `work_root/_runs/<sid>.json`
 (`runs.py`), so a driver killed outright is reaped by the next start and its key held by the probe:
@@ -18,7 +19,12 @@ Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded fir
   proves the watch sees a cell's processes, or the start fails;
 * REST: the core's gate on 127.0.0.1 (`gaterun.py`), with the token in its memory alone; the cell resolves the zone's
   and the provider's names to the loopback and trusts the run's CA; its `ONEDATA_TOKEN` is the placeholder (O23);
-* a mount: refused until the helper of hook (c) is given (`mounthook.py`);
+* a mount: oneclient on the node, outside every cell, by the helper of hook (c) (`mounthook.py`, `hostmount.py`); a
+  mount run is refused at its start without the helper, without `[sandbox.mount]`, and by the helper itself for a
+  direct mount (HPC mounts are proxy-only until the direct-I/O comparison passes);
+* no name server: every cell binds a `resolv.conf` that names none and an `nsswitch.conf` whose hosts are `files`, so
+  the C library resolves the names of `/etc/hosts` alone: the federation's, as Docker's `--add-host` gives them
+  (`facts.py`, `dns_none`);
 * every cell one `apptainer exec --containall` (`cells.py`, `argv.py`), the root of the image and every bind but
   `/work`, `/tmp` and `/dev/shm` read-only, proved at the start as on Docker, with the read-only inputs (O20).
 
@@ -122,7 +128,7 @@ class ApptainerSandbox:
             "data_path": spec.mode.value,
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,
             "backend": self.app.record() if self.app is not None else {"backend": "apptainer"},
-            "infrastructure_facts": facts.record(),
+            "infrastructure_facts": facts.record(mount_refused=self._mount_refused()),
             "images": {},
             "tls": settings.tls.record(),
             "certifi": None,
@@ -198,6 +204,12 @@ class ApptainerSandbox:
                 log.error("cleanup after a failed start was incomplete: %s", describe_error(error))
             raise
 
+    def _mount_refused(self) -> bool:
+        """Whether a mount data path is refused here: no helper is given or the platform declares no `[sandbox.mount]`.
+        The run's facts list `mount_refused` exactly when this holds; the helper's own refusals (a direct mount, a run
+        without a token) come after it, at the helper's start."""
+        return self._mount_factory is None or self.s.mount is None
+
     def _validate(self) -> None:
         sp, s = self.spec, self.s
         if self.app is None:
@@ -206,7 +218,7 @@ class ApptainerSandbox:
             raise StartRefused("the run key must be 1 to 200 printable ASCII characters without spaces")
         if (sp.token is None) != (sp.mode is DataPathMode.NONE):
             raise StartRefused("a data path takes the data-path token, and no data path takes none")
-        if sp.mode is DataPathMode.MOUNT and (self._mount_factory is None or s.mount is None):
+        if sp.mode is DataPathMode.MOUNT and self._mount_refused():
             raise StartRefused(MOUNT_REFUSED)
         if sp.mode is not DataPathMode.NONE and sp.provider is None:
             raise StartRefused("a data path needs the agent's local provider")
@@ -413,10 +425,13 @@ class ApptainerSandbox:
         names = list(gaterun.hosts(sp.zone, sp.provider)) if rest else []
         preloads = [f"{AV.PRELOAD_DIR}/{n}.so" for n in range(len(self.app.preload))]
         layout.write_text(cell / "hosts", AV.hosts_text(names))
+        layout.write_text(cell / "resolv.conf", AV.RESOLV_TEXT)
+        layout.write_text(cell / "nsswitch.conf", AV.NSSWITCH_TEXT)
         layout.write_text(cell / "ld.so.preload", AV.preload_text([*preloads, AV.SHIM_TARGET]))
         binds = [
             AV.Bind(self.dir / "work", "/work", True), AV.Bind(self.dir / "tmp", "/tmp", True),
             AV.Bind(self.dir / "shm", "/dev/shm", True), AV.Bind(cell / "hosts", "/etc/hosts"),
+            AV.Bind(cell / "resolv.conf", AV.RESOLV_CONF), AV.Bind(cell / "nsswitch.conf", AV.NSSWITCH_CONF),
             AV.Bind(self.dir / "egress-sock", AV.EGRESS_DIR), AV.Bind(cell / "egresslog.so", AV.SHIM_TARGET),
             AV.Bind(cell / "ld.so.preload", "/etc/ld.so.preload"),
             *(AV.Bind(cell / f"preload-{n}.so", target) for n, target in enumerate(preloads)),
@@ -449,6 +464,7 @@ class ApptainerSandbox:
             spaces=spaces_of(self.dir, {"work": limits.work_disk_bytes, "tmp": limits.tmp_bytes,
                                         "shm": limits.shm_bytes}),
             memory_poll_s=self.app.memory_poll_s, disk_poll_s=self.app.disk_poll_s,
+            hidden_margin_bytes=self.app.hidden_memory_margin_bytes,
         )  # fmt: skip
         self._watch.start()
         escalation = DL.Escalation(self.s.kill_grace_s, _no_mount, sleep=self._sleep, clock=self._clock)
@@ -680,6 +696,11 @@ class ApptainerSandbox:
         could not be read (`expcore.egress.EgressSource`)."""
         return self.collection.egress_bytes
 
+    def process_visibility(self) -> dict[str, Any] | None:
+        """What the watch saw of the processes `/proc` hides (`expcore.visibility.ProcessVisibility`'s source): read
+        once the run's cells have ended; None before the watch exists."""
+        return None if self._watch is None else self._watch.visibility()
+
     def mount_watch_log(self) -> bytes | None:
         """The mount guard's log (`expcore.mountguard.MountWatchSource`), its window closed first (O60); None without a
         mount helper that keeps one. Read after the run's cells have ended: the collection does, and so may the
@@ -735,6 +756,7 @@ class ApptainerSandbox:
             meta["cells"] = len(self._cells.cells)
         if self._watch is not None:
             meta["watch"] = self._watch.summary()
+            meta["infrastructure_facts"]["memory"] = meta["watch"]["memory"]  # never `within` unless the check held
         if self.spec.mode is DataPathMode.REST:
             lines = self.gate_log_lines()
             meta["gate_log"] = gatelog.unknown("the gate log could not be read") if lines is None else (
