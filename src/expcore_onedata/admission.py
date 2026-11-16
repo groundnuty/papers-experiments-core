@@ -89,7 +89,15 @@ let go) `federation.reset`. Who waits for what, holding what:
 - `link-epoch.lock` (`fault_epoch`) comes last of all: a link check of the fault gate waits for it (shared) holding
   its share of `federation.lock` and `federation.reset`, or the heal's exclusive admission, and a run admission's
   re-check (`admission_recheck`) waits for it (exclusive, polled within `admission_timeout_s`) holding the admission it
-  took. No holder of it waits for anything but the journal-wide lock.
+  took. No holder of it waits for anything but the journal-wide lock and the leaf below;
+- `link-check.lock` (`linkrecord`) is a leaf, taken after all of those: a restore's or a heal's link check holds it
+  (exclusively) inside the exclusive admission it runs under, the health gate's routine check inside its shared hold
+  of the federation (and its share of `link-epoch.lock`), around the check and the writing of its record, and `up`
+  holds it holding nothing. A holder waits for nothing but the platform's answers to the check, which the check
+  bounds, and never for a lock above, so no cycle closes through it: the most a holder of one of those waits for it is
+  another such check's end. A heal's exclusive admission and the gate's shared hold never overlap, so they never wait
+  for each other here; the routine checks of two campaigns that hold the federation shared together, and `up` run on
+  a federation being checked, are what it orders.
 
 No holder of `federation.reset` waits for `federation.lock` or the turnstile, and no holder of `federation.lock` waits
 for the turnstile, so no wait closes a cycle. Two resetters cannot deadlock: each gives up its share before it waits, so

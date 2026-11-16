@@ -20,9 +20,22 @@ declared for raises ConfigError, naming the file and the table, never the servic
 injection stays open and the fault gate fails, as for a restore that never served, until a later clear finds every link
 transferring. `ServingProbe.matrix` is the same check pair by pair, which the heal of `[faults] heal` reads, and `arm`
 and `sessions` are the session gate that comes before it (`expcore_onedata.fault_sessions`).
+
+**Every one of those checks is recorded (O35, `expcore_onedata.linkrecord`).** The restore's check, each read of the
+pairs a heal makes (its re-check after the settle among them) and the health gate's routine check
+(`health.PlatformHealth`) write `link-check.json` in the federation's root, the file `up` writes (the journal's parent:
+`linkrecord.federation_root`), whichever platform file the check ran through, atomically and in the format `up`
+writes. So the record on disk is the latest check's verdict and time: a passing re-check after a heal leaves a pass, a
+check that finds a pair stuck leaves its failing verdict over an older pass, and a check that raises removes the older
+record (or empties it in place), as does one whose record cannot be written (logged, never failing the restore or the
+heal). One check at a time makes the record (`linkrecord.recording`: a leaf lock around the check and its write), so a
+late finisher never replaces a later check's record. All of them go through `recorded`, one function with one set of
+rules. The record is read by no admission: it touches no federation lock and no epoch.
 """
 
+import logging
 from collections.abc import Callable
+from pathlib import Path
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
@@ -30,10 +43,12 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_sessions import SessionGate
 from expcore_onedata.fault_settings import FaultSettings
-from expcore_onedata.linkcheck import check_links
+from expcore_onedata.linkcheck import LinkReport, check_links
+from expcore_onedata.linkrecord import discard_record, record_path, recording, write_record
 from expcore_onedata.readretry import ONE_ATTEMPT
 
 PROBE_TIMEOUT_S = 10.0
+log = logging.getLogger(__name__)
 
 
 def _path(config: PlatformConfig, provider: str) -> str:
@@ -42,6 +57,43 @@ def _path(config: PlatformConfig, provider: str) -> str:
         if provider in entry.support.providers:
             return f"/spaces/{entry.space.id}"
     return "/configuration"
+
+
+def recorded(path: Path, check: Callable[[], LinkReport]) -> LinkReport:
+    """One all-pairs check, made by `check`, and its record at `path` (`linkrecord.record_path`: the federation's root),
+    pass or fail: the record on disk is always the latest check's verdict, never an older one. The check and the writing
+    of its record are one step under the record's lock, so a check that starts while another is under way waits for it
+    and writes after it; one that cannot take the lock writes no record at all, and removes the older one. A check that
+    raises answers nothing, so the older record is removed (or, when the directory refuses that, emptied in place)
+    before the error goes on to the caller; a record that cannot be written is treated the same, and logged (its
+    error's type only), and the check's answer is returned as made: the record is advisory, and neither the restore's
+    verdict, the heal's nor the gate's depends on it. It touches no federation lock and no epoch (`fault_epoch`). The
+    restore's check, the heal's reads and the gate's routine check all come through here."""
+    with recording(path) as serialized:
+        try:
+            report = check()
+        except Exception:
+            _discarded(path)
+            raise
+        if not serialized:  # a verdict that another check's may overlap is published by no one: the old one goes
+            log.warning("the link check's record lock could not be taken, so no record is written")
+            _discarded(path)
+            return report
+        try:
+            write_record(report, path)
+        except OSError as error:
+            log.warning("the link check's record could not be written (%s)", type(error).__name__)
+            _discarded(path)
+        return report
+
+
+def _discarded(path: Path) -> None:
+    """Make sure no older verdict stands: the record removed, or emptied in place; a record that can be neither is
+    logged, its error's type only."""
+    try:
+        discard_record(path)
+    except OSError as error:
+        log.warning("the older link check record could be neither removed nor emptied (%s)", type(error).__name__)
 
 
 class ServingProbe:
@@ -85,11 +137,14 @@ class ServingProbe:
 
     def matrix(self, service: str) -> LinkMatrix | None:
         """The same check as a matrix of every pair by label, which the heal reads (`fault_heal`); None without a
-        `[link_check]`."""
+        `[link_check]`. Every check made here, a restore's and each read of the pairs a heal makes, is recorded as
+        `link-check.json` in the federation's root, in the format `up` writes (`recorded`)."""
         self._provider(service)
         if self._config.link_check is None:
             return None
-        return LinkMatrix.from_report(check_links(self._config, self._client))
+        return LinkMatrix.from_report(
+            recorded(record_path(self._settings.journal), lambda: check_links(self._config, self._client))
+        )
 
     def arm(self, service: str) -> str | None:
         """Before an injection: the session gate's probe file, found or written and seen by every provider of the probe
