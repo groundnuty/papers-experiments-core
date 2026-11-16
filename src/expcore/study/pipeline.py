@@ -71,6 +71,7 @@ from expcore.campaign.export import (
     verify_export_fingerprint,
 )
 from expcore.campaign.export_join import join_exports
+from expcore.campaign.healthgate import PlatformDeferral
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
@@ -93,6 +94,7 @@ from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapsho
 from expcore.campaign.storecopy import StoreChanged
 from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
+from expcore.config.platform_loads import PlatformLoad, watching_platform_loads
 from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
 from expcore.errors import study_kinds
 from expcore.guards import GuardsAnalysis, guards_analysis
@@ -323,6 +325,24 @@ def _run_campaign(
     """
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
     declared = platform_deferrals(study)  # from each platform's own configuration, before any study code runs (C11)
+    # the study's build, from its plugin's import to the scheduler's start, is watched for the platform loaders it runs
+    with watching_platform_loads() as loaded:
+        return _start_campaign(study, code, declared, loaded, crash_hook, shard, after, spend_journal)
+
+
+def _start_campaign(
+    study: StudyConfig,
+    code: Mapping[str, Any],
+    declared: Sequence[PlatformDeferral],
+    loaded: Sequence[PlatformLoad],
+    crash_hook: Callable[[str, str], None] | None,
+    shard: Spec | None,
+    after: Sequence[Path],
+    spend_journal: Path | None,
+) -> RunSummary:
+    """Build the study's plugin and the scheduler of its campaign, and run it. `loaded` is the record the study's build
+    fills, a list the platform loaders append to while this runs; the scheduler gets what it holds once the build is
+    done, and refuses a platform the study did not list (C11)."""
     plugin = load_plugin(StudyContext(study, code))
     out = out_dir(study)
     leases = None if plugin.probe is None else LeasePool(out / "leases", plugin.lease_keys, plugin.probe)
@@ -364,6 +384,7 @@ def _run_campaign(
             reset_settings=plugin.reset_settings,
             platform_deferrals=declared,
             listed_platforms=study.platforms,
+            platform_loads=tuple(loaded),  # what the build loaded through the core's loaders, whatever the plugin hides
             **options,
         ) as scheduler:
             _say_lost(scheduler.lost_counted)

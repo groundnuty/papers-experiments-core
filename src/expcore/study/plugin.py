@@ -85,7 +85,9 @@ class StudyPlugin:
       deferred (a `DeferralBound` or None, read from the platform's settings), which the core holds `health` to: a
       health check that exposes no `max_deferral_s`, or a smaller bound, is refused when the campaign starts. The core
       also reads the declaration itself, from the platform's own configuration through the module `[study] platforms`
-      names (`study.platform_deferral`), so wrapping `admission` hides nothing.
+      names (`study.platform_deferral`), so wrapping `admission` hides nothing, and it refuses a study whose build ran a
+      platform's loader for a module `[study] platforms` does not list (`config.platform_loads`), so hiding both
+      declarations and listing nothing hides nothing either.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
       Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, each level's data path and
       listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign
