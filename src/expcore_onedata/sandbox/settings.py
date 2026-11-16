@@ -7,6 +7,9 @@ in strict mode (no host bits set), so a typo fails at load and not when the thir
 
 ```toml
 [sandbox]
+backend = "docker"              # optional: docker, or apptainer for an HPC batch node with [sandbox.apptainer] (O56,
+                                # apptainer/settings.py), which reads neither images, network, federation, sudo,
+                                # agent_uid, earlyoom_comm, python nor label_namespace
 work_root = "/path"             # host directory for the per-sandbox directories and the teardown log
 name_prefix = "sbx"             # prefix of container, network and directory names; letters, digits and '-'
 label_namespace = "org.expcore" # docker labels are <namespace>.sandbox, .owner, .dir, .lease

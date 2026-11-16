@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from expcore_onedata.fault_drain import GATE, MOUNT
@@ -110,7 +111,9 @@ class Teardown:
         if cells is None:
             return
         state = cells.quiesce("teardown")
-        if not cells.quiet(state):
+        # stricter than the collection's `quiet`: a process in D may never leave the kernel (a dead mount), and no
+        # container's removal follows here to show it gone, so only a zombie, which is dead, may be left
+        if state["killed"] is None or any(p["state"] != "Z" for p in state["left"]):
             raise SandboxError("a process of the run's cells could not be shown gone")
 
     def _helper(self, role: str) -> Callable[[], None]:
@@ -136,12 +139,34 @@ class Teardown:
             raise SandboxError("the run directory is left where it is: a copy of the data-path token is in it")
         if box._ca_copy is not None:
             box._ca_copy.unlink(missing_ok=True)  # configuration, not evidence
+        removed = scrub(box.dir, box.spec.token.reveal().encode() if box.spec.token is not None else b"")
         kept = box.s.work_root / KEPT
         kept.mkdir(mode=0o700, exist_ok=True)
         os.rename(box.dir, kept / box.sid)
         with box._meta_lock:
             box._meta["evidence_kept"] = {"under": "sandbox.work_root", "directory_id": box.sid.rsplit("-", 1)[-1],
-                                          "relocated": True}  # fmt: skip
+                                          "relocated": True, "files_holding_the_token_removed": removed}  # fmt: skip
 
 
-__all__ = ["Teardown"]
+def scrub(root: Path, token: bytes) -> int:
+    """Remove every regular file under `root` that holds `token` (never following a link): a secret is never
+    evidence (O05). How many were removed; a file that cannot be read is removed too, since it cannot be shown clean."""
+    if not token:
+        return 0
+    removed = 0
+    for base, _, names in os.walk(root, followlinks=False):
+        for name in names:
+            path = Path(base, name)
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                holds = token in path.read_bytes()
+            except OSError:
+                holds = True
+            if holds:
+                path.unlink()
+                removed += 1
+    return removed
+
+
+__all__ = ["Teardown", "scrub"]

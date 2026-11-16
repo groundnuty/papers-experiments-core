@@ -128,3 +128,66 @@ def test_remove_tree_removes_read_only_directories_and_never_follows_a_link(tmp_
     runs.remove_tree(tree)
     assert not tree.exists()
     assert (outside / "keep.txt").read_text() == "keep"
+
+
+def test_a_gate_that_cannot_be_shown_gone_after_a_failed_start_stays_on_record(node, settings):
+    """O56: a gate that never got ready and outlives its kill is kept among the run's helpers, so the teardown says
+    it is not gone and the run's record stays for the reaper and the probe."""
+    node.gate_never_ready = True
+    real = node.signal
+    node.signal = lambda pid, start_, sig: (
+        True if node.gates and pid == node.gates[-1].proc.pid else real(pid, start_, sig)
+    )
+    with pytest.raises(SandboxError) as failed:
+        start(node, settings)
+    box = failed.value.sandbox
+    assert "gate" in box._helpers
+    assert runs.record_path(settings.work_root, box.sid).exists()
+    assert not box.stopped
+
+
+def test_a_helper_the_record_does_not_name_yet_is_reaped_by_its_tag(node, settings):
+    """O56: a driver killed between a helper's spawn and its record leaves a helper the reaper finds by its tag."""
+    old, _ = _abandoned(node, settings)
+    document = json.loads(runs.record_path(settings.work_root, old.sid).read_text())
+    document["helpers"] = []
+    runs.write(settings.work_root, {k: v for k, v in document.items() if k != "format"})
+    gate = node.gates[-1].proc
+    assert f"EXPCORE_SANDBOX={old.sid}" in gate.environ
+    node.owner = Spawned(1001, "5151")
+    node.procs[1001] = type(node.procs[999])(1001, "5151", "pid:[4026531836]", "driver", role="driver")
+    fresh = start(node, settings)
+    try:
+        assert not gate.alive
+        assert not old.dir.exists()
+    finally:
+        fresh.stop()
+
+
+def test_a_reap_whose_last_listing_fails_keeps_the_run(node, settings):
+    """O56: the reaper drops a record only once it has shown everything gone: an unreadable listing is not gone."""
+    old, _ = _abandoned(node, settings)
+    listings = {"n": 0}
+    real = node.processes
+
+    def flaky(tags=()):
+        listings["n"] += 1
+        return None if listings["n"] == 2 else real(tags)
+
+    node.processes = flaky
+    assert runs.reap(node, settings.work_root, own="none-00000000")["left"] == 1
+    assert old.dir.exists()
+    assert runs.record_path(settings.work_root, old.sid).exists()
+
+
+def test_a_teardown_never_takes_a_process_left_in_the_kernel_for_gone(node, settings):
+    """O56: a cell's process in D that outlives its kill fails the teardown, which keeps the run's record."""
+    box = start(node, settings)
+    stuck = node._new_proc(node.new_namespace(), "python3", environ=(f"EXPCORE_SANDBOX={box.sid}",), state="D",
+                           unkillable=True)  # fmt: skip
+    with pytest.raises(SandboxError, match="could not be shown gone"):
+        box.stop()
+    assert runs.record_path(settings.work_root, box.sid).exists()
+    stuck.unkillable, stuck.alive = False, False
+    box.stop(force=True)
+    assert not runs.record_path(settings.work_root, box.sid).exists()

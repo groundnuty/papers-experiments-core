@@ -11,8 +11,9 @@ as a container's OOM kill is on Docker (where the kernel kills the largest proce
 
 Every `disk_poll_s` (stretched to ten times a walk's own duration) it walks the run's `/work`, `/tmp` and `/dev/shm`,
 which are directories on the node's tmpfs, charged to the step's memory with the dispatcher's and the gate's: each over
-its size (`work_disk_bytes`, `tmp_bytes`, `shm_bytes`), or holding more entries than a disk of that size has inodes
-(one per 16 KiB, as `mkfs.ext4` makes them), kills the run's processes as `disk_limit`, also the agent's own; on
+its size (`work_disk_bytes`, `tmp_bytes`, `shm_bytes`), holding more entries than a disk of that size has inodes
+(one per 16 KiB, as `mkfs.ext4` makes them), or holding a directory the walk may not read (whose size is unknown),
+kills the run's processes as `disk_limit`, also the agent's own; on
 Docker a write past the size is refused with ENOSPC instead.
 
 What it cannot see is recorded, never taken for nothing (`facts.py`): a spike shorter than a period, a file the agent
@@ -56,10 +57,12 @@ class Space:
         return max(self.cap_bytes // BYTES_PER_INODE, 1)
 
 
-def usage(path: Path, max_entries: int) -> tuple[int, int]:
-    """The bytes allocated under `path` and its entries, never following a link; the walk stops past `max_entries`
-    entries, so a tree of millions of files costs no more than the cap. A file gone while it is walked is skipped."""
-    total, entries, stack = 0, 0, [path]
+def usage(path: Path, max_entries: int) -> tuple[int, int, bool]:
+    """The bytes allocated under `path`, its entries, and whether the walk saw all of it; never following a link. The
+    walk stops past `max_entries` entries, so a tree of millions of files costs no more than the cap. A file gone while
+    it is walked is skipped; one the walk may not read or list (a directory its owner made 0000, say) makes the walk
+    incomplete, since what is under it is unknown, never nothing."""
+    total, entries, stack, whole = 0, 0, [path], True
     while stack and entries <= max_entries:
         try:
             with os.scandir(stack.pop()) as listing:
@@ -67,16 +70,21 @@ def usage(path: Path, max_entries: int) -> tuple[int, int]:
                     entries += 1
                     try:
                         info = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
                     except OSError:
+                        whole = False
                         continue
                     total += info.st_blocks * 512
                     if stat.S_ISDIR(info.st_mode):
                         stack.append(Path(entry.path))
                     if entries > max_entries:
                         break
-        except OSError:
+        except FileNotFoundError:
             continue
-    return total, entries
+        except OSError:
+            whole = False
+    return total, entries, whole
 
 
 class Watch:
@@ -177,10 +185,12 @@ class Watch:
         began = self._clock()
         over: tuple[str, int, int] | None = None
         for space in self._spaces:
-            used, entries = usage(space.path, space.cap_entries)
+            used, entries, whole = usage(space.path, space.cap_entries)
             with self._lock:
-                self.disk[space.name] = {"bytes": used, "entries": entries}
-            if over is None and used > space.cap_bytes:
+                self.disk[space.name] = {"bytes": used, "entries": entries, "whole": whole}
+            if over is None and not whole:  # what it could not see is unknown: taken as past its size
+                over = (f"{space.name}_unwalkable", used, space.cap_bytes)
+            elif over is None and used > space.cap_bytes:
                 over = (space.name, used, space.cap_bytes)
             elif over is None and entries > space.cap_entries:
                 over = (f"{space.name}_entries", entries, space.cap_entries)

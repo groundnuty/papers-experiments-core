@@ -20,7 +20,7 @@ import signal
 import socket
 import subprocess
 import threading
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -71,9 +71,12 @@ class NodeOps(Protocol):
         """Whether a path exists on the node (the shared copy helper asks it of the run's working directory)."""
         ...
 
-    def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path) -> Spawned:
+    def spawn(
+        self, argv: Sequence[str], *, stdout: Path, stderr: Path, env: Mapping[str, str] | None = None
+    ) -> Spawned:
         """Start a helper process in a session of its own, stdin from /dev/null, its streams to two new files (made
-        0600, refused if they exist); raise `OSError` when it cannot be started."""
+        0600, refused if they exist), its environment the node's `PATH`, `HOME` and `LC_ALL` and `env` (the run's tag,
+        so a reaper finds it even before the run's record names it); raise `OSError` when it cannot be started."""
         ...
 
     def exit_status(self, process: Spawned) -> int | None:
@@ -169,7 +172,7 @@ class LocalNode:
     zombie that `/proc` shows as alive."""
 
     def __init__(self) -> None:
-        self._children: dict[int, subprocess.Popen[bytes]] = {}
+        self._children: dict[int, tuple[subprocess.Popen[bytes], str]] = {}  # pid -> the child and its start
         self._lock = threading.Lock()
 
     def _apptainer_env(self) -> dict[str, str]:
@@ -199,7 +202,9 @@ class LocalNode:
     def exists(self, path: str | Path) -> bool:
         return Path(path).exists()
 
-    def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path) -> Spawned:
+    def spawn(
+        self, argv: Sequence[str], *, stdout: Path, stderr: Path, env: Mapping[str, str] | None = None
+    ) -> Spawned:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
         out = os.open(stdout, flags, 0o600)
         try:
@@ -207,33 +212,34 @@ class LocalNode:
             try:
                 child = subprocess.Popen(
                     list(argv), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True,
-                    env=self._apptainer_env(), close_fds=True,
+                    env={**self._apptainer_env(), **(env or {})}, close_fds=True,
                 )  # fmt: skip
             finally:
                 os.close(err)
         finally:
             os.close(out)
-        with self._lock:
-            self._children[child.pid] = child
-        start = _start_of(child.pid)
-        if start is None:  # it ended at once and was reaped, or /proc hides it: it is no helper of ours to keep
+        start = _start_of(child.pid)  # it cannot have been reaped: only this object reaps it, and has not yet
+        if start is None:  # /proc hides it: it is no helper of ours to keep
             with contextlib.suppress(OSError):
                 child.kill()
             child.wait()
-            raise OSError("a helper process ended before it could be identified")
+            raise OSError("a helper process could not be identified")
+        with self._lock:
+            self._children[child.pid] = (child, start)
         return Spawned(child.pid, start)
 
-    def _reaped(self, pid: int) -> int | None:
-        """A child of ours that has ended, reaped now: its exit status; None while it runs or when it is not ours."""
+    def _reaped(self, pid: int, start: str) -> int | None:
+        """A child of ours, the one that started at `start`, that has ended, reaped now: its exit status; None while
+        it runs, or when that pid with that start was no child of ours (another process may hold the pid now)."""
         with self._lock:
-            child = self._children.get(pid)
-        if child is None:
+            found = self._children.get(pid)
+        if found is None or found[1] != start:
             return None
-        code = child.poll()
+        code = found[0].poll()
         return None if code is None else (128 - code if code < 0 else code)
 
     def exit_status(self, process: Spawned) -> int | None:
-        return self._reaped(process.pid)
+        return self._reaped(process.pid, process.start)
 
     def processes(self, tags: Collection[str] = ()) -> list[P.Proc] | None:
         uid = os.getuid()
@@ -295,7 +301,7 @@ class LocalNode:
         return True
 
     def alive(self, pid: int, start: str) -> bool | None:
-        if self._reaped(pid) is not None:
+        if self._reaped(pid, start) is not None:
             return False
         now = _start_of(pid)
         if now is not None:

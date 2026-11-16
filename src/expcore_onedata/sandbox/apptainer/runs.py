@@ -136,7 +136,8 @@ def _reap_one(node: NodeOps, work_root: Path, document: Mapping[str, Any]) -> in
     for relative in document.get("token_files", []):  # first: a secret is never left for a later step to remove
         (run_dir / relative).unlink(missing_ok=True)
     states = [node.alive(int(h["pid"]), str(h["start"])) for h in document.get("helpers", [])]
-    if any(state is not False for state in states) or _tagged(node, sid):
+    left = _tagged(node, sid)
+    if any(state is not False for state in states) or left is None or left:  # unknown is never gone
         raise SandboxError("a dead driver's helper or cell is not shown gone")
     remove_tree(run_dir)
     drop(work_root, sid)

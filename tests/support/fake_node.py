@@ -235,20 +235,22 @@ class FakeNode:
         return Path(path).exists()
 
     # ------------------------------------------------------------------------------------------------ helpers
-    def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path) -> Spawned:
+    def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path, env: dict[str, str] | None = None) -> Spawned:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         os.close(os.open(stdout, flags, 0o600))
         os.close(os.open(stderr, flags, 0o600))
         self.spawned.append(list(argv))
+        environ = tuple(f"{k}={v}" for k, v in (env or {}).items())
         if any(a.endswith("gate.py") for a in argv):
-            return self._spawn_gate(list(argv), stdout, stderr)
+            return self._spawn_gate(list(argv), stdout, stderr, environ)
         if any(a.endswith("egress-collector.py") for a in argv):
-            return self._spawn_collector(list(argv), stdout)
+            return self._spawn_collector(list(argv), stdout, environ)
         raise AssertionError(f"the fake node spawns only the gate and the collector, not {argv[:3]}")
 
-    def _spawn_gate(self, argv: list[str], stdout: Path, stderr: Path) -> Spawned:
+    def _spawn_gate(self, argv: list[str], stdout: Path, stderr: Path, environ: tuple[str, ...]) -> Spawned:
         config = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
-        proc = self._new_proc(OWN_NS, "python3", cmdline=tuple(argv), role="gate", ignores=self.helpers_ignore)
+        proc = self._new_proc(OWN_NS, "python3", cmdline=tuple(argv), environ=environ, role="gate",
+                              ignores=self.helpers_ignore)  # fmt: skip
         self.gates.append(Gate(config, proc))
         if self.gate_busy:
             self.gate_busy -= 1
@@ -273,13 +275,14 @@ class FakeNode:
                 handle.write(json.dumps({"event": "teardown_complete"}) + "\n")
         proc.alive, proc.exit_status = False, 0 if sig == signal.SIGTERM else 128 + sig
 
-    def _spawn_collector(self, argv: list[str], stdout: Path) -> Spawned:
+    def _spawn_collector(self, argv: list[str], stdout: Path, environ: tuple[str, ...]) -> Spawned:
         sock_dir, log, nonce = Path(argv[-3]), Path(argv[-2]), argv[-1]
         info = os.lstat(sock_dir)
         assert info.st_mode & 0o777 == 0o700, "the collector's socket directory is owner-only"
         assert not os.listdir(sock_dir), "the collector's socket directory is empty"
         assert not log.exists(), "the collector's log exists before it starts"
-        proc = self._new_proc(OWN_NS, "python3", cmdline=tuple(argv), role="collector", ignores=self.helpers_ignore)
+        proc = self._new_proc(OWN_NS, "python3", cmdline=tuple(argv), environ=environ, role="collector",
+                              ignores=self.helpers_ignore)  # fmt: skip
         collector = Collector(log, nonce, proc)
         collector.write("start", format="hpcop-egress/1", nonce=nonce, pid=proc.pid, uid=os.getuid())
         self.collectors.append(collector)

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import signal
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,14 +54,16 @@ def start(
     ready: str,
     *,
     noted: Callable[[Helper], None],
+    env: Mapping[str, str] | None = None,
     wait_s: float = READY_WAIT_S,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> Helper:
-    """Spawn a helper and wait for its ready line. `noted` is given it as soon as it exists, before the wait, so a
+    """Spawn a helper and wait for its ready line. `env` is the run's tag, so the helper is found by it even if the
+    driver dies before the run's record names it; `noted` is given it as soon as it exists, before the wait, so a
     teardown finds it whatever happens next."""
-    helper = Helper(role, node.spawn(argv, stdout=directory / f"{role}.stdout", stderr=directory / f"{role}.stderr"),
-                    directory / f"{role}.stdout", directory / f"{role}.stderr")  # fmt: skip
+    stdout, stderr = directory / f"{role}.stdout", directory / f"{role}.stderr"
+    helper = Helper(role, node.spawn(argv, stdout=stdout, stderr=stderr, env=env), stdout, stderr)
     noted(helper)
     until = clock() + wait_s
     while True:
