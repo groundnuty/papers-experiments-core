@@ -242,7 +242,9 @@ SHELL_PYTHON = re.compile(
     r"""(?:^|[\s;|&(`]|\$\()(?:exec\s+)?("\$\{?HPC(?:OP_PY|T_PYTHON)\}?"|\$\{?HPC(?:OP_PY|T_PYTHON)\}?|"""
     r""""?(?:[^\s"'=;|&()]*/bin/)?python(?:3(?:\.\d+)?)?"?)\s+(\S+)"""
 )
-MESSAGE = re.compile(r"""\b(?:echo|printf|say|die|ok|fail|warn)\s+("[^"]*"|'[^']*')""")  # words, never a command
+# A message's words, never a command: a single-quoted string, or a double-quoted one with no `$(...)` or backquote in
+# it (a command substitution runs, so it stays and is scanned).
+MESSAGE = re.compile(r"""\b(?:echo|printf|say|die|ok|fail|warn)\s+("(?:[^"`$\\]|\\.|\$(?!\())*"|'[^']*')""")
 UV_SUBCOMMAND = re.compile(r"""(?:\buv|UV\}?)"?\s*$""")  # `uv python install ...`: uv's, no interpreter run
 SHELL_SLURM = re.compile(r"(?:^|[\s;|&(`]|\$\()(srun|sbatch)\s+-")
 SHELL_IN_ROOT = re.compile(r"""(?:^|\s)--chdir=/(?=[\s"']|$)""")
@@ -291,7 +293,8 @@ def test_o58_the_scans_find_a_python_without_isolation_and_a_launch_that_names_n
         "srun --jobid=1 \\\n  -w n bash x.sh", "sbatch --wrap=x", '  "$dir/venv/bin/python" -m pytest',
         "$HPCT_PYTHON -c x", "python -m expcore run s", "out=$(python -c 'import x')", 'bash -c "python -m x"',
         "srun --jobid=1 --chdir=/tmp bash x.sh", 'srun --jobid=1 --chdir="$PWD" bash x.sh',
-        "sbatch --chdir=/scratch --wrap=x",
+        "sbatch --chdir=/scratch --wrap=x", "echo \"$(python3 -c 'import inspect')\"",
+        'echo "$(srun --jobid=1 bash x.sh)"', 'die "no: `python3 -c x`"', 'say "at $(date): $(python -m x)"',
     ]  # fmt: skip
     shell_good = (
         'python3 -I -c "x"\n"$HPCOP_PY" -I z.py  # python3 x\n# python3 y.py\n'
