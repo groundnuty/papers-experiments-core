@@ -269,16 +269,23 @@ run's context, so its admission), and the caller keeps that thread's future as `
   run a recovery without the lock, which finds nothing open (this block's recovery settled it) and leaves alone a
   target whose lock is held. The re-reads above refuse each of these that lands before `inject` reads; the identity
   read before the stop, the session gate's probe and the holder line are `inject`'s own.
+- **The fault relay on the HPC backend** (`fault_relay`), which the run's admission requires live (`relay_refusal`, the
+  hold `federation_busy`), can stop answering in the window. It is not read again here: every request of the driver
+  checks the relay's heartbeat first and sends nothing to a relay that is not answering, so `inject`'s first request,
+  the read of the target's identity, fails with nothing sent, and `inject` fails as `injector_failure` before anything
+  is journalled, locked or stopped, the admission let go at the block's exit. Unlike the admission's hold, that
+  failure costs the attempt, as a failed start's does.
 - **The token's window and the deferral bound: the window documented.** In the documented order the run's tokens are
   minted before the injector starts, so a baseline spends token life, and the least `[tokens] margin_s`
-  (`fault_settings.restore_token_margin_s`) counts the injector's start after the mint only inside `TOKEN_SLACK_S`
-  (300 s, shared with the rest of the slack). A study whose baseline may take longer declares a larger margin (the
-  least is a floor), or reads its baseline before its launches mint a token. An overrun is never silent: the tool
-  server's stop re-verifies the token after the restore and fails the run as `tool_plane_integrity`, which is never
-  scored. A heal's skip is decided at the heal's start from the steps that then run, which a baseline does not change.
-  A longer exclusive hold lengthens the deferral of other runs' health checks, which no setting bounds already (a
-  deferral begun while an outage run holds the federation counts from its first answer, `fault_settings`), so a
-  campaign whose `max_defer_s` it outlasts meets a blocking hold, never a wrong result.
+  (`fault_settings.restore_token_margin_s`) counts no baseline: the injector's start after the mint falls inside
+  `TOKEN_SLACK_S` (300 s, shared with the rest of the slack), apart from, on the HPC backend, the start's stop, a term
+  of its own (`settle_timeout_s` and `relay_wait_s`). A study whose baseline may take longer than the slack leaves
+  declares a larger margin (the least is a floor), or reads its baseline before its launches mint a token. An overrun is
+  never silent: the tool server's stop re-verifies the token after the restore and fails the run as
+  `tool_plane_integrity`, which is never scored. A heal's skip is decided at the heal's start from the steps that then
+  run, which a baseline does not change. A longer exclusive hold lengthens the deferral of other runs' health checks,
+  which no setting bounds already (a deferral begun while an outage run holds the federation counts from its first
+  answer, `fault_settings`), so a campaign whose `max_defer_s` it outlasts meets a blocking hold, never a wrong result.
 - **The snapshot** is `start`'s: the `injected` step is labelled with its own time, so the gap after the preparation's
   last step shows the baseline.
 
