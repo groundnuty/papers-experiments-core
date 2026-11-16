@@ -84,7 +84,9 @@ def test_o62_a_snapshot_restores_the_store_and_runs_with_directories_under_the_n
     assert manifest["campaign"] is None
     new = tmp_path / "new" / "out"
     restored = [p.relative_to(new).as_posix() for p in sorted(new.rglob("*")) if p.is_file()]
-    assert sorted(manifest["files"]) == [name for name in restored if not name.startswith("state.sqlite")]
+    marked = "leases/ROLLED_BACK"  # every key of the restored lease directory needs its proof (C19)
+    assert marked in restored
+    assert sorted(manifest["files"]) == [n for n in restored if not n.startswith("state.sqlite") and n != marked]
     with sqlite3.connect(new / "state.sqlite") as copy:
         (run_dir,) = copy.execute("SELECT run_dir FROM attempts").fetchone()
     assert run_dir.startswith(str(new / "runs"))

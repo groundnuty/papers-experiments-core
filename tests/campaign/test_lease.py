@@ -23,6 +23,7 @@ from expcore.campaign.lease import (
     LeasePool,
     LeaseTimeout,
     NoResources,
+    mark_rolled_back,
     process_gone,
     process_owner,
 )
@@ -671,3 +672,25 @@ def test_c19_a_probe_that_raises_while_a_run_ends_leaves_the_key_quarantined(tmp
     leases = pool(tmp_path, keys=("k1",), probe=Broken())
     assert leases.finish(leases.try_acquire("g", "run-a")) is False
     assert leases.held_back() == 1
+
+
+def test_o62_a_lease_directory_put_back_from_a_snapshot_needs_the_proof_for_every_key(tmp_path):
+    """O62: copied back after a kill, a note that says released may be older than a holder that took the key since,
+    and a key first taken since has no file: every key, released or new, goes to a new holder only once its resource
+    is shown gone, as a dead holder's does."""
+    before = pool(tmp_path, keys=("k1",))
+    before.try_acquire("g", "run-a").release()  # released when the snapshot was taken
+    assert mark_rolled_back(tmp_path / "leases") == 1
+    clock, probe = Clock(), Probe()
+    leases = pool(tmp_path, keys=("k1", "k2"), probe=probe, clock=clock)
+    with pytest.raises(AllQuarantined):
+        leases.try_acquire("g", "run-b")
+    assert sorted(key for key, _ in probe.asked) == ["k1", "k2"]  # k2 had no file: created needing the proof too
+    probe.gone_keys.update({"k1", "k2"})
+    clock.now += 60
+    lease = leases.try_acquire("g", "run-b")
+    assert lease is not None
+    lease.release()
+    asked = len(probe.asked)
+    assert leases.try_acquire("g", "run-c") is not None  # proven once: released in order from then on
+    assert len(probe.asked) == asked

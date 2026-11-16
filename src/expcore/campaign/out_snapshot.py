@@ -31,9 +31,11 @@ new one is in place. A kill at any point leaves every snapshot that was whole as
 restored, and the next `take` removes it.
 
 **Restore.** `restore` copies one snapshot into a new out/, every file hashed as copied and compared with the
-manifest (one missing, added or changed fails it), checks the store copy's integrity, and points its attempts'
-directories at the new `runs/` (`snapshot.rebase_run_dirs`); one that fails leaves nothing behind. `snapshots` lists
-them newest first, for the caller to try in turn.
+manifest (one missing, added or changed fails it), checks the store copy's integrity, points its attempts'
+directories at the new `runs/` (`snapshot.rebase_run_dirs`), and marks the lease directory rolled back
+(`lease.mark_rolled_back`): a key the copy shows released may have been taken after it, and one first taken after it
+has no note, so every key needs its resource shown gone before a new holder (C19). One that fails leaves nothing.
+`snapshots` lists them newest first, for the caller to try in turn.
 """
 
 import hashlib
@@ -47,6 +49,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote
 
+from expcore.campaign.lease import mark_rolled_back
 from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.markers import MARKER_NAME
 from expcore.campaign.snapshot import rebase_run_dirs, take_snapshot
@@ -56,6 +59,7 @@ MANIFEST = "snapshot.json"
 STORE = "state.sqlite"  # the scheduler's STATE_FILE, under out/
 STORE_FILES = (STORE, f"{STORE}-wal", f"{STORE}-shm", f"{STORE}-journal")  # the live store: its backup stands for them
 RUNS = "runs"
+LEASES = "leases"  # the campaign's lease directory under out/ (`study.pipeline`)
 KEEP = 2  # the newest snapshots kept: a damaged newest one falls back to the one before
 ENDED = ("done", "infra_fail", "harness_error", "outage_discarded")  # states whose attempt wrote its marker (C04)
 CHUNK = 1 << 20
@@ -298,6 +302,7 @@ def restore(snapshot: Path, out: Path) -> dict[str, Any]:
                 raise OutSnapshotError(f"{snapshot.name}: {name} is not the file its manifest names")
         _integrity(snapshot, out / STORE)
         rebase_run_dirs(out / STORE, out / RUNS)
+        mark_rolled_back(out / LEASES)  # a key released in the copy may have been taken since: each needs its proof
     except (OSError, sqlite3.Error) as error:
         shutil.rmtree(out, ignore_errors=True)
         raise OutSnapshotError(f"{snapshot.name}: cannot be restored ({type(error).__name__}: {error})") from None
