@@ -31,8 +31,15 @@ record (or empties it in place), as does one whose record cannot be written (log
 heal). One check at a time makes the record (`linkrecord.recording`: a leaf lock around the check and its write), so a
 late finisher never replaces a later check's record. All of them go through `recorded`, one function with one set of
 rules. The record is read by no admission: it touches no federation lock and no epoch.
+
+**A check whose record was not written says so in its report.** One that could not be serialized (the lock not taken)
+or whose record could not be written answers with a report whose `not_written` is `lock_not_taken` or `write_failed`
+(`linkrecord`), which the matrix of the restore's and the heal's reads carries to the injector's snapshot and the
+heal's record, and the routine check's to the try's note: the run whose check it was has it in its record, not only in
+a log line. A check that wrote its record answers with the report as made, which has no such field.
 """
 
+import dataclasses
 import logging
 from collections.abc import Callable
 from pathlib import Path
@@ -44,7 +51,14 @@ from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_sessions import SessionGate
 from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.linkcheck import LinkReport, check_links
-from expcore_onedata.linkrecord import discard_record, record_path, recording, write_record
+from expcore_onedata.linkrecord import (
+    LOCK_NOT_TAKEN,
+    WRITE_FAILED,
+    discard_record,
+    record_path,
+    recording,
+    write_record,
+)
 from expcore_onedata.readretry import ONE_ATTEMPT
 
 PROBE_TIMEOUT_S = 10.0
@@ -67,8 +81,10 @@ def recorded(path: Path, check: Callable[[], LinkReport]) -> LinkReport:
     raises answers nothing, so the older record is removed (or, when the directory refuses that, emptied in place)
     before the error goes on to the caller; a record that cannot be written is treated the same, and logged (its
     error's type only), and the check's answer is returned as made: the record is advisory, and neither the restore's
-    verdict, the heal's nor the gate's depends on it. It touches no federation lock and no epoch (`fault_epoch`). The
-    restore's check, the heal's reads and the gate's routine check all come through here."""
+    verdict, the heal's nor the gate's depends on it. Made as it was, except that the report says the record was not
+    written (`LinkReport.not_written`: `lock_not_taken` or `write_failed`), which carries the fact to the record of the
+    run whose check it was. It touches no federation lock and no epoch (`fault_epoch`). The restore's check, the
+    heal's reads and the gate's routine check all come through here."""
     with recording(path) as serialized:
         try:
             report = check()
@@ -78,12 +94,13 @@ def recorded(path: Path, check: Callable[[], LinkReport]) -> LinkReport:
         if not serialized:  # a verdict that another check's may overlap is published by no one: the old one goes
             log.warning("the link check's record lock could not be taken, so no record is written")
             _discarded(path)
-            return report
+            return dataclasses.replace(report, not_written=LOCK_NOT_TAKEN)
         try:
             write_record(report, path)
         except OSError as error:
             log.warning("the link check's record could not be written (%s)", type(error).__name__)
             _discarded(path)
+            return dataclasses.replace(report, not_written=WRITE_FAILED)
         return report
 
 

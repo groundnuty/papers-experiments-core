@@ -5,13 +5,16 @@
 (`providers[i]`, never a name, O12), whether it passed, its seconds, and whether its fetch failed (`stuck`: a link that
 transferred nothing; a pair whose probe could not be made ready was not tested, fails too, and names no link to heal).
 Its record (`to_json`) holds every pair, the count of failing pairs per source, and the source they all share when they
-share one, which names a crashed provider.
+share one, which names a crashed provider. A check whose record was not written (`linkrecord.fact`) says so in its own
+record, `link_record` and `link_record_reason`, and in no other case holds either key.
 """
 
 import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
+
+from expcore_onedata.linkrecord import fact
 
 _LABEL = re.compile(r"providers\[(\d+)\]")
 
@@ -44,14 +47,16 @@ class LinkMatrix:
     ok: bool
     detail: str
     pairs: tuple[PairState, ...] = ()
+    not_written: str | None = None  # why the check's record was not written (`linkrecord.fact`); None when it was
 
     @classmethod
     def from_report(cls, report: Any) -> "LinkMatrix":
-        """From a `linkcheck.LinkReport`: a pair is stuck when its fetch failed (its result names the remedy)."""
+        """From a `linkcheck.LinkReport`: a pair is stuck when its fetch failed (its result names the remedy), and a
+        record the check did not write (`LinkReport.not_written`) is carried over."""
         pairs = tuple(
             PairState(p.reader, p.source, p.ok, p.seconds, not p.ok and p.remedy is not None) for p in report.pairs
         )
-        return cls(bool(report.ok), str(report.detail), pairs)
+        return cls(bool(report.ok), str(report.detail), pairs, getattr(report, "not_written", None))
 
     def failing(self) -> list[PairState]:
         return [pair for pair in self.pairs if not pair.ok]
@@ -81,6 +86,7 @@ class LinkMatrix:
             "pairs": [pair.to_json() for pair in self.pairs],
             "failing_sources": dict(sorted(failing.items(), key=lambda item: label_order(item[0]))),
             "shared_source": self.shared_source(),
+            **({} if self.not_written is None else fact(self.not_written)),
         }
 
 
