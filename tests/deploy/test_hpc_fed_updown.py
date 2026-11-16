@@ -53,7 +53,7 @@ class Rig:
         self.driver.core = self.core
         self.driver.relay_available = lambda: False  # a test of the relay says so; M4's module may be importable
 
-    def core(self, layout, owner, values):
+    def core(self, layout, owner, values, environ=None):
         self.core_calls.append((layout, owner, values))
         return "core: the link check passed"
 

@@ -781,6 +781,7 @@ def test_o59_the_mount_check_is_a_control_step_on_the_owners_node(base):
     assert argv == [
         "python3.11",
         "-I",
+        "-B",
         str(base / "bundle" / "importstorage.py"),
         "mounts",
         "--workdir",

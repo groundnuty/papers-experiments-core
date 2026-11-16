@@ -11,14 +11,15 @@ The hooks, in the order `up` meets them (DESIGN.md, section 8):
 
 0. `check_support`, in the preflight: the support the layout gives a space is no smaller than its tree's manifest.
 1. `provider_import_args`: appended to a provider's `provider.sbatch` command, so its service mounts the trees it owns.
-2. `import_storage_extra`: returned by the HPC bootstrap's `Bootstrap.import_storage_extra`, so an imported storage is
+2. `mount_check_argv`: the control step on each owner's node, once every provider is up, that proves from the mounts
+   the service holds that each tree is read-only; before the bootstrap starts any scan.
+3. `import_storage_extra`: returned by the HPC bootstrap's `Bootstrap.import_storage_extra`, so an imported storage is
    made for a provider that runs as the job's user.
-3. `luma_requests`: the panel calls that map the space and its members to the job's user on a storage, sent for the
+4. `luma_requests`: the panel calls that map the space and its members to the job's user on a storage, sent for the
    imported storage as for the provider's regular one (`Bootstrap.storage_for` names the right one).
-4. `fedimport.verify_imports`, after the platform file is rendered: the core's check that the space holds its manifest.
-5. `mount_check_argv`: the control step on the owner's node that proves, from the mounts the service holds, that each
-   tree is read-only.
-6. `direct_storages`: the host directories a direct mount reads, for the platform file's `[sandbox.mount.storages]`.
+5. `direct_storages`: the host directories a direct mount reads, for the platform file's `[sandbox.mount.storages]`
+   (the placeholder `@hpc_direct_storages@`), once the bootstrap has made the storages.
+6. `fedimport.verify_imports`, after the platform file is rendered: the core's check that the space holds its manifest.
 """
 
 import os
@@ -97,8 +98,9 @@ def luma_requests(storage_id, space_id, user_ids, uid, gid):
 
 def mount_check_argv(bundle, workdir, python="python3.11"):
     """The argv of the control step, on a provider's node, that reads the mounts its service holds and exits 0 only
-    when every listed tree is held read-only (`importstorage.py mounts`)."""
-    return [python, "-I", os.path.join(bundle, "importstorage.py"), "mounts", "--workdir", workdir]
+    when every listed tree is held read-only (`importstorage.py mounts`). `python` is the node's own
+    (`site.node_python`), and `-I -B` as every Python a step runs takes them (DESIGN.md, section 3)."""
+    return [python, "-I", "-B", os.path.join(bundle, "importstorage.py"), "mounts", "--workdir", workdir]
 
 
 def direct_storages(layout, storage_ids, environ):
