@@ -4,6 +4,10 @@
 Every run's metadata holds `infrastructure_facts` (this list, by key) so a reader of a record knows which bounds held
 on the node it ran on. A key is stable; its text explains it. Each departure is the node's (an HPC batch node gives an
 unprivileged user no namespace but setuid Apptainer's and no cgroup of its own), never a choice of the study's.
+
+One key is conditional, `mount_refused`: it is listed only for a run whose sandbox refuses a mount data path at its
+start (`ApptainerSandbox._mount_refused`: no mount helper is given, or the platform declares no `[sandbox.mount]`), so a
+mount run, which was not refused, never carries it, nor does any run of a sandbox that would accept one.
 """
 
 from __future__ import annotations
@@ -59,15 +63,18 @@ FACTS: dict[str, str] = {
     ),
     "apptainer_stderr": "Apptainer's own warnings would be the cell's stderr: it runs with -q, which keeps its errors",
     "mount_refused": (
-        "a mount data path is refused at the start until the mount's helper lands (hook c): a cell would share the "
-        "uid of the oneclient that holds the mount's token"
+        "this sandbox refuses a mount data path at its start: it is given no mount helper (`mount_helper=`, hook c, "
+        "`host_mount_factory()`) or the platform declares no `[sandbox.mount]`; listed only for a run whose sandbox "
+        "refuses one, so a mount run never carries it. The helper accepts proxy I/O only, and refuses a direct "
+        "mount: HPC mounts are proxy-only until the direct-I/O comparison passes"
     ),
 }
 
 
-def record() -> dict[str, Any]:
-    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up."""
-    return {"backend": "apptainer", "facts": sorted(FACTS)}
+def record(*, mount_refused: bool) -> dict[str, Any]:
+    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up. `mount_refused` is listed only when
+    the run's sandbox refuses a mount data path (the module's docstring)."""
+    return {"backend": "apptainer", "facts": sorted(key for key in FACTS if mount_refused or key != "mount_refused")}
 
 
 __all__ = ["FACTS", "record"]
