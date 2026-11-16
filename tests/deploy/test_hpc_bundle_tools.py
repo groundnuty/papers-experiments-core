@@ -139,6 +139,17 @@ def test_o57_home_in_points_every_home_a_tool_uses_into_the_work_directory_made_
         assert stat.S_IMODE(path.stat().st_mode) == 0o700, name
 
 
+def test_o57_home_at_points_the_home_into_the_work_directory_and_makes_nothing(tmp_path):
+    """O57, O58: a step that writes nothing (status.sh) points the same variables into the work directory and makes
+    nothing there: the directory is ours and 0700, so no one else can make its home."""
+    work = tmp_path / "work"
+    work.mkdir(mode=0o700)
+    shown = 'printf "%s %s\\n" "$HOME" "$APPTAINER_CACHEDIR"'
+    done = run(bin_dir(tmp_path / "bin", None), tmp_path, f'home_at "{work}"; {shown}')
+    assert done.stdout == f"{work}/home {work}/home/.apptainer/cache\n"
+    assert list(work.iterdir()) == []
+
+
 # Every script the driver runs as a step, or as the service step's own body, that knows its work directory.
 STEP_SCRIPTS = ("zone.sbatch", "provider.sbatch", "teardown.sh", "status.sh", "exec.sh", "restart.sh", "zone-export.sh",
                 "mint-registration-token.sh", "deliver-token.sh")  # fmt: skip
@@ -154,7 +165,9 @@ def test_o57_every_step_script_points_its_home_into_its_work_directory_before_an
     code = [line for line in (BUNDLE / script).read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")]  # fmt: skip
     learnt = next(i for i, line in enumerate(code) if line.startswith("W=$("))
-    pointed = next(i for i, line in enumerate(code) if line.startswith('home_in "$W"'))
+    pointed = next(i for i, line in enumerate(code) if line.startswith(('home_in "$W"', 'home_at "$W"')))
+    if script == "status.sh":  # read-only (O58): it points the home there and makes nothing
+        assert code[pointed].startswith('home_at "$W"')
     reads = [i for i, line in enumerate(code) if i > learnt and READS_HOME.search(line)]
     assert learnt < pointed, script
     assert all(pointed < i for i in reads), (script, [code[i] for i in reads if i < pointed])
@@ -166,7 +179,7 @@ def test_o57_the_service_itself_starts_with_its_home_in_its_work_directory():
     text = (BUNDLE / "lib.sh").read_text(encoding="utf-8")
     body = text[text.index("run_service() {") :]
     body = body[: body.index("\n}\n")]
-    assert body.index('home_in "$W"') < body.index("apptainer exec")
+    assert body.index('home_in "$W"') < body.index("run -- apptainer exec")
 
 
 def test_node_init_names_a_missing_ss_before_it_makes_anything(tmp_path, no_ss):

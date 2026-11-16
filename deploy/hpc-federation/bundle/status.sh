@@ -13,7 +13,7 @@ source "$(dirname "$0")/lib.sh"
 component "${1:-}"; shift
 [[ ${1:-} == --workdir && -n ${2:-} && $# == 2 ]] || die "usage: status.sh <op|oz> --workdir W"
 W=$(find_workdir "$COMP" "$2")
-home_in "$W"   # every tool's HOME, caches and Apptainer's directories in the work directory, never the account's ~
+home_at "$W"   # every tool's HOME in the work directory, never the account's ~; nothing made: status writes nothing
 alive=false ready=false pid=null start=null
 if recorded_service_runs "$W"; then alive=true; fi
 if [[ -n $REC_PID ]]; then pid=$REC_PID start=\"$REC_START\"; fi

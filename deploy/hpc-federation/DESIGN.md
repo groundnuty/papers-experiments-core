@@ -161,7 +161,7 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   planted. Every bundle script that knows a service's work directory (the batch scripts, `teardown.sh`, `status.sh`,
   `exec.sh`, `restart.sh`, `zone-export.sh`, the token's mint and delivery, and `run_service`) points every one of
   them into it (`lib.sh`'s `home_in`, made 0700 there, gone with it) before any command that may read a home, Apptainer
-  and curl among them; a shard step's dispatcher gets them in the step's own directory (`shards.py step`). Nothing else, and never a secret. The bundle's helpers
+  and curl among them (`status.sh`, which writes nothing, points them there without making it: `home_at`); a shard step's dispatcher gets them in the step's own directory (`shards.py step`). Nothing else, and never a secret. The bundle's helpers
   then run on the first `python3.11` on that `PATH` (`lib.sh`'s default `HPCOP_PY`), which must be the node's own:
   `supervise.py`, which holds every service, needs `os.pidfd_open`, which uv's standalone Python lacks. Only the core's
   step (`HPC_CORE_PYTHON`) runs a venv's Python.

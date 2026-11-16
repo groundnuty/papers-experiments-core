@@ -58,6 +58,12 @@ home_in() {
   local h=$1/home
   install -d -m 700 -- "$h" "$h/.config" "$h/.cache" "$h/.local" "$h/.local/share" "$h/.local/state" \
     "$h/.apptainer" "$h/.apptainer/cache"
+  home_at "$1"
+}
+# <work directory>: the same variables pointed into it, nothing made: for a step that writes nothing (status.sh). The
+# work directory is ours and 0700, so no one else can make its home; a tool that would write there fails instead.
+home_at() {
+  local h=$1/home
   export HOME=$h XDG_CONFIG_HOME=$h/.config XDG_CACHE_HOME=$h/.cache XDG_DATA_HOME=$h/.local/share \
     XDG_STATE_HOME=$h/.local/state APPTAINER_CONFIGDIR=$h/.apptainer APPTAINER_CACHEDIR=$h/.apptainer/cache \
     UV_CACHE_DIR=$h/.cache/uv PIP_CACHE_DIR=$h/.cache/pip PYTHONNOUSERSITE=1 GIT_CONFIG_GLOBAL=/dev/null \
