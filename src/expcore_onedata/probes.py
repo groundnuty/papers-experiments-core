@@ -12,7 +12,8 @@
 snapshot and never the live platform (R13). The snapshot holds, for the files the study names:
 
 - each tracked provider's block map before and after (merged blocks, held bytes);
-- the record of every transfer the provisioner scheduled (`transfers`: state and counters as the provider reports them);
+- the record of every transfer the provisioner scheduled (`transfers`: counters as the provider reports them, and its
+  state as the transfer log reads it, from the half the job does, `transferrecord.state_of`);
 - the record of every transfer of the space that started in the run's window, whoever started it: the harness, the
   agent through the tool plane, or a QoS requirement (`space_transfers`: its type, source and target by position
   label, state, counters, and schedule, start and end times; `transferlog.py` says how it is read and where it fails
@@ -56,6 +57,7 @@ from expcore_onedata.placement import Range, held_bytes, merged, uncovered
 from expcore_onedata.provision import Listings, Provisioner
 from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferlog import MAX_LISTED, PAGE_LIMIT, TransferLog
+from expcore_onedata.transferrecord import state_of
 from expcore_onedata.transferwindow import Window, split_gained
 
 NAMESPACE = "platform_probes"
@@ -285,9 +287,7 @@ class PlatformProbes:
                     "transfer_id": tid,
                     "kind": kind,
                     **found.to_json(),
-                    "state": next(
-                        (body[k] for k in ("transferStatus", "replicationStatus", "evictionStatus") if k in body), None
-                    ),
+                    "state": state_of(body),  # read per kind, as the transfer log reads it (O32)
                     "bytes_replicated": body.get("bytesReplicated"),
                     "files_replicated": body.get("filesReplicated"),
                     "files_evicted": body.get("filesEvicted"),

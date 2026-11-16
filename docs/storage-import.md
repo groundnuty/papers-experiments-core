@@ -47,6 +47,62 @@ A read-only imported storage is only read: the panel skips its write test, op-wo
 - the owner of each imported file, which is the storage file's uid through LUMA, or the space's virtual owner when it maps to no user (op-worker `modules/storage/luma/luma.erl`); the agent's user reads a file as a member of the space, so the tree must be readable by its group;
 - the mode and times, which are the storage file's (`storage_import_engine.erl:888-905`: the mode's permission bits, and the creation time the least of `stat`'s three), where an uploaded file gets 664 and the upload's times.
 
+## A tree on the cluster's shared filesystem (O59)
+
+An HPC federation can hold a space on a directory of the cluster's shared filesystem that other federations import too,
+so several of them serve one dataset with no copy of it. The directory is declared in the layout and in `platform.toml`
+as **shared**, which means read-only everywhere, for every federation, always:
+
+- **The layout** (`deploy/hpc-federation/layouts/shared-import.toml`, and `pilot-shape-import.toml` for the pilot's shape): `import = { readonly = true, shared = true,
+  source_env = "EXPCORE_FED_IMPORT_...", manifest_env = "EXPCORE_FED_IMPORT_..._MANIFEST" }`, and optionally
+  `direct_io = true`. The path and the manifest's file come from the two variables (`site.env`), never from the layout.
+  `shared` with `readonly = false` is refused at load; a shared import without a manifest is refused; so are two spaces on
+  one tree, a manifest inside a tree that is imported (the scan would import it as a file of the dataset) and a
+  `direct_io` import that is writable.
+- **The platform file** repeats `import = { readonly = true, shared = true }`. The core refuses `shared` beside
+  `readonly = false` at load, puts `shared` in the fingerprint when true, and `ImportedSpace.check_storage` refuses a
+  shared import whose storage the owner's panel does not show as the boolean `true`, before the scan is read. After up,
+  `fedimport.verify_imports` reads the platform file and refuses a space the layout shares and it does not declare so.
+- **The owner's service** binds the tree read-only: `bundle/importstorage.py` takes it only as a plain absolute path of a
+  narrow character set, with no symbolic link on the way, an existing directory its user can read, not on node-local
+  memory (the other nodes would not see it), not inside the service's work directory; it makes an empty mountpoint
+  `/volumes/import/<space>` in the rootfs and the service starts with `--bind <tree>:/volumes/import/<space>:ro`. The
+  list is checked again at every start. Nothing in the bundle writes below the tree, and the work directory's removal
+  (`rm -rf --one-file-system`) never enters it: the bind exists only in the container's own mount namespace.
+- **The proof that it is read-only** is the kernel's: `importstorage.py mounts`, a control step on the owner's node, reads
+  the mount table of this service's container processes (the children of the Apptainer starter that the service's own
+  supervisor, named by `service.pid`, started; another service of the same account on the node is never counted) and
+  exits 0 only when each holds the mountpoint, and every mount below it, with `ro` in the mount's own options. A
+  service that is not running, or whose starter has no visible child, proves nothing, and the check fails. No write is attempted to find out: if the declarations were wrong, a probe would be the
+  first write into a tree other federations read. The panel's flag and the core's refusal of every write
+  (`Provisioner.read_only`) are the other two layers; op-worker's own test suite shows a read-only storage answering
+  EROFS (`readonly_storage_test_SUITE`, above).
+- **Only the owner mounts it.** A space has one importing provider; its mirrors keep node-local storage, fetch what the
+  owner holds, and mount nothing of the tree (Onedata imports a directory at one provider per space, as the Compose
+  layout's mirrors show).
+
+**A reset on such a space touches no file.** `reset --clean` is refused for any imported space (above; the HPC driver
+has no such command). The per-run reset (`SpaceReset`) evicts replicas from the mirrors, cancels transfers and removes the
+run's own QoS requirements; it has no stage that writes or deletes a file, a plan naming the owner is refused before any
+stage (O09), and the provisioner refuses every write under `/data/` and every replication onto the owner. To start a
+federation again: `down`, then `up`, which scans the tree again under new ids. The scan's load on the shared filesystem
+is one `stat` per entry per federation, and it is a live measurement, not a figure here.
+
+**Direct I/O** is a mode of the agent's mount, not of the storage: `[sandbox.mount] io_mode = "direct"` with the
+storage's id mapped to the tree's directory in `[sandbox.mount.storages]`. `direct_io = true` in the layout declares that
+this import is read that way, and `hpcimport.direct_storages` gives the mapping from the storage ids the bootstrap made, which the HPC driver puts in the platform file as `@hpc_direct_storages@`;
+the mode in effect is shown per run by the record (O49), never by the layout. A direct mount reads the storage of the
+agent's own provider (`local` in the platform file; O40's start check reads a file that provider holds in full), so
+`direct_io` belongs on a space that provider owns: the layout has no `local`, and the platform template carries it. The
+sandbox node must see the same directory, which the sandbox milestone's step provides.
+
+Not shown by anything in this repository, and for a live slot: that the mount check finds the service's container as the
+visible child of the setuid starter its supervisor started (it fails closed when it does not); that Onepanel accepts the imported storage with the job
+user's ids, the local LUMA feed and the canonical path type; that the apptainer bind is read-only on the site's
+filesystem as the mount table shows it; the owner and mode the scan gives files owned by another account (the
+agent's user reads as a member of the space; the tree must be readable by its group); the scan's time and load for a
+tree of 15,000 files; and a second federation importing the same tree at once.
+
 ## The live checks
 
 `tests/live/test_storage_import.py`, gated by `EXPCORE_LIVE_IMPORT=1` and `EXPCORE_LIVE_MUTATE=1`, on `deploy/compose-federation/layouts/storage-import.toml` brought up with `EXPCORE_FED_IMPORT_ALPHA` naming a tree that `make_import_tree.py` wrote. The tree is imported read-only into `alpha-import` and uploaded into `alpha-upload` by `Provisioner.upload`; both are checked against the same manifest. Each test asserts one thing equal for the two copies:

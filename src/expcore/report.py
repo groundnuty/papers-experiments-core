@@ -44,6 +44,12 @@ are the same text: no clock, no path and no random number enters it.
   `operator_holds`) gets a section "Holds that needed an operator" after the budget holds (`expcore.report_holds`): each
   hold's start, its end or `open`, whether it blocked the campaign and whether it charged a run, and the platform's
   reason. A report of an export without them is the text it was before (C11).
+- A campaign whose store a kill took spend out of (its export has `lost_in_kill`, O62) gets a section "Spend lost in
+  kills" after that (`expcore.report_lost`): each lost attempt, top-up and probe charge counted back from the spend
+  journal, with what it was charged. A report of an export without it is the text it was before.
+- A campaign whose interrupted attempts kept a call log (its export has `interrupted_spend`, C05) gets a section
+  "Interrupted attempts' spend" after that (`expcore.report_interrupted`): per model, how many were charged measured,
+  measured plus a request in flight, or at their bound. A report of an export without it is the text it was before.
 - A batch merged from shards (its export has `shards`, and each run entry its `shard`) gets one more section after the
   conditions (`expcore.report_shards`): per shard, with its label and start, the runs of each condition by how they
   ended with their rates, the infrastructure attempts by kind, and the wall time, turn latency and reset time, each
@@ -77,6 +83,8 @@ from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.egress.sensitivity import EgressAnalysis
+from expcore.guards import GuardsAnalysis
+from expcore.mountguard.sensitivity import MountGuardAnalysis
 from expcore.report_egress import egress_lines
 from expcore.report_families import (
     check_equivalence_families,
@@ -85,7 +93,13 @@ from expcore.report_families import (
     one_line,
     steps_lines,
 )
+from expcore.report_guards import LEFT_OUT as EITHER_GUARD
+from expcore.report_guards import guards_lines
 from expcore.report_holds import section as operator_holds
+from expcore.report_interrupted import section as interrupted_spend
+from expcore.report_lost import section as lost_in_kill
+from expcore.report_mountguard import LEFT_OUT as NOT_CLEAN
+from expcore.report_mountguard import mount_guard_lines
 from expcore.report_notes import (
     ARM_LOST_HEADINGS,
     ARM_RUNS_NOTES,
@@ -640,6 +654,8 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
         *_budget_holds(export),
         "",
         *operator_holds(export, _table),  # only an export with such a hold has it (C11)
+        *lost_in_kill(export, _table),  # only an export whose store a kill took spend out of has it (O62)
+        *interrupted_spend(export, _table),  # only an export whose interrupted attempts kept a call log has it (C05)
     ]
 
 
@@ -725,24 +741,25 @@ def _budget_holds(export: Mapping[str, Any]) -> list[str]:
     ]
 
 
-def _sensitivity(result: AnalysisResult, level: float | None) -> list[str]:
+def _sensitivity(result: AnalysisResult, level: float | None, left_out: str = "the flagged runs") -> list[str]:
     """The confirmatory contrasts of a sensitivity analysis in the primary analysis's own tables (#179): the Holm
-    family's, or every contrast for a preregistration with no family (S12), each with its pairs."""
+    family's, or every contrast for a preregistration with no family (S12), each with its pairs. `left_out` names the
+    runs the rerun leaves out, in its titles."""
     for r in result.contrasts:
         _check_conclusion(r)
     _check_no_claim(result)
     adjusted = {d.name: d.p_holm for d in result.holm}
     if result.exploratory_only:
         shown = list(result.contrasts)
-        title = "#### Every contrast without the flagged runs (exploratory: the preregistration makes no claim)"
+        title = f"#### Every contrast without {left_out} (exploratory: the preregistration makes no claim)"
     else:
         shown = [r for r in result.contrasts if not _exploratory(r, adjusted)]
-        title = f"#### Preregistered contrasts without the flagged runs (Holm family of {len(shown)})"
+        title = f"#### Preregistered contrasts without {left_out} (Holm family of {len(shown)})"
     if not shown:
         return [title, "", "No contrast in the family."]
     with_mde = any(r.minimum_detectable_effect is not None for r in shown)
     table = _contrast_table(shown, adjusted, level, result.alpha, with_mde=with_mde)
-    return [title, "", *table, "", *_pairs(shown, "#### Pairs without the flagged runs")]
+    return [title, "", *table, "", *_pairs(shown, f"#### Pairs without {left_out}")]
 
 
 def _egress_summary(egress: EgressAnalysis) -> list[str]:
@@ -756,17 +773,63 @@ def _egress_summary(egress: EgressAnalysis) -> list[str]:
         return [*lines, f"sensitivity: not computed ({egress.refused})"]
     if egress.sensitivity is None:
         return [*lines, "sensitivity: no run flagged, the same as the analysis above"]
-    result = egress.sensitivity
+    return lines + _rerun_lines(egress.sensitivity, "sensitivity")
+
+
+def _rerun_lines(result: AnalysisResult, prefix: str) -> list[str]:
+    """One terminal line per confirmatory contrast of a sensitivity analysis."""
+    lines = []
     adjusted = {d.name: d.p_holm for d in result.holm}
     for r in result.contrasts:
         if result.exploratory_only or not _exploratory(r, adjusted):
             holm = EXPLORATORY if result.exploratory_only else _p(adjusted[r.name])
             estimate = f"estimate {_num(r.estimate)}, p {_p(r.p_value)}, Holm p {holm}"
-            lines.append(f"sensitivity {r.name}: {estimate}, {r.conclusion}")
+            lines.append(f"{prefix} {r.name}: {estimate}, {r.conclusion}")
     return lines
 
 
-def summary_lines(result: AnalysisResult, egress: EgressAnalysis | None = None) -> list[str]:
+def _mount_guard_summary(guard: MountGuardAnalysis) -> list[str]:
+    """The terminal's mount-guard lines (O60): the runs that are not clean by verdict and flag, then each confirmatory
+    contrast without them."""
+    n = guard.counts()
+    lines = [
+        f"mount guard: {n['left_out']} of {n['analysed']} analysed run(s) not clean ({n['flagged']} flagged: "
+        f"{n['token_access']} token access, {n['process_access']} process access; {n['unknown']} unknown: "
+        f"{n['log_unknown']} log unknown, {n['isolation_unproven']} isolation unproven)"
+    ]
+    if guard.refused is not None:
+        return [*lines, f"mount sensitivity: not computed ({guard.refused})"]
+    if guard.sensitivity is None:
+        return [*lines, "mount sensitivity: every run clean, the same as the analysis above"]
+    return lines + _rerun_lines(guard.sensitivity, "mount sensitivity")
+
+
+def _guards_summary(guards: GuardsAnalysis) -> list[str]:
+    """The terminal's lines of both guards together (O60): the runs either leaves out, then each confirmatory contrast
+    without them."""
+    n = guards.counts()
+    lines = [
+        f"both guards: {n['left_out']} of {n['analysed']} analysed run(s) left out ({n['egress_only']} by egress "
+        f"alone, {n['mount_only']} by the mount guard alone, {n['both']} by both)"
+    ]
+    for condition, c in guards.by_condition().items():
+        lines.append(
+            f"both guards, {condition}: {c['left_out']} of {c['analysed']} left out ({c['egress_only']} by egress "
+            f"alone, {c['mount_only']} by the mount guard alone, {c['both']} by both)"
+        )
+    if guards.refused is not None:
+        return [*lines, f"both-guards sensitivity: not computed ({guards.refused})"]
+    if guards.sensitivity is None:
+        return [*lines, "both-guards sensitivity: every run clean to both, the same as the analysis above"]
+    return lines + _rerun_lines(guards.sensitivity, "both-guards sensitivity")
+
+
+def summary_lines(
+    result: AnalysisResult,
+    egress: EgressAnalysis | None = None,
+    mount_guard: MountGuardAnalysis | None = None,
+    guards: GuardsAnalysis | None = None,
+) -> list[str]:
     """One line per contrast for a terminal: the estimate, the raw p-value, the Holm-adjusted one (or the word
     exploratory) and the conclusion word, which is labelled exploratory too outside the family. A conclusion is never
     printed without the basis it rests on, and `untestable` is never printed for a contrast that used a pair, or
@@ -794,7 +857,9 @@ def summary_lines(result: AnalysisResult, egress: EgressAnalysis | None = None) 
         kind, arm = d.kind.replace("_", " "), " + ".join(d.conditions)
         interval = f"[{_num(d.ci_low)}, {_num(d.ci_high)}]"
         lines.append(f"{d.name} (descriptive, {kind} of {d.outcome} in {arm}): {_num(d.estimate)} {interval}")
-    return lines + (_egress_summary(egress) if egress is not None else [])
+    lines += _egress_summary(egress) if egress is not None else []
+    lines += _mount_guard_summary(mount_guard) if mount_guard is not None else []
+    return lines + (_guards_summary(guards) if guards is not None else [])
 
 
 def _partial_line(export: Mapping[str, Any]) -> str:
@@ -867,15 +932,18 @@ def render_report(
     scorers: Mapping[str, str] | None = None,
     interval_level: float | None = None,
     egress: EgressAnalysis | None = None,
+    mount_guard: MountGuardAnalysis | None = None,
+    guards: GuardsAnalysis | None = None,
 ) -> str:
     """Render the report as Markdown.
 
     `code` is the code identity (`provenance.codestamp.version`), `scorers` the version of each scorer by name (the
     report says n/a without them), `interval_level` the level of the contrasts' intervals when the preregistration
     states one, `egress` the egress verdicts and the sensitivity analysis of a batch checked for egress (no section
-    without it, #179). A partial analysis is described by the export (`partial`,
-    `running_attempts`, `excluded_attempts`). What each number counts is stated in the report beside it. The
-    text ends with a newline.
+    without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60),
+    `guards` the rerun without the runs either guard leaves out (a batch checked by both, O60). A
+    partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`). What each number
+    counts is stated in the report beside it. The text ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
     planned = export["planned_runs"]
@@ -904,11 +972,15 @@ def render_report(
     lines.append("")
     shards = shard_lines(export, _table)  # only a batch merged from shards has any (#154)
     checked = egress_lines(egress, _table, lambda r: _sensitivity(r, interval_level))  # only a checked batch (#179)
+    guarded = mount_guard_lines(mount_guard, _table, lambda r: _sensitivity(r, interval_level, NOT_CLEAN))  # O60
+    both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, EITHER_GUARD))  # O60
     sections = (
         _contrasts(result, interval_level)
         + _conditions(export)
         + shards
         + checked
+        + guarded
+        + both
         + _deployments(export)
         + _left_out(left_out)
     )

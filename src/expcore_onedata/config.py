@@ -279,13 +279,15 @@ class PlatformConfig:
         whenever the `[[spaces]]` form is used (one entry or several), each entry's SHA-256 in the file's order
         (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
         The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was, unless `[space]`
-        declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly`.
+        declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly` (and `shared`,
+        when true: O59).
 
         With a `[sandbox]`, it also holds every level of the data path with its kind and a REST level's listing mode
         (O21), so a resume after a level changed its data path or its listing is refused. A declared
         `[sandbox.served_bytes]` puts the caps of the tables of the bytes served there too (O22), since they decide what
         a run's evidence can show; without the table the fingerprint keeps the shape it had before the caps could be
-        declared, so a campaign that ran under the defaults still resumes.
+        declared, so a campaign that ran under the defaults still resumes. On the Apptainer backend it holds that
+        backend's pins too (`sandbox_backend`, O56); the Docker backend's fingerprint is unchanged.
 
         When the file has `[faults]`, it holds the fault injector's sanction and targets too
         (`fault_settings.faults_fingerprint`), never a path, a name or a value (O12). A file without `[faults]` keeps
@@ -297,11 +299,13 @@ class PlatformConfig:
         if self.spaces_table:
             out["spaces"] = [entry.digest() for entry in self.spaces]
         elif self.spaces[0].imported is not None:  # the one-space form's: only when declared, so the old one stands
-            out["storage_import"] = {"readonly": self.spaces[0].imported.readonly}
+            out["storage_import"] = self.spaces[0].imported.record()
         if self.sandbox is not None:
             out["data_paths"] = self.sandbox.data_path_record()
             if self.sandbox.served_caps_declared:
                 out["served_bytes"] = self.sandbox.served_caps.record()
+            if self.sandbox.apptainer is not None:  # O56: a Docker and an Apptainer run are never one experiment
+                out["sandbox_backend"] = self.sandbox.apptainer.record()
         faults = faults_fingerprint(self)
         if faults is not None:
             out["faults"] = faults

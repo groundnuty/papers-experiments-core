@@ -9,6 +9,7 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 import pytest
+from transfer_shapes import EVICTION_ENDED, LIVE_REPLICATION, LIVE_REPLICATION_ENQUEUED, MIGRATION_ENDED, live
 
 from expcore_onedata.testing import (
     ALPHA_ID,
@@ -49,8 +50,47 @@ def run_job(fake: FakeData, provider: str, kind: str, file_id: str) -> dict:
     job = made.json()["transferId"]
     for _ in range(fake.transfer_flip_after + 1):
         record = call(fake, ALPHA_ID, "GET", f"/transfers/{job}").json()
-    assert record.get("replicationStatus", record.get("evictionStatus")) == "completed"
+    assert record["evictionStatus" if kind == "eviction" else "replicationStatus"] == "completed"
     return record
+
+
+@pytest.mark.parametrize(
+    ("shape", "ended"),
+    [
+        pytest.param(LIVE_REPLICATION, True, id="live: a replication that ended"),
+        pytest.param(LIVE_REPLICATION_ENQUEUED, False, id="live: a replication in flight"),
+        pytest.param(EVICTION_ENDED, True, id="derived from op-worker: an eviction that ended"),
+        pytest.param(MIGRATION_ENDED, True, id="derived from op-worker: a migration that ended"),
+    ],
+)
+def test_o32_a_transfer_record_has_the_status_fields_and_the_unused_half_of_the_real_answers(shape, ended):
+    """O32: the fake answered one status half, so no test saw the real shape, where the half a job does not do is
+    `skipped`. Its record now carries the same status fields as the recorded answers (the two live replication ones,
+    and an eviction's and a migration's derived from op-worker f118ed9), `transferStatus` and `effectiveJobStatus`
+    derived from the halves as op-worker does, and the unused half's provider id null. The fake has no enqueued
+    phase, so a job in flight shares the live enqueued answer's fields and its unused half, and is active."""
+    fake = make_federation(clock=Ticker().clock)
+    fake.add_file("a.bin", DATA)
+    fake.transfer_flip_after = 10**6  # reading its record never ends a job
+    kind = shape["type"]
+    source = ALPHA_ID if kind == "migration" else None
+    tid = fake.add_transfer(kind, "a.bin", BETA_ID, scheduled=1000, ended=ended, source_id=source)
+    answer = call(fake, ALPHA_ID, "GET", f"/transfers/{tid}").json()
+    assert {k for k in answer if k.endswith(("Status", "State"))} == {k for k in shape if k.endswith("Status")}
+    ids = {"replicatingProviderId": BETA_ID, "evictingProviderId": BETA_ID if kind == "eviction" else ALPHA_ID}
+    if ended:
+        assert {k: answer[k] for k in shape} == live(shape, **ids)
+    else:
+        assert {k: answer[k] for k in ("type", "evictionStatus", "evictingProviderId")} == {
+            "type": "replication",
+            "evictionStatus": "skipped",
+            "evictingProviderId": None,
+        }
+        assert [answer[k] for k in ("transferStatus", "replicationStatus", "effectiveJobStatus")] == [
+            "replicating",
+            "active",
+            "replicating",
+        ]
 
 
 def children(fake: FakeData, provider: str, directory: str = ROOT_ID) -> list[str]:

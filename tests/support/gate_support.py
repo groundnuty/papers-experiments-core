@@ -177,12 +177,18 @@ def noting_check(journal):
     return check
 
 
-def gate_of(tmp_path, federation=None, **faults):
+def gate_of(tmp_path, federation=None, edit=None, **faults):
     """The fault gate around `GateCheck`, as `PlatformHealth` builds it, on a fake clock that is also its wall: four
     providers (`heal_support.four_providers`, with the token margin a declared heal needs) and a short wait for the
-    federation."""
+    federation. `edit`, when given, changes the platform document after that (a `[link_check]`, say)."""
     tmp_path.mkdir(parents=True, exist_ok=True)  # a test may build a second federation under a subdirectory
-    platform = write_platform(tmp_path, lambda data: four_providers(data, **{"health_wait_s": 0.2, **faults}))
+
+    def document(data):
+        four_providers(data, **{"health_wait_s": 0.2, **faults})
+        if edit is not None:
+            edit(data)
+
+    platform = write_platform(tmp_path, document)
     config = load_platform(platform, require_secrets=False)
     settings = load_faults(platform, config)
     federation = federation or Federation()

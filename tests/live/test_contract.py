@@ -417,9 +417,12 @@ def test_a_transfer_record_has_the_fields_the_probes_read(config, client):
     """O08: a listed transfer's record has a type of replication, eviction or migration, a schedule time, and for a job
     that replicates its target and byte counter (job_of refuses a record without them), and start and finish times
     that are numbers. The times are epoch seconds, the unit the run's window is compared in: a time in milliseconds
-    would put every job outside the window and record none. Skipped when the space lists no transfer."""
+    would put every job outside the window and record none. O32: its status fields never read conflicting, the half a
+    replication or an eviction does not do is `skipped`, and a job listed ended reads a final state. Skipped when the
+    space lists no transfer."""
     # covers: GET /transfers/{id}
-    from expcore_onedata.transferrecord import TYPES, job_of
+    from expcore_onedata.transferrecord import CONFLICTING, TYPES, job_of
+    from expcore_onedata.transferwindow import FINAL_STATES
 
     ten_years_s = 10 * 365 * 86400
     provider = config.support.providers[0]
@@ -435,6 +438,12 @@ def test_a_transfer_record_has_the_fields_the_probes_read(config, client):
         assert abs(job.scheduled - time.time()) < ten_years_s
         for moment in (job.started, job.finished):
             assert moment == 0 or abs(moment - time.time()) < ten_years_s  # 0 is a time not reached yet
+        assert job.state != CONFLICTING, f"a {job.kind} record's status fields read conflicting (O32)"
+        half = {"replication": "evictionStatus", "eviction": "replicationStatus"}.get(job.kind)
+        if half is not None:
+            assert body.get(half) == "skipped", f"a {job.kind} record's unused half is not skipped (O32)"
+        if state == "ended":
+            assert job.state in FINAL_STATES, f"an ended {job.kind} record reads {job.state}, no final state (O32)"
 
 
 @MUTATE

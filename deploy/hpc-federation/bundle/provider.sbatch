@@ -16,8 +16,11 @@
 # --no-requeue: a requeued provider would restart with an empty /tmp and nothing would relaunch it.
 # No secret is on this command line: only paths, names, an email and peer addresses. The token arrives
 # later through a step's stdin.
+# Shared imported trees (O59): a provider that owns imported spaces is given one `--import=SPACE=PATH` per space after
+# the peers; configure.sh checks each tree and the service binds it read-only (importstorage.py).
 # Usage: sbatch --nodelist=<node-B> --time=<t> --mem=32G [--exclusive] provider.sbatch \
-#          <bundle-dir> <oneprovider.tar> <provider-name> <zone-fqdn> <admin-email> <zone-ip> [<peer-ip> ...]
+#          <bundle-dir> <oneprovider.tar> <provider-name> <zone-fqdn> <admin-email> <zone-ip> [<peer-ip> ...] \
+#          [--import=SPACE=PATH ...]
 set -euo pipefail
 B=${1:?usage: provider.sbatch <bundle-dir> <tar> <name> <zone-fqdn> <admin-email> <zone-ip> [peer-ip ...]}; shift
 [[ -f $B/lib.sh ]] || { echo "hpcop: no lib.sh in '$B'" >&2; exit 1; }
@@ -31,6 +34,10 @@ export HPCOP_OWNER_PID=$$   # node-init.sh records this batch script as the owne
 W=$(bash "$B/node-init.sh" op "$TAR")
 svc='' svc_start=''
 cleanup() {
+  if kept_stop "$W"; then   # teardown.sh --keep (hpcfed.py stop): stop what still runs, remove nothing
+    if [[ -n $svc ]]; then stop_service "$svc" "${HPCOP_STOP_SECONDS:-600}" "$svc_start"; fi
+    return 0
+  fi
   rm -rf -- "$(secrets_dir "$W")"   # not needed to stop; gone even if SIGKILL cuts the stop short
   if [[ -n $svc ]]; then stop_service "$svc" "${HPCOP_STOP_SECONDS:-600}" "$svc_start"; fi
   remove_workdir "$W"
@@ -59,6 +66,9 @@ if ! bash "$B/finish.sh" --workdir "$W" "$svc"; then
   while [[ -e $W ]] && (( SECONDS < end )); do sleep 10; done
   exit 1
 fi
+# The ready marker, once finish.sh has passed every check: service-verified holds service.pid as it is now
+# (status.sh reads "ready" from it; a later launch has another service.pid, so a stale marker never matches).
+mark_verified "$W"
 say "provider up; holding until teardown or the end of the job"
 status=0; wait "$svc" || status=$?
 # The job's state says how the service ended: a stop teardown.sh asked for is a success, any other end a

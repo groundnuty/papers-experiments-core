@@ -88,6 +88,8 @@ from expcore_onedata.credentials import Principal
 from expcore_onedata.fault_drain import SessionTicket
 from expcore_onedata.sandbox import gatelog, kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
+from expcore_onedata.sandbox.apptainer.runs import ApptainerProbe
+from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
 from expcore_onedata.sandbox.gatepolicy import PAGED
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, mount_identity, parse_mountinfo
 from expcore_onedata.sandbox.inputs import InputsRecord
@@ -403,8 +405,11 @@ class SandboxPlatform:
         group; a group the slots do not declare is refused. A lease-less platform has no slots: ConfigError."""
         return self._slots_needed("name the keys of a lease group").keys_of(group)
 
-    def sandbox_probe(self) -> SandboxProbe:
-        """The probe that proves a key's sandbox gone: no container, network or mount of it is left."""
+    def sandbox_probe(self) -> SandboxProbe | ApptainerProbe:
+        """The probe that proves a key's sandbox gone: no container, network or mount of it is left; on the Apptainer
+        backend no run record, run directory or process of it (`apptainer.runs`, O56)."""
+        if self._s.backend == "apptainer":
+            return ApptainerProbe(self._host, self._s.work_root, starting=self._threads.active)
         return SandboxProbe(self._host, self._s, starting=self._threads.active)
 
     def probe(self) -> SlotProbe:
@@ -500,10 +505,12 @@ class SandboxPlatform:
         inputs: Sequence[ReadOnlyInput] = (),
     ) -> DockerSandbox:
         """The sandbox of a run, built and not started: it has no effect on the host, so a launch holds it, and can stop
-        it, from before the first resource exists. Its metadata records each token's expiry beside the lifetime it was
-        minted for and the whole-time ceiling that lifetime follows (O06)."""
+        it, from before the first resource exists. `[sandbox] backend` picks its class: Docker's, or Apptainer's on an
+        HPC batch node (O56), whose `host` is then the node (`apptainer.node.NodeOps`). Its metadata records each
+        token's expiry beside the lifetime it was minted for and the whole-time ceiling that lifetime follows (O06)."""
         data = tokens.data_path if tokens is not None else None
-        sandbox = DockerSandbox(
+        backend = ApptainerSandbox if self._s.backend == "apptainer" else DockerSandbox
+        sandbox = backend(
             self._host,
             self._s,
             self._spec(run_key, level, data, lease, inputs),

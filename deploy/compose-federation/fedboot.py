@@ -277,7 +277,11 @@ class Bootstrap:
             }
             found = self.storages(service).get(name)
             if found is None:
-                self.panel(service, "POST", "/provider/storages", "storages", json={name: wanted})
+                extra = self.import_storage_extra(service)
+                clash = sorted(set(extra) & set(wanted))
+                if clash:
+                    raise RuntimeError(f"a deployment's settings for an imported storage may not override {clash[0]}")
+                self.panel(service, "POST", "/provider/storages", "storages", json={name: {**wanted, **extra}})
                 found = self.storages(service).get(name)
             if found is None:
                 raise RuntimeError(f"{service.name} has no storage {name} after creating it")
@@ -290,6 +294,14 @@ class Bootstrap:
                     "supports a space: down, then up, makes it anew"
                 )
             self.ids.storages[(space.owner, space.name)] = storage_id
+
+    def import_storage_extra(self, service: Service) -> dict[str, Any]:
+        """What a deployment adds when it creates an imported storage, beyond what the layout declares (never one of
+        those keys). None here: the Compose providers run as root. The HPC federation's providers run as the job's user,
+        so its bootstrap adds the user's ids, the local LUMA feed and the canonical path type
+        (`hpcimport.import_storage_extra`). They are sent once, at the creation, and never compared with what the panel
+        shows afterwards, which need not echo them."""
+        return {}
 
     def storage_for(self, service: Service, space: Space) -> str:
         """The id of the storage a provider supports a space on, found by its name: the import storage named for the

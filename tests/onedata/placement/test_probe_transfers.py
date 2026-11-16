@@ -1,6 +1,7 @@
 """The probes record every transfer of the space that started in the run's window, whoever started it (O08)."""
 
 import pytest
+from transfer_shapes import EVICTION_ACTIVE, EVICTION_ENDED, LIVE_REPLICATION, LIVE_REPLICATION_ENQUEUED, statuses
 
 from expcore_onedata.probes import PlatformProbes
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA, tool_plane_replicates
@@ -213,3 +214,41 @@ def test_o08_a_snapshot_without_a_start_has_no_window_and_no_transfers(probes, s
     section = probes.finish()["space_transfers"]
     assert section["probe_ok"] is False
     assert section["records"] is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "shape", "omit", "expected"),
+    [
+        pytest.param("replication", LIVE_REPLICATION, (), "completed", id="live: a replication that ended"),
+        pytest.param("replication", LIVE_REPLICATION_ENQUEUED, (), "enqueued", id="live: a replication enqueued"),
+        pytest.param("eviction", EVICTION_ENDED, (), "completed", id="derived: an eviction that ended"),
+        pytest.param(
+            "eviction", EVICTION_ACTIVE, ("transferStatus",), "active", id="derived: an eviction under way, no summary"
+        ),
+    ],
+)
+def test_o32_the_record_of_a_harness_transfer_reads_its_state_as_the_transfer_log_does(
+    client, provisioner, seeded, ticker, kind, shape, omit, expected
+):
+    """O32: the probes' record of a transfer the harness scheduled reads its state from the half the job does: the live
+    replication answers read completed and enqueued, and the eviction ones derived from op-worker completed and active.
+    Read as the first status field present, an eviction answered without `transferStatus` read its unused
+    `replicationStatus: skipped`, an ended state, while it was still under way."""
+    seeded.clock = ticker.clock
+    tid = seeded.add_transfer(kind, PATH, BETA_ID, scheduled=ticker.now)
+    for provider in (ALPHA_ID, BETA_ID):
+        seeded.provider_view[(tid, provider)] = statuses(shape)
+    seeded.transfer_omit = set(omit)
+    probes = PlatformProbes(
+        client,
+        provisioner,
+        {"data": PATH},
+        ["alpha", "beta"],
+        transfers=lambda: [("beta", tid, kind)],
+        sleep=ticker.sleep,
+        now=ticker.clock,
+    )
+    probes.start({})
+    ticker.sleep(5)
+    (record,) = probes.finish()["transfers"]
+    assert (record["transfer_id"], record["state"]) == (tid, expected)

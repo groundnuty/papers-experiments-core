@@ -3,7 +3,8 @@
 
 - **Spend** (`spend_of`) is the budget gate's own figure (`campaign.gate`): every attempt's cost by
   `attempt_bounds.attempt_costs` (measured, or the bound its row records it was reserved at, top-ups included), plus
-  what admission's probes were charged (`campaign.probe_spend`), in total and per model. A later sequential selection
+  what admission's probes were charged (`campaign.probe_spend`) and what a kill took out of the store
+  (`campaign.lost_spend`, O62), in total and per model. A later sequential selection
   is given the total minus it (`selection_budget.remaining_budget`), and the merge sums it over every selection. An
   attempt of a model whose cost is unknown makes the spend unknown, which a budget refuses.
 - **Window** (`window_of`): from the selection's first start (`META_STARTED`) to the last time an attempt of it began
@@ -21,7 +22,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from expcore.campaign import probe_spend, reply_cap
+from expcore.campaign import lost_spend, probe_spend, reply_cap
 from expcore.campaign.attempt_bounds import attempt_costs, spent_usd
 from expcore.campaign.gate import RELEASED_KEY
 from expcore.campaign.shard import META_STARTED
@@ -81,9 +82,10 @@ def spend_of(query: Query, pricing: Pricing) -> Spend:
     marks = reply_cap.unheld(view)
     taken_off = frozenset(m for m in pricing.models if reply_cap.is_unheld(marks, m))
     costs = attempt_costs(view, pricing.models, pricing.limits, taken_off=taken_off)
-    probes = probe_spend.charged(view)
-    if probes is None:
+    probes, ledger = probe_spend.charged(view), lost_spend.read(view)
+    if probes is None or ledger is None:
         return Spend(None, dict.fromkeys(pricing.models))
+    costs += lost_spend.costs(ledger, pricing.models, pricing.limits, taken_off=taken_off)
     total = spent_usd(costs)
     per_model = {}
     for model in sorted(pricing.models):

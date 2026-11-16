@@ -2,6 +2,7 @@
 space the agent may reach supports, refused at load otherwise; up runs the platform layer's check last, through the
 platform.toml it rendered, and is not ready until every pair transfers."""
 
+import contextlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import pytest
 from federation_support import MINIMAL
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
+from expcore_onedata.linkrecord import ROOT_FILE, federation_root, record_path
 from expcore_onedata.testing import ADMIN_ENV, write_platform
 from expcore_onedata.testing.world import with_link_check
 
@@ -157,6 +159,66 @@ def test_up_runs_the_layers_check_and_writes_its_report_beside_the_facts(fed, fe
     assert "providers[1] -> providers[0] 0.25 s 65536 B" in out
     record = json.loads((tmp_path / fedlinks.REPORT).read_text(encoding="utf-8"))
     assert record["pairs"][0]["seconds"] == 0.25
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_up_writes_its_record_in_the_text_it_always_has_through_the_layers_writer(
+    fed, fedlinks, tmp_path, monkeypatch, ok
+):
+    """O35: the record is `json.dumps(report.to_json(), indent=2, sort_keys=True)` and a newline, as before the
+    restore's and the heal's checks began to write it; `up` writes it through `expcore_onedata.linkrecord`, the one
+    writer (atomic: a draft and a rename), and a failing report is written before up fails."""
+    layout = layout_with(fed, tmp_path, monkeypatch, two_providers)
+    pair = PairResult("providers[0]", "providers[1]", ok, 0.25, 65536 if ok else None, reason=None if ok else "stuck")
+    report = LinkReport(ok, "ok" if ok else "a provider link is stuck", (pair,), 1.0, 2.0)
+    monkeypatch.setattr(fedlinks, "check_links", lambda config, client: report)
+    written = []
+    real = fedlinks.write_record
+
+    def spy(made, path):
+        written.append((made, path))
+        real(made, path)
+
+    monkeypatch.setattr(fedlinks, "write_record", spy)
+    if ok:
+        fedlinks.check_after_up(layout, {"link-probes": "sp-probe-0009"})
+    else:
+        with pytest.raises(RuntimeError, match="not ready"):
+            fedlinks.check_after_up(layout, {"link-probes": "sp-probe-0009"})
+    assert written == [(report, tmp_path / "link-check.json")]
+    assert fedlinks.REPORT == "link-check.json"
+    expected = json.dumps(report.to_json(), indent=2, sort_keys=True) + "\n"
+    assert (tmp_path / "link-check.json").read_text(encoding="utf-8") == expected
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []  # no draft is left
+
+
+def test_the_platform_layer_finds_the_root_up_writes_its_record_in_from_the_journal(fed, fedlinks, tmp_path):
+    """O35: a restore's, a heal's and the gate's checks find the federation's root as the parent of the `[faults]
+    journal` their platform file names, and need `platform.toml` in it. `up` makes the journal as
+    `<root>/fault-journal`, renders `platform.toml` in the root and writes its record there, so the three agree: a check
+    through any platform file of the federation (a derived one included, which names the root's journal) writes the
+    record `up` writes."""
+    layout = fed.layout.Layout(tmp_path, spec=fed.spec.load_spec(write(tmp_path, MINIMAL)))
+    assert federation_root(layout.journal) == layout.root == layout.platform.parent
+    assert layout.platform.name == ROOT_FILE
+    assert record_path(layout.journal) == layout.root / fedlinks.REPORT
+
+
+def test_up_whose_record_lock_cannot_be_taken_writes_its_record_and_says_so(fed, fedlinks, tmp_path, monkeypatch):
+    """O35: up runs while nothing else does, so it writes its record without the lock, and its output says that a check
+    under way elsewhere may overlap."""
+    layout = layout_with(fed, tmp_path, monkeypatch, two_providers)
+    passed = PairResult("providers[0]", "providers[1]", True, 0.25, 65536)
+    monkeypatch.setattr(fedlinks, "check_links", lambda config, client: LinkReport(True, "ok", (passed,), 1.0, 2.0))
+
+    @contextlib.contextmanager
+    def unlocked(path):
+        yield False
+
+    monkeypatch.setattr(fedlinks, "recording", unlocked)
+    out = fedlinks.check_after_up(layout, {"link-probes": "sp-probe-0009"})
+    assert "lock could not be taken" in out
+    assert json.loads((tmp_path / fedlinks.REPORT).read_text(encoding="utf-8"))["ok"] is True
 
 
 def test_a_stuck_pair_fails_up_naming_it(fed, fedlinks, tmp_path, monkeypatch):
