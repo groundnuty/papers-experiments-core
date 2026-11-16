@@ -215,11 +215,23 @@ def test_a_problem_a_later_look_finds_in_a_proved_namespace_is_a_failed_proof():
     assert [(ok, problems) for _, ok, problems, _ in proofs] == [(True, []), (False, [MP.PROTECTED_REACHABLE])]
 
 
-def test_a_process_is_looked_at_again_only_while_it_is_young(monkeypatch):
-    monkeypatch.setattr(MP, "RECHECK_POLLS", 2)
+def test_a_process_of_ours_is_looked_at_again_at_every_poll_however_long_it_lives():
+    """O60 (Codex, round 2): no count of polls shows Apptainer done with a cell's mounts; a change at any later poll is
+    seen."""
     proc = node(cell_process(500, mountinfo=table(("0:70", "/", "/", "overlay"))))
     poll, proofs = polled(proc)
+    for _ in range(300):
+        poll.poll()
+    proc.procs[500].mountinfo = cell_table(("0:20", "/", "/hostproc", "proc"))
     poll.poll()
-    proc.procs[500].mountinfo = cell_table()
-    poll.poll()
-    assert proofs == []  # settled before the change, which a cell's own privileges could not make
+    assert [(label, ok, problems) for label, ok, problems, _ in proofs] == [("cell", False, [MP.HOST_PROC_IN_CELL])]
+
+
+def test_a_process_of_another_uid_that_becomes_ours_is_looked_at_within_a_second():
+    """A setuid starter's process runs as root, then as the user, under one pid."""
+    proc = node(cell_process(500, uid=0))
+    poll, proofs = polled(proc)
+    proc.procs[500].uid = UID
+    for _ in range(MP.OTHER_EVERY):
+        poll.poll()
+    assert [(label, ok) for label, ok, _, _ in proofs] == [("cell", True)]

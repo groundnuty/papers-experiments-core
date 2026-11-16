@@ -21,9 +21,10 @@ host, through the host's `/proc`, which no cell can see or write. Everything is 
     the host's `/proc` would be;
   - no mount of the cell is on a protected directory's device with a root that is, holds or lies under it
     (`protected_reachable`; one that could not be resolved at the start is `protected_unresolved`).
-  Apptainer may still be making a cell's mounts when its first process is seen, so each process of this uid is looked
-  at again at every poll for `RECHECK_POLLS` polls: a cell's namespace found later, or a problem a later look finds,
-  is written then (a failed proof). After that a process's mount table no longer changes: a cell cannot mount.
+  Apptainer may still be making a cell's mounts when its first process is seen, so every process of this uid is looked
+  at again at every poll for as long as it lives: a cell's namespace found later, or a problem a later look finds, is
+  written then (a failed proof). A process of another uid is read again every `OTHER_EVERY` polls, as a setuid
+  starter's process may become one of this uid's (on a node with `hidepid=invisible` it is not listed until it is).
 - **A process of the node's PID namespace** whose mount table holds the run's FUSE mount anywhere but at the host's
   own mount point is a cell started without a PID namespace of its own: a failed proof, label `host_process`,
   `same_pid_namespace`.
@@ -54,7 +55,7 @@ PROTECTED_UNRESOLVED = "protected_unresolved"
 SAME_PID_NAMESPACE = "same_pid_namespace"
 CELL_ALIVE_AT_CLOSE = "cell_alive_at_close"
 CELL, HOST_PROCESS, CLOSE = "cell", "host_process", "close"
-RECHECK_POLLS = 200  # a process of ours is looked at again for this many polls (10 s at the watcher's 50 ms)
+OTHER_EVERY = 20  # a process of another uid is read again every this many polls (1 s at the watcher's 50 ms)
 
 
 class ProcView(Protocol):
@@ -214,23 +215,26 @@ class CellPoll:
 
     def __init__(self, proc: ProcView, host: Host, emit: Callable[[str, bool, list[str], dict[str, int]], None]):
         self._proc, self._host, self._emit = proc, host, emit
-        self._seen: set[Seen] = set()
+        self._later: dict[int, int] = {}  # processes of another uid by pid, with the poll that reads them again
         self._proved: dict[Any, set[str]] = {}  # each namespace proved, with the problems written for it
-        self._young: dict[Seen, int] = {}  # processes of ours still looked at again, with the polls left
         self.cells: dict[Seen, int] = {}  # the processes found to be this run's cells, with their depth
         self.polls = 0
         self.failed = 0
 
     def poll(self) -> None:
-        """Look once at each process not seen before."""
+        """Look at each process of this uid, and at each of another uid when it is due (the module's docstring)."""
         self.polls += 1
         try:
             pids = list(self._proc.pids())
         except OSError:
             self.failed += 1
             return
+        listed = set(pids)
+        self._later = {pid: due for pid, due in self._later.items() if pid in listed}
         broken = False
         for pid in pids:
+            if self._later.get(pid, 0) > self.polls:
+                continue
             broken = self._look(pid) is False or broken
         if broken:
             self.failed += 1
@@ -250,36 +254,25 @@ class CellPoll:
             return None
 
     def _look(self, pid: int) -> bool | None:
-        """Look at one process: False when it is one of ours that could not be read whole, else None. A process of
-        ours is looked at again at each of the `RECHECK_POLLS` polls after it is first seen, as Apptainer may still be
-        making its mounts when it is first seen; after that its mount table no longer changes (a cell has no privilege
-        to mount)."""
+        """Look at one process: False when it is one of ours that could not be read whole, else None."""
         started = self._started(pid)
-        if started is None or (pid, started) in self._seen:
-            return None
+        if started is None:
+            return None  # gone between the listing and the read
         try:
             status = self._proc.read(f"/proc/{pid}/status")
         except OSError:
-            return None  # gone between the listing and the read
+            return None
         values = nspid(status)
         if real_uid(status) != self._host.uid or values is None:
-            self._seen.add((pid, started))
+            self._later[pid] = self.polls + OTHER_EVERY
             return None
         try:
             mounts = parse_mountinfo(self._proc.read(f"/proc/{pid}/mountinfo"))
         except (FileNotFoundError, ProcessLookupError):
             return None
         except (OSError, MountTableError):
-            if len(values) > self._host.depth:
-                return False  # a nested process of ours we cannot read: it may be a cell; looked at again next poll
-            self._seen.add((pid, started))
-            return None
-        left = self._young.get((pid, started), RECHECK_POLLS) - 1
-        if left <= 0:
-            self._young.pop((pid, started), None)
-            self._seen.add((pid, started))
-        else:
-            self._young[(pid, started)] = left
+            # a nested process of ours we cannot read may be a cell: a failed poll, and looked at again next poll
+            return False if len(values) > self._host.depth else None
         self._judge(pid, started, values, mounts)
         return None
 
