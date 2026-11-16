@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import tarfile
 from pathlib import Path
 
@@ -432,6 +433,30 @@ def test_R04_a_link_to_a_directory_and_any_entry_that_is_no_regular_file_are_une
         assert batch_files(batch).unexpected == [rel]
         refused(batch, f"unexpected file.*{rel}")
         assert unexpected_of(verify_batch(batch, code=CODE)) == [rel]
+        (batch / rel).unlink()
+    assert require_current_check(batch, code=CODE)
+
+
+def test_R04_a_link_to_a_file_is_unexpected_under_any_name_a_dot_name_a_records_or_a_hashed_only_files(batch, tmp_path):
+    """R04: a link is classified before every name rule, so a link to a file is unexpected whether it is named as a
+    temporary (a dot-name the walk otherwise skips), as a record (whose bytes the check would read through it, from
+    outside the batch) or as a hashed-only file. Each fails the check alone, is never counted as a record or hashed,
+    and one added after a passing check is refused."""
+    patterns = ["*attempt-marker.json"]
+    record = next(path for path in sorted(batch.iterdir()) if path.is_file())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "copy.json").write_bytes(record.read_bytes())
+    write_check(batch, verify_batch(batch, code=CODE, hashed_only=patterns))
+    records_before = batch_files(batch, patterns).records
+    for rel in ("shard-2/.payload", f"shard-2/{record.name}", "shard-2/attempt-marker.json"):
+        (batch / rel).symlink_to(outside / "copy.json")
+        found = batch_files(batch, patterns)
+        assert found.unexpected == [rel]
+        assert found.records == records_before
+        assert found.hashed == []
+        refused(batch, f"unexpected file.*{re.escape(rel)}")
+        assert unexpected_of(verify_batch(batch, code=CODE, hashed_only=patterns)) == [rel]
         (batch / rel).unlink()
     assert require_current_check(batch, code=CODE)
 

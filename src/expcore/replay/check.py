@@ -227,14 +227,16 @@ def batch_files(batch: Path, hashed_only: Sequence[str] = ()) -> BatchFiles:
     A hashed-only pattern is matched first, so that a record a pattern names is found and refused
     (`HashedOnlyRecord`); then a file is a record only when it is named as one (`is_record_name`). The check file at
     the top of the batch and the temporary files an interrupted write leaves (names starting with a dot) are none of
-    the three: the check never reads them. A link to a directory is unexpected whatever its name, since the walk does
-    not enter it and a copy of the batch (the merge's) would follow it; so is any other entry that is neither a
-    directory nor a regular file (a dangling link, a FIFO, a socket), which is never opened.
+    the three: the check never reads them. **Every link is unexpected, whatever it points at and whatever its name**
+    (a dot-name, a record's name, a declared side file's), and is classified before any name rule: a check that
+    read through a link would vouch for bytes outside the batch, a relative link can point elsewhere once the batch
+    is moved, and the merge copies a link as a link. So is any other entry that is neither a directory nor a
+    regular file (a FIFO, a socket), which is never opened.
     """
     records, hashed, unexpected = [], [], []
     for path in batch.rglob("*"):
         rel = path.relative_to(batch).as_posix()
-        if path.is_symlink() and path.is_dir():
+        if path.is_symlink():  # before every name rule: a link is never a record, a side file or a temporary
             unexpected.append(rel)
         elif rel == CHECK_FILE or path.name.startswith(".") or path.is_dir():
             continue
