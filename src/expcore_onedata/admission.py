@@ -69,13 +69,15 @@ runs, last first, when the last share lets the lock go.
 
 **The reset lock (`federation.reset`, `resetlock.py`, `resetgrant.py`).** Every shared admission (a campaign run's, a
 tool's outside a campaign, the health check's) also holds `federation.reset` shared, recorded in `reset-holds.jsonl`,
-for as long as it holds `federation.lock`. A shortcut reset (O51), which skips the block maps of files a planner's
-reading showed empty and so needs no reader to place bytes during it, takes `federation.reset` exclusively: its run
-gives up its own share of `federation.reset` (its agent has not started) and keeps its share of `federation.lock`, polls
-for the exclusive hold within `[placement] reset_exclusive_wait_s`, and afterwards lets it go and takes its share back
-within `admission_timeout_s`, each on a new descriptor: a flock is never converted in place (`LOCK_SH` to `LOCK_EX` on
-one descriptor drops the old lock before it waits, and a failed non-blocking conversion has lost it). An exclusive
-admission of `federation.lock` takes no reset lock: it already excludes every shared holder, every resetter included.
+for as long as it holds `federation.lock`. Every reset (O66), full or shortcut, evicts and reads block maps and so
+needs no reader to act during it (a shortcut reset, O51, also skips the block maps of files a planner's reading showed
+empty), so it takes `federation.reset` exclusively: its run gives up its own share of `federation.reset` (its agent has
+not started) and keeps its share of `federation.lock`, polls for the exclusive hold within `admission_timeout_s` and
+until the admission's `cancel` is set, refusing at the bound (`resetgrant.ResetLockBusy`, the hold `federation_busy`)
+rather than resetting under another holder, and afterwards lets it go and takes its share back within the same bound,
+each on a new descriptor: a flock is never converted in place (`LOCK_SH` to `LOCK_EX` on one descriptor drops the old
+lock before it waits, and a failed non-blocking conversion has lost it). An exclusive admission of `federation.lock`
+takes no reset lock: it already excludes every shared holder, every resetter included.
 
 **The lock order, which every holder keeps:** `federation.intent`, then `federation.lock`, then (after the turnstile is
 let go) `federation.reset`. Who waits for what, holding what:
@@ -84,7 +86,7 @@ let go) `federation.reset`. Who waits for what, holding what:
   turnstile, and for `federation.reset` (shared) holding `federation.lock`;
 - an exclusive one (an outage run, the injector, an `exclusive = true` run, the health gate's `RECOVERY`) waits for the
   turnstile holding nothing and for `federation.lock` (exclusive) holding the turnstile, and takes nothing more;
-- a shortcut reset waits for `federation.reset` (exclusive) holding `federation.lock` shared and no share of
+- a reset waits for `federation.reset` (exclusive) holding `federation.lock` shared and no share of
   `federation.reset`, and, its exclusive hold let go, for its share back holding the same;
 - `link-epoch.lock` (`fault_epoch`) comes last of all: a link check of the fault gate waits for it (shared) holding
   its share of `federation.lock` and `federation.reset`, or the heal's exclusive admission, and a run admission's
@@ -101,8 +103,10 @@ let go) `federation.reset`. Who waits for what, holding what:
 
 No holder of `federation.reset` waits for `federation.lock` or the turnstile, and no holder of `federation.lock` waits
 for the turnstile, so no wait closes a cycle. Two resetters cannot deadlock: each gives up its share before it waits, so
-neither holds what the other waits for, one is granted, and the other's wait is bounded (past it, the full reads). The
-windows the shortcut must not have: **an outage run never gets in during it**, since the resetting run's share of
+neither holds what the other waits for, one is granted, and the other's wait is bounded (past it, the refusal). No
+reset waits on its own run's hold: the run's share is given up before the wait, a worker's share of the admission is
+a count, not a lock, and a reset in a context that holds no admission is refused at once (`resetgrant.py`). The windows
+a reset must not have: **an outage run never gets in during it**, since the resetting run's share of
 `federation.lock`, which the exclusive admission conflicts with, is never let go (so it never lapses either); **no other
 run's agent, no tool and no health check acts during it**, since each acts only under its share of `federation.reset`,
 which conflicts with the exclusive hold; and nothing of the resetting run's own does, since the section seals its
@@ -116,7 +120,7 @@ exec'd child never inherits one, and every held lock is a `HeldLock`, which the 
 server never holds a lock: the attempt holds it for it. The MCP client starts the server in a session of its own
 (`start_new_session`), so it survives its parent's death; `PR_SET_PDEATHSIG` is not set, since the client gives no hook
 to set it, it would reach only the direct child (a configured launcher such as `uv run` leaves the server a
-grandchild), and it would fire with the forking thread rather than the process. Instead a shortcut reset that finds a
+grandchild), and it would fire with the forking thread rather than the process. Instead a reset that finds a
 holder line whose process is gone takes no shortcut (`resetgrant.HOLDER_GONE`), and neither does any for
 `resetgrant.DEAD_HOLDER_QUIET_S` after: a read it sent may still be placing bytes, and a server it started may still
 run.
@@ -212,7 +216,7 @@ class _Shares:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.count, self.owner_left = 1, False
-        self.sealed = False  # a shortcut reset's section: no worker may take a share, and nothing of the run may act
+        self.sealed = False  # a reset's section: no worker may take a share, and nothing of the run may act
 
 
 class _Steps:
@@ -278,12 +282,12 @@ class Admission:
 
     @property
     def may_act(self) -> bool:
-        """Whether the holder may act on the federation: held, not sealed for its own shortcut reset (`seal`), and,
+        """Whether the holder may act on the federation: held, not sealed for its own reset (`seal`), and,
         shared, with its share of the reset lock held, not given up for that reset (`resetlock.py`)."""
         return self.held and not self.shares.sealed and (self.reset is None or self.reset.shared)
 
     def seal(self) -> bool:
-        """For a shortcut reset's section (`resetgrant.py`): refuse every worker a share from now on, and return True,
+        """For a reset's section (`resetgrant.py`): refuse every worker a share from now on, and return True,
         when the admission is held and its one share is its owner's (the owner has not left, and no worker holds a
         share); else False, sealing nothing. A worker that holds a share, the last one after the owner left included,
         may be reading, which the section must rule out."""
@@ -301,7 +305,7 @@ class Admission:
     def try_retain(self) -> Callable[[], None] | None:
         """Take one more share of the admission for a worker; return the call that gives it up (only the first call
         counts, in any thread), or None when there is no share to take: the admission is no longer held, or its last
-        share is already given up and its release is under way, or a shortcut reset's section has sealed it (`seal`),
+        share is already given up and its release is under way, or a reset's section has sealed it (`seal`),
         so it cannot be kept for the worker (a tool reusing it refuses then)."""
         with self.shares.lock:
             if not self.held or self.shares.count == 0 or self.shares.sealed:
@@ -466,7 +470,7 @@ def retain_to_act() -> Callable[[], None]:
     share = admission.try_retain()
     if share is None:
         raise AdmissionRefused(
-            "the run's admission is being given up, or its own shortcut reset holds the federation: nothing may start "
+            "the run's admission is being given up, or its own reset holds the federation: nothing may start "
             "under it until the reset has ended"
         )
     try:
@@ -661,7 +665,7 @@ class FederationLock:
             except BaseException:
                 main.close()
                 raise
-            if reset is None:  # a shortcut reset holds it exclusively
+            if reset is None:  # a reset holds it exclusively
                 main.close()
                 return None
         return self._admit(main, exclusive, purpose, target, reset)
@@ -681,7 +685,7 @@ class FederationLock:
         `injector_failure` when it was cancelled or the holder record failed. `purpose` and `target` go into the holder
         record of an exclusive admission. Shared, it then takes its share of the reset lock within the same bound
         (`resetlock.py`): every shared holder does, the health check's too, whose first call reads a file of a study's
-        space (`precampaign.content_type_check`), so a shortcut reset defers it, uncharged."""
+        space (`precampaign.content_type_check`), so a reset defers it, uncharged."""
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         try:
             intent = self._wait(FEDERATION_INTENT, fcntl.LOCK_EX, deadline, cancel)
@@ -939,11 +943,11 @@ def require_admission(config: PlatformConfig) -> None:
 
 
 def require_reset_share(admission: Admission) -> None:
-    """Refuse to act under an admission its own shortcut reset holds (`Admission.may_act`): sealed for the reset's
+    """Refuse to act under an admission its own reset holds (`Admission.may_act`): sealed for the reset's
     section, or, shared, with its share of the reset lock given up for it or not taken back after it (`resetlock.py`).
     Nothing of the run may then reach the federation, since the reset counts on no reader placing bytes."""
     if not admission.may_act:
         raise AdmissionRefused(
-            "the run's own shortcut reset holds the federation (its share of the reset lock is given up, or was not "
+            "the run's own reset holds the federation (its share of the reset lock is given up, or was not "
             "taken back after it): nothing of the run may act on the federation until the reset has ended"
         )
