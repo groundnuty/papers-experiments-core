@@ -8,8 +8,10 @@ run's CA, and forwards to the federation's URLs, checking their certificate as t
 the data-path token from a file in an owner-only directory of the run's that no cell binds, written here and removed by
 the sandbox once the gate says it is ready, so the token is in the gate's memory alone (`token_held_by_gate`).
 
-Hook (a): `[sandbox.apptainer.gate_options]` adds keys to the configuration (a peer-uid check, say); a key the sandbox
-writes itself is refused when the settings load, and again here.
+Hook (a): `[sandbox.apptainer.gate_options]` adds keys to the configuration; a key the sandbox writes itself is refused
+when the settings load, and again here. The gate's peer-uid check (`peer_uid_check`, #317) is on by default whenever the
+gate's directory holds its `gatepeer.py`, so the loopback the node's other users share reaches the gate only from this
+uid; `gate_options` may set it false.
 """
 
 from __future__ import annotations
@@ -27,6 +29,9 @@ from expcore_onedata.sandbox.apptainer.settings import GATE_OWN_KEYS
 from expcore_onedata.tls import TlsSettings
 
 GATE_PY = Path(__file__).resolve().parent.parent / "gate.py"  # the core's gate, beside its policy and boundary
+# the gate's peer-uid check (#317, O61), beside it once that lands: on by default on this backend whenever the gate has
+# it, so a co-located user's connection to the loopback is refused; `gate_options` may still turn it off
+PEER_CHECK, PEER_CHECK_KEY = GATE_PY.parent / "gatepeer.py", "peer_uid_check"
 READY = "gate ready"
 TOKEN_DIR = "gate-secret"
 TOKEN_FILE = Path(TOKEN_DIR, "gate-token")
@@ -59,6 +64,10 @@ def config(
     if clash:
         raise SandboxError(f"the gate's options may not set {clash[0]!r}: the sandbox writes it itself")
     out: dict[str, Any] = dict(options)
+    if PEER_CHECK.is_file():  # never set for a gate that would not read it: a check claimed is a check made
+        out.setdefault(PEER_CHECK_KEY, True)
+    elif out.get(PEER_CHECK_KEY) is True:  # asked of a gate that would ignore it: refused, never claimed
+        raise SandboxError("gate_options asks for the gate's peer-uid check, and this core's gate does not have it")
     out.update(
         run_key=run_key,
         verify_ssl=not tls.insecure,

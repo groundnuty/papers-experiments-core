@@ -224,6 +224,8 @@ class ApptainerSandbox:
                 self._ca_bytes = s.tls.bundle()
             except ConfigError as error:
                 raise StartRefused(str(error)) from None
+        if self.app.gate_options.get(gaterun.PEER_CHECK_KEY) is True and not gaterun.PEER_CHECK.is_file():
+            raise StartRefused("gate_options asks for the gate's peer-uid check, and this core's gate does not have it")
         self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s), storages=inputs.storage_paths(s))
         layout.check_work_root(s.work_root, os.getuid())
         self._image_identity = layout.pin_image(self.app.image)  # O13, before anything exists
@@ -342,7 +344,10 @@ class ApptainerSandbox:
                 raise SandboxError("the gate did not start") from None
             break
         self._remove_token_files()  # the gate read it before it said ready; it keeps it in memory alone
-        self._meta["gate"] = {"port": self._gate_port, "hosts": len(served)}
+        asked = json.loads(config.read_text(encoding="utf-8")).get(gaterun.PEER_CHECK_KEY) is True
+        # in effect only when asked of a gate that has it, which refuses to start when it cannot make it (#317)
+        self._meta["gate"] = {"port": self._gate_port, "hosts": len(served),
+                              "peer_uid_check": asked and gaterun.PEER_CHECK.is_file()}  # fmt: skip
 
     def _retire_gate(self) -> None:
         """A gate that failed to start: shown gone before another is tried (a stop that cannot show it raises)."""
