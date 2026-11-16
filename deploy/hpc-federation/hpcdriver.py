@@ -196,8 +196,9 @@ class Driver(Down):
     def check_scratch(self, site: Site) -> None:
         """The provider storage's scratch root, and the inode guard (hpcquota; DESIGN.md section 11): with a scratch
         root, the account's inode usage and quota are read through the site's command and the federation refused when
-        its estimate would pass 95% of the quota, or when the quota cannot be read, before anything is submitted.
-        Nothing without a scratch root: nothing of the federation lands on scratch."""
+        its estimate would pass 95% of the quota, or when the quota cannot be read, before anything is submitted. The
+        check is mandatory there: the providers' storage is bound onto scratch, and no override skips it. Nothing
+        without a scratch root: nothing of the federation lands on scratch."""
         if not site.storage_root:
             return
         hpcstorage.check_root(site, self.root)
@@ -512,7 +513,9 @@ class Driver(Down):
             argv = ["bash", str(BUNDLE / "provider.sbatch"), str(BUNDLE), tar, name, zone["fqdn"], site.admin_mail]
             # --import=SPACE=PATH for each tree it owns, none for a mirror
             imports = hpcimport.provider_import_args(self.layout, name, self.environ)
-            self.launch(name, [*argv, zone["address"], *peers, *imports])
+            # --storage=PATH, its own directory on scratch, bound onto /volumes/posix; none without a scratch root
+            storage = hpcstorage.provider_args(state, name)
+            self.launch(name, [*argv, zone["address"], *peers, *imports, *storage])
         self.say(f"{len(names)} provider(s) launched; registering each")
         for name in names:
             self.register(name, self.record_workdir(name, self.wait_log(name, TOKEN_WAIT)))

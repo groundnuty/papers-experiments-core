@@ -6,9 +6,13 @@ With `HPC_STORAGE_ROOT` set, `up` makes below it one directory of its own, named
 that fails on anything already there, never adopting it. Each of them holds an owner marker (`.hpcop-storage-owner`,
 0600) that names the allocation and a random token the state file also holds (a provider's also names the provider),
 so each directory proves itself and the parent's marker is no proof of its children. The state file records the paths
-before the first `mkdir`, so a crash after it leaves enough for `down`. The providers use the directories as their
-storage once the bundle binds them (not in this release: the driver makes, records and removes them, and guards their
-inode quota).
+before the first `mkdir`, so a crash after it leaves enough for `down`.
+
+Each provider's directory also holds, beside its marker, the directory its service binds onto `/volumes/posix`
+(`posix`, 0700, made empty): `up` gives the provider's step that one (`provider_args`, from the record checked whole),
+and the bundle binds it (`bundle/posixstorage.py`), so the provider stores its data on scratch and never sees the
+marker, which stays where `down` proves the directory by it. The cell sees its storage at the path it always did, so
+the provider's posix storage is declared to Onedata as before and nothing in `platform.toml` changes.
 
 `down` removes them only once the held job and every service are gone, and removes exactly what `up` made:
 
@@ -35,12 +39,13 @@ import re
 import secrets
 import stat
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from hpcremove import remove_tree
 from hpcsettings import Site
 
 OWNER = ".hpcop-storage-owner"  # in the storage's own directory and in each provider's: whose, and this up's token
+BOUND = "posix"  # in each provider's directory, beside its marker: what its service binds onto /volumes/posix
 PARENT_NAME = re.compile(r"hpcop-[a-z0-9][a-z0-9_-]{0,39}-[0-9a-f]{8}")  # the allocation's name (initial_state)
 PROVIDER_NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?")  # a Compose service name (fedspec.SERVICE_NAME)
 TOKEN = re.compile(r"[0-9a-f]{32}")
@@ -131,9 +136,10 @@ def _mark(directory: str, content: bytes) -> None:
 
 def create(record: Mapping[str, Any]) -> None:
     """Make the storage the record names: the storage's own directory by an exclusive `mkdir` (anything already there
-    refuses `up`, and is never adopted) with its owner marker, and each provider's directory with its own. OSError
-    becomes a refusal that names the cause and never the path. What is made before a failure is the state's, and `down`
-    removes it; a directory whose marker could not be written is removed at once (`_mark`)."""
+    refuses `up`, and is never adopted) with its owner marker, and each provider's directory with its own and, beside
+    it, the empty directory its service binds (`BOUND`). OSError becomes a refusal that names the cause and never the
+    path. What is made before a failure is the state's, and `down` removes it; a directory whose marker could not be
+    written is removed at once (`_mark`)."""
     parent = record["parent"]
     try:
         os.mkdir(parent, 0o700)
@@ -150,6 +156,26 @@ def create(record: Mapping[str, Any]) -> None:
         except OSError as error:
             raise _fail(error) from None
         _mark(path, _marker(record, name))
+        try:  # after the marker, so a failure here leaves a directory `down` proves and removes
+            os.mkdir(f"{path}/{BOUND}", 0o700)
+        except OSError as error:
+            raise _fail(error) from None
+
+
+def provider_args(state: Mapping[str, Any], name: str) -> List[str]:
+    """The provider step's `--storage=PATH`: the directory in its own recorded directory that its service binds onto
+    `/volumes/posix`, read from the state's record checked whole (`checked`), so a step is never given another path.
+    No argument without a scratch root (the provider stores on its node's tmpfs, as before); StorageRefused for a state
+    that names a scratch root and no record, since a provider must never fall back to tmpfs for want of one."""
+    record = state.get("storage")
+    if record is None:
+        if state.get("site", {}).get("storage_root"):
+            raise StorageRefused(
+                "the state records a scratch root and no provider storage on it, which up always records: the "
+                "provider is not started"
+            )
+        return []
+    return [f"--storage={checked(record, state)['providers'][name]}/{BOUND}"]
 
 
 def checked(record: Any, state: Mapping[str, Any]) -> Dict[str, Any]:
