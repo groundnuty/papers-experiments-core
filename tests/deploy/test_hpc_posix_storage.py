@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,11 @@ def prepare(workdir, storage, provider="aspen", mounts=NO_MOUNTS):
     return ps.prepare(str(workdir), provider, f"--storage={storage}", mountinfo=mounts)
 
 
+def bind(workdir, storage):
+    """binds as run_service calls it at a start that names `storage` (the federation's state's own)."""
+    return ps.binds(str(workdir), f"--storage={storage}")
+
+
 def refused(match, workdir, storage, provider="aspen", mounts=NO_MOUNTS):
     with pytest.raises(ps.StorageRefused, match=match) as failure:
         prepare(workdir, storage, provider, mounts)
@@ -106,13 +112,31 @@ def test_o57_prepare_records_the_storage_and_binds_name_it_writable_over_the_pos
     record = workdir / "posix-storage"
     assert record.read_text(encoding="utf-8") == f"aspen\t{storage}\n"
     assert record.stat().st_mode & 0o777 == 0o600
-    assert ps.binds(str(workdir)) == ["--bind", f"{storage}:/volumes/posix:rw"]
+    assert bind(workdir, storage) == ["--bind", f"{storage}:/volumes/posix:rw"]
 
 
-def test_o57_a_service_with_no_recorded_storage_binds_nothing(workdir):
-    """O57: without a record (no HPC_STORAGE_ROOT, or the zone) there is nothing to bind: the storage stays the rootfs's
-    own /volumes/posix, on the node's tmpfs."""
-    assert ps.binds(str(workdir)) == []
+def test_o57_a_start_that_names_a_storage_the_work_directory_does_not_record_is_refused(workdir, storage):
+    """O57: a start given a storage (the federation's state names one) whose work directory records none was never
+    prepared for it: refused, never started on the node's tmpfs instead."""
+    with pytest.raises(ps.StorageRefused, match="records none") as failure:
+        bind(workdir, storage)
+    assert str(storage) not in str(failure.value)
+
+
+def test_o57_a_record_edited_to_name_another_federations_storage_is_refused_at_the_start(base, workdir, storage):
+    """O57: the start is given its own storage from the federation's state, and binds only when the work directory
+    records exactly that: a record edited to another federation's directory for the same provider (whose marker would
+    pass every other check) is refused, as is one naming another provider of this federation."""
+    prepare(workdir, storage)
+    other = make_storage(base / "other-federation", allocation="hpcop-expcore-hpc-pilot-feedf00d")
+    node.put(workdir / "posix-storage", f"aspen\t{other}\n")
+    with pytest.raises(ps.StorageRefused, match="another storage than") as failure:
+        bind(workdir, storage)
+    assert str(other) not in str(failure.value)
+    sibling = make_storage(base, provider="larch")
+    node.put(workdir / "posix-storage", f"larch\t{sibling}\n")
+    with pytest.raises(ps.StorageRefused, match="another storage than"):
+        bind(workdir, storage)
 
 
 @pytest.mark.parametrize(
@@ -176,7 +200,7 @@ def test_o57_a_setgid_bit_that_a_projects_scratch_passes_down_is_accepted(workdi
         if not path.stat().st_mode & 0o2000:
             pytest.skip("this filesystem keeps no setgid bit on a directory")
     prepare(workdir, storage)
-    assert ps.binds(str(workdir)) == ["--bind", f"{storage}:/volumes/posix:rw"]
+    assert bind(workdir, storage) == ["--bind", f"{storage}:/volumes/posix:rw"]
 
 
 def test_o57_a_storage_this_user_does_not_own_is_refused(workdir, storage, monkeypatch):
@@ -234,7 +258,7 @@ def test_o57_a_storage_that_holds_files_at_the_first_start_is_refused_but_a_rest
     prepare(workdir, storage)
     (storage / "space-id").mkdir()
     (storage / "space-id" / "data.bin").write_bytes(b"what the provider stored")
-    assert ps.binds(str(workdir)) == ["--bind", f"{storage}:/volumes/posix:rw"]
+    assert bind(workdir, storage) == ["--bind", f"{storage}:/volumes/posix:rw"]
 
 
 def test_o57_a_storage_on_node_local_memory_is_refused_since_it_is_there_to_keep_the_data_off_the_node(
@@ -261,14 +285,14 @@ def test_o57_a_rootfs_mountpoint_that_is_missing_a_link_or_holds_files_is_refuse
     prepare(workdir, storage)
     (point / "stale.bin").write_bytes(b"x")
     with pytest.raises(ps.StorageRefused, match="holds files"):
-        ps.binds(str(workdir))
+        bind(workdir, storage)
     shutil.rmtree(point)
     point.symlink_to(base)
     with pytest.raises(ps.StorageRefused, match="link or not a directory"):
-        ps.binds(str(workdir))
+        bind(workdir, storage)
     point.unlink()
     with pytest.raises(ps.StorageRefused, match="no /volumes/posix"):
-        ps.binds(str(workdir))
+        bind(workdir, storage)
 
 
 def test_o57_a_work_directory_that_is_not_a_providers_private_one_is_refused(storage, base):
@@ -291,13 +315,13 @@ def test_o57_a_storage_that_became_a_link_or_lost_its_marker_after_prepare_is_re
     saved = marker.read_text(encoding="utf-8")
     marker.unlink()
     with pytest.raises(ps.StorageRefused, match="owner marker"):
-        ps.binds(str(workdir))
+        bind(workdir, storage)
     node.put(marker, saved)
     storage.rename(storage.parent / "moved")
     (storage.parent / "moved").chmod(0o700)
     storage.symlink_to(storage.parent / "moved")
     with pytest.raises(ps.StorageRefused, match="symbolic link"):
-        ps.binds(str(workdir))
+        bind(workdir, storage)
 
 
 def test_o57_a_record_that_was_edited_is_a_link_or_is_readable_by_others_is_refused(workdir, storage, base):
@@ -306,19 +330,19 @@ def test_o57_a_record_that_was_edited_is_a_link_or_is_readable_by_others_is_refu
     record = workdir / "posix-storage"
     node.put(record, f"larch\t{storage}\n")
     with pytest.raises(ps.StorageRefused, match="not of the form up makes"):
-        ps.binds(str(workdir))
+        bind(workdir, storage)
     node.put(record, f"aspen\t{storage}\n", mode=0o644)
     with pytest.raises(ps.StorageRefused, match="readable by no one else"):
-        ps.binds(str(workdir))
+        bind(workdir, storage)
     record.unlink()
     node.put(base / "other-record", f"aspen\t{storage}\n")
     record.symlink_to(base / "other-record")
     with pytest.raises(ps.StorageRefused, match="cannot be opened"):
-        ps.binds(str(workdir))
+        bind(workdir, storage)
     record.unlink()
     node.put(record, "aspen\n")
     with pytest.raises(ps.StorageRefused, match="NAME<TAB>PATH"):
-        ps.binds(str(workdir))
+        bind(workdir, storage)
 
 
 def test_o57_the_record_is_never_written_through_a_link_and_is_replaced_whole(workdir, storage, base):
@@ -342,10 +366,11 @@ def test_o57_the_command_line_prepares_and_binds_and_a_refusal_names_no_path(wor
     assert str(bad) not in done.stderr + done.stdout
     assert not (workdir / "posix-storage").exists()
     prepare(workdir, storage)
-    done = cli("binds", "--workdir", str(workdir))
+    done = cli("binds", "--workdir", str(workdir), f"--storage={storage}")
     assert done.returncode == 0, done.stderr
     assert done.stdout.splitlines() == ["--bind", f"{storage}:/volumes/posix:rw"]
-    assert cli("binds", "--workdir", str(workdir), "--provider", "aspen").returncode == 1
+    assert cli("binds", "--workdir", str(workdir)).returncode == 1  # a start that names its storage, always
+    assert cli("binds", "--workdir", str(workdir), "--provider", "aspen", f"--storage={storage}").returncode == 1
     assert cli("prepare", "--workdir", str(workdir), "--provider", "Aspen", f"--storage={storage}").returncode == 1
 
 
@@ -399,16 +424,22 @@ def test_o57_the_arguments_are_split_into_the_one_storage_and_the_rest():
     assert "given twice" in twice.stderr
 
 
-def test_o57_the_service_binds_the_recorded_storage_and_one_with_none_binds_nothing(workdir, storage):
-    """O57: storage_binds prints the record's bind, and nothing without a record (a link in its place is not none)."""
-    assert lib("storage_binds", str(workdir)).stdout == ""
+def test_o57_the_service_binds_the_storage_its_start_names_and_one_that_names_none_binds_nothing(workdir, storage):
+    """O57: storage_binds prints the bind of the storage the start names, as recorded; a start that names none binds
+    nothing where nothing is recorded (tmpfs, as before), and refuses where a storage is recorded (a link in its place
+    included), so a provider bound onto scratch is never started on tmpfs for want of an argument."""
+    done = lib("storage_binds", str(workdir), "")
+    assert (done.returncode, done.stdout) == (0, "")
     prepare(workdir, storage)
-    done = lib("storage_binds", str(workdir))
+    done = lib("storage_binds", str(workdir), f"--storage={storage}")
     assert done.returncode == 0, done.stderr
     assert done.stdout.splitlines() == ["--bind", f"{storage}:/volumes/posix:rw"]
+    done = lib("storage_binds", str(workdir), "")
+    assert done.returncode != 0
+    assert "names none" in done.stderr
     (workdir / "posix-storage").unlink()
     (workdir / "posix-storage").symlink_to(workdir / "no-such-file")
-    assert lib("storage_binds", str(workdir)).returncode != 0
+    assert lib("storage_binds", str(workdir), "").returncode != 0
 
 
 def read(name):
@@ -434,21 +465,46 @@ def test_o57_the_storage_is_declared_to_onedata_as_it_always_was():
 # -- the service's argv, with the stand-in apptainer -------------------------------------------------------------------
 
 
-def service_argv(holder, tmp_path, storage=None):
-    """Run run-node.sh over a provider's work directory with the stand-in apptainer, which records its argv and exits;
-    with `storage`, configure.sh's prepare has recorded it first. The argv, one word per line."""
-    work = node.make_work(holder)
+def provider_work(holder, **kwargs):
+    """A provider's work directory as node-init.sh and configure.sh leave it, its rootfs's /volumes/posix empty."""
+    work = node.make_work(holder, **kwargs)
     (work / "rootfs" / "volumes" / "posix").mkdir(parents=True)
     (work / "rootfs" / "etc").mkdir()
     (work / "rootfs" / "etc" / "hpcop-erlang-env").write_text("ERL_EPMD_PORT=21500\n", encoding="utf-8")
-    if storage is not None:
-        prepare(work, storage)
+    return work
+
+
+def stand_in_env(holder, tmp_path):
+    """The node's environment with the stand-in apptainer first on PATH, recording the service's argv and ending."""
     bin_dir = node.install_fakes(tmp_path / "bin")
+    return node.node_env(
+        holder, PATH=f"{bin_dir}:{os.environ['PATH']}", FAKE_RUN_ARGS=str(tmp_path / "run-args"),
+        FAKE_LOG=str(tmp_path / "fake-log"), HPCOP_STOP_SECONDS="30",
+    )  # fmt: skip
+
+
+def started(tmp_path):
+    """The argv the stand-in service was started with, one word per line; None when it never was."""
     args = tmp_path / "run-args"
-    env = node.node_env(holder, PATH=f"{bin_dir}:{os.environ['PATH']}", FAKE_RUN_ARGS=str(args))
-    done = node.script("run-node.sh", "--workdir", str(work), env=env)
+    return args.read_text(encoding="utf-8").splitlines() if args.exists() else None
+
+
+def run_node(holder, tmp_path, *, record=None, given=None):
+    """run-node.sh over a provider's work directory: `record` is what configure.sh's prepare recorded first, `given`
+    the storage this start names. (The work directory, the script's end, the service's argv or None.)"""
+    work = provider_work(holder)
+    if record is not None:
+        prepare(work, record)
+    named = [f"--storage={given}"] if given is not None else []
+    done = node.script("run-node.sh", "--workdir", str(work), *named, env=stand_in_env(holder, tmp_path))
+    return work, done, started(tmp_path)
+
+
+def service_argv(holder, tmp_path, storage=None):
+    """The service's argv at a start that names `storage`, as recorded at the first (none: neither)."""
+    work, done, argv = run_node(holder, tmp_path, record=storage, given=storage)
     assert done.returncode == 0, done.stderr
-    return work, args.read_text(encoding="utf-8").splitlines()
+    return work, argv
 
 
 @pytest.fixture
@@ -487,8 +543,88 @@ def test_o57_the_run_takes_its_storage_bind_from_the_function_alone_and_a_failur
     run = read("lib.sh")
     body = run[run.index("run_service() {") :]
     body = body[: body.index("\n}\n")]
-    assert 'storage_binds "$W") || die' in body
+    assert 'storage_binds "$W" "$storage") || die' in body
     assert body.index('import_binds "$W"') < body.index('storage_binds "$W"') < body.index("exec ")
     exec_line = body[body.index("exec ") :]
     assert exec_line.index('"${binds[@]}"') < exec_line.index('"$R"')
     assert not re.search(r"--bind[ =]", exec_line)
+
+
+@node.needs_pidfd
+@pytest.mark.parametrize(("recorded", "named"), [(True, False), (False, True)], ids=["record-only", "named-only"])
+def test_o57_a_start_whose_storage_and_record_disagree_never_starts_the_service(
+    holder, tmp_path, base, recorded, named
+):
+    """O57: a work directory that records a storage started with none named (the state's argument lost), and a start
+    that names one the work directory never recorded, are both refused before the service: never on tmpfs instead."""
+    storage = make_storage(base)
+    _, done, argv = run_node(holder, tmp_path, record=storage if recorded else None, given=storage if named else None)
+    assert done.returncode != 0
+    assert argv is None
+
+
+def test_o57_the_provider_job_passes_its_storage_to_its_service_and_configuration():
+    """O57: provider.sbatch takes the one --storage= of its arguments for its service's start, and configure.sh gets
+    every argument as before."""
+    batch = read("provider.sbatch")
+    assert 'split_storage STORAGE REST "$@"' in batch
+    assert 'bash "$B/run-node.sh" --workdir "$W" ${STORAGE:+"$STORAGE"} &' in batch
+    assert 'configure.sh" op --workdir "$W" "$NAME" "$ZONE" "$MAIL" "$@"' in batch
+
+
+# -- a start again (restart.sh), with the stand-in apptainer -----------------------------------------------------------
+
+
+def kept(holder, kind="op"):
+    """A provider's work directory a kept stop left (teardown.sh --keep): the keep marks and the identity."""
+    work = provider_work(holder, kind=kind)
+    node.put(work / "stop-requested", "keep\n")
+    node.put(work / "keep-until", f"{int(time.time()) + 3600}\n")
+    node.put(work / "identity.json", json.dumps({"kind": kind, "providerId": "pid-1", "domain": "a.invalid"}) + "\n")
+    return work
+
+
+def restart(holder, tmp_path, work, *args, kind="op"):
+    return node.script(
+        "restart.sh", kind, "--workdir", str(work), *args, env=stand_in_env(holder, tmp_path), timeout=120
+    )
+
+
+@node.needs_pidfd
+def test_o57_a_start_again_binds_the_storage_it_is_given_with_the_providers_data_in_it(holder, tmp_path, base):
+    """O57: restart.sh, given the storage by `hpcfed.py start`, starts the service with the same bind, the provider's
+    data in it. (The stand-in service ends at once, so the restart then fails its readiness: only the start is read.)"""
+    storage = make_storage(base)
+    work = kept(holder)
+    prepare(work, storage)
+    (storage / "space-id").mkdir()
+    (storage / "space-id" / "data.bin").write_bytes(b"what the provider stored")
+    restart(holder, tmp_path, work, f"--storage={storage}")
+    argv = started(tmp_path)
+    assert argv is not None
+    assert argv[argv.index("--bind") : argv.index("--bind") + 2] == ["--bind", f"{storage}:/volumes/posix:rw"]
+    assert argv.index("--bind") < argv.index(f"{work}/rootfs")
+
+
+def test_o57_a_start_again_without_the_storage_its_work_directory_records_changes_nothing(holder, tmp_path, base):
+    """O57: restart.sh named no storage over a work directory that records one is refused before it takes the
+    directory over: its owner and its kept stop are as they were, and no service was started."""
+    storage = make_storage(base)
+    work = kept(holder)
+    prepare(work, storage)
+    owner = (work / "owner.pid").read_text(encoding="utf-8")
+    done = restart(holder, tmp_path, work)
+    assert done.returncode != 0
+    assert "names none" in done.stderr
+    assert started(tmp_path) is None
+    assert (work / "owner.pid").read_text(encoding="utf-8") == owner
+    assert (work / "stop-requested").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_o57_a_start_again_of_the_zone_takes_no_storage(holder, tmp_path, base):
+    """O57: the zone has no posix storage to bind: restart.sh refuses one, naming why, before anything."""
+    work = kept(holder, kind="oz")
+    done = restart(holder, tmp_path, work, f"--storage={make_storage(base)}", kind="oz")
+    assert done.returncode != 0
+    assert "the zone has no posix storage" in done.stderr
+    assert started(tmp_path) is None

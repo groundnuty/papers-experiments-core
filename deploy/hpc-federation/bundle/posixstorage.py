@@ -9,11 +9,14 @@ job as `--storage=PATH`. This script is what the node does with it:
   posixstorage.py prepare --workdir W --provider NAME --storage=PATH
       configure.sh's step, at the first start. Check the directory and the rootfs's mountpoint (below), then write the
       record `W/posix-storage` (0600, one `NAME<TAB>PATH` line). Nothing is written when either is refused.
-  posixstorage.py binds --workdir W
-      run_service's step, at every start (restart.sh's included, which keeps the work directory): check the recorded
-      directory and the mountpoint again and print the arguments for `apptainer exec`, one per line: `--bind` and
-      `PATH:/volumes/posix:rw`. Nothing without a record: the provider then stores in its rootfs's own /volumes/posix,
-      on the node's tmpfs, as without the key.
+  posixstorage.py binds --workdir W --storage=PATH
+      run_service's step, at every start: the first (provider.sbatch) and every start again (restart.sh, which
+      `hpcfed.py start` gives the same argument, read from the federation's state). The record must name exactly the
+      PATH this start was given, so a record edited or put in place since cannot redirect the bind, and one that is
+      missing refuses the start rather than leave the provider on tmpfs. Check the directory and the mountpoint again
+      and print the arguments for `apptainer exec`, one per line: `--bind` and `PATH:/volumes/posix:rw`. A start given
+      no storage binds nothing (lib.sh's storage_binds, which also refuses a work directory that records one): the
+      provider then stores in its rootfs's own /volumes/posix, on the node's tmpfs, as without the key.
 
 The directory is accepted only as a plain absolute path of characters that cannot end a bind option, with no symbolic
 link on the way (a link could be re-pointed between the check and the bind), of the form `up` makes
@@ -238,14 +241,24 @@ def recorded(workdir):
     return provider, parse_arg(PREFIX + path)
 
 
-def binds(workdir):
-    """The `apptainer exec` arguments that bind the recorded storage onto /volumes/posix, writable, after checking it
-    and the mountpoint again (with no mount table and no emptiness: the provider's data is in it after a first start);
-    none without a record."""
+def binds(workdir, arg):
+    """The `apptainer exec` arguments that bind the storage this start was given (`--storage=PATH`, from the
+    federation's state) onto /volumes/posix, writable: only when the work directory records exactly that path, after
+    checking it and the mountpoint again (with no mount table and no emptiness: the provider's data is in it after a
+    first start). A missing record refuses: the provider is never started on the node's tmpfs instead."""
+    expected = parse_arg(arg)
     found = recorded(workdir)
     if found is None:
-        return []
+        raise StorageRefused(
+            "this start names a storage on scratch, but the work directory records none (configure.sh never prepared "
+            "it): the provider is not started, and never on the node's tmpfs instead"
+        )
     provider, path = found
+    if path != expected:
+        raise StorageRefused(
+            "the work directory records another storage than the federation's state names for this start: the record "
+            "is not the one configure.sh wrote for it"
+        )
     check_storage(path, provider, workdir)
     check_mountpoint(workdir)
     return ["--bind", "%s:%s:rw" % (path, MOUNT)]
@@ -272,7 +285,8 @@ def main(argv):
         verb = argv[0] if argv else ""
         if "workdir" not in named or verb not in ("prepare", "binds"):
             raise StorageRefused(
-                "usage: posixstorage.py prepare --workdir W --provider NAME --storage=PATH | binds --workdir W"
+                "usage: posixstorage.py prepare --workdir W --provider NAME --storage=PATH | binds --workdir W "
+                "--storage=PATH"
             )
         if verb == "prepare":
             if "provider" not in named or len(rest) != 1:
@@ -280,9 +294,9 @@ def main(argv):
             prepare(named["workdir"], named["provider"], rest[0])
             print("ok: the provider's storage on scratch is prepared, to be bound onto %s" % MOUNT, file=sys.stderr)
             return 0
-        if rest or "provider" in named:
-            raise StorageRefused("binds takes only --workdir")
-        for argument in binds(named["workdir"]):
+        if len(rest) != 1 or "provider" in named:
+            raise StorageRefused("binds takes --workdir and one --storage=PATH")
+        for argument in binds(named["workdir"], rest[0]):
             print(argument)
         return 0
     except StorageRefused as refusal:

@@ -9,14 +9,16 @@ hpc_fed_support and temporary directories for scratch; nothing reaches a cluster
 import dataclasses
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import stat
+import sys
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path
+from hpc_fed_support import LAYOUT, SITE, FakeProcess, FakeSlurm, agent_site, data_stand_in, hpc_on_path
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
 from expcore_onedata.config import load_platform
@@ -32,8 +34,9 @@ def hpc():
     with hpc_on_path() as modules:
         import fedcontent
         import fedlinks
+        import hpcfed_control
 
-        modules.fedlinks, modules.content = fedlinks, fedcontent
+        modules.fedlinks, modules.content, modules.control = fedlinks, fedcontent, hpcfed_control
         yield modules
 
 
@@ -205,7 +208,7 @@ def test_o57_the_directory_up_names_in_a_providers_step_is_the_one_its_node_take
             assert rig.bound()[name].stat().st_mode & stat.S_ISGID
         work = provider_workdir(tmp_path / "nodes" / name)
         script.prepare(str(work), name, command[-1], mountinfo="")
-        assert script.binds(str(work)) == ["--bind", f"{rig.bound()[name]}:/volumes/posix:rw"]
+        assert script.binds(str(work), command[-1]) == ["--bind", f"{rig.bound()[name]}:/volumes/posix:rw"]
     elsewhere = provider_workdir(tmp_path / "nodes" / "elsewhere")
     with pytest.raises(script.StorageRefused, match="not of the form up makes"):
         script.prepare(str(elsewhere), "aspen", steps["larch"][-1], mountinfo="")
@@ -223,6 +226,81 @@ def test_o57_a_scratch_root_given_through_a_link_is_refused_before_anything_is_s
     assert not any(call[0] == "sbatch" for call in rig.fake.calls)
     assert listing(Path(site["HPC_STORAGE_ROOT"])) == set()
     assert not rig.root.exists()
+
+
+class Verbs:
+    """`hpcfed.py stop | start <service>` over a rig's federation, and their node side: status.sh reads a service alive
+    while its step is listed, teardown.sh --keep ends its step."""
+
+    def __init__(self, hpc, rig, monkeypatch):
+        self.hpc, self.rig = hpc, rig
+        rig.fake.on_control = self.node
+        monkeypatch.setattr(hpc.control, "_SLEEP", lambda s: None)
+
+    def node(self, srun):
+        script = Path(srun.command[1]).name if len(srun.command) > 1 else ""
+        if script not in ("status.sh", "teardown.sh"):
+            return None
+        workdir = srun.command[srun.command.index("--workdir") + 1]
+        services = self.rig.state()["services"]
+        (step,) = [r["step"]["name"] for r in services.values() if r.get("workdir") == workdir]
+        if script == "teardown.sh":
+            self.rig.fake.steps.pop(step, None)
+            said = 'kept stop ended\nhpcop-stop {"ended": "exit", "seconds": 3.5}\n'
+            return FakeProcess(self.hpc.slurm.Completed(0, said, ""))
+        alive = step in self.rig.fake.steps
+        reading = {"alive": alive, "pid": 4321 if alive else None, "start": "88" if alive else None, "ready": alive}
+        return FakeProcess(self.hpc.slurm.Completed(0, json.dumps(reading) + "\n", ""))
+
+    def __call__(self, *words):
+        out, err = io.StringIO(), io.StringIO()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(sys, "stdout", out)
+            patch.setattr(sys, "stderr", err)
+            status = self.hpc.cli.main(["--layout", str(LAYOUT), "--root", str(self.rig.root), *words], {},
+                                       runner=self.rig.fake)  # fmt: skip
+        return status, err.getvalue()
+
+    def restarts(self):
+        return [s.command for s in self.rig.fake.spawned if Path(s.command[1]).name == "restart.sh"]
+
+
+def test_o57_a_provider_started_again_is_given_its_own_storage_from_the_state_and_the_zone_none(
+    hpc, tmp_path, monkeypatch
+):
+    """O57: `hpcfed.py start` gives restart.sh the provider's own directory on scratch, read from the state's record
+    checked whole, so its node binds exactly what the state names; a tmpfs federation's start is as it was."""
+    for scratch in (True, False):
+        base = tmp_path / ("scratch" if scratch else "tmpfs")
+        rig = Rig(hpc, base, make_site(base, scratch=scratch))
+        rig.up()
+        verb = Verbs(hpc, rig, monkeypatch)
+        assert verb("stop", "aspen")[0] == 0
+        status, err = verb("start", "aspen")
+        assert status == 0, err
+        record = rig.state()["services"]["aspen"]
+        named = [f"--storage={rig.bound()['aspen']}"] if scratch else []
+        script = str(hpc.control.BUNDLE / "restart.sh")
+        assert verb.restarts() == [["bash", script, "op", "--workdir", record["workdir"], *named]]
+
+
+def test_o57_a_provider_whose_state_lost_its_storage_record_is_not_started_again(hpc, tmp_path, monkeypatch):
+    """O57: a state that names a scratch root and no storage record (or an edited one) starts no provider: refused
+    before anything is recorded or launched, so it is never started on its node's tmpfs instead."""
+    rig = Rig(hpc, tmp_path, make_site(tmp_path, scratch=True))
+    rig.up()
+    verb = Verbs(hpc, rig, monkeypatch)
+    assert verb("stop", "aspen")[0] == 0
+    before = rig.state()["services"]["aspen"]
+    path = rig.root / "hpc-federation.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    for broken in (None, {**state["storage"], "providers": {**state["storage"]["providers"], "aspen": "/elsewhere"}}):
+        path.write_text(json.dumps({**state, "storage": broken}), encoding="utf-8")
+        status, err = verb("start", "aspen")
+        assert status == 1
+        assert "storage" in err
+        assert verb.restarts() == []
+        assert rig.state()["services"]["aspen"] == before
 
 
 # -- what up makes, and down removes ---------------------------------------------------------------------------------

@@ -692,10 +692,18 @@ directories are made after the state exists and before the job is submitted, so 
   data off the node). The rootfs's `/volumes/posix`, which the bind covers, must be a real directory holding nothing.
   Only then is the path recorded in the work directory (`posix-storage`, 0600, `<provider><TAB><path>`, by a draft made
   exclusively and replaced whole). A refusal fails the job, naming what was refused and never the path.
-- `run_service` binds the recorded directory, writable, onto `/volumes/posix` (`--bind <path>:/volumes/posix:rw`, after
-  any shared import's read-only binds and before the rootfs) at every start, `restart.sh`'s included: `posixstorage.py
-  binds` checks it again (all but the emptiness and the mount table, since after a first start it holds the provider's
-  data) and a failure stops the start. With no record nothing is bound and the argv is word for word what it was.
+- **Every start names its storage, from the state.** The first start's `run-node.sh` is given the job's own argument
+  (`provider.sbatch`), and every start again is given it by `hpcfed.py start`, which reads it from the state's record
+  checked whole (`hpcstorage.provider_args`; a state with a scratch root and no record, or an edited one, is refused
+  before anything is recorded or launched) and passes it to `restart.sh`. `run_service` binds the directory, writable,
+  onto `/volumes/posix` (`--bind <path>:/volumes/posix:rw`, after any shared import's read-only binds and before the
+  rootfs) only when the work directory's record names exactly that path: `posixstorage.py binds` checks it again (all
+  but the emptiness and the mount table, since after a first start it holds the provider's data). A record edited to
+  another directory (another federation's, whose marker would pass every other check), a record missing where a start
+  names a storage, and a record present where a start names none each stop the start before the service (`restart.sh`
+  refuses before it takes the work directory over): a provider is never started on another directory or on tmpfs
+  instead. A start that names none over a work directory with no record binds nothing, and the argv is word for word
+  what it was.
 - **Ownership and mode.** Setuid Apptainer without `--fakeroot` runs the cell's processes as the job's user, and
   `finish.sh` declares the posix storage owned by that uid and gid (`rootUid`, `rootGid`), as on tmpfs, whose
   `/volumes/posix` is a 0700 directory of the same user: a 0700 directory of this user is what the provider needs, and the

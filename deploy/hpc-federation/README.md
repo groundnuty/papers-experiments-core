@@ -264,7 +264,8 @@ contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   way, 0700 and yours (a setgid bit the scratch passes down is allowed), the marker naming the provider and the
   allocation, empty and not on the node's memory) and
   record it in the work directory, and the service binds it writable onto `/volumes/posix` at every start, `hpcfed.py
-  start` included. A refusal stops the start: a provider never falls back to tmpfs. The provider runs as you in its
+  start` included, which gives the start the same path again from the state: the bind happens only when the record
+  names exactly it. A refusal stops the start: a provider never falls back to tmpfs or another directory. The provider runs as you in its
   cell, so 0700 is all it needs, and it never sees the marker, which stays beside the bound directory. Its storage is at
   the same path in the cell, so it is declared to Onedata as before (`finish.sh`), `platform.toml` and its fingerprint
   are the same as a tmpfs federation's, and the data check reads each space through its owner, wherever that stores it.

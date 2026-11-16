@@ -32,6 +32,7 @@ private_output   # the batch log: 0600 before anything is written to it
 component op
 (( $# >= 5 )) || die "usage: provider.sbatch <bundle-dir> <tar> <name> <zone-fqdn> <admin-email> <zone-ip> [peer-ip ...]"
 TAR=$1 NAME=$2 ZONE=$3 MAIL=$4; shift 4
+split_storage STORAGE REST "$@"   # its own storage on scratch (O57), if given: configure.sh records it, the service binds it
 
 export HPCOP_OWNER_PID=$$   # node-init.sh records this batch script as the owner of the work directory
 W=$(bash "$B/node-init.sh" op "$TAR")
@@ -56,7 +57,7 @@ say "waiting for the registration token (mint-registration-token.sh | deliver-to
 end=$((SECONDS + ${HPCOP_TOKEN_WAIT:-3600}))
 until [[ -s $S/registration-token ]]; do (( SECONDS < end )) || die "no registration token was delivered"; sleep 5; done
 
-bash "$B/run-node.sh" --workdir "$W" &
+bash "$B/run-node.sh" --workdir "$W" ${STORAGE:+"$STORAGE"} &
 # supervise.py, once run_service execs it: our uid, visible in /proc; its start time identifies it for every signal
 svc=$!; svc_start=$(proc_field "$svc" 22 || true)
 if ! bash "$B/finish.sh" --workdir "$W" "$svc"; then
