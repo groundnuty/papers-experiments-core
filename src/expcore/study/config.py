@@ -200,17 +200,18 @@ def _platform_config(top: Section, root: Path) -> Path | None:
     directory, as the plugin is), or without the key the `platform.toml` beside study.toml when there is one, else None.
     The core never reads it: it hands the path to each platform module that declares its deferral from it, and that
     file's being there is checked only then (`platform_deferral`), since a replication package ships the study without
-    its platform.toml and still loads it."""
+    its platform.toml and still loads it. A named path must lie inside the study directory (links followed); the default
+    is returned as it resolves and refused only where a platform would read it, since nothing read it before."""
     section = Section(top.section("study").data, top.file, "[study]")
     named = section.optional_string(PLATFORM_CONFIG_KEY)
-    if named is None and not (root / PLATFORM_FILE).is_file():
-        return None
-    given = PLATFORM_FILE if named is None else named
-    file = (root / given).resolve()  # a link is followed: where it leads is what the platform would read
+    if named is None:  # the default is never refused here: nothing read it before, so a study that links a shared
+        default = root / PLATFORM_FILE  # platform.toml in loads as ever, and is refused only where a platform reads it
+        return default.resolve() if default.is_file() else None
+    file = (root / named).resolve()  # a link is followed: where it leads is what the platform would read
     if not inside_study(file, root):
         raise section.fail(
             PLATFORM_CONFIG_KEY,
-            f"must name a file inside the study directory; {given!r} is not one (a link that leaves the directory "
+            f"must name a file inside the study directory; {named!r} is not one (a link that leaves the directory "
             "is not inside it)",
         )
     return file

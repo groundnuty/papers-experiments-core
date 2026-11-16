@@ -162,19 +162,45 @@ def test_c11_a_platform_without_the_hook_and_one_the_study_does_not_list_declare
     assert platform_deferrals(load_study(study_with(tmp_path / "t"))) == ()  # no platform at all
 
 
-def test_c11_a_platform_configuration_that_is_a_link_out_of_the_study_directory_is_refused(tmp_path):
-    """C11: the file the core hands to a platform is inside the study directory whichever way it is named: a link
-    beside study.toml (the default) or under a named key that leaves the directory is refused when the study loads."""
+def test_c11_a_named_platform_configuration_that_is_a_link_out_of_the_study_directory_is_refused_at_load(tmp_path):
+    """C11: the file the core hands to a platform is inside the study directory whichever way it is named: a link under
+    a named key that leaves the directory is refused when the study loads."""
     outside = tmp_path / "outside.toml"
     outside.write_text("deferral_s = 7\n", encoding="utf-8")
-    implicit = study_with(tmp_path / "implicit", platform=None)
-    (implicit / "platform.toml").symlink_to(outside)
     named = study_with(tmp_path / "named", platform=None, key='platform_config = "link.toml"\n')
     (named / "link.toml").symlink_to(outside)
-    for study in (implicit, named):
-        text = refused(study)
-        assert "platform_config" in text, text
-        assert "inside the study directory" in text, text
+    text = refused(named)
+    assert "platform_config" in text, text
+    assert "inside the study directory" in text, text
+
+
+def test_c11_an_implicit_platform_toml_that_links_out_loads_and_is_refused_only_where_a_platform_reads_it(
+    tmp_path, monkeypatch
+):
+    """C11: nothing read the default platform.toml before, so a study that links a shared one in still loads, and
+    the platform is never asked to read what lies outside the study: a listed platform with the function is refused,
+    naming the key, and one without the function is not asked."""
+    outside = tmp_path / "outside.toml"
+    outside.write_text("deferral_s = 7\n", encoding="utf-8")
+    calls = tmp_path / "calls"
+    hooked = platform_module(
+        tmp_path / "a",
+        monkeypatch,
+        f"def {PLATFORM_HOOK}(path):\n    open({str(calls)!r}, 'a').write(str(path))\n    return None\n",
+    )
+    plain = platform_module(tmp_path / "b", monkeypatch, UNHOOKED)
+    for number, module in enumerate((hooked, plain)):
+        study = study_with(tmp_path / f"s{number}", module, platform=None)
+        (study / "platform.toml").symlink_to(outside)
+        loaded = load_study(study)
+        assert loaded.platform_config == outside.resolve()
+        if module == plain:
+            assert platform_deferrals(loaded) == ()
+            continue
+        with pytest.raises(ConfigError, match="inside the study directory") as caught:
+            platform_deferrals(loaded)
+        assert "[study] platform_config" in str(caught.value)
+    assert not calls.exists()
 
 
 def test_c11_a_study_built_in_code_with_a_platform_configuration_outside_the_directory_is_refused_unread(
