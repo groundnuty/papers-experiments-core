@@ -1,0 +1,224 @@
+"""O56: the shard driver of deploy/hpc-federation (one shard per HPC federation), checked without a cluster: the
+manifest, the login node's step line, the step on its node with a stand-in dispatcher, and the archives the merge
+takes. Every path, name and job here is invented, and nothing runs srun."""
+
+import argparse
+import importlib.util
+import json
+import os
+import sys
+import tarfile
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
+
+
+@pytest.fixture(scope="module")
+def shards():
+    spec = importlib.util.spec_from_file_location("hpc_shards", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["hpc_shards"] = module  # its dataclasses look their module up by name
+    try:
+        spec.loader.exec_module(module)
+        yield module
+    finally:
+        sys.modules.pop("hpc_shards", None)
+
+
+def _manifest(tmp_path, **changes):
+    roots = [tmp_path / "fed" / name for name in ("a", "b")]
+    for n, root in enumerate(roots, 1):
+        root.mkdir(parents=True)
+        state = {"format": "expcore-hpc-federation/1", "allocation": {"job": str(100 + n), "name": f"hpcop-x-{n}"},
+                 "sandbox": {"node": f"node-s{n}"}}  # fmt: skip
+        (root / "hpc-federation.json").write_text(json.dumps(state))
+    lines = [
+        f'study = "{tmp_path / "study"}"',
+        f'python = "{tmp_path / "venv" / "python"}"',
+        f'core_src = "{tmp_path / "core" / "src"}"',
+        f'results = "{tmp_path / "results"}"',
+        f'tmpfs = "{tmp_path / "tmpfs"}"',
+        'step_path = "/usr/bin:/bin"',
+        "cpus = 6",
+        'memory = "18g"',
+    ]
+    labels = changes.get("labels", ("fed-a", "fed-b"))
+    for label, root in zip(labels, roots, strict=False):
+        lines += ["[[shards]]", f'label = "{label}"', f'root = "{root}"']
+    path = tmp_path / "shards.toml"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_the_manifest_gives_one_shard_per_federation_in_order(shards, tmp_path):
+    """O56: shard i is the i-th federation; each label is checked by the core's rule."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    assert [(s.index, s.count, s.label) for s in plan.shards] == [(1, 2, "fed-a"), (2, 2, "fed-b")]
+
+
+@pytest.mark.parametrize("labels", [("fed-a",), ("fed-a", "fed-a"), ("Fed.A", "fed-b")])
+def test_a_manifest_with_one_shard_a_label_twice_or_a_host_like_label_is_refused(shards, tmp_path, labels):
+    with pytest.raises(shards.ShardsError):
+        shards.load_plan(_manifest(tmp_path, labels=labels))
+
+
+def test_the_step_line_is_an_exact_step_on_the_sandbox_node_with_the_allowlist_alone(shards, tmp_path):
+    """O56: `--exact`, never `--overlap`; the federation's job and sandbox node; an environment of PATH, LC_ALL and the
+    federation's root alone; the dispatcher's shard and label."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    shard = plan.shards[1]
+    line = shards.step_argv(plan, shard, shards.federation(shard), SCRIPT)
+    assert line[:3] == ["srun", "--jobid=102", "--exact"]
+    assert "--overlap" not in line
+    assert line[line.index("-w") + 1] == "node-s2"
+    at = line.index("-i") + 1
+    env = line[at : at + 4]
+    assert [e.split("=")[0] for e in env] == ["PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT"]
+    assert env[3] == f"EXPCORE_FED_ROOT={shard.root}"
+    assert line[at + 4 : at + 7] == [plan.python, "-I", str(SCRIPT)]
+    assert line[line.index("--index") + 1 : line.index("--index") + 2] == ["2"]
+    assert line[line.index("--label") + 1] == "fed-b"
+
+
+def test_a_federation_whose_state_names_no_held_job_is_refused(shards, tmp_path):
+    plan = shards.load_plan(_manifest(tmp_path))
+    (plan.shards[0].root / "hpc-federation.json").write_text(json.dumps({"format": "expcore-hpc-federation/1"}))
+    with pytest.raises(shards.ShardsError, match="no held job"):
+        shards.federation(plan.shards[0])
+
+
+def _step_args(tmp_path, index=1, label="fed-a", resume=False):
+    study = tmp_path / "study"
+    study.mkdir(exist_ok=True)
+    (study / "study.toml").write_text("[study]\n")
+    for name in ("tmpfs", "results"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    return argparse.Namespace(study=study, index=index, count=2, label=label, tmpfs=tmp_path / "tmpfs",
+                              results=tmp_path / "results", core_src=tmp_path, resume=resume)  # fmt: skip
+
+
+def _dispatcher(status=0, lock=True):
+    seen = {}
+
+    def run(argv, env, cwd):
+        seen.update(argv=list(argv), env=dict(env), cwd=cwd)
+        out = Path(argv[argv.index("run") + 1]) / "out"
+        (out / "runs").mkdir(parents=True, exist_ok=True)
+        (out / "runs" / "r1.json").write_text("{}")
+        if lock:
+            (out / "campaign.lock").write_text("")
+        return status
+
+    return run, seen
+
+
+def test_the_step_runs_the_shard_on_a_tmpfs_copy_and_archives_its_out_whole(shards, tmp_path):
+    """O56, #305: the dispatcher runs the shard on a copy on the node's tmpfs, with HOME and TMPDIR there; its `out/`
+    comes back whole, lock included, and the tmpfs copy is gone."""
+    run, seen = _dispatcher(status=3)
+    args = _step_args(tmp_path)
+    assert shards.step(args, runner=run, core_found=lambda path: True) == 3
+    assert seen["argv"][-4:] == ["--shard", "1/2", "--shard-label", "fed-a"]
+    assert seen["env"]["HOME"].startswith(str(tmp_path / "tmpfs"))
+    assert not list((tmp_path / "tmpfs").iterdir())
+    manifest = json.loads((tmp_path / "results" / "fed-a.out.json").read_text())
+    assert manifest["lock"] is True
+    assert manifest["exit_status"] == 3
+    with tarfile.open(tmp_path / "results" / "fed-a.out.tar") as tar:
+        assert {"out/campaign.lock", "out/runs/r1.json"} <= set(tar.getnames())
+
+
+def test_a_step_whose_interpreter_imports_another_core_runs_nothing(shards, tmp_path):
+    """O56: lane H's trap: a step that would run an installed core instead of the one given stops first."""
+    run, seen = _dispatcher()
+    assert shards.step(_step_args(tmp_path), runner=run, core_found=lambda path: False) == shards.CORE_MISMATCH
+    assert not seen
+
+
+def test_the_core_check_compares_where_the_core_was_imported_from(shards, tmp_path):
+    inside = tmp_path / "src" / "expcore" / "__init__.py"
+    assert shards.imports_core_from(tmp_path / "src", lambda: str(inside))
+    assert not shards.imports_core_from(tmp_path / "elsewhere", lambda: str(inside))
+
+
+def test_a_resumed_step_starts_from_its_last_archive(shards, tmp_path):
+    """O56: `--resume` unpacks the shard's verified archive into its copy before the dispatcher starts."""
+    run, _ = _dispatcher()
+    shards.step(_step_args(tmp_path), runner=run, core_found=lambda path: True)
+    found = {}
+
+    def resumed(argv, env, cwd):
+        out = Path(argv[argv.index("run") + 1]) / "out"
+        found["kept"] = (out / "runs" / "r1.json").is_file()
+        return 0
+
+    shards.step(_step_args(tmp_path, resume=True), runner=resumed, core_found=lambda path: True)
+    assert found["kept"]
+
+
+def test_the_snapshot_hook_runs_once_more_after_the_dispatcher_and_never_ends_the_run(shards, tmp_path):
+    """O56: the hook of limit 1 runs after the dispatcher exits, before the archive; one that raises is reported."""
+    taken = []
+
+    def take(out):
+        taken.append(out.name)
+        raise OSError("disk full")
+
+    run, _ = _dispatcher()
+    hook = shards.Snapshots(take, every_s=3600)
+    assert shards.step(_step_args(tmp_path), runner=run, core_found=lambda path: True, snapshots=hook) == 0
+    assert taken == ["out"]
+    assert (tmp_path / "results" / "fed-a.out.tar").is_file()
+
+
+def _archived(shards, tmp_path, label, index, lock=True):
+    out = tmp_path / "src-out" / label / "out"
+    (out / "runs").mkdir(parents=True)
+    (out / "runs" / "r.json").write_text(json.dumps({"label": label}))
+    if lock:
+        (out / "campaign.lock").write_text("")
+    (tmp_path / "results").mkdir(exist_ok=True)
+    shards.archive(out, tmp_path / "results", {"index": index, "count": 2, "label": label}, 0)
+
+
+def test_collect_verifies_and_unpacks_every_shard_read_only_and_names_the_merge(shards, tmp_path):
+    """O56, #305: each shard's `out/` whole under `<into>/<label>/out`, read-only, and the merge's command line."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    for shard in plan.shards:
+        _archived(shards, tmp_path, shard.label, shard.index)
+    outs = shards.collect(plan, tmp_path / "merge")
+    assert [o.relative_to(tmp_path / "merge").as_posix() for o in outs] == ["fed-a/out", "fed-b/out"]
+    assert (outs[0] / "campaign.lock").is_file()
+    assert not os.access(outs[0] / "runs" / "r.json", os.W_OK)
+    line = shards.merge_argv(plan, outs)
+    assert line[1:4] == ["-m", "expcore", "merge"]
+    assert line[5:] == [str(o) for o in outs]
+
+
+def test_collect_refuses_a_shard_without_its_lock(shards, tmp_path):
+    plan = shards.load_plan(_manifest(tmp_path))
+    _archived(shards, tmp_path, "fed-a", 1)
+    _archived(shards, tmp_path, "fed-b", 2, lock=False)
+    with pytest.raises(shards.ShardsError, match=r"fed-b.*campaign\.lock"):
+        shards.collect(plan, tmp_path / "merge")
+    assert not (tmp_path / "merge").exists()
+
+
+def test_collect_refuses_an_archive_that_is_not_the_one_its_manifest_names(shards, tmp_path):
+    plan = shards.load_plan(_manifest(tmp_path))
+    for shard in plan.shards:
+        _archived(shards, tmp_path, shard.label, shard.index)
+    with open(tmp_path / "results" / "fed-b.out.tar", "ab") as handle:
+        handle.write(b"\0" * 512)
+    with pytest.raises(shards.ShardsError, match=r"fed-b.*not the one"):
+        shards.collect(plan, tmp_path / "merge")
+
+
+def test_collect_refuses_another_shard_s_archive_under_a_label(shards, tmp_path):
+    plan = shards.load_plan(_manifest(tmp_path))
+    _archived(shards, tmp_path, "fed-a", 1)
+    _archived(shards, tmp_path, "fed-b", 1)
+    with pytest.raises(shards.ShardsError, match="another shard"):
+        shards.collect(plan, tmp_path / "merge")
