@@ -366,13 +366,12 @@ def started(tmp_path, factory, executor, budget: Budget, **options):
     )
 
 
-def test_c27_a_restart_charges_an_interrupted_attempt_the_bound_by_the_maximum_it_was_reserved_and_resumes(
-    tmp_path, endpoint
-):
-    """C27 and C05: a run reserved by the reply maximum is killed before its usage was recorded. At the restart the
-    early gate, which pays for admission's probes before any model is shown held to the maximum, charges the
-    interrupted attempt the bound its row records, 0.54 USD, not the bound by the window, 1.32 USD. Under a ceiling of
-    1.20 USD, which the real total fits, the probes go out, the model is admitted, and the run is run again."""
+def test_c27_a_restart_admits_the_model_of_an_attempt_reserved_by_the_maximum_and_resumes(tmp_path, endpoint):
+    """C27 and C05: a run reserved by the reply maximum is killed before its usage was recorded. Its replies went
+    through the core's recording, so its call log holds them and the restart charges it what they cost (C05), well
+    under the bound its row records, 0.54 USD, let alone the bound by the window, 1.32 USD; an attempt whose log cannot
+    say is charged the recorded bound (`interrupted_store` below). Under a ceiling of 1.20 USD, which the real total
+    fits, the early gate lets admission's probes go out, the model is admitted, and the run is run again."""
     executor = FakeExecutor(default=through_the_adapter)
     killing = started(tmp_path, default_backend_factory, executor, CEILING, crash_hook=killed_before_marker)
     with killing as killed, pytest.raises(RuntimeError, match="unexpected error"):
