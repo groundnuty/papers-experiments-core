@@ -37,6 +37,7 @@ def judged(data: bytes | None, **options):
 
 
 def test_a_run_with_an_intact_log_no_access_and_a_proven_isolation_is_clean():
+    """O60: the one way to be clean; every other run is flagged or unknown."""
     run = judged(log())
     assert run.verdict == CLEAN
     assert run.flags == ()

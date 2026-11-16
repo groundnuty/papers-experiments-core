@@ -42,6 +42,7 @@ def node(*procs) -> FakeProc:
 
 
 def test_a_cell_in_its_own_namespace_with_the_runs_mount_and_nothing_protected_is_proved():
+    """O60: nested in the watcher's PID namespace, the run's mount in its table, no host `/proc`, nothing private."""
     poll, proofs = polled(node(cell_process(500)))
     assert [(label, ok, problems) for label, ok, problems, _ in proofs] == [("cell", True, [])]
     assert proofs[0][3] == {"pid": 500, "start_time": 1500, "nspid_depth": 2}

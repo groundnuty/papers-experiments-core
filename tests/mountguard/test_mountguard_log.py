@@ -11,6 +11,7 @@ TOUCH = inotify("dir", "IN_OPEN", "IN_ISDIR")
 
 
 def test_a_complete_log_of_this_run_is_intact_with_no_access_and_proven_isolation():
+    """O60: start, oneclient, the canary, the window with a passing cell proof, the end: known, no access, proven."""
     reading = read_log(log(), NONCE)
     assert reading.intact
     assert reading.problems == ()

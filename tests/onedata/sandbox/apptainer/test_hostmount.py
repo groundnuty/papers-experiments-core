@@ -57,6 +57,7 @@ def test_start_returns_the_mount_point_with_oneclient_mounted_and_the_window_ope
 
 
 def test_oneclient_reads_the_token_from_a_private_file_that_is_gone_when_start_returns(node, settings, binary):
+    """O60: the token reaches oneclient through a 0600 file in a 0700 directory, removed before any cell starts."""
     mount = helper(node, settings, binary)
     try:
         mount.start()

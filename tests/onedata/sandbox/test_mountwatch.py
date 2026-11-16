@@ -60,6 +60,7 @@ def finish(w: MW.Watcher, run) -> bytes:
 
 
 def test_a_run_that_never_touches_the_token_reads_clean(run, capsys):
+    """O60: armed by the host's removal of the token, a cell proved, nothing touched: the core reads it clean."""
     proc = FakeProc().add(host_process(99))
     w = watcher(run, proc)
     w.tick()
