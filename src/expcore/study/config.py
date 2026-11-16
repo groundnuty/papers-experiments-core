@@ -22,6 +22,14 @@ Two optional keys of `[study]` widen the infrastructure kinds a condition may de
     [study.kinds]                         # the study's own kinds; treatable is true unless it says false
     relay_flap = { description = "the relay restarted under the run", treatable = true }
 
+A platform module may also tell the core, when a campaign starts, the longest its health check may stay deferred, read
+from the platform's own configuration (`study.platform_deferral`, C11). The configuration is the file `[study]
+platform_config` names, a file of the study directory; without the key it is the `platform.toml` beside study.toml,
+and a study with neither points at none:
+
+    [study]
+    platform_config = "platform.toml"     # optional: the platform's own settings, a file of the study directory
+
 A module that cannot be imported is refused, as is a study kind that is a core kind or a platform's. A platform's kinds
 are the process's once imported. A study's own last only while it is loaded and while the pipeline works on it
 (`errors.study_kinds(study.kinds)`), so a study's kinds do not outlast it. Neither key is part of the factor schema;
@@ -78,6 +86,7 @@ PREREG_FILE = "preregistration.toml"
 OUT_DIR = "out"  # everything a study produces goes below it (`study.pipeline`)
 CONFIG_FILES = (STUDY_FILE, MODELS_FILE, CAMPAIGN_FILE, PREREG_FILE)
 PLATFORMS_KEY, KINDS_KEY, SIDE_FILES_KEY = "platforms", "kinds", "side_files"
+PLATFORM_CONFIG_KEY, PLATFORM_FILE = "platform_config", "platform.toml"
 KIND_KEYS = ("description", "treatable")
 SIDE_FILE_KEYS = ("pattern", "hash_field")
 _FIELD = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*")
@@ -109,6 +118,10 @@ class StudyConfig:
     kinds: Mapping[str, StudyKind] = field(default_factory=dict)  # `[study.kinds]`, for `errors.study_kinds`
     requires: tuple[str, ...] = ()  # distributions beyond the core: part of the campaign's environment
     side_files: tuple[SideFile, ...] = ()  # `[[study.side_files]]`: what the check, analysis and package verify
+    platforms: tuple[
+        str, ...
+    ] = ()  # `[study] platforms`: the modules the core asks for the platform's declared deferral
+    platform_config: Path | None = None  # `[study] platform_config`, or the platform.toml beside study.toml; resolved
 
     @property
     def manifest(self) -> Manifest:
@@ -154,7 +167,9 @@ def _tasks(top: Section, file: Path) -> dict[str, Task]:
 
 def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope, tuple[str, ...]]:
     section = Section(top.section("study").data, top.file, "[study]")
-    section.reject_unknown(["name", "plugin", "code", PLATFORMS_KEY, KINDS_KEY, "requires", SIDE_FILES_KEY])
+    section.reject_unknown(
+        ["name", "plugin", "code", PLATFORMS_KEY, PLATFORM_CONFIG_KEY, KINDS_KEY, "requires", SIDE_FILES_KEY]
+    )
     name, plugin = section.string("name"), section.string("plugin")
     plugin_file = (root / plugin).resolve()
     if not plugin_file.is_file() or root.resolve() not in plugin_file.parents:
@@ -178,6 +193,21 @@ def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope, tuple[
 
 def _platforms(top: Section) -> tuple[str, ...]:
     return Section(top.section("study").data, top.file, "[study]").strings(PLATFORMS_KEY)
+
+
+def _platform_config(top: Section, root: Path) -> Path | None:
+    """The platform's own configuration, resolved: the file `[study] platform_config` names (a file inside the study
+    directory, as the plugin is), or without the key the `platform.toml` beside study.toml when there is one, else None.
+    The core never reads it: it hands the path to each platform module that declares its deferral from it."""
+    section = Section(top.section("study").data, top.file, "[study]")
+    named = section.optional_string(PLATFORM_CONFIG_KEY)
+    if named is None:
+        default = root / PLATFORM_FILE
+        return default.resolve() if default.is_file() else None
+    file = (root / named).resolve()
+    if not file.is_file() or root.resolve() not in file.parents:
+        raise section.fail(PLATFORM_CONFIG_KEY, f"must name a file inside the study directory; {named!r} is not one")
+    return file
 
 
 def import_platforms(study_file: Path, modules: Sequence[str]) -> None:
@@ -333,7 +363,21 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
         _check_clusters(name, tasks, loaded)
     hashes = {file: hashlib.sha256(_hashed_bytes(root, file)).hexdigest() for file in CONFIG_FILES}
     study = StudyConfig(
-        root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds, requires, side_files
+        root,
+        name,
+        schema,
+        tasks,
+        models,
+        campaign,
+        loaded,
+        plugin_file,
+        scope,
+        hashes,
+        kinds,
+        requires,
+        side_files,
+        _platforms(top),
+        _platform_config(top, root),
     )
     _check_shard_budgets(study)
     return study

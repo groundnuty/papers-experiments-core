@@ -32,7 +32,7 @@ import datetime as dt
 import json
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -51,6 +51,7 @@ from expcore.campaign.healthgate import (
     DECLARED_HOOK,
     HealthCheck,
     HealthGate,
+    PlatformDeferral,
     deferral_bound,
     exposes_deferral,
 )
@@ -138,6 +139,7 @@ class Scheduler:
         shard: ShardStart | None = None,
         reset_settings: Mapping[str, Any] | None = None,
         spend_journal: Path | None = None,
+        platform_deferrals: Sequence[PlatformDeferral] = (),
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
         self.shard = shard  # a shard's start: `manifest` is then its part of the plan, `settings` its shares (#154)
@@ -165,7 +167,7 @@ class Scheduler:
         )
         self.settings.check_kinds(schema)
         if health is not None:  # before the lock or the store: the platform's own wait must fit under max_defer_s
-            self._check_deferral(health, admission)
+            self._check_deferral(health, admission, tuple(platform_deferrals))
         exclusive = [name for name, value in schema.exclusive.items() if value]
         if exclusive and admission is None:  # nothing would hold the platform exclusively: refuse, never pretend
             raise Section({}, schema.file, f"[conditions.{exclusive[0]}]").fail(
@@ -191,13 +193,24 @@ class Scheduler:
         self._run_thread: threading.Thread | None = None  # the thread inside `run`, while there is one
         self._fatal: BaseException | None = None
 
-    def _check_deferral(self, health: HealthCheck, admission: RunAdmission | None) -> None:
-        """Refuse a campaign the platform's own deferral outlasts: first one whose health check does not carry what the
-        platform declares through its admission (a wrapper that hid `max_deferral_s`), then a `max_defer_s` shorter than
-        what the check declares (`SchedulerConfig.check_declared_deferral`, `check_deferral_bound`)."""
+    def _check_deferral(
+        self, health: HealthCheck, admission: RunAdmission | None, platforms: Sequence[PlatformDeferral]
+    ) -> None:
+        """Refuse a campaign the platform's own deferral outlasts: first one whose health check does not carry what each
+        platform of the study declares from its own configuration (`platforms`, read through the registry with no object
+        of the study's plugin between), then what the platform's admission declares (a wrapper that hid `max_deferral_s`
+        is seen either way), then a `max_defer_s` shorter than what the check declares
+        (`SchedulerConfig.check_declared_deferral`, `check_deferral_bound`)."""
+        reported, exposed = deferral_bound(health), exposes_deferral(health)
+        for platform in platforms:  # the registry's: no wrapper of the study's can hide it
+            self.settings.check_declared_deferral(
+                platform.bound,
+                reported,
+                exposed=exposed,
+                source=f"the platform {platform.platform!r} (its configuration, read through [study] platforms)",
+            )
         declared = deferral_bound(admission, DECLARED_HOOK, ADMISSION_OWNER)
-        reported = deferral_bound(health)
-        self.settings.check_declared_deferral(declared, reported, exposed=exposes_deferral(health))
+        self.settings.check_declared_deferral(declared, reported, exposed=exposed)
         self.settings.check_deferral_bound(reported)
 
     # --- lifecycle ------------------------------------------------------------------------------------------------
