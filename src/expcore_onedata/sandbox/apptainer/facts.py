@@ -21,7 +21,9 @@ FACTS: dict[str, str] = {
     "gate_on_loopback": (
         "the data gate is a process of the driver's on 127.0.0.1 at a high port: the node's loopback is shared with "
         "every user of the node: the gate refuses another uid's connection only with its peer-uid check, on by "
-        "default whenever the gate has it (`gate.peer_uid_check` in the metadata says whether it ran)"
+        "default whenever the gate has it; `gate.peer_uid_check` in the metadata is true only when it was asked of a "
+        "gate that has it, which refuses to start when it cannot make it, and a check asked of a gate without it "
+        "refuses the run's start"
     ),
     "token_held_by_gate": (
         "the cell holds no token: the gate reads it from an owner-only file outside every bind, which is removed "

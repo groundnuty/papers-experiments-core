@@ -66,6 +66,8 @@ def config(
     out: dict[str, Any] = dict(options)
     if PEER_CHECK.is_file():  # never set for a gate that would not read it: a check claimed is a check made
         out.setdefault(PEER_CHECK_KEY, True)
+    elif out.get(PEER_CHECK_KEY) is True:  # asked of a gate that would ignore it: refused, never claimed
+        raise SandboxError("gate_options asks for the gate's peer-uid check, and this core's gate does not have it")
     out.update(
         run_key=run_key,
         verify_ssl=not tls.insecure,

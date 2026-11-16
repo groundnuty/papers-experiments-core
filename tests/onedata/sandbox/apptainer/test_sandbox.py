@@ -218,3 +218,14 @@ def test_the_gate_s_peer_uid_check_is_on_by_default_only_where_the_gate_has_it(n
         assert box.metadata()["gate"]["peer_uid_check"] is True
     finally:
         box.stop()
+
+
+def test_a_peer_uid_check_asked_of_a_gate_without_it_refuses_the_start(node, tmp_path, monkeypatch):
+    """O56: an operator's `peer_uid_check = true` for a gate that would ignore it is never a claimed boundary."""
+    from expcore_onedata.sandbox.apptainer import gaterun
+
+    monkeypatch.setattr(gaterun, "PEER_CHECK", tmp_path / "absent" / "gatepeer.py")
+    settings = make_settings(tmp_path, gate_options={"peer_uid_check": True})
+    with pytest.raises(StartRefused, match="does not have it"):
+        start(node, settings)
+    assert not node.spawned
