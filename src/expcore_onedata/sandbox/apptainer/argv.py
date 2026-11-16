@@ -14,9 +14,11 @@ the node's. Its network is the node's: there is no network namespace for an unpr
 
 The binds: `/work`, `/tmp` and `/dev/shm` from the run's directory (a cell's own `/tmp` would be gone at its end, where
 Docker's container keeps it for the run); read-only, `/etc/hosts` (the federation's names on loopback, where the gate
-listens), `/etc/expcore/gate.json` (the gate's address, port and names, for a connect hook to read where a cleared
-environment cannot drop it), the run's CA and trust bundles, the egress collector's socket directory, the egress shim,
-the libraries of hook (b), `/etc/ld.so.preload` naming them all, the read-only inputs and the files of hook (b).
+listens), `/etc/resolv.conf` naming no name server and `/etc/nsswitch.conf` looking hosts up in files alone (so no
+name is looked up by DNS), `/etc/expcore/gate.json` (the gate's address, port and names, for a connect hook to read
+where a cleared environment cannot drop it), the run's CA and trust bundles, the egress collector's socket directory,
+the egress shim, the libraries of hook (b), `/etc/ld.so.preload` naming them all, the read-only inputs and the files of
+hook (b).
 """
 
 from __future__ import annotations
@@ -36,6 +38,13 @@ PRELOAD_DIR = "/expcore-preload"  # hook (b)'s libraries, each `<n>.so`
 LOOPBACK = "127.0.0.1"
 FATAL = "FATAL:"  # how apptainer itself says it could not run a container, on its stderr
 APPTAINER_FAILED_EXIT = 255
+RESOLV_CONF, NSSWITCH_CONF = "/etc/resolv.conf", "/etc/nsswitch.conf"
+# No name server (facts.py, dns_none). A resolv.conf without one alone would not do: the C library then asks the name
+# server on 127.0.0.1, the node's loopback that every user shares; so the hosts database is the files alone.
+RESOLV_TEXT = "# no name server: a cell resolves the names of /etc/hosts alone\noptions attempts:1 timeout:1\n"
+NSSWITCH_TEXT = "".join(
+    f"{db}: files\n" for db in ("passwd", "group", "shadow", "hosts", "networks", "protocols", "services", "ethers")
+)
 
 
 @dataclass(frozen=True)
@@ -107,6 +116,10 @@ def bindable(path: Path) -> bool:
 __all__ = [
     "GATE_INFO",
     "GATE_PORT_ENV",
+    "NSSWITCH_CONF",
+    "NSSWITCH_TEXT",
+    "RESOLV_CONF",
+    "RESOLV_TEXT",
     "RUN_TAG",
     "Bind",
     "apptainer_failed",

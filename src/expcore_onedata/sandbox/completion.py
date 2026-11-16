@@ -85,18 +85,17 @@ if died_by is not None:
 os._exit(status)
 """
 
-SOURCE_NOT_SENT = "the cell's source was not written whole to docker exec ({why}): its program did not run"
+DOCKER_EXEC = "docker exec"  # the exec a cause names unless the backend names its own (`Completion.runner`)
+SOURCE_NOT_SENT = "the cell's source was not written whole to {runner} ({why}): its program did not run"
 SOURCE_NOT_WHOLE = (
     "the cell's source did not arrive whole in the container ({got} of {size} bytes): its program did not run"
 )
 NOT_STARTED = "the cell's interpreter could not be started in the container ({why})"
 NOT_RECORDED = (
-    "the exec's exit was not recorded: docker exec reported exit {rc} with no completion record from the container, "
+    "the exec's exit was not recorded: {runner} reported exit {rc} with no completion record from the container, "
     "so its program may not have run, or its output ended before the program did"
 )
-OTHER_STATUS = (
-    "the exec's exit was not recorded: docker exec reported exit {rc} and the container recorded exit {status}"
-)
+OTHER_STATUS = "the exec's exit was not recorded: {runner} reported exit {rc} and the container recorded exit {status}"
 STREAM_LOST = "the cell's {stream} ended before its completion record: its output was lost"
 UNREADABLE = "the completion record of the exec could not be read: its exit is not known"
 UNKNOWN_FACTS = {"source_whole": None, "exit_status": None, "nonce_matched": False}
@@ -148,16 +147,18 @@ def _parse(payload: str) -> dict[str, Any] | None:
 
 @dataclass(frozen=True)
 class Completion:
-    """One exec's program and the nonce its completion record carries."""
+    """One exec's program and the nonce its completion record carries; `runner` is the exec a cause names (`docker
+    exec`, or the Apptainer backend's `apptainer exec`)."""
 
     nonce: str
     size: int
     sha256: str
+    runner: str = DOCKER_EXEC
 
     @classmethod
-    def for_source(cls, code: str) -> "Completion":
+    def for_source(cls, code: str, *, runner: str = DOCKER_EXEC) -> "Completion":
         data = encode_input(code)  # the bytes `docker exec` is given, so the bytes the bootstrap checks
-        return cls(secrets.token_hex(16), len(data), hashlib.sha256(data).hexdigest())
+        return cls(secrets.token_hex(16), len(data), hashlib.sha256(data).hexdigest(), runner)
 
     @property
     def marker(self) -> bytes:
@@ -170,11 +171,15 @@ class Completion:
         return [python, "-I", "-c", BOOTSTRAP, self.nonce, str(self.size), self.sha256, python]
 
     def check(self, done: CmdResult) -> Check:
-        """Read a finished `docker exec` against this exec's completion record (see the module docstring)."""
+        """Read a finished exec against this exec's completion record (see the module docstring)."""
         out, err = done.stdout_marks or (), done.stderr_marks or ()
-        rc = _status(done.returncode)
+        rc, runner = _status(done.returncode), self.runner
         if not out and not err:
-            why = SOURCE_NOT_SENT.format(why=done.input_error) if done.input_error else NOT_RECORDED.format(rc=rc)
+            why = (
+                SOURCE_NOT_SENT.format(runner=runner, why=done.input_error)
+                if done.input_error
+                else NOT_RECORDED.format(runner=runner, rc=rc)
+            )
             return Check(dict(UNKNOWN_FACTS), why)
         if len(out) > 1 or len(err) > 1 or (out and err and out != err):
             return Check(dict(UNKNOWN_FACTS), UNREADABLE)
@@ -190,7 +195,7 @@ class Completion:
         if status is None:
             return Check(facts, NOT_STARTED.format(why=record.get("error", "no exit status")))
         if status != rc:
-            return Check(facts, OTHER_STATUS.format(rc=rc, status=status))
+            return Check(facts, OTHER_STATUS.format(runner=runner, rc=rc, status=status))
         return Check(facts, None)
 
 
