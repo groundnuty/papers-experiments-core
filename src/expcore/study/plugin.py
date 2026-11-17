@@ -9,6 +9,9 @@ study.toml names one Python file (`[study] plugin`). The core loads it and calls
 The module is the study's own code and lives in the study directory, so the code identity covers it. It may import
 modules beside it relatively (`from .scoring import Scorer`), each a file `[study] code` lists. Nothing in the core
 imports a study by name.
+
+A study whose `build` needs its platform may also define `build_analysis(context) -> StudyPlugin`, which gives the
+analysis the scorers alone (`study.analysis_plugin`). `load_plugin`, the run's loader, never looks for it.
 """
 
 import datetime as dt
@@ -137,8 +140,7 @@ class StudyPlugin:
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
-        entries = sorted([scorer_name(s), scorer_version(s)] for s in self.scorers)
-        return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return scorers_digest(self.scorers)
 
     def backend_factory_identity(self) -> dict[str, str] | None:
         """The factory's name and version for the campaign fingerprint; None when the plugin supplies no factory.
@@ -157,6 +159,12 @@ class StudyPlugin:
         else:
             name = f"{module}.{qualname}"
         return {"name": name, "version": factory.version}
+
+
+def scorers_digest(scorers: Iterable[Any]) -> str:
+    """The SHA-256 of scorers' names and versions: what the campaign fingerprint records as `scorer_digest`."""
+    entries = sorted([scorer_name(s), scorer_version(s)] for s in scorers)
+    return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def factory_name(factory: Any) -> tuple[str, str]:
@@ -316,27 +324,52 @@ def _relative_import(study: StudyConfig | StudyIdentity, path: str) -> str:
 
 
 def load_plugin(context: StudyContext) -> StudyPlugin:
-    """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve."""
+    """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve.
+
+    This is the run's loader: every start, resume and shard of a campaign builds its plugin here, and nothing here ever
+    looks for `build_analysis` (`analysis_plugin`, which only the analysis calls).
+    """
+    return call_builder(context, import_for_build(context), BUILD)
+
+
+def import_for_build(context: StudyContext) -> ModuleType:
+    """Import the study's plugin module as a build imports it: the study's models redact a failure's text, and the
+    traceback of one goes to the study's `out/`."""
+    return import_plugin_module(context.study, models=context.study.models, log_root=context.study.root / OUT_DIR)
+
+
+def call_builder(context: StudyContext, module: ModuleType, name: str, *, scorers_only: bool = False) -> StudyPlugin:
+    """Call the function `name` of the imported plugin module with the context and return the `StudyPlugin` it gives,
+    after the same refusals for each builder: not a function, a file of the study run outside its covered code, and not
+    a `StudyPlugin`. The plugin is then checked against the study (`_check`), or, with `scorers_only`, for its
+    scorers alone (`check_scorers`), as an analysis, which reads nothing else of it, needs."""
     file = context.study.plugin_file
-    module = import_plugin_module(context.study, models=context.study.models, log_root=context.study.root / OUT_DIR)
-    build = getattr(module, BUILD, None)
-    if not callable(build):
-        raise ConfigError(f"{file}: must define a function {BUILD}(context) that returns a StudyPlugin")
+    builder = getattr(module, name, None)
+    if not callable(builder):
+        raise ConfigError(f"{file}: must define a function {name}(context) that returns a StudyPlugin")
     with watching() as ran:
-        plugin = build(context)
-    check_plugin_modules(context.study, module, ran)  # again: `build` may import or run a file of the study too
+        plugin = builder(context)
+    check_plugin_modules(context.study, module, ran)  # again: the builder may import or run a file of the study too
     if not isinstance(plugin, StudyPlugin):
-        raise ConfigError(f"{file}: {BUILD}(context) returned {type(plugin).__name__}, not a StudyPlugin")
-    _check(file, context.study, plugin)
+        raise ConfigError(f"{file}: {name}(context) returned {type(plugin).__name__}, not a StudyPlugin")
+    if scorers_only:
+        check_scorers(file, plugin)
+    else:
+        _check(file, context.study, plugin)
     return plugin
 
 
-def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
-    """Refuse a plugin that does not cover the study: a scorer twice, a condition without a prompt or tool hash, a
-    model whose backend nothing can build."""
+def check_scorers(file: Any, plugin: StudyPlugin) -> None:
+    """Refuse a plugin with no scorer, or with two of one name: the one thing every use of a plugin needs of it."""
     names = [scorer_name(s) for s in plugin.scorers]
     if not names or len(set(names)) != len(names):
         raise ConfigError(f"{file}: the plugin needs at least one scorer, and their names must differ: {names}")
+
+
+def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
+    """Refuse a plugin that does not cover the study: no scorer or one twice (`check_scorers`), a condition without a
+    prompt or tool hash, a model whose backend nothing can build."""
+    check_scorers(file, plugin)
     for label, hashes in (("prompts", plugin.prompts), ("tools", plugin.tools)):
         missing = [c for c in study.schema.conditions if c not in hashes]
         if missing:

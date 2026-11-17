@@ -18,13 +18,13 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, scorer_notes
 from study_support import HEAD, Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
 from expcore.campaign.shard import ShardSpec
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
 from expcore.study import analysis_plugin, pipeline
+from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, scorer_notes
 from expcore.study.config import load_study
 from expcore.study.pipeline import Refused, analyse_study, output_bytes, regenerate, run_study
 from expcore.study.plugin import StudyContext, StudyPlugin, load_plugin
@@ -376,6 +376,8 @@ def test_r17_a_snapshot_that_records_none_is_said_and_never_makes_the_others_unc
     rest are compared as they are, and the note counts the ones that could not be."""
     mine = [Scorer("tiny", "1")]
     recorded = {"scorer_digest": digest_of(*mine)}
+    (note,) = scorer_notes(mine, "plugin.py", [])  # no snapshot read at all: nothing was compared, and it says so
+    assert "no snapshot" in note
     for blank in (None, {}, {"scorer_digest": "not a digest"}, {"scorer_digest": 7}):
         (note,) = scorer_notes(mine, "plugin.py", [blank])
         assert "1 of 1 snapshot" in note
