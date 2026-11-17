@@ -124,7 +124,7 @@ def test_down_refuses_when_the_evidence_changed_after_it_was_collected_though_no
     rig = Rig(hpc, tmp_path, site)
     record_step(rig.root, "shard-1")
     rig.collected()
-    (rig.root / "fault-journal").mkdir()
+    (rig.root / "fault-journal").mkdir(exist_ok=True)
     (rig.root / "fault-journal" / "injections.jsonl").write_text('{"event": "injecting"}\n')
     with pytest.raises(RuntimeError, match=r"changed after it was collected.*end the shard's step"):
         rig.driver.down()
