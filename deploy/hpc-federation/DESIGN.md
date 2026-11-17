@@ -208,9 +208,18 @@ sandbox_placement = "het"                # S as component 1 of a heterogeneous j
 ## 3. How every step is launched
 
 ```
-srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name> --export=PATH \
+srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name> --export=PATH --chdir=/ \
      [--network=<HPC_STEP_NETWORK>] [--output=<log>] /usr/bin/env -i <allowlist> <argv>  # stdin </dev/null unless the payload
 ```
+
+- **Every step starts in `/`** (`--chdir=/`), never in the directory srun was called from: where that directory does not
+  exist on the node, slurmstepd starts the step in the node's `/tmp` instead, which other users share (another study's
+  audit, 16 Nov 2026). `/` exists on every node and nobody but root writes it; a service step's own work directory does
+  not exist yet when it starts, and a control step names its work directory by `--workdir`, never by where it starts.
+  Every script then works by absolute paths: the bundle's from `$(dirname "$0")`, its work directory from `--workdir`; a
+  shard manifest's paths and the run harness's `B`, `SH`, `L` and `GATE_DIR` must be absolute. The shards' steps
+  (`shards.py lines`), the test runner's (`deploy/hpc-tests`) and the run harness's (`run/common.sh`) are launched the
+  same way, and the held job's `sbatch` takes `--chdir=/` too.
 
 - **`--network=<value>` is on every step the driver launches when the site sets `HPC_STEP_NETWORK`** (empty by default:
   no option, and the line is what it was). A control step, a service step, a teardown and a step in either component
@@ -257,8 +266,17 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   pipe are finished whatever the first does. Ending a client is verified (SIGTERM, then SIGKILL, each only while the
   pid still has its recorded start tick), and `down` also ends any `srun --jobid=<job>` of ours on the same login node (run `down` where `up` ran) that
   no record names (one spawned just before a crash).
+- **Every Python the driver launches runs isolated and writes no bytecode** (`-I -B`, O58): on a node, on the login node
+  (the fault relay's `serve`, `alive` and `stop`, and the verbs' argv prefix, section 7), in a container and in
+  `shards.py` (its step, its dispatcher, the merge `collect --run` runs), and so does the test runner's pytest
+  (`deploy/hpc-tests`). Without it `python -m` and `python -c` put the directory they were launched from first on
+  `sys.path`, and every `PYTHON*` variable is read: on 16 Nov 2026 (F2) a `down` launched from the login node's `/tmp`,
+  which held 49 `.py` files of other users, had the relay's `stop` import another user's `/tmp/inspect.py` in place of
+  the standard library's. Launch `up`, `down` and the verbs as `python -I -B deploy/hpc-federation/hpcfed.py ...` from a
+  directory of ours (the checkout) all the same, never a shared one: `uv run` takes the project of the working directory
+  when it has a `pyproject.toml`, and builds it.
 - **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python a
-  step runs takes `-I -B`.
+  step or the driver launches takes `-I -B` (above), the relay's among them, and `shards.py collect --run` its merge.
 - **The core the driver imports is recorded**: `up` writes the resolved paths of `expcore_onedata`, `fedlayout` and
   `hpcfed` into the state file, and refuses to run when `expcore_onedata` is not imported from this checkout's `src`.
   The core's step (`[hpc] core = "step"`) makes the same check on the node and exits 97 on a mismatch, which fails
@@ -279,7 +297,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "project": "<the layout's project>",
   "layout": {"source": "<file name>", "digest": "<sha256>", "path": "<absolute path>"},
   "core": {"expcore_onedata": "<path>", "fedlayout": "<path>", "hpcfed": "<path>"},
-  "command": ["<python>", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
+  "command": ["<python>", "-I", "-B", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
            "billing_weight": null, "step_network": "", "study_artifacts": "<directory, or empty>",
@@ -422,10 +440,13 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    layer's own check through the rendered `platform.toml`, which writes `link-check.json` in the root through
    `expcore_onedata.linkrecord`. `up` fails unless every pair passes.
 10. **The fault relay** (M4's `expcore_onedata.fault_relay`), when the core has it: started detached on the login node
-    (`env -i PATH HOME LC_ALL [SLURM_CONF] <python> -m expcore_onedata.fault_relay serve --root <root> -- <this
-    driver's argv prefix>`, its output appended to `<L>/<allocation name>-fault-relay.log`), then `fault_relay alive`
-    polled until it beats (30 s at most; a relay that never beats fails `up` and is ended). It is recorded in the
-    state file as `relay`. One relay per root: it takes a lock.
+    (`env -i PATH HOME LC_ALL [SLURM_CONF] <python> -I -B -m expcore_onedata.fault_relay serve --root <root> --
+    <this driver's argv prefix>`, its output appended to `<L>/<allocation name>-fault-relay.log`), in the root as its
+    working directory (a 0700 directory of ours that no symbolic link reaches, or the relay is not started: `up`'s
+    preflight refuses such a root before anything is submitted), never the directory `up` was launched from, since
+    every verb it runs inherits it; then `fault_relay alive` (`-I -B` too) polled until it beats (30 s at
+    most; a relay that never beats fails `up` and is ended). It is recorded in the state file as `relay`. One relay
+    per root: it takes a lock.
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
@@ -442,7 +463,8 @@ removed while held would let the next `up` or `down` lock another file of the sa
 
 **`down`** (login node), whatever `up` reached:
 
-0. **Stop the fault relay first** (`fault_relay stop --root <root>`, when the core has it), so no service verb launches
+0. **Stop the fault relay first** (`<python> -I -B -m expcore_onedata.fault_relay stop --root <root>`, when the core
+   has it), so no service verb launches
    a step while the federation goes down; a relay that will not stop is reported, and `down` goes on. Its directory
    `<root>/fault-relay/` goes with the root. The stop signals the relay by the pid and start tick of its heartbeat,
    through a pidfd where the kernel has `pidfd_open` and, on a login node whose kernel has none (Linux before 5.3, which
@@ -585,7 +607,7 @@ runs the core's phase: it reaches the services' 8443 from there, and has no `cor
 ## 7. Service verbs for faults and the heal (M4)
 
 Per service, by its layout name. **Each verb is one argv**, run on the login node (only there can a step be
-launched): `<python> deploy/hpc-federation/hpcfed.py --layout PATH --root PATH <verb> <service> [-- argv...]`; the
+launched): `<python> -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH <verb> <service> [-- argv...]`; the
 site's values come from the state file, so the verb needs no environment. A campaign that runs on a compute node
 cannot launch a step: its fault injector asks the login node's **fault relay** (M4's, which `up` starts with this
 argv prefix and `down` stops first; section 5), which runs the verb and answers.

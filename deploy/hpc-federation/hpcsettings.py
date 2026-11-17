@@ -402,7 +402,9 @@ def checked_site(site: Site) -> Site:
     _absolute(site.node_tmp, "HPC_NODE_TMP")
     for entry in site.step_path.split(":"):
         _absolute(entry, "HPC_STEP_PATH")
-    if not re.fullmatch(r"[A-Za-z0-9_./-]+", site.node_python):
+    if not re.fullmatch(r"[A-Za-z0-9_./-]+", site.node_python) or (
+        "/" in site.node_python and not (os.path.isabs(site.node_python) and ".." not in site.node_python.split("/"))
+    ):  # every step starts in / (`--chdir=/`): a relative path would name another interpreter there
         raise SettingsError("HPCOP_PY: must be a command name or an absolute path")
     if site.core_python:
         _absolute(site.core_python, "HPC_CORE_PYTHON")

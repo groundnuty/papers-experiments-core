@@ -138,7 +138,7 @@ def support(workdir, bundle, payload, result):
     t0 = time.monotonic()
     onboard = os.path.join(bundle, "onboard.py")
     done = subprocess.run(
-        [sys.executable, "-I", onboard, "--workdir", workdir],
+        [sys.executable, "-I", "-B", onboard, "--workdir", workdir],
         input=json.dumps(payload),
         capture_output=True,
         text=True,

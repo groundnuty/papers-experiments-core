@@ -31,7 +31,7 @@ BAKED_CB_SHA256=(
 # it); false when one does or the scan fails. The files holding one are named on stderr, never the value.
 no_baked() {  # <dir>
   local out p rc=0
-  out=$("$HPCOP_PY" -I "$HPCOP_BUNDLE/baked.py" "$1" "${BAKED_CB_SHA256[@]}") || rc=$?
+  out=$("$HPCOP_PY" -I -B "$HPCOP_BUNDLE/baked.py" "$1" "${BAKED_CB_SHA256[@]}") || rc=$?
   if [[ -n $out ]]; then
     while IFS= read -r p; do printf 'hpcop: a shipped Couchbase value is in %s\n' "$p" >&2; done <<<"$out"
   fi
@@ -123,7 +123,7 @@ running_ours() { alive "$1" && [[ -n $2 && $(proc_field "$1" 22) == "$2" ]]; }  
 
 signal_ours() {  # <pid> <start> <TERM|USR1|KILL>: signal it only if it is still the process that started at <start>
   [[ $1 =~ ^[1-9][0-9]*$ && $2 =~ ^[0-9]+$ ]] || return 1
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" signal "$1" "$2" "$3"
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" signal "$1" "$2" "$3"
 }
 
 stop_service() {  # <pid> <seconds> <start>: stop the service process run_service started (supervise.py, our child)
@@ -459,7 +459,7 @@ need_2xx() {  # <status> <what> <body-file>: fail on anything but 2xx
   [[ $1 =~ ^2[0-9][0-9]$ ]] || die "$2: HTTP $1: $(head -c 300 -- "$3" 2>/dev/null | tr -cd '[:print:]')"
 }
 
-jsonget() { "$HPCOP_PY" -I "$HPCOP_BUNDLE/jsonget.py" "$@"; }   # <file> <path> [--default V]
+jsonget() { "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/jsonget.py" "$@"; }   # <file> <path> [--default V]
 
 node_fqdn() {
   local f
@@ -512,7 +512,7 @@ split_imports() {  # <imports-array> <other-array> args...: the --import=SPACE=P
 
 import_binds() {  # <workdir>: the `apptainer exec` arguments that bind each listed tree read-only, one per line; none for none
   [[ -e $1/imports ]] || return 0
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/importstorage.py" binds --workdir "$1"
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/importstorage.py" binds --workdir "$1"
 }
 
 # A provider's posix storage on the shared scratch filesystem (O57, HPC_STORAGE_ROOT): its job is given its own directory
@@ -542,7 +542,7 @@ storage_binds() {  # <workdir> [--storage=PATH]: the `apptainer exec` arguments 
     fi
     return 0
   fi
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/posixstorage.py" binds --workdir "$1" "$2"
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/posixstorage.py" binds --workdir "$1" "$2"
 }
 
 run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exec) in the foreground of this process
@@ -560,7 +560,7 @@ run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exe
   if [[ -n $b ]]; then mapfile -t binds <<<"$b"; fi
   b=$(storage_binds "$W" "$storage") || die "the posix storage of $W on scratch cannot be bound (see above): the service is not started"
   if [[ -n $b ]]; then mapfile -t -O "${#binds[@]}" binds <<<"$b"; fi
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" check || die "$HPCOP_PY cannot use pidfds, which the service's stop needs"
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" check || die "$HPCOP_PY cannot use pidfds, which the service's stop needs"
   # exec keeps this PID for supervise.py, which stays visible in /proc under hidepid (apptainer's setuid starter, its
   # child, does not). teardown.sh signals it only while its start time (stat field 22) still matches.
   printf '%s %s\n' "$$" "$(proc_field "$$" 22)" > "$W/service.pid"
@@ -569,7 +569,7 @@ run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exe
   # bind (`:ro`) of the list's, over the empty mountpoint configure.sh made in the rootfs, which the container cannot
   # write to. A provider's storage on scratch, when its job was given one, is the one writable bind: its own directory
   # there, over the rootfs's empty /volumes/posix. Nothing else of the node's filesystems is seen.
-  exec "$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" run -- apptainer exec --writable --containall --no-home --pwd /root \
+  exec "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" run -- apptainer exec --writable --containall --no-home --pwd /root \
     --workdir "$W/work" "${binds[@]}" "$R" /root/hpcop-start.sh > "$W/run.log" 2>&1 < /dev/null
 }
 
@@ -587,7 +587,7 @@ redact_stream() {  # <workdir>: stdin to stdout with every plain and base64 form
   local pat
   pat=$(mktemp "$1/tmp/redact.XXXXXX")
   secret_values_file "$1" "$pat"
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/scrub.py" filter "$pat" || printf '(excerpt withheld: the redaction failed)'
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/scrub.py" filter "$pat" || printf '(excerpt withheld: the redaction failed)'
   rm -f -- "$pat"
 }
 
@@ -738,7 +738,7 @@ scrub_secrets() {  # <workdir>: once the service has stopped, delete every secre
   S=$(secrets_dir "$W"); pat=$W/scrub.values; nee=$W/scrub.needles
   CB=$R/volumes/persistence/opt/couchbase/var/lib/couchbase
   secret_values_file "$W" "$pat"
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/scrub.py" needles "$pat" "$nee" || { rm -f -- "$pat" "$nee"; die "scrub.py could not list the secret forms"; }
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/scrub.py" needles "$pat" "$nee" || { rm -f -- "$pat" "$nee"; die "scrub.py could not list the secret forms"; }
   rm -rf -- "$S"
   for home in /root "/var/lib/$PANEL" "/var/lib/$WORKER" /var/lib/cluster_manager; do rm -f -- "$R$home/.erlang.cookie"; done
   if d=$(config_dir "$R" "$PANEL" 2>/dev/null); then rm -f -- "$d/40-hpcop-couchbase.config"; fi
@@ -756,7 +756,7 @@ scrub_secrets() {  # <workdir>: once the service has stopped, delete every secre
   if [[ -s $nee ]]; then
     mapfile -d '' -t hits < <(grep -rlZF -f "$nee" -- "${where[@]}" 2>/dev/null || true)
     if (( ${#hits[@]} )); then
-      "$HPCOP_PY" -I "$HPCOP_BUNDLE/scrub.py" redact "$pat" "${hits[@]}" >&2 \
+      "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/scrub.py" redact "$pat" "${hits[@]}" >&2 \
         || { rm -f -- "$pat" "$nee"; die "scrub.py failed on: ${hits[*]}"; }
     fi
     left=$(grep -rlF -f "$nee" -- "${where[@]}" 2>/dev/null || true)

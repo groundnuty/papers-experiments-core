@@ -214,7 +214,7 @@ class FakeProcess:
 
 @dataclass
 class Srun:
-    """One srun command line, taken apart."""
+    """One srun command line, taken apart; `chdir` is its `--chdir`, the step's working directory on the node."""
 
     argv: list
     job: str
@@ -228,6 +228,7 @@ class Srun:
     exact: bool
     overlap: bool
     het_group: int | None = None
+    chdir: str | None = None
     refused: bool = False  # srun refuses the step, as the site's does: it names no component, or its interconnect fails
     refusal: str = HET_REFUSAL  # what srun prints to stderr when it refuses the step
     network: str | None = None  # srun's --network=<value>, when the step names one (the site's HPC_STEP_NETWORK)
@@ -236,7 +237,7 @@ class Srun:
 def parse_srun(argv: list) -> Srun:
     assert argv[0] == "srun"
     words = iter(argv[1:])
-    found = {"exact": False, "overlap": False, "output": None}
+    found = {"exact": False, "overlap": False, "output": None, "chdir": None}
     for word in words:
         if word == "/usr/bin/env":
             break
@@ -260,6 +261,8 @@ def parse_srun(argv: list) -> Srun:
             found["name"] = next(words)
         elif word.startswith("--output="):
             found["output"] = word.split("=", 1)[1]
+        elif word.startswith("--chdir="):
+            found["chdir"] = word.split("=", 1)[1]
     rest = list(words)
     assert rest[0] == "-i", "every step's command runs behind env -i"
     env = [w for w in rest[1:] if re.fullmatch(r"[A-Z][A-Z0-9_]*=.*", w)]
@@ -267,9 +270,39 @@ def parse_srun(argv: list) -> Srun:
     return Srun(argv, env=env, command=command, **found)
 
 
+INTERPRETER = re.compile(r"python[0-9.]*")  # a Python interpreter by its file name: python, python3, python3.11
+RELAY_MODULE = "expcore_onedata.fault_relay"
+
+
+def unisolated(argv) -> list:
+    """Each interpreter in an argv whose options do not hold both `-I` and `-B` (O58, F2): without `-I`, Python puts
+    the directory it was launched from first on `sys.path` (`-m`, `-c`) and reads every PYTHON* variable; without
+    `-B` it writes bytecode beside what it imports, into a shared interpreter or checkout."""
+    words = [str(w) for w in argv]
+    found = []
+    for i, word in enumerate(words):
+        if INTERPRETER.fullmatch(PurePosixPath(word).name):
+            options = set()
+            for option in words[i + 1 :]:
+                if option not in ("-I", "-B"):
+                    break
+                options.add(option)
+            if options != {"-I", "-B"}:
+                found.append(word)
+    return found
+
+
+def isolated(argv) -> list:
+    """The argv, once every Python in it runs with `-I -B`; any other fails the test, whatever it tests."""
+    assert not unisolated(argv), f"a Python launched without -I -B (O58): {list(argv)}"
+    return list(argv)
+
+
 @dataclass
 class FakeSlurm:
-    """The login node's view of a cluster with one user's held job."""
+    """The login node's view of a cluster with one user's held job. Every command the driver gives it must run each
+    Python with `-I`, and every step must name `/` as its working directory (`--chdir=/`), or the fake fails the test
+    (O58, O57): a step that inherited the login node's working directory would start in the node's shared /tmp."""
 
     nodes: list = field(default_factory=lambda: [f"node{i:02d}" for i in range(1, 9)])
     job_id: str = "4242"
@@ -291,6 +324,7 @@ class FakeSlurm:
     relay_calls: list = field(default_factory=list)  # alive, stop, ... in order
     relay_rc: dict = field(default_factory=dict)  # a relay verb's exit status, when not 0
     relays: list = field(default_factory=list)  # each relay started: its argv
+    relay_cwds: list = field(default_factory=list)  # each relay started: the working directory it was given
     stray_clients: list = field(default_factory=list)  # srun clients of the job found on the host, never recorded
     unkillable: list = field(default_factory=list)  # clients that survive their end
     dead_clients: list = field(default_factory=list)  # clients that exited by themselves (a refused step's)
@@ -317,7 +351,7 @@ class FakeSlurm:
     def run(self, argv, timeout):
         from hpcslurm import Completed
 
-        argv = list(argv)
+        argv = isolated(argv)
         self.calls.append(argv)
         tool = argv[0]
         if tool == "sbatch":
@@ -362,9 +396,10 @@ class FakeSlurm:
             return Completed(0, "", "")
         if tool == "sacct":
             return Completed(0, "", "")
-        if argv[1:4] == ["-B", "-m", "expcore_onedata.fault_relay"]:
-            self.relay_calls.append(argv[4])
-            return Completed(self.relay_rc.get(argv[4], 0), "", "")
+        if RELAY_MODULE in argv and argv[argv.index(RELAY_MODULE) - 1] == "-m":
+            verb = argv[argv.index(RELAY_MODULE) + 1]
+            self.relay_calls.append(verb)
+            return Completed(self.relay_rc.get(verb, 0), "", "")
         if tool in self.tools:
             return self.tools[tool](argv, timeout)
         raise AssertionError(f"an unexpected command: {argv}")
@@ -458,7 +493,8 @@ class FakeSlurm:
         return "\n".join(lines) + "\n"
 
     def _step(self, argv) -> Srun:
-        srun = parse_srun(list(argv))
+        srun = parse_srun(isolated(argv))
+        assert srun.chdir == "/", f"a step that names no working directory (O57: --chdir=/): {srun.argv}"
         self.calls.append(list(argv))
         self.sruns.append(srun)
         if self.submitted:  # Slurm places a step only on a node of the job and the component it names
@@ -527,6 +563,7 @@ class FakeSlurm:
     def pipe(self, first, second):
         from hpcslurm import Completed
 
+        isolated(first), isolated(second)
         mint, deliver = self._step(first), self._step(second)
         assert Path(mint.command[1]).name == "mint-registration-token.sh"
         assert Path(deliver.command[1]).name == "deliver-token.sh"
@@ -539,11 +576,12 @@ class FakeSlurm:
         log.write_text(log.read_text(encoding="utf-8") + "hpcop: OK provider pid-x at a.example, storage s\n")
         return FakeProcess(Completed(0, "", "")), FakeProcess(Completed(0, "", ""))
 
-    def spawn(self, argv, client_log):
+    def spawn(self, argv, client_log, cwd=None):
         from hpcslurm import Client
 
         if argv[0] == "/usr/bin/env":  # the login node's fault relay, not a step
-            self.relays.append(list(argv))
+            self.relays.append(isolated(argv))
+            self.relay_cwds.append(cwd)
             self.relay_calls.append("serve")
             return Client(9999, 1)
         srun = self._step(argv)
