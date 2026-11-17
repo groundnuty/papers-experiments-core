@@ -925,6 +925,42 @@ def test_o90_checked_returns_the_reading_of_its_own_call_and_never_the_pre_run_c
     assert checked(world.health)[1] is None  # outside a try: the call is made, and there is no note to read it from
 
 
+def test_o90_overlapping_calls_in_one_try_each_get_their_own_reading(tmp_path, fake):
+    """O90: an executor may make two `checked` calls at once (`asyncio.to_thread` for each) in one try, which share one
+    note. A's call has returned its verdict and is held before `checked` takes its reading; B's call, begun after
+    the target went down, publishes its own. A's reading is the one A's call made (nothing offline), never B's."""
+    world = four_spaces(tmp_path, fake)
+    a_called, b_done, got = threading.Event(), threading.Event(), {}
+
+    def slow_a():
+        verdict = world.health()
+        a_called.set()
+        assert b_done.wait(30)
+        return verdict
+
+    with prerun.opened():
+        a = threading.Thread(target=lambda: got.update(a=checked(slow_a, source=world.health)), name="a")
+        a.start()
+        assert a_called.wait(30)
+        down(fake, "beta")
+        got["b"] = checked(world.health)
+        b_done.set()
+        a.join(30)
+    assert target_only(got["a"][1]) is True
+    assert got["a"][1].offline == frozenset()
+    assert got["b"][1].offline == {TARGET}
+
+
+def test_o90_a_check_that_never_asked_the_platform_leaves_no_reading_even_in_a_thread_that_read_before(tmp_path, fake):
+    """O90: the calling thread's earlier reading is cleared before the call, so a wrapper that answers without asking
+    the platform (a guard that refuses early) has no reading, not the previous call's."""
+    world = four_spaces(tmp_path, fake)
+    with prerun.opened():
+        assert checked(world.health)[1] is not None
+        verdict, reading = checked(lambda: Health(False, "refused by a guard"), source=world.health)
+    assert (verdict.ok, reading) == (False, None)
+
+
 def test_o90_the_instruments_snapshot_carries_the_reading_inside_the_injection_and_target_only_reads_the_record(
     tmp_path, fake
 ):
