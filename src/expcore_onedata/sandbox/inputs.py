@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox.api import ReadOnlyInput, StartRefused
+from expcore_onedata.sandbox.cellpath import normal
 from expcore_onedata.sandbox.containers import CA_PATH
 from expcore_onedata.sandbox.hostops import describe_error
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -93,6 +94,7 @@ def _entries(root: Path) -> list[_Entry]:
 
 
 def _overlap(one: str, other: str) -> bool:
+    one, other = normal(one), normal(other)  # paths, not text: `/etc/ssl/./certs` and `/etc/ssl/certs` are one place
     return one == other or one.startswith(other.rstrip("/") + "/") or other.startswith(one.rstrip("/") + "/")
 
 
