@@ -336,14 +336,14 @@ def test_a_link_in_a_directory_above_the_log_is_not_followed(node, settings, tmp
         (mount.where.log_dir / "oneclient.INFO").symlink_to("oneclient.host.log.INFO.1")
         assert mount.oneclient_log() == text.encode()  # the control: the same log, with no link above it
         os.rename(directory, parked)  # the whole directory, log and all, is now reached through a link to it
-        directory.symlink_to(parked)
         swapped = True
+        directory.symlink_to(parked)
         assert mount.oneclient_log() is None
         mount.close_watch()
         assert mount.metadata()["io_mode"]["effective"] == "unknown"
     finally:
         if swapped:
-            directory.unlink()
+            directory.unlink(missing_ok=True)
             os.rename(parked, directory)
         mount.stop()
 

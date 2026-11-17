@@ -7,7 +7,8 @@ driver's, resolves to nothing there. `load_platform` refuses one by these functi
 the study can change it, and not at the first launch.
 
 The rule is lexical: nothing is looked up, since a platform file is loaded on hosts where the paths it names may not
-exist. It refuses only what cannot be mistaken for something else, so no valid server is refused:
+exist. It refuses only the plain forms below, which no documented server takes as anything else (an option whose value
+is `.` or `./x` without being a path, say `--sep=.`, or a `~/x` that the server expands itself, is refused too):
 
 - a command with a directory part that does not begin at the root (`./bin/server`, `venv/bin/python`, `~/bin/x`); a bare
   name (`python3`, `uv`) is looked for on `PATH` and is never a place beside the working directory;
