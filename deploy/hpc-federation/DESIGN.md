@@ -422,17 +422,20 @@ serves both:
   with M4's defaults), so a measured `stop_seconds`, or a term the loader adds, moves it. A core whose loader cannot
   read the HPC `[faults]` (one without M4's backend) gets the restore's rule over the keys it knows, with the HPC
   settle time and poll;
-- **`[placement]`, always** (O79; `hpcboot.with_placement`): the platform layer requires the table
-  (`rangemap.load_placement`), and the pilot's template declares none, so a reader that found the render without one
-  patched in a default of its own, and defaults supplied separately by each tool are how a setting drifts unseen. `up`
-  writes it into every render, in both of its passes: a table the template declares stays as declared, byte for byte
-  (a header, an inline table and a dotted key all count); with none declared, every setting is written at the core's
-  default, read from the fields of `PlacementSettings` (the one place the numbers are, so a field added there is in the
-  next render with no change here), and `holder` is the first provider the file declares, the one setting the core has
-  no default for. Every `[[spaces]]` entry names its own `holder`, which the provisioner uses; this one is the
-  file-wide fallback and only has to be a provider of the file. A file that declares no provider fails the render. No
-  tool adds a table to the render or reads it with a default of its own: `shards.py step` copies the file as it is, and
-  `load_placement` still refuses a file without the table.
+- **`[placement]`, always and complete** (O79; `hpcplacement.py`): the platform layer requires the table
+  (`rangemap.load_placement`), and a reader that found the render without one patched in a default of its own;
+  defaults supplied separately by each tool are how a setting drifts unseen. The core has no default for `holder`
+  (the file-wide data provider; every `[[spaces]]` entry names its own, which the provisioner uses), so the template
+  declares it, a provider the file declares, with a comment saying why, and `up` refuses a template that declares no
+  holder (or a holder that is no provider of the file), naming the key and never a value, in its preflight, before
+  anything is submitted. The render, in both of its passes, keeps what the template declares and writes every other
+  setting at the core's default, read from the fields of `PlacementSettings` (the one place the numbers are, so a field
+  added there is in the next render with no change here), each with its own TOML type. The missing settings are added
+  where the template declares the table (inside one `placement = { ... }` line of the root, or after one
+  `[placement]` header: TOML cannot add to an inline table from elsewhere, nor reopen a table, so any other spelling is
+  refused) and the result is read back as TOML, which must be the declared document plus exactly the added settings or
+  the render fails and writes nothing. No tool adds a table to the render or reads it with a default of its own:
+  `shards.py step` copies the file as it is, and `load_placement` still refuses a file without the table.
 
 The core's platform layer (gate, health, link check, faults) points at `<root>/platform.toml` wherever it runs,
 provided it reaches the services' 8443 and reads the root. A layout's link check covers the pairs its

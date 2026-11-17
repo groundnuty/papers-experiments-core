@@ -414,11 +414,14 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   is the bundle's own, hashed from this checkout. The rendered file's pins are in the campaign fingerprint
   (`sandbox_backend`), no path is. Every path `up` renders into the root is absolute (`@hpc_root@`), so a copy of the
   file (the one a shard step places beside a study) reads the root's secrets, CA and journal.
-- **`[placement]` is always in the rendered file** (O79): the platform layer requires it, and the pilot's template
-  declares none. `up` keeps a table the template declares as declared; otherwise it writes every setting at the core's
-  default (read from `PlacementSettings`, never a copy of the numbers) and the first provider as `holder`, the one
-  setting the core has no default for (each `[[spaces]]` entry's own `holder` overrides it). So every reader, a shard's
-  step and an ingest tool alike, reads the same file, and none patches a default table in on its own.
+- **`[placement]` is always in the rendered file, complete** (O79): the platform layer requires it, and a reader that
+  finds none patches in a default of its own. The core has no default for `holder`, so every template declares it
+  (`placement = { holder = "..." }`, a provider the template declares) and `up` refuses one that does not, before
+  anything is submitted, naming the key (`hpcplacement.py`). The render keeps what the template declares and writes
+  every other setting at the core's default beside it, read from `PlacementSettings` (never a copy of the numbers),
+  where the template declares the table: as one `placement = { ... }` line of the root or one `[placement]` table
+  (any other spelling is refused). So every reader, a shard's step and an ingest tool alike, reads the same file, and
+  none patches a default table in on its own.
 - **The data each space holds** (C06, O63): every template's `[[spaces]]` entry names its `data_manifest`. A shared import's is the manifest its layout names; every other space's is written by `up` into `<root>/data-manifests/` from its baseline, the same for every federation of a layout. Before the link check `up` reads every space back through its owner (directories, sizes, bytes; a shared import by `verify_imports`) and fails, naming the space, when it is not exactly its manifest. So shards on two federations of one layout record one campaign fingerprint (each space by its declared identity and its data, never its Onezone id), and `shards.py plan` refuses federations whose platform files leave a space's data undeclared.
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
