@@ -257,6 +257,62 @@ def test_o68_step_stop_that_cannot_cancel_the_step_still_ends_the_client_and_say
     assert [c.pid for c in bench.ended] == [bench.spawned[0].pid]
     stopped = shard_record(bench, "shard-1")["launches"][-1]["stopped"]
     assert (stopped["step"], stopped["cancelled"]) == (mine, False)
+    code, printed = bench.run("status")
+    assert "shard-1: on fed-1, its step ended (stopped by step-stop, but its step was not cancelled)" in printed
+
+
+def test_o68_step_stop_cancels_no_step_once_the_recorded_client_has_ended(bench, deploy):
+    """O68: a step name is not the fleet's alone (`shards.py lines` and `resume-line` give a hand-run step of the same
+    shard the same name), and only a live recorded client vouches that a listed step is the fleet's launch: with the
+    client gone and a step of the name listed, nothing is cancelled, the stop is refused naming the step's id for the
+    operator, and the record holds no stop."""
+    started(bench)
+    handrun = list_step(bench, deploy, "shard-1", "fed-1")
+    bench.alive.discard(bench.spawned[0].pid)  # the fleet's launch ended
+    code, printed = bench.run("step-stop", "--shard", "shard-1")
+    assert code != 0
+    assert "has ended" in printed
+    assert handrun in printed
+    assert bench.ended == []
+    assert bench.fake("fed-1").cancelled == []
+    assert handrun in bench.fake("fed-1").steps.values()
+    assert "stopped" not in shard_record(bench, "shard-1")["launches"][-1]
+
+
+def test_o68_step_stop_with_nothing_left_to_stop_says_so_and_changes_nothing(bench):
+    """O68: the client has ended and no step of the shard is listed: nothing to stop, exit 0, no stop recorded."""
+    started(bench)
+    bench.alive.discard(bench.spawned[0].pid)
+    code, printed = bench.run("step-stop", "--shard", "shard-1")
+    assert code == 0, printed
+    assert "nothing to stop" in printed
+    assert bench.fake("fed-1").cancelled == []
+    assert "stopped" not in shard_record(bench, "shard-1")["launches"][-1]
+
+
+def test_o68_step_stop_refuses_when_more_than_one_step_carries_the_shards_name(bench, deploy):
+    """O68: the live client's step and a hand-run one carry the one name, and the listing cannot tell them apart: the
+    whole stop is refused, naming both ids, with nothing signalled or cancelled."""
+    started(bench)
+    mine = list_step(bench, deploy, "shard-1", "fed-1", 7)
+    name, job = step_of(bench, deploy, "shard-1")
+    fake = bench.fake("fed-1")
+    real = fake.run
+
+    def twice(argv, timeout):
+        done = real(argv, timeout)
+        if argv[:2] == ["squeue", "-s"] and "-j" in argv and argv[argv.index("-j") + 1] == job:
+            return done._replace(stdout=done.stdout + f"{job}.9 {name}\n")
+        return done
+
+    fake.run = twice
+    code, printed = bench.run("step-stop", "--shard", "shard-1")
+    assert code != 0
+    assert mine in printed
+    assert f"{job}.9" in printed
+    assert bench.ended == []
+    assert fake.cancelled == []
+    assert "stopped" not in shard_record(bench, "shard-1")["launches"][-1]
 
 
 @pytest.mark.parametrize("shard", ["shard-9", "shard-1"])
