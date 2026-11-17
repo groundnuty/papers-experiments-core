@@ -721,8 +721,48 @@ the wait for any request issued before it (the relay runs one at a time, in orde
 about 30 s on every verb, measured live. The relay lists `requests/` the same way; a login-node wait (`up`'s for the
 heartbeat, `stop`'s for it to go) runs on the host that writes the file and is no such poll.
 
+**A verb that outlives the relay's bound (O58).** A verb is a process that launches an `srun` step and waits for it, and
+the controller can stall silently for its message timeout (about 200 s on the site) before it makes the step. Ended
+alone at the bound, the verb left its `srun` orphaned: when the controller caught up the step was made and launched,
+so the verb ran after the relay had answered `timed_out`, and its own cancel path (`hpcslurm.Slurm._finish`) never
+ran. A late stop could land inside a restore, a late `restart_link` inside a heal's settle, up to about twice the
+message timeout after the request. The relay now does three things (`fault_relay_group`, `fault_relay_late`, `hpclate.py`):
+
+- **Each verb runs in a session and process group of its own, and at the bound the whole group is ended:** SIGTERM, a
+  grace of 5 s, then SIGKILL, with the leader reaped only afterwards so the group id is its own. No `srun` client of the
+  verb survives it. The pipes are closed on our side, so a descendant that left the group cannot hold the relay.
+- **The relay stamps the verb's steps.** It derives a tag of 12 hex digits from its own nonce and the request's id and
+  runs `hpcfed.py ... --step-tag <tag> <verb> <service>`; every control step the verb launches is then named
+  `<allocation>-<service>-<word>-<tag>` (`word` of `hpcfed_control.CONTROL_WORDS`: `status` and `mounts` for a status,
+  `stop`, `status` for a start, `exec`), in place of the clock's millisecond. The name is the request's alone: no other
+  request, and no verb run by hand, can share it.
+- **After a timed-out verb the relay starts a watch** (`hpcfed.py late-steps <service> --for-verb <verb> --request <id>
+  --journal <path> --window-s 400 --poll-s 5`; a command of its own, outside `fault_hpc.VERBS`, which no request can
+  name, and which refuses a journal other than this root's). The watch is a detached process, so it outlives a relay
+  that stops or dies. For 400 s (twice the controller's message timeout, from the bound) it lists the steps of the
+  federation's own job (`hpclaunch.listings`) every 5 s and cancels any whose name is one of the verb's exact names,
+  by its exact `<job>.<step>` id through `Launcher.cancel`, which refuses an id of another job of the federation's;
+  never by user, name or pattern. At the window's end it reads the accounting (`sacct`) for the same names, to record a
+  step that was made and ended between two looks (`accounted_late`); nothing is cancelled that is over.
+
+The answer is still `timed_out` and the injector still reads the verb's outcome as unknown: a stop is waited out and a
+start verified by a changed identity, as before. **The record** is `<root>/fault-relay/late-steps.jsonl` (0600, one JSON
+line per event, fsynced): `watch_opened` (written before the watch starts, so a relay that dies in the window still
+leaves the record that a watch was owed), `watch_failed`, `late_step` (the step's name, its id, whether the cancel
+worked and, if not, the error's type; a failed cancel is tried again at the next look), `accounted_late`, `watch_ended`
+(a watch that exited nonzero) and `watch_closed` with an outcome: `late_steps`, `none_seen` (only when at least one look
+and the accounting were read), `unreadable` (a controller that never answered in the window says nothing about
+whether a step came), `job_gone` or `state_gone`. **A `watch_opened` with no `watch_closed` is a window nobody
+watched to its end.** The cancel is best-effort (a step may have run before it was found, and Slurm gives a cancelled
+step its KillWait, 182 s here, to end); the record is the guarantee. **Not covered, on purpose:** a start's service step
+(`<allocation>-<service>-run-<n>`) is launched detached, in a session of its own, and recorded in the state file by the
+verb; it is the start arriving, which a restore wants, and is never cancelled by name (a later stop or `down` ends
+it). **Not covered either:** a verb that crashes before its bound with an `srun` still waiting; it is answered with
+its exit status, not as timed out.
+
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
-`hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` for a verb in
+`hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` (and
+`step_tag=<tag>` when the relay gave one) for a verb in
 `hpcfed_control.VERBS = ("stop", "start", "status", "exec")` and exits with its status; `argv` is what follows `--`
 (for `exec`), else `[]`; `stop_seconds` is the layout's; `mounts` is the read-only proof of a shared import's owner
 (`hpcfed.mount_check`: None in a core without `hpcimport`, section 8). What it is given:

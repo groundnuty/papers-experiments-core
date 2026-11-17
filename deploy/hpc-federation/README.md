@@ -564,7 +564,14 @@ job too, and a step with `--het-group=1` from the login node (`DESIGN.md`, secti
 the cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`, over this
 driver's launcher and state file; DESIGN.md section 7), which also repeat the mount check after a `start` (the first
 `status` that finds a restarted owner otherwise ready runs it); `up` starts the core's fault relay
-(`expcore_onedata.fault_relay`) and `down` stops it. Tested offline, none of it run live: a kept stop and a start again
+(`expcore_onedata.fault_relay`) and `down` stops it. **The relay ends a verb that outlives its bound with its whole
+process group, and watches for its late steps (O58):** each verb runs in a group of its own, so no `srun` client of a
+timed-out verb survives to make its step after the relay has answered (the controller can stall for about 200 s first);
+the relay names the verb's control steps with a tag of its own (`hpcfed.py --step-tag`), and `hpcfed.py late-steps`, a
+detached watch of 400 s, cancels a step of those exact names that appears in the federation's job, by its exact
+`<job>.<step>` id and no other, and writes what it saw to `<root>/fault-relay/late-steps.jsonl`. A `watch_opened` there
+with no `watch_closed` is a window nobody watched to its end, and `none_seen` is written only when the looks and the
+accounting were read (DESIGN.md section 7). The answer is still `timed_out`. Tested offline, none of it run live: a kept stop and a start again
 over the same work directory, `exec.sh` beside a running service, and every stop's real duration (from which `[hpc]
 stop_seconds` is to be set) are the live slot's. The agent's node's step (M5) is not built here. A layout with a shared
 import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.

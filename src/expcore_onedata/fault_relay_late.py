@@ -26,6 +26,8 @@ the record is what is guaranteed.
 
 A start's service step (`<allocation>-<service>-run-<n>`) is launched detached by the verb, in a session of its own, and
 recorded in the federation's state file: it is the start itself arriving, never a step to cancel by name.
+
+This module imports nothing of the core: the watch (`hpcfed.py late-steps`) imports it for `record`, and stays light.
 """
 
 import hashlib
@@ -36,8 +38,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from expcore_onedata.fault_hpc import STEP_TAG_OPTION
-
+STEP_TAG_OPTION = "--step-tag"  # hpcfed.py's option before a verb: the relay's tag for the steps the verb launches
 JOURNAL = "late-steps.jsonl"
 WATCH_COMMAND = "late-steps"  # a command of `hpcfed.py` the relay alone starts; never a verb a request can name
 LATE_WINDOW_S = 400.0  # twice the site's controller message timeout (about 200 s), counted from the verb's bound

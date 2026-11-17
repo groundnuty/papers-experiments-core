@@ -85,6 +85,7 @@ from expcore_onedata.compose import (
     link_result,
     run_command,
 )
+from expcore_onedata.fault_relay_late import STEP_TAG_OPTION
 
 if TYPE_CHECKING:  # the heal's module imports the Compose driver's, which this one shares
     from expcore_onedata.fault_matrix import LinkMatrix
@@ -101,7 +102,6 @@ HPC_POLL_S = 10.0  # every status is a Slurm step on the node's one control core
 IDENTITY = re.compile(r"[A-Za-z0-9@:._+-]{1,200}")  # an identity as a status prints it: one word, never a path
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # a layout's service name, as `[faults.services]` holds it
 STOP_ENDS = ("exit", "kill", "none")
-STEP_TAG_OPTION = "--step-tag"  # hpcfed.py's option before the verb: the relay's tag for the steps the verb launches
 STATUS = "read the service's status"
 
 
