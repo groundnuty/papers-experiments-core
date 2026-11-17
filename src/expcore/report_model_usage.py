@@ -56,10 +56,6 @@ NOTES = textwrap.wrap(
     "kill lost, probes), so what scored runs cost can be read beside the overhead.",
     width=118,
 )
-SHARD_NOTES = textwrap.wrap(
-    "A batch merged from shards adds its shards' figures: each shard's start probes its own models and pays for it.",
-    width=118,
-)
 ATTEMPT_NOTES = textwrap.wrap(
     "Every attempt of the export's `retries_by_kind`, added over the conditions; Charged says whether it used one of "
     "the run's attempts. A model with none has a row of zeros.",
@@ -204,8 +200,7 @@ def section(usage: Mapping[str, Any] | None, export: Mapping[str, Any], table: T
     classes = ["Model", "Attempts of", "Attempts", "Input tokens", "Output tokens", "Cache writes", "Cache reads"]
     classes += ["Usage incomplete", "Charged at a bound", "Measured (USD)", "Measured plus in flight (USD)"]
     classes += ["Bound (USD)", "Top-ups (USD)", "Total (USD)"]
-    notes = [*NOTES, *SHARD_NOTES] if export.get("shards") else NOTES  # an unsharded report names no shard
-    lines = [HEADING, "", *notes, "", "### Spend by model", "", *table(spend, _spend_rows(models)), ""]
+    lines = [HEADING, "", *NOTES, "", "### Spend by model", "", *table(spend, _spend_rows(models)), ""]
     lines += ["### Attempts, tokens and spend by what became of the attempt", ""]
     lines += [*table(classes, _class_rows(models)), ""]
     lines += ["### Attempts set aside as infrastructure", ""]

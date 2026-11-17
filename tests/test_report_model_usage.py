@@ -248,10 +248,7 @@ def test_c39_figures_of_another_shape_are_refused_not_shown(bad):
         render(export(), bad)
 
 
-def test_c39_only_a_report_of_a_merged_batch_says_a_word_of_shards(tmp_path):
-    """C39: an unsharded report never mentions a shard (a pinned property of it): the sentence that says a merged
-    batch adds its shards' figures is in the notes only when the export has `shards`."""
-    usage = usage_of_two_models(tmp_path)
-    assert "shard" not in render(export(), usage).lower()
-    merged = render(export(shards=[{"index": 1}, {"index": 2}]), usage)
-    assert "adds its shards' figures" in section_of(merged)
+def test_c39_the_section_names_no_shard_so_a_merged_report_is_an_unsharded_ones_text(tmp_path):
+    """C39: an unsharded report mentions no shard (a pinned property of it), and the section is the same text for a
+    merged batch, whose figures are its shards' added: the merged-batch test compares the two reports line by line."""
+    assert "shard" not in render(export(), usage_of_two_models(tmp_path)).lower()
