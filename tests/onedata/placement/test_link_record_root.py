@@ -5,9 +5,11 @@ a platform file derived elsewhere (the outage check's example, in a work directo
 `[faults] journal`, which `up` makes in its root (`<root>/fault-journal`), so the root is the journal's parent: every
 check that needs `[faults]` (a restore's, a heal's reads, and the health gate's routine pre-run check) writes the
 root's record, and nothing lands beside the derived file. A check run without `[faults]` declares no root and writes
-nothing. A `[faults] journal` whose parent holds no `platform.toml` is refused at load.
+nothing. A `[faults] journal` whose parent holds no `platform.toml` is refused at load, and so is a relative one in a
+platform file beside a `study.toml`, where it would resolve into the study and the root check would pass vacuously.
 """
 
+import contextlib
 import json
 from functools import partial
 
@@ -15,15 +17,16 @@ import pytest
 from fault_support import SERVICES, faults_table
 from link_support import BOUND_S, GAMMA_ID, add_providers, three_providers
 
+from expcore.campaign import prerun
 from expcore.config.loading import ConfigError
-from expcore_onedata import fault_serves, health, linkcheck
+from expcore_onedata import fault_serves, fault_settings, health, linkcheck
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import load_faults
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.linkcheck import check_links
-from expcore_onedata.linkrecord import LOCK, RECORD, record_text
+from expcore_onedata.linkrecord import LINK_RECORD_NOTE, LOCK, RECORD, record_text
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, write_platform
 from expcore_onedata.testing.world import with_link_check
 from expcore_onedata.tokens import TokenIssuer
@@ -157,6 +160,54 @@ def test_o35_a_routine_check_that_raises_removes_the_older_record(root, fake, ti
     assert not (root / RECORD).exists()
 
 
+def test_o35_a_routine_check_whose_record_was_written_says_nothing_of_it(root, fake, ticker):
+    """O35: the fact is absent when the record was written as it always was: the gate holds none and the try's note,
+    which the run's own admission and executor read, has no such key."""
+    gate = health_through(root / "platform.toml", fake, ticker)
+    with prerun.opened() as note:
+        assert gate().ok
+    assert gate.link_record is None
+    assert LINK_RECORD_NOTE not in note
+
+
+def test_o35_a_routine_check_that_cannot_take_the_lock_says_so_to_the_run_whose_check_it_was(
+    root, fake, ticker, monkeypatch
+):
+    """O35: a routine check whose record lock could not be taken writes no record, and the run whose pre-run check it
+    was learns it from more than a log line: the try's note holds `link_record: "not_written"` with the reason
+    `lock_not_taken` (what an executor reads, with `prerun.current()`, to put it in the run's record), and the gate's
+    `link_record` holds it for the latest check. The verdict is the check's, as ever."""
+
+    @contextlib.contextmanager
+    def unlocked(path):
+        yield False
+
+    monkeypatch.setattr(fault_serves, "recording", unlocked)
+    gate = health_through(root / "platform.toml", fake, ticker)
+    with prerun.opened() as note:
+        verdict = gate()
+    assert verdict.ok, verdict.detail
+    said = {"link_record": "not_written", "link_record_reason": "lock_not_taken"}
+    assert note[LINK_RECORD_NOTE] == said
+    assert gate.link_record == said
+    assert not (root / RECORD).exists()
+
+
+def test_o35_a_routine_check_whose_record_cannot_be_written_says_write_failed(root, fake, ticker, monkeypatch):
+    """O35: the lock taken and the write refused is the other reason, `write_failed`, a fixed word."""
+
+    def refused(report, path):
+        raise PermissionError(13, "read-only file system")
+
+    monkeypatch.setattr(fault_serves, "write_record", refused)
+    gate = health_through(root / "platform.toml", fake, ticker)
+    with prerun.opened() as note:
+        verdict = gate()
+    assert verdict.ok, verdict.detail
+    assert note[LINK_RECORD_NOTE] == {"link_record": "not_written", "link_record_reason": "write_failed"}
+    assert gate.link_record == note[LINK_RECORD_NOTE]
+
+
 def test_o35_a_restore_check_through_a_derived_file_writes_the_roots_record_and_nothing_beside_the_derived_file(
     root, derived, fake
 ):
@@ -242,3 +293,64 @@ def test_o35_a_journal_whose_parent_holds_no_platform_file_is_refused_at_load(tm
     assert "state" not in str(refused.value).split("key 'journal'")[1]
     (tmp_path / "state" / "platform.toml").write_text("# the federation's own\n", encoding="utf-8")
     assert load_faults(platform, config).journal == (tmp_path / "state" / "fault-journal").resolve()
+
+
+STUDY_DIRECTORY = "study"
+RELATIVE_JOURNALS = ("fault-journal", "../root/fault-journal")  # the template's, and one that points at the root
+
+
+def platform_in_a_study(tmp_path, **faults):
+    """The federation's platform.toml, copied beside a `study.toml` (a study directory)."""
+    study = tmp_path / STUDY_DIRECTORY
+    study.mkdir()
+    (study / "study.toml").write_text("# a study directory is the one that holds study.toml\n", encoding="utf-8")
+    return write_platform(study, lambda d: federation_document(d, **faults))
+
+
+@pytest.mark.parametrize("journal", RELATIVE_JOURNALS)
+def test_o35_a_relative_journal_beside_study_toml_is_refused_naming_the_absolute_form(tmp_path, root, fake, journal):
+    """O35: a platform.toml copied beside study.toml, with a relative `[faults] journal`, resolves the journal into the
+    study directory, whose parent then holds the copy, so the root check would pass vacuously and the lock and the
+    journal would land in the study. Refused at load, whatever the relative path says, naming the key and the absolute
+    form to write (never a path of this host)."""
+    platform = platform_in_a_study(tmp_path, journal=journal)
+    config = load_platform(platform)
+    with pytest.raises(ConfigError, match=r"platform\.toml\.faults: key 'journal'") as refused:
+        load_faults(platform, config)
+    message = str(refused.value).split("key 'journal'")[1]
+    assert "<absolute path of the federation's root>/fault-journal" in message
+    assert "study.toml" in message
+    assert str(tmp_path) not in message
+
+
+def test_o35_the_federations_journal_written_in_full_loads_beside_study_toml(tmp_path, root, fake):
+    """O35: the absolute form the refusal names loads, and the journal is the root's, so its lock and the link-check
+    record are the federation's, not the study's."""
+    platform = platform_in_a_study(tmp_path, journal=str(root / "fault-journal"))
+    settings = load_faults(platform, load_platform(platform))
+    assert settings.journal == (root / "fault-journal").resolve()
+    assert not (tmp_path / STUDY_DIRECTORY / "fault-journal").exists()
+
+
+def test_o35_a_relative_journal_still_loads_where_the_file_lies_in_the_federations_root(root, fake):
+    """O35: the root's own platform.toml, rendered by `up` with the relative `fault-journal`, has no study.toml beside
+    it: the relative journal is the root's and loads, as before."""
+    platform = root / "platform.toml"
+    assert not (root / "study.toml").exists()
+    assert load_faults(platform, load_platform(platform)).journal == (root / "fault-journal").resolve()
+
+
+def test_o35_a_relative_journal_still_loads_in_a_derived_directory_that_holds_no_study_toml(tmp_path, root, fake):
+    """O35: a file derived in a work directory (no study.toml) may state the root's journal relative to itself."""
+    work = tmp_path / "work"
+    work.mkdir()
+    platform = write_platform(work, lambda d: federation_document(d, journal="../root/fault-journal"))
+    assert load_faults(platform, load_platform(platform)).journal == (root / "fault-journal").resolve()
+
+
+def test_o35_a_study_directory_is_the_one_the_study_loader_names():
+    """O35: the refusal's marker is the file the study loader looks for (the two are pinned together, as the core's
+    `expcore_onedata` does not import the study layer)."""
+    from expcore.study.config import STUDY_FILE
+
+    assert fault_settings.STUDY_FILE == STUDY_FILE
