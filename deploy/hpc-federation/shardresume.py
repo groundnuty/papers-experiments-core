@@ -23,6 +23,10 @@ It prints the line only after every check passed, each refusal naming the shard'
   taken.
 - **Cleanup follows the step**: J and N are recorded in the federation's state file (`shard_nodes`, under the root's
   lifecycle lock: never beside an up or a down), before the line is printed, so its `down` sweeps N too, in J.
+
+The same fingerprint is taken before any line is printed (`check_one_campaign`, O63): `shards.py plan` and `lines`, and
+`fleet.py plan` for the shards it assigns, take each shard's beside its own federation's `platform.toml` and refuse
+unless they are all one, because shards on federations that render other settings would never merge.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -175,11 +179,12 @@ def check_no_live_step(
 
 
 def study_fingerprint(
-    shards: Any, plan: Any, shard: Any, scratch: Path, refuse: Any, out: Path | None = None
+    shards: Any, plan: Any, shard: Any, scratch: Path, refuse: Any, out: Path | None = None, detail: bool = True
 ) -> dict[str, Any]:
     """The campaign fingerprint the study pins beside this federation's `platform.toml`, by the manifest's Python on a
     private copy, with the step's own environment (the allowlist, a home of its own), and with `out` (a restored
-    snapshot's) moved in as the copy's `out/`, as the step places it: what the step's dispatcher would pin."""
+    snapshot's) moved in as the copy's `out/`, as the step places it: what the step's dispatcher would pin. A program
+    that ends non-zero is refused with the end of its stderr, unless `detail` is false (its words may hold a path)."""
     copy = scratch / "study"
     shutil.copytree(plan.study, copy, symlinks=True)
     platform = shard.root / shards.PLATFORM
@@ -198,12 +203,77 @@ def study_fingerprint(
     except (OSError, subprocess.TimeoutExpired) as error:
         refuse(f"the study's fingerprint could not be computed ({type(error).__name__})")
     if done.returncode != 0:
+        words = f": {done.stderr.strip()[-400:]}" if detail else ""
         refuse(f"the study's fingerprint could not be computed with its federation's {shards.PLATFORM} (status "
-               f"{done.returncode}): {done.stderr.strip()[-400:]}")  # fmt: skip
+               f"{done.returncode}){words}")  # fmt: skip
     try:
         return json.loads(done.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
         refuse("the study's fingerprint was not printed whole")
+
+
+def canonical(fingerprint: Mapping[str, Any]) -> str:
+    """A fingerprint by its canonical JSON, as the merge compares the fingerprints a store recorded (JSON)."""
+    return json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
+
+
+def first_difference(one: Mapping[str, Any], other: Mapping[str, Any]) -> str:
+    """The first top-level key, in key order, that the two fingerprints do not hold alike (one lacking it counts):
+    named, never shown. Two fingerprints that differ differ in one."""
+
+    def held(fingerprint: Mapping[str, Any], key: str) -> tuple[bool, str]:
+        return key in fingerprint, canonical(fingerprint.get(key))
+
+    return next(key for key in sorted({*one, *other}) if held(one, key) != held(other, key))
+
+
+def check_one_campaign(shards: Any, plan: Any, only: Iterable[str] | None = None) -> None:
+    """The study's campaign fingerprint, taken beside each shard's federation's `platform.toml` (`study_fingerprint`:
+    the manifest's Python on a private copy, as the step places it), is one for every shard of `only` (every shard of
+    the plan when None): `shards.ShardsError` otherwise, before any line is printed. Shards on federations that render
+    other settings would never merge, and `merge` says so only once the money is spent. A refusal names each shard that
+    differs from the largest group of equal shards by its label, with the first differing top-level key of the
+    fingerprint, never a host, a path or a value; a shard whose `platform.toml` cannot be read, or whose fingerprint
+    cannot be taken, is refused by its label too."""
+    wanted = None if only is None else set(only)
+    chosen = [shard for shard in plan.shards if wanted is None or shard.label in wanted]
+
+    def refusing(shard: Any) -> Any:
+        def refuse(why: str) -> None:
+            raise shards.ShardsError(f"shard {shard.label}: {why}; no line is printed")
+
+        return refuse
+
+    for shard in chosen:  # every file first: nothing is copied or run for a campaign that cannot be one
+        try:
+            (shard.root / shards.PLATFORM).read_bytes()
+        except OSError:
+            refusing(shard)(f"its federation's {shards.PLATFORM} could not be read")
+    found: dict[str, dict[str, Any]] = {}
+    for shard in chosen:
+        scratch = Path(tempfile.mkdtemp(prefix="expcore-plan-fingerprint."))  # 0700, on this host: never the shared one
+        try:
+            found[shard.label] = study_fingerprint(shards, plan, shard, scratch, refusing(shard), detail=False)
+        except OSError as error:
+            refusing(shard)(f"the study could not be copied beside its federation's {shards.PLATFORM} "
+                            f"({type(error).__name__})")  # fmt: skip
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+    groups: dict[str, list[str]] = {}
+    for label, fingerprint in found.items():
+        groups.setdefault(canonical(fingerprint), []).append(label)
+    if len(groups) < 2:
+        return
+    reference = max(groups.values(), key=len)  # the largest group of equal shards; the first of equals
+    parts = []
+    for labels in (labels for labels in groups.values() if labels is not reference):
+        key = first_difference(found[labels[0]], found[reference[0]])
+        parts.append(f"{', '.join(labels)} {'differs' if len(labels) == 1 else 'differ'} from {', '.join(reference)} "
+                     f"(first differing key: {key})")  # fmt: skip
+    raise shards.ShardsError(
+        f"the shards' campaign fingerprints differ, so they would never merge (the study beside each federation's "
+        f"{shards.PLATFORM}): {'; '.join(parts)}; no line is printed"
+    )
 
 
 def pinned_of(shards: Any, plan: Any, other: Any, scratch: Path) -> str | None:

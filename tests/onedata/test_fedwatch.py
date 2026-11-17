@@ -20,6 +20,9 @@ from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.fault_settings import load_faults
 from expcore_onedata.fedwatch import FORMAT, ComposeSource, FederationWatch, HpcSource, Member, members_of, watch_for
 
+ME = {"process": "proc-1", "campaign": "campaign-1", "attempt_id": 5}  # the run a window is of
+ANOTHER = {"process": "proc-1", "campaign": "campaign-1", "attempt_id": 6}  # an earlier attempt of its campaign
+PROCESS_ONLY = {"process": "proc-1"}  # an injection outside any attempt (a tool's, a gate's heal)
 ZONE, ALPHA, BETA = "zn-svc", "store-one", "store-two"  # a backend's names for the services: never in a result
 MEMBERS = (Member("zone", ZONE, None), Member("providers[0]", ALPHA, "prov-a"), Member("providers[1]", BETA, "prov-b"))
 DOC_AT = "2026-11-17T04:00:00Z"
@@ -104,14 +107,16 @@ def journal_of(tmp_path):
     return InjectionJournal(tmp_path / "fault-journal")
 
 
-def injection(journal, service, *, heal=False, clears="restored", stop=True):
-    """What the injector writes for one outage (or, with `heal`, one heal's container restart), as faults.py does."""
+def injection(journal, service, *, heal=False, clears="restored", stop=True, owner=None):
+    """What the injector writes for one outage (or, with `heal`, one heal's container restart), as faults.py does; with
+    an `owner`, the owner token it writes (`liveness.owner()`, O80), else a line written before owners were recorded."""
     entry = uuid.uuid4().hex
     line = {
         "target": "a-target",
         "service": service,
         "identity_sha256": "f" * 64,
         "holder": {"pid": 1, "boot_id": None},
+        **({} if owner is None else {"owner": owner}),
     }
     journal.append({"event": "injecting", "id": entry, **line, **({"heal": True} if heal else {})})
     if stop:
@@ -244,17 +249,20 @@ def test_o86_a_service_down_at_the_start_and_restored_in_the_window_is_explained
     assert [(r["label"], r["explained"]) for r in seen["restarts"]] == [("outage", True)]
 
 
-def test_o86_an_outage_still_open_at_the_end_is_down_and_explained(tmp_path):
-    """O86: the injector stopped a provider in the window and has not restored it: `down`, and no finding for it."""
+def test_o86_an_outage_still_open_at_the_end_is_held_and_explained(tmp_path):
+    """O86: the injector stopped a provider in the window and has not restored it: `held`, and no finding for it; the
+    window's verdict is `held`, not `restarted`: nothing restarted."""
     containers = steady()
     watch = compose_watch(containers, tmp_path)
     start = watch.read()
     containers.by_service[ALPHA] = container("ctr-a", running=False, health=None, exit_code=0)
     injection(journal_of(tmp_path), ALPHA, clears=None)
     result = watch.window(start)
-    assert result["services"]["providers[0]"]["status"] == "down"
+    assert result["services"]["providers[0]"]["status"] == "held"
+    assert result["services"]["providers[0]"]["restarts"] == []
     assert result["findings"] == []
-    assert result["verdict"] == "restarted"
+    assert result["verdict"] == "held"
+    assert result["ownership"] == "not_checked"
 
 
 def test_o86_a_restart_by_dockers_own_policy_is_a_finding_even_with_a_journal_line(tmp_path):
@@ -441,6 +449,144 @@ def test_o86_members_of_labels_the_zone_and_each_declared_provider(config):
         members_of(config, zone="zn-svc", providers={"not-declared": "x"})
 
 
+# --- whose an injection is: a run's window counts only its own (#371's owner) -----------------------------------------
+
+
+def down_target(tmp_path, *, owner, clears=None):
+    """The pilot's order: the target is down, held by an injection, when the window opens, and still when it ends."""
+    containers = steady()
+    journal = journal_of(tmp_path)
+    injection(journal, ALPHA, clears=clears, owner=owner)
+    containers.by_service[ALPHA] = container("ctr-a", running=False, health=None, exit_code=0)
+    watch = compose_watch(containers, tmp_path)
+    return watch, watch.read(), containers, journal
+
+
+def test_o86_a_target_down_at_both_ends_by_the_runs_own_open_injection_is_held_not_restarted(tmp_path):
+    """O86: the injection came before the start reading and is still open at the end: the run's own injection holds the
+    target down, `held`, explained and no finding; every other service is `stable`; the verdict is `held`."""
+    watch, start, _, _ = down_target(tmp_path, owner=ME)
+    result = watch.window(start, owner=ME)
+    held = result["services"]["providers[0]"]
+    assert (held["status"], held["restarts"], held["start"]["state"], held["end"]["state"]) == (
+        "held", [], "not_running", "not_running",
+    )  # fmt: skip
+    assert held["held"]["injections"] == 1
+    assert held["held"]["opened"] == "before the window"
+    assert "this run owns" in held["held"]["reason"]
+    assert "restore outcome" in held["held"]["reason"]
+    assert [result["services"][label]["status"] for label in ("zone", "providers[1]")] == ["stable", "stable"]
+    assert (result["verdict"], result["findings"], result["ownership"]) == ("held", [], "run")
+
+
+@pytest.mark.parametrize(
+    ("owner", "why"),
+    [
+        (ANOTHER, "not this run's"),
+        (None, "that are not this run's"),
+        (PROCESS_ONLY, "that are not this run's"),
+    ],
+    ids=["another attempt's", "ownerless", "a process alone"],
+)
+def test_o86_a_down_target_whose_injection_is_not_the_runs_is_a_finding(tmp_path, owner, why):
+    """O86: an earlier attempt's leftover, a line written before owners were recorded and an injection outside any
+    attempt hold the service down but are not this run's: it is `down` with a finding, never `held`."""
+    watch, start, _, _ = down_target(tmp_path, owner=owner)
+    result = watch.window(start, owner=ME)
+    assert result["services"]["providers[0]"]["status"] == "down"
+    assert result["services"]["providers[0]"]["held"] is None
+    assert result["verdict"] == "finding"
+    assert any(why in finding for finding in result["findings"])
+
+
+@pytest.mark.parametrize("owner", [ME, None], ids=["the run's own", "no run named"])
+def test_o86_an_old_open_injection_the_service_ran_through_holds_nothing_down_when_it_later_fails(tmp_path, owner):
+    """O86: an injection stopped before the window and never cleared (its restore unverified) while the service was
+    running again at the window's start does not hold it down: a crash inside the window is another outage, a finding,
+    never `held`, in a run's window and in a batch's alike."""
+    containers = steady()
+    injection(
+        journal_of(tmp_path), ALPHA, clears=None, owner=ME
+    )  # stopped and left open, then the service was restarted
+    watch = compose_watch(containers, tmp_path)
+    start = watch.read()
+    assert start["services"]["providers[0]"]["state"] == "running"
+    containers.by_service[ALPHA] = container("ctr-a", running=False, health=None, exit_code=137)  # it crashed
+    result = watch.window(start, owner=owner)
+    assert result["services"]["providers[0]"]["status"] == "down"
+    assert result["services"]["providers[0]"]["held"] is None
+    assert result["verdict"] == "finding"
+
+
+def test_o86_a_run_that_names_no_attempt_owns_no_injection(tmp_path):
+    """O86: a window asked of a process alone (no attempt) cannot tell its injection from another's: none is its own."""
+    watch, start, _, _ = down_target(tmp_path, owner=PROCESS_ONLY)
+    result = watch.window(start, owner=PROCESS_ONLY)
+    assert result["ownership"] == "unattributed"
+    assert result["services"]["providers[0]"]["status"] == "down"
+    assert any("names no attempt" in finding for finding in result["findings"])
+
+
+@pytest.mark.parametrize(
+    ("owner", "label", "verdict"),
+    [(ME, "outage", "restarted"), (ANOTHER, "finding", "finding"), (None, "finding", "finding")],
+    ids=["the run's own", "another attempt's", "ownerless"],
+)
+def test_o86_a_restart_by_the_runs_own_injection_is_explained_and_another_attempts_is_a_finding(
+    tmp_path, owner, label, verdict
+):
+    """O86: the same restart, in the window, is explained only when the injection that has a line in it is the run's."""
+    containers = steady()
+    watch = compose_watch(containers, tmp_path)
+    start = watch.read()
+    containers.by_service[ALPHA] = container("ctr-a", "2026-11-17T03:00:00Z")
+    injection(journal_of(tmp_path), ALPHA, owner=owner)
+    result = watch.window(start, owner=ME)
+    seen = result["services"]["providers[0]"]
+    assert [r["label"] for r in seen["restarts"]] == [label]
+    assert result["verdict"] == verdict
+    reason = seen["restarts"][0]["reason"]
+    assert ("this run's own" in reason) if owner is ME else ("not this run's" in reason or "no journalled" in reason)
+
+
+def test_o86_only_the_injections_target_may_restart_or_be_down_and_another_service_that_does_is_a_finding(tmp_path):
+    """O86: an S3 run's target is held and explained; a second provider that restarted or is down in the same window
+    is not the target of any injection of the run: a finding, even inside an injecting run."""
+    watch, start, containers, _ = down_target(tmp_path, owner=ME)
+    containers.by_service[BETA] = container("ctr-b", "2026-11-17T03:00:00Z")  # restarted, nothing journalled for it
+    result = watch.window(start, owner=ME)
+    assert result["services"]["providers[0]"]["status"] == "held"
+    assert [r["label"] for r in result["services"]["providers[1]"]["restarts"]] == ["finding"]
+    assert result["verdict"] == "finding"
+    containers.by_service[BETA] = container("ctr-b", running=False, health=None, exit_code=137)
+    result = watch.window(start, owner=ME)
+    assert result["services"]["providers[1]"]["status"] == "down"
+    assert result["verdict"] == "finding"
+
+
+def test_o86_the_verdict_follows_the_worst_service_finding_unknown_held_restarted_stable(tmp_path):
+    """O86: held outranks restarted, unknown outranks held, and a finding outranks them all."""
+    watch, start, containers, _ = down_target(tmp_path, owner=ME)
+    containers.by_service[BETA] = container("ctr-b-new")
+    injection(journal_of(tmp_path), BETA, owner=ME)  # the second service restarted, and its restart is the run's too
+    assert watch.window(start, owner=ME)["verdict"] == "held"
+    assert watch.window(start, owner=ME)["services"]["providers[1]"]["status"] == "restarted"
+    containers.by_service[ZONE] = None  # no container: unknown
+    assert watch.window(start, owner=ME)["verdict"] == "unknown"
+    containers.by_service[ZONE] = container("ctr-z", running=False, health=None)  # not running: a finding
+    assert watch.window(start, owner=ME)["verdict"] == "finding"
+
+
+def test_o86_a_window_with_no_run_named_counts_any_injection_and_says_so(tmp_path):
+    """O86: a batch's window (no `owner`) is as it was: any open injection holds a service down and any one explains a
+    restart, and the result says the ownership was not checked."""
+    watch, start, _, _ = down_target(tmp_path, owner=ANOTHER)
+    result = watch.window(start)
+    assert result["services"]["providers[0]"]["status"] == "held"
+    assert result["ownership"] == "not_checked"
+    assert "whose they are is not checked" in result["services"]["providers[0]"]["held"]["reason"]
+
+
 # --- HPC: the documents hpcobserve prints ---------------------------------------------------------------------------
 
 
@@ -460,10 +606,11 @@ class Cluster:
 
     def __init__(self, **services):
         self.services = dict(services)
-        self.returncode, self.raises, self.commands = 0, None, []
+        self.returncode, self.raises, self.commands, self.timeouts = 0, None, [], []
 
     def __call__(self, argv, *, timeout_s):
         self.commands.append(list(argv))
+        self.timeouts.append(timeout_s)
         if self.raises is not None:
             raise self.raises
         doc = {"format": "expcore-hpc-observe/1", "at": DOC_AT, "services": self.services}
@@ -681,3 +828,141 @@ def test_o86_watch_for_builds_the_watch_the_faults_table_describes(fake, tmp_pat
     )
     hpc_watch_of = watch_for(config, hpc, Client(), zone=ZONE, hpc_command=["python", "-I", "x.py"], runner=cluster)
     assert hpc_watch_of.window(hpc_watch_of.read())["verdict"] == "stable"
+
+
+def test_o86_an_hpc_target_down_at_both_ends_by_the_runs_own_open_injection_is_held(tmp_path):
+    """O86: the pilot's federation is HPC: its target's step ended before the window and is still ended at its end,
+    held by the run's own injection, which was made before the read: `held` for the target, `stable` for the rest."""
+    cluster = Cluster(
+        **{
+            ZONE: hpc_record("4242.3", kind="oz"),
+            ALPHA: hpc_record("4242.5"),
+            BETA: hpc_record("4242.6", running=False, stops=1),
+        }
+    )
+    injection(journal_of(tmp_path), BETA, clears=None, owner=ME)
+    watch = hpc_watch(cluster, tmp_path)
+    start = watch.read()
+    assert start["services"]["providers[1]"]["state"] == "not_running"
+    result = watch.window(start, owner=ME)
+    assert result["backend"] == "hpc"
+    assert result["services"]["providers[1]"]["status"] == "held"
+    assert [result["services"][label]["status"] for label in ("zone", "providers[0]")] == ["stable", "stable"]
+    assert (result["verdict"], result["findings"], result["unknown"]) == ("held", [], [])
+    cluster.services[BETA] = hpc_record("4242.6", running=False, stops=1)
+    assert watch.window(start, owner=ANOTHER)["verdict"] == "finding"
+
+
+# --- HPC: a stop that Slurm's accounting is behind on ------------------------------------------------------------
+
+
+def lagging(**service):
+    """What hpcobserve prints for a service the state says was stopped when accounting never caught up in its bound."""
+    return hpc_record("4242.6", running=None, started=None, unknown="accounting_lag", stops=1, **service)
+
+
+def test_o86_a_side_carries_the_seconds_the_read_waited_for_accounting(tmp_path):
+    """O86: hpcobserve records how long it waited for Slurm's accounting to show a step stopped, per service; the side
+    keeps it as `accounting_wait_s_used` (none for a document that predates it, none on Compose), and says so in its
+    notes only when it did wait."""
+    cluster = hpc_steady()
+    cluster.services[BETA] = hpc_record("4242.6", running=False, stops=1, accounting_wait_s_used=6.0)
+    cluster.services[ALPHA]["accounting_wait_s_used"] = 0.0
+    sides = hpc_watch(cluster, tmp_path).read()["services"]
+    assert sides["providers[1]"]["accounting_wait_s_used"] == 6.0
+    assert sides["providers[1]"]["unknown"] == []
+    assert any("waited 6 s" in note and "accounting" in note for note in sides["providers[1]"]["notes"])
+    assert sides["providers[0]"]["accounting_wait_s_used"] == 0.0
+    assert sides["providers[0]"]["notes"] == []
+    assert sides["zone"]["accounting_wait_s_used"] is None  # a document of an older hpcobserve
+    compose = compose_watch(steady(), tmp_path / "c").read()
+    assert all(side["accounting_wait_s_used"] is None for side in compose["services"].values())
+
+
+@pytest.mark.parametrize("bad", ["6", True, -1.0, float("nan"), [6]], ids=["text", "bool", "negative", "nan", "list"])
+def test_o86_a_wait_that_is_not_a_number_of_seconds_makes_the_document_unreadable(tmp_path, bad):
+    """O86: a figure the side cannot trust is not carried: the service's answer is not readable, so unknown."""
+    cluster = hpc_steady()
+    cluster.services[ALPHA]["accounting_wait_s_used"] = bad
+    side = hpc_watch(cluster, tmp_path).read()["services"]["providers[0]"]
+    assert side["state"] == "unknown"
+    assert any("not readable" in why for why in side["unknown"])
+
+
+def test_o86_accounting_that_never_caught_up_is_unknown_with_that_reason_never_running_or_held(tmp_path):
+    """O86: hpcobserve gave up at its bound (`accounting_lag`) for a target the state says was stopped: at the start
+    the window has no reading of it, so it is unknown with the reason and the wait, never held, never stable, and no
+    finding; read at the end instead, the same."""
+    for where in ("start", "end"):
+        cluster = hpc_steady()
+        lagged = lagging(accounting_wait_s_used=60.0)
+        injection(journal_of(tmp_path / where), BETA, clears=None, owner=ME)
+        if where == "start":
+            cluster.services[BETA] = lagged
+        watch = hpc_watch(cluster, tmp_path / where)
+        start = watch.read()
+        assert (start["services"]["providers[1]"]["state"] == "unknown") is (where == "start")
+        cluster.services[BETA] = lagged
+        result = watch.window(start, owner=ME)
+        seen = result["services"]["providers[1]"]
+        assert (seen["status"], result["verdict"], result["findings"]) == ("unknown", "unknown", [])
+        assert seen["end"]["unknown"] == ["accounting_lag"]
+        assert seen["end"]["running"] is None
+        assert seen["end"]["accounting_wait_s_used"] == 60.0
+        assert any("accounting_lag" in reason for reason in result["unknown"])
+        assert any("did not catch up" in note and "60 s" in note for note in seen["end"]["notes"])
+
+
+def test_o86_watch_for_hands_the_read_its_bound_and_allows_for_it_in_the_time_it_gives_the_command(fake, tmp_path):
+    """O86: the HPC watch appends `--accounting-wait-s <bound>` to the caller's command (60 unless declared) and gives
+    the command that long on top of `command_timeout_s`, so a read that waits is never cut off for waiting."""
+    path = write_faults(tmp_path)
+    config = load_platform(path)
+    hpc = replace(load_faults(path, config), backend="hpc")
+    seen = {}
+    for wait, shown in ((None, "60"), (0, "0"), (12.5, "12.5"), (300, "300")):
+        cluster = Cluster(
+            **{
+                ZONE: hpc_record("4242.3", kind="oz"),
+                "store-one": hpc_record("4242.5"),
+                "store-two": hpc_record("4242.6"),
+            }
+        )
+        extra = {} if wait is None else {"accounting_wait_s": wait}
+        watch = watch_for(
+            config, hpc, Client(), zone=ZONE, hpc_command=["python", "-I", "x.py"], runner=cluster, **extra
+        )
+        watch.read()
+        assert cluster.commands[0] == ["python", "-I", "x.py", "--accounting-wait-s", shown]
+        seen[shown] = cluster.timeouts[0]
+    assert seen == {"60": hpc.command_timeout_s + 60, "0": hpc.command_timeout_s,
+                    "12.5": hpc.command_timeout_s + 12.5, "300": hpc.command_timeout_s + 300}  # fmt: skip
+
+
+@pytest.mark.parametrize("wait", [-1, 300.5, float("nan"), float("inf"), True, "60", None])
+def test_o86_watch_for_refuses_a_bound_outside_zero_to_three_hundred(fake, tmp_path, wait):
+    """O86: the bound is a number of seconds from 0 to 300 on either backend; anything else is refused, naming it."""
+    path = write_faults(tmp_path)
+    config = load_platform(path)
+    settings = load_faults(path, config)
+    for backend in ("compose", "hpc"):
+        with pytest.raises(ValueError, match="accounting_wait_s"):
+            watch_for(
+                config,
+                replace(settings, backend=backend),
+                Client(),
+                zone=ZONE,
+                hpc_command=["x"],
+                accounting_wait_s=wait,
+            )
+
+
+def test_o86_a_compose_watch_adds_no_flag_and_no_wait(fake, tmp_path):
+    """O86: the bound is the HPC read's: Compose's runner sees the commands it saw before."""
+    path = write_faults(tmp_path)
+    config = load_platform(path)
+    containers = Containers(
+        **{ZONE: container("ctr-z"), "store-one": container("ctr-a"), "store-two": container("ctr-b")}
+    )
+    watch_for(config, load_faults(path, config), Client(), zone=ZONE, runner=containers, accounting_wait_s=5).read()
+    assert all("--accounting-wait-s" not in command for command in containers.commands)

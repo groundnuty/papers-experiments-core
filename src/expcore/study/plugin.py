@@ -30,6 +30,7 @@ from typing import Any
 from expcore.campaign.attempt import RunAdmission
 from expcore.campaign.defect_log import write_failure
 from expcore.campaign.executor import BackendFactory, RunExecutor
+from expcore.campaign.factors import DATA_PATH_FACTOR
 from expcore.campaign.healthgate import ContextHealthCheck, HealthCheck
 from expcore.campaign.lease import ResourceProbe
 from expcore.campaign.reset_settings import checked as checked_settings
@@ -40,7 +41,7 @@ from expcore.provenance.codestamp import covered_files
 from expcore.provenance.environment import EnvironmentUnknown, closure
 from expcore.records.build import redactor_for
 from expcore.records.rescore import Scorer, SideFileScorer, scorer_name, scorer_version
-from expcore.study.config import OUT_DIR, STUDY_FILE, StudyConfig, StudyIdentity
+from expcore.study.config import DATA_PATH_FACTOR_KEY, OUT_DIR, STUDY_FILE, StudyConfig, StudyIdentity
 from expcore.study.plugin_import import (
     PLUGIN_MODULE_PREFIX,
     Locator,
@@ -102,6 +103,11 @@ class StudyPlugin:
       declare its data). A store whose recorded fingerprint is this campaign's with `platform` in that form resumes
       under the fingerprint it recorded, unchanged; nothing else accepts it, and a merge compares the shards'
       recorded fingerprints as they are, so a store of the earlier form never merges with one of the later (C06).
+    - `data_path_factor`: the name of the factor the platform reads a run's data path by (the Onedata layer's
+      `SandboxPlatform.data_path_factor`, which a study passes from `StudyConfig.data_path_factor` when it builds the
+      platform); None for a platform that says nothing, read as the default `data_path`. The campaign refuses to start
+      when it is not the name `[study] data_path_factor` gives the study (`check_data_path_factor`, O75), so a platform
+      built without the name its study declares is never left to read the default.
     - `reset_settings`: the platform's settings that change how it does its work and not what an agent sees, and so are
       in no fingerprint, after its defaults (the Onedata layer's `Placement.reset_settings()`): a flat mapping
       of names to text, numbers, booleans or None, without a secret or a name that identifies a machine, since it
@@ -137,6 +143,7 @@ class StudyPlugin:
     environment_identity: Callable[[], Mapping[str, str]] | None = None
     reset_settings: Mapping[str, Any] = field(default_factory=dict)  # last, so positional callers keep their order
     platform_legacy: Mapping[str, Any] | None = None  # after it, for the same reason
+    data_path_factor: str | None = None  # after it, for the same reason
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
@@ -377,6 +384,11 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
     if not isinstance(plugin.platform, Mapping):
         kind = type(plugin.platform).__name__
         raise ConfigError(f"{file}: the plugin's platform must be a mapping of plain data, not a {kind}")
+    factor = plugin.data_path_factor
+    if factor is not None and (not isinstance(factor, str) or not factor.strip()):
+        raise ConfigError(
+            f"{file}: the plugin's data_path_factor must be the name of a factor, or None, not {factor!r}"
+        )
     if plugin.platform_legacy is not None and not isinstance(plugin.platform_legacy, Mapping):
         kind = type(plugin.platform_legacy).__name__
         raise ConfigError(f"{file}: the plugin's platform_legacy must be a mapping of plain data or None, not a {kind}")
@@ -401,6 +413,30 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
                 f"{file}: the plugin's backend_factory needs a 'version' attribute, a non-empty string, for the "
                 "campaign fingerprint; change it whenever the factory's behaviour changes"
             )
+
+
+def check_data_path_factor(study: StudyConfig, plugin: StudyPlugin) -> None:
+    """Refuse a campaign whose platform reads a run's data path by another factor than the study names, naming both.
+
+    The study names its data-path factor in `[study] data_path_factor` (`data_path` unset), and the plugin says which
+    one its platform reads (`StudyPlugin.data_path_factor`, None: the default). The platform maps the level of that
+    factor to a mount, a REST path or none, so one built without the name its study declares would read the default,
+    or a factor that is not the study's data path, and give a run the wrong sandbox; this refuses it before any run.
+    It holds at a campaign's start only: analysis builds no platform (O75).
+    """
+    study_name = study.data_path_factor
+    platform_name = DATA_PATH_FACTOR if plugin.data_path_factor is None else plugin.data_path_factor
+    if platform_name != study_name:
+        where = Section({}, study.root / STUDY_FILE, "[study]")
+        how = "set" if study_name != DATA_PATH_FACTOR else "the default"
+        build = f"data_path_factor={study_name!r}"
+        raise where.fail(
+            DATA_PATH_FACTOR_KEY,
+            f"names {study_name!r} as the study's data-path factor ({how}), and the plugin's platform reads a run's "
+            f"data path by {platform_name!r}: build the platform with `{build}` "
+            "(`SandboxPlatform(..., data_path_factor=context.study.data_path_factor)`) and pass "
+            "`StudyPlugin(..., data_path_factor=platform.data_path_factor)`, or make the two names one",
+        )
 
 
 def _check_backends(study: StudyConfig) -> None:

@@ -24,6 +24,10 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     h1 = ["a-vs-b"]            # Holm-adjusted over its own members, apart from the Holm families; each member in a
                                # Holm family with a margin, and in one equivalence family at most
 
+    [sensitivity]              # (S19) the sensitivity reruns the study expects, which `analyze` must run exactly;
+                               # optional only for a study no guard checks: an absent table reads as reruns = []
+    reruns = ["egress", "mount_guard", "process_visibility", "any_guard"]   # any of the four, each at most once
+
     [bootstrap]
     replicates = 2000
     seed = 20260101
@@ -99,7 +103,7 @@ from typing import Any
 
 from expcore.campaign.factors import BUILTIN_FACTORS, FactorSchema
 from expcore.config.loading import ConfigError, Section
-from expcore.stats import estimators, smallest
+from expcore.stats import estimators, reruns, smallest
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
 from expcore.stats.onearm import DescriptiveSpec
 from expcore.stats.pairing import MODEL_KEY, TREATMENT_OUTCOMES, ContrastSpec
@@ -116,6 +120,7 @@ _TOP_KEYS = (
     "exploratory_only",
     "equivalence_family",
     "equivalence_families",
+    "sensitivity",
     "bootstrap",
     "power",
     "estimators",
@@ -201,6 +206,8 @@ class Preregistration:
     holm_families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)  # named families (S17)
     # named equivalence families (S18), each Holm-adjusted over its own members
     equivalence_families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
+    # the sensitivity reruns the study declares (S19), None without the table, which `analyze` reads as `()`
+    sensitivity_reruns: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Deep-freeze the contrasts, the families, the estimator parameters and the one-arm estimates into fresh
@@ -222,6 +229,7 @@ class Preregistration:
         )
         for name in names:
             object.__setattr__(self, name, freeze(getattr(self, name)))
+        object.__setattr__(self, "sensitivity_reruns", reruns.checked(self.sensitivity_reruns))
         if self.holm_families:
             object.__setattr__(self, "holm_family", self._union_of_families())
         if self.equivalence_families:
@@ -405,6 +413,7 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
         descriptives,
         holm_families=families,
         equivalence_families=equivalence_families,  # its union fills in `equivalence`, empty beside it (S18)
+        sensitivity_reruns=reruns.declared(root),
     )
 
 

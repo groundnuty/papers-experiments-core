@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fingerprint_support import standin_python
 from hpc_fed_support import LAYOUT, PILOT_TEMPLATE, SITE, agent_site, data_stand_in, hpc_on_path, services_only
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
@@ -30,9 +31,11 @@ EXPECTED = "render-identity.expected.json"
 STUDY_STATE = "study-state"
 VERSION = "expcore-render-identity/1"
 PINS = {"sandbox_sif_sha256", "egress_shim_sha256", "egress_collector_sha256", "oneclient_bundle_sha256"}
+GATEPORT = "gateport_sha256"  # in the record only when the template names the 443 mapper's preload (the REST layout)
 ARTIFACTS = "study_artifacts_tree_sha256"  # in the record only when the site declares HPC_STUDY_ARTIFACTS
-RENDERED = {"version", "template_sha256", "platform_fingerprint_sha256"} | PINS  # a render with no artifacts directory
-KEYS = RENDERED | {ARTIFACTS}
+RENDERED = {"version", "template_sha256", "platform_fingerprint_sha256"} | PINS  # the pilot's, no artifacts directory
+KEYS = RENDERED | {GATEPORT, ARTIFACTS}
+REST_LAYOUT = LAYOUT.parent / "pilot-shape-rest.toml"
 HEX = re.compile(r"[0-9a-f]{64}")
 SIF = b"an invented SIF image\n"
 
@@ -58,6 +61,9 @@ def shards():
     sys.modules["hpc_shards_render_identity"] = module  # its dataclasses look their module up by name
     try:
         spec.loader.exec_module(module)
+        # these manifests name an interpreter that does not exist; the core it imports is asked in
+        # test_hpc_shards_core_identity.py (C06), with real interpreters
+        module.identify_core = lambda plan: {"known": True, "stale": False, "why": None}
         yield module
     finally:
         sys.modules.pop("hpc_shards_render_identity", None)
@@ -85,6 +91,7 @@ def render(
     printed: list | None = None,
     work_root: Path | None = None,
     tree: Path | None = None,
+    gateport: bytes | None = None,
 ) -> Path:
     """The core's phase of `layout` over a root of its own (as `hpcfed.py up` runs it), its pins the site's files
     `agent_site(…, sif=sif)` as declared and its sandbox's work root `work_root` (the step makes it under its tmpfs);
@@ -106,7 +113,7 @@ def render(
     federation = fedlayout.Layout(root, root.parent, hpc.boot.hpc_spec(spec, hosts))
     site = {
         **SITE,
-        **agent_site(root.parent / "pins", sif=sif, work_root=work_root),
+        **agent_site(root.parent / "pins", sif=sif, work_root=work_root, gateport=gateport),
         "SH": "/invented/images",
         "L": "/invented/logs",
     }
@@ -198,6 +205,50 @@ def test_o74_a_changed_pin_gives_another_record_in_the_pin_and_the_fingerprint_t
     assert differing(record_of(one), record_of(other)) == {"sandbox_sif_sha256", "platform_fingerprint_sha256"}
 
 
+MAPPER = b"an invented 443 mapper\n"
+
+
+def test_o74_up_of_the_rest_layout_records_the_mappers_pin_beside_the_others(hpc, tmp_path, ca):
+    """O74: the REST layout's template names the 443 mapper's preload, so its record holds `gateport_sha256`, the
+    SHA-256 `HPC_GATEPORT_SHA256` declared and `up` checked, beside the pilot's pins, and no path of the mapper."""
+    root = render(hpc, tmp_path / "a" / "root", ca, layout=REST_LAYOUT, gateport=MAPPER)
+    declared = agent_site(tmp_path / "a" / "pins", gateport=MAPPER)
+    text = (root / FILE).read_text(encoding="utf-8")
+    record = json.loads(text)
+    assert set(record) == RENDERED | {GATEPORT}
+    assert record[GATEPORT] == declared["HPC_GATEPORT_SHA256"] == sha(MAPPER)
+    assert all(HEX.fullmatch(value) for key, value in record.items() if key != "version")
+    assert "gateport.so" not in text
+    assert str(tmp_path) not in text
+
+
+def test_o74_a_template_that_names_no_mapper_has_no_such_key_though_the_site_declares_one(hpc, tmp_path, ca):
+    """O74: the pilot's template names no preload, so its record holds no `gateport_sha256` (absent, never null) even
+    for a site that declares the mapper: a pin is in the record when the template names it, not when the site has it."""
+    root = render(hpc, tmp_path / "a" / "root", ca, gateport=MAPPER)
+    assert set(record_of(root)) == RENDERED
+    assert GATEPORT not in (root / FILE).read_text(encoding="utf-8")
+    assert "null" not in (root / FILE).read_text(encoding="utf-8")
+
+
+def test_o74_a_changed_mapper_gives_another_record_in_its_pin_and_the_fingerprint_that_holds_it(hpc, tmp_path, ca):
+    """O74: the mapper rebuilt: the record differs in `gateport_sha256` and in the platform's fingerprint (which holds
+    the preload's hash), and in nothing else."""
+    one = render(hpc, tmp_path / "a" / "root", ca, layout=REST_LAYOUT, gateport=MAPPER)
+    other = render(hpc, tmp_path / "b" / "root", ca, layout=REST_LAYOUT, gateport=MAPPER + b"another build\n")
+    assert differing(record_of(one), record_of(other)) == {GATEPORT, "platform_fingerprint_sha256"}
+
+
+def test_o74_the_rest_and_the_pilot_layouts_give_records_that_differ_by_the_template_the_pin_and_the_fingerprint(
+    hpc, tmp_path, ca
+):
+    """O74: one site, two layouts: the REST arm's record is the pilot's with the mapper's pin, another template hash
+    and another platform fingerprint, the pins of the pilot unchanged."""
+    pilot = render(hpc, tmp_path / "a" / "root", ca, gateport=MAPPER)
+    rest = render(hpc, tmp_path / "b" / "root", ca, layout=REST_LAYOUT, gateport=MAPPER)
+    assert differing(record_of(pilot), record_of(rest)) == {GATEPORT, "template_sha256", "platform_fingerprint_sha256"}
+
+
 def test_o74_a_changed_template_gives_another_record_in_the_template_entry_alone(hpc, tmp_path, ca):
     """O74: the template edited (a comment: the platform it renders is the same) differs in the template's hash only."""
     one = render(hpc, tmp_path / "a" / "root", ca, layout=edited_layout(tmp_path / "la", "one"))
@@ -241,7 +292,7 @@ def test_o74_up_with_a_study_artifacts_directory_records_the_digest_of_its_tree_
     root = render(hpc, tmp_path / "a" / "root", ca, tree=tree)
     text = (root / FILE).read_text(encoding="utf-8")
     record = json.loads(text)
-    assert set(record) == KEYS
+    assert set(record) == RENDERED | {ARTIFACTS}
     assert record[ARTIFACTS] == hpc.identity.tree_sha256(tree)
     assert HEX.fullmatch(record[ARTIFACTS])
     assert text == json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
@@ -445,6 +496,8 @@ def test_o74_a_step_expecting_the_old_record_refuses_before_anything_is_made_nam
     [({"version": "expcore-render-identity/2"}, {"version"}),
      ({"template_sha256": sha("an edited template")}, {"template_sha256"}),
      ({"egress_shim_sha256": None}, {"egress_shim_sha256"}),  # a pin the federation's render does not hold
+     ({"gateport_sha256": None}, {"gateport_sha256"}),  # the mapper's pin: the plan's, not the federation's
+     ({"gateport_sha256": sha("another mapper")}, {"gateport_sha256"}),
      ({"oneclient_bundle_sha256": sha("another bundle"), "egress_collector_sha256": sha("another collector")},
       {"oneclient_bundle_sha256", "egress_collector_sha256"})],
 )  # fmt: skip
@@ -789,7 +842,7 @@ def manifest(tmp_path: Path, extra: str = "", expected: dict | str | None = None
     """A shard plan of two federations; `extra` (top-level keys) goes before the `[[shards]]`; `expected` is the study's
     expected record, when there is one."""
     make_study(tmp_path, expected)
-    lines = [f'study = "{tmp_path / "study"}"', f'python = "{tmp_path / "venv" / "python"}"',
+    lines = [f'study = "{tmp_path / "study"}"', f'python = "{standin_python(tmp_path / "venv")}"',
              f'core_src = "{tmp_path / "core" / "src"}"', f'results = "{tmp_path / "results"}"',
              f'tmpfs = "{tmp_path / "tmpfs"}"', 'step_path = "/usr/bin:/bin"', "cpus = 6",
              'memory = "18g"']  # fmt: skip
@@ -896,7 +949,7 @@ def test_o74_the_step_s_own_copy_of_the_records_names_is_the_driver_s(hpc, shard
     identity_module = hpc.identity
     assert shards.RENDER_IDENTITY == identity_module.FILE == FILE
     assert shards.RENDER_IDENTITY_VERSION == identity_module.VERSION == VERSION
-    assert set(shards.RENDER_IDENTITY_PINS) == set(identity_module.PINS) == PINS
+    assert set(shards.RENDER_IDENTITY_PINS) == set(identity_module.PINS) == PINS | {GATEPORT}
     assert shards.RENDER_IDENTITY_ARTIFACTS == identity_module.ARTIFACTS == ARTIFACTS
     assert set(shards.RENDER_IDENTITY_KEYS) == set(identity_module.KEYS) == KEYS
     assert shards.STUDY_STATE == STUDY_STATE

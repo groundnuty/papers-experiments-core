@@ -57,7 +57,7 @@ from expcore.egress import Declaration, declaration
 from expcore_onedata import tls as TLS
 from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import deadline as DL
-from expcore_onedata.sandbox import gatelog, gatepolicy, inputs, kinds, tokenfiles
+from expcore_onedata.sandbox import gatelog, gatepolicy, hostfacts, inputs, kinds, tokenfiles
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
     DataPathMode,
@@ -154,6 +154,7 @@ class ApptainerSandbox:
         if config_sha256:
             self._meta["platform_config_sha256"] = config_sha256
         self._meta_lock = threading.RLock()
+        self._evidence: list[Path] = []  # where `collect` wrote its evidence: a host path, never in the metadata
         self._phase = threading.Lock()
         self._agent_began, self._steps_running, self._refusals_seen = False, 0, 0
         self._stopped, self._stop_lock = True, threading.Lock()
@@ -308,6 +309,7 @@ class ApptainerSandbox:
         self._started = time.time()
         self._meta.update(host=self.node.node_facts(self.app.apptainer),
                           started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))  # fmt: skip
+        self._meta["infrastructure_facts"]["node"] = hostfacts.of_node(lambda: self.node.node_readings())  # O87
         self._checkpoint()
         self._start_collector()
         self._checkpoint()
@@ -757,6 +759,13 @@ class ApptainerSandbox:
         """The nonce of the mount guard's watcher (`expcore.mountguard.MountGuard`), once the helper exists."""
         return getattr(self._mount, "nonce", None)
 
+    @property
+    def data_path_kind(self) -> str:
+        """The run's data path, `mount`, `rest` or `none`, from the spec it was started with: what
+        `expcore.mountguard.mount_guard_for` decides on. It is the spec's and never read from the helper, so a mount run
+        whose helper keeps no watcher is still a mount run (O60)."""
+        return self.spec.mode.value
+
     def mount_io_mode(self) -> dict[str, Any]:
         if self.spec.mode is not DataPathMode.MOUNT or self._mount is None:
             return {"mount": False}
@@ -832,6 +841,7 @@ class ApptainerSandbox:
         self.record(tool_server_process={"on": "node", "home": "run_directory", "tmpdir": "home", "run_tag": True,
                                          "inherited": ["PATH"]})  # fmt: skip
         try:
+            self._note_tool_server_host()
             yield ServerProcess(home=home, env={AV.RUN_TAG: self.sid, "TMPDIR": str(home / "tmp")})
         finally:
             try:
@@ -841,9 +851,33 @@ class ApptainerSandbox:
             except OSError as error:  # the teardown removes the run's directory, this one with it
                 log.error("the tool server's directory could not be removed: %s", describe_error(error))
 
+    def _note_tool_server_host(self) -> None:
+        """O87: the tool server's host's OS release, glibc and kernel, beside the node's, when they differ from it: on
+        the node's own host (the driver's child) they are the node's and nothing is added. Recorded, never refused."""
+        theirs = hostfacts.of_node(lambda: self.node.tool_server_readings())  # the lookup is guarded too
+        with self._meta_lock:
+            facts = self._meta["infrastructure_facts"]
+            if theirs != facts.get("node"):
+                facts["tool_server_host"] = theirs
+
     def record(self, **fields: Any) -> None:
         with self._meta_lock:
             self._meta.update(fields)
+
+    def note_evidence(self, dest: Path) -> None:
+        """Remember a directory `collect` wrote the run's evidence into (as Docker's, for the federation's window)."""
+        with self._meta_lock:
+            if dest not in self._evidence:
+                self._evidence.append(dest)
+
+    def evidence_dirs(self) -> tuple[Path, ...]:
+        with self._meta_lock:
+            return tuple(self._evidence)
+
+    def record_infrastructure_fact(self, key: str, value: Any) -> None:
+        """Add one fact beside the departures in `infrastructure_facts` (as Docker's: the federation's window, O86)."""
+        with self._meta_lock:
+            self._meta.setdefault("infrastructure_facts", {})[key] = value
 
     def note_end(self, kind: str) -> None:
         with self._meta_lock:

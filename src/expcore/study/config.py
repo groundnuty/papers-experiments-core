@@ -30,6 +30,16 @@ and a study with neither points at none:
     [study]
     platform_config = "platform.toml"     # optional: the platform's own settings, a file of the study directory
 
+The study names which of its declared factors is the data path, the factor whose levels `platform.toml` maps to a
+mount, a REST path or none, in one optional key; the core reads the data path of a run from it and from nothing else
+(`StudyConfig.data_path_factor`, the mount guard's judge of a run with no mount, O75):
+
+    [study]
+    data_path_factor = "path"             # optional, default "data_path": the name of a declared factor, else refused
+
+Without the key the factor is `data_path`, whether or not the study declares it, and the study is exactly as it was.
+The key is a setting of study.toml, so it is in that file's hash and in no other part of the campaign fingerprint.
+
 A module that cannot be imported is refused, as is a study kind that is a core kind or a platform's. A platform's kinds
 are the process's once imported. A study's own last only while it is loaded and while the pipeline works on it
 (`errors.study_kinds(study.kinds)`), so a study's kinds do not outlast it. Neither key is part of the factor schema;
@@ -62,7 +72,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.config import CampaignConfig, load_campaign
-from expcore.campaign.factors import FactorSchema, PlanError, load_factor_schema
+from expcore.campaign.factors import DATA_PATH_FACTOR, FactorSchema, PlanError, load_factor_schema
 from expcore.campaign.manifest import Manifest, build_manifest
 from expcore.campaign.markers import MARKER_NAME
 from expcore.campaign.shard import ShardError
@@ -86,6 +96,7 @@ PREREG_FILE = "preregistration.toml"
 OUT_DIR = "out"  # everything a study produces goes below it (`study.pipeline`)
 CONFIG_FILES = (STUDY_FILE, MODELS_FILE, CAMPAIGN_FILE, PREREG_FILE)
 PLATFORMS_KEY, KINDS_KEY, SIDE_FILES_KEY = "platforms", "kinds", "side_files"
+DATA_PATH_FACTOR_KEY = "data_path_factor"
 PLATFORM_CONFIG_KEY, PLATFORM_FILE = "platform_config", "platform.toml"
 KIND_KEYS = ("description", "treatable")
 SIDE_FILE_KEYS = ("pattern", "hash_field")
@@ -122,6 +133,8 @@ class StudyConfig:
         str, ...
     ] = ()  # `[study] platforms`: the modules the core asks for the platform's declared deferral
     platform_config: Path | None = None  # `[study] platform_config`, or the platform.toml beside study.toml; resolved
+    # `[study] data_path_factor`: the declared factor whose levels are the study's data paths (O75), `data_path` unset
+    data_path_factor: str = DATA_PATH_FACTOR
 
     @property
     def manifest(self) -> Manifest:
@@ -168,7 +181,17 @@ def _tasks(top: Section, file: Path) -> dict[str, Task]:
 def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope, tuple[str, ...]]:
     section = Section(top.section("study").data, top.file, "[study]")
     section.reject_unknown(
-        ["name", "plugin", "code", PLATFORMS_KEY, PLATFORM_CONFIG_KEY, KINDS_KEY, "requires", SIDE_FILES_KEY]
+        [
+            "name",
+            "plugin",
+            "code",
+            PLATFORMS_KEY,
+            PLATFORM_CONFIG_KEY,
+            KINDS_KEY,
+            "requires",
+            SIDE_FILES_KEY,
+            DATA_PATH_FACTOR_KEY,
+        ]
     )
     name, plugin = section.string("name"), section.string("plugin")
     plugin_file = (root / plugin).resolve()
@@ -189,6 +212,23 @@ def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope, tuple[
     if bad or len(set(requires)) != len(requires):
         raise section.fail("requires", "must name installed distributions, each once, with no version")
     return name, plugin_file, scope, requires
+
+
+def _data_path_factor(top: Section, schema: FactorSchema) -> str:
+    """The factor `[study] data_path_factor` names, a factor the study declares (O75), else the default name."""
+    section = Section(top.section("study").data, top.file, "[study]")
+    name = section.optional_string(DATA_PATH_FACTOR_KEY)
+    if name is None:
+        return DATA_PATH_FACTOR
+    if name not in schema.declared:
+        raise section.fail(DATA_PATH_FACTOR_KEY, _undeclared(name, schema))
+    return name
+
+
+def _undeclared(name: str, schema: FactorSchema) -> str:
+    """Why a data-path factor is not one: it names no factor the study declares, which are listed."""
+    declared = ", ".join(schema.declared) or "none"
+    return f"names no declared factor: {name!r} is not one of the study's factors ({declared})"
 
 
 def _platforms(top: Section) -> tuple[str, ...]:
@@ -390,6 +430,7 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
         side_files,
         _platforms(top),
         _platform_config(top, root),
+        _data_path_factor(top, schema),
     )
     _check_shard_budgets(study)
     return study
@@ -411,7 +452,8 @@ def check_study(study: StudyConfig) -> None:
       contrast's cluster is an attribute of every task, a campaign that shards by model and has a budget shares it;
     - the plan expands: no list is empty or repeats, a seed is an integer, and a task a condition names is a task of
       the plan, so a cut of the tasks that leaves a condition naming one it dropped is refused here and not at the
-      first run (every refusal is a ConfigError, the plan's own named for campaign.toml).
+      first run (every refusal is a ConfigError, the plan's own named for campaign.toml);
+    - the data-path factor is `data_path` or a factor the study declares (`[study] data_path_factor`, O75).
 
     Not repeated: importing `[study] platforms`, which `load_study` does for the process, since a config names a
     platform's kind only in a process that has imported the platform; and the preregistration against the schema,
@@ -419,6 +461,10 @@ def check_study(study: StudyConfig) -> None:
     campaign, not of the analysis it was preregistered with.
     """
     declared = Section({}, study.root / STUDY_FILE, f"[study.{KINDS_KEY}]")
+    where = Section({}, study.root / STUDY_FILE, "[study]")
+    factor = study.data_path_factor
+    if not isinstance(factor, str) or (factor != DATA_PATH_FACTOR and factor not in study.schema.declared):
+        raise where.fail(DATA_PATH_FACTOR_KEY, _undeclared(str(factor), study.schema))
     for kind, entry in study.kinds.items():
         try:
             check_study_kind(kind, entry.description)

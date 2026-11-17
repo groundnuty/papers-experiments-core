@@ -133,6 +133,15 @@ def support_record(config: PlatformConfig) -> dict[str, Any]:
     }
 
 
+def check_provider_record(config: PlatformConfig) -> str | None:
+    """The provider `[sandbox] content_check_provider` has the content check read through, by its position in the
+    file (`providers[i]`, never its name, O12), or None when that is the agent's local provider, named or not: a
+    setting at its default and one left out are one experiment (C06), and a store started before the key resumes.
+    The check reads where the study's states say a file is, so a run's baseline depends on it (O87)."""
+    reader = config.content_check_reader
+    return None if reader.name == config.local_provider.name else config.provider_label(reader.name)
+
+
 def sandbox_record(sandbox: SandboxSettings, roles: list[tuple[str, str]]) -> dict[str, Any]:
     """`[sandbox]`'s settings that shape a run beside its data paths, served caps and Apptainer pins (which keep their
     own keys): the backend; on Docker every image by its pinned id (on Apptainer the SIF is in its pins); every limit;
@@ -142,7 +151,8 @@ def sandbox_record(sandbox: SandboxSettings, roles: list[tuple[str, str]]) -> di
     the agent's placeholder token by its SHA-256. Not here: the work root, the name prefix, the label namespace, the
     privilege command and earlyoom's name for the driver (the host's own), the network pools and `[sandbox.federation]`
     (the host's and the federation's addresses and names), the mount's storages and check file (the federation's
-    storage ids and the host's paths), and `content_check_file`, read once before a campaign."""
+    storage ids and the host's paths), and `content_check_file`, read once before a campaign. The provider that file is
+    read through is in, when it is not the local one, beside this record (`check_provider_record`, O87)."""
     from expcore_onedata.sandbox.settings import Limits  # it imports the sandbox's modules: import when used
 
     mount = sandbox.mount

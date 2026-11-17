@@ -106,6 +106,8 @@ def log(window=(), **options) -> bytes:
     return encode(lines(window, **options))
 
 
-def record(*, instruments=None, run_key="run-1", attempt=1):
+def record(*, instruments=None, run_key="run-1", attempt=1, factors=None):
     """A stand-in for a RunRecord with what `judge` reads."""
-    return SimpleNamespace(run_key=run_key, attempt=attempt, instruments=dict(instruments or {}))
+    return SimpleNamespace(
+        run_key=run_key, attempt=attempt, instruments=dict(instruments or {}), factors=dict(factors or {})
+    )

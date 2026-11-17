@@ -425,13 +425,17 @@ def test_o57_a_template_that_is_no_toml_once_filled_in_is_left_to_the_renderer(p
 
 
 @pytest.mark.parametrize("kind", ["tmpfs", "shared_filesystem"])
-def test_o57_every_shipped_template_is_toml_once_filled_in_and_the_pilot_s_declares_the_kind(pins, kind):
+def test_o57_every_shipped_template_is_toml_once_filled_in_and_the_sandbox_ones_declare_the_kind(pins, kind):
     """O57: the preflight really reads the templates this repository ships (none is silently skipped as no TOML), and
-    the pilot's and the slots example's (the pilot's with the slots and the tool server after it), filled in for a
-    site, declare that site's kind in `[sandbox.apptainer]`; the others declare no Apptainer sandbox."""
+    the pilot's, its REST arm's and the slots example's (the pilot's with the slots and the tool server after it),
+    filled in for a site, declare that site's kind in `[sandbox.apptainer]`; the others declare no Apptainer sandbox."""
     import tomllib
 
-    declaring = {PILOT_TEMPLATE, PILOT_TEMPLATE.with_name("pilot-shape-slots.platform.toml.template")}
+    declaring = {
+        PILOT_TEMPLATE,
+        PILOT_TEMPLATE.with_name("pilot-shape-rest.platform.toml.template"),
+        PILOT_TEMPLATE.with_name("pilot-shape-slots.platform.toml.template"),
+    }
     for template in sorted(PILOT_TEMPLATE.parent.glob("*.platform.toml.template")):
         document = tomllib.loads(pins.filled_in(template.read_text(encoding="utf-8"), kind))
         declared = document.get("sandbox", {}).get("apptainer", {}).get("provider_storage")

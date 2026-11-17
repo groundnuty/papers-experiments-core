@@ -184,12 +184,17 @@ def _parse_run(args: Sequence[str]) -> tuple[dict[str, Any], str, list[str]]:
     return options, args[i], list(args[i + 1 :])
 
 
+READINGS = {"os": {"id": "invented", "version_id": "9.9"}, "glibc": "glibc 2.99", "kernel": "9.99.0-invented"}
+
+
 class FakeHost:
     """An in-memory host. Set `images`, `files`, `mounts` and the handlers before the code under test runs."""
 
     def __init__(self, work_root: Path | None = None) -> None:
         self.lock = threading.RLock()
         self.work_root = work_root
+        self.readings: Any = READINGS  # what `host_readings` answers (O87); a test sets another, or `readings_error`
+        self.readings_error: Exception | None = None
         self.images: dict[str, str] = {}
         self.containers: dict[str, FakeContainer] = {}
         self.networks: dict[str, dict[str, Any]] = {}
@@ -344,6 +349,11 @@ class FakeHost:
 
     def host_facts(self) -> dict[str, Any]:
         return {"kernel": "test-kernel", "docker_server": "0.0"}
+
+    def host_readings(self) -> dict[str, Any]:
+        if self.readings_error is not None:
+            raise self.readings_error
+        return json.loads(json.dumps(self.readings))
 
     # ---------------------------------------------------------------- HostOps: run
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:

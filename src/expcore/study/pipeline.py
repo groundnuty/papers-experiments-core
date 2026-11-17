@@ -102,6 +102,7 @@ from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
 from expcore.errors import study_kinds
 from expcore.guards import GuardsAnalysis, guards_analysis
 from expcore.models.route import sdk_version
+from expcore.mountguard.campaign import recorded_data_paths
 from expcore.mountguard.sensitivity import MountGuardAnalysis, mount_guard_analysis
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
@@ -124,6 +125,8 @@ from expcore.replay.side_file_placement import settle_side_files
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.ratio import OMIT_NONE
+from expcore.stats.reruns import difference as reruns_difference
+from expcore.stats.reruns import missing_table, ran_reruns
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, require_run_scorers
 from expcore.study.config import (
@@ -143,7 +146,7 @@ from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
 from expcore.study.platform_deferral import platform_deferrals
 from expcore.study.platform_legacy import legacy_fingerprint_of
-from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
+from expcore.study.plugin import StudyContext, StudyPlugin, check_data_path_factor, import_plugin_module, load_plugin
 from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
 from expcore.visibility.sensitivity import VisibilityAnalysis, visibility_analysis
@@ -177,7 +180,9 @@ class StudyAnalysis:
     scorers: Mapping[str, str]  # the version of each scorer that scored the records, by name
     egress: EgressAnalysis | None = None  # a batch checked for egress: the verdicts and the sensitivity analysis
     mount_guard: MountGuardAnalysis | None = None  # a batch whose mount was guarded: the same, of the mount (O60)
-    guards: GuardsAnalysis | None = None  # a batch checked by both: the rerun without the runs either leaves out
+    guards: GuardsAnalysis | None = (
+        None  # a batch checked by two or more guards: the rerun without the runs any leaves out
+    )
     visibility: VisibilityAnalysis | None = None  # a batch watched for hidden processes: the same, of those (O56)
 
 
@@ -416,6 +421,7 @@ def _build(
     scheduler's settings, the campaign's fingerprint, and the manifest and the start of a shard or a selection. This is
     the study's build, which runs the study's own code (`run_built_study` watches it for platform loaders)."""
     plugin = load_plugin(StudyContext(study, code))
+    check_data_path_factor(study, plugin)  # before any run: the platform reads the data path by the study's factor
     leases = None if plugin.probe is None else LeasePool(out_dir(study) / "leases", plugin.lease_keys, plugin.probe)
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
     fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
@@ -891,16 +897,21 @@ def _analyse_loaded(
         except MergeRefused as error:
             verified.close()
             raise Refused(str(error)) from None
-    fingerprints = []
+    fingerprints, recorded_paths = [], []
     for snapshot in verified.snapshots.values():
         rows = snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
-        fingerprints.append(recorded_fingerprint(rows))
-        changed = differences(campaign_environment(fingerprints[-1]), check["environment"])
+        fingerprint = recorded_fingerprint(rows)
+        fingerprints.append(fingerprint)
+        recorded_paths.append(recorded_data_paths(fingerprint))
+        changed = differences(campaign_environment(fingerprint), check["environment"])
         if changed:
             verified.close()
             raise Refused(
                 "the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed)
             )
+    # the data path of each level of `data_path`, as every snapshot's campaign fingerprint records it; none when the
+    # snapshots disagree, so a run the guard might not apply to is then left unknown (O75)
+    data_paths = recorded_paths[0] if recorded_paths and all(p == recorded_paths[0] for p in recorded_paths) else None
     loaded = load_analysis_plugin(StudyContext(study, code))  # the one place a `build_analysis` is built (R17)
     plugin = loaded.plugin
     if loaded.from_build_analysis:  # the run's own `build` is not compared: re-scoring after a scorer change is R13
@@ -931,12 +942,29 @@ def _analyse_loaded(
     except ContrastRefused as error:  # a treatment attempt's None (S10), a failed run's None numerator (S13)
         raise Refused(str(error)) from None
     egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
-    guard = mount_guard_analysis(runs, rows, absent, study.prereg)  # None for a batch whose mount was not guarded
-    both = guards_analysis(rows, absent, study.prereg, egress, guard)  # None unless both guards checked the batch
+    guard = mount_guard_analysis(runs, rows, absent, study.prereg, data_paths, study.data_path_factor)  # O75
     seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
+    both = guards_analysis(rows, absent, study.prereg, egress, guard, seen)  # None unless two guards checked the batch
+    _require_declared_reruns(study, ran_reruns(egress, guard, seen, both))
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
     return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen)
+
+
+def _require_declared_reruns(study: StudyConfig, ran: tuple[str, ...]) -> None:
+    """Refuse an analysis whose sensitivity reruns are not exactly those the preregistration declares in
+    `[sensitivity] reruns` (S19), in either direction, naming the difference. An absent table reads as `reruns = []`:
+    a batch no guard checked runs no rerun and passes, and one a guard checked is refused, naming the reruns it would
+    run and the table that is missing."""
+    declared = study.prereg.sensitivity_reruns
+    said = reruns_difference(() if declared is None else declared, ran)
+    if said is not None:
+        missing = "" if declared is not None else f"\n  {missing_table(study.prereg.source, ran)}"
+        raise Refused(
+            f"{study.prereg.source}: the sensitivity reruns this analysis would run are not the ones [sensitivity] "
+            f"reruns declares:\n  {said}{missing}\nlist the guard's instrument on the runs it applies to, or change "
+            "the declaration before the analysis"
+        )
 
 
 def _checked_environment(batch: Path) -> Any:
@@ -998,7 +1026,8 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
     Holm decision, with each named family's steps (S17) and each declared equivalence family's (S18). `exploratory_only`
     is true when the preregistration makes no confirmatory claim (S12): there is then no Holm decision, and every
-    contrast is exploratory."""
+    contrast is exploratory. A preregistration that declares its sensitivity reruns (S19) has them under
+    `sensitivity_reruns`."""
     return (
         {
             "preregistration": dict(analysis.result.manifest),
@@ -1018,7 +1047,14 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         | ({} if analysis.mount_guard is None else {"mount_guard": _mount_guard_summary(analysis.mount_guard)})
         | ({} if analysis.guards is None else {"guards": _guards_summary(analysis.guards)})
         | ({} if analysis.visibility is None else {"process_visibility": _visibility_summary(analysis.visibility)})
+        | _declared_reruns_entry(analysis.study.prereg.sensitivity_reruns)
     )
+
+
+def _declared_reruns_entry(declared: tuple[str, ...] | None) -> dict[str, Any]:
+    """`sensitivity_reruns` (S19): the reruns the preregistration declares, which the analysis ran exactly; nothing for
+    a preregistration that declares none, so its analysis.json is as it was."""
+    return {} if declared is None else {"sensitivity_reruns": list(declared)}
 
 
 def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
@@ -1054,8 +1090,8 @@ def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
 
 def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds of a batch whose mount was guarded (O60): each analysed run's verdict (its flags, its
-    log's and its isolation's state and reasons, its accesses and tracers) and the sensitivity analysis without the
-    runs that are not clean, or why there is none."""
+    log's and its isolation's state and reasons, its accesses and tracers; `not_applicable` with its `data_path` for a
+    run that had no mount) and the sensitivity analysis without the runs that are not clean, or why there is none."""
     sensitivity = guard.sensitivity
     return {
         "counts": guard.counts(),
@@ -1064,6 +1100,8 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
                 "run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "verdict": run.verdict,
                 "flags": list(run.flags), "log": run.log, "unknown": list(run.unknown), "isolation": run.isolation,
                 "unproven": list(run.unproven), "accesses": dict(run.accesses), "traced": run.traced,
+                "data_path": run.not_applicable,  # `rest` or `none` for a run the guard does not apply to, else None
+                "data_path_from": run.data_path_from,  # `record` or `campaign` for such a run, else None
             }
             for run in guard.runs
         ],
@@ -1076,15 +1114,17 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
 
 
 def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
-    """What `analysis.json` holds of a batch checked by both guards (O60): the runs either leaves out, overall and per
-    condition, each run as both found it, and the rerun without the left-out runs, or why there is none."""
+    """What `analysis.json` holds of a batch checked by two or more guards (O60, O76): the guards that checked it, the
+    runs any leaves out, overall and per condition, each run as each guard found it (None for a guard that did not
+    check the batch), and the rerun without the left-out runs, or why there is none."""
     sensitivity = guards.sensitivity
     return {
+        "guards": list(guards.guards),
         "counts": guards.counts(),
         "by_condition": guards.by_condition(),
         "runs": [
             {"run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "egress": run.egress,
-             "mount": run.mount, "left_out_by": run.by}
+             "mount": run.mount, "visibility": run.visibility, "left_out_by": run.by}
             for run in guards.runs
         ],
         "sensitivity": None
