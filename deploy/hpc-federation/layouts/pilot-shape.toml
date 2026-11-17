@@ -3,7 +3,7 @@
 # declares the four data spaces, so the link check covers ten ordered provider pairs, as the pilot's does.
 #
 #   set -a; . deploy/hpc-federation/site.env; set +a
-#   uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
+#   uv run python -I -B deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
 #     --root <a directory on a filesystem the login node and the nodes see> up
 #
 # The ports and memory limits are the Compose federation's and unused here: on HPC every service listens on its node's

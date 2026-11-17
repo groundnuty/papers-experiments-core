@@ -332,16 +332,17 @@ fake Slurm; not run live.**
 
 ```bash
 set -a; . deploy/hpc-federation/site.env; set +a
-uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
   --root <a directory on a filesystem the login node and the nodes see> describe   # the plan and what it bills
-uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> up
-uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> down
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> up
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> down
 ```
 
-Run them from the checkout, or another directory of ours, never a shared one such as the login node's `/tmp`: `uv
-run` takes the project of the working directory when it has a `pyproject.toml`, and builds it. Every Python the driver
-itself launches runs with `-I` (the fault relay among them, in the federation's root), so the working directory never
-reaches its `sys.path` (`DESIGN.md`, section 3).
+Run them as shown, `python -I -B`, from the checkout or another directory of ours, never a shared one such as the
+login node's `/tmp`: `uv run` takes the project of the working directory when it has a `pyproject.toml`, and builds it.
+Every Python the driver itself launches runs with `-I -B` (the fault relay among them, in the federation's root), so
+the working directory never reaches its `sys.path` and no bytecode is written beside what it imports (`DESIGN.md`,
+section 3).
 
 - **The layout** is a `deploy/compose-federation` layout (its providers, spaces, principals, probe space and platform
   template) with an `[hpc]` table of sizes, which Compose ignores: the held job's `--time`, each service step's cores
@@ -382,7 +383,7 @@ reaches its `sys.path` (`DESIGN.md`, section 3).
   `up`: it finds them there), and
   removes the root. After a partial `up` it finds the job by its recorded id, or by its allocation's exact name.
 - **Every step** is `srun --jobid --exact` with a name, its size, `--chdir=/` and `/usr/bin/env -i PATH=... LC_ALL=C
-  TMPDIR=<node tmpfs>`, and every Python in it runs with `-I`; no step uses `--overlap`; a control step's srun client
+  TMPDIR=<node tmpfs>`, and every Python in it runs with `-I -B`; no step uses `--overlap`; a control step's srun client
   is ended only once its step is gone from `squeue -s`, and one still listed at its bound is cancelled by its own id.
 - **The site** comes from `site.env` (`HPC_ACCOUNT`, `HPC_PARTITION`, `SH`, `L`, and optionally `HPC_STEP_PATH`,
   `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`), recorded in the state file
@@ -442,9 +443,10 @@ line, whose environment is an allowlist (`PATH`, `LC_ALL` and the federation's r
 the stamped study to the node's tmpfs (the store's lock refuses a network filesystem), checks the interpreter imports
 the core it was given, runs `python -m expcore run STUDY --shard i/N --shard-label L`, and once the dispatcher has
 exited writes the copy's `out/` whole to `<results>/<label>.out.tar` with a manifest. `shards.py collect --manifest
-shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only and prints the `<python> -I -m expcore
-merge` line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's
-docstring has its form). Outage runs (`[faults]`) go through the login node's fault relay (M4), which `up`
+shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only into DIR (a new or empty 0700 directory of
+ours) and prints the `<python> -I -B -m expcore merge` line (`--run` runs it in DIR). The manifest names the site's
+paths and stays out of the repository (the script's docstring has its form). Outage runs (`[faults]`) go through the
+login node's fault relay (M4), which `up`
 starts.
 
 **What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the

@@ -85,7 +85,7 @@ def test_the_step_line_is_an_exact_step_on_the_sandbox_node_with_the_allowlist_a
     assert [e.split("=")[0] for e in env[:4]] == ["PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT"]
     assert env[3] == f"EXPCORE_FED_ROOT={shard.root}"
     assert env[4:] == homeless
-    assert line[at + len(env) : at + len(env) + 3] == [plan.python, "-I", str(SCRIPT)]
+    assert line[at + len(env) : at + len(env) + 4] == [plan.python, "-I", "-B", str(SCRIPT)]
     assert line[line.index("--index") + 1 : line.index("--index") + 2] == ["2"]
     assert line[line.index("--label") + 1] == "fed-b"
 
@@ -255,8 +255,8 @@ def test_collect_verifies_and_unpacks_every_shard_read_only_and_names_the_merge(
     assert (outs[0] / "campaign.lock").is_file()
     assert not os.access(outs[0] / "runs" / "r.json", os.W_OK)
     line = shards.merge_argv(plan, outs)
-    assert line[1:5] == ["-I", "-m", "expcore", "merge"]  # isolated (O58): `collect --run` runs it where it is
-    assert line[6:] == [str(o) for o in outs]
+    assert line[1:6] == ["-I", "-B", "-m", "expcore", "merge"]  # isolated, no bytecode written (O58)
+    assert line[7:] == [str(o) for o in outs]
 
 
 def test_collect_refuses_a_shard_without_its_lock(shards, tmp_path):
@@ -413,3 +413,37 @@ def test_o57_the_step_line_starts_the_step_in_the_root_directory(shards, tmp_pat
     plan = shards.load_plan(_manifest(tmp_path))
     line = shards.step_argv(plan, plan.shards[0], shards.federation(plan.shards[0]), SCRIPT)
     assert "--chdir=/" in line[: line.index("/usr/bin/env")]
+
+
+def test_o58_collect_runs_the_merge_isolated_in_its_own_private_directory(shards, tmp_path, monkeypatch, capsys):
+    """O58: `collect --run` starts the merge as `<python> -I -B -m expcore merge`, in the directory it collected into
+    (0700, ours), never in the directory it was launched from, which may hold another user's modules."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    for shard in plan.shards:
+        _archived(shards, tmp_path, shard.label, shard.index)
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    seen = {}
+
+    def run(argv, **keywords):
+        seen.update(argv=list(argv), **keywords)
+        return argparse.Namespace(returncode=0)
+
+    monkeypatch.setattr(shards.subprocess, "run", run)
+    into = tmp_path / "merge"
+    assert shards.main(["collect", "--manifest", str(tmp_path / "shards.toml"), "--into", str(into), "--run"]) == 0
+    assert seen["argv"][:6] == [plan.python, "-I", "-B", "-m", "expcore", "merge"]
+    assert seen["cwd"] == into
+    assert oct(into.stat().st_mode & 0o777) == "0o700"
+    capsys.readouterr()
+
+
+def test_o58_collect_refuses_a_directory_to_collect_into_that_others_may_enter(shards, tmp_path):
+    """O58: the merge runs in the directory collected into, so an existing one open to others is refused."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    into = tmp_path / "merge"
+    into.mkdir()
+    into.chmod(0o777)
+    with pytest.raises(shards.ShardsError, match="private directory"):
+        shards.collect(plan, into)

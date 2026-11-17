@@ -787,8 +787,8 @@ def test_the_canary_and_the_agent_run_under_one_array_of_binds_and_every_bind_is
         assert f":{target}" in definition
     cell_execs = [line for line in SANDBOX.splitlines() if "apptainer exec --containall --cleanenv" in line]
     assert len(cell_execs) == 2
-    for line in cell_execs:
-        assert "-B " not in line
+    for line in cell_execs:  # apptainer's own options, before the image: no bind outside the array (Python's -B after)
+        assert "-B " not in line.split('"$D/cell.sif"')[0]
 
 
 def test_the_canary_runs_after_the_collector_and_the_gate_and_before_the_agent():
@@ -796,20 +796,20 @@ def test_the_canary_runs_after_the_collector_and_the_gate_and_before_the_agent()
     assert SANDBOX.index("egress collector ready") < canary
     assert SANDBOX.index("gate ready on") < canary
     assert canary < SANDBOX.index("agent=0")
-    assert "python3 -I -c 'import json, socket, sys" in SANDBOX
+    assert "python3 -I -B -c 'import json, socket, sys" in SANDBOX
     assert 'rec canary "$E/sandbox/canary.json" 127.0.0.1 "$port" "$canary"' in SANDBOX
 
 
 def test_nothing_runs_in_the_cell_with_the_shim_before_the_canary():
     first_bound_exec = SANDBOX.index('"${BINDS[@]}"')
     assert SANDBOX.index("canary=0") < first_bound_exec
-    assert "python3 -I -c" in SANDBOX[first_bound_exec : first_bound_exec + 200]
+    assert "python3 -I -B -c" in SANDBOX[first_bound_exec : first_bound_exec + 200]
     assert '"$D/preload:/etc/ld.so.preload' not in SANDBOX[: SANDBOX.index("BINDS=(")]
 
 
 def test_the_collector_gets_a_fresh_socket_directory_made_just_before_it_starts():
     made = SANDBOX.index('EGRESS=$(mktemp -d "$D/egress.XXXXXX"); chmod 700 -- "$EGRESS"')
-    started = SANDBOX.index('python3.11 -I "$BUNDLE/egress-collector.py" "$EGRESS" "$D/egress.jsonl"')
+    started = SANDBOX.index('python3.11 -I -B "$BUNDLE/egress-collector.py" "$EGRESS" "$D/egress.jsonl"')
     assert made < started
     between = SANDBOX[made:started].splitlines()
     assert len(between) <= 2

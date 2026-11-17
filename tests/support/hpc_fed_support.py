@@ -260,19 +260,26 @@ RELAY_MODULE = "expcore_onedata.fault_relay"
 
 
 def unisolated(argv) -> list:
-    """Each interpreter in an argv that `-I` does not follow (O58, F2): without it, Python puts the directory it was
-    launched from first on `sys.path` (`-m`, `-c`) and reads every PYTHON* variable."""
+    """Each interpreter in an argv whose options do not hold both `-I` and `-B` (O58, F2): without `-I`, Python puts
+    the directory it was launched from first on `sys.path` (`-m`, `-c`) and reads every PYTHON* variable; without
+    `-B` it writes bytecode beside what it imports, into a shared interpreter or checkout."""
     words = [str(w) for w in argv]
-    return [
-        w
-        for i, w in enumerate(words)
-        if INTERPRETER.fullmatch(PurePosixPath(w).name) and words[i + 1 : i + 2] != ["-I"]
-    ]
+    found = []
+    for i, word in enumerate(words):
+        if INTERPRETER.fullmatch(PurePosixPath(word).name):
+            options = set()
+            for option in words[i + 1 :]:
+                if option not in ("-I", "-B"):
+                    break
+                options.add(option)
+            if options != {"-I", "-B"}:
+                found.append(word)
+    return found
 
 
 def isolated(argv) -> list:
-    """The argv, once every Python in it runs with `-I`; any other fails the test, whatever it tests."""
-    assert not unisolated(argv), f"a Python launched without -I (O58): {list(argv)}"
+    """The argv, once every Python in it runs with `-I -B`; any other fails the test, whatever it tests."""
+    assert not unisolated(argv), f"a Python launched without -I -B (O58): {list(argv)}"
     return list(argv)
 
 

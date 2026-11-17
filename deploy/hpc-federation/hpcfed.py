@@ -1,9 +1,9 @@
 """Bring a throwaway Onedata federation up on HPC batch nodes, and take it down, from the Compose federation's layout
 file (DESIGN.md is the process model; README.md says what has run).
 
-    uv run python deploy/hpc-federation/hpcfed.py --layout PATH --root PATH up | down | describe
-    uv run python deploy/hpc-federation/hpcfed.py --layout PATH --root PATH stop | start | status SERVICE
-    uv run python deploy/hpc-federation/hpcfed.py --layout PATH --root PATH exec SERVICE -- ARGV...
+    uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH up | down | describe
+    uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH stop | start | status SERVICE
+    uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH exec SERVICE -- ARGV...
 
 Run on the login node. `up` reads the site's values from the environment (`set -a; . site.env; set +a`) and records
 them in the state file in the root, so `down` and the service verbs need no environment: the login node's fault relay

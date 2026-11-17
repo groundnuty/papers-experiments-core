@@ -51,7 +51,7 @@ chmod 600 -- "$S/env"
 chmod 644 -- "$R/etc/hpcop-peers"
 
 if (( ${#IMPORTS[@]} > 0 )); then
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/importstorage.py" prepare --workdir "$W" "${IMPORTS[@]}" \
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/importstorage.py" prepare --workdir "$W" "${IMPORTS[@]}" \
     || die "a shared imported tree was refused: nothing was prepared for it (see above)"
 fi
 

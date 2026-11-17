@@ -217,17 +217,29 @@ def interpreter(node: ast.expr) -> bool:
     return name is not None and NAMED_PYTHON.search(name) is not None
 
 
+BOTH = {"-I", "-B"}  # isolated, and no bytecode written into a shared interpreter or checkout
+
+
+def options_after(words: list[ast.expr], at: int) -> set[str]:
+    """The run of `-I` and `-B` constants right after an interpreter."""
+    found = set()
+    for word in words[at + 1 :]:
+        if not (isinstance(word, ast.Constant) and word.value in BOTH):
+            break
+        found.add(word.value)
+    return found
+
+
 def python_findings(source: str) -> list[str]:
-    """Each list or tuple display in Python source that names an interpreter not followed by `-I`, or starts a Slurm
-    launch that does not name `--chdir=/`: `<line>: <the display>`."""
+    """Each list or tuple display in Python source that names an interpreter not followed by both `-I` and `-B`, or
+    starts a Slurm launch that does not name `--chdir=/`: `<line>: <the display>`."""
     found = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.List | ast.Tuple):
             continue
         words = node.elts
         for at, word in enumerate(words):
-            after = words[at + 1] if at + 1 < len(words) else None
-            if interpreter(word) and not (isinstance(after, ast.Constant) and after.value == "-I"):
+            if interpreter(word) and options_after(words, at) != BOTH:
                 found.append(f"{node.lineno}: {ast.unparse(node)}")
         first = words[0] if words else None
         launch = isinstance(first, ast.Constant) and first.value in LAUNCHERS
@@ -240,7 +252,7 @@ def python_findings(source: str) -> list[str]:
 # path to one in a `bin/` (`"$dir/venv/bin/python"`), followed by the next word.
 SHELL_PYTHON = re.compile(
     r"""(?:^|[\s;|&(`]|\$\()(?:exec\s+)?("\$\{?HPC(?:OP_PY|T_PYTHON)\}?"|\$\{?HPC(?:OP_PY|T_PYTHON)\}?|"""
-    r""""?(?:[^\s"'=;|&()]*/bin/)?python(?:3(?:\.\d+)?)?"?)\s+(\S+)"""
+    r""""?(?:[^\s"'=;|&()]*/bin/)?python(?:3(?:\.\d+)?)?"?)((?:\s+-[IB])*)\s+(\S+)"""
 )
 # A message's words, never a command: a single-quoted string, or a double-quoted one with no `$(...)` or backquote in
 # it (a command substitution runs, so it stays and is scanned).
@@ -251,8 +263,9 @@ SHELL_IN_ROOT = re.compile(r"""(?:^|\s)--chdir=/(?=[\s"']|$)""")
 
 
 def shell_findings(source: str) -> list[str]:
-    """Each command of a shell script that runs a Python without `-I`, or an `srun` or `sbatch` that does not name
-    `--chdir=/`, on its logical line (continuations joined, comments and message strings dropped): `<line>: <it>`."""
+    """Each command of a shell script that runs a Python without both `-I` and `-B`, or an `srun` or `sbatch` that
+    does not name `--chdir=/`, on its logical line (continuations joined, comments and message strings dropped):
+    `<line>: <the command>`."""
     found, logical, start = [], "", 0
     for number, line in enumerate(source.splitlines(), 1):
         code = "" if line.lstrip().startswith("#") else re.split(r"\s#\s", line, maxsplit=1)[0]
@@ -266,7 +279,8 @@ def shell_findings(source: str) -> list[str]:
         # an interpreter followed by an operator is an argument (`uv python install "$HPCT_PYTHON" || ...`)
         bad = [
             m for m in SHELL_PYTHON.finditer(text)
-            if m.group(2) != "-I" and m.group(2)[0] not in "|&;)" and not UV_SUBCOMMAND.search(text[: m.start(1)])
+            if set(m.group(2).split()) != BOTH and (m.group(2) or m.group(3)[0] not in "|&;)")
+            and not UV_SUBCOMMAND.search(text[: m.start(1)])
         ]  # fmt: skip
         bad += [m for m in SHELL_SLURM.finditer(text) if not SHELL_IN_ROOT.search(text[m.start() :])]
         found += [f"{start}: {logical.strip()}" for _ in bad[:1]]
@@ -285,9 +299,12 @@ def test_o58_the_scans_find_a_python_without_isolation_and_a_launch_that_names_n
         '[python, "-B", "-m", "x"]', '[sys.executable, "x.py"]', '("python3.11", "-c", "y")', '[site.node_python, "z"]',
         '[plan.python, "-m", "expcore"]', '["srun", "--exact", "-N1"]', '["sbatch", "--wrap=x"]',
         '["/v/bin/python", "a"]', '["python", "-m", "expcore"]', '["srun", "--chdir=/tmp", "x"]',
-        '["sbatch", "--chdir=/scratch", "--wrap=x"]',
+        '["sbatch", "--chdir=/scratch", "--wrap=x"]', '[python, "-I", "-m", "x"]', '[sys.executable, "-B", "x.py"]',
     ]  # fmt: skip
-    python_good = '[python, "-I", "-B", "-m", "x"]\n["srun", "--chdir=/", "x"]\n{"study", "python", "tmpfs"}\n'
+    python_good = (
+        '[python, "-I", "-B", "-m", "x"]\n["srun", "--chdir=/", "x"]\n{"study", "python", "tmpfs"}\n'
+        '[sys.executable, "-B", "-I", "x.py"]\n'
+    )
     shell_bad = [
         'python3 -c "x"', "x=$(python3.11 y.py)", '"$HPCOP_PY" --version', "exec $HPCOP_PY -B z.py",
         "srun --jobid=1 \\\n  -w n bash x.sh", "sbatch --wrap=x", '  "$dir/venv/bin/python" -m pytest',
@@ -295,12 +312,13 @@ def test_o58_the_scans_find_a_python_without_isolation_and_a_launch_that_names_n
         "srun --jobid=1 --chdir=/tmp bash x.sh", 'srun --jobid=1 --chdir="$PWD" bash x.sh',
         "sbatch --chdir=/scratch --wrap=x", "echo \"$(python3 -c 'import inspect')\"",
         'echo "$(srun --jobid=1 bash x.sh)"', 'die "no: `python3 -c x`"', 'say "at $(date): $(python -m x)"',
+        'python3 -I "$RUN/x.py"', '"$HPCOP_PY" -B -c y', "exec $HPCOP_PY -I",
     ]  # fmt: skip
     shell_good = (
-        'python3 -I -c "x"\n"$HPCOP_PY" -I z.py  # python3 x\n# python3 y.py\n'
+        'python3 -I -B -c "x"\n"$HPCOP_PY" -I -B z.py  # python3 x\n# python3 y.py\n'
         'srun --jobid=1 \\\n  --chdir=/ bash x.sh\ndie "$HPCOP_PY cannot run"\nHPCOP_PY=${HPCOP_PY:-python3.11}\n'
         'echo "uv $v, python $HPCT_PYTHON"\n"$HPCT_UV" python install x\nforce_rm "$root/python" "$root/x"\n'
-        '"$dir/venv/bin/python" -I -c x\nuv python install "$HPCT_PYTHON" || return 1\npython -I -m expcore\n'
+        '"$dir/venv/bin/python" -I -B -c x\nuv python install "$HPCT_PYTHON" || return 1\npython -B -I -m expcore\n'
         "sbatch --chdir=/ --wrap=x\n"
     )
     assert [len(python_findings(text)) for text in python_bad] == [1] * len(python_bad)

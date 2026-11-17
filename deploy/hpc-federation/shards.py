@@ -1,19 +1,19 @@
 """shards.py: one shard of a campaign per HPC federation (#154, milestone M5), from launch to merge.
 
-    uv run python deploy/hpc-federation/shards.py plan    --manifest shards.toml
-    uv run python deploy/hpc-federation/shards.py lines   --manifest shards.toml
-    <python> -I deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
+    uv run python -I -B deploy/hpc-federation/shards.py plan    --manifest shards.toml
+    uv run python -I -B deploy/hpc-federation/shards.py lines   --manifest shards.toml
+    <python> -I -B deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
         --results DIR --core-src DIR                    # inside the step on the sandbox node; `lines` writes it
-    uv run python deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
-    <python> -I deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
-    <node python> -I deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
+    uv run python -I -B deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
+    <python> -I -B deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
+    <node python> -I -B deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
 
 **Where the dispatcher runs.** One shard runs per federation, as one job step on that federation's sandbox node: the
 Apptainer sandbox's data gate listens on that node's loopback and its cells are that node's `apptainer exec`s, so the
 dispatcher (`python -m expcore run STUDY --shard i/N --shard-label L`) must run there, never on the login node. A step
 is launched from the login node alone (srun cannot start one on a compute node), as the federation's own services are
 (`DESIGN.md`): `lines` prints each shard's `srun --jobid=<job> [--het-group=<g>] --exact ... --chdir=/ /usr/bin/env
--i <allowlist> <python> -I shards.py step ...`, to run detached (`setsid nohup ... &`). The job and the component are
+-i <allowlist> <python> -I -B shards.py step ...`, to run detached (`setsid nohup ... &`). The job and the component are
 the state file's `sandbox` record's: a component of the federation's heterogeneous job (`het`) or a job of its own
 (`separate`). Nothing here runs srun.
 
@@ -64,8 +64,9 @@ its tmpfs directory; an archive that cannot be written leaves that directory in 
 the only whole `out/`. A start of a shard that has results is refused unless it is `--resume`, which unpacks that
 archive into its copy first, so a repeated launch line never replaces a finished shard. `collect` verifies a private
 copy of every shard's archive against its manifest and the manifest against the plan, unpacks that copy into
-`<into>/<label>/out`, read-only, and prints (or with `--run` runs) `<python> -I -m expcore merge`. A shard whose archive
-has no `campaign.lock`, does not verify, or is missing is refused, naming its label: the merge would refuse it too.
+`<into>/<label>/out`, read-only, and prints (or with `--run` runs, in `<into>`, a 0700 directory of ours) `<python> -I
+-B -m expcore merge`. A shard whose archive has no `campaign.lock`, does not verify, or is missing is refused, naming
+its label: the merge would refuse it too.
 
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
@@ -330,7 +331,7 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
     environment of the allowlist alone, set on the node by `env -i`, with no secret in it."""
     env = [f"PATH={plan.step_path}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={shard.root.parent}",
            f"EXPCORE_FED_ROOT={shard.root}", *(f"{k}={v}" for k, v in home_env(NO_HOME).items())]  # fmt: skip
-    step = [plan.python, "-I", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
+    step = [plan.python, "-I", "-B", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
             "--results", str(plan.results), "--core-src", str(plan.core_src),
             "--snapshot-every", f"{plan.snapshot_every_s:g}"]  # fmt: skip
@@ -445,7 +446,12 @@ def collect(plan: Plan, into: Path) -> list[Path]:
     if into.exists() and any(into.iterdir()):
         raise ShardsError("the directory to collect into must be new or empty")
     created = not into.exists()
-    into.mkdir(parents=True, exist_ok=True)
+    into.mkdir(mode=0o700, parents=True, exist_ok=True)
+    seen = into.lstat()  # the merge runs in it (`--run`): a private directory of ours, never one others may enter
+    if not stat.S_ISDIR(seen.st_mode) or seen.st_uid != os.getuid() or seen.st_mode & 0o077:
+        if created:
+            into.rmdir()
+        raise ShardsError("the directory to collect into must be a private directory of this user (0700)")
     try:
         found = [verified(plan.results, shard, into) for shard in plan.shards]
     except ShardsError:  # refused whole: nothing of it is left behind
@@ -466,7 +472,7 @@ def collect(plan: Plan, into: Path) -> list[Path]:
 
 
 def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
-    return [plan.python, "-I", "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
+    return [plan.python, "-I", "-B", "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
 
 
 # ------------------------------------------------------------------------------------------------ the step
@@ -510,9 +516,9 @@ if not tied or os.getppid() != int(sys.argv[1]):
     sys.stderr.write("shards: ERROR: the dispatcher could not be tied to its step, so it does not start\\n")
     os._exit(71)
 argv = sys.argv[2:]
-if argv[1:4] != ["-I", "-m", "expcore"]:
+if argv[1:5] != ["-I", "-B", "-m", "expcore"]:
     os.execv(argv[0], argv)
-sys.argv = ["expcore", *argv[4:]]
+sys.argv = ["expcore", *argv[5:]]
 try:  # its SystemExit, its message and its exit status pass as `python -m expcore`'s own
     runpy.run_module("expcore", run_name="__main__", alter_sys=True)
 finally:
@@ -527,7 +533,7 @@ NOT_TIED = 71  # the dispatcher could not be tied to its step: it never started
 def run_dispatcher(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int:
     """Run the dispatcher, relaying SIGTERM and SIGINT to it, and return its exit status (128 + N for a signal N). It
     dies with this step, and records its own end in the step's record (`DISPATCHER`); `cwd` is the step's directory."""
-    words = [sys.executable, "-I", "-c", DISPATCHER, str(os.getpid()), *argv]
+    words = [sys.executable, "-I", "-B", "-c", DISPATCHER, str(os.getpid()), *argv]
     child = subprocess.Popen(words, env=dict(env), cwd=cwd, stdin=subprocess.DEVNULL)
 
     def relay(signum: int, _frame: Any) -> None:
@@ -988,7 +994,7 @@ def step(
         journals = args.results / args.label / JOURNALS
         journals.mkdir(parents=True, exist_ok=True)
         journal = journals / f"{_stamp()}-{os.getpid()}-{secrets.token_hex(4)}.jsonl"
-        argv = [sys.executable, "-I", "-m", "expcore", "run", str(copy), "--spend-journal", str(journal),
+        argv = [sys.executable, "-I", "-B", "-m", "expcore", "run", str(copy), "--spend-journal", str(journal),
                 "--shard", f"{args.index}/{args.count}", "--shard-label", args.label]  # fmt: skip
         out = copy / "out"
         live = threading.Event()
@@ -1059,7 +1065,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "collect":
             line = merge_argv(plan, collect(plan, args.into))
             print(shlex.join(line))
-            return subprocess.run(line, check=False).returncode if args.run else 0
+            return subprocess.run(line, check=False, cwd=args.into).returncode if args.run else 0
         missing = undeclared_data(plan)
         if missing:
             raise ShardsError(

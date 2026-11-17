@@ -189,16 +189,17 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   pipe are finished whatever the first does. Ending a client is verified (SIGTERM, then SIGKILL, each only while the
   pid still has its recorded start tick), and `down` also ends any `srun --jobid=<job>` of ours on the same login node (run `down` where `up` ran) that
   no record names (one spawned just before a crash).
-- **Every Python the driver launches runs isolated** (`-I`, O58): on a node, on the login node (the fault relay's
-  `serve`, `alive` and `stop`, and the verbs' argv prefix, section 7), in a container and in `shards.py` (its step, its
-  dispatcher, the merge `collect --run` runs), and so does the test runner's pytest (`deploy/hpc-tests`). Without it
-  `python -m` and `python -c` put the directory they were launched from first on `sys.path`, and every `PYTHON*`
-  variable is read: on 16 Nov 2026 (F2) a `down` launched from the login node's `/tmp`, which held 49 `.py` files of
-  other users, had the relay's `stop` import another user's `/tmp/inspect.py` in place of the standard library's. Launch
-  `up`, `down` and the verbs from a directory of ours (the checkout) all the same, never a shared one: `uv run` takes
-  the project of the working directory when it has a `pyproject.toml`, and builds it.
+- **Every Python the driver launches runs isolated and writes no bytecode** (`-I -B`, O58): on a node, on the login node
+  (the fault relay's `serve`, `alive` and `stop`, and the verbs' argv prefix, section 7), in a container and in
+  `shards.py` (its step, its dispatcher, the merge `collect --run` runs), and so does the test runner's pytest
+  (`deploy/hpc-tests`). Without it `python -m` and `python -c` put the directory they were launched from first on
+  `sys.path`, and every `PYTHON*` variable is read: on 16 Nov 2026 (F2) a `down` launched from the login node's `/tmp`,
+  which held 49 `.py` files of other users, had the relay's `stop` import another user's `/tmp/inspect.py` in place of
+  the standard library's. Launch `up`, `down` and the verbs as `python -I -B deploy/hpc-federation/hpcfed.py ...` from a
+  directory of ours (the checkout) all the same, never a shared one: `uv run` takes the project of the working directory
+  when it has a `pyproject.toml`, and builds it.
 - **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python a
-  step runs takes `-I -B`.
+  step or the driver launches takes `-I -B` (above), the relay's among them, and `shards.py collect --run` its merge.
 - **The core the driver imports is recorded**: `up` writes the resolved paths of `expcore_onedata`, `fedlayout` and
   `hpcfed` into the state file, and refuses to run when `expcore_onedata` is not imported from this checkout's `src`.
   The core's step (`[hpc] core = "step"`) makes the same check on the node and exits 97 on a mismatch, which fails

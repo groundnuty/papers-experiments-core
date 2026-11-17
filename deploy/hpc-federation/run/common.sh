@@ -36,7 +36,7 @@ HPC_USER=${USER:-$(id -un)}
 : "${E:?E must name the run evidence directory, a 0700 directory on a filesystem every node sees (run/README.md)}"
 [[ -d $E && ! -L $E && -O $E && $(stat -c %a -- "$E") == 700 ]] || die "E is not a private (0700) directory of yours"
 
-rec() { python3 -I "$RUN/record.py" "$@"; }                # how evidence files are written (record.py)
+rec() { python3 -I -B "$RUN/record.py" "$@"; }                # how evidence files are written (record.py)
 # <step>: that step's evidence directory, made once per run: a step that ran already cannot run again into this run,
 # where its earlier files would stand beside the new ones (the cell is the one step repeated: fresh_step_dir).
 ev() {

@@ -99,7 +99,7 @@ do_env() {
 do_check() {
   local want line out
   want=$(readlink -f "$dir/repo/src")/
-  out=$(cd "$dir" && env -i PATH=/usr/bin:/bin HOME="$dir/home" "$dir/venv/bin/python" -I -c \
+  out=$(cd "$dir" && env -i PATH=/usr/bin:/bin HOME="$dir/home" "$dir/venv/bin/python" -I -B -c \
     'import os, expcore, expcore_onedata; print(os.path.realpath(expcore.__file__)); print(os.path.realpath(expcore_onedata.__file__))' 2>&1) \
     || { echo "$out"; return 1; }
   while IFS= read -r line; do
