@@ -350,12 +350,7 @@ def test_c29_the_merged_batch_gives_the_scores_of_one_unsharded_driver(whole, me
     the fields of a shard's own sequence (dispatch positions, start times, lease waits), the shard tags, the run times
     only a merged export carries and the report's `## Shards` section differ."""
     assert (merged.root / "out" / "scores.json").read_bytes() == (whole.root / "out" / "scores.json").read_bytes()
-    one_usage, many_usage = (
-        read(whole, "analysis.json").pop("model_usage"),
-        read(merged, "analysis.json").pop("model_usage"),
-    )
-    assert without_usage(merged) == without_usage(whole)  # C39: the spend is the one thing that is not the same, below
-    assert_usage_differs_only_in_the_probes(one_usage, many_usage)
+    assert (merged.root / "out" / "analysis.json").read_bytes() == (whole.root / "out" / "analysis.json").read_bytes()
     one, many = read(whole, "export.json"), read(merged, "export.json")
     own = {"shard", "dispatch_seq", "started_at", "lease_wait_s", *MERGE_TIMES}
     for key in one:
@@ -366,23 +361,6 @@ def test_c29_the_merged_batch_gives_the_scores_of_one_unsharded_driver(whole, me
     assert plain(many["analysed_attempts"]) == plain(one["analysed_attempts"])  # the same rows, in the same order
     assert set(many) - set(one) == set(MERGED_ONLY)
     assert _report_differs_only_in_positions(without_shard_section(merged.report), whole.report)
-
-
-def without_usage(campaign: Campaign) -> bytes:
-    """The bytes of a campaign's analysis.json without its `model_usage`, which a merged batch's shards add."""
-    analysis = read(campaign, "analysis.json")
-    del analysis["model_usage"]
-    return json.dumps(analysis, sort_keys=True).encode()
-
-
-def assert_usage_differs_only_in_the_probes(one: dict, many: dict) -> None:
-    """C39: a merged batch's spend is its shards' added, and each shard's start pays its own admission probes: the
-    attempts, tokens, dollars by class, records and served ids are those of one driver; the probes are not fewer."""
-    assert [m["model"] for m in many["models"]] == [m["model"] for m in one["models"]]
-    for alone, joined in zip(one["models"], many["models"], strict=True):
-        assert joined["probes_usd"] >= alone["probes_usd"]
-        keep = lambda entry: {k: v for k, v in entry.items() if k not in ("probes_usd", "usd")}  # noqa: E731
-        assert keep(joined) == keep(alone)
 
 
 def _report_differs_only_in_positions(merged: str, whole: str) -> bool:

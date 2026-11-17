@@ -246,3 +246,12 @@ def test_c39_figures_of_another_shape_are_refused_not_shown(bad):
     """C39: a figure the report cannot place is an error, never a guessed row."""
     with pytest.raises(ValueError, match="model-usage-1"):
         render(export(), bad)
+
+
+def test_c39_only_a_report_of_a_merged_batch_says_a_word_of_shards(tmp_path):
+    """C39: an unsharded report never mentions a shard (a pinned property of it): the sentence that says a merged
+    batch adds its shards' figures is in the notes only when the export has `shards`."""
+    usage = usage_of_two_models(tmp_path)
+    assert "shard" not in render(export(), usage).lower()
+    merged = render(export(shards=[{"index": 1}, {"index": 2}]), usage)
+    assert "adds its shards' figures" in section_of(merged)

@@ -30,7 +30,9 @@ PRICING = Pricing({"m1": SPEC}, LIMITS)
 TOKENS = {"input_tokens": 1_000_000, "output_tokens": 100_000}  # 4.5 USD
 HALF = {"input_tokens": 500_000, "output_tokens": 100_000}  # 3.0 USD
 FIRST = (10_000, 500, 0, 0)
+SECOND = (20_000, 800, 0, 0)
 FIRST_USD = (10_000 * 3.0 + 500 * 15.0) / 1e6
+SECOND_USD = (20_000 * 3.0 + 800 * 15.0) / 1e6
 BOUND_USD, REQUEST_USD = 30.0, 1.5
 
 
@@ -191,6 +193,39 @@ def test_c39_an_interrupted_attempt_is_shown_on_the_basis_its_log_gave_and_a_mea
     assert INFLIGHT != MEASURED
 
 
+def test_c39_an_interrupted_attempts_tokens_are_the_replies_its_call_log_recorded_and_agree_with_its_dollars(tmp_path):
+    """C39: a kill left no counts in the row but the call log kept each reply's: the tokens shown are those replies', so
+    a measured attempt shows the tokens its dollars were charged for; one with a request in flight, or a log that could
+    not be trusted, has them known only in part and says so (Usage incomplete)."""
+    store, _, manifest = planned_store(tmp_path)
+    keys = keys_of(manifest)
+    logged(store, keys[0], "sent", FIRST)  # every request answered: measured
+    logged(store, keys[1], "sent", FIRST, "sent", SECOND)  # measured, two replies
+    logged(store, keys[2], "sent", FIRST, "sent")  # a request in flight
+    store.begin_attempt(keys[3], NOW, 1, "")  # no log at all
+    recover(store, LATER, 3)
+    killed = klass(model_of(usage_of(store.q, PRICING)), "interrupted")
+    assert killed["attempts"] == 4
+    assert killed["input_tokens"] == 10_000 + (10_000 + 20_000) + 10_000  # the replies; nothing for the other two
+    assert killed["output_tokens"] == 500 + (500 + 800) + 500
+    assert killed["usage_incomplete_attempts"] == 2  # the one with a request in flight, and the one with no log
+    assert killed["usd"]["measured"] == pytest.approx(FIRST_USD + (FIRST_USD + SECOND_USD))
+    assert killed["usd"]["measured_plus_inflight"] == pytest.approx(FIRST_USD + REQUEST_USD)
+    assert killed["usd"]["bound"] == pytest.approx(BOUND_USD)
+
+
+def test_c39_a_row_whose_log_no_longer_says_its_recorded_basis_shows_no_tokens_from_it(tmp_path):
+    """C39: tokens come from a log only where the gate trusts it (its basis is still the one recorded): one the row has
+    outgrown is charged its bound and its tokens are unknown."""
+    store, _, manifest = planned_store(tmp_path)
+    begun = logged(store, keys_of(manifest)[0], "sent", FIRST)
+    recover(store, LATER, 3)
+    store.db.execute("UPDATE attempts SET calls_sent = calls_sent + 1 WHERE id=?", (begun.id,))
+    killed = klass(model_of(usage_of(store.q, PRICING)), "interrupted")
+    assert (killed["input_tokens"], killed["usage_incomplete_attempts"]) == (0, 1)
+    assert killed["usd"]["bound"] == pytest.approx(BOUND_USD)
+
+
 def test_c39_what_a_kill_lost_is_its_own_class_with_the_attempts_the_journal_counted_and_their_charges(tmp_path):
     """C39: attempts and charges the spend journal counted back (O62) are in the model's spend, as the gate counts
     them, in a class of their own."""
@@ -225,6 +260,7 @@ def test_c39_what_a_kill_lost_is_its_own_class_with_the_attempts_the_journal_cou
     assert cell["attempts"] == 1
     assert cell["usd"]["bound"] == pytest.approx(BOUND_USD)  # the journal never saw it end: its bound
     assert cell["usd"]["charges"] == pytest.approx(0.5 + 0.2 + 0.1)
+    assert (cell["input_tokens"], cell["usage_incomplete_attempts"]) == (0, 1)  # no log: tokens unknown
     assert m1["usd"]["total"] == pytest.approx(spend_of(store.q, PRICING).per_model["m1"])
 
 
@@ -290,3 +326,20 @@ def test_c39_a_store_from_before_the_later_columns_is_read_as_it_was(tmp_path):
         pytest.skip("this SQLite cannot drop a column")
     m1 = model_of(usage_of(store.q, PRICING))
     assert klass(m1, "analysed")["usd"]["total"] == pytest.approx(4.5)
+
+
+def test_c39_a_lost_attempt_the_journal_saw_every_reply_of_shows_those_replies_tokens(tmp_path):
+    """C39: a lost attempt whose journaled log is whole (every request answered) is measured, and its tokens are the
+    replies' the journal recorded."""
+    store, _, manifest = planned_store(tmp_path)
+    lost = {
+        "id": 99, "run_key": keys_of(manifest)[1], "model": "m1", "started_utc": NOW, "state": "running",
+        "reserved_capped": None, "input_tokens": None, "output_tokens": None, "cache_creation_tokens": None,
+        "cache_read_tokens": None, "turn_usage": None, "usage_complete": None, "replies_checked": None,
+        "topups": 0, "topup_usd": 0.0, "calls_sent": 1, "calls_usage": json.dumps([list(FIRST)]), "basis": "measured",
+    }  # fmt: skip
+    ledger = {"campaign": "c" * 64, "journal": "j2.jsonl", "counted": {"j1.jsonl": {"attempts": [lost], "charges": []}}}
+    store.put_meta(LOST_KEY, json.dumps(ledger), NOW)
+    cell = klass(model_of(usage_of(store.q, PRICING)), "lost_in_kill")
+    assert (cell["input_tokens"], cell["output_tokens"], cell["usage_incomplete_attempts"]) == (10_000, 500, 0)
+    assert cell["usd"]["measured"] == pytest.approx(FIRST_USD)
