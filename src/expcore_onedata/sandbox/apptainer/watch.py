@@ -22,6 +22,12 @@ that `/proc` does not show. Memory nothing visible explains that grew past the m
 the limit and kills the run's processes as `memory_limit` (`memory_hidden`); what cannot be told the cell's, a hidden
 child and a reading that failed make the run's memory reading unknown, never within (`summary()["memory"]`).
 
+At every poll it also keeps what a cgroup would (`limits.py`, `limitspoll.py`, O70): the tasks of the run's processes
+(`Threads:`) against `pids`, over which it kills the running cell's processes as `pids_limit`, the agent's own (`scope:
+cell`); the cores of every task of every process of the run against the canary's effective set, a wider one recorded as
+`widened` and never killed; and the gate helper's resident memory against `gate_memory_bytes`, over which it SIGKILLs
+the gate through its pidfd (a kill of its own, in `gate_kills`, never a cell's: the collection reads it as a death).
+
 What it cannot see is recorded, never taken for nothing (`facts.py`): a spike shorter than a period, a file the agent
 writes elsewhere, a hidden process's shared memory. A listing of `/proc` that fails is counted (`unreadable_polls`),
 and a cell whose namespace was never found is `seen: false` in its record.
@@ -41,12 +47,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.apptainer.hidden import DEFAULT_MARGIN_BYTES, Hidden, HiddenCheck
+from expcore_onedata.sandbox.apptainer.limits import LimitsCheck, Probe
+from expcore_onedata.sandbox.apptainer.limitspoll import LimitsPoll
 from expcore_onedata.sandbox.apptainer.node import NodeOps
 from expcore_onedata.sandbox.apptainer.procs import Proc
 
 log = logging.getLogger(__name__)
 
+UNATTRIBUTED_WHY = (
+    "hidden memory past the margin cannot be told this run's cell's: another run's cell is charged to the same cgroup"
+)
 BYTES_PER_INODE = 16384  # mkfs.ext4's default ratio: a disk of N bytes has N // 16384 inodes
 WALK_STRETCH = 10.0  # the disk walk waits at least this many times its own last duration
 
@@ -110,12 +122,15 @@ class Watch:
         disk_poll_s: float,
         hidden_margin_bytes: int = DEFAULT_MARGIN_BYTES,
         clock: Callable[[], float] = time.monotonic,
+        limits: LimitsCheck | None = None,
     ) -> None:
         self._node, self._tag, self._own = node, run_tag, own_pidns
         self._limit, self._spaces = memory_bytes, spaces
         self._period, self._disk_period, self._clock = memory_poll_s, disk_poll_s, clock
         self._hidden = HiddenCheck(node, own_pidns=own_pidns, margin_bytes=hidden_margin_bytes)
         self._lock = threading.RLock()
+        # pids, cpus and the gate's memory (O70); None: the watch keeps memory and disks alone
+        self._limits = None if limits is None else LimitsPoll(limits, node, self._lock, self._kill)
         self._ns: dict[str, int | None] = {}  # the run's PID namespaces, each with the cell it was found in
         self._cell: int | None = None
         self._nonce: str | None = None
@@ -129,6 +144,8 @@ class Watch:
         self._next_walk = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.ended: dict[str, Any] | None = None  # the kill that ended the run (`scope: run`), once one did
+        self.on_run_end: Callable[[dict[str, Any]], None] = lambda event: None
 
     # ------------------------------------------------------------------------------------------------ cells
     def begin_cell(self, cell: int, nonce: str, *, calibration: bool = False) -> None:
@@ -194,15 +211,27 @@ class Watch:
             if found is None or members is None:
                 self.unreadable_polls += 1
                 self._hidden.unreadable_poll()
+                self._unreadable_limits()
                 return
             total = sum(p.rss or 0 for p in members)
             self.peak_bytes = max(self.peak_bytes, total)
             if self._cell is not None:
                 self._cell_peak = max(self._cell_peak, total)
+        tasks = None
+        if self._limits is not None:  # read before any kill: a poll that kills still shows what it saw (O70)
+            self._limits.check_gate(found)
+            tasks = self._limits.sample(members)
+            self._limits.check_affinity(members)
+        over_pids = tasks is not None and self._limits is not None and tasks > self._limits.check.pids
         if members and total > self._limit:
-            if self._kill(members, "memory_limit", "memory", total, self._limit) == 0:
+            beside = (KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids) if over_pids else None
+            sent = self._kill(members, "memory_limit", "memory", total, self._limit, beside=beside)
+            if sent == 0:
                 with self._lock:  # nothing was signalled: never a reading of `over`
                     self._hidden.unreached()
+            return
+        if over_pids:
+            self._kill(members, KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids)
             return
         self._check_hidden(found, members, before, after)
         if self._clock() >= self._next_walk:
@@ -227,7 +256,9 @@ class Watch:
             else:
                 hidden = self._hidden.assess(listings, before, after, namespaces)
             running = self._hidden.running
-        if hidden is not None:
+        if hidden is not None and not hidden.attributed:
+            self._end_run(members, hidden)
+        elif hidden is not None:
             sent = self._kill(members, "memory_limit", "memory_hidden", hidden.grown_bytes, hidden.allowance_bytes,
                               figures=_figures(hidden)) if members else 0  # fmt: skip
             with self._lock:
@@ -243,6 +274,28 @@ class Watch:
                 seen.update(children)
         with self._lock:
             self._hidden.note_children(seen, unreadable)
+
+    # ------------------------------------------------------------------------------------------------ limits (O70)
+    def _unreadable_limits(self) -> None:
+        if self._limits is not None:
+            self._limits.unreadable(self._cell is not None)
+
+    def gate_kill(self) -> dict[str, Any] | None:
+        """The watch's kill of the gate that signalled it, None when there was none (`limitspoll`)."""
+        return None if self._limits is None else self._limits.gate_kill()
+
+    def note_probe(self, probe: Probe | None) -> None:
+        """What the start's canary read of the limits inside a cell (`limits.parse_probe`)."""
+        if self._limits is not None:
+            self._limits.note_probe(probe)
+
+    def limits_record(self) -> dict[str, Any] | None:
+        """The run's `infrastructure_facts.limits` (`limits.LimitsCheck.record`); None without a check."""
+        if self._limits is None:
+            return None
+        with self._lock:
+            memory = self._hidden.reading(_killed_for_memory(self.kills))
+            return self._limits.record(self.kills, memory)
 
     def _measure_spaces(self, members: list[Proc]) -> None:
         began = self._clock()
@@ -261,12 +314,27 @@ class Watch:
         if over is not None and members:
             self._kill(members, "disk_limit", *over)
 
+    def _end_run(self, members: list[Proc], hidden: Hidden) -> None:
+        """Hidden memory past the margin that cannot be told the running cell's (another run's cell is in the cgroup):
+        the cell cannot be isolated, so its processes are killed and the run ended (`on_run_end`, O72), its reading
+        left unknown (`unattributed`), never `over`."""
+        if self.ended is None:
+            self._kill(members, "memory_limit", "memory_hidden", hidden.grown_bytes, hidden.allowance_bytes,
+                       figures=_figures(hidden), scope="run", why=UNATTRIBUTED_WHY, attributed=False)  # fmt: skip
+            with self._lock:
+                self.ended = dict(self.kills[-1])
+            self.on_run_end(dict(self.ended))
+        with self._lock:
+            self._hidden.ended()
+
     def _kill(
         self, members: list[Proc], reason: str, what: str, amount: int, limit: int, *,
-        figures: Mapping[str, int] | None = None,
+        figures: Mapping[str, int] | None = None, scope: str = "cell", why: str | None = None, attributed: bool = True,
+        beside: tuple[str, str, int, int] | None = None,
     ) -> int:  # fmt: skip
         """SIGKILL every process of the run through its pidfd, and record it against the running cell; how many were
-        signalled."""
+        signalled. `beside`: another reason (`reason`, `what`, `amount`, `limit`) that the same signal ended the
+        processes for, recorded in the same step, against the same cell."""
         sent = sum(1 for p in members if self._node.signal(p.pid, p.start, signal.SIGKILL) is True)
         with self._lock:
             event = {
@@ -275,14 +343,25 @@ class Watch:
                 "what": what,
                 "amount": amount,
                 "limit": limit,
+                # nothing of a cell outlives its exec, so the run's processes are the running cell's: its own are
+                # killed, the run goes on, as a container's OOM kill is the cell's on Docker; `run` when the cell
+                # could not be isolated and the run was ended
+                "scope": scope,
+                **({"why": why} if why else {}),
+                **({} if attributed else {"attributed": False}),
                 "processes": len(members),
                 "signalled": sent,
                 "utc": dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds"),
                 **({"figures": dict(figures)} if figures else {}),
             }
-            self.kills.append(event)
-            if self._cell is not None:
-                self._cell_kills.append(event)
+            events = [event]
+            if beside is not None:
+                reason2, what2, amount2, limit2 = beside
+                events.append({**event, "reason": reason2, "what": what2, "amount": amount2, "limit": limit2})
+            for each in events:
+                self.kills.append(each)
+                if self._cell is not None:
+                    self._cell_kills.append(each)
         log.info("the run's watch killed its processes: %s of %s over its limit", reason, what)
         return sent
 
@@ -299,6 +378,7 @@ class Watch:
                     with self._lock:
                         self.unreadable_polls += 1
                         self._hidden.unreadable_poll()
+                        self._unreadable_limits()
                     log.error("the run's watch failed a sample: %s", type(error).__name__)
                 self._stop.wait(self._period)
 
@@ -320,6 +400,7 @@ class Watch:
                 "spaces": {s.name: {"cap_bytes": s.cap_bytes, "cap_entries": s.cap_entries} for s in self._spaces},
                 "peak_bytes": self.peak_bytes,
                 "kills": list(self.kills),
+                "gate_kills": [] if self._limits is None else list(self._limits.gate_kills),
                 "polls": self.polls,
                 "unreadable_polls": self.unreadable_polls,
                 "disk": {k: dict(v) for k, v in self.disk.items()},
@@ -339,8 +420,9 @@ class Watch:
 
 
 def _killed_for_memory(kills: list[dict[str, Any]]) -> bool:
-    """Whether a kill of the watch's for memory reached a process: one that signalled none bounded nothing."""
-    return any(k["reason"] == "memory_limit" and k["signalled"] > 0 for k in kills)
+    """Whether a kill of the watch's for memory reached a process: one that signalled none bounded nothing, and one
+    for memory that may be another run's (`attributed: false`) never shows this run's over its limit."""
+    return any(k["reason"] == "memory_limit" and k["signalled"] > 0 and k.get("attributed", True) for k in kills)
 
 
 def _figures(hidden: Hidden) -> dict[str, int]:

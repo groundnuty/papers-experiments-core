@@ -1,6 +1,7 @@
 """O56: the real node's own operations on this machine: apptainer's environment named whole, and a helper process
 spawned, listed, signalled only as the process it is, and reaped. Nothing here runs apptainer."""
 
+import os
 import signal
 import sys
 import time
@@ -11,6 +12,21 @@ from expcore_onedata.sandbox.apptainer.node import LocalNode
 from expcore_onedata.sandbox.hostops import run_bounded
 
 SLEEPER = "import time\nprint('ready', flush=True)\ntime.sleep(30)\n"
+# a main thread on one core and a second thread on another: what a process's cores are, task by task
+SPLIT = (
+    "import os, threading, time\n"
+    "cores = sorted(os.sched_getaffinity(0))\n"
+    "os.sched_setaffinity(0, {cores[0]})\n"
+    "done = threading.Event()\n"
+    "def other():\n"
+    "    os.sched_setaffinity(0, {cores[1]})\n"
+    "    done.set()\n"
+    "    time.sleep(30)\n"
+    "threading.Thread(target=other, daemon=True).start()\n"
+    "done.wait()\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(30)\n"
+)
 
 
 def test_run_bounded_without_inheriting_gives_exactly_the_environment_named():
@@ -120,3 +136,37 @@ def test_a_pid_an_ended_helper_held_is_not_taken_for_that_helper_once_another_pr
 def test_the_node_reads_its_own_mount_table_for_mounts_under_a_directory(tmp_path):
     """O56: what the reaper unmounts is read from this process's mount table; a directory with none has none."""
     assert LocalNode().mounts_under(tmp_path) == []
+
+
+def test_o70_a_listed_process_has_its_task_count(child):
+    """O70: the pids limit counts tasks, which the listing reads from `Threads:` of the status file."""
+    node, process = child
+    found = {p.pid: p for p in node.processes()}
+    assert found[process.pid].threads >= 1
+
+
+def test_o70_the_node_reads_its_own_affinity_sorted():
+    """O70: the step's cores, from which a cell's pin is taken, are the driver's own CPU affinity."""
+    assert LocalNode().own_affinity() == sorted(os.sched_getaffinity(0))
+
+
+@pytest.mark.skipif(len(os.sched_getaffinity(0)) < 2, reason="needs two cores to put two tasks on different ones")
+def test_o70_the_cores_of_a_process_are_those_of_every_one_of_its_tasks(tmp_path):
+    """O70: `sched_setaffinity` is per thread, so a process whose main thread is pinned may have a task on another
+    core: the node reads the status of every task and gives their union; a process that is gone, or is another now,
+    has none."""
+    node = LocalNode()
+    cores = sorted(os.sched_getaffinity(0))
+    process = node.spawn([sys.executable, "-c", SPLIT], stdout=tmp_path / "o", stderr=tmp_path / "e")
+    try:
+        until = time.monotonic() + 20
+        while "ready" not in (tmp_path / "o").read_text() and time.monotonic() < until:
+            time.sleep(0.02)
+        assert node.task_affinity(process.pid, process.start) == frozenset(cores[:2])
+        assert node.task_affinity(process.pid, str(int(process.start) + 1)) == frozenset()
+    finally:
+        node.signal(process.pid, process.start, signal.SIGKILL)
+        until = time.monotonic() + 10
+        while node.alive(process.pid, process.start) and time.monotonic() < until:
+            time.sleep(0.02)
+    assert node.task_affinity(process.pid, process.start) == frozenset()

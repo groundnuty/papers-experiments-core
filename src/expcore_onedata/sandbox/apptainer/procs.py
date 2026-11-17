@@ -31,7 +31,8 @@ class Proc:
     `pidns` its PID namespace (`pid:[<inode>]`), None when the link could not be read; `rss` its resident anonymous and
     shared-memory bytes (`RssAnon` + `RssShmem`), None when `status` could not be read; `tags` which of the strings the
     caller asked for its environment or its command line holds; `anon` its `RssAnon` alone (what a cgroup's `anon`
-    counts of it), None when there is none (a zombie); `cgroup` its cgroup v2 path, None when it could not be read."""
+    counts of it), None when there is none (a zombie); `cgroup` its cgroup v2 path, None when it could not be read;
+    `threads` its tasks (`Threads:` of `status`, which Docker's pids.max counts), None when the line is not a number."""
 
     pid: int
     start: str
@@ -43,6 +44,7 @@ class Proc:
     tags: frozenset[str] = frozenset()
     anon: int | None = None
     cgroup: str | None = None
+    threads: int | None = None
 
     def brief(self) -> dict[str, object]:
         """The process as a deadline's or a quiesce's record keeps it: pid, start, comm and state."""
@@ -85,6 +87,45 @@ def parse_anon(text: str) -> int | None:
         if key == "RssAnon":
             parts = value.split()
             return int(parts[0]) * PAGE_KIB if len(parts) == 2 and parts[1] == "kB" and parts[0].isdigit() else None
+    return None
+
+
+def parse_threads(text: str) -> int | None:
+    """`Threads:` of `/proc/<pid>/status`, the process's tasks; None when the line is missing or not a whole number
+    (unknown, never 0)."""
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key == "Threads":
+            word = value.strip()
+            return int(word) if word.isdigit() else None
+    return None
+
+
+MAX_CORE = 65535  # a cpu list names no core above this: a longer range is no affinity, and is not expanded
+
+
+def parse_cpu_list(text: str) -> frozenset[int] | None:
+    """A list of cores and ranges (`0-3,8`, as `Cpus_allowed_list` and `taskset -c` write them) as a set; None when it
+    is not one, the empty list included: an affinity nothing can be read from is unknown, and the empty set would pass
+    for a subset of any pin."""
+    cores: set[int] = set()
+    for part in text.strip().split(","):
+        low, dash, high = part.partition("-")
+        if not low.isdigit() or (dash and not high.isdigit()):
+            return None
+        first, last = int(low), int(high) if dash else int(low)
+        if first > last or last > MAX_CORE:
+            return None
+        cores.update(range(first, last + 1))
+    return frozenset(cores)
+
+
+def parse_cpus_allowed(text: str) -> frozenset[int] | None:
+    """`Cpus_allowed_list` of a task's `status`, as a set; None when the line is missing or not a list."""
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key == "Cpus_allowed_list":
+            return parse_cpu_list(value)
     return None
 
 
@@ -174,8 +215,11 @@ __all__ = [
     "namespace",
     "parse_anon",
     "parse_children",
+    "parse_cpu_list",
+    "parse_cpus_allowed",
     "parse_rss",
     "parse_stat",
+    "parse_threads",
     "parse_uid",
     "stat_value",
     "tags_in",

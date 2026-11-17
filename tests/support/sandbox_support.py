@@ -170,6 +170,14 @@ def is_copy(argv: Sequence[str]) -> bool:
     return argv[0] == "cp" or (argv[0] == sys.executable and argv[-1] == "copy")
 
 
+def is_signal(argv: Sequence[str], name: str | None = None) -> bool:
+    """Whether a host command signals the agent's processes: the root half of a signal (`killhelper.py`, `TERM` or
+    `KILL`), or `kill` as earlier versions signalled."""
+    if argv[0] == "kill":
+        return name is None or argv[2] == name
+    return argv[0] == sys.executable and "-c" in argv and argv[-1] in ("TERM", "KILL") and name in (None, argv[-1])
+
+
 def around_run(host, wrapper: Callable[..., CmdResult]) -> Callable[[], None]:
     """Put `wrapper(original, argv, timeout_s, sudo=, input=)` around the host's `run`; return what undoes it."""
     original = host.run
@@ -191,6 +199,20 @@ def after_first(host, matches: Callable[[Sequence[str]], bool], action: Callable
             done.append(True)
             action()
         return result
+
+    around_run(host, wrapper)
+
+
+def before_first_signal(host, action: Callable[[], None]) -> None:
+    """Run `action` once, right before the first signal the harness sends to the agent's processes, so after the
+    listing it was decided from: the window in which a pid can be given to another process (O72)."""
+    done: list[bool] = []
+
+    def wrapper(original, argv, timeout_s, **kwargs):
+        if not done and is_signal(argv):
+            done.append(True)
+            action()
+        return original(argv, timeout_s, **kwargs)
 
     around_run(host, wrapper)
 
