@@ -35,17 +35,20 @@ SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatche
 PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a value the platform template leaves to up (fedfacts)
 SHA256 = re.compile(r"[0-9a-f]{64}")
 # The site's variables of the agent's Apptainer sandbox (M5), by the Site field each fills: the files' paths and the
-# work root, and the SHA-256 each file is declared to have (oneclient's bundle: the host mount's oneclient).
+# work root, and the SHA-256 each file is declared to have (oneclient's bundle: the host mount's oneclient; the
+# gateport: the cell's 443 mapper, `bundle/gateport.c`, the preload of a layout with a REST level).
 AGENT_PATHS = {
     "HPC_AGENT_SIF": "agent_sif",
     "HPC_EGRESS_SHIM": "egress_shim",
     "HPC_ONECLIENT_BUNDLE": "oneclient_bundle",
+    "HPC_GATEPORT": "gateport",
     "HPC_AGENT_WORK_ROOT": "agent_work_root",
 }
 AGENT_PINS = {
     "HPC_AGENT_SIF_SHA256": "agent_sif_sha256",
     "HPC_EGRESS_SHIM_SHA256": "egress_shim_sha256",
     "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
+    "HPC_GATEPORT_SHA256": "gateport_sha256",
 }
 # The study's own artifacts (its tool server's venv, clone and manifests) on the filesystem the login node and the
 # agent's node see: the directory a platform template (or a space's `data_manifest`) names as `@study_artifacts@`;
@@ -325,15 +328,17 @@ class Site:
     admin_mail: str = "admin@example.org"
     billing_weight: Optional[float] = None  # the site's billing weight per GB of memory, for describe
     # The agent's Apptainer sandbox (M5), for a platform template that names them (`hpcpins`): the SIF and the egress
-    # shim built for it on the filesystem the nodes see, and oneclient's bundle (oneclient_bundle.py), each with the
-    # SHA-256 it is declared to have, and the sandbox's work_root on the agent's node's tmpfs. Empty when the site
-    # declares none.
+    # shim built for it on the filesystem the nodes see, oneclient's bundle (oneclient_bundle.py) and the 443 mapper
+    # (the gateport, built for the SIF: the preload of a layout with a REST level), each with the SHA-256 it is
+    # declared to have, and the sandbox's work_root on the agent's node's tmpfs. Empty when the site declares none.
     agent_sif: str = ""
     agent_sif_sha256: str = ""
     egress_shim: str = ""
     egress_shim_sha256: str = ""
     oneclient_bundle: str = ""
     oneclient_bundle_sha256: str = ""
+    gateport: str = ""
+    gateport_sha256: str = ""
     agent_work_root: str = ""
     # The directory of the study's own artifacts (HPC_STUDY_ARTIFACTS), which `@study_artifacts@` stands for in a
     # template: `up` takes the digest of its tree in its preflight and records it, with this value, in the state file,

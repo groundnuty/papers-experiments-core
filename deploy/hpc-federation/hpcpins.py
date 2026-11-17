@@ -2,8 +2,9 @@
 own paths from `site.env`, and the check of every pinned file before the cluster is touched.
 
 A template that declares the Apptainer sandbox names its site values as placeholders (`PLACEHOLDERS`): the agent's SIF
-and the egress shim built for it, and oneclient's bundle for a mount level (`oneclient_bundle.py`), each with the
-SHA-256 the site declares, and the sandbox's work root on the agent's node's tmpfs. A pin is a declaration, not a
+and the egress shim built for it, oneclient's bundle for a mount level (`oneclient_bundle.py`) and the 443 mapper
+(`bundle/gateport.c`, built for the SIF) for a REST level, each with the SHA-256 the site declares, and the sandbox's
+work root on the agent's node's tmpfs. A pin is a declaration, not a
 measurement: `check` reads each declared file (on the filesystem the login node sees) and refuses `up` when one is
 missing or its SHA-256 is not the one declared, naming the variable and never the path; the rendered file then carries
 the declared SHA-256s, which the sandbox checks at every start (O13) and the campaign fingerprint holds
@@ -46,6 +47,8 @@ PLACEHOLDERS = {
     "hpc_egress_shim_sha": ("HPC_EGRESS_SHIM_SHA256", "egress_shim_sha256"),
     "hpc_oneclient_bundle": ("HPC_ONECLIENT_BUNDLE", "oneclient_bundle"),
     "hpc_oneclient_bundle_sha": ("HPC_ONECLIENT_BUNDLE_SHA256", "oneclient_bundle_sha256"),
+    "hpc_gateport": ("HPC_GATEPORT", "gateport"),
+    "hpc_gateport_sha": ("HPC_GATEPORT_SHA256", "gateport_sha256"),
     "hpc_agent_work_root": ("HPC_AGENT_WORK_ROOT", "agent_work_root"),
     "study_artifacts": ("HPC_STUDY_ARTIFACTS", "study_artifacts"),
 }
@@ -56,6 +59,7 @@ FILES = {  # file -> its pin
     "hpc_agent_sif": "hpc_agent_sif_sha",
     "hpc_egress_shim": "hpc_egress_shim_sha",
     "hpc_oneclient_bundle": "hpc_oneclient_bundle_sha",
+    "hpc_gateport": "hpc_gateport_sha",
 }
 OWN = ("hpc_egress_collector", "hpc_egress_collector_sha")  # the bundle's collector: filled from this checkout
 

@@ -75,16 +75,25 @@ PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"  # no cer
 
 
 def agent_site(directory: Path, sif: bytes = b"an invented SIF image\n", shim: bytes = b"an invented egress shim\n",
-               work_root: Path | None = None) -> dict:  # fmt: skip
+               work_root: Path | None = None, gateport: bytes | None = None) -> dict:  # fmt: skip
     """The site's variables of the agent's Apptainer sandbox (the pilot template's `[sandbox]`), its files written
     into `directory` and pinned by their SHA-256 (oneclient's bundle an invented tar a host mount can unpack:
     fake_elf); the work root `work_root`, or one under `directory` (made by the shard step on the agent's node, never
-    here)."""
+    here). With `gateport`, the site also declares the 443 mapper's file (the preload of the REST layout) with these
+    bytes; without it, the site declares none, as one whose layout has no REST level does."""
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "agent.sif").write_bytes(sif)
     (directory / "egresslog.so").write_bytes(shim)
     bundle = directory / "oneclient-bundle.tar"
+    mapper = {}
+    if gateport is not None:
+        (directory / "gateport.so").write_bytes(gateport)
+        mapper = {
+            "HPC_GATEPORT": str(directory / "gateport.so"),
+            "HPC_GATEPORT_SHA256": hashlib.sha256(gateport).hexdigest(),
+        }
     return {
+        **mapper,
         "HPC_AGENT_SIF": str(directory / "agent.sif"),
         "HPC_AGENT_SIF_SHA256": hashlib.sha256(sif).hexdigest(),
         "HPC_EGRESS_SHIM": str(directory / "egresslog.so"),
