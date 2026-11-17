@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign import liveness, prerun
+from expcore.campaign.after_loop import settle_usage
 from expcore.campaign.attempts import classify, is_charged, unverified
 from expcore.campaign.defect_log import DefectLog
 from expcore.campaign.executor import (
@@ -362,6 +363,8 @@ class AttemptRunner:
                     treatment_targets=targets,
                     sent_nothing=sent_no_request(error, backend),
                 )
+                if guard is not None and guard.loop_ended:  # past the loop its call log is all it spent (C05)
+                    result = settle_usage(result, *self._call_log(begun.id))
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
             result, moved = self._judge(result, record, model, key)
@@ -375,6 +378,11 @@ class AttemptRunner:
             status = self._finish(begun, run_dir, key, result, bookkeeping)
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
+
+    def _call_log(self, attempt_id: int) -> tuple[Any, Any]:
+        """The attempt's call log as its row keeps it: the requests sent and how each closed one ended."""
+        [row] = self.p.store.q("SELECT calls_sent, calls_usage FROM attempts WHERE id=?", (attempt_id,))
+        return row["calls_sent"], row["calls_usage"]
 
     def _judge(self, result: AttemptResult, record: Any, model: str, key: str) -> tuple[AttemptResult, bool]:
         """Apply the post-run health check (C11) and the served-identity check (C16) to a result."""
