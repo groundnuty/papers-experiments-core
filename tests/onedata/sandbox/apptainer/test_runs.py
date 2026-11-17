@@ -60,7 +60,7 @@ def test_the_next_start_reaps_a_dead_driver_s_run_whole(node, settings):
 
 def test_o71_the_reaper_counts_the_processes_that_held_a_dead_run_s_image(node, tmp_path):
     """O71: a FUSE server of the dead run's work disk is killed before its directory goes, and counted with the rest:
-    `end_holders` returned the number it killed and the reaper dropped it, so `reaped_orphans` undercounted."""
+    `end_holders` returned the number it found and killed, which the reaper dropped: `reaped_orphans` undercounted."""
     settings = make_settings(tmp_path, work_disk="image")
     old, cell = _abandoned(node, settings)
     image = workdisk.image_path(old.dir)
