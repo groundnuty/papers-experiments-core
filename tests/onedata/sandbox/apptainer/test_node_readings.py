@@ -25,11 +25,9 @@ def os_release(tmp_path, text=RELEASE, *, raw: bytes | None = None):
 
 def read(tmp_path, **given):
     """`readings` over an invented machine; `given` replaces one of its three sources."""
-    sources = {
-        "os_release": os_release(tmp_path),
-        "confstr": lambda name: GLIBC,
-        "uname": lambda: SimpleNamespace(release=KERNEL),
-    }
+    sources = {"confstr": lambda name: GLIBC, "uname": lambda: SimpleNamespace(release=KERNEL)}
+    if "os_release" not in given:  # one that is given is written already, to the same path
+        given["os_release"] = os_release(tmp_path)
     return hostfacts.readings(**{**sources, **given})
 
 
