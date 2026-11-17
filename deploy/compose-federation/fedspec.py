@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from fedslots import Slot, ToolServer, read_slots, read_toolserver
+
 HERE = Path(__file__).resolve().parent
 DEFAULT_LAYOUT = HERE / "federation.toml"
 LOOPBACK = "127.0.0.1"  # the only address anything is published on
@@ -61,6 +63,8 @@ TOP_KEYS = {
     "providers",
     "spaces",
     "principals",
+    "slots",  # the leased users, each slot pairing two principals (fedslots.py)
+    "toolserver",  # the tool server and its conditions, served by the slots (fedslots.py)
     "hpc",  # read by deploy/hpc-federation (hpcsettings.py) only; kept here unread, and Compose ignores it
 }
 SERVICE_KEYS = {"port", "memory_limit"}
@@ -176,6 +180,8 @@ class Spec:
     principals: tuple[Principal, ...]
     platform_template: Path | None = None
     probe_space: str | None = None  # the link check's probe space (#221): agent_visible = false, never reset per run
+    slots: tuple[Slot, ...] = ()  # O83: the leased users, each slot two of the principals above (none: no slot)
+    toolserver: ToolServer | None = None  # O83: the tool server's declaration (needs slots)
     hpc: Mapping[str, Any] | None = None  # the [hpc] table as written: the HPC driver checks it, Compose never reads it
 
     @property
@@ -195,6 +201,9 @@ class Spec:
 
     def members(self, space: str) -> tuple[Principal, ...]:
         return tuple(p for p in self.principals if space in p.spaces)
+
+    def principal(self, name: str) -> Principal:
+        return next(p for p in self.principals if p.name == name)
 
     @property
     def memory_bytes(self) -> int:
@@ -430,6 +439,12 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
             )
         principals.append(Principal(name, tuple(rights), member_of, agent))
 
+    slots = read_slots(read, top["slots"], {p.name: p for p in principals}) if "slots" in top else ()
+    tool = (
+        read_toolserver(read, top["toolserver"], slots, {p.name: p for p in principals})
+        if "toolserver" in top
+        else None
+    )
     template = checked_template(read, path, top["platform_template"]) if "platform_template" in top else None
     probe = checked_probe_space(read, top, spaces, template) if "probe_space" in top else None
     return Spec(
@@ -444,6 +459,8 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         principals=tuple(principals),
         platform_template=template,
         probe_space=probe,
+        slots=slots,
+        toolserver=tool,
         hpc=_hpc_table(read, top),
     )
 
