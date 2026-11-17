@@ -16,10 +16,11 @@ write goes through an `InfrastructureFacts`, which is made of a sandbox's metada
   the first owner that wrote it. An owner may write its own keys again as often as it likes; an update that names one
   key of another owner writes none of its keys.
 
-The table's key, `infrastructure_facts`, is written in this module only: a scanner (`tests/onedata/sandbox/
-test_infrafacts.py`) fails for any other source of `src` that names it, as a string or a keyword argument, so a new
-writer is this one's or is found by the test. A fact of the run that exists only when `metadata()` is read is added to
-the copy that call returns (`annotate`), under the same owners.
+The table's key, `infrastructure_facts`, is written in this module only: a scanner
+(`tests/onedata/sandbox/test_infrafacts.py`) fails for any other source of `src` that names it, as a string, a keyword
+argument or by this module's private name for it, so a new writer is this one's or is found by the test. A fact of the
+run that exists only when `metadata()` is read is added to the copy that call returns (`annotate`), under the same
+owners.
 
 A feature that adds a fact: write it with its own `owner`, and, if it is the sandbox's own, declare its key in `OWNED`
 (`tests/onedata/sandbox/test_infrafacts.py` checks the declared keys against the modules that make them).
@@ -32,7 +33,9 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
-KEY = "infrastructure_facts"  # the key of the run's metadata that holds the table; named here and nowhere else
+# The key of the run's metadata that holds the table. Private: the scanner fails for any reference to it outside this
+# module (the literal, this name, or an import of it), so no writer names the table itself.
+_TABLE = "infrastructure_facts"
 
 # the owners of the sandbox's own keys
 WORK_DISK = "work_disk"  # `apptainer.facts.record`: the departures, the work disk's keys, the provider's storage
@@ -70,23 +73,23 @@ class InfrastructureFacts:
         nothing, when a key belongs to another owner. The table is made by the first write: a run that has none has no
         empty one."""
         with self._lock:
-            table = self._meta.get(KEY, {})
+            table = self._meta.get(_TABLE, {})
             self._claim(owner, update, table)
-            self._meta.setdefault(KEY, {}).update(update)
+            self._meta.setdefault(_TABLE, {}).update(update)
 
     def get(self, key: str, default: Any = None) -> Any:
         """The value the run's table holds for `key`, or `default`."""
         with self._lock:
-            return self._meta.get(KEY, {}).get(key, default)
+            return self._meta.get(_TABLE, {}).get(key, default)
 
     def annotate(self, snapshot: dict[str, Any], owner: str, update: Mapping[str, Any]) -> None:
         """Add `update`'s keys to the table of `snapshot`, a copy of the run's metadata that `metadata()` returns, for
         `owner`: a fact that exists only when the metadata is read. The run's own table is not touched. The same
         refusals as `write`, against what the copy holds."""
         with self._lock:
-            table = snapshot.get(KEY, {})
+            table = snapshot.get(_TABLE, {})
             self._claim(owner, update, table)
-            snapshot.setdefault(KEY, {}).update(update)
+            snapshot.setdefault(_TABLE, {}).update(update)
 
     def _claim(self, owner: str, update: Mapping[str, Any], table: Mapping[str, Any]) -> None:
         """Check every key before any is claimed, so a refusal leaves the owners and the table as they were."""
@@ -107,7 +110,7 @@ class InfrastructureFacts:
 def refuse_replacement(fields: Mapping[str, Any]) -> None:
     """Refuse a `record(**fields)` that names the table, which would replace it whole: its facts are written by
     `InfrastructureFacts` and by nothing else."""
-    if KEY in fields:
+    if _TABLE in fields:
         raise FactsConflict(
             "a record may not replace the run's whole infrastructure facts: write one fact, with its owner"
         )

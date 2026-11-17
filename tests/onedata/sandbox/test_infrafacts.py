@@ -19,6 +19,7 @@ from expcore_onedata.sandbox.infrafacts import FactsConflict, InfrastructureFact
 SRC = Path(__file__).resolve().parents[3] / "src"
 HELPER = SRC / "expcore_onedata" / "sandbox" / "infrafacts.py"
 LITERAL = "infrastructure_facts"
+PRIVATE = "_TABLE"  # the helper's own name for it
 
 
 def handle(meta=None):
@@ -194,9 +195,9 @@ def test_o89_the_declared_owners_hold_disjoint_keys_that_the_features_actually_w
 
 
 def offences(source: str) -> list[int]:
-    """The lines of a source that name the table: its key as a string, or as a keyword argument. A docstring or a
-    comment that talks about the table is a longer string, or no string, and is not one. Writing the table by a name
-    that is not this literal needs the helper's constant, which the helper does not export."""
+    """The lines of a source that reach the table: its key as a string, as a keyword argument, or the helper's private
+    name for it (as a name, an attribute, an import or a string). A docstring or a comment that talks about the table is
+    a longer string, or no string, and is not one."""
     found = []
     tree = ast.parse(source)
     documentation = {
@@ -205,10 +206,16 @@ def offences(source: str) -> list[int]:
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
     }
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and node.value == LITERAL and id(node) not in documentation:
+        if isinstance(node, ast.Constant) and node.value in (LITERAL, PRIVATE) and id(node) not in documentation:
             found.append(node.lineno)
-        if isinstance(node, ast.keyword) and node.arg == LITERAL:
+        elif isinstance(node, ast.keyword) and node.arg == LITERAL:
             found.append(node.value.lineno)
+        elif (
+            (isinstance(node, ast.Name) and node.id == PRIVATE)
+            or (isinstance(node, ast.Attribute) and node.attr == PRIVATE)
+            or (isinstance(node, ast.ImportFrom) and any(alias.name == PRIVATE for alias in node.names))
+        ):
+            found.append(node.lineno)
     return sorted(found)
 
 
@@ -223,6 +230,11 @@ def offences(source: str) -> list[int]:
         'facts = meta["infrastructure_facts"]\nfacts["node"] = 1',
         'facts = meta.get("infrastructure_facts")',
         'x = {"infrastructure_facts": 1}',
+        "meta[infrafacts._TABLE] = {}",
+        "from expcore_onedata.sandbox.infrafacts import _TABLE",
+        "from expcore_onedata.sandbox.infrafacts import _TABLE as table",
+        'name = getattr(infrafacts, "_TABLE")',
+        "meta.setdefault(_TABLE, {})",
     ],
 )
 def test_o89_the_scanner_finds_each_way_of_reaching_the_table(source):
