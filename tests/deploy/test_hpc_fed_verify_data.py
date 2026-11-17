@@ -482,6 +482,86 @@ def test_c06_the_core_phase_of_a_federation_that_was_not_linked_does_not_overwri
     assert phase(fed) == "stopping"
 
 
+REFUSED = "a core phase is already running on this federation"
+
+
+def attempt_meanwhile(fed, found: list):
+    """The driver's core wrapped so that, once, a second `core_here` is attempted from inside it: `found` gets what that
+    attempt raised (None if it ran) and the state before and after it."""
+    real, attempted = fed.driver.core, []
+
+    def with_a_second(*args: Any, **kwargs: Any) -> str:
+        if not attempted:
+            attempted.append(True)
+            before = fed.driver.store.read()
+            try:
+                fed.driver.core_here()
+                raised = None
+            except RuntimeError as error:
+                raised = str(error)
+            found.append((raised, before, fed.driver.store.read()))
+        return real(*args, **kwargs)
+
+    fed.driver.core = with_a_second
+
+
+def test_c06_a_core_rerun_is_refused_while_another_core_phase_runs_and_changes_nothing(hpc, tmp_path, ca):
+    """C06, O63: `hpcfed.py core` takes no lifecycle lock, so two reruns could overlap: the second would read the
+    `bootstrapped` the first left, not be a rerun of a `linked` federation, and the first would then link it over the
+    second's failed check. The core's phase holds an exclusive lock on the root, never waited for: a second one is
+    refused at once, naming the state, and writes nothing; the first goes on and ends `linked`."""
+    fed = verified(hpc, tmp_path, ca)
+    found: list = []
+    attempt_meanwhile(fed, found)
+    rerun(hpc, fed, link_check_stand_in([]))
+    ((raised, before, after),) = found
+    assert raised is not None
+    assert REFUSED in raised
+    assert "phase bootstrapped" in raised  # the state the first run left while it works
+    assert after == before
+    assert phase(fed) == "linked"
+
+
+def test_c06_the_core_phase_lock_is_held_by_a_rerun_that_fails_and_released_when_it_ends(hpc, tmp_path, ca):
+    """C06, O63: a rerun whose link check fails holds the lock to its end, so a second one is refused meanwhile; it
+    releases it however it ends, so a rerun after it is not refused (and, the state not being `linked`, ends
+    `bootstrapped`)."""
+    fed = verified(hpc, tmp_path, ca)
+    found: list = []
+    attempt_meanwhile(fed, found)  # once: a second `core_here` from inside the first rerun
+    with pytest.raises(RuntimeError, match="the link check failed"):
+        rerun(hpc, fed, failing_links)
+    assert found[0][0] is not None
+    assert REFUSED in found[0][0]
+    assert phase(fed) == "bootstrapped"
+    rerun(hpc, fed, link_check_stand_in([]))  # raises if the lock were still held
+    assert phase(fed) == "bootstrapped"
+
+
+def test_c06_a_core_rerun_by_hand_is_refused_while_ups_own_core_phase_runs(hpc, tmp_path):
+    """C06, O63: `up`'s core phase (here, or the node's step under `[hpc] core = "step"`) takes the same lock: a rerun
+    started by hand meanwhile is refused, and `up` ends `linked` all the same."""
+    art = artifacts(tmp_path / "art")
+    fed = driver_over(hpc, tmp_path / "fed", study_layout(tmp_path / "layout"))
+    fed.site = site_env(tmp_path / "fed", art)
+    seen: list = []
+
+    def core_while_up_runs(layout: Any, owner: Any, values: Any, environ: Any = None) -> str:
+        if not seen:
+            seen.append(None)
+            try:
+                fed.driver.core_here()
+            except RuntimeError as error:
+                seen[0] = str(error)
+        return "core: linked"
+
+    fed.driver.core = core_while_up_runs
+    fed.driver.up(hpc.settings.site_from_environment(fed.site))
+    assert seen[0] is not None
+    assert REFUSED in seen[0]
+    assert phase(fed) == "linked"
+
+
 @pytest.mark.parametrize("before", ["providers", "bootstrapped"])
 def test_c06_the_core_phase_of_a_federation_that_was_not_linked_ends_bootstrapped_as_up_needs(
     hpc, tmp_path, ca, before
