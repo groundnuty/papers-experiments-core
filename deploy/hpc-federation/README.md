@@ -578,26 +578,44 @@ paths and stays out of the repository (the script's docstring has its form). Out
 login node's fault relay (M4), which `up`
 starts.
 
-**Copy the archives back and verify them: required, after `collect` and before `down`.** Nothing durable may live only
+**Copy the shards' results back and verify them: required, after `collect` and before `down`.** Nothing durable may live only
 on the cluster's scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all of scratch after 20 days with no job submitted (take your site's own limits; these are the ones this
-step was written against). The cluster cannot push to your host, so you pull. `collect` writes
-`archives.sha256.json` beside the archives in `<results>` and prints that file's SHA-256 on stderr, after the merge
-line; keep that line. From your own host, pull the results directory and check it:
+step was written against). The cluster cannot push to your host, so you pull. Run `collect` once every step has ended
+(a journal still being written is listed as `collect` read it). It writes `archives.sha256.json` in `<results>` and
+prints that file's SHA-256 on stderr, after the merge line; keep that line. From your own host, pull the whole results
+directory and check it:
 
 ```bash
-rsync -a <login node>:<results>/ <local dir>/    # or scp -r: the archives, their .out.json files and the manifest
+rsync -a <login node>:<results>/ <local dir>/    # or scp -r: the whole directory, with its subdirectories
 python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha256.json <local dir> \
     --manifest-sha256 <the hash collect printed>
 ```
 
+**What the required pull covers.** For each shard, exactly what the manifest lists, which `verify-copy` checks:
+
+| in `<results>` | what it is | why it must be in the pull |
+|---|---|---|
+| `<label>.out.tar` | the shard's `out/`, which the merge reads | the results |
+| `<label>.out.json` | the archive's manifest (its SHA-256, the exit status, the post-run record) | what the archive is |
+| `<label>/journals/*` (every file) | a spend journal per step (`expcore run --spend-journal`) | what a step killed outright spent, which `--resume` counts as `lost_in_kill`: nowhere else |
+| `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one |
+
+Every other snapshot is resume material and **not part of the required pull.** A snapshot names the archive its step
+started from (`shards.py`, `_run_step`: `facts = {"shard": spec, "base": base}`), and `--resume` restores the newest one
+only if it names the shard's current archive (`restore_newest`: `facts.get("base") != base` returns none). The snapshots
+of the step that wrote an archive name an earlier archive or none, and the last of them was taken before the archive was
+written, so the verified archive holds all they do. (Also not required: `<label>/running.json` and the manifest's `*.part`
+drafts.) Pulling the whole directory, as above, brings them anyway; `verify-copy` does not check them.
+
 `verify-copy` uses the standard library alone (Python 3.11 or later), so it runs on a host where the core is not
 installed: take `shards.py` from a checkout. It exits 0 only when the manifest is the file whose hash `collect` printed
-(a manifest pulled with the archives proves nothing about itself, so the hash is required) and every archive it names
-is in the directory with its size and SHA-256. It exits 1 naming each archive that is missing, not a regular file,
-cut short or changed, and 2 for a manifest it cannot use. An `*.out.tar` in the directory that the manifest does not
-name is a warning. It checks the archives, which are what the merge needs; the `<label>.out.json` files and each
-shard's journals and snapshots in `<results>` come along in the same pull and are evidence too, but are not checked.
-**Do not run `down` until it exits 0**: `down` cannot see your host and does not check that you did.
+(a manifest pulled with the archives proves nothing about itself, so the hash is required) and every file it names is in
+the directory, as a regular file under plain directories, with its size and SHA-256. It exits 1 naming each file that is
+missing, not a regular file, cut short or changed (name and reason, never a path), and 2 for a manifest it cannot use,
+among them a manifest with no list of the files beside the archives (an earlier tip's: it checked the archives alone).
+A file in the directory that the manifest does not name (an `*.out.tar` or `*.out.json`, or a journal in a shard's
+`journals/`: a step that ran after `collect`) is a warning. **Do not run `down` until it exits 0**: `down` cannot see
+your host and does not check that you did.
 
 > **A bare copy of the core without `.git` is refused as `core_src`.** The core names itself by its commit in every
 > campaign's environment (`provenance.core_identity`), read from the git work tree its `src/` lies in, or from the build
@@ -807,8 +825,8 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" plan --manifest <sh
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" status
 uv run python -I deploy/hpc-federation/shards.py collect --manifest "$F/shards.toml" --into <a new directory> --run
-# REQUIRED before down: pull the manifest's `results` directory to your own host and run verify-copy with the hash
-# collect printed (above, in the section on a shard's archive)
+# REQUIRED before down: pull the manifest's `results` directory (archives, journals and the rest, as listed in the
+# section on a shard's archive) to your own host and run verify-copy with the hash collect printed
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
 ```
 

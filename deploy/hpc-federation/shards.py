@@ -150,16 +150,23 @@ its label: the merge would refuse it too.
 **The copy back (required, after `collect` and before `down`).** Nothing durable may live only on the cluster's
 scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all
 of scratch after 20 days with no job submitted. The cluster cannot push to the operator's host, so the operator PULLS
-the archives (rsync or scp, run from their host). `collect` writes `<results>/archives.sha256.json` beside them from the
-private copies it verified (`expcore-hpc-archives/1`: a `plan_id`, which is the SHA-256 of the plan's study and results
-directories and each shard's index, count, label and root, and each archive's name, size and SHA-256) and prints that
-file's own SHA-256 on stderr. `verify-copy` takes the pulled manifest, the local directory and that hash
-(`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1 naming
-each archive that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only, never
-a path), 2 for a manifest it cannot use, and 0 when every archive matches. An archive of the directory that the manifest
-does not name is a warning. It uses the standard library alone (Python 3.11 or later, for `tomllib`), so it runs on a
-host without the core; it checks the archives only, which are what the merge needs (their `<label>.out.json` files come
-along in the same pull but are not checked).
+(rsync or scp, run from their host), once every step has ended. What the pull must hold, for each shard, is what
+`collect` lists in `<results>/archives.sha256.json` (`expcore-hpc-archives/1`): the archive `<label>.out.tar`; its
+manifest `<label>.out.json`; every file under `<label>/journals/` (a spend journal per step, which holds what a step
+killed outright spent and `--resume` counts as `lost_in_kill`); and the newest snapshot that verifies, when it is NEWER
+than the archive (`newer_snapshot`: a step resumed from the archive was killed before it archived, so its snapshot names
+that archive and holds runs the archive lacks, which the merge does not see). Every other snapshot is resume material,
+superseded by the verified archive (a snapshot of the step that wrote an archive names an earlier one or none, and was
+taken before it), and is not required. The manifest has the plan's `plan_id` (the SHA-256 of the plan's study and
+results directories and each shard's index, count, label and root), then the archives and the other files, each with
+its name relative to `<results>`, size and SHA-256 from the bytes `collect` read, sorted, with no path and no timestamp;
+`collect` prints the file's own SHA-256 on stderr. `verify-copy` takes the pulled manifest, the local directory and that
+hash (`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1
+naming each file that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only,
+never a path), 2 for a manifest it cannot use (one without the list of files beside the archives is an earlier tip's,
+which checked the archives alone), and 0 when every file matches. A file of the directory that the manifest does not
+name (an archive, an archive manifest, a journal) is a warning. It uses the standard library alone (Python 3.11 or
+later, for `tomllib`), so it runs on a host without the core.
 
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
@@ -2406,7 +2413,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     again.add_argument("--label", required=True)
     again.add_argument("--job", required=True)
     again.add_argument("--node", required=True)
-    copy = sub.add_parser("verify-copy", help="check the archives pulled to this host against collect's manifest")
+    copy = sub.add_parser("verify-copy", help="check the results pulled to this host against collect's manifest")
     copy.add_argument("manifest", type=Path, help="the pulled archives.sha256.json")
     copy.add_argument("local_dir", type=Path, help="the directory the archives were pulled into")
     copy.add_argument("--manifest-sha256", dest="manifest_sha256", required=True, help="the hash collect printed")
@@ -2430,7 +2437,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(shlex.join(line))  # first, and alone on stdout: callers read it as the merge line
             manifest_hash = _sha256(plan.results / ARCHIVES_MANIFEST)
             print(f"shards: archives manifest {ARCHIVES_MANIFEST} sha256 {manifest_hash}", file=sys.stderr)
-            print("shards: pull the archives and run verify-copy with that hash before down (README)", file=sys.stderr)
+            print("shards: pull the results directory and run verify-copy with that hash before down (README)",
+                  file=sys.stderr)  # fmt: skip
             return subprocess.run(line, check=False, cwd=args.into).returncode if args.run else 0
         missing = undeclared_data(plan)
         if missing:
