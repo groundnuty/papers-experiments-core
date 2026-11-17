@@ -320,6 +320,24 @@ def test_w1_down_sweeps_the_node_a_shard_was_resumed_on_in_its_job_and_never_can
     assert not world.root.exists()
 
 
+def test_w1_down_cancels_the_shards_step_still_running_in_the_resume_job_before_it_sweeps(world):
+    """O63 (W1): a shard step of this federation still running in the operator's job (its name) would outlive its
+    federation: down cancels it by its own id before it sweeps that node, and touches no other step of that job, nor
+    the job itself."""
+    world.snapshot(world.fingerprint())
+    world.line()
+    fed = world.shards.federation(world.plan.shards[0])
+    world.fake.steps[f"{fed['name']}-shard-1"] = f"{JOB}.2"
+    world.fake.steps["the-operators-own"] = f"{JOB}.3"
+    world.driver.down()
+    assert f"{JOB}.2" in world.fake.cancelled
+    assert f"{JOB}.3" not in world.fake.cancelled
+    assert JOB not in world.fake.cancelled
+    (resumed,) = [s for s in world.fake.sruns if "sweep" in s.command and s.job == JOB]
+    assert "--live-fails" in resumed.command
+    assert not world.root.exists()
+
+
 def test_w1_a_resume_job_that_ended_is_said_and_never_stepped_into(world, capsys):
     """O63 (W1): a recorded resume job that ended is said and no step goes into it (its id may be another job's by now);
     down still finishes."""

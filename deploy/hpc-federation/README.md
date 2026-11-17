@@ -525,8 +525,11 @@ next shard step there reaps what it left). Hand-edited lines are not supported: 
 **The running mark.** Every step keeps `<results>/<label>/running.json` (its node, process, job, step name and a
 nonce) from its start to its own end, written exclusively; a step killed outright leaves it. A start is refused while
 one is there; a `--resume` takes one over only on the node it names once its process is gone (a resume of `lines` on
-the same node), or with the nonce `resume-line` showed gone (`--over`), renaming it aside first, so of two launches of
-one line one alone runs.
+the same node), or with the nonce `resume-line` showed gone (`--over`). The mark is never absent while a step holds
+it: a takeover first makes that mark's one claim (`.running.json.<nonce>.taken`, exclusively, never removed), then
+renames its own mark over it, so of any number of launches of one line one alone runs. `down` cancels a step of this
+federation's shards still running in a resume's job, by its id, before it sweeps that node, and a step still there
+after it fails that sweep (the root is kept).
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into

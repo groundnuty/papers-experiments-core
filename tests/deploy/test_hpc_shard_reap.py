@@ -311,3 +311,36 @@ def test_of_two_steps_taking_one_mark_over_only_the_first_runs(shards, tmp_path,
     with pytest.raises(shards.ShardsError, match="running mark"):
         shards.claim_running(args, SPEC)
     assert json.loads(mark_of(tmp_path).read_text())["nonce"] == first["nonce"]
+
+
+def test_a_takeover_of_a_mark_another_step_already_claimed_is_refused_and_the_mark_is_never_absent(shards, tmp_path):
+    """O63: two resumes shown the same mark: the first made its one claim (`.running.json.<nonce>.taken`, here made
+    as it would be, the mark not yet replaced); the second is refused at its claim, the mark stays in place
+    throughout, so a start meanwhile finds it and is refused too: never two steps of the shard."""
+    mark = planted(tmp_path)
+    (mark_of(tmp_path).parent / f".running.json.{mark['nonce']}.taken").touch()
+    with pytest.raises(shards.ShardsError, match="took its running mark over first"):
+        shards.claim_running(step_args(tmp_path, resume=True, over=mark["nonce"]), SPEC)
+    assert json.loads(mark_of(tmp_path).read_text()) == mark
+    with pytest.raises(shards.ShardsError, match="running mark"):
+        shards.claim_running(step_args(tmp_path), SPEC)
+    assert json.loads(mark_of(tmp_path).read_text()) == mark
+    assert sorted(p.name for p in mark_of(tmp_path).parent.iterdir()) == [f".running.json.{mark['nonce']}.taken",
+                                                                          "running.json"]  # fmt: skip
+
+
+def test_a_sweep_that_must_find_no_live_step_fails_on_one_of_this_federations(shards, tmp_path, capsys):
+    """O63 (W1): down's sweep of a node in a job it never cancels (a resume's), once it cancelled this federation's
+    shard steps there: a step of this federation still running there fails it (exit 3), so down keeps the root; one of
+    another federation's is no business of this sweep's."""
+    root = federation(tmp_path, tmp_path / "root")
+    tmpfs = tmp_path / "tmpfs"
+    for name, owner_root in (("live", str(root)), ("other", "/another/root")):
+        path = tmpfs / f"expcore-shard-fed-a.{name}"
+        path.mkdir(parents=True)
+        record = {"shard": SPEC, "pid": os.getpid(), "start": shards._start_of(os.getpid()), "root": owner_root,
+                  "phase": "running"}  # fmt: skip
+        (path / "step.json").write_text(json.dumps(record))
+    assert shards.sweep(tmpfs, str(root), FakeNode(), live_fails=True) == 3
+    assert "1 step(s) of this federation still run here" in capsys.readouterr().out
+    assert (tmpfs / "expcore-shard-fed-a.live").is_dir()

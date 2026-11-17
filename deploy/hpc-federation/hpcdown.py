@@ -173,16 +173,42 @@ class Down:
             self.say(f"shard {entry['label']} was resumed in job {entry['job']}, which has ended: its node is not "
                      "swept here (the next shard step there reaps what it left)")  # fmt: skip
             return ""
+        self.end_shard_steps(state, entry["job"])
         name = f"{state['allocation']['name']}-shard-{entry['label']}-sweep"
-        return self.sweep_node(state, entry["node"], name, job=entry["job"])
+        return self.sweep_node(state, entry["node"], name, job=entry["job"], live_fails=True)
 
-    def sweep_node(self, state: Mapping[str, Any], node: str, name: str, job: Optional[str] = None) -> str:
+    def end_shard_steps(self, state: Mapping[str, Any], job: str) -> None:
+        """A step of this federation's shards still running in a job down does not cancel (an operator's, where a
+        shard was resumed) would outlive its federation: each one listed under that job, by the name every step of a
+        shard of this federation carries (`<allocation or agent's job name>-shard-<n>`), is cancelled by its own id,
+        and must leave the list within the cancel's bound; RuntimeError otherwise, so the root and its state are kept
+        for a second down. No other step of that job is touched."""
+        prefixes = [n for n in (state["allocation"]["name"], (state.get("sandbox") or {}).get("name")) if n]
+        shard_step = re.compile("(?:" + "|".join(re.escape(p) for p in prefixes) + r")-shard-[0-9]+")
+        live = {name: step for name, step in self.slurm.steps(job).items() if shard_step.fullmatch(name)}
+        for name, step in live.items():
+            self.say(f"a shard step of this federation ({name}) still runs in job {job}: it is cancelled by its id")
+            try:
+                self.slurm.cancel_step(step)
+            except SlurmError as error:  # its leaving the list decides (wait_steps)
+                self.say(f"the cancel of step {step} reported a failure ({error})")
+        deadline = self.clock() + self.timeouts["cancel"]
+        while any(name in self.slurm.steps(job) for name in live) and self.clock() < deadline:
+            self.sleep(self.poll_s)
+        if any(name in self.slurm.steps(job) for name in live):
+            raise RuntimeError(f"a shard step of this federation is still listed in job {job} after its cancel")
+
+    def sweep_node(
+        self, state: Mapping[str, Any], node: str, name: str, job: Optional[str] = None, live_fails: bool = False
+    ) -> str:
         """`shards.py sweep` on `node` (in `job`, a recorded resume's, when given), by the core's Python on the nodes
         (`HPC_CORE_PYTHON`, which up asks for with an agent's node: the reaper of the sandbox's runs is the core's), or
-        the nodes' own for a state an earlier up wrote without it, whose sweep then fails when it finds a work root."""
+        the nodes' own for a state an earlier up wrote without it, whose sweep then fails when it finds a work root.
+        `live_fails`: a step of this federation still running there fails the sweep (`--live-fails`), never passes."""
         site = Site.from_json(state["site"])
         python = site.core_python or site.node_python
         argv = [python, "-I", "-B", str(SHARDS), "sweep", "--tmpfs", site.node_tmp, "--root", str(self.root)]
+        argv += ["--live-fails"] if live_fails else []
         done = self.launcher.control(node, argv, name=name, timeout_s=self.timeouts["step"], job=job)
         if done.returncode != 0:
             tail = (done.stdout or "").strip().splitlines()[-1:]

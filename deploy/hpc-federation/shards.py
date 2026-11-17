@@ -122,6 +122,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -972,15 +973,17 @@ def archive_left(args: argparse.Namespace) -> int:
     return 0
 
 
-def sweep(tmpfs: Path, root: str, node: Any = None) -> int:
+def sweep(tmpfs: Path, root: str, node: Any = None, live_fails: bool = False) -> int:
     """On a node a shard step of this federation ran on, at the federation's down: remove every step's directory of
     this federation (its owner record names `root`) whose step was killed while its dispatcher ran and is shown gone;
     name each one kept (an out/ not archived, a step still running). Then the sandbox's work root that the federation's
     `platform.toml` names: its killed runs reaped (`reap_work_root`, W2), and the root itself removed once empty (W1),
     unless a step directory of ours on this node is kept (its step may still use it). Exit 1 when the work root could
     not be reaped (its leftovers, or a Python that cannot import the core's reaper: down's `HPC_CORE_PYTHON`), so down
-    never takes a work root it could not reap for a clean one."""
-    removed, kept = 0, []
+    never takes a work root it could not reap for a clean one. With `live_fails` (down's sweep of a node in a job it
+    does not cancel, once it cancelled this federation's shard steps there), a step of this federation that still runs
+    there, or cannot be shown gone, is exit 3: down never takes it for clean."""
+    removed, kept, live = 0, [], 0
     for left in leftovers(tmpfs):
         if left.owner is None or left.owner.get("root") != root:
             continue  # not this federation's, or not to be told
@@ -988,9 +991,14 @@ def sweep(tmpfs: Path, root: str, node: Any = None) -> int:
             kept.append(f"{left.path.name} (its out/ was not archived: `shards.py step --archive-left`)")
         elif not left.removable:
             kept.append(f"{left.path.name} (its step still runs, or cannot be shown gone)")
+            live += 1
         else:
             remove_tree(left.path)
             removed += 1
+    if live_fails and live:
+        print(f"shards: sweep: ERROR: {live} step(s) of this federation still run here, or cannot be shown gone; "
+              f"kept: {'; '.join(kept)}")  # fmt: skip
+        return 3
     try:
         work_root = sandbox_work_root(root)
         reaped = reap_work_root(work_root, node) if work_root is not None else {"runs": 0}
@@ -1054,6 +1062,8 @@ def taking_over(found: Mapping[str, Any] | None, args: argparse.Namespace, spec:
     never taken over."""
     if found is None or found.get("format") != RUNNING_FORMAT or found.get("shard") != dict(spec):
         return False
+    if not isinstance(found.get("nonce"), str) or not re.fullmatch(r"[0-9a-f]{32}", found["nonce"]):
+        return False  # it names its claim's file: never anything but a nonce of ours
     over = getattr(args, "over", None)
     if over:
         return found.get("nonce") == over
@@ -1064,17 +1074,32 @@ def claim_running(args: argparse.Namespace, spec: Mapping[str, Any]) -> dict[str
     """The shard's running mark, `<results>/<label>/running.json`, taken for this step before anything else (O62):
     which node, process, job and step run the shard, and a nonce. A step's directory on one node's tmpfs cannot be
     seen from another (`clear_leftovers`), so this mark on the shared results directory is what stops two steps of
-    one shard on two nodes. Written exclusively, and removed when the step ends by itself (`release_running`): a step
-    killed outright leaves it. A start finds none, or is refused; a `--resume` takes one over only as `taking_over`
-    says, by renaming it aside first (of two that try, one alone succeeds) and making its own exclusively. `ShardsError`
-    on any refusal; nothing of the shard is touched then."""
+    one shard on two nodes. It is removed when the step ends by itself (`release_running`): a step killed outright
+    leaves it. The mark is never absent while a step holds it, so it is made whole in a draft of this step's and put
+    in place by an exclusive link (a start: refused when one is there) or, for a `--resume` that may take one over
+    (`taking_over`), by a rename over it once this step made the one claim of that mark, `.running.json.<its
+    nonce>.taken`, exclusively: of any number of steps taking one mark over, one alone makes the claim, and the claim
+    is never removed, so a later step can never claim that mark again. `ShardsError` on any refusal; nothing of the
+    shard is touched then."""
     path = _mark_path(args)
     path.parent.mkdir(parents=True, exist_ok=True)
     mark = {"format": RUNNING_FORMAT, "shard": dict(spec), "nonce": secrets.token_hex(16),
             "node": os.uname().nodename, "pid": os.getpid(), "start": _start_of(os.getpid()),
             "job": getattr(args, "job", None), "step": getattr(args, "step_name", None),
             "root": os.environ.get("EXPCORE_FED_ROOT"), "started": _stamp()}  # fmt: skip
-    if os.path.lexists(path):
+    draft = path.with_name(f".{RUNNING_MARK}.{mark['nonce']}.draft")
+    descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(mark, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        if not os.path.lexists(path):
+            try:
+                os.link(draft, path)  # exclusive, and whole: a reader never sees a part of it
+            except FileExistsError:
+                raise ShardsError(f"shard {args.label}: another step of it started meanwhile") from None
+            return mark
         found = _record(path)
         if not args.resume:
             raise ShardsError(f"shard {args.label}: a step of it runs, or was killed outright (its running mark is "
@@ -1082,28 +1107,17 @@ def claim_running(args: argparse.Namespace, spec: Mapping[str, Any]) -> dict[str
         if not taking_over(found, args, spec):
             raise ShardsError(f"shard {args.label}: a step of it may still run on another node (its running mark "
                               "names it); `shards.py resume-line` shows it gone and continues it")  # fmt: skip
-        aside = path.with_name(f".{RUNNING_MARK}.{mark['nonce']}.taken")
+        claim = path.with_name(f".{RUNNING_MARK}.{found['nonce']}.taken")
         try:
-            os.rename(path, aside)
-        except FileNotFoundError:
+            os.close(os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        except FileExistsError:
             raise ShardsError(f"shard {args.label}: another step took its running mark over first") from None
-        if _record(aside) != found:  # another step's, made between the reading and the rename: put back
-            try:
-                os.link(aside, path)
-                os.unlink(aside)
-            except OSError:
-                pass  # left aside, never removed: it names a step that may run
-            raise ShardsError(f"shard {args.label}: another step took its running mark over first")
-        os.unlink(aside)
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    except FileExistsError:
-        raise ShardsError(f"shard {args.label}: another step of it started meanwhile") from None
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(mark, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    return mark
+        if _record(path) != found:  # only the claim's maker replaces that mark: never another step's, kept
+            raise ShardsError(f"shard {args.label}: its running mark changed while it was taken over")
+        os.replace(draft, path)
+        return mark
+    finally:
+        draft.unlink(missing_ok=True)
 
 
 def release_running(args: argparse.Namespace, mark: Mapping[str, Any]) -> None:
@@ -1280,6 +1294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     left = sub.add_parser("sweep")
     left.add_argument("--tmpfs", type=Path, required=True)
     left.add_argument("--root", required=True)
+    left.add_argument("--live-fails", dest="live_fails", action="store_true")
     again = sub.add_parser("resume-line")
     again.add_argument("--manifest", type=Path, required=True)
     again.add_argument("--label", required=True)
@@ -1288,7 +1303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "sweep":
-            return sweep(args.tmpfs, args.root)
+            return sweep(args.tmpfs, args.root, live_fails=args.live_fails)
         if args.command == "resume-line":
             line = _sibling("shardresume").resume_line(sys.modules[__name__], args.manifest, args.label, args.job,
                                                        args.node, script=Path(__file__).resolve())  # fmt: skip
