@@ -230,7 +230,7 @@ def test_a_marker_that_cannot_be_written_is_a_warning_naming_the_shard_and_the_c
     assert not (plan.shards[1].root / "evidence-collected.json").exists()
     assert "WARNING: shard fed-b: the collected-evidence marker could not be written" in capsys.readouterr().err
     record_step(plan.shards[1].root, "fed-b")
-    assert module.uncollected(plan.shards[1].root) == (["fed-b"], False)
+    assert module.uncollected(plan.shards[1].root) == (["fed-b", "shard"], False)  # `shard`: the fixture's own record
 
 
 def test_the_hash_collect_prints_is_the_hash_of_the_manifest_it_wrote(shards, tmp_path, capsys):

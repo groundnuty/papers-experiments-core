@@ -339,12 +339,13 @@ def test_a_step_refused_before_it_starts_leaves_no_record(shards, tmp_path, monk
     monkeypatch.setenv("EXPCORE_FED_ROOT", str(root))
     seen: list = []
     assert shards.step(_step_args(tmp_path), runner=_dispatcher(seen), core_found=lambda path: False) != 0
-    assert not (root / "shard-steps").exists()
+    assert not (root / "shard-steps" / "fed-a.json").exists()
 
 
 def test_a_step_that_cannot_write_its_record_does_not_start(shards, tmp_path, monkeypatch):
     """O63: no record means `down` would not know a step ran: the step is refused and its dispatcher never runs."""
     root = make_root(tmp_path / "fed" / "fed-a")
+    shutil.rmtree(root / "shard-steps")
     (root / "shard-steps").write_text("a file where the directory should be")
     monkeypatch.setenv("EXPCORE_FED_ROOT", str(root))
     seen: list = []
