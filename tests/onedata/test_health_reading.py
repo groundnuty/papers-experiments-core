@@ -624,13 +624,27 @@ class Record:
 
 
 def inside_injection(
-    tmp_path, world, *, extra=None, report_offline=True, down_names=(), abandon=False, instrument=False, returned=False
+    tmp_path,
+    world,
+    *,
+    extra=None,
+    report_offline=True,
+    down_names=(),
+    abandon=False,
+    instrument=False,
+    returned=False,
+    taking=None,
 ):
     """The pilot's executor reads health inside the injection and restores after: the run's pre-run check, its
     exclusive admission, the injector started (its entry open), then the post-run check through the gate; `extra` is
     given the journal and the attempt's own token while the injection is open (to put another's lines there), and
     `down_names` go down with the target; `abandon` drops the injector (its lock goes) before the check, as an executor
-    that returned without restoring would. Return the answer, the try's reading and the entries open at the check."""
+    that returned without restoring would. Return the answer, the try's reading and the entries open at the check.
+
+    `taking` is the owner's way (`PostRunHealth.take`): it is called with a started `PostRunHealth` inside the
+    injection, which then finishes AFTER the restore, as an injector that restores when its own session closes leaves
+    it, still in the run's admission. The answer is then the snapshot `finish_instruments` records, and the reading the
+    one read back from the record."""
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     store, _, _ = planned_store(campaign)
@@ -655,7 +669,11 @@ def inside_injection(
                 returned
             ):  # the executor has returned, as the scheduler's post-run check finds it: nothing is in progress
                 prerun.note(prerun.EXECUTOR_RETURNED, True)
-            if instrument:  # the record's way: the instrument finishes inside the injection, before the restore
+            if taking is not None:  # the owner's way: it takes the reading here, and the instrument finishes after
+                owned = PostRunHealth(world.health)
+                owned.start(RUN)
+                taking(owned)
+            elif instrument:  # the record's way: the instrument finishes inside the injection, before the restore
                 record = finish_instruments(Record(), [PostRunHealth(world.health)])
                 answer, reading = record.instruments[NAMESPACE], reading_in_instruments(record.instruments)
             else:
@@ -667,6 +685,9 @@ def inside_injection(
                     journal.append({"event": "cleared", "id": entry["id"]})
             if injectors:
                 assert injectors[0].finish()["ok"] is True  # the restore, after the reading
+            if taking is not None:  # the executor's finish_instruments, after the injector's restore
+                record = finish_instruments(Record(), [owned])
+                answer, reading = record.instruments[NAMESPACE], reading_in_instruments(record.instruments)
     return answer, reading, opened
 
 
@@ -1013,3 +1034,168 @@ def test_o90_an_instrument_whose_check_raises_leaves_no_reading_and_the_record_s
 def test_o90_a_record_with_no_whole_reading_reads_as_unknown(carried):
     """O90: absent or malformed in the record, the reading is None, never True."""
     assert reading_in_instruments(carried) is None
+
+
+# --- take(): the owner of the injection takes the reading inside it, finish() hands it over --------------------------
+
+
+class Calls:
+    """A health check that counts its calls and answers `answers` in order (then the last one again)."""
+
+    def __init__(self, *answers):
+        self.answers, self.calls = list(answers), 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.answers[min(self.calls, len(self.answers)) - 1]
+
+
+def test_o90_a_reading_taken_inside_the_own_injection_is_what_finish_returns_after_the_restore(tmp_path, fake):
+    """O90: an injector that restores when its own session closes does so before `finish_instruments`. The owner takes
+    the reading inside the injection (`take`), the injector restores, and `finish` returns THAT reading unchanged: the
+    target is held and target-only, which a reading made after the restore (its entry cleared) cannot say."""
+    world = four_spaces(tmp_path, fake, faults={})
+    snapshot, reading, opened = inside_injection(tmp_path, world, taking=lambda taken: taken.take())
+    assert [entry["target"] for entry in opened] == [TARGET]
+    assert (snapshot["ok"], snapshot["deferred"]) == (False, False)  # the target is reported offline
+    assert reading.targets == {TARGET}
+    assert reading.held == {TARGET}
+    assert target_only(reading) is True
+
+
+def test_o90_with_no_take_finish_reads_after_the_restore_as_it_did(tmp_path, fake):
+    """O90: nothing changes for an instrument whose `take` is never called: `finish` makes its own call, after the
+    restore here, so the run's own entry is cleared and the reading holds no target."""
+    world = four_spaces(tmp_path, fake, faults={})
+    _, reading, _ = inside_injection(tmp_path, world, taking=lambda taken: None)
+    assert reading.targets == {TARGET}
+    assert reading.held == frozenset()
+
+
+def test_o90_the_snapshot_is_the_same_bytes_whichever_path_took_it(tmp_path, fake):
+    """O90: a bare instrument's `finish` inside the injection and a taken one handed over by `finish` after the
+    restore give the same snapshot, byte for byte."""
+    world = four_spaces(tmp_path, fake, faults={})
+    bare = []
+
+    def both(taken):
+        reader = PostRunHealth(world.health)
+        reader.start(RUN)
+        bare.append(reader.finish())
+        taken.take()
+
+    snapshot, _, _ = inside_injection(tmp_path, world, taking=both)
+    assert json.dumps(snapshot, sort_keys=True) == json.dumps(bare[0], sort_keys=True)
+    assert bare[0]["reading"]["held"] == [TARGET]
+
+
+def test_o90_a_second_take_is_refused_by_name_and_the_first_reading_stands(tmp_path, fake):
+    """O90: one take per run: the second is an error that names the instrument, and `finish` still returns the first
+    reading."""
+    world = four_spaces(tmp_path, fake, faults={})
+
+    def twice(taken):
+        taken.take()
+        with pytest.raises(RuntimeError, match=NAMESPACE):
+            taken.take()
+
+    _, reading, _ = inside_injection(tmp_path, world, taking=twice)
+    assert reading.held == {TARGET}
+    assert target_only(reading) is True
+
+
+def test_o90_a_take_after_the_executor_returned_explains_nothing_and_finish_keeps_it_unread(tmp_path, fake):
+    """O90: a take is made inside the executor, so it is within the fault gate's contract: once the executor has
+    returned (`prerun.EXECUTOR_RETURNED`) an own entry still open is a leftover and stays unsettled, take or no take.
+    The reading is unread and `finish` hands that over, never a fresh one."""
+    world = four_spaces(tmp_path, fake, faults={})
+    snapshot, reading, opened = inside_injection(tmp_path, world, returned=True, taking=lambda taken: taken.take())
+    assert [entry["target"] for entry in opened] == [TARGET]
+    assert snapshot["ok"] is False
+    assert reading == UNREAD
+    assert target_only(reading) is None
+
+
+def test_o90_take_makes_the_one_call_and_finish_makes_no_other(tmp_path):
+    """O90: with a take there is exactly one call of the check, the take's; finish returns its answer; and a refused
+    second take makes none. With no take, finish makes the one call."""
+    check = Calls(Health(False, "the take's"), Health(True, "a later call's"))
+    taken = PostRunHealth(check)
+    taken.start(RUN)
+    taken.take()
+    assert check.calls == 1
+    with pytest.raises(RuntimeError):
+        taken.take()
+    assert check.calls == 1
+    assert taken.finish() == {"ok": False, "deferred": False, "reading": None}
+    assert check.calls == 1
+    bare = Calls(Health(True, "finish's"))
+    reader = PostRunHealth(bare)
+    reader.start(RUN)
+    assert reader.finish() == {"ok": True, "deferred": False, "reading": None}
+    assert bare.calls == 1
+
+
+def test_o90_a_take_that_fails_is_never_made_up_by_a_fresh_reading_in_finish():
+    """O90: the check raised inside the take, so the record says the finish failed (`{"ok": False, "error": ...}`,
+    unknown), as for a bare instrument whose call raised: finish never reads again, after the restore, to put a clean
+    reading in its place. The take itself does not cost the run its record, and a second take is refused."""
+    calls = []
+
+    def broken():
+        calls.append(1)
+        raise OSError("the check could not run")
+
+    failing = PostRunHealth(broken)
+    failing.start(RUN)
+    failing.take()
+    with pytest.raises(RuntimeError, match=NAMESPACE):
+        failing.take()
+    record = finish_instruments(Record(), [failing])
+    assert record.instruments[NAMESPACE] == {"ok": False, "error": "OSError"}
+    assert reading_in_instruments(record.instruments) is None
+    assert len(calls) == 1
+
+
+def test_o90_start_clears_a_take_whose_finish_never_ran_so_it_is_never_the_next_runs(tmp_path):
+    """O90: an instrument that serves run after run never hands the next run the reading an earlier run took and never
+    finished: `start` clears it, and the next `finish` is that run's own call. A take whose finish ran leaves nothing
+    behind either, so the next run takes its own."""
+    check = Calls(Health(False, "the first run's"), Health(True, "the second run's"), Health(False, "the third's"))
+    instrument = PostRunHealth(check)
+    instrument.start(RUN)
+    instrument.take()  # the executor failed before finish_instruments
+    instrument.start(RUN)  # the next run
+    assert instrument.finish()["ok"] is True
+    assert check.calls == 2
+    instrument.start(RUN)
+    instrument.take()
+    assert instrument.finish()["ok"] is False
+    assert check.calls == 3
+
+
+def test_o90_a_take_that_outlives_its_run_never_overwrites_the_next_runs_snapshot():
+    """O90: run A's take is still inside its check when `start` begins run B on the same instance and B takes: when A's
+    check answers, late, A's snapshot is dropped, and B's `finish` returns B's own (a failed verdict), never A's."""
+    released, entered, calls = threading.Event(), threading.Event(), []
+
+    def check():
+        calls.append(1)
+        if len(calls) == 1:
+            entered.set()
+            assert released.wait(30)
+            return Health(True, "the first run's, late")
+        return Health(False, "the second run's")
+
+    instrument = PostRunHealth(check)
+    instrument.start(RUN)
+    first = threading.Thread(target=instrument.take, name="first-take")
+    first.start()
+    assert entered.wait(30)
+    instrument.start(RUN)  # the next run, while the first run's take is still reading
+    instrument.take()
+    released.set()
+    first.join(30)
+    assert not first.is_alive()
+    assert instrument.finish()["ok"] is False
+    assert len(calls) == 2

@@ -38,6 +38,7 @@ A reading is per call: `PlatformHealth` resets it at the start of every call, so
 import json
 import logging
 import re
+import threading
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -315,18 +316,82 @@ class PostRunHealth:
     (the fault gate explains the run's own injection there, and answers every other open one, which leaves the reading
     unread). `check` is the platform's `PlatformHealth`; the snapshot is `{"ok", "deferred", "reading"}`, the reading
     as `HealthReading.to_json()` or None, and `reading_in_instruments(record.instruments)` reads it back. A call that
-    raises is recorded by `finish_instruments` as `{"ok": False, "error": ...}`, which reads as no reading."""
+    raises is recorded by `finish_instruments` as `{"ok": False, "error": ...}`, which reads as no reading.
+
+    **`take()`, for an injector that restores before `finish_instruments`.** A study's injector can restore when its
+    own session closes, before the executor runs `finish_instruments`, and then a bare `finish` reads after the restore
+    (nothing offline, `held` empty). The OWNER of the injection calls `take()` ONCE inside it, after the agent loop and
+    before it collects and restores: it makes the one `checked` call then, under the run's own admission and before
+    the executor has returned, and keeps the snapshot. `finish` then returns THAT snapshot, never a new reading, and
+    clears it. The snapshot is built by one function for both paths, so it is the same bytes whichever took it. Nothing
+    changes for an instrument whose `take` is never called: `finish` makes the call itself. A second `take` raises a
+    `RuntimeError` naming the instrument, whether or not the first one succeeded; a check that raises inside `take` does
+    not cost the run its record: its type is logged, the take is kept as failed, and `finish` raises it again, which
+    `finish_instruments` records as `{"ok": False, "error": ...}` (unknown), never a fresh reading after the restore.
+    `take` called once the executor has returned is within the same contract as any check: the fault gate explains
+    nothing then, and the reading is unread. The state is per run: `start` clears a take whose `finish` never ran, and a
+    take still reading when the next run begins drops its answer, so an instance that serves run after run never hands
+    one run another's reading; give each concurrent run its own."""
 
     namespace = NAMESPACE
 
     def __init__(self, check: Callable[[], Health], source: Any = None) -> None:
         """`check` is the platform's whole check or a wrapper of it; `source` the `PlatformHealth` a wrapper calls."""
         self._check, self._source = check, source
+        self._lock = threading.Lock()  # guards `_called` only: never held across the check's call
+        self._called = False  # `take` was called for this run: `finish` never makes a call of its own
+        self._kept: Mapping[str, Any] | None = None  # the snapshot the take made
+        self._failure: Exception | None = None  # what the check raised inside the take
+        self._run = 0  # which run `start` began last: a take publishes its result only into the run it began in
 
     def start(self, identity: Mapping[str, Any]) -> None:
-        """Nothing is read before the run."""
+        """Nothing is read before the run; a take an earlier run made and never finished is dropped, and one still
+        reading is left to drop its own answer when it comes."""
+        with self._lock:
+            self._called, self._kept, self._failure = False, None, None
+            self._run += 1
+
+    def take(self) -> None:
+        """Make the run's one call now, inside its own open injection, and keep its snapshot for `finish` to return.
+
+        Called once by the owner of the injection, in the executor, after the agent loop and before it collects and the
+        injector restores. A second call raises `RuntimeError`; a check that raises is kept for `finish` to raise."""
+        with self._lock:
+            if self._called:
+                raise RuntimeError(
+                    f"the {self.namespace} instrument was taken already: take() makes the run's one reading, once, "
+                    "inside the run's own injection"
+                )
+            self._called = True
+            run = self._run
+        kept: Mapping[str, Any] | None = None
+        failure: Exception | None = None
+        try:
+            kept = self._snapshot()
+        except Exception as error:  # `finish` raises it again, where the record keeps it as a failed finish
+            log.warning("the %s take failed (%s): finish records it as failed", self.namespace, type(error).__name__)
+            failure = error
+        with self._lock:
+            if run != self._run:  # the run was over (`start` began another) while the check was reading: not its own
+                log.warning("the %s take of an earlier run finished after its run: dropped", self.namespace)
+                return
+            self._kept, self._failure = kept, failure
 
     def finish(self) -> Mapping[str, Any]:
+        """The snapshot `take` kept (and forgets it), or, when `take` was never called, one call of the check now."""
+        with self._lock:
+            called, kept, failure = self._called, self._kept, self._failure
+            self._called, self._kept, self._failure = False, None, None
+        if not called:
+            return self._snapshot()
+        if kept is not None:
+            return kept
+        if failure is not None:
+            raise failure
+        raise RuntimeError(f"the {self.namespace} take did not finish, so there is no reading to return")
+
+    def _snapshot(self) -> dict[str, Any]:
+        """One call of the check as the snapshot: the one builder both paths use."""
         verdict, reading = checked(self._check, self._source)
         return {
             "ok": verdict.ok,
