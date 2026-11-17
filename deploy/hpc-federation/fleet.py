@@ -324,6 +324,7 @@ class Fleet:
             plan = fleetplan.load(draft)
             holding = {**{s["label"]: s["member"] for s in record["shards"] if s["member"]}, **new}
             lines = {label: fleetplan.line_of(plan, label, False) for label in sorted(holding)}
+            fleetplan.check_campaign(plan, sorted(holding))  # one campaign fingerprint, before anything is assigned
 
             def apply(current: Dict[str, Any]) -> None:
                 current["template"] = settings

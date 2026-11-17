@@ -22,7 +22,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import hpcstate
 import shards
@@ -229,6 +229,16 @@ def load(path: Path) -> shards.Plan:
         return shards.load_plan(path)
     except shards.ShardsError as error:
         raise FleetError(f"the fleet's shard manifest: {error}") from None
+
+
+def check_campaign(plan: shards.Plan, labels: Sequence[str]) -> None:
+    """The study's campaign fingerprint, taken beside each of these shards' federations' `platform.toml`, is one
+    (`shards.check_one_campaign`, O63): FleetError otherwise. A study's plugin may fingerprint a setting that the
+    platform's own fingerprint (`platform_fingerprint`) leaves out, and the shards would never merge."""
+    try:
+        shards.check_one_campaign(plan, labels)
+    except shards.ShardsError as error:
+        raise FleetError(str(error)) from None
 
 
 def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None) -> List[str]:

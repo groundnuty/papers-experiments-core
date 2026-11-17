@@ -539,6 +539,14 @@ def undeclared_spaces(label: str, root: Path) -> str | None:
     return f"{label}: {', '.join(missing)}" if missing else None
 
 
+def check_one_campaign(plan: Plan, only: Sequence[str] | None = None) -> None:
+    """`ShardsError` unless the study's campaign fingerprint, taken beside each shard's federation's `platform.toml`
+    (`only`: the labels of the shards a line is made for, all by default), is one: the shards would never merge, and
+    `merge` finds it after the spend (O63; `shardresume.check_one_campaign`). `plan` and `lines` call it before they
+    print a line, `fleet.py plan` before it assigns a shard."""
+    _sibling("shardresume").check_one_campaign(sys.modules[__name__], plan, only)
+
+
 def _job_id(job: Any) -> bool:
     return isinstance(job, str) and job.isdigit()
 
@@ -2124,6 +2132,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"(data_manifest in its platform.toml, C06); undeclared: {'; '.join(missing)}"
             )
         plan = pinned(plan)  # each declared script read and hashed before any line is printed
+        check_one_campaign(plan)  # and every shard's campaign fingerprint shown to be one (O63)
         script = Path(__file__).resolve()
         for shard in plan.shards:
             fed = federation(shard)
