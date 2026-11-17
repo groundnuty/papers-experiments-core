@@ -9,4 +9,4 @@ shift 2
 cd /
 "$@"
 rc=$?
-python3 -I "$(dirname "$0")/record.py" rc "$rcfile" "$name" "$rc"
+python3 -I -B "$(dirname "$0")/record.py" rc "$rcfile" "$name" "$rc"

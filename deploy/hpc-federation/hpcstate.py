@@ -22,6 +22,7 @@ WORKDIR_NAME = re.compile(r"hpcop-o[pz]\.[A-Za-z0-9]{6}")  # the bundle's mktemp
 JOB_ID = re.compile(r"[0-9]{1,12}")
 STEP_ID = re.compile(r"[0-9]{1,12}\.[0-9]{1,9}")
 PLACEMENTS = ("het", "separate")  # where the agent's node is held (hpcsettings.SANDBOX_PLACEMENTS)
+SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class StateError(RuntimeError):
@@ -90,7 +91,37 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
     sandbox = state.get("sandbox")
     if sandbox is not None:
         checked_sandbox(sandbox)
+    if "data" in state:
+        checked_data(state["data"])
     return state
+
+
+def checked_data(data: Any) -> None:
+    """The record of the spaces the study ingests into (`data.ingested`, by space name): the digest of the manifest each
+    is verified against, whether the layout declares it, and `verified`, null until `hpcfed.py verify-data` has read
+    the space back and found exactly that manifest, then the digest it was verified against and the counts.
+    `shards.py plan` reads it, so a shape other than the driver's is a state that is not this one's."""
+    where = f"{STATE}: data"
+    if not isinstance(data, dict) or not isinstance(data.get("ingested"), dict):
+        raise StateError(f"{where}.ingested is not a table of spaces")
+    for record in data["ingested"].values():
+        if not isinstance(record, dict) or not isinstance(record.get("declared"), bool):
+            raise StateError(f"{where}.ingested: a space's record is not the driver's")
+        if not (isinstance(record.get("manifest"), str) and SHA256.fullmatch(record["manifest"])):
+            raise StateError(f"{where}.ingested: a space's manifest is not a SHA-256")
+        verified = record.get("verified")
+        if verified is None:
+            continue
+        sound = isinstance(verified, dict) and isinstance(verified.get("manifest"), str)
+        if not (
+            sound
+            and SHA256.fullmatch(verified["manifest"])
+            and all(
+                isinstance(verified.get(key), int) and not isinstance(verified.get(key), bool) and verified[key] >= 0
+                for key in ("files", "bytes")
+            )
+        ):
+            raise StateError(f"{where}.ingested: a space's verified marker is not the driver's")
 
 
 def checked_sandbox(sandbox: Any) -> None:

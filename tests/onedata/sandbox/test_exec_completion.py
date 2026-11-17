@@ -226,5 +226,5 @@ def test_o55_each_exec_has_its_own_nonce_and_a_marker_that_names_it():
 def test_o55_the_argv_runs_the_bootstrap_isolated_with_the_interpreter_named_for_the_program():
     done = Completion.for_source("print(1)\n")
     argv = done.argv("python3")
-    assert argv[:4] == ["python3", "-I", "-c", completion.BOOTSTRAP]
-    assert argv[4:] == [done.nonce, str(done.size), done.sha256, "python3"]
+    assert argv[:5] == ["python3", "-I", "-B", "-c", completion.BOOTSTRAP]
+    assert argv[5:] == [done.nonce, str(done.size), done.sha256, "python3"]

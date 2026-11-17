@@ -31,7 +31,7 @@ BAKED_CB_SHA256=(
 # it); false when one does or the scan fails. The files holding one are named on stderr, never the value.
 no_baked() {  # <dir>
   local out p rc=0
-  out=$("$HPCOP_PY" -I "$HPCOP_BUNDLE/baked.py" "$1" "${BAKED_CB_SHA256[@]}") || rc=$?
+  out=$("$HPCOP_PY" -I -B "$HPCOP_BUNDLE/baked.py" "$1" "${BAKED_CB_SHA256[@]}") || rc=$?
   if [[ -n $out ]]; then
     while IFS= read -r p; do printf 'hpcop: a shipped Couchbase value is in %s\n' "$p" >&2; done <<<"$out"
   fi
@@ -123,7 +123,7 @@ running_ours() { alive "$1" && [[ -n $2 && $(proc_field "$1" 22) == "$2" ]]; }  
 
 signal_ours() {  # <pid> <start> <TERM|USR1|KILL>: signal it only if it is still the process that started at <start>
   [[ $1 =~ ^[1-9][0-9]*$ && $2 =~ ^[0-9]+$ ]] || return 1
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" signal "$1" "$2" "$3"
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" signal "$1" "$2" "$3"
 }
 
 stop_service() {  # <pid> <seconds> <start>: stop the service process run_service started (supervise.py, our child)
@@ -459,7 +459,10 @@ need_2xx() {  # <status> <what> <body-file>: fail on anything but 2xx
   [[ $1 =~ ^2[0-9][0-9]$ ]] || die "$2: HTTP $1: $(head -c 300 -- "$3" 2>/dev/null | tr -cd '[:print:]')"
 }
 
-jsonget() { "$HPCOP_PY" -I "$HPCOP_BUNDLE/jsonget.py" "$@"; }   # <file> <path> [--default V]
+# <file> <path> [--default V]. A JSON null is no value: the default stands in for it, and without a default it exits
+# JSONGET_NULL (3), never printing the word null; 2 is a field that is not there or a file that is not JSON.
+JSONGET_NULL=3
+jsonget() { "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/jsonget.py" "$@"; }
 
 node_fqdn() {
   local f
@@ -512,7 +515,7 @@ split_imports() {  # <imports-array> <other-array> args...: the --import=SPACE=P
 
 import_binds() {  # <workdir>: the `apptainer exec` arguments that bind each listed tree read-only, one per line; none for none
   [[ -e $1/imports ]] || return 0
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/importstorage.py" binds --workdir "$1"
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/importstorage.py" binds --workdir "$1"
 }
 
 # A provider's posix storage on the shared scratch filesystem (O57, HPC_STORAGE_ROOT): its job is given its own directory
@@ -542,7 +545,7 @@ storage_binds() {  # <workdir> [--storage=PATH]: the `apptainer exec` arguments 
     fi
     return 0
   fi
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/posixstorage.py" binds --workdir "$1" "$2"
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/posixstorage.py" binds --workdir "$1" "$2"
 }
 
 run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exec) in the foreground of this process
@@ -560,7 +563,7 @@ run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exe
   if [[ -n $b ]]; then mapfile -t binds <<<"$b"; fi
   b=$(storage_binds "$W" "$storage") || die "the posix storage of $W on scratch cannot be bound (see above): the service is not started"
   if [[ -n $b ]]; then mapfile -t -O "${#binds[@]}" binds <<<"$b"; fi
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" check || die "$HPCOP_PY cannot use pidfds, which the service's stop needs"
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" check || die "$HPCOP_PY cannot use pidfds, which the service's stop needs"
   # exec keeps this PID for supervise.py, which stays visible in /proc under hidepid (apptainer's setuid starter, its
   # child, does not). teardown.sh signals it only while its start time (stat field 22) still matches.
   printf '%s %s\n' "$$" "$(proc_field "$$" 22)" > "$W/service.pid"
@@ -569,7 +572,7 @@ run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exe
   # bind (`:ro`) of the list's, over the empty mountpoint configure.sh made in the rootfs, which the container cannot
   # write to. A provider's storage on scratch, when its job was given one, is the one writable bind: its own directory
   # there, over the rootfs's empty /volumes/posix. Nothing else of the node's filesystems is seen.
-  exec "$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" run -- apptainer exec --writable --containall --no-home --pwd /root \
+  exec "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" run -- apptainer exec --writable --containall --no-home --pwd /root \
     --workdir "$W/work" "${binds[@]}" "$R" /root/hpcop-start.sh > "$W/run.log" 2>&1 < /dev/null
 }
 
@@ -587,7 +590,7 @@ redact_stream() {  # <workdir>: stdin to stdout with every plain and base64 form
   local pat
   pat=$(mktemp "$1/tmp/redact.XXXXXX")
   secret_values_file "$1" "$pat"
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/scrub.py" filter "$pat" || printf '(excerpt withheld: the redaction failed)'
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/scrub.py" filter "$pat" || printf '(excerpt withheld: the redaction failed)'
   rm -f -- "$pat"
 }
 
@@ -629,6 +632,53 @@ wait_ready() {  # <workdir> <service pid> [timeout s] [fresh|restart]: until the
     sleep 1
   done
   die "timed out waiting for the deployment (see $log)"
+}
+
+# The readiness budget of a start, in whole seconds: the 1800 s wait_ready has always been given, or HPCOP_READY_SECONDS
+# (a test shortens it). finish.sh spends it on wait_ready and then on wait_domain, so one deadline covers both.
+ready_budget() {  # prints it; fails on anything that is not a whole number of seconds from 1 to 99999
+  local s=${HPCOP_READY_SECONDS:-1800}
+  [[ $s =~ ^[1-9][0-9]{0,4}$ ]] || die "HPCOP_READY_SECONDS is '$s', not a whole number of seconds from 1 to 99999"
+  printf '%s\n' "$s"
+}
+
+# op_worker's /configuration, once it holds a domain. op_worker answers `domain` from the provider record it reads over
+# its Onezone connection, so a start whose REST listener already answers can say null for a moment before that
+# connection is up (live, a restart: the identity check ran 1.9 s before op_worker logged the connection, and compared the
+# word null with the recorded domain of a service that had not changed). A null or empty domain is waited for, polling
+# every HPCOP_POLL_S (1) s up to <deadline>, a SECONDS value: the end of the readiness budget, which the wait is part of.
+# There is always one read, and the first non-empty domain ends the wait whatever it is: the identity check then compares
+# it as ever, so another domain is refused as changed, with no wait. A field that is not there (or an answer that is not
+# JSON) is not a connection coming up, and fails at once.
+# DOMAIN_WAIT_S is how long it waited, in seconds with three decimals (as STOP_SECONDS is): from the first read to the
+# answer that held a domain, and exactly 0.000 when the first read held it, so "no wait was needed" is not a measurement.
+# The wait lengthens a restart's down time, so a restart's status reports it (status.sh, `domain_wait_s`).
+DOMAIN_WAIT_S=0.000
+wait_domain() {  # <tmpdir> <fqdn> <ca> <service pid> <deadline> <budget s>: leaves the answer in <tmpdir>/conf.json
+  local code rc dom t0 ms waited=0
+  DOMAIN_WAIT_S=0.000
+  t0=$(date +%s%N)
+  while :; do
+    code=$(http GET "https://$2:8443/configuration" "$1/conf.json" --cacert "$3" --resolve "$2:8443:127.0.0.1")
+    need_2xx "$code" "op_worker /configuration" "$1/conf.json"
+    rc=0; dom=$(jsonget "$1/conf.json" domain) || rc=$?
+    case $rc in
+      0)
+        if [[ -n $dom ]]; then
+          if (( waited )); then
+            ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+            DOMAIN_WAIT_S=$(printf '%d.%03d' "$((ms / 1000))" "$((ms % 1000))")
+          fi
+          return 0
+        fi ;;
+      "$JSONGET_NULL") ;;
+      *) die "op_worker's /configuration has no readable domain field (jsonget status $rc, its message above)" ;;
+    esac
+    waited=1
+    (( SECONDS < $5 )) || die "the provider's domain stayed null (or empty) in op_worker's /configuration for the readiness budget of $6 s: its Onezone connection did not come up, so its identity could not be checked"
+    alive "$4" || die "the service exited before it reported its domain"
+    sleep "${HPCOP_POLL_S:-1}"
+  done
 }
 
 cb_status() {  # <tmpdir> <user> <password>: HTTP status of an authenticated GET on this node's Couchbase
@@ -738,7 +788,7 @@ scrub_secrets() {  # <workdir>: once the service has stopped, delete every secre
   S=$(secrets_dir "$W"); pat=$W/scrub.values; nee=$W/scrub.needles
   CB=$R/volumes/persistence/opt/couchbase/var/lib/couchbase
   secret_values_file "$W" "$pat"
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/scrub.py" needles "$pat" "$nee" || { rm -f -- "$pat" "$nee"; die "scrub.py could not list the secret forms"; }
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/scrub.py" needles "$pat" "$nee" || { rm -f -- "$pat" "$nee"; die "scrub.py could not list the secret forms"; }
   rm -rf -- "$S"
   for home in /root "/var/lib/$PANEL" "/var/lib/$WORKER" /var/lib/cluster_manager; do rm -f -- "$R$home/.erlang.cookie"; done
   if d=$(config_dir "$R" "$PANEL" 2>/dev/null); then rm -f -- "$d/40-hpcop-couchbase.config"; fi
@@ -756,7 +806,7 @@ scrub_secrets() {  # <workdir>: once the service has stopped, delete every secre
   if [[ -s $nee ]]; then
     mapfile -d '' -t hits < <(grep -rlZF -f "$nee" -- "${where[@]}" 2>/dev/null || true)
     if (( ${#hits[@]} )); then
-      "$HPCOP_PY" -I "$HPCOP_BUNDLE/scrub.py" redact "$pat" "${hits[@]}" >&2 \
+      "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/scrub.py" redact "$pat" "${hits[@]}" >&2 \
         || { rm -f -- "$pat" "$nee"; die "scrub.py failed on: ${hits[*]}"; }
     fi
     left=$(grep -rlF -f "$nee" -- "${where[@]}" 2>/dev/null || true)

@@ -208,9 +208,18 @@ sandbox_placement = "het"                # S as component 1 of a heterogeneous j
 ## 3. How every step is launched
 
 ```
-srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name> --export=PATH \
+srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name> --export=PATH --chdir=/ \
      [--network=<HPC_STEP_NETWORK>] [--output=<log>] /usr/bin/env -i <allowlist> <argv>  # stdin </dev/null unless the payload
 ```
+
+- **Every step starts in `/`** (`--chdir=/`), never in the directory srun was called from: where that directory does not
+  exist on the node, slurmstepd starts the step in the node's `/tmp` instead, which other users share (another study's
+  audit, 16 Nov 2026). `/` exists on every node and nobody but root writes it; a service step's own work directory does
+  not exist yet when it starts, and a control step names its work directory by `--workdir`, never by where it starts.
+  Every script then works by absolute paths: the bundle's from `$(dirname "$0")`, its work directory from `--workdir`; a
+  shard manifest's paths and the run harness's `B`, `SH`, `L` and `GATE_DIR` must be absolute. The shards' steps
+  (`shards.py lines`), the test runner's (`deploy/hpc-tests`) and the run harness's (`run/common.sh`) are launched the
+  same way, and the held job's `sbatch` takes `--chdir=/` too.
 
 - **`--network=<value>` is on every step the driver launches when the site sets `HPC_STEP_NETWORK`** (empty by default:
   no option, and the line is what it was). A control step, a service step, a teardown and a step in either component
@@ -257,8 +266,17 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   pipe are finished whatever the first does. Ending a client is verified (SIGTERM, then SIGKILL, each only while the
   pid still has its recorded start tick), and `down` also ends any `srun --jobid=<job>` of ours on the same login node (run `down` where `up` ran) that
   no record names (one spawned just before a crash).
+- **Every Python the driver launches runs isolated and writes no bytecode** (`-I -B`, O58): on a node, on the login node
+  (the fault relay's `serve`, `alive` and `stop`, and the verbs' argv prefix, section 7), in a container and in
+  `shards.py` (its step, its dispatcher, the merge `collect --run` runs), and so does the test runner's pytest
+  (`deploy/hpc-tests`). Without it `python -m` and `python -c` put the directory they were launched from first on
+  `sys.path`, and every `PYTHON*` variable is read: on 16 Nov 2026 (F2) a `down` launched from the login node's `/tmp`,
+  which held 49 `.py` files of other users, had the relay's `stop` import another user's `/tmp/inspect.py` in place of
+  the standard library's. Launch `up`, `down` and the verbs as `python -I -B deploy/hpc-federation/hpcfed.py ...` from a
+  directory of ours (the checkout) all the same, never a shared one: `uv run` takes the project of the working directory
+  when it has a `pyproject.toml`, and builds it.
 - **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python a
-  step runs takes `-I -B`.
+  step or the driver launches takes `-I -B` (above), the relay's among them, and `shards.py collect --run` its merge.
 - **The core the driver imports is recorded**: `up` writes the resolved paths of `expcore_onedata`, `fedlayout` and
   `hpcfed` into the state file, and refuses to run when `expcore_onedata` is not imported from this checkout's `src`.
   The core's step (`[hpc] core = "step"`) makes the same check on the node and exits 97 on a mismatch, which fails
@@ -270,7 +288,8 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
 The root is the Compose federation's (`fedlayout.Layout`: `EXPCORE_FED_ROOT_PARENT`, `EXPCORE_FED_ROOT`, the same
 checks, the same mark): a 0700 directory, here **on a filesystem the login node and the nodes see** (named in
 `site.env`; never node tmpfs). It holds what `up` lays out for Compose (`platform.toml`, `fault-journal/`,
-`link-check.json`, `facts.json`, `ca/`, `secrets/`) and the state file, **`hpc-federation.json`**:
+`link-check.json`, `facts.json`, `ca/`, `secrets/`), the federation's render identity, **`render-identity.json`**
+(section 8, O74: hashes and a version, mode 0600), and the state file, **`hpc-federation.json`**:
 
 ```json
 {
@@ -278,10 +297,12 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "project": "<the layout's project>",
   "layout": {"source": "<file name>", "digest": "<sha256>", "path": "<absolute path>"},
   "core": {"expcore_onedata": "<path>", "fedlayout": "<path>", "hpcfed": "<path>"},
-  "command": ["<python>", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
+  "command": ["<python>", "-I", "-B", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
-           "billing_weight": null, "step_network": "", "storage_root": "<scratch root, or empty>"},
+           "billing_weight": null, "step_network": "", "study_artifacts": "<directory, or empty>",
+           "storage_root": "<scratch root, or empty>"},
+  "study_artifacts_tree_sha256": "<64 hex: the digest of that directory's tree, taken in the preflight (section 8); absent without one>",
   "storage": {"root": "<the site's scratch root>", "parent": "<root>/<allocation name>", "token": "<32 hex>",
               "providers": {"<provider name>": "<parent>/<provider name>"}},
   "allocation": {
@@ -317,6 +338,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   },
   "clients": {"<step name>": {"pid": 0, "start": 0}},
   "relay": {"pid": 0, "start": 0, "log": "<log dir>/<allocation name>-fault-relay.log"},
+  "data": {"ingested": {"<space>": {"manifest": "<sha256>", "declared": true,
+                                    "verified": null}}},
   "phase": "preflight | submitted | placed | zone | providers | bootstrapped | linked | stopping | down"
 }
 ```
@@ -330,6 +353,13 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   service verbs need no environment. **`command`** is this driver's argv prefix, which `platform.toml`'s `[faults]
   command` holds. **`clients`** are the detached srun clients of the service steps, by step name, which `down` ends
   once their steps are gone. **`owner`** is the job's uid and gid on the nodes (the posix storage's owner).
+- **`data.ingested`** (O57, C06) names each space whose data is the study's own, put there after `up` (section 6a),
+  written by `up` from the layout alone: `manifest` is the SHA-256 of the manifest it is to be verified against
+  (`Manifest.digest()`: the declared file's, or the empty manifest's for a space that declares none), `declared` whether
+  the layout declares it, and `verified` is `null` until `hpcfed.py verify-data` has read the space back and found
+  exactly that manifest, then `{"manifest": <the digest it compared with>, "files": n, "bytes": n}`. **A state without
+  `data`** (an `up` of an earlier driver) cannot be shown verified, and `shards.py plan` refuses it. Every run of
+  `verify-data` sets `verified` back to `null` first, and a pass sets it again.
 - **`storage`** is `null` without a scratch root (`HPC_STORAGE_ROOT`, section 11), else the provider storage `up` makes
   on scratch, recorded before the first `mkdir`; `down` reads its paths here and nowhere else.
 - **Read and changed through one store** (`hpclaunch.StateStore`): `read()` the whole file; `update(fn)` a
@@ -353,8 +383,10 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 
 1. **Preflight**, touching nothing on the cluster: the layout and its `[hpc]` table; `site.env`'s keys; the root's
    rules and mark (as Compose); the two rootfs tarballs and their `.provenance`; the core's self-check; a shared
-   imported tree's variables and manifest (section 8); with a scratch root (`HPC_STORAGE_ROOT`), that root and the
-   inode guard (section 11). A root that holds a state file is refused: `down` first.
+   imported tree's variables and manifest (section 8); `HPC_STUDY_ARTIFACTS` where the template or a space's
+   `data_manifest` names `@study_artifacts@`, and each declared manifest of an ingested space loaded (section 6a); with a
+   scratch root (`HPC_STORAGE_ROOT`), that root and the inode guard (section 11). A root that holds a state file is
+   refused: `down` first.
 2. **The provider storage** (only with a scratch root, section 11): the state file is created, then the federation's
    own directory on scratch and one per provider, each by an exclusive `mkdir`, before any job exists.
    **Submit** the held job: `sbatch --parsable --job-name=<allocation name> --account --partition --no-requeue
@@ -401,17 +433,26 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    user to that uid, as `onboard.py` does), the members, the baseline content (`fedcontent.Content`). An owner of a
    shared imported space also has its `import-<space>` storage made before any support, and the scan awaited after
    the members (section 8).
-9. **`facts.json` and `platform.toml`** (section 6), then each shared import verified against its manifest (section 8),
-   then **the link check**: `fedlinks.check_after_up`, the platform
+9. **`facts.json` and `platform.toml`** (section 6) and the render identity of that platform (`render-identity.json`,
+   section 8), then each shared import verified against its manifest (section 8)
+   and each baseline space read back against its own (section 6a; an ingested space holds nothing yet, so it is not
+   checked here), then **the link check**: `fedlinks.check_after_up`, the platform
    layer's own check through the rendered `platform.toml`, which writes `link-check.json` in the root through
    `expcore_onedata.linkrecord`. `up` fails unless every pair passes.
 10. **The fault relay** (M4's `expcore_onedata.fault_relay`), when the core has it: started detached on the login node
-    (`env -i PATH HOME LC_ALL [SLURM_CONF] <python> -m expcore_onedata.fault_relay serve --root <root> -- <this
-    driver's argv prefix>`, its output appended to `<L>/<allocation name>-fault-relay.log`), then `fault_relay alive`
-    polled until it beats (30 s at most; a relay that never beats fails `up` and is ended). It is recorded in the
-    state file as `relay`. One relay per root: it takes a lock.
+    (`env -i PATH HOME LC_ALL [SLURM_CONF] <python> -I -B -m expcore_onedata.fault_relay serve --root <root> --
+    <this driver's argv prefix>`, its output appended to `<L>/<allocation name>-fault-relay.log`), in the root as its
+    working directory (a 0700 directory of ours that no symbolic link reaches, or the relay is not started: `up`'s
+    preflight refuses such a root before anything is submitted), never the directory `up` was launched from, since
+    every verb it runs inherits it; then `fault_relay alive` (`-I -B` too) polled until it beats (30 s at
+    most; a relay that never beats fails `up` and is ended). It is recorded in the state file as `relay`. One relay
+    per root: it takes a lock.
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
+
+**`verify-data`** (login node, after the study's ingest; section 6a) is no part of `up` and touches no job: it reads
+the state file, and reads each ingested space back through its owner. It is its own branch of the command line, never
+the `else` of `down`.
 
 **`up` and `down` each hold the root's lifecycle lock** (`<root>.lifecycle.lock`, beside the root, `flock`, never
 waited for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job
@@ -422,7 +463,8 @@ removed while held would let the next `up` or `down` lock another file of the sa
 
 **`down`** (login node), whatever `up` reached:
 
-0. **Stop the fault relay first** (`fault_relay stop --root <root>`, when the core has it), so no service verb launches
+0. **Stop the fault relay first** (`<python> -I -B -m expcore_onedata.fault_relay stop --root <root>`, when the core
+   has it), so no service verb launches
    a step while the federation goes down; a relay that will not stop is reported, and `down` goes on. Its directory
    `<root>/fault-relay/` goes with the root. The stop signals the relay by the pid and start tick of its heartbeat,
    through a pidfd where the kernel has `pidfd_open` and, on a login node whose kernel has none (Linux before 5.3, which
@@ -490,6 +532,10 @@ serves both:
 - `[faults]` for the HPC backend (M4's loader): `backend = "hpc"`, `stop_bound_s`, `journal`, `[faults.services]`
   naming every provider, and none of `compose_file`, `project`, `command` or `docker`, which that backend refuses;
   its defaults are `settle_timeout_s = stop_bound_s + 60`, `poll_s` 10 and `relay_wait_s` 30;
+- **`@study_artifacts@`**, from `site.env`'s `HPC_STUDY_ARTIFACTS` (section 6a): the study's own directory on the nodes,
+  so a template names the paths of its tool server's venv, clone and manifests under it and a public replication package
+  carries no site path. A template that names it without the key is refused at the preflight, naming the variable; an
+  unset key is no value, so the renderer would refuse the placeholder too, never write an empty path;
 - the values only the HPC driver fills, for a template that names them: **`@hpc_stop_bound_s@`**, `stop_seconds + 90`
   (690 by default, section 7e); **`@hpc_settle_timeout_s@`**, `stop_bound_s + 60`; **`@hpc_command@`**, this
   driver's argv prefix as a TOML array; and **`@hpc_token_margin_s@`**, the least `[tokens] margin_s` the platform
@@ -509,13 +555,72 @@ none into it. `layouts/pilot-shape-import.toml` is the same shape with the four 
 shared filesystem (section 8), whose template adds `import = { readonly = true, shared = true }` to each of them and
 leaves the ten pairs as they were.
 
+## 6a. The data identity of each space (C06, O63, O57)
+
+A space is the same experimental condition across federations when its declared identity and its data identity match,
+and the campaign fingerprint holds a space's data identity only when its `platform.toml` entry declares it
+(`data_manifest`, the manifest's content hash, never its path): otherwise it holds the space's Onezone id, which every
+`up` makes anew. `up` renders `@data_manifest.<space>@` for each space, and shows the space holds exactly it:
+
+| The space | Its manifest | When its data is shown to be it |
+|---|---|---|
+| a shared import (section 8) | the layout's own (`import.manifest_env`) | at `up`, `fedimport.verify_imports` |
+| a baseline space | made by `up` from the baseline plan, into `<root>/data-manifests/` | at `up`, read back through its owner (every directory, every file's size and bytes) |
+| an **ingested** space | the one it declares: `data_manifest` on the space, a path under `@study_artifacts@` or absolute (the empty manifest when it declares none) | **after the ingest**, `hpcfed.py verify-data` |
+
+An **ingested space** is `baseline = false`, no `import`, with its `@data_manifest.<space>@` named by the template (the
+link check's probe space is `baseline = false` too, and nothing names it). Its baseline is empty, so a manifest made from
+that, as for every `baseline = false` space before, fingerprinted two federations that ingested different bytes alike.
+The manifest is **in the core's import-manifest format** (`expcore_onedata.importmanifest`): `{"version": 1, "files":
+[{"path", "size", "sha256"}, ...], "directories": [...]}`, both lists sorted by path, each once, every directory a file
+lies in listed; `manifest_of_tree` makes one from a local copy of the data, `load_manifest` checks one.
+`Manifest.digest()`, the SHA-256 of `json.dumps(manifest.to_json(), sort_keys=True)`, is the hash the fingerprint
+holds, so the directories count: the ingest must create exactly the listed ones.
+
+The layout (`deploy/compose-federation/fedspec.py`, read by this driver only) refuses `data_manifest` on a baseline space
+or an import, and a path that is neither absolute nor under `@study_artifacts@`, of plain names with no `..` (it is
+written into a quoted TOML string). `up` loads each declared manifest in the preflight, so a mistake fails before a job
+is held, naming the space and never the path. **The directory must be on a filesystem both the login node and the
+agent's node see**: `up`, `verify-data` and `plan` read the manifest on the login node, and the dispatcher's fingerprint
+reads it on the agent's node. `up` also refuses a rendered `platform.toml` whose entry for a space names another
+`data_manifest` than the one it rendered (a template that hard-codes a path of its own), or declares one for a space the
+study fills without taking it from `@data_manifest.<space>@` (even the root's own file): only a manifest `up` renders
+is read back or verified.
+
+**`verify-data`** (`Driver.verify_data`, `hpcboot.verify_ingested`): refused unless the state's phase is `linked`, the
+layout's ingested spaces are the ones the state recorded, and each manifest's digest is the one `up` recorded. Each space
+is read back through its owner (`hpcdata.content_reader`: every directory walked, every file's bytes read and hashed; the
+space ids come from `facts.json`, as the process is a fresh one) and compared with the manifest by `hpcdata.differences`,
+which counts, in counts alone (never a path): files missing, files not in the manifest, files of another size or other
+bytes, directories not as listed. On any difference it exits 1 naming the space and the counts, and, for a space that
+declares none, says where to declare it. Every earlier marker is cleared before anything is read, so a failure, or a
+read that dies half way, leaves none. On a pass it records the marker in
+`data.ingested.<space>.verified` (section 4).
+
+**`shards.py plan` and `lines`** (`federation()`, so a shard is never planned past it) refuse a federation whose
+ingested spaces lack a marker bound to the manifest `up` recorded, and to the manifest the platform file names now (a
+file edited after the verification changes the hash the fingerprint carries, which the pass was not for), naming the
+shard and the spaces. A later ingest needs another `verify-data`: nothing watches the space after the pass. Reading
+every file's bytes through the owner holds each whole in memory (16 workers): a very large ingested file is the limit. `verify-data` runs on the login node, as `[hpc] core = "login"`
+runs the core's phase: it reaches the services' 8443 from there, and has no `core = "step"` form yet.
+
 ## 7. Service verbs for faults and the heal (M4)
 
 Per service, by its layout name. **Each verb is one argv**, run on the login node (only there can a step be
-launched): `<python> deploy/hpc-federation/hpcfed.py --layout PATH --root PATH <verb> <service> [-- argv...]`; the
+launched): `<python> -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH <verb> <service> [-- argv...]`; the
 site's values come from the state file, so the verb needs no environment. A campaign that runs on a compute node
 cannot launch a step: its fault injector asks the login node's **fault relay** (M4's, which `up` starts with this
 argv prefix and `down` stops first; section 5), which runs the verb and answers.
+
+**How the answer is awaited.** The request and the answer are files under `<root>/fault-relay/` on the shared
+file system, and a compute node's NFS client keeps a negative entry for a name it looked up while the file was
+missing, failing every later lookup of it until the directory's attributes expire (30 s by default). The client
+therefore never looks the answer's path up while waiting: on every poll (0.5 s) it lists `answers/` with
+`os.scandir`, whose `opendir` revalidates the directory, and reads `<id>.json` only once the listing shows that
+exact name. The file system then adds at most one poll to a relayed verb's time, which is the verb's own plus
+the wait for any request issued before it (the relay runs one at a time, in order); polling the path had cost
+about 30 s on every verb, measured live. The relay lists `requests/` the same way; a login-node wait (`up`'s for the
+heartbeat, `stop`'s for it to go) runs on the host that writes the file and is no such poll.
 
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
 `hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` for a verb in
@@ -566,13 +671,20 @@ claims its launch, and is `ready` only once a status has run `hpcimport.mount_ch
 report against the spaces it owns: the start returns once its step is listed, before the service holds its mounts, so
 the proof is taken by the first status that finds it otherwise ready, and recorded for that launch alone.
 
+**A restart's identity check waits for the domain (O58).** `finish.sh --restart` compares the provider id and the domain that op_worker's `/configuration` reports with `identity.json`, before anything is rotated. op_worker answers `domain` from the provider record it reads over its Onezone connection, so for a moment after its REST listener answers it says null (live: a restart's check ran 1.9 s before the connection came up, and compared the word null with the recorded domain of a service that had not changed). `finish.sh` therefore polls `/configuration` first (`wait_domain` in `lib.sh`, every `HPCOP_POLL_S`, 1 s) until `domain` is neither null nor empty, under **one deadline with `wait_ready`: 1800 s from `finish.sh`'s start**, `wait_ready`'s own bound (`HPCOP_READY_SECONDS`, validated, for a test to shorten), so the wait takes what `wait_ready` left; there is always one read, and the deadline is checked between requests, so the wait can end one request (`http`'s 120 s bound) past it. The first non-empty answer ends the wait whatever it holds and the check runs unchanged: another non-null domain fails as `the service's identity changed across the restart`; a domain still null at the deadline fails as `stayed null`, so a start that lacks Onezone is not read as a changed deployment; an answer with no `domain` field, or one that is not JSON, fails at once, and so does a service that exited meanwhile. A first start waits the same way and records the identity only from a real domain. How long a start waited is kept in `domain-wait` and reported as `domain_wait_s` (section (c)). `jsonget` never prints a JSON null as a word: with no `--default` it prints nothing and exits 3 (2 is a field that is not there), so no script compares or records "null" as an id, a domain, a user id or a token.
+
 **(c) STATUS** `hpcfed.py status <service>`: one JSON line, no secret: `{"service", "state", "running", "ready",
-"identity", "launch", "node", "step"}`. `running` is true only when the service step is listed in `squeue -s` **and**
+"identity", "launch", "node", "step"[, "domain_wait_s"]}`. `running` is true only when the service step is listed in `squeue -s` **and**
 a control step on the node (`status.sh`) finds the recorded service process alive with its recorded start tick.
 **`ready`** is true only once the service's own checks passed for this launch: a marker whose content is the current
 `service.pid` line, written by `zone.sbatch` and `provider.sbatch` after `finish*.sh` and by `restart.sh` after its
 checks; running but not ready is a Compose container not yet healthy, so a restore is never verified before a
-restart's guard, rotation and live checks pass. **`identity` is `"<launch>:<pid>:<start tick>"`**, from
+restart's guard, rotation and live checks pass. **A ready launch's status also carries `domain_wait_s` (O58)**: the seconds its start waited for op_worker's
+domain (`finish.sh` writes `domain-wait` in the work directory, 0.000 when the first read held it, and `restart.sh`
+removes an earlier launch's first; `status.sh` prints it only for a ready launch and only in the form `finish.sh` writes;
+the status verb passes it on only for a ready launch and only as a finite number of at least 0). The injector records it
+as `domain_wait_s` beside `ready_after_s` in the restore: the part of the provider's down time spent waiting for its
+Onezone connection, which a live slot measures. Absent when nothing reported it, never 0. **`identity` is `"<launch>:<pid>:<start tick>"`**, from
 `service.pid`, which `run_service` rewrites on every start: stable while the service is untouched, different after
 every start.
 
@@ -605,7 +717,7 @@ service steps through `zone.sbatch` and `provider.sbatch` unchanged):
   in `stop-requested` it must remove neither, and end with status 0.
 - `wait_ready` demands a fresh deployment (`Congratulations! New`) and the guard's first-start flow. A restart over an
   existing deployment prints neither: `restart.sh` needs its own readiness (`service-ready.lock`, `/configuration`
-  answering, the guard's verdict for a restart) and the live default and port checks again. The guard's behaviour on a
+  answering with a domain, the guard's verdict for a restart) and the live default and port checks again. The guard's behaviour on a
   restart is untested.
 - **`sweep_leftovers` removes a work directory whose `owner.pid` process has ended**, and a stop ends it. A stopped
   service's directory would then be removed by the next `node-init.sh` of ours on that node (another federation's,
@@ -667,6 +779,54 @@ into the root is rendered absolute. M5 launches its shard's step on `sandbox.nod
 the root's `platform.toml` beside the study's `study.toml`. The driver holds, reads back and places S, runs its node
 facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`: each shard step's directory of this
 federation whose step is gone), then releases it.
+
+**The render identity (O74).** What `up` rendered is recorded as hashes alone in `<root>/render-identity.json` (mode 0600,
+canonical JSON with sorted keys; `hpcidentity.py`, written by `hpcboot.write_facts` beside `platform.toml`, so for
+`[hpc] core = "login"` and `"step"` alike): `version` (`expcore-render-identity/1`); `template_sha256`, the template as
+the renderer read it, before it was rendered; `platform_fingerprint_sha256`, the canonical JSON of the rendered file's
+`PlatformConfig.fingerprint()` hashed as the core hashes a fingerprint (`expcore.campaign.manifest.fingerprint_sha256`);
+and the SHA-256 of each pin the platform holds (`sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256`,
+`oneclient_bundle_sha256`), the very values the preflight checked (`hpcpins`), never read again; and, when `site.env`
+declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256`, the digest of that directory's tree. It holds no address,
+id, job, node, path, user or secret, so it can travel with a shard's results and be committed beside a study. A pin the
+template does not name is left out, and so is the artifacts digest of a site with no such directory; a layout with no
+template writes no record. **The artifacts digest** is taken by `up` once, in its preflight on the login node, before
+the root is made or a job submitted (a tree that cannot be digested fails `up` there), kept in the state file and
+handed to the core's phase among its values, so a core step on a node, whose environment is an allowlist, has it and
+never reads the tree. It is the SHA-256 of one canonical listing: `expcore-artifacts-tree/1` and a NUL, then one record
+per entry sorted by its relative path as bytes, none for the directory itself: `F NUL path NUL size NUL sha256 NUL` (a
+regular file), `D NUL path NUL` (a directory), `L NUL path NUL target NUL` (a symbolic link, by its target string, never
+followed, so what it points at must be in the tree to be pinned: the directory is self-contained, its interpreter
+installed in it and its venv built on it, and a link whose resolved target leaves it is refused. A link is resolved as
+the kernel resolves it, against the tree's own entries alone: a component that is a link is replaced by its target, `..`
+goes up one and one at the root is an escape, an absolute target must begin, by whole components, with the root's real
+path or the path it was declared by, and a path may pass through 40 links at most, so a loop is refused; a link that
+dangles inside is allowed and recorded, and a tree whose links stay inside has its earlier digest). A special file, or a
+root that is not a directory of its own, is refused, naming `HPC_STUDY_ARTIFACTS` and a path relative to the directory, never an absolute one. No mode, owner, time
+or path of the directory is in it, so a copy elsewhere has the same digest. The tree is read below one held descriptor
+with no link followed and never written (the pilot makes it read-only first). A manifest's `expect_render_identity`
+(a path of the study; the lines carry it with its hash as `--expect-render-identity*`) makes `step` compare the
+federation's record with the expected one before it makes anything, beside the pre-step guard and before it, refusing
+with 73 and naming the keys that differ; and every step writes the record it validated into
+`out/study-state/render-identity.<step id>.json` at its start (after a resume has restored `out/`, before the
+dispatcher), a file of its own per step, so every snapshot, a killed step's `out/` and the archive carry it and a
+resumed shard keeps the identity each step ran under. `shards.py` keeps its own copy of the record's names, since it runs alone with `-I`; a test compares them.
+
+**The study's own scripts: a pre-step guard and a post-run script.** A study's own refusals (one worker, every
+planned model's cap 1, a federation root of its own) must hold at every shard's start, and `step` makes the work root and
+its tmpfs directory itself, so they cannot be checked from the study's plugin, which runs later, nor from a wrapper, which
+a line run directly skips. The manifest's `pre_step` (a path relative to the study's root, with its bound
+`pre_step_timeout_s`) is hashed by `plan` and `lines` and rides on every line as `--pre-step`, `--pre-step-sha256` and
+`--pre-step-timeout`. `step` runs it before anything else: it holds the stamped study's root open (a directory of this
+user's, not writable by group or others; the tmpfs copy is not made yet), reads the guard below it, checks the hash,
+and runs those bytes as `<python> -I -B - <label> <campaign.toml>` with the held root as its working directory, under the
+step's allowlist and no-home variables, in a session of its own with a bound. A refusal ends the step with 73 and nothing
+made; a pass is recorded in `step.json` and the archive's manifest. The symmetrical `post_run` (`--post-run*` on the
+line, a bound of 300 s by default) is checked at the same point and run once the dispatcher has exited 0, before the
+archive, while the federation is up: `<python> -I -B - <label> <out/> <status>` in the tmpfs copy of the study, in the
+dispatcher's environment. A pass makes the shard's results final; anything else archives them anyway, with `final: false`
+in the manifest and `NOT-FINAL.json` in `out/`, which `collect` and the core's merge refuse. `--archive-left` runs
+neither script: it starts no work, and it archives from the step's record.
 
 ## 9. Assumptions a live slot verifies first
 
@@ -737,8 +897,11 @@ run is open.
    test pins the two together). A shared import's owner adds nothing on scratch (its storage is the tree, read-only), but
    the copy a mirror fetches does, so it counts once like every other space; a replica on every mirror is **not**
    multiplied in (no multiplier is invented), and the 5% below the line is the room for what the estimate leaves out. For
-   the ingest layout (`pilot-shape.toml`) the estimate is a handful of files (its spaces declare no data: `baseline =
-   false`, or one small file), because the study's own ingest is in no manifest `up` knows; for the import layout
+   the ingest layout (`pilot-shape.toml`) the estimate is a handful of files while its ingested space declares no
+   manifest (`baseline = false`, nothing the study will put there is known to `up`); a study that declares it
+   (`data_manifest = "@study_artifacts@/..."`, which `up` loads and records, section 6a) has that manifest counted too,
+   from the site's `HPC_STUDY_ARTIFACTS`: the pilot's largest space is 15,340 files (`hpcdata.declared` takes it through
+   `ingested_manifests`, so the estimate and the manifest `up` verifies the space against are one count); for the import layout
    (`pilot-shape-import.toml`) it is the four imported manifests, about the pilot's 17,500.
 3. **Refuse** when `used + estimate > quota * 95 // 100`, in integers, so a total exactly at the line passes. The message
    names the used count, the estimate, the quota and the 95% line.

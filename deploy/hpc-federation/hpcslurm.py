@@ -5,9 +5,10 @@
   was asked for. A heterogeneous job (`sbatch <component 0> : <component 1>`, the agent's node as component 1) is read
   back component by component: one record each, by `HetJobOffset`; squeue lists it as `<leader>+<k>`, and a cancel of
   its leader's id ends every component.
-- **Every step** is `srun --jobid --exact` with a name, its cores and memory, and `/usr/bin/env -i` with an explicit
-  allowlist in front of its command, so neither the login environment nor a site prolog decides what it sees. No step
-  uses `--overlap`.
+- **Every step** is `srun --jobid --exact` with a name, its cores and memory, `--chdir=/`, and `/usr/bin/env -i` with
+  an explicit allowlist in front of its command, so neither the login environment nor a site prolog decides what it
+  sees, and it never starts in the login node's working directory (or, where that does not exist on the node, in the
+  node's shared /tmp, where slurmstepd falls back). No step uses `--overlap`.
 - **A control step's srun client** that outlives its bound is ended only once its step has been gone from `squeue -s`
   for three polls in a row (a finished step's client can hang on the login node); a step still listed at the bound is
   cancelled by its own id.
@@ -213,13 +214,15 @@ class Runner:
         left.stdout.close()  # the right-hand side holds the only reading end
         return Process(left, None), Process(right, None)
 
-    def spawn(self, argv: Sequence[str], client_log: str) -> Client:
-        """Start a command in its own session, detached from this one, its output into a 0600 file."""
+    def spawn(self, argv: Sequence[str], client_log: str, cwd: Optional[str] = None) -> Client:
+        """Start a command in its own session, detached from this one, its output into a 0600 file; in `cwd` when
+        given (the fault relay's: the federation's root), else in this process's working directory."""
         descriptor = os.open(client_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         try:
             popen = subprocess.Popen(
-                list(argv), stdin=subprocess.DEVNULL, stdout=descriptor, stderr=descriptor, start_new_session=True
-            )
+                list(argv), stdin=subprocess.DEVNULL, stdout=descriptor, stderr=descriptor, start_new_session=True,
+                cwd=cwd,
+            )  # fmt: skip
         finally:
             os.close(descriptor)
         start = proc_start(popen.pid)
@@ -354,6 +357,7 @@ class Step:
             "-J",
             self.name,
             "--export=PATH",
+            "--chdir=/",  # never the login node's directory, or the node's shared /tmp where that does not exist
             *network,
             *out,
             ENV,

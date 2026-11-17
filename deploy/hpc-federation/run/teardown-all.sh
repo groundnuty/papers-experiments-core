@@ -39,7 +39,7 @@ out=$(squeue -s -j "$HPC_JOB" -h -o '%j')
 rc=$?
 printf '%s\n' "$out" | rec lines "$E/teardown/steps-left.json" steps_left "$rc"
 for role in Z P1 P2 P3 S; do   # read-only: it changes nothing on the node
-  st "$role" -c1 --mem=200M python3.11 -I "$RUN/nodecheck.py" "$role" < /dev/null > "$E/teardown/nodecheck-$role.json"
+  st "$role" -c1 --mem=200M python3.11 -I -B "$RUN/nodecheck.py" "$role" < /dev/null > "$E/teardown/nodecheck-$role.json"
   say "node check $role: exit status $?"
 done
 sacct -j "$HPC_JOB" -n -P -o JobID,JobName,State,Elapsed,MaxRSS | cut -c1-120
