@@ -225,6 +225,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `B` | the bundle on a filesystem the nodes see (`<shared_root>/hpc-federation/bundle`), `chmod -R go-w` |
 | `SH` | a 0700 directory for the two rootfs tarballs, each with its `.provenance` (SHA-256): single files only (`<scratch_root>/hpcop-images`) |
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
+| `HPC_GATEPORT`, `HPC_GATEPORT_SHA256` | optional: the 443 mapper (`bundle/gateport.c`, built for the agent's SIF) and its SHA-256, read only for a template that names it (`layouts/pilot-shape-rest.toml`); both or neither |
 | `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's venv, clone and data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it. `up` also digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
@@ -434,7 +435,16 @@ section 3).
 - **The agent's sandbox** (O63): the pilot's template declares the Apptainer sandbox, whose limits size the agent's
   node (an 8-core, 17 GiB step), and names the site's values as placeholders `up` fills from `site.env`:
   `HPC_AGENT_SIF`, `HPC_EGRESS_SHIM` and `HPC_ONECLIENT_BUNDLE` (the mount level's oneclient, O65) with their
-  `..._SHA256`, and `HPC_AGENT_WORK_ROOT` (`site.env.example`). A pin
+  `..._SHA256`, and `HPC_AGENT_WORK_ROOT` (`site.env.example`). **A REST arm** (#384) is
+  the layout `layouts/pilot-shape-rest.toml`: the pilot's, but for its own template, which adds the three things a REST
+  level needs and nothing else (a test reads both and refuses any other difference): `[sandbox] content_check_file`
+  (the study space's `hello.txt`, which the layout's own baseline writes at `up`), a REST level beside the mount level
+  in `[sandbox.data_paths]`, and the cell's 443 mapper (`bundle/gateport.c`, built for the agent's SIF) as the one
+  `[sandbox.apptainer] preload`, pinned like the other files: it is `@hpc_gateport@` with `@hpc_gateport_sha@`, filled
+  from `HPC_GATEPORT` and `HPC_GATEPORT_SHA256`, two optional keys that only a template naming them reads. The pilot's
+  template names neither, so a layout with no REST level needs no mapper, and a site that declares one has it read for
+  the REST layout alone. `fleet.py` refuses the REST layout as it does the pilot's (its agent's node is a
+  component of the services' job). A pin
   is a declaration: `up` reads each file and refuses, before the cluster is touched, a variable not set, a file
   missing or one whose SHA-256 is not the one declared, naming the variable and never the path. The egress collector
   is the bundle's own, hashed from this checkout. The rendered file's pins are in the campaign fingerprint
@@ -447,8 +457,8 @@ section 3).
   else: `version` (`expcore-render-identity/1`), `template_sha256` (the template as the renderer read it, before it was
   rendered), `platform_fingerprint_sha256` (the canonical JSON of the rendered file's `PlatformConfig.fingerprint()`,
   hashed as the core hashes a fingerprint) and, for each pin the rendered platform holds, the SHA-256 `up` filled in and
-  checked: `sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256` and `oneclient_bundle_sha256`; and,
-  when `site.env` declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256` (the next bullet). A pin the template
+  checked: `sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256`, `oneclient_bundle_sha256` and, for
+  the REST layout, `gateport_sha256`; and, when `site.env` declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256` (the next bullet). A pin the template
   does not name, and the digest of a site that declares no directory, are not in the record, and no entry is ever
   empty. It holds no address, id, job, node, path, user or secret. Two federations rendered from one template, with the same pins and the same data (every space
   declaring its `data_manifest`, as above), have byte-equal records; a changed pin changes its own entry and the

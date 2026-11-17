@@ -810,7 +810,10 @@ last, recorded in the state file as the service `sandbox` (kind `sandbox`, no wo
 (`sandbox_placement = "het"`) or as a held job of its own (`"separate"`; section 1). `[sandbox]` is in the pilot's
 template (O63), with placeholders `up` fills from `site.env` (`hpcpins`: the SIF and the egress shim, each checked
 against its declared SHA-256 before the cluster is touched, the work root, and the bundle's collector), and every path
-into the root is rendered absolute. M5 launches its shard's step on `sandbox.node` with `--jobid=<sandbox.job>`, plus
+into the root is rendered absolute. The REST arm (#384) is a layout of its own, `pilot-shape-rest.toml`, whose template
+adds a content check file, a REST level and the 443 mapper as the one preload, pinned by `@hpc_gateport@` and
+`@hpc_gateport_sha@` (`HPC_GATEPORT`, `HPC_GATEPORT_SHA256`) and checked by the same preflight, only when its template
+names them. M5 launches its shard's step on `sandbox.node` with `--jobid=<sandbox.job>`, plus
 `--het-group=<sandbox.het_group>` when that is not `null`; the step makes the sandbox's work root on S's tmpfs and copies
 the root's `platform.toml` beside the study's `study.toml`. The driver holds, reads back and places S, runs its node
 facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`, by `HPC_CORE_PYTHON`, which `up` asks for
@@ -827,7 +830,8 @@ canonical JSON with sorted keys; `hpcidentity.py`, written by `hpcboot.write_fac
 the renderer read it, before it was rendered; `platform_fingerprint_sha256`, the canonical JSON of the rendered file's
 `PlatformConfig.fingerprint()` hashed as the core hashes a fingerprint (`expcore.campaign.manifest.fingerprint_sha256`);
 and the SHA-256 of each pin the platform holds (`sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256`,
-`oneclient_bundle_sha256`), the very values the preflight checked (`hpcpins`), never read again; and, when `site.env`
+`oneclient_bundle_sha256`, and `gateport_sha256` for the REST layout), the very values the preflight checked
+(`hpcpins`), never read again; and, when `site.env`
 declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256`, the digest of that directory's tree. It holds no address,
 id, job, node, path, user or secret, so it can travel with a shard's results and be committed beside a study. A pin the
 template does not name is left out, and so is the artifacts digest of a site with no such directory; a layout with no
