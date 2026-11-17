@@ -505,9 +505,10 @@ def test_c40_a_local_log_that_cannot_be_written_costs_neither_the_attempt_nor_di
     )
     assert json.loads(row["diagnostic"])["error"] == "Withheld"
     assert (row["state"], row["charged"], row["infra_kind"]) == ("infra_fail", 1, "sandbox")
-    [event] = [e for e in events if e["kind"] == "diagnostic_note_unwritten"]
-    assert "could not be written" in event["detail"]
-    assert "a file, not a directory" not in event["detail"]
+    noted = [e for e in events if e["kind"] == "diagnostic_note_unwritten"]
+    assert noted  # one for each attempt that was set aside: dispatch went on past the first
+    assert all("could not be written" in e["detail"] for e in noted)
+    assert not any("a file, not a directory" in e["detail"] for e in noted)
 
 
 def test_c40_the_local_note_is_redacted_structurally_and_never_cut_through_a_known_secret(tmp_path, monkeypatch):

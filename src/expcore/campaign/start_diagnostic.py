@@ -97,29 +97,12 @@ def snapshot_of(
         return {**_head(origin, redactor), "ok": False, "error": type(problem).__name__}
 
 
-def private_text(error: BaseException) -> str | None:
-    """What the campaign's local log keeps of a diagnostic that is not shown: the instrument, the phase and the
-    diagnostic as canonical JSON, cut to `LIMIT_BYTES`; None when the error carries no diagnostic. Never raises. It goes
-    through the log's redactor when written, and nowhere else: a store, its snapshot and the markers ship."""
-    given = getattr(error, "diagnostic", None)
-    if not isinstance(error, InfraError) or given is None:
-        return None
-    try:
-        text = json.dumps(
-            {**dict(getattr(error, "origin", None) or {}), "diagnostic": given}, sort_keys=True, allow_nan=False
-        )
-    except (TypeError, ValueError) as problem:
-        return f"a diagnostic that is not JSON ({type(problem).__name__}), not kept"
-    return (
-        text
-        if len(text.encode("utf-8")) <= LIMIT_BYTES
-        else text.encode("utf-8")[:LIMIT_BYTES].decode("utf-8", "ignore")
-    )
-
-
 def _phase(origin: Any) -> dict[str, Any]:
-    """The phase of an origin when it is the literal `start_instruments` sets; nothing otherwise."""
-    held = dict(origin or {})
+    """The phase of an origin when it is the literal `start_instruments` sets; nothing otherwise, and never an error."""
+    try:
+        held = dict(origin or {})
+    except Exception:
+        return {}
     return {"phase": held["phase"]} if held.get("phase") == "start" else {}
 
 

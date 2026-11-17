@@ -157,6 +157,7 @@ class DefectLog:
         self.root, self.run_key, self.attempt, self._stamp = Path(root), run_key, attempt, stamp
         self._base = redactor  # the runner's own: the process, the models and the registry, whatever is installed after
         self._redactor = redactor
+        self.note_unwritten: str | None = None  # the class of what stopped a note being written, if one did (C40)
         self.failure: Exception | None = None  # the first entry that could not be written, if any
         self._where = f"the harness-error log {log_path(self.root)}"
 
@@ -190,21 +191,24 @@ class DefectLog:
                 self.failure = failure
             return None
 
-    def keep_private(self, title: str, text: str) -> Path | None:
-        """Write a note of this attempt to the campaign's local log, redacted as an entry is (`write_note`); return the
-        log's path, or None when it could not be written (the failure is kept for `raise_failure`, as an entry's is)."""
+    def keep_private(self, title: str, text: str) -> bool:
+        """Write a note of this attempt to the campaign's local log, redacted as an entry is (`write_note`);
+        tell whether it was written. It never raises and never stops dispatch: the note is a courtesy copy of
+        what was withheld, so a log that cannot be written is recorded in `note_unwritten` (the exception's
+        class, never its text) for the attempt to say in an event, and not as the failure `raise_failure`
+        raises, which an entry's is (C17)."""
         try:
-            return write_note(
+            write_note(
                 self.root,
                 title=f"{self.run_key} attempt {self.attempt}: {title}",
                 stamp=self._stamp(),
                 text=text,
                 redactor=self.build_redactor,
             )
-        except Exception as failure:  # kept, and raised by the attempt once its result is stored
-            if self.failure is None:
-                self.failure = failure
-            return None
+        except Exception as failure:
+            self.note_unwritten = type(failure).__name__
+            return False
+        return True
 
     def keep(self, failure: Exception) -> None:
         """Keep what an executor's own defect sink raised, to be raised by `raise_failure` once the result is stored."""

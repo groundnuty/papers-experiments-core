@@ -53,6 +53,7 @@ SKIPPED_PARTS = frozenset({".git", "__pycache__", ".venv", "venv", ".pytest_cach
 SKIPPED_SUFFIXES = frozenset({".pyc", ".pyo"})
 LIVE_CAMPAIGN = ("out/state.sqlite", "out/campaign.lock", "out/leases")
 LOCAL_ONLY = ("out/logs",)  # the campaign's local logs (`campaign.defect_log`): never committed, never packaged
+LOCAL_LOG_NAME = "harness-errors.log"  # that log by its name, wherever it lies: a shard's out/ unpacked under the study
 # An HPC campaign's private evidence (`deploy/hpc-federation/shards.py collect`): by what a file is called, wherever it
 # lies. The root archive's files are not named here, since they are `facts.json` and the like: the archive is.
 PRIVATE_EVIDENCE_SUFFIXES = (".root.tar", ".root.json", ".root.tar.part", ".root.json.part")  # and a killed draft
@@ -175,7 +176,7 @@ def never_selected(rel: str) -> bool:
     parts = rel.split("/")
     if SKIPPED_PARTS.intersection(parts) or os.path.splitext(rel)[1] in SKIPPED_SUFFIXES:
         return True
-    if any(rel == local or rel.startswith(local + "/") for local in LOCAL_ONLY):
+    if any(rel == local or rel.startswith(local + "/") for local in LOCAL_ONLY) or parts[-1] == LOCAL_LOG_NAME:
         return True
     if parts[-1].endswith(PRIVATE_EVIDENCE_SUFFIXES) or parts[-1] in PRIVATE_EVIDENCE_NAMES:
         return True
