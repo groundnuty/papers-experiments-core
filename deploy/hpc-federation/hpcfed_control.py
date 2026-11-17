@@ -117,6 +117,11 @@ import hpcstorage
 from hpclaunch import STEP_NAME
 
 VERBS = ("stop", "start", "status", "exec")
+# The words of the control steps a verb launches (`Target.control_name`): the relay's late-step watch (`hpclate`) looks
+# for exactly these, so a verb that gains a control step names its word here. A start's service step (`...-run-<n>`) is
+# no control step: it is launched detached, recorded in the state, and never cancelled by name.
+CONTROL_WORDS = {"status": ("status", "mounts"), "stop": ("stop",), "start": ("status",), "exec": ("exec",)}
+STEP_TAG = re.compile(r"[0-9a-f]{12}")  # the fault relay's tag for one request's control steps (`--step-tag`)
 KINDS = ("op", "oz")
 BUNDLE = Path(__file__).resolve().parent / "bundle"
 ENDED = ("exit", "kill", "none")
@@ -162,6 +167,11 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def control_step_name(prefix: str, service: str, word: str, tag: Optional[str] = None) -> str:
+    """`<allocation>-<service>-<word>-<tag>`, or with no tag the clock's millisecond in its place."""
+    return "%s-%s-%s-%s" % (prefix, service, word, tag if tag is not None else int(_STAMP() * 1000))
+
+
 class Refusal(Exception):
     """The request cannot be carried out as given: exit 2 (or 1 for a state that is not the one the verb needs)."""
 
@@ -180,7 +190,7 @@ def _site_value(site: Dict[str, Any], key: str) -> str:
 class Target:
     """What the state file says about one service, validated."""
 
-    def __init__(self, doc: Any, service: Any, mounts: Any = None) -> None:
+    def __init__(self, doc: Any, service: Any, mounts: Any = None, step_tag: Optional[str] = None) -> None:
         services = doc.get("services") if isinstance(doc, dict) else None
         allocation = doc.get("allocation") if isinstance(doc, dict) else None
         site = doc.get("site") if isinstance(doc, dict) else None
@@ -201,7 +211,10 @@ class Target:
         prefix = allocation.get("name")
         if not isinstance(prefix, str) or not STEP_NAME.fullmatch("%s-%s-mounts-%d" % (prefix, service, 10**12)):
             raise Refusal("the allocation or the service has no name a step can carry")  # the longest name made here
+        if step_tag is not None and not STEP_TAG.fullmatch(step_tag):
+            raise Refusal("the step tag is not 12 hex digits")
         step = record.get("step")
+        self.step_tag = step_tag
         self.service, self.kind, self.node, self.workdir = service, kind, node, workdir
         self.prefix, self.site, self.doc = prefix, site, doc
         self.ends = allocation.get("ends")
@@ -220,8 +233,10 @@ class Target:
         return ["bash", str(BUNDLE / name), self.kind, "--workdir", self.workdir, *args]
 
     def control_name(self, verb: str) -> str:
-        """A control step's name, `<allocation>-<service>-<verb>-<n>`, unique per call."""
-        return "%s-%s-%s-%d" % (self.prefix, self.service, verb, int(_STAMP() * 1000))
+        """A control step's name, `<allocation>-<service>-<word>-<n>`, unique per call: `n` is the clock's millisecond,
+        or, for a verb the fault relay runs, the relay's tag for the request (`--step-tag`), which no other request and
+        no verb run by hand shares, so the relay's watch names this verb's steps exactly (`hpclate`)."""
+        return control_step_name(self.prefix, self.service, verb, self.step_tag)
 
     @property
     def needs_proof(self) -> bool:
@@ -629,8 +644,10 @@ def run(
     mounts: Any = None,
     out: Any = None,
     err: Any = None,
+    step_tag: Optional[str] = None,
 ) -> int:
-    """Carry out one verb on one service; return the exit status (see the module docstring)."""
+    """Carry out one verb on one service; return the exit status (see the module docstring). `step_tag`: the fault
+    relay's tag for this request, which names every control step the verb launches."""
     out = sys.stdout if out is None else out  # read at the call, so a caller that redirects them is followed
     err = sys.stderr if err is None else err
     try:
@@ -643,7 +660,7 @@ def run(
                 doc = state.read()
             except Exception as error:  # an unreadable state names its path: only the error's type is told
                 raise Refusal("the federation's state could not be read (%s)" % type(error).__name__) from None
-            target = Target(doc, service, mounts)
+            target = Target(doc, service, mounts, step_tag)
             if verb == "status":
                 return _status(target, launcher, state, mounts, out, err)
             if verb == "stop":

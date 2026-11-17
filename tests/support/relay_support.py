@@ -5,7 +5,7 @@ import errno
 import io
 import json
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -41,8 +41,15 @@ def root_of(tmp_path: Path) -> Path:
     return root
 
 
+def no_watch(argv: Sequence[str], env: Mapping[str, str]) -> Any:
+    """The watch for a timed-out verb's late steps, which the tests that use this setup do not run."""
+    return type("Handle", (), {"poll": staticmethod(lambda: 0)})()
+
+
 def relay_of(root: Path, verbs: Verbs) -> Relay:
-    return Relay(root, PREFIX, runner=verbs, environ={"PATH": "/usr/bin:/bin", "HOME": "/home/someone"})
+    return Relay(
+        root, PREFIX, runner=verbs, environ={"PATH": "/usr/bin:/bin", "HOME": "/home/someone"}, watcher=no_watch
+    )
 
 
 def serving(relay: Relay, clock: FakeClock) -> Callable[[float], None]:

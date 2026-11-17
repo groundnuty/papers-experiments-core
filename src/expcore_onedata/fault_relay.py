@@ -43,6 +43,12 @@ so the injector journals a stop of unknown outcome (`stop_unknown`, `faults.py`)
 to show down, a start is verified only by a changed identity read afterwards, and a link restart is `command_timeout`,
 never retried. A relay that is not answering (no heartbeat, or one older than `RELAY_STALE_S`) gets no request at all.
 
+**A timed-out verb's late steps.** A verb runs as a process that launches an `srun` step. It runs in a process group of
+its own, and at its bound the whole group is ended (`fault_relay_group`), so no `srun` client survives it to create
+the step after the relay has answered. The relay also stamps each verb's steps with a tag of its own, and after a
+timed-out verb starts a watch that cancels, by exact id and in the federation's own job alone, any step of that verb's
+exact names that is made late, and journals it (`fault_relay_late`). The answer stays `timed_out`.
+
 **Liveness.** The relay writes `heartbeat.json` every `BEAT_S` (its nonce, the federation, a count and the wall clock),
 removes it when it stops, and holds `relay.lock` while it runs, so a second relay for the same root refuses to start.
 The fault gate's pre-run check reads it and notes what it saw in the try's note (`RELAY_NOTE`), and the run admission
@@ -71,6 +77,16 @@ from typing import Any
 
 from expcore_onedata.compose import CommandResult, DriverError
 from expcore_onedata.fault_hpc import EXEC_COMMANDS, VERBS, Request, VerbCommand
+from expcore_onedata.fault_relay_group import GRACE_S, run_in_group
+from expcore_onedata.fault_relay_late import (
+    LATE_POLL_S,
+    LATE_WINDOW_S,
+    journal_path,
+    record,
+    spawn_watch,
+    step_tag,
+    watch_argv,
+)
 
 FORMAT = "expcore-fault-relay/1"
 RELAY_DIR = "fault-relay"
@@ -291,22 +307,14 @@ def clean_environment(environ: Mapping[str, str]) -> dict[str, str]:
     return {name: environ[name] for name in ENVIRONMENT if name in environ and not SECRET_NAME.search(name)}
 
 
-def run_clean(environ: Mapping[str, str]) -> Callable[..., CommandResult]:
-    """A command runner whose commands get `clean_environment(environ)` and no stdin."""
+def run_clean(environ: Mapping[str, str], *, grace_s: float = GRACE_S) -> Callable[..., CommandResult]:
+    """A command runner whose commands get `clean_environment(environ)` and no stdin, each in a process group of its own
+    that is ended whole at the bound (SIGTERM, `grace_s`, SIGKILL: `fault_relay_group`), so nothing a verb launched, its
+    `srun` client above all, outlives it."""
     env = clean_environment(environ)
 
     def run(argv: Sequence[str], *, timeout_s: float) -> CommandResult:
-        done = subprocess.run(
-            list(argv),
-            capture_output=True,
-            text=True,
-            errors="replace",  # output that is not UTF-8 is still an answer, never an error after the verb ran
-            timeout=timeout_s,
-            check=False,
-            env=env,
-            stdin=subprocess.DEVNULL,
-        )
-        return CommandResult(done.returncode, done.stdout, done.stderr)
+        return run_in_group(argv, env=env, timeout_s=timeout_s, grace_s=grace_s)
 
     return run
 
@@ -324,14 +332,22 @@ class Relay:
         environ: Mapping[str, str] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
+        watcher: Callable[[Sequence[str], Mapping[str, str]], Any] | None = None,
+        late_window_s: float = LATE_WINDOW_S,
+        late_poll_s: float = LATE_POLL_S,
     ) -> None:
         environ = dict(os.environ if environ is None else environ)
         named = sorted(name for name in environ if SECRET_NAME.search(name))
         if named:  # names only: never a value
             raise PermissionError(f"the relay refuses to run with a secret-like name in its environment: {named}")
         self.root, self.nonce = Path(root), uuid.uuid4().hex
+        self._prefix = list(prefix)
         self._verbs = VerbCommand(prefix, runner or run_clean(environ))
         self._clock, self._wall = clock, wall
+        self._env = clean_environment(environ)  # what the verbs, and the watch, are run with
+        self._watcher = watcher or spawn_watch  # (argv, env) -> a process handle with `poll()`
+        self._late_window_s, self._late_poll_s = late_window_s, late_poll_s
+        self._watches: list[tuple[str, Any]] = []  # each watch started: its request id and handle, until it ends
         self._beats = 0
         self._taken: set[str] = set()  # every request id this relay has claimed: one never runs twice
         self._stop = threading.Event()
@@ -392,6 +408,7 @@ class Relay:
                     )
             with contextlib.suppress(OSError):
                 claimed.unlink()
+        self._reap_watches()
         return taken
 
     def _refusal(self, record: dict[str, Any] | None, key: str | None) -> str | None:
@@ -434,15 +451,54 @@ class Relay:
         if left < MIN_RUN_S:  # too late to run and answer: refused, so nothing is started and killed at once
             return {"refused": "expired"}
         bound = min(float(record["bound_s"]), left)
+        assert key is not None  # `_refusal` holds it
+        tag = step_tag(self.nonce, key)
         try:
-            done = self._verbs(request, timeout_s=bound)
+            done = self._verbs(request, timeout_s=bound, step_tag=tag)
         except subprocess.TimeoutExpired:
+            self._watch(request, key, tag)  # before the answer: the guard is in place when the client reads `timed_out`
             return {"timed_out": True}
         except OSError:  # the verb's process could not be started
             return {"refused": "not_run"}
         except Exception:  # anything else once the verb may have run: its outcome is unknown, never "not run"
+            self._watch(request, key, tag)
             return {"timed_out": True}
         return {"returncode": done.returncode, "stdout": done.stdout[:OUTPUT_CAP], "stderr": done.stderr[:OUTPUT_CAP]}
+
+    def _watch(self, request: Request, key: str, tag: str) -> None:
+        """Journal that a watch is owed for the verb's steps, then start it. It never raises: a journal that cannot be
+        written never keeps the watch from starting (the watch is the guard), and a watch that cannot be started is
+        journalled."""
+        journal = journal_path(self.root)
+        event = {"request": key, "verb": request.verb, "service": request.service, "tag": tag}
+        with contextlib.suppress(OSError):
+            record(journal, {"event": "watch_opened", **event, "window_s": self._late_window_s, "wall": self._wall()})
+        argv = watch_argv(
+            self._prefix, tag, request.verb, request.service, key, journal, self._late_window_s, self._late_poll_s
+        )
+        try:
+            handle = self._watcher(argv, self._env)
+        except Exception as error:  # no process to start it with, say: said in the journal, the answer unchanged
+            with contextlib.suppress(OSError):
+                record(journal, {"event": "watch_failed", **event, "error": type(error).__name__, "wall": self._wall()})
+            return
+        self._watches.append((key, handle))
+
+    def _reap_watches(self) -> None:
+        """Collect the watches that ended; one that failed (a nonzero status) is journalled, since it may have ended
+        with no closing line of its own. A running watch is never waited for."""
+        running = []
+        for key, handle in self._watches:
+            status = handle.poll()
+            if status is None:
+                running.append((key, handle))
+            elif status != 0:
+                with contextlib.suppress(OSError):
+                    record(
+                        journal_path(self.root),
+                        {"event": "watch_ended", "request": key, "returncode": status, "wall": self._wall()},
+                    )
+        self._watches = running
 
     def stop(self) -> None:
         self._stop.set()

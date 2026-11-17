@@ -594,6 +594,29 @@ class Slurm:
                 return 128 + killed if killed else status  # a step a signal ended never reads as a success
         return None
 
+    def accounted(self, job: str) -> Dict[str, Dict[str, object]]:
+        """The job's steps as the accounting records them, by name: each one's id, its exit status (None when it is not
+        a status) and its state; the batch and extern steps left out. SlurmError when the accounting cannot be read, so
+        a caller never takes an unread record for an empty one."""
+        done = self.runner.run(
+            ["sacct", "-j", job, "-n", "-P", "-o", "JobID,JobName,ExitCode,State"], self.command_timeout_s
+        )
+        if done.returncode != 0:
+            raise SlurmError(f"sacct failed with status {done.returncode}: {done.stderr.strip()[:300]}")
+        found: Dict[str, Dict[str, object]] = {}
+        for line in done.stdout.splitlines():
+            parts = line.split("|")
+            if len(parts) != 4 or not STEP_ID.fullmatch(parts[0]):
+                continue
+            status: Optional[int] = None
+            if re.fullmatch(r"[0-9]+:[0-9]+", parts[2]):
+                code, killed = (int(part) for part in parts[2].split(":"))
+                status = 128 + killed if killed else code
+            found.setdefault(
+                parts[1], {"id": parts[0], "exit": status, "state": parts[3].split()[0] if parts[3] else ""}
+            )
+        return found
+
     def _finish(self, process: Process, step: Step, timeout_s: float) -> Completed:
         """The result of a control step within its bound; past it, end a client whose step is gone (three polls in a
         row), and cancel a step still listed, by its own id."""

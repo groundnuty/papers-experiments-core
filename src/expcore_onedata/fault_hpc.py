@@ -101,6 +101,7 @@ HPC_POLL_S = 10.0  # every status is a Slurm step on the node's one control core
 IDENTITY = re.compile(r"[A-Za-z0-9@:._+-]{1,200}")  # an identity as a status prints it: one word, never a path
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # a layout's service name, as `[faults.services]` holds it
 STOP_ENDS = ("exit", "kill", "none")
+STEP_TAG_OPTION = "--step-tag"  # hpcfed.py's option before the verb: the relay's tag for the steps the verb launches
 STATUS = "read the service's status"
 
 
@@ -143,14 +144,17 @@ class VerbCommand:
             raise ValueError("the verbs' command is a non-empty argv")
         self._prefix, self._runner = list(prefix), runner
 
-    def argv(self, request: Request) -> list[str]:
+    def argv(self, request: Request, step_tag: str | None = None) -> list[str]:
+        """The verb's argv; with `step_tag` (the relay's), `--step-tag <tag>` follows the prefix, so the verb names the
+        control steps it launches by it (`fault_relay_late`)."""
+        head = self._prefix if step_tag is None else [*self._prefix, STEP_TAG_OPTION, step_tag]
         if request.verb == "exec":
             assert request.command is not None  # `Request` holds it for an exec
-            return [*self._prefix, "exec", request.service, "--", *EXEC_COMMANDS[request.command]]
-        return [*self._prefix, request.verb, request.service]
+            return [*head, "exec", request.service, "--", *EXEC_COMMANDS[request.command]]
+        return [*head, request.verb, request.service]
 
-    def __call__(self, request: Request, *, timeout_s: float) -> CommandResult:
-        return self._runner(self.argv(request), timeout_s=timeout_s)
+    def __call__(self, request: Request, *, timeout_s: float, step_tag: str | None = None) -> CommandResult:
+        return self._runner(self.argv(request, step_tag), timeout_s=timeout_s)
 
 
 class HpcDriver:

@@ -8,6 +8,7 @@ is answered as the relay would answer it between two of the client's looks, and 
 import errno
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -57,6 +58,14 @@ class Verbs:
         return self.answer
 
 
+def untagged(argv):
+    """The verb's argv without the relay's `--step-tag <12 hex>`, which follows the prefix (`fault_relay_late`)."""
+    at = len(PREFIX)
+    assert argv[at] == "--step-tag"
+    assert re.fullmatch(r"[0-9a-f]{12}", argv[at + 1])
+    return [*argv[:at], *argv[at + 2 :]]
+
+
 def root_of(tmp_path):
     root = tmp_path / "root"
     root.mkdir(mode=0o700)
@@ -64,8 +73,15 @@ def root_of(tmp_path):
     return root
 
 
+def no_watch(argv, env):
+    """The watch for a timed-out verb's late steps, which these tests do not run (test_fault_relay_late.py's)."""
+    return type("Handle", (), {"poll": staticmethod(lambda: 0)})()
+
+
 def relay_of(root, verbs):
-    return Relay(root, PREFIX, runner=verbs, environ={"PATH": "/usr/bin:/bin", "HOME": "/home/someone"})
+    return Relay(
+        root, PREFIX, runner=verbs, environ={"PATH": "/usr/bin:/bin", "HOME": "/home/someone"}, watcher=no_watch
+    )
 
 
 def serving(relay, clock):
@@ -91,7 +107,7 @@ def test_o58_a_request_is_run_by_the_relay_as_the_federations_verb_and_answered_
     with relay.holding():
         done = client_of(root, relay, clock)(Request("status", SERVICE), timeout_s=10)
         ((argv, bound),) = verbs.calls
-        assert argv == [*PREFIX, "status", SERVICE]
+        assert untagged(argv) == [*PREFIX, "status", SERVICE]
         assert 0 < bound <= 10
         assert done == verbs.answer
         directory = relay_dir(root)
@@ -111,7 +127,7 @@ def test_o58_an_exec_runs_only_the_allowed_command_by_its_name(tmp_path):
         driver = HpcDriver(client_of(root, relay, clock), timeout_s=10, probe=lambda service: True)
         assert driver.ping(SERVICE) is True
     ((argv, _),) = verbs.calls
-    assert argv == [*PREFIX, "exec", SERVICE, "--", "/usr/sbin/op_worker", "ping"]
+    assert untagged(argv) == [*PREFIX, "exec", SERVICE, "--", "/usr/sbin/op_worker", "ping"]
 
 
 def write_request(root, relay, **fields):
