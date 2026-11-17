@@ -27,6 +27,8 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from expcore.provenance.gitobjects import git_env
+
 STAMP = ".code-stamp.json"
 SKIP_DIRS = frozenset({"__pycache__", ".pytest_cache", ".venv", ".git"})
 SKIP_SUFFIXES = frozenset({".pyc"})
@@ -153,7 +155,9 @@ def _git(repo: Path, *args: str, raw: bool = False) -> str | None:
     name may start or end with a space.
     """
     try:
-        done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=30)
+        done = subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=30, env=git_env()
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:
