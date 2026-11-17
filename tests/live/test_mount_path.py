@@ -410,7 +410,7 @@ def freeze_facts(host: DockerHost, sandbox: DockerSandbox, path: str, size: int)
     the freeze, and how long the freeze took or why it failed. The freeze is #129/#130's (`_frozen`); without it, only
     the reader is measured."""
     out: dict = {"freeze_available": hasattr(sandbox, "_frozen")}
-    # started by the harness beside the cells, never by one: a cell's processes end with it (O69), and this measures
+    # started by the harness beside the cells, never by one: a cell's processes end with it (O72), and this measures
     # the collection's freeze of a reader that is still running when it comes; no cell runs before the collection,
     # whose sweep would kill it
     uid = sandbox.s.agent_uid

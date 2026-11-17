@@ -10,7 +10,7 @@ One key is conditional, `mount_refused`: it is listed only for a run whose sandb
 start (`ApptainerSandbox._mount_refused`: no mount helper is given, or the platform declares no `[sandbox.mount]`), so a
 mount run, which was not refused, never carries it, nor does any run of a sandbox that would accept one.
 
-A cell's processes end with its exec here, its PID namespace ending with it, and on Docker since O69 too (the sandbox
+A cell's processes end with its exec here, its PID namespace ending with it, and on Docker since O72 too (the sandbox
 kills what a cell left once its `docker exec` returns), so the code tool's "State does not carry between calls" holds
 on both: that is no departure, and has no key.
 """

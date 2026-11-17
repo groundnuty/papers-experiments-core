@@ -1,4 +1,4 @@
-"""O69: a Docker cell's processes end with it, as an Apptainer cell's do: the code tool tells the agent that state does
+"""O72: a Docker cell's processes end with it, as an Apptainer cell's do: the code tool tells the agent that state does
 not carry between calls, so whatever a cell leaves running is killed and shown gone once its `docker exec` returns."""
 
 import time
@@ -22,13 +22,13 @@ def sbx(world):
     sandbox.stop(force=True)
 
 
-def test_o69_the_code_tool_promises_that_state_does_not_carry_between_calls():
-    """O69: the promise both backends keep, in the words the model is given by default."""
+def test_o72_the_code_tool_promises_that_state_does_not_carry_between_calls():
+    """O72: the promise both backends keep, in the words the model is given by default."""
     assert "State does not carry between calls" in DEFAULT_DESCRIPTION
 
 
-def test_o69_a_worker_a_docker_cell_detached_is_killed_when_its_exec_returns(world, sbx):
-    """O69: a worker in a session of its own, outside `timeout`'s group, is killed and shown gone at the cell's end,
+def test_o72_a_worker_a_docker_cell_detached_is_killed_when_its_exec_returns(world, sbx):
+    """O72: a worker in a session of its own, outside `timeout`'s group, is killed and shown gone at the cell's end,
     with the rest of what the cell left; the container's init and its `sleep` are spared, and the count is on the
     cell's record and in the quiesce records."""
     pids = cell_processes(world, sbx)
@@ -41,15 +41,15 @@ def test_o69_a_worker_a_docker_cell_detached_is_killed_when_its_exec_returns(wor
     assert [(q["reason"], q["killed"]) for q in swept] == [("end of cell", 3)]
 
 
-def test_o69_a_docker_cell_that_leaves_nothing_kills_nothing(world, sbx):
-    """O69: a cell whose processes all ended with it is swept to no effect, and nothing is added to the record."""
+def test_o72_a_docker_cell_that_leaves_nothing_kills_nothing(world, sbx):
+    """O72: a cell whose processes all ended with it is swept to no effect, and nothing is added to the record."""
     sbx.exec("print(1)", 30)
     assert sbx._cells.cells[-1]["left_after_exec"] == 0
     assert not [q for q in sbx.metadata().get("quiesced", []) if q.get("cell")]
 
 
-def test_o69_a_leftover_that_no_kill_ends_ends_the_run_as_survived_kill(world, sbx):
-    """O69, O34: a process the cell left that is not shown gone after its kill would be running in the next cell, so
+def test_o72_a_leftover_that_no_kill_ends_ends_the_run_as_survived_kill(world, sbx):
+    """O72, O34: a process the cell left that is not shown gone after its kill would be running in the next cell, so
     the run is ended as `survived_kill`, and every later cell is refused as `cell_unkillable`."""
     pids = cell_processes(world, sbx)
     world.host.unkillable.add(pids["grandchild"])
@@ -61,8 +61,8 @@ def test_o69_a_leftover_that_no_kill_ends_ends_the_run_as_survived_kill(world, s
     assert refused.value.kind == "cell_unkillable"
 
 
-def test_o69_the_sweep_s_wait_is_the_harness_s_never_the_cell_s_time(world, sbx):
-    """O69: the sweep runs after the cell's duration is taken, so a leftover it waits for (up to 10 s, here one no kill
+def test_o72_the_sweep_s_wait_is_the_harness_s_never_the_cell_s_time(world, sbx):
+    """O72: the sweep runs after the cell's duration is taken, so a leftover it waits for (up to 10 s, here one no kill
     ends) never lengthens the cell's recorded time, and a harness step's exit is never read as its backstop's."""
     pids = cell_processes(world, sbx)
     world.host.unkillable.add(pids["grandchild"])
@@ -73,8 +73,8 @@ def test_o69_the_sweep_s_wait_is_the_harness_s_never_the_cell_s_time(world, sbx)
     assert sbx._cells.cells[-1]["duration_s"] < 5
 
 
-def test_o69_a_leftover_in_d_whose_kill_failed_ends_the_run(world, sbx):
-    """O69: a process in D takes a pending SIGKILL on its next return, but only one the kill reached: when the kill
+def test_o72_a_leftover_in_d_whose_kill_failed_ends_the_run(world, sbx):
+    """O72: a process in D takes a pending SIGKILL on its next return, but only one the kill reached: when the kill
     command failed, a leftover in D is not known to be signalled, so the run ends as `survived_kill`."""
     agent = world.host.containers[sbx.names.agent]
     world.host.add_stat(7010, "reader", agent.pid, state="D")
@@ -85,8 +85,8 @@ def test_o69_a_leftover_in_d_whose_kill_failed_ends_the_run(world, sbx):
     assert sbx._cells.ended["outcome"] == deadline.SURVIVED
 
 
-def test_o69_every_leftover_counts_not_only_the_first_sixteen_recorded(world, sbx):
-    """O69: the quiesce's record keeps 16 leftovers, but whether the run goes on is judged on all of them: sixteen in
+def test_o72_every_leftover_counts_not_only_the_first_sixteen_recorded(world, sbx):
+    """O72: the quiesce's record keeps 16 leftovers, but whether the run goes on is judged on all of them: sixteen in
     D and a seventeenth still running end the run."""
     agent = world.host.containers[sbx.names.agent]
     pids = list(range(7100, 7117))

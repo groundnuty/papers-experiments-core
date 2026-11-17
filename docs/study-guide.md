@@ -463,7 +463,7 @@ How a run works there:
 - Your agent's code runs as one `apptainer exec` per cell.
 - The data gate runs on the node's loopback and holds the token; the agent never sees it.
 - The harness keeps the memory limit and the sizes of `/work`, `/tmp` and `/dev/shm`. A cell past one of them is killed as `memory_limit` or `disk_limit`, the agent's own outcome. The kill ends the cell, never the run (`scope: cell` on the kill's record): the agent's next cell runs, as after a container's OOM kill on Docker.
-- A cell's processes end with it, on this backend and on Docker alike, so the code tool's promise to the model, "State does not carry between calls", holds on both (O69). A worker a cell starts in the background, in a session of its own included, is killed once the cell returns; a study whose agent needs a server across cells has to start it in every cell.
+- A cell's processes end with it, on this backend and on Docker alike, so the code tool's promise to the model, "State does not carry between calls", holds on both (O72). A worker a cell starts in the background, in a session of its own included, is killed once the cell returns; a study whose agent needs a server across cells has to start it in every cell.
 - A process your agent's code hides from the harness (one that makes itself non-dumpable, which the node's `/proc` then hides) is still caught from the cgroup that charges its memory. Its memory, past a margin, kills the cell as `memory_limit`; a hidden child is recorded. Declare the `process_visibility` instrument (below) so the report says so.
 
 These things differ from Docker, and the record says so (`infrastructure_facts`):

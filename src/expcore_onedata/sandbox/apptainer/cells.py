@@ -116,7 +116,7 @@ class AppCellRunner(CellRunner):
         watch.on_run_end = self.run_ended_by_watch
 
     def run_ended_by_watch(self, event: dict[str, Any]) -> None:
-        """The watch ended the run (`scope: run`, O69): every later exec and the collection are refused (`ended`)."""
+        """The watch ended the run (`scope: run`, O72): every later exec and the collection are refused (`ended`)."""
         with self.meta_lock:
             self.ended = self.ended or {"outcome": RUN_ENDED, "scope": "run", "reason": event.get("reason"),
                                         "what": event.get("what"), "why": event.get("why")}  # fmt: skip

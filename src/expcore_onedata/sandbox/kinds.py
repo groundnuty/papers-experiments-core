@@ -164,7 +164,7 @@ def deadline_error(kill: Mapping[str, Any] | None) -> InfraError | None:
 def run_ended_error(record: Mapping[str, Any]) -> InfraError:
     """The error of every later cell of a run a cell's deadline ended (O34), and of its collection once the sandbox was
     stopped: kind `cell_unkillable`, with how that deadline ended. A run the Apptainer backend's watch ended, because
-    what passed a limit could not be told one cell's (`scope: run`, O69), is kind `sandbox` instead: set aside."""
+    what passed a limit could not be told one cell's (`scope: run`, O72), is kind `sandbox` instead: set aside."""
     if record.get("scope") == "run":
         why = record.get("why") or "what passed a limit could not be told one cell's"
         reason = record.get("reason")

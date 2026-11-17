@@ -87,8 +87,8 @@ def test_a_cell_over_its_memory_limit_is_killed_by_the_watch_as_a_memory_limit(n
     assert result.kill["watch_kills"][0]["what"] == "memory"
 
 
-def test_o69_a_memory_kill_is_the_cell_s_own_and_the_next_cell_runs(node, box):
-    """O69: as a container's OOM kill on Docker, the watch's memory kill ends the cell, never the run: it is recorded
+def test_o72_a_memory_kill_is_the_cell_s_own_and_the_next_cell_runs(node, box):
+    """O72: as a container's OOM kill on Docker, the watch's memory kill ends the cell, never the run: it is recorded
     with `scope: cell` (the code tool raises nothing for it), and the agent's next cell runs."""
 
     def greedy(cell):
@@ -106,8 +106,8 @@ def test_o69_a_memory_kill_is_the_cell_s_own_and_the_next_cell_runs(node, box):
     assert (after.exit_code, after.stdout, after.kill) == (0, "recovered\n", None)
 
 
-def test_o69_hidden_memory_no_one_cell_can_be_told_to_hold_ends_the_run_as_infrastructure(node, box, tmp_path):
-    """O69: hidden memory past the margin while another run's cell shares the cgroup cannot be told this cell's: the
+def test_o72_hidden_memory_no_one_cell_can_be_told_to_hold_ends_the_run_as_infrastructure(node, box, tmp_path):
+    """O72: hidden memory past the margin while another run's cell shares the cgroup cannot be told this cell's: the
     cell is killed and the run ended with its reason (`scope: run`), infrastructure the code tool raises as `sandbox`;
     every later exec and the collection are refused, and the run's memory reading is unknown, never over."""
     node._new_proc(node.new_namespace(), "python3", environ=("EXPCORE_SANDBOX=other-run-ffff0000",))
@@ -236,8 +236,8 @@ def test_a_worker_a_cell_left_running_is_killed_at_the_cell_s_end(node, box):
     assert box._cells.cells[-1]["left_after_exec"] == 1
 
 
-def test_o69_every_process_a_cell_left_counts_not_only_the_first_sixteen_recorded(node, box):
-    """O69: whether the run goes on is judged on every process left after the kill, never only the 16 the record
+def test_o72_every_process_a_cell_left_counts_not_only_the_first_sixteen_recorded(node, box):
+    """O72: whether the run goes on is judged on every process left after the kill, never only the 16 the record
     keeps: sixteen in D and a seventeenth still running end the run as `survived_kill`."""
 
     def stuck(cell):
