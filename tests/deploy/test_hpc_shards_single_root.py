@@ -491,7 +491,7 @@ def test_down_refuses_the_stopped_root_until_it_is_collected_and_then_goes_on_wi
     assert "was not collected" in str(refused.value)
     assert "collect --roots-only --root" in str(refused.value)
     assert "--into" in str(refused.value)
-    assert "needs a shard plan" not in str(refused.value)
+    assert "one federation, no plan" in str(refused.value)
     assert rig.fake.cancelled == []
     assert rig.fake.calls == []
     assert _collect(shards, rig.root, tmp_path / "copy") == 0
