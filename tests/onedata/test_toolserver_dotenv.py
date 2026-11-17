@@ -11,6 +11,10 @@ The python-dotenv library is no dependency of the core, so the end-to-end test i
 `load_dotenv` follows python-dotenv 1.2.2's default search (the directory of the file that calls it, up to `/`, the
 first `.env`, nothing overridden) behind the guard onedata-mcp has; the library itself is exercised in onedata-mcp's own
 tests. Names are invented.
+
+`python -m expcore_onedata.toolmanifest freeze` and `check` start the server exactly as the launch does (the same
+function builds its command, its environment and its private directory), so a manifest is frozen from what a run's
+server sees; their end-to-end tests below use the same stand-in and the same planted `.env`.
 """
 
 import asyncio
@@ -27,13 +31,23 @@ import pytest
 from mcp import StdioServerParameters
 
 from expcore.tools.manifest import FrozenManifest, live_manifest
+from expcore_onedata import toolmanifest
 from expcore_onedata.addresses import FORMAT
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.testing import CEILING_S, NOW, TOOL_SERVER_ARGS, write_platform
 from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
+from expcore_onedata.testing.fake_onedata_mcp import SETTINGS
 from expcore_onedata.tokens import TokenIssuer, tool_server_spec
-from expcore_onedata.toolserver import ENV_TOOLS, ToolServerLauncher, server_argv, server_environment
+from expcore_onedata.toolserver import (
+    ENV_TOOLS,
+    MANAGED_ENV,
+    OVERRIDDEN_ENV,
+    ToolServerLauncher,
+    server_argv,
+    server_environment,
+    server_start,
+)
 
 DOTENV = "ONEDATA_MCP_DOTENV"
 NODE_NAMES = "ONEDATA_MCP_NODE_NAMES"
@@ -233,3 +247,155 @@ def test_o84_a_real_server_process_started_by_the_launch_reads_no_dotenv_file_ab
     assert seen[DOTENV] == "0"
     assert seen[NODE_NAMES] is None
     assert_private_empty_directory(seen)
+
+
+# -- the manifest tool: `python -m expcore_onedata.toolmanifest freeze|check PLATFORM CONDITION` --------------------
+
+RECORD = "FAKE_MCP_RECORD"
+TOKEN_VARIABLE = "MANIFEST_TEST_TOKEN"
+FROZEN_ACTIONS = ("freeze", "check")
+
+
+def manifest_tool(config, action: str, *argv: str, condition: str = "read") -> int:
+    """Run the tool's command line on a loaded platform's file, as a study would."""
+    return toolmanifest.main([action, str(config.file), condition, *argv])
+
+
+def recorded(tmp_path: Path, monkeypatch, name: str = "tool-seen.json") -> Path:
+    """Have the stand-in server write what it saw to a file, which the tool passes it by name; return that file."""
+    seen = tmp_path / name
+    monkeypatch.setenv(RECORD, str(seen))
+    return seen
+
+
+@pytest.mark.parametrize("action", FROZEN_ACTIONS)
+@pytest.mark.parametrize("kind", PLATFORMS)
+def test_o84_freeze_and_check_start_the_server_with_the_environment_and_directory_the_launch_gives_it(
+    tmp_path, fake, frozen, events, monkeypatch, kind, action
+):
+    """O84: the server a manifest is frozen or checked from receives, setting by setting, what a launch of the same
+    condition gives it (the allow-list, the hosts, the token, the word), on a Compose platform and on an HPC platform
+    whose server starts through the resolve launcher, and starts in a new empty directory of mode 0700 that is gone
+    once it has stopped; the old tool gave it only what `--pass-env` named, in the driver's working directory."""
+    code = plant(tmp_path)
+    config, launcher, token = launching(tmp_path, fake, frozen, events, kind, [str(code / "wrapper.py"), "serve"])
+    launched = start(launcher, token, tmp_path)
+    seen_file = recorded(tmp_path, monkeypatch)
+    monkeypatch.setenv(TOKEN_VARIABLE, token.reveal())
+    argv = ["--pass-env", RECORD, "--token-env", TOKEN_VARIABLE]
+    assert manifest_tool(config, action, *argv) == 0
+    seen = json.loads(seen_file.read_text(encoding="utf-8"))
+    for name in SETTINGS:
+        assert seen[name] == launched[name], name
+    assert seen[ENV_TOOLS] == "echo,add"
+    assert seen[DOTENV] == "0"
+    assert_private_empty_directory(seen)
+    assert not os.path.exists(seen["cwd"])
+
+
+@pytest.mark.parametrize("action", FROZEN_ACTIONS)
+@pytest.mark.parametrize("kind", PLATFORMS)
+def test_o84_freeze_and_check_of_a_real_server_read_no_dotenv_file_above_its_code(
+    tmp_path, fake, frozen, events, monkeypatch, kind, action
+):
+    """O84: a real child started by the tool, with the stand-in config behind the same guard and a `.env` in an
+    ancestor directory of its code that sets ONEDATA_MCP_NODE_NAMES, loads nothing: the manifest is frozen, and
+    checked, from the server a run would have, not from the one the file would have configured."""
+    code = plant(tmp_path)
+    assert import_standin(code, None) == NAMES  # the control: unguarded, the `.env` above the code is read
+    config, _, _ = launching(tmp_path, fake, frozen, events, kind, [str(code / "wrapper.py"), "serve"])
+    seen_file = recorded(tmp_path, monkeypatch)
+    assert manifest_tool(config, action, "--pass-env", RECORD) == 0
+    seen = json.loads(seen_file.read_text(encoding="utf-8"))
+    assert seen[DOTENV] == "0"
+    assert seen[NODE_NAMES] is None
+    assert_private_empty_directory(seen)
+
+
+def test_o84_freeze_writes_the_tools_the_condition_allows_to_the_manifest_it_declares(tmp_path, fake, frozen, events):
+    """O84: the tools frozen are the ones the server shows under the condition's allow-list, which the launch sets and
+    the old tool left to the caller, and they go to the file the condition names, which need not exist yet."""
+    config, _, _ = launching(tmp_path, fake, frozen, events, "compose")
+    declared = config.condition("manage").manifest
+    declared.unlink()
+    assert manifest_tool(config, "check", condition="manage") == 2  # nothing to check against yet
+    assert manifest_tool(config, "freeze", condition="manage") == 0
+    assert [t["name"] for t in FrozenManifest.load(declared).tools] == sorted(config.condition("manage").allow)
+    assert manifest_tool(config, "check", condition="manage") == 0
+    shutil.copy(frozen / "read.manifest.json", declared)  # the read condition's tools are not the manage condition's
+    assert manifest_tool(config, "check", condition="manage") == 1
+
+
+@pytest.mark.parametrize("name", [*MANAGED_ENV, *OVERRIDDEN_ENV])
+def test_o84_a_setting_the_launch_fixes_cannot_be_passed_to_the_manifest_tool(
+    tmp_path, fake, frozen, events, monkeypatch, capsys, name
+):
+    """O84: every variable the launch sets itself (the managed settings, the word among them, and the two it always
+    overrides) is refused by `--pass-env` with a message that names it, whatever the driver's environment holds, set
+    or not; the server is never started and nothing is written."""
+    config, _, _ = launching(tmp_path, fake, frozen, events, "compose")
+    seen_file = recorded(tmp_path, monkeypatch)
+    monkeypatch.setenv(name, os.environ.get(name, "1"))
+    before = config.condition("read").manifest.read_bytes()
+    for action in FROZEN_ACTIONS:
+        assert manifest_tool(config, action, "--pass-env", RECORD, "--pass-env", name) == 2
+        error = capsys.readouterr().err
+        assert name in error
+        assert "the launch sets" in error
+    assert not seen_file.exists()
+    assert config.condition("read").manifest.read_bytes() == before
+
+
+def test_o84_the_word_is_refused_by_the_manifest_tool_when_the_driver_does_not_hold_it_either(
+    tmp_path, fake, frozen, events, monkeypatch, capsys
+):
+    """O84: the refusal does not depend on the variable being set: naming the word is refused as a fixed setting, not
+    reported as missing."""
+    config, _, _ = launching(tmp_path, fake, frozen, events, "compose")
+    monkeypatch.delenv(DOTENV, raising=False)
+    assert manifest_tool(config, "freeze", "--pass-env", DOTENV) == 2
+    assert "the launch sets" in capsys.readouterr().err
+
+
+def test_o84_a_variable_that_is_not_set_cannot_be_passed_to_the_manifest_tool(
+    tmp_path, fake, frozen, events, monkeypatch, capsys
+):
+    """O84: a name given to `--pass-env` or `--token-env` that the driver's environment lacks is an error naming it,
+    not a quiet omission: a freeze with a variable missing is not the launch's environment."""
+    config, _, _ = launching(tmp_path, fake, frozen, events, "compose")
+    monkeypatch.delenv("MANIFEST_TEST_MISSING", raising=False)
+    for option in ("--pass-env", "--token-env"):
+        assert manifest_tool(config, "freeze", option, "MANIFEST_TEST_MISSING") == 2
+        assert "MANIFEST_TEST_MISSING" in capsys.readouterr().err
+
+
+def test_o84_without_a_token_variable_the_server_gets_the_fixed_placeholder_for_both_hosts(
+    tmp_path, fake, frozen, events, monkeypatch
+):
+    """O84: a freeze needs no credential (the tools do not depend on the token), so without `--token-env` both of the
+    server's token settings hold the tool's fixed placeholder, which is no token of any run."""
+    config, _, token = launching(tmp_path, fake, frozen, events, "compose")
+    seen_file = recorded(tmp_path, monkeypatch)
+    assert manifest_tool(config, "check", "--pass-env", RECORD) == 0
+    seen = json.loads(seen_file.read_text(encoding="utf-8"))
+    assert seen["ONEDATA_ONEZONE_TOKEN"] == seen["ONEDATA_ONEPROVIDER_TOKEN"] == toolmanifest.FREEZE_TOKEN
+    assert token.reveal() != toolmanifest.FREEZE_TOKEN
+
+
+def test_o84_the_launch_and_the_manifest_tool_build_the_servers_start_in_one_place(tmp_path, fake, frozen, events):
+    """O84: `server_start`, which both the launch and the tool use, yields the command and arguments `server_argv`
+    gives, the environment `server_environment` builds (key by key, a caller's own variable included) and a private
+    empty directory, each time a new one."""
+    config, _, token = launching(tmp_path, fake, frozen, events, "compose")
+    condition, extra = config.condition("read"), {"OTHER": "kept"}
+    directories = []
+    for _ in range(2):
+        with server_start(config, condition, token, extra) as begun:
+            assert (begun.command, begun.args) == server_argv(config)
+            assert begun.env == server_environment(config, condition, token, extra)
+            assert begun.env["OTHER"] == "kept"
+            assert sorted(os.listdir(begun.cwd)) == []
+            assert stat.S_IMODE(begun.cwd.stat().st_mode) == stat.S_IRWXU
+            directories.append(begun.cwd)
+    assert directories[0] != directories[1]
+    assert not any(d.exists() for d in directories)
