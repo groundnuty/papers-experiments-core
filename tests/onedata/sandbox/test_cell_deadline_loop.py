@@ -239,12 +239,14 @@ def test_o34_collect_settles_a_cell_still_running_before_it_decides(world, mount
 REFUSAL = {"status": 502, "upstream_status": 200, "gate_refusal": "credential_in_header", "client_saw": "5xx"}
 
 
-@pytest.mark.parametrize("by_the_code_tool", [False, True], ids=["the body returns", "the code tool raises the cell's"])
+@pytest.mark.parametrize(
+    "by_the_code_tool", [False, True], ids=["the body returns", "the code tool returns the cell's timeout"]
+)
 def test_o34_a_cell_that_outlives_its_kill_ends_a_rest_run_before_the_gates_refusals_do(platform, by_the_code_tool):
     """O34: in a REST run whose gate has refused an answer, a cell that outlives its kill (with no FUSE mount there is
     nothing to abort: the sandbox is stopped) ends the run as `cell_unkillable`, not `data_gate_integrity`: after a
     stop the gate's log is not the run's evidence, so its refusals do not end the run in place of the cell, whether the
-    body returns or raises the code tool's own error for the cell."""
+    body returns or has had the code tool's own result for the cell (its timeout, O72)."""
     kept = []
 
     async def body(sandbox):

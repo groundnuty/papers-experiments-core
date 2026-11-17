@@ -66,7 +66,7 @@ def sbx(world, monkeypatch):
     runs_to_its_cap(world, sandbox)
     yield sandbox
     world.host.unkillable.clear()
-    sandbox.stop(force=True)
+    sandbox.stop()  # the deadline ordered the stop already: a forced second one finds nothing
 
 
 def recorded(sbx):
@@ -145,7 +145,7 @@ def stopped(world):
     runs_to_its_cap(world, sandbox)
     yield sandbox
     world.host.unkillable.clear()
-    sandbox.stop(force=True)
+    sandbox.stop()  # the deadline ordered the stop already: a forced second one finds nothing
 
 
 def test_o72_a_cell_whose_process_the_sandbox_s_stop_ended_is_its_own_timeout_too(stopped):

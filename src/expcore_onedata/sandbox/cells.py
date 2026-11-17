@@ -386,6 +386,8 @@ class CellRunner:
         the outcome is decided."""
         outcome = record["outcome"]
         with self.meta_lock:
+            if outcome in DL.ESCALATED:
+                record["cell"] = cell  # the run's end says whose deadline it was: the cell ran, its result stands (O72)
             self._deadline = record
             self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})  # shares the record's steps
             # the run is over from now, whatever the cell's record makes of it after. An end already published stands:
@@ -400,7 +402,7 @@ class CellRunner:
     def _unknown(self, why: str, **facts: Any) -> dict[str, Any]:
         """The record of a deadline whose outcome is not known: `survived_kill`, since unknown is never a clean kill. It
         is the most severe outcome (`deadline.SEVERITY`), so never below a step the escalation took. `facts` say what
-        else ended the run, when it was not a deadline (`by`, the cell it followed)."""
+        else ended the run, when it was not a deadline (`by`), and the `cell` it followed or whose deadline it was."""
         esc = self._escalation
         return {
             "grace_s": esc.grace_s, "margin_s": esc.margin_s, "outcome": DL.SURVIVED, "why": why, "steps": [], **facts,
@@ -423,7 +425,7 @@ class CellRunner:
             if record is not None:
                 return True, record
             why = "not decided within its margin" if fired is None else "decided with no record"
-            record = self._unknown(why)
+            record = self._unknown(why, cell=cell)
             self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})
             self.ended = self.ended or record
         log.error("a cell's deadline was %s: the run is ended as %s", why, DL.SURVIVED)
