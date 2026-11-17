@@ -296,6 +296,25 @@ def test_c06_a_repository_around_the_core_is_never_taken_for_the_cores_own(make_
     assert found.source == "none"
 
 
+def test_p01_a_bare_copy_of_a_checkout_without_git_is_unknown_and_the_gate_refuses_it_even_when_dirt_is_allowed(
+    repo, tmp_path, monkeypatch
+):
+    """P01: the HPC README's rule for a shard's `core_src`: a copy of the core's files without `.git` (a tarball, an
+    `rsync` that leaves it out) has no commit to name, so its identity is unknown and `require_core` refuses it, with
+    the allow-dirty option as without; the checkout it was copied from is known."""
+    root = core_project(repo)
+    assert from_checkout(root).known
+    bare = tmp_path / "bare"
+    shutil.copytree(root, bare, ignore=shutil.ignore_patterns(".git"))
+    assert not (bare / ".git").exists()
+    found = identity_of(bare / "src" / "expcore")
+    assert (found.commit, found.source, found.known) == ("unknown", "none", False)
+    monkeypatch.setattr(core_identity, "current", lambda: found)
+    for allowed in (False, True):
+        with pytest.raises(CoreVersionUnknown, match="the core's commit is unknown"):
+            require_core("run", allow_dirty=allowed)
+
+
 def test_c06_what_counts_as_shipped_covers_every_path_the_wheel_includes():
     """C06: an untracked file is dirt where a wheel would ship it: under every path `only-include` names."""
     wheel = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["hatch"]["build"]["targets"]
