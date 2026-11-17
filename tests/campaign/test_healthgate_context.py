@@ -113,9 +113,57 @@ class Method:
     def other(self): ...
 
 
+def binds_a_client(function):
+    """A decorator whose wrapper takes no argument of its own (`*args`) and gives the function one it requires."""
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        return function("client", *args, **kwargs)
+
+    return wrapper
+
+
+def binds_the_context(function):
+    """A decorator whose wrapper takes no argument and gives the function the `context` it declares."""
+
+    @functools.wraps(function)
+    def wrapper():
+        return function(context="bound")
+
+    return wrapper
+
+
+def forwards_the_context(function):
+    """A decorator whose wrapper declares `context` itself and passes it on."""
+
+    @functools.wraps(function)
+    def wrapper(context):
+        return function(context)
+
+    return wrapper
+
+
+@binds_a_client
+def decorated_with_a_required_parameter(client):
+    return Health(True, f"bound {client}")
+
+
+@binds_the_context
+def decorated_that_declares_context(context):
+    return Health(True, f"bound {context}")
+
+
+@forwards_the_context
+def decorated_through_its_wrapper(context):
+    return Health(True, "none" if context is None else said(context))
+
+
 @pytest.mark.parametrize(
     ("check", "expected"),
     [
+        (decorated_with_a_required_parameter, False),  # the wrapper's own signature, not the function it wraps
+        (decorated_that_declares_context, False),
+        (decorated_through_its_wrapper, True),
         (lambda: None, False),
         (plain, False),
         (named, True),
@@ -139,6 +187,19 @@ def test_o82_a_callable_whose_signature_cannot_be_read_is_called_as_before():
     """O82: a signature the interpreter cannot give leaves the check as it was: no argument."""
     with mock.patch("inspect.signature", side_effect=ValueError("no signature found")):
         assert takes_context(plain) is False
+
+
+def test_o82_a_decorated_check_opts_in_through_the_wrappers_own_signature(tmp_path):
+    """O82: the rule reads the callable's own signature, never the function a `functools.wraps` wrapper wraps: a
+    wrapper that takes no argument and supplies a required one, or the `context` the function declares, is called as
+    before and not refused or handed a keyword it cannot take; one that declares `context` receives it."""
+    for index, check in enumerate((decorated_with_a_required_parameter, decorated_that_declares_context)):
+        gate, _ = gate_for(tmp_path / str(index), check)
+        verdict = gate.before_run("run-a", attempt=2)
+        assert verdict.verdict == GO
+        assert verdict.detail == ("bound client", "bound bound")[index]
+    gate, _ = gate_for(tmp_path / "forwards", decorated_through_its_wrapper)
+    assert gate.before_run("run-a", attempt=2).detail == "pre_run run-a 2 None"
 
 
 def positional_only(context, /): ...
