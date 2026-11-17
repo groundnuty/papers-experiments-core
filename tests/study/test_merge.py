@@ -45,6 +45,7 @@ from expcore.campaign.export import (
 from expcore.campaign.lock import DispatchLock
 from expcore.campaign.merge import SHARDS_DIR
 from expcore.campaign.scheduler import STATE_FILE
+from expcore.campaign.selection_ledger import spend_of
 from expcore.campaign.shard import (
     MERGE_FILE,
     MERGE_SCHEMA,
@@ -57,6 +58,7 @@ from expcore.campaign.snapshot import SNAPSHOT_FILE, StoreSnapshot, take_snapsho
 from expcore.records.record import record_filename
 from expcore.study.config import load_study
 from expcore.study.pipeline import Refused, regenerate
+from expcore.study.selection_start import pricing_of
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
@@ -320,6 +322,27 @@ def test_c29_the_report_of_a_merged_batch_shows_each_shards_run_and_turn_times_a
     kinds = [line for line in block.splitlines() if line.startswith("| ")]  # the table, not the notes below it
     assert len(kinds) > 2
     assert not any("not recorded" in line for line in kinds)
+
+
+def test_c39_a_merged_batch_adds_what_its_shards_spent_model_by_model(merged, shard1, shard2, tmp_path):
+    """C39: the merged analysis's `model_usage` is the shards' added: for each model and class, the attempts and tokens
+    of both snapshots, and the dollars as the sum of what each shard's gate counted."""
+    usage = read(merged, "analysis.json")["model_usage"]
+    study = load_study(merged.root)
+    pricing = pricing_of(study)
+    parts = []
+    for index, campaign in {1: shard1, 2: shard2}.items():
+        snapshot = tmp_path / f"shard-{index}.sqlite"
+        take_snapshot(campaign.root / "out" / "state.sqlite", snapshot)
+        held = StoreSnapshot(snapshot.read_bytes(), study.schema)
+        parts.append(spend_of(held.q, pricing))
+    for entry in usage["models"]:
+        assert entry["usd"]["total"] == pytest.approx(sum(p.per_model[entry["model"]] for p in parts))
+    assert sum(m["usd"]["total"] for m in usage["models"]) == pytest.approx(sum(p.total for p in parts))
+    assert [c["attempts"] for m in usage["models"] for c in m["classes"] if c["class"] == "analysed"] == [
+        len([e for e in read(merged, "export.json")["analysed_attempts"] if e["factors"]["model"] == m["model"]])
+        for m in usage["models"]
+    ]
 
 
 def test_c29_the_merged_batch_gives_the_scores_of_one_unsharded_driver(whole, merged):

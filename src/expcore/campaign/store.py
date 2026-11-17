@@ -107,6 +107,8 @@ _ADDED_COLUMNS = (
     # how an interrupted attempt is charged: measured | measured_plus_inflight | bound; NULL: no log was kept. A
     # finished attempt that raised after its model loop has measured | bound too (`after_loop`); NULL for any other
     ("attempts", "spend_basis", "TEXT"),
+    # JSON: the redacted snapshot of a failed instrument start or another failure that carried a diagnostic (C40); NULL: none
+    ("attempts", "diagnostic", "TEXT"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -688,7 +690,7 @@ class Store:
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"
                 " detail=?, termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?,"
-                " cache_read_tokens=?, usage_complete=?, turn_usage=?, replies_checked=?, spend_basis=? WHERE id=?",
+                " cache_read_tokens=?, usage_complete=?, turn_usage=?, replies_checked=?, spend_basis=?, diagnostic=? WHERE id=?",
                 (
                     state,
                     int(charged),
@@ -707,6 +709,7 @@ class Store:
                     None if result.turn_usage is None else json.dumps(result.turn_usage),
                     int(result.replies_checked),
                     result.spend_basis,
+                    None if result.diagnostic is None else json.dumps(result.diagnostic, sort_keys=True),
                     attempt_id,
                 ),
             )

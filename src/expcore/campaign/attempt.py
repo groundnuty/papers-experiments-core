@@ -32,9 +32,9 @@ The order is fixed, and each step is decided by what a kill at that point must l
 
 An exception in the executor is the study's: `InfraError` is infrastructure, anything else is a harness defect, whose
 redacted traceback goes to the campaign's local log (`defect_log`) and nowhere else; the request carries that log, so a
-crash the loop catches inside `record_run` is logged too, redacted with the secrets the executor passed it. An
-exception in the steps around it is our own bookkeeping failing, and propagates: the scheduler stops dispatch loudly
-and leaves the 'running' row for recovery (C17).
+crash the loop catches inside `record_run` is logged too, redacted with the secrets the executor declared or passed
+it. An exception in the steps around it is our own bookkeeping failing, and propagates: the scheduler stops dispatch
+loudly and leaves the 'running' row for recovery (C17).
 """
 
 import asyncio
@@ -52,9 +52,10 @@ from typing import Any
 from expcore.campaign import liveness, prerun
 from expcore.campaign.after_loop import settle_usage
 from expcore.campaign.attempts import BegunAttempt, classify, is_charged, unverified
-from expcore.campaign.defect_log import DefectLog
+from expcore.campaign.defect_log import Chained, DefectLog
 from expcore.campaign.executor import (
     BackendFactory,
+    DeclaredSecrets,
     Endpoint,
     RunExecutor,
     RunRequest,
@@ -73,6 +74,7 @@ from expcore.campaign.no_request import EVENT as ZERO_EVENT
 from expcore.campaign.no_request import REASON as ZERO_REASON
 from expcore.campaign.no_request import settle_unsent
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.start_diagnostic import WITHHELD_ERROR, snapshot_of
 from expcore.campaign.store import Store
 from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.campaign.units import UnitHealth
@@ -83,7 +85,9 @@ from expcore.loop.outcomes import Outcome
 from expcore.models import spend
 from expcore.records.build import RunIdentity, redactor_for
 from expcore.records.injections import restore_refusal
+from expcore.records.redact import Redactor
 
+NOTE_EVENT = "diagnostic_note_unwritten"  # an event of an attempt whose withheld diagnostic left no note (C40)
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
 # A platform's run admission: given the run's treatment kinds, its treatment targets, the campaign's end and whether its
 # condition declares `exclusive = true`, a context manager that holds what the run needs from before the attempt until
@@ -367,6 +371,7 @@ class AttemptRunner:
                     treatment_targets=targets,
                     sent_nothing=sent_no_request(error, backend),
                 )
+                result = self._with_diagnostic(result, error, defects, request.declared)
                 result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
@@ -384,10 +389,58 @@ class AttemptRunner:
                 ):  # the reading, with the result: both stand, or neither does (O90)
                     text = json.dumps(result.post_run_health, sort_keys=True)
                     p.store.event(p.stamp(), "post_run_health", model, f"{key}: {text}")
+                if (
+                    defects.note_unwritten is not None
+                ):  # the stub stands; the courtesy copy of its text did not get written
+                    p.store.event(
+                        p.stamp(),
+                        NOTE_EVENT,
+                        model,
+                        f"{key}: the withheld diagnostic could not be written to the local log "
+                        f"({defects.note_unwritten})",
+                    )
 
             status = self._finish(begun, run_dir, key, result, bookkeeping)
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
+
+    def _with_diagnostic(
+        self, result: AttemptResult, error: BaseException, defects: DefectLog, declared: DeclaredSecrets
+    ) -> AttemptResult:
+        """Keep on the result the snapshot an infrastructure error carries (a failed instrument start's), redacted with
+        the attempt's redaction context as it stands (C40): the runner's own base (the process, the models, the
+        registry), the one installed after it (the secrets the executor declared with `RunRequest.declare_secrets`, or
+        the whole context `record_attempt` gave) and the declared secrets themselves, pinned, so what replaces the log's
+        redactor never takes one away.
+
+        Never a diagnostic redacted against a partial list of the run's secrets: `declared.called` says the executor
+        called `declare_secrets` (a call with no secret says it has none), which is the only way to show one, since a
+        secret only a later `record_run` names is not known to the core, and `record_run` given secrets is not a
+        declaration. Otherwise the row and the marker keep a stub, with the phase alone and the reason, and what would
+        have been shown, redacted with what the core does know, goes to the campaign's local log, which no merge or
+        package carries. One that cannot be kept is recorded as failed, not raised."""
+
+        def redactor() -> Chained | Redactor:
+            context = defects.build_redactor()
+            return Chained(context, Redactor(declared.secrets)) if declared.secrets else context
+
+        kept = snapshot_of(error, redactor, complete=declared.called)
+        if kept is not None and kept.get("error") == WITHHELD_ERROR:
+            self._keep_withheld(defects, error, redactor)
+        return result if kept is None else dataclasses.replace(result, diagnostic=kept)
+
+    @staticmethod
+    def _keep_withheld(defects: DefectLog, error: BaseException, redactor: Callable[[], Chained | Redactor]) -> None:
+        """Leave in the local log what a withheld diagnostic would have shown, as `snapshot_of` shows it (structurally
+        redacted, whole or recorded as failed, never cut), and never raise: a note that cannot be written is
+        `defects.note_unwritten`."""
+        try:
+            shown = snapshot_of(error, redactor, complete=True)
+            text = json.dumps(shown, sort_keys=True)
+        except Exception as problem:
+            defects.note_unwritten = type(problem).__name__
+            return
+        defects.keep_private("a diagnostic withheld, since the executor declared no secrets", text)
 
     def _settle_failure(
         self, result: AttemptResult, guard: AttemptSpend | None, backend: Any, attempt_id: int

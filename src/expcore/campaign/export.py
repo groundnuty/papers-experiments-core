@@ -85,6 +85,12 @@ A campaign whose interrupted attempts kept a call log (C05, `campaign.interrupte
 `calls_sent` and `calls_answered` (None without a log). A campaign none of whose interrupted attempts records a basis
 (no budget, or attempts from before the log) has no such key, and its export is the one it had before.
 
+A campaign whose attempts kept a diagnostic snapshot (C40, `campaign.start_diagnostic`) also exports
+`attempt_diagnostics`, after `interrupted_spend`: every attempt that kept one in attempt order (`attempt_id`, `run_key`,
+`condition`, `model`, `attempt`, `state`, `infra_kind`, `charged` and the redacted `diagnostic`: for a failed instrument
+start, its phase, the instrument and what the instrument checked and saw). A campaign none of whose attempts kept one,
+or a snapshot from before the column, has no such key, and its export is the one it had before.
+
 A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campaign.shard.EXPORT_KEY`), last: the
 `spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
 budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
@@ -128,6 +134,9 @@ from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
 from expcore.campaign.reset_settings import exported as exported_settings
 from expcore.campaign.shard import EXPORT_KEY, META_ENVIRONMENT, META_SHARD, META_SHARES, META_STARTED
+from expcore.campaign.start_diagnostic import EXPORT_KEY as DIAGNOSTICS_KEY
+from expcore.campaign.start_diagnostic import DiagnosticUnreadable
+from expcore.campaign.start_diagnostic import exported as exported_diagnostics
 from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
 FORMAT = "campaign-export-1"
@@ -208,6 +217,14 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         except LostSpendError as error:
             raise ExportError(f"{error}, so it cannot be exported") from None
         interrupted = exported_interrupted(store)
+        try:
+            diagnostics = exported_diagnostics(
+                store,
+                {key: who["condition"] for key, who in identities.items()},
+                {key: who["factors"]["model"] for key, who in identities.items()},
+            )
+        except DiagnosticUnreadable as error:
+            raise ExportError(f"{error}, so it cannot be exported") from None
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
     scored: list[tuple[str, Any]] = []  # the model and the analysed attempt of each analysed run
@@ -284,6 +301,8 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         data[LOST_KEY] = lost
     if interrupted is not None:  # only a campaign whose interrupted attempts kept a call log has the key (C05)
         data[INTERRUPTED_KEY] = interrupted
+    if diagnostics is not None:  # only a campaign whose attempts kept a diagnostic snapshot has the key (C40)
+        data[DIAGNOSTICS_KEY] = diagnostics
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)

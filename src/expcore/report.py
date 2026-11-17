@@ -50,6 +50,10 @@ are the same text: no clock, no path and no random number enters it.
 - A campaign whose interrupted attempts kept a call log (its export has `interrupted_spend`, C05) gets a section
   "Interrupted attempts' spend" after that (`expcore.report_interrupted`): per model, how many were charged measured,
   measured plus a request in flight, or at their bound. A report of an export without it is the text it was before.
+- A campaign whose attempts kept a diagnostic snapshot (its export has `attempt_diagnostics`, C40) gets a section
+  "Instrument start failures" after that (`expcore.report_diagnostics`): per condition, instrument, kind and state, the
+  attempts, how many were charged and how many snapshots could not be kept, with a row of zeros for a condition that
+  had none. A report of an export without it is the text it was.
 - A batch merged from shards (its export has `shards`, and each run entry its `shard`) gets one more section after the
   conditions (`expcore.report_shards`): per shard, with its label and start, the runs of each condition by how they
   ended with their rates, the infrastructure attempts by kind, and the wall time, turn latency and reset time, each
@@ -69,6 +73,12 @@ are the same text: no clock, no path and no random number enters it.
   interest" after the contrast tables (`expcore.report_smallest`): the estimate with its sign and its interval against
   it, the decision, the minimum detectable effect and whether the design detects it; its terminal line adds the
   decision with the signed estimate. A report with none has neither, so it keeps its bytes.
+- A report given the model usage (`model_usage`, C39) has a section "Model usage and spend" after the conditions
+  (`expcore.report_model_usage`) and one line of the provenance: per model, what it spent in all, on the analysed
+  attempts and on the rest, each dollar on the basis it was charged on (measured, measured plus a request in flight,
+  bound, top-ups, probes), the attempts, tokens and dollars by what became of each attempt, the attempts set aside by
+  kind, the requests retried inside an attempt and the served model ids and fingerprints. A report given none is the
+  text it was.
 - The fixed prose beside the tables is in `expcore.report_notes`.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
   the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13). An
@@ -87,6 +97,7 @@ from expcore.accounting import condition_accounting
 from expcore.egress.sensitivity import EgressAnalysis
 from expcore.guards import GuardsAnalysis
 from expcore.mountguard.sensitivity import MountGuardAnalysis
+from expcore.report_diagnostics import section as start_failures
 from expcore.report_egress import egress_lines
 from expcore.report_families import (
     check_equivalence_families,
@@ -100,6 +111,8 @@ from expcore.report_guards import summary_lines as guards_summary_lines
 from expcore.report_holds import section as operator_holds
 from expcore.report_interrupted import section as interrupted_spend
 from expcore.report_lost import section as lost_in_kill
+from expcore.report_model_usage import provenance_line as usage_provenance
+from expcore.report_model_usage import section as model_usage_section
 from expcore.report_mountguard import LEFT_OUT as NOT_CLEAN
 from expcore.report_mountguard import mount_guard_lines
 from expcore.report_notes import (
@@ -664,6 +677,7 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
         *operator_holds(export, _table),  # only an export with such a hold has it (C11)
         *lost_in_kill(export, _table),  # only an export whose store a kill took spend out of has it (O62)
         *interrupted_spend(export, _table),  # only an export whose interrupted attempts kept a call log has it (C05)
+        *start_failures(export, _table),  # only an export whose attempts kept a diagnostic snapshot has it (C40)
     ]
 
 
@@ -991,6 +1005,7 @@ def render_report(
     mount_guard: MountGuardAnalysis | None = None,
     guards: GuardsAnalysis | None = None,
     visibility: VisibilityAnalysis | None = None,
+    model_usage: Mapping[str, Any] | None = None,
 ) -> str:
     """Render the report as Markdown.
 
@@ -1001,7 +1016,9 @@ def render_report(
     without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60),
     `guards` the rerun without the runs any guard leaves out (a batch checked by two or more, O60, O76), `visibility`
     the process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
-    it, O56). A partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`).
+    it, O56), `model_usage` what each model spent and what served and retried its requests (`campaign.model_usage`: no
+    section and no provenance line without it, C39). A partial analysis is described by the export (`partial`,
+    `running_attempts`, `excluded_attempts`).
     What each number counts is stated in the report beside it. The text ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
@@ -1029,6 +1046,7 @@ def render_report(
         "attempt), "
         f"{len(export['unfinished_runs'])} unfinished, {len(left_out)} left out of the analysis",
         _partial_line(export),
+        *usage_provenance(model_usage),
     ]
     if result.exploratory_only:
         lines.append(f"- **Confirmatory claims**: none; {NO_CLAIM}")
@@ -1042,6 +1060,7 @@ def render_report(
         _contrasts(result, interval_level)
         + _conditions(export)
         + shards
+        + model_usage_section(model_usage, export, _table)
         + checked
         + guarded
         + seen
