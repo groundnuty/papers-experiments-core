@@ -35,6 +35,7 @@ def _manifest(tmp_path, **changes):
                  "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked",
                  "data": {"ingested": {}}}  # fmt: skip
         (root / "platform.toml").write_text('[space]\nname = "s"\ndata_manifest = "m.json"\n')  # its data declared
+        (root / "facts.json").write_text("{}")  # what `up` writes beside the state: a collect archives both
         if changes.get("placement") == "separate":
             state["sandbox"] = {"placement": "separate", "node": f"node-s{n}", "job": str(200 + n),
                                 "name": f"hpcop-sbx-{n}"}  # fmt: skip

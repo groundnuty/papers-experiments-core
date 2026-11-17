@@ -7,6 +7,7 @@
 # core refuses a shared import that is not read-only at load, checks the owner's panel for it, and
 # `fedimport.verify_imports` reads this file for it. `alpha-work` is the study's own space. The tables sit after every
 # top-level key, since a key written after `[[spaces]]` belongs to the last entry.
+addresses = @hpc_addresses@   # O73: the address map and the resolve launcher, as one inline table that up fills; the platform layer dials each declared name at its mapped address. A top-level key, so before the first table
 zone = { name = "zone", url = "@zone_url@" }
 providers.pine = { url = "@provider_url.pine@", id = "@provider_id.pine@" }
 providers.birch = { url = "@provider_url.birch@", id = "@provider_id.birch@" }

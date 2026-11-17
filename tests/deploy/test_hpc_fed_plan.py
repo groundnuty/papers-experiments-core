@@ -5,11 +5,21 @@ Nothing here reaches a cluster: Slurm is the fake of hpc_fed_support."""
 import json
 import math
 import os
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import LAYOUT, FakeProcess, FakeSlurm, hpc_on_path, manifest_values, parse_srun, pin_values
+from hpc_fed_support import (
+    LAYOUT,
+    FakeProcess,
+    FakeSlurm,
+    address_values,
+    hpc_on_path,
+    manifest_values,
+    parse_srun,
+    pin_values,
+)
 
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
@@ -53,11 +63,48 @@ def test_billing_is_the_larger_of_cores_and_the_weight_times_the_memory_per_node
 
 
 def test_the_settle_time_exceeds_the_stops_whole_bound(hpc):
-    """O57: a stop takes at most stop_seconds, the 30 s SIGKILL tail and 60 s for its step to leave: settle_timeout_s
-    is above that, derived from the layout, never a constant."""
-    assert hpc.settings.load_settings(None).settle_timeout_s == 750
-    settings = hpc.settings.load_settings({"stop_seconds": 120})
-    assert (settings.stop_bound_s, settings.settle_timeout_s) == (210, 270)
+    """O57: a stop takes at most stop_seconds, the 30 s SIGKILL tail and 60 s for its step to leave, after the step's
+    launch wait; settle_timeout_s is above that and the stop verb's own tail (70 s: the waits for the step to leave the
+    list and after a cancel, and a margin), derived from the layout, never a constant."""
+    assert hpc.settings.load_settings(None).settle_timeout_s == 450
+    settings = hpc.settings.load_settings({"stop_seconds": 120, "step_launch_wait_s": 100})
+    assert (settings.stop_bound_s, settings.settle_timeout_s) == (210, 380)
+
+
+LAYOUTS = sorted(LAYOUT.parent.glob("*.toml"))
+
+
+@pytest.mark.parametrize("layout", LAYOUTS, ids=lambda path: path.name)
+def test_every_committed_layout_stops_a_service_within_50_s_and_holds_the_job_for_down(hpc, layout):
+    """O58: three provider outages on one HPC federation (17 Nov) ended a service 26.1 to 33.1 s after its SIGTERM, so
+    every committed layout's graceful stop is 50 s (the largest plus 50 %), whether it declares `stop_seconds` or takes
+    the default: the service's stop bound is 140 s, a control step may wait 240 s to start (a controller's
+    message timeout, 200 s, plus 20 %), so settle_timeout_s is 450 s, and the held job's time still exceeds twice the
+    stop verb's whole bound (380 s), which the loader requires for `down` to finish."""
+    import tomllib
+
+    assert LAYOUTS  # the glob found the committed layouts
+    settings = hpc.settings.load_settings(tomllib.loads(layout.read_text(encoding="utf-8")).get("hpc"))
+    assert settings.stop_seconds == 50
+    assert (settings.stop_bound_s, settings.step_launch_wait_s, settings.settle_timeout_s) == (140, 240, 450)
+    assert settings.stop_verb_bound_s == 380
+    assert settings.time_s > 2 * settings.stop_verb_bound_s
+
+
+MEASURED = {"stop_seconds": ("17 Nov", "33.1 s", "50 %"), "step_launch_wait_s": ("17 Nov", "103 s", "200 s", "20 %")}
+
+
+@pytest.mark.parametrize("layout", LAYOUTS, ids=lambda path: path.name)
+def test_a_layout_that_declares_a_measured_bound_says_where_the_figure_comes_from(layout):
+    """O58: a declared `stop_seconds` or `step_launch_wait_s` has its measurement in the comment line above it, so a
+    later change is made from a measurement and not from the number."""
+    lines = layout.read_text(encoding="utf-8").splitlines()
+    declared = [(n, key) for n, line in enumerate(lines) for key in MEASURED if line.startswith(f"{key} ")]
+    for number, key in declared:
+        assert lines[number - 1].startswith(f"# {key}:")
+        assert all(words in lines[number - 1] for words in MEASURED[key])
+    if "hpc" in tomllib.loads(layout.read_text(encoding="utf-8")):
+        assert {key for _, key in declared} == set(MEASURED)
 
 
 @pytest.mark.parametrize(
@@ -67,11 +114,27 @@ def test_the_settle_time_exceeds_the_stops_whole_bound(hpc):
         ({"provider": {"cpus": 4, "memory": "10 GB"}}, "hpc.provider.memory"),
         ({"control": {"cpus": 1}}, "hpc.control.memory: is required"),
         ({"time": "2h"}, "hpc.time"),
-        ({"time": "00:20:00"}, "must exceed twice the stop's bound"),
+        ({"time": "00:20:00", "stop_seconds": 600}, "must exceed twice the stop's bound"),
+        ({"time": "00:10:00"}, "must exceed twice the stop's bound"),
         ({"core": "elsewhere"}, "hpc.core"),
         ({"nodes": 3}, "hpc.nodes: is not a key"),
+        ({"step_launch_wait_s": -1}, "hpc.step_launch_wait_s"),
+        ({"step_launch_wait_s": 3601}, "hpc.step_launch_wait_s"),
+        ({"step_launch_wait_s": 90.5}, "hpc.step_launch_wait_s"),
     ],
-    ids=["no cores", "bad memory", "missing memory", "bad time", "too short", "bad core place", "unknown key"],
+    ids=[
+        "no cores",
+        "bad memory",
+        "missing memory",
+        "bad time",
+        "too short",
+        "too short for the launch wait",
+        "bad core place",
+        "unknown key",
+        "negative launch wait",
+        "huge launch wait",
+        "fractional launch wait",
+    ],
 )
 def test_a_bad_hpc_table_is_refused_naming_the_key(hpc, table, words):
     """O57: a bad hpc table is refused naming the key."""
@@ -233,6 +296,7 @@ def rendered_pilot(hpc, root: Path, make_ca) -> Path:
         **hpc.boot.hpc_values(command, settings.stop_bound_s, settings.settle_timeout_s, root),
         **pin_values(root / "agent"),
         **manifest_values(root),
+        **address_values(root),
     }
     hpc.boot.write_platform(root / "platform.toml", spec.platform_template.read_text(encoding="utf-8"), facts, values)
     return root / "platform.toml"
@@ -287,7 +351,7 @@ def test_the_platform_declares_the_hpc_backend_and_its_stop_bound_and_no_compose
 
     faults = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))["faults"]
     assert faults["backend"] == "hpc"
-    assert faults["stop_bound_s"] == 690
+    assert (faults["stop_bound_s"], faults["step_launch_wait_s"], faults["command_timeout_s"]) == (140, 240, 300)
     assert faults["journal"] == str(tmp_path / "fault-journal")  # absolute: a copy beside a study names the root's
     assert set(faults["services"]) == {"aspen", "larch", "rowan", "alder", "hazel"}
     assert not {"compose_file", "project", "command", "docker"} & set(faults)
@@ -319,8 +383,9 @@ def test_the_token_margin_is_the_least_the_loader_of_this_core_accepts(hpc, tmp_
 
 def test_with_this_cores_loader_the_pilot_shapes_least_margin_is_the_hpc_restores_rule(hpc, tmp_path, make_ca):
     """O58: with this core's [faults] loader (backend "hpc", M4), up's [tokens] margin_s is the loader's own rule over
-    the file as written, `restore_token_margin_s` of what `load_faults` reads, with nothing stubbed: 5,340 s for the
-    pilot shape's defaults (stop_seconds 600), the restore's bound, the slack, the drain and the start's own stop."""
+    the file as written, `restore_token_margin_s` of what `load_faults` reads, with nothing stubbed: 5,370 s for the
+    pilot shape's defaults (stop_seconds 50, step_launch_wait_s 240, command_timeout_s 300), the restore's bound, the
+    slack, the drain and the start's own stop."""
     import tomllib
 
     from expcore_onedata.fault_settings import load_faults
@@ -328,26 +393,31 @@ def test_with_this_cores_loader_the_pilot_shapes_least_margin_is_the_hpc_restore
     assert hpc.boot.has_hpc_backend() is True
     path = rendered_pilot(hpc, tmp_path, make_ca)
     settings = load_faults(path, load_platform(path))
-    assert (settings.backend, settings.stop_bound_s, settings.settle_timeout_s) == ("hpc", 690.0, 750.0)
+    assert (settings.backend, settings.stop_bound_s, settings.settle_timeout_s) == ("hpc", 140.0, 450.0)
     margin = tomllib.loads(path.read_text(encoding="utf-8"))["tokens"]["margin_s"]
-    assert margin == math.ceil(restore_token_margin_s(settings)) == 5340
+    assert margin == math.ceil(restore_token_margin_s(settings)) == 5370
 
 
 def test_a_core_without_the_hpc_backend_takes_the_restores_rule_with_the_hpc_settle_and_poll(
     hpc, tmp_path, make_ca, monkeypatch
 ):
     """O57: a core whose loader cannot read the HPC [faults] (no backend "hpc" yet) still gets a margin: the restore's
-    rule over the keys it knows, with the HPC settle time (stop bound + 60 s) and poll (10 s). Such a core's settings
-    know none of the HPC backend's keys (O58's `backend`, `stop_bound_s` and `relay_wait_s`), so they are left out
+    rule over the keys it knows, with the HPC settle time (stop bound + launch wait + 60 s) and poll (10 s), and the
+    relay verb bound `up` declares (300 s, a key every core knows). Such a core's settings know none of the HPC
+    backend's own keys (O58's `backend`, `stop_bound_s`, `relay_wait_s` and `step_launch_wait_s`), so they are left out
     here as that core leaves them out."""
     import tomllib
 
     monkeypatch.setattr(hpc.boot, "has_hpc_backend", lambda: False)
-    monkeypatch.setattr(hpc.boot, "NOT_A_BOUND", hpc.boot.NOT_A_BOUND | {"backend", "stop_bound_s", "relay_wait_s"})
+    monkeypatch.setattr(
+        hpc.boot,
+        "NOT_A_BOUND",
+        hpc.boot.NOT_A_BOUND | {"backend", "stop_bound_s", "relay_wait_s", "step_launch_wait_s"},
+    )
     document = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))
     rule = FaultSettings(
         file=Path("p"), sanctioned=False, journal=Path("j"), compose_file=Path("c"), services={},
-        settle_timeout_s=750.0, poll_s=10.0,
+        settle_timeout_s=450.0, poll_s=10.0, command_timeout_s=300.0,
     )  # fmt: skip
     assert document["tokens"]["margin_s"] == math.ceil(restore_token_margin_s(rule))
 

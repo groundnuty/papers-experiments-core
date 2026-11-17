@@ -12,12 +12,15 @@
 #
 # platform.toml of the pilot-shape layout, rendered by hpcfed.py up into the federation's root. Each @...@ is filled
 # from facts.json (the ids are new at every up; every URL is https://<node FQDN>:8443) or by the HPC driver:
-# hpc_stop_bound_s is a stop's whole bound ([hpc] stop_seconds + 90 s), and hpc_token_margin_s is the least [tokens]
+# hpc_stop_bound_s is the service's own stop bound ([hpc] stop_seconds + 90 s), hpc_step_launch_wait_s what a control
+# step may wait to start ([hpc] step_launch_wait_s), hpc_command_timeout_s the floor of every relay verb's bound (that and 60 s), and
+# hpc_token_margin_s is the least [tokens]
 # margin_s the platform layer's own loader accepts for the rest of the file. Every path is absolute: the root's
 # (hpc_root), so a copy of the file beside a study (shards.py step) reads the root's own secrets, CA and journal, and
 # [sandbox]'s, which are the site's (hpc_agent_* and hpc_egress_shim* from site.env, each file checked against its
 # declared SHA-256 at up; hpc_egress_collector* the bundle's own). The four data spaces give the link check ten ordered
 # pairs.
+addresses = @hpc_addresses@   # O73: the address map and the resolve launcher, as one inline table that up fills; the platform layer dials each declared name at its mapped address. A top-level key, so before the first table
 zone = { name = "zone", url = "@zone_url@" }
 providers.aspen = { url = "@provider_url.aspen@", id = "@provider_id.aspen@" }
 providers.larch = { url = "@provider_url.larch@", id = "@provider_id.larch@" }
@@ -80,7 +83,9 @@ holder = "hazel"
 sanctioned = false                           # the configuration's half of the sanction: true only for a study that injects
 backend = "hpc"                              # no compose_file, project, command or docker: the HPC backend refuses them
 journal = "@hpc_root@/fault-journal"
-stop_bound_s = @hpc_stop_bound_s@            # settle_timeout_s defaults to it + 60, poll_s to 10, relay_wait_s to 30
+stop_bound_s = @hpc_stop_bound_s@            # the service's own stop; settle_timeout_s defaults to it + the launch wait + 70
+step_launch_wait_s = @hpc_step_launch_wait_s@  # a control step's wait to start: it widens timeouts only
+command_timeout_s = @hpc_command_timeout_s@    # the floor of every relay verb's bound: the launch wait and 60 s
 
 [faults.services]
 aspen = "aspen"
