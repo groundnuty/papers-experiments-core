@@ -427,7 +427,8 @@ serves both:
   defaults supplied separately by each tool are how a setting drifts unseen. The core has no default for `holder`
   (the file-wide data provider; every `[[spaces]]` entry names its own, which the provisioner uses), so the template
   declares it, a provider the file declares, with a comment saying why, and `up` refuses a template that declares no
-  holder (or a holder that is no provider of the file), naming the key and never a value, in its preflight, before
+  holder (or a holder that is no provider of the file), or declares the table in a spelling the render cannot add to,
+  naming the key and never a value, in its preflight (which runs the render's own completion over the template), before
   anything is submitted. The render, in both of its passes, keeps what the template declares and writes every other
   setting at the core's default, read from the fields of `PlacementSettings` (the one place the numbers are, so a field
   added there is in the next render with no change here), each with its own TOML type. The missing settings are added
