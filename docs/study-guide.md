@@ -532,10 +532,7 @@ Choose it from your own measurement, never from a guess:
 2. Declare a value several times that longest healthy request, in seconds, rounded up: a healthy read the gate cuts short is the gate's error in every run, not the platform's. A study whose agent should not wait for an outage longer than a few minutes sets a few hundred seconds; one that wants the outage to outlast the run leaves the default.
 3. Read `infrastructure_facts.gate_upstream_read_timeout_s` of any REST run to confirm the gate was given the value you meant (the effective number, the default's included), and keep the measurement beside the campaign, since a later reader needs it to judge the value.
 
-```toml
-[sandbox.gate]
-upstream_read_timeout_s = 600    # 1 to 86400; the longest healthy read measured was well under 150 s
-```
+For example, `upstream_read_timeout_s = 600` under `[sandbox.gate]` in `platform.toml` (1 to 86400; the longest healthy read measured was well under 150 s).
 
 A value above 14,400 s changes nothing an agent sees, since the client gives up first. The table is refused where no data path is rest. The gate's 60 s connect timeout is not set here.
 
