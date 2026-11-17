@@ -6,14 +6,14 @@ fedtools.py`), not typed as a document. The tests that follow are the existing o
 slot the renderer writes is one the lease pool, the token journal and the revocation take as they take a document's.
 """
 
+import importlib.util
 import json
 import os
+import sys
 import tomllib
 from pathlib import Path
 
 import pytest
-import test_lease_groups as groups
-import test_provider as provider
 from federation_support import DEPLOY, MINIMAL
 from sandbox_support import SLOT_USERS, add_sandbox, slots_data
 
@@ -22,6 +22,21 @@ from expcore_onedata.testing import BASELINE, CREDENTIALS_DIR, write_platform
 from expcore_onedata.users import GROUP, SlotProbe, TokenJournal, load_slots
 
 MODULES = {}
+
+
+def sibling(name: str):
+    """A test module of this directory, loaded from its file as a module of its own (the tests import by path, so none
+    is importable by name): its tests and fixtures are the existing ones, and the `platform_file` they build their
+    platform through is the copy's, which a fixture below replaces."""
+    spec = importlib.util.spec_from_file_location(f"o83_{name}", Path(__file__).with_name(f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+groups = sibling("test_lease_groups")
+provider = sibling("test_provider")
 
 
 @pytest.fixture(scope="module", autouse=True)
