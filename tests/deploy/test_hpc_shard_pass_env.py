@@ -280,23 +280,25 @@ def test_o63_a_step_refuses_a_loader_or_shell_variable_its_line_declares_with_no
 
 @pytest.mark.parametrize("name", ["LDAP_MODE", "LDFLAGS", "ENVIRONMENT_NAME", "IFS_MODE", "BASH_ENVIRONMENT",
                                   "LOCPATHS", "DYLD", "LD", "NODE", "NODEMODE", "PERL", "PS40", "A" * 64,
-                                  "S3_ALLOW_OUTAGE", "HPC_STUDY_ARTIFACTS"])  # fmt: skip
+                                  "EXAMPLE2_ALLOW_OUTAGE", "HPC_STUDY_ARTIFACTS"])  # fmt: skip
 def test_o63_a_name_that_only_starts_like_a_loader_or_shell_variable_is_still_accepted(shards, name):
     """O63: the refusal is of the families (`LD_`, `DYLD_`, `PERL5`, `RUBY` and `NODE_` as prefixes) and of the exact
-    shell, locale and loader names: no other variable that begins alike is refused, and the pilot's two names pass."""
+    shell, locale and loader names: no other variable that begins alike is refused, and names of the shapes a study
+    declares pass."""
     assert shards.pass_env_name_problem(name) is None
 
 
-def test_o63_the_pilots_two_names_are_pinned_on_every_line(shards, tmp_path, capsys, monkeypatch):
-    """O63: `S3_ALLOW_OUTAGE` and `HPC_STUDY_ARTIFACTS`, the names a study of the pilot declares, are read from the
-    operator's environment and carried by every line as words of the step's environment and as `--pass-env` options."""
-    monkeypatch.setenv("S3_ALLOW_OUTAGE", "yes")
+def test_o63_two_names_of_the_shape_a_study_declares_are_pinned_on_every_line(shards, tmp_path, capsys, monkeypatch):
+    """O63: `EXAMPLE2_ALLOW_OUTAGE` (an invented name, a digit in its first word) and `HPC_STUDY_ARTIFACTS` (the
+    artifacts variable of the pilot) are read from the operator's environment and carried by every line as words of the
+    step's environment and as `--pass-env` options."""
+    monkeypatch.setenv("EXAMPLE2_ALLOW_OUTAGE", "yes")
     monkeypatch.setenv("HPC_STUDY_ARTIFACTS", TREE)
-    lines = printed(shards, tmp_path, capsys, "lines", 'pass_env = ["S3_ALLOW_OUTAGE", "HPC_STUDY_ARTIFACTS"]')
+    lines = printed(shards, tmp_path, capsys, "lines", 'pass_env = ["EXAMPLE2_ALLOW_OUTAGE", "HPC_STUDY_ARTIFACTS"]')
     assert len(lines) == 2
     for line in lines:
         environ, argv = node_words(line)
-        assert environ["S3_ALLOW_OUTAGE"] == "yes"
+        assert environ["EXAMPLE2_ALLOW_OUTAGE"] == "yes"
         assert environ["HPC_STUDY_ARTIFACTS"] == TREE
         assert argv.count("--pass-env") == 2
 
