@@ -118,6 +118,12 @@ class DefectLog:
         """Use this redactor for the attempt's entries from now on."""
         self._redactor = redactor
 
+    def build_redactor(self) -> Redactor:
+        """The redactor of the attempt's redaction context as it stands now: the one it started with, or the whole
+        context `record_attempt` gave it (the secrets and secret variables the executor passed). What else of the
+        attempt is kept redacted (the diagnostic of a failed start, C40) uses it too."""
+        return self._redactor()
+
     def __call__(self, error: BaseException, defect: HarnessDefect) -> Path | None:
         """Write the redacted traceback of a harness defect of this attempt; return the log's path, or None when the
         entry could not be written (the failure is kept for `raise_failure`)."""

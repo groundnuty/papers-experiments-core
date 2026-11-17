@@ -39,9 +39,11 @@ retries is in `observed_by_model`, attached with `attach_observed`.
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any
 
-from expcore.campaign.attempt_bounds import BILLED_STATES, LOST_STATE, AttemptCost
+from expcore.campaign.attempt_bounds import BILLED_STATES, LOST_STATE, AttemptCost, known_no_turn
 from expcore.campaign.interrupted_spend import BOUND, INFLIGHT, MEASURED, CallLog, basis_of, read_log, trusted_log
-from expcore.campaign.selection_ledger import Pricing, Query, charges_of
+from expcore.campaign.lost_ledger import Ledger
+from expcore.campaign.lost_ledger import read as read_ledger
+from expcore.campaign.selection_ledger import Pricing, Query, charges_of, store_view
 from expcore.campaign.store import column_for
 
 FORMAT = "model-usage-1"
@@ -58,12 +60,18 @@ CLASSES = (
 BUCKETS = (MEASURED, INFLIGHT, BOUND, "charges")  # where an attempt's dollars are counted, then their `total`
 _TOKENS = ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens")
 _LOG = ("calls_sent", "calls_usage", "spend_basis")  # an interrupted attempt's call log and the basis it records
+_TURNS = ("turn_usage", "replies_checked")  # what says an attempt is known to have had no turn
 _COUNTS = ("attempts", *_TOKENS, "usage_incomplete_attempts", "bounded_attempts", "unpriced_attempts")
 _DECIMALS = 12  # a sum of dollars is kept to a millionth of a millionth: no float noise in the bytes of an output
 
 
 def _money(value: float) -> float:
     return round(float(value), _DECIMALS)
+
+
+def _seconds(value: float) -> float:
+    """Seconds of waiting to a millisecond, so a sum carries no float noise into the bytes of an output."""
+    return round(float(value), 3)
 
 
 def usage_of(
@@ -81,12 +89,13 @@ def usage_of(
     keys a partial analysis leaves out, whose done attempts are the class `left_out`.
     """
     rows = _attempt_rows(query)
+    ledger = read_ledger(store_view(query))  # what a kill lost: its tokens are the store's whatever the prices are
     found, reason = None, why
     if pricing is not None:
         try:
             found = charges_of(query, pricing)
-        except ValueError as error:  # a bound that cannot be computed (no context window, silly limits)
-            reason = f"the bound of an attempt cannot be computed: {error}"
+        except (ValueError, TypeError, KeyError) as error:  # a bound that cannot be computed, or a row it cannot read
+            reason = f"the charges cannot be computed: {error}"
         else:
             if found is None:
                 reason = "the store's record of its probes' charges or of what a kill lost cannot be read"
@@ -104,9 +113,11 @@ def usage_of(
         cell["usage_incomplete_attempts"] += int(incomplete)
         if found is not None:
             _charge(cell, by_id.get(row["id"]))
-    if found is not None:
-        _add_lost(cells, found)
-    entries = [_entry(model, pricing, cells, found) for model in _models(rows, pricing, models)]
+    lost_probes: dict[str, float] = {}
+    if ledger is not None:
+        _add_lost(cells, lost_probes, ledger, found)
+    named = _models(rows, pricing, models, ledger)
+    entries = [_entry(model, pricing, cells, found, lost_probes) for model in named]
     return {"format": FORMAT, "dollars": {"known": found is not None, "reason": reason}, "models": entries}
 
 
@@ -114,7 +125,7 @@ def _attempt_rows(query: Query) -> list[Any]:
     """Every attempt that has or may have spent tokens, with its model and its counts, in attempt order. A snapshot made
     before a column existed is read without it."""
     columns = {row["name"] for row in query("PRAGMA table_info(attempts)")}
-    counts = ", ".join(f"a.{c}" if c in columns else f"NULL AS {c}" for c in (*_TOKENS, *_LOG))
+    counts = ", ".join(f"a.{c}" if c in columns else f"NULL AS {c}" for c in (*_TOKENS, *_LOG, *_TURNS))
     states = (*BILLED_STATES, "running")
     marks = ",".join("?" * len(states))
     return list(
@@ -157,7 +168,7 @@ def _log_counts(log: CallLog) -> tuple[tuple[int, ...], bool]:
 def _incomplete(row: Any) -> bool:
     """Whether an attempt's usage is not known whole: its totals are known to be short, a count was not reported, or it
     has not ended."""
-    unreported = row["input_tokens"] is None or row["output_tokens"] is None
+    unreported = (row["input_tokens"] is None or row["output_tokens"] is None) and not known_no_turn(row)
     return row["state"] == "running" or not row["complete"] or unreported
 
 
@@ -174,15 +185,16 @@ def _cell(cells: dict[tuple[str, str], dict[str, Any]], model: str, kind: str) -
     return cells.setdefault((model, kind), _blank())
 
 
-def _charge(cell: dict[str, Any], cost: AttemptCost | None) -> None:
+def _charge(cell: dict[str, Any], cost: AttemptCost | None, *, attempt: bool = True) -> None:
     """Add what an attempt was charged to its class: its basis's bucket without the top-ups, the top-ups apart. An
-    attempt with no cost listed (a running one with no top-up) was charged nothing yet."""
+    attempt with no cost listed (a running one with no top-up) was charged nothing yet. `attempt` is False for a charge
+    that is no attempt (a top-up a kill lost)."""
     if cost is None:
         return
     cell["charged"] = True
-    cell["bounded_attempts"] += int(cost.bounded)
+    cell["bounded_attempts"] += int(cost.bounded and attempt)
     if cost.usd is None:
-        cell["unpriced_attempts"] += 1
+        cell["unpriced_attempts"] += int(attempt)
         cell["unknown"] = True
         return
     base = cost.usd - cost.topup_usd
@@ -193,19 +205,35 @@ def _charge(cell: dict[str, Any], cost: AttemptCost | None) -> None:
     cell["buckets"]["charges"] += cost.topup_usd
 
 
-def _add_lost(cells: dict[tuple[str, str], dict[str, Any]], found: Any) -> None:
-    """The attempts and the charges a kill took out of the store, counted back from its spend journal (O62)."""
-    for name in sorted(found.ledger.counted):
-        for lost in found.ledger.counted[name]["attempts"]:
+def _add_lost(
+    cells: dict[tuple[str, str], dict[str, Any]], probes: dict[str, float], ledger: Ledger, found: Any
+) -> None:
+    """The attempts a kill took out of the store and their tokens, counted back from its spend journal (O62), whatever
+    the prices; and, where dollars are known, what they and the lost charges were charged: a top-up in the class, a
+    probe send among the model's probes."""
+    for name in sorted(ledger.counted):
+        entry = ledger.counted[name]
+        for lost in entry["attempts"]:
             cell = _cell(cells, lost["model"], "lost_in_kill")
             cell["attempts"] += 1
             counts, incomplete = _lost_counted(lost)
             for token, count in zip(_TOKENS, counts, strict=True):
                 cell[token] += count
             cell["usage_incomplete_attempts"] += int(incomplete)
-    for cost in found.costs:
-        if cost.state == LOST_STATE:
-            _charge(_cell(cells, cost.model, "lost_in_kill"), cost)
+        if found is None:
+            continue
+        for charge in entry["charges"]:
+            usd = float(charge["usd"])
+            if charge["kind"] == "probe":
+                probes[charge["model"]] = probes.get(charge["model"], 0.0) + usd
+            else:
+                cell = _cell(cells, charge["model"], "lost_in_kill")
+                cell["charged"] = True
+                cell["buckets"]["charges"] += usd
+    if found is not None:
+        for cost in found.costs:
+            if cost.state == LOST_STATE and cost.attempt_id != 0:  # a lost attempt; a lost charge is above
+                _charge(_cell(cells, cost.model, "lost_in_kill"), cost)
 
 
 def _lost_counted(lost: Mapping[str, Any]) -> tuple[tuple[int, ...], bool]:
@@ -215,28 +243,39 @@ def _lost_counted(lost: Mapping[str, Any]) -> tuple[tuple[int, ...], bool]:
         log = read_log(lost.get("calls_sent"), lost.get("calls_usage"))
         if log is not None and basis_of(log) in (MEASURED, INFLIGHT):
             return _log_counts(log)
-    unreported = lost.get("input_tokens") is None or lost.get("output_tokens") is None
+    unreported = (lost.get("input_tokens") is None or lost.get("output_tokens") is None) and not known_no_turn(lost)
     whole = lost.get("usage_complete") is None or bool(lost["usage_complete"])
     return tuple(lost.get(token) or 0 for token in _TOKENS), lost["state"] == "running" or unreported or not whole
 
 
-def _models(rows: Sequence[Any], pricing: Pricing | None, planned: Iterable[str]) -> list[str]:
-    """The plan's models, and any other the store holds, sorted: a model with no attempt is listed with zeros."""
+def _models(rows: Sequence[Any], pricing: Pricing | None, planned: Iterable[str], ledger: Ledger | None) -> list[str]:
+    """The plan's models, and any other the store or its ledger of a kill's losses holds, sorted: a model with no
+    attempt is listed with zeros."""
     named = {row["model"] for row in rows} | set(planned) | (set() if pricing is None else set(pricing.models))
+    for entry in () if ledger is None else ledger.counted.values():
+        named |= {lost["model"] for lost in entry["attempts"]} | {charge["model"] for charge in entry["charges"]}
     return sorted(named)
 
 
 def _entry(
-    model: str, pricing: Pricing | None, cells: Mapping[tuple[str, str], dict[str, Any]], found: Any
+    model: str,
+    pricing: Pricing | None,
+    cells: Mapping[tuple[str, str], dict[str, Any]],
+    found: Any,
+    lost_probes: Mapping[str, float],
 ) -> dict[str, Any]:
+    price = _price(model, pricing)
     classes = []
     for kind in CLASSES:
         cell = cells.get((model, kind))
         if cell is None or not (cell["attempts"] or cell["charged"]):
             continue
-        classes.append({"class": kind, **{name: cell[name] for name in _COUNTS}, "usd": _usd(cell, found)})
-    probes = None if found is None else _money(found.probes.get(model, 0.0))
-    entry = {"model": model, "price": _price(model, pricing), "classes": classes, "probes_usd": probes}
+        usd = None if price == "unpriced" else _usd(kind, cell, found)  # nothing priced a model with no price
+        classes.append({"class": kind, **{name: cell[name] for name in _COUNTS}, "usd": usd})
+    probes = None
+    if found is not None and price != "unpriced":
+        probes = _money(found.probes.get(model, 0.0) + lost_probes.get(model, 0.0))
+    entry = {"model": model, "price": price, "classes": classes, "probes_usd": probes}
     entry["usd"] = _model_usd(entry)
     return entry
 
@@ -251,12 +290,20 @@ def _price(model: str, pricing: Pricing | None) -> str | None:
     return "free" if spec.free else "priced"
 
 
-def _usd(cell: Mapping[str, Any], found: Any) -> dict[str, float] | None:
-    """A class's dollars by basis and in total; None when any of its attempts has no known cost, or without prices."""
+def _usd(kind: str, cell: Mapping[str, Any], found: Any) -> dict[str, float | None] | None:
+    """A class's dollars by basis and in total; None when any of its attempts has no known cost, or without prices.
+    An attempt still running has no spend of its own known yet: only the top-ups the gate charged it are."""
     if found is None or cell["unknown"]:
         return None
-    buckets = dict(cell["buckets"])
-    return {**{name: _money(value) for name, value in buckets.items()}, "total": _money(sum(buckets.values()))}
+    buckets = {name: _money(value) for name, value in cell["buckets"].items()}
+    if kind == "running":
+        return {MEASURED: None, INFLIGHT: None, BOUND: None, "charges": buckets["charges"], "total": None}
+    return {**buckets, "total": _money(sum(buckets.values()))}
+
+
+def _gate_counted(usd: Mapping[str, float | None], kind: str) -> float:
+    """What the gate counts of a class: its total, and for the attempts still running their top-ups alone."""
+    return float(usd["charges"] if kind == "running" else usd["total"])
 
 
 def _model_usd(entry: Mapping[str, Any]) -> dict[str, float] | None:
@@ -265,8 +312,9 @@ def _model_usd(entry: Mapping[str, Any]) -> dict[str, float] | None:
     probes = entry["probes_usd"]
     if probes is None or any(c["usd"] is None for c in entry["classes"]):
         return None
-    analysed = _money(sum(c["usd"]["total"] for c in entry["classes"] if c["class"] == "analysed"))
-    other = _money(sum(c["usd"]["total"] for c in entry["classes"] if c["class"] != "analysed") + probes)
+    classes = [(c["class"], _gate_counted(c["usd"], c["class"])) for c in entry["classes"]]
+    analysed = _money(sum(usd for kind, usd in classes if kind == "analysed"))
+    other = _money(sum(usd for kind, usd in classes if kind != "analysed") + probes)
     return {"total": _money(analysed + other), "analysed": analysed, "not_analysed": other}
 
 
@@ -297,43 +345,49 @@ def usage_of_batch(
 
 def merge_usage(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """The figures of a batch merged from shards: the shards' added, class by class and model by model. A dollar is
-    known only where every shard's is. The shards' order is the caller's, so a sum is the same bytes every time."""
+    known only where every shard's is: when any shard's are not, no class, probe or total dollar of the merge is, and
+    the tokens are still all the shards'. The shards' order is the caller's, so a sum is the same bytes every time."""
     if len(parts) == 1:
         return dict(parts[0])
     unknown = [part["dollars"]["reason"] for part in parts if not part["dollars"]["known"]]
-    entries: dict[str, dict[str, Any]] = {}
+    entries: dict[str, list[Mapping[str, Any]]] = {}
     for part in parts:
         for model in part["models"]:
-            entries.setdefault(model["model"], {"model": model["model"], "price": model["price"], "parts": []})
-            entries[model["model"]]["parts"].append(model)
-    models = [_merged_entry(entry) for _, entry in sorted(entries.items())]
+            entries.setdefault(model["model"], []).append(model)
+    models = [_merged_entry(name, held, known=not unknown) for name, held in sorted(entries.items())]
     dollars = {"known": not unknown, "reason": unknown[0] if unknown else None}
     return {"format": FORMAT, "dollars": dollars, "models": models}
 
 
-def _merged_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+def _merged_entry(name: str, parts: Sequence[Mapping[str, Any]], *, known: bool) -> dict[str, Any]:
     classes = []
     for kind in CLASSES:
-        held = [c for part in entry["parts"] for c in part["classes"] if c["class"] == kind]
+        held = [c for part in parts for c in part["classes"] if c["class"] == kind]
         if not held:
             continue
-        merged = {"class": kind, **{name: sum(c[name] for c in held) for name in _COUNTS}}
-        merged["usd"] = None if any(c["usd"] is None for c in held) else _sum_usd([c["usd"] for c in held])
+        merged = {"class": kind, **{count: sum(c[count] for c in held) for count in _COUNTS}}
+        merged["usd"] = None if not known or any(c["usd"] is None for c in held) else _sum_usd([c["usd"] for c in held])
         classes.append(merged)
-    probes = [part["probes_usd"] for part in entry["parts"]]
-    merged_entry = {
-        "model": entry["model"],
-        "price": entry["price"],
+    probes = [part["probes_usd"] for part in parts]
+    prices = {part["price"] for part in parts}
+    entry = {
+        "model": name,
+        "price": prices.pop() if len(prices) == 1 else None,  # shards that disagree on it show none
         "classes": classes,
-        "probes_usd": None if any(p is None for p in probes) else _money(sum(probes)),
+        "probes_usd": None if not known or any(p is None for p in probes) else _money(sum(probes)),
     }
-    merged_entry["usd"] = _model_usd(merged_entry)
-    return merged_entry
+    entry["usd"] = _model_usd(entry)
+    return entry
 
 
-def _sum_usd(parts: Iterable[Mapping[str, float]]) -> dict[str, float]:
+def _sum_usd(parts: Iterable[Mapping[str, float | None]]) -> dict[str, float | None]:
+    """The dollars of several classes added bucket by bucket; a bucket that is None in any (an attempt still running has
+    no spend of its own known) is None in the sum."""
     held = list(parts)
-    return {name: _money(sum(p[name] for p in held)) for name in (*BUCKETS, "total")}
+    return {
+        name: None if any(p[name] is None for p in held) else _money(sum(p[name] for p in held))
+        for name in (*BUCKETS, "total")
+    }
 
 
 # ----------------------------------------------------------------------------------------- what the records say
@@ -361,7 +415,7 @@ def observed_by_model(records: Iterable[Any]) -> dict[str, dict[str, Any]]:
             events = turn.get("retries") or []
             entry["turns_retried"] += int(bool(events))
             for event in events:
-                kind = entry["retries"].setdefault(str(event.get("kind")), {"events": 0, "wait_s": 0.0})
+                kind = entry["retries"].setdefault(str(event.get("kind") or "unknown"), {"events": 0, "wait_s": 0.0})
                 kind["events"] += 1
                 kind["wait_s"] += float(event.get("wait_s") or 0.0)
     return found
@@ -390,8 +444,11 @@ def attach_observed(usage: Mapping[str, Any], observed: Mapping[str, Mapping[str
                 "retries": {
                     "events": sum(v["events"] for _, v in by_kind),
                     "turns_retried": seen.get("turns_retried", 0),
-                    "wait_s": float(sum(v["wait_s"] for _, v in by_kind)),
-                    "by_kind": [{"kind": kind, **counts} for kind, counts in by_kind],
+                    "wait_s": _seconds(sum(v["wait_s"] for _, v in by_kind)),
+                    "by_kind": [
+                        {"kind": kind, "events": counts["events"], "wait_s": _seconds(counts["wait_s"])}
+                        for kind, counts in by_kind
+                    ],
                 },
             }
         )

@@ -102,6 +102,11 @@ def charges_of(query: Query, pricing: Pricing) -> Charges | None:
     return Charges(costs, probes, ledger)
 
 
+def store_view(query: Query) -> _View:
+    """A store read through a query, answering `q` and `get_meta` as the modules that read a store's records ask."""
+    return _View(query)
+
+
 def spend_of(query: Query, pricing: Pricing) -> Spend:
     """What the store spent, as the budget gate counts it at its next assessment with nothing in flight."""
     found = charges_of(query, pricing)

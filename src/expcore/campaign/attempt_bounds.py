@@ -226,6 +226,12 @@ def measured_usd(spec: ModelSpec, row: Mapping[str, Any]) -> float | None:
     )
 
 
+def known_no_turn(row: Mapping[str, Any]) -> bool:
+    """Whether an attempt's usage is known to hold no turn (`_no_turn`): no count was reported because no reply was
+    answered, which costs 0 and is not an unreported count."""
+    return _no_turn(row)
+
+
 def _no_turn(row: Mapping[str, Any]) -> bool:
     """Tell whether an attempt is known to have had no request answered: its per-turn usage holds no turn, and its
     usage was judged with the check that a billed reply the backend could not read leaves it incomplete (C26). A row

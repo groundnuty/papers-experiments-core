@@ -51,7 +51,10 @@ NOTES = textwrap.wrap(
     "Charged at a bound counts the attempts whose charge holds a bound or a top-up. An attempt that failed before any "
     "request was sent and was charged a measured zero has 0 tokens and 0 dollars. n/a: not known, because the model "
     "has no price, the prices are not the ones the campaign ran under, a bound cannot be computed or a record cannot "
-    "be read; it is never 0. Spent is the model's total, On analysed attempts that of the attempts the analysis uses, "
+    "be read; it is never 0. An attempt still running (a partial analysis) has no spend of its own known yet: its "
+    "dollars are n/a and Spent has only the top-ups it was charged. Top-ups and probes are what the budget gate "
+    "charged: a campaign without a budget has no gate, so both are 0 there, though its endpoints may have billed what "
+    "nothing counted. Spent is the model's total, On analysed attempts that of the attempts the analysis uses, "
     "and On the rest everything else (attempts that were never scored, runs left out of a partial analysis, what a "
     "kill lost, probes), so what scored runs cost can be read beside the overhead.",
     width=118,
@@ -89,7 +92,7 @@ def _sum(entry: Mapping[str, Any], bucket: str) -> float | None:
     """A model's dollars on one basis over its classes; None unless every dollar of the model is known."""
     if entry["usd"] is None:
         return None
-    return float(sum(c["usd"][bucket] for c in entry["classes"]))
+    return float(sum(c["usd"][bucket] or 0.0 for c in entry["classes"]))  # None: an attempt still running
 
 
 def _spend_rows(models: Sequence[Mapping[str, Any]]) -> list[list[object]]:
@@ -246,4 +249,7 @@ def provenance_line(usage: Mapping[str, Any] | None) -> list[str]:
     )
     if unknown:
         line += f"; {UNKNOWN} for {', '.join(unknown)} (no price)"
+    running = sum(c["attempts"] for m in usage["models"] for c in m["classes"] if c["class"] == "running")
+    if running:
+        line += f"; {running} attempt(s) still running, counted by their top-ups only"
     return [f"{line}; {pointer}"]

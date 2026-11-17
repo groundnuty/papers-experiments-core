@@ -84,6 +84,7 @@ from expcore.loop.outcomes import Outcome
 from expcore.models import spend
 from expcore.records.build import RunIdentity, redactor_for
 from expcore.records.injections import restore_refusal
+from expcore.records.redact import Redactor
 
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
 # A platform's run admission: given the run's treatment kinds, its treatment targets, the campaign's end and whether its
@@ -368,7 +369,7 @@ class AttemptRunner:
                     treatment_targets=targets,
                     sent_nothing=sent_no_request(error, backend),
                 )
-                result = self._with_diagnostic(result, error, backend)
+                result = self._with_diagnostic(result, error, defects.build_redactor)
                 result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
@@ -386,10 +387,13 @@ class AttemptRunner:
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
 
-    def _with_diagnostic(self, result: AttemptResult, error: BaseException, backend: Any) -> AttemptResult:
+    def _with_diagnostic(
+        self, result: AttemptResult, error: BaseException, redactor: Callable[[], Redactor]
+    ) -> AttemptResult:
         """Keep on the result the snapshot an infrastructure error carries (a failed instrument start's), redacted
-        with this attempt's secrets as a record is (C40). One that cannot be kept is recorded as failed, not raised."""
-        kept = snapshot_of(error, lambda: redactor_for(backend, models=self.p.models))
+        with the attempt's whole redaction context as a record is (C40). One that cannot be kept is recorded as
+        failed, not raised."""
+        kept = snapshot_of(error, redactor)
         return result if kept is None else dataclasses.replace(result, diagnostic=kept)
 
     def _settle_failure(
