@@ -361,7 +361,8 @@ def test_o62_the_manifest_sets_how_often_a_step_snapshots(shards, tmp_path):
     for label, root in zip(("fed-a", "fed-b"), roots, strict=True):
         root.mkdir(parents=True)
         state = {"format": "expcore-hpc-federation/1", "allocation": {"job": "101", "name": "hpcop-x"},
-                 "sandbox": {"placement": "het", "node": "node-s1", "het_group": 1}, "phase": "linked"}  # fmt: skip
+                 "sandbox": {"placement": "het", "node": "node-s1", "het_group": 1}, "phase": "linked",
+                 "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         lines += ["[[shards]]", f'label = "{label}"', f'root = "{root}"']
     (tmp_path / "shards.toml").write_text("\n".join(lines) + "\n")

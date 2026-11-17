@@ -32,7 +32,8 @@ def _manifest(tmp_path, **changes):
     for n, root in enumerate(roots, 1):
         root.mkdir(parents=True)
         state = {"format": "expcore-hpc-federation/1", "allocation": {"job": str(100 + n), "name": f"hpcop-x-{n}"},
-                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked"}  # fmt: skip
+                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked",
+                 "data": {"ingested": {}}}  # fmt: skip
         (root / "platform.toml").write_text('[space]\nname = "s"\ndata_manifest = "m.json"\n')  # its data declared
         if changes.get("placement") == "separate":
             state["sandbox"] = {"placement": "separate", "node": f"node-s{n}", "job": str(200 + n),
@@ -256,6 +257,7 @@ def test_collect_verifies_and_unpacks_every_shard_read_only_and_names_the_merge(
     assert not os.access(outs[0] / "runs" / "r.json", os.W_OK)
     line = shards.merge_argv(plan, outs)
     assert line[1:6] == ["-I", "-B", "-m", "expcore", "merge"]  # isolated, no bytecode written (O58)
+    assert line[6] == str(plan.study / "out")
     assert line[7:] == [str(o) for o in outs]
 
 

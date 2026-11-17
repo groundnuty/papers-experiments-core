@@ -60,7 +60,11 @@ owner = "alder"
 mirrors = ["aspen"]
 
 [spaces.delta-space]                     # stands for the pilot's largest space, 15,340 files; up writes none into it
-owner = "hazel"                          # (its synthetic tree of that count is M3's, on an imported storage)
+owner = "hazel"                          # (its synthetic tree of that count is M3's, on an imported storage). It is
+                                         # this layout's ingested space (README, "An ingested space"): a study that
+                                         # fills it declares `data_manifest = "@study_artifacts@/manifests/<file>.json"`
+                                         # here and runs `hpcfed.py verify-data` after its ingest; with none declared
+                                         # its manifest is the empty one, which verify-data holds it to
 mirrors = ["aspen"]
 baseline = false
 

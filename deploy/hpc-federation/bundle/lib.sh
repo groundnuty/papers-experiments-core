@@ -515,8 +515,38 @@ import_binds() {  # <workdir>: the `apptainer exec` arguments that bind each lis
   "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/importstorage.py" binds --workdir "$1"
 }
 
-run_service() {  # <workdir>: become the service (apptainer exec) in the foreground of this process
-  local W=$1 R=$1/rootfs S epmd b
+# A provider's posix storage on the shared scratch filesystem (O57, HPC_STORAGE_ROOT): its job is given its own directory
+# there (--storage=PATH, up's), configure.sh's `posixstorage.py prepare` checks it and records it in the work directory,
+# and every start is given the same argument again (provider.sbatch's first, restart.sh's from `hpcfed.py start`) and
+# binds it, writable, onto /volumes/posix only when the record names exactly that path. Without it the storage is the
+# rootfs's own /volumes/posix, on the node's tmpfs, and the service is started as it always was.
+split_storage() {  # <storage-var> <other-array> args...: the one --storage=PATH argument ('' for none), then every other one
+  local -n _storage=$1 _rest=$2
+  local a
+  shift 2
+  _storage='' _rest=()
+  for a in "$@"; do
+    if [[ $a == --storage=* ]]; then
+      [[ -z $_storage ]] || die "a provider binds one posix storage: --storage= is given twice"
+      _storage=$a
+    else
+      _rest+=("$a")
+    fi
+  done
+}
+
+storage_binds() {  # <workdir> [--storage=PATH]: the `apptainer exec` arguments that bind this start's storage, one per line
+  if [[ -z ${2:-} ]]; then  # this start names no storage: none is bound, and a work directory that records one refuses
+    if [[ -e $1/posix-storage || -L $1/posix-storage ]]; then
+      die "the work directory records a posix storage on scratch, but this start names none: it is not started on the node's tmpfs instead"
+    fi
+    return 0
+  fi
+  "$HPCOP_PY" -I "$HPCOP_BUNDLE/posixstorage.py" binds --workdir "$1" "$2"
+}
+
+run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exec) in the foreground of this process
+  local W=$1 R=$1/rootfs S epmd b storage=${2:-}
   local -a binds=()
   S=$(secrets_dir "$W")
   check_service_files "$W"
@@ -528,14 +558,17 @@ run_service() {  # <workdir>: become the service (apptainer exec) in the foregro
   home_in "$W"   # apptainer's configuration and cache, and every other tool's, in the work directory: never ~
   b=$(import_binds "$W") || die "the shared imported trees of $W cannot be bound (see above): the service is not started"
   if [[ -n $b ]]; then mapfile -t binds <<<"$b"; fi
+  b=$(storage_binds "$W" "$storage") || die "the posix storage of $W on scratch cannot be bound (see above): the service is not started"
+  if [[ -n $b ]]; then mapfile -t -O "${#binds[@]}" binds <<<"$b"; fi
   "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" check || die "$HPCOP_PY cannot use pidfds, which the service's stop needs"
   # exec keeps this PID for supervise.py, which stays visible in /proc under hidepid (apptainer's setuid starter, its
   # child, does not). teardown.sh signals it only while its start time (stat field 22) still matches.
   printf '%s %s\n' "$$" "$(proc_field "$$" 22)" > "$W/service.pid"
   # --containall: own PID, IPC and mount namespaces, clean environment; the node's network and name.
   # --workdir keeps the container's /tmp and /var/tmp inside the private work directory. A shared tree is a read-only
-  # bind (`:ro`) of the list's, over the empty mountpoint configure.sh made in the rootfs: the one thing of the node's
-  # filesystems the container sees, and one it cannot write to.
+  # bind (`:ro`) of the list's, over the empty mountpoint configure.sh made in the rootfs, which the container cannot
+  # write to. A provider's storage on scratch, when its job was given one, is the one writable bind: its own directory
+  # there, over the rootfs's empty /volumes/posix. Nothing else of the node's filesystems is seen.
   exec "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" run -- apptainer exec --writable --containall --no-home --pwd /root \
     --workdir "$W/work" "${binds[@]}" "$R" /root/hpcop-start.sh > "$W/run.log" 2>&1 < /dev/null
 }

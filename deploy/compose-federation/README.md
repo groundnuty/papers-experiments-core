@@ -83,6 +83,7 @@ generated `layouts/storage-import.compose.yaml` and `layouts/storage-import.plat
 | `[zone] port`, `[providers.<name>] port` | each service's port on `127.0.0.1` |
 | `[spaces.<name>] owner`, `mirrors` | the provider the space's data is written through and kept on, and the other providers that support it |
 | `[spaces.<name>] baseline` | `false` for a space that up leaves empty and `reset --clean` empties, the study space included (default `true`: the baseline files, see "The baseline") |
+| `[spaces.<name>] data_manifest` | HPC only (`deploy/hpc-federation`, ignored by Compose): the manifest of the data the study ingests into a space that declares `baseline = false` and has no `import`, a path under `@study_artifacts@` or absolute, in the core's import-manifest format (see its README, "An ingested space") |
 | `[spaces.<name>] import` | a table `{ readonly, source_env }` for a space its owner holds on an imported POSIX storage: `readonly` says whether the platform may write to it, `source_env` names the environment variable that holds the host directory of the dataset, never a path; the space must declare `baseline = false` (see "An imported space") |
 | `[spaces.<name>] agent_visible` | `false` for a space the day-0 checks alone use: no user of the agent may be a member, and it is never the study space |
 | `[principals.<user>] privileges`, `spaces` | a fixed user's exact privileges, in the study space unless `spaces` names others |
@@ -354,7 +355,9 @@ the root, so the relative `fault-journal` is that directory; a file derived in a
 (`link-check.json`, which `up` writes in the root and a pre-check reads there) is written in it by every fault-gate
 check made through any such file: the restore's, the heal's and the health gate's routine pre-run check. Nothing is
 written beside a derived file. A table whose journal's parent holds no `platform.toml` is refused at load, naming the
-key (a journal that is not in a federation's root has no record to write); a platform file with no `[faults]` declares
+key (a journal that is not in a federation's root has no record to write), and so is a relative journal in a file that
+lies beside a `study.toml` (it would resolve into the study, where the copy of `platform.toml` satisfies that check
+vacuously): there the journal is written in full; a platform file with no `[faults]` declares
 no root, so its link checks write no record.
 
 ```sh

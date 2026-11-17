@@ -1,7 +1,7 @@
 """Bring a throwaway Onedata federation up on HPC batch nodes, and take it down, from the Compose federation's layout
 file (DESIGN.md is the process model; README.md says what has run).
 
-    uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH up | down | describe
+    uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH up | down | describe | verify-data
     uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH stop | start | status SERVICE
     uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH exec SERVICE -- ARGV...
 
@@ -20,6 +20,12 @@ them in the state file in the root, so `down` and the service verbs need no envi
 - down: every service torn down (the providers, then the zone), every step gone, each node checked, the held job
   (and the agent's own job, when it has one) cancelled by its id, then the root removed; on whatever up reached.
 - describe: the plan: the nodes and their shape, every step's size, and what the job bills per hour.
+- verify-data: after the study's ingest, read each ingested space (a space that is neither a baseline space nor a
+  shared import, whose data is the study's own) back through its owner and compare every file's path, size and SHA-256
+  and every directory with the manifest it declares (`data_manifest` on the space, rendered by `up`); it exits 1,
+  naming the space and how many files differ, on any difference, and records a verified marker in the state file on a
+  pass, which `shards.py plan` requires (O57). It reads the root and needs no site environment; it never touches the
+  job.
 - stop, start, status, exec: the service verbs, `hpcfed_control.run` (M4), through the hook in `main`.
 - core: the core's phase alone, as the step of `[hpc] core = "step"` runs it.
 """
@@ -47,7 +53,7 @@ from hpcsettings import SettingsError, agent_limits, load_settings, site_from_en
 from hpcslurm import Runner, Slurm  # noqa: E402
 
 CONTROL_VERBS = ("stop", "start", "status", "exec")  # hpcfed_control.VERBS (M4)
-COMMANDS = ("up", "down", "describe", "core", *CONTROL_VERBS)
+COMMANDS = ("up", "down", "describe", "core", "verify-data", *CONTROL_VERBS)
 
 
 def core_paths() -> Dict[str, str]:
@@ -193,11 +199,16 @@ def main(
         elif args.command == "core":
             self_check()
             print(driver.core_here())
+        elif args.command == "verify-data":
+            self_check()
+            print(driver.verify_data())
         elif args.command == "up":
             self_check()
             print(driver.up(site_from_environment(environ)))
-        else:
+        elif args.command == "down":  # never an `else`: a command added without a branch would tear the federation down
             print(driver.down())
+        else:
+            raise AssertionError(f"{args.command}: no branch")  # pragma: no cover
     except CoreMismatch as error:
         print(f"error: {args.command}: {error}", file=sys.stderr)
         return CORE_MISMATCH
