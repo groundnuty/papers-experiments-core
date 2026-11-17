@@ -5,6 +5,7 @@ reset is full (deploy/hpc-federation/fleetplan.py).
 Every federation runs over a fake cluster of its own (`hpc_fleet_support.Bench`), its platform.toml the one its own
 up rendered; the step's srun is stood in by `StepRunner`, which checks each line on its federation's cluster."""
 
+import hashlib
 import json
 
 import pytest
@@ -48,6 +49,28 @@ def plan(bench, *extra: str) -> tuple[int, str, dict]:
 
 def assigned(bench) -> dict:
     return {s["label"]: s["member"] for s in record(bench)["shards"]}
+
+
+GUARD, POST = "raise SystemExit(0)  # a study's guard\n", "raise SystemExit(0)  # a study's post-run script\n"
+DECLARED_SCRIPTS = ('pre_step = "guards/pre_step.py"', 'post_run = "guards/post_run.py"')
+
+
+def make_scripts(bench) -> None:
+    """The study directory the settings name, with the two scripts they declare."""
+    guards = bench.base / "study" / "guards"
+    guards.mkdir(parents=True)
+    (guards / "pre_step.py").write_text(GUARD)
+    (guards / "post_run.py").write_text(POST)
+
+
+def sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def script_words(argv: list) -> dict:
+    """The guard's and the post-run script's words on a step line: each option and its value."""
+    options = ("--pre-step", "--pre-step-sha256", "--post-run", "--post-run-sha256")
+    return {option: argv[argv.index(option) + 1] for option in options if option in argv}
 
 
 # ------------------------------------------------------------------------------------------------ plan
@@ -278,3 +301,54 @@ def test_o68_status_says_each_federation_its_job_and_shard_and_runs_nothing(benc
     assert "shard-1: on fed-1, its step runs" in printed
     assert "shard-2: unassigned" in printed
     assert {label: len(fake.calls) for label, fake in bench.fakes.items()} == calls
+
+
+# ------------------------------------------------------------------------------------------------ the study's scripts
+SCRIPT_WORDS = {"--pre-step": "guards/pre_step.py", "--pre-step-sha256": sha(GUARD),
+                "--post-run": "guards/post_run.py", "--post-run-sha256": sha(POST)}  # fmt: skip
+
+
+def test_o63_the_fleets_line_builder_pins_the_studys_guard_and_post_run_script_as_plan_does(bench, deploy):
+    """O63: `fleetplan.line_of` made its line from a plan nothing had hashed, so a manifest declaring `pre_step` or
+    `post_run` could give no line at all (`step_argv`'s refusal of an unpinned plan escaped as a traceback). It pins
+    them as `shards.py plan` and `lines` do: the line carries each script's path and SHA-256 as the study holds it."""
+    assert bench.up(2)[0] == 0
+    assert plan(bench)[0] == 0
+    make_scripts(bench)
+    text = (bench.fleet / "shards.toml").read_text(encoding="utf-8")
+    head, divider, tail = text.partition("\n\n[[shards]]")
+    declared = bench.base / "declared.toml"
+    declared.write_text(head + "\n" + "\n".join(DECLARED_SCRIPTS) + divider + tail, encoding="utf-8")
+    fleetplan = deploy.fleet.fleetplan
+    argv = fleetplan.line_of(fleetplan.shards.load_plan(declared), "shard-1", False)
+    assert script_words(argv) == SCRIPT_WORDS
+
+
+def test_o63_the_shard_settings_take_the_studys_guard_and_post_run_script_and_plan_and_step_pin_them(bench):
+    """O63: a fleet's campaign carries the study's own refusals like any other (the settings took none of the
+    optional keys but `snapshot_every_s`, so a step it launched could never run the study's guard): `pre_step` and
+    `post_run` in the settings are hashed by `plan`, which prints lines carrying them, written to shards.toml for
+    `collect`, and by `step`, which launches those lines."""
+    assert bench.up(2)[0] == 0
+    make_scripts(bench)
+    code, printed = bench.run("plan", "--manifest", str(bench.settings(*DECLARED_SCRIPTS)))
+    assert code == 0, printed
+    lines = {e["shard"]: e for e in map(json.loads, (t for t in printed.splitlines() if t.startswith("{")))}
+    for entry in lines.values():
+        assert script_words(entry["argv"]) == SCRIPT_WORDS
+    manifest = (bench.fleet / "shards.toml").read_text(encoding="utf-8")
+    assert 'pre_step = "guards/pre_step.py"' in manifest
+    assert 'post_run = "guards/post_run.py"' in manifest
+    assert bench.run("step")[0] == 0
+    assert [script_words(s.argv) for s in bench.spawned] == [SCRIPT_WORDS] * 2
+
+
+def test_o63_plan_refuses_a_guard_the_study_does_not_hold_before_it_assigns_anything(bench):
+    """O63: a declared script that is not in the study refuses `plan` whole, as it refuses `shards.py plan`: no
+    shard is assigned and nothing is written."""
+    assert bench.up(2)[0] == 0
+    code, printed = bench.run("plan", "--manifest", str(bench.settings('pre_step = "guards/missing.py"')))
+    assert code == 2
+    assert "guards/missing.py" in printed
+    assert all(member is None for member in assigned(bench).values())
+    assert not (bench.fleet / "shards.toml").exists()

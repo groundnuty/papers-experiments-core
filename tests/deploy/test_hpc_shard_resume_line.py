@@ -9,6 +9,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -249,6 +250,47 @@ def test_resume_line_refuses_an_unset_declared_variable_before_it_records_anythi
     monkeypatch.delenv("FAULT_ACK_MODE", raising=False)
     world.snapshot(world.fingerprint())
     refused(world, "FAULT_ACK_MODE is not set")
+
+
+GUARD, POST = "raise SystemExit(0)  # guard\n", "raise SystemExit(0)  # post-run\n"
+
+
+def declare_scripts(world, *, write=True):
+    """The manifest, with the study's guard and post-run script declared (and, `write`, in the study)."""
+    if write:
+        guards = world.plan.study / "guards"
+        guards.mkdir()
+        (guards / "pre_step.py").write_text(GUARD)
+        (guards / "post_run.py").write_text(POST)
+    text = world.manifest.read_text(encoding="utf-8")
+    world.manifest.write_text(
+        text.replace(
+            'memory = "17g"\n', 'memory = "17g"\npre_step = "guards/pre_step.py"\npost_run = "guards/post_run.py"\n'
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_resume_line_pins_the_studys_guard_and_post_run_script_as_lines_does(world):
+    """O63: A manifest declaring `pre_step` and `post_run` gives a resume line carrying each script's path and its
+    SHA-256 as the study holds it, as `lines` does: the resumed step runs the study's guard first and its post-run
+    script last. The line was refused as unpinned (`step_argv`), so such a shard could not be resumed at all."""
+    declare_scripts(world)
+    world.snapshot(world.fingerprint())
+    line = flagged(world.line())
+    options = ("--pre-step", "--pre-step-sha256", "--post-run", "--post-run-sha256")
+    wanted = {"--pre-step": "guards/pre_step.py", "--pre-step-sha256": sha256(GUARD.encode()).hexdigest(),
+              "--post-run": "guards/post_run.py", "--post-run-sha256": sha256(POST.encode()).hexdigest()}  # fmt: skip
+    assert {option: line[line.index(option) + 1] for option in options} == wanted
+    assert "--resume" in line
+
+
+def test_resume_line_refuses_a_declared_script_the_study_does_not_hold_before_it_records_anything(world):
+    """O63: The scripts are read before the job and node are recorded in the federation's state: a declared guard that
+    is not in the study refuses the line, naming it, and the state is as it was."""
+    declare_scripts(world, write=False)
+    world.snapshot(world.fingerprint())
+    refused(world, "guards/pre_step.py")
 
 
 @pytest.mark.parametrize(
