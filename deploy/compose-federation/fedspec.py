@@ -15,7 +15,8 @@ storage (Onedata's storage import) whose directory is a dataset the layout does 
 environment variable that gives its path, never the path, since a layout is public. An import may be `shared` with
 other federations (O59): it is then read-only and names the variable of its manifest. Every key is checked when the file
 is read, and a refusal names the file and the key. The two images stay pinned by the deployment itself
-(fedlayout.IMAGES): a layout cannot name another.
+(fedlayout.IMAGES): a layout cannot name another. `[slots.<name>]` pairs two of the layout's principals as the users of
+a leased slot, and `[toolserver]` declares the server they run (O83, `fedslots.py`).
 """
 
 import hashlib

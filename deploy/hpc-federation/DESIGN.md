@@ -469,6 +469,19 @@ serves both:
   read the HPC `[faults]` (one without M4's backend) gets the restore's rule over the keys it knows, with the HPC
   settle time and poll.
 
+**Slots and a tool server (O83).** The core starts a tool server only for a slot's user, and no layout declared one, so
+the tool-server arm could not run here. A layout's `[slots.<name>]` pairs two of its principals and `[toolserver]` declares
+the server (`fedslots.py`, shared with Compose, which provisioned no slot either), and the HPC driver adds nothing to
+provisioning: the users are principals, so section 5's bootstrap makes the zone user, its 0600 password file and its
+memberships, and `HpcBootstrap.support` maps every principal to the job's uid. One function (`fedtools.additions`) writes
+`[slots.*]` and `[toolserver]` after the template's text, from the layout's declarations and the facts' ids, and
+`write_platform` appends it; a template that declares either is refused. The manifests are copied into the root and named
+by absolute path (the file is copied beside a study); `@study_artifacts@` is `HPC_STUDY_ARTIFACTS` (`Site.study_artifacts`,
+recorded in the state file for a hand-run `core` step; an unset key is no value, so a placeholder is never written empty).
+`preflight` refuses a site without it and artifacts the server cannot run from before a job is held, and `write_facts`
+loads the written file as a campaign does (`fedtools.check_rendered`), so a federation is not ready on a file the core
+refuses. A layout with no slot takes none of these paths.
+
 The core's platform layer (gate, health, link check, faults) points at `<root>/platform.toml` wherever it runs,
 provided it reaches the services' 8443 and reads the root. A layout's link check covers the pairs its
 `platform.toml` declares (`linksettings.link_pairs`): `layouts/pilot-shape.toml` beside this file has the pilot's shape
