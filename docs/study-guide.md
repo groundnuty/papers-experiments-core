@@ -1447,6 +1447,26 @@ Once one analysed record carries it, `analyze` judges every analysed run:
 
 The analysis then runs again without every run that is not clean, and with the egress check or the mount guard it also joins the rerun without every run any guard leaves out, `## Egress, mount isolation and process visibility together` for all three (O76). `report.md` gains `## Process visibility (detected, not prevented)`, `analysis.json` gains `process_visibility`, and `analyze` prints a line per contrast. The check detects, it does not prevent. Hidden memory under the margin (`hidden_memory_margin_bytes`, 128 MiB by default) and a hidden process's shared memory are not told apart from the node's own; the step's memory limit bounds them, and every hidden process ends with its cell. What each field means is in [`interfaces.md`](interfaces.md#processes-hidden-from-the-watch-the-process_visibility-instrument).
 
+### Forged read-log records: detected and reported, not prevented
+
+A study's canonical scripts log every read they make to the read-log channel, and the study's omission scoring rests on that log. The channel is a datagram socket bound read-only into every cell, so your agent's code can send a record of its own, and an item it never read then looks read. Nothing prevents that. `expcore_onedata.readlog.scan` detects the likely routes from the record alone: a run is flagged when the code of one of its cells names the channel's socket or client, builds a Unix datagram socket, reads a process's environment, or searches for the socket.
+
+```python
+from expcore_onedata.readlog.scan import scan_cells
+
+ran_a_script = "import subprocess\nsubprocess.run(['python', '-I', '/inputs/scripts/read_item.py', 'fileX'])"
+forged = "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\ns.sendto(b'{}', '/expcore-readlog/sock')"
+assert scan_cells([ran_a_script])["flagged"] is False  # a script run by its path names none of the channel
+assert [(hit["kind"], hit["what"]) for hit in scan_cells([forged])["hits"]] == [
+    ("channel_path", "/expcore-readlog/sock"),
+    ("unix_datagram", "AF_UNIX+SOCK_DGRAM"),
+]
+```
+
+- **Let the agent run a canonical script by its path and never paste its text into a cell.** A cell that holds a script's text names the client and is flagged.
+- `read_log_analysis(runs, rows, absent, prereg)` judges every analysed run once a record carries the `read_log` instrument, and runs the preregistered analysis again without the flagged runs; `read_log_lines` renders the `## Read log` section of the report. They are not called by `analyze` yet (the core does not import the platform layer), so a study that wants the section calls them from its own analysis step.
+- **Report the primary analysis as it stands and the sensitivity analysis beside it.** The scan reads text: code that builds a name at run time, decodes it, or edits a copy of a canonical script passes it, and it flags a cell that names `AF_UNIX` and `SOCK_DGRAM` for two unrelated sockets. A run that is not flagged is not shown to have an unforged log; on a REST data path the gate's per-file served table (O22) is the check that does not read code.
+
 ### The sensitivity reruns a preregistration declares
 
 Which reruns `analyze` runs depends on which guard instruments your records carry: the egress rerun, the mount guard's, the process-visibility check's, and the one without every run any guard that checked the batch leaves out (`any_guard`, when two or more did). A guard listed on the wrong runs, or on none, would silently give a different set than the one you meant to preregister. Declare the set in `preregistration.toml`, in its hash like the rest, as a `[sensitivity]` table whose `reruns` lists any of `egress`, `mount_guard`, `process_visibility` and `any_guard`, in any order, each at most once (the block below appends one to the example's file and loads it).

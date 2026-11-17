@@ -13,15 +13,6 @@ from pathlib import Path
 
 import pytest
 from egress_logs import CODE_TOOL, record
-from expcore_onedata.readlog import scan
-from expcore_onedata.readlog.scan import (
-    LEFT_OUT_AS,
-    NAMESPACE,
-    judge,
-    read_log_analysis,
-    read_log_lines,
-    scan_cells,
-)
 from readlog_cells import FORGING, ORDINARY, SPLIT
 from stats_support import both_arms
 
@@ -31,6 +22,15 @@ from expcore.egress import scan as egress_scan
 from expcore.egress import scan_cells as egress_scan_cells
 from expcore.stats.analysis import analyse
 from expcore.stats.prereg import parse
+from expcore_onedata.readlog import scan
+from expcore_onedata.readlog.scan import (
+    LEFT_OUT_AS,
+    NAMESPACE,
+    judge,
+    read_log_analysis,
+    read_log_lines,
+    scan_cells,
+)
 
 GOLDEN = Path(__file__).resolve().parents[2] / "data" / "readlog_egress_scan_golden.json"
 SCHEMA = FactorSchema({"arm": ["a", "b"]}, ["task", "arm", "model", "seed"], {f"cond-{a}": {"arm": a} for a in "ab"})

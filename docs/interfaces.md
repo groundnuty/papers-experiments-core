@@ -675,6 +675,33 @@ instruments = [..., ProcessVisibility(sandbox)]  # sandbox.process_visibility() 
   A batch in which no record carries it has none of these, byte for byte. Its verdicts also enter the rerun of every guard together (O76, above).
 - **Limits.** Detection, not prevention: hidden memory under the margin, a hidden process's shared memory, pages a visible process shares with its forked children (counted once per process in the visible sum), and a process forked twice under the cell's hidden init (for the `hidden_process` signal) are missed; the step's limit bounds them, and every hidden process ends with its cell.
 
+### Forged records in the read log: the read-log scan
+
+`expcore_onedata.readlog.scan` (O-readlog). A study's canonical scripts log every read they make to the read-log channel: a datagram socket the harness binds read-only into every cell (`/expcore-readlog/sock`, in the directory `/expcore-readlog`), through a client module it binds the same way (`/expcore-readlog-client/expcore_readlog_client.py`). The study's omission scoring rests on that log, and the agent's own code runs in the same cell, so it can send a datagram of its own: **a forged append cannot be prevented, only detected**, and an item the agent never read then looks read. This scan is the detection that reads code. It has a version of its own and changes none of the egress scan's verdicts (`expcore.egress.scan` and its `SCAN_VERSION` are untouched).
+
+```python
+from expcore_onedata.readlog.scan import judge, read_log_analysis, read_log_lines, scan_cells
+
+done = scan_cells(["print(1)", "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)"])
+assert (done["flagged"], [hit["cell"] for hit in done["hits"]]) == (True, [1])
+```
+
+- **What it reads.** The code cells of a record, as `expcore.egress.scan.code_cells` reads them: the `code` argument of every call to a tool whose input schema has a string `code` property, run or not.
+- **What it finds** (`scan_cells(cells)`, `SCAN_VERSION` 1). Each hit is `{"cell", "kind", "what"}`, the cell's index, a kind and a fixed name, once per cell, never the cell's own text (a process number or the tail of a path stays out). Up to `MAX_HITS` (200) are kept, and `hits_cut` says when more were found. Any hit flags the run.
+  - `channel_path`: the socket directory or the socket (`/expcore-readlog`, `/expcore-readlog/sock`), with or without the leading slash.
+  - `client`: the client's directory, its module name (`expcore_readlog_client`, and the earlier `expcore_readlog`) or its bound path.
+  - `unix_datagram`: a Unix-family name (`AF_UNIX`, `AF_LOCAL`, `PF_UNIX`, `PF_LOCAL`) with `SOCK_DGRAM` or `SOCK_SEQPACKET`, in one cell or in two cells of the run (the hit is at the cell where the run first holds both), or the numbers in a `socket(...)` call (`socket(1, 2)`).
+  - `proc_environ`: a path `/environ`, which is `/proc/<pid>/environ` however the process is named.
+  - `channel_discovery`: finding the socket without naming it, which a canonical script never does: the table of Unix sockets (`/proc/net/unix`), the mount table (`/proc/<pid>/mountinfo`, `/proc/mounts`), a test for a socket file (`S_ISSOCK`, `is_socket()`), a search for one (`find -type s`, `-name` with `sock`, a glob `*/sock`) and a tool that lists Unix sockets (`ss -x`, `netstat -x`, `lsof -U`).
+  - `channel_name`: the bare word `readlog` in any case, where nothing above names the channel in the cell.
+
+  A canonical script is run by its path (`python -I /inputs/.../script.py`), so a cell that runs one names none of these and is not flagged; the script's text is not part of the cell. **A cell that pastes a canonical script's text names the client and is flagged.**
+- **The verdict** (`judge(record, condition)`): a `RunReadLog` with `run_key`, `attempt`, `condition`, `scan`, `flagged` and `kinds`. It is computed at analysis time from the record's code alone and never stored in the record. The state of the log itself, intact or unknown, is the instrument's snapshot and the reader's, not this scan's.
+- **The analysis** (`read_log_analysis(runs, rows, absent, prereg)`), built as `expcore.visibility.sensitivity.visibility_analysis` is. It returns None unless an analysed record carries the `read_log` instrument, so a batch without it has no verdicts and no section, byte for byte. Once one record carries it, every analysed run is judged, and the preregistered analysis runs again without the flagged runs, each passed as an absent run of reason `excluded`. A rerun the kernel refuses keeps the primary analysis and records the refusal (`ReadLogAnalysis`: `runs`, `sensitivity`, `refused`, `flagged`, `counts()` by flag state and by kind).
+- **The report** (`read_log_lines(analysis, table, sensitivity)`): the section `## Read log: runs that touched the channel (detected, not prevented)`, with the counts per condition, one row per run that touched the channel (its run key, attempt, condition and hits as kind, name and cell) and the rerun's tables, rendered by the caller's own `table` and `sensitivity` so the two cannot differ in form from the primary analysis's.
+- **Not wired into `analyze` yet.** `expcore.study.pipeline`, `expcore.report`, `expcore.guards` and `expcore.stats.reruns` are the core's, and the core does not import the platform layer (`tests/test_import_boundary.py`). A study's own analysis calls these functions; running the rerun inside `analyze` needs a rerun name in `[sensitivity] reruns` (S19) and a place for the section in the report, which is open.
+- **Limits.** A heuristic over text, and the second line. Code that builds a name at run time, decodes it, reads it from a file, or copies a canonical script and edits its logging passes it, so a run that is not flagged is not shown to have an unforged log. It over-flags as well: a cell that names `AF_UNIX` and `SOCK_DGRAM` for two unrelated sockets is flagged, and a flagged run is only reported and left out of a sensitivity analysis. On a REST data path the gate's per-file served table (O22) is the check that does not read code.
+
 ### Refusing an attempt: the first-turn hook and the post-run check
 
 A manipulation can be defined on the agent's clock: at the agent's first turn, the arriving files are in their declared start state. An instrument that measures it needs a call at that moment to read the state, and a way to say, after the run, that the manipulation was not realised (the start state was wrong, or the plan failed mid-run), so that the attempt is not scored. Two optional methods give it both (C31). An instrument without them is called as it always was.
