@@ -368,8 +368,8 @@ def test_c40_the_processs_secrets_stay_redacted_when_record_run_is_given_an_envi
 def test_c40_an_undeclared_executor_whose_record_run_has_an_environment_of_its_own_still_redacts_the_processs_secrets(
     tmp_path, monkeypatch
 ):
-    """C40: `record_attempt` installs on the log a redactor built from the environment `record_run` is given, and says the
-    context is whole; the diagnostic of an error raised after it is redacted with the runner's own base too (the
+    """C40: `record_attempt` installs on the log a redactor built from the environment `record_run` is given and says
+    the context is whole; the diagnostic of an error raised after it is redacted with the runner's own base too (the
     process, the models, the registry), so it is never redacted against a partial list, declared or not."""
     credential = "process_credential_5678"
     monkeypatch.setenv("EXAMPLE_API_KEY", credential)

@@ -42,6 +42,23 @@ WITHHELD = (
 )
 
 
+class Chained:
+    """Several redactors applied one after the other: what is kept is redacted with every one's secrets, so a snapshot
+    is never redacted against the shorter list of any of them (the attempt's own context, which `record_attempt` may
+    have narrowed to the environment `record_run` was given, and the runner's base: the process, the models, the
+    registry)."""
+
+    def __init__(self, *redactors: Redactor):
+        self._redactors = redactors
+
+    def structure(self, obj: Any) -> tuple[Any, list[str]]:
+        paths: list[str] = []
+        for redactor in self._redactors:
+            obj, changed = redactor.structure(obj)
+            paths += changed
+        return obj, paths
+
+
 class DiagnosticTooLarge(ValueError):
     """A diagnostic is more than `LIMIT_BYTES` of canonical JSON."""
 
@@ -51,7 +68,7 @@ class DiagnosticUnreadable(ValueError):
 
 
 def snapshot_of(
-    error: BaseException, redactor: Callable[[], Redactor], *, complete: bool = True
+    error: BaseException, redactor: Callable[[], Redactor | Chained], *, complete: bool = True
 ) -> dict[str, Any] | None:
     """The snapshot an attempt keeps of an error, redacted with `redactor()`; None when the error has nothing to keep
     (it is no infrastructure error, or it names no instrument and carries no diagnostic). Never raises.
@@ -82,7 +99,7 @@ def snapshot_of(
         return {**_head(origin, redactor), "ok": False, "error": type(problem).__name__}
 
 
-def _head(origin: Any, redactor: Callable[[], Redactor]) -> dict[str, Any]:
+def _head(origin: Any, redactor: Callable[[], Redactor | Chained]) -> dict[str, Any]:
     """The phase and the instrument a snapshot that holds no evidence keeps, redacted like the rest (an instrument's
     name can be any word, a secret's value among them). When they cannot be redacted only the phase is kept: it is the
     literal `start_instruments` sets, never a name the study chose."""

@@ -73,7 +73,7 @@ from expcore.campaign.no_request import EVENT as ZERO_EVENT
 from expcore.campaign.no_request import REASON as ZERO_REASON
 from expcore.campaign.no_request import settle_unsent
 from expcore.campaign.settings import SchedulerConfig
-from expcore.campaign.start_diagnostic import snapshot_of
+from expcore.campaign.start_diagnostic import Chained, snapshot_of
 from expcore.campaign.store import Store
 from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.campaign.units import UnitHealth
@@ -368,7 +368,7 @@ class AttemptRunner:
                     treatment_targets=targets,
                     sent_nothing=sent_no_request(error, backend),
                 )
-                result = self._with_diagnostic(result, error, defects)
+                result = self._with_diagnostic(result, error, defects, backend)
                 result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
@@ -386,14 +386,22 @@ class AttemptRunner:
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
 
-    def _with_diagnostic(self, result: AttemptResult, error: BaseException, defects: DefectLog) -> AttemptResult:
+    def _with_diagnostic(
+        self, result: AttemptResult, error: BaseException, defects: DefectLog, backend: Any
+    ) -> AttemptResult:
         """Keep on the result the snapshot an infrastructure error carries (a failed instrument start's), redacted
         with the attempt's redaction context as it stands (C40): the environment's secrets, the models' keys, the
         registered secrets and the secrets the executor declared (`RunRequest.declare_secrets`, which it calls before
         it starts its instruments, since `record_run` comes after). Never a diagnostic redacted against a partial list:
         until the executor has declared its secrets (or `record_attempt` has given the whole context) the diagnostic is
         withheld, and the snapshot says so. One that cannot be kept is recorded as failed, not raised."""
-        kept = snapshot_of(error, defects.build_redactor, complete=defects.context_given)
+
+        def redactor() -> Chained:
+            # the attempt's context as it stands, and the runner's own base: record_attempt narrows the former to the
+            # environment record_run was given, and a diagnostic is never redacted against the shorter list of the two
+            return Chained(defects.build_redactor(), redactor_for(backend, models=self.p.models))
+
+        kept = snapshot_of(error, redactor, complete=defects.context_given)
         return result if kept is None else dataclasses.replace(result, diagnostic=kept)
 
     def _settle_failure(
