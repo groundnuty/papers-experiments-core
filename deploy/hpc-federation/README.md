@@ -855,7 +855,12 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 `collect --roots-only [--shard L]` archives and marks the root evidence alone, for a shard about to move while the other
 shards are not final (see "Moving a shard" under the fleet); it writes no `archives.sha256.json`, so a full collect lists
 the archives later (a root archive whose federation the shard has left is put aside under `<label>.<12 hex digits>.root.*`
-and listed too). The archives are mode 0600.
+and listed too). The archives are mode 0600. `collect` reads `<label>.out.tar` and `<label>.out.json` as regular files and
+never through a link, as it reads every journal, `pass-env.json` and snapshot file: a link in their place refuses the
+collect, naming the shard, since a pull that keeps links could not reproduce it. It makes the manifest durable (a sync of
+the results directory) before it marks any root: an I/O error from that sync refuses the collect (exit 2, `--into` as it
+was found, no marker, so `down` still refuses), while a filesystem that says it cannot sync a directory (`EINVAL`,
+`ENOTSUP`) is left as it always was.
 
 **The root archive and `pass-env.json` are private evidence.** The state file and the facts name nodes and site paths, the
 state file also the account and the administrator's address (no secret, but the site's own), and `pass-env.json` a site
@@ -901,7 +906,9 @@ rewritten while the federation runs (by state updates, and by each link check), 
 it in the state (`evidence_rewritten_after_collect`: the time in UTC, the shards, the names); the copy `collect` took
 stays what the post-check reads, so no second archive is made. A link check a step makes also appends to the fault
 journal's holds, so a step still running after the collect is refused through the journal all the same.
-`pass-env.json` is in the results, not in the root: `verify-copy` checks it. A root that holds no evidence a run left
+The marker names each archived file by its path in the root, and takes every path the archive can hold: up to
+`MAX_DEPTH` (4) directories below a tree and names of at most 200 plain characters, the longest being 1,018 characters
+of the fault journal's. `pass-env.json` is in the results, not in the root: `verify-copy` checks it. A root that holds no evidence a run left
 (an NFS silly-rename file, a removed file still held open, is none: a `down` run again after a removal cut short finds only
 these) goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
 down's output then says which shards' evidence (or which kinds, for a root with no step record) was discarded, and **every
@@ -932,8 +939,9 @@ installed: take `shards.py` from a checkout. It exits 0 only when the manifest i
 the directory, as a regular file under plain directories, with its size and SHA-256. It exits 1 naming each file that is
 missing, not a regular file, cut short or changed (name and reason, never a path), and 2 for a manifest it cannot use,
 among them a manifest with no list of the files beside the archives (an earlier tip's: it checked the archives alone).
-A file in the directory that the manifest does not name (an `*.out.tar` or `*.out.json`, or a journal in a shard's
-`journals/`: a step that ran after `collect`) is a warning. **Do not run `down` until it exits 0**: `down` cannot see
+A file in the directory that the manifest does not name (an `*.out.tar` or `*.out.json`, or a journal in the `journals/`
+of any shard whose archive it names, whether or not the shard had a journal then: a step that ran after `collect`) is a
+warning. **Do not run `down` until it exits 0**: `down` cannot see
 your host and does not check that you did.
 
 > **The core on the shared filesystem is a git checkout, or a wheel built with its build identity (C06).** The core
@@ -966,7 +974,9 @@ federation's `platform.toml` beside it, as the step places it, and the manifest'
 step is: see `pass_env`, below; `shardresume.check_one_campaign`), and print nothing unless they are all one. A refusal names each shard that differs from the largest group of equal shards by its label and
 the first differing top-level key of the fingerprint (`platform` for a setting of the platform file, the usual one),
 never a host, a path or a value, so the fix is to compare those federations' files; a federation whose `platform.toml`
-cannot be read, or whose fingerprint cannot be taken, is refused by its label too, with the program's status and none
+cannot be read, or whose fingerprint cannot be taken, is refused by its label too (so is a study that holds a
+`platform.toml` of its own, a file or a link, as `step` refuses it: the copy is given the federation's by a write that
+would follow a link to its target), with the program's status and none
 of its output. It costs one start of the manifest's Python per shard.
 
 **What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the
@@ -1126,7 +1136,10 @@ launched through `shards.py` is refused. The manifest declares such variables by
 
 A name matches `^[A-Z][A-Z0-9_]{0,63}$`, contains none of KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL or AUTH
 (any case, anywhere in it) and is none the step sets itself: the allowlist's, `HOME`, `TMPDIR`, the XDG, Apptainer, uv,
-pip and git variables of its own home, anything starting `EXPCORE_` or `PYTHON`. `plan` and `lines` read each value
+pip and git variables of its own home, anything starting `EXPCORE_` or `PYTHON`; and none that changes how a program
+is loaded or started: anything starting `LD_` or `DYLD_`, `BASH_ENV`, `ENV`, `IFS`, `GCONV_PATH`, `LOCPATH` and `NLSPATH`
+(a library named by `LD_PRELOAD` runs before Python starts, so before the step's own checks, and the step's `env -i`
+words would carry it there). `plan` and `lines` read each value
 from the environment they run in before any line is printed (`resume-line` the same, before it records its node); a
 variable that is unset, or whose value is neither a plain word (`^[A-Za-z0-9._:=,+-]{0,128}$`, but not `.` or `..`) nor
 an absolute path (`^/[A-Za-z0-9._/-]{1,1024}$`, such as `/srv/example/artifacts/tree`, with no `..` or `.` part and no
@@ -1160,7 +1173,9 @@ study's own refusal stops the run.
 
 **One value for a shard's whole life (O63).** The first step of a shard that passes variables records each name and
 value once, in `<results>/<label>/pass-env.json` (whole, mode 0600, once it holds the shard's running mark; nothing is
-written when it passes none). Every later step is compared with that record before anything is made or launched, so a
+written when it passes none, and never more than 65,536 bytes, which is what its reader takes: a step whose variables
+would make a longer record is refused, naming the limit, before its dispatcher starts). Every later step is compared
+with that record before anything is made or launched, so a
 resume or a later fleet step cannot carry a value its shard's first step did not have:
 
 - `step` does it as its first act, `--resume` or not (a first step killed before its first snapshot leaves this record
@@ -1174,8 +1189,13 @@ carries are each refused, naming the variable and never either value. A record t
 shard's, holds a name or a value a variable may not carry, is too long or is a link is refused too, never taken for
 none, so emptying it does not lift the rule. A shard with no record and no results (an archive or a snapshot) has had
 no first step: nothing is compared, and a step that passes variables records them. A shard with results and no record
-had a first step that passed nothing, so a step that now passes a declared variable adds one mid-shard, which is a
-change of value, and is refused the same way, naming the variable. Nothing here removes the record: a shard that has
+either had a first step that passed nothing or has lost the record (deleting `pass-env.json` is no way round the rule):
+its latest archive's manifest, which holds each name and value its step passed, says which, and a later step is compared
+with what it records (a step that now passes a declared variable the manifest does not hold adds one mid-shard, one that
+drops a recorded variable or gives another value is refused likewise, each naming the variable and never a value). A
+step that matches the manifest continues and writes the record again. A manifest that cannot be read as the shard's
+(not JSON, another shard's, a link, a name or a value a variable may not carry) is refused too, never taken for "nothing
+was passed". A shard with a snapshot alone and no archive has nothing to say what its first step passed. Nothing here removes the record: a shard that has
 made nothing and must start over with other values has it removed by hand, which is the operator's call.
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to

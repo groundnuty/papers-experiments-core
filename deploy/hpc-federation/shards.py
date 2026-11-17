@@ -54,9 +54,9 @@ is neither a plain word (`[A-Za-z0-9._:=,+-]`, at most 128) nor an absolute path
 the archive's manifest. The post-run script runs in the dispatcher's environment and sees them; the guard does not.
 `step` never reads the manifest, so `collect` refuses a shard whose manifest lacks a declared name or holds an
 undeclared one (`pass_env_problem`): a line that dropped a declaration with its word. The programs that build the
-study's plugin at plan time, to take its campaign fingerprint (`plan`, `lines`, `resume-line`, the fleet's `plan`),
-are given the same pinned variables and nothing else of the operator's (`pinned_pass_env`), so a plugin that needs one
-can be fingerprinted.
+study's plugin at plan time, to take its campaign fingerprint (`plan`, `lines`, `resume-line`, the fleet's `plan`), are
+given the same pinned variables and nothing else of the operator's (`pinned_pass_env`), so a plugin that needs one can
+be fingerprinted.
 
 **One value for a shard's whole life.** A first step that passes variables records each name and value once, in
 `<results>/<label>/pass-env.json` (`record_pass_env_origin`: whole, by an exclusive link, mode 0600, once it holds the
