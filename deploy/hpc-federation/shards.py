@@ -89,8 +89,10 @@ step's record says its script passed.
 
 **Which render a shard runs against: the render identity (O74).** `hpcfed.py up` writes `render-identity.json` in the
 federation's root (`hpcidentity.py`): mode 0600, canonical JSON, nothing but SHA-256s and a version: the template as it
-was read before it was rendered, the rendered platform's fingerprint, and each pin the platform holds (the agent's SIF,
-the egress shim, the egress collector, oneclient's bundle). A manifest that declares `expect_render_identity`, a path
+was read before it was rendered, the rendered platform's fingerprint, each pin the platform holds (the agent's SIF,
+the egress shim, the egress collector, oneclient's bundle), and, when the site declares `HPC_STUDY_ARTIFACTS`, the
+digest of that directory's tree (`study_artifacts_tree_sha256`; no path of the directory). A manifest that declares
+`expect_render_identity`, a path
 of the study (`render-identity.expected.json` at its root, say: a federation's record copied there), makes every line
 carry `--expect-render-identity REL --expect-render-identity-sha256 HEX` (`plan` and `lines` read the file by the
 guard's path rules, refuse one that is not a well-formed record, and record its hash; with none declared the line and
@@ -255,7 +257,14 @@ RENDER_IDENTITY_PINS = (
     "egress_collector_sha256",
     "oneclient_bundle_sha256",
 )
-RENDER_IDENTITY_KEYS = ("version", "template_sha256", "platform_fingerprint_sha256", *RENDER_IDENTITY_PINS)
+RENDER_IDENTITY_ARTIFACTS = "study_artifacts_tree_sha256"  # in the record only when the site declares the directory
+RENDER_IDENTITY_KEYS = (
+    "version",
+    "template_sha256",
+    "platform_fingerprint_sha256",
+    *RENDER_IDENTITY_PINS,
+    RENDER_IDENTITY_ARTIFACTS,
+)
 STUDY_STATE = "study-state"  # in a step's out/: what the step records of the federation it ran against
 SHA256_TEXT = re.compile(r"[0-9a-f]{64}")
 
@@ -1499,8 +1508,8 @@ def expected_identity_name(path: str) -> str:
 
 def identity_problem(record: Any) -> str | None:
     """Why `record` is not a render identity (hpcidentity.py), or None: a JSON object with the version, the template's
-    and the platform fingerprint's hashes, perhaps some of the pins' hashes, and nothing else. It says what kind of
-    thing is wrong and never what the record holds."""
+    and the platform fingerprint's hashes, perhaps some of the pins' hashes and the study's artifacts digest, and
+    nothing else. It says what kind of thing is wrong and never what the record holds."""
     if not isinstance(record, dict):
         return "it is not a JSON object"
     if not {"version", "template_sha256", "platform_fingerprint_sha256"} <= set(record):

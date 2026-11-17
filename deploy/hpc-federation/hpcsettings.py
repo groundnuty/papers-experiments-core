@@ -48,7 +48,8 @@ AGENT_PINS = {
     "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
 }
 # The study's own artifacts (its tool server's venv, clone and manifests) on the filesystem the login node and the
-# agent's node see: the directory a platform template (or a space's `data_manifest`) names as `@study_artifacts@`.
+# agent's node see: the directory a platform template (or a space's `data_manifest`) names as `@study_artifacts@`;
+# `up` digests the directory's tree into the federation's render identity (O74, hpcidentity).
 STUDY_PATHS = {"HPC_STUDY_ARTIFACTS": "study_artifacts"}
 OPTIONAL_VARIABLES = {**AGENT_PATHS, **AGENT_PINS, **STUDY_PATHS}  # each may be left out of site.env
 # HPC_QUOTA_CHECK's one value. It never applies to a federation bound onto scratch (a site that sets it with
@@ -334,8 +335,10 @@ class Site:
     oneclient_bundle: str = ""
     oneclient_bundle_sha256: str = ""
     agent_work_root: str = ""
-    # The directory of the study's own artifacts, which `@study_artifacts@` stands for in a template; empty when the
-    # site declares none, and then a template that names it is refused.
+    # The directory of the study's own artifacts (HPC_STUDY_ARTIFACTS), which `@study_artifacts@` stands for in a
+    # template: `up` takes the digest of its tree in its preflight and records it, with this value, in the state file,
+    # and the render identity holds the digest (never the path); empty when the site declares none, and then a
+    # template that names it is refused.
     study_artifacts: str = ""
     # The providers' storage on the cluster's shared scratch filesystem and the guard of its inode quota (hpcstorage,
     # hpcquota; README, "Provider storage on scratch"). `storage_root` is the directory below which `up` makes the
