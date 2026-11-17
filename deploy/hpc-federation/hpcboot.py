@@ -103,6 +103,11 @@ class HpcBootstrap(Bootstrap):
         self._mapped: set = set()  # the (provider, storage) pairs whose users are mapped already
         self.registered: Optional[Dict[str, str]] = None  # what each service reported as its domain (O70), once read
 
+    def read_registered(self) -> Dict[str, str]:
+        """What each service reports as its domain (O70), kept for the facts and the checks of `core_phase`."""
+        self.registered = hpcnames.registered_domains(self)
+        return self.registered
+
     def import_storage_extra(self, service: Service) -> Dict[str, Any]:
         """What an imported storage is made with beyond what the layout declares: the job user's ids, the local LUMA
         feed the mappings below need, and the canonical path type (O59), as finish.sh makes the regular storage."""
@@ -162,9 +167,6 @@ def bring_up(boot: Bootstrap) -> None:
         if boot.spec.members(space.name):
             boot.ensure_members(space.name)
     boot.wait_import(IMPORT_TIMEOUT_S)  # each import's one scan complete (no-op with no import)
-    boot.registered = hpcnames.registered_domains(
-        boot
-    )  # O70: what each service registered, for the facts and the checks
 
 
 def rule_margin_s(rendered: str, settle_timeout_s: float) -> int:
@@ -319,6 +321,11 @@ def core_phase(
     try:
         boot = bootstrap(client, layout, owner)
         steps(boot)
+        read = getattr(
+            boot, "read_registered", None
+        )  # the HPC bootstrap reads what each service registered under (O70)
+        if read is not None:
+            read()
         registered = getattr(boot, "registered", None)
         if registered is not None:  # O70: every service registered under its declared name, or nothing reaches it
             hpcnames.check_registered(hpcnames.declared_names(layout.spec), registered)

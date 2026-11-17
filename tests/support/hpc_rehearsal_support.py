@@ -182,7 +182,7 @@ def driver_maker(deploy: Deploy, fed: Federation) -> Any:
         driver.poll_s = driver.slurm.poll_s = 0.0
         driver.core = functools.partial(
             boot.core_phase,
-            rest=lambda ca: SimpleNamespace(close=lambda: None),
+            rest=lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
             bootstrap=BootStandIn(fed.label),
             steps=lambda b: None,
             content=lambda b: SimpleNamespace(reset=lambda timeout: None),

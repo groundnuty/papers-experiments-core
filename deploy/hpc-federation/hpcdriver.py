@@ -502,7 +502,7 @@ class Driver(Down):
             imports = hpcimport.provider_import_args(self.layout, name, self.environ)
             # O70: the name it registers under, and every service's name with its address, for its hosts file
             naming = [f"--declared={services[name]['declared']}", *self.host_args(state)]
-            self.launch(name, [*argv, zone["address"], *peers, *imports, *naming])
+            self.launch(name, [*argv, zone["address"], *peers, *naming, *imports])
         self.say(f"{len(names)} provider(s) launched; registering each")
         for name in names:
             self.register(name, self.record_workdir(name, self.wait_log(name, TOKEN_WAIT)))
