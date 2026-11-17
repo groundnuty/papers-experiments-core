@@ -8,10 +8,22 @@ The relay runs in this process over a fake runner and a recording watcher; what 
 
 import errno
 import json
+import os
 import re
+import signal
 import stat
 import subprocess
+import sys
+import time
+from pathlib import Path
 
+import pytest
+from fault_support import SERVICES, FakeClock
+from hpc_support import write_state
+
+from expcore_onedata.compose import CommandResult, DriverError
+from expcore_onedata.fault_hpc import Request
+from expcore_onedata.fault_relay import Relay, RelayClient, beat, clean_environment, relay_dir
 from expcore_onedata.fault_relay_late import (
     JOURNAL,
     LATE_POLL_S,
@@ -20,12 +32,6 @@ from expcore_onedata.fault_relay_late import (
     step_tag,
     watch_argv,
 )
-from fault_support import SERVICES, FakeClock
-from hpc_support import write_state
-
-from expcore_onedata.compose import CommandResult, DriverError
-from expcore_onedata.fault_hpc import Request
-from expcore_onedata.fault_relay import Relay, RelayClient, relay_dir
 
 SERVICE = SERVICES["beta"]
 PREFIX = ["/opt/venv/bin/python", "-I", "-B", "hpcfed.py", "--layout", "LAYOUT", "--root", "ROOT"]
@@ -219,3 +225,75 @@ def test_o58_the_window_covers_twice_the_controllers_message_timeout():
     """O58: the site's controller stalls for up to about 200 s before it answers a step's creation, and a late step can
     follow a second wait: the watch lasts twice that, counted from the bound."""
     assert LATE_WINDOW_S >= 2 * 200
+
+
+# A stand-in `hpcfed.py`: as a verb it starts a child that outlives it, records the child and waits; as the watch
+# (`late-steps`) it records the arguments it was given and ends.
+STAND_IN = """
+import os, subprocess, sys, time
+here = os.path.dirname(os.path.abspath(__file__))
+if "late-steps" in sys.argv:
+    with open(os.path.join(here, "watch.argv"), "w", encoding="utf-8") as handle:
+        handle.write("\\n".join(sys.argv[1:]))
+    sys.exit(0)
+child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(300)"])
+with open(os.path.join(here, "child.pid"), "w", encoding="utf-8") as handle:
+    handle.write(str(child.pid))
+time.sleep(300)
+"""
+
+
+def test_o58_a_real_relay_ends_a_timed_out_verbs_group_and_starts_the_watch_with_the_verbs_tag(tmp_path):
+    """O58 (guard): a relay process runs a verb that starts a child and waits past its bound: it answers `timed_out`,
+    the verb and its child are gone, and the watch (a detached process, given the relay's prefix) is started with the
+    tag the verb was run with, after `watch_opened` is on disk."""
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    write_state(root, tuple(SERVICES.values()))
+    script, log = tmp_path / "hpcfed.py", tmp_path / "relay.log"
+    script.write_text(STAND_IN, encoding="utf-8")
+    prefix = [sys.executable, "-I", str(script)]
+    with log.open("wb") as sink:
+        relay = subprocess.Popen(
+            [sys.executable, "-B", "-m", "expcore_onedata.fault_relay", "serve", "--root", str(root), "--", *prefix],
+            env=clean_environment(os.environ),
+            stdin=subprocess.DEVNULL,
+            stdout=sink,
+            stderr=sink,
+        )
+    child = None
+    try:
+        deadline = time.monotonic() + 30
+        while beat(root) is None:
+            assert relay.poll() is None, f"the relay ended at its start: {log.read_text()}"
+            assert time.monotonic() < deadline, f"the relay never beat: {log.read_text()}"
+            time.sleep(0.1)
+        with pytest.raises(subprocess.TimeoutExpired):  # answered `timed_out`: unknown, never done
+            RelayClient(root, wait_s=20)(Request("status", SERVICE), timeout_s=2)
+        child = int((tmp_path / "child.pid").read_text(encoding="utf-8"))
+        end = time.monotonic() + 10
+        while time.monotonic() < end and Path(f"/proc/{child}/stat").exists() and not zombie(child):
+            time.sleep(0.05)
+        assert not Path(f"/proc/{child}/stat").exists() or zombie(child), "the verb's child outlived its bound"
+        while time.monotonic() < end and not (tmp_path / "watch.argv").exists():
+            time.sleep(0.05)
+        watch = (tmp_path / "watch.argv").read_text(encoding="utf-8").splitlines()
+        assert watch[0] == "--step-tag"
+        assert TAG.fullmatch(watch[1])
+        assert watch[2:4] == ["late-steps", SERVICE]
+        (opened,) = lines_of(root)
+        assert (opened["event"], opened["tag"], opened["verb"]) == ("watch_opened", watch[1], "status")
+    finally:
+        relay.terminate()
+        relay.wait(timeout=30)
+        if child is not None and not zombie(child) and Path(f"/proc/{child}/stat").exists():
+            os.kill(child, signal.SIGKILL)
+
+
+def zombie(pid):
+    """Whether a process is a zombie nobody has reaped (dead, for these tests)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return True
+    return stat[stat.rfind(")") + 2 :].split()[0] in ("Z", "X")
