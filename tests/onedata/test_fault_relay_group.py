@@ -130,7 +130,11 @@ def test_o58_a_descendant_that_holds_the_verbs_pipes_never_holds_the_relay(tmp_p
 LEAVER = textwrap.dedent(
     """
     import subprocess, sys
-    child = subprocess.Popen([sys.executable, "-I", "-c", sys.argv[2]], start_new_session=sys.argv[3] == "detached")
+    nul = subprocess.DEVNULL  # as an srun's, the child's pipes are not the verb's
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-c", sys.argv[2]],
+        stdin=nul, stdout=nul, stderr=nul, start_new_session=sys.argv[3] == "detached",
+    )
     with open(sys.argv[1], "w", encoding="utf-8") as handle:
         handle.write(f"{child.pid}\\n")
     sys.exit(int(sys.argv[4]))

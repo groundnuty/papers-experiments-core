@@ -302,7 +302,9 @@ def zombie(pid):
 LEAVER = """
 import subprocess, sys, os
 here = os.path.dirname(os.path.abspath(__file__))
-child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(300)"])
+nul = subprocess.DEVNULL  # as an srun's, the child's pipes are not the verb's
+sleeper = [sys.executable, "-I", "-c", "import time; time.sleep(300)"]
+child = subprocess.Popen(sleeper, stdin=nul, stdout=nul, stderr=nul)
 with open(os.path.join(here, "child.pid"), "w", encoding="utf-8") as handle:
     handle.write(str(child.pid))
 print("failed with a step waiting")
