@@ -1209,9 +1209,44 @@ assert not analysis.from_build_analysis  # the example defines `build` alone, so
 assert analysis.plugin.scorer_digest() == plugin.scorer_digest()
 ```
 
-The campaign records the digest of the run's scorers (their names and versions) in its fingerprint, and `analyze` refuses a `build_analysis` whose scorers have another, naming them: change a scorer's `version` when its behaviour changes, as for any scorer, so that this can see it. A store whose snapshot records no valid digest is refused too, since every fingerprint the core writes holds one. Scorers must come out the same in both builders: build them from values both can read (a file of the study, not the platform's settings), and declare `version` on each, since a scorer without one is versioned by the hash of its file and adding `build_analysis` to that file would change it. With `build_analysis` defined the campaign's scorers are the reference, so a scorer changed since the run is refused unless you ask for the re-score with `--rescore`, below. See [what the plugin may define](interfaces.md#the-study-plugin).
+The campaign records the digest of the run's scorers (their names and versions) in its fingerprint, and `analyze` refuses a `build_analysis` whose scorers have another, naming them: change a scorer's `version` when its behaviour changes, as for any scorer, so that this can see it, and let the version cover what the scorer is built from as well as its code (below). A store whose snapshot records no valid digest is refused too, since every fingerprint the core writes holds one. Scorers must come out the same in both builders: build them from values both can read (a file of the study, not the platform's settings), and declare `version` on each, since a scorer without one is versioned by the hash of its file and adding `build_analysis` to that file would change it. With `build_analysis` defined the campaign's scorers are the reference, so a scorer changed since the run is refused unless you ask for the re-score with `--rescore`, below. See [what the plugin may define](interfaces.md#the-study-plugin).
 
-**Correcting a scorer after an HPC batch.** A scorer is found wrong after the batch is copied back, where `build` cannot run. Fix it and change its `version`, in the one function both builders call. The scorer is code, so the replay check is stale: run `check` again on the batch (it builds nothing, so it needs no federation). Then run `analyze my-study --rescore` and `report my-study --rescore`. Without the flag both refuse, naming the scorers. With it the analysis scores every record anew with the corrected scorer, and says so: `scores.json`, the `scorers` of `analysis.json` and the report's `Scorers` line hold the new version, as any re-score does (R13), and `analysis.json` (`rescore`) and one line of the report's Provenance hold the digest the campaign recorded and the digest of the scorers used. They cannot name the scorer that changed, because the campaign records one digest of all its scorers: keep the old version in your own notes or in git. The flag changes nothing when the scorers are the campaign's own, and nothing for a module without `build_analysis`. A store that records no digest is refused with the flag too. Then build the replication package as for any study, with no flag: the decision was recorded at `analyze`, so the package's build, its `make check` and `package-check` honour it, and an anonymised package does too. A differing scorer digest is accepted exactly when the `analysis.json` that ships holds a `rescore` entry equal to what the check works out now, the digests the store recorded and the digest of the scorers in the package's plugin; with no entry, with an entry for other scorers or another store, or with a store that records no digest, the build and the check refuse as `analyze` does, and they never re-ask. The package's outputs are still compared byte for byte with what the records give, so an entry on a batch that re-scored nothing fails as differing, and the package carries the `rescore` entry and the Provenance line, so a reader of it sees the re-score.
+**A scorer's identity covers everything that decides its scores.** The digest is made of each scorer's name and the version it declares, and of nothing else: not its code, not what it is built from. A scorer that declares no version is versioned by the hash of the file its code is in, which covers no reference kept in another file. So the name and version must cover the scorer's code and its reference inputs, such as an answer key or a table of expected values. A scorer reads the reference when it is built, never in `score`, which opens no file by path. If the version names the code alone, `build_analysis` can build the scorer from another reference and the digest still matches: the analysis is not refused and records no re-score, though its scores are not the run's. Fold a hash of the reference into the version, taken from the bytes that are parsed:
+
+```python
+import hashlib
+import json
+
+from expcore.study.plugin import scorers_digest
+
+
+class AnswerKeyScorer:
+    """Accuracy against an answer key that the study keeps in a file, read once when the scorer is built."""
+
+    name = "answer-key"
+    CODE_VERSION = "2"  # change it whenever this class's behaviour changes
+
+    def __init__(self, key_bytes: bytes) -> None:
+        self.key = json.loads(key_bytes)
+        # the version covers the code and the key: the hash is of the bytes that were parsed, not of a second read
+        self.version = f"{self.CODE_VERSION}+key-{hashlib.sha256(key_bytes).hexdigest()[:12]}"
+
+    def score(self, record):
+        submitted = [c for c in record.tool_calls if c["name"] == "submit" and c["status"] == "ok"]
+        answer = submitted[-1]["arguments"].get("answer") if submitted else None
+        return {"outcomes": {"accuracy": float(answer == self.key[record.factors["task"]])}}
+
+
+first_key = json.dumps({"largest-moon": "Titan"}).encode()  # a mistake in the key, found after the batch
+fixed_key = json.dumps({"largest-moon": "Ganymede"}).encode()
+assert AnswerKeyScorer(first_key).version != AnswerKeyScorer(fixed_key).version  # the same code, another key
+assert scorers_digest([AnswerKeyScorer(first_key)]) != scorers_digest([AnswerKeyScorer(fixed_key)])  # so refused
+assert scorers_digest([AnswerKeyScorer(first_key)]) == scorers_digest([AnswerKeyScorer(first_key)])  # the same: equal
+```
+
+The version, hash included, is what `scores.json`, `analysis.json` and the report's `Scorers` line record, so a reader sees which key scored.
+
+**Correcting a scorer after an HPC batch.** A scorer is found wrong after the batch is copied back, where `build` cannot run. Fix it and change its `version`, in the one function both builders call; a reference it is built from, corrected, is a correction of the scorer in the same way, and with its hash folded into the version, as above, the version changes by itself. The scorer is code, so the replay check is stale: run `check` again on the batch (it builds nothing, so it needs no federation). Then run `analyze my-study --rescore` and `report my-study --rescore`. Without the flag both refuse, naming the scorers. With it the analysis scores every record anew with the corrected scorer, and says so: `scores.json`, the `scorers` of `analysis.json` and the report's `Scorers` line hold the new version, as any re-score does (R13), and `analysis.json` (`rescore`) and one line of the report's Provenance hold the digest the campaign recorded and the digest of the scorers used. They cannot name the scorer that changed, because the campaign records one digest of all its scorers: keep the old version in your own notes or in git. The flag changes nothing when the scorers are the campaign's own, and nothing for a module without `build_analysis`. A store that records no digest is refused with the flag too. Then build the replication package as for any study, with no flag: the decision was recorded at `analyze`, so the package's build, its `make check` and `package-check` honour it, and an anonymised package does too. A differing scorer digest is accepted exactly when the `analysis.json` that ships holds a `rescore` entry equal to what the check works out now, the digests the store recorded and the digest of the scorers in the package's plugin; with no entry, with an entry for other scorers or another store, or with a store that records no digest, the build and the check refuse as `analyze` does, and they never re-ask. The package's outputs are still compared byte for byte with what the records give, so an entry on a batch that re-scored nothing fails as differing, and the package carries the `rescore` entry and the Provenance line, so a reader of it sees the re-score.
 
 ### How pairs become a contrast's input
 
