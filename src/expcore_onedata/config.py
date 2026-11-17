@@ -627,21 +627,7 @@ def load_platform(
     if require_secrets:
         _check_fixed_users(users, principals, file, environ)
     spaces = load_spaces(root, providers)
-    sandbox_section = Section(root.table("sandbox"), file, "[sandbox]")
-    sandbox = (
-        load_sandbox(
-            sandbox_section,
-            file.parent,
-            tls=tls,
-            providers=tuple(providers),
-            local=spaces[0].support.local,  # the same in every entry (load_spaces, O03)
-        )
-        if "sandbox" in root.data
-        else None
-    )
-    if sandbox is not None:
-        check_content_provider(sandbox_section, sandbox.content_check_provider, providers, spaces)  # O87
-    return PlatformConfig(
+    config = PlatformConfig(
         file=file,
         zone=Zone(_name(zone, "name", zone.string("name"), "the zone name"), _url(zone, "url")),
         providers=MappingProxyType(providers),
@@ -652,8 +638,20 @@ def load_platform(
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),
         principals=principals,
         toolserver=_toolserver(root.section("toolserver"), file.parent) if "toolserver" in root.data else None,
-        sandbox=sandbox,
+        sandbox=load_sandbox(
+            Section(root.table("sandbox"), file, "[sandbox]"),
+            file.parent,
+            tls=tls,
+            providers=tuple(providers),
+            local=spaces[0].support.local,  # the same in every entry (load_spaces, O03)
+        )
+        if "sandbox" in root.data
+        else None,
         sha256=digest,
         tls=tls,
         link_check=load_link_check(root, providers, spaces),
     )
+    if config.sandbox is not None:  # the key names a provider of the spaces just read: checked once the file is
+        section = Section(root.table("sandbox"), file, "[sandbox]")
+        check_content_provider(section, config.sandbox.content_check_provider, providers, spaces)  # O87
+    return config

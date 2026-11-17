@@ -139,6 +139,24 @@ def test_o87_the_check_provider_is_in_the_fingerprint_by_position_only_when_it_i
     assert "birch" not in json.dumps(prints[0])
 
 
+def test_o87_an_apptainer_platform_with_spaces_takes_the_check_provider_of_the_first_data_path_space(tmp_path, cas):
+    """O87: the Apptainer backend's `[sandbox]` with `[[spaces]]` is checked through `load_platform`: a provider of the
+    first space is read through and in the fingerprint by position; one that supports another space alone is refused,
+    naming the key."""
+    anchor = "kill_grace_s = 5"
+
+    def with_provider(name):
+        text = anchor + f'\ncontent_check_file = "dir/check.bin"\ncontent_check_provider = "{name}"'
+        return edited(APPTAINER, [platform(anchor, text)])
+
+    loaded = load(with_provider("larch"), tmp_path / "ok", cas[0])
+    assert loaded.content_check_reader.name == "larch"
+    assert loaded.fingerprint()["sandbox"]["content_check_provider"] == "providers[1]"
+    with pytest.raises(ConfigError, match="content_check_provider") as raised:
+        load(with_provider("rowan"), tmp_path / "other", cas[0])  # supports the second space alone
+    assert "rowan" not in str(raised.value).replace(str(tmp_path), "")
+
+
 @pytest.mark.parametrize(
     ("template", "edits"),
     [

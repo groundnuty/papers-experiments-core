@@ -210,3 +210,32 @@ def test_o87_a_tool_server_host_that_cannot_be_read_is_unknown_and_the_server_st
         assert set(found["unknown"].values()) == {"RuntimeError"}
     finally:
         box.stop()
+
+
+class Older:
+    """A node made before the readings: it answers everything a FakeNode does, and has neither new method."""
+
+    def __init__(self):
+        self._node = FakeNode()
+
+    def __getattr__(self, name):
+        if name in ("node_readings", "tool_server_readings"):
+            raise AttributeError(name)
+        return getattr(self._node, name)
+
+
+def test_o87_a_node_without_the_readings_methods_is_unknown_and_neither_the_start_nor_the_tool_server_fails(tmp_path):
+    """O87: never refused, whatever the node object: the lookup is guarded as the call is, so the start goes on and
+    the tool server's home is made and removed as ever."""
+    box = start(Older(), make_settings(tmp_path), make_spec("via-gate"))
+    try:
+        found = box.metadata()["infrastructure_facts"]["node"]
+        assert found["kernel"] == hostfacts.UNKNOWN
+        assert set(found["unknown"].values()) == {"AttributeError"}
+        with box.tool_server_process() as process:
+            home = process.home
+            assert home.is_dir()
+        assert not home.exists()
+        assert "tool_server_host" not in box.metadata()["infrastructure_facts"]  # unknown for the same reason: no news
+    finally:
+        box.stop()

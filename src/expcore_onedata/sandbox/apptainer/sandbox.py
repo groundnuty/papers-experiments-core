@@ -306,7 +306,7 @@ class ApptainerSandbox:
         self._started = time.time()
         self._meta.update(host=self.node.node_facts(self.app.apptainer),
                           started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))  # fmt: skip
-        self._meta["infrastructure_facts"]["node"] = hostfacts.of_node(self.node.node_readings)  # O87
+        self._meta["infrastructure_facts"]["node"] = hostfacts.of_node(lambda: self.node.node_readings())  # O87
         self._checkpoint()
         self._start_collector()
         self._checkpoint()
@@ -806,8 +806,8 @@ class ApptainerSandbox:
         (home / "tmp").mkdir(mode=0o700)  # its TMPDIR: never the node's shared /tmp
         self.record(tool_server_process={"on": "node", "home": "run_directory", "tmpdir": "home", "run_tag": True,
                                          "inherited": ["PATH"]})  # fmt: skip
-        self._note_tool_server_host()
         try:
+            self._note_tool_server_host()
             yield ServerProcess(home=home, env={AV.RUN_TAG: self.sid, "TMPDIR": str(home / "tmp")})
         finally:
             try:
@@ -820,7 +820,7 @@ class ApptainerSandbox:
     def _note_tool_server_host(self) -> None:
         """O87: the tool server's host's OS release, glibc and kernel, beside the node's, when they differ from it: on
         the node's own host (the driver's child) they are the node's and nothing is added. Recorded, never refused."""
-        theirs = hostfacts.of_node(self.node.tool_server_readings)
+        theirs = hostfacts.of_node(lambda: self.node.tool_server_readings())  # the lookup is guarded too
         with self._meta_lock:
             facts = self._meta["infrastructure_facts"]
             if theirs != facts.get("node"):

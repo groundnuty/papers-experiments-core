@@ -12,6 +12,7 @@ from expcore_onedata.day0.registry import REGISTRY
 from expcore_onedata.day0.runner import build_context
 from expcore_onedata.precampaign import measure_content_type
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA, with_placement, write_platform
+from expcore_onedata.testing.world import with_spaces
 
 CHECK_FILE = "study/probe.bin"  # an invented path under the space root
 UNKNOWN = "quince"  # a provider name no platform here declares
@@ -138,3 +139,37 @@ def test_o87_the_day0_content_type_check_reads_through_the_named_provider(tmp_pa
     assert "providers[1]" in found.summary
     assert providers_asked(fake) == {BETA_ID}
     assert fake.blocks.get((held_by_beta, ALPHA_ID)) is None
+
+
+def spaces(data, *, first_has_beta: bool, first_tokens: list[str]):
+    """Two spaces, alpha local in both: the second is supported by alpha and beta, the first by beta as well or not,
+    and its token planes as given (without `data_path` the data path's first space is the second)."""
+    with_placement(data)
+    add_sandbox(data)
+    with_spaces(data, 2)
+    data["sandbox"]["content_check_file"] = CHECK_FILE
+    data["sandbox"]["content_check_provider"] = "beta"
+    data["spaces"][0]["providers"] = ["alpha", "beta"] if first_has_beta else ["alpha"]
+    data["spaces"][0]["tokens"] = first_tokens
+
+
+@pytest.mark.parametrize(
+    ("first_has_beta", "first_tokens", "refused"),
+    [
+        (False, ["data_path", "tool_server"], True),  # the data path's first space is the first, beta lacks it
+        (False, ["tool_server"], False),  # the data path's first space is the second, which beta supports
+        (True, ["data_path", "tool_server"], False),
+    ],
+    ids=["first-space-without-beta", "data-path-starts-at-the-second", "both-support-beta"],
+)
+def test_o87_the_provider_must_support_the_first_space_the_data_path_reaches_and_no_other(
+    tmp_path, fake, first_has_beta, first_tokens, refused
+):
+    """O87: with several spaces the check file lies in the first space the data path's token reaches (O05), so the
+    named provider is checked against that space's support set alone, never against the first entry's by position."""
+    platform = write_platform(tmp_path, lambda d: spaces(d, first_has_beta=first_has_beta, first_tokens=first_tokens))
+    if refused:
+        with pytest.raises(ConfigError, match="content_check_provider"):
+            load_platform(platform)
+    else:
+        assert load_platform(platform).content_check_reader.name == "beta"
