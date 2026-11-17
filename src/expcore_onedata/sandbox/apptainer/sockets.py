@@ -5,11 +5,13 @@ A collector binds `<work_root>/<run id>/<socket dir>/sock`. A Unix socket's addr
 the path is at most 107; a collector that cannot bind it ends before it says it is ready, with nothing said of why. The
 bound is held in three places, each saying the length and the limit and never a path:
 
-* at load, `work_root_problem`: the work root may hold at most 107 minus a run id of its longest (57 bytes) and the
-  socket's own suffix, so a plan or any other load of the platform fails at once;
+* at load, `work_root_problem`, ONLY where the platform pins the read-log collector (a platform that does not keeps
+  loading as it did, whatever its work root): the work root may hold at most 107 minus a run id of its longest (57
+  bytes) and the socket's own suffix, 31 bytes, so a plan or any other load of that platform fails at once;
 * at a run's start, `socket_path_problem` with the run's own id: the backstop, and the read-log collector's refusal
   before anything exists (`layout.check_socket_path`);
-* when the egress collector's start fails, `socket_path_problem` again, so the failure names the cause.
+* when the egress collector's start fails, `socket_path_problem` again, so the failure names the cause. The egress
+  collector has no load-time bound: every platform has it, and its fake starts bind no socket.
 """
 
 from __future__ import annotations
@@ -43,21 +45,17 @@ def work_root_max_bytes(socket_dir: str) -> int:
     return SOCKET_PATH_MAX_BYTES - 1 - RUN_ID_MAX_BYTES - len(f"/{socket_dir}/{SOCKET_NAME}")
 
 
-def work_root_problem(size: int, *, readlog: bool) -> str | None:
-    """What is wrong with a work root of `size` bytes, as the end of a sentence about the key, or None when every
-    collector's socket fits under it at the worst case. `readlog` is whether the platform pins the read-log collector:
-    its directory name is one byte longer than the egress collector's, so it sets the bound where it is declared."""
-    for what, socket_dir in (("read-log", READLOG_SOCK_DIR), ("egress", EGRESS_SOCK_DIR)):
-        if what == "read-log" and not readlog:
-            continue
-        limit = work_root_max_bytes(socket_dir)
-        if size > limit:
-            return (
-                f"is {size} bytes, over the {limit} a run's {what} collector socket allows: "
-                f"<work_root>/<run id of at most {RUN_ID_MAX_BYTES} bytes>/{socket_dir}/{SOCKET_NAME} must fit a Unix "
-                f"socket's {SOCKET_PATH_MAX_BYTES} bytes, so use a shorter work_root"
-            )
-    return None
+def work_root_problem(size: int) -> str | None:
+    """What is wrong with a work root of `size` bytes for a platform that pins the read-log collector, as the end of a
+    sentence about the key, or None when the read-log socket fits under it at the worst case."""
+    limit = work_root_max_bytes(READLOG_SOCK_DIR)
+    if size <= limit:
+        return None
+    return (
+        f"is {size} bytes, over the {limit} a run's read-log collector socket allows: "
+        f"<work_root>/<run id of at most {RUN_ID_MAX_BYTES} bytes>/{READLOG_SOCK_DIR}/{SOCKET_NAME} must fit a Unix "
+        f"socket's {SOCKET_PATH_MAX_BYTES} bytes, so use a shorter work_root"
+    )
 
 
 __all__ = [

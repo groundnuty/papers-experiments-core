@@ -655,9 +655,10 @@ def _apptainer_sandbox(
     work_root = (base / section.string("work_root")).resolve()
     if any(c in str(work_root) for c in ":,") or any(c.isspace() for c in str(work_root)):
         raise section.fail("work_root", "may hold no ':', ',' or white space: Apptainer's binds are made under it")
-    too_long = socket_work_root_problem(len(os.fsencode(work_root)), readlog=app.readlog_collector_sha256 is not None)
-    if too_long is not None:  # a collector's socket path is under it, and a Unix socket's holds 107 bytes (O56, O91)
-        raise section.fail("work_root", too_long)
+    if app.readlog_collector_sha256 is not None:  # the read-log collector's socket is under it (O91)
+        too_long = socket_work_root_problem(len(os.fsencode(work_root)))  # and a Unix socket's path holds 107 bytes
+        if too_long is not None:
+            raise section.fail("work_root", too_long)
     prefix = section.optional_string("name_prefix") or "sbx"
     if not PREFIX_RE.fullmatch(prefix):
         raise section.fail("name_prefix", "must be lower-case letters, digits and '-', starting with a letter")

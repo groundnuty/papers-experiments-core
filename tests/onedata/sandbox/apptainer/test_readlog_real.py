@@ -236,8 +236,8 @@ def test_o91_the_longest_work_root_the_load_allows_binds_with_the_real_collector
     lease key cut to 48, "-" and 8 hex digits: 57 bytes), leaves the read-log socket path at exactly 107 bytes, and the
     real collector binds it: the bound refuses what cannot bind and nothing that can."""
     longest = work_root_max_bytes(READLOG_SOCK_DIR)
-    assert work_root_problem(longest, readlog=True) is None
-    assert work_root_problem(longest + 1, readlog=True) is not None
+    assert work_root_problem(longest) is None
+    assert work_root_problem(longest + 1) is not None
     base = short_dir(limit=longest - len("/root") - 2)  # leaves one byte at least for the name that makes up the rest
     try:
         pin = files.sha256_of(files.collector_file())
