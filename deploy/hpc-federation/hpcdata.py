@@ -226,7 +226,7 @@ def check(layout: Layout, manifests: Mapping[str, Path], read: Callable[[str], T
 
     The probe space (`probe_space` of the layout) holds the files the link check writes into it, which its manifest, the
     empty baseline, does not declare. `up` checks the data before the link check, so the first run finds none; a rerun
-    of this phase (`hpcfed.py core`, a resume) finds them, and they are left out (`without_link_check_files`) and
+    of this phase (`hpcfed.py core`) finds them, and they are left out (`without_link_check_files`) and
     counted in what is printed. Nothing else is left out of it, and no other space is read that way."""
     imported = {s.name for s in layout.shared_imports()}  # verify_imports showed these
     waiting = ingested(layout)

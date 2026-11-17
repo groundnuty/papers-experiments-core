@@ -45,7 +45,7 @@ def ca(tmp_path_factory) -> bytes:
 
 def core(hpc, root: Path, label: str, ca: bytes, data=None, links=None) -> str:
     """The core's phase of the pilot's layout over a root of its own, the bootstrap's ids its federation's own. Run
-    again over the same root, it is a rerun of `up`'s core phase (`hpcfed.py core`, a resume). `links` is the link
+    again over the same root, it is a rerun of `up`'s core phase (`hpcfed.py core`). `links` is the link
     check's stand-in (every pair passing, with none given)."""
     import fedlayout
     import fedspec
@@ -198,8 +198,8 @@ def test_o63_a_probe_named_file_below_a_directory_of_the_probe_space_is_still_re
 
 def test_o63_the_core_phase_rerun_on_a_root_after_a_link_check_passes_its_data_check(hpc, tmp_path, ca):
     """C06, O63 (live, 17 Nov 2026, O35): `up`'s first run checks the data before the link check, so the probe space is
-    empty then. The link check then leaves one probe per pair there, and a rerun of the core phase (`hpcfed.py core`, a
-    resume) read them as undeclared data and refused the federation. The rerun passes, leaving the probes out and
+    empty then. The link check then leaves one probe per pair there, and a rerun of the core phase (`hpcfed.py core`)
+    read them as undeclared data and refused the federation. The rerun passes, leaving the probes out and
     counting them, and the record the link check writes is rewritten."""
     root, spaces, pairs = tmp_path / "root", {PROBE_SPACE: []}, []
     stand_in = link_check_stand_in(pairs)
