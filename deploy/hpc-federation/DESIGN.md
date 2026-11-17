@@ -57,6 +57,40 @@ zone (it also runs the holding `sleep`, which costs nothing), then one node per 
 boundary on a node (bundle README). Later milestones add nodes with roles of their own (the agent's cell, which must
 never share a node with a service) by appending them; the order of the existing roles does not change.
 
+### Two federations of one account
+
+**One service per node holds across federations too, and `up` enforces it** (issue 398). The services have no network
+namespace and Couchbase's guard watches the fixed port 8091 (`bundle/lib.sh`), matching listeners by uid only, so a
+second federation's Couchbase on a node of the first fails on its bind and its `up` fails closed. The held job asks for
+cores and memory, never a whole node, and Slurm packs jobs onto a node that has room: nothing placed two federations
+apart. **Decision: node exclusion, not per-federation ports.** The Couchbase port set is large and fixed in the image;
+a port per federation would patch the shim, the guard and the images, for a placement question that the scheduler can
+answer. `--exclusive` was the other option: it bills a whole node for each service, against a 5-core step.
+
+- **Which jobs.** Every live job of the account (`squeue --me`, read-only, ids, names, states and node lists) whose
+  name starts with `hpcop-` (`hpcexclude.JOB_PREFIX`, the one prefix `up` names its jobs by, and the bundle's batch
+  scripts carry): the held job, the agent's own job (`-sandbox`), the older scripts' `hpcop-zone` and `hpcop-provider`. A
+  job is read whole, a heterogeneous job's components together, so another federation's agent's node is one of its nodes:
+  the agent's sandbox never runs on a node that hosts an Onedata service. A pending job holds none, a completing one still
+  does.
+- **Before the submit** (section 5, step 2): the nodes of those jobs go to every component of every held job `up`
+  submits as `--exclude` (Slurm passes no such option from one component to the next), and only when there are some, so
+  the argv is what it was without them. The count, never a name, is in the state (`allocation.excluded_nodes`) and in what
+  `up` says. A read that fails, or a line of such a job that cannot be taken apart, refuses `up` before the state file
+  exists: the job is never submitted without the exclusion.
+- **After the allocation, before any step** (step 3): a second read; any of this federation's nodes (a service's or the
+  agent's) in another live federation's jobs (this up's own jobs left out by their ids) refuses `up`. Its held jobs are
+  cancelled by their ids, none of the placement is recorded, and the refusal names the roles (`zone`, `providers[i]`,
+  `agent`), never a host. A failed second read refuses and releases the same way. Two ups that read before either
+  submitted are the case: the one whose job runs later sees the other's nodes and is refused, and both are when both
+  ran before either read again.
+- **Too few nodes.** Slurm keeps a job pending, or sbatch refuses it, when the exclusion leaves none that fits. `up`
+  waits no longer than the queue bound it always had (30 min, step 3) and its message says that it excluded N nodes of
+  other live federations; an sbatch refusal says the same, the nodes' names Slurm repeats removed. What the site's
+  sbatch does is not known (a live slot sees it).
+- **A fleet** (below) is N such federations: each member's `up` reads the others' jobs, so members brought up one after
+  another take distinct nodes by this rule alone; members brought up at once may race and the later one is refused.
+
 ### The agent's node: a component of its own
 
 The agent's node S (M5, section 8) needs about the agent's memory, work and tmp bytes plus 4 GB for the gate, the
@@ -320,7 +354,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
     "cpus_per_node": 5, "memory_mib_per_node": 11264, "time": "02:00:00",
     "readback": {"JobName": "...", "TimeLimit": "...", "Requeue": "0", "Account": "...", "Partition": "...",
                  "NumNodes": "...", "NumCPUs": "...", "MinMemoryNode": "..."},
-    "started": "<Slurm's StartTime>", "ends": "<Slurm's EndTime>"
+    "started": "<Slurm's StartTime>", "ends": "<Slurm's EndTime>",
+    "excluded_nodes": 0
   },
   "sandbox": {
     "placement": "het | separate", "name": "<allocation name> (het) | <allocation name>-sandbox (separate)",
@@ -403,9 +438,10 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    refused: `down` first.
 2. **The provider storage** (only with a scratch root, section 11): the state file is created, then the federation's
    own directory on scratch and one per provider, each by an exclusive `mkdir`, before any job exists.
-   **Submit** the held job: `sbatch --parsable --job-name=<allocation name> --account --partition --no-requeue
-   --time --nodes --ntasks-per-node=1 --cpus-per-task --mem --chdir=/ --output=/dev/null --export=NONE --wrap 'exec sleep
-   <seconds of --time>'`. **The read-back:** `scontrol show job -o <id>` must report what was asked (TimeLimit,
+   **Read the account's other live federations' nodes** (section 1, "Two federations of one account"), before the state
+   file is made: read-only, and a failed read refuses. **Submit** the held job: `sbatch --parsable --job-name=<allocation
+   name> --account --partition --no-requeue --time --nodes --ntasks-per-node=1 --cpus-per-task --mem
+   [--exclude=<those nodes>] --chdir=/ --output=/dev/null --export=NONE --wrap 'exec sleep <seconds of --time>'`. **The read-back:** `scontrol show job -o <id>` must report what was asked (TimeLimit,
    Requeue=0, Account, Partition, NumNodes, NumCPUs, MinMemoryNode, JobName); otherwise `up` cancels that one job id
    and fails, naming the field. sbatch's stderr is kept apart from the id it prints. With the agent's node under
    `het`, the same sbatch has a second component (section 1), and **each component's record** is read back (one per
@@ -417,7 +453,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 3. **Wait for it to run** (each job, under `separate`), bounded (30 min); at the bound, or if it ends first, it is
    cancelled by its id. **The read-back runs again on the running job**: a scheduler that allocated more than the
    pending request showed is caught there, and the job cancelled before any step; so is a component, or a job, on
-   another count of nodes than asked, or on a node another holds.
+   another count of nodes than asked, or on a node another holds, and so is a node another live federation of the
+   account holds (the second read, section 1): the job is cancelled before any step and the roles named.
 4. **Place** (section 1), then one control step per node prints the node's FQDN and its IPv4 address on the
    cluster's network (`nodefacts.py`, Python 3.9-compatible, stdlib only); on S, with `--het-group=1` under `het` and
    S's own job id under `separate`, and on a service node with `--het-group=0` under `het`. Nothing else of `up` runs
