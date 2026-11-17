@@ -3,8 +3,8 @@ with every one of them.
 
 An executor starts its instruments before `record_run`, so a secret it names only to `record_run(secrets=...)` is not
 known when a start fails: its diagnostic would be kept with the value in it, on the row, in the marker, in the export.
-`RunRequest.declare_secrets(secrets=, secret_env=, environ=)` is the executor's way to tell the core first: the attempt's
-redaction context (the one its diagnostic and its harness-defect log are redacted with) then holds them, and
+`RunRequest.declare_secrets(secrets=, secret_env=, environ=)` is the executor's way to tell the core first: the
+attempt's redaction context (the one its diagnostic and its harness-defect log are redacted with) then holds them, and
 `record_run` merges them with what it is given, so the record is redacted with them too.
 """
 
