@@ -33,7 +33,7 @@ class _Handler(BaseHTTPRequestHandler):
         peer = self.server.peer  # type: ignore[attr-defined]
         status, body = peer.answer
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", peer.content_type)
         if peer.chunks:  # a chunked answer: each piece goes alone, so a name can be split across them
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
@@ -67,9 +67,9 @@ class TlsPeer:
         self.sni: list[str | None] = []
         self.requests: list[dict[str, Any]] = []
         self.answer: tuple[int, bytes] = (200, b"{}")  # what every request is answered with: a test sets it
-        self.chunks: list[
-            bytes
-        ] = []  # when set, the answer's body is sent in these pieces (Transfer-Encoding: chunked)
+        self.content_type = "application/json"  # a file's content is answered as bytes: a test sets it
+        # when set, the answer's body is sent in these pieces (Transfer-Encoding: chunked)
+        self.chunks: list[bytes] = []
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(directory / f"{name}.pem", directory / f"{name}.key")
         context.sni_callback = self._remember

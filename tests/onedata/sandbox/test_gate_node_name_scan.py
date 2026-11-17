@@ -212,12 +212,24 @@ def test_o73_a_files_content_is_the_studys_data_and_is_not_scanned(tmp_path, wor
     counted, and the count says `rest_answers` only."""
     with TlsPeer(tmp_path / "up", SERVED) as upstream:
         httpd, tls, log = world(upstream)
+        upstream.content_type = "application/octet-stream"
         upstream.answer = (200, f"a file that names {NODE} and {ADDRESS}".encode())
         status, body = _get(httpd, tls, CONTENT)
         assert status == 200
         assert NODE.encode() in body
         (line,) = _requests(log, 1)
     assert "node_name_hits" not in line
+
+
+def test_o73_an_error_answered_at_a_content_route_is_an_answer_of_the_platform_and_is_scanned(tmp_path, world):
+    """O73: the gate streams a content route's answer only when it is a file's bytes; the platform's JSON error at the
+    same route is read whole and checked, and so is scanned."""
+    with TlsPeer(tmp_path / "up", SERVED) as upstream:
+        httpd, tls, log = world(upstream)
+        upstream.answer = (404, json.dumps({"error": {"details": {"providerDomain": NODE}}}).encode())
+        assert _get(httpd, tls, CONTENT)[0] == 404
+        (line,) = _requests(log, 1)
+    assert line["node_name_hits"] == 1
 
 
 def test_o73_without_scan_names_nothing_is_scanned_or_recorded(tmp_path, world):
