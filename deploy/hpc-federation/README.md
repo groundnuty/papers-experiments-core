@@ -171,7 +171,7 @@ against `tests/fake_couchbase.py`, a loopback stand-in with Couchbase 4.5's acce
 A federation's services run with no network namespace and the guard watches Couchbase's fixed port 8091, so two
 federations of one account on one node would make the second one's Couchbase fail on its bind and its `up` fail
 (issue 398). Slurm packs jobs onto a node by cores and memory and keeps nothing apart, so `up` keeps them apart itself,
-with two read-only reads of the account's live jobs (`squeue --me`, asked for every state in which a job holds a node, a suspended one included, and run with no `SQUEUE_*` and no output-format variable of the login shell: ids, names, states and node lists, nothing else).
+with two read-only reads of the account's live jobs (`squeue --me --all`, with squeue's own default states, a suspended job included, and run with no `SQUEUE_*` (but `SQUEUE_ALL`) and no output-format variable of the login shell: ids, names, states and node lists, nothing else).
 A job whose name starts with `hpcop-` is a federation's: a held job (`hpcop-<project>-<random>`), an agent's own job
 (`...-sandbox`) and the bundle's own batch scripts (`hpcop-zone`, `hpcop-provider`). A job of any other name is none of
 its business, whatever it runs. It never reads or prints a node's name into a message: only roles and counts.

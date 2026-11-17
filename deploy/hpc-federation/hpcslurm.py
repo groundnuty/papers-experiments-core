@@ -225,11 +225,20 @@ def clients_of(job: str, proc: str = "/proc") -> List[Client]:
 # would fail open without a word. The commands `Runner.run` runs get an environment without them; every other variable,
 # the site's own SLURM_CONF and SBATCH_* among them, reaches them as it was.
 OUTPUT_FORMAT_VARIABLES = ("SLURM_TIME_FORMAT", "SLURM_BITSTR_LEN")
+WIDENING_VARIABLES = (
+    "SQUEUE_ALL",
+)  # `--all`: jobs of hidden partitions too. It only widens, and a site that hides its
+# partition may rely on it for every squeue read of the driver, so it is the one SQUEUE_* variable that is kept
 
 
 def read_environment(environ: Mapping[str, str]) -> Dict[str, str]:
-    """`environ` without every SQUEUE_* variable and without Slurm's output-format variables."""
-    return {k: v for k, v in environ.items() if not k.startswith("SQUEUE_") and k not in OUTPUT_FORMAT_VARIABLES}
+    """`environ` without every SQUEUE_* variable that narrows or reshapes what squeue lists (all but `SQUEUE_ALL`) and
+    without Slurm's output-format variables."""
+    return {
+        k: v
+        for k, v in environ.items()
+        if (not k.startswith("SQUEUE_") or k in WIDENING_VARIABLES) and k not in OUTPUT_FORMAT_VARIABLES
+    }
 
 
 class Runner:
