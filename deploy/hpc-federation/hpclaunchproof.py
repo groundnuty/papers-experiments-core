@@ -1,5 +1,5 @@
 """The proofs that a service's launch failed before anything of the service ran, so `up` may launch it once more
-(O57, DESIGN.md section 4, "A launch that failed at launch"). Pure functions: nothing here reads Slurm; the driver
+(O57, DESIGN.md section 5, "A launch that failed at launch"). Pure functions: nothing here reads Slurm; the driver
 reads the three sources (srun's client log, sacct, the run log) and asks here whether they prove it.
 
 Seen live twice on 17 Nov 2026: srun's fan-out on the login node could not find the nodes' addresses, and every
