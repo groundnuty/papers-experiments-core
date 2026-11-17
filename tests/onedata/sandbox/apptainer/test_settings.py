@@ -358,3 +358,16 @@ def test_o57_a_platform_that_declares_no_storage_kind_keeps_the_fingerprint_it_h
     assert {"tls", "data_paths"} <= set(docker)  # what the Docker backend's fingerprint held before the key existed
     assert "sandbox_backend" not in docker
     assert "provider_storage" not in json.dumps(docker)  # nothing the key adds reaches a Compose federation's
+
+
+def test_o87_the_apptainer_backend_reads_the_check_provider_as_the_docker_backend_does(tmp_path):
+    """O87: `content_check_provider` is a `[sandbox]` key of both backends: a layout name, kept for the platform's
+    load to check against its providers and the space; unset it is None, the agent's local provider."""
+    assert _load(tmp_path, _document()).content_check_provider is None
+    assert _load(tmp_path, {**_document(), "content_check_provider": "owner"}).content_check_provider == "owner"
+
+
+@pytest.mark.parametrize("value", [5, "", "with space", ["a"]])
+def test_o87_a_check_provider_that_is_no_name_is_refused_naming_the_key(tmp_path, value):
+    with pytest.raises(ConfigError, match="content_check_provider"):
+        _load(tmp_path, {**_document(), "content_check_provider": value})

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from expcore_onedata.sandbox import hostfacts
 from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import loopback
@@ -146,6 +147,16 @@ class NodeOps(Protocol):
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         """Facts of the node for a record: its kernel and the version of `apptainer` (the command words). No name
         and no address."""
+        ...
+
+    def node_readings(self) -> dict[str, Any]:
+        """The node's OS release (ID, VERSION_ID), glibc version and kernel release (`hostfacts.readings`, O87): files
+        read as text and system values asked, nothing executed; a reading that fails is `unknown` with its reason."""
+        ...
+
+    def tool_server_readings(self) -> dict[str, Any]:
+        """The same readings of the host the run's tool server runs on. The server is the driver's own child, so on
+        the node it is the node's own; a node that places it elsewhere answers for that host."""
         ...
 
 
@@ -462,6 +473,12 @@ class LocalNode:
         done = self.apptainer([*apptainer, "--version"], VERSION_S)
         version = done.stdout.strip() if done.returncode == 0 else None
         return {"kernel": platform.release(), "apptainer": version[:80] if version else None}
+
+    def node_readings(self) -> dict[str, Any]:
+        return hostfacts.readings()
+
+    def tool_server_readings(self) -> dict[str, Any]:
+        return self.node_readings()  # the tool server is a process of this driver's, on this node
 
 
 __all__ = ["LocalNode", "NodeOps", "Spawned"]

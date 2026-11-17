@@ -42,6 +42,7 @@ real addresses (DESIGN.md, sections 5 and 6).
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
@@ -389,6 +390,44 @@ def core_phase(
     finally:
         client.close()
     return f"{written}\n{held}\n{checked}"
+
+
+READINGS_KEYS = ("os.id", "os.version_id", "glibc", "kernel")
+_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}")
+_GLIBC = re.compile(r"glibc [0-9][A-Za-z0-9._+~-]{0,31}")
+_REASON = re.compile(r"[A-Za-z0-9._ -]{1,80}")
+
+
+def _unknown_readings(reason: str) -> Dict[str, Any]:
+    return {
+        "os": {"id": "unknown", "version_id": "unknown"},
+        "glibc": "unknown",
+        "kernel": "unknown",
+        "unknown": dict.fromkeys(READINGS_KEYS, reason),
+    }
+
+
+def load_readings(found: Any) -> Dict[str, Any]:
+    """A node's OS release, glibc version and kernel release as its facts step printed them (O87), rebuilt from the
+    known keys, each a plain string or "unknown" beside its reason. Recorded and never refused: a step that printed
+    none (an older bundle's), or anything of another shape, is unknown for that reason. The shape is
+    `expcore_onedata.sandbox.hostfacts.checked`'s, which the tests hold this to."""
+    if not isinstance(found, Mapping):
+        return _unknown_readings("the step gave none" if found is None else "not a mapping")
+    os_part, reasons = found.get("os"), found.get("unknown", {})
+    if not isinstance(os_part, Mapping) or not isinstance(reasons, Mapping):
+        return _unknown_readings("not the expected shape")
+    values = (os_part.get("id"), os_part.get("version_id"), found.get("glibc"), found.get("kernel"))
+    shapes = (_WORD, _WORD, _GLIBC, _WORD)
+    if not all(isinstance(v, str) and (v == "unknown" or shape.fullmatch(v)) for v, shape in zip(values, shapes)):
+        return _unknown_readings("not the expected shape")
+    why = {k: v for k, v in reasons.items() if k in READINGS_KEYS and isinstance(v, str) and _REASON.fullmatch(v)}
+    if len(why) != len(reasons) or {k for k, v in zip(READINGS_KEYS, values) if v == "unknown"} != set(why):
+        return _unknown_readings("not the expected shape")
+    out: Dict[str, Any] = {"os": {"id": values[0], "version_id": values[1]}, "glibc": values[2], "kernel": values[3]}
+    if why:
+        out["unknown"] = dict(sorted(why.items()))
+    return out
 
 
 def verify_ingested(
