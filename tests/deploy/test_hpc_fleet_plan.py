@@ -352,3 +352,139 @@ def test_o63_plan_refuses_a_guard_the_study_does_not_hold_before_it_assigns_anyt
     assert "guards/missing.py" in printed
     assert all(member is None for member in assigned(bench).values())
     assert not (bench.fleet / "shards.toml").exists()
+
+
+# ------------------------------------------------------------------------------------------------ pass_env
+NAME, VALUE = "FAULT_ACK_MODE", "1"  # an invented operator variable, as a study's sanction takes one
+TREE_NAME, TREE = "HPC_STUDY_ARTIFACTS", "/srv/example/artifacts/tree"  # and an invented absolute path
+PASS_ENV = f'pass_env = ["{NAME}", "{TREE_NAME}"]'
+
+
+def operator(bench, **given) -> dict:
+    """The operator's environment the fleet runs in (the bench's site) with the declared variables set."""
+    return {**bench.environ, NAME: VALUE, TREE_NAME: TREE, **given}
+
+
+def planned(bench, environ, *settings) -> tuple[int, str, dict]:
+    """`fleet.py plan` with these settings in `environ`: its status, what it printed and each shard's entry."""
+    code, printed = bench.run("plan", "--manifest", str(bench.settings(*settings)), environ=environ)
+    entries = [json.loads(text) for text in printed.splitlines() if text.startswith("{")]
+    return code, printed, {entry["shard"]: entry for entry in entries}
+
+
+def env_words(argv: list) -> dict:
+    """The `env -i` words of a step line: the step's whole environment on its node."""
+    words = {}
+    for word in argv[argv.index("-i") + 1 :]:
+        if "=" not in word or word.startswith("-"):
+            break
+        key, _, value = word.partition("=")
+        words[key] = value
+    return words
+
+
+def test_o63_the_shard_settings_take_pass_env_and_plan_pins_each_value_on_every_line(bench, deploy):
+    """O63: the fleet's campaign passes the operator's variables to its dispatchers: `plan` reads each declared value
+    from the operator's environment, every line carries it as an `env -i` word and `--pass-env NAME`, the entry
+    printed shows the values, and shards.toml (which `collect` reads) declares the names; the fake cluster takes each
+    line."""
+    assert bench.up(2)[0] == 0
+    code, printed, lines = planned(bench, operator(bench), PASS_ENV)
+    assert code == 0, printed
+    for index, label in enumerate(("fed-1", "fed-2"), 1):
+        entry = lines[f"shard-{index}"]
+        assert entry["pass_env"] == {NAME: VALUE, TREE_NAME: TREE}
+        words = env_words(entry["argv"])
+        assert (words[NAME], words[TREE_NAME]) == (VALUE, TREE)
+        assert [entry["argv"][i + 1] for i, w in enumerate(entry["argv"]) if w == "--pass-env"] == [NAME, TREE_NAME]
+        bench.fake(label)._step(entry["argv"])
+    manifest = deploy.fleet.fleetplan.shards.load_plan(bench.fleet / "shards.toml")
+    assert manifest.pass_env == (NAME, TREE_NAME)
+    assert f'pass_env = ["{NAME}", "{TREE_NAME}"]' in (bench.fleet / "shards.toml").read_text(encoding="utf-8")
+
+
+def test_o63_step_launches_the_lines_pinned_with_the_values_the_operator_holds_when_it_runs(bench):
+    """O63: `fleet.py step` pins the declared variables as `plan` does, from its own environment: the lines it spawns
+    carry what the operator holds then (here changed since the plan), and no line carries a variable that was not
+    declared."""
+    assert bench.up(2)[0] == 0
+    assert planned(bench, operator(bench), PASS_ENV)[0] == 0
+    code, printed = bench.run("step", environ=operator(bench, **{NAME: "2", "NOT_DECLARED_VAR": "x"}))
+    assert code == 0, printed
+    assert len(bench.spawned) == 2
+    for spawned in bench.spawned:
+        assert (env_words(spawned.argv)[NAME], env_words(spawned.argv)[TREE_NAME]) == ("2", TREE)
+        assert spawned.argv.count("--pass-env") == 2
+        assert "NOT_DECLARED_VAR" not in env_words(spawned.argv)
+
+
+def test_o63_plan_refuses_a_declared_variable_the_operator_has_not_set_and_assigns_nothing(bench):
+    """O63: an unset variable refuses `plan` whole, naming it: nothing is printed, assigned or written."""
+    assert bench.up(2)[0] == 0
+    environ = operator(bench)
+    del environ[NAME]
+    code, printed, lines = planned(bench, environ, PASS_ENV)
+    assert code == 2
+    assert f"{NAME} is not set" in printed
+    assert lines == {}
+    assert all(member is None for member in assigned(bench).values())
+    assert record(bench)["template"] is None
+    assert not (bench.fleet / "shards.toml").exists()
+
+
+def test_o63_step_refuses_whole_when_a_declared_variable_is_no_longer_set_and_launches_nothing(bench):
+    """O63: the variable is set at `plan` and gone at `step`: no line is made, so no shard is launched."""
+    assert bench.up(2)[0] == 0
+    assert planned(bench, operator(bench), PASS_ENV)[0] == 0
+    environ = operator(bench)
+    del environ[TREE_NAME]
+    code, printed = bench.run("step", environ=environ)
+    assert code == 2
+    assert f"{TREE_NAME} is not set" in printed
+    assert bench.spawned == []
+
+
+@pytest.mark.parametrize(
+    ("setting", "says"),
+    [
+        ('pass_env = ["FAULT_API_KEY"]', "looks like a secret"),
+        ('pass_env = ["PATH"]', "sets itself"),
+        ('pass_env = ["EXPCORE_FED_ROOT"]', "sets itself"),
+        ('pass_env = ["lower_case"]', "must match"),
+        ('pass_env = "FAULT_ACK_MODE"', "must be a list"),
+        (f'pass_env = ["{NAME}", "{NAME}"]', "twice"),
+    ],
+)
+def test_o63_the_settings_refuse_a_declaration_shards_py_would_refuse_and_nothing_is_made(bench, setting, says):
+    """O63: the names are checked by `shards.py`'s own rule when the settings are read: a secret-looking name, one
+    the step sets itself, a bad one, a string and a repeat refuse `plan` before anything is assigned or written."""
+    assert bench.up(2)[0] == 0
+    code, printed, _ = planned(bench, operator(bench, FAULT_API_KEY="x"), setting)
+    assert code == 2
+    assert says in printed
+    assert record(bench)["template"] is None
+    assert not (bench.fleet / "shards.toml").exists()
+
+
+@pytest.mark.parametrize("value", ["go ahead", "/srv/../etc", "relative/dir", "/srv/my dir", "/srv/$HOME"])
+def test_o63_plan_refuses_a_value_that_is_neither_a_plain_word_nor_a_plain_path_never_echoing_it(bench, value):
+    """O63: the value rule is `shards.py`'s: a space, a climbing path, a relative path or a shell character refuses
+    `plan`, naming the variable and never the value."""
+    assert bench.up(2)[0] == 0
+    code, printed, _ = planned(bench, operator(bench, **{TREE_NAME: value}), PASS_ENV)
+    assert code == 2
+    assert f"{TREE_NAME}'s value does not match" in printed
+    assert value not in printed
+    assert not (bench.fleet / "shards.toml").exists()
+
+
+def test_o63_a_relaunch_with_resume_carries_the_pins_too(bench):
+    """O63: `step --resume` on a shard whose step ended pins the declared variables like any launch."""
+    assert bench.up(2)[0] == 0
+    assert planned(bench, operator(bench), PASS_ENV)[0] == 0
+    assert bench.run("step", environ=operator(bench))[0] == 0
+    bench.alive.discard(bench.spawned[0].pid)
+    code, printed = bench.run("step", "--shard", "shard-1", "--resume", environ=operator(bench))
+    assert code == 0, printed
+    assert (bench.spawned[-1].argv[-1], env_words(bench.spawned[-1].argv)[NAME]) == ("--resume", VALUE)
+    assert bench.spawned[-1].argv.count("--pass-env") == 2
