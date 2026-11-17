@@ -1612,11 +1612,20 @@ A class that wraps an instrument passes both methods on, or it drops them withou
 If your instrument verifies something in `start` (a state inducer that checks the start state it induced) and it does not hold, raise an `InfraError` of a kind no condition declares as its treatment, as for any refusal, and give it what you checked and what you saw (C40):
 
 ```python
-raise InfraError(
-    "sandbox",
-    "the start state was not reached",
-    diagnostic={"checked": "the replica count", "seen": "2 of 3", "wanted": 3},
-)
+from expcore.errors import InfraError
+
+
+class StateInducer:
+    namespace = "state_inducer"
+
+    def start(self, identity):
+        seen = self.read_state()
+        if seen != self.wanted:
+            raise InfraError(
+                "sandbox",
+                "the start state was not reached",
+                diagnostic={"checked": "the replica count", "seen": seen, "wanted": self.wanted},
+            )
 ```
 
 `start_instruments` names your instrument on the error it lets through, and the attempt that is set aside and run again keeps the snapshot `{"phase": "start", "instrument": ..., "diagnostic": ...}` on its row and in its marker, redacted with the secrets of the environment as an instrument's snapshot is. The export lists every such attempt (`attempt_diagnostics`, with its run, condition, kind and whether it was charged) and the report counts them per condition, instrument and kind under "Instrument start failures", with a row of zeros for a condition that had none, so you can count induction failures per condition and read each one. Keep the diagnostic a plain JSON object of at most 16 KiB; one that is not, or whose redaction fails, is recorded as `{"ok": false, "error": ...}` and costs the attempt nothing. Nothing about the run record changes, since an attempt that raised from `start` has none. If your instrument is wrapped by another class, the wrapper needs nothing: the error is the instrument's own.
