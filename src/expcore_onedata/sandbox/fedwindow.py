@@ -18,9 +18,14 @@ its label (`zone`, `providers[i]`) with its status, its state at each end and it
 container or step id, an address, a path or a secret: the watch's own result holds none (`fedwatch`), and nothing the
 backend's commands print is copied.
 
-**Where it is written, and when.** `collect()` writes the sandbox's `metadata.json` before the injector's restore, so
-that file holds no window; read `sandbox.metadata()` once the launch has ended (as for `teardown`). A platform given no
-watch records nothing, and a Docker sandbox then has no `infrastructure_facts` at all.
+**Where it is written, and when.** Every run of a platform has the key from its preparation on, so a reader never meets
+a silent absence: a platform given no watch records `unknown` with the reason "no federation watch configured"
+(`unwatched`), and one given a watch records `unknown` "pending" (`pending`) until its launch closes the window.
+`collect()` writes the sandbox's `metadata.json` before the injector's restore, so that file holds the placeholder, and
+the window is written at the launch's exit as `federation-window.json` beside `metadata.json` in each directory
+`collect` wrote its evidence into (`persist`), and in `sandbox.metadata()` (as for `teardown`). A directory that is gone
+or cannot be written is logged and skipped, never a failure of the run; a run that was never collected has the window
+in its metadata alone. The file is the facts as `metadata()` holds them, plain JSON.
 
 **The limit.** The window is the run's only when the injection comes after the read and the restore before the window:
 an executor whose `running` encloses the launch takes its target down before the read and restores after the window,
@@ -28,15 +33,30 @@ and its window shows the target not running at its end, never stable.
 """
 
 import asyncio
+import json
+import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
+log = logging.getLogger(__name__)
+
 KEY = "federation_window"  # the key of the run's `infrastructure_facts`
+FILE = "federation-window.json"  # the window, beside `metadata.json` in the run's evidence
 VERSION = 1
+NO_WATCH = "no federation watch configured"
+PENDING = f"the window closes after the run's evidence is collected: see {FILE} beside metadata.json"
 CANCELLED = "the run was cancelled before its window was read"
 INTERRUPTED = "the run was interrupted before its window was read"
 TEXT_CAP = 300  # a reason or a finding is a sentence: a longer one is cut, never copied whole
+
+
+class Evidence(Protocol):
+    """A sandbox as far as `persist` uses it: the directories `collect` wrote into."""
+
+    def evidence_dirs(self) -> tuple[Path, ...]: ...
 
 
 class Watch(Protocol):
@@ -64,10 +84,12 @@ def _failed(what: str, error: Exception) -> str:
 
 
 def unread(*reasons: str) -> dict[str, Any]:
-    """The facts of a window that was never taken: unknown, with why, in the shape of a window with no service."""
+    """The facts of a window that was never taken: unknown, with why (`reason` is the first), in the shape of a window
+    with no service."""
     return {
         "version": VERSION,
         "verdict": "unknown",
+        "reason": _text(reasons[0]) if reasons else None,
         "backend": None,
         "window": {"start": None, "end": None},
         "services": {},
@@ -75,6 +97,34 @@ def unread(*reasons: str) -> dict[str, Any]:
         "unknown": [_text(reason) for reason in reasons],
         "journal": None,
     }
+
+
+def unwatched() -> dict[str, Any]:
+    """What a run of a platform given no watch records, so that a post-check sees the gap and not an absence."""
+    return unread(NO_WATCH)
+
+
+def pending() -> dict[str, Any]:
+    """What a run of a platform with a watch records until its window is closed: what `metadata.json` holds."""
+    return unread(PENDING)
+
+
+def persist(sandbox: Evidence, facts: Mapping[str, Any]) -> None:
+    """Write the facts as `federation-window.json` beside the `metadata.json` of every directory the sandbox's `collect`
+    wrote its evidence into, atomically. A directory that is gone is skipped and one that cannot be written is logged
+    (the error's type), neither raised: the window is also in the sandbox's metadata, and the run goes on (O86)."""
+    text = json.dumps(facts, indent=1)
+    for directory in sandbox.evidence_dirs():
+        if not directory.is_dir():
+            continue
+        temporary = directory / f".{FILE}.tmp"
+        try:
+            temporary.write_text(text, encoding="utf-8")
+            os.replace(temporary, directory / FILE)
+        except OSError as error:
+            log.error(
+                "the federation's window could not be written beside the run's evidence (%s)", type(error).__name__
+            )
 
 
 def interrupted(error: BaseException) -> dict[str, Any]:
@@ -139,14 +189,21 @@ async def close_window(watch: Watch, opened: Opened) -> dict[str, Any]:
 
 __all__ = [
     "CANCELLED",
+    "FILE",
     "INTERRUPTED",
     "KEY",
+    "NO_WATCH",
+    "PENDING",
     "VERSION",
+    "Evidence",
     "Opened",
     "Watch",
     "close_window",
     "interrupted",
     "open_window",
+    "pending",
+    "persist",
     "project",
     "unread",
+    "unwatched",
 ]

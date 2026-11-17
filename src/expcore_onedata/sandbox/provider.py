@@ -51,8 +51,10 @@ agent's own time and are never waits (see `codetool.py`).
 
 **The federation's window (O86).** A platform built with `federation_watch=` (`fedwatch.watch_for`, built once for the
 platform) reads the federation before each run's sandbox exists and again after its body, before the stop, each inside
-a `sandbox_lifecycle` wait, and records the window in the sandbox's `infrastructure_facts` (`fedwindow`). A read that
-fails is recorded unknown and never fails the run. A platform given none reads nothing and its runs are unchanged.
+a `sandbox_lifecycle` wait, and records the window in the sandbox's `infrastructure_facts` (`fedwindow`) and, after the
+run's `collect`, in `federation-window.json` beside its `metadata.json`. A read that fails is recorded unknown and never
+fails the run. A platform given none reads nothing and records `unknown` ("no federation watch configured"), so no run
+has the key absent.
 
 The study's `data_path` factor names its levels in the study's words; `[sandbox.data_paths]` of platform.toml maps each to
 mount, rest or none. Which runs have a tool server, and of which condition, is the study's to say (`tool_condition`).
@@ -524,6 +526,10 @@ class SandboxPlatform:
             config_sha256=self._config.sha256,
             **self._options,
         )
+        # the window is a fact of every run from its preparation on: unknown until a watch closes it, never absent (O86)
+        sandbox.record_infrastructure_fact(
+            fedwindow.KEY, fedwindow.unwatched() if self._watch is None else fedwindow.pending()
+        )
         # never a value, and the slot by its place in the file, never by its name (O12)
         slot = self._slots.keys_of(GROUP).index(lease.key) if lease is not None else "principals.data_path"
         lifetime = {}  # a run that minted nothing records no lifetime; one that minted had its ceiling accepted
@@ -589,8 +595,9 @@ class SandboxPlatform:
         A platform with a `federation_watch` reads the federation first, after the refusals above and before anything
         is minted, and reads it again once the body has ended, before the stop, each in a `sandbox_lifecycle` wait
         (`fedwindow`, O86). A fault injector whose `running` is inside the launch has restored by then. The window is in
-        the sandbox's `metadata()["infrastructure_facts"]["federation_window"]`, read after the launch; a read that fails
-        is recorded unknown and the run's outcome is the body's own.
+        the sandbox's `metadata()["infrastructure_facts"]["federation_window"]`, read after the launch, and in
+        `federation-window.json` beside the `metadata.json` of each directory `collect` wrote into; a read that fails is
+        recorded unknown and the run's outcome is the body's own. A platform with no watch records `unknown`, never nothing.
 
         The start runs in a thread, and cancelling the launch does not stop a thread: it goes on creating the sandbox.
         So the sandbox is built before the thread begins, and the launch holds it. On cancellation, or any failure of
@@ -703,7 +710,7 @@ class SandboxPlatform:
         except BaseException as interrupted:
             # a cancellation: the stop waits for a deadline under way, and the run is not classified
             if opened is not None:  # no read is awaited under a cancellation, and the window says so
-                sandbox.record_infrastructure_fact(fedwindow.KEY, fedwindow.interrupted(interrupted))
+                self._record_window(sandbox, fedwindow.interrupted(interrupted))
             await self._stop(ctx, sandbox, quiet=True)
             raise
         await self._end_with_window(ctx, sandbox, opened, None)
@@ -716,6 +723,14 @@ class SandboxPlatform:
         async with ctx.infrastructure_wait(WAIT_KIND):
             return await fedwindow.open_window(self._watch)
 
+    @staticmethod
+    def _record_window(sandbox: DockerSandbox, facts: dict[str, Any]) -> None:
+        """Put the closed window in the sandbox's metadata and, beside each `metadata.json` its `collect` wrote (which
+        came before the window existed), in `federation-window.json`. Never raises: a file that cannot be written is
+        logged (O86)."""
+        sandbox.record_infrastructure_fact(fedwindow.KEY, facts)
+        fedwindow.persist(sandbox, facts)
+
     async def _end_with_window(
         self, ctx: CallContext, sandbox: DockerSandbox, opened: fedwindow.Opened | None, error: Exception | None
     ) -> None:
@@ -727,9 +742,9 @@ class SandboxPlatform:
             try:
                 async with ctx.infrastructure_wait(WAIT_KIND):
                     facts = await fedwindow.close_window(self._watch, opened)
-                sandbox.record_infrastructure_fact(fedwindow.KEY, facts)
+                self._record_window(sandbox, facts)
             except BaseException as interrupted:  # cancelled during the read: say so, stop, then raise it
-                sandbox.record_infrastructure_fact(fedwindow.KEY, fedwindow.interrupted(interrupted))
+                self._record_window(sandbox, fedwindow.interrupted(interrupted))
                 await self._stop(ctx, sandbox, quiet=True)
                 raise
         await self._end_run(ctx, sandbox, error)

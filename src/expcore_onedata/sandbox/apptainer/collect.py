@@ -55,6 +55,7 @@ class Collection:
             log.error("processes left before collection: %s", state)
             raise SandboxError("the agent's processes could not be shown stopped before collection")
         dest.mkdir(parents=True, exist_ok=True)
+        box.note_evidence(dest)
         deaths = self.deaths()
         result: dict[str, Any] = {"outputs": self._outputs(dest, outputs), "deaths": deaths}
         if "refused_output" in box._meta:

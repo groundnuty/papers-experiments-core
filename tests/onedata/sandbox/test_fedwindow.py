@@ -12,8 +12,11 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import logging
+import shutil
 import threading
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from apptainer_support import make_settings
@@ -474,7 +477,7 @@ def test_o86_a_launch_that_closes_before_the_restore_never_reads_stable(config, 
 
 def test_o86_the_waits_are_the_lifecycle_waits_and_none_without_a_watch(config, issuer, slots, tmp_path):
     """O86: the reads are infrastructure time, never the agent's: each is inside a sandbox_lifecycle wait. A platform
-    given no watch enters the two waits it always did, and its facts carry no key and no `infrastructure_facts`."""
+    given no watch enters the two waits it always did, and records the gap (`unknown`, no watch configured)."""
     federation = Federation(config)
     platform, _ = build(config, issuer, slots, tmp_path, federation.watch)
     ctx = Ctx()
@@ -484,7 +487,7 @@ def test_o86_the_waits_are_the_lifecycle_waits_and_none_without_a_watch(config, 
     ctx = Ctx()
     box = run(bare, federation.settings, nothing, ctx=ctx)
     assert ctx.waits == ["sandbox_lifecycle"] * 2
-    assert "infrastructure_facts" not in box.metadata()
+    assert window_of(box)["reason"] == fedwindow.NO_WATCH
 
 
 def test_o86_no_fact_names_a_service_a_container_an_address_or_a_provider(config, issuer, slots, tmp_path):
@@ -501,6 +504,107 @@ def test_o86_no_fact_names_a_service_a_container_an_address_or_a_provider(config
     text = json.dumps(window_of(run(platform, federation.settings, agent, exclusive=True)))
     for name in (*SECRETS, "http", "://", str(tmp_path)):
         assert name not in text
+
+
+def test_o86_the_window_is_persisted_beside_the_metadata_json_of_the_runs_evidence(config, issuer, slots, tmp_path):
+    """O86: `collect` writes `metadata.json` before the restore, so the closed window is written at the launch's exit
+    as `federation-window.json` beside it: the same facts as `metadata()`, an S3-shaped run's outage explained, and
+    the `metadata.json` collect wrote says the window was not closed yet and where it is."""
+    federation = Federation(config)
+    platform, _ = build(config, issuer, slots, tmp_path, federation.watch)
+    injector = federation.injector()
+    evidence = tmp_path / "evidence"
+
+    async def agent(box):
+        async with injector.running(RUN):
+            box.collect(evidence)  # inside the injector, before its restore, as the documented order collects
+
+    box = run(platform, federation.settings, agent, exclusive=True)
+    persisted = json.loads((evidence / fedwindow.FILE).read_text(encoding="utf-8"))
+    assert persisted == window_of(box)
+    assert persisted["verdict"] == "restarted"
+    assert [(r["label"], r["explained"]) for r in persisted["services"]["providers[1]"]["restarts"]] == [
+        ("outage", True)
+    ]
+    collected = json.loads((evidence / "metadata.json").read_text(encoding="utf-8"))
+    placeholder = collected["infrastructure_facts"][fedwindow.KEY]
+    assert placeholder["verdict"] == "unknown"
+    assert fedwindow.FILE in placeholder["reason"]
+    assert not [path for path in evidence.iterdir() if path.name.startswith(".")]  # no temporary file is left
+
+
+def test_o86_every_collected_directory_that_still_exists_gets_the_file_and_a_run_never_collected_has_none(
+    config, issuer, slots, tmp_path
+):
+    """O86: a study may collect into a scratch directory (a side file's staging) as well as the run's own: each
+    directory `collect` wrote into gets the file beside its `metadata.json`, one that is gone is skipped, and a run
+    that never collected has the window in its metadata alone."""
+    federation = Federation(config)
+    platform, _ = build(config, issuer, slots, tmp_path, federation.watch)
+    first, scratch = tmp_path / "first", tmp_path / "scratch"
+
+    async def body(box):
+        box.collect(first)
+        box.collect(scratch)
+        shutil.rmtree(scratch)
+
+    box = run(platform, federation.settings, body)
+    assert json.loads((first / fedwindow.FILE).read_text(encoding="utf-8")) == window_of(box)
+    assert not scratch.exists()
+    uncollected = run(
+        build(config, issuer, slots, tmp_path / "other", federation.watch)[0], federation.settings, nothing
+    )
+    assert window_of(uncollected)["verdict"] == "stable"
+    assert sorted(path.parent.name for path in tmp_path.rglob(fedwindow.FILE)) == ["first"]
+
+
+def test_o86_a_file_that_cannot_be_written_is_logged_and_never_fails_the_run(
+    config, issuer, slots, tmp_path, monkeypatch, caplog
+):
+    """O86: the window's file cannot be written (the rename fails): the run finishes, the window is in its metadata,
+    and the failure is logged with the error's type."""
+
+    def refuse(source, target):
+        raise PermissionError("the directory is read-only")
+
+    monkeypatch.setattr(fedwindow, "os", SimpleNamespace(replace=refuse))
+    federation = Federation(config)
+    platform, host = build(config, issuer, slots, tmp_path, federation.watch)
+
+    async def body(box):
+        box.collect(tmp_path / "evidence")
+
+    with caplog.at_level(logging.ERROR, logger=fedwindow.log.name):
+        box = run(platform, federation.settings, body)
+    assert window_of(box)["verdict"] == "stable"
+    assert "could not be written beside the run's evidence (PermissionError)" in caplog.text
+    assert "read-only" not in caplog.text
+    assert not host.containers
+
+
+def test_o86_a_platform_with_no_watch_records_the_gap_on_both_backends_and_writes_no_file(
+    config, issuer, slots, tmp_path
+):
+    """O86: no run has the key absent: with no watch the fact is `unknown` with the reason, so a post-check sees the
+    gap, in the sandbox's metadata (and so in the `metadata.json` collect writes) and in no extra file."""
+    federation = Federation(config)
+    docker, _ = build(config, issuer, slots, tmp_path, None)
+    batch = build_apptainer(config, issuer, slots, tmp_path, None)
+
+    for name, platform in (("docker", docker), ("apptainer", batch)):
+
+        async def body(box, name=name):
+            box.collect(tmp_path / name)
+
+        fact = window_of(run(platform, federation.settings, body))
+        assert (fact["verdict"], fact["reason"], fact["unknown"]) == (
+            "unknown",
+            fedwindow.NO_WATCH,
+            [fedwindow.NO_WATCH],
+        )
+        collected = json.loads((tmp_path / name / "metadata.json").read_text(encoding="utf-8"))
+        assert collected["infrastructure_facts"][fedwindow.KEY] == fact
+    assert not list(tmp_path.rglob(fedwindow.FILE))
 
 
 # --- the Apptainer backend, and an HPC federation -----------------------------------------------------------------
@@ -587,3 +691,20 @@ def test_o86_an_hpc_federations_window_is_read_the_same_way_on_a_batch_nodes_san
     text = json.dumps(window)
     for name in (*SECRETS, "4242", "hpcobserve", "/r"):
         assert name not in text
+
+
+def test_o86_an_apptainer_runs_window_is_persisted_beside_its_metadata_json(config, issuer, slots, tmp_path):
+    """O86: the Apptainer backend's collection is tracked as Docker's: the window is written beside metadata.json."""
+    federation = Federation(config)
+    platform = build_apptainer(config, issuer, slots, tmp_path, federation.watch)
+    evidence = tmp_path / "evidence"
+
+    async def body(box):
+        box.collect(evidence)
+
+    box = run(platform, federation.settings, body)
+    persisted = json.loads((evidence / fedwindow.FILE).read_text(encoding="utf-8"))
+    assert persisted == window_of(box)
+    assert persisted["verdict"] == "stable"
+    collected = json.loads((evidence / "metadata.json").read_text(encoding="utf-8"))
+    assert collected["infrastructure_facts"][fedwindow.KEY]["verdict"] == "unknown"
