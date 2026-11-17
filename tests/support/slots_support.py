@@ -4,6 +4,7 @@ artifacts directory the layout's `@study_artifacts@` names, made as a study ship
 Every name here is invented. The commit is a stand-in of forty hex digits: nothing here runs a real tool server.
 """
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -63,7 +64,7 @@ WITH_SLOTS = MINIMAL + SLOTS
 WITH_TOOLSERVER = MINIMAL + SLOTS + TOOLSERVER
 USERS = ("alpha-reader", "slot1-data", "slot1-tools", "slot2-data", "slot2-tools")  # the fixed user and the slots'
 
-# a minimal platform template: the study space, support, credentials and tls, and nothing of slots or a tool server
+# a minimal platform template: the study space, support and credentials, and nothing of slots or a tool server
 TEMPLATE = """\
 zone = { name = "zone", url = "@zone_url@" }
 providers.oak = { url = "@provider_url.oak@", id = "@provider_id.oak@" }
@@ -73,7 +74,6 @@ support = { providers = ["oak", "elm"], local = "oak" }
 credentials.admin = { file = "secrets/admin.token" }
 credentials.users = { directory = "secrets/users", pattern = "{user}.pass" }
 principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-reader@" }
-tls = { ca_file = "ca/federation-ca.pem" }
 """
 
 
@@ -119,3 +119,36 @@ def artifacts(directory: Path) -> Path:
     (directory / "manifests" / "knowledge.json").write_text(frozen(READ_TOOLS), encoding="utf-8")
     (directory / "manifests" / "writing.json").write_text(frozen(WRITE_TOOLS), encoding="utf-8")
     return directory
+
+
+def secret_of(user: str) -> str:
+    """The password a test gives a user: one nothing else in the root may hold."""
+    return f"pw-{user}-" + hashlib.sha256(user.encode()).hexdigest()[:20]
+
+
+def make_root(layout, *, passwords: bool = True) -> dict[str, str]:
+    """The root's secrets as `up` leaves them once the users exist: the admin token and one password file per
+    principal (each 0600, in 0700 directories). Returns each secret's value by its file's name, to scan the rest."""
+    layout.secrets.mkdir(parents=True, exist_ok=True)
+    layout.users.mkdir(parents=True, exist_ok=True)
+    layout.secrets.chmod(0o700)
+    layout.users.chmod(0o700)
+    found = {"admin.token": "an-admin-token-" + hashlib.sha256(b"admin").hexdigest()[:20]}
+    layout.admin_token.write_text(found["admin.token"], encoding="utf-8")
+    layout.admin_token.chmod(0o600)
+    if passwords:
+        for principal in layout.spec.principals:
+            path = layout.password(principal.name)
+            path.write_text(secret_of(principal.name), encoding="utf-8")
+            path.chmod(0o600)
+            found[path.name] = secret_of(principal.name)
+    return found
+
+
+def ids_of(spec) -> dict:
+    """The ids Onezone would have given: the facts' view of every user, provider and space."""
+    return {
+        "users": {p.name: f"uid-{p.name}" for p in spec.principals},
+        "providers": {p.name: f"pid-{p.name}" for p in spec.providers},
+        "spaces": {s.name: f"sid-{s.name}" for s in spec.spaces},
+    }
