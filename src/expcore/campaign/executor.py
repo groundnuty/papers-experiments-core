@@ -83,6 +83,7 @@ class DeclaredSecrets:
     them."""
 
     secrets: tuple[str, ...] = ()
+    called: bool = False  # `declare_secrets` was called and its check passed: only then is a diagnostic shown (C40)
 
 
 @dataclass(frozen=True)
@@ -148,10 +149,11 @@ class RunRequest:
         of the failed start (which goes to the row, the marker and the export) would keep it. Declared here, the secret
         is in the attempt's redaction context from now on: the diagnostic and the harness-defect log are redacted with
         it, and `record_run` merges it with its own `secrets`, so the record is too. Call it first, in the executor's
-        own task, once or more; a secret already declared is not declared again. **Without a call, a failed start's
-        diagnostic is withheld** (never a diagnostic redacted against a partial list of the run's secrets); a call with
-        no argument says there is nothing beyond the environment's, the models' keys and the registry, and the
-        diagnostic is kept.
+        own task, once or more; a secret already declared is not declared again. **Only a call shows a failed start's
+        diagnostic in the export and the report** (never a diagnostic redacted against a partial list of the run's
+        secrets): without one the row and the marker keep a stub, and the text goes to the campaign's local log alone. A
+        call with no argument says there is nothing beyond the environment's, the models' keys and the registry. A
+        `record_run` that is given secrets is not a declaration.
 
         `secrets` are values; `secret_env` are names of variables whose values are secrets whatever the names, read
         from `environ` (the process's by default) **now** and kept as values. A given `environ` is the mapping the
@@ -191,6 +193,7 @@ class RunRequest:
             read += [value for value in kept if len(value) >= MIN_SECRET_LEN]
         held = tuple(dict.fromkeys([*self.declared.secrets, *given, *read]))
         self.declared.secrets = held
+        self.declared.called = True  # after the check: a refused declaration declares nothing
         if self.defect_log is not None:
             self.defect_log.redact_with(lambda: redactor_for(self.backend, secrets=held, models=self.models))
 

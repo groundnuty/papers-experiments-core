@@ -219,6 +219,7 @@ class TinyExecutor:
         slots = {"TASK": task.id, "REGION": task.attributes["region"], "HINT": HINTS[factors["tools"]]}
         user = self.template.render(slots, study_run=True)  # study_run: no draft marker reaches the model
         shelf = Shelf()
+        request.declare_secrets()  # no secret beyond the environment's: a failed start's diagnostic is then shown (C40)
         instruments = [FactsServed(shelf)]  # fresh for every run: an instrument holds one run's reading
         identity = {"run_key": request.run_key, "factors": dict(factors), "attempt": request.identity.attempt}
         await asyncio.to_thread(start_instruments, instruments, identity)  # blocking I/O stays off the event loop

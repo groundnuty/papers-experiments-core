@@ -15,18 +15,24 @@ no phase or instrument. An error with neither has no snapshot, and the attempt i
 
 The snapshot goes through the attempt's redactor, as an instrument's snapshot goes through the record's (R12): every
 string, a key among them, loses the secrets of the environment, the models and the registry, and those the executor
-declared (`RunRequest.declare_secrets`: an executor starts its instruments before `record_run`, so a secret it names
-only to `record_run` is not known when a start fails, and it declares it first, or declares none to say there is
-nothing more). **Never a diagnostic redacted against a partial list of the run's secrets**: until the executor has
-declared (or `record_attempt` has given the attempt's whole context) a diagnostic is withheld: the snapshot keeps the
-phase alone (the instrument's name is the study's own word, and can be a secret only the executor knows) and is
-`{"ok": false, "error": "Withheld", "why": ...}`; a failed start that gave no diagnostic is `{"phase": "start"}`. It
-is kept on the attempt's row (`attempts.diagnostic`, canonical JSON), in its outcome marker (so recovery commits it
-after a kill) and in the export (`attempt_diagnostics`, only when an attempt kept one). A snapshot that cannot be kept
-(not a JSON object, a number JSON cannot hold, more than `LIMIT_BYTES`, a redaction that raised) is `{"ok": false,
-"error": <class>}` with the phase and the instrument's name, redacted like the rest (only the phase, when the redactor
-cannot be built), as an instrument whose `finish` failed is (O08): it is never dropped, never guessed, and never an
-exception, since one that escaped the attempt runner would stop dispatch (C17).
+declared (`RunRequest.declare_secrets`).
+
+**Never a diagnostic redacted against a partial list of the run's secrets.** An executor starts its instruments before
+`record_run`, so a secret it names only to `record_run` is not known when a start fails. Only an attempt whose
+executor called `declare_secrets` (a call with no argument says it has none beyond the environment's) has its
+diagnostic shown in the row, the marker, the export and the report. For any other the snapshot is a stub, `{"phase":
+"start", "ok": false, "error": "Withheld", "why": ...}`: the phase alone, since the instrument's name is the study's
+own word and can be a secret only the executor knows (a failed start that gave no diagnostic is `{"phase": "start"}`).
+The text of a withheld diagnostic goes to the campaign's local log and nowhere else (`private_text`,
+`DefectLog.keep_private`): a store, its snapshot and the markers are merged and packaged, and `out/logs` is the one
+place that is not (`package.spec.LOCAL_ONLY`).
+
+What is shown is kept on the attempt's row (`attempts.diagnostic`, canonical JSON), in its outcome marker (so recovery
+commits it after a kill) and in the export (`attempt_diagnostics`, only when an attempt kept one). A snapshot that
+cannot be kept (not a JSON object, a number JSON cannot hold, more than `LIMIT_BYTES`, a redaction that raised) is
+`{"ok": false, "error": <class>}` with the phase and the instrument's name, redacted like the rest (only the phase,
+when the redactor cannot be built), as an instrument whose `finish` failed is (O08): it is never dropped, never
+guessed, and never an exception, since one that escaped the attempt runner would stop dispatch (C17).
 """
 
 import json
@@ -39,9 +45,13 @@ from expcore.records.redact import Redactor
 
 EXPORT_KEY = "attempt_diagnostics"
 LIMIT_BYTES = 16 * 1024  # the canonical JSON of a snapshot, before redaction
+WITHHELD_ERROR = (
+    "Withheld"  # the `error` of a snapshot whose diagnostic is not shown: the stub of an undeclared executor
+)
 WITHHELD = (
-    "the executor did not tell the core its secrets (RunRequest.declare_secrets) before it started its instruments, so "
-    "the diagnostic cannot be shown redacted with all of them; declare them, or declare none, and it is kept"
+    "withheld: the executor declared no secrets (RunRequest.declare_secrets) before it started its instruments, so the "
+    "diagnostic cannot be shown redacted with all of the run's secrets; its text is in the campaign's local log only. "
+    "Declare them, or declare none, and the diagnostic is shown"
 )
 
 
@@ -59,17 +69,18 @@ def snapshot_of(
     """The snapshot an attempt keeps of an error, redacted with `redactor()`; None when the error has nothing to keep
     (it is no infrastructure error, or it names no instrument and carries no diagnostic). Never raises.
 
-    `complete` says the redaction context is known to be whole: the executor declared its secrets, or `record_attempt`
-    gave the attempt's whole context. Never a diagnostic redacted against a partial list of the run's secrets: without
-    it, a diagnostic is withheld (`{"ok": false, "error": "Withheld", "why": WITHHELD}`, with the phase and the
-    instrument), since a secret that only the executor knows would be kept on the row, in the marker and the export.
-    A failed start that gave no diagnostic has nothing to redact and is kept either way."""
+    `complete` says the executor declared its secrets (`RunRequest.declare_secrets`; a call with none says it has
+    none). Never a diagnostic redacted against a partial list of the run's secrets: without it a diagnostic is withheld
+    (`{"phase": "start", "ok": false, "error": "Withheld", "why": WITHHELD}`: the phase alone, since the instrument's
+    name can be a secret too), because a secret that only the executor knows would be kept on the row, in the marker
+    and in the export, which ship. A failed start that gave no diagnostic has nothing to redact: it is the phase, and
+    the instrument's name only when `complete`."""
     given, origin = getattr(error, "diagnostic", None), getattr(error, "origin", None)  # a subclass may skip the base
     if not isinstance(error, InfraError) or (given is None and origin is None):
         return None
     if not complete:  # only the literal phase: the instrument's name is the study's own word, a secret's value perhaps
         head = _phase(origin)
-        return head if given is None else {**head, "ok": False, "error": "Withheld", "why": WITHHELD}
+        return head if given is None else {**head, "ok": False, "error": WITHHELD_ERROR, "why": WITHHELD}
     try:
         if given is not None and not isinstance(given, Mapping):
             raise TypeError("a diagnostic is a JSON object")
@@ -84,6 +95,26 @@ def snapshot_of(
         return dict(redacted)
     except Exception as problem:  # whatever is wrong with it, the attempt keeps its result and says the snapshot failed
         return {**_head(origin, redactor), "ok": False, "error": type(problem).__name__}
+
+
+def private_text(error: BaseException) -> str | None:
+    """What the campaign's local log keeps of a diagnostic that is not shown: the instrument, the phase and the
+    diagnostic as canonical JSON, cut to `LIMIT_BYTES`; None when the error carries no diagnostic. Never raises. It goes
+    through the log's redactor when written, and nowhere else: a store, its snapshot and the markers ship."""
+    given = getattr(error, "diagnostic", None)
+    if not isinstance(error, InfraError) or given is None:
+        return None
+    try:
+        text = json.dumps(
+            {**dict(getattr(error, "origin", None) or {}), "diagnostic": given}, sort_keys=True, allow_nan=False
+        )
+    except (TypeError, ValueError) as problem:
+        return f"a diagnostic that is not JSON ({type(problem).__name__}), not kept"
+    return (
+        text
+        if len(text.encode("utf-8")) <= LIMIT_BYTES
+        else text.encode("utf-8")[:LIMIT_BYTES].decode("utf-8", "ignore")
+    )
 
 
 def _phase(origin: Any) -> dict[str, Any]:

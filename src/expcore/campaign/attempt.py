@@ -73,7 +73,7 @@ from expcore.campaign.no_request import EVENT as ZERO_EVENT
 from expcore.campaign.no_request import REASON as ZERO_REASON
 from expcore.campaign.no_request import settle_unsent
 from expcore.campaign.settings import SchedulerConfig
-from expcore.campaign.start_diagnostic import snapshot_of
+from expcore.campaign.start_diagnostic import private_text, snapshot_of
 from expcore.campaign.store import Store
 from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.campaign.units import UnitHealth
@@ -368,7 +368,7 @@ class AttemptRunner:
                     treatment_targets=targets,
                     sent_nothing=sent_no_request(error, backend),
                 )
-                result = self._with_diagnostic(result, error, defects)
+                result = self._with_diagnostic(result, error, defects, declared=request.declared.called)
                 result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
@@ -386,15 +386,23 @@ class AttemptRunner:
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
 
-    def _with_diagnostic(self, result: AttemptResult, error: BaseException, defects: DefectLog) -> AttemptResult:
-        """Keep on the result the snapshot an infrastructure error carries (a failed instrument start's), redacted
-        with the attempt's redaction context as it stands (C40): the runner's own base (the process, the models, the
-        registry) and the one installed after it (the secrets the executor declared with `RunRequest.declare_secrets`,
-        which it calls before it starts its instruments since `record_run` comes after, or the whole context
-        `record_attempt` gave), one after the other. Never a diagnostic redacted against a partial list: until the
-        executor has declared (or `record_attempt` has given the whole context) the diagnostic is withheld, with the
-        phase alone, and the snapshot says so. One that cannot be kept is recorded as failed, not raised."""
-        kept = snapshot_of(error, defects.build_redactor, complete=defects.context_given)
+    def _with_diagnostic(
+        self, result: AttemptResult, error: BaseException, defects: DefectLog, *, declared: bool
+    ) -> AttemptResult:
+        """Keep on the result the snapshot an infrastructure error carries (a failed instrument start's), redacted with
+        the attempt's redaction context as it stands (C40): the runner's own base (the process, the models, the
+        registry) and the one installed after it (the secrets the executor declared with
+        `RunRequest.declare_secrets`, or the whole context `record_attempt` gave), one after the other.
+
+        Never a diagnostic redacted against a partial list of the run's secrets: `declared` says the executor called
+        `declare_secrets` (a call with no secret says it has none), which is the only way to show one, since a secret
+        only a later `record_run` names is not known to the core, and `record_run` given secrets is not a declaration.
+        Otherwise the row and the marker keep a stub, with the phase alone and the reason, and the text goes to the
+        campaign's local log, which no merge or package carries. One that cannot be kept is recorded as failed, not
+        raised."""
+        kept = snapshot_of(error, defects.build_redactor, complete=declared)
+        if not declared and (text := private_text(error)) is not None:
+            defects.keep_private("a diagnostic withheld, since the executor declared no secrets", text)
         return result if kept is None else dataclasses.replace(result, diagnostic=kept)
 
     def _settle_failure(

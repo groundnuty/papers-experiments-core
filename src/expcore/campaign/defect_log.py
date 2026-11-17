@@ -96,7 +96,22 @@ def write_failure(
         text = redactor().with_lines().text("".join(traceback.format_exception(error)))  # plain text, never sealed
     except ConfigError as refusal:
         text = f"the traceback is withheld, since it cannot be redacted: {refusal}\n"
-    head = f"=== {stamp} {title}\n"
+    return _append(root, f"=== {stamp} {title}\n", text)
+
+
+def write_note(root: Path, *, title: str, stamp: str, text: str, redactor: Callable[[], Redactor | Chained]) -> Path:
+    """Append a note to the campaign's local log, redacted as a traceback is (each line of a multi-line secret too);
+    return the log's path. What a diagnostic that is not shown elsewhere keeps (C40): the log is never merged,
+    committed or packaged (`package.spec.LOCAL_ONLY`), which the stores, their snapshots and the markers are not."""
+    try:
+        text = redactor().with_lines().text(text)
+    except ConfigError as refusal:
+        text = f"the note is withheld, since it cannot be redacted: {refusal}"
+    return _append(root, f"=== {stamp} {title}\n", text)
+
+
+def _append(root: Path, head: str, text: str) -> Path:
+    """Append an entry to the campaign's local log; return the log's path."""
     path = log_path(root)
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,17 +157,12 @@ class DefectLog:
         self.root, self.run_key, self.attempt, self._stamp = Path(root), run_key, attempt, stamp
         self._base = redactor  # the runner's own: the process, the models and the registry, whatever is installed after
         self._redactor = redactor
-        # whether the executor said the redaction context is the attempt's whole one (`redact_with`); until then it is
-        # the environment's, the models' and the registry's secrets, and a secret only the executor knows is not in it
-        self.context_given = False
         self.failure: Exception | None = None  # the first entry that could not be written, if any
         self._where = f"the harness-error log {log_path(self.root)}"
 
     def redact_with(self, redactor: Callable[[], Redactor]) -> None:
-        """Use this redactor for the attempt's entries from now on. It is the executor's word that the context is the
-        attempt's whole one: `RunRequest.declare_secrets` and `record_attempt` both say it so."""
+        """Use this redactor for the attempt's entries from now on."""
         self._redactor = redactor
-        self.context_given = True
 
     def build_redactor(self) -> Chained:
         """The redactor of the attempt's redaction context as it stands now: the runner's own base and the one
@@ -173,6 +183,22 @@ class DefectLog:
                 stamp=self._stamp(),
                 run_key=self.run_key,
                 attempt=self.attempt,
+                redactor=self.build_redactor,
+            )
+        except Exception as failure:  # kept, and raised by the attempt once its result is stored
+            if self.failure is None:
+                self.failure = failure
+            return None
+
+    def keep_private(self, title: str, text: str) -> Path | None:
+        """Write a note of this attempt to the campaign's local log, redacted as an entry is (`write_note`); return the
+        log's path, or None when it could not be written (the failure is kept for `raise_failure`, as an entry's is)."""
+        try:
+            return write_note(
+                self.root,
+                title=f"{self.run_key} attempt {self.attempt}: {title}",
+                stamp=self._stamp(),
+                text=text,
                 redactor=self.build_redactor,
             )
         except Exception as failure:  # kept, and raised by the attempt once its result is stored

@@ -15,7 +15,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from expcore.campaign.start_diagnostic import EXPORT_KEY
+from expcore.campaign.start_diagnostic import EXPORT_KEY, WITHHELD_ERROR
 
 HEADING = "### Instrument start failures"
 NONE = "-"  # an instrument that is not named, and the cells of a condition's row of zeros
@@ -23,10 +23,12 @@ NOTES = textwrap.wrap(
     "Attempts that kept a diagnostic snapshot, which a failed instrument start leaves on the attempt that was set "
     "aside and run again: the instrument that failed, and what it checked and saw as the instrument gave it, redacted "
     "as an instrument's snapshot is. An infrastructure failure from anywhere else that carried a diagnostic is listed "
-    "with no instrument (-), as is a failed start of an executor that did not declare its secrets. Charged counts "
-    "the attempts that used one of the run's attempts; Not kept counts the snapshots that could not be kept (not a "
-    "JSON object, too large, a redaction that failed, or withheld because the executor did not declare its secrets "
-    "before it started its instruments), which the export "
+    "with no instrument (-). Charged counts the attempts that used one of the run's attempts. Withheld counts the "
+    "attempts whose executor declared no secrets (`RunRequest.declare_secrets`, called before it starts an "
+    "instrument): the core cannot show a diagnostic redacted against a partial list of the run's secrets, so the "
+    "export and this report say that it was withheld and why, never its text, which is in the campaign's local log "
+    "only; such an attempt names no instrument. Not kept counts the snapshots that could not be kept (not a JSON "
+    "object, too large, or a redaction that failed), which the export "
     f"records as failed. The snapshots are in export.json under {EXPORT_KEY}, one entry per attempt.",
     width=118,
 )
@@ -53,18 +55,22 @@ def section(export: Mapping[str, Any], table: Table) -> list[str]:
     sharded = any("shard" in entry for entry in entries)
     found: Counter[tuple[Any, ...]] = Counter()
     charged: Counter[tuple[Any, ...]] = Counter()
+    withheld: Counter[tuple[Any, ...]] = Counter()
     unkept: Counter[tuple[Any, ...]] = Counter()
     for entry in entries:
         key = _key(entry)
         found[key] += 1
         charged[key] += int(bool(entry["charged"]))
-        unkept[key] += int(entry["diagnostic"].get("ok") is False)
+        failed = entry["diagnostic"].get("ok") is False
+        is_withheld = failed and entry["diagnostic"].get("error") == WITHHELD_ERROR
+        withheld[key] += int(is_withheld)
+        unkept[key] += int(failed and not is_withheld)
     present = {key[:2] for key in found}  # (shard, condition) with a row
     planned = {(entry.get("shard"), entry["condition"]) for name in _RUN_LISTS for entry in export.get(name, [])}
-    rows = [[*key, found[key], charged[key], unkept[key]] for key in found]
-    rows += [[shard, condition, NONE, NONE, NONE, 0, 0, 0] for shard, condition in planned - present]
+    rows = [[*key, found[key], charged[key], withheld[key], unkept[key]] for key in found]
+    rows += [[shard, condition, NONE, NONE, NONE, 0, 0, 0, 0] for shard, condition in planned - present]
     rows.sort(key=_order)
-    header = ["Condition", "Instrument", "Kind", "State", "Attempts", "Charged", "Not kept"]
+    header = ["Condition", "Instrument", "Kind", "State", "Attempts", "Charged", "Withheld", "Not kept"]
     if sharded:
         header.insert(0, "Shard")
         rows = [[NONE if row[0] is None else row[0], *row[1:]] for row in rows]
