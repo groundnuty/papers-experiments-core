@@ -459,7 +459,10 @@ need_2xx() {  # <status> <what> <body-file>: fail on anything but 2xx
   [[ $1 =~ ^2[0-9][0-9]$ ]] || die "$2: HTTP $1: $(head -c 300 -- "$3" 2>/dev/null | tr -cd '[:print:]')"
 }
 
-jsonget() { "$HPCOP_PY" -I "$HPCOP_BUNDLE/jsonget.py" "$@"; }   # <file> <path> [--default V]
+# <file> <path> [--default V]. A JSON null is no value: the default stands in for it, and without a default it exits
+# JSONGET_NULL (3), never printing the word null; 2 is a field that is not there or a file that is not JSON.
+JSONGET_NULL=3
+jsonget() { "$HPCOP_PY" -I "$HPCOP_BUNDLE/jsonget.py" "$@"; }
 
 node_fqdn() {
   local f
@@ -596,6 +599,39 @@ wait_ready() {  # <workdir> <service pid> [timeout s] [fresh|restart]: until the
     sleep 1
   done
   die "timed out waiting for the deployment (see $log)"
+}
+
+# The readiness budget of a start, in whole seconds: the 1800 s wait_ready has always been given, or HPCOP_READY_SECONDS
+# (a test shortens it). finish.sh spends it on wait_ready and then on wait_domain, so one deadline covers both.
+ready_budget() {  # prints it; fails on anything that is not a whole number of seconds from 1 to 99999
+  local s=${HPCOP_READY_SECONDS:-1800}
+  [[ $s =~ ^[1-9][0-9]{0,4}$ ]] || die "HPCOP_READY_SECONDS is '$s', not a whole number of seconds from 1 to 99999"
+  printf '%s\n' "$s"
+}
+
+# op_worker's /configuration, once it holds a domain. op_worker answers `domain` from the provider record it reads over
+# its Onezone connection, so a start whose REST listener already answers can say null for a moment before that
+# connection is up (live, a restart: the identity check ran 1.9 s before op_worker logged the connection, and compared the
+# word null with the recorded domain of a service that had not changed). A null or empty domain is waited for, polling
+# every HPCOP_POLL_S (1) s up to <deadline>, a SECONDS value: the end of the readiness budget, which the wait is part of.
+# There is always one read, and the first non-empty domain ends the wait whatever it is: the identity check then compares
+# it as ever, so another domain is refused as changed, with no wait. A field that is not there (or an answer that is not
+# JSON) is not a connection coming up, and fails at once.
+wait_domain() {  # <tmpdir> <fqdn> <ca> <service pid> <deadline> <budget s>: leaves the answer in <tmpdir>/conf.json
+  local code rc dom
+  while :; do
+    code=$(http GET "https://$2:8443/configuration" "$1/conf.json" --cacert "$3" --resolve "$2:8443:127.0.0.1")
+    need_2xx "$code" "op_worker /configuration" "$1/conf.json"
+    rc=0; dom=$(jsonget "$1/conf.json" domain) || rc=$?
+    case $rc in
+      0) if [[ -n $dom ]]; then return 0; fi ;;
+      "$JSONGET_NULL") ;;
+      *) die "op_worker's /configuration has no readable domain field (jsonget status $rc, its message above)" ;;
+    esac
+    (( SECONDS < $5 )) || die "the provider's domain stayed null (or empty) in op_worker's /configuration for the readiness budget of $6 s: its Onezone connection did not come up, so its identity could not be checked"
+    alive "$4" || die "the service exited before it reported its domain"
+    sleep "${HPCOP_POLL_S:-1}"
+  done
 }
 
 cb_status() {  # <tmpdir> <user> <password>: HTTP status of an authenticated GET on this node's Couchbase

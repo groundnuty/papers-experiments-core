@@ -35,10 +35,10 @@ read_secret PW "$S/passphrase"; curl_auth_file "$T/admin.cfg" admin "$PW"; unset
 
 code=$(http GET "$OZ/user" "$T/user.json" "${TLS[@]}" -K "$T/admin.cfg")
 need_2xx "$code" "zone admin GET /user" "$T/user.json"
-ADMIN_ID=$(jsonget "$T/user.json" userId)
+ADMIN_ID=$(jsonget "$T/user.json" userId) || die "the zone's GET /user names no userId (null or missing)"
 "$HPCOP_PY" -I "$HPCOP_BUNDLE/tokenbody.py" "$NAME" "$ADMIN_ID" "$TTL" "$LIMIT" > "$T/body.json"
 code=$(http POST "$OZ/user/tokens/named" "$T/token.json" "${TLS[@]}" -K "$T/admin.cfg" \
   -H 'Content-Type: application/json' --data @"$T/body.json")
 need_2xx "$code" "mint the registration token" "$T/token.json"
-jsonget "$T/token.json" token
+jsonget "$T/token.json" token || die "the zone's answer holds no registration token (null or missing)"
 say "registration token for '$NAME' minted (valid ${TTL}s, usage limit $LIMIT)"
