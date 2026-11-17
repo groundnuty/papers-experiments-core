@@ -1,6 +1,6 @@
 # Provenance: new
-"""The root half of a signal to the agent's processes: a standalone script, run as `sudo PYTHON -I -c SOURCE TERM|KILL`
-(O72).
+"""The root half of a signal to the agent's processes: a standalone script, run as
+`sudo PYTHON -I -B -c SOURCE TERM|KILL` (O72).
 
 `procsignal.py` passes this file's source to the interpreter it runs under, so the script imports nothing but the
 standard library and nothing of the package. The agent runs as another user, so the harness signals its processes
@@ -174,7 +174,7 @@ def _kill_if_started(pid, start, digest, signum):
 def main(argv, stdin):
     """`SIGNAL` (TERM or KILL) in `argv`, the request on `stdin`; the answer is printed, the exit code returned."""
     if len(argv) != 1 or argv[0] not in SIGNALS:
-        print("usage: PYTHON -I -c SOURCE TERM|KILL, the request on stdin", file=sys.stderr)
+        print("usage: PYTHON -I -B -c SOURCE TERM|KILL, the request on stdin", file=sys.stderr)
         return 2
     try:
         targets = json.load(stdin)["targets"]

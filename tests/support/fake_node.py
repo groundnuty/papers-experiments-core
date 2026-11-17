@@ -503,7 +503,7 @@ class FakeNode:
         return apply_output_cap(result, output_cap, marker)
 
     def _one_shot(self, parsed: Exec) -> CmdResult:
-        if parsed.command[1:4] == ["-I", "-c", workdisk.wrapper_source()]:
+        if parsed.command[1:5] == ["-I", "-B", "-c", workdisk.wrapper_source()]:
             return self._copy_helper(parsed)
         if parsed.command[-1] == CERTIFI_PROBE:
             return CmdResult(0, f"certifi:{CERTIFI}\n")
@@ -516,7 +516,7 @@ class FakeNode:
         and the staging directory where the exec binds it. While it runs, a process of its namespace carries the exec's
         environment, and the watch is given time to list it; one the watch killed makes the exec's exit 137."""
         environ = tuple(f"{k}={v}" for k, v in parsed.env.items())
-        proc = self._new_proc(self.new_namespace(), "python3", environ=environ, cmdline=tuple(parsed.command[:3]))
+        proc = self._new_proc(self.new_namespace(), "python3", environ=environ, cmdline=tuple(parsed.command[:4]))
         try:
             if self.wait_for_watch:
                 seen, until = self.listed, time.monotonic() + 0.3
@@ -536,7 +536,7 @@ class FakeNode:
             request["root"] = str(image.backing / parsed.images["/work"].strip("/"))
         if str(request.get("dest", "")).startswith(workdisk.EXPORT + "/"):
             request["dest"] = export + request["dest"][len(workdisk.EXPORT) :]
-        argv = [sys.executable, "-I", "-c", parsed.command[3], parsed.command[4]]
+        argv = [sys.executable, "-I", "-B", "-c", parsed.command[4], parsed.command[5]]
         return run_bounded(argv, 120, input=json.dumps(request))
 
     def _run_cell(self, parsed: Exec, stdin: str, nonce: str, size: int, digest: str, python: str) -> CmdResult:

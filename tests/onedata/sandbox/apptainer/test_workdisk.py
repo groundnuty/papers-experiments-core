@@ -205,7 +205,7 @@ def test_o71_a_named_output_is_copied_out_of_the_image_by_execs_of_the_image(nod
         done = box.collect(tmp_path / "out", ["out"])
         assert done["outputs"] == {"out": True}
         assert (tmp_path / "out" / "work" / "out" / "result.txt").read_text() == "42\n"
-        copies = [e for e in node.execs if e.command[:3] == [settings.apptainer.python, "-I", "-c"]]
+        copies = [e for e in node.execs if e.command[:4] == [settings.apptainer.python, "-I", "-B", "-c"]]
         assert [e.command[-1] for e in copies] == ["list", "copy"] * 2  # the start's proof, then the collection
         for e in copies:
             assert e.images["/work"] == "/work"

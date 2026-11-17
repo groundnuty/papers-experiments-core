@@ -5,8 +5,8 @@ The harness lists the agent container's processes from its cgroup and signals th
 (the agent runs as another user), so a pid that ends and is given to another process between the two could be the data
 gate or the dispatcher on the agent's node. A listing therefore carries, with each process's pid and start tick, the
 digest of its command line (`cmd_digest`, key `cmd_sha256`), and `signal_processes` hands both to the root half
-(`killhelper.py`, run as `sudo PYTHON -I -c SOURCE TERM|KILL`, with a pidfd where the kernel has one), which signals a
-pid only while it is still that process. It answers for each target (`Signalled`): a process it signalled, found gone
+(`killhelper.py`, run as `sudo PYTHON -I -B -c SOURCE TERM|KILL`, with a pidfd where the kernel has one), which signals
+a pid only while it is still that process. It answers for each target (`Signalled`): a process it signalled, found gone
 or found replaced by another has been reached; one it did not signal, because its command line changed (an exec), its
 identity could not be read or the signal could not be sent, has not, and the caller lists it again and never reads it
 as gone or as quiet.
@@ -27,7 +27,7 @@ from typing import Any
 from expcore_onedata.sandbox import killhelper
 from expcore_onedata.sandbox.hostops import HostOps
 
-PROGRAM = Path(killhelper.__file__).read_text(encoding="utf-8")  # runs as root under this interpreter, `-I -c`
+PROGRAM = Path(killhelper.__file__).read_text(encoding="utf-8")  # runs as root under this interpreter, `-I -B -c`
 KEY = "cmd_sha256"  # the digest of a listed process's command line, in the listing's dicts
 digest_of = killhelper.digest_of
 REACHED = (killhelper.SIGNALLED, killhelper.GONE, killhelper.REPLACED)  # the listed process needs no further signal
@@ -89,7 +89,7 @@ def signal_processes(host: HostOps, procs: Sequence[Mapping[str, Any]], name: st
         return Signalled({})
     targets = [{"pid": p["pid"], "start": p.get("start"), "cmd_sha256": p.get(KEY)} for p in procs]
     done = host.run(
-        [sys.executable, "-I", "-c", PROGRAM, name], timeout_s, sudo=True, input=json.dumps({"targets": targets})
+        [sys.executable, "-I", "-B", "-c", PROGRAM, name], timeout_s, sudo=True, input=json.dumps({"targets": targets})
     )
     if done.returncode != 0:
         return Signalled({}, failed=f"exit {done.returncode}: {done.stderr.strip()[:200]}")

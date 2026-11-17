@@ -242,7 +242,8 @@ def superblock(image: Path) -> dict[str, Any] | None:
 @functools.cache
 def wrapper_source() -> str:
     """The copy helper (`copyhelper.py`, unchanged) behind a few lines that move the listing's device to the one the
-    root has in this exec (the module's docstring); run as `python -I -c <source> list|copy`, its request on stdin."""
+    root has in this exec (the module's docstring); run as `python -I -B -c <source> list|copy`, its request on
+    stdin."""
     return f"HELPER = {copyout.HELPER.read_text(encoding='utf-8')!r}\n{_WRAPPER_BODY}"
 
 
@@ -288,7 +289,7 @@ class ImageCopyHost:
                 raise SandboxError("a copy out of the work disk must go to the run's staging directory")
             request = {**request, "dest": str(Path(EXPORT) / dest.relative_to(self._staging)),
                        "listed_device": self._listed}  # fmt: skip
-        argv = self._argv_of([self._python, "-I", "-c", wrapper_source(), operation])
+        argv = self._argv_of([self._python, "-I", "-B", "-c", wrapper_source(), operation])
         done = self._node.apptainer(argv, timeout_s, input=json.dumps(request))
         if operation == "list":
             self._listed = listed_device(done.stdout) if done.returncode == 0 else None
