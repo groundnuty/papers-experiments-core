@@ -11,6 +11,8 @@ provider with two storages lists them in no order a support may rely on. The own
 for one initial scan of the storage and no later one, which only adds the files it finds; `wait_import` waits for it.
 """
 
+import json
+import os
 import secrets
 import time
 from collections.abc import Callable, Sequence
@@ -104,7 +106,9 @@ class Bootstrap:
     def slot_planes(self) -> dict[str, str]:
         """The slot users the layout's platform template declares (`fedtools.slot_users`), by principal name. They are
         ordinary principals, provisioned by the steps below; the difference is that one that exists is never changed."""
-        return self.__dict__.setdefault("_slot_planes", slot_users(self.layout.spec))
+        if "_slot_planes" not in self.__dict__:
+            self.__dict__["_slot_planes"] = slot_users(self.layout.spec)
+        return self.__dict__["_slot_planes"]
 
     @property
     def slot_status(self) -> dict[str, str]:
@@ -115,6 +119,36 @@ class Bootstrap:
     @property
     def _existing(self) -> set[str]:
         return self.__dict__.setdefault("_existing_slot_users", set())
+
+    @property
+    def _pending_file(self):
+        """The root's record of the slot users this bootstrap made and has not finished: written before a user is made,
+        cleared once the audit has passed. A rerun after an up that stopped midway (a panel answering 500) finishes them
+        as it finishes any principal; a slot user that is not in it was there before, and stays read-only. Names only,
+        in the root's private directory."""
+        return self.layout.secrets / "slot-users.pending"
+
+    def _pending(self) -> set[str]:
+        try:
+            names = json.loads(self._pending_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        except (OSError, ValueError):
+            raise RuntimeError("the root's record of slot users made and not finished cannot be read") from None
+        return set(names) if isinstance(names, list) and all(isinstance(n, str) for n in names) else set()
+
+    def _record_pending(self, names: set[str]) -> None:
+        path = self._pending_file
+        if not names:
+            path.unlink(missing_ok=True)
+            return
+        scratch = path.with_name(f".{path.name}.{os.getpid()}.part")
+        descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(sorted(names)))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(scratch, path)
 
     @staticmethod
     def refuse_slot(user: str, attribute: str, why: str) -> RuntimeError:
@@ -214,13 +248,15 @@ class Bootstrap:
             own = basic(user, password)
             try:
                 self.ids.users[user] = self.zone("GET", "/user", "user", auth=own)["userId"]
-                if user in self.slot_planes:
+                if user in self.slot_planes and user not in self._pending():
                     self._existing.add(user)  # it was there before this call: read-only from here on
                 continue
             except RestError as error:
                 if error.status not in (401, 403):
                     raise
             body = {"username": user, "password": password, "groups": []}
+            if user in self.slot_planes:  # recorded before it is made, so an up that stops midway can finish it
+                self._record_pending(self._pending() | {user})
             try:
                 self.rest.json(
                     "POST",
@@ -231,6 +267,7 @@ class Bootstrap:
                 )
             except RestError as error:
                 if user in self.slot_planes and error.status is not None and error.status < 500:
+                    self._record_pending(self._pending() - {user})  # the zone made nothing: it was never ours
                     if not kept:
                         path.unlink(missing_ok=True)  # a password this call made for a user it could not make
                     raise self.refuse_slot(
@@ -462,6 +499,7 @@ class Bootstrap:
                 continue  # a template naming a user the layout lacks is refused when the file is rendered
             if user not in self._existing:
                 self.slot_status[user] = SLOT_CREATED
+                self._record_pending(self._pending() - {user})  # made, and its memberships verified as declared
                 continue
             own = basic(user, ensure_secret(self.layout.password(user)))
             declared = {self.ids.spaces[name] for name in principal.spaces}

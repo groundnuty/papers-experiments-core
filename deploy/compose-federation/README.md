@@ -102,7 +102,8 @@ back directly and effectively. The platform template declares the slots and the 
 its conditions, with paths under `@study_artifacts@`). A **slot user that already exists is never changed**: made by hand or
 by an earlier up, it is verified, recorded `matched` in `facts.json` (`slot_users`) with nothing sent for it, or refused
 naming the user and the attribute (`password`, `membership of <space>`, `direct privileges in <space>`, `effective
-privileges in <space>`, `spaces`, `group`, `cluster`); a fixed principal is converged as it always was. The written file is
+privileges in <space>`, `spaces`, `group`, `cluster`); a fixed principal is converged as it always was. A slot user this
+up made and did not finish (it stopped midway) is recorded in `secrets/slot-users.pending` and finished by the rerun. The written file is
 loaded as a campaign loads it, and checked against the layout's principals (`fedtools.check_rendered`): a slot user that is
 no principal, an id that is not the facts', a data-path user with more than the baseline, and `rights` that are not exactly
 the privileges the layout gave the tool-server user are refused, so what the file says is what was provisioned.
