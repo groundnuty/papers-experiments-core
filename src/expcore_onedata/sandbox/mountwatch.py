@@ -2,7 +2,7 @@
 """The host's watcher of a mount run on an HPC node: every access to the mount's token file and its directory, any
 tracer on oneclient, and the proof that each cell is isolated from both, logged where no cell can write (O60).
 
-    python -I -m expcore_onedata.sandbox.mountwatch --log <file> --nonce <hex> --token <file> --mountpoint <dir>
+    python -I -B -m expcore_onedata.sandbox.mountwatch --log <file> --nonce <hex> --token <file> --mountpoint <dir>
         --oneclient <pid>:<start> --protect <dir> [--protect <dir> ...] [--poll-s 0.05]
 
 The host (`apptainer.hostmount`) starts it once oneclient's wrapper has read the token file into oneclient's

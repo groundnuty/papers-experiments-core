@@ -47,7 +47,11 @@ AGENT_PINS = {
     "HPC_EGRESS_SHIM_SHA256": "egress_shim_sha256",
     "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
 }
-AGENT_VARIABLES = {**AGENT_PATHS, **AGENT_PINS}
+# The study's own artifacts (its tool server's venv, clone and manifests) on the filesystem the login node and the
+# agent's node see: the directory a platform template (or a space's `data_manifest`) names as `@study_artifacts@`;
+# `up` digests the directory's tree into the federation's render identity (O74, hpcidentity).
+STUDY_PATHS = {"HPC_STUDY_ARTIFACTS": "study_artifacts"}
+OPTIONAL_VARIABLES = {**AGENT_PATHS, **AGENT_PINS, **STUDY_PATHS}  # each may be left out of site.env
 # HPC_QUOTA_CHECK's one value. It never applies to a federation bound onto scratch (a site that sets it with
 # HPC_STORAGE_ROOT is refused), and without a scratch root there is no check to skip (README, "Provider storage").
 QUOTA_CHECK_OFF = "off"
@@ -331,6 +335,11 @@ class Site:
     oneclient_bundle: str = ""
     oneclient_bundle_sha256: str = ""
     agent_work_root: str = ""
+    # The directory of the study's own artifacts (HPC_STUDY_ARTIFACTS), which `@study_artifacts@` stands for in a
+    # template: `up` takes the digest of its tree in its preflight and records it, with this value, in the state file,
+    # and the render identity holds the digest (never the path); empty when the site declares none, and then a
+    # template that names it is refused.
+    study_artifacts: str = ""
     # The providers' storage on the cluster's shared scratch filesystem and the guard of its inode quota (hpcstorage,
     # hpcquota; README, "Provider storage on scratch"). `storage_root` is the directory below which `up` makes the
     # federation's own storage; with none, nothing is made on scratch and no check runs. `quota_cmd` is the site's
@@ -362,7 +371,7 @@ class Site:
             "admin_mail": self.admin_mail,
             "billing_weight": self.billing_weight,
             "step_network": self.step_network,
-            **{attribute: getattr(self, attribute) for attribute in AGENT_VARIABLES.values()},
+            **{attribute: getattr(self, attribute) for attribute in OPTIONAL_VARIABLES.values()},
             "storage_root": self.storage_root,
         }
 
@@ -393,7 +402,9 @@ def checked_site(site: Site) -> Site:
     _absolute(site.node_tmp, "HPC_NODE_TMP")
     for entry in site.step_path.split(":"):
         _absolute(entry, "HPC_STEP_PATH")
-    if not re.fullmatch(r"[A-Za-z0-9_./-]+", site.node_python):
+    if not re.fullmatch(r"[A-Za-z0-9_./-]+", site.node_python) or (
+        "/" in site.node_python and not (os.path.isabs(site.node_python) and ".." not in site.node_python.split("/"))
+    ):  # every step starts in / (`--chdir=/`): a relative path would name another interpreter there
         raise SettingsError("HPCOP_PY: must be a command name or an absolute path")
     if site.core_python:
         _absolute(site.core_python, "HPC_CORE_PYTHON")
@@ -407,7 +418,7 @@ def checked_site(site: Site) -> Site:
             "HPC_STEP_NETWORK: must be an option of srun's --network (for example 'no_vni'): up to 128 letters, "
             "digits and _ . , = : + -, with no space"
         )
-    for variable, attribute in AGENT_PATHS.items():
+    for variable, attribute in {**AGENT_PATHS, **STUDY_PATHS}.items():
         if getattr(site, attribute):
             _absolute(getattr(site, attribute), variable)
     for variable, attribute in AGENT_PINS.items():
@@ -452,7 +463,7 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             admin_mail=environ.get("HPC_ADMIN_MAIL") or defaults.admin_mail,
             billing_weight=billing,
             step_network=environ.get("HPC_STEP_NETWORK") or "",
-            **{attribute: environ.get(variable) or "" for variable, attribute in AGENT_VARIABLES.items()},
+            **{attribute: environ.get(variable) or "" for variable, attribute in OPTIONAL_VARIABLES.items()},
             storage_root=environ.get("HPC_STORAGE_ROOT") or "",
             quota_cmd=environ.get("HPC_QUOTA_CMD") or "",
             quota_pattern=environ.get("HPC_QUOTA_PATTERN") or "",

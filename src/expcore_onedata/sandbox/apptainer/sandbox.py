@@ -327,7 +327,7 @@ class ApptainerSandbox:
 
     def _start_collector(self) -> None:
         egress = self.dir / "egress"
-        argv = [self._host_python(), "-I", str(egress / "egress-collector.py"), str(self.dir / "egress-sock"),
+        argv = [self._host_python(), "-I", "-B", str(egress / "egress-collector.py"), str(self.dir / "egress-sock"),
                 str(egress / "egress.jsonl"), self.egress_nonce]  # fmt: skip
         helpers.start(self.node, "collector", argv, egress, COLLECTOR_READY, noted=self._note_helper,
                       env={AV.RUN_TAG: self.sid}, sleep=self._sleep, clock=self._clock)  # fmt: skip

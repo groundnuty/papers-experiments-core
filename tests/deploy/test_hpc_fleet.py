@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, data_stand_in
 from hpc_fleet_support import SEPARATE_LAYOUT, fleet_modules, job_ids, make_bench, make_ca
+from hpc_ingested_support import artifacts, manifest_of, study_layout
 from tls_support import HAS_OPENSSL
 
 pytestmark = pytest.mark.skipif(not HAS_OPENSSL, reason="the zone's CA is made with openssl")
@@ -423,6 +424,26 @@ def test_o68_the_inode_guard_is_the_cores_own_read_once_for_n_times_one_federati
         deploy.fleet.inode_guard(FakeSlurm(tools={TOOL: over}), 4, layout, site, {})
     assert "nothing was submitted" in str(refused.value)
     assert len(over.calls) == 1
+
+
+def test_o68_the_fleets_estimate_counts_each_federations_ingested_space_n_times(deploy, tmp_path):
+    """O68, O57: a layout whose ingested space declares its manifest (the study's own data, which `up` loads) counts it
+    in every federation of the fleet: N times one federation's estimate, ingested space included, at the line and one
+    inode over, from the site's `HPC_STUDY_ARTIFACTS`."""
+    manifest = manifest_of({f"records/d{k % 20:02d}/f{k:04d}.csv": f"{k}".encode() for k in range(2_000)})
+    folder = artifacts(tmp_path / "art", manifest)
+    spec = deploy.fleet.load_spec(study_layout(tmp_path / "layout"))
+    layout = deploy.fleet.Layout(Path("/x/fed-1/root"), Path("/x/fed-1"), spec)
+    site = dataclasses.replace(scratch_site(deploy), study_artifacts=str(folder))
+    values = {"study_artifacts": str(folder)}
+    each = sum(deploy.hpc.quota.estimate_inodes(layout, {}, values).values())
+    assert each >= len(manifest.files) + len(manifest.directories)
+    at_the_line = Quota(deploy, used=LINE - 3 * each)
+    said = deploy.fleet.inode_guard(FakeSlurm(tools={TOOL: at_the_line}), 3, layout, site, {})
+    assert f"estimate {3 * each}" in said
+    over = Quota(deploy, used=LINE - 3 * each + 1)
+    with pytest.raises(deploy.hpc.quota.QuotaRefused, match=f"estimate {3 * each}"):
+        deploy.fleet.inode_guard(FakeSlurm(tools={TOOL: over}), 3, layout, site, {})
 
 
 def test_o68_the_inode_guard_of_a_site_without_a_scratch_root_runs_no_command_and_says_so(deploy):

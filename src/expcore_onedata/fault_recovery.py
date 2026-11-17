@@ -367,6 +367,7 @@ class Recovery(LinkSettling):
                 return Settled(False, "serves_unconfigured", after)
             if ready_after_s is None:
                 return Settled(False, "not_serving", after)  # fail closed: the injection stays open, the identity known
+            self._note_domain_wait(links)
             if child:  # its gate (and pairs) only after a settle held on its entry
                 self._settle_child(entry, how)
                 stuck = self._child_settled(entry, heal)
@@ -377,6 +378,16 @@ class Recovery(LinkSettling):
         if clear:
             self.journal.append({"event": "cleared", "id": entry["id"], "how": how})
         return Settled(True, how, after, ready_after_s)
+
+    def _note_domain_wait(self, links: bool) -> None:
+        """Once the restored service serves: the seconds its start waited for the provider's domain, as the driver kept
+        them from the status that showed it ready (`HpcDriver.last_domain_wait_s`), into `restore_record` for the
+        injector's snapshot (O58). A driver with no such wait (Compose), or a status that carried none, records nothing:
+        never a 0 nobody measured. Only the settling of the target itself: a heal's restart of a reader (`links` false)
+        is another provider's start, and does not replace the target's figure."""
+        figure = getattr(self._driver, "last_domain_wait_s", None)
+        if links and figure is not None:
+            self.restore_record["domain_wait_s"] = figure
 
     def _await_serving(self, service: str) -> float | None:
         """Ask the driver whether the service serves, now and then every `poll_s`, until it does or `ready_timeout_s`

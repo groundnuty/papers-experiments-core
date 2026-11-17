@@ -5,7 +5,7 @@ A cell is one `apptainer exec`:
 
     apptainer -q exec --containall --cleanenv --no-home --no-mount hostfs,bind-paths,cwd --pwd /work
         -B <run>/work:/work -B <run>/tmp:/tmp -B <run>/shm:/dev/shm -B ...:ro ... --env NAME=value ... <image.sif>
-        timeout -s KILL <limit> <python> -I -c <completion bootstrap> <nonce> <size> <sha256> <python>
+        timeout -s KILL <limit> <python> -I -B -c <completion bootstrap> <nonce> <size> <sha256> <python>
 
 `--containall` gives the cell its own PID, IPC and mount namespaces, a minimal `/dev` and an environment of the image's
 and the `--env` values alone; `--no-home` and `--no-mount hostfs,bind-paths,cwd` keep the driver's home, the host's

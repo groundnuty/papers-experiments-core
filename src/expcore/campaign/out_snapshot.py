@@ -31,7 +31,8 @@ new one is in place. A kill at any point leaves every snapshot that was whole as
 restored, and the next `take` removes it.
 
 **Restore.** `restore` copies one snapshot into a new out/, every file hashed as copied and compared with the
-manifest (one missing, added or changed fails it), checks the store copy's integrity, points its attempts'
+manifest (one missing, added or changed fails it), checks the store copy's integrity and that every ended attempt's
+marker is there (as `take` checked it), points its attempts'
 directories at the new `runs/` (`snapshot.rebase_run_dirs`), and marks the lease directory rolled back
 (`lease.mark_rolled_back`): a key the copy shows released may have been taken after it, and one first taken after it
 has no note, so every key needs its resource shown gone before a new holder (C19). One that fails leaves nothing.
@@ -301,6 +302,12 @@ def restore(snapshot: Path, out: Path) -> dict[str, Any]:
             if _copy(snapshot / name, out / name)["sha256"] != expected[name]:
                 raise OutSnapshotError(f"{snapshot.name}: {name} is not the file its manifest names")
         _integrity(snapshot, out / STORE)
+        missing = _markers_missing(out)
+        if missing:  # take checked it; a snapshot whose manifest was made otherwise is never restored without them
+            raise OutSnapshotError(
+                f"{snapshot.name}: its store names {len(missing)} ended attempt(s) whose marker runs/ lacks "
+                f"({missing[0]})"
+            )
         rebase_run_dirs(out / STORE, out / RUNS)
         mark_rolled_back(out / LEASES)  # a key released in the copy may have been taken since: each needs its proof
     except (OSError, sqlite3.Error) as error:
@@ -310,6 +317,17 @@ def restore(snapshot: Path, out: Path) -> dict[str, Any]:
         shutil.rmtree(out, ignore_errors=True)
         raise
     return manifest
+
+
+def _markers_missing(out: Path) -> list[str]:
+    """The run directories (`<digest>/try<N>`, as the store copy names them before its rebase) of the ended attempts
+    whose marker `out/runs` lacks: a restored store must never name a record `runs/` does not hold."""
+    connection = sqlite3.connect(out / STORE)
+    try:
+        rows = connection.execute("SELECT state, run_dir FROM attempts WHERE run_dir IS NOT NULL").fetchall()
+    finally:
+        connection.close()
+    return sorted(d for state, d in rows if state in ENDED and not (out / RUNS / d / MARKER_NAME).is_file())
 
 
 def _raise(error: OSError) -> None:

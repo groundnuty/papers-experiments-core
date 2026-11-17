@@ -27,6 +27,10 @@ replay check (`study.merge`) last:
 5. each shard passes the replay check `python -m expcore check` performs on a batch;
 6. every shard records the same environment identity.
 
+A shard whose `out/` holds `NOT-FINAL.json` (`shard.NOT_FINAL_FILE`) is refused first of all, naming it and the reason
+the file gives: a driver that checks a shard's results before archiving them, as the HPC shard driver's post-run script
+does (O63), marks them so when the check did not pass.
+
 A campaign run in **selections** (`expcore-shard/4`, C38) is merged by the same command, with the checks of
 `campaign.merge_selection` in place of 1, 3 and 4: the selections are disjoint and cover the plan, sequential ones ran
 one after another, and their spend together stayed within the budget.
@@ -67,6 +71,7 @@ from expcore.campaign.shard import (
     META_SHARD,
     META_SHARES,
     META_STARTED,
+    NOT_FINAL_FILE,
     ShardError,
     check_identity,
     in_shard,
@@ -166,7 +171,19 @@ def read_shard(out: Path, scratch: Path, pricing: Pricing | None = None) -> Shar
         raise MergeRefused(f"{out}: {error}; a shard is merged when it has finished") from None
     except SnapshotError as error:
         raise MergeRefused(str(error)) from None
-    return facts_of_bytes(scratch.read_bytes(), out, out=out, snapshot=scratch, pricing=pricing)
+    facts = facts_of_bytes(scratch.read_bytes(), out, out=out, snapshot=scratch, pricing=pricing)
+    if os.path.lexists(out / NOT_FINAL_FILE):  # a driver's check of the shard's results did not pass (it says why)
+        raise MergeRefused(f"{facts.name}: its results are marked not final ({_not_final_reason(out)})")
+    return facts
+
+
+def _not_final_reason(out: Path) -> str:
+    """The reason the shard's `NOT-FINAL.json` gives, for a message; a fixed phrase when it cannot be read."""
+    try:
+        reason = json.loads((out / NOT_FINAL_FILE).read_text(encoding="utf-8")).get("reason")
+    except (OSError, ValueError, AttributeError):
+        reason = None
+    return reason if isinstance(reason, str) and reason else f"{NOT_FINAL_FILE} says so"
 
 
 def facts_of_bytes(

@@ -16,11 +16,12 @@ import pytest
 from campaign_support import NOW, finished, make_manifest, make_schema
 from scheduler_support import models_for
 
+from expcore.campaign import out_snapshot
 from expcore.campaign.attempt_bounds import bound_usd
 from expcore.campaign.export import export_run_state
 from expcore.campaign.gate import Budget, BudgetGate
 from expcore.campaign.lost_spend import Pricing, open_journal
-from expcore.campaign.markers import write_marker
+from expcore.campaign.markers import MARKER_NAME, write_marker
 from expcore.campaign.recovery import recover
 from expcore.campaign.store import Store
 from expcore.config.models import Limits
@@ -352,6 +353,35 @@ def test_o62_a_run_end_takes_a_snapshot_before_the_clock_would(shards, tmp_path)
         hook._thread.join()
 
 
+def test_o62_no_snapshot_is_taken_before_a_run_has_ended(shards, tmp_path):
+    """O62: a step's out/ has no runs/ until its first attempt begins (no reading), and an attempt running with none
+    ended reads 0; neither is a run's end, so the thread takes no snapshot until a marker is written. The first look
+    used to count the first attempt's beginning, None to 0, as an end and snapshotted with that attempt in flight."""
+    out = tmp_path / "out"
+    out.mkdir()
+    looked, taken = threading.Semaphore(0), threading.Event()
+
+    def progress():
+        reading = out_snapshot.ended_attempts(out)
+        looked.release()  # after the reading and before the thread compares it
+        return reading
+
+    hook = shards.Snapshots(lambda out: taken.set(), every_s=3600.0, progress=progress, poll_s=0.01)
+    hook.start(out)
+    try:
+        assert looked.acquire(timeout=5.0)  # the thread's first reading, of an out/ with no runs/
+        run_dir = out / "runs" / "d" / "try1"
+        run_dir.mkdir(parents=True)  # attempt 1 began; none has ended
+        for _ in range(3):  # two of these readings are of the begun attempt, the first one's comparison made
+            assert looked.acquire(timeout=5.0)
+        assert not taken.is_set()
+        (run_dir / MARKER_NAME).write_text("{}")  # attempt 1 ended
+        assert taken.wait(5.0)
+    finally:
+        hook._stop.set()
+        hook._thread.join()
+
+
 def test_o62_the_manifest_sets_how_often_a_step_snapshots(shards, tmp_path):
     """O62: `snapshot_every_s` is optional, at least 60, and reaches the step's line."""
     roots = [tmp_path / "fed" / name for name in ("a", "b")]
@@ -361,7 +391,8 @@ def test_o62_the_manifest_sets_how_often_a_step_snapshots(shards, tmp_path):
     for label, root in zip(("fed-a", "fed-b"), roots, strict=True):
         root.mkdir(parents=True)
         state = {"format": "expcore-hpc-federation/1", "allocation": {"job": "101", "name": "hpcop-x"},
-                 "sandbox": {"placement": "het", "node": "node-s1", "het_group": 1}, "phase": "linked"}  # fmt: skip
+                 "sandbox": {"placement": "het", "node": "node-s1", "het_group": 1}, "phase": "linked",
+                 "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         lines += ["[[shards]]", f'label = "{label}"', f'root = "{root}"']
     (tmp_path / "shards.toml").write_text("\n".join(lines) + "\n")
