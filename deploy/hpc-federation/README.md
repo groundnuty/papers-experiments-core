@@ -847,7 +847,7 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 | `<label>.out.tar` | the shard's `out/`, which the merge reads | the results |
 | `<label>.out.json` | the archive's manifest (its SHA-256, the exit status, the post-run record) | what the archive is |
 | `<label>/journals/*` (every file) | a spend journal per step (`expcore run --spend-journal`) | what a step killed outright spent, which `--resume` counts as `lost_in_kill`: nowhere else |
-| `<label>.root.tar` | the federation's **root evidence**: the state (`hpc-federation.json`), `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml`, `shard-claim.json` and `shard-claim.lock` (the study's pre-step guard: who held the root), `data-manifests/*.json` (what each space's data identity was made from), `shard-steps/*.json` (which steps ran), the **whole `fault-journal/` directory** (its journals, the holder and drain records, the lock files, read as they are and never locked) and the fault relay's `late-steps.jsonl` and request, taken and answer files (those present). **An allow-list: never `secrets/`, a file holding a token, key or password, the CA, or the relay's heartbeat and lock** | what `down` removes with the root, and the study's post-check and the facts read: nowhere else once the root is gone |
+| `<label>.root.tar` | the federation's **root evidence**: the state (`hpc-federation.json`), `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml`, `ingest-evidence.json` (a study's `ingest run --out <root>/ingest-evidence.json`: the id map the study reads back), `shard-claim.json` and `shard-claim.lock` (the study's pre-step guard: who held the root), `data-manifests/*.json` (what each space's data identity was made from), `shard-steps/*.json` (which steps ran), the **whole `fault-journal/` directory** (its journals, the holder and drain records, the lock files, read as they are and never locked) and the fault relay's `late-steps.jsonl` and request, taken and answer files (those present). **An allow-list: never `secrets/`, a file holding a token, key or password, the CA, or the relay's heartbeat and lock** | what `down` removes with the root, and the study's post-check and the facts read: nowhere else once the root is gone |
 | `<label>.root.json` | the root archive's manifest (its SHA-256 and size, and each file's name, size and SHA-256) | what the root archive is |
 | `<label>/pass-env.json`, **when there is one** | the shard's first-step `pass_env` names and values (a site path of the study's artifacts) | what the first step was given, which the archive's `out/` does not hold |
 | `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one, and `collect --run` refuses |
@@ -1227,6 +1227,7 @@ F=<an absolute path, not there yet, on the filesystem the login node and the nod
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" --layout deploy/hpc-federation/layouts/pilot-shape-separate.toml up 4
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" plan --manifest <shard settings>
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step-stop --shard <shard-k>   # a stuck shard, below
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" status
 uv run python -I deploy/hpc-federation/shards.py collect --manifest "$F/shards.toml" --into <a new directory> --run
 # REQUIRED before down: pull the manifest's `results` directory (archives, journals and the rest, as listed in the
@@ -1296,7 +1297,12 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   `up` gave it (Slurm reuses ids). A shard is not launched again while its
   client runs; one whose step ended is relaunched only with `--shard L --resume`. A shard refused exits 1. A site that
   needs `HPC_STEP_NETWORK` gives it to each federation's own steps (`hpcfed`); a shard's step, on the agent's own job of
-  one component, carries none.
+  one component, carries none. **A step that resumes and finds its shard's running mark** (`<results>/<label>/running.json`,
+  left by a step killed outright) carries the mark's nonce as `--over`, exactly as `shards.py resume-line` builds it
+  (`fleetstuck.over_proof`, which reuses `shardresume.check_no_live_step`): only after no step of yours carries the
+  shard's step name and the step the mark names is no longer listed, in its job or anywhere (asked through every
+  federation that held or ran the shard). A shard whose holder still runs, or whose mark cannot be read as its own, is
+  refused with the reason and launched nowhere (the others are launched); a shard with no mark carries no `--over`.
 - **`status` and the first lines of `plan` say each federation's state in plain words**, by its label (`fed-k`),
   never a host: `up and ready` (linked, its relay serving), `up with no relay`, ``failed, still HOLDING 2 job(s): it
   bills until `fleet.py down --member fed-k` `` (the count is the distinct job ids its state file and the fleet's record
@@ -1314,6 +1320,29 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   checked), with the fleet's fingerprint, and only when its `platform.toml` leaves `[placement] reset_shortcut` off, so
   every reset there, the shard's first included, takes the full reads; `step` then starts it with `--resume` from its
   snapshots or archive. A federation that ran a shard is never given another.
+- **A stuck shard (`step-stop`).** A step that hangs on its federation (its client alive, its step listed, nothing
+  more written) moves to a spare through the fleet alone, in this order:
+  1. `fleet.py --fleet "$F" step-stop --shard L` ends the step the fleet launched for L, by the ids the fleet recorded
+     for it and nothing else: the srun client by its recorded pid and start tick (SIGTERM, then SIGKILL, each only
+     while the pid is still that process), and the Slurm step by its exact `<job>.<n>` id, found under the job the
+     federation's state names by the one step name the fleet gave it and cancelled through the federation's launcher,
+     which refuses a step of any other job. It never cancels by name or user, and it signals and cancels nothing when
+     the shard is not held by a federation of this fleet whose root and state are the ones its `up` made, when the
+     job's id now names another job (Slurm reuses ids), or when **the recorded pid holds another process now** (the
+     client ended and the pid was reused: the whole stop is refused, and the step is yours to look at with `squeue`).
+     The stop is written to the fleet's record (`stopped`: the step's id, whether it was cancelled and the client
+     ended) before it acts and again with what happened; `status` then says `its step ended (stopped by step-stop)`.
+     A step that ignores TERM keeps running for Slurm's KillWait after the cancel (182 s on this site): the stop does
+     not wait, and `step --resume` refuses until the step is no longer listed. A step ended from outside leaves its
+     running mark (a step removes it only when it ends by itself, `shards.release_running`).
+  2. Move the shard as in "Moving a shard": `shards.py collect --roots-only --shard L`, `down --member fed-k`,
+     `add 1`, `plan`.
+  3. `fleet.py --fleet "$F" step --shard L --resume` launches it on the spare with `--resume` and `--over <the mark's
+     nonce>`, which lets the new step take the mark over on another node (`shards.claim_running`), after the proof
+     above. Without a mark, or with a holder that still runs, there is no `--over`: the first never needs one, and the
+     second refuses the shard.
+  A shard that stays on its federation takes the same two commands (`step-stop`, then `step --shard L --resume`), and
+  carries `--over` the same way once its step is gone.
 - **`down`** takes down every federation the fleet made (or `--member` one), each by `hpcfed.py down` (which cancels
   its jobs by id) and each verified: the exit status and its root gone. A root that is not the directory the fleet
   made, or whose state file is another federation's (another job name, an agent's job record not the one its `up`
@@ -1321,7 +1350,9 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   nothing outside the record is ever looked at. The fleet's directory stays with its record, its logs and each root's
   lifecycle lock (hpcfed never removes one); remove it by hand once `status` shows every federation down.
 
-`tests/deploy/test_hpc_fleet.py`, `test_hpc_fleet_plan.py` and `test_hpc_fleet_relay.py` run the fleet over a fake cluster per federation, the
+`tests/deploy/test_hpc_fleet.py`, `test_hpc_fleet_plan.py`, `test_hpc_fleet_relay.py` and `test_hpc_fleet_stuck_shard.py` (a step killed
+outright resumed on a spare with the mark's nonce, a holder that still runs refused, the stop's signals and cancels only the recorded
+pid and step) run the fleet over a fake cluster per federation, the
 core's phase the real one over a bootstrap stand-in: several federations, one failing `up`, the maximum and the inode
 guard refusing before anything is made, a `het` layout refused, the bound on ups at once, `down` of all and of one, a
 federation and a job the fleet did not make left untouched (an agent's job record replaced included), the fingerprint
