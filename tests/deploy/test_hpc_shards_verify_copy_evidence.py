@@ -37,7 +37,7 @@ def test_verify_copy_passes_on_an_exact_copy_of_archives_journals_and_manifests(
     assert verify(shards, manifest, local, given) == 0
     seen = capsys.readouterr()
     assert "2 archives" in seen.out
-    assert "5 evidence files" in seen.out
+    assert "9 evidence files" in seen.out
     assert seen.err == ""
 
 
@@ -53,6 +53,24 @@ def test_verify_copy_passes_on_an_exact_copy_with_the_newer_snapshot(shards, tmp
     assert verify(shards, manifest, local, given) == 1
     seen = capsys.readouterr().err
     assert f"fed-a/snapshots/{snapshot.name}/state.sqlite: missing" in seen
+
+
+@pytest.mark.parametrize("change", ["missing", "changed"])
+def test_verify_copy_fails_naming_a_pass_env_file_that_is_missing_or_changed(shards, tmp_path, capsys, change):
+    """O63: `<label>/pass-env.json` (private evidence: a site path) is checked like a journal once collect listed it."""
+    plan = make_plan(shards, tmp_path)
+    planted = plan.results / "fed-a" / "pass-env.json"
+    planted.write_text('{"STUDY_ARTIFACTS": "/scratch/invented/artifacts"}\n')
+    shards.collect(plan, tmp_path / "merge")
+    manifest, local, given = pull(plan, tmp_path)
+    assert verify(shards, manifest, local, given) == 0
+    capsys.readouterr()
+    if change == "missing":
+        (local / "fed-a" / "pass-env.json").unlink()
+    else:
+        (local / "fed-a" / "pass-env.json").write_text('{"STUDY_ARTIFACTS": "/scratch/other/artifacts"}\n')
+    assert verify(shards, manifest, local, given) == 1
+    assert "fed-a/pass-env.json: " in capsys.readouterr().err
 
 
 def test_verify_copy_fails_naming_a_missing_journal_and_no_other(shards, tmp_path, capsys):
@@ -107,7 +125,7 @@ def test_verify_copy_names_every_failure_across_archives_and_evidence_in_one_run
     (local / "fed-b.out.json").unlink()
     assert verify(shards, manifest, local, given) == 1
     seen = capsys.readouterr().err
-    assert "3 of 7" in seen
+    assert "3 of 11" in seen
     assert "fed-a.out.tar" in seen
     assert "fed-a/journals/" in seen
     assert "fed-b.out.json" in seen
@@ -236,7 +254,7 @@ def test_verify_copy_checks_the_evidence_on_a_host_without_the_core(shards, tmp_
     passed = _on_a_bare_interpreter(*args)
     assert passed.returncode == 0, passed.stderr
     assert "2 archives" in passed.stdout
-    assert "5 evidence files" in passed.stdout
+    assert "9 evidence files" in passed.stdout
     _evidence_file(local).write_bytes(b"x")
     failed = _on_a_bare_interpreter(*args)
     assert failed.returncode == 1

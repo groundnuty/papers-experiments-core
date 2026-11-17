@@ -25,6 +25,7 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 ENV = "/usr/bin/env"
@@ -796,6 +797,34 @@ class Slurm:
         if not seen:  # the job itself has rows (its batch step at least): none at all is no record of it
             raise SlurmError("accounting holds no record of the job")
         return rows
+
+    def accounted(self, job: str) -> Dict[str, Dict[str, object]]:
+        """The job's steps as the accounting records them, by name: each one's id, its exit status (None when it is not
+        a status), its state and its Start (epoch seconds, from sacct's local time, None when it has none); the batch
+        and extern steps left out. SlurmError when the accounting cannot be read, so a caller never takes an unread
+        record for an empty one."""
+        done = self.runner.run(
+            ["sacct", "-j", job, "-n", "-P", "-o", "JobID,JobName,ExitCode,State,Start"], self.command_timeout_s
+        )
+        if done.returncode != 0:
+            raise SlurmError(f"sacct failed with status {done.returncode}: {done.stderr.strip()[:300]}")
+        found: Dict[str, Dict[str, object]] = {}
+        for line in done.stdout.splitlines():
+            parts = line.split("|")
+            if len(parts) != 5 or not STEP_ID.fullmatch(parts[0]):
+                continue
+            status: Optional[int] = None
+            if re.fullmatch(r"[0-9]+:[0-9]+", parts[2]):
+                code, killed = (int(part) for part in parts[2].split(":"))
+                status = 128 + killed if killed else code
+            began: Optional[float] = None
+            with contextlib.suppress(ValueError, OverflowError, OSError):  # "Unknown" and the like: no Start
+                began = datetime.strptime(parts[4], "%Y-%m-%dT%H:%M:%S").timestamp()
+            found.setdefault(
+                parts[1],
+                {"id": parts[0], "exit": status, "state": parts[3].split()[0] if parts[3] else "", "start": began},
+            )
+        return found
 
     def _finish(self, process: Process, step: Step, timeout_s: float) -> Completed:
         """The result of a control step within its bound; past it, end a client whose step is gone (three polls in a

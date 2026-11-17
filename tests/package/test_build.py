@@ -292,6 +292,25 @@ def with_notes(campaign: Campaign, tmp_path: Path, directory: str) -> Path:
     return root
 
 
+def test_o63_a_root_archive_and_a_pass_env_file_of_an_hpc_campaign_never_reach_the_package(campaign, hashes, tmp_path):
+    """O63: the study includes the directory they were pulled into; the package holds its clean file and none of
+    them, in any form (the archive, its manifest, the shard's `pass-env.json`), so no node name or site path of theirs
+    is in it."""
+    root = with_notes(campaign, tmp_path, "results")
+    results = root / "notes" / "results"
+    (results / "fed-a").mkdir()
+    site = "/scratch/site-account/artifacts node-17.cluster.example"
+    for name in ("fed-a.root.tar", "fed-a.root.json", "fed-a/pass-env.json"):
+        (results / name).write_text(site, encoding="utf-8")
+    archive = build_package(root, tmp_path / "dist", hashes=hashes)
+    with tarfile.open(archive) as members:
+        names = members.getnames()
+        content = b"".join(members.extractfile(m).read() for m in members.getmembers() if m.isfile())
+    assert f"{NAME}/notes/results/data.txt" in names
+    assert not [name for name in names if name.endswith((".root.tar", ".root.json", "pass-env.json"))]
+    assert site.encode() not in content
+
+
 def test_k05_a_private_name_in_a_path_is_reported_once_for_the_file_never_through_a_generated_file(
     campaign, hashes, tmp_path
 ):

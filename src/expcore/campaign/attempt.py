@@ -69,6 +69,9 @@ from expcore.campaign.holds import Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import Lease, LeaseCancelled, LeasePool, LeaseRefused
 from expcore.campaign.markers import AttemptResult, write_marker
+from expcore.campaign.no_request import EVENT as ZERO_EVENT
+from expcore.campaign.no_request import REASON as ZERO_REASON
+from expcore.campaign.no_request import settle_unsent
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.store import Store
 from expcore.campaign.topup import AttemptSpend, Ledger
@@ -351,7 +354,7 @@ class AttemptRunner:
                     await backend.aclose()
 
             started = p.monotonic()
-            record = None
+            record, unsent = None, False
             try:
                 record = asyncio.run(go())
                 result = result_from_record(record, ended_utc=p.stamp())
@@ -364,8 +367,7 @@ class AttemptRunner:
                     treatment_targets=targets,
                     sent_nothing=sent_no_request(error, backend),
                 )
-                if guard is not None and guard.loop_ended:  # past the loop its call log is all it spent (C05)
-                    result = settle_usage(result, *self._call_log(begun.id))
+                result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
             result, moved = self._judge(result, record, model, key, begun)
@@ -373,6 +375,8 @@ class AttemptRunner:
 
             def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
                 self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
+                if unsent:  # the row and the marker say `measured`; this says why (C05)
+                    p.store.event(p.stamp(), ZERO_EVENT, model, f"{key}: {ZERO_REASON}; charged 0, basis measured")
                 if mix is not None:
                     p.store.record_deployments(begun.id, mix)
 
@@ -380,10 +384,27 @@ class AttemptRunner:
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
 
-    def _call_log(self, attempt_id: int) -> tuple[Any, Any]:
-        """The attempt's call log as its row keeps it: the requests sent and how each closed one ended."""
-        [row] = self.p.store.q("SELECT calls_sent, calls_usage FROM attempts WHERE id=?", (attempt_id,))
-        return row["calls_sent"], row["calls_usage"]
+    def _settle_failure(
+        self, result: AttemptResult, guard: AttemptSpend | None, backend: Any, attempt_id: int
+    ) -> tuple[AttemptResult, bool]:
+        """Settle the usage of an executor that raised from the attempt's call log (C05), and tell whether it was
+        settled as no request sent. Past the loop the log is all the attempt spent (`settle_usage`: measured, or its
+        bound); before or during it, an attempt whose complete log holds no request and whose backend did not start
+        one is charged nothing (`settle_unsent`), and any other keeps its usage unknown and its bound. Without a
+        budget there is no guard, no log, and nothing to settle."""
+        if guard is None:
+            return result, False
+        sent, usage, topup_usd = self._call_log(attempt_id)
+        if guard.loop_ended:
+            return settle_usage(result, sent, usage), False
+        settled = settle_unsent(result, sent, usage, topup_usd, backend)
+        return settled, settled is not result
+
+    def _call_log(self, attempt_id: int) -> tuple[Any, Any, Any]:
+        """The attempt's call log as its row keeps it, and its top-ups: the requests sent, how each closed one ended,
+        and the dollars it was topped up."""
+        [row] = self.p.store.q("SELECT calls_sent, calls_usage, topup_usd FROM attempts WHERE id=?", (attempt_id,))
+        return row["calls_sent"], row["calls_usage"], row["topup_usd"]
 
     def _judge(
         self, result: AttemptResult, record: Any, model: str, key: str, begun: BegunAttempt

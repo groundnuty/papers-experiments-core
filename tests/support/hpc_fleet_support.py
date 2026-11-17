@@ -83,6 +83,8 @@ class Bench:
     core: Any = None  # what the manifest's interpreter says of its core (`shards.identify_core`'s report), or the
     # error it raises; a core with a known commit that is not stale until a test says otherwise
     asked: list = field(default_factory=list)  # the plan of each time the core was asked
+    no_relay: set = field(default_factory=set)  # the federations whose up finds no fault relay in its core (O68)
+    needs: tuple = ()  # the variables the settings' study plugin refuses to be built without (`standin_python`)
 
     def __post_init__(self) -> None:
         self.real = self.deploy.hpc.cli.make_driver
@@ -130,6 +132,7 @@ class Bench:
         made = self.real(layout, str(root), self.fake(label), self.environ, agent=agent)
         made.sleep = made.slurm.sleep = lambda seconds: None
         made.poll_s = made.slurm.poll_s = 0.0
+        made.relay_available = lambda: label not in self.no_relay  # every federation serves one unless a test says not
         made.core = functools.partial(
             self.deploy.hpc.boot.core_phase,
             rest=lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
@@ -196,14 +199,15 @@ class Bench:
     def up(self, count: int, **given: Any) -> tuple[int, str]:
         return self.run("--layout", str(self.layout), "up", str(count), **given)
 
-    def settings(self) -> Path:
-        """The shard settings an operator gives plan: shards.py's keys, no [[shards]]."""
+    def settings(self, *extra: str) -> Path:
+        """The shard settings an operator gives plan: shards.py's keys, no [[shards]]; `extra` are more `key = value`
+        lines (an optional key of shards.py's manifest)."""
         path = self.base / "shard-settings.toml"
         (self.base / "study").mkdir(exist_ok=True)  # the campaign fingerprint is taken on a copy of it (O63)
-        python = standin_python(self.base / "venv", real_platform=True)
+        python = standin_python(self.base / "venv", real_platform=True, needs=self.needs)
         lines = [f'{key} = "{self.base / key}"' for key in ("study", "results")]
         lines += [f'python = "{python}"', f'core_src = "{self.base / "src"}"', f'tmpfs = "{self.node_tmp}"']
-        lines += ['step_path = "/usr/bin:/bin"', "cpus = 2", 'memory = "4g"']
+        lines += ['step_path = "/usr/bin:/bin"', "cpus = 2", 'memory = "4g"', *extra]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
 

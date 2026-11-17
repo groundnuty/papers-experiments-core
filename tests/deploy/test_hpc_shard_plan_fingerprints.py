@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from fingerprint_support import seen_platforms, standin_python
+from fingerprint_support import seen_environments, seen_platforms, standin_python
 from shard_support import make_study
 
 import expcore
@@ -45,15 +45,18 @@ def platform_text(n: int, body: str = FAULTS + PLACEMENT) -> str:
 
 
 def manifest(tmp_path: Path, platforms: dict | None = None, *, python: Path | None = None, same_root: bool = False,
-             study: Path | None = None, core_src: Path | None = None) -> Path:  # fmt: skip
+             study: Path | None = None, core_src: Path | None = None,
+             pass_env: tuple[str, ...] = ()) -> Path:  # fmt: skip
     """A shard plan of three federations, each linked, with its platform file (`platforms` by label, else the same
-    settings); `same_root` puts every shard on the first federation."""
+    settings); `same_root` puts every shard on the first federation; `pass_env` declares those variables."""
     study = study or tmp_path / "study"
     study.mkdir(exist_ok=True)
     python = python or standin_python(tmp_path / "venv")
     lines = [f'study = "{study}"', f'python = "{python}"', f'core_src = "{core_src or tmp_path / "core" / "src"}"',
              f'results = "{tmp_path / "results"}"', f'tmpfs = "{tmp_path / "tmpfs"}"', 'step_path = "/usr/bin:/bin"',
              "cpus = 6", 'memory = "18g"']  # fmt: skip
+    if pass_env:
+        lines.append(f"pass_env = {json.dumps(list(pass_env))}")
     for n, label in enumerate(LABELS, 1):
         root = tmp_path / "fed" / ("a" if same_root else label)
         root.mkdir(parents=True, exist_ok=True)
@@ -190,3 +193,116 @@ def test_o63_the_real_interpreter_takes_the_same_fingerprint_of_a_real_study_bes
     assert (code, err) == (0, "")
     assert len(out.splitlines()) == 3
     assert not (study / "platform.toml").exists()  # a copy of the study was given each platform file, never the study
+
+
+# ------------------------------------------------------------------------------------------------ pass_env
+NAME, VALUE = "FAULT_ACK_MODE", "go-ahead"  # invented: a variable a study's plugin needs, and what the operator holds
+TREE_NAME, TREE = "HPC_STUDY_ARTIFACTS", "/srv/example/artifacts/tree"  # another, holding an invented absolute path
+DECLARED = (NAME, TREE_NAME)
+NOT_DECLARED = ("NOT_DECLARED_VAR", "FAULT_API_KEY")  # the operator holds both; the manifest declares neither
+
+
+def operator_holds(monkeypatch, *, tree: bool = True) -> None:
+    """The operator's environment: the declared variables (`TREE_NAME` only when `tree`) and two it does not declare."""
+    monkeypatch.setenv(NAME, VALUE)
+    if tree:
+        monkeypatch.setenv(TREE_NAME, TREE)
+    else:
+        monkeypatch.delenv(TREE_NAME, raising=False)
+    for name in NOT_DECLARED:
+        monkeypatch.setenv(name, "x")
+
+
+def needing(tmp_path: Path) -> Path:
+    """A stand-in interpreter whose study plugin refuses to be built without the declared variables."""
+    return standin_python(tmp_path / "venv", needs=DECLARED)
+
+
+@pytest.mark.parametrize("command", ["plan", "lines"])
+def test_o63_a_plugin_that_needs_a_declared_variable_is_fingerprinted_with_the_values_each_line_pins(
+    shards, tmp_path, capsys, monkeypatch, command
+):
+    """O63: a study's plugin may refuse to be built without a variable the manifest declares in `pass_env` (the first
+    study's refuses without its artifacts directory), so no fingerprint could be taken and no line printed. With the
+    variables declared and set, the program that takes each shard's fingerprint is given them as the step is: the
+    values the printed lines carry."""
+    operator_holds(monkeypatch)
+    code, out, err = run(shards, manifest(tmp_path, python=needing(tmp_path), pass_env=DECLARED), capsys, command)
+    assert (code, err) == (0, "")
+    assert len(out.splitlines()) == 3
+    taken = seen_environments(tmp_path / "venv")
+    assert [(env[NAME], env[TREE_NAME]) for env in taken] == [(VALUE, TREE)] * 3
+    assert f"{NAME}={VALUE}" in out
+    assert f"{TREE_NAME}={TREE}" in out  # the lines pin what the fingerprint was taken with
+
+
+@pytest.mark.parametrize("declared", [DECLARED, ()])
+def test_o63_a_variable_the_manifest_does_not_declare_never_reaches_the_fingerprint_program(
+    shards, tmp_path, capsys, monkeypatch, declared
+):
+    """O63: nothing else of the operator's environment is given the program that builds the plugin: with two variables
+    declared, or none, the operator's other variables (one that looks like a secret too) are not in what each
+    fingerprint call received."""
+    operator_holds(monkeypatch)
+    python = standin_python(tmp_path / "venv", needs=declared)
+    code, _, err = run(shards, manifest(tmp_path, python=python, pass_env=declared), capsys)
+    assert (code, err) == (0, "")
+    taken = seen_environments(tmp_path / "venv")
+    assert len(taken) == 3
+    for env in taken:
+        assert [name for name in NOT_DECLARED if name in env] == []
+        assert {name for name in (NAME, TREE_NAME) if name in env} == set(declared)
+
+
+@pytest.mark.parametrize("command", ["plan", "lines"])
+def test_o63_an_unset_declared_variable_refuses_before_the_fingerprint_program_runs_naming_only_the_variable(
+    shards, tmp_path, capsys, monkeypatch, command
+):
+    """O63: the operator's values are read before any program is run for the plan: an unset declared variable refuses
+    `plan` and `lines` with nothing printed, naming it and never a value or a path, and the program that builds the
+    plugin is not run for any shard."""
+    operator_holds(monkeypatch, tree=False)
+    code, out, err = run(shards, manifest(tmp_path, python=needing(tmp_path), pass_env=DECLARED), capsys, command)
+    assert (code, out) == (2, "")
+    assert f"pass_env variable {TREE_NAME} is not set" in err
+    assert not [word for word in (VALUE, TREE, str(tmp_path)) if word in err]
+    assert seen_environments(tmp_path / "venv") == []
+
+
+def test_o63_a_plan_whose_declared_variables_nobody_pinned_is_refused_before_the_program_runs(shards, tmp_path):
+    """O63: `check_one_campaign` of a plan that declares `pass_env` and has not read its values (a caller that forgot
+    to pin it) fails closed, as `step_argv` does: it never runs the plugin without the variables its steps would get."""
+    path = manifest(tmp_path, python=needing(tmp_path), pass_env=DECLARED)
+    with pytest.raises(shards.ShardsError, match="not pinned"):
+        shards.check_one_campaign(shards.load_plan(path))
+    assert seen_environments(tmp_path / "venv") == []
+
+
+def requiring(root: Path) -> None:
+    """The study's plugin refuses to be built without the artifacts variable, as a study's may."""
+    plugin = root / "plugin.py"
+    head = "def build(context: StudyContext) -> StudyPlugin:\n"
+    text = plugin.read_text(encoding="utf-8")
+    assert head in text
+    guard = f'    if {TREE_NAME!r} not in __import__("os").environ:\n        raise RuntimeError("needs its tree")\n'
+    plugin.write_text(text.replace(head, head + guard), encoding="utf-8")
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_o63_the_real_interpreter_builds_a_real_plugin_that_needs_a_variable_only_when_it_is_declared(
+    shards, tmp_path, capsys, monkeypatch, declared
+):
+    """O63: through the real interpreter (`-I -B`) and a real stamped study whose plugin raises unless the artifacts
+    variable is in its environment: `lines` prints all three lines when the manifest declares it (and the operator
+    holds it), and refuses by the shard's label when it does not, though the operator holds it all the same."""
+    operator_holds(monkeypatch)
+    study = make_study(tmp_path, "needing-study", edit=requiring)
+    path = manifest(tmp_path, python=Path(sys.executable), study=study, core_src=Path(expcore.__file__).parents[1],
+                    pass_env=(TREE_NAME,) if declared else ())  # fmt: skip
+    code, out, err = run(shards, path, capsys)
+    if declared:
+        assert (code, err) == (0, "")
+        assert len(out.splitlines()) == 3
+    else:
+        assert (code, out) == (2, "")
+        assert "shard fed-a: the study's fingerprint could not be computed" in err

@@ -23,6 +23,8 @@ JOB_ID = re.compile(r"[0-9]{1,12}")
 STEP_ID = re.compile(r"[0-9]{1,12}\.[0-9]{1,9}")
 PLACEMENTS = ("het", "separate")  # where the agent's node is held (hpcsettings.SANDBOX_PLACEMENTS)
 SHA256 = re.compile(r"[0-9a-f]{64}")
+RELAYS = ("serving", "none")  # the login node's fault relay as `up` ended: its heartbeat seen, or this core has none
+UNRECORDED = "unrecorded"  # `relay_of`'s word for a state that says neither: an older up, or one that never got there
 
 
 class StateError(RuntimeError):
@@ -31,6 +33,15 @@ class StateError(RuntimeError):
 
 def path(root: Path) -> Path:
     return Path(root) / STATE
+
+
+def relay_of(state: Dict[str, Any]) -> str:
+    """The fault relay's state as `up` recorded it once the relay beat (`serving`) or found none in its core (`none`);
+    `unrecorded` when the state has neither, as one written by an older up, or by an up that failed before the relay's
+    heartbeat, has none. The `relay` record (the client's pid, kept so `down` can end it) is no answer: it is written at
+    the relay's spawn, before its heartbeat."""
+    found = state.get("fault_relay")
+    return found if found in RELAYS else UNRECORDED
 
 
 def checked_workdir(value: str, node_tmp: str, kind: str) -> str:
@@ -93,12 +104,16 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
     excluded = state["allocation"].get("excluded_nodes")  # a count (O57): none in a state an older up wrote
     if excluded is not None and not (isinstance(excluded, int) and not isinstance(excluded, bool) and excluded >= 0):
         raise StateError(f"{STATE}: allocation.excluded_nodes is not a count")
+    if "fault_relay" in state and state["fault_relay"] not in RELAYS:
+        raise StateError(f"{STATE}: fault_relay is not one of {', '.join(RELAYS)}")
     sandbox = state.get("sandbox")
     if sandbox is not None:
         checked_sandbox(sandbox)
     if "data" in state:
         checked_data(state["data"])
     checked_shard_nodes(state.get("shard_nodes", []))
+    checked_discards(state.get("evidence_discarded", []))
+    checked_rewritten(state.get("evidence_rewritten_after_collect", []))
     return state
 
 
@@ -147,6 +162,38 @@ def checked_shard_nodes(entries: Any) -> None:
             raise StateError(f"{STATE}: a shard_nodes entry's node is not a node name")
         if not all(isinstance(entry[key], str) and entry[key] for key in ("label", "name")):
             raise StateError(f"{STATE}: a shard_nodes entry has no label or job name")
+
+
+def checked_discards(entries: Any) -> None:
+    """Each use of `down --discard-evidence` (O63): when it was, the shards whose evidence was not collected, or changed
+    after it was, and so went with the root, and the reason given on the command line (None when none was)."""
+    if not isinstance(entries, list):
+        raise StateError(f"{STATE}: evidence_discarded is not a list")
+    for entry in entries:
+        ok = isinstance(entry, dict) and set(entry) == {"at", "shards", "changed_since_collect", "reason"}
+        ok = ok and isinstance(entry["at"], str) and isinstance(entry["changed_since_collect"], bool)
+        ok = ok and isinstance(entry["shards"], list) and all(isinstance(label, str) for label in entry["shards"])
+        ok = ok and (entry["reason"] is None or isinstance(entry["reason"], str))
+        if not ok:
+            raise StateError(
+                f"{STATE}: an evidence_discarded entry is not {{at, shards, changed_since_collect, reason}}"
+            )
+
+
+def checked_rewritten(entries: Any) -> None:
+    """Each `down` that found files the federation rewrites itself changed since `collect` (O63): when it was, the
+    shards the root's evidence was collected for, and the names of those files (never a value of one), which are no
+    reason to refuse and are not evidence a second archive would add to."""
+    if not isinstance(entries, list):
+        raise StateError(f"{STATE}: evidence_rewritten_after_collect is not a list")
+    for entry in entries:
+        ok = isinstance(entry, dict) and set(entry) == {"at", "shards", "files"}
+        ok = ok and isinstance(entry["at"], str)
+        ok = ok and all(
+            isinstance(entry[key], list) and all(isinstance(n, str) for n in entry[key]) for key in ("shards", "files")
+        )
+        if not ok:
+            raise StateError(f"{STATE}: an evidence_rewritten_after_collect entry is not {{at, shards, files}}")
 
 
 def checked_sandbox(sandbox: Any) -> None:

@@ -4,6 +4,8 @@ file (DESIGN.md is the process model; README.md says what has run).
     uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH up | down | describe | verify-data
     uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH stop | start | status SERVICE
     uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH exec SERVICE -- ARGV...
+    (the fault relay's own: `--step-tag TAG` before a verb, and `late-steps SERVICE --for-verb VERB --request ID
+    --window-s N --poll-s N --since T`; see hpclate.py)
 
 Run on the login node. `up` reads the site's values from the environment (`set -a; . site.env; set +a`) and records
 them in the state file in the root, so `down` and the service verbs need no environment: the login node's fault relay
@@ -18,7 +20,11 @@ them in the state file in the root, so `down` and the service verbs need no envi
   (`hpcboot.core_phase`). The layout's `[hpc] core` says where that phase runs: "login" (in this process) or "step"
   (a control step on the zone's node, the core's Python).
 - down: every service torn down (the providers, then the zone), every step gone, each node checked, the held job
-  (and the agent's own job, when it has one) cancelled by its id, then the root removed; on whatever up reached.
+  (and the agent's own job, when it has one) cancelled by its id, then the root removed; on whatever up reached. A
+  root that a shard step ran against and whose evidence `shards.py collect` did not collect (no current marker), or
+  whose step- or study-written evidence changed after it did, is refused first, with nothing stopped; the state and the
+  link check, which the federation rewrites itself, are named in the output and the state, never refused. `down
+  --discard-evidence` removes it all the same and its output says so (O63).
 - describe: the plan: the nodes and their shape, every step's size, and what the job bills per hour.
 - verify-data: after the study's ingest, read each ingested space (a space that is neither a baseline space nor a
   shared import, whose data is the study's own) back through its owner and compare every file's path, size and SHA-256
@@ -26,13 +32,20 @@ them in the state file in the root, so `down` and the service verbs need no envi
   naming the space and how many files differ, on any difference, and records a verified marker in the state file on a
   pass, which `shards.py plan` requires (O57). It reads the root and needs no site environment; it never touches the
   job.
-- stop, start, status, exec: the service verbs, `hpcfed_control.run` (M4), through the hook in `main`.
+- stop, start, status, exec: the service verbs, `hpcfed_control.run` (M4), through the hook in `main`. With
+  `--step-tag TAG` (the fault relay's: 12 hex digits) every control step a verb launches is named by the tag, so the
+  relay can find its steps by their exact names.
+- late-steps: the fault relay's watch for the steps of a verb it answered `timed_out` (`hpclate.py`): it cancels, by
+  exact id and in the federation's own job alone, a step of the verb's exact names that is made late, and journals what
+  it saw in the relay's directory. No request can name it.
 - core: the core's phase alone, as the step of `[hpc] core = "step"` runs it.
 """
 
 import argparse
+import math
 import os
 import pwd
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,7 +66,10 @@ from hpcsettings import SettingsError, agent_limits, load_settings, site_from_en
 from hpcslurm import Runner, Slurm  # noqa: E402
 
 CONTROL_VERBS = ("stop", "start", "status", "exec")  # hpcfed_control.VERBS (M4)
-COMMANDS = ("up", "down", "describe", "core", "verify-data", *CONTROL_VERBS)
+COMMANDS = ("up", "down", "describe", "core", "verify-data", *CONTROL_VERBS, "late-steps")
+STEP_TAG = re.compile(r"[0-9a-f]{12}")  # hpcfed_control.STEP_TAG
+REQUEST_ID = re.compile(r"[0-9a-f]{32}")  # a fault relay request's id
+LATE_BOUNDS = (3600.0, 60.0)  # the most `--window-s` and `--poll-s` the watch accepts
 
 
 def core_paths() -> Dict[str, str]:
@@ -144,7 +160,9 @@ def mount_check(driver: Driver) -> Optional[SimpleNamespace]:
     )
 
 
-def control_hook(driver: Driver, verb: str, service: Optional[str], rest: List[str]) -> int:
+def control_hook(
+    driver: Driver, verb: str, service: Optional[str], rest: List[str], step_tag: Optional[str] = None
+) -> int:
     """The service verbs (DESIGN.md, section 7), by `hpcfed_control.run` (M4). The hook is stable: the verb, the
     service, what follows `--` (for exec), the launcher, the state store, the layout's stop bound and the read-only
     proof of a shared import's owner (`mount_check`)."""
@@ -156,6 +174,7 @@ def control_hook(driver: Driver, verb: str, service: Optional[str], rest: List[s
     if verb not in hpcfed_control.VERBS:
         print(f"error: {verb}: not a verb of hpcfed_control", file=sys.stderr)
         return 2
+    given = {} if step_tag is None else {"step_tag": step_tag}  # only the relay's verbs carry one
     return hpcfed_control.run(
         verb,
         service,
@@ -163,7 +182,55 @@ def control_hook(driver: Driver, verb: str, service: Optional[str], rest: List[s
         launcher=driver.launcher,
         state=driver.store,
         stop_seconds=driver.settings.stop_seconds,
+        step_launch_wait_s=driver.settings.step_launch_wait_s,
         mounts=mount_check(driver),
+        **given,
+    )
+
+
+def late_steps(driver: Driver, args: argparse.Namespace) -> int:
+    """`late-steps`: the fault relay's watch for a timed-out verb's steps (`hpclate.py`). Every argument is checked
+    before Slurm is looked at: the tag, the request id, the verb (one of the four), the service and the numbers. It
+    journals to the relay's own file in this federation's root, which it derives from the root, and nowhere else."""
+    import hpcfed_control
+    import hpclate
+
+    from expcore_onedata.fault_relay_late import JOURNAL
+
+    journal = driver.layout.root / "fault-relay" / JOURNAL
+    window, poll = args.window_s, args.poll_s
+    numbers = all(
+        isinstance(n, float) and math.isfinite(n) and 0 < n <= top for n, top in zip((window, poll), LATE_BOUNDS)
+    )
+    problems = [
+        text
+        for ok, text in (
+            (args.step_tag is not None and STEP_TAG.fullmatch(args.step_tag), "--step-tag is 12 hex digits"),
+            (args.service, "name the service"),
+            (args.for_verb in hpcfed_control.VERBS, "--for-verb is one of %s" % ", ".join(hpcfed_control.VERBS)),
+            (args.request is not None and REQUEST_ID.fullmatch(args.request), "--request is a request id"),
+            (numbers, "--window-s and --poll-s are positive numbers within bounds"),
+            (
+                args.since is None or (math.isfinite(args.since) and args.since > 0),
+                "--since is a time in epoch seconds",
+            ),
+        )
+        if not ok
+    ]
+    if problems:
+        print("error: late-steps: %s" % "; ".join(problems), file=sys.stderr)
+        return 2
+    return hpclate.watch(
+        driver.launcher,
+        driver.store,
+        args.service,
+        args.for_verb,
+        args.step_tag,
+        request=args.request,
+        journal=journal,
+        window_s=window,
+        poll_s=poll,
+        since=args.since,
     )
 
 
@@ -180,9 +247,32 @@ def main(
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--layout", type=Path, default=DEFAULT_LAYOUT, help="the layout file")
     parser.add_argument("--root", help="the federation's root (default: EXPCORE_FED_ROOT)")
+    parser.add_argument("--step-tag", help=argparse.SUPPRESS)  # the fault relay's tag for a verb's control steps
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("service", nargs="?", help="the service a verb acts on, by its layout name")
+    for late in ("--for-verb", "--request"):  # late-steps only: the fault relay's own watch
+        parser.add_argument(late, help=argparse.SUPPRESS)
+    parser.add_argument("--window-s", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--poll-s", type=float, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--since", type=float, help=argparse.SUPPRESS
+    )  # late-steps: the epoch second the verb was answered
+    parser.add_argument(
+        "--discard-evidence",
+        action="store_true",
+        help="down only: remove a root whose shard evidence was not collected (shards.py collect), and say so",
+    )
+    parser.add_argument(
+        "--discard-reason",
+        help="with --discard-evidence: why, recorded in the state file and in down's output (at most 500 characters)",
+    )
     args = parser.parse_args(words)
+    if args.discard_evidence and args.command != "down":
+        print(f"error: {args.command}: --discard-evidence belongs to down", file=sys.stderr)
+        return 2
+    if args.discard_reason is not None and (not args.discard_evidence or len(args.discard_reason) > 500):
+        print("error: --discard-reason goes with --discard-evidence and is at most 500 characters", file=sys.stderr)
+        return 2
     environ = os.environ if environ is None else environ
     try:
         root = args.root or environ.get("EXPCORE_FED_ROOT")
@@ -190,8 +280,21 @@ def main(
     except (LayoutError, SettingsError, ValueError) as error:
         print(f"error: {args.command}: {error}", file=sys.stderr)
         return 2
+    if args.step_tag is not None and not STEP_TAG.fullmatch(args.step_tag):
+        print("error: %s: --step-tag is 12 hex digits" % args.command, file=sys.stderr)
+        return 2
+    if args.step_tag is not None and args.command not in (*CONTROL_VERBS, "late-steps"):
+        print("error: %s: --step-tag belongs to a verb or to late-steps" % args.command, file=sys.stderr)
+        return 2
+    if args.command != "late-steps" and any(
+        value is not None for value in (args.for_verb, args.request, args.window_s, args.poll_s, args.since)
+    ):
+        print("error: %s: the late-steps options belong to late-steps" % args.command, file=sys.stderr)
+        return 2
+    if args.command == "late-steps":
+        return late_steps(driver, args)
     if args.command in CONTROL_VERBS:
-        return control_hook(driver, args.command, args.service, rest)
+        return control_hook(driver, args.command, args.service, rest, args.step_tag)
     try:
         if args.command == "describe":
             weight = environ.get("HPC_BILLING_MEM_WEIGHT")
@@ -206,7 +309,7 @@ def main(
             self_check()
             print(driver.up(site_from_environment(environ)))
         elif args.command == "down":  # never an `else`: a command added without a branch would tear the federation down
-            print(driver.down())
+            print(driver.down(discard_evidence=args.discard_evidence, discard_reason=args.discard_reason))
         else:
             raise AssertionError(f"{args.command}: no branch")  # pragma: no cover
     except CoreMismatch as error:

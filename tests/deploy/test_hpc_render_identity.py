@@ -21,7 +21,16 @@ from types import SimpleNamespace
 
 import pytest
 from fingerprint_support import standin_python
-from hpc_fed_support import LAYOUT, PILOT_TEMPLATE, SITE, agent_site, data_stand_in, hpc_on_path, services_only
+from hpc_fed_support import (
+    LAYOUT,
+    PILOT_TEMPLATE,
+    SITE,
+    agent_site,
+    data_stand_in,
+    hpc_on_path,
+    services_only,
+    write_address_map,
+)
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
 HPC = LAYOUT.parents[1]
@@ -111,6 +120,7 @@ def render(
     spec = fedspec.load_spec(layout)
     hosts = {s.name: f"{s.name}.{label}.cluster.example.org" for s in spec.services}
     federation = fedlayout.Layout(root, root.parent, hpc.boot.hpc_spec(spec, hosts))
+    write_address_map(federation)  # `up` leaves one in a root of declared names
     site = {
         **SITE,
         **agent_site(root.parent / "pins", sif=sif, work_root=work_root, gateport=gateport),
@@ -854,6 +864,7 @@ def manifest(tmp_path: Path, extra: str = "", expected: dict | str | None = None
                  "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         (root / "platform.toml").write_text('[space]\nname = "s"\ndata_manifest = "m.json"\n')
+        (root / "facts.json").write_text("{}")  # what `up` writes beside the state: a collect archives both
     if extra:
         lines.append(extra)
     for label, name in (("fed-a", "a"), ("fed-b", "b")):

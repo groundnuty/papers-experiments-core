@@ -16,10 +16,16 @@ real addresses (DESIGN.md, sections 5 and 6).
   rendered `platform.toml`, before the link check.
 - **`platform.toml`** is rendered from the layout's own template by the Compose renderer, plus the HPC values a template
   may name: `@hpc_root@` (the root, so every path into it is absolute and a copy of the file beside a study reads the
-  root's files), `@hpc_stop_bound_s@` (a stop's whole bound, `[hpc] stop_seconds` + 90 s), `@hpc_settle_timeout_s@`
-  (above it), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of each direct-I/O
-  import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and `@hpc_token_margin_s@`: the
-  least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
+  root's files), `@hpc_stop_bound_s@` (the service's own stop bound, `[hpc] stop_seconds` + 90 s),
+  `@hpc_step_launch_wait_s@` (what a control step may wait to start, `[hpc] step_launch_wait_s`),
+  `@hpc_command_timeout_s@` (the floor of every relay verb's bound: that and 60 s), `@hpc_settle_timeout_s@` (above
+  the stop and the wait), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of
+  each direct-I/O import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none),
+  `@hpc_addresses@` (the inline table `{ file, resolver }` that is the value of the template's top-level
+  `addresses = @hpc_addresses@`, O73: the address map's file and the resolve launcher; the render adds no line the
+  template does not have) and
+  `@hpc_token_margin_s@`: the least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file
+  (`least_margin_s`).
   The site's values come from `hpcpins` (the agent's sandbox's pins and `@study_artifacts@`, the study's own directory
   on the nodes), and each space's `@data_manifest.<space>@` from `hpcdata` (DESIGN.md, section 6a).
   A template that declares `[sandbox.apptainer]` also names `@hpc_provider_storage@` (`hpcpins.values`: `tmpfs`, or
@@ -63,8 +69,9 @@ from fedlinks import check_after_up
 from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
 from fedtools import check_rendered, require_study_artifacts
+from hpcsettings import DEFAULT_STEP_LAUNCH_WAIT_S, VERB_WORK_S
 
-from expcore_onedata.addresses import AddressMap
+from expcore_onedata.addresses import AddressMap, AddressMapError
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
 from expcore_onedata.importmanifest import Manifest
 
@@ -233,7 +240,15 @@ def least_margin_s(path: Path, rendered: str, settle_timeout_s: float) -> int:
     return math.ceil(restore_token_margin_s(load_faults(path, load_platform(path))))
 
 
-def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int, root: Path) -> Dict[str, str]:
+def hpc_values(
+    command: Sequence[str],
+    stop_bound_s: int,
+    settle_timeout_s: int,
+    root: Path,
+    *,
+    step_launch_wait_s: int = DEFAULT_STEP_LAUNCH_WAIT_S,
+    command_timeout_s: int = DEFAULT_STEP_LAUNCH_WAIT_S + VERB_WORK_S,
+) -> Dict[str, str]:
     """The HPC values a platform template may name, but the token margin (`write_platform` derives it). `root` is the
     federation's root, as an absolute path in a basic string of TOML: the template's paths into the root are written
     with it (`@hpc_root@/secrets/...`), so a copy of the file elsewhere (beside a study, `shards.py step`) reads the
@@ -244,6 +259,8 @@ def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int,
     return {
         "hpc_command": json.dumps(list(command)),  # a TOML array of basic strings is JSON's
         "hpc_stop_bound_s": str(stop_bound_s),
+        "hpc_step_launch_wait_s": str(step_launch_wait_s),
+        "hpc_command_timeout_s": str(command_timeout_s),
         "hpc_settle_timeout_s": str(settle_timeout_s),
         "hpc_root": text,
     }
@@ -278,14 +295,16 @@ def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, 
 
 
 def rendered(template: str, filled: Mapping[str, str]) -> str:
-    """The template filled in, and, once the root holds an address map (`hpc_addresses`, its path), `addresses` first:
-    the file where the platform layer's clients find the address each declared name is dialled at (O73). A top-level key
-    of its own, so it may precede every table."""
+    """The template with its `@slots@` replaced, and nothing added, moved or removed (a study's conformance check holds
+    a render to that). Once the root holds an address map (`hpc_addresses`, the table `hpcnames.addresses_value` gives)
+    the template's own `addresses = @hpc_addresses@` is where the platform layer's clients find the address each
+    declared name is dialled at (O73); a map with no such line, or the line with no map, is refused naming the slot."""
+    given = hpcnames.ADDRESSES_SLOT in filled
+    hpcnames.check_addresses_slot(template, map_written=given)
     text = render(template, dict(filled))
-    if "hpc_addresses" not in filled:
-        return text
-    resolver = f", resolver = {json.dumps(filled['hpc_resolver'])}" if "hpc_resolver" in filled else ""
-    return f"addresses = {{ file = {json.dumps(filled['hpc_addresses'])}{resolver} }}\n" + text
+    if given:
+        hpcnames.check_rendered_addresses(text, filled[hpcnames.ADDRESSES_SLOT])
+    return text
 
 
 def registered_of(facts: Mapping[str, Any]) -> Dict[str, str]:
@@ -315,11 +334,9 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
     if layout.address_map.is_file():  # the platform layer's clients dial each declared name at its mapped address
-        values = {**values, "hpc_addresses": str(layout.address_map)}
-        if (
-            layout.toolshim / hpcnames.LAUNCHER
-        ).is_file():  # the launcher `up` copied into the root, for a Python server
-            values["hpc_resolver"] = str(layout.toolshim / hpcnames.LAUNCHER)
+        launcher = layout.toolshim / hpcnames.LAUNCHER  # the one `up` copied into the root, for a Python server
+        table = hpcnames.addresses_value(layout.address_map, launcher if launcher.is_file() else None)
+        values = {**values, hpcnames.ADDRESSES_SLOT: table}
     text = template.read_text(encoding="utf-8")
     require_study_artifacts(text, values.get("study_artifacts"))
     write_platform(layout.platform, text, facts, values)
@@ -341,13 +358,49 @@ def direct_storages_value(layout: Layout, boot: Bootstrap, environ: Mapping[str,
     return "{" + ", ".join(f"{json.dumps(key)} = {json.dumps(path)}" for key, path in mapping.items()) + "}"
 
 
+def declares_names(layout: Layout) -> bool:
+    """Whether the layout's services are reached by their declared names (O73): `hpc_spec` (`placed_layout`'s) makes
+    each an `HpcService`, whose URL carries the name, which resolves nowhere on the site. The services of a Compose
+    layout are at loopback ports, and it declares no name to dial."""
+    return any(isinstance(service, HpcService) for service in layout.spec.services)
+
+
+def root_address_map(layout: Layout) -> AddressMap:
+    """The address map the root holds (`up` writes it before any service is launched), or an `AddressMapError` naming
+    the file by its place in the root: it is missing, or it cannot be used and the map's own reason says why. Never a
+    declared name, an address or a path of the host."""
+    shown = layout.address_map.relative_to(layout.root).as_posix()
+    why = (
+        "every service of this federation is at a name that resolves nowhere, so the login node's client could reach "
+        "none without it (`up` writes it before it launches any service)"
+    )
+    try:
+        return AddressMap.load(layout.address_map)
+    except AddressMapError as error:
+        if not os.path.lexists(layout.address_map):
+            raise AddressMapError(f"{shown} is missing: {why}") from None
+        raise AddressMapError(f"{shown} cannot be used ({error}): {why}") from None
+
+
+def service_client(layout: Layout, rest: Callable[..., Any]) -> Any:
+    """The one constructor of the login node's REST client of the federation's services (O73): the core phase's and
+    `verify-data`'s alike, so neither can reach a service by name only. On a layout of declared names every URL carries
+    a name that resolves nowhere, so the client is given the root's address map (`addresses`) and its absence or an
+    unusable one is refused (`AddressMapError`), never answered with a client that has none. A layout that declares no
+    name (a Compose one) is at loopback ports and gets the client with none. `tests/deploy/test_rest_constructors.py`
+    fails on a client of the services built anywhere else that is not listed with its reason."""
+    if not declares_names(layout):
+        return rest(layout.ca_pem)
+    return rest(layout.ca_pem, addresses=root_address_map(layout))
+
+
 def core_phase(
     layout: Layout,
     owner: Tuple[int, int],
     values: Mapping[str, str],
     *,
     environ: Optional[Mapping[str, str]] = None,
-    rest: Callable[[Path], Any] = Rest,
+    rest: Callable[..., Any] = Rest,
     bootstrap: Callable[[Any, Layout, Tuple[int, int]], Bootstrap] = HpcBootstrap,
     steps: Callable[[Bootstrap], None] = bring_up,
     content: Callable[[Bootstrap], Any] = Content,
@@ -365,8 +418,7 @@ def core_phase(
     if not passphrase.is_file() or not layout.ca_pem.is_file():
         raise RuntimeError("the root holds no zone passphrase or no CA: the zone's export did not run")
     env = os.environ if environ is None else environ
-    addresses = AddressMap.load(layout.address_map) if layout.address_map.is_file() else None
-    client = rest(layout.ca_pem) if addresses is None else rest(layout.ca_pem, addresses=addresses)
+    client = service_client(layout, rest)
     try:
         boot = bootstrap(client, layout, owner)
         steps(boot)
@@ -441,21 +493,23 @@ def verify_ingested(
     owner: Tuple[int, int],
     manifests: Mapping[str, Manifest],
     *,
-    rest: Callable[[Path], Any] = Rest,
+    rest: Callable[..., Any] = Rest,
     bootstrap: Callable[[Any, Layout, Tuple[int, int]], Bootstrap] = HpcBootstrap,
     data: Callable[[Bootstrap], Callable[[str], Any]] = hpcdata.content_reader,
 ) -> Dict[str, str]:
     """Read each ingested space back through its owner and compare it with its manifest (O57): what makes each other
     than the manifest, in counts alone (empty for one that is exactly it), never a path. A fresh process holds none of
     the ids the bootstrap made, so the spaces' ids are read from facts.json, which `up` wrote; the services' addresses
-    are the placed layout's. `rest`, `bootstrap` and `data` are the core phase's own, for a stand-in."""
+    are the placed layout's, dialled through the root's address map as the core phase's are (`service_client`, O73:
+    every service's URL carries its declared name, which resolves nowhere on the site, so a root with no usable map is
+    refused). `rest`, `bootstrap` and `data` are the core phase's own, for a stand-in."""
     try:
         recorded = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]
         ids = {name: space["id"] for name, space in recorded.items()}
     except (OSError, ValueError, KeyError, TypeError) as error:
         why = type(error).__name__
         raise RuntimeError(f"{layout.facts.name} cannot be read as the facts up writes ({why})") from None
-    client = rest(layout.ca_pem)
+    client = service_client(layout, rest)
     try:
         boot = bootstrap(client, layout, owner)
         boot.ids.spaces.update(ids)

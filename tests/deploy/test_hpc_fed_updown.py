@@ -21,6 +21,7 @@ from hpc_fed_support import (
     data_stand_in,
     hpc_on_path,
     pin_values,
+    write_address_map,
 )
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
@@ -274,7 +275,8 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_d
     assert layout.spec.zone.url == "https://zone.expcore-hpc-pilot.test:8443"
     assert layout.spec.provider("hazel").url == "https://hazel.expcore-hpc-pilot.test:8443"
     assert owner == (5001, 5001)
-    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("690", "750")
+    assert (values["hpc_step_launch_wait_s"], values["hpc_command_timeout_s"]) == ("240", "300")
+    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("140", "450")
     command = json.loads(values["hpc_command"])
     assert command[1:3] == ["-I", "-B"]  # isolated (O58): the relay runs every verb through it
     assert command[3:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
@@ -313,7 +315,7 @@ def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancel
     teardowns = [s for s in rig.fake.sruns if s.command[1:2] and s.command[1].endswith("teardown.sh")]
     assert [s.command[s.command.index("--workdir") + 1].split(".")[0] for s in teardowns][-1] == "/tmp/hpcop-oz"
     assert [s.node for s in teardowns] == [f"node{i:02d}" for i in (2, 3, 4, 5, 6, 1)]
-    assert all(s.command[-2:] == ["--timeout", "600"] for s in teardowns)
+    assert all(s.command[-2:] == ["--timeout", "50"] for s in teardowns)
     checks = [s for s in rig.fake.sruns if s.command[0] == "test"]
     assert len(checks) == 6
     assert all(s.command[1:3] == ["!", "-e"] for s in checks)
@@ -321,6 +323,27 @@ def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancel
     assert len(rig.fake.ended_clients) == 6
     assert not rig.root.exists()
     assert "is gone" in out
+
+
+def test_a_teardown_step_is_bounded_by_the_launch_wait_the_stop_the_kill_and_a_margin(hpc, tmp_path, site):
+    """O58: down's teardown step is waited for from its start, so its bound holds the step's launch wait (240 s), the
+    graceful stop (50 s), supervise.py's kill tail (30 s) and 90 s: 410 s, past a step that starts 200 s late (the
+    controller's message timeout) and ends 33 s after its SIGTERM, and past the worst teardown after it (the whole
+    graceful stop, then the kill)."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    asked, inner = {}, rig.driver.launcher.control
+
+    def control(node, argv, *, name, timeout_s, job=None):
+        asked[name] = timeout_s
+        return inner(node, argv, name=name, timeout_s=timeout_s, job=job)
+
+    rig.driver.launcher.control = control
+    rig.driver.down()
+    teardown = {bound for name, bound in asked.items() if "-teardown-" in name}
+    assert teardown == {240 + 50 + 30 + 90}
+    assert 200 + 33 < 410
+    assert 200 + 50 + 30 < 410
 
 
 def test_a_held_job_recorded_otherwise_is_cancelled_and_down_after_it_removes_the_root(hpc, tmp_path, site):
@@ -734,6 +757,7 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
         os.chmod(root / name, 0o600)
     hosts = {s.name: f"{s.name}.cluster.example.org" for s in spec.services}
     layout = fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
+    write_address_map(layout)  # `up` leaves one in a root of declared names
     ids = SimpleNamespace(
         admin="uid-admin",
         providers={p.name: f"pid-{p.name}" for p in spec.providers},
@@ -786,7 +810,8 @@ def test_the_service_verbs_go_through_the_stable_hook_with_the_launcher_and_the_
     (verb, service, argv), keywords = calls[0]
     assert (verb, service, argv) == ("exec", "aspen", ["op_worker", "ping"])
     assert calls[1][0] == ("status", "aspen", [])
-    assert keywords["stop_seconds"] == 600
+    assert keywords["stop_seconds"] == 50
+    assert keywords["step_launch_wait_s"] == 240
     assert isinstance(keywords["launcher"], hpc.launch.Launcher)
     assert isinstance(keywords["state"], hpc.launch.StateStore)
 

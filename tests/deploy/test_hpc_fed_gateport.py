@@ -18,6 +18,7 @@ from hpc_fed_support import (
     PILOT_TEMPLATE,
     SITE,
     FakeSlurm,
+    address_values,
     agent_site,
     hpc_on_path,
     manifest_values,
@@ -110,6 +111,7 @@ def render(hpc, pins, root: Path, site: dict, ca: bytes, layout: Path = REST_LAY
         ["/venv/python", "/repo/hpcfed.py"], settings.stop_bound_s, settings.settle_timeout_s, root
     )
     values |= pins.values(hpc.settings.site_from_environment(site)) | manifest_values(root, layout)
+    values |= address_values(root)
     template = spec.platform_template.read_text(encoding="utf-8")
     hpc.boot.write_platform(root / "platform.toml", template, facts, values)
     return root / "platform.toml"
