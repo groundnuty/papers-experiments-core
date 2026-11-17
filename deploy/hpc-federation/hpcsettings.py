@@ -47,6 +47,9 @@ AGENT_PINS = {
     "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
 }
 AGENT_VARIABLES = {**AGENT_PATHS, **AGENT_PINS}
+QUOTA_CHECK_OFF = (
+    "off"  # HPC_QUOTA_CHECK's one value: the inode check is skipped, and up says so (README, "Provider storage")
+)
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
     # 2.5 GB rootfs, plus its posix storage on the same tmpfs; the largest control step (a token's delivery) about
@@ -327,6 +330,16 @@ class Site:
     oneclient_bundle: str = ""
     oneclient_bundle_sha256: str = ""
     agent_work_root: str = ""
+    # The providers' storage on the cluster's shared scratch filesystem and the guard of its inode quota (hpcstorage,
+    # hpcquota; README, "Provider storage on scratch"). `storage_root` is the directory below which `up` makes the
+    # federation's own storage; with none, nothing is made on scratch and no check runs. `quota_cmd` is the site's
+    # command that prints the account's inode usage and quota (split as a shell would, run without one),
+    # `quota_pattern` the regular expression with the named groups `used` and `quota` that reads its output, and
+    # `quota_check` is "off" to skip the check. Only `storage_root` is recorded in the state file: `down` needs it.
+    storage_root: str = ""
+    quota_cmd: str = ""
+    quota_pattern: str = ""
+    quota_check: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -341,6 +354,7 @@ class Site:
             "admin_mail": self.admin_mail,
             "billing_weight": self.billing_weight,
             **{attribute: getattr(self, attribute) for attribute in AGENT_VARIABLES.values()},
+            "storage_root": self.storage_root,
         }
 
     @classmethod
@@ -385,6 +399,10 @@ def checked_site(site: Site) -> Site:
     for variable, attribute in AGENT_PINS.items():
         if getattr(site, attribute) and not SHA256.fullmatch(getattr(site, attribute)):
             raise SettingsError(f"{variable}: must be 64 lower-case hexadecimal digits")
+    if site.storage_root:
+        _absolute(site.storage_root, "HPC_STORAGE_ROOT")
+    if site.quota_check not in ("", QUOTA_CHECK_OFF):
+        raise SettingsError(f"HPC_QUOTA_CHECK: must be '{QUOTA_CHECK_OFF}' or unset (unset is not off)")
     return site
 
 
@@ -414,5 +432,9 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             admin_mail=environ.get("HPC_ADMIN_MAIL") or defaults.admin_mail,
             billing_weight=billing,
             **{attribute: environ.get(variable) or "" for variable, attribute in AGENT_VARIABLES.items()},
+            storage_root=environ.get("HPC_STORAGE_ROOT") or "",
+            quota_cmd=environ.get("HPC_QUOTA_CMD") or "",
+            quota_pattern=environ.get("HPC_QUOTA_PATTERN") or "",
+            quota_check=environ.get("HPC_QUOTA_CHECK") or "",
         )
     )

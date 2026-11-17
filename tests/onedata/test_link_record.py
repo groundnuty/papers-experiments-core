@@ -6,6 +6,7 @@ wants a check under an hour old) sees a torn file.
 """
 
 import errno
+import fcntl
 import json
 import os
 import threading
@@ -275,8 +276,8 @@ def test_o35_a_check_that_starts_while_another_is_under_way_waits_for_it(tmp_pat
 
 
 def test_o35_a_lock_file_another_user_made_read_only_is_still_taken(tmp_path):
-    """O35: `flock` needs no write permission, so the lock file is opened read-only: a lock file that only its owner can
-    write (0644, or here 0444) is taken by every process that can read it, and is not skipped."""
+    """O35: `flock` needs no write permission on a local filesystem, so a lock file that only its owner can write (0644,
+    or here 0444) is opened read-only by a process that cannot write it, and taken by every process that can read it."""
     lock = tmp_path / LOCK
     lock.write_bytes(b"")
     lock.chmod(0o444)
@@ -303,13 +304,74 @@ def test_o35_a_lock_that_cannot_be_taken_is_said_by_a_false_and_never_raises(tmp
         assert held is False
 
 
+def test_o35_the_lock_is_taken_where_an_exclusive_flock_needs_a_write_descriptor(tmp_path, nfs_flock_rule):
+    """O35: NFS implements `flock` as a POSIX lock, so an exclusive one on a read-only descriptor fails there with EBADF
+    (live, on an HPC federation's NFSv4 root, `up` said the record's lock could not be taken and no check left a
+    record). The lock file is opened for writing, so the lock is taken, and it excludes another taker."""
+    path = tmp_path / RECORD
+    with recording(path) as held:
+        assert held is True
+        other = os.open(tmp_path / LOCK, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(other)
+    assert (tmp_path / LOCK).stat().st_mode & 0o777 == 0o644
+
+
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EROFS, errno.EPERM])
+def test_o35_a_lock_file_that_cannot_be_written_is_opened_read_only_and_taken_where_flock_allows_it(
+    tmp_path, refuse_lock_writes, code
+):
+    """O35: a lock file this process may read but not write (another user's 0644 file, a read-only mount, an immutable
+    file) is opened read-only after the write is refused, and locked: on a local filesystem `flock` needs no write
+    permission."""
+    (tmp_path / LOCK).write_bytes(b"")
+    tried = refuse_lock_writes(code)
+    with recording(tmp_path / RECORD) as held:
+        assert held is True
+    assert tried == [os.O_RDWR, os.O_RDONLY]
+
+
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EROFS, errno.EPERM])
+def test_o35_a_lock_file_that_cannot_be_written_is_not_taken_where_flock_needs_a_write_descriptor(
+    tmp_path, nfs_flock_rule, refuse_lock_writes, code
+):
+    """O35: where an exclusive `flock` needs a write descriptor (NFS) and the lock file cannot be written, the lock
+    cannot be taken: `recording` says so with a False and raises nothing, so the caller publishes no verdict."""
+    (tmp_path / LOCK).write_bytes(b"")
+    tried = refuse_lock_writes(code)
+    with recording(tmp_path / RECORD) as held:
+        assert held is False
+    assert tried == [os.O_RDWR, os.O_RDONLY]
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EMFILE, errno.ENOENT])
+def test_o35_a_failure_to_open_the_lock_that_is_no_refusal_to_write_is_not_tried_read_only(
+    tmp_path, refuse_lock_writes, code
+):
+    """O35: only a refusal to write (EACCES, EROFS, EPERM) sends the lock to a read-only open; any other failure to
+    open the lock file is a lock that cannot be taken, said by a False."""
+    tried = refuse_lock_writes(code)
+    with recording(tmp_path / RECORD) as held:
+        assert held is False
+    assert tried == [os.O_RDWR]
+
+
 def test_o35_the_module_names_what_up_and_the_platforms_probe_import():
-    """O35: the writer's whole interface: the writer, its lock, and where the federation's record lies (its root)."""
+    """O35: the writer's whole interface: the writer, its lock, where the federation's record lies (its root), and the
+    words and the fact by which a check whose record was not written says so in the run's record (`fact`)."""
     assert set(linkrecord.__all__) == {
+        "LINK_RECORD_NOTE",
         "LOCK",
+        "LOCK_NOT_TAKEN",
+        "NOT_WRITTEN",
         "RECORD",
         "ROOT_FILE",
+        "WRITE_FAILED",
         "discard_record",
+        "fact",
         "federation_root",
         "record_path",
         "record_text",

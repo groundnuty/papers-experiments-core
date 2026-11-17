@@ -198,13 +198,18 @@ class PairResult:
 
 @dataclass(frozen=True)
 class LinkReport:
-    """The verdict of one link check, with every pair's result and the check's window on the host's epoch clock."""
+    """The verdict of one link check, with every pair's result and the check's window on the host's epoch clock.
+
+    `not_written` is set only by `fault_serves.recorded`, on the report of a check whose record was not written:
+    `linkrecord.LOCK_NOT_TAKEN` or `linkrecord.WRITE_FAILED`. It is no part of the record file, so `to_json` holds
+    nothing of it and the bytes `up` writes are what they were; it carries the fact to the run's record."""
 
     ok: bool
     detail: str
     pairs: tuple[PairResult, ...] = ()
     started: float | None = None
     ended: float | None = None
+    not_written: str | None = None
 
     @property
     def health(self) -> Health:

@@ -166,9 +166,11 @@ def _import_hpc():
     import hpcdriver
     import hpcfed
     import hpclaunch
+    import hpcquota
     import hpcsettings
     import hpcslurm
     import hpcstate
+    import hpcstorage
 
     return type(
         "Hpc",
@@ -178,9 +180,11 @@ def _import_hpc():
             "driver": hpcdriver,
             "cli": hpcfed,
             "launch": hpclaunch,
+            "quota": hpcquota,
             "settings": hpcsettings,
             "slurm": hpcslurm,
             "state": hpcstate,
+            "storage": hpcstorage,
         },
     )
 
@@ -318,6 +322,9 @@ class FakeSlurm:
     leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
     step_cancel_rc: int = 0  # a step's scancel ends it but exits so (225: as the site's did on a het job, live slot 5)
     accounting: dict = field(default_factory=dict)  # job id -> what `sacct -o JobID,State,AllocTRES` prints of it
+    # A command of the login node beyond Slurm's, by its first word (the site's quota command, invented): a test's
+    # answer, `(argv, timeout) -> Completed`, which may raise what the real Runner does. Every call is in `calls`.
+    tools: dict = field(default_factory=dict)
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -384,6 +391,8 @@ class FakeSlurm:
         if argv[1:5] == ["-I", "-B", "-m", "expcore_onedata.fault_relay"]:
             self.relay_calls.append(argv[5])
             return Completed(self.relay_rc.get(argv[5], 0), "", "")
+        if tool in self.tools:
+            return self.tools[tool](argv, timeout)
         raise AssertionError(f"an unexpected command: {argv}")
 
     @staticmethod
