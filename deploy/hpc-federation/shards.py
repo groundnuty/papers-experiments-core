@@ -1897,7 +1897,11 @@ def copy_directory(root: Path, into: Path) -> Path:
 def holds_copy(into: Path, archive_sha256: str | None) -> str | None:
     """The SHA-256 of the archives manifest in `into`, when `into` holds exactly the copy a root-only collect makes
     (the manifest, the archive and its manifest and no other file), the copy verifies against the manifest and the
-    archive is the one the root's marker names (`archive_sha256`); None otherwise, and when there is no marker."""
+    archive is the one the root's marker names (`archive_sha256`); None otherwise, and when there is no marker. The
+    archive and its manifest must also be one another's, as `hpcevidence.verified_pair` shows them (the manifest names
+    the archive's hash and size and lists exactly the files it holds): the manifest of `archives.sha256.json` only says
+    what its bytes are, so a manifest swapped for another and its line there updated would otherwise pass for the
+    copy. `ShardsError` naming the manifest when they are not: the copy is not what the root's marker vouches for."""
     if archive_sha256 is None or {entry.name for entry in into.iterdir()} != {
         *(f"{ROOT_ONLY_STEM}{s}" for s in ROOT_SUFFIXES),
         ARCHIVES_MANIFEST,
@@ -1915,7 +1919,14 @@ def holds_copy(into: Path, archive_sha256: str | None) -> str | None:
         archive = {entry["name"]: entry["sha256"] for entry in document["evidence"]}[f"{ROOT_ONLY_STEM}.root.tar"]
     except (OSError, ValueError, KeyError, TypeError, AttributeError, ShardsError):
         return None
-    return digest if archive == archive_sha256 else None
+    if archive != archive_sha256:
+        return None
+    module = _evidence()
+    try:
+        module.verified_pair(into, ROOT_ONLY_STEM, ROOT_ONLY_STEM)
+    except module.EvidenceError as error:
+        raise ShardsError(f"{error}: the copy in the directory is not what the root's marker vouches for") from None
+    return digest
 
 
 def root_only_payload(held: Any) -> bytes:
