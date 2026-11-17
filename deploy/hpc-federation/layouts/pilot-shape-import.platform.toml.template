@@ -8,6 +8,7 @@
 # refuses a shared import that is not read-only at load, checks the owner's panel for it, and
 # `fedimport.verify_imports` reads this file for it, refusing a file that leaves the sharing out. The study's own space
 # (alpha-work) is not declared here.
+addresses = @hpc_addresses@   # O73: the address map and the resolve launcher, as one inline table that up fills; the platform layer dials each declared name at its mapped address. A top-level key, so before the first table
 zone = { name = "zone", url = "@zone_url@" }
 providers.aspen = { url = "@provider_url.aspen@", id = "@provider_id.aspen@" }
 providers.larch = { url = "@provider_url.larch@", id = "@provider_id.larch@" }
