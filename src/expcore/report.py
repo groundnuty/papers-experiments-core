@@ -93,8 +93,8 @@ from expcore.report_families import (
     one_line,
     steps_lines,
 )
-from expcore.report_guards import LEFT_OUT as EITHER_GUARD
-from expcore.report_guards import guards_lines
+from expcore.report_guards import guards_lines, left_out_label
+from expcore.report_guards import summary_lines as guards_summary_lines
 from expcore.report_holds import section as operator_holds
 from expcore.report_interrupted import section as interrupted_spend
 from expcore.report_lost import section as lost_in_kill
@@ -844,23 +844,9 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> list[str]:
 
 
 def _guards_summary(guards: GuardsAnalysis) -> list[str]:
-    """The terminal's lines of both guards together (O60): the runs either leaves out, then each confirmatory contrast
+    """The terminal's lines of the guards together (O60, O70): the runs any leaves out, then each confirmatory contrast
     without them."""
-    n = guards.counts()
-    lines = [
-        f"both guards: {n['left_out']} of {n['analysed']} analysed run(s) left out ({n['egress_only']} by egress "
-        f"alone, {n['mount_only']} by the mount guard alone, {n['both']} by both)"
-    ]
-    for condition, c in guards.by_condition().items():
-        lines.append(
-            f"both guards, {condition}: {c['left_out']} of {c['analysed']} left out ({c['egress_only']} by egress "
-            f"alone, {c['mount_only']} by the mount guard alone, {c['both']} by both)"
-        )
-    if guards.refused is not None:
-        return [*lines, f"both-guards sensitivity: not computed ({guards.refused})"]
-    if guards.sensitivity is None:
-        return [*lines, "both-guards sensitivity: every run clean to both, the same as the analysis above"]
-    return lines + _rerun_lines(guards.sensitivity, "both-guards sensitivity")
+    return guards_summary_lines(guards, _rerun_lines)
 
 
 def _visibility_summary(seen: VisibilityAnalysis) -> list[str]:
@@ -915,8 +901,8 @@ def summary_lines(
         lines.append(f"{d.name} (descriptive, {kind} of {d.outcome} in {arm}): {_num(d.estimate)} {interval}")
     lines += _egress_summary(egress) if egress is not None else []
     lines += _mount_guard_summary(mount_guard) if mount_guard is not None else []
-    lines += _guards_summary(guards) if guards is not None else []
-    return lines + (_visibility_summary(visibility) if visibility is not None else [])
+    lines += _visibility_summary(visibility) if visibility is not None else []
+    return lines + (_guards_summary(guards) if guards is not None else [])
 
 
 def _partial_line(export: Mapping[str, Any]) -> str:
@@ -999,8 +985,8 @@ def render_report(
     report says n/a without them), `interval_level` the level of the contrasts' intervals when the preregistration
     states one, `egress` the egress verdicts and the sensitivity analysis of a batch checked for egress (no section
     without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60),
-    `guards` the rerun without the runs either guard leaves out (a batch checked by both, O60), `visibility` the
-    process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
+    `guards` the rerun without the runs any guard leaves out (a batch checked by two or more, O60, O70), `visibility`
+    the process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
     it, O56). A partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`).
     What each number counts is stated in the report beside it. The text ends with a newline.
     """
@@ -1032,7 +1018,7 @@ def render_report(
     shards = shard_lines(export, _table)  # only a batch merged from shards has any (#154)
     checked = egress_lines(egress, _table, lambda r: _sensitivity(r, interval_level))  # only a checked batch (#179)
     guarded = mount_guard_lines(mount_guard, _table, lambda r: _sensitivity(r, interval_level, NOT_CLEAN))  # O60
-    both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, EITHER_GUARD))  # O60
+    both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, left_out_label(guards)))  # O60
     seen = visibility_lines(visibility, _table, lambda r: _sensitivity(r, interval_level, HID_OR_UNKNOWN))  # O56
     sections = (
         _contrasts(result, interval_level)
@@ -1040,8 +1026,8 @@ def render_report(
         + shards
         + checked
         + guarded
-        + both
         + seen
+        + both
         + _deployments(export)
         + _left_out(left_out)
     )

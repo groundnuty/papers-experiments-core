@@ -169,7 +169,9 @@ class StudyAnalysis:
     scorers: Mapping[str, str]  # the version of each scorer that scored the records, by name
     egress: EgressAnalysis | None = None  # a batch checked for egress: the verdicts and the sensitivity analysis
     mount_guard: MountGuardAnalysis | None = None  # a batch whose mount was guarded: the same, of the mount (O60)
-    guards: GuardsAnalysis | None = None  # a batch checked by both: the rerun without the runs either leaves out
+    guards: GuardsAnalysis | None = (
+        None  # a batch checked by two or more guards: the rerun without the runs any leaves out
+    )
     visibility: VisibilityAnalysis | None = None  # a batch watched for hidden processes: the same, of those (O56)
 
 
@@ -865,8 +867,8 @@ def _analyse_loaded(
         raise Refused(str(error)) from None
     egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
     guard = mount_guard_analysis(runs, rows, absent, study.prereg)  # None for a batch whose mount was not guarded
-    both = guards_analysis(rows, absent, study.prereg, egress, guard)  # None unless both guards checked the batch
     seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
+    both = guards_analysis(rows, absent, study.prereg, egress, guard, seen)  # None unless two guards checked the batch
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
     return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen)
@@ -1000,15 +1002,17 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
 
 
 def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
-    """What `analysis.json` holds of a batch checked by both guards (O60): the runs either leaves out, overall and per
-    condition, each run as both found it, and the rerun without the left-out runs, or why there is none."""
+    """What `analysis.json` holds of a batch checked by two or more guards (O60, O70): the guards that checked it, the
+    runs any leaves out, overall and per condition, each run as each guard found it (None for a guard that did not
+    check the batch), and the rerun without the left-out runs, or why there is none."""
     sensitivity = guards.sensitivity
     return {
+        "guards": list(guards.guards),
         "counts": guards.counts(),
         "by_condition": guards.by_condition(),
         "runs": [
             {"run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "egress": run.egress,
-             "mount": run.mount, "left_out_by": run.by}
+             "mount": run.mount, "visibility": run.visibility, "left_out_by": run.by}
             for run in guards.runs
         ],
         "sensitivity": None

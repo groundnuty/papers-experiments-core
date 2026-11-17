@@ -81,7 +81,30 @@ class _StubEgress:
 '''  # fmt: skip
 
 
-def prepared(tmp_path: Path, *, guard: bool, egress: bool = False, rest_task: str | None = None) -> Path:
+# Added beside the guard for a batch checked by all three: a process-visibility reading that is within the limit for
+# every run but those of the task `river`, whose memory reading is unknown.
+VISIBILITY = '''
+
+from expcore.visibility import ProcessVisibility
+
+
+class _StubSeen:
+    def __init__(self, task):
+        self.task = task
+
+    def process_visibility(self):
+        figures = dict.fromkeys(("margin_bytes", "start_unexplained_bytes", "unexplained_peak_bytes",
+                                 "cgroup_anon_bytes", "visible_anon_bytes"), 1)
+        unknown = self.task == "river"
+        return {"version": 1, "memory": "unknown" if unknown else "within",
+                "unknown": ["memory_unreadable"] if unknown else [], "hidden_process": 0, "hidden_memory": 0,
+                "figures": figures}
+'''  # fmt: skip
+
+
+def prepared(
+    tmp_path: Path, *, guard: bool, egress: bool = False, rest_task: str | None = None, visibility: bool = False
+) -> Path:
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
     if guard:
@@ -96,15 +119,20 @@ def prepared(tmp_path: Path, *, guard: bool, egress: bool = False, rest_task: st
             )
         if egress:
             added = added[:-1] + ", EgressLog(_StubEgress(factors['task']), declaration([_GATE], _GATE), _NONCE)]"
-        plugin.write_text(text.replace(INSTRUMENTS, added) + GUARD + (EGRESS if egress else ""), encoding="utf-8")
+        if visibility:
+            added = added[:-1] + ", ProcessVisibility(_StubSeen(factors['task']))]"
+        extra = GUARD + (EGRESS if egress else "") + (VISIBILITY if visibility else "")
+        plugin.write_text(text.replace(INSTRUMENTS, added) + extra, encoding="utf-8")
     write_stamp(study, HEAD, load_study(study).scope)
     summary = run_study(study)
     assert summary.statuses == {"done": len(load_study(study).manifest.rows)}, summary.statuses
     return study
 
 
-def checked_study(tmp_path, environment, *, guard: bool, egress: bool = False, rest_task: str | None = None):
-    study = prepared(tmp_path, guard=guard, egress=egress, rest_task=rest_task)
+def checked_study(
+    tmp_path, environment, *, guard: bool, egress: bool = False, rest_task: str | None = None, visibility: bool = False
+):
+    study = prepared(tmp_path, guard=guard, egress=egress, rest_task=rest_task, visibility=visibility)
     code, stderr = cli(environment, "check", str(study / "out" / "runs"), process=True)
     assert code == 0, stderr
     return analyse_study(study)
@@ -197,3 +225,30 @@ def test_o69_a_campaign_that_mixes_data_paths_keeps_its_rest_runs_in_the_mount_g
     assert summary["counts"]["not_applicable"] == len(river)
     assert not river & set(summary["sensitivity"]["left_out"])
     assert "Not applicable" in made[REPORT_FILE].decode()
+
+
+def test_o70_a_study_checked_by_all_three_guards_reruns_without_the_runs_any_of_them_leaves_out(
+    tmp_path, clean_environment
+):
+    """O70: the process-visibility check joins the combined rerun: `river`'s runs, whose memory reading is unknown, are
+    left out of it beside the runs the mount guard and egress leave out, and analysis.json, the report and the
+    terminal carry it."""
+    analysis = checked_study(tmp_path, clean_environment, guard=True, egress=True, visibility=True)
+    both = analysis.guards
+    assert both is not None
+    assert both.guards == ("egress", "mount", "visibility")
+    out = {run.run_key for run in both.left_out}
+    assert out == (
+        {run.run_key for run in analysis.mount_guard.left_out}
+        | {run.run_key for run in analysis.egress.flagged}
+        | {run.run_key for run in analysis.visibility.left_out}
+    )
+    assert analysis.visibility.left_out
+    assert {run.by for run in both.left_out if run.visibility == "unknown"} >= {"visibility"}
+    made = output_bytes(analysis)
+    summary = json.loads(made[ANALYSIS_FILE])["guards"]
+    assert summary["guards"] == ["egress", "mount", "visibility"]
+    assert summary["counts"]["left_out"] == len(out)
+    report = made[REPORT_FILE].decode()
+    assert "## Egress, mount isolation and process visibility together" in report
+    assert "#### Preregistered contrasts without the runs any guard leaves out" in report

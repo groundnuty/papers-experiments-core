@@ -344,3 +344,91 @@ def test_s17_a_flat_family_rerun_keeps_its_analysis_json_keys_in_both_guards():
     """S17: one flat family gives each guard's rerun the keys it had before families were named."""
     assert list(_mount_guard_summary(guarded())["sensitivity"]) == ["left_out", "contrasts", "holm"]
     assert list(_guards_summary(combined())["sensitivity"]) == ["left_out", "contrasts", "holm"]
+
+
+# --- the combined section of three guards, and of egress with the visibility check (O70) --------------------------
+
+ALL_HEADING = "## Egress, mount isolation and process visibility together (detected, not prevented)"
+ANY_SENSITIVITY = "#### Preregistered contrasts without the runs any guard leaves out"
+
+
+def combined_all(**changes):
+    """k1 left out by the visibility check alone, k2 by the mount guard alone, k3 by egress and visibility (several),
+    k4 clean to all three, k5 a REST run (not applicable to the mount guard) that is clean to the others."""
+    from expcore.guards import GuardedRun, GuardsAnalysis
+
+    runs = (
+        GuardedRun("k1", 1, "cond-a", "clean", "clean", "flagged"),
+        GuardedRun("k2", 1, "cond-b", "clean", "unknown", "clean"),
+        GuardedRun("k3", 1, "cond-b", "flagged", "clean", "unknown"),
+        GuardedRun("k4", 1, "cond-a", "clean", "clean", "clean"),
+        GuardedRun("k5", 1, "cond-a", "clean", "not_applicable", "clean"),
+    )
+    again = analysis(contrast("a-vs-b", "difference", n_pairs=30, estimate=0.15))
+    return dataclasses.replace(GuardsAnalysis(runs, again), **changes)
+
+
+def test_o70_the_section_of_three_guards_is_named_for_all_of_them_and_counts_each_alone_and_several():
+    """O70: process visibility joins the combined section; a run not applicable to the mount guard is not left out."""
+    report = render(analysis(contrast("a-vs-b", "difference")), guards=combined_all())
+    assert ALL_HEADING in report
+    assert (
+        "3 of 5 analysed run(s) left out by any guard: 0 by egress alone, 1 by the mount guard alone, 1 by the "
+        "process visibility check alone, 1 by several." in report
+    )
+    by_condition = table_of(report, "### Left out by any guard, by condition")
+    assert by_condition["Condition"][1:] == ["Analysed", "Left out", "By egress alone", "By the mount guard alone",
+                                             "By the process visibility check alone", "By several"]  # fmt: skip
+    assert by_condition["cond-a"][1:] == ["3", "1", "0", "0", "1", "0"]
+    assert by_condition["cond-b"][1:] == ["2", "2", "0", "1", "0", "1"]
+    rows = table_of(report, "### Runs any guard leaves out")
+    assert rows["Run key"][3:] == ["Egress", "Mount guard", "Process visibility", "Left out by"]
+    assert rows["k3"][3:] == ["flagged", "clean", "unknown", "egress + process visibility"]
+    assert set(rows) == {"Run key", "k1", "k2", "k3"}  # k4 is clean, k5 not applicable to the mount guard
+    assert table_of(report, ANY_SENSITIVITY)["a-vs-b"][3] == "0.15"
+
+
+def test_o70_egress_with_the_visibility_check_alone_reads_as_a_pair_of_guards():
+    """O70: two guards other than the first pair are named, and `both` means both of them."""
+    from expcore.guards import GuardedRun, GuardsAnalysis
+
+    runs = (
+        GuardedRun("k1", 1, "cond-a", "flagged", None, "flagged"),
+        GuardedRun("k2", 1, "cond-a", "clean", None, "clean"),
+    )
+    pair = GuardsAnalysis(runs, analysis(contrast("a-vs-b", "difference", n_pairs=1)))
+    report = render(analysis(contrast("a-vs-b", "difference")), guards=pair)
+    assert "## Egress and process visibility together (detected, not prevented)" in report
+    assert (
+        "1 of 2 analysed run(s) left out by either guard: 0 by egress alone, 0 by the process visibility check "
+        "alone, 1 by both." in report
+    )
+    rows = table_of(report, "### Runs either guard leaves out")
+    assert rows["Run key"][3:] == ["Egress", "Process visibility", "Left out by"]
+    assert rows["k1"][3:] == ["flagged", "flagged", "both"]
+
+
+def test_o70_the_terminal_summary_of_three_guards_says_all_guards():
+    lines = summary_lines(analysis(contrast("a-vs-b", "difference")), None, None, combined_all())
+    assert (
+        "all guards: 3 of 5 analysed run(s) left out (0 by egress alone, 1 by the mount guard alone, 1 by the "
+        "process visibility check alone, 1 by several)" in lines
+    )
+    assert any(line.startswith("all guards, cond-b: 2 of 2 left out") for line in lines)
+    assert lines[-1].startswith("all-guards sensitivity a-vs-b: estimate 0.15")
+    quiet = summary_lines(analysis(contrast("a-vs-b", "difference")), None, None, combined_all(sensitivity=None))
+    assert quiet[-1] == "all-guards sensitivity: every run clean to all, the same as the analysis above"
+
+
+def test_o70_analysis_json_names_the_guards_that_checked_the_batch_and_each_runs_visibility_state():
+    both = _guards_summary(combined_all())
+    assert both["guards"] == ["egress", "mount", "visibility"]
+    by_key = {run["run_key"]: run for run in both["runs"]}
+    assert by_key["k3"]["visibility"] == "unknown"
+    assert by_key["k3"]["left_out_by"] == "egress+visibility"
+    assert by_key["k5"]["mount"] == "not_applicable"
+    assert by_key["k5"]["left_out_by"] is None
+    assert both["counts"]["visibility_only"] == 1
+    legacy = _guards_summary(combined())
+    assert legacy["guards"] == ["egress", "mount"]
+    assert legacy["runs"][0]["visibility"] is None
