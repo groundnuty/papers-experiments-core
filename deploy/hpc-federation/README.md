@@ -163,6 +163,42 @@ random administrator, then `bucket-create`.
 `tests/deploy/test_hpc_couchbase_guard.py` and `test_hpc_credentials.py` run the guard and the password rules
 against `tests/fake_couchbase.py`, a loopback stand-in with Couchbase 4.5's access rules (O53).
 
+## Two federations of one account
+
+A federation's services run with no network namespace and the guard watches Couchbase's fixed port 8091, so two
+federations of one account on one node would make the second one's Couchbase fail on its bind and its `up` fail
+(issue 398). Slurm packs jobs onto a node by cores and memory and keeps nothing apart, so `up` keeps them apart itself,
+with two read-only reads of the account's live jobs (`squeue --me`: ids, names, states and node lists, nothing else).
+A job whose name starts with `hpcop-` is a federation's: a held job (`hpcop-<project>-<random>`), an agent's own job
+(`...-sandbox`) and the bundle's own batch scripts (`hpcop-zone`, `hpcop-provider`). A job of any other name is none of
+its business, whatever it runs. It never reads or prints a node's name into a message: only roles and counts.
+
+- **Before it submits,** `up` collects the nodes of every such job (a pending job holds none yet, a completing one still
+  does) and submits every component of its held jobs, and the agent's own job under `separate`, with
+  `--exclude=<those nodes>`; the agent's sandbox never runs on a node that hosts an Onedata service, another
+  federation's included. How many it excluded is in the state (`allocation.excluded_nodes`) and in what `up` says. **Fail
+  closed:** with `squeue` unreadable, or a line of such a job that cannot be taken apart, `up` refuses before anything is
+  made and submits nothing.
+- **Once the job runs and before any step,** `up` reads them again. A node of this federation, a service's or the
+  agent's, that holds another live federation's job (two ups read before either had submitted, and Slurm placed both on
+  it) refuses `up`: its held jobs are cancelled by their ids, no step runs, and the message names the roles (`zone`,
+  `providers[i]`, `agent`), never a host. A second read that fails refuses the same way. Two ups that raced may both
+  refuse: `down`, then `up` again.
+- **Too few nodes.** The exclusion can leave Slurm no node that fits the job: it stays pending, or sbatch refuses it. `up`
+  waits no longer than its queue bound (`TIMEOUTS["queue"]`, 30 minutes), cancels the job by its id and says that it
+  excluded N nodes of other live federations; a refusal by sbatch says the same, with Slurm's own words stripped of those
+  nodes' names.
+
+In a fleet each member's `up` is its own, so each reads the members already up: with `HPC_FLEET_PARALLEL` at 1 (the
+default) every member takes nodes of its own. With more at once, two members that read before either has submitted can
+land on one node, and the later one is refused (reported as a failed member, nothing left held): bring it down and add
+another (`down --member fed-k`, `add 1`).
+
+`tests/deploy/test_hpc_distinct_nodes.py` runs both reads against the fake Slurm (a live federation's nodes excluded
+from each component and job, an unreadable `squeue` refusing, a race refused before any step with the roles named and
+the jobs released, the queue bound's reason) and a fleet of three members on one shared pool. Not run live: what the
+site's `sbatch` does when the exclusion leaves no node that fits (refuses at once, or keeps the job pending to the bound).
+
 ## The host mount's oneclient: a relocatable bundle
 
 A mount run on a batch node (O60, `expcore_onedata.sandbox.apptainer.hostmount`) runs oneclient on the node, outside
@@ -950,8 +986,9 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   refuses the fleet as it refuses one `up`), asked once for all N by the fleet: the account's usage against N times one
   federation's estimate (each federation's own `up` then checks its own estimate again, as it always does). Without a scratch root nothing is on scratch, and the fleet says it made no check.
   The account's home guard (`hpcquota.home_guard`, the section "The account's home, and its guard") is read once too, ahead of the inode guard, whenever the site sets its keys: a home past 95% of its files or bytes refuses the fleet's `up` and `add` before anything is made.
-  `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once. The maximum is one fleet's: two fleets of
-  one account share the grant by hand.
+  `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once; with more than one, two members' ups can
+  race for a node ("Two federations of one account"). The maximum is one fleet's: two fleets of one account share the
+  grant by hand.
 - **What `up` makes.** The fleet's directory (new: never adopted), and federations `fed-1` ... `fed-N`, each its own
   root `<fleet>/fed-k/root`, state file and held job, each brought up by `hpcfed.py up` in a process of its own (its
   output in `<fleet>/logs/fed-k.up.log`). The fleet's record, `<fleet>/fleet.json`, holds each one's root, its job's

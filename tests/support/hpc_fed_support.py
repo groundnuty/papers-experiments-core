@@ -180,6 +180,7 @@ def hpc_on_path():
 def _import_hpc():
     import hpcboot
     import hpcdriver
+    import hpcexclude
     import hpcfed
     import hpclaunch
     import hpcquota
@@ -194,6 +195,7 @@ def _import_hpc():
         {
             "boot": hpcboot,
             "driver": hpcdriver,
+            "exclude": hpcexclude,
             "cli": hpcfed,
             "launch": hpclaunch,
             "quota": hpcquota,
@@ -334,6 +336,21 @@ def isolated(argv) -> list:
 
 
 @dataclass
+class OtherJob:
+    """A live job of the account that is none of one fake's own: another federation's held job, or a job of no
+    federation. `squeue --me` lists it as the site's does (`%i %j %T %N`), its nodes as a node list (empty while it
+    is pending)."""
+
+    job: str
+    name: str
+    state: str = "RUNNING"
+    nodes: tuple = ()
+
+    def row(self) -> str:
+        return f"{self.job} {self.name} {self.state} {','.join(self.nodes)}".rstrip()
+
+
+@dataclass
 class FakeSlurm:
     """The login node's view of a cluster with one user's held job. Every command the driver gives it must run each
     Python with `-I -B` (`flagged`, `isolated`), and every step must name `/` as its working directory (`--chdir=/`), or
@@ -396,6 +413,14 @@ class FakeSlurm:
     launch_failures: dict = field(default_factory=dict)
     step_rows: dict = field(default_factory=dict)  # job id -> the `JobID|JobName|State|ExitCode|End` rows sacct prints
     sacct_steps: Callable | None = None  # a test's own answer to that sacct query, `(argv) -> Completed`, or raises
+    # The rest of the account's live jobs, which `squeue --me` lists beside this fake's own (O57, distinct nodes):
+    # `others` on every read, or `others_by_read` (one list per read, the last repeating) when the cluster changes
+    # between two reads; `peers` are other fakes sharing this one's nodes, whose own jobs are listed too.
+    others: list = field(default_factory=list)
+    others_by_read: list = field(default_factory=list)
+    peers: list = field(default_factory=list)
+    me_reads: int = 0  # the `squeue --me` reads so far
+    on_me: Callable | None = None  # a test's own answer, `(read number, listed rows) -> Completed | None`
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -405,6 +430,12 @@ class FakeSlurm:
         argv = isolated(flagged(argv))
         self.calls.append(argv)
         tool = argv[0]
+        if tool == "squeue" and "--me" in argv:  # the account's live jobs: ids, names, states and node lists only
+            assert argv == ["squeue", "--me", "-h", "-o", "%i %j %T %N"], f"the read is not read-only as agreed: {argv}"
+            self.me_reads += 1
+            listed = self.me_rows()
+            answer = self.on_me(self.me_reads, listed) if self.on_me is not None else None
+            return answer or Completed(0, "".join(f"{row}\n" for row in listed), "")
         if tool == "sbatch":
             ident = self.second_id if self.job_id in self.submitted else self.job_id
             self.submitted[ident] = self._components(argv[1:])
@@ -519,17 +550,44 @@ class FakeSlurm:
         return found
 
     def placed(self, ident, component) -> list:
-        """The nodes a component got: the first free ones, in submit order, unless a test names them."""
+        """The nodes a component got: the first free ones, in submit order, that it did not exclude (`--exclude`),
+        unless a test names them. Other jobs of the account are not considered, as on a site whose nodes are shared by
+        cores: what a job did not exclude it may share with them."""
         if (ident, component) in self.node_lists:
             return list(self.node_lists[(ident, component)])
-        start = 0
+        taken: set = set()
         for job in self.submitted or {self.job_id: None}:
             for index, options in enumerate(self._options(job)):
                 count = int(options.get("--nodes", "1"))
+                excluded = set(filter(None, options.get("--exclude", "").split(",")))
+                mine = [n for n in self.nodes if n not in excluded and n not in taken][:count]
                 if (job, index) == (ident, component):
-                    return self.nodes[start : start + count]
-                start += count
+                    return mine
+                taken.update(mine)
         return []
+
+    def own_rows(self) -> list:
+        """This fake's own live jobs as `squeue --me` lists them: a job's id, or `<leader>+<k>` per component of a
+        heterogeneous one, with its name, its state and, once it runs, its nodes."""
+        rows = []
+        for ident in self.submitted:  # none before the first sbatch: the account's own jobs are the ones submitted
+            if self.gone_job(ident):
+                continue
+            state = self.state if ident == self.job_id else self.job_states.get(ident, "RUNNING")
+            options = self._options(ident)
+            for index, component in enumerate(options):
+                listed = ident if len(options) == 1 else f"{ident}+{index}"
+                nodes = () if state == "PENDING" else tuple(self.placed(ident, index))
+                rows.append(OtherJob(listed, component.get("--job-name"), state, nodes).row())
+        return rows
+
+    def me_rows(self) -> list:
+        """Every row `squeue --me` lists now: this fake's own jobs, its peers', and the account's other jobs."""
+        if self.others_by_read:
+            others = self.others_by_read[min(self.me_reads, len(self.others_by_read)) - 1]
+        else:
+            others = self.others
+        return [*self.own_rows(), *(row for peer in self.peers for row in peer.own_rows()), *(o.row() for o in others)]
 
     def scontrol_lines(self, ident) -> str:
         components = self._options(ident)
