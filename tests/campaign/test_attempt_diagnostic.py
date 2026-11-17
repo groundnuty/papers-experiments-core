@@ -87,6 +87,20 @@ def test_c40_a_diagnostic_is_withheld_when_the_redaction_context_is_not_known_to
     assert json.dumps(SEEN) not in json.dumps(kept)
 
 
+def test_c40_an_error_whose_origin_is_not_a_mapping_never_makes_the_snapshot_raise():
+    """C40: `snapshot_of` never raises, whatever a subclass put in `origin`: the snapshot keeps no phase then."""
+
+    class Odd(InfraError):
+        def __init__(self):
+            super().__init__("sandbox", "odd", diagnostic={"seen": "x"})
+            self.origin = "start"  # not the mapping `start_instruments` sets
+
+    for complete in (False, True):
+        kept = snapshot_of(Odd(), plain(), complete=complete)
+        assert kept is not None
+        assert kept.get("ok") is False or kept.get("diagnostic") == {"seen": "x"}
+
+
 def test_c40_a_failed_start_with_no_diagnostic_keeps_the_instrument_only_when_the_context_is_whole():
     """C40: an instrument that gave no diagnostic has nothing to redact, but its name is redacted against the context
     like any text: without a whole context only the phase is kept, so the start is still counted as a start."""

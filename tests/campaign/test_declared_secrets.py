@@ -25,6 +25,7 @@ from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.models.adapters import ModelTurn, ToolCall
 from expcore.records.instruments import start_instruments
+from expcore.records.redact import Redactor
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult
 
@@ -471,3 +472,101 @@ def test_c40_a_refused_declaration_is_not_a_declaration_so_the_diagnostic_is_wit
     row, marker, export = run_failing_start(tmp_path / "out", declare)
     assert json.loads(row["diagnostic"])["error"] == "Withheld"
     assert not any(SECRET in text for text in where_it_is_kept(row, marker, export).values())
+
+
+def run_undeclared(root, diagnostic, *, before=lambda: None):
+    """A campaign whose executor never declares and whose instrument fails its start with `diagnostic`; return the
+    first attempt's row, its events and the scheduler's error, if it raised one."""
+
+    class Quoting(Inducer):
+        def start(self, identity):
+            raise InfraError("sandbox", "refused", diagnostic=diagnostic)
+
+    async def executor(request):
+        before()
+        start_instruments([Quoting()], {"run_key": request.run_key})
+
+    settings = settings_for(max_attempts=1)
+    with build(root, plan=PLAN, executor=FakeExecutor(default=executor), settings=settings) as scheduler:
+        scheduler.run()
+        row = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
+        events = [dict(e) for e in scheduler.store.q("SELECT kind, detail FROM events")]
+    return row, events
+
+
+def test_c40_a_local_log_that_cannot_be_written_costs_neither_the_attempt_nor_dispatch(tmp_path):
+    """C40: the note an undeclared attempt leaves in the local log is a courtesy copy of what was withheld: when the log
+    cannot be written (`out/logs` is a file here) the attempt is still set aside with its stub and charged as before,
+    dispatch goes on (the scheduler does not stop, as it does for a traceback that cannot be written), and an event says
+    the note was not written, with the exception's class and never its text."""
+    root = tmp_path / "out"
+    row, events = run_undeclared(
+        root, {"seen": "x"}, before=lambda: (root / "logs").write_text("a file, not a directory", encoding="utf-8")
+    )
+    assert json.loads(row["diagnostic"])["error"] == "Withheld"
+    assert (row["state"], row["charged"], row["infra_kind"]) == ("infra_fail", 1, "sandbox")
+    [event] = [e for e in events if e["kind"] == "diagnostic_note_unwritten"]
+    assert "could not be written" in event["detail"]
+    assert "a file, not a directory" not in event["detail"]
+
+
+def test_c40_the_local_note_is_redacted_structurally_and_never_cut_through_a_known_secret(tmp_path, monkeypatch):
+    """C40: the note goes through the redaction a shown diagnostic does (keys that name a secret lose their values, the
+    core's known secrets are replaced), whole: a diagnostic too large to keep is recorded as failed, never cut into a
+    fragment of a secret the core knows."""
+    known = "sk-live-secret-0123456789"
+    monkeypatch.setenv("SERVICE_API_KEY", known)
+    root = tmp_path / "out"
+    run_undeclared(root, {"authorization": "Bearer cred-9876", "token": "tok-1234", "seen": f"quoted {known}"})
+    written = log_path(root).read_text(encoding="utf-8")
+    assert "withheld" in written
+    assert not any(value in written for value in ("cred-9876", "tok-1234", known))
+    assert written.count("[redacted]") >= 3
+    big = tmp_path / "big"
+    run_undeclared(big, {"pad": "x" * 16_340, "seen": known})
+    cut = log_path(big).read_text(encoding="utf-8")
+    assert "sk-live" not in cut
+    assert "DiagnosticTooLarge" in cut
+
+
+def test_c40_a_diagnostic_that_cannot_be_serialised_never_raises_from_the_runner_declared_or_not(tmp_path):
+    """C40: a diagnostic nested past the recursion limit makes `json.dumps` raise: the attempt is set aside and its
+    snapshot is recorded as failed (declared) or withheld (not), and nothing stops dispatch."""
+    nested: dict = {}
+    for _ in range(5000):
+        nested = {"a": nested}
+    row, _ = run_undeclared(tmp_path / "out", nested)
+    assert json.loads(row["diagnostic"])["error"] == "Withheld"
+    assert (row["state"], row["charged"]) == ("infra_fail", 1)
+
+    async def executor(request):
+        request.declare_secrets()
+        raise InfraError("sandbox", "refused", diagnostic=nested)
+
+    with build(
+        tmp_path / "declared", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+    ) as scheduler:
+        scheduler.run()
+        declared = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
+    assert json.loads(declared["diagnostic"])["ok"] is False
+    assert (declared["state"], declared["charged"]) == ("infra_fail", 1)
+
+
+def test_c40_what_the_executor_declared_stays_in_a_shown_diagnostics_redaction_whatever_replaces_the_logs_redactor(
+    tmp_path,
+):
+    """C40: an executor that declared a secret and then installs a redactor of its own on the attempt's log (a direct
+    `record_attempt` that does not forward `request.declared`) still has the declared secret redacted from the
+    diagnostic it shows: the declaration is pinned, not only installed."""
+
+    async def executor(request):
+        request.declare_secrets(secrets=[SECRET])
+        request.defect_log.redact_with(lambda: Redactor([]))  # replaces the log's redactor, the declared one with it
+        raise InfraError("sandbox", "post-run check refused", diagnostic={"seen": f"it quoted {SECRET}"})
+
+    with build(
+        tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+    ) as scheduler:
+        scheduler.run()
+        row = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
+    assert json.loads(row["diagnostic"])["diagnostic"] == {"seen": "it quoted [redacted]"}

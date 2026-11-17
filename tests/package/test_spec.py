@@ -88,6 +88,24 @@ def test_l08_the_harness_defect_log_is_never_selected_whatever_the_patterns_say(
             select(tree, spec_with(tree, ["study.toml", pattern]))
 
 
+def test_l08_the_harness_log_is_never_selected_wherever_it_lies_in_the_tree(tree):
+    """L08: a shard's `out/logs/harness-errors.log` unpacked under a subdirectory of the study (a pulled archive, a
+    shard's out) holds what a withheld diagnostic and a traceback keep: no pattern takes it, by its name, wherever it
+    lies, and it is the same name the campaign writes."""
+    from expcore.campaign.defect_log import LOG_NAME
+
+    for where in ("shards/s1/out/logs", "pulled", "."):
+        (tree / where).mkdir(parents=True, exist_ok=True)
+        (tree / where / LOG_NAME).write_text("a withheld diagnostic\n", encoding="utf-8")
+    assert LOG_NAME == "harness-errors.log"
+    for pattern in ("**", "shards/**", "pulled/*", f"**/{LOG_NAME}"):
+        try:
+            chosen = select(tree, spec_with(tree, ["study.toml", pattern]))
+        except PackageError:
+            continue  # a pattern that names only the log names nothing
+        assert not [path for path in chosen if path.endswith(LOG_NAME)]
+
+
 PRIVATE_EVIDENCE = [
     "results/fed-a.root.tar",
     "results/fed-a.root.json",
