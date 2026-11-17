@@ -9,7 +9,7 @@ import hashlib
 import json
 
 import pytest
-from fingerprint_support import seen_platforms
+from fingerprint_support import seen_environments, seen_platforms
 from hpc_fed_support import data_stand_in
 from hpc_fleet_support import another_ca, fleet_modules, job_ids, make_bench, make_ca
 from tls_support import HAS_OPENSSL
@@ -304,50 +304,6 @@ def test_o68_status_says_each_federation_its_job_and_shard_and_runs_nothing(benc
     assert {label: len(fake.calls) for label, fake in bench.fakes.items()} == calls
 
 
-# ------------------------------------------------------------------------------------------------ one campaign (O63)
-def test_o63_plan_takes_each_assigned_shards_campaign_fingerprint_beside_its_own_federations_platform_file(bench):
-    """O63: three federations of one platform fingerprint: each shard's campaign fingerprint is taken by the manifest's
-    Python beside its own federation's platform.toml, all three equal, and every line printed."""
-    assert bench.up(3)[0] == 0
-    code, printed, lines = plan(bench)
-    assert code == 0, printed
-    assert sorted(lines) == ["shard-1", "shard-2", "shard-3"]
-    files = [bench.root(label) / "platform.toml" for label in ("fed-1", "fed-2", "fed-3")]
-    assert seen_platforms(bench.base / "venv") == [hashlib.sha256(f.read_bytes()).hexdigest() for f in files]
-
-
-def test_o63_plan_refuses_federations_whose_campaign_fingerprints_differ_though_their_platform_fingerprints_do_not(
-    bench,
-):
-    """O63: fed-3 renders a setting only the study's plugin fingerprints (the platform's own fingerprint leaves it out,
-    so O68's check passes): the campaign fingerprints differ, and the plan names the shard and the key, assigns
-    nothing, writes nothing and prints no line, before any step is launched."""
-    assert bench.up(3)[0] == 0
-    with (bench.root("fed-3") / "platform.toml").open("a", encoding="utf-8") as handle:
-        handle.write("\n# study-setting: another\n")
-    assert bench.fingerprint("fed-3") == bench.fingerprint("fed-1")  # the platform's half is one
-    code, printed, lines = plan(bench)
-    assert code == 2
-    assert "shard-3 differs from shard-1, shard-2 (first differing key: study_setting)" in printed
-    assert str(bench.base) not in printed
-    assert lines == {}
-    assert all(member is None for member in assigned(bench).values())
-    assert record(bench)["reference"] is None
-    assert not (bench.fleet / "shards.toml").exists()
-    assert bench.spawned == []
-
-
-def test_o63_a_shard_no_federation_holds_is_not_part_of_the_campaign_check(bench):
-    """O63: fed-2's up failed and shard-2 is unassigned: its federation's file is not read, shard-1 and shard-3 are
-    compared and planned as before."""
-    bench.data["fed-2"] = data_stand_in(differ="alpha-space")
-    assert bench.up(3)[0] == 1
-    code, _, lines = plan(bench)
-    assert code == 1
-    assert sorted(lines) == ["shard-1", "shard-3"]
-    assert len(seen_platforms(bench.base / "venv")) == 2
-
-
 # ------------------------------------------------------------------------------------------------ the study's scripts
 SCRIPT_WORDS = {"--pre-step": "guards/pre_step.py", "--pre-step-sha256": sha(GUARD),
                 "--post-run": "guards/post_run.py", "--post-run-sha256": sha(POST)}  # fmt: skip
@@ -487,6 +443,55 @@ def test_o63_step_refuses_whole_when_a_declared_variable_is_no_longer_set_and_la
     assert code == 2
     assert f"{TREE_NAME} is not set" in printed
     assert bench.spawned == []
+
+
+def needing(bench):
+    """The settings' study plugin refuses to be built without the declared variables; the directory in which the
+    program that builds it records the environment of each of its calls."""
+    bench.needs = (NAME, TREE_NAME)
+    return bench.base / "venv"
+
+
+def test_o63_plan_builds_a_plugin_that_needs_a_declared_variable_with_the_values_its_lines_pin(bench):
+    """O63: a study's plugin may refuse to be built without a variable the settings declare in `pass_env`, so the
+    campaign fingerprint `plan` takes before it assigns a shard could never be taken. The program that takes it is
+    given the declared variables, valued as the lines pin them (from the environment `fleet.py` runs in), once for
+    each assigned shard."""
+    assert bench.up(2)[0] == 0
+    venv = needing(bench)
+    code, printed, lines = planned(bench, operator(bench), PASS_ENV)
+    assert code == 0, printed
+    assert [(env[NAME], env[TREE_NAME]) for env in seen_environments(venv)] == [(VALUE, TREE)] * 2
+    assert [entry["pass_env"] for entry in lines.values()] == [{NAME: VALUE, TREE_NAME: TREE}] * 2
+
+
+def test_o63_plan_gives_the_plugin_no_variable_the_settings_do_not_declare(bench):
+    """O63: nothing else of the operator's environment, nor of the site's, reaches the program that builds the
+    plugin."""
+    assert bench.up(2)[0] == 0
+    venv = needing(bench)
+    code, printed, _ = planned(bench, operator(bench, NOT_DECLARED_VAR="x", FAULT_API_KEY="y"), PASS_ENV)
+    assert code == 0, printed
+    taken = seen_environments(venv)
+    assert len(taken) == 2
+    for env in taken:
+        assert not [name for name in ("NOT_DECLARED_VAR", "FAULT_API_KEY", "HPC_FLEET_MAX") if name in env]
+
+
+def test_o63_plan_refuses_an_unset_declared_variable_before_it_builds_the_plugin_naming_only_the_variable(bench):
+    """O63: the values are read before any program is run: a declared variable the operator does not hold refuses the
+    whole `plan`, naming it and showing no value, with nothing assigned and the plugin never built."""
+    assert bench.up(2)[0] == 0
+    venv = needing(bench)
+    environ = operator(bench)
+    del environ[TREE_NAME]
+    code, printed, lines = planned(bench, environ, PASS_ENV)
+    assert code == 2
+    assert f"{TREE_NAME} is not set" in printed
+    assert TREE not in printed
+    assert lines == {}
+    assert seen_environments(venv) == []
+    assert all(member is None for member in assigned(bench).values())
 
 
 @pytest.mark.parametrize(
@@ -632,3 +637,47 @@ def test_o63_plan_after_a_first_step_still_prints_the_lines_it_always_printed(be
     code, printed, lines = planned(bench, operator(bench, **{NAME: LATER}), PASS_ENV)
     assert code == 0, printed
     assert lines["shard-1"]["pass_env"][NAME] == LATER
+
+
+# ------------------------------------------------------------------------------------------------ one campaign (O63)
+def test_o63_plan_takes_each_assigned_shards_campaign_fingerprint_beside_its_own_federations_platform_file(bench):
+    """O63: three federations of one platform fingerprint: each shard's campaign fingerprint is taken by the manifest's
+    Python beside its own federation's platform.toml, all three equal, and every line printed."""
+    assert bench.up(3)[0] == 0
+    code, printed, lines = plan(bench)
+    assert code == 0, printed
+    assert sorted(lines) == ["shard-1", "shard-2", "shard-3"]
+    files = [bench.root(label) / "platform.toml" for label in ("fed-1", "fed-2", "fed-3")]
+    assert seen_platforms(bench.base / "venv") == [hashlib.sha256(f.read_bytes()).hexdigest() for f in files]
+
+
+def test_o63_plan_refuses_federations_whose_campaign_fingerprints_differ_though_their_platform_fingerprints_do_not(
+    bench,
+):
+    """O63: fed-3 renders a setting only the study's plugin fingerprints (the platform's own fingerprint leaves it out,
+    so O68's check passes): the campaign fingerprints differ, and the plan names the shard and the key, assigns
+    nothing, writes nothing and prints no line, before any step is launched."""
+    assert bench.up(3)[0] == 0
+    with (bench.root("fed-3") / "platform.toml").open("a", encoding="utf-8") as handle:
+        handle.write("\n# study-setting: another\n")
+    assert bench.fingerprint("fed-3") == bench.fingerprint("fed-1")  # the platform's half is one
+    code, printed, lines = plan(bench)
+    assert code == 2
+    assert "shard-3 differs from shard-1, shard-2 (first differing key: study_setting)" in printed
+    assert str(bench.base) not in printed
+    assert lines == {}
+    assert all(member is None for member in assigned(bench).values())
+    assert record(bench)["reference"] is None
+    assert not (bench.fleet / "shards.toml").exists()
+    assert bench.spawned == []
+
+
+def test_o63_a_shard_no_federation_holds_is_not_part_of_the_campaign_check(bench):
+    """O63: fed-2's up failed and shard-2 is unassigned: its federation's file is not read, shard-1 and shard-3 are
+    compared and planned as before."""
+    bench.data["fed-2"] = data_stand_in(differ="alpha-space")
+    assert bench.up(3)[0] == 1
+    code, _, lines = plan(bench)
+    assert code == 1
+    assert sorted(lines) == ["shard-1", "shard-3"]
+    assert len(seen_platforms(bench.base / "venv")) == 2

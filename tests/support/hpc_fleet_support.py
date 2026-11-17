@@ -84,6 +84,7 @@ class Bench:
     # error it raises; a core with a known commit that is not stale until a test says otherwise
     asked: list = field(default_factory=list)  # the plan of each time the core was asked
     no_relay: set = field(default_factory=set)  # the federations whose up finds no fault relay in its core (O68)
+    needs: tuple = ()  # the variables the settings' study plugin refuses to be built without (`standin_python`)
 
     def __post_init__(self) -> None:
         self.real = self.deploy.hpc.cli.make_driver
@@ -203,7 +204,7 @@ class Bench:
         lines (an optional key of shards.py's manifest)."""
         path = self.base / "shard-settings.toml"
         (self.base / "study").mkdir(exist_ok=True)  # the campaign fingerprint is taken on a copy of it (O63)
-        python = standin_python(self.base / "venv", real_platform=True)
+        python = standin_python(self.base / "venv", real_platform=True, needs=self.needs)
         lines = [f'{key} = "{self.base / key}"' for key in ("study", "results")]
         lines += [f'python = "{python}"', f'core_src = "{self.base / "src"}"', f'tmpfs = "{self.node_tmp}"']
         lines += ['step_path = "/usr/bin:/bin"', "cpus = 2", 'memory = "4g"', *extra]

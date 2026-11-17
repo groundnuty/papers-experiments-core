@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from campaign_support import make_manifest, make_schema
+from fingerprint_support import seen_environments, standin_python
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, flagged, hpc_on_path
 from shard_support import make_study
 
@@ -125,7 +126,8 @@ class World:
 
         scratch = self.tmp / "fp-scratch"
         scratch.mkdir(mode=0o700)
-        return self.resume.study_fingerprint(self.shards, self.plan, self.plan.shards[0], scratch, refuse)
+        plan = self.shards.pin_pass_env(self.plan)  # the declared variables, valued as the operator holds them
+        return self.resume.study_fingerprint(self.shards, plan, plan.shards[0], scratch, refuse)
 
     def snapshot(self, fingerprint, *, label="fed-a", index=1):
         """A snapshot of the shard's out/, its store pinning `fingerprint`, as the step's snapshot thread takes one."""
@@ -313,6 +315,68 @@ def test_resume_line_with_the_values_of_the_first_step_prints_its_line(world, mo
     assert f"FAULT_ACK_MODE={FIRST}" in line
     assert world.state()["shard_nodes"] == [{"job": JOB, "node": NODE, "label": "fed-a", "name": "expcore-resume"}]
     assert origin.read_bytes() == before
+
+
+TREE_NAME, TREE = "HPC_STUDY_ARTIFACTS", "/srv/example/artifacts/tree"  # another invented variable, with a path
+NEEDED = ["FAULT_ACK_MODE", TREE_NAME]
+
+
+def with_needing_plugin(world, monkeypatch):
+    """The manifest's python is a stand-in whose study plugin refuses to be built without the two variables the
+    manifest declares and the operator holds (the operator holds a third it does not declare), and the shard's first
+    step passed both. Returns the directory the stand-in records the environment of each of its calls in."""
+    python = standin_python(world.tmp / "venv", needs=tuple(NEEDED))
+    text = world.manifest.read_text(encoding="utf-8")
+    assert f'python = "{sys.executable}"' in text
+    world.manifest.write_text(text.replace(f'python = "{sys.executable}"', f'python = "{python}"'), encoding="utf-8")
+    declare_pass_env(world, NEEDED)
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    monkeypatch.setenv(TREE_NAME, TREE)
+    monkeypatch.setenv("NOT_DECLARED_VAR", "x")
+    world.plan = world.shards.load_plan(world.manifest)
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST, TREE_NAME: TREE})
+    return world.tmp / "venv"
+
+
+def test_resume_line_builds_a_plugin_that_needs_a_declared_variable_with_the_values_its_line_carries(
+    world, monkeypatch
+):
+    """O63: a study's plugin may refuse to be built without a variable the manifest declares in `pass_env`; the campaign
+    fingerprint `resume-line` takes before it records a node is taken by a program given the declared variables, with
+    the values its line carries, so the line is printed."""
+    venv = with_needing_plugin(world, monkeypatch)
+    world.snapshot(world.fingerprint())
+    line = flagged(world.line())
+    assert "--resume" in line
+    assert f"FAULT_ACK_MODE={FIRST}" in line
+    assert f"{TREE_NAME}={TREE}" in line
+    taken = seen_environments(venv)  # the test's own fingerprint of the snapshot, then resume-line's
+    assert [(env["FAULT_ACK_MODE"], env[TREE_NAME]) for env in taken] == [(FIRST, TREE)] * 2
+
+
+def test_resume_line_gives_the_plugin_no_variable_the_manifest_does_not_declare(world, monkeypatch):
+    """O63: nothing else of the operator's environment reaches the program that builds the plugin."""
+    venv = with_needing_plugin(world, monkeypatch)
+    world.snapshot(world.fingerprint())
+    world.line()
+    taken = seen_environments(venv)
+    assert len(taken) == 2
+    for env in taken:
+        assert "NOT_DECLARED_VAR" not in env
+
+
+def test_resume_line_refuses_an_unset_declared_variable_before_it_builds_the_plugin_naming_only_the_variable(
+    world, monkeypatch
+):
+    """O63: a declared variable the operator no longer holds refuses the line before the plugin is built for it (the
+    program is not run again), naming the variable and showing no value, with the federation's state untouched."""
+    venv = with_needing_plugin(world, monkeypatch)
+    world.snapshot(world.fingerprint())
+    monkeypatch.delenv(TREE_NAME)
+    built = len(seen_environments(venv))
+    said = refusal_naming_only(world, TREE_NAME)
+    assert TREE not in said
+    assert len(seen_environments(venv)) == built
 
 
 def test_resume_line_refuses_a_manifest_that_dropped_a_variable_the_first_step_passed(world, monkeypatch):

@@ -871,8 +871,8 @@ run, which each federation's `platform.toml` renders: the faults sanction and ta
 identity, the sandbox's pins. Shards on federations that render different ones pin different fingerprints, and the core's
 `merge` refuses them only after the shards have run. `shards.py plan` and `lines` therefore take each shard's campaign
 fingerprint first, as `resume-line` does (the manifest's Python, `-I -B`, on a private copy of the study with that
-federation's `platform.toml` beside it, as the step places it; `shardresume.check_one_campaign`), and print nothing
-unless they are all one. A refusal names each shard that differs from the largest group of equal shards by its label and
+federation's `platform.toml` beside it, as the step places it, and the manifest's `pass_env` variables given it as the
+step is: see `pass_env`, below; `shardresume.check_one_campaign`), and print nothing unless they are all one. A refusal names each shard that differs from the largest group of equal shards by its label and
 the first differing top-level key of the fingerprint (`platform` for a setting of the platform file, the usual one),
 never a host, a path or a value, so the fix is to compare those federations' files; a federation whose `platform.toml`
 cannot be read, or whose fingerprint cannot be taken, is refused by its label too, with the program's status and none
@@ -1044,6 +1044,16 @@ and never the value. Each line then pins the value: an `env -i` word
 `NAME=VALUE` after the step's own, and `--pass-env NAME` at the end of the step's arguments; `plan` prints
 `pass_env: {NAME: VALUE}` beside each line. What the operator's environment holds when the step starts is not read, so
 a step cannot gain or change one. With no `pass_env` the lines and the plan are what they were, word for word.
+
+The declared variables reach the plan-time builds of the study's plugin too (O63). `plan` and `lines`, `resume-line`
+and `fleet.py plan` build the plugin to take each shard's campaign fingerprint (above), by the manifest's Python in a
+program of its own whose environment is the same allowlist. A plugin that needs a declared variable (the first
+study's refuses without its artifacts directory) could never be fingerprinted there, so no line could be printed. That
+program is now given each declared variable with the value the lines pin, read as above before it runs, so an unset
+variable or a bad value refuses before any program is started and names only the variable; it is given nothing else of
+the operator's environment, and `fleet.py plan` gives it the values of the environment `fleet.py` runs in, as its lines
+pin them. A plan that declares variables and has not read their values is refused before the program runs. The probe
+that asks which core the Python imports builds no plugin and is given none.
 
 `step` checks again, as its first act (before the render identity and the guard), what `lines` checked, since a line
 can be edited: each name declared with `--pass-env` must be one it may pass, be given by an `env -i` word with a plain

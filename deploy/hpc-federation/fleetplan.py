@@ -318,6 +318,16 @@ def load(path: Path) -> shards.Plan:
         raise FleetError(f"the fleet's shard manifest: {error}") from None
 
 
+def pin(plan: shards.Plan, environ: Optional[Mapping[str, str]] = None) -> shards.Plan:
+    """The plan as `shards.py plan` and `lines` pin it before they print a line: the study's scripts hashed as the
+    study holds them now, and each declared variable's value read from `environ` (the operator's, by default the
+    process's): an unset variable or a value that may not ride on a line refuses it, naming the variable."""
+    try:
+        return shards.pin_pass_env(shards.pinned(plan), environ)
+    except shards.ShardsError as error:
+        raise FleetError(str(error)) from None
+
+
 def require_core(plan: shards.Plan) -> None:
     """Refuse a plan whose interpreter imports a core that `expcore run` would refuse to start on: its commit unknown
     or its install stale (C06). The fleet builds its lines with `shards.step_argv` and never goes through
@@ -330,22 +340,15 @@ def require_core(plan: shards.Plan) -> None:
         raise FleetError(refusal)
 
 
-def check_campaign(plan: shards.Plan, labels: Sequence[str]) -> None:
+def check_campaign(plan: shards.Plan, labels: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> None:
     """The study's campaign fingerprint, taken beside each of these shards' federations' `platform.toml`, is one
     (`shards.check_one_campaign`, O63): FleetError otherwise. A study's plugin may fingerprint a setting that the
-    platform's own fingerprint (`platform_fingerprint`) leaves out, and the shards would never merge."""
+    platform's own fingerprint (`platform_fingerprint`) leaves out, and the shards would never merge. The plan is
+    pinned first (`pin`), so the plugin is built with the variables the manifest declares, valued as the steps' lines
+    will carry them (`environ` is the operator's), and an unset one refuses before any program runs."""
+    plan = pin(plan, environ)
     try:
         shards.check_one_campaign(plan, labels)
-    except shards.ShardsError as error:
-        raise FleetError(str(error)) from None
-
-
-def pin(plan: shards.Plan, environ: Optional[Mapping[str, str]] = None) -> shards.Plan:
-    """The plan as `shards.py plan` and `lines` pin it before they print a line: the study's scripts hashed as the
-    study holds them now, and each declared variable's value read from `environ` (the operator's, by default the
-    process's): an unset variable or a value that may not ride on a line refuses it, naming the variable."""
-    try:
-        return shards.pin_pass_env(shards.pinned(plan), environ)
     except shards.ShardsError as error:
         raise FleetError(str(error)) from None
 

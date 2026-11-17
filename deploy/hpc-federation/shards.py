@@ -52,7 +52,10 @@ neither a plain word (`[A-Za-z0-9._:=,+-]`, at most 128) nor an absolute path of
 `PRE_STEP_REFUSED` a declaration its line gives no plain value for, and records each name and value in `step.json` and
 the archive's manifest. The post-run script runs in the dispatcher's environment and sees them; the guard does not.
 `step` never reads the manifest, so `collect` refuses a shard whose manifest lacks a declared name or holds an
-undeclared one (`pass_env_problem`): a line that dropped a declaration with its word.
+undeclared one (`pass_env_problem`): a line that dropped a declaration with its word. The programs that build the
+study's plugin at plan time, to take its campaign fingerprint (`plan`, `lines`, `resume-line`, the fleet's `plan`),
+are given the same pinned variables and nothing else of the operator's (`pinned_pass_env`), so a plugin that needs one
+can be fingerprinted.
 
 **One value for a shard's whole life.** A first step that passes variables records each name and value once, in
 `<results>/<label>/pass-env.json` (`record_pass_env_origin`: whole, by an exclusive link, mode 0600, once it holds the
@@ -534,6 +537,20 @@ def pin_pass_env(plan: Plan, environ: Mapping[str, str] | None = None) -> Plan:
     return replace(plan, pass_env_pins=tuple(pins))
 
 
+def pinned_pass_env(plan: Plan) -> tuple[tuple[str, str], ...]:
+    """The name and value of each variable the plan declares in `pass_env`, as `pin_pass_env` read them: what a step's
+    line carries as `env -i` words (`step_argv`) and what each program that builds the study's plugin at plan time is
+    given (`shardresume.study_fingerprint`), so a plugin sees the variables, with the values, its step will. Empty
+    when none is declared; `ShardsError` for a plan that declares some and has not pinned them, so that nothing is run
+    or made from a plan that has not read their values."""
+    if not plan.pass_env:
+        return ()
+    if plan.pass_env_pins is None or tuple(name for name, _ in plan.pass_env_pins) != plan.pass_env:
+        raise ShardsError("the declared pass_env variables are not pinned: nothing is run or made from a plan that has "
+                          "not read their values")  # fmt: skip
+    return plan.pass_env_pins
+
+
 def read_pass_env_origin(results: Path, spec: Mapping[str, Any]) -> dict[str, str] | None:
     """The name and value of each variable the shard's first step passed (`record_pass_env_origin`), or None when it
     recorded none: no file, which is a shard not started yet or one whose first step passed nothing. A file that is
@@ -849,11 +866,8 @@ def step_argv(
     `resume` and `over` are `resume-line`'s."""
     env = [f"PATH={plan.step_path}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={shard.root.parent}",
            f"EXPCORE_FED_ROOT={shard.root}", *(f"{k}={v}" for k, v in home_env(NO_HOME).items())]  # fmt: skip
-    if plan.pass_env:  # the operator's variables the manifest declares: each name once, with its pinned value
-        if plan.pass_env_pins is None or tuple(name for name, _ in plan.pass_env_pins) != plan.pass_env:
-            raise ShardsError("the declared pass_env variables are not pinned: no line is made from a plan that has "
-                              "not read their values")  # fmt: skip
-        env += [f"{name}={value}" for name, value in plan.pass_env_pins]
+    # the operator's variables the manifest declares: each name once, with its pinned value
+    env += [f"{name}={value}" for name, value in pinned_pass_env(plan)]
     step = [plan.python, "-I", "-B", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
             "--results", str(plan.results), "--core-src", str(plan.core_src),
@@ -3247,7 +3261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"(data_manifest in its platform.toml, C06); undeclared: {'; '.join(missing)}"
             )
         plan = pin_pass_env(pinned(plan))  # each declared script hashed, each declared variable read, before any line
-        check_one_campaign(plan)  # and every shard's campaign fingerprint shown to be one (O63)
+        check_one_campaign(plan)  # every shard's campaign fingerprint shown to be one (O63), by a plugin given the pins
         script = Path(__file__).resolve()
         built = []
         for shard in plan.shards:

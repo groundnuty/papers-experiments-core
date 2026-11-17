@@ -347,7 +347,8 @@ class Fleet:
             lines = {label: fleetplan.line_of(plan, label, False, None, self.environ) for label in sorted(holding)}
             # what each line pins, shown to the operator beside it
             values = dict(fleetplan.pin(plan, self.environ).pass_env_pins or ())
-            fleetplan.check_campaign(plan, sorted(holding))  # one campaign fingerprint, before anything is assigned
+            # one campaign fingerprint, before anything is assigned: by a plugin given the lines' own pinned variables
+            fleetplan.check_campaign(plan, sorted(holding), self.environ)
             fleetplan.require_core(plan)  # last: it runs the manifest's interpreter; nothing is recorded before it
 
             def apply(current: Dict[str, Any]) -> None:
