@@ -4,6 +4,8 @@ never holds the declared cell name (`sandbox`), which is the allowed one, nor `l
 declares: counting those would be false hits. A run with no names to scan scans nothing."""
 
 import json
+import threading
+import time
 
 import pytest
 from apptainer_support import make_settings, make_spec, start
@@ -13,6 +15,7 @@ from expcore_onedata.sandbox import cellhost, gate
 from expcore_onedata.sandbox.api import DataPathMode, SandboxSpec
 from expcore_onedata.sandbox.apptainer import loopback
 from expcore_onedata.sandbox.apptainer.node import LocalNode
+from expcore_onedata.sandbox.cellhost import OwnNames
 from expcore_onedata.tokens import Secret
 
 NODE_A = "cn-r3c07-n12.cluster.example.org"
@@ -84,13 +87,40 @@ def test_o73_the_local_node_reads_its_host_name_and_its_fqdn_from_the_system(mon
     """O73: the node is asked for its own names, both as the system says them; a lookup that fails is skipped."""
     monkeypatch.setattr(loopback.socket, "gethostname", lambda: "CN-Own-N01")
     monkeypatch.setattr(loopback.socket, "getfqdn", lambda: "cn-own-n01.cluster.example.invalid")
-    assert LocalNode().own_names() == ("CN-Own-N01", "cn-own-n01.cluster.example.invalid")
+    assert LocalNode().own_names() == OwnNames(("CN-Own-N01", "cn-own-n01.cluster.example.invalid"))
 
     def broken():
         raise OSError("no resolver")
 
     monkeypatch.setattr(loopback.socket, "getfqdn", broken)
-    assert LocalNode().own_names() == ("CN-Own-N01",)
+    assert LocalNode().own_names() == OwnNames(("CN-Own-N01",), ("fqdn_failed",))
+    monkeypatch.setattr(loopback.socket, "gethostname", broken)
+    assert LocalNode().own_names() == OwnNames((), ("host_name_failed", "fqdn_failed"))
+
+
+def test_o73_a_resolver_that_hangs_costs_the_bound_and_leaves_the_host_name_alone(monkeypatch):
+    """O73: `getfqdn` runs in a thread of its own with a short bound: a resolver that never answers delays a start by
+    that bound and no more, the host name is scanned alone, and the reason, not the name, says what was not read."""
+    release = threading.Event()
+    monkeypatch.setattr(loopback.socket, "gethostname", lambda: "cn-own-n01")
+    monkeypatch.setattr(loopback.socket, "getfqdn", lambda: release.wait(30) and "never.answered.invalid")
+    monkeypatch.setattr(loopback, "FQDN_TIMEOUT_S", 0.2)
+    try:
+        began = time.monotonic()
+        found = LocalNode().own_names()
+        assert time.monotonic() - began < 5
+        assert found == OwnNames(("cn-own-n01",), ("fqdn_timeout",))
+    finally:
+        release.set()
+
+
+def test_o73_a_lookup_that_answers_in_time_is_read_whole_and_a_thread_that_ends_is_not_left_behind(monkeypatch):
+    """O73: the bound costs a quick lookup nothing: its answer is read, nothing is unread, no thread of ours stays."""
+    monkeypatch.setattr(loopback.socket, "gethostname", lambda: "cn-own-n01")
+    monkeypatch.setattr(loopback.socket, "getfqdn", lambda: "cn-own-n01.cluster.example.invalid")
+    before = threading.active_count()
+    assert loopback.own_names(timeout_s=5) == OwnNames(("cn-own-n01", "cn-own-n01.cluster.example.invalid"))
+    assert threading.active_count() == before
 
 
 def test_o73_the_gate_scans_for_the_agent_node_after_the_federation_s_nodes(node, tmp_path):
@@ -114,12 +144,33 @@ def test_o73_a_name_the_run_serves_is_not_scanned_for_even_if_the_node_has_it(no
     assert _scanned(node, tmp_path) == list(SERVICES)
 
 
+def test_o73_a_form_the_node_could_not_read_is_in_the_run_s_facts_by_its_reason_alone(node, tmp_path):
+    """O73: a scanning run records how many forms of the agent node's names it scanned and the reasons any could not be
+    read (`own_node_scan`), never a name; read whole, the reasons are none."""
+    box = start(node, make_settings(tmp_path), _spec())
+    try:
+        assert box.metadata()["infrastructure_facts"]["own_node_scan"] == {"version": 1, "forms": 2, "unread": []}
+    finally:
+        box.stop()
+    node.own_hosts, node.own_unread = (OWN_HOST,), ("fqdn_timeout",)
+    box = start(node, make_settings(tmp_path), _spec())
+    try:
+        facts = box.metadata()["infrastructure_facts"]
+        assert facts["own_node_scan"] == {"version": 1, "forms": 1, "unread": ["fqdn_timeout"]}
+        assert OWN_HOST not in json.dumps(box.metadata())
+        box._meta["infrastructure_facts"] = {"backend": "apptainer"}  # a record of the facts made again later
+        assert box.metadata()["infrastructure_facts"]["own_node_scan"]["unread"] == ["fqdn_timeout"]
+    finally:
+        box.stop()
+
+
 def test_o73_a_run_with_no_names_to_scan_asks_the_node_for_none(node, tmp_path):
     """O73: a federation whose names are the real ones (Compose's) has no list and no scan; the node is not asked."""
     node.own_hosts = RuntimeError("never asked")
     box = start(node, make_settings(tmp_path), make_spec("via-gate"))
     try:
         assert "scan_names" not in node.gates[-1].config
+        assert "own_node_scan" not in box.metadata()["infrastructure_facts"]
     finally:
         box.stop()
 

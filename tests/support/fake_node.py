@@ -43,6 +43,7 @@ from expcore_onedata.sandbox import completion
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer.node import LocalNode, Spawned
 from expcore_onedata.sandbox.apptainer.procs import Proc
+from expcore_onedata.sandbox.cellhost import OwnNames
 from expcore_onedata.sandbox.containers import CERTIFI_PROBE
 from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_input, run_bounded
 from expcore_onedata.sandbox.sandbox import READ_ONLY_PROBE
@@ -195,6 +196,7 @@ class FakeNode:
         self.unmounts: list[list[str]] = []
         self.mount_table_unreadable = False
         self.own_hosts: tuple[str, ...] | Exception = (OWN_HOST, OWN_FQDN)  # what `own_names` answers (O73)
+        self.own_unread: tuple[str, ...] = ()  # the reasons a form of them could not be read
         self.readings: Any = READINGS  # what `node_readings` answers (O87); a test sets another, or `readings_error`
         self.readings_error: Exception | None = None
         self.tool_server_host: Any = None  # the tool server's host's readings; None: the node's own host
@@ -303,10 +305,10 @@ class FakeNode:
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         return {"kernel": "invented", "apptainer": "apptainer version invented"}
 
-    def own_names(self) -> tuple[str, ...]:
+    def own_names(self) -> OwnNames:
         if isinstance(self.own_hosts, Exception):
             raise self.own_hosts
-        return self.own_hosts
+        return OwnNames(self.own_hosts, self.own_unread)
 
     def node_readings(self) -> dict[str, Any]:
         if self.readings_error is not None:
