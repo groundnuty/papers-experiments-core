@@ -286,7 +286,7 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
         ).is_file():  # the launcher `up` copied into the root, for a Python server
             values["hpc_resolver"] = str(layout.toolshim / hpcnames.LAUNCHER)
     # O83: the layout's slots and tool server, with the frozen manifests in the root, named by the root's absolute path
-    extra = additions(layout, facts, values.get("study_artifacts"), absolute_root=values["hpc_root"])
+    extra = additions(layout, facts, values.get("study_artifacts"), absolute_root=values.get("hpc_root"))
     more = (extra,) if extra else ()  # a layout with no slot renders as it always did, by the same call
     write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values, *more)
     check_rendered(layout)  # the file as a campaign loads it, its slots as the lease pool does: refused here, not then
