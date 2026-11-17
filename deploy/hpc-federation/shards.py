@@ -168,10 +168,12 @@ its name relative to `<results>`, size and SHA-256 from the bytes `collect` read
 `collect` prints the file's own SHA-256 on stderr. `collect` is atomic (G9): it stages every shard in a private
 directory beside `--into`, checks it all, and only then moves the trees in, publishes the root archives and writes the
 manifest last; a refusal leaves `--into` as it was and writes no manifest. Then it writes `evidence-collected.json`
-into each root, which `hpcfed.py down` requires of a root a step ran against (`shard-steps/<label>.json`, which `step`
-leaves there): `down` refuses one without it, or where a file a step or the study writes is no longer what the marker
-names (it holds the hash of each file archived), unless `--discard-evidence`; the state and the link check, which the
-running federation rewrites itself, are named by `down` and never refused.
+into each root, which `hpcfed.py down` requires of a root that holds evidence a run left (a step record, which `step`
+leaves in `shard-steps/<label>.json`, or a fault-journal line, the relay's journals, a shard claim or the pilot's
+wiring, as after Day-0 measurements with no step): `down` refuses one without it, or where a file a step or the study
+writes is no longer what the marker names (it holds the hash of each file archived), unless `--discard-evidence`; a
+root that holds none (after `up` alone) goes as before, and the state and the link check, which the running federation
+rewrites itself, are named by `down` and never refused.
 `verify-copy` takes the pulled manifest, the local directory and that
 hash (`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1
 naming each file that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only,
@@ -2809,7 +2811,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(shlex.join(line))  # first, and alone on stdout: callers read it as the merge line
             print(f"shards: archives manifest {ARCHIVES_MANIFEST} sha256 {manifest_hash}", file=sys.stderr)
             print("shards: each root's evidence is archived (<label>.root.tar) and marked collected; down refuses a "
-                  "root that ran a step and has no current mark, unless --discard-evidence",
+                  "root that holds evidence a run left (a step record, a journal line) and has no current mark, "
+                  "unless --discard-evidence",
                   file=sys.stderr)  # fmt: skip
             print("shards: pull the results directory and run verify-copy with that hash before down (README)",
                   file=sys.stderr)  # fmt: skip
