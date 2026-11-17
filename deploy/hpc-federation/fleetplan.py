@@ -390,10 +390,10 @@ def target_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] 
     plan = pin(plan, environ)
     try:
         fed = shards.federation(shard)
-        argv = shards.step_argv(plan, shard, fed, SCRIPT, resume=resume, over=over)
+        argv = shards.step_argv(plan, shard, fed, SCRIPT)
     except shards.ShardsError as error:
         raise FleetError(str(error)) from None
-    return argv, fed
+    return argv + (["--resume"] if resume else []) + (["--over", over] if over else []), fed
 
 
 @dataclass(frozen=True)

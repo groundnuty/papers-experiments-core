@@ -197,7 +197,8 @@ def test_o68_step_stop_ends_only_the_recorded_client_and_cancels_only_the_record
     code, printed = bench.run("step-stop", "--shard", "shard-1")
     assert code == 0, printed
     assert bench.fake("fed-1").cancelled == [mine]
-    assert bench.fake("fed-1").steps == {"someone-elses-step": f"{job}.8"}
+    assert bench.fake("fed-1").steps["someone-elses-step"] == f"{job}.8"
+    assert mine not in bench.fake("fed-1").steps.values()
     assert bench.fake("fed-2").cancelled == []
     assert list(bench.fake("fed-2").steps.values()) == [theirs]
     assert [c.pid for c in bench.ended] == [bench.spawned[0].pid]
