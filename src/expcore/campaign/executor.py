@@ -169,7 +169,7 @@ class RunRequest:
 
         if self.defect_log is not None:
             # as `record_attempt` does: the redactor goes in before it is checked, so a secret too short to redact
-            # leaves the log one that cannot be built, which withholds the traceback of the ConfigError and not writes it
+            # leaves the log one that cannot be built, which withholds the traceback of the ConfigError
             self.defect_log.redact_with(checked)
         checked()  # refuses a secret too short to redact, naming the variable
         read = tuple(shown[name] for name in names if shown.get(name, "").strip())
