@@ -124,6 +124,25 @@ def test_o70_the_dialled_address_is_named_by_the_served_name_in_a_failure(text, 
     assert gate._as_served(text, SERVED, hcfg) == expected
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Content-Length: depot.layout.test:8443", "Content-Length: depot.layout.test:443"),
+        (
+            "refused at DEPOT.layout.test:8443 and [depot.layout.test]:8443",
+            "refused at depot.layout.test:443 and depot.layout.test:443",
+        ),
+        ("not valid for 'depot.layout.test'.", "not valid for 'depot.layout.test'."),
+    ],
+)
+def test_o70_a_declared_name_with_the_upstream_port_is_given_on_443(text, expected):
+    """O70: the URL's host is the served name itself on a mapped federation, so the gate's failure text may quote
+    `name:8443` (a malformed answer's header, a library's repr): the port of the nodes never reaches the client, and the
+    bare name, which needs no replacement, is left as it is."""
+    hcfg = {"role": "oneprovider", "addr": SERVED, "dial": "192.0.2.10", "port": 8443, "tls": True}
+    assert gate._as_served(text, SERVED, hcfg).lower() == expected.lower()
+
+
 def test_o70_a_host_with_a_node_name_and_an_address_names_both_by_the_served_name():
     """O70: a gate whose URL host is a node name and which also dials an address (a map of the node's own) names both
     by the served name, the longer form first."""
