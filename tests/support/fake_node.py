@@ -36,6 +36,7 @@ import json
 import os
 import shutil
 import signal
+import struct
 import sys
 import threading
 import time
@@ -237,6 +238,8 @@ class FakeNode:
         self.disk_probe_answer: str | None = None  # what the start's probe of a work disk says, if not the image's
         self.disk_check_answer: str | None = None
         self.copy_helper_result: CmdResult | None = None  # what every copy exec of a work disk returns, if not its own
+        self.boot: str | None = "00000000-0000-4000-8000-000000000001"  # this boot of the node (`boot_id`)
+        self.mkfs_superblock = True  # whether the fake's mkfs writes an ext superblock into the image
 
     # ------------------------------------------------------------------------------------------------ processes
     def _new_proc(self, pidns: str, comm: str, **kw: Any) -> FakeProc:
@@ -342,6 +345,9 @@ class FakeNode:
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         return {"kernel": "invented", "apptainer": "apptainer version invented"}
 
+    def boot_id(self) -> str | None:
+        return self.boot
+
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
         if argv and argv[0] == "fusermount3":
             return self._fusermount(list(argv))
@@ -361,7 +367,17 @@ class FakeNode:
         if backing.exists():
             shutil.rmtree(backing)
         shutil.copytree(tree, backing, symlinks=True)
-        self.images[str(image)] = FakeImage(image.stat().st_size, backing)
+        size = image.stat().st_size
+        self.images[str(image)] = FakeImage(size, backing)
+        if self.mkfs_superblock:  # what workdisk.superblock reads: blocks of 4096, ext's magic, ext3's features
+            raw = bytearray(1024)
+            struct.pack_into("<I", raw, 4, size // 4096)
+            struct.pack_into("<I", raw, 24, 2)
+            struct.pack_into("<H", raw, 56, 0xEF53)
+            struct.pack_into("<III", raw, 92, 0x3C, 0x2, 0x3)
+            with open(image, "r+b") as handle:
+                handle.seek(1024)
+                handle.write(bytes(raw))
         return CmdResult(0, "")
 
     def exists(self, path: str | Path) -> bool:
@@ -557,9 +573,12 @@ class FakeNode:
             if image is not None:  # the file it leaves for the start's copy out of the image
                 (cell.work_dir() / workdisk.COPY_PROBE).write_bytes(workdisk.COPY_MARK)
             return CmdResult(0, (said if self.disk_probe_answer is None else self.disk_probe_answer) + "\n")
-        if cell.program.startswith(workdisk.CHECK_HEAD):  # the work disk's size and whether it is /tmp's
+        if cell.program.startswith(workdisk.MARK_HEAD):  # the copy probe's file, on a start that relies on a proof
+            (cell.work_dir() / workdisk.COPY_PROBE).write_bytes(workdisk.COPY_MARK)
+            return CmdResult(0, "marked\n")
+        if cell.program.startswith(workdisk.CHECK_HEAD):  # the work disk's size, whether it is /tmp's, its type
             image = cell.image()
-            said = f"{image.holds} 1" if image is not None else f"{1 << 40} 0"
+            said = f"{image.holds} 1 ext3" if image is not None else f"{1 << 40} 0 tmpfs"
             return CmdResult(0, (said if self.disk_check_answer is None else self.disk_check_answer) + "\n")
         return CmdResult(0, "")
 

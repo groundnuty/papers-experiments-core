@@ -22,7 +22,9 @@ decides, and the start's proof below is what is relied on).
   command, the probed one's memory given back. Before that, the probe leaves a small file (`COPY_PROBE`), and the
   collection's own path (`collect`, below) must copy it out byte for byte, or the start fails: a run whose outputs
   could not be collected is never paid for. A last cell shows the image made again a file system of its own (not
-  `/tmp`'s) of at most its size.
+  `/tmp`'s) of at most its size, and names its mount type. The fill runs once per driver per boot of the node per
+  configuration: its proof is kept (`workproof.py`), and a later start checks the invariants instead (the copy, the
+  image made again, its superblock as the host reads it, and the size and mount type a cell sees).
 * **The collection** (`ImageCopyHost`, `collect`): the host cannot read an ext3 image without privilege, so
   `copyout.copy_tree` runs as for Docker, with its copy helper in a one-shot exec of the image that binds the run's
   disk at `/work` and a staging directory of the run's at `EXPORT`. The listing is the image's own, so every refusal
@@ -45,11 +47,14 @@ import functools
 import json
 import logging
 import os
+import re
 import shutil
 import signal
+import struct
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 from expcore_onedata.sandbox import copyout
 from expcore_onedata.sandbox.api import SandboxError
@@ -102,8 +107,20 @@ PROBE = PROBE_HEAD + (
 CHECK = CHECK_HEAD + (
     "import os\n"
     "fs = os.statvfs('/work')\n"
-    "print(fs.f_blocks * fs.f_frsize, int(os.stat('/work').st_dev != os.stat('/tmp').st_dev))\n"
+    "kind = '?'\n"
+    "try:\n"
+    "    for line in open('/proc/self/mountinfo', encoding='utf-8', errors='replace'):\n"
+    "        head, sep, tail = line.partition(' - ')\n"
+    "        if sep and head.split()[4] == '/work':\n"
+    "            kind = tail.split()[0]\n"
+    "except (OSError, IndexError):\n"
+    "    kind = '?'\n"
+    "print(fs.f_blocks * fs.f_frsize, int(os.stat('/work').st_dev != os.stat('/tmp').st_dev), kind)\n"
 )
+MARK_HEAD = "# expcore work disk copy mark (O71)\n"
+MARK = MARK_HEAD + "with open('/work/{copy}', 'xb') as handle:\n    handle.write({mark!r})\nprint('marked')\n"
+SUPERBLOCK_AT, EXT_MAGIC = 1024, 0xEF53
+FSTYPE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 _WRAPPER_BODY = (
     "import io, json, os, sys\n"
     "request = json.loads(sys.stdin.read())\n"
@@ -185,14 +202,41 @@ def judge(stdout: str, exit_code: int, size: int) -> int | None:
     return held if size // 2 < held <= size else None
 
 
-def judge_check(stdout: str, exit_code: int, size: int) -> int | None:
-    """The size of the file system at `/work`, when it is one of its own (not `/tmp`'s) past half of `size` and at most
-    `size`; None otherwise."""
+def judge_check(stdout: str, exit_code: int, size: int) -> tuple[int, str | None] | None:
+    """The size of the file system at `/work` and its mount type (None when the cell could not name it), when it is
+    one of its own (not `/tmp`'s) past half of `size` and at most `size`; None otherwise."""
     words = stdout.split()
-    if exit_code != 0 or len(words) != 2 or not words[0].isdigit() or words[1] != "1":
+    if exit_code != 0 or len(words) != 3 or not words[0].isdigit() or words[1] != "1":
+        return None
+    if words[2] != "?" and not FSTYPE.fullmatch(words[2]):
         return None
     total = int(words[0])
-    return total if size // 2 < total <= size else None
+    return (total, None if words[2] == "?" else words[2]) if size // 2 < total <= size else None
+
+
+def mark_source() -> str:
+    """A cell's program that leaves the copy probe's file in `/work` without a fill (a start that relies on a kept
+    proof, `workproof.py`)."""
+    return MARK.format(copy=COPY_PROBE, mark=COPY_MARK)
+
+
+def superblock(image: Path) -> dict[str, Any] | None:
+    """The image's ext superblock as the host reads it, its file never written: its block size, its size in bytes and
+    its feature words (compat, incompat, ro_compat); None when it is no ext file system (its magic) or cannot be
+    read. Offsets as dumpe2fs shows them (checked on e2fsprogs 1.47.0)."""
+    try:
+        with open(image, "rb") as handle:
+            handle.seek(SUPERBLOCK_AT)
+            raw = handle.read(1024)
+    except OSError:
+        return None
+    if len(raw) < 1024 or struct.unpack_from("<H", raw, 56)[0] != EXT_MAGIC:
+        return None
+    count, log_size = struct.unpack_from("<I", raw, 4)[0], struct.unpack_from("<I", raw, 24)[0]
+    if log_size > 6:
+        return None
+    block = 1024 << log_size
+    return {"block_bytes": block, "bytes": count * block, "features": list(struct.unpack_from("<III", raw, 92))}
 
 
 @functools.cache
@@ -319,6 +363,7 @@ __all__ = [
     "COPY_TAG",
     "EXPORT",
     "IMAGE_NAME",
+    "MARK_HEAD",
     "PROBE",
     "PROBE_CHUNK",
     "PROBE_HEAD",
@@ -332,8 +377,10 @@ __all__ = [
     "judge",
     "judge_check",
     "make",
+    "mark_source",
     "mkfs_version",
     "probe_source",
     "probe_timeout_s",
+    "superblock",
     "wrapper_source",
 ]

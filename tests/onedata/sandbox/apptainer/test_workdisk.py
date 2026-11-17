@@ -131,7 +131,7 @@ def test_o71_the_start_is_refused_when_the_probe_does_not_see_enospc_at_the_size
     assert not list((settings.work_root / runs.RUNS).iterdir())
 
 
-@pytest.mark.parametrize("answer", [f"{SIZE + 4096} 1", f"{SIZE} 0", "0 1", "x 1", ""])
+@pytest.mark.parametrize("answer", [f"{SIZE + 4096} 1 ext3", f"{SIZE} 0 ext3", "0 1 ext3", "x 1 ext3", f"{SIZE} 1", ""])
 def test_o71_the_start_is_refused_when_the_run_s_image_is_not_a_disk_of_its_own_of_at_most_its_size(
     node, settings, answer
 ):

@@ -60,7 +60,7 @@ from expcore_onedata.sandbox import gatelog, gatepolicy, inputs, kinds, tokenfil
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs, workdisk
+from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs, workdisk, workproof
 from expcore_onedata.sandbox.apptainer.cells import RUN_ENDED_FACT, AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
@@ -524,13 +524,63 @@ class ApptainerSandbox:
         self._meta["read_only_verified"] = {"root": True}
 
     def _verify_work_disk(self) -> None:
-        """O71: a cell writes past `/work`'s size and must be refused with ENOSPC at most at it (`workdisk.judge`), and
-        the file it leaves must come out through the collection's path (`Collection.prove_image_copy`), or the start
-        fails; the image, which the probe filled, is then made again by the same command, and a cell shows it a file
-        system of its own of at most its size (`workdisk.judge_check`). Only then does the record say so."""
+        """O71: the work disk proved before the agent's first cell, or the start fails. The first start of this driver
+        on this boot of the node with this configuration runs the full fill (`_full_fill`) and keeps its proof on the
+        node (`workproof.py`); a later one checks the invariants against that proof (`_invariants`), and a proof that is
+        missing, unreadable or whose invariants differ makes the full fill run again. Either way the file a cell leaves
+        must come out through the collection's path, the image the agent uses is made afresh, and only then does the
+        record say `/work` is closed, naming the proof it relied on (`work_disk.proof`)."""
         if not self.work_image:
             return
         size = workdisk.image_size(self.s.limits.work_disk_bytes)
+        config = self._proof_config(size)
+        key = workproof.key_of(config)
+        kept, why = (
+            workproof.load(self.s.work_root, key, config) if key is not None else (None, "unknown_configuration")
+        )
+        if kept is not None:
+            found = self._invariants(size, kept)
+            if found is not None:
+                total, fstype = found
+                proof = {"kind": "invariants", **workproof.reference(kept)}
+                with self._meta_lock:
+                    self._meta["work_disk"].update(filesystem_bytes=total, fstype=fstype, remade=True, proof=proof)
+                    self._meta["infrastructure_facts"] = facts.record("image", mount_refused=self._mount_refused())
+                return
+            why = "invariants_differ"
+        held, total, fstype, block = self._full_fill(size)
+        document = workproof.make(key or "", config, held=held, size=size, total=total, fstype=fstype or "",
+                                  superblock=block)  # fmt: skip
+        kept_now = key is not None and fstype is not None and workproof.keep(self.s.work_root, document)
+        with self._meta_lock:
+            self._meta["work_disk"].update(
+                enospc_verified=True, held_bytes=held, filesystem_bytes=total, fstype=fstype, remade=True,
+                proof={"kind": "full_fill", "full_fill_because": why, "kept": kept_now,
+                       **workproof.reference(document)},
+            )  # fmt: skip
+            self._meta["infrastructure_facts"] = facts.record("image", mount_refused=self._mount_refused())
+
+    def _proof_config(self, size: int) -> dict[str, Any]:
+        """What a kept proof is for (`workproof.key_of`): this boot of the node, this driver, the image, the size, the
+        mkfs and Apptainer commands and their versions. A part that cannot be read is None, which keys nothing."""
+        try:
+            owner = self.node.identity()
+            driver = f"{owner.pid}:{owner.start}"
+        except OSError:
+            driver = None
+        return {
+            "boot": self.node.boot_id(), "driver": driver, "image_sha256": self.app.image.sha256, "size_bytes": size,
+            "mkfs": " ".join(self.app.work_disk_mkfs), "mkfs_version": self._meta["work_disk"].get("mkfs"),
+            "apptainer": " ".join(self.app.apptainer),
+            "apptainer_version": (self._meta.get("host") or {}).get("apptainer"),
+        }  # fmt: skip
+
+    def _full_fill(self, size: int) -> tuple[int, int, str | None, dict[str, Any]]:
+        """A cell writes past `/work`'s size and must be refused with ENOSPC at most at it (`workdisk.judge`), and the
+        file it leaves must come out through the collection's path; the image, which it filled, is made again, and
+        must be an ext file system of at most its size (`workdisk.superblock`) that a cell sees as one of its own
+        (`workdisk.judge_check`). What `/work` held, the file system's size, its mount type and its superblock; the
+        start fails otherwise."""
         r = self._cells.run(workdisk.probe_source(size), workdisk.probe_timeout_s(size), record=False)
         held = workdisk.judge(r.stdout, r.exit_code, size)
         if held is None:
@@ -538,14 +588,42 @@ class ApptainerSandbox:
             raise SandboxError("a write past /work's size is not refused with ENOSPC for the agent")
         self.collection.prove_image_copy()  # the collection's path, on the file the probe left
         workdisk.make(self.node, self.dir, size, self.app.work_disk_mkfs)  # the probed image's pages given back
+        block = self._superblock(size)
+        total, fstype = self._check(size)
+        return held, total, fstype, block
+
+    def _invariants(self, size: int, kept: dict[str, Any]) -> tuple[int, str | None] | None:
+        """A start that relies on a kept proof: a cell leaves the copy probe's file and it must come out through the
+        collection's path (else the start fails, as after a fill); the image is made again; its superblock and the
+        file system a cell sees must be the proof's (size and mount type). The file system's size and type, or None
+        when an invariant differs (then the full fill runs)."""
+        r = self._cells.run(workdisk.mark_source(), PROBE_S, record=False)
+        if r.exit_code != 0 or r.stdout.strip() != "marked":
+            log.error("the work disk's mark said %r (%s)", r.stdout.strip()[:80], describe_stderr(r.stderr))
+            raise SandboxError("a cell could not write the copy probe's file into /work")
+        self.collection.prove_image_copy()
+        workdisk.make(self.node, self.dir, size, self.app.work_disk_mkfs)
+        if workdisk.superblock(workdisk.image_path(self.dir)) != kept["superblock"]:
+            return None
         r = self._cells.run(workdisk.CHECK, PROBE_S, record=False)
-        total = workdisk.judge_check(r.stdout, r.exit_code, size)
-        if total is None:
+        found = workdisk.judge_check(r.stdout, r.exit_code, size)
+        if found is None or found != (kept["filesystem_bytes"], kept["fstype"]):
+            return None
+        return found
+
+    def _superblock(self, size: int) -> dict[str, Any]:
+        block = workdisk.superblock(workdisk.image_path(self.dir))
+        if block is None or not size // 2 < block["bytes"] <= size:
+            raise SandboxError("the work disk's image has no ext superblock of at most its size")
+        return block
+
+    def _check(self, size: int) -> tuple[int, str | None]:
+        r = self._cells.run(workdisk.CHECK, PROBE_S, record=False)
+        found = workdisk.judge_check(r.stdout, r.exit_code, size)
+        if found is None:
             log.error("the work disk's check said %r (%s)", r.stdout.strip()[:80], describe_stderr(r.stderr))
             raise SandboxError("the run's /work is not a file system of its own of at most its size")
-        with self._meta_lock:
-            self._meta["work_disk"].update(enospc_verified=True, held_bytes=held, filesystem_bytes=total, remade=True)
-            self._meta["infrastructure_facts"] = facts.record("image", mount_refused=self._mount_refused())
+        return found
 
     def _snapshot_inputs(self) -> list[tuple[Path, str]]:
         """Copy each read-only input into the run's directory, hash it, and take every write bit away (O20)."""
