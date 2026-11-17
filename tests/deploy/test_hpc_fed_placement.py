@@ -1,4 +1,4 @@
-"""O63: the HPC render always writes `[placement]` (deploy/hpc-federation/hpcboot.py, `write_platform`), so every reader
+"""O79: the HPC render always writes `[placement]` (deploy/hpc-federation/hpcboot.py, `write_platform`), so every reader
 of the rendered platform.toml (a shard's step, an ingest tool, the platform layer) reads one file and none supplies a
 default table of its own. A template's own `[placement]` passes through as declared; without one the render writes
 every setting at the core's default, `PlacementSettings`' fields being the one source of the numbers, and the holder
@@ -99,8 +99,8 @@ def render(hpc, root: Path, template: str, ca: bytes) -> tuple[Path, str]:
 # -- what the render writes ------------------------------------------------------------------------------------------
 
 
-def test_o63_the_render_of_a_template_that_declares_no_placement_carries_one(hpc, tmp_path, ca):
-    """O63: the pilot's template declares no `[placement]` (its spaces name their own data providers) and
+def test_o79_the_render_of_a_template_that_declares_no_placement_carries_one(hpc, tmp_path, ca):
+    """O79: the pilot's template declares no `[placement]` (its spaces name their own data providers) and
     `load_placement` requires the table, so the file `up` rendered was refused by it and every tool that read the
     render patched a default table in on its own. The file on disk, the last of the two passes that fill the token
     margin, and the text `write_platform` returns both carry it."""
@@ -111,10 +111,10 @@ def test_o63_the_render_of_a_template_that_declares_no_placement_carries_one(hpc
     assert "placement" in tomllib.loads(text)
 
 
-def test_o63_the_table_a_render_writes_is_the_cores_defaults_in_full_and_the_first_provider_as_holder(
+def test_o79_the_table_a_render_writes_is_the_cores_defaults_in_full_and_the_first_provider_as_holder(
     hpc, tmp_path, ca
 ):
-    """O63: every setting of `PlacementSettings` is written out at its default, with its own type (a float stays a
+    """O79: every setting of `PlacementSettings` is written out at its default, with its own type (a float stays a
     float, `reset_shortcut` a boolean), in the dataclass's order, the holder first; nothing else is in the table."""
     _, text = render(hpc, tmp_path / "root", TEMPLATE, ca)
     written = tomllib.loads(text)["placement"]
@@ -124,8 +124,8 @@ def test_o63_the_table_a_render_writes_is_the_cores_defaults_in_full_and_the_fir
     assert {key: type(value) for key, value in written.items()} == {key: type(v) for key, v in expected.items()}
 
 
-def test_o63_the_loader_reads_the_written_table_as_the_defaults_of_a_file_that_names_only_its_holder(hpc, tmp_path, ca):
-    """O63: defaults written out and defaults implied are one setting. The loader keeps its own literal copy of every
+def test_o79_the_loader_reads_the_written_table_as_the_defaults_of_a_file_that_names_only_its_holder(hpc, tmp_path, ca):
+    """O79: defaults written out and defaults implied are one setting. The loader keeps its own literal copy of every
     default, so the render's table (from the dataclass), a table of the holder alone (the loader's copy) and the
     dataclass's own defaults must all read as one `PlacementSettings`, and as one record at a resume
     (`reset_settings`)."""
@@ -138,10 +138,12 @@ def test_o63_the_loader_reads_the_written_table_as_the_defaults_of_a_file_that_n
     assert written.reset_settings() == implied.reset_settings()
 
 
-def test_o63_the_platform_fingerprint_is_the_same_with_the_defaults_written_out_or_implied(hpc, tmp_path, ca):
-    """O63: a render that writes the defaults out and one whose template implies them (a table naming the holder
+def test_o79_the_platform_fingerprint_is_the_same_with_the_defaults_written_out_or_implied(hpc, tmp_path, ca):
+    """O79: a render that writes the defaults out and one whose template implies them (a table naming the holder
     alone) are one platform: `PlatformConfig.fingerprint()` is equal, so shards of two federations rendered either
-    way still merge as one campaign."""
+    way still merge as one campaign. The fingerprint holds no `[placement]` setting today, so this holds trivially;
+    it pins the property for the day it holds the placement bounds a run reads, which it must take after their
+    defaults (as the two files' `reset_settings` are, above), never from the text of the table."""
     holder = first_provider()
     written_file, _ = render(hpc, tmp_path / "written", TEMPLATE, ca)
     implied_file, _ = render(hpc, tmp_path / "implied", f'placement = {{ holder = "{holder}" }}\n' + TEMPLATE, ca)
@@ -149,8 +151,8 @@ def test_o63_the_platform_fingerprint_is_the_same_with_the_defaults_written_out_
 
 
 @pytest.mark.parametrize("form", ["inline", "header"])
-def test_o63_a_template_that_declares_placement_keeps_its_values_and_gains_no_others(hpc, tmp_path, ca, form):
-    """O63: the table a template declares, as an inline key or as a header, is rendered as it is: its values, and no
+def test_o79_a_template_that_declares_placement_keeps_its_values_and_gains_no_others(hpc, tmp_path, ca, form):
+    """O79: the table a template declares, as an inline key or as a header, is rendered as it is: its values, and no
     default of the core's added beside them (the loader supplies those, as it does for every other file)."""
     declared = {"holder": "larch", "poll_s": 5.0, "concurrency": 4}
     if form == "inline":
@@ -163,8 +165,8 @@ def test_o63_a_template_that_declares_placement_keeps_its_values_and_gains_no_ot
     assert path.read_text(encoding="utf-8") == text
 
 
-def test_o63_the_loader_reads_a_declared_table_as_declared_and_every_other_setting_at_its_default(hpc, tmp_path, ca):
-    """O63: what a template declares is what a reader gets: the declared settings, and the core's default for the rest
+def test_o79_the_loader_reads_a_declared_table_as_declared_and_every_other_setting_at_its_default(hpc, tmp_path, ca):
+    """O79: what a template declares is what a reader gets: the declared settings, and the core's default for the rest
     (the loader's own, as for every file that declares a table in part)."""
     template = 'placement = { holder = "larch", poll_s = 5.0, concurrency = 4 }\n' + TEMPLATE
     path, _ = render(hpc, tmp_path / "root", template, ca)
@@ -172,8 +174,8 @@ def test_o63_the_loader_reads_a_declared_table_as_declared_and_every_other_setti
     assert settings == PlacementSettings(holder="larch", poll_s=5.0, concurrency=4)
 
 
-def test_o63_a_template_with_no_provider_is_refused_naming_what_is_missing_and_writes_nothing(hpc, tmp_path):
-    """O63: the holder is a provider the file declares, so a file that declares none has no table to write: the render
+def test_o79_a_template_with_no_provider_is_refused_naming_what_is_missing_and_writes_nothing(hpc, tmp_path):
+    """O79: the holder is a provider the file declares, so a file that declares none has no table to write: the render
     fails, naming it, and leaves no platform.toml."""
     path = tmp_path / "platform.toml"
     template = 'zone = { name = "zone", url = "https://zone.example.org:8443" }\n'
@@ -188,8 +190,8 @@ def test_o63_a_template_with_no_provider_is_refused_naming_what_is_missing_and_w
     "value", [True, False, 0, 3, 16 << 20, 2.0, 0.001, 1e-07, 1e16, 3600.0, "listing", 'a "quoted" \\ word'],
     ids=repr,
 )  # fmt: skip
-def test_o63_a_written_setting_reads_back_as_the_same_value_of_the_same_type(hpc, value):
-    """O63: a boolean is `true`/`false` (not `0`), an integer stays one, a float stays one, and a string is a basic
+def test_o79_a_written_setting_reads_back_as_the_same_value_of_the_same_type(hpc, value):
+    """O79: a boolean is `true`/`false` (not `0`), an integer stays one, a float stays one, and a string is a basic
     string of TOML."""
     read = tomllib.loads(f"x = {hpc.boot.toml_scalar(value)}")["x"]
     assert read == value
@@ -197,8 +199,8 @@ def test_o63_a_written_setting_reads_back_as_the_same_value_of_the_same_type(hpc
 
 
 @pytest.mark.parametrize("value", [math.inf, math.nan, None, [1], {"a": 1}], ids=repr)
-def test_o63_a_setting_of_a_type_the_writer_does_not_know_is_refused_never_written_as_text(hpc, value):
-    """O63: a field that a later core adds with a type the writer cannot spell fails the render, instead of writing a
+def test_o79_a_setting_of_a_type_the_writer_does_not_know_is_refused_never_written_as_text(hpc, value):
+    """O79: a field that a later core adds with a type the writer cannot spell fails the render, instead of writing a
     value the loader would read differently."""
     with pytest.raises((TypeError, ValueError)):
         hpc.boot.toml_scalar(value)
@@ -218,10 +220,10 @@ def step_args(tmp_path):
                               archive_left=False, snapshot_every=3600.0)  # fmt: skip
 
 
-def test_o63_a_shard_step_places_the_platform_file_as_it_is_and_the_loader_refuses_a_file_without_the_table(
+def test_o79_a_shard_step_places_the_platform_file_as_it_is_and_the_loader_refuses_a_file_without_the_table(
     shards, tmp_path, monkeypatch
 ):
-    """O63: the step adds no `[placement]` to the federation's platform.toml it places beside a study, whatever the
+    """O79: the step adds no `[placement]` to the federation's platform.toml it places beside a study, whatever the
     file holds: a file without the table is copied as it is, and `load_placement` refuses that copy, naming the key.
     A federation rendered by `up` always has the table; a file that has none is not made loadable on the way."""
     from expcore_onedata.testing import write_platform
