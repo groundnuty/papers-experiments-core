@@ -879,6 +879,16 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   ingested space** (the pilot's `delta-space`) is planned only once its data is verified: run `hpcfed.py --layout L
   --root <fleet>/fed-k/root verify-data` on each, after the study's ingest and before `plan` (the fleet has no verb
   for it); until then `plan` refuses it, naming the space.
+- **The study's own refusals and the operator's variables (O63).** The shard settings take `shards.py`'s optional
+  keys: `pre_step`, `post_run` (and their bounds), `expect_render_identity` and `pass_env`, each as `shards.py`'s
+  manifest has it (above). `plan` and `step` pin them as `shards.py plan` and `lines` do before they print or spawn a
+  line: the study's scripts hashed as the study holds them then, each declared variable read from the environment
+  `fleet.py` runs in (`NAME=VALUE` as an `env -i` word, with `--pass-env NAME`; an unset variable or a value that may not
+  ride on a line refuses the whole `plan` or `step`, naming the variable, before anything is assigned or launched). The
+  value a line pins is the one the operator holds when that command runs, so `step` pins afresh (`plan` prints the
+  values it pinned beside each line, as `"pass_env"`). `shards.toml` declares the names, so `collect` refuses a shard
+  whose step was not given them. Before this the settings took `snapshot_every_s` alone, so a step launched by a fleet
+  could carry none of the study's own refusals, and `shards.py resume-line` refused a manifest that declared one.
 - **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never
   starts in the directory you ran it from), its client recorded and its output in `<fleet>/logs/`, after checking the
   federation again, that `shards.toml` is the one the record gives, and that Slurm still holds the job the line lands
