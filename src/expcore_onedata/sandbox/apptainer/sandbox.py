@@ -524,9 +524,10 @@ class ApptainerSandbox:
         self._meta["read_only_verified"] = {"root": True}
 
     def _verify_work_disk(self) -> None:
-        """O71: a cell writes past `/work`'s size and must be refused with ENOSPC at most at it (`workdisk.judge`), or
-        the start fails; the image, which the probe filled, is then made again by the same command, and a cell shows it
-        a file system of its own of at most its size (`workdisk.judge_check`). Only then does the record say so."""
+        """O71: a cell writes past `/work`'s size and must be refused with ENOSPC at most at it (`workdisk.judge`), and
+        the file it leaves must come out through the collection's path (`Collection.prove_image_copy`), or the start
+        fails; the image, which the probe filled, is then made again by the same command, and a cell shows it a file
+        system of its own of at most its size (`workdisk.judge_check`). Only then does the record say so."""
         if not self.work_image:
             return
         size = workdisk.image_size(self.s.limits.work_disk_bytes)
@@ -535,6 +536,7 @@ class ApptainerSandbox:
         if held is None:
             log.error("the work disk's probe said %r (%s)", r.stdout.strip()[:80], describe_stderr(r.stderr))
             raise SandboxError("a write past /work's size is not refused with ENOSPC for the agent")
+        self.collection.prove_image_copy()  # the collection's path, on the file the probe left
         workdisk.make(self.node, self.dir, size, self.app.work_disk_mkfs)  # the probed image's pages given back
         r = self._cells.run(workdisk.CHECK, PROBE_S, record=False)
         total = workdisk.judge_check(r.stdout, r.exit_code, size)

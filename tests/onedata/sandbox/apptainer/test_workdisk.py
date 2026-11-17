@@ -100,8 +100,19 @@ def test_o71_the_start_proves_a_write_past_the_size_is_refused_with_enospc_in_a_
         assert disk["remade"] is True
         assert disk["mkfs"].startswith("mke2fs")
         assert len([argv for argv in node.mkfs_calls if "-V" not in argv]) == 2
+        image = node.images[str(box.dir / "work" / workdisk.IMAGE_NAME)]
+        assert not (image.backing / "work" / workdisk.COPY_PROBE).exists()  # the agent's /work is the new image's
     finally:
         box.stop()
+
+
+def test_o71_the_start_is_refused_when_a_file_cannot_be_copied_out_of_the_image(node, settings):
+    """O71: the probe's file must come out through the collection's own path before the agent's first cell; a run whose
+    outputs could not be collected is never started, and nothing is left."""
+    node.copy_helper_result = CmdResult(1, "", "OSError (13)\n")
+    with pytest.raises(SandboxError, match="copied out of the work disk"):
+        start(node, settings)
+    assert not [p for p in settings.work_root.iterdir() if p.name != runs.RUNS]
 
 
 @pytest.mark.parametrize(
@@ -146,7 +157,8 @@ def test_o71_the_probe_writes_at_most_one_chunk_past_the_size_and_names_enospc(t
     done = run_bounded([sys.executable, "-I", "-c", source], 60)
     assert done.returncode == 0
     assert done.stdout.split() == ["unbounded", str((1 << 20) + workdisk.PROBE_CHUNK)]
-    assert not list(work.iterdir())
+    assert [p.name for p in work.iterdir()] == [workdisk.COPY_PROBE]  # its own file gone, the copy's left
+    assert (work / workdisk.COPY_PROBE).read_bytes() == workdisk.COPY_MARK
 
 
 # ------------------------------------------------------------------------------------------------ a cell's write
@@ -193,7 +205,7 @@ def test_o71_a_named_output_is_copied_out_of_the_image_by_execs_of_the_image(nod
         assert done["outputs"] == {"out": True}
         assert (tmp_path / "out" / "work" / "out" / "result.txt").read_text() == "42\n"
         copies = [e for e in node.execs if e.command[:3] == [settings.apptainer.python, "-I", "-c"]]
-        assert [e.command[-1] for e in copies] == ["list", "copy"]
+        assert [e.command[-1] for e in copies] == ["list", "copy"] * 2  # the start's proof, then the collection
         for e in copies:
             assert e.images["/work"] == "/work"
             assert e.env == workdisk.copy_env(box.sid)

@@ -236,6 +236,7 @@ class FakeNode:
         self.mkfs_fails = False
         self.disk_probe_answer: str | None = None  # what the start's probe of a work disk says, if not the image's
         self.disk_check_answer: str | None = None
+        self.copy_helper_result: CmdResult | None = None  # what every copy exec of a work disk returns, if not its own
 
     # ------------------------------------------------------------------------------------------------ processes
     def _new_proc(self, pidns: str, comm: str, **kw: Any) -> FakeProc:
@@ -483,7 +484,9 @@ class FakeNode:
                 seen, until = self.listed, time.monotonic() + 0.3
                 while self.listed < seen + 10 and time.monotonic() < until:
                     time.sleep(0.005)
-            return self._copy_helper_run(parsed) if proc.alive else CmdResult(137, "", "")
+            if not proc.alive:
+                return CmdResult(137, "", "")
+            return self._copy_helper_run(parsed) if self.copy_helper_result is None else self.copy_helper_result
         finally:
             proc.alive = False
 
@@ -551,6 +554,8 @@ class FakeNode:
         if cell.program.startswith(workdisk.PROBE_HEAD):  # a write past the work disk's size
             image = cell.image()
             said = f"enospc {image.holds}" if image is not None else f"unbounded {1 << 30}"
+            if image is not None:  # the file it leaves for the start's copy out of the image
+                (cell.work_dir() / workdisk.COPY_PROBE).write_bytes(workdisk.COPY_MARK)
             return CmdResult(0, (said if self.disk_probe_answer is None else self.disk_probe_answer) + "\n")
         if cell.program.startswith(workdisk.CHECK_HEAD):  # the work disk's size and whether it is /tmp's
             image = cell.image()

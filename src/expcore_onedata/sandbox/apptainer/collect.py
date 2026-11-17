@@ -28,6 +28,7 @@ from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox.api import DataPathMode, SandboxError
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import helpers, runs, workdisk
+from expcore_onedata.sandbox.hostops import describe_error
 from expcore_onedata.sandbox.sandbox import TEARDOWN_TROUBLE
 
 if TYPE_CHECKING:
@@ -132,7 +133,26 @@ class Collection:
         try:
             return workdisk.collect(host, staging, dest / "work", outputs, max_bytes=box.s.limits.work_disk_bytes)
         finally:
-            runs.remove_tree(staging)
+            _remove(staging)
+
+    def prove_image_copy(self) -> None:
+        """O71, at the start: the file the work disk's probe left (`workdisk.COPY_PROBE`) comes out of the image byte
+        for byte through the collection's own path (`_image_outputs`), or `SandboxError`: a run whose outputs could not
+        be collected is never started."""
+        box = self.box
+        dest = box.dir / "copy-probe"
+        try:
+            copied = self._image_outputs(dest, [workdisk.COPY_PROBE])
+            same = copied[workdisk.COPY_PROBE] is not None and (
+                (dest / "work" / workdisk.COPY_PROBE).read_bytes() == workdisk.COPY_MARK
+            )
+        except (SandboxError, OSError) as error:
+            log.error("the start's copy out of the work disk failed: %s", describe_error(error))
+            same = False
+        finally:
+            _remove(dest)
+        if not same:
+            raise SandboxError("a file could not be copied out of the work disk's image")
 
     def _inputs_unchanged(self) -> None:
         box = self.box
@@ -222,6 +242,15 @@ class Collection:
                 self.egress_bytes = None
         if held:
             raise kinds.collection_error("the run's evidence", f"{len(held)} file(s) held the data-path token")
+
+
+def _remove(path: Path) -> None:
+    """Remove a directory of the collection's own; one that stays is logged and left to the teardown, which removes the
+    run's directory and fails if it cannot."""
+    try:
+        runs.remove_tree(path)
+    except OSError as error:
+        log.error("a directory of the collection could not be removed: %s", describe_error(error))
 
 
 __all__ = ["Collection"]

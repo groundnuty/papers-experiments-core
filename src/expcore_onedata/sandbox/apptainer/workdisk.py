@@ -19,7 +19,9 @@ decides, and the start's proof below is what is relied on).
   with ENOSPC, past half the image's size and at most at its size; anything else refuses it: no bound, a bound that
   came only at `fsync` (the write itself reported success), another error. The probe allocates the whole image on the
   node's tmpfs, and the blocks ext3 frees stay allocated in the file, so the image is then made again by the same
-  command, the probed one's memory given back. A last cell shows the image made again a file system of its own (not
+  command, the probed one's memory given back. Before that, the probe leaves a small file (`COPY_PROBE`), and the
+  collection's own path (`collect`, below) must copy it out byte for byte, or the start fails: a run whose outputs
+  could not be collected is never paid for. A last cell shows the image made again a file system of its own (not
   `/tmp`'s) of at most its size.
 * **The collection** (`ImageCopyHost`, `collect`): the host cannot read an ext3 image without privilege, so
   `copyout.copy_tree` runs as for Docker, with its copy helper in a one-shot exec of the image that binds the run's
@@ -71,6 +73,8 @@ PROBE_CHUNK = 1 << 20
 GONE_WAIT_S, GONE_POLL_S = 10.0, 0.1
 PROBE_HEAD = "# expcore work disk probe (O71)\n"
 CHECK_HEAD = "# expcore work disk check (O71)\n"
+COPY_PROBE = ".expcore-copy-probe"  # the file the probe leaves in /work for the start's copy out of the image
+COPY_MARK = b"expcore work disk copy probe (O71)\n"
 PROBE = PROBE_HEAD + (
     "import errno, os\n"
     "path, limit, chunk = '/work/.expcore-disk-probe', {limit}, bytes({chunk})\n"
@@ -91,6 +95,8 @@ PROBE = PROBE_HEAD + (
     "finally:\n"
     "    os.close(fd)\n"
     "    os.unlink(path)\n"
+    "with open('/work/{copy}', 'xb') as handle:\n"
+    "    handle.write({mark!r})\n"
     "print(verdict, written)\n"
 )
 CHECK = CHECK_HEAD + (
@@ -162,7 +168,7 @@ def mkfs_version(node: NodeOps, mkfs: Sequence[str]) -> str | None:
 
 def probe_source(size: int) -> str:
     """The probe's program for an image of `size` bytes: it writes at most one chunk past it."""
-    return PROBE.format(limit=size + PROBE_CHUNK, chunk=PROBE_CHUNK)
+    return PROBE.format(limit=size + PROBE_CHUNK, chunk=PROBE_CHUNK, copy=COPY_PROBE, mark=COPY_MARK)
 
 
 def probe_timeout_s(size: int) -> float:
@@ -300,6 +306,8 @@ def end_holders(
 __all__ = [
     "CHECK",
     "CHECK_HEAD",
+    "COPY_MARK",
+    "COPY_PROBE",
     "COPY_TAG",
     "EXPORT",
     "IMAGE_NAME",
