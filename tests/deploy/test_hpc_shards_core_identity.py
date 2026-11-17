@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fingerprint_support import standin_python
 
 from expcore.provenance import core_identity
 
@@ -132,7 +133,12 @@ def step_path() -> str:
 
 
 def write_manifest(tmp_path: Path, python: Path | str, core_src: Path) -> Path:
-    """The manifest of two shards on two federations that are ready, as `plan` reads it."""
+    """The manifest of two shards on two federations that are ready, as `plan` reads it. `plan` and `lines` also take
+    each shard's campaign fingerprint (O63), which these cores cannot (each holds the identity module alone): the
+    manifest's `python` is the fingerprint stand-in, which answers the core probe as `python`, the real interpreter of
+    the core, answers it."""
+    (tmp_path / "study").mkdir(exist_ok=True)
+    python = standin_python(tmp_path / "standin", core_python=python)
     roots = [tmp_path / "fed" / name for name in ("a", "b")]
     for n, root in enumerate(roots, 1):
         root.mkdir(parents=True)

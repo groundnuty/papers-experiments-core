@@ -10,6 +10,10 @@ that takes the same arguments, ignores the code and prints the fingerprint of th
 `# study-setting: X` comment line adds a key only a study's plugin could see, which `PlatformConfig.fingerprint()`
 leaves out. Each call is recorded in `calls.txt` beside the stand-in (the SHA-256 of the platform file it was handed),
 so a test shows each fingerprint was taken beside its own federation's file.
+
+`plan` and `lines` also ask the same interpreter which core it imports (C06: `shards.identify_core`, `python -I -B -c
+CODE` with no study copy); the stand-in answers that call too, with a known core by default or as a real interpreter
+(`core_python`), and records no call in `calls.txt` for it.
 """
 
 import json
@@ -21,7 +25,7 @@ from pathlib import Path
 SECTIONS = ("faults", "placement")
 """The tables of a platform file a stand-in study fingerprints by default: settings that shape a run."""
 
-PROGRAM = """import hashlib, json, re, sys, tomllib
+PROGRAM = """import hashlib, json, os, re, sys, tomllib
 from pathlib import Path
 
 here = Path(sys.argv[0]).resolve().parent
@@ -29,8 +33,13 @@ config = json.loads((here / "standin.json").read_text(encoding="utf-8"))
 if config["fail"]:
     sys.stderr.write("standin: a path that must never be shown: /private/place/of/the/federation\\n")
     raise SystemExit(config["fail"])
+if not sys.argv[2]:  # no study copy: the core probe (`shards.identify_core`), which asks what core the Python imports
+    if config["core_python"]:  # a real interpreter's answer, as its own process: it is not made to run, so it fails
+        os.execv(config["core_python"], [config["core_python"], "-I", "-B", "-c", sys.argv[1]])
+    print(json.dumps(config["core"]))
+    raise SystemExit(0)
 fingerprint = {"seeds": {"1": True}}
-platform_file = Path(sys.argv[1]) / "platform.toml"
+platform_file = Path(sys.argv[2]) / "platform.toml"
 seen = "none"
 if platform_file.is_file():
     raw = platform_file.read_bytes()
@@ -54,18 +63,42 @@ print(json.dumps(fingerprint, sort_keys=True))
 """
 
 
+CORE = {"known": True, "stale": False, "why": "a stand-in's core"}
+"""What the stand-in says of its core when `shards.identify_core` asks (O63 with C06): a commit that is known and not
+stale, so `plan` and `lines` go on to print their lines."""
+
+
 def standin_python(
-    directory: Path, *, sections: tuple[str, ...] = SECTIONS, real_platform: bool = False, fail: int = 0
+    directory: Path,
+    *,
+    sections: tuple[str, ...] = SECTIONS,
+    real_platform: bool = False,
+    fail: int = 0,
+    core: dict | None = None,
+    core_python: Path | str | None = None,
 ) -> Path:
     """The stand-in's executable in `directory` (made if need be), to name as a manifest's `python`. `fail` is an exit
-    status it ends with after writing a message that holds a path to stderr, to show that message is never repeated."""
+    status it ends with after writing a message that holds a path to stderr, to show that message is never repeated.
+    Asked which core it imports (`python -I -B -c CODE`, no study copy), it prints `core` (`CORE` by default), or, with
+    `core_python`, becomes that interpreter running the same arguments, so a real core's answer is the one given."""
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "standin.py").write_text(PROGRAM, encoding="utf-8")
     (directory / "standin.json").write_text(
-        json.dumps({"sections": list(sections), "real_platform": real_platform, "fail": fail}), encoding="utf-8"
+        json.dumps(
+            {
+                "sections": list(sections),
+                "real_platform": real_platform,
+                "fail": fail,
+                "core": core or CORE,
+                "core_python": str(core_python) if core_python else None,
+            }
+        ),
+        encoding="utf-8",
     )
     executable = directory / "python"
-    script = f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -I -B {shlex.quote(str(directory / "standin.py"))} "$5"\n'
+    script = (
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -I -B {shlex.quote(str(directory / "standin.py"))} "$4" "$5"\n'
+    )
     executable.write_text(script, encoding="utf-8")
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     return executable

@@ -58,7 +58,8 @@ def test_c06_plan_asks_the_manifests_interpreter_which_core_it_imports(bench):
     assert bench.up(2)[0] == 0
     code, printed = plan(bench)
     assert code == 0, printed
-    assert [(asked.python, asked.step_path) for asked in bench.asked] == [("/usr/bin/python3", "/usr/bin:/bin")]
+    manifest_python = str(bench.base / "venv" / "python")  # the interpreter the bench's manifest names (O63's stand-in)
+    assert [(str(asked.python), asked.step_path) for asked in bench.asked] == [(manifest_python, "/usr/bin:/bin")]
 
 
 @pytest.mark.parametrize(("core", "said"), REFUSED, ids=["unknown", "stale"])
