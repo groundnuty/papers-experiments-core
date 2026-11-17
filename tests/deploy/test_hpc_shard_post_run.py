@@ -339,6 +339,83 @@ def test_o63_archive_left_of_a_step_killed_before_its_script_passed_archives_not
     assert "out/NOT-FINAL.json" in names_in(tmp_path)
 
 
+def test_o63_the_not_final_mark_is_written_into_the_archive_never_through_the_nodes_tmpfs(
+    shards, tmp_path, monkeypatch
+):
+    """O63: a shard that is not final carries NOT-FINAL.json in its archive whatever the node's tmpfs can take: the mark
+    is written into the tar from memory, so a tmpfs out of inodes cannot leave it out and let the unpacked out/ be
+    merged directly. The copy's out/ never held it when the archive was written, and a file of that name the
+    dispatcher left there is replaced by the mark (one member, with the reason), not duplicated."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    held = {}
+    real = shards.archive
+
+    def watching(out, *more, **kwargs):
+        held["file"] = (out / "NOT-FINAL.json").exists()
+        return real(out, *more, **kwargs)
+
+    monkeypatch.setattr(shards, "archive", watching)
+    code, _ = run_step(shards, step_args(tmp_path, "raise SystemExit(2)\n"))
+    assert code == shards.POST_RUN_FAILED
+    assert held == {"file": False}
+    with tarfile.open(tmp_path / "results" / "fed-a.out.tar") as tar:
+        assert [m.name for m in tar.getmembers()].count("out/NOT-FINAL.json") == 1
+        assert "exited with status 2" in json.loads(tar.extractfile("out/NOT-FINAL.json").read())["reason"]
+
+
+def test_o63_a_mark_left_in_out_by_the_dispatcher_is_replaced_in_a_not_final_archive(shards, tmp_path, monkeypatch):
+    """O63: a NOT-FINAL.json the dispatcher itself left in out/ is not a second member of a not-final archive: the
+    archive holds the step's own mark once, with the real reason."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+
+    def leave_one():
+        # the dispatcher's stand-in writes a file of that name into out/
+        for out in (tmp_path / "tmpfs").glob("expcore-shard-fed-a.*/study/out"):
+            (out / "NOT-FINAL.json").write_text('{"reason": "left by the dispatcher"}')
+
+    run, _ = dispatcher(then=leave_one)
+    args = step_args(tmp_path, "raise SystemExit(2)\n")
+    assert shards.step(args, runner=run, core_found=lambda path: True) == shards.POST_RUN_FAILED
+    with tarfile.open(tmp_path / "results" / "fed-a.out.tar") as tar:
+        assert [m.name for m in tar.getmembers()].count("out/NOT-FINAL.json") == 1
+        assert "exited with status 2" in json.loads(tar.extractfile("out/NOT-FINAL.json").read())["reason"]
+
+
+def test_o63_a_store_that_cannot_be_settled_never_costs_the_results_their_archive(
+    shards, tmp_path, monkeypatch, capsys
+):
+    """O63: a failing `settle_store` (an I/O error on the store a post-run script left with a -wal) is said and the
+    results are archived as they are, whatever the script's outcome: the working directory is never removed with its
+    out/ unarchived."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+
+    def broken(out):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(shards, "settle_store", broken)
+    code, _ = run_step(shards, step_args(tmp_path, "raise SystemExit(2)\n"))
+    assert code == shards.POST_RUN_FAILED
+    assert "the store could not be settled" in capsys.readouterr().err
+    assert manifest_of(tmp_path)["final"] is False
+    assert "out/runs/r1.json" in names_in(tmp_path)
+
+
+def test_o63_a_post_run_step_that_raises_archives_the_results_not_final(shards, tmp_path, monkeypatch):
+    """O63: an unexpected error in running the script is a not-final shard, archived, never a crash that removes the
+    working directory with the results in it."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+
+    def raising(*more, **kwargs):
+        raise ValueError("unexpected")
+
+    monkeypatch.setattr(shards, "run_hook", raising)
+    code, _ = run_step(shards, step_args(tmp_path, PASS))
+    assert code == shards.POST_RUN_FAILED
+    assert "the post-run step failed (ValueError)" in manifest_of(tmp_path)["post_run"]["reason"]
+    assert "out/NOT-FINAL.json" in names_in(tmp_path)
+    assert not list((tmp_path / "tmpfs").iterdir())
+
+
 # -- refused at the start, before anything is made ------------------------------------------------------------------
 
 

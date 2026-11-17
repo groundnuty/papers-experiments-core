@@ -156,6 +156,7 @@ import argparse
 import contextlib
 import errno
 import hashlib
+import io
 import json
 import os
 import re
@@ -531,6 +532,11 @@ def _write_whole(path: Path, write: Callable[[Path], None]) -> None:
     os.replace(draft, path)
 
 
+def not_final_mark(reason: str) -> bytes:
+    """The bytes of `NOT-FINAL.json`, which the core's merge refuses (`expcore.campaign.shard.NOT_FINAL_FILE`)."""
+    return (json.dumps({"format": NOT_FINAL_FORMAT, "final": False, "reason": reason}, sort_keys=True) + "\n").encode()
+
+
 def archive(
     out: Path,
     results: Path,
@@ -546,9 +552,22 @@ def archive(
     tar_path = results / f"{label}.out.tar"
     files = sum(1 for p in out.rglob("*") if p.is_file() and not p.is_symlink())
 
+    final = post_run is None or post_run.get("final") is True
+    mark = None if final else not_final_mark(str(post_run.get("reason") or "the post-run script did not pass"))
+
     def write_tar(draft: Path) -> None:
         with tarfile.open(draft, "w", format=tarfile.PAX_FORMAT) as tar:
-            tar.add(out, arcname="out", recursive=True)
+            # a shard not final carries the mark in its archive, written here from memory so that no full tmpfs can
+            # leave it out; a file of that name in out/ is replaced by it, and in a final shard's it is left, for
+            # `collect` and the merge to refuse
+            def keep(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+                return None if mark is not None and info.name == f"out/{NOT_FINAL}" else info
+
+            tar.add(out, arcname="out", recursive=True, filter=keep)
+            if mark is not None:
+                info = tarfile.TarInfo(f"out/{NOT_FINAL}")
+                info.size, info.mode, info.mtime = len(mark), 0o644, int(time.time())
+                tar.addfile(info, io.BytesIO(mark))
 
     _write_whole(tar_path, write_tar)
     manifest = {
@@ -836,6 +855,16 @@ def settle_store(out: Path) -> None:
         connection.close()
 
 
+def settle_quietly(out: Path) -> None:
+    """`settle_store`, where a failure is said and never ends the step: the archive that follows holds `out/` as it is
+    (its store with its -wal and -shm, which a reader recovers from a private copy), and nothing here may lose it."""
+    try:
+        settle_store(out)
+    except Exception as error:
+        print(f"shards: ERROR: the store could not be settled ({type(error).__name__}); out/ is archived as it is",
+              file=sys.stderr)  # fmt: skip
+
+
 def archive_named(results: Path, label: str) -> str | None:
     """The SHA-256 the shard's archive manifest names: None when there is none; a value no snapshot names when it
     cannot be read, so that the archive, which then fails its check, is never passed over for an older snapshot."""
@@ -1088,7 +1117,6 @@ def archive_left(args: argparse.Namespace) -> int:
     post = dict(post) if isinstance(post, Mapping) else None
     if post is not None and post.get("final") is not True:  # its script did not pass, or the step ended before it did
         post["reason"] = post.get("reason") or "the step ended before its post-run script passed"
-        mark_not_final(out, str(post["reason"]))
     manifest = archive(out, args.results, spec, int(status), guard if isinstance(guard, Mapping) else None, post)
     remove_tree(left.path)
     print(f"shards: shard {args.label}'s kept out/ archived: {manifest['files']} files, sha256 {manifest['sha256']}")
@@ -1336,18 +1364,6 @@ def note_post_run(work: Path, post: Mapping[str, Any]) -> None:
               file=sys.stderr)  # fmt: skip
 
 
-def mark_not_final(out: Path, reason: str) -> None:
-    """Mark the shard's `out/` not final, in a file the merge refuses (`NOT_FINAL`); said when it cannot be written
-    (the manifest of the archive says it as well, and `collect` reads that)."""
-    mark = {"format": NOT_FINAL_FORMAT, "final": False, "reason": reason}
-    try:
-        (out / NOT_FINAL).write_text(json.dumps(mark, sort_keys=True) + "\n", encoding="utf-8")
-    except OSError as error:
-        print(
-            f"shards: ERROR: the not-final mark could not be written to out/ ({type(error).__name__})", file=sys.stderr
-        )
-
-
 def step(
     args: argparse.Namespace,
     *,
@@ -1444,21 +1460,24 @@ def step(
         finally:
             live.clear()  # the dispatcher has exited: the last snapshot reads a private copy of the store
             snapshots.stop(out)
-        settle_store(out)
+        settle_quietly(out)
         if not out.is_dir():
             print(f"shards: shard {args.label} left no out/ to archive (exit status {status})", file=sys.stderr)
             return status
         post = None
         if post_hook is not None:  # the dispatcher has exited and the federation is up: the study's own check
-            post = run_post_run(post_hook, args.label, copy, out, env, status)
+            try:
+                post = run_post_run(post_hook, args.label, copy, out, env, status)
+            except Exception as error:  # whatever the check does, the results are archived: not final
+                post = {"path": post_hook.path, "sha256": post_hook.sha256, "ran": False, "exit_status": None,
+                        "final": False, "reason": f"the post-run step failed ({type(error).__name__})"}  # fmt: skip
             note_post_run(work, post)
             if post["final"]:
                 print(f"shards: {post_hook.name} passed for shard {args.label}: its results are final", file=sys.stderr)
             else:
-                mark_not_final(out, post["reason"])
                 print(f"shards: ERROR: {post['reason']}; shard {args.label}'s results are archived, NOT final",
                       file=sys.stderr)  # fmt: skip
-            settle_store(out)  # a script that read the store may leave its -shm
+            settle_quietly(out)  # a script that read the store may leave its -shm
         try:
             manifest = archive(out, args.results, spec, status, guard, post)
         except (OSError, tarfile.TarError) as error:  # the only whole out/ is the tmpfs copy: kept, never removed
