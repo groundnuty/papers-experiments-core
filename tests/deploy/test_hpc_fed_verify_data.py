@@ -240,7 +240,8 @@ def test_o57_a_state_file_with_a_malformed_data_record_is_refused_when_it_is_rea
 def shard_manifest(tmp_path: Path, feds: list) -> Path:
     (tmp_path / "study").mkdir(exist_ok=True)  # the campaign fingerprint is taken on a copy of it (O63)
     lines = [f'{k} = "{tmp_path / k}"' for k in ("study", "core_src", "results", "tmpfs")]
-    lines += [f'python = "{standin_python(tmp_path / "venv")}"', 'step_path = "/usr/bin:/bin"', "cpus = 6"]
+    python = standin_python(tmp_path / "venv", real_platform=True)  # the federations' own rendered files
+    lines += [f'python = "{python}"', 'step_path = "/usr/bin:/bin"', "cpus = 6"]
     lines += ['memory = "18g"']
     for n, fed in enumerate(feds):
         lines += ["[[shards]]", f'label = "fed-{n}"', f'root = "{fed.root}"']
