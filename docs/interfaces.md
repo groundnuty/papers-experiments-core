@@ -1157,7 +1157,7 @@ Not carried over from the earlier study: the gate's whole-file mode, the tracer 
 backend = "apptainer"
 work_root = "/node/tmpfs/dir"       # an existing 0700 directory of the driver's, not a link
 content_check_file = "dir/f"
-[sandbox.limits]                    # memory_bytes, tmp_bytes, shm_bytes, work_disk_bytes: the watch's bounds
+[sandbox.limits]                    # all kept (limits.py): the watch's bounds, the cell's prlimit and taskset
 cpus = 2.0
 memory_bytes = 8589934592
 pids = 512
@@ -1192,6 +1192,24 @@ hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: the defaul
   - `unknown`, `margin_bytes`, `start_unexplained_bytes`, `peak` (`unexplained_bytes`, `cgroup_anon_bytes`, `visible_anon_bytes`, `baseline_bytes`, `allowance_bytes`), `hidden_processes`, `hidden_memory_cells`, `children_unreadable_polls` and `cgroup_unreadable_polls`.
 
   Each cell's record has its own (`watched.memory`). `process_visibility()` gives the same reading to the `process_visibility` instrument. A hidden process's shared memory (a memfd, a shared anonymous mapping) is not compared, since the cgroup counts it with the run's tmpfs files.
+- **The limits** (`apptainer.limits`, `limitspoll`, O70; `metadata()["infrastructure_facts"]["limits"]`, beside `["memory"]`, also in the collected `metadata.json`), every key always present:
+
+  ```
+  {"version": 1,
+   "cpus": {"declared": float, "reading": "pinned" | "widened" | "unknown", "unknown": [reason...],
+            "effective_set": [int...] | null, "effective_count": int | null, "step_set": [int...] | null,
+            "widened": bool, "widened_processes": int},
+   "pids": {"declared": int, "reading": "within" | "over" | "unknown", "unknown": [...], "max_seen": int | null, "kills": int},
+   "nofile": {"declared": int, "reading": "set" | "unknown", "unknown": [...], "hard_limit": int | null},
+   "gate_memory": {"declared": int, "reading": "within" | "over" | "unknown" | "not_applicable", "unknown": [...],
+                   "peak_bytes": int | null}}
+  ```
+
+  - **nofile:** every cell command starts `prlimit --nofile=N:N -- ...` (`limits.prefix`), so the cell holds a hard and soft `RLIMIT_NOFILE` of `limits.nofile` it cannot raise. The start's canary prints `resource.getrlimit(RLIMIT_NOFILE)` and `os.sched_getaffinity(0)` from inside a cell (`limits.CANARY`); a hard limit that is not the declared one fails the start with `SandboxError`, and so does a `prlimit` or `taskset` that cannot run (named). `reading` is `set` only when the canary showed the declared hard limit; `hard_limit` is what it showed.
+  - **cpus:** the prefix continues `taskset -c <cores>`: the first `ceil(cpus)` of the driver's own affinity (`NodeOps.own_affinity`, the step's cores, `step_set`), all of them when `cpus` is more, none when they could not be read. `effective_set` is the canary's reading inside a cell and `effective_count` its length. At every poll the watch reads the union of each task's `Cpus_allowed_list` for every process of the run (`NodeOps.task_affinity`; `sched_setaffinity` is per thread) and counts a process outside the effective set in `widened_processes`, never killing it (until the canary has answered, against the pin). `reading` is `widened` when one was seen or the canary's set is wider than the pin, `pinned` only when none was and nothing below made it unknown.
+  - **pids:** at every poll the watch sums `Threads:` (`Proc.threads`) of the run's processes into `max_seen` and over `limits.pids` kills them as `pids_limit` (`scope: "cell"`, `what: "pids"`, `amount` the count; `kills` counts those that signalled a process), `over` once one did.
+  - **gate_memory:** at every poll the watch reads the gate helper's `RssAnon` and `RssShmem` (`peak_bytes`) and over `limits.gate_memory_bytes` SIGKILLs it through its pidfd, recorded in `metadata()["watch"]["gate_kills"]` and not among the cells' `kills`; `over` once one signalled it. `Collection.deaths()` then gives the gate's death `cause: "component_defect"` (infrastructure, kind `sandbox`) and a basis naming the watch, only for a death that signal caused. `not_applicable`: a run with no gate (no REST data path).
+  - **Reasons** (`unknown`): `affinity_unreadable` (a task's cores could not be read), `step_set_unreadable`, `proc_unreadable` (a listing of `/proc` failed during a cell, a process's status had no task count, or no process was ever counted), `hidden_process` (the run's memory reading holds `hidden_process`, or a cell was killed for hidden memory: `/proc` hides such a process's tasks and cores), `probe_unreadable` (the canary's line did not come back whole), `gate_unreadable` (the gate's memory could not be read), `kill_reached_none` (the watch's kill signalled no process). A shown `over` or `widened` outweighs them; an `unknown` reading never reads as within, pinned or set.
 - **No name server:** every cell binds a `/etc/resolv.conf` that names none and a `/etc/nsswitch.conf` whose databases are `files`, read-only (`argv.RESOLV_TEXT`, `argv.NSSWITCH_TEXT`; a hook (b) bind onto either is refused). So the C library resolves the names of `/etc/hosts` alone, and `infrastructure_facts.dns` is `"none"`. A program with a resolver of its own can still send a query, which is egress like any other. This is no departure from Docker: the agent's network is `--internal` with `--add-host` entries and no `--dns`; the engine's embedded resolver (127.0.0.11) answers every outside name with SERVFAIL at once (no addresses, no timeout), the `--add-host` names resolve only through `/etc/hosts`, and a connect to an outside address fails at once with ENETUNREACH (no default route); measured on engine 29.2.1.
 - **Completion causes** name `apptainer exec` (`Completion.for_source(code, runner="apptainer exec")`).
 - **Facts** are listed by key in every run's `metadata()["infrastructure_facts"]` (`apptainer.facts.FACTS`): the departures from the Docker sandbox, and one fact that is no departure (`dns_none`):
@@ -1201,7 +1219,7 @@ hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: the defaul
   - memory and disks are kept by a watch, whose kill ends the cell (`scope: cell` on each kill and on the cell's `kill`) and never the run, as a container's OOM kill on Docker, though it kills every process of the cell where Docker's kernel kills the largest alone; a disk past its size kills the cell, where Docker's write fails with ENOSPC;
   - what `/proc` hides is checked from the cgroup (`hidden_memory`);
   - a cell has no name server (`dns_none`; a Docker cell resolves the same, so no departure);
-  - cpus, pids and nofile are not enforced;
+  - cpus is a set of cores where Docker's is a quota (`cpu_affinity`), pids a poll that kills where Docker refuses the fork with EAGAIN (`pids_watch`), and the gate's memory limit a poll (`gate_memory_watch`); nofile is kept as Docker's is and is no departure;
   - no freezer;
   - the mount is refused.
 
