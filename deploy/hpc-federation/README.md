@@ -822,8 +822,11 @@ to `DIR/federation.root.tar` and `DIR/federation.root.json`, mode 0600, and list
 where `evidence` names exactly the `.root.tar` and the `.root.json` of one stem, each with size and SHA-256, and no other key
 (the full form `expcore-hpc-archives/1`, which refuses an empty list of archives, is unchanged). The manifest's SHA-256 is
 the only line of stdout, for `verify-copy --manifest-sha256`; the rest goes to stderr. **Last,** once the copy is in `DIR`,
-it writes `evidence-collected.json` in the root, which is what lets `down` go on: if the marker cannot be written the collect
-fails (exit 2) and puts `DIR` back as it found it, so that it can be run again. A root that holds step records is collected
+it writes `evidence-collected.json` in the root, which is what lets `down` go on. If the marker cannot be written the collect
+fails (exit 2) **and the copy stays in `DIR`**, never removed: the error can come after the marker's rename (the sync of the
+root's directory), when the root already holds a current marker, so a copy deleted then would leave the marker and no
+evidence. The same command run again says `already collected` and exits 0 if the marker landed; otherwise collect into a new
+directory. A root that holds step records is collected
 with a warning: the shards' own archives are not part of this form.
 
 `DIR` must be new, or empty and private (0700), and may never be the root, inside it (`down` removes the root with whatever

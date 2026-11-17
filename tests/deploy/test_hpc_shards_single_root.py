@@ -250,6 +250,8 @@ def _entry(name):
         ({"format": ROOT_ONLY_FORMAT, "evidence": []}, "names no evidence file"),
         ({"format": ROOT_ONLY_FORMAT, "evidence": [_entry(TAR)]}, "exactly"),
         ({"format": ROOT_ONLY_FORMAT, "evidence": [_entry(TAR), _entry("other.root.json")]}, "exactly"),
+        ({"format": ROOT_ONLY_FORMAT, "evidence": [_entry(TAR), _entry("other.root.tar")]}, "exactly"),
+        ({"format": ROOT_ONLY_FORMAT, "evidence": [_entry(INFO), _entry("other.root.json")]}, "exactly"),
         ({"format": ROOT_ONLY_FORMAT, "evidence": [_entry(TAR), _entry(INFO), _entry("extra.json")]}, "exactly"),
         ({"format": ROOT_ONLY_FORMAT, "evidence": [_entry(TAR), _entry(TAR)]}, "twice"),
         ({"format": ROOT_ONLY_FORMAT, "evidence": [_entry(TAR), _entry(INFO)], "archives": [_entry("a.out.tar")]},
@@ -258,7 +260,10 @@ def _entry(name):
         ({"format": "expcore-hpc-archives/1", "archives": [], "evidence": [_entry(TAR), _entry(INFO)]},
          "no archive"),
     ],
-    ids=["empty", "one file", "another pair", "a third file", "twice", "an archives list", "another key", "full form"],
+    ids=[
+        "empty", "one file", "another pair", "two archives", "two manifests", "a third file", "twice",
+        "an archives list", "another key", "full form",
+    ],
 )  # fmt: skip
 def test_verify_copy_refuses_a_root_only_manifest_that_would_verify_less_than_the_pair(
     shards, tmp_path, capsys, document, why
@@ -392,9 +397,11 @@ def test_an_empty_private_directory_is_collected_into_and_stays_the_directory(sh
     assert _written(into) == {TAR, INFO, MANIFEST}
 
 
-def test_a_marker_that_cannot_be_written_fails_the_collect_and_leaves_no_copy(shards, tmp_path, capsys, monkeypatch):
+def test_a_marker_that_cannot_be_written_fails_the_collect_and_keeps_the_copy(shards, tmp_path, capsys, monkeypatch):
     """O63: the marker is what lets `down` go on, and it is written last; if it cannot be, the collect fails (exit 2,
-    not a warning) and the directory is put back as it was, so that the run can be repeated into it."""
+    not a warning) but the copy it made stays whole in the directory: a copy is never removed once it is in place. The
+    root holds no marker, so `down` refuses it; the same command is refused (the copy is not replaced) and a new
+    directory collects it."""
     root, into = _stopped_root(tmp_path), tmp_path / "copy"
 
     def refuse(*args, **kwargs):
@@ -402,10 +409,42 @@ def test_a_marker_that_cannot_be_written_fails_the_collect_and_leaves_no_copy(sh
 
     monkeypatch.setattr(shards._evidence(), "write_marker", refuse)
     assert _collect(shards, root, into) == 2
-    assert "marker" in capsys.readouterr().err
-    _nothing_collected(root, into)
+    err = capsys.readouterr().err
+    assert "marker" in err
+    assert "stays in the directory" in err
+    assert _written(into) == {TAR, INFO, MANIFEST}
+    assert not (root / "evidence-collected.json").exists()
+    assert not list(tmp_path.glob(".collect-*"))
+    monkeypatch.undo()
+    assert _collect(shards, root, into) == 2  # the copy is not replaced
+    assert "new or empty" in capsys.readouterr().err
+    assert _collect(shards, root, tmp_path / "again") == 0
+    assert (root / "evidence-collected.json").is_file()
+
+
+def test_a_marker_that_landed_before_its_write_failed_never_costs_the_only_copy(shards, tmp_path, capsys, monkeypatch):
+    """O63: the marker's rename can succeed and the sync of the root's directory after it fail, so that the root holds a
+    current marker when `write_marker` raises. The collect fails (exit 2), the copy stays, so `down` (which goes on with
+    that marker) has its evidence in the directory, and the same command run again says it is already collected, exit
+    0, and verify-copy passes on the copy. A copy deleted on that error would have left a marker and no evidence."""
+    root, into = _stopped_root(tmp_path), tmp_path / "copy"
+    evidence = shards._evidence()
+    written = evidence._write_private
+
+    def land_then_fail(path, payload):
+        written(path, payload)
+        raise OSError("the directory could not be synced")
+
+    monkeypatch.setattr(evidence, "_write_private", land_then_fail)
+    assert _collect(shards, root, into) == 2
+    capsys.readouterr()
+    assert (root / "evidence-collected.json").is_file()  # the marker is in the root
+    assert _written(into) == {TAR, INFO, MANIFEST}  # and so is the copy it vouches for
     monkeypatch.undo()
     assert _collect(shards, root, into) == 0
+    captured = capsys.readouterr()
+    assert "already collected" in captured.err
+    assert shards.main(["verify-copy", str(into / MANIFEST), str(into), "--manifest-sha256", captured.out.strip()]) == 0
 
 
 # ------------------------------------------------------------------------------------------------ collected twice

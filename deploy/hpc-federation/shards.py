@@ -1812,8 +1812,11 @@ def collect_root(root: Path, into: Path) -> tuple[str, str]:
 
     `into` must be new, or empty and private, and a copy is never replaced: the evidence of a root that changed since
     is collected into another directory, the first copy left as it was. Everything is made in a private directory beside
-    `into`, checked against its own manifest, and moved in with one rename; a marker that cannot be written (it unlocks
-    `down`) fails the collect and puts `into` back, so that it can be run again."""
+    `into`, checked against its own manifest, and moved in with one rename. **The copy is never removed once it is in
+    place.** A marker that cannot be written (it unlocks `down`) fails the collect, but the error can come after the
+    marker landed (the directory sync that follows its rename), and a copy deleted then would leave a current marker and
+    no evidence: so the copy stays, complete, and the same command run again says `already` (exit 0) if the marker
+    landed; otherwise the evidence is collected into a new directory."""
     root = federation_root(root)
     into = copy_directory(root, into)
     module = _evidence()
@@ -1823,7 +1826,6 @@ def collect_root(root: Path, into: Path) -> tuple[str, str]:
         if digest is None:
             raise ShardsError("the directory to collect into must be new or empty (an earlier copy is never replaced)")
         return digest, "already"
-    existed = into.exists()
     made: list[Path] = []
     stage: Path | None = None
     done = False
@@ -1839,14 +1841,15 @@ def collect_root(root: Path, into: Path) -> tuple[str, str]:
         if verify_copy(stage / ARCHIVES_MANIFEST, stage, digest).problems:
             raise ShardsError("the copy written does not match its own manifest (nothing is kept)")
         os.rename(stage, into)  # onto nothing, or onto the empty directory: one step, never a partial one
+        _fsync_dir(into)  # its entries durable before the marker says they are there
         _fsync_dir(into.parent)
         try:
             module.write_marker(root, ROOT_ONLY_STEM, held.sha256, held.steps_sha256, held.hashes)
         except (OSError, module.EvidenceError) as error:
-            _put_back(into, existed)
             raise ShardsError(
-                f"the collected-evidence marker could not be written in the root ({type(error).__name__}): nothing is "
-                "kept in the directory, and `down` still refuses the root; run the collect again"
+                f"the collected-evidence marker could not be written in the root ({type(error).__name__}), but the "
+                "copy is complete and stays in the directory; the marker may or may not be in place: run the same "
+                "command again (it says `already collected` and exits 0 if it is) or collect into a new directory"
             ) from None
         done = True
     except OSError as error:
@@ -1948,8 +1951,8 @@ def _root_only_entries(document: Mapping[str, Any]) -> list[Entry]:
     evidence = _entries(document.get("evidence"), "evidence file", False, set())
     by_suffix = {suffix: [name for name, _, _ in evidence if name.endswith(suffix)] for suffix in ROOT_SUFFIXES}
     tar, info = (by_suffix[suffix] for suffix in ROOT_SUFFIXES)
-    if not (len(evidence) == 2 == len(tar) + len(info) and tar[0].removesuffix(ROOT_SUFFIXES[0])
-            == info[0].removesuffix(ROOT_SUFFIXES[1])):  # fmt: skip
+    stems = {name.removesuffix(suffix) for suffix, names in by_suffix.items() for name in names}
+    if len(evidence) != 2 or len(tar) != 1 or len(info) != 1 or len(stems) != 1:
         raise ShardsError("the root-only manifest must name exactly a .root.tar and the .root.json of the same stem")
     return evidence
 
