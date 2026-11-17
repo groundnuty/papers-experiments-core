@@ -303,7 +303,7 @@ def test_o73_a_map_the_launcher_may_not_use_stops_the_start_naming_nothing(tmp_p
     assert not re.search(r"layout\.test|192\.0\.2|\.json|/tmp|" + re.escape(str(tmp_path)), done.stderr)
 
 
-@pytest.mark.parametrize("server", [[], ["-X", "dev"], ["-m"], ["-m", ""], ["-c", "print(1)"]])
+@pytest.mark.parametrize("server", [[], ["-X", "dev"], ["-m"], ["-m", ""], ["-c", "print(1)"], [""], ["", "x"]])
 def test_o73_a_server_the_launcher_cannot_run_is_refused(tmp_path, server):
     """O73: the launcher runs `-m <module>` or a script and nothing else of an interpreter's command line."""
     done = _launch(_map(tmp_path / "map.json", {ZONE: "192.0.2.10"}), server, tmp_path=tmp_path)

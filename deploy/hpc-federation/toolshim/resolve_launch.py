@@ -91,6 +91,8 @@ def main(argv):
         options = {"run_name": "__main__", "alter_sys": True}
     elif server[0].startswith("-"):
         refuse("the server is started by -m <module> or by a script, with no other interpreter option")
+    elif not server[0]:
+        refuse("the script is empty")
     else:
         target, arguments, run = server[0], server[1:], runpy.run_path
         options = {"run_name": "__main__"}
