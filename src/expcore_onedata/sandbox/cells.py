@@ -17,6 +17,14 @@ that outcome, the cell's own included, lasts at most the margin and `SETTLE_SLAC
 like an escalation that raised and whose quiesce did not show the cell gone, is `survived_kill`, never a clean kill.
 The first end published stands: an outcome decided later is kept among the cell's deadlines, never made the run's end.
 
+**A cell's processes end with it** (O56): the code tool tells the agent that state does not carry between calls
+(`codetool.DEFAULT_DESCRIPTION`), so whatever of the agent's is left in the container once a cell's `docker exec` has
+returned, a worker it detached into a session of its own included, is killed and shown gone (`_sweep`: every process
+of the container but its init and the init's `sleep`, as the quiesce kills them), and counted on the cell's record
+(`left_after_exec`). The Apptainer backend's cells end so too, since each is an exec of its own PID namespace. One
+that cannot be shown gone, or a listing that fails, ends the run as `survived_kill`, as a process that outlives its
+kill at the cap does (O34): the next cell would find it running.
+
 A cell runs under the completion bootstrap (`completion.py`, O55): its program is checked whole in the container before
 it runs, and a record written after the interpreter's exit carries this exec's nonce and the exit status. The record's
 lines are taken out of the streams as they are read, so the output is the program's own; what it showed is the
@@ -277,6 +285,27 @@ class CellRunner:
         is outside `timeout`'s group, and could go on changing outputs after the cap. The container stays up, since its
         cgroup's counters classify the kills and a mount has its own teardown; only its init and `sleep` remain.
         `killed` None means the processes could not be listed, so nothing is known. It never raises."""
+        state = self._kill_all(reason)
+        self._meta.setdefault("quiesced", []).append(state)
+        return state
+
+    def _sweep(self, cell: int) -> int | None:
+        """After a cell's exec: kill whatever of the agent's is left and show it gone (the module's docstring). How many
+        were left, None when that is unknown; the state is on the record when anything was left or nothing is known, and
+        a process that is not shown gone ends the run (O34). It never raises."""
+        state = self._kill_all("end of cell")
+        if state["killed"] != 0:
+            with self.meta_lock:
+                self._meta.setdefault("quiesced", []).append({"cell": cell, **state})
+        if not self.quiet(state):
+            log.error("a process of a cell outlived its exec and its kill: the run is ended as %s", DL.SURVIVED)
+            with self.meta_lock:
+                self.ended = self.ended or self._unknown("a process of the cell outlived its exec and its kill")
+            return None
+        return state["killed"]
+
+    def _kill_all(self, reason: str) -> dict[str, Any]:
+        """`quiesce` without its record."""
         state: dict[str, Any] = {"reason": reason, "killed": None, "left": None}
         try:
             killed, left, seen = 0, [], set()
@@ -300,7 +329,6 @@ class CellRunner:
                 state.update(killed=killed, left=[{k: p[k] for k in ("pid", "comm", "state")} for p in left[:16]])
         except Exception as e:
             state.update(killed=None, left=None, error=describe_error(e))
-        self._meta.setdefault("quiesced", []).append(state)
         return state
 
     @staticmethod
@@ -483,8 +511,15 @@ class CellRunner:
             bound = BD.named(fired=fired, gave_up=gave_up, exit_code=rc, ran_s=res.duration_s, limit_s=limit_s)
             # incomplete, and no bound or kill of the harness's own to say how it ended: never a result (O55)
             incomplete = check.cause if not gave_up and not fired else None
+            # state does not carry between calls: nothing of the cell outlives it, its time measured before (the sweep
+            # is the harness's). At the cap the deadline has killed every process already and said what outlived it,
+            # and a run already ended is the stop's to end
+            with self.meta_lock:
+                ended = self.ended is not None
+            left = self._sweep(cell) if not fired and not ended else None
             if record:
                 self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, deadline, wall0, incomplete)
+                self.cells[-1]["left_after_exec"] = left
                 res.bound = bound if res.timed_out else None
             else:  # no timer ran: only the container's own bound, or the host's giving up, can have ended it (O39)
                 res.timed_out, res.bound = bound is not None, bound

@@ -1,0 +1,72 @@
+"""O69: a Docker cell's processes end with it, as an Apptainer cell's do: the code tool tells the agent that state does
+not carry between calls, so whatever a cell leaves running is killed and shown gone once its `docker exec` returns."""
+
+import time
+
+import pytest
+from deadline_support import cell_processes, killed_pids
+from sandbox_support import make_spec, start_options
+
+from expcore.errors import InfraError
+from expcore_onedata.sandbox import deadline
+from expcore_onedata.sandbox.codetool import DEFAULT_DESCRIPTION
+from expcore_onedata.sandbox.sandbox import DockerSandbox
+
+
+@pytest.fixture
+def sbx(world):
+    sandbox = DockerSandbox.start(world.host, world.s, make_spec(world, "isolated"), **start_options(world))
+    yield sandbox
+    world.host.unkillable.clear()
+    sandbox.stop(force=True)
+
+
+def test_o69_the_code_tool_promises_that_state_does_not_carry_between_calls():
+    """O69: the promise both backends keep, in the words the model is given by default."""
+    assert "State does not carry between calls" in DEFAULT_DESCRIPTION
+
+
+def test_o69_a_worker_a_docker_cell_detached_is_killed_when_its_exec_returns(world, sbx):
+    """O69: a worker in a session of its own, outside `timeout`'s group, is killed and shown gone at the cell's end,
+    with the rest of what the cell left; the container's init and its `sleep` are spared, and the count is on the
+    cell's record and in the quiesce records."""
+    pids = cell_processes(world, sbx)
+    result = sbx.exec("start_a_worker()", 30)
+    assert result.kill is None
+    assert {pids["python"], pids["child"], pids["grandchild"]} <= killed_pids(world)
+    assert pids["sleep"] not in killed_pids(world)
+    assert sbx._cells.cells[-1]["left_after_exec"] == 3
+    swept = [q for q in sbx.metadata()["quiesced"] if q.get("cell") == 1]
+    assert [(q["reason"], q["killed"]) for q in swept] == [("end of cell", 3)]
+
+
+def test_o69_a_docker_cell_that_leaves_nothing_kills_nothing(world, sbx):
+    """O69: a cell whose processes all ended with it is swept to no effect, and nothing is added to the record."""
+    sbx.exec("print(1)", 30)
+    assert sbx._cells.cells[-1]["left_after_exec"] == 0
+    assert not [q for q in sbx.metadata().get("quiesced", []) if q.get("cell")]
+
+
+def test_o69_a_leftover_that_no_kill_ends_ends_the_run_as_survived_kill(world, sbx):
+    """O69, O34: a process the cell left that is not shown gone after its kill would be running in the next cell, so
+    the run is ended as `survived_kill`, and every later cell is refused as `cell_unkillable`."""
+    pids = cell_processes(world, sbx)
+    world.host.unkillable.add(pids["grandchild"])
+    sbx.exec("start_a_worker()", 30)
+    assert sbx._cells.cells[-1]["left_after_exec"] is None
+    assert sbx._cells.ended["outcome"] == deadline.SURVIVED
+    with pytest.raises(InfraError) as refused:
+        sbx.exec("print('next')", 30)
+    assert refused.value.kind == "cell_unkillable"
+
+
+def test_o69_the_sweep_s_wait_is_the_harness_s_never_the_cell_s_time(world, sbx):
+    """O69: the sweep runs after the cell's duration is taken, so a leftover it waits for (up to 10 s, here one no kill
+    ends) never lengthens the cell's recorded time, and a harness step's exit is never read as its backstop's."""
+    pids = cell_processes(world, sbx)
+    world.host.unkillable.add(pids["grandchild"])
+    began = time.monotonic()
+    result = sbx.exec("start_a_worker()", 30)
+    assert time.monotonic() - began >= 5  # the sweep waited for the survivor
+    assert result.duration_s < 5
+    assert sbx._cells.cells[-1]["duration_s"] < 5

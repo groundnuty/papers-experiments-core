@@ -47,6 +47,9 @@ from expcore_onedata.sandbox.apptainer.procs import Proc
 
 log = logging.getLogger(__name__)
 
+UNATTRIBUTED_WHY = (
+    "hidden memory past the margin cannot be told this run's cell's: another run's cell is charged to the same cgroup"
+)
 BYTES_PER_INODE = 16384  # mkfs.ext4's default ratio: a disk of N bytes has N // 16384 inodes
 WALK_STRETCH = 10.0  # the disk walk waits at least this many times its own last duration
 
@@ -129,6 +132,8 @@ class Watch:
         self._next_walk = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.ended: dict[str, Any] | None = None  # the kill that ended the run (`scope: run`), once one did
+        self.on_run_end: Callable[[dict[str, Any]], None] = lambda event: None
 
     # ------------------------------------------------------------------------------------------------ cells
     def begin_cell(self, cell: int, nonce: str, *, calibration: bool = False) -> None:
@@ -227,7 +232,9 @@ class Watch:
             else:
                 hidden = self._hidden.assess(listings, before, after, namespaces)
             running = self._hidden.running
-        if hidden is not None:
+        if hidden is not None and not hidden.attributed:
+            self._end_run(members, hidden)
+        elif hidden is not None:
             sent = self._kill(members, "memory_limit", "memory_hidden", hidden.grown_bytes, hidden.allowance_bytes,
                               figures=_figures(hidden)) if members else 0  # fmt: skip
             with self._lock:
@@ -261,9 +268,22 @@ class Watch:
         if over is not None and members:
             self._kill(members, "disk_limit", *over)
 
+    def _end_run(self, members: list[Proc], hidden: Hidden) -> None:
+        """Hidden memory past the margin that cannot be told the running cell's (another run's cell is in the cgroup):
+        the cell cannot be isolated, so its processes are killed and the run ended (`on_run_end`, O69), its reading
+        left unknown (`unattributed`), never `over`."""
+        if self.ended is None:
+            self._kill(members, "memory_limit", "memory_hidden", hidden.grown_bytes, hidden.allowance_bytes,
+                       figures=_figures(hidden), scope="run", why=UNATTRIBUTED_WHY, attributed=False)  # fmt: skip
+            with self._lock:
+                self.ended = dict(self.kills[-1])
+            self.on_run_end(dict(self.ended))
+        with self._lock:
+            self._hidden.ended()
+
     def _kill(
         self, members: list[Proc], reason: str, what: str, amount: int, limit: int, *,
-        figures: Mapping[str, int] | None = None,
+        figures: Mapping[str, int] | None = None, scope: str = "cell", why: str | None = None, attributed: bool = True,
     ) -> int:  # fmt: skip
         """SIGKILL every process of the run through its pidfd, and record it against the running cell; how many were
         signalled."""
@@ -275,6 +295,12 @@ class Watch:
                 "what": what,
                 "amount": amount,
                 "limit": limit,
+                # nothing of a cell outlives its exec, so the run's processes are the running cell's: its own are
+                # killed, the run goes on, as a container's OOM kill is the cell's on Docker; `run` when the cell
+                # could not be isolated and the run was ended
+                "scope": scope,
+                **({"why": why} if why else {}),
+                **({} if attributed else {"attributed": False}),
                 "processes": len(members),
                 "signalled": sent,
                 "utc": dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds"),
@@ -339,8 +365,9 @@ class Watch:
 
 
 def _killed_for_memory(kills: list[dict[str, Any]]) -> bool:
-    """Whether a kill of the watch's for memory reached a process: one that signalled none bounded nothing."""
-    return any(k["reason"] == "memory_limit" and k["signalled"] > 0 for k in kills)
+    """Whether a kill of the watch's for memory reached a process: one that signalled none bounded nothing, and one
+    for memory that may be another run's (`attributed: false`) never shows this run's over its limit."""
+    return any(k["reason"] == "memory_limit" and k["signalled"] > 0 and k.get("attributed", True) for k in kills)
 
 
 def _figures(hidden: Hidden) -> dict[str, int]:

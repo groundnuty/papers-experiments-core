@@ -51,6 +51,7 @@ APPTAINER_FAILED = (
     "apptainer could not run the cell's container (exit {rc}, its own FATAL line on stderr): its program did not run"
 )
 EXEC = "apptainer exec"  # the exec a completion cause names on this backend (`completion.Completion.runner`)
+RUN_ENDED = "watch_ended_run"  # the outcome of the `ended` record the watch makes when a cell cannot be isolated
 HIDDEN_BASIS = (
     "the harness's watch killed the run's processes: the cgroup charged {amount} bytes more anonymous memory during "
     "the cell than any process /proc shows explains, past the margin of {limit}, and memory the watch cannot see is "
@@ -105,6 +106,13 @@ class AppCellRunner(CellRunner):
         self.node, self.watch, self._argv_of, self._python = node, watch, argv_of, python
         self._before_exec, self._sleep, self._clock = before_exec, sleep, clock
         self.last_watch: dict[str, Any] = {}  # what the watch saw of the last exec: `seen`, `peak_bytes`, `kills`
+        watch.on_run_end = self.run_ended_by_watch
+
+    def run_ended_by_watch(self, event: dict[str, Any]) -> None:
+        """The watch ended the run (`scope: run`, O69): every later exec and the collection are refused (`ended`)."""
+        with self.meta_lock:
+            self.ended = self.ended or {"outcome": RUN_ENDED, "scope": "run", "reason": event.get("reason"),
+                                        "what": event.get("what"), "why": event.get("why")}  # fmt: skip
 
     # ------------------------------------------------------------------------------------------------ no earlyoom here
     def sample_pids(self) -> None:
@@ -273,7 +281,7 @@ class AppCellRunner(CellRunner):
             return {"reason": "host_oom", "category": KC.CATEGORY["host_oom"], "basis": basis, "timer_fired": fired,
                     "watch_kills": kills}  # fmt: skip
         if kills:
-            first = kills[0]
+            first = next((k for k in kills if k.get("scope") == "run"), kills[0])  # one that ended the run first
             reason = first["reason"]
             basis = (
                 HIDDEN_BASIS.format(amount=first["amount"], limit=first["limit"])
@@ -281,8 +289,11 @@ class AppCellRunner(CellRunner):
                 else f"the harness's watch killed the run's processes: {first['what']} at {first['amount']}, over its "
                 f"limit of {first['limit']}"
             )
-            return {"reason": reason, "category": KC.CATEGORY[reason], "basis": basis, "watch_kills": kills,
-                    "timer_fired": fired}  # fmt: skip
+            if first["scope"] == "run":  # the cell could not be isolated: the run cannot go on as on Docker
+                basis = f"{basis}; the watch ended the run: {first['why']}"
+            category = "infrastructure" if first["scope"] == "run" else KC.CATEGORY[reason]
+            return {"reason": reason, "category": category, "basis": basis, "scope": first["scope"],
+                    "watch_kills": kills, "timer_fired": fired}  # fmt: skip
         if fired:
             basis = f"the harness's timer fired at the cell's limit of {timeout_s:g} s"
             return {"reason": "time_limit", "category": KC.CATEGORY["time_limit"], "basis": basis, "timer_fired": True}
