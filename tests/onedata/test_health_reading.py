@@ -20,7 +20,7 @@ from expcore.campaign.healthgate import GO, HealthGate
 from expcore_onedata.admission import run_admission
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_journal import InjectionJournal
-from expcore_onedata.fault_owner import in_progress_of
+from expcore_onedata.fault_owner import NO_ATTEMPT, in_progress_of
 from expcore_onedata.faults import load_faults
 from expcore_onedata.federation import ReportedProvider, SpaceView
 from expcore_onedata.health import compare
@@ -687,6 +687,31 @@ def test_o90_another_attempts_open_injection_is_unsettled_and_never_target_only(
     answer, reading, _ = inside_injection(tmp_path, world, extra=another)
     assert answer.detail.startswith("an injection of providers[2] is unsettled")
     assert answer.charge is False
+    assert reading == UNREAD
+    assert target_only(reading) is None
+
+
+def owner_without_attempt(journal, mine):
+    """What a harness that runs its injection outside any attempt leaves: the same entry, owned by the process alone."""
+    lines = [json.loads(line) for line in journal.path.read_text(encoding="utf-8").splitlines()]
+    for line in lines:
+        if line.get("event") == "injecting" and line.get("target") == TARGET:
+            line["owner"] = {"process": mine["process"]}
+    journal.path.write_text("".join(json.dumps(line, sort_keys=True) + "\n" for line in lines), encoding="utf-8")
+
+
+def test_o90_the_same_injection_owned_by_no_attempt_stays_unsettled_where_the_owner_matched_one_is_held(tmp_path, fake):
+    """O90: the acceptance case. The injection a real attempt's injector journals carries the attempt as its owner
+    (`test_o90_inside_its_own_injection_the_runs_check_compares_every_space_and_reads_target_only`: held, target-only).
+    The same entry from an injection run outside the attempt's context names only a process: it explains nothing, the
+    fault gate answers it as unsettled, charged as before with the clause that says so, and nothing is read. A study's
+    injection runs inside the attempt's context, as the core's injector does, so that its entry names its attempt."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, opened = inside_injection(tmp_path, world, extra=owner_without_attempt)
+    assert [entry["target"] for entry in opened] == [TARGET]
+    assert answer.detail.startswith("an injection of providers[1] is unsettled")
+    assert NO_ATTEMPT in answer.detail
+    assert answer.charge is True
     assert reading == UNREAD
     assert target_only(reading) is None
 
