@@ -2030,7 +2030,8 @@ def step(
     declares (`check_pass_env`), the check of the federation's render identity against the one the line expects
     (`check_render_identity`) and then the study's pre-step guard, when its line declares one (`start_hooks`): nothing
     is made, removed or read before them, and `PRE_STEP_REFUSED` ends a step they refuse. The variables the line
-    declares go to the dispatcher, and so to a post-run script, which runs in its environment, and to nothing else.
+    declares go to the dispatcher, and so to a post-run script, which runs in its environment; the step's own
+    environment holds them as it holds its allowlist, and the guard is given the allowlist alone.
     The federation's render identity is written into `out/study-state/` before the dispatcher starts,
     after a resume has restored its `out/`, in a file of this step's own (`note_render_identity`). A declared post-run
     script runs after the dispatcher exits 0 and before the archive (`run_post_run`): a step whose script does not
