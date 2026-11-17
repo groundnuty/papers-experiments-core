@@ -264,7 +264,8 @@ The manifest (`shards.toml`, operator-local, never committed, since it names the
     expect_render_identity = "render-identity.expected.json"  # optional: the render a federation must have (see above)
     [[shards]]                        # in order: shard i is the i-th entry
     label = "fed-a"                   # the shard's label (no host name: it travels with the export)
-    root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml
+    root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml; one
+                                      # shard's own: two shards at one root (by the path it resolves to) are refused
     sandbox_node = "..."              # optional when the state file names the sandbox's node
 """
 
@@ -351,6 +352,7 @@ ROOT_SUFFIXES = (".root.tar", ".root.json")
 ASIDE_NAME = re.compile(
     r"(?P<label>[A-Za-z0-9][A-Za-z0-9-]*)\.[0-9a-f]{12}\.root\.json"
 )  # <results>/<label>: a federation's root evidence and its manifest
+ASIDE_TAR = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*\.[0-9a-f]{12}\.root\.tar")  # the archive beside such a manifest
 # The step's record in its federation's root that `down` reads (`hpcevidence`, the source: this file runs alone on a
 # node and keeps its own copy of the two names; a test compares them).
 STEP_RECORDS = "shard-steps"
@@ -653,6 +655,26 @@ def record_pass_env_origin(results: Path, spec: Mapping[str, Any], passed: Mappi
         draft.unlink(missing_ok=True)
 
 
+def one_root_each(shards: Sequence[Shard]) -> None:
+    """Refuse two shards whose roots are one directory, naming both labels and no path (O63). They would share one
+    federation's `down` gate: `collect --roots-only` for one shard writes the marker `down` reads for both, after which
+    the full collect, which archives the root for each shard, refuses for ever. A root is told by the path it resolves
+    to (a link, a `..` part, a trailing slash); one that cannot be resolved against the file system is told by the path
+    as written."""
+    seen: dict[str, str] = {}
+    for shard in shards:
+        try:
+            where = os.path.realpath(shard.root)
+        except (OSError, ValueError, RuntimeError):
+            where = os.path.normpath(str(shard.root))
+        if where in seen:
+            raise ShardsError(
+                f"shards {seen[where]} and {shard.label} have one federation root between them: "
+                "each shard needs a federation of its own"
+            )
+        seen[where] = shard.label
+
+
 def load_plan(path: Path) -> Plan:
     """Read and check the manifest: every key present, absolute paths, at least two shards, labels by the core's rule
     and each once. The optional `pass_env` names the operator's variables a step passes to its dispatcher (names
@@ -704,6 +726,7 @@ def load_plan(path: Path) -> Plan:
     labels = [s.label for s in shards]
     if len(set(labels)) != len(labels):
         raise ShardsError("a label is given to two shards")
+    one_root_each(shards)
     return Plan(Path(data["study"]), str(data["python"]), Path(data["core_src"]), Path(data["results"]),
                 Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
                 float(every), data.get("pre_step"), None, float(bounds["pre_step"]), data.get("post_run"), None,
@@ -1517,8 +1540,17 @@ def _set_aside(plan: Plan, shard: Shard, up_id: str) -> None:
 def aside_entries(plan: Plan) -> list[dict[str, Any]]:
     """The root archives an earlier collect put aside (`_set_aside`: `<label>.<12 hex digits>.root.tar` and its
     manifest), each pair shown to be one another's, as name, size and SHA-256, so that `verify-copy` checks what a moved
-    shard's first federation left: `ShardsError` for a pair that is not."""
+    shard's first federation left: `ShardsError` for a pair that is not, and for an archive with no manifest beside it
+    (it cannot be verified, and the listing is made from the manifests)."""
     module, entries = _evidence(), []
+    for path in sorted(plan.results.glob("*.root.tar")):  # one with no manifest beside it is listed by none
+        if ASIDE_TAR.fullmatch(path.name) and not os.path.lexists(
+            path.with_name(path.name.removesuffix(".tar") + ".json")
+        ):
+            raise ShardsError(
+                f"{path.name} is a root archive put aside for a shard that moved with no manifest beside it, so it "
+                "cannot be verified: restore its manifest, or move the archive out of the results directory"
+            )
     for path in sorted(plan.results.glob("*.root.json")):
         found = ASIDE_NAME.fullmatch(path.name)
         if found is None:

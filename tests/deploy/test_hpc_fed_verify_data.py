@@ -252,9 +252,9 @@ def shard_manifest(tmp_path: Path, feds: list) -> Path:
     return tmp_path / "shards.toml"
 
 
-def first_shard(shards, tmp_path, fed):
-    """The first shard of a manifest of two shards, both on `fed` (only the first is read)."""
-    return shards.load_plan(shard_manifest(tmp_path, [fed, fed])).shards[0]
+def first_shard(shards, fed):
+    """The first shard of a manifest of two shards, on `fed` (`federation()` reads the one shard it is given)."""
+    return shards.Shard(1, 2, "fed-0", fed.root)
 
 
 def test_o57_plan_refuses_a_federation_whose_ingested_space_has_no_verified_marker(hpc, shards, tmp_path, ca, capsys):
@@ -283,7 +283,7 @@ def test_o57_plan_refuses_a_marker_for_another_manifest_than_the_platform_file_n
     fed = brought_up(hpc, tmp_path, ca, art=art)
     verify_stand_in(hpc, fed, {"delta-space": ONE})
     fed.driver.verify_data()
-    shard = first_shard(shards, tmp_path, fed)
+    shard = first_shard(shards, fed)
     assert shards.federation(shard)["job"]
     write_manifest(OTHER, art / "manifests" / "delta.json")
     with pytest.raises(shards.ShardsError, match=r"ingested space\(s\) have no verified data: delta-space"):
@@ -297,7 +297,7 @@ def test_o57_plan_refuses_a_marker_that_is_for_another_manifest_than_the_one_up_
     fed.driver.verify_data()
     fed.driver.set(lambda s: s["data"]["ingested"]["delta-space"]["verified"].update(manifest=OTHER.digest()))
     with pytest.raises(shards.ShardsError, match="no verified data: delta-space"):
-        shards.federation(first_shard(shards, tmp_path, fed))
+        shards.federation(first_shard(shards, fed))
 
 
 def test_o57_plan_refuses_a_state_that_holds_no_record_of_its_ingested_spaces(hpc, shards, tmp_path, ca):
@@ -305,7 +305,7 @@ def test_o57_plan_refuses_a_state_that_holds_no_record_of_its_ingested_spaces(hp
     fed = brought_up(hpc, tmp_path, ca)
     fed.driver.set(lambda s: s.pop("data"))
     with pytest.raises(shards.ShardsError, match="no record of its ingested spaces"):
-        shards.federation(first_shard(shards, tmp_path, fed))
+        shards.federation(first_shard(shards, fed))
 
 
 def test_o57_plan_takes_a_federation_with_no_ingested_space_as_it_always_did(hpc, shards, tmp_path, ca):
@@ -313,4 +313,4 @@ def test_o57_plan_takes_a_federation_with_no_ingested_space_as_it_always_did(hpc
     asks nothing more of it."""
     fed = brought_up(hpc, tmp_path, ca)
     fed.driver.set(lambda s: s["data"].update(ingested={}))
-    assert shards.federation(first_shard(shards, tmp_path, fed))["job"]
+    assert shards.federation(first_shard(shards, fed))["job"]
