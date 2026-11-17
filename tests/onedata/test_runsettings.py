@@ -156,6 +156,30 @@ def test_o87_an_apptainer_platform_with_spaces_takes_the_check_provider_of_the_f
     assert "rowan" not in str(raised.value).replace(str(tmp_path), "")
 
 
+@pytest.mark.parametrize(("template", "declared"), [("docker", 3600), ("apptainer", 7200)])
+def test_o85_the_gates_upstream_read_timeout_is_in_the_fingerprint_only_when_it_is_not_the_default(
+    tmp_path, cas, template, declared
+):
+    """O85, C06: `[sandbox.gate] upstream_read_timeout_s` decides when an agent's REST read fails in an outage, so a
+    value other than the default is in `sandbox.gate` (as a float, so `3600` and `3600.0` are one value); the default
+    written either way, and no table, leave the fingerprint as it was before the key (a store started before it
+    resumes). It is the same on both backends."""
+    table = f"[sandbox.gate]\nupstream_read_timeout_s = {declared}\n\n"
+    base = load(TEMPLATES[template], tmp_path / "declared", cas[0]).fingerprint()
+    left_out = load(edited(TEMPLATES[template], [platform(table, "")]), tmp_path / "left-out", cas[0]).fingerprint()
+    assert base["sandbox"]["gate"] == {"upstream_read_timeout_s": float(declared)}
+    assert "gate" not in left_out["sandbox"]
+    assert base != left_out
+    for written in ("14400", "14400.0"):
+        same = [platform(table, f"[sandbox.gate]\nupstream_read_timeout_s = {written}\n\n")]
+        at_default = load(edited(TEMPLATES[template], same), tmp_path / f"default-{written}", cas[0]).fingerprint()
+        assert at_default == left_out
+        assert json.dumps(at_default, sort_keys=True) == json.dumps(left_out, sort_keys=True)
+    spelled = [platform(f"upstream_read_timeout_s = {declared}\n", f"upstream_read_timeout_s = {declared}.0\n")]
+    float_spelled = load(edited(TEMPLATES[template], spelled), tmp_path / "float", cas[0]).fingerprint()
+    assert json.dumps(float_spelled, sort_keys=True) == json.dumps(base, sort_keys=True)
+
+
 @pytest.mark.parametrize(
     ("template", "edits"),
     [
