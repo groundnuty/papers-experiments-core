@@ -4,9 +4,11 @@ real addresses (DESIGN.md, sections 5 and 6).
 - **The services' URLs** are `https://<node FQDN>:8443` (the shim moves the worker's 443 there), so `HpcService` is the
   Compose `Service` with the node's name in place of the loopback port; the Compose bootstrap (`fedboot.Bootstrap`), the
   baseline (`fedcontent.Content`) and the facts (`fedfacts`) then run unchanged.
-- **The storage** is the one posix storage the bundle's `finish.sh` adds to each provider, owned by the job's uid on
-  the node's tmpfs, with Onedata's LUMA local feed: each support also maps the space's default credentials, and every
-  user of the federation, to that uid (as `bundle/onboard.py` does), or the users could reach none of its files. The
+- **The storage** is the one posix storage the bundle's `finish.sh` adds to each provider at `/volumes/posix`, owned by
+  the job's uid, on the node's tmpfs or, with `HPC_STORAGE_ROOT`, bound from the provider's own directory on scratch
+  (`hpcstorage`; the same storage in the cell either way), with Onedata's LUMA local feed: each support also maps the
+  space's default credentials, and every user of the federation, to that uid (as `bundle/onboard.py` does), or the
+  users could reach none of its files. The
   owner of a shared imported space (O59) has a second, `import-<space>`, on its tree on the shared filesystem, made
   with the same ids (`hpcimport.import_storage_extra`) and mapped the same way, on the storage its support names; the
   core's phase waits for the scan, and verifies each space against its manifest (`fedimport.verify_imports`) over the
@@ -19,6 +21,13 @@ real addresses (DESIGN.md, sections 5 and 6).
   least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
   The site's values come from `hpcpins` (the agent's sandbox's pins and `@study_artifacts@`, the study's own directory
   on the nodes), and each space's `@data_manifest.<space>@` from `hpcdata` (DESIGN.md, section 6a).
+  A template that declares `[sandbox.apptainer]` also names `@hpc_provider_storage@` (`hpcpins.values`: `tmpfs`, or
+  `shared_filesystem` with a scratch root), which the platform layer records in the campaign fingerprint, and the
+  rendered file is read back for it (`check_provider_storage`): a federation on scratch and one on tmpfs are two
+  experiments.
+- **The render identity** (O74, `hpcidentity`) is written beside it, once the platform file is rendered: the hashes of
+  the template, of the rendered platform's fingerprint and of each pin it holds, as `render-identity.json` in the root,
+  which a shard's step compares with the one its plan expects.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -31,7 +40,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
+import hpcidentity
 import hpcimport
+import hpcpins
 import tomllib
 from fedboot import Bootstrap
 from fedcontent import Content
@@ -46,6 +57,7 @@ from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
 from expcore_onedata.importmanifest import Manifest
 
 HTTPS_PORT = 8443  # every service's public port: its 443, moved by the port shim
+PROVIDER_STORAGE = "hpc_provider_storage"  # the value hpcpins.values fills: the providers' storage kind (O57)
 HPC_STORAGE = "posix-local"  # the posix storage bundle/finish.sh adds to every provider, owned by the job's uid
 ZONE_TIMEOUT_S = 900.0
 PROVIDER_TIMEOUT_S = 900.0
@@ -215,11 +227,20 @@ def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int,
     }
 
 
+def check_provider_storage(rendered: str, values: Mapping[str, str]) -> None:
+    """Refuse a rendered file whose `[sandbox.apptainer]` does not declare the providers' storage kind the site has
+    (`values["hpc_provider_storage"]`, O57; `hpcpins.check_declared_kind`): the kind is in the campaign fingerprint, so
+    a file that leaves it out, or hard-codes another, would let shards on tmpfs and on scratch merge."""
+    hpcpins.check_declared_kind(rendered, values.get(PROVIDER_STORAGE))
+
+
 def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, str]) -> str:
     """Write the platform file: the Compose placeholders from the facts, the HPC ones, and the token margin last, the
-    least the platform layer accepts for the rest of the file. Returns the text written."""
+    least the platform layer accepts for the rest of the file. Returns the text written. The kind of storage the
+    providers have is checked in the first render, before anything is written (`check_provider_storage`)."""
     filled = {**placeholders(facts), **values, "hpc_token_margin_s": str(PROVISIONAL_MARGIN_S)}
     text = render(template, filled)
+    check_provider_storage(text, values)
     write_private(path, text)
     if "@hpc_token_margin_s@" not in template:
         return text
@@ -230,14 +251,17 @@ def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, 
 
 
 def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> str:
-    """facts.json, and platform.toml from the layout's template with the HPC values."""
+    """facts.json, and platform.toml from the layout's template with the HPC values, and the render identity of that
+    platform (O74): the template is read once, and what is hashed is the text that was rendered."""
     facts = facts_of(boot)
     layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     template = layout.spec.platform_template
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
-    write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values)
-    return "facts.json and platform.toml written"
+    text = template.read_text(encoding="utf-8")
+    write_platform(layout.platform, text, facts, values)
+    hpcidentity.write(layout.root, hpcidentity.build(text, values, layout.platform))
+    return f"facts.json and platform.toml written; {hpcidentity.FILE} written"
 
 
 def direct_storages_value(layout: Layout, boot: Bootstrap, environ: Mapping[str, str]) -> str:

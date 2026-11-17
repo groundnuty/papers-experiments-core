@@ -17,8 +17,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 import hpcdata
 import hpcimport
 import hpcpins
+import hpcquota
 import hpcrelay
 import hpcstate
+import hpcstorage
 from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
@@ -161,6 +163,10 @@ class Driver(Down):
             self.layout.import_manifest(space.name, self.environ)
         hpcimport.check_support(self.layout, self.environ)
         places = {"the federation's root": self.root, "the log directory (L)": Path(site.logs)}
+        if (
+            site.storage_root
+        ):  # the provider storage's scratch root: `down` removes below it, and nothing may reach a tree
+            places["the provider storage root (HPC_STORAGE_ROOT)"] = Path(site.storage_root)
         hpcimport.check_separate(self.layout, self.environ, places)
 
     def preflight(self, site: Site) -> None:
@@ -185,11 +191,23 @@ class Driver(Down):
         hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None, declared)
         # every declared manifest loads now, so a mistake in one fails before a job is held
         hpcdata.ingested_manifests(self.layout, hpcdata.study_values(site.study_artifacts))
+        self.check_scratch(site)
         if self.settings.sandbox is not None:
             self.say(
                 f"the layout declares the agent's node ({self.settings.sandbox_placement}): it is held and placed, and "
                 "only its node facts step runs on it here (M5's shard step runs the agent)"
             )
+
+    def check_scratch(self, site: Site) -> None:
+        """The provider storage's scratch root, and the inode guard (hpcquota; DESIGN.md section 11): with a scratch
+        root, the account's inode usage and quota are read through the site's command and the federation refused when
+        its estimate would pass 95% of the quota, or when the quota cannot be read, before anything is submitted. The
+        check is mandatory there: the providers' storage is bound onto scratch, and no override skips it. Nothing
+        without a scratch root: nothing of the federation lands on scratch."""
+        if not site.storage_root:
+            return
+        hpcstorage.check_root(site, self.root)
+        self.say(hpcquota.guard(self.slurm.runner, site, self.layout, self.environ))
 
     def prepare_root(self) -> None:
         private_directory(self.root)
@@ -223,6 +241,7 @@ class Driver(Down):
                 "ends": None,
             },
             "sandbox": self.sandbox_record(name),
+            "storage": hpcstorage.plan(site, name, [p.name for p in self.spec.providers]),
             "roles": [role.name for role in roles],
             "services": {role.name: hpcstate.new_service(role.kind) for role in roles},
             "clients": {},
@@ -297,6 +316,7 @@ class Driver(Down):
 
     def bring_up(self, site: Site) -> str:
         state = self.store.create(self.initial_state(site))
+        self.make_storage(state)  # recorded above, made before any job exists to bill for it
         asked, alone = self.allocation(state, site), self.sandbox_allocation(state, site)
         held = [(self.submit(asked, "allocation"), asked)]
         if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
@@ -315,6 +335,16 @@ class Driver(Down):
         out = self.run_core()
         self.set(lambda s: s.update(phase="linked"))
         return f"{out}\n{self.start_relay()}"
+
+    def make_storage(self, state: Mapping[str, Any]) -> None:
+        """The providers' storage directories on scratch, as the state records them (hpcstorage.create); none without a
+        scratch root. `down` removes exactly these, and only these."""
+        record = state.get("storage")
+        if record is None:
+            return
+        hpcstorage.create(record)
+        made = len(record["providers"])
+        self.say(f"provider storage: {made} director(ies) made on scratch and recorded; down removes them")
 
     def start_relay(self) -> str:
         """The login node's fault relay, for a campaign on a compute node (M4); none in a core without it."""
@@ -490,7 +520,9 @@ class Driver(Down):
             argv = ["bash", str(BUNDLE / "provider.sbatch"), str(BUNDLE), tar, name, zone["fqdn"], site.admin_mail]
             # --import=SPACE=PATH for each tree it owns, none for a mirror
             imports = hpcimport.provider_import_args(self.layout, name, self.environ)
-            self.launch(name, [*argv, zone["address"], *peers, *imports])
+            # --storage=PATH, its own directory on scratch, bound onto /volumes/posix; none without a scratch root
+            storage = hpcstorage.provider_args(state, name)
+            self.launch(name, [*argv, zone["address"], *peers, *imports, *storage])
         self.say(f"{len(names)} provider(s) launched; registering each")
         for name in names:
             self.register(name, self.record_workdir(name, self.wait_log(name, TOKEN_WAIT)))

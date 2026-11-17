@@ -269,6 +269,7 @@ class SpaceReset:
         qos_rights: bool | None = None,
         never_holds: Collection[str] = (),
         planned: Holdings | None = None,
+        full_reason: str | None = None,
     ) -> dict[str, Any]:
         """Check the plan, verify the space, run the stages in order and return the record; raise ResetFailed at the
         first stage that fails. It is `resetspaces.SpacesReset` with this space alone, so its stages, and the
@@ -295,7 +296,12 @@ class SpaceReset:
         its scan the qos stage's first, so the space is listed once (`resetplan.py`); by default the stage scans. With
         `[placement] reset_shortcut` on and the reading made inside a live exclusive section (`exclusive`), the
         occupancy and quiet stages re-read only what may have changed since it (`resetshortcut.py`); the record's
-        `occupancy_reads` says which reads were made, and why."""
+        `occupancy_reads` says which reads were made, and why. `full_reason`, a short code that says why
+        (`resetshortcut.checked_reason`: a lower-case letter, then up to 63 lower-case letters, digits or
+        underscores, holding no name the configuration gives, since the record is published, O12), asks for the full
+        reads all the same, inside the section, which holds its grant as without it: the record says `full`, the
+        core's own why (`requested` where it would have given the shortcut) and the code beside it (`full_reason`).
+        Any other reason is refused before anything is sent."""
         from expcore_onedata.resetspaces import ResetPlan, SpacesReset  # the driver builds on this module
 
         plan = ResetPlan(
@@ -306,6 +312,7 @@ class SpaceReset:
             qos_rights=qos_rights,
             never_holds=never_holds,
             planned=planned,
+            full_reason=full_reason,
         )
         return SpacesReset([self], concurrency=1).run_one(plan)
 
@@ -316,9 +323,10 @@ class SpaceReset:
         return plan_scan(self, never_holds=never_holds)
 
     def exclusive(self) -> AbstractContextManager[ResetGrant]:
-        """The exclusive section of a shortcut reset (`resetgrant.exclusive`): the planner's reading and the reset that
-        uses it go inside, under the run's shared admission, which keeps its share of `federation.lock` throughout.
-        With `[placement] reset_shortcut` off it takes nothing."""
+        """The exclusive hold of the reset lock (`resetgrant.exclusive`), which `run` takes itself unless it runs inside
+        a live one: a shortcut reset's planner's reading and the reset that uses it go inside, under the run's shared
+        admission, which keeps its share of `federation.lock` throughout. With `[placement] reset_shortcut` off it
+        holds the lock all the same, and gives no shortcut (`off`)."""
         return resetgrant.exclusive(self._p.config, self._p.settings)
 
     # -- 1. QoS requirements, and 1a. their files settled (`resetqos.py`) -------------------

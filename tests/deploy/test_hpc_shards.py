@@ -256,8 +256,9 @@ def test_collect_verifies_and_unpacks_every_shard_read_only_and_names_the_merge(
     assert (outs[0] / "campaign.lock").is_file()
     assert not os.access(outs[0] / "runs" / "r.json", os.W_OK)
     line = shards.merge_argv(plan, outs)
-    assert line[1:4] == ["-m", "expcore", "merge"]
-    assert line[5:] == [str(o) for o in outs]
+    assert line[1:5] == ["-I", "-m", "expcore", "merge"]
+    assert line[5] == str(plan.study / "out")
+    assert line[6:] == [str(o) for o in outs]
 
 
 def test_collect_refuses_a_shard_without_its_lock(shards, tmp_path):
