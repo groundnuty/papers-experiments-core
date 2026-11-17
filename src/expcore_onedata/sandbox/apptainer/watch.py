@@ -230,10 +230,8 @@ class Watch:
                 with self._lock:  # nothing was signalled: never a reading of `over`
                     self._hidden.unreached()
             return
-        if over_pids:
-            self._kill(members, KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids)
-            with self._lock:  # this poll returns before the hidden check: the cell's memory was not read at it
-                self._hidden.unchecked()
+        if over_pids:  # this poll returns before the hidden check: the cell's memory was not read at it
+            self._kill(members, KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids, unchecked=True)
             return
         self._check_hidden(found, members, before, after)
         if self._clock() >= self._next_walk:
@@ -332,11 +330,13 @@ class Watch:
     def _kill(
         self, members: list[Proc], reason: str, what: str, amount: int, limit: int, *,
         figures: Mapping[str, int] | None = None, scope: str = "cell", why: str | None = None, attributed: bool = True,
-        beside: tuple[str, str, int, int] | None = None,
+        beside: tuple[str, str, int, int] | None = None, unchecked: bool = False,
     ) -> int:  # fmt: skip
         """SIGKILL every process of the run through its pidfd, and record it against the running cell; how many were
         signalled. `beside`: another reason (`reason`, `what`, `amount`, `limit`) that the same signal ended the
-        processes for, recorded in the same step, against the same cell."""
+        processes for, recorded in the same step, against the same cell. `unchecked`: the poll ends at this kill,
+        before the hidden-memory check, so the cell's memory reading is marked unknown in the same step, against the
+        same cell (`hidden.HiddenCheck.unchecked`)."""
         sent = sum(1 for p in members if self._node.signal(p.pid, p.start, signal.SIGKILL) is True)
         with self._lock:
             event = {
@@ -364,6 +364,8 @@ class Watch:
                 self.kills.append(each)
                 if self._cell is not None:
                     self._cell_kills.append(each)
+            if unchecked:
+                self._hidden.unchecked()
         log.info("the run's watch killed its processes: %s of %s over its limit", reason, what)
         return sent
 

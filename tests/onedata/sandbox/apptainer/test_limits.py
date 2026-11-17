@@ -74,6 +74,28 @@ def test_o70_a_poll_that_kills_for_pids_leaves_the_memory_reading_unknown_never_
     assert watch.limits_record()["pids"]["reading"] == "over"
 
 
+def test_o70_a_cell_that_ends_while_the_watch_logs_its_pids_kill_keeps_the_unknown_reading(node, tmp_path, monkeypatch):
+    """O70: the memory reading is marked in the step that records the kill, against the cell it killed: a cell that
+    ends and another that begins while the watch logs the kill neither loses the mark nor lends it to the next."""
+    from expcore_onedata.sandbox.apptainer import watch as W
+
+    ns = node.new_namespace()
+    procs = [node._new_proc(ns, "python3", environ=(TAG,), threads=40) for _ in range(2)]
+    node._new_proc(ns, "python3", hidden=True, anon=4 << 20, parent=procs[0].pid)
+    watch = _watch(node, tmp_path, _check())
+    watch.begin_cell(1, "n")
+    first: list = []
+
+    def next_cell(*args, **kwargs):  # the exec thread: the cell ended, another began, while the watch logs
+        first.append(watch.end_cell())
+        watch.begin_cell(2, "m")
+
+    monkeypatch.setattr(W.log, "info", next_cell)
+    watch.poll()
+    assert first[0]["memory"]["unknown"] == ["hidden_unchecked"]
+    assert watch.end_cell()["memory"]["unknown"] == []
+
+
 def test_o70_a_poll_that_does_not_kill_for_pids_still_reads_the_cell_s_memory(node, tmp_path):
     """O70: the control of the case above: the same cell under its `pids` limit has its hidden child found, so its
     memory reading is `unknown` for `hidden_process` and not for a poll that did not look."""
