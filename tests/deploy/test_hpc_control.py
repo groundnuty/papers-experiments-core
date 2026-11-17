@@ -1297,18 +1297,118 @@ def test_o58_step_launch_wait_must_be_a_whole_number_of_seconds_of_at_least_zero
     assert world.launcher.controls == []
 
 
-def test_o58_the_launch_wait_and_the_verbs_work_are_one_figure_in_the_core_the_layout_and_the_verbs():
-    """O58: the core's default launch wait (`fault_hpc.HPC_STEP_LAUNCH_WAIT_S`), the layout's (`hpcsettings`) and this
-    module's agree, and the core's allowance for a relay verb's own work (`HPC_VERB_WORK_S`) holds the longest bound
-    a verb waits on its own step for besides the launch wait (a status step, a start's wait to be listed) and 60 s."""
-    from expcore_onedata.fault_hpc import HPC_STEP_LAUNCH_WAIT_S, HPC_VERB_WORK_S
-
+def layout_settings(**table):
+    """`[hpc]` as the layout's loader reads it (`hpcsettings`, imported by its plain name for as long as it takes)."""
     with pytest.MonkeyPatch.context() as patch:
         patch.syspath_prepend(str(HPC.parent / "compose-federation"))
         patch.syspath_prepend(str(HPC))
         import hpcsettings
 
-        layout_default = hpcsettings.DEFAULTS["step_launch_wait_s"]
-        layout_work = hpcsettings.VERB_WORK_S
-    assert control.DEFAULT_LAUNCH_WAIT_S == layout_default == HPC_STEP_LAUNCH_WAIT_S == 240
-    assert HPC_VERB_WORK_S == layout_work >= max(control.STATUS_TIMEOUT_S, control.START_LISTED_WAIT_S)
+        return hpcsettings, hpcsettings.load_settings(table)
+
+
+def test_o58_the_core_mirrors_the_control_steps_bounds_and_the_layouts_figures():
+    """O58: the core cannot import this directory, so `fault_hpc` mirrors the bounds of the steps its verb bounds are
+    derived from; each equals its original here, and so do the launch wait and the verb's work of the core, the layout
+    and this module, and the stop bound's part beyond `stop_seconds`."""
+    from expcore_onedata import fault_hpc
+
+    hpcsettings, defaults = layout_settings()
+    assert (
+        control.DEFAULT_LAUNCH_WAIT_S == hpcsettings.DEFAULTS["step_launch_wait_s"] == fault_hpc.HPC_STEP_LAUNCH_WAIT_S
+    )
+    assert hpcsettings.VERB_WORK_S == fault_hpc.HPC_VERB_WORK_S == 60
+    assert fault_hpc.HPC_COMMAND_TIMEOUT_S == defaults.command_timeout_s == 300
+    assert fault_hpc.HPC_STOP_BOUND_S == defaults.stop_bound_s == 140
+    assert fault_hpc.HPC_STATUS_STEP_S == control.STATUS_TIMEOUT_S
+    assert fault_hpc.HPC_MOUNT_STEP_S == control.MOUNT_CHECK_TIMEOUT_S
+    assert fault_hpc.HPC_START_LISTED_S == control.START_LISTED_WAIT_S
+    assert fault_hpc.HPC_EXEC_STEP_S == control.EXEC_TIMEOUT_S
+    assert fault_hpc.HPC_STOP_STEP_MARGIN_S == control.STOP_MARGIN_S
+    assert fault_hpc.HPC_STEP_GONE_S == control.STEP_GONE_WAIT_S
+    assert fault_hpc.HPC_CANCEL_WAIT_S == control.CANCEL_WAIT_S
+    assert fault_hpc.HPC_STOP_EXTRA_S == hpcsettings.KILL_TAIL_S + hpcsettings.STEP_END_S
+    assert (
+        defaults.settle_timeout_s
+        == fault_hpc.verb_bounds(step_launch_wait_s=240, stop_bound_s=140, command_timeout_s=300, settle_timeout_s=0)[
+            "stop"
+        ]
+    )
+
+
+def at_their_bounds(world, clock):
+    """Every control step takes its whole bound and answers just then, and (with the clock) every poll waits its whole
+    wait: the longest a verb can run without a step timing out. Returns a function for the time the verb has taken."""
+    inner, began = world.launcher.control, clock.now
+
+    def control_step(node, argv, *, name, timeout_s):
+        clock.now += timeout_s
+        return inner(node, argv, name=name, timeout_s=timeout_s)
+
+    world.launcher.control = control_step
+    return lambda: clock.now - began
+
+
+def a_stop_that_leaves_its_step(world):
+    """A stop whose teardown ends well and whose service step never leaves the list, a cancel included: the stop waits
+    out the step's leaving and the cancel's, and is unconfirmed."""
+    stopping_launcher(world, steps_end=False)
+    world.launcher.cancel = lambda step_id: None
+
+
+def a_start_after_an_unrecorded_stop(world):
+    """A start of a service whose state says `stopping`: a status step first (nothing alive), then a service step that
+    is never listed, so the start waits out its whole wait."""
+    world.state.doc["services"]["prov-a"]["state"] = "stopping"
+    world.launcher.steps.pop(f"{PREFIX}-prov-a-run-1")
+    world.launcher.on_control = lambda argv: DEAD
+    world.launcher.on_service = lambda name: None
+
+
+def a_restarted_owners_status(world):
+    """A status of a restarted shared-import owner: the status step, then the read-only check of its trees."""
+    world.state.doc["services"]["prov-a"]["mounts_proven"] = False
+    world.launcher.on_control = owner_answers(Done(0, "proven\n"))
+
+
+WORST_CASES = {
+    "status": (lambda world: setattr(world.launcher, "on_control", lambda argv: alive()), "status", {}, ("status",)),
+    "a restarted owner's status": (a_restarted_owners_status, "status", {"mounts": Mounts()}, ("status",)),
+    "a start after an unrecorded stop": (a_start_after_an_unrecorded_stop, "start", {}, ("start",)),
+    "a stop": (a_stop_that_leaves_its_step, "stop", {"stop_seconds": 50}, ("stop",)),
+    "an exec": (
+        lambda world: setattr(world.launcher, "on_control", lambda argv: Done(0, "pong\n")),
+        "exec",
+        {},
+        ("ping", "restart_link"),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(WORST_CASES))
+@pytest.mark.parametrize("launch", [200, 240])
+def test_o58_each_verbs_relay_bound_exceeds_the_longest_it_can_run_by_30_s(world, clock, case, launch):
+    """O58: with every step of the verb taking its whole bound and every wait its whole wait, and a launch wait of 200 s
+    (a controller's message timeout, the longest a step's creation can wait with no error) or the default 240 s, the
+    verb takes the time its inner worst case says, and the bound the relay gives it (`fault_hpc.verb_bounds`, from the
+    layout's own settings) exceeds that by 30 s: the relay never cuts a verb that was about to complete, as one bound of
+    300 s did for a start after an unrecorded stop (600 s) and a restarted owner's status (570 s)."""
+    from expcore_onedata.fault_hpc import verb_bounds
+
+    setup, name, extra, relay_verbs = WORST_CASES[case]
+    _, layout = layout_settings(step_launch_wait_s=launch)
+    bounds = verb_bounds(
+        step_launch_wait_s=layout.step_launch_wait_s,
+        stop_bound_s=layout.stop_bound_s,
+        command_timeout_s=layout.command_timeout_s,
+        settle_timeout_s=layout.settle_timeout_s,
+    )
+    setup(world)
+    elapsed = at_their_bounds(world, clock)
+    status, _out, _err = verb(
+        world, name, argv=["/usr/sbin/op_worker", "ping"] if name == "exec" else [], step_launch_wait_s=launch, **extra
+    )
+    assert status in (0, 1, 124), case
+    assert elapsed() > 0
+    for relay_verb in relay_verbs:
+        assert bounds[relay_verb] >= elapsed() + 30, (case, relay_verb, elapsed(), bounds[relay_verb])

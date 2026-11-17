@@ -56,7 +56,7 @@ def test_billing_is_the_larger_of_cores_and_the_weight_times_the_memory_per_node
 def test_the_settle_time_exceeds_the_stops_whole_bound(hpc):
     """O57: a stop takes at most stop_seconds, the 30 s SIGKILL tail and 60 s for its step to leave: settle_timeout_s
     is above that, derived from the layout, never a constant."""
-    assert hpc.settings.load_settings(None).settle_timeout_s == 440
+    assert hpc.settings.load_settings(None).settle_timeout_s == 450
     settings = hpc.settings.load_settings({"stop_seconds": 120, "step_launch_wait_s": 100})
     assert (settings.stop_bound_s, settings.settle_timeout_s) == (210, 370)
 
@@ -69,14 +69,14 @@ def test_every_committed_layout_stops_a_service_within_50_s_and_holds_the_job_fo
     """O58: three provider outages on one HPC federation (17 Nov) ended a service 26.1 to 33.1 s after its SIGTERM, so
     every committed layout's graceful stop is 50 s (the largest plus 50 %), whether it declares `stop_seconds` or takes
     the default: the service's stop bound is 140 s, a control step may wait 240 s to start (a controller's
-    message timeout, 200 s, plus 20 %), so settle_timeout_s is 440 s, and the held job's time still exceeds twice the
+    message timeout, 200 s, plus 20 %), so settle_timeout_s is 450 s, and the held job's time still exceeds twice the
     stop verb's whole bound (380 s), which the loader requires for `down` to finish."""
     import tomllib
 
     assert LAYOUTS  # the glob found the committed layouts
     settings = hpc.settings.load_settings(tomllib.loads(layout.read_text(encoding="utf-8")).get("hpc"))
     assert settings.stop_seconds == 50
-    assert (settings.stop_bound_s, settings.step_launch_wait_s, settings.settle_timeout_s) == (140, 240, 440)
+    assert (settings.stop_bound_s, settings.step_launch_wait_s, settings.settle_timeout_s) == (140, 240, 450)
     assert settings.stop_verb_bound_s == 380
     assert settings.time_s > 2 * settings.stop_verb_bound_s
 
@@ -372,7 +372,7 @@ def test_the_token_margin_is_the_least_the_loader_of_this_core_accepts(hpc, tmp_
 
 def test_with_this_cores_loader_the_pilot_shapes_least_margin_is_the_hpc_restores_rule(hpc, tmp_path, make_ca):
     """O58: with this core's [faults] loader (backend "hpc", M4), up's [tokens] margin_s is the loader's own rule over
-    the file as written, `restore_token_margin_s` of what `load_faults` reads, with nothing stubbed: 4,330 s for the
+    the file as written, `restore_token_margin_s` of what `load_faults` reads, with nothing stubbed: 5,370 s for the
     pilot shape's defaults (stop_seconds 50, step_launch_wait_s 240, command_timeout_s 300), the restore's bound, the
     slack, the drain and the start's own stop."""
     import tomllib
@@ -382,9 +382,9 @@ def test_with_this_cores_loader_the_pilot_shapes_least_margin_is_the_hpc_restore
     assert hpc.boot.has_hpc_backend() is True
     path = rendered_pilot(hpc, tmp_path, make_ca)
     settings = load_faults(path, load_platform(path))
-    assert (settings.backend, settings.stop_bound_s, settings.settle_timeout_s) == ("hpc", 140.0, 440.0)
+    assert (settings.backend, settings.stop_bound_s, settings.settle_timeout_s) == ("hpc", 140.0, 450.0)
     margin = tomllib.loads(path.read_text(encoding="utf-8"))["tokens"]["margin_s"]
-    assert margin == math.ceil(restore_token_margin_s(settings)) == 4330
+    assert margin == math.ceil(restore_token_margin_s(settings)) == 5370
 
 
 def test_a_core_without_the_hpc_backend_takes_the_restores_rule_with_the_hpc_settle_and_poll(
@@ -406,7 +406,7 @@ def test_a_core_without_the_hpc_backend_takes_the_restores_rule_with_the_hpc_set
     document = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))
     rule = FaultSettings(
         file=Path("p"), sanctioned=False, journal=Path("j"), compose_file=Path("c"), services={},
-        settle_timeout_s=440.0, poll_s=10.0, command_timeout_s=300.0,
+        settle_timeout_s=450.0, poll_s=10.0, command_timeout_s=300.0,
     )  # fmt: skip
     assert document["tokens"]["margin_s"] == math.ceil(restore_token_margin_s(rule))
 

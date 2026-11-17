@@ -20,7 +20,7 @@ from typing import Any
 from fault_support import SERVICES, FakeClock
 
 from expcore_onedata.compose import OP_WORKER, RESTART_LINK_SCRIPT, CommandResult
-from expcore_onedata.fault_hpc import HpcDriver, VerbCommand, link_restart_bound_s
+from expcore_onedata.fault_hpc import HpcDriver, VerbCommand
 from expcore_onedata.fault_matrix import LinkMatrix, PairState
 from expcore_onedata.testing import write_platform
 
@@ -229,7 +229,7 @@ def hpc_driver(federation: FakeHpc, *, timeout_s: float = 10.0, stop_timeout_s: 
         transport,
         timeout_s=timeout_s,
         stop_timeout_s=stop_timeout_s,
-        link_timeout_s=link_restart_bound_s(0.0),
+        link_timeout_s=210.0,
         probe=federation.probe,
     )
 

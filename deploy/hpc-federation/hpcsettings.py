@@ -40,7 +40,8 @@ DEFAULT_STEP_LAUNCH_WAIT_S = 240  # `[hpc] step_launch_wait_s`: see DEFAULTS
 VERB_WORK_S = 60  # what a relay verb does beside waiting for its step to start: its step's own bound, a status's 60 s
 KILL_TAIL_S = 30  # supervise.py's SIGKILL tail after the graceful stop's bound (lib.sh, stop_service)
 STEP_END_S = 60  # the longest the driver polls for a stopped service's step to leave squeue -s
-SETTLE_SLACK_S = 60  # what settle_timeout_s keeps beyond the stop's bound
+SETTLE_SLACK_S = 70  # what settle_timeout_s keeps beyond the stop's bound and the launch wait: the stop verb's
+# own tail past its control step (the wait for the step to leave the list and after a cancel: 40 s) and a 30 s margin
 STEP_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"  # HPC_STEP_PATH's default
 SANDBOX_SPARE_CPUS = 2  # beside the agent's cores on its node: the gate, the dispatcher and the egress collector
 SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatcher, the collector, the store, the SIF

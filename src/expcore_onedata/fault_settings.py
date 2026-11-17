@@ -222,9 +222,11 @@ from expcore_onedata.fault_hpc import (
     HPC_POLL_S,
     HPC_STEP_LAUNCH_WAIT_S,
     HPC_STOP_BOUND_S,
+    HPC_VERB_MARGIN_S,
     HPC_VERB_WORK_S,
     HpcDriver,
-    link_restart_bound_s,
+    verb_bounds,
+    verb_inner_worst_s,
 )
 from expcore_onedata.fault_relay import RelayClient
 from expcore_onedata.linkrecord import ROOT_FILE, federation_root
@@ -393,7 +395,9 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         settle_timeout_s=_number(
             table,
             "settle_timeout_s",
-            stop_bound_s + launch_wait_s + SETTLE_MARGIN_S if hpc else DEFAULT_SETTLE_TIMEOUT_S,
+            verb_inner_worst_s(launch_wait_s, stop_bound_s)["stop"] + HPC_VERB_MARGIN_S
+            if hpc
+            else DEFAULT_SETTLE_TIMEOUT_S,
             0,
         ),
         command_timeout_s=_number(table, "command_timeout_s", launch_wait_s + HPC_VERB_WORK_S if hpc else 120.0, 1),
@@ -420,7 +424,7 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
             f"the longest a service's stop takes on an HPC federation, by default the layout's stop_seconds 50, "
             f"supervise.py's kill 30 s and the step's end 60 s, and {launch_wait_s:g} s a control step may wait to "
             f"start), not {settings.settle_timeout_s:g}: a stop waited for less is never seen to end; leave it out "
-            f"for {stop_bound_s + launch_wait_s + SETTLE_MARGIN_S:g}",
+            f"for {verb_inner_worst_s(launch_wait_s, stop_bound_s)['stop'] + HPC_VERB_MARGIN_S:g}",
         )
     declared = "heal_timeout_s" in table.data
     if not declared:  # never a fixed number: one the loader's own check would refuse for some size is wrong
@@ -472,36 +476,55 @@ def _seconds(value: float) -> str:
     return str(int(number)) if number.is_integer() else repr(number)
 
 
+def hpc_verb_bounds(settings: FaultSettings) -> dict[str, float]:
+    """The bound the relay gives each verb of the HPC backend (`fault_hpc.verb_bounds`): its inner worst case, with
+    the declared launch wait counted in every step, and a margin, never below `command_timeout_s` (a status, a start
+    and an exec) or `settle_timeout_s` (a stop). Raises ValueError for a Compose table, which has no such verbs."""
+    if settings.backend != "hpc":
+        raise ValueError("only the HPC backend's verbs have a bound of their own")
+    return verb_bounds(
+        step_launch_wait_s=settings.step_launch_wait_s,
+        stop_bound_s=settings.stop_bound_s,
+        command_timeout_s=settings.command_timeout_s,
+        settle_timeout_s=settings.settle_timeout_s,
+    )
+
+
 def command_bound_s(settings: FaultSettings) -> float:
-    """The longest one driver command may take: `command_timeout_s`, and for the HPC backend the relay's wait too
-    (`relay_wait_s`: a request's wait beyond its command's bound, `fault_relay`)."""
+    """The longest one driver command may take: `command_timeout_s` on Compose; for the HPC backend the slowest of its
+    status, start and ping (`hpc_verb_bounds`) and the relay's wait (`relay_wait_s`: a request's wait beyond its
+    command's bound, `fault_relay`)."""
     if settings.backend == "hpc":
-        return settings.command_timeout_s + settings.relay_wait_s
+        bounds = hpc_verb_bounds(settings)
+        return max(bounds["status"], bounds["start"], bounds["ping"]) + settings.relay_wait_s
     return settings.command_timeout_s  # Compose: exactly as before
 
 
 def stop_command_s(settings: FaultSettings) -> float:
-    """The longest a stop command may take: a command's on Compose; for the HPC backend its own bound,
-    `settle_timeout_s`, which outlasts a service's stop (`fault_hpc.HpcDriver`), and the relay's wait."""
+    """The longest a stop command may take: a command's on Compose; for the HPC backend the stop verb's own bound
+    (`hpc_verb_bounds`, which outlasts a service's stop and `settle_timeout_s`) and the relay's wait."""
     if settings.backend == "hpc":
-        return settings.settle_timeout_s + settings.relay_wait_s
+        return hpc_verb_bounds(settings)["stop"] + settings.relay_wait_s
     return command_bound_s(settings)
 
 
 def link_command_s(settings: FaultSettings) -> float:
-    """The longest a link restart's command may take: the RPC's bound and its margin, and for the HPC backend the
-    exec step's launch wait (`step_launch_wait_s`), its client's end (`fault_hpc.HPC_EXEC_MARGIN_S`) and the relay's
-    wait."""
+    """The longest a link restart's command may take: the RPC's bound and its margin on Compose; for the HPC backend
+    the restart verb's own bound (`hpc_verb_bounds`: the exec step's launch wait and bound, and a margin) and the
+    relay's wait."""
     if settings.backend == "hpc":
-        return link_restart_bound_s(settings.step_launch_wait_s) + settings.relay_wait_s
+        return hpc_verb_bounds(settings)["restart_link"] + settings.relay_wait_s
     return RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S
 
 
 def _command_words(settings: FaultSettings) -> str:
-    """`command_timeout_s` in words, with the relay's wait for the HPC backend."""
+    """The command's bound in words: `command_timeout_s` on Compose; for the HPC backend the slowest command verb's
+    bound, which is never below it, and the relay's wait."""
     n = _seconds
-    words = f"command_timeout_s {n(settings.command_timeout_s)} s"
-    return f"{words} + relay_wait_s {n(settings.relay_wait_s)} s" if settings.backend == "hpc" else words
+    if settings.backend != "hpc":
+        return f"command_timeout_s {n(settings.command_timeout_s)} s"
+    slowest = command_bound_s(settings) - settings.relay_wait_s
+    return f"slowest command verb {n(slowest)} s + relay_wait_s {n(settings.relay_wait_s)} s"
 
 
 def _bound_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
@@ -543,11 +566,8 @@ def _start_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
     holds."""
     if settings.backend != "hpc":
         return ()
-    n = _seconds
-    words = (
-        f"the injector's start's stop (settle_timeout_s {n(settings.settle_timeout_s)} s + relay_wait_s "
-        f"{n(settings.relay_wait_s)} s)"
-    )
+    n, stop = _seconds, stop_command_s(settings) - settings.relay_wait_s
+    words = f"the injector's start's stop (stop verb {n(stop)} s + relay_wait_s {n(settings.relay_wait_s)} s)"
     return ((words, stop_command_s(settings)),)
 
 
@@ -709,7 +729,10 @@ def faults_fingerprint(config: PlatformConfig) -> dict[str, Any] | None:
 
 def _bounds_record(settings: FaultSettings) -> dict[str, Any]:
     """The fault injector's bounds as the fingerprint holds them: every one after its default, a whole number of
-    attempts as an integer, every other number as a float, so `2` and `2.0` are one value."""
+    attempts as an integer, every other number as a float, so `2` and `2.0` are one value. The HPC backend's record
+    holds the bound the relay gives each verb too (`verb_bounds`, derived from the declared launch wait, floor and
+    settle), so a change to a step's own bound moves the fingerprint as a declared one does; a Compose record has
+    none."""
     seconds = (
         "poll_s",
         "settle_timeout_s",
@@ -725,12 +748,14 @@ def _bounds_record(settings: FaultSettings) -> dict[str, Any]:
         "relay_wait_s",
         "step_launch_wait_s",
     )
+    verbs = {"verb_bounds": {v: float(s) for v, s in sorted(hpc_verb_bounds(settings).items())}}
     return {
         "backend": settings.backend,
         "heal": settings.heal,
         "heal_container_fallback": settings.heal_container_fallback,
         "clear_attempts": int(settings.clear_attempts),
         **{key: float(getattr(settings, key)) for key in seconds},
+        **(verbs if settings.backend == "hpc" else {}),
     }
 
 
@@ -760,10 +785,14 @@ def hpc_driver(settings: FaultSettings, *, probe: Callable[[str], bool], transpo
     if settings.backend != "hpc":
         raise ConfigError(f'{settings.file}: [faults]: backend = "{settings.backend}" has no HPC driver')
     sent = transport or RelayClient(federation_root(settings.journal), wait_s=settings.relay_wait_s)
+    bounds = hpc_verb_bounds(settings)
     return HpcDriver(
         sent,
         timeout_s=settings.command_timeout_s,
-        stop_timeout_s=settings.settle_timeout_s,
-        link_timeout_s=link_restart_bound_s(settings.step_launch_wait_s),
+        stop_timeout_s=bounds["stop"],
+        link_timeout_s=bounds["restart_link"],
+        status_timeout_s=bounds["status"],
+        start_timeout_s=bounds["start"],
+        ping_timeout_s=bounds["ping"],
         probe=probe,
     )

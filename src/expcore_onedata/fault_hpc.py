@@ -54,9 +54,9 @@ measured `[hpc] stop_seconds` comes from. A stop with no answer has none.
 **The heal (O35).** `ping` runs op-worker's runner (`/usr/sbin/op_worker ping`) inside the provider's service, and
 `restart_link` runs the Compose driver's very command, `compose.RESTART_LINK_SCRIPT` (rtransfer_config's restart_link
 through nodetool's rpcterms), inside it, so env.sh finds the service's own epmd port and cookie and none is on a
-command line. Its bound is the Compose one plus the step's launch wait (`step_launch_wait_s`) and
-`HPC_EXEC_MARGIN_S` for the client's end (`link_restart_bound_s`), which the heal's reserves count
-(`fault_settings.link_command_s`). Its result is the same word (`compose.link_result`); a failure the
+command line. Its bound is its own inner worst case, the exec step's launch wait and bound, and
+`HPC_VERB_MARGIN_S` (`verb_bounds`), which the heal's reserves count (`fault_settings.link_command_s`); a ping's is
+the same. Its result is the same word (`compose.link_result`); a failure the
 exec does not describe, a step that could not be made among them, may have reached the node, so it is never `not_run`
 and never retried. **The container fallback** is the heal's restart of a reader through the injector's own stop and
 start (`fault_restore.LinkSettling.restart_container`), which here is the provider's service stopped and started again,
@@ -77,9 +77,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from expcore_onedata.compose import (
     OP_WORKER,
-    RESTART_LINK_MARGIN_S,
     RESTART_LINK_SCRIPT,
-    RPC_TIMEOUT_S,
     CommandResult,
     CommandRunner,
     DriverError,
@@ -114,14 +112,51 @@ HPC_VERB_WORK_S = 60.0
 # launch wait and the verb's work, 300 s, where a command had 120 s (Compose's, which keeps it) until one round trip
 # took 104.6 s with launch waits of up to 103 s. `up` declares it in the platform file, derived from the launch wait.
 HPC_COMMAND_TIMEOUT_S = HPC_STEP_LAUNCH_WAIT_S + HPC_VERB_WORK_S
-HPC_EXEC_MARGIN_S = 60.0  # what an exec's client's end adds to the command's own bound (the launch wait: apart)
 HPC_POLL_S = 10.0  # every status is a Slurm step on the node's one control core: read every 10 s, not every 2
 
+# The bounds of the deploy driver's control steps (`deploy/hpc-federation/hpcfed_control.py`), mirrored here because the
+# core cannot import the deploy directory; a test pins each to its original. A verb's relay bound is derived from them.
+HPC_STATUS_STEP_S = 60.0  # `STATUS_TIMEOUT_S`: the status step's own bound, beyond its launch wait
+HPC_MOUNT_STEP_S = 30.0  # `MOUNT_CHECK_TIMEOUT_S`: a restarted shared-import owner's read-only proof
+HPC_START_LISTED_S = 60.0  # `START_LISTED_WAIT_S`: a start's wait for its new service step to be listed
+HPC_EXEC_STEP_S = 300.0  # `EXEC_TIMEOUT_S`: the exec step's own bound, whatever the command
+HPC_STOP_STEP_MARGIN_S = 60.0  # `STOP_MARGIN_S`: the stop step's bound past `stop_seconds`
+HPC_STEP_GONE_S = 60.0  # `STEP_GONE_WAIT_S`: a stop's wait for the service step to leave the list
+HPC_CANCEL_WAIT_S = 10.0  # `CANCEL_WAIT_S`: and for a step it cancelled to leave it
+HPC_STOP_EXTRA_S = (
+    90.0  # `stop_bound_s` beyond `stop_seconds`: supervise.py's kill tail (30 s) and the step's end (60 s)
+)
+HPC_VERB_MARGIN_S = 30.0  # what a verb's relay bound keeps beyond its inner worst case
 
-def link_restart_bound_s(step_launch_wait_s: float = HPC_STEP_LAUNCH_WAIT_S) -> float:
-    """A link restart's bound: the exec step's launch wait, the RPC's bound and its margin (the Compose driver's), and
-    the exec's client's end (`HPC_EXEC_MARGIN_S`); 390 s with the defaults."""
-    return step_launch_wait_s + RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S + HPC_EXEC_MARGIN_S
+
+def verb_inner_worst_s(step_launch_wait_s: float, stop_bound_s: float) -> dict[str, float]:
+    """Each verb's own longest run when every step it makes takes its whole bound and every wait its whole wait, the
+    launch wait counted in each step: a status then a restarted owner's mount check; a start after an unrecorded stop (a
+    status step, then the wait to see its service step listed); a stop (its control step, the wait for the step to
+    leave the list, the wait after a cancel); an exec, which `hpcfed_control` bounds alike for every command, a ping and
+    a link restart too. 570 s, 600 s, 420 s, 540 s and 540 s with the defaults."""
+    launch, status_step = step_launch_wait_s, step_launch_wait_s + HPC_STATUS_STEP_S
+    stop_seconds = max(stop_bound_s - HPC_STOP_EXTRA_S, 0.0)
+    return {
+        "status": status_step + launch + HPC_MOUNT_STEP_S,
+        "start": status_step + launch + HPC_START_LISTED_S,
+        "stop": stop_seconds + launch + HPC_STOP_STEP_MARGIN_S + HPC_STEP_GONE_S + HPC_CANCEL_WAIT_S,
+        "ping": launch + HPC_EXEC_STEP_S,
+        "restart_link": launch + HPC_EXEC_STEP_S,
+    }
+
+
+def verb_bounds(
+    *, step_launch_wait_s: float, stop_bound_s: float, command_timeout_s: float, settle_timeout_s: float
+) -> dict[str, float]:
+    """The bound the relay gives each verb: its own inner worst case (`verb_inner_worst_s`) and `HPC_VERB_MARGIN_S`, and
+    never less than the declared floor, `command_timeout_s` for a status, a start and an exec, `settle_timeout_s` for a
+    stop. 600 s, 630 s, 450 s, 570 s and 570 s with the defaults. A relay that cut a verb short would time out one
+    that was about to complete, and a restore after a stop of unknown outcome would fail exactly when it matters."""
+    inner = verb_inner_worst_s(step_launch_wait_s, stop_bound_s)
+    bounds = {verb: max(command_timeout_s, worst + HPC_VERB_MARGIN_S) for verb, worst in inner.items()}
+    bounds["stop"] = max(settle_timeout_s, inner["stop"] + HPC_VERB_MARGIN_S)
+    return bounds
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9@:._+-]{1,200}")  # an identity as a status prints it: one word, never a path
@@ -189,15 +224,21 @@ class HpcDriver:
         timeout_s: float = HPC_COMMAND_TIMEOUT_S,
         stop_timeout_s: float | None = None,
         link_timeout_s: float | None = None,
+        status_timeout_s: float | None = None,
+        start_timeout_s: float | None = None,
+        ping_timeout_s: float | None = None,
         probe: Callable[[str], bool],
     ) -> None:
         """`probe(service)` says whether the provider behind a service answers its REST API: True when it does, False
         when it does not (yet). It is required: the driver's `serves` is not defined without it. `timeout_s` bounds
-        every request but a stop and a link restart, which `stop_timeout_s` (`timeout_s` when None) and `link_timeout_s`
-        (`link_restart_bound_s()` when None) bound."""
+        every request, and each verb has a bound of its own where given (`verb_bounds`): `stop_timeout_s`,
+        `link_timeout_s`, `status_timeout_s`, `start_timeout_s` and `ping_timeout_s`, each `timeout_s` when None."""
         self._transport, self._timeout_s, self._probe = transport, timeout_s, probe
         self._stop_timeout_s = timeout_s if stop_timeout_s is None else stop_timeout_s
-        self._link_timeout_s = link_restart_bound_s() if link_timeout_s is None else link_timeout_s
+        self._link_timeout_s = timeout_s if link_timeout_s is None else link_timeout_s
+        self._status_timeout_s = timeout_s if status_timeout_s is None else status_timeout_s
+        self._start_timeout_s = timeout_s if start_timeout_s is None else start_timeout_s
+        self._ping_timeout_s = timeout_s if ping_timeout_s is None else ping_timeout_s
         self.last_stop: dict[str, Any] | None = None  # the latest stop's evidence, once it answered (see the docstring)
         self.last_domain_wait_s: float | None = (
             None  # the latest ready status's `domain_wait_s`, if any (the docstring)
@@ -236,13 +277,13 @@ class HpcDriver:
         """Start the provider's stopped service again. The figure of an earlier launch is gone: this one has not
         reported."""
         self.last_domain_wait_s = None
-        self._ask(Request("start", service), "start the service", self._timeout_s)
+        self._ask(Request("start", service), "start the service", self._start_timeout_s)
 
     def observe(self, service: str) -> Observation:
         """Read whether the service runs, its identity and whether it is ready; raise DriverError when the status
         cannot be read. `last_domain_wait_s` is the figure of this status when the service is ready, else None."""
         self.last_domain_wait_s = None
-        stdout = self._ask(Request("status", service), STATUS, self._timeout_s).stdout
+        stdout = self._ask(Request("status", service), STATUS, self._status_timeout_s).stdout
         seen = parse_status(stdout)
         self.last_domain_wait_s = status_domain_wait(stdout) if seen.health == "healthy" else None
         return seen
@@ -265,7 +306,7 @@ class HpcDriver:
         """Whether the op-worker node in the service answers `pong` to its runner's `ping`. A command that fails,
         times out or prints anything else is no pong; raise DriverError only when the request is refused."""
         try:
-            done = self._exec(service, "ping", self._timeout_s)
+            done = self._exec(service, "ping", self._ping_timeout_s)
         except (subprocess.TimeoutExpired, OSError):
             return False
         return done.returncode == 0 and done.stdout.strip() == "pong"

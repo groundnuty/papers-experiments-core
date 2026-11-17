@@ -274,7 +274,7 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_d
     assert layout.spec.provider("hazel").url == "https://hazel.expcore-hpc-pilot.test:8443"
     assert owner == (5001, 5001)
     assert (values["hpc_step_launch_wait_s"], values["hpc_command_timeout_s"]) == ("240", "300")
-    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("140", "440")
+    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("140", "450")
     command = json.loads(values["hpc_command"])
     assert command[1:3] == ["-I", "-B"]  # isolated (O58): the relay runs every verb through it
     assert command[3:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
