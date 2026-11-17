@@ -322,16 +322,22 @@ def test_the_command_refuses_a_day0_only_root_and_takes_the_flag(hpc, tmp_path, 
 
 def test_the_state_loader_takes_a_discard_record_with_and_without_the_kinds_of_evidence(hpc, tmp_path, site):
     """O63: `evidence` is an added key of an `evidence_discarded` entry: an entry an earlier down wrote (without it) is
-    still of the form, one with it must be a list of strings, and anything else is refused."""
+    still of the form, and one with it is too."""
     rig = Rig(hpc, tmp_path, site)
     base = {"at": "2026-11-17T00:00:00Z", "shards": [], "changed_since_collect": False, "reason": None}
-    for entry in (base, {**base, "evidence": ["the fault journal"]}):
+    for entry in (base, {**base, "evidence": ["the fault journal"]}, {**base, "evidence": []}):
         rig.driver.store.update(lambda state, entry=entry: {**state, "evidence_discarded": [entry]})
         assert rig.driver.store.read()["evidence_discarded"] == [entry]
-    for bad in ({**base, "evidence": "the fault journal"}, {**base, "evidence": [1]}, {**base, "kinds": []}):
-        rig.driver.store.update(lambda state, bad=bad: {**state, "evidence_discarded": [bad]})
-        with pytest.raises(hpc.state.StateError, match="evidence_discarded"):
-            rig.driver.store.read()
+
+
+@pytest.mark.parametrize("bad", [{"evidence": "the fault journal"}, {"evidence": [1]}, {"evidence": 3}, {"kinds": []}])
+def test_the_state_loader_refuses_a_discard_record_whose_evidence_is_not_a_list_of_strings(hpc, tmp_path, site, bad):
+    """O63: the key is optional, but when it is there it is a list of kinds, and no other key is taken."""
+    rig = Rig(hpc, tmp_path, site)
+    entry = {"at": "2026-11-17T00:00:00Z", "shards": [], "changed_since_collect": False, "reason": None, **bad}
+    rig.driver.store.update(lambda state: {**state, "evidence_discarded": [entry]})
+    with pytest.raises(hpc.state.StateError, match="evidence_discarded"):
+        rig.driver.store.read()
 
 
 # ------------------------------------------------------------------------------------------------ the two sets

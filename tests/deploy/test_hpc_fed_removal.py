@@ -169,12 +169,13 @@ def test_a_lock_held_inside_the_root_is_what_failed_live_and_a_second_down_finis
 
 
 def test_a_file_another_process_holds_in_the_root_is_waited_for_and_the_root_goes(hpc, tmp_path, site):
-    """O57: a file of the root held open elsewhere while down removes it (a reader of the journal, say) becomes a
-    silly file; the removal waits for its holder to close it, then removes its directory and the root."""
+    """O57: a file of the root held open elsewhere while down removes it (a lock file of the journal, say: one with
+    nothing in it, which is no evidence a run left, O63) becomes a silly file; the removal waits for its holder to close
+    it, then removes its directory and the root."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
-    journal = rig.driver.layout.journal / "held.jsonl"
-    journal.write_text("{}\n", encoding="utf-8")
+    journal = rig.driver.layout.journal / "held.lock"
+    journal.write_text("", encoding="utf-8")
     handle = Held(journal)
     rig.nfs.on_sleep = lambda count: handle.close() if count == 3 else None
     try:
