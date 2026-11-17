@@ -121,6 +121,53 @@ Two more tables follow in the section (`expcore.report_shards`), each figure wit
 
 `expcore.study.merged_times` adds `wall_s` and `turn_latency_s` to each shard's export before the join, so each analysed entry of a merged export is `run_key`, `digest`, `condition`, `factors`, `attempt`, `run_dir`, `treatment`, `infra_kind`, `dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`, `admission`, `wall_s`, `turn_latency_s`, `shard`, in that order, and the last two top-level keys are `shard_retries_by_kind` and `shards`. The export of an unmerged batch, and of a shard on its own, is made by `campaign.export` alone and has none of the five. The values are exact copies (a wall time and a latency are not rounded), and the report rounds them to four significant figures. An export without `shards` ignores all of these.
 
+What each model spent (C39; [`campaign/model_usage.py`](../src/expcore/campaign/model_usage.py), [`report_model_usage.py`](../src/expcore/report_model_usage.py)). `analysis.json` has a `model_usage` object and `report.md` a section "Model usage and spend" (after the conditions and the shards) with one line of its provenance (`- Spend: ...`: the total, the part measured and the part at a bound, the part on the analysed attempts and on the rest). `export.json` has no key for it, so its key order is what it was. The figures are the budget gate's own: `selection_ledger.charges_of(query, pricing)` gathers every charge the gate counts (each attempt's cost by `attempt_costs`, each attempt and charge a kill lost, `lost_spend.costs`, and the admission probes' charges) and `spend_of` totals it, so a model's `usd.total` is `spend_of`'s figure for it, probes included, and nothing is priced a second time. `usage_of(query, pricing, left_out=, why=, models=)` breaks it down for one store or snapshot; `usage_of_batch` does it for a batch (each store's figures added in shard order, the records' attached); `AttemptCost` has a trailing `topup_usd` (the part of `usd` that is its top-ups) and `charged_on` (`measured`, `measured_plus_inflight`, `bound` or None), the basis the rest was charged on, which is the one the gate charged and not the one a row records: a row that records `measured` and is charged its bound is in `bound`. `AttemptCost.basis` is as it was.
+
+```python
+{
+    "format": "model-usage-1",
+    "dollars": {"known": True, "reason": None},  # False, and why, when no dollar can be shown (below)
+    "models": [
+        {
+            "model": "m1",
+            "price": "priced",  # "free", "unpriced", or None when no prices applied
+            "classes": [
+                {
+                    "class": "analysed",  # "left_out", "infra_fail", "outage_discarded", "harness_error",
+                    # "interrupted", "running", "lost_in_kill"; only classes that have one
+                    "attempts": 11,
+                    "input_tokens": 1972,
+                    "output_tokens": 164,
+                    "cache_creation_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "usage_incomplete_attempts": 0,  # totals known to be short, a count missing, or still running
+                    "bounded_attempts": 0,  # their charge holds a bound or a top-up
+                    "unpriced_attempts": 0,
+                    "usd": {
+                        "measured": 0.0023,
+                        "measured_plus_inflight": 0.0,
+                        "bound": 0.0,
+                        "charges": 0.0,  # top-ups, and the top-up and probe sends a kill lost
+                        "total": 0.0023,
+                    },
+                }
+            ],  # None when any attempt's cost is unknown
+            "probes_usd": 0.0,
+            "usd": {"total": 0.0023, "analysed": 0.0023, "not_analysed": 0.0},  # None unless every dollar is known
+            "records": 11,
+            "turns": 30,  # what the verified records say, below
+            "served": [{"served_model": None, "system_fingerprint": None, "turns": 30, "records": 11}],
+            "retries": {"events": 0, "turns_retried": 0, "wait_s": 0.0, "by_kind": []},
+        }
+    ],
+}
+```
+
+- **Where a dollar is `None` (shown `n/a`), never 0:** a model with no price (and not free); prices that are not the ones the campaign ran under, which are applied to a store only where its fingerprint shows them to be (`Pricing.mismatch`: the model digests and the loop's caps, or a store that records no fingerprint at all) and then `dollars.known` is false with the reason; a bound that cannot be computed (a priced model with no `context_tokens`: the analysis of a campaign made before the rule still runs); a record of the probes or of what a kill lost that cannot be read. The tokens are the store's whatever the dollars are. A count the endpoint did not report is not 0: the attempt is counted in `usage_incomplete_attempts` and the tokens are the sum of what was reported. An attempt that failed at start and was charged a measured zero (C05) is an attempt of its class with 0 tokens, complete, and 0 measured dollars.
+- **What the records give** (`observed_by_model`, `attach_observed`): per model, `records` (the verified records of its attempts, whatever became of them, which are the attempts that kept one) and `turns`; `served`, each distinct served model id and system fingerprint its turns carried with the turns and the records that carried it (`None` for a turn whose reply named none, shown `not reported`: never the id that was asked for); `retries`, the retry events of its requests by kind with their waits (`Retrier` events in each turn's `retries`) and the turns that retried. A model with no record has zeros and empty lists.
+- **A merged batch** adds its shards' figures class by class (`merge_usage`), a dollar known only where every shard's is. Each shard's start pays its own admission probes, so a merged batch's probes are not those of one driver's and its other figures are (`tests/study/test_merge.py`). A sum of dollars is kept to 12 decimals.
+- **Regenerated like the rest.** The figures derive from the snapshot, the verified records and the study's `models.toml` and `[agent]` caps, so `regenerate` and a package's check derive the same bytes anywhere. `render_report(..., model_usage=)` has the section and the line only when given the figures; a report built without them is the text it was.
+
 Side files are verified with the records. A file a run writes beside its record, which the record names by its SHA-256, is declared in `study.toml` ([below](#side-files-of-a-record)). `check` hashes every file of a declared name in the batch it parses into its inputs, never replays one, and pairs each with the one record in its directory; the check records the declaration (`side_files`) and each side file's hash in `inputs`. `analyze`, `report`, `regenerate` and a package's `make check` refuse a check made under another declaration, refuse a side file changed, removed or added since the check, and read each side file once to pair it with its record again, whatever the check file claims; the bytes so read are what a [scorer](#scorer) that takes `side_files` is handed. A study that declares none is checked exactly as before, and its check file holds no `side_files`.
 
 ### Shards of a campaign
@@ -727,6 +774,25 @@ def missing_hooks(wrapper: Instrument, wrapped: Instrument) -> tuple[str, ...]
 - **The list is the core's discovery.** `_method`, the one lookup of an optional hook, refuses a name that is not in `OPTIONAL_HOOKS`, and a test compares the list with every name the module looks an instrument up by, and fails on a lookup outside `_method` whose name it cannot read, so a hook the core gains later is in the list, and so in the rule, or its tests fail.
 - **`missing_hooks` is for a study's own test.** It returns the names the wrapped instrument has and the wrapper does not, in the list's order: `assert missing_hooks(wrapper, wrapped) == ()` for a wrapper that passes everything on, or the tuple a wrapper that drops one on purpose expects. A hook counts as the core counts it when it looks it up: an attribute that is callable. A property that answers None is no hook (the progressive ingest's `at_first_turn` is one outside its preallocated mode), so a wrapper around it misses nothing then, and a hook only the wrapper has is not missing. Test the wrapper around each instrument it wraps, in each mode that changes which hooks the instrument has.
 
+
+### A failed start: the diagnostic
+
+An instrument whose `start` verifies something (a state inducer whose start-state check fails) raises an `InfraError` of a kind no condition declares, and the attempt is set aside and run again. What was checked and what was seen used to live only on the exception, so the set-aside attempt's record held a kind and a detail and no evidence of why (C40; [`campaign/start_diagnostic.py`](../src/expcore/campaign/start_diagnostic.py)). The error can now carry it:
+
+```python
+raise InfraError(
+    "sandbox",
+    "the start state was not reached",
+    diagnostic={"checked": "the replica count", "seen": "2 of 3", "wanted": 3},
+)
+```
+
+- **`diagnostic`** is optional, a JSON object, and kept as given: `InfraError.diagnostic` is None by default and is not part of the message, so an existing raise is unchanged. `start_instruments` lets the same error through with `InfraError.origin` set to `{"phase": "start", "instrument": <namespace>}` (never overwritten, and set by nothing else), so a failed start of an instrument that gives no diagnostic is still counted by instrument. Anything but an `InfraError` passes through untouched, as before.
+- **What the attempt keeps** is one snapshot, `{"phase": "start", "instrument": "state_inducer", "diagnostic": {...}}`; an `InfraError` from anywhere else that carries a diagnostic keeps `{"diagnostic": {...}}`, and one with neither keeps nothing, so every other attempt is what it was. It goes through the attempt's redactor as an instrument's snapshot goes through the record's (every string, a key among them, loses the secrets of the environment, the models and the registry), and is kept on the row (`attempts.diagnostic`, canonical JSON; NULL for any other attempt), in the outcome marker (optional in schema 3, written only when set, so a kill after the marker loses none and recovery commits it) and in the export. The attempt's state, its charge and its kind do not depend on it.
+- **A snapshot that cannot be kept** (not a JSON object, a number JSON cannot hold, a value that is not JSON, more than `start_diagnostic.LIMIT_BYTES` (16 KiB) of canonical JSON, a redaction that raised) is recorded as `{"phase": ..., "instrument": ..., "ok": false, "error": <class name>}`, as an instrument whose `finish` failed is (O08): never dropped, never guessed, and never an exception, since one that escaped the attempt runner would stop dispatch (C17).
+- **The export** has `attempt_diagnostics` after `interrupted_spend`, only when an attempt kept a snapshot: per attempt in id order `attempt_id`, `run_key`, `condition`, `model`, `attempt`, `state`, `infra_kind`, `charged` and the `diagnostic`. A snapshot made before the column exports none; a stored snapshot that is not a JSON object is an `ExportError` naming the attempt. A batch merged from shards joins every shard's entries in shard order, each with its `shard`.
+- **The report** has a section "Instrument start failures" after the infrastructure tables, only for such an export: per condition, instrument, kind and state the attempts, how many were charged and how many snapshots could not be kept, a row of zeros for a condition that had none (a column for the shard in a merged batch). What each snapshot says is in the export.
+- **No run-record field changes** (the fixtures of version 3 keep validating): the attempt that raised from `start` has no record, so the snapshot lives with the attempt, in the store and its marker.
 
 ### Side files of a record
 

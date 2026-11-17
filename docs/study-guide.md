@@ -1007,6 +1007,16 @@ The campaign records the digest of the run's scorers (their names and versions) 
 
 **Correcting a scorer after an HPC batch.** A scorer is found wrong after the batch is copied back, where `build` cannot run. Fix it and change its `version`, in the one function both builders call. The scorer is code, so the replay check is stale: run `check` again on the batch (it builds nothing, so it needs no federation). Then run `analyze my-study --rescore` and `report my-study --rescore`. Without the flag both refuse, naming the scorers. With it the analysis scores every record anew with the corrected scorer, and says so: `scores.json`, the `scorers` of `analysis.json` and the report's `Scorers` line hold the new version, as any re-score does (R13), and `analysis.json` (`rescore`) and one line of the report's Provenance hold the digest the campaign recorded and the digest of the scorers used. They cannot name the scorer that changed, because the campaign records one digest of all its scorers: keep the old version in your own notes or in git. The flag changes nothing when the scorers are the campaign's own, and nothing for a module without `build_analysis`. A store that records no digest is refused with the flag too. Then build the replication package as for any study, with no flag: the decision was recorded at `analyze`, so the package's build, its `make check` and `package-check` honour it, and an anonymised package does too. A differing scorer digest is accepted exactly when the `analysis.json` that ships holds a `rescore` entry equal to what the check works out now, the digests the store recorded and the digest of the scorers in the package's plugin; with no entry, with an entry for other scorers or another store, or with a store that records no digest, the build and the check refuse as `analyze` does, and they never re-ask. The package's outputs are still compared byte for byte with what the records give, so an entry on a batch that re-scored nothing fails as differing, and the package carries the `rescore` entry and the Provenance line, so a reader of it sees the re-score.
 
+### What each model cost
+
+`analysis.json` has `model_usage` and `report.md` a section "Model usage and spend" (and one line of the provenance, `- Spend: ...`) for every analysis, so a reader can tell what the campaign spent per model, the tokens, how many attempts were set aside, which model ids served it and how often its requests were retried (C39). Nothing in it is priced or counted again: it is the budget gate's own figure broken down, read from the snapshot of the store the check took, the verified records and your `models.toml`.
+
+- **Spend by model** gives each model's total, the part spent on the attempts the analysis uses and the part on the rest, and the total on each basis. **Cost per scored run is the first figure over the number of scored runs; the rest is the overhead beside it**, and it is not small when attempts were set aside, harness errors, interrupted or lost in a kill: those were never scored and were paid for all the same.
+- **The basis is the one the dollars were charged on.** *Measured*: the attempt's counts at the model's price, each request at its own tier. *Measured plus in flight*: an interrupted attempt's replies and one request sent and not answered, at the most one request can cost. *Bound*: the most its caps let it cost, because its usage is unknown (a count the endpoint did not report, a run killed before its log could be read, a model whose cost cannot be told from the totals). *Top-ups* and the *probes* of admission are charged apart. An attempt charged a measured zero (it failed before any request was sent, C05) has 0 tokens and 0 dollars, measured.
+- **`n/a` is not 0.** A model with no price has tokens and no dollars. If `models.toml` or the `[agent]` caps are not the ones the campaign ran under (compared with the campaign fingerprint), no dollar is shown for any model and the provenance line says why; a priced model with no `context_tokens` cannot be bounded, so a campaign made before that rule still analyses, reports and regenerates, with `n/a` where a bound was needed. A count the endpoint did not report is counted under Usage incomplete and is not added as 0.
+- **Served ids and retries come from the records** of the batch: each served model id and system fingerprint a model's turns carried, with the turns and records; `not reported` for a reply that named none (a stub's, say), never the id you asked for. Retries inside an attempt are the transient errors the backend retried before a reply, by kind, with the seconds waited; the attempts set aside as infrastructure are those of the export's `retries_by_kind`, added over the conditions.
+- **A batch merged from shards** adds its shards, so its probes are the sum of its shards' (each shard's start probes its own models). The figures are the same on every machine: `regenerate` and a package's check derive the same bytes.
+
 ### How pairs become a contrast's input
 
 What a contrast estimates is decided by how its pairs are combined, in stages of plain means:
@@ -1596,6 +1606,20 @@ else:
 A class that wraps an instrument passes both methods on, or it drops them without a word. The core finds `at_first_turn` and `check` by name on the object it is given, so a wrapper that forwards `start` and `finish` only hides the wrapped instrument's refusal, and the attempt is scored. `expcore.records.instruments.OPTIONAL_HOOKS` lists the names, and `missing_hooks(wrapper, wrapped)` returns the ones a wrapper lacks, so a test of your wrapper can assert `missing_hooks(wrapper, wrapped) == ()` ([the wrapper rule](interfaces.md#a-class-that-wraps-an-instrument)).
 
 [`interfaces.md`](interfaces.md#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check) says when each runs, what it may do and how a failure is classified.
+
+### An instrument whose start fails: say why
+
+If your instrument verifies something in `start` (a state inducer that checks the start state it induced) and it does not hold, raise an `InfraError` of a kind no condition declares as its treatment, as for any refusal, and give it what you checked and what you saw (C40):
+
+```python
+raise InfraError(
+    "sandbox",
+    "the start state was not reached",
+    diagnostic={"checked": "the replica count", "seen": "2 of 3", "wanted": 3},
+)
+```
+
+`start_instruments` names your instrument on the error it lets through, and the attempt that is set aside and run again keeps the snapshot `{"phase": "start", "instrument": ..., "diagnostic": ...}` on its row and in its marker, redacted with the secrets of the environment as an instrument's snapshot is. The export lists every such attempt (`attempt_diagnostics`, with its run, condition, kind and whether it was charged) and the report counts them per condition, instrument and kind under "Instrument start failures", with a row of zeros for a condition that had none, so you can count induction failures per condition and read each one. Keep the diagnostic a plain JSON object of at most 16 KiB; one that is not, or whose redaction fails, is recorded as `{"ok": false, "error": ...}` and costs the attempt nothing. Nothing about the run record changes, since an attempt that raised from `start` has none. If your instrument is wrapped by another class, the wrapper needs nothing: the error is the instrument's own.
 
 ### Data that arrives during a run
 
