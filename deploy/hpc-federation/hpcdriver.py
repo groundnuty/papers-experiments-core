@@ -204,7 +204,9 @@ class Driver(Down):
         text = template.read_text(encoding="utf-8") if template is not None else None
         declared = [space.data_manifest for space in self.spec.spaces if space.data_manifest]
         hpcpins.check(site, text, declared)
-        hpcplacement.check_template(text)  # a template declares [placement] holder (O79), which the core has no default for
+        hpcplacement.check_template(
+            text
+        )  # a template declares [placement] holder (O79), which the core has no default for
         # O83: a template that names @study_artifacts@ has its tool server's files checked, and the frozen manifests
         check_launchable(self.spec, site.study_artifacts)  # the names resolve through the launcher here (O73)
         check_artifacts(self.spec, site.study_artifacts, self.root)
