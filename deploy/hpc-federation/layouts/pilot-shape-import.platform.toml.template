@@ -76,7 +76,7 @@ import = { readonly = true, shared = true }
 sanctioned = false                           # the configuration's half of the sanction: true only for a study that injects
 backend = "hpc"                              # no compose_file, project, command or docker: the HPC backend refuses them
 journal = "@hpc_root@/fault-journal"
-stop_bound_s = @hpc_stop_bound_s@            # the service's own stop; settle_timeout_s defaults to it + the launch wait + 60
+stop_bound_s = @hpc_stop_bound_s@            # the service's own stop; settle_timeout_s defaults to it + the launch wait + 70
 step_launch_wait_s = @hpc_step_launch_wait_s@  # a control step's wait to start: it widens timeouts only
 command_timeout_s = @hpc_command_timeout_s@    # the floor of every relay verb's bound: the launch wait and 60 s
 
