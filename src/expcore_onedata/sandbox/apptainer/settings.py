@@ -85,7 +85,7 @@ WORK_DISKS = ("directory", "image")  # work_disk: the first is the default (O71)
 # the keys of the gate's configuration the sandbox writes itself (`gaterun.config`): gate_options may set none of them
 GATE_OWN_KEYS = frozenset(
     {"run_key", "verify_ssl", "log", "tls_dir", "hosts", "listing", "token_file", "token", "upstream_ca_file",
-     "listen_host", "listen_port", "tcp_forwards", "scan_names"}
+     "listen_host", "listen_port", "tcp_forwards", "scan_names", "upstream_read_timeout_s"}
 )  # fmt: skip
 
 

@@ -425,6 +425,7 @@ class ApptainerSandbox:
                 run_key=sp.run_key, tls=self.s.tls, served=served, listing=sp.listing, directory=gate_dir,
                 tls_dir=tls_dir, token_file=token, port=self._gate_port, upstream_ca=self._ca_copy,
                 options=self.app.gate_options, scan_names=sp.node_names,
+                upstream_read_timeout_s=self.s.gate_upstream_read_timeout_s,
             ))  # fmt: skip
             self._token_files = [token]  # before it exists: every teardown removes it, whatever fails from here
             self.run_record()
@@ -443,7 +444,10 @@ class ApptainerSandbox:
                 raise SandboxError("the gate did not start") from None
             break
         self._remove_token_files()  # the gate read it before it said ready; it keeps it in memory alone
-        asked = json.loads(config.read_text(encoding="utf-8")).get(gaterun.PEER_CHECK_KEY) is True
+        written = json.loads(config.read_text(encoding="utf-8"))  # what this gate was given, not what was meant
+        asked = written.get(gaterun.PEER_CHECK_KEY) is True
+        given = written["upstream_read_timeout_s"]  # the fact is what the file holds, never what was meant (O85)
+        self.record_infrastructure_fact(gatepolicy.UPSTREAM_READ_TIMEOUT_FACT, given)
         # in effect only when asked of a gate that has it, which refuses to start when it cannot make it (#317)
         self._meta["gate"] = {"port": self._gate_port, "hosts": len(served),
                               "names": "declared" if self.s.federation is not None else "urls",  # whose, not which

@@ -99,6 +99,18 @@ ONEZONE, ONEPROVIDER = "onezone", "oneprovider"
 PAGED, COMPLETE = "paged", "complete"  # the listing modes of a REST data path (O21)
 LISTINGS = (PAGED, COMPLETE)
 
+# How long the gate waits for the upstream to send the next byte of an answer before it gives the read up (O85): a
+# platform's `[sandbox.gate] upstream_read_timeout_s`, which the sandbox writes into the gate's configuration. The default
+# is the constant the gate always had: not below the official client's own read timeout (4 h), so the gate never fails
+# a read before the client would. A declared value below it makes the gate the one that gives up (a 502 of origin
+# `gate`), so it decides when an agent's REST read fails while the platform hangs. The bounds are what the loader
+# accepts: under a second is no read timeout, and above the client's 4 h the client gives up first.
+UPSTREAM_READ_TIMEOUT_S = 14400
+UPSTREAM_READ_TIMEOUT_BOUNDS_S = (1, 86400)
+UPSTREAM_READ_TIMEOUT_FACT = (
+    "gate_upstream_read_timeout_s"  # the key of a REST run's facts: the value its gate was given
+)
+
 _P = "/api/v3/"
 _RULES = (
     # (role, method, regex, tag)

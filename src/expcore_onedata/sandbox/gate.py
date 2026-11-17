@@ -15,7 +15,7 @@ in argv[1]:
 
   {"run_key": "...", "verify_ssl": true, "log": "/var/gate/requests.jsonl",
    "upstream_ca_file": "/etc/gate/federation-ca.pem", "tls_dir": "/etc/gate/tls",
-   "listing": "paged|complete", "peer_uid_check": false,
+   "listing": "paged|complete", "peer_uid_check": false, "upstream_read_timeout_s": 14400,
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
                         "port": 443, "tls": true, "dial": "<address to connect to>"}},
    "scan_names": ["<a node's name or address>", ...],
@@ -31,6 +31,12 @@ connection with a reset before one byte is read or written and logging one `peer
 The gate stops at its start if it could not run the check (it runs as uid 0, which the tables also print for a socket
 nobody owns, or it cannot read the table, or `gatepeer.py` is not beside it). Off, nothing of this runs and `gatepeer.py`
 is not needed beside it: Docker's gate, on its own network, is as it was.
+
+`upstream_read_timeout_s` (O85) is how long an upstream socket may stay silent before the gate gives the read up: a
+positive finite number of seconds, `READ_TIMEOUT` (14,400, the official client's own read timeout) when absent; anything
+else refuses the start. A read given up is a 502 `badGateway` of origin `gate` (a read already begun is reset), as the
+gate's own timer always was; the platform's `[sandbox.gate]` declares it, so a platform that sets it shortens how long
+an agent's REST read hangs through an outage.
 
 `listing` is the data path's listing mode (gatepolicy, O21), `paged` when absent; a gate given another refuses to
 start. In `complete` the gate answers a listing with all of the directory's entries as one page, which it merges from
@@ -261,14 +267,16 @@ def _tcp_facts(sock) -> dict:
     return out
 
 
-# The gate must never give up before the client would. A client's effective timeouts can be 8 s to connect
+# By default the gate never gives up before the client would. A client's effective timeouts can be 8 s to connect
 # (TCP and TLS) and 4 h to read; behind the gate the client's 8 s covers only
 # the hop to the gate, and it then waits up to 4 h for the answer. So upstream (Onezone and Oneprovider alike) the gate
 # allows 60 s to connect and hand-shake, plus one transparent retry, and 4 h to read. An earlier gate with an 8 s
-# bound returned a 502 when a TLS handshake to the zone ran out of it under load.
+# bound returned a 502 when a TLS handshake to the zone ran out of it under load. The read bound is the platform's to
+# declare (`[sandbox.gate] upstream_read_timeout_s`, O85): a value below the client's 4 h makes the gate the one that
+# gives a hung read up, as a 502 of origin `gate`, so it is a setting of the run and is in the campaign's fingerprint.
 UPSTREAM_CLOSED_AFTER_BODY = "after_body"  # the fixed word of the line's `upstream_closed` (O85)
 CONNECT_TIMEOUT = 60  # gate config `upstream_connect_timeout_s` overrides
-READ_TIMEOUT = 14400  # not below the client's read timeout: the gate must never fail first
+READ_TIMEOUT = gatepolicy.UPSTREAM_READ_TIMEOUT_S  # gate config `upstream_read_timeout_s` overrides (O85): 14400
 LOCAL_ERRNOS = {
     errno.EMFILE,
     errno.ENFILE,
@@ -321,7 +329,9 @@ def _upstream_conn(h: dict) -> http.client.HTTPConnection:
             (dial, address[1]), timeout, source
         )
     conn.connect()
-    conn.sock.settimeout(READ_TIMEOUT)  # short connect, then a read timeout that outlasts the client's
+    conn.sock.settimeout(
+        CFG.get("upstream_read_timeout_s", READ_TIMEOUT)
+    )  # short connect, then the declared read bound
     return conn
 
 
@@ -1827,6 +1837,11 @@ def _read_token(path: str | None) -> str:
         return ""
 
 
+def _positive_seconds(value: object) -> bool:
+    """Whether a configured timeout is a positive finite number of seconds (a boolean is no number here)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+
 def main() -> None:
     with open(sys.argv[1]) as handle:
         CFG.update(json.load(handle))
@@ -1835,6 +1850,8 @@ def main() -> None:
         raise SystemExit("the gate has no token to add to the requests it forwards")
     if CFG.get("listing", gatepolicy.PAGED) not in gatepolicy.LISTINGS:  # O21: never a mode it would guess at
         raise SystemExit("the gate's listing mode is not one it knows")
+    if not _positive_seconds(CFG.get("upstream_read_timeout_s", READ_TIMEOUT)):  # O85: never a bound it would guess at
+        raise SystemExit("the gate's upstream read timeout is not a positive number of seconds")
     _start_peer_check()  # before any listener: the HTTPS one and every forward judge their peers by it
     for f in CFG.get("tcp_forwards", []):
         _tcp_forward(f["listen"], f["host"], f["port"])
