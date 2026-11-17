@@ -291,6 +291,7 @@ preload = [{{ path = "@root@/pins/hook.so", sha256 = "{SHA["preload"]}" }}]
 binds = [{{ path = "@root@/pins/extra.conf", sha256 = "{SHA["bind"]}", target = "/etc/extra.conf" }}]
 oneclient_bundle = "@root@/pins/oneclient.tar"
 oneclient_bundle_sha256 = "{SHA["bundle"]}"
+provider_storage = "tmpfs"
 
 [sandbox.apptainer.gate_options]
 read_timeout_s = 30
@@ -471,6 +472,8 @@ IN = {
                                                                    'target = "/etc/other.conf"')),
     "sandbox.apptainer.gate_options": edit("apptainer", platform("read_timeout_s = 30", "read_timeout_s = 31")),
     "sandbox.apptainer.oneclient_bundle_sha256": edit("apptainer", platform(SHA["bundle"], SHA["gate"])),
+    "sandbox.apptainer.provider_storage": edit("apptainer", platform('provider_storage = "tmpfs"',
+                                                                     'provider_storage = "shared_filesystem"')),
     "placement.holder": edit("docker", platform('holder = "birch"', 'holder = "pine"')),
     "placement.map": edit("docker", platform('map = "ranges.toml"\n', "")),
     "placement.map.*.file": edit("docker", ("ranges.toml", 'file = "dir/file.bin"', 'file = "dir/other.bin"')),
@@ -529,7 +532,8 @@ IN_REASONS = {
     "sandbox": "what the agent runs in and is held to: images by id, limits, mount, interpreter, user, grace, pins",
     "sandbox.data_paths": "each level's data path, listing and I/O mode (O21, O36)",
     "sandbox.served_bytes": "the caps of a run's tables of the bytes served, which bound its evidence (O22)",
-    "sandbox.apptainer": "the Apptainer backend's pins and watch: image, egress shim and collector, memory guard (O56)",
+    "sandbox.apptainer": "the Apptainer backend's pins and watch (image, egress shim and collector, memory guard: O56) "
+    "and the kind of storage the providers keep their data on, tmpfs or shared (O57)",
     "placement": "where a run's bytes lie (data provider, range map), and the bounds its probes and ingest read",
     "faults": "the injector's sanction, targets and every bound of its restore and heal, which decide a run's fate",
 }
