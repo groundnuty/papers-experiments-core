@@ -42,7 +42,7 @@ def shards():
 
 
 def test_b1_the_check_finds_a_python_without_both_flags():
-    """B1: the check itself: a Python by any of its names, followed by anything but `-I -B`, is found."""
+    """O57 (B1): the check itself: a Python by any of its names, followed by anything but `-I -B`, is found."""
     assert unflagged(["/venv/bin/python", "-I", "x.py"]) == ["/venv/bin/python"]
     assert unflagged(["env", "-i", "A=b", "python3.11", "-B", "-I", "x.py"]) == ["python3.11"]
     assert unflagged(["srun", "/usr/bin/env", "-i", "python3", "-I", "-B", "-m", "expcore"]) == []
@@ -57,7 +57,7 @@ def _plan(shards, tmp_path):
 
 
 def test_b1_the_shard_step_line_and_the_merge_run_their_python_with_both_flags(shards, tmp_path):
-    """B1: the step's line (its Python on the node) and the merge `collect` prints or runs on the login node."""
+    """O57 (B1): the step's line (its Python on the node) and the merge `collect` prints or runs on the login node."""
     plan = _plan(shards, tmp_path)
     fed = {"job": "4343", "name": "hpcop-p-1234-sandbox", "node": "node07", "het_group": None}
     line = shards.step_argv(plan, plan.shards[0], fed, SCRIPT)
@@ -66,7 +66,7 @@ def test_b1_the_shard_step_line_and_the_merge_run_their_python_with_both_flags(s
 
 
 def test_b1_the_dispatcher_and_the_expcore_it_runs_take_both_flags(shards, tmp_path, monkeypatch):
-    """B1: the dispatcher's own interpreter, and the `expcore run` it runs in its own process (so its imports are
+    """O57 (B1): the dispatcher's own interpreter, and the `expcore run` it runs in its own process (so its imports are
     under `-B` too): its first words still take that argv for `python -I -B -m expcore` and run it in process."""
     seen = []
 
@@ -91,8 +91,9 @@ def test_b1_the_dispatcher_and_the_expcore_it_runs_take_both_flags(shards, tmp_p
 
 
 def test_b1_the_dispatchers_expcore_runs_in_process_and_writes_no_bytecode(shards, tmp_path):
-    """B1: run through the dispatcher's first words, `python -I -B -m expcore` runs in the dispatcher's own process,
-    whose `-B` holds for every import (`sys.dont_write_bytecode`), and it still swaps the step's record as it ends."""
+    """O57 (B1): run through the dispatcher's first words, `python -I -B -m expcore` runs in the dispatcher's own
+    process, whose `-B` holds for every import (`sys.dont_write_bytecode`), and it still swaps the step's record as it
+    ends."""
     work = tmp_path / "work"
     work.mkdir()
     (work / ".step.ended.json").write_text(json.dumps({"phase": "archiving"}))
@@ -108,7 +109,7 @@ def test_b1_the_dispatchers_expcore_runs_in_process_and_writes_no_bytecode(shard
 
 
 def test_b1_the_steps_expcore_run_takes_both_flags(shards, tmp_path):
-    """B1: the `expcore run` argv `step` hands its dispatcher."""
+    """O57 (B1): the `expcore run` argv `step` hands its dispatcher."""
     study = tmp_path / "study"
     study.mkdir()
     (study / "study.toml").write_text("[study]\n")
@@ -129,8 +130,8 @@ def test_b1_the_steps_expcore_run_takes_both_flags(shards, tmp_path):
 
 
 def test_b1_the_sandboxs_helpers_on_the_node_take_both_flags(tmp_path):
-    """B1: the gate and the egress collector (the node's interpreter, or the core's), the mount's watcher and the copy
-    helper: each a Python the dispatcher starts on the node."""
+    """O57 (B1): the gate and the egress collector (the node's interpreter, or the core's), the mount's watcher and the
+    copy helper: each a Python the dispatcher starts on the node."""
     node = FakeNode()
     box = start(node, make_settings(tmp_path))
     try:
@@ -158,8 +159,8 @@ NODE_PYTHON = re.compile(r'"\$HPCOP_PY"(?P<rest>[^\n]*)')
 
 
 def test_b1_every_python_the_bundles_scripts_run_on_a_node_takes_both_flags():
-    """B1: every `"$HPCOP_PY"` the bundle's scripts run takes `-I -B`; its `--version` (the probe's) and the list of
-    tools node-init checks are no runs of a script. The Pythons of a service's rootfs (`python3 -I /root/...`, which
+    """O57 (B1): every `"$HPCOP_PY"` the bundle's scripts run takes `-I -B`; its `--version` (the probe's) and the list
+    of tools node-init checks are no runs of a script. The Pythons of a service's rootfs (`python3 -I /root/...`, which
     patch.sh writes and check-defaults.sh pins byte for byte) are the image's, not the node's, and stay as they are."""
     found = 0
     for script in sorted((HPC / "bundle").glob("*.sh")) + sorted((HPC / "bundle").glob("*.sbatch")):

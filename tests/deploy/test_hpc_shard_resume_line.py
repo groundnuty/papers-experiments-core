@@ -149,8 +149,8 @@ def world(hpc, shards, resume, tmp_path):
 
 
 def test_resume_line_prints_the_shards_resume_in_the_operators_job_and_records_its_node(world):
-    """The line: the shard's step in job J on node N (no het group), in `/`, named as every step of the shard, every
-    Python isolated and writing no bytecode, with --resume; and J and N recorded in the federation's state."""
+    """O63: The line: the shard's step in job J on node N (no het group), in `/`, named as every step of the shard,
+    every Python isolated and writing no bytecode, with --resume; and J and N recorded in the federation's state."""
     world.snapshot(world.fingerprint())
     line = flagged(world.line())
     fed = world.shards.federation(world.plan.shards[0])
@@ -167,7 +167,7 @@ def test_resume_line_prints_the_shards_resume_in_the_operators_job_and_records_i
 
 
 def test_resume_line_passes_the_proof_that_the_marked_step_is_gone(world):
-    """A running mark the killed step left, naming a step no longer listed: the line carries its nonce (`--over`),
+    """O63: A running mark the killed step left, naming a step no longer listed: the line carries its nonce (`--over`),
     which the step needs to take it over on another node."""
     world.snapshot(world.fingerprint())
     mark = world.plan.results / "fed-a" / "running.json"
@@ -186,7 +186,7 @@ def refused(world, match, **given):
 
 
 def test_resume_line_refuses_while_a_step_of_the_shard_is_listed_anywhere(world):
-    """A step carrying the shard's step name under any job of this user's (here the agent's own) lives: refused."""
+    """O63: A step carrying the shard's step name under any job of this user's (here the agent's own) lives: refused."""
     world.snapshot(world.fingerprint())
     fed = world.shards.federation(world.plan.shards[0])
     world.fake.steps[f"{fed['name']}-shard-1"] = "4343.9"
@@ -194,7 +194,7 @@ def test_resume_line_refuses_while_a_step_of_the_shard_is_listed_anywhere(world)
 
 
 def test_resume_line_refuses_while_the_step_its_mark_names_is_listed(world):
-    """The running mark names a step still listed (under its own name, here): refused."""
+    """O63: The running mark names a step still listed (under its own name, here): refused."""
     world.snapshot(world.fingerprint())
     mark = world.plan.results / "fed-a" / "running.json"
     mark.write_text(json.dumps({"format": "expcore-hpc-shard-running/1", "shard": SPEC, "nonce": "a" * 32,
@@ -204,7 +204,7 @@ def test_resume_line_refuses_while_the_step_its_mark_names_is_listed(world):
 
 
 def test_resume_line_refuses_a_mark_that_names_no_step(world):
-    """A mark it cannot show gone (no job or step in it): refused, never taken for gone."""
+    """O63: A mark it cannot show gone (no job or step in it): refused, never taken for gone."""
     world.snapshot(world.fingerprint())
     mark = world.plan.results / "fed-a" / "running.json"
     mark.write_text(json.dumps({"format": "expcore-hpc-shard-running/1", "shard": SPEC, "nonce": "a" * 32}))
@@ -221,12 +221,15 @@ def test_resume_line_refuses_a_mark_that_names_no_step(world):
     ids=["the services' job", "another node", "no such job"],
 )
 def test_resume_line_refuses_a_job_that_is_not_the_operators_free_one_on_the_node(world, change, match):
+    """O63: the services' job of a federation, a job on another node than the one named, and an id Slurm does not know
+    are refused, and nothing is recorded."""
     world.snapshot(world.fingerprint())
     world.fake.job_states["6161"] = "GONE"  # Slurm knows no such id
     refused(world, match, **change)
 
 
 def test_resume_line_refuses_a_job_that_is_not_this_users_or_not_running(world):
+    """O63: a job of another user's (its UserId), and one that is not RUNNING, are refused."""
     world.snapshot(world.fingerprint())
     world.fake.component_recorded[(JOB, 0)] = {"UserId": "another(1)"}
     refused(world, "not this user's")
@@ -235,7 +238,7 @@ def test_resume_line_refuses_a_job_that_is_not_this_users_or_not_running(world):
 
 
 def test_resume_line_refuses_a_job_whose_steps_hold_its_cores(world):
-    """The job's running steps hold 4 of its 9 cores: the manifest's 8 are not free."""
+    """O63: The job's running steps hold 4 of its 9 cores: the manifest's 8 are not free."""
     world.snapshot(world.fingerprint())
     rows = [f"{JOB}|RUNNING|cpu=9,mem=18G,node=1", f"{JOB}.batch|RUNNING|cpu=9,mem=18G,node=1",
             f"{JOB}.3|RUNNING|cpu=4,mem=2G,node=1", f"{JOB}.2|COMPLETED|cpu=9,mem=18G,node=1"]  # fmt: skip
@@ -246,11 +249,12 @@ def test_resume_line_refuses_a_job_whose_steps_hold_its_cores(world):
 
 
 def test_resume_line_refuses_a_shard_with_no_snapshot(world):
+    """O63: a shard with no snapshot newer than its archive has nothing a resume elsewhere continues: refused."""
     refused(world, "no snapshot of it verifies")
 
 
 def test_resume_line_refuses_a_snapshot_of_another_campaign(world):
-    """The snapshot pins a fingerprint the study does not, with this federation's platform file: refused before a
+    """O63: The snapshot pins a fingerprint the study does not, with this federation's platform file: refused before a
     node is taken."""
     pinned = world.fingerprint()
     world.snapshot({**pinned, "seeds": ["another"]})
@@ -258,6 +262,8 @@ def test_resume_line_refuses_a_snapshot_of_another_campaign(world):
 
 
 def test_resume_line_refuses_when_another_shard_pins_another_campaign(world):
+    """O63: the other shard's newest snapshot pins another fingerprint: the shards would never merge, so refused before
+    a node is taken."""
     pinned = world.fingerprint()
     world.snapshot(pinned)
     world.snapshot({**pinned, "seeds": ["another"]}, label="fed-b", index=2)
@@ -266,6 +272,7 @@ def test_resume_line_refuses_when_another_shard_pins_another_campaign(world):
 
 
 def test_resume_line_refuses_while_the_federation_is_not_linked(world):
+    """O63: a federation whose state is not linked (going down, say) is refused before anything is read of Slurm."""
     world.snapshot(world.fingerprint())
     path = world.root / "hpc-federation.json"
     state = world.state()
@@ -275,8 +282,8 @@ def test_resume_line_refuses_while_the_federation_is_not_linked(world):
 
 
 def test_up_refuses_an_agents_node_without_the_cores_python_on_the_nodes(hpc, shards, resume, tmp_path, monkeypatch):
-    """W2: down's sweep of a node a shard step ran on reaps the sandbox's killed runs with the core's reaper, so up
-    asks for the core's Python on the nodes (HPC_CORE_PYTHON) with an agent's node, before it submits anything."""
+    """O63 (W2): down's sweep of a node a shard step ran on reaps the sandbox's killed runs with the core's reaper, so
+    up asks for the core's Python on the nodes (HPC_CORE_PYTHON) with an agent's node, before it submits anything."""
     import hpc_fed_support
 
     real = hpc_fed_support.agent_site
@@ -290,6 +297,7 @@ def test_up_refuses_an_agents_node_without_the_cores_python_on_the_nodes(hpc, sh
 
 
 def test_the_command_line_refuses_a_manifest_it_cannot_read(shards, tmp_path, capsys):
+    """O63: `shards.py resume-line` with a manifest that cannot be read exits 2, naming it, and prints no line."""
     assert shards.main(["resume-line", "--manifest", str(tmp_path / "none.toml"), "--label", "fed-a", "--job", JOB,
                         "--node", NODE]) == 2  # fmt: skip
     assert "could not be read" in capsys.readouterr().err
@@ -299,6 +307,8 @@ def test_the_command_line_refuses_a_manifest_it_cannot_read(shards, tmp_path, ca
 
 
 def test_w1_down_sweeps_the_node_a_shard_was_resumed_on_in_its_job_and_never_cancels_that_job(world):
+    """O63 (W1): down sweeps the agent's node and the node resume-line recorded, in the job it recorded, each by the
+    core's Python; it cancels the federation's jobs and never the operator's, and removes the root."""
     world.snapshot(world.fingerprint())
     world.line()
     printed = world.driver.down()
@@ -311,6 +321,8 @@ def test_w1_down_sweeps_the_node_a_shard_was_resumed_on_in_its_job_and_never_can
 
 
 def test_w1_a_resume_job_that_ended_is_said_and_never_stepped_into(world, capsys):
+    """O63 (W1): a recorded resume job that ended is said and no step goes into it (its id may be another job's by now);
+    down still finishes."""
     world.snapshot(world.fingerprint())
     world.line()
     world.fake.job_states[JOB] = "GONE"
@@ -320,6 +332,7 @@ def test_w1_a_resume_job_that_ended_is_said_and_never_stepped_into(world, capsys
 
 
 def test_w1_a_sweep_of_the_resume_node_that_fails_keeps_the_root(world):
+    """O63 (W1): a sweep of the resume node that fails keeps the root and its state for a second down."""
     from hpc_fed_support import FakeProcess
     from hpcslurm import Completed
 
@@ -332,6 +345,8 @@ def test_w1_a_sweep_of_the_resume_node_that_fails_keeps_the_root(world):
 
 
 def test_the_launcher_steps_into_no_job_the_state_does_not_record_a_resume_in(world):
+    """O63 (W1): the launcher runs a step in a job of the operator's only where the state records a resume of this
+    federation's shard."""
     with pytest.raises(world.hpc.state.StateError, match="no shard of this federation was resumed in"):
         world.driver.launcher.control(NODE, ["true"], name="x-sweep", timeout_s=5, job=JOB)
 
@@ -343,6 +358,8 @@ def test_the_launcher_steps_into_no_job_the_state_does_not_record_a_resume_in(wo
     ids=["a job that is no id", "a node that is no name", "a missing name"],
 )  # fmt: skip
 def test_a_state_whose_shard_nodes_are_not_slurms_is_refused(world, entry):
+    """O63 (W1): down steps into each recorded job on its node, so a `shard_nodes` entry must be a job id, a node name,
+    a label and a job name."""
     path = world.root / "hpc-federation.json"
     path.write_text(json.dumps({**world.state(), "shard_nodes": [entry]}), encoding="utf-8")
     with pytest.raises(world.hpc.state.StateError, match="shard_nodes"):

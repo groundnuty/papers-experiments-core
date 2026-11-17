@@ -1,12 +1,16 @@
 """shards.py: one shard of a campaign per HPC federation (#154, milestone M5), from launch to merge.
 
-    uv run python deploy/hpc-federation/shards.py plan    --manifest shards.toml
-    uv run python deploy/hpc-federation/shards.py lines   --manifest shards.toml
-    <python> -I deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
-        --results DIR --core-src DIR                    # inside the step on the sandbox node; `lines` writes it
-    uv run python deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
-    <python> -I deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
-    <node python> -I deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
+    <python> -I -B deploy/hpc-federation/shards.py plan    --manifest shards.toml
+    <python> -I -B deploy/hpc-federation/shards.py lines   --manifest shards.toml
+    <python> -I -B deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
+        --results DIR --core-src DIR --job J --step-name S  # inside the step on the sandbox node; `lines` writes it
+    <python> -I -B deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
+    <python> -I -B deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
+    <python> -I -B deploy/hpc-federation/shards.py resume-line --manifest M --label L --job J --node N
+    <core python> -I -B deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
+
+Every Python here runs with `-I -B` (B1, live slot 5: a node step's imports wrote bytecode into the core's interpreter
+under the account's shared home; `-I` ignores PYTHONDONTWRITEBYTECODE, so only the flag stops it).
 
 **Where the dispatcher runs.** One shard runs per federation, as one job step on that federation's sandbox node: the
 Apptainer sandbox's data gate listens on that node's loopback and its cells are that node's `apptainer exec`s, so the
@@ -70,6 +74,14 @@ no `campaign.lock`, does not verify, or is missing is refused, naming its label:
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
 own, and `EXPCORE_FED_ROOT` is how it finds that root. Outage runs on HPC depend on that relay.
+
+**What a step killed outright leaves, and a resume on another node (W1, W2, live slot 5).** Its sandbox's run, a
+dead FUSE mount in it: the next step on the node reaps the work root before it uses it (`reap_work_root`, the core's
+Apptainer reaper), and `sweep`, on every node a shard step of the federation ran on, reaps it too and removes the work
+root once empty. The shard's running mark on the shared results directory (`claim_running`) is what stops two steps
+of one shard on two nodes. `resume-line` (`shardresume.py`, login node only) prints a resume's line for a held job of
+the operator's on another node, after its checks, and records the job and the node in the federation's state, so
+`down` sweeps that node too.
 
 **Snapshots, and a step killed outright (O62).** The step's `out/` is on the node's tmpfs, so a step killed outright
 (walltime, a node's end, an OOM in the step's cgroup) would lose all of it. While the dispatcher runs, `step`

@@ -164,7 +164,8 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   and curl among them (`status.sh`, which writes nothing, points them there without making it: `home_at`); a shard step's dispatcher gets them in the step's own directory (`shards.py step`). Nothing else, and never a secret. The bundle's helpers
   then run on the first `python3.11` on that `PATH` (`lib.sh`'s default `HPCOP_PY`), which must be the node's own:
   `supervise.py`, which holds every service, needs `os.pidfd_open`, which uv's standalone Python lacks. Only the core's
-  step (`HPC_CORE_PYTHON`) runs a venv's Python.
+  step and `down`'s sweep of a node a shard step ran on (`HPC_CORE_PYTHON`), and the shard step itself (its
+  manifest's `python`), run a venv's Python.
 - **Every write on a node is under the node's tmpfs**, never Slurm's per-job `$TMPDIR`: on the site that is a link
   into a shared filesystem with a file quota. The allowlist sets `TMPDIR` itself, and the bundle refuses a `TMPDIR`
   that is a link (`lib.sh`). Work directories are the bundle's `mktemp -d <tmpfs>/hpcop-<oz|op>.XXXXXX` (0700); the
@@ -181,8 +182,15 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   pipe are finished whatever the first does. Ending a client is verified (SIGTERM, then SIGKILL, each only while the
   pid still has its recorded start tick), and `down` also ends any `srun --jobid=<job>` of ours on the same login node (run `down` where `up` ran) that
   no record names (one spawned just before a crash).
-- **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python a
-  step runs takes `-I -B`.
+- **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python the
+  driver and the shard driver launch, on a node or on the login node, takes `-I -B` (the bundle's `"$HPCOP_PY"`, the
+  fault relay, the shard step, its dispatcher and its `expcore run`, the merge, and the sandbox's gate, collector,
+  mount watcher and copy helper on the node). `-I` alone ignores `PYTHONDONTWRITEBYTECODE`, so only the flag stops
+  it: live slot 5 found a shard step's first import of a stdlib module writing its `.pyc` into the core's interpreter,
+  which uv had installed under the account's home, shared by every job and agent of the account. **Install the venv's
+  interpreter under the site directory** (`UV_PYTHON_INSTALL_DIR=<site dir>/python` before `uv sync`), never in the
+  shared home, so a node step that writes there by any other path still writes into the site's own tree. The fake Slurm
+  of the tests fails any command that runs a Python without both flags.
 - **The core the driver imports is recorded**: `up` writes the resolved paths of `expcore_onedata`, `fedlayout` and
   `hpcfed` into the state file, and refuses to run when `expcore_onedata` is not imported from this checkout's `src`.
   The core's step (`[hpc] core = "step"`) makes the same check on the node and exits 97 on a mismatch, which fails
@@ -239,6 +247,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   },
   "clients": {"<step name>": {"pid": 0, "start": 0}},
   "relay": {"pid": 0, "start": 0, "log": "<log dir>/<allocation name>-fault-relay.log"},
+  "shard_nodes": [{"job": "<the operator's job id>", "node": "<node>", "label": "<shard>", "name": "<its job name>"}],
   "phase": "preflight | submitted | placed | zone | providers | bootstrapped | linked | stopping | down"
 }
 ```
@@ -248,6 +257,11 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   its step with `--jobid=<sandbox.job>`, plus `--het-group=<sandbox.het_group>` when that is not `null`; S's facts
   (FQDN, address) are in `services.sandbox`, the role's record. `down` cancels `sandbox.job` itself only under
   `separate`; under `het` the leader's cancel ends S's component.
+- **`shard_nodes`** (absent until one is recorded) are the nodes a shard of this federation was resumed on outside its
+  own jobs, each in the operator's held job it was resumed in: `shards.py resume-line` records one, under the root's
+  lifecycle lock, before it prints the line that starts the step there. `down` sweeps each such node in that job, only
+  while the job runs and still carries the recorded name (Slurm reuses ids), and never cancels it; the launcher runs a
+  step in such a job on its recorded node alone.
 - **`site`** is what `up` read from `site.env` (no secret): every later command reads it here, so `down` and the
   service verbs need no environment. **`command`** is this driver's argv prefix, which `platform.toml`'s `[faults]
   command` holds. **`clients`** are the detached srun clients of the service steps, by step name, which `down` ends
@@ -353,7 +367,14 @@ removed while held would let the next `up` or `down` lock another file of the sa
    the zone), each bounded by `stop_seconds`; then wait until no step but `batch` and `extern` is listed in `squeue -s`
    under the held job's id and, under `het`, its component 1's own id (S's steps, a shard step's among them, are listed
    there alone), one deadline for both (ending each service step's srun client only then); a step still listed at the
-   bound is cancelled by its own id.
+   bound is cancelled by its own id. **A cancel's own exit status is no verdict:** on a heterogeneous job `scancel
+   <leader>.<n>` printed "Invalid job id specified" and exited 225 while it did end the step (live slot 5); whether the
+   step left the list decides. **A cancel on that site was an outright kill** (the step's processes ended within a
+   second, no trap ran), which left each such service's work directory (2 to 2.6 GB of the node's tmpfs) on its node:
+   once a cancelled step has left the list, `down` removes the work directory the state recorded for that service, and
+   only one the bundle makes (`hpcstate.checked_workdir`), by `teardown.sh <kind> --workdir W --timeout 0` in a
+   control step on its node, and step 3 shows it gone. Nothing the state did not record is removed: a service whose
+   log never named a work directory is left to `leftovers.py`, which only counts.
 3. One read-only control step per node checks that no recorded work directory is left on it. A service whose step
    was launched but whose log never named a work directory (seen live: a zone that failed in node-init before making
    one) is clean only when both are shown: its step has ended (listed no more, once seen listed, or cancelled by its
@@ -572,8 +593,13 @@ against its declared SHA-256 before the cluster is touched, the work root, and t
 into the root is rendered absolute. M5 launches its shard's step on `sandbox.node` with `--jobid=<sandbox.job>`, plus
 `--het-group=<sandbox.het_group>` when that is not `null`; the step makes the sandbox's work root on S's tmpfs and copies
 the root's `platform.toml` beside the study's `study.toml`. The driver holds, reads back and places S, runs its node
-facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`: each shard step's directory of this
-federation whose step is gone), then releases it.
+facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`, by `HPC_CORE_PYTHON`, which `up` asks for
+with an agent's node: each shard step's directory of this federation whose step is gone; then the Apptainer run reaper
+over the sandbox's work root, each dead run's mounts unmounted, `fusermount3 -u` then `-uz`, shown gone by the mount
+table, before its directory and record go, and the work root removed once empty and no step directory is on the node),
+on S and on every node `shard_nodes` records, then releases it. A sweep that cannot reap (its leftovers, or a Python
+without the core) fails, and `down` keeps the root. The next shard step on a node reaps the same way before it uses its
+work root, and refuses when it cannot.
 
 ## 9. Assumptions a live slot verifies first
 

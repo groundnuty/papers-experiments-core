@@ -76,7 +76,7 @@ def rig(hpc, tmp_path, site, nodes, fake=None):
 def test_k1_down_removes_each_cancelled_services_recorded_work_directory_and_finishes_in_one_pass(
     hpc, tmp_path, site, cancel_rc
 ):
-    """K1: every service would not stop, so down cancels each step at the bound; once each has left the list, it
+    """O57 (K1): every service would not stop, so down cancels each step at the bound; once each has left the list, it
     removes the work directory the state recorded for that service (teardown.sh, on the service's own node), each
     shown gone, and the root goes: one pass. A cancel that exits 225 as it ends the step changes nothing."""
     nodes = Nodes()
@@ -96,8 +96,8 @@ def test_k1_down_removes_each_cancelled_services_recorded_work_directory_and_fin
 
 
 def test_k1_a_removal_that_leaves_the_directory_keeps_the_root_and_still_cancels_the_job(hpc, tmp_path, site):
-    """K1: a work directory still there after its removal is never passed: down says the service is unverified, keeps
-    the root and its state for a second down, and cancels the job all the same."""
+    """O57 (K1): a work directory still there after its removal is never passed: down says the service is unverified,
+    keeps the root and its state for a second down, and cancels the job all the same."""
     nodes = Nodes()
     driver, fake = rig(hpc, tmp_path, site, nodes)
     stuck = driver.store.read()["services"]["larch"]["workdir"]
@@ -110,8 +110,8 @@ def test_k1_a_removal_that_leaves_the_directory_keeps_the_root_and_still_cancels
 
 
 def test_k1_down_removes_nothing_its_state_did_not_record_as_the_bundles(hpc, tmp_path, site):
-    """K1: a recorded work directory that is not one the bundle makes (here, edited into the state) is never removed:
-    no removal step runs for it, the service stays unverified, and the others are removed as recorded."""
+    """O57 (K1): a recorded work directory that is not one the bundle makes (here, edited into the state) is never
+    removed: no removal step runs for it, the service stays unverified, and the others are removed as recorded."""
     nodes = Nodes()
     driver, _ = rig(hpc, tmp_path, site, nodes)
     driver.store.update(lambda s: (s["services"]["rowan"].update(workdir="/tmp/not-the-bundles"), s)[1])
