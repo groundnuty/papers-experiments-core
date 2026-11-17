@@ -1134,12 +1134,15 @@ launched through `shards.py` is refused. The manifest declares such variables by
 
     pass_env = ["FAULT_ACK_MODE"]   # an invented name; each once; the value is the operator's, read when `lines` runs
 
-A name matches `^[A-Z][A-Z0-9_]{0,63}$`, contains none of KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL or AUTH
+A name matches `^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$` (words of letters and digits joined by single underscores, none
+leading, trailing or doubled) and is at most 64 characters, contains none of KEY, TOKEN, SECRET, PASSWORD, PASSWD,
+CREDENTIAL or AUTH
 (any case, anywhere in it) and is none the step sets itself: the allowlist's, `HOME`, `TMPDIR`, the XDG, Apptainer, uv,
 pip and git variables of its own home, anything starting `EXPCORE_` or `PYTHON`; and none that changes how a program
-is loaded or started: anything starting `LD_` or `DYLD_`, `BASH_ENV`, `ENV`, `IFS`, `GCONV_PATH`, `LOCPATH` and `NLSPATH`
-(a library named by `LD_PRELOAD` runs before Python starts, so before the step's own checks, and the step's `env -i`
-words would carry it there). `plan` and `lines` read each value
+is loaded or started: anything starting `LD_`, `DYLD_`, `PERL5`, `RUBY` or `NODE_` (the loader's and the interpreters'
+options and paths), `GLIBC_TUNABLES`, `BASH_ENV`, `ENV`, `IFS`, `PS4`, `SHELLOPTS`, `PROMPT_COMMAND` (the shell's),
+`GCONV_PATH`, `LOCPATH` and `NLSPATH` (a library named by `LD_PRELOAD` runs before Python starts, so before the step's
+own checks, and the step's `env -i` words would carry it there). `plan` and `lines` read each value
 from the environment they run in before any line is printed (`resume-line` the same, before it records its node); a
 variable that is unset, or whose value is neither a plain word (`^[A-Za-z0-9._:=,+-]{0,128}$`, but not `.` or `..`) nor
 an absolute path (`^/[A-Za-z0-9._/-]{1,1024}$`, such as `/srv/example/artifacts/tree`, with no `..` or `.` part and no

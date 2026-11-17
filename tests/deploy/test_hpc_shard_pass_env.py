@@ -248,15 +248,18 @@ def test_o63_a_name_the_step_sets_itself_refuses_the_plan_naming_it(shards, tmp_
 
 
 LOADER_AND_SHELL = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
-                    "BASH_ENV", "ENV", "IFS", "GCONV_PATH", "LOCPATH", "NLSPATH"]  # fmt: skip
+                    "GLIBC_TUNABLES", "PERL5LIB", "PERL5OPT", "RUBYOPT", "RUBYLIB", "NODE_OPTIONS", "NODE_PATH",
+                    "BASH_ENV", "ENV", "IFS", "PS4", "SHELLOPTS", "PROMPT_COMMAND", "GCONV_PATH", "LOCPATH",
+                    "NLSPATH"]  # fmt: skip
 
 
 @pytest.mark.parametrize("name", LOADER_AND_SHELL)
 def test_o63_a_loader_or_shell_variable_refuses_the_plan_naming_only_it(shards, tmp_path, capsys, name):
     """O63: the dynamic loader's variables (a library named by `LD_PRELOAD` runs before Python starts, so before the
-    environment, identity and guard checks), the shell's start-up file and field separator, and the locale and
-    conversion paths change how a program is started: none can be declared, whatever the operator's environment holds
-    (it is not read: the name is refused first). The message names the variable and nothing else."""
+    environment, identity and guard checks), the Perl, Ruby and Node option and path families, the shell's start-up
+    file, field separator, trace prompt, options and prompt command, and the locale and conversion paths change how a
+    program is started: none can be declared, whatever the operator's environment holds (it is not read: the name is
+    refused first). The message names the variable and nothing else."""
     err = refused_plan(shards, tmp_path, capsys, f'pass_env = ["{name}"]')
     assert name in err
     assert "loaded or started" in err
@@ -276,18 +279,47 @@ def test_o63_a_step_refuses_a_loader_or_shell_variable_its_line_declares_with_no
 
 
 @pytest.mark.parametrize("name", ["LDAP_MODE", "LDFLAGS", "ENVIRONMENT_NAME", "IFS_MODE", "BASH_ENVIRONMENT",
-                                  "LOCPATHS", "DYLD", "LD"])  # fmt: skip
+                                  "LOCPATHS", "DYLD", "LD", "NODE", "NODEMODE", "PERL", "PS40", "A" * 64,
+                                  "S3_ALLOW_OUTAGE", "HPC_STUDY_ARTIFACTS"])  # fmt: skip
 def test_o63_a_name_that_only_starts_like_a_loader_or_shell_variable_is_still_accepted(shards, name):
-    """O63: the refusal is of the names, `LD_` and `DYLD_` as prefixes and the exact shell and locale names: no other
-    variable that begins alike is refused."""
+    """O63: the refusal is of the families (`LD_`, `DYLD_`, `PERL5`, `RUBY` and `NODE_` as prefixes) and of the exact
+    shell, locale and loader names: no other variable that begins alike is refused, and the pilot's two names pass."""
     assert shards.pass_env_name_problem(name) is None
 
 
+def test_o63_the_pilots_two_names_are_pinned_on_every_line(shards, tmp_path, capsys, monkeypatch):
+    """O63: `S3_ALLOW_OUTAGE` and `HPC_STUDY_ARTIFACTS`, the names a study of the pilot declares, are read from the
+    operator's environment and carried by every line as words of the step's environment and as `--pass-env` options."""
+    monkeypatch.setenv("S3_ALLOW_OUTAGE", "yes")
+    monkeypatch.setenv("HPC_STUDY_ARTIFACTS", TREE)
+    lines = printed(shards, tmp_path, capsys, "lines", 'pass_env = ["S3_ALLOW_OUTAGE", "HPC_STUDY_ARTIFACTS"]')
+    assert len(lines) == 2
+    for line in lines:
+        environ, argv = node_words(line)
+        assert environ["S3_ALLOW_OUTAGE"] == "yes"
+        assert environ["HPC_STUDY_ARTIFACTS"] == TREE
+        assert argv.count("--pass-env") == 2
+
+
 @pytest.mark.parametrize(
-    "name", ["lower_case", "1STARTS_WITH_DIGIT", "HAS-DASH", "WITH SPACE", "A" * 65, "", "NAME\\n"]
+    "name",
+    [
+        "lower_case",
+        "1STARTS_WITH_DIGIT",
+        "HAS-DASH",
+        "WITH SPACE",
+        "A" * 65,
+        "",
+        "NAME\\n",
+        "_LEADING",
+        "TRAILING_",
+        "DOUBLE__UNDERSCORE",
+        "A" * 63 + "_",
+    ],
 )
 def test_o63_a_name_that_is_not_a_plain_upper_case_name_refuses_the_plan(shards, tmp_path, capsys, name):
-    """O63: a name matches `^[A-Z][A-Z0-9_]{0,63}$` (a trailing newline included)."""
+    """O63: a name matches `^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$` and is at most 64 characters: words of letters and digits
+    joined by single underscores, none leading, trailing or doubled (a trailing newline included)."""
     err = refused_plan(shards, tmp_path, capsys, f'pass_env = ["{name}"]')
     assert "must match" in err
 
