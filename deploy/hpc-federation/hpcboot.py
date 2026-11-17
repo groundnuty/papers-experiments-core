@@ -23,6 +23,11 @@ real addresses (DESIGN.md, sections 5 and 6).
   `shared_filesystem` with a scratch root), which the platform layer records in the campaign fingerprint, and the
   rendered file is read back for it (`check_provider_storage`): a federation on scratch and one on tmpfs are two
   experiments.
+- **`[placement]`** is always in the rendered file (`with_placement`), since the platform layer requires it
+  (`rangemap.load_placement`) and a reader that finds none patches in a default of its own, which is how a setting
+  drifts unseen. A template that declares one keeps it as declared; a template that declares none gets every setting
+  at the core's default (`PlacementSettings`' fields, the one place the numbers are) and the first provider the file
+  declares as the holder, which the core has no default for and each `[[spaces]]` entry's own `holder` overrides.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -30,7 +35,7 @@ real addresses (DESIGN.md, sections 5 and 6).
 import json
 import math
 import os
-from dataclasses import dataclass, fields, replace
+from dataclasses import MISSING, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -48,6 +53,7 @@ from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
 
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
+from expcore_onedata.rangemap import PlacementSettings
 
 HTTPS_PORT = 8443  # every service's public port: its 443, moved by the port shim
 PROVIDER_STORAGE = "hpc_provider_storage"  # the value hpcpins.values fills: the providers' storage kind (O57)
@@ -227,18 +233,80 @@ def check_provider_storage(rendered: str, values: Mapping[str, str]) -> None:
     hpcpins.check_declared_kind(rendered, values.get(PROVIDER_STORAGE))
 
 
+def toml_scalar(value: Any) -> str:
+    """One setting as TOML text: a boolean as `true` or `false` (tested before the integers, which it is one of), an
+    integer and a finite float as Python spells them (TOML's spelling too) and a string as a basic string (JSON's).
+    A value of another type, or a float TOML cannot hold, is refused: a setting that a later core adds with a type
+    this cannot spell fails the render, and is never written as text the loader would read another way."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"a [placement] setting of {value} cannot be written as TOML")
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    raise TypeError(f"a [placement] setting of type {type(value).__name__} cannot be written as TOML")
+
+
+def placement_defaults() -> Dict[str, Any]:
+    """The core's own default of every `[placement]` setting but the holder, which has none: `PlacementSettings`'
+    fields, in their order. The one place the numbers are read from; none is written here."""
+    table: Dict[str, Any] = {}
+    for item in fields(PlacementSettings):
+        if item.name == "holder":
+            continue
+        if item.default is MISSING:
+            raise RuntimeError(f"PlacementSettings.{item.name} has no default for the render to write")
+        table[item.name] = item.default
+    return table
+
+
+def placement_holder(providers: Mapping[str, Any]) -> str:
+    """The holder of a `[placement]` table the render writes: the first provider the file declares. The core has no
+    default holder, and every `[[spaces]]` entry names its own data provider (which the provisioner uses), so this one
+    only has to be a provider of the file, as the loader requires; one rule, here, for every reader of the render."""
+    for name in providers:
+        return name
+    raise RuntimeError("the rendered platform file declares no provider, so [placement] has no holder to default to")
+
+
+def with_placement(text: str) -> str:
+    """The rendered platform file with `[placement]` in it. A template that declares one (read as TOML, so a header,
+    an inline table and a dotted key all count) is returned as it is, byte for byte; otherwise the table is appended,
+    every setting at the core's default (`placement_defaults`) and the first provider as the holder
+    (`placement_holder`). The platform layer requires the table and refuses a file without one, and a reader that
+    patched in a default of its own would be a second source of the numbers."""
+    data = tomllib.loads(text)
+    if "placement" in data:
+        return text
+    table = {"holder": placement_holder(data.get("providers", {})), **placement_defaults()}
+    rows = "".join(f"{key} = {toml_scalar(value)}\n" for key, value in table.items())
+    return (
+        f"{text.rstrip()}\n\n"
+        "# Written by the render (hpcboot.with_placement): the template declares no [placement], which the\n"
+        "# platform layer requires. Every setting at the core's default; the holder is the first provider, and\n"
+        "# each [[spaces]] entry's own holder overrides it.\n"
+        f"[placement]\n{rows}"
+    )
+
+
 def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, str]) -> str:
     """Write the platform file: the Compose placeholders from the facts, the HPC ones, and the token margin last, the
-    least the platform layer accepts for the rest of the file. Returns the text written. The kind of storage the
-    providers have is checked in the first render, before anything is written (`check_provider_storage`)."""
+    least the platform layer accepts for the rest of the file, and `[placement]` (`with_placement`) in both. Returns
+    the text written. The kind of storage the providers have is checked in the first render, before anything is written
+    (`check_provider_storage`)."""
     filled = {**placeholders(facts), **values, "hpc_token_margin_s": str(PROVISIONAL_MARGIN_S)}
     text = render(template, filled)
     check_provider_storage(text, values)
+    text = with_placement(text)
     write_private(path, text)
     if "@hpc_token_margin_s@" not in template:
         return text
     filled["hpc_token_margin_s"] = str(least_margin_s(path, text, float(values["hpc_settle_timeout_s"])))
-    text = render(template, filled)
+    text = with_placement(render(template, filled))
     write_private(path, text)
     return text
 
