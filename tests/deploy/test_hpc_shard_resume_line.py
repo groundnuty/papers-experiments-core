@@ -252,6 +252,90 @@ def test_resume_line_refuses_an_unset_declared_variable_before_it_records_anythi
     refused(world, "FAULT_ACK_MODE is not set")
 
 
+FIRST, LATER = "go-ahead", "changed-mode"  # the value the shard's first step passed, and one the operator holds later
+
+
+def lay_origin(world, values):
+    """The shard's first step's record of the values it passed, as the step's own writer makes it."""
+    world.shards.record_pass_env_origin(world.plan.results, SPEC, values)
+
+
+def refusal_naming_only(world, name):
+    """`resume-line` refuses, with the federation's state untouched, naming `name` and showing neither value."""
+    before = world.state()
+    with pytest.raises(world.shards.ShardsError) as caught:
+        world.line()
+    said = str(caught.value)
+    assert name in said
+    assert FIRST not in said
+    assert LATER not in said
+    assert world.state() == before  # nothing recorded
+    return said
+
+
+def test_resume_line_refuses_a_value_that_changed_since_the_first_step_naming_only_the_variable(world, monkeypatch):
+    """O63: the operator now holds another value of a declared variable than the shard's first step passed: the
+    resume's line is refused, before the job is looked at and before its node is recorded, naming the variable and
+    showing neither value."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", LATER)
+    world.snapshot(world.fingerprint())
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    said = refusal_naming_only(world, "FAULT_ACK_MODE")
+    assert "no line is printed" in said
+
+
+def test_resume_line_refuses_a_changed_value_before_it_asks_slurm_anything(world, monkeypatch):
+    """O63: the check is the first of the line's: a job that is not the operator's (here, one Slurm does not know)
+    does not hide it, so the operator learns the value first."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", LATER)
+    world.snapshot(world.fingerprint())
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    before = world.state()
+    with pytest.raises(world.shards.ShardsError, match="FAULT_ACK_MODE") as caught:
+        world.line(job="999999")
+    assert "not known to Slurm" not in str(caught.value)
+    assert world.state() == before
+
+
+def test_resume_line_with_the_values_of_the_first_step_prints_its_line(world, monkeypatch):
+    """O63: the same value again: the line is printed and the job and node recorded, as ever, and the origin is the
+    first step's, untouched."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    world.snapshot(world.fingerprint())
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    origin = world.plan.results / "fed-a" / "pass-env.json"
+    before = origin.read_bytes()
+    line = flagged(world.line())
+    assert f"FAULT_ACK_MODE={FIRST}" in line
+    assert world.state()["shard_nodes"] == [{"job": JOB, "node": NODE, "label": "fed-a", "name": "expcore-resume"}]
+    assert origin.read_bytes() == before
+
+
+def test_resume_line_refuses_a_manifest_that_dropped_a_variable_the_first_step_passed(world, monkeypatch):
+    """O63: the manifest declares nothing now, the first step passed a variable: the resumed shard would lose it,
+    so the line is refused, naming the variable."""
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    world.snapshot(world.fingerprint())
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    refusal_naming_only(world, "FAULT_ACK_MODE")
+
+
+def test_resume_line_refuses_an_origin_it_cannot_read_as_the_shards(world, monkeypatch):
+    """O63: an origin that is not a record of this shard refuses the line, as no record at all would not."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    world.snapshot(world.fingerprint())
+    origin = world.plan.results / "fed-a" / "pass-env.json"
+    origin.write_text("{")
+    before = world.state()
+    with pytest.raises(world.shards.ShardsError, match=r"pass-env\.json"):
+        world.line()
+    assert world.state() == before
+
+
 GUARD, POST = "raise SystemExit(0)  # guard\n", "raise SystemExit(0)  # post-run\n"
 
 

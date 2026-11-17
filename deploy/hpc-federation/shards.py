@@ -52,6 +52,17 @@ the archive's manifest. The post-run script runs in the dispatcher's environment
 `step` never reads the manifest, so `collect` refuses a shard whose manifest lacks a declared name or holds an
 undeclared one (`pass_env_problem`): a line that dropped a declaration with its word.
 
+**One value for a shard's whole life.** A first step that passes variables records each name and value once, in
+`<results>/<label>/pass-env.json` (`record_pass_env_origin`: whole, by an exclusive link, mode 0600, once it holds the
+shard's running mark; nothing is written when it passes none). Every later step compares what it passes with that
+record before anything is made or launched (`check_pass_env_origin`): `step` as its first act, whether or not it is a
+`--resume` (a first step killed before its first snapshot leaves the record and no archive), `resume-line` before it
+asks Slurm anything or records its node, and the fleet's `step`. A declared variable whose value differs, one the first
+step did not pass and one it passed that the line no longer carries are refused, naming the variable and never either
+value (status 73 for `step`); a record that cannot be read as the shard's is refused too, never taken for none. With
+no record (a first step, or one that passed nothing) nothing is compared. `plan` and `lines` print first steps' lines
+and are not compared.
+
 **One campaign across federations (C06).** A space is the same experimental condition across federations only when
 its declared identity and its data identity match, and the campaign fingerprint holds a space's data identity only when
 its federation's `platform.toml` declares it (`data_manifest`, which `up` renders and checks): otherwise it holds the
@@ -334,6 +345,10 @@ PASS_ENV_PATH = re.compile(r"/[A-Za-z0-9._/-]{1,1024}")
 PASS_ENV_SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH", re.IGNORECASE)
 PASS_ENV_OWN_PREFIXES = ("EXPCORE_", "PYTHON")
 PASS_ENV_OWN = frozenset({*ALLOWLIST, "HOME", "TMPDIR", *home_env(NO_HOME)})  # the step's own: never a declared one
+# The values a shard's first step passed, kept for its whole life (O63): `<results>/<label>/pass-env.json`, written by
+# that step once it holds the shard's running mark, and read by every later step, `resume-line` and the fleet's step.
+PASS_ENV_ORIGIN, PASS_ENV_ORIGIN_FORMAT = "pass-env.json", "expcore-hpc-shard-pass-env/1"
+PASS_ENV_ORIGIN_MAX = 1 << 16  # a record is a few names and short words: anything longer is not one
 
 
 class ShardsError(Exception):
@@ -449,6 +464,88 @@ def pin_pass_env(plan: Plan, environ: Mapping[str, str] | None = None) -> Plan:
             raise ShardsError(problem)
         pins.append((name, environ[name]))
     return replace(plan, pass_env_pins=tuple(pins))
+
+
+def read_pass_env_origin(results: Path, spec: Mapping[str, Any]) -> dict[str, str] | None:
+    """The name and value of each variable the shard's first step passed (`record_pass_env_origin`), or None when it
+    recorded none: no file, which is a shard not started yet or one whose first step passed nothing. A file that is
+    there and cannot be read as this shard's (empty, not JSON, of another shard, holding a name or a value a variable
+    may not carry, too long, a link) is `ShardsError` naming the file, never a value: it is never taken for none, so
+    that emptying or replacing it does not lift the rule."""
+    label = str(spec["label"])
+    path = results / label / PASS_ENV_ORIGIN
+    if not os.path.lexists(path):
+        return None
+    unreadable = (f"shard {label}: its first step's record of the variables it passed ({PASS_ENV_ORIGIN}) cannot be "
+                  "read as this shard's")  # fmt: skip
+    try:
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:  # no link is followed
+            raw = handle.read(PASS_ENV_ORIGIN_MAX + 1) if stat.S_ISREG(os.fstat(handle.fileno()).st_mode) else b""
+        record = json.loads(raw) if len(raw) <= PASS_ENV_ORIGIN_MAX else None
+    except (OSError, ValueError):
+        raise ShardsError(unreadable) from None
+    values = record.get("pass_env") if isinstance(record, dict) else None
+    if (
+        not isinstance(record, dict)
+        or record.get("format") != PASS_ENV_ORIGIN_FORMAT
+        or record.get("shard") != dict(spec)
+        or not isinstance(values, dict)
+        or any(pass_env_name_problem(name) or pass_env_value_problem(name, value) for name, value in values.items())
+    ):
+        raise ShardsError(unreadable)
+    return dict(values)
+
+
+def check_pass_env_origin(results: Path, spec: Mapping[str, Any], given: Mapping[str, str]) -> None:
+    """A shard's declared variables keep the values its first step passed, for the shard's whole life: `given` (the
+    name and value of each variable a later step would pass: a resume, a plain launch after a first step killed before
+    it archived anything, a fleet's step) must be exactly what that step recorded. `ShardsError` naming each variable
+    that is not, one that is added or dropped included, and never a value, before anything is launched. Nothing is
+    compared when the shard has no record of a first step (`read_pass_env_origin`)."""
+    recorded = read_pass_env_origin(results, spec)
+    if recorded is None:
+        return
+    changed = sorted(name for name in {*recorded, *given} if recorded.get(name) != given.get(name))
+    if changed:
+        many = len(changed) > 1
+        raise ShardsError(
+            f"shard {spec['label']}: pass_env variable{'s' if many else ''} {', '.join(changed)} "
+            f"{'are' if many else 'is'} not what its first step passed (recorded in {PASS_ENV_ORIGIN}): a shard's "
+            "declared variables keep one value across its whole life"
+        )
+
+
+def record_pass_env_origin(results: Path, spec: Mapping[str, Any], passed: Mapping[str, str]) -> None:
+    """The shard's first step records what it passed, in `<results>/<label>/pass-env.json`: made whole in a draft of
+    its own and put in place by an exclusive link, so a reader never sees a part of it and a later step never replaces
+    it. Written only when the step passed a variable (with none, the results directory is what it was). A record that
+    is already there is compared instead (`check_pass_env_origin`), so two first steps that raced agree or one is
+    refused. `ShardsError` when it differs, cannot be read or cannot be written: a step that cannot record its values
+    does not start."""
+    label = str(spec["label"])
+    if not passed:
+        check_pass_env_origin(results, spec, passed)
+        return
+    path = results / label / PASS_ENV_ORIGIN
+    draft = path.with_name(f".{PASS_ENV_ORIGIN}.{secrets.token_hex(8)}.draft")
+    record = {"format": PASS_ENV_ORIGIN_FORMAT, "shard": dict(spec), "pass_env": dict(passed)}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with os.fdopen(os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(draft, path)
+        except FileExistsError:
+            check_pass_env_origin(results, spec, passed)  # another first step won the link: it must have passed these
+    except OSError as error:
+        raise ShardsError(
+            f"shard {label}: its first step's variables could not be recorded in {PASS_ENV_ORIGIN} "
+            f"({type(error).__name__}): a step that cannot record them does not start"
+        ) from None
+    finally:
+        draft.unlink(missing_ok=True)
 
 
 def load_plan(path: Path) -> Plan:
@@ -2031,6 +2128,22 @@ def check_pass_env(args: argparse.Namespace) -> dict[str, str]:
     return passed
 
 
+def check_pass_env_stable(args: argparse.Namespace, passed: Mapping[str, str]) -> None:
+    """The variables this step passes are the ones the shard's first step passed, each with the same value
+    (`check_pass_env_origin`, on the shard's directory of `--results`): `StepRefused` naming each that is not, never a
+    value, before anything is made. A label the core does not accept is left to `step`'s own refusal of it, which
+    comes later and is what it always was (the label names a directory here, and is looked up only once it is one)."""
+    spec = {"index": args.index, "count": args.count, "label": args.label}
+    try:
+        _label_ok(args.index, args.count, args.label)
+    except (ShardsError, ImportError):  # a core that cannot be imported is `step`'s own refusal (CORE_MISMATCH), next
+        return
+    try:
+        check_pass_env_origin(args.results, spec, passed)
+    except ShardsError as error:
+        raise StepRefused(str(error)) from None
+
+
 def step(
     args: argparse.Namespace,
     *,
@@ -2054,6 +2167,7 @@ def step(
     pass archives its results marked not final and ends with `POST_RUN_FAILED`."""
     try:
         passed = check_pass_env(args)  # what the line declares, before anything of the study's runs
+        check_pass_env_stable(args, passed)  # and what the shard's first step passed: one value for its whole life
         identity = check_render_identity(args)  # the federation's render is the plan's, before the study's own guard
         guard, post_hook = start_hooks(args)
     except StepRefused as error:
@@ -2089,6 +2203,11 @@ def step(
         clear_leftovers(args.tmpfs, spec, os.environ.get("EXPCORE_FED_ROOT"), args.results)
     mark = claim_running(args, spec)  # no other step of the shard runs anywhere from here until this one ends
     try:
+        try:  # the shard's first step records what it passed; a later one, or a racing first one, is compared again
+            record_pass_env_origin(args.results, spec, passed)
+        except ShardsError as error:
+            print(f"shards: ERROR: {error}; the step is refused before its dispatcher starts", file=sys.stderr)
+            return PRE_STEP_REFUSED
         return _run_step(args, spec, runner, snapshots, node, identity, guard, post_hook, passed)
     finally:
         release_running(args, mark)

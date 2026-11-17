@@ -296,6 +296,11 @@ def resume_line(
     shard = next((s for s in plan.shards if s.label == label), None)
     if shard is None:
         raise shards.ShardsError(f"the manifest has no shard labelled {label}")
+    spec = {"index": shard.index, "count": shard.count, "label": shard.label}
+    try:  # the declared variables keep the values the shard's first step passed: the first check, before any query
+        shards.check_pass_env_origin(plan.results, spec, dict(plan.pass_env_pins or ()))
+    except shards.ShardsError as error:
+        raise shards.ShardsError(f"{error}; no line is printed") from None
     fed = shards.federation(shard)
     with _driver_modules() as (hpclaunch, hpcslurm, hpcstate):
         slurm = hpcslurm.Slurm(runner or hpcslurm.Runner())

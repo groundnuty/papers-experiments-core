@@ -829,6 +829,24 @@ refuses a shard whose manifest lacks a name the plan declares, or holds one it d
 variable, as it refuses one whose line dropped the post-run script. A dropped sanction variable also fails closed: the
 study's own refusal stops the run.
 
+**One value for a shard's whole life (O63).** The first step of a shard that passes variables records each name and
+value once, in `<results>/<label>/pass-env.json` (whole, mode 0600, once it holds the shard's running mark; nothing is
+written when it passes none). Every later step is compared with that record before anything is made or launched, so a
+resume or a later fleet step cannot carry a value its shard's first step did not have:
+
+- `step` does it as its first act, `--resume` or not (a first step killed before its first snapshot leaves this record
+  and no archive, so a plain relaunch is compared too), and ends with status 73;
+- `resume-line` does it before it asks Slurm anything or records its node, and prints no line;
+- `fleet.py step` does it for each shard it would launch, and refuses the whole command, launching nothing. `plan` and
+  `lines` print first steps' lines and are not compared.
+
+A declared variable whose value differs, one the first step did not pass and one it passed that the line no longer
+carries are each refused, naming the variable and never either value. A record that is empty, is not JSON, is another
+shard's, holds a name or a value a variable may not carry, is too long or is a link is refused too, never taken for
+none, so emptying it does not lift the rule. With no record (a shard's first step, or one that passed nothing) nothing
+is compared, and a step that passes variables records them. Nothing here removes the record: a shard that has made
+nothing and must start over with other values has it removed by hand, which is the operator's call.
+
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into
 `<results>/<label>/snapshots/` every `snapshot_every_s` seconds (a manifest key, 900 by default, at least 60) and after
@@ -912,7 +930,9 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   `fleet.py` runs in (`NAME=VALUE` as an `env -i` word, with `--pass-env NAME`; an unset variable or a value that may not
   ride on a line refuses the whole `plan` or `step`, naming the variable, before anything is assigned or launched). The
   value a line pins is the one the operator holds when that command runs, so `step` pins afresh (`plan` prints the
-  values it pinned beside each line, as `"pass_env"`). `shards.toml` declares the names, so `collect` refuses a shard
+  values it pinned beside each line, as `"pass_env"`), but a shard whose first step recorded its values
+  (`<results>/<label>/pass-env.json`, above) is launched only with those: another value, or a name added or dropped,
+  refuses the whole `step` before anything is launched, naming the variable and never either value. `shards.toml` declares the names, so `collect` refuses a shard
   whose step was not given them. Before this the settings took `snapshot_every_s` alone, so a step launched by a fleet
   could carry none of the study's own refusals, and `shards.py resume-line` refused a manifest that declared one.
 - **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never

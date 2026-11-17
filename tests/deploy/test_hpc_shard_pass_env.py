@@ -314,12 +314,12 @@ def test_o63_a_value_that_is_neither_a_plain_word_nor_a_plain_absolute_path_refu
 # -- the step: exactly what its line pins ---------------------------------------------------------------------------
 
 
-def step_args(tmp_path, pass_env=None, *, index=1, label="fed-a"):
+def step_args(tmp_path, pass_env=None, *, index=1, label="fed-a", resume=False):
     """The step's arguments as its generated line gives them; `pass_env=None` is a line with no such option."""
     study = make_study(tmp_path)
     extra = {} if pass_env is None else {"pass_env": list(pass_env)}
     return argparse.Namespace(study=study, index=index, count=2, label=label, tmpfs=tmp_path / "tmpfs",
-                              results=tmp_path / "results", core_src=tmp_path, resume=False, archive_left=False,
+                              results=tmp_path / "results", core_src=tmp_path, resume=resume, archive_left=False,
                               snapshot_every=3600.0, **extra)  # fmt: skip
 
 
@@ -606,3 +606,177 @@ def test_o63_collect_needs_no_operator_environment_and_pins_nothing(shards, tmp_
     monkeypatch.delenv(NAME, raising=False)
     plan = shards.load_plan(manifest_file(tmp_path, DECLARED))
     assert shards.pinned(plan).pass_env_pins is None
+
+
+# -- one value for a shard's whole life: a later step is refused a value its first step did not have ----------------
+
+CHANGED = "changed-mode"  # a value the operator holds later: it must appear in no message
+SPEC_A = {"index": 1, "count": 2, "label": "fed-a"}
+
+
+def origin_file(tmp_path, label="fed-a") -> Path:
+    """Where the shard's first step records the values it passed: its directory of the results, beside its mark."""
+    return tmp_path / "results" / label / "pass-env.json"
+
+
+def node_holds(monkeypatch, value=VALUE):
+    """The node's environment the step reads: the federation's root and the declared variable (its line's word)."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    monkeypatch.setenv(NAME, value)
+
+
+def first_step(shards, tmp_path, monkeypatch, value=VALUE):
+    """The shard's first step, really run with a stand-in dispatcher: its archive, and the record of its values."""
+    node_holds(monkeypatch, value)
+    run, _ = dispatcher()
+    assert shards.step(step_args(tmp_path, [NAME]), runner=run, core_found=lambda path: True) == 0
+
+
+def never_run(argv, env, cwd):
+    raise AssertionError("a refused step must never start its dispatcher")
+
+
+def refused_step(shards, tmp_path, capsys, args) -> str:
+    """A step with `args` that the check refuses (status 73) before its dispatcher starts: what it said."""
+    capsys.readouterr()
+    assert shards.step(args, runner=never_run, core_found=lambda path: True) == shards.PRE_STEP_REFUSED
+    return capsys.readouterr().err
+
+
+def test_o63_a_first_step_records_the_values_it_passed_in_its_shards_results_directory(shards, tmp_path, monkeypatch):
+    """O63: the shard's first step writes the name and value of each variable it passed into
+    `<results>/<label>/pass-env.json` (the origin a later step is compared with), whole and private to its user."""
+    first_step(shards, tmp_path, monkeypatch)
+    record = json.loads(origin_file(tmp_path).read_text())
+    assert record["pass_env"] == {NAME: VALUE}
+    assert record["shard"] == SPEC_A
+    assert origin_file(tmp_path).stat().st_mode & 0o077 == 0
+    assert not list(origin_file(tmp_path).parent.glob(".pass-env*"))  # no draft left behind
+
+
+def test_o63_a_step_that_passes_nothing_records_no_origin(shards, tmp_path, monkeypatch):
+    """O63: with no `pass_env` the results directory is as it was: no origin file."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    run, _ = dispatcher()
+    assert shards.step(step_args(tmp_path), runner=run, core_found=lambda path: True) == 0
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_step_refused_before_it_runs_records_no_origin(shards, tmp_path, capsys, monkeypatch):
+    """O63: a step the pass_env check refuses on its own line (a name with no value) made no first step: no origin."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    monkeypatch.delenv(NAME, raising=False)
+    assert "is not set" in refused_step(shards, tmp_path, capsys, step_args(tmp_path, [NAME]))
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_resume_whose_value_changed_since_the_first_step_is_refused_naming_only_the_variable(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: a `--resume` step, through the real `step`, whose line gives the declared variable another value than the
+    shard's first step passed is refused (73) before anything is made or its dispatcher runs; the message names the
+    variable and shows neither value; the archive and the origin are as they were."""
+    first_step(shards, tmp_path, monkeypatch)
+    archived = manifest_of(tmp_path)
+    node_holds(monkeypatch, CHANGED)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, [NAME], resume=True))
+    assert NAME in said
+    assert VALUE not in said
+    assert CHANGED not in said
+    assert manifest_of(tmp_path) == archived
+    assert json.loads(origin_file(tmp_path).read_text())["pass_env"] == {NAME: VALUE}
+    assert not list((tmp_path / "tmpfs").iterdir())
+    assert not (tmp_path / "results" / "fed-a" / "running.json").exists()
+
+
+def test_o63_a_resume_with_the_same_values_proceeds_and_keeps_the_origin(shards, tmp_path, monkeypatch):
+    """O63: the same value again continues the shard, and the origin is the first step's, untouched."""
+    first_step(shards, tmp_path, monkeypatch)
+    before = origin_file(tmp_path).read_bytes()
+    node_holds(monkeypatch)
+    run, seen = dispatcher()
+    assert shards.step(step_args(tmp_path, [NAME], resume=True), runner=run, core_found=lambda path: True) == 0
+    assert seen["env"][NAME] == VALUE
+    assert origin_file(tmp_path).read_bytes() == before
+    assert manifest_of(tmp_path)["pass_env"] == {NAME: VALUE}
+
+
+def test_o63_a_plain_relaunch_is_compared_too_when_the_first_step_left_only_its_origin(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: a first step killed before its first snapshot left no archive and no snapshot, only its origin: a plain
+    (not `--resume`) launch is refused a changed value, and proceeds with the same one."""
+    shards.record_pass_env_origin(tmp_path / "results", SPEC_A, {NAME: VALUE})  # the step's own writer
+    node_holds(monkeypatch, CHANGED)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, [NAME]))
+    assert NAME in said
+    assert VALUE not in said
+    assert CHANGED not in said
+    node_holds(monkeypatch)
+    run, _ = dispatcher()
+    assert shards.step(step_args(tmp_path, [NAME]), runner=run, core_found=lambda path: True) == 0
+
+
+@pytest.mark.parametrize(
+    ("origin", "line", "named", "not_named"),
+    [
+        ({NAME: VALUE}, [], [NAME], []),  # the manifest dropped the declaration: the shard would lose its variable
+        ({OTHER: VALUE}, [NAME], [NAME, OTHER], []),  # one the first step did not pass, and one it passed and lost
+        ({NAME: VALUE, OTHER: VALUE}, [NAME], [OTHER], [NAME]),  # only the one that differs is named
+    ],
+)
+def test_o63_a_later_step_must_pass_the_names_of_the_first_one_not_more_not_fewer(
+    shards, tmp_path, capsys, monkeypatch, origin, line, named, not_named
+):
+    """O63: the names count as the values do: a later step that passes a name the first did not, or leaves one out,
+    is refused, naming those variables only."""
+    shards.record_pass_env_origin(tmp_path / "results", SPEC_A, origin)
+    node_holds(monkeypatch)
+    monkeypatch.setenv(OTHER, VALUE)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, line))
+    assert all(name in said for name in named)
+    assert not any(name in said for name in not_named)
+    assert VALUE not in said
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    ["", "not json", "[]", '{"format": "other/1"}', json.dumps({"format": "expcore-hpc-shard-pass-env/1", "shard":
+     {"index": 2, "count": 2, "label": "fed-b"}, "pass_env": {NAME: VALUE}}),
+     json.dumps({"format": "expcore-hpc-shard-pass-env/1", "shard": SPEC_A, "pass_env": {NAME: ["x"]}}),
+     json.dumps({"format": "expcore-hpc-shard-pass-env/1", "shard": SPEC_A, "pass_env": {"lower": VALUE}})],
+)  # fmt: skip
+def test_o63_an_origin_that_cannot_be_read_as_this_shards_refuses_the_step_never_taken_for_none(
+    shards, tmp_path, capsys, monkeypatch, garbage
+):
+    """O63: an origin file that is empty, not JSON, not a record, of another shard, or holding a value or a name a
+    variable may not carry refuses the step: truncating the record must not lift the rule."""
+    origin_file(tmp_path).parent.mkdir(parents=True)
+    origin_file(tmp_path).write_text(garbage)
+    node_holds(monkeypatch)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, [NAME]))
+    assert "pass-env.json" in said
+    assert VALUE not in said
+
+
+def test_o63_the_origin_is_never_followed_through_a_link(shards, tmp_path, capsys, monkeypatch):
+    """O63: an origin that is a link to a file elsewhere is refused unread, as any record it cannot take for the
+    shard's."""
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text(json.dumps({"format": shards.PASS_ENV_ORIGIN_FORMAT, "shard": SPEC_A,
+                                     "pass_env": {NAME: VALUE}}))  # fmt: skip
+    origin_file(tmp_path).parent.mkdir(parents=True)
+    origin_file(tmp_path).symlink_to(elsewhere)
+    node_holds(monkeypatch)
+    assert "pass-env.json" in refused_step(shards, tmp_path, capsys, step_args(tmp_path, [NAME]))
+
+
+def test_o63_a_bad_label_is_still_the_labels_refusal_not_the_origins(shards, tmp_path, monkeypatch):
+    """O63: the origin is looked for only under a label the core accepts: a path-like label reaches `step`'s own label
+    check, which refuses it as it always did."""
+    node_holds(monkeypatch)
+    args = step_args(tmp_path, [NAME], label="../escape")
+    run, _ = dispatcher()
+    with pytest.raises(shards.ShardsError, match="label"):
+        shards.step(args, runner=run, core_found=lambda path: True)
+    assert not (tmp_path / "escape").exists()

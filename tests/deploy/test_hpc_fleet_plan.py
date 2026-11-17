@@ -488,3 +488,88 @@ def test_o63_a_relaunch_with_resume_carries_the_pins_too(bench):
     assert code == 0, printed
     assert (bench.spawned[-1].argv[-1], env_words(bench.spawned[-1].argv)[NAME]) == ("--resume", VALUE)
     assert bench.spawned[-1].argv.count("--pass-env") == 2
+
+
+# -- a shard's variables keep their values from its first step: a later fleet step is refused a changed one ----------
+FIRST, LATER = "go-ahead", "changed-mode"  # the value the first step passed, and one the operator holds later
+
+
+def first_steps(bench, deploy, *values):
+    """Each shard's first step's record of the values it passed (`values[i]` for shard i + 1), as the step's own
+    writer makes it."""
+    shards = deploy.fleet.fleetplan.shards
+    for index, passed in enumerate(values, 1):
+        spec = {"index": index, "count": 2, "label": f"shard-{index}"}
+        shards.record_pass_env_origin(bench.base / "results", spec, passed)
+
+
+def launched_and_ended(bench):
+    """Both shards' first launch made, as the fleet's record has it, and both steps ended."""
+    assert bench.up(2)[0] == 0
+    assert planned(bench, operator(bench, **{NAME: FIRST}), PASS_ENV)[0] == 0
+    assert bench.run("step", environ=operator(bench, **{NAME: FIRST}))[0] == 0
+    for spawned in bench.spawned:
+        bench.alive.discard(spawned.pid)
+
+
+def test_o63_a_later_fleet_step_whose_value_changed_since_the_first_step_is_refused_and_launches_nothing(bench, deploy):
+    """O63: `fleet.py step --resume`, the operator holding another value of a declared variable than the shard's
+    first step passed: refused whole before anything is launched (status 2), naming the variable and showing neither
+    value (nor the variable that did not change)."""
+    launched_and_ended(bench)
+    first_steps(bench, deploy, *[{NAME: FIRST, TREE_NAME: TREE}] * 2)
+    spawned = len(bench.spawned)
+    code, printed = bench.run("step", "--resume", environ=operator(bench, **{NAME: LATER}))
+    assert code == 2
+    assert NAME in printed
+    assert FIRST not in printed
+    assert LATER not in printed
+    assert TREE_NAME not in printed
+    assert len(bench.spawned) == spawned
+
+
+def test_o63_a_later_fleet_step_with_the_values_of_the_first_step_launches_with_resume(bench, deploy):
+    """O63: the same values again: both shards are launched with `--resume`, carrying the first step's values."""
+    launched_and_ended(bench)
+    first_steps(bench, deploy, *[{NAME: FIRST, TREE_NAME: TREE}] * 2)
+    spawned = len(bench.spawned)
+    code, printed = bench.run("step", "--resume", environ=operator(bench, **{NAME: FIRST}))
+    assert code == 0, printed
+    assert len(bench.spawned) == spawned + 2
+    assert all(env_words(each.argv)[NAME] == FIRST for each in bench.spawned[spawned:])
+
+
+def test_o63_a_first_fleet_step_has_no_origin_to_differ_from(bench):
+    """O63: with no first step recorded, the first launch is not compared with anything and takes the operator's values
+    as they are."""
+    assert bench.up(2)[0] == 0
+    assert planned(bench, operator(bench, **{NAME: FIRST}), PASS_ENV)[0] == 0
+    assert bench.run("step", environ=operator(bench, **{NAME: LATER}))[0] == 0
+    assert all(env_words(each.argv)[NAME] == LATER for each in bench.spawned)
+
+
+def test_o63_each_shard_is_compared_with_its_own_first_step(bench, deploy):
+    """O63: the origin is the shard's own, in the results directory the shards share (not a federation's): shard 1's
+    first step passed the value the operator holds now and shard 2's another, so `step --resume` of shard 1 launches
+    and that of shard 2 is refused, naming the variable and showing neither value."""
+    launched_and_ended(bench)
+    first_steps(bench, deploy, {NAME: LATER, TREE_NAME: TREE}, {NAME: FIRST, TREE_NAME: TREE})
+    spawned = len(bench.spawned)
+    code, printed = bench.run("step", "--shard", "shard-2", "--resume", environ=operator(bench, **{NAME: LATER}))
+    assert (code, len(bench.spawned)) == (2, spawned)
+    assert NAME in printed
+    assert LATER not in printed
+    assert FIRST not in printed
+    code, printed = bench.run("step", "--shard", "shard-1", "--resume", environ=operator(bench, **{NAME: LATER}))
+    assert code == 0, printed
+    assert len(bench.spawned) == spawned + 1
+
+
+def test_o63_plan_after_a_first_step_still_prints_the_lines_it_always_printed(bench, deploy):
+    """O63: `plan` launches nothing and prints first-step lines, so it is not compared with the origin: it prints the
+    operator's values as it did; the refusal is at the step that would launch."""
+    launched_and_ended(bench)
+    first_steps(bench, deploy, *[{NAME: FIRST, TREE_NAME: TREE}] * 2)
+    code, printed, lines = planned(bench, operator(bench, **{NAME: LATER}), PASS_ENV)
+    assert code == 0, printed
+    assert lines["shard-1"]["pass_env"][NAME] == LATER

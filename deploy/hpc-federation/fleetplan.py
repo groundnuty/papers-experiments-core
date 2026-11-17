@@ -255,6 +255,20 @@ def pin(plan: shards.Plan, environ: Optional[Mapping[str, str]] = None) -> shard
         raise FleetError(str(error)) from None
 
 
+def check_first_values(plan: shards.Plan, label: str, environ: Optional[Mapping[str, str]] = None) -> None:
+    """A shard's declared variables keep the values its first step passed, on whichever federation a later step runs
+    (`shards.check_pass_env_origin`, in the results directory every shard shares): the values `environ` gives now (the
+    operator's, as `pin` reads them) must be those, else `FleetError` naming the variable and never a value. Nothing is
+    compared for a shard with no first step recorded. `launches` asks before it makes a line to launch: `plan`'s lines
+    are first steps' and launch nothing."""
+    (shard,) = [s for s in plan.shards if s.label == label]
+    spec = {"index": shard.index, "count": shard.count, "label": shard.label}
+    try:
+        shards.check_pass_env_origin(plan.results, spec, dict(pin(plan, environ).pass_env_pins or ()))
+    except shards.ShardsError as error:
+        raise FleetError(str(error)) from None
+
+
 def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None,
             environ: Optional[Mapping[str, str]] = None) -> List[str]:  # fmt: skip
     """The login node's srun line of one shard (`shards.step_argv`) on the federation the manifest gives it, which must
@@ -339,6 +353,7 @@ def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], re
         if shard["moved"] and not here:
             note = (f"moved from {shard['last']}: {holder}'s platform.toml leaves [placement] reset_shortcut off, so "
                     "every reset there takes the full reads, its first included")  # fmt: skip
+        check_first_values(plan, label, environ)  # a later step of the shard carries the values its first one did
         argv, fed = target_of(plan, label, again, root_of(directory, holder), environ)
         found.append(Launch(label, holder, argv, again, note, str(fed["job"]), str(fed["name"])))
     return found, said, refused
