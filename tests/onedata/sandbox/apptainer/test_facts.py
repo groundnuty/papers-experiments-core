@@ -10,8 +10,9 @@ import dataclasses
 import pytest
 from apptainer_support import make_settings, make_spec, options, pinned_bundle, start
 from fake_mount_node import FakeMountNode
-from fake_node import FakeNode
+from fake_node import READINGS, FakeNode
 
+from expcore_onedata.sandbox import fedwindow
 from expcore_onedata.sandbox.api import StartRefused
 from expcore_onedata.sandbox.apptainer import facts
 from expcore_onedata.sandbox.apptainer import hostmount as HM
@@ -151,5 +152,36 @@ def test_o57_an_image_run_keeps_the_provider_storage_kind_after_its_work_disk_is
             assert "work_disk_image" in meta["infrastructure_facts"]["facts"]  # the record of the proved disk
             assert meta["infrastructure_facts"]["provider_storage"] == kind
             assert meta["backend"]["provider_storage"] == kind
+        finally:
+            box.stop()
+
+
+@pytest.mark.parametrize(
+    ("work_disk", "proofs"), [("directory", (None,)), ("image", ("full_fill", "invariants"))]
+)  # fmt: skip
+def test_o71_o86_o87_the_work_disk_s_proof_keeps_every_fact_another_feature_recorded(tmp_path, work_disk, proofs):
+    """O71, O86, O87: a run's facts hold more than `facts.record` makes: the node's readings (`node`, at the start), the
+    federation's window (`federation_window`, which the platform records from the run's preparation on while a watch
+    is configured), `provider_storage` and whatever a feature adds beside them. The proof of an image replaces the
+    record of the work disk's own keys (on the first start of the driver's node, the full fill, and on a later one,
+    the invariants against the kept proof) and sets only what `facts.record` produces: nothing else is dropped, and a
+    directory run, which proves nothing, keeps them as well."""
+    settings = make_settings(tmp_path, work_disk=work_disk, provider_storage="shared_filesystem")
+    node = FakeNode()
+    window = fedwindow.pending()
+    for proof in proofs:
+        box = ApptainerSandbox(node, settings, make_spec("via-gate"), **options())
+        box.record_infrastructure_fact(fedwindow.KEY, window)  # as `SandboxPlatform` does before the start
+        box.record_infrastructure_fact("recorded_before_the_start_by_another_feature", {"kept": True})
+        box.begin()
+        try:
+            kept = box.metadata()["infrastructure_facts"]
+            if proof is not None:
+                assert box.metadata()["work_disk"]["proof"]["kind"] == proof
+            assert ("work_disk_image" in kept["facts"]) == (work_disk == "image")  # the proof's own record is there
+            assert kept["node"] == READINGS
+            assert kept[fedwindow.KEY] == window
+            assert kept["provider_storage"] == "shared_filesystem"
+            assert kept["recorded_before_the_start_by_another_feature"] == {"kept": True}
         finally:
             box.stop()
