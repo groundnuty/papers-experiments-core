@@ -10,6 +10,7 @@ from fake_node import FakeNode
 from expcore.errors import InfraError
 from expcore_onedata.sandbox import bounds as BD
 from expcore_onedata.sandbox import deadline as DL
+from expcore_onedata.sandbox import kinds
 from expcore_onedata.sandbox.hostops import CmdResult
 
 
@@ -84,6 +85,91 @@ def test_a_cell_over_its_memory_limit_is_killed_by_the_watch_as_a_memory_limit(n
     assert result.kill["category"] == "agent"
     assert not result.timed_out
     assert result.kill["watch_kills"][0]["what"] == "memory"
+
+
+def test_o72_a_memory_kill_is_the_cell_s_own_and_the_next_cell_runs(node, box):
+    """O72: as a container's OOM kill on Docker, the watch's memory kill ends the cell, never the run: it is recorded
+    with `scope: cell` (the code tool raises nothing for it), and the agent's next cell runs."""
+
+    def greedy(cell):
+        cell.procs[1].rss = 200 << 20
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "", "")
+
+    node.cell_handler = greedy
+    killed = box.exec("x = bytearray(200 << 20)", 30)
+    assert (killed.kill["reason"], killed.kill["scope"]) == ("memory_limit", "cell")
+    assert killed.kill["watch_kills"][0]["scope"] == "cell"
+    assert kinds.kill_error(killed.kill) is None
+    node.cell_handler = lambda cell: CmdResult(0, "recovered\n", "")
+    after = box.exec("print('recovered')", 30)
+    assert (after.exit_code, after.stdout, after.kill) == (0, "recovered\n", None)
+
+
+def test_o72_hidden_memory_no_one_cell_can_be_told_to_hold_ends_the_run_as_infrastructure(node, box, tmp_path):
+    """O72: hidden memory past the margin while another run's cell shares the cgroup cannot be told this cell's: the
+    cell is killed and the run ended with its reason (`scope: run`), infrastructure the code tool raises as
+    `cell_not_isolated`; every later exec and the collection are refused, and the run's memory reading is unknown,
+    never over."""
+    node._new_proc(node.new_namespace(), "python3", environ=("EXPCORE_SANDBOX=other-run-ffff0000",))
+
+    def hiding(cell):
+        node._new_proc(cell.pidns, "python3", hidden=True, anon=768 << 20)
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "", "")
+
+    node.cell_handler = hiding
+    result = box.exec("hide_and_grow()", 30)
+    assert (result.kill["reason"], result.kill["scope"], result.kill["category"]) == (
+        "memory_limit", "run", "infrastructure"
+    )  # fmt: skip
+    assert "another run's cell is charged to the same cgroup" in result.kill["basis"]
+    assert kinds.kill_error(result.kill).kind == "cell_not_isolated"
+    with pytest.raises(InfraError) as refused:
+        box.exec("print('next')", 30)
+    assert refused.value.kind == "cell_not_isolated"
+    with pytest.raises(InfraError):
+        box.collect(tmp_path / "out")
+    assert box.metadata()["infrastructure_facts"]["memory"]["reading"] == "unknown"
+
+
+def test_o72_a_run_ended_because_its_cell_could_not_be_isolated_says_so_in_its_infrastructure_facts(
+    node, box, tmp_path
+):
+    """O72: the run-level fact a campaign counts such runs by: `infrastructure_facts.run_ended` names the scope `run`,
+    `attributed: false`, and the kill's reason, what and why, and it is there after the collection was refused. A
+    run that went on has no such fact."""
+    assert "run_ended" not in box.metadata()["infrastructure_facts"]
+    node._new_proc(node.new_namespace(), "python3", environ=("EXPCORE_SANDBOX=other-run-ffff0000",))
+
+    def hiding(cell):
+        node._new_proc(cell.pidns, "python3", hidden=True, anon=768 << 20)
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "", "")
+
+    node.cell_handler = hiding
+    box.exec("hide_and_grow()", 30)
+    with pytest.raises(InfraError):
+        box.collect(tmp_path / "out")
+    ended = box.metadata()["infrastructure_facts"]["run_ended"]
+    assert set(ended) == {"scope", "attributed", "reason", "what", "why"}
+    assert (ended["scope"], ended["attributed"]) == ("run", False)
+    assert (ended["reason"], ended["what"]) == ("memory_limit", "memory_hidden")
+    assert "another run's cell is charged to the same cgroup" in ended["why"]
+
+
+def test_o72_a_cell_s_own_memory_kill_leaves_no_run_ended_fact(node, box):
+    """O72: a memory kill that is the cell's own, with the run going on, is no `run_ended`: only a run the watch ended
+    because it could not tell whose memory it was is counted as one."""
+
+    def greedy(cell):
+        cell.procs[1].rss = 200 << 20
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "", "")
+
+    node.cell_handler = greedy
+    box.exec("x = bytearray(200 << 20)", 30)
+    assert "run_ended" not in box.metadata()["infrastructure_facts"]
 
 
 def test_o56_a_cell_whose_hidden_process_holds_memory_is_killed_as_over_its_limit(node, box):
@@ -188,6 +274,23 @@ def test_a_worker_a_cell_left_running_is_killed_at_the_cell_s_end(node, box):
     box.exec("start_a_daemon()", 30)
     assert not node.cell_left[0].alive
     assert box._cells.cells[-1]["left_after_exec"] == 1
+
+
+def test_o72_every_process_a_cell_left_counts_not_only_the_first_sixteen_recorded(node, box):
+    """O72: whether the run goes on is judged on every process left after the kill, never only the 16 the record
+    keeps: sixteen in D and a seventeenth still running end the run as `survived_kill`."""
+
+    def stuck(cell):
+        for n in range(17):
+            proc = node._new_proc(cell.pidns, "reader", state="D" if n < 16 else "S", unkillable=True)
+            node.cell_left.append(proc)
+        return CmdResult(0, "")
+
+    node.cell_handler = stuck
+    box.exec("start_readers()", 30)
+    assert box._cells.ended["outcome"] == DL.SURVIVED
+    swept = [q for q in box.metadata()["quiesced"] if q.get("cell") == 1]
+    assert (len(swept[0]["left"]), swept[0]["left_running"]) == (16, 1)
 
 
 def test_an_oom_of_the_step_s_cgroup_comes_before_the_watch_s_kill(node, box):

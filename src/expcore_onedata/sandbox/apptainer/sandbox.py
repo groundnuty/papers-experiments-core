@@ -70,7 +70,7 @@ from expcore_onedata.sandbox.api import (
 )
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs
-from expcore_onedata.sandbox.apptainer.cells import AppCellRunner
+from expcore_onedata.sandbox.apptainer.cells import RUN_ENDED_FACT, AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.infra import InfraCheck
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
@@ -875,8 +875,11 @@ class ApptainerSandbox:
         """The facts of the run for its record. Never a secret: the token is in none of them."""
         with self._meta_lock:
             meta = json.loads(json.dumps(self._meta, default=str))
+            ended = None if self._cells is None else self._cells.ended
         if self._cells is not None:
             meta["cells"] = len(self._cells.cells)
+        if ended is not None and ended.get("scope") == "run":  # the watch ended the run: a fact of the run (O72)
+            meta["infrastructure_facts"]["run_ended"] = {key: ended.get(key) for key in RUN_ENDED_FACT}
         if self._watch is not None:
             meta["watch"] = self._watch.summary()
             meta["infrastructure_facts"]["memory"] = meta["watch"]["memory"]  # never `within` unless the check held

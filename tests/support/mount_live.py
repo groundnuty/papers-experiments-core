@@ -574,8 +574,10 @@ print(json.dumps({{"pid": reader.pid}}))
 
 
 def reader_cell(path: str, size: int, counter: str) -> str:
-    """Start a reader that outlives the cell: it reads 1 MiB at a random offset of the file, again and again, and
-    writes how many reads it has done to `counter`, so the host sees whether it moves (a frozen reader does not)."""
+    """Start a reader that outlives the program that starts it: it reads 1 MiB at a random offset of the file, again
+    and again, and writes how many reads it has done to `counter`, so the host sees whether it moves (a frozen reader
+    does not). Run by the harness with `docker exec -d`, never as a cell, whose processes end with it (O72); the next
+    cell's sweep kills it too, so no cell runs while it is measured."""
     return READER.format(path=path, size=size, counter=counter)
 
 

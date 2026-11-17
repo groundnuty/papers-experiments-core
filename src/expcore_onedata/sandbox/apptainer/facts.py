@@ -14,6 +14,10 @@ One more entry is no departure either: `provider_storage`, the kind of storage t
 data on (`tmpfs` or `shared_filesystem`), which the HPC driver declares in `[sandbox.apptainer]` (O57). It sits beside
 the list of keys, only for a platform that declares it, so a Compose federation's runs and an older platform's keep
 their record.
+
+A cell's processes end with its exec here, its PID namespace ending with it, and on Docker since O72 too (the sandbox
+kills what a cell left once its `docker exec` returns), so the code tool's "State does not carry between calls" holds
+on both: that is no departure, and has no key.
 """
 
 from __future__ import annotations
@@ -45,20 +49,24 @@ FACTS: dict[str, str] = {
     ),
     "memory_watch": (
         "no cgroup per container: the agent's memory limit is the harness's watch, which sums the RssAnon and "
-        "RssShmem of the run's processes every memory_poll_s and kills them all over the limit (Docker's kernel "
-        "kills the largest process alone); a spike shorter than the period is missed, and the kernel's limit is "
-        "the step's, shared with the driver and the gate, so its OOM kill is infrastructure. A process that makes "
-        "itself non-dumpable is hidden by /proc's hidepid, so this sum neither counts nor kills it (hidden_memory); "
-        "the end of its cell's PID namespace when the exec returns ends it"
+        "RssShmem of the run's processes every memory_poll_s and, over the limit, kills them all: they are the "
+        "running cell's (nothing of a cell outlives its exec), so the kill is the cell's (scope cell) and the run "
+        "goes on, as after a container's OOM kill on Docker, whose kernel kills the cell's largest process alone, "
+        "so a cell may live on there where here it ends; a spike shorter than the period is missed, and the "
+        "kernel's limit is the step's, shared with the driver and the gate, so its OOM kill is infrastructure. A "
+        "process that makes itself non-dumpable is hidden by /proc's hidepid, so this sum neither counts nor kills "
+        "it (hidden_memory); the end of its cell's PID namespace when the exec returns ends it"
     ),
     "hidden_memory": (
         "a process /proc hides is checked from outside: at every poll the watch compares the anonymous memory of the "
         "driver's own cgroup (memory.stat anon, which counts a hidden process) with the RssAnon of every process of "
         "the uid /proc shows in it (the larger of two listings' totals around the cgroup's), and memory nothing "
         "visible explains that grew past hidden_memory_margin_bytes during a cell for two polls kills the cell as "
-        "memory_limit (memory_hidden); one that cannot be told the "
-        "cell's (another run's cell in the cgroup, or a margin the start's own cells passed) makes the run's memory "
-        "reading unknown, never within, as do a child of a cell process that /proc does not show (hidden_process, "
+        "memory_limit (memory_hidden); with another run's cell charged to the same cgroup it cannot be told this "
+        "cell's, so the cell cannot be isolated and the watch kills it and ends the run (scope run, infrastructure: "
+        "set aside), its memory reading unknown, never over: the memory may be the other run's, and every run whose "
+        "watch sees it ends so; a margin the start's own cells passed makes the run's memory reading unknown, "
+        "never within, with no kill, as do a child of a cell process that /proc does not show (hidden_process, "
         "which a process that forks twice under the cell's hidden init escapes) and a reading that failed; hidden "
         "memory under the margin, and a hidden process's shared memory (a memfd, a shared anonymous mapping), which "
         "the cgroup counts with the run's tmpfs files, are bounded by the step's limit alone"
@@ -79,11 +87,6 @@ FACTS: dict[str, str] = {
         "uid is unknown to the walk and taken as past its size"
     ),
     "cpu_pids_nofile": "cpus, pids, nofile and the gate's memory limit are recorded and not enforced per container",
-    "cell_ends_its_processes": (
-        "each cell is one apptainer exec with a PID namespace of its own: whatever of it is left when the exec "
-        "returns is killed and shown gone, so no worker it detached lives on into the next cell, as one would on "
-        "Docker until the next cap or the collection"
-    ),
     "no_freezer": (
         "the outputs are copied with no cgroup freezer: no process of the run is left between cells (each cell's "
         "end shows them gone), and the copy and the removals run as the one uid there is, with no privilege"

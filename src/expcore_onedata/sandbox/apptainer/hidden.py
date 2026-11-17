@@ -23,9 +23,10 @@ the two listings' totals, so a process that freed memory just as it was read and
 must do so around both readings to look hidden; each total is one listing's own, so two processes that hold memory in
 turn are never counted twice. A growth that passes so for `HIDDEN_CONFIRM`
 polls in a row is the running cell's when no other cell's namespace is in the cgroup. Memory the watch
-cannot see is taken as past the limit, as a directory the disk walk cannot read is taken as past its size: the watch
-kills the run's processes as `memory_limit`, of `memory_hidden` (`watch.Watch`), once per cell. With another run's
-cell in the cgroup it cannot be told whose it is, and the reading is unknown (`unattributed`).
+cannot see is taken as past the limit: the watch kills the run's processes as `memory_limit`, of `memory_hidden`
+(`watch.Watch`), once per cell. With another run's cell in the cgroup it cannot be told whose it is: the cell cannot
+be isolated, so the watch ends the run (`scope: run`, `attributed: false`, O72), and the reading is unknown
+(`unattributed`), never `over`, since the memory may be the other run's; the run is not counted as hiding.
 
 The second signal, `hidden_process`: a visible process of the run's cell whose `children` files list a pid that `/proc`
 does not show as the uid's while a process holds it (`NodeOps.hidden_children`). It is recorded, never a kill, and it
@@ -75,6 +76,7 @@ class Hidden:
     allowance_bytes: int
     cgroup_anon_bytes: int
     visible_anon_bytes: int
+    attributed: bool = True  # False: another run's cell is in the cgroup, so it may be that run's (it ends the run)
 
 
 class HiddenCheck:
@@ -198,7 +200,7 @@ class HiddenCheck:
             return None
         if foreign:
             self._cell_reasons.add(UNATTRIBUTED)
-            return None
+            return Hidden(grown, allowance, charged, visible, attributed=False)
         if self._uncalibrated:
             self._cell_reasons.add(MARGIN_AT_START)
             return None
@@ -214,6 +216,11 @@ class HiddenCheck:
             self._acted = True
         else:
             self._cell_reasons.add(KILL_REACHED_NONE)
+
+    def ended(self) -> None:
+        """The watch ended the run for a growth it could not tell the cell's: nothing more is done for this cell, and
+        the run is not counted as hiding (the memory may be another run's)."""
+        self._acted = True
 
     def unreached(self) -> None:
         """A kill of the watch's for visible memory that signalled no process: the cell's memory is unknown."""

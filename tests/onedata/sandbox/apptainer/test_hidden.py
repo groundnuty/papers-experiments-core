@@ -11,7 +11,7 @@ from fake_node import CGROUP, OWN_NS, FakeNode
 from expcore.visibility import judge
 from expcore.visibility.instrument import readable, snapshot
 from expcore_onedata.sandbox.apptainer.hidden import HIDDEN_CONFIRM
-from expcore_onedata.sandbox.apptainer.watch import Space, Watch
+from expcore_onedata.sandbox.apptainer.watch import UNATTRIBUTED_WHY, Space, Watch
 
 TAG = "EXPCORE_SANDBOX=run-1-abcd1234"
 MIB = 1 << 20
@@ -179,10 +179,13 @@ def test_o56_a_second_namespace_of_the_run_s_own_never_widens_the_margin(node, t
     assert watch.end_cell()["kills"][0]["limit"] == MARGIN
 
 
-def test_o56_hidden_memory_with_another_run_s_cell_in_the_cgroup_is_unknown_never_a_kill(node, tmp_path):
-    """O56: with another run's cell charged to the same cgroup, the memory cannot be told whose it is: the reading is
-    `unknown` (`unattributed`), and nothing is killed."""
+def test_o72_hidden_memory_another_run_s_cell_may_hold_ends_the_run_and_reads_unknown(node, tmp_path):
+    """O72, O56: with another run's cell charged to the same cgroup, the hidden memory cannot be told the cell's, so
+    the cell cannot be isolated: the watch kills it and ends the run (`scope: run`, `attributed: false`, with its
+    reason), once; the reading is `unknown` (`unattributed`), never `over`, and the run is not counted as hiding."""
     watch = _watch(node, tmp_path)
+    ended = []
+    watch.on_run_end = ended.append
     watch.poll()
     other = node.new_namespace()
     node._new_proc(other, "python3", environ=("EXPCORE_SANDBOX=run-2-ffff0000",))
@@ -190,12 +193,18 @@ def test_o56_hidden_memory_with_another_run_s_cell_in_the_cgroup_is_unknown_neve
     ns, top, _agent = _cell(node)
     node._new_proc(ns, "python3", hidden=True, anon=768 * MIB)
     _polls(watch, 4)
-    assert top.alive
+    assert not top.alive
     found = watch.end_cell()
-    assert found["kills"] == []
+    (kill,) = found["kills"]
+    assert (kill["reason"], kill["what"], kill["scope"], kill["attributed"]) == (
+        "memory_limit", "memory_hidden", "run", False
+    )  # fmt: skip
+    assert kill["why"] == UNATTRIBUTED_WHY
+    assert [e["scope"] for e in ended] == ["run"]
     assert found["memory"]["reading"] == "unknown"
     assert found["memory"]["unknown"] == ["unattributed"]
     assert watch.reading()["reading"] == "unknown"
+    assert watch.visibility()["hidden_memory"] == 0
 
 
 def test_o56_a_start_cell_past_the_margin_makes_the_reading_unknown_and_never_kills(node, tmp_path):
