@@ -270,7 +270,8 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
 The root is the Compose federation's (`fedlayout.Layout`: `EXPCORE_FED_ROOT_PARENT`, `EXPCORE_FED_ROOT`, the same
 checks, the same mark): a 0700 directory, here **on a filesystem the login node and the nodes see** (named in
 `site.env`; never node tmpfs). It holds what `up` lays out for Compose (`platform.toml`, `fault-journal/`,
-`link-check.json`, `facts.json`, `ca/`, `secrets/`) and the state file, **`hpc-federation.json`**:
+`link-check.json`, `facts.json`, `ca/`, `secrets/`), the federation's render identity, **`render-identity.json`**
+(section 8, O74: hashes and a version, mode 0600), and the state file, **`hpc-federation.json`**:
 
 ```json
 {
@@ -281,7 +282,9 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "command": ["<python>", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
-           "billing_weight": null, "step_network": "", "storage_root": "<scratch root, or empty>"},
+           "billing_weight": null, "step_network": "", "study_artifacts": "<directory, or empty>",
+           "storage_root": "<scratch root, or empty>"},
+  "study_artifacts_tree_sha256": "<64 hex: the digest of that directory's tree, taken in the preflight (section 8); absent without one>",
   "storage": {"root": "<the site's scratch root>", "parent": "<root>/<allocation name>", "token": "<32 hex>",
               "providers": {"<provider name>": "<parent>/<provider name>"}},
   "allocation": {
@@ -401,7 +404,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    user to that uid, as `onboard.py` does), the members, the baseline content (`fedcontent.Content`). An owner of a
    shared imported space also has its `import-<space>` storage made before any support, and the scan awaited after
    the members (section 8).
-9. **`facts.json` and `platform.toml`** (section 6), then each shared import verified against its manifest (section 8),
+9. **`facts.json` and `platform.toml`** (section 6) and the render identity of that platform (`render-identity.json`,
+   section 8), then each shared import verified against its manifest (section 8),
    then **the link check**: `fedlinks.check_after_up`, the platform
    layer's own check through the rendered `platform.toml`, which writes `link-check.json` in the root through
    `expcore_onedata.linkrecord`. `up` fails unless every pair passes.
@@ -667,6 +671,34 @@ into the root is rendered absolute. M5 launches its shard's step on `sandbox.nod
 the root's `platform.toml` beside the study's `study.toml`. The driver holds, reads back and places S, runs its node
 facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`: each shard step's directory of this
 federation whose step is gone), then releases it.
+
+**The render identity (O74).** What `up` rendered is recorded as hashes alone in `<root>/render-identity.json` (mode 0600,
+canonical JSON with sorted keys; `hpcidentity.py`, written by `hpcboot.write_facts` beside `platform.toml`, so for
+`[hpc] core = "login"` and `"step"` alike): `version` (`expcore-render-identity/1`); `template_sha256`, the template as
+the renderer read it, before it was rendered; `platform_fingerprint_sha256`, the canonical JSON of the rendered file's
+`PlatformConfig.fingerprint()` hashed as the core hashes a fingerprint (`expcore.campaign.manifest.fingerprint_sha256`);
+and the SHA-256 of each pin the platform holds (`sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256`,
+`oneclient_bundle_sha256`), the very values the preflight checked (`hpcpins`), never read again; and, when `site.env`
+declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256`, the digest of that directory's tree. It holds no address,
+id, job, node, path, user or secret, so it can travel with a shard's results and be committed beside a study. A pin the
+template does not name is left out, and so is the artifacts digest of a site with no such directory; a layout with no
+template writes no record. **The artifacts digest** is taken by `up` once, in its preflight on the login node, before
+the root is made or a job submitted (a tree that cannot be digested fails `up` there), kept in the state file and
+handed to the core's phase among its values, so a core step on a node, whose environment is an allowlist, has it and
+never reads the tree. It is the SHA-256 of one canonical listing: `expcore-artifacts-tree/1` and a NUL, then one record
+per entry sorted by its relative path as bytes, none for the directory itself: `F NUL path NUL size NUL sha256 NUL` (a
+regular file), `D NUL path NUL` (a directory), `L NUL path NUL target NUL` (a symbolic link, by its target string, never
+followed: a venv's `bin/python` is a link to an interpreter outside the tree, so refusing links would refuse the venv,
+and the interpreter's own bytes are not in the digest). A special file, or a root that is not a directory of its own, is
+refused, naming `HPC_STUDY_ARTIFACTS` and a path relative to the directory, never an absolute one. No mode, owner, time
+or path of the directory is in it, so a copy elsewhere has the same digest. The tree is read below one held descriptor
+with no link followed and never written (the pilot makes it read-only first). A manifest's `expect_render_identity`
+(a path of the study; the lines carry it with its hash as `--expect-render-identity*`) makes `step` compare the
+federation's record with the expected one before it makes anything, beside the pre-step guard and before it, refusing
+with 73 and naming the keys that differ; and every step writes the record it validated into
+`out/study-state/render-identity.<step id>.json` at its start (after a resume has restored `out/`, before the
+dispatcher), a file of its own per step, so every snapshot, a killed step's `out/` and the archive carry it and a
+resumed shard keeps the identity each step ran under. `shards.py` keeps its own copy of the record's names, since it runs alone with `-I`; a test compares them.
 
 **The study's own scripts: a pre-step guard and a post-run script.** A study's own refusals (one worker, every
 planned model's cap 1, a federation root of its own) must hold at every shard's start, and `step` makes the work root and

@@ -318,6 +318,20 @@ def test_collect_merges_both_shards_and_every_command_on_the_merge_succeeds(merg
     assert [(s["index"], s["label"]) for s in batch["shards"]] == [(1, KILLED), (2, WHOLE)]
 
 
+@pytest.mark.parametrize("label", LABELS)
+def test_o74_up_wrote_each_federations_render_identity_0600_and_each_shards_out_carries_it_once_per_step(
+    plan, merged, federations, label
+):
+    """O74: `up` wrote `render-identity.json` in each root (mode 0600); each shard's collected `out/` holds that record
+    in `study-state/`, one file per step: the shard that ran to its end one, the shard killed outright and resumed two
+    (the first life's, which its snapshot carried, and the resume's own, under another name)."""
+    record = federations[label].root / "render-identity.json"
+    assert stat.S_IMODE(record.stat().st_mode) == 0o600
+    kept = sorted((plan.results.parent / "collected" / label / "out" / "study-state").glob("render-identity.*.json"))
+    assert len(kept) == (2 if label == KILLED else 1)
+    assert [path.read_bytes() for path in kept] == [record.read_bytes()] * len(kept)
+
+
 def test_the_merged_export_carries_the_kills_lost_spend_with_its_basis_and_the_interrupted_attempt(merged):
     export = merged.read("export.json")
     lost = export[LOST_KEY]
