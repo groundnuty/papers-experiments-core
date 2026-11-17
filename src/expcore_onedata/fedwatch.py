@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from expcore_onedata.client import PlatformError
 from expcore_onedata.compose import CommandRunner, ComposeDriver, DriverError, run_command
 from expcore_onedata.fault_journal import JOURNAL
+from expcore_onedata.fault_owner import attempt_of
 from expcore_onedata.fault_settings import FaultSettings, compose_driver
 from expcore_onedata.readretry import ONE_ATTEMPT
 
@@ -272,7 +273,7 @@ def _entries(lines: Sequence[str]) -> list[dict[str, Any]]:
             if not isinstance(line.get("service"), str) or not isinstance(key, str):
                 raise _Unreadable(f"line {number + 1} of the journal names no service")
             found[key] = {"service": line["service"], "heal": line.get("heal") is True, "events": {event},
-                          "lines": [number], "stop_line": -1, "cleared": None}  # fmt: skip
+                          "lines": [number], "stop_line": -1, "cleared": None, "owner": line.get("owner")}  # fmt: skip
         elif key in found:
             entry = found[key]
             entry["events"].add(event)
@@ -284,16 +285,24 @@ def _entries(lines: Sequence[str]) -> list[dict[str, Any]]:
     return list(found.values())
 
 
-def _explaining(entries: list[dict[str, Any]], service: str, first: int, was_running: bool) -> list[dict[str, Any]]:
+def _explaining(
+    entries: list[dict[str, Any]],
+    service: str,
+    first: int,
+    was_running: bool,
+    owned: Callable[[Mapping[str, Any]], bool],
+) -> list[dict[str, Any]]:
     """The injections of `service` that can explain a restart inside the window that began at line `first`, in the
     order they began: the stop was asked for, and the injection did not end `never_down`; and either the stop was asked
     inside the window, or the service was down at the window's start and the injection has a line in it (its restore is
     the restart). An injection whose stop and restore came before the window, with only its `cleared` line written
-    after the start reading, explains nothing: the restart it made is not in the window."""
+    after the start reading, explains nothing: the restart it made is not in the window. And only an injection that the
+    window's `owned` accepts: with a run named, the run's own (see `_ownership`)."""
     return [
         entry
         for entry in entries
         if entry["service"] == service
+        and owned(entry)
         and entry["stop_line"] >= 0
         and entry["cleared"] != "never_down"
         and (entry["stop_line"] >= first or (not was_running and entry["lines"][-1] >= first))
@@ -310,32 +319,89 @@ def _kind(entries: Sequence[dict[str, Any]]) -> str:
 NO_JOURNAL = "no journal is declared, so nothing can explain a restart"
 
 
+def _anyone(entry: Mapping[str, Any]) -> bool:
+    return True
+
+
+def _ownership(owner: Mapping[str, Any] | None) -> tuple[Callable[[Mapping[str, Any]], bool], str]:
+    """Which injections of the journal may explain this window, and the word for how that was decided.
+
+    With no run named (`owner` None: a batch's window), any: `not_checked`. With a run named, only the injections whose
+    `owner` names the same attempt (`fault_owner.attempt_of`: the process, the campaign and the attempt's id): `run`.
+    A run that names no attempt (a process alone) cannot be told from another, so nothing is its own: `unattributed`.
+    An injection of another attempt, and one that records no owner (written before #371), explain nothing: an owner is
+    never guessed."""
+    if owner is None:
+        return _anyone, "not_checked"
+    judged = attempt_of(owner)
+    if judged is None:
+        return (lambda entry: False), "unattributed"
+    return (lambda entry: attempt_of(entry.get("owner")) == judged), "run"
+
+
 @dataclass(frozen=True)
 class _JournalWindow:
-    """What the journal says about one window: its injections (None when it cannot be used, and `why`), and the
-    number of the first line written after the start reading."""
+    """What the journal says about one window: its injections (None when it cannot be used, and `why`), the number of
+    the first line written after the start reading, and which injections count as the run's (`owned`, `ownership`)."""
 
     entries: list[dict[str, Any]] | None
     first: int
     why: str | None
+    owned: Callable[[Mapping[str, Any]], bool] = _anyone
+    ownership: str = "not_checked"
 
     @classmethod
-    def of(cls, lines: list[str] | None, why: str | None, start: Mapping[str, Any] | None) -> "_JournalWindow":
+    def of(
+        cls,
+        lines: list[str] | None,
+        why: str | None,
+        start: Mapping[str, Any] | None,
+        owner: Mapping[str, Any] | None = None,
+    ) -> "_JournalWindow":
+        owned, ownership = _ownership(owner)
         if lines is None:
-            return cls(None, 0, why or NO_JOURNAL)
+            return cls(None, 0, why or NO_JOURNAL, owned, ownership)
         before = None if start is None else start["journal"].get("lines")
         if not isinstance(before, int):
-            return cls(None, 0, "the journal could not be read at the window's start")
+            return cls(None, 0, "the journal could not be read at the window's start", owned, ownership)
         if len(lines) < before:
-            return cls(None, 0, "the journal is shorter than it was at the window's start")
+            return cls(None, 0, "the journal is shorter than it was at the window's start", owned, ownership)
         try:
-            return cls(_entries(lines), before, None)
+            return cls(_entries(lines), before, None, owned, ownership)
         except _Unreadable as error:
-            return cls(None, 0, str(error))
+            return cls(None, 0, str(error), owned, ownership)
 
     def held(self, service: str, was_running: bool) -> list[dict[str, Any]]:
-        """The injections that can explain a restart of the service in the window (`was_running` at its start)."""
-        return [] if self.entries is None else _explaining(self.entries, service, self.first, was_running)
+        """The injections that can explain a restart of the service in the window (`was_running` at its start), the
+        run's own when a run is named."""
+        return [] if self.entries is None else _explaining(self.entries, service, self.first, was_running, self.owned)
+
+    def foreign(self, service: str, was_running: bool) -> int:
+        """How many injections would have explained a restart of the service but are not the run's own."""
+        if self.entries is None or self.ownership == "not_checked":
+            return 0
+        every = _explaining(self.entries, service, self.first, was_running, _anyone)
+        return len(every) - len(_explaining(self.entries, service, self.first, was_running, self.owned))
+
+    def holding(self, service: str) -> list[dict[str, Any]]:
+        """The open injections of the service that hold it down, wherever they began, before the start reading or in
+        the window: its stop was asked, it did not end `never_down`, nothing has cleared it, and it is the run's own
+        when a run is named."""
+        return [] if self.entries is None else [e for e in self.entries if self._holds(e, service) and self.owned(e)]
+
+    def strangers(self, service: str) -> int:
+        """How many open injections of the service hold it down and are not the run's own."""
+        if self.entries is None or self.ownership == "not_checked":
+            return 0
+        return sum(1 for e in self.entries if self._holds(e, service) and not self.owned(e))
+
+    @staticmethod
+    def _holds(entry: Mapping[str, Any], service: str) -> bool:
+        return (
+            entry["service"] == service
+            and entry["stop_line"] >= 0
+            and entry["cleared"] is None  # `never_down` is a clearing: such an entry never held it
+        )
 
 
 @dataclass(frozen=True)
@@ -407,6 +473,9 @@ def _restarts(
         return [finding(why) for _ in range(change.count)]
     held = window.held(member.service, bool(before["running"]))
     capacity, short = min(len(held), change.eligible), "no journalled injection of it is left"
+    foreign = window.foreign(member.service, bool(before["running"]))
+    if foreign and not held:
+        short = f"{foreign} injection(s) of it in the window are not this run's (another attempt's, or none named)"
     if change.eligible < change.count:
         short = change.cannot
     if isinstance(before["stops"], int) and isinstance(after["stops"], int):  # HPC: a running service owes a stop
@@ -417,7 +486,8 @@ def _restarts(
     for index in range(change.count):
         if index < capacity:
             label = _kind(held[index : index + 1]) if change.exact else _kind(held)
-            reason = f"{said}; the journal holds {len(held)} injection(s) of the service in the window"
+            whose = ", this run's own" if window.ownership == "run" else ""
+            reason = f"{said}; the journal holds {len(held)} injection(s) of the service in the window{whose}"
             restarts.append({"label": label, "explained": True, "reason": reason})
         else:
             restarts.append(finding(f"{min(change.count, capacity)} explained, the rest not: {short}"))
@@ -438,21 +508,65 @@ def _judge(
         restarts = _restarts(member, before, after, change, window)
     findings = [f"restart not explained, {r['reason']}" for r in restarts if not r["explained"]]
     down = after["state"] == "not_running"
-    open_now = [
-        entry for entry in window.held(member.service, bool(before and before["running"])) if entry["cleared"] is None
-    ]
-    if down and not open_now:
-        findings.append("not running at the window's end, and no open injection of it holds it down")
+    holding = window.holding(member.service)
+    if down and not holding:
+        findings.append(_down_finding(window, member.service))
     if after["state"] == "running" and after["health"] not in (None, "healthy"):
         findings.append(f"its container's health check reports {after['health']} at the window's end")
-    status = "unknown" if unknown else "down" if down else "restarted" if restarts else "stable"
+    status = (
+        "unknown"
+        if unknown
+        else "held"
+        if down and holding
+        else "down"
+        if down
+        else "restarted"
+        if restarts
+        else "stable"
+    )
     return {
         "status": status,
         "start": before,
         "end": after,
         "restarts": restarts,
+        "held": _held(window, holding) if status == "held" else None,
         "unknown": unknown,
         "findings": findings,
+    }
+
+
+def _down_finding(window: _JournalWindow, service: str) -> str:
+    """Why a service not running at the window's end is a finding: nothing holds it down that the window may count."""
+    strangers = window.strangers(service)
+    if window.ownership == "unattributed":
+        return "not running at the window's end, and the run names no attempt, so no open injection of it is its own"
+    if strangers:
+        return (
+            f"not running at the window's end, held down only by {strangers} open injection(s) that are not this run's "
+            "(another attempt's, or one that names no attempt)"
+        )
+    mine = " that this run owns" if window.ownership == "run" else ""
+    return f"not running at the window's end, and no open injection of it{mine} holds it down"
+
+
+def _held(window: _JournalWindow, holding: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """What holds a service down at the window's end: how many open injections, which the run owns, and where they
+    began. Not a pass by itself: the restore comes after the window, so the run's restore outcome is read with it."""
+    before = any(entry["lines"][0] < window.first for entry in holding)
+    inside = any(entry["lines"][0] >= window.first for entry in holding)
+    where = (
+        "before the window and inside it"
+        if before and inside
+        else "before the window"
+        if before
+        else "inside the window"
+    )
+    whose = "this run owns" if window.ownership == "run" else "(whose they are is not checked: no run was named)"
+    return {
+        "injections": len(holding),
+        "opened": where,
+        "reason": f"not running at the window's end, held down by {len(holding)} open injection(s) of it that {whose}, "
+        f"opened {where}; its restore comes after the window, so the run's own restore outcome is read with this",
     }
 
 
@@ -518,13 +632,16 @@ class FederationWatch:
         """One reading of every service now, to be kept as a window's start: plain JSON."""
         return self._reading(*self._lines())
 
-    def window(self, start: Mapping[str, Any] | None) -> dict[str, Any]:
+    def window(self, start: Mapping[str, Any] | None, *, owner: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Read now and return the window since `start` (a reading `read` made); a missing or foreign `start` leaves
-        every service unknown."""
+        every service unknown. `owner` names the run the window is of, as the injector writes it into each `injecting`
+        line (`liveness.owner()`): only the injections that name the same attempt explain a restart or hold a service
+        down, so another attempt's leftover, and a line written before owners were recorded, explain nothing. With no
+        `owner` (a batch's window) any injection counts, which the result says (`ownership`: `not_checked`)."""
         lines, why = self._lines()
         end = self._reading(lines, why)
         first = start if _is_start(start, end["backend"]) else None
-        window = _JournalWindow.of(lines, why, first)
+        window = _JournalWindow.of(lines, why, first, owner)
         services: dict[str, Any] = {}
         findings: list[str] = []
         unknown: list[str] = []
@@ -534,8 +651,11 @@ class FederationWatch:
             findings += [f"{member.label}: {reason}" for reason in seen.pop("findings")]
             unknown += [f"{member.label}: {reason}" for reason in seen["unknown"]]
             services[member.label] = seen
-        busy = any(s["restarts"] or s["status"] == "down" for s in services.values())
-        verdict = "finding" if findings else "unknown" if unknown else "restarted" if busy else "stable"
+        held = any(s["status"] == "held" for s in services.values())
+        busy = any(s["restarts"] for s in services.values())
+        verdict = (
+            "finding" if findings else "unknown" if unknown else "held" if held else "restarted" if busy else "stable"
+        )
         journal = {
             "declared": end["journal"]["declared"],
             "lines_start": None if first is None else first["journal"].get("lines"),
@@ -547,6 +667,7 @@ class FederationWatch:
             "backend": end["backend"],
             "window": {"start": None if first is None else first["at"], "end": end["at"]},
             "verdict": verdict,
+            "ownership": window.ownership,
             "services": services,
             "findings": findings,
             "unknown": unknown,

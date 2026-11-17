@@ -26,6 +26,7 @@ from fake_node import FakeNode
 from fault_support import OUTAGE_TARGET, SERVICE_NAMES, FakeServices, faults_table, injector_for
 from sandbox_support import FAST, add_sandbox
 
+from expcore.campaign import liveness
 from expcore_onedata.admission import FederationLock
 from expcore_onedata.client import PlatformError
 from expcore_onedata.compose import CommandResult
@@ -40,6 +41,8 @@ from expcore_onedata.testing import NOW, write_platform
 from expcore_onedata.users import TokenJournal
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
+ATTEMPT, EARLIER = 5, 6  # the store's ids of the run's attempt and of an earlier one
+CAMPAIGN = SimpleNamespace(key=None)  # the key of the campaign this test registered in `liveness`
 CEILING_S = 600.0
 ZONE_SERVICE = "zn-svc"  # the backend's name for the zone: never in a fact
 PROVIDER_SERVICES = SERVICE_NAMES  # providers[0], providers[1]
@@ -57,6 +60,20 @@ def config(tmp_path, fake):
         data["tokens"] = {"margin_s": 1125}
 
     return load_platform(write_platform(tmp_path, edit))
+
+
+@pytest.fixture(autouse=True)
+def campaign():
+    """A campaign registered in this process, whose attempts 5 and 6 are running: what `liveness.running` runs a run as,
+    so the injector writes the attempt as the owner of each injection (O80) and the window knows whose it is."""
+    CAMPAIGN.key = liveness.register({ATTEMPT: "running", EARLIER: "running"}.get)
+    yield
+    liveness.unregister(CAMPAIGN.key)
+
+
+def earlier_attempt():
+    """The owner token of an earlier attempt of the campaign, as the injector would have written it."""
+    return {"process": liveness.this_process(), "campaign": CAMPAIGN.key, "attempt_id": EARLIER}
 
 
 class Ctx:
@@ -149,9 +166,9 @@ class Spy:
         self.events.append("read")
         return self.watch.read()
 
-    def window(self, start):
+    def window(self, start, *, owner=None):
         self.events.append("window")
-        return self.watch.window(start)
+        return self.watch.window(start, owner=owner)
 
 
 class Raising:
@@ -165,7 +182,7 @@ class Raising:
             raise RuntimeError("the zone zn-svc at zone.internal.example refused the read")
         return {"format": "expcore-fedwatch/1"}
 
-    def window(self, start):
+    def window(self, start, *, owner=None):
         if self.fail_window:
             raise RuntimeError("the zone zn-svc at zone.internal.example refused the read")
         return {"format": "expcore-fedwatch/1"}
@@ -200,8 +217,12 @@ def launching(platform, ctx=None):
     return platform.launch(ctx or Ctx(), run_key=RUN["run_key"], level="isolated", ceiling_s=CEILING_S)
 
 
-def admitted(settings, *, exclusive):
-    return FederationLock(settings).admitted(exclusive=exclusive, timeout_s=10, target=OUTAGE_TARGET)
+@contextlib.asynccontextmanager
+async def admitted(settings, *, exclusive):
+    """The run as the campaign runs it: an attempt, admitted to the federation."""
+    with liveness.running(CAMPAIGN.key, ATTEMPT):
+        async with FederationLock(settings).admitted(exclusive=exclusive, timeout_s=10, target=OUTAGE_TARGET):
+            yield
 
 
 def run(platform, settings, body, *, exclusive=False, ctx=None):
@@ -260,10 +281,123 @@ def test_o86_an_s3_shaped_runs_own_outage_is_explained_by_its_own_injection(conf
     hit = window["services"]["providers[1]"]
     assert hit["status"] == "restarted"
     assert [(r["label"], r["explained"]) for r in hit["restarts"]] == [("outage", True)]
+    assert "this run's own" in hit["restarts"][0]["reason"]
+    assert (window["ownership"], hit["held"], window["restore"]) == ("run", None, None)
     assert hit["start"] == hit["end"] == "running"
     assert window["services"]["providers[0]"]["status"] == window["services"]["zone"]["status"] == "stable"
     assert window["journal"]["lines_end"] > window["journal"]["lines_start"]
     assert not host.containers
+
+
+def pilots_order(federation, platform, body=None):
+    """The pilot's S3 order: prepare (admission, recovery, drain), the injection (which returns once the target reads
+    not running), the launch with the agent inside it, the launch's exit, and only then the restore, verified."""
+    injector = federation.injector()
+    seen = []
+
+    def inject():
+        with injector.prepared(RUN) as prepared:
+            prepared.inject()
+
+    async def go():
+        async with admitted(federation.settings, exclusive=True):
+            await asyncio.to_thread(inject)
+            async with launching(platform) as box:
+                seen.append(box)
+                if body is not None:
+                    await body(box)
+            return await asyncio.to_thread(injector.finish)
+
+    restore = asyncio.run(go())
+    return seen[0], restore, injector
+
+
+def test_o86_in_the_pilots_order_the_target_is_held_down_by_the_runs_own_injection_across_the_window(
+    config, issuer, slots, tmp_path
+):
+    """O86: the injection is made before the launch and restored after it: the target is down at the window's start and
+    at its end, with no restart inside it. The window is `held` for the target, `stable` for every other service, with
+    no finding, the reason says the run owns the injection, and it points at where the restore is recorded: the
+    restore comes after the window and is the run's own to prove (`restore_verified` of the injector's snapshot)."""
+    federation = Federation(config)
+    platform, host = build(config, issuer, slots, tmp_path, federation.spy())
+    evidence = tmp_path / "evidence"
+
+    async def agent(box):
+        box.collect(evidence)
+
+    box, restore, injector = pilots_order(federation, platform, agent)
+    assert federation.events == ["stop", "read", "window", "start"]  # the restore is after the window
+    window = window_of(box)
+    assert window["verdict"] == "held"
+    assert (window["findings"], window["unknown"], window["ownership"]) == ([], [], "run")
+    target = window["services"]["providers[1]"]
+    assert (target["status"], target["start"], target["end"], target["restarts"]) == (
+        "held", "not_running", "not_running", [],
+    )  # fmt: skip
+    assert target["held"]["injections"] == 1
+    assert target["held"]["opened"] == "before the window"
+    assert "this run owns" in target["held"]["reason"]
+    assert [window["services"][label]["status"] for label in ("zone", "providers[0]")] == ["stable", "stable"]
+    assert window["restore"]["instrument"] == "fault_injector"
+    assert window["restore"]["field"] == "restore_verified"
+    assert restore["ok"] is True
+    assert injector.snapshot()["restore_verified"] is True  # what the window points at
+    assert json.loads((evidence / fedwindow.FILE).read_text(encoding="utf-8")) == window
+    assert not host.containers
+
+
+@pytest.mark.parametrize("owner", ["another attempt's", "no owner"])
+def test_o86_a_target_held_down_by_an_injection_that_is_not_the_runs_is_a_finding(
+    config, issuer, slots, tmp_path, owner
+):
+    """O86: the target was already down, held by an earlier attempt's injection or by a line written before owners were
+    recorded: neither is this run's, so neither holds it down for the window, and it is a finding, never `held`."""
+    federation = Federation(config)
+    platform, host = build(config, issuer, slots, tmp_path, federation.watch)
+    leave_open(federation, PROVIDER_SERVICES[1], owner=earlier_attempt() if owner == "another attempt's" else None)
+
+    box = run(platform, federation.settings, nothing, exclusive=True)
+    window = window_of(box)
+    assert window["verdict"] == "finding"
+    assert window["services"]["providers[1]"]["status"] == "down"
+    assert window["services"]["providers[1]"]["held"] is None
+    assert any("providers[1]: not running at the window's end" in text for text in window["findings"])
+    assert not host.containers
+
+
+def leave_open(federation, service, *, owner):
+    """An injection of `service` that was made, and not cleared, before the run: as another attempt's, or an older
+    version's, journal line, with the service stopped."""
+    journal = InjectionJournal(federation.settings.journal)
+    entry = uuid.uuid4().hex
+    line = {
+        "target": OUTAGE_TARGET,
+        "service": service,
+        "identity_sha256": "f" * 64,
+        "holder": {"pid": 1, "boot_id": None},
+    }
+    journal.append({"event": "injecting", "id": entry, **line, **({} if owner is None else {"owner": owner})})
+    journal.append({"event": "stopping", "id": entry})
+    journal.append({"event": "injected", "id": entry})
+    federation.services.stop(service)
+
+
+def test_o86_in_the_pilots_order_a_second_service_that_restarts_is_a_finding(config, issuer, slots, tmp_path):
+    """O86: only the injection's target may be held or restarted: a provider that restarts in an injecting run with no
+    injection of its own is a finding, whatever holds the target."""
+    federation = Federation(config)
+    platform, _ = build(config, issuer, slots, tmp_path, federation.watch)
+
+    async def outside(box):
+        federation.services.stop(PROVIDER_SERVICES[0])
+        federation.services.start(PROVIDER_SERVICES[0])
+
+    box, _, _ = pilots_order(federation, platform, outside)
+    window = window_of(box)
+    assert window["verdict"] == "finding"
+    assert window["services"]["providers[1]"]["status"] == "held"
+    assert [r["label"] for r in window["services"]["providers[0]"]["restarts"]] == ["finding"]
 
 
 def test_o86_a_restart_the_journal_does_not_explain_is_a_finding(config, issuer, slots, tmp_path):
@@ -322,9 +456,9 @@ def test_o86_a_start_reading_that_failed_leaves_the_window_unknown_never_stable(
         def read(self):
             raise RuntimeError("no")
 
-        def window(self, start):
+        def window(self, start, *, owner=None):
             starts.append(start)
-            return real.window(start)
+            return real.window(start, owner=owner)
 
     platform, _ = build(config, issuer, slots, tmp_path, FirstReadFails())
     window = window_of(run(platform, federation.settings, nothing))
@@ -387,7 +521,7 @@ def test_o86_a_cancellation_during_the_closing_read_still_records_the_window_and
         def read(self):
             return {}
 
-        def window(self, start):
+        def window(self, start, *, owner=None):
             entered.set()
             release.wait(10)
             return {}
@@ -425,7 +559,7 @@ def test_o86_a_cancellation_during_the_opening_read_creates_nothing_and_keeps_no
             release.wait(10)
             return {}
 
-        def window(self, start):
+        def window(self, start, *, owner=None):
             raise AssertionError("the run never began")
 
     platform, host = build(config, issuer, slots, tmp_path, Slow())
@@ -454,10 +588,11 @@ async def run_in_loop(platform, settings, body):
         await body(box)
 
 
-def test_o86_a_launch_that_closes_before_the_restore_never_reads_stable(config, issuer, slots, tmp_path):
-    """O86: an executor whose `running` encloses the launch has taken the target down before the read, and closes the
-    launch before the restore: that window is not the run's outage. It is never `stable`: the service is not running
-    at its end, and the injection that holds it down began before the window, so the window reports a finding."""
+def test_o86_an_executor_whose_running_encloses_the_launch_reads_held_never_stable_or_a_finding(
+    config, issuer, slots, tmp_path
+):
+    """O86: `running` encloses the launch, so the target is down before the read and restored after the window: the
+    run's own open injection holds it down across the window, `held`, explained: not `stable`, not a finding."""
     federation = Federation(config)
     platform, host = build(config, issuer, slots, tmp_path, federation.watch)
     injector = federation.injector()
@@ -469,9 +604,9 @@ def test_o86_a_launch_that_closes_before_the_restore_never_reads_stable(config, 
 
     asyncio.run(go())
     window = window_of(seen[0])
-    assert window["verdict"] == "finding"
+    assert (window["verdict"], window["findings"]) == ("held", [])
+    assert window["services"]["providers[1]"]["status"] == "held"
     assert window["services"]["providers[1]"]["end"] == "not_running"
-    assert any("not running at the window's end" in text for text in window["findings"])
     assert not host.containers
 
 
@@ -722,7 +857,8 @@ def test_o86_an_hpc_federations_window_is_read_the_same_way_on_a_batch_nodes_san
         entry = uuid.uuid4().hex
         journal = InjectionJournal(settings.journal)
         journal.append({"event": "injecting", "id": entry, "target": "a-target", "service": PROVIDER_SERVICES[1],
-                        "identity_sha256": "f" * 64, "holder": {"pid": 1, "boot_id": None}})  # fmt: skip
+                        "identity_sha256": "f" * 64, "holder": {"pid": 1, "boot_id": None},
+                        "owner": liveness.owner()})  # fmt: skip
         for event in ("stopping", "injected"):
             journal.append({"event": event, "id": entry})
         journal.append({"event": "cleared", "id": entry, "how": "restored"})

@@ -39,8 +39,12 @@ import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
+
+from expcore.campaign import liveness
+from expcore.records.injections import FAULT_NAMESPACE
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +55,11 @@ NO_WATCH = "no federation watch configured"
 PENDING = f"the window closes after the run's evidence is collected: see {FILE} beside metadata.json"
 CANCELLED = "the run was cancelled before its window was read"
 INTERRUPTED = "the run was interrupted before its window was read"
+RESTORE = {  # where the restore of a held service is recorded: the window closes before it comes
+    "instrument": FAULT_NAMESPACE,
+    "field": "restore_verified",
+    "why": "a held service is restored after the window: it is no pass unless the run's restore was verified",
+}
 TEXT_CAP = 300  # a reason or a finding is a sentence: a longer one is cut, never copied whole
 
 
@@ -65,15 +74,18 @@ class Watch(Protocol):
 
     def read(self) -> dict[str, Any]: ...
 
-    def window(self, start: Mapping[str, Any] | None) -> dict[str, Any]: ...
+    def window(self, start: Mapping[str, Any] | None, *, owner: Mapping[str, Any] | None = None) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
 class Opened:
-    """A window's start: the reading, or why there is none (`why` names an exception's type only)."""
+    """A window's start: the reading, or why there is none (`why` names an exception's type only), and the run's owner
+    token as the injector writes it (`liveness.owner()`, taken in the run's own context): the window counts only the
+    injections that name this attempt. Held in memory for the window's judge, never recorded."""
 
     reading: dict[str, Any] | None
     why: str | None
+    owner: Mapping[str, Any]
 
 
 def _text(value: Any) -> str:
@@ -93,10 +105,12 @@ def unread(*reasons: str) -> dict[str, Any]:
         "reason": _text(reasons[0]) if reasons else None,
         "backend": None,
         "window": {"start": None, "end": None},
+        "ownership": None,
         "services": {},
         "findings": [],
         "unknown": [_text(reason) for reason in reasons],
         "journal": None,
+        "restore": None,
     }
 
 
@@ -152,15 +166,18 @@ def project(window: Mapping[str, Any]) -> dict[str, Any]:
                 {"label": _text(r["label"]), "explained": r["explained"] is True, "reason": _text(r["reason"])}
                 for r in seen["restarts"]
             ],
+            "held": None if seen["held"] is None else {k: seen["held"][k] for k in ("injections", "opened", "reason")},
         }
         for label, seen in window["services"].items()
     }
+    held = any(seen["held"] is not None for seen in services.values())
     journal = window["journal"]
     return {
         "version": VERSION,
         "verdict": _text(window["verdict"]),
         "backend": _text(window["backend"]),
         "window": {key: window["window"][key] for key in ("start", "end")},
+        "ownership": _text(window["ownership"]),
         "services": services,
         "findings": [_text(text) for text in window["findings"]],
         "unknown": [_text(text) for text in window["unknown"]],
@@ -170,23 +187,25 @@ def project(window: Mapping[str, Any]) -> dict[str, Any]:
             "lines_end": journal["lines_end"],
             "read": True if journal["read"] is True else _text(journal["read"]),
         },
+        "restore": dict(RESTORE) if held else None,
     }
 
 
 async def open_window(watch: Watch) -> Opened:
     """Read the federation, off the event loop (a read may run commands and wait on the platform's client). A read that
     raises is no start, with its reason."""
+    owner = liveness.owner()  # in the run's own context: a worker thread would carry it too, but this reads it once
     try:
-        return Opened(await asyncio.to_thread(watch.read), None)
+        return Opened(await asyncio.to_thread(watch.read), None, owner)
     except Exception as error:
-        return Opened(None, _failed("the window's start could not be read", error))
+        return Opened(None, _failed("the window's start could not be read", error), owner)
 
 
 async def close_window(watch: Watch, opened: Opened) -> dict[str, Any]:
     """The window since `opened`, as facts. Never raises an `Exception`: what cannot be read is unknown with its
     reason, and a window whose start was not read is never stable, whatever its end shows."""
     try:
-        facts = project(await asyncio.to_thread(watch.window, opened.reading))
+        facts = project(await asyncio.to_thread(partial(watch.window, opened.reading, owner=opened.owner)))
     except Exception as error:
         return unread(*([opened.why] if opened.why else []), _failed("the window could not be read", error))
     if opened.why is not None:

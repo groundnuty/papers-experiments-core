@@ -20,6 +20,9 @@ from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.fault_settings import load_faults
 from expcore_onedata.fedwatch import FORMAT, ComposeSource, FederationWatch, HpcSource, Member, members_of, watch_for
 
+ME = {"process": "proc-1", "campaign": "campaign-1", "attempt_id": 5}  # the run a window is of
+ANOTHER = {"process": "proc-1", "campaign": "campaign-1", "attempt_id": 6}  # an earlier attempt of its campaign
+PROCESS_ONLY = {"process": "proc-1"}  # an injection outside any attempt (a tool's, a gate's heal)
 ZONE, ALPHA, BETA = "zn-svc", "store-one", "store-two"  # a backend's names for the services: never in a result
 MEMBERS = (Member("zone", ZONE, None), Member("providers[0]", ALPHA, "prov-a"), Member("providers[1]", BETA, "prov-b"))
 DOC_AT = "2026-11-17T04:00:00Z"
@@ -104,14 +107,16 @@ def journal_of(tmp_path):
     return InjectionJournal(tmp_path / "fault-journal")
 
 
-def injection(journal, service, *, heal=False, clears="restored", stop=True):
-    """What the injector writes for one outage (or, with `heal`, one heal's container restart), as faults.py does."""
+def injection(journal, service, *, heal=False, clears="restored", stop=True, owner=None):
+    """What the injector writes for one outage (or, with `heal`, one heal's container restart), as faults.py does; with
+    an `owner`, the owner token it writes (`liveness.owner()`, O80), else a line written before owners were recorded."""
     entry = uuid.uuid4().hex
     line = {
         "target": "a-target",
         "service": service,
         "identity_sha256": "f" * 64,
         "holder": {"pid": 1, "boot_id": None},
+        **({} if owner is None else {"owner": owner}),
     }
     journal.append({"event": "injecting", "id": entry, **line, **({"heal": True} if heal else {})})
     if stop:
@@ -244,17 +249,20 @@ def test_o86_a_service_down_at_the_start_and_restored_in_the_window_is_explained
     assert [(r["label"], r["explained"]) for r in seen["restarts"]] == [("outage", True)]
 
 
-def test_o86_an_outage_still_open_at_the_end_is_down_and_explained(tmp_path):
-    """O86: the injector stopped a provider in the window and has not restored it: `down`, and no finding for it."""
+def test_o86_an_outage_still_open_at_the_end_is_held_and_explained(tmp_path):
+    """O86: the injector stopped a provider in the window and has not restored it: `held`, and no finding for it; the
+    window's verdict is `held`, not `restarted`: nothing restarted."""
     containers = steady()
     watch = compose_watch(containers, tmp_path)
     start = watch.read()
     containers.by_service[ALPHA] = container("ctr-a", running=False, health=None, exit_code=0)
     injection(journal_of(tmp_path), ALPHA, clears=None)
     result = watch.window(start)
-    assert result["services"]["providers[0]"]["status"] == "down"
+    assert result["services"]["providers[0]"]["status"] == "held"
+    assert result["services"]["providers[0]"]["restarts"] == []
     assert result["findings"] == []
-    assert result["verdict"] == "restarted"
+    assert result["verdict"] == "held"
+    assert result["ownership"] == "not_checked"
 
 
 def test_o86_a_restart_by_dockers_own_policy_is_a_finding_even_with_a_journal_line(tmp_path):
@@ -439,6 +447,125 @@ def test_o86_members_of_labels_the_zone_and_each_declared_provider(config):
     ]
     with pytest.raises(ValueError, match="declared"):
         members_of(config, zone="zn-svc", providers={"not-declared": "x"})
+
+
+# --- whose an injection is: a run's window counts only its own (#371's owner) -----------------------------------------
+
+
+def down_target(tmp_path, *, owner, clears=None):
+    """The pilot's order: the target is down, held by an injection, when the window opens, and still when it ends."""
+    containers = steady()
+    journal = journal_of(tmp_path)
+    injection(journal, ALPHA, clears=clears, owner=owner)
+    containers.by_service[ALPHA] = container("ctr-a", running=False, health=None, exit_code=0)
+    watch = compose_watch(containers, tmp_path)
+    return watch, watch.read(), containers, journal
+
+
+def test_o86_a_target_down_at_both_ends_by_the_runs_own_open_injection_is_held_not_restarted(tmp_path):
+    """O86: the injection came before the start reading and is still open at the end: the run's own injection holds the
+    target down, `held`, explained and no finding; every other service is `stable`; the verdict is `held`."""
+    watch, start, _, _ = down_target(tmp_path, owner=ME)
+    result = watch.window(start, owner=ME)
+    held = result["services"]["providers[0]"]
+    assert (held["status"], held["restarts"], held["start"]["state"], held["end"]["state"]) == (
+        "held", [], "not_running", "not_running",
+    )  # fmt: skip
+    assert held["held"]["injections"] == 1
+    assert held["held"]["opened"] == "before the window"
+    assert "this run owns" in held["held"]["reason"]
+    assert "restore outcome" in held["held"]["reason"]
+    assert [result["services"][label]["status"] for label in ("zone", "providers[1]")] == ["stable", "stable"]
+    assert (result["verdict"], result["findings"], result["ownership"]) == ("held", [], "run")
+
+
+@pytest.mark.parametrize(
+    ("owner", "why"),
+    [
+        (ANOTHER, "not this run's"),
+        (None, "no open injection of it that this run owns"),
+        (PROCESS_ONLY, "not this run's"),
+    ],
+    ids=["another attempt's", "ownerless", "a process alone"],
+)
+def test_o86_a_down_target_whose_injection_is_not_the_runs_is_a_finding(tmp_path, owner, why):
+    """O86: an earlier attempt's leftover, a line written before owners were recorded and an injection outside any
+    attempt hold the service down but are not this run's: it is `down` with a finding, never `held`."""
+    watch, start, _, _ = down_target(tmp_path, owner=owner)
+    result = watch.window(start, owner=ME)
+    assert result["services"]["providers[0]"]["status"] == "down"
+    assert result["services"]["providers[0]"]["held"] is None
+    assert result["verdict"] == "finding"
+    assert any(why in finding for finding in result["findings"])
+
+
+def test_o86_a_run_that_names_no_attempt_owns_no_injection(tmp_path):
+    """O86: a window asked of a process alone (no attempt) cannot tell its injection from another's: none is its own."""
+    watch, start, _, _ = down_target(tmp_path, owner=PROCESS_ONLY)
+    result = watch.window(start, owner=PROCESS_ONLY)
+    assert result["ownership"] == "unattributed"
+    assert result["services"]["providers[0]"]["status"] == "down"
+    assert any("names no attempt" in finding for finding in result["findings"])
+
+
+@pytest.mark.parametrize(
+    ("owner", "label", "verdict"),
+    [(ME, "outage", "restarted"), (ANOTHER, "finding", "finding"), (None, "finding", "finding")],
+    ids=["the run's own", "another attempt's", "ownerless"],
+)
+def test_o86_a_restart_by_the_runs_own_injection_is_explained_and_another_attempts_is_a_finding(
+    tmp_path, owner, label, verdict
+):
+    """O86: the same restart, in the window, is explained only when the injection that has a line in it is the run's."""
+    containers = steady()
+    watch = compose_watch(containers, tmp_path)
+    start = watch.read()
+    containers.by_service[ALPHA] = container("ctr-a", "2026-11-17T03:00:00Z")
+    injection(journal_of(tmp_path), ALPHA, owner=owner)
+    result = watch.window(start, owner=ME)
+    seen = result["services"]["providers[0]"]
+    assert [r["label"] for r in seen["restarts"]] == [label]
+    assert result["verdict"] == verdict
+    reason = seen["restarts"][0]["reason"]
+    assert ("this run's own" in reason) if owner is ME else ("not this run's" in reason or "no journalled" in reason)
+
+
+def test_o86_only_the_injections_target_may_restart_or_be_down_and_another_service_that_does_is_a_finding(tmp_path):
+    """O86: an S3 run's target is held and explained; a second provider that restarted or is down in the same window
+    is not the target of any injection of the run: a finding, even inside an injecting run."""
+    watch, start, containers, _ = down_target(tmp_path, owner=ME)
+    containers.by_service[BETA] = container("ctr-b", "2026-11-17T03:00:00Z")  # restarted, nothing journalled for it
+    result = watch.window(start, owner=ME)
+    assert result["services"]["providers[0]"]["status"] == "held"
+    assert [r["label"] for r in result["services"]["providers[1]"]["restarts"]] == ["finding"]
+    assert result["verdict"] == "finding"
+    containers.by_service[BETA] = container("ctr-b", running=False, health=None, exit_code=137)
+    result = watch.window(start, owner=ME)
+    assert result["services"]["providers[1]"]["status"] == "down"
+    assert result["verdict"] == "finding"
+
+
+def test_o86_the_verdict_follows_the_worst_service_finding_unknown_held_restarted_stable(tmp_path):
+    """O86: held outranks restarted, unknown outranks held, and a finding outranks them all."""
+    watch, start, containers, _ = down_target(tmp_path, owner=ME)
+    containers.by_service[BETA] = container("ctr-b-new")
+    injection(journal_of(tmp_path), BETA, owner=ME)  # the second service restarted, and its restart is the run's too
+    assert watch.window(start, owner=ME)["verdict"] == "held"
+    assert watch.window(start, owner=ME)["services"]["providers[1]"]["status"] == "restarted"
+    containers.by_service[ZONE] = None  # no container: unknown
+    assert watch.window(start, owner=ME)["verdict"] == "unknown"
+    containers.by_service[ZONE] = container("ctr-z", running=False, health=None)  # not running: a finding
+    assert watch.window(start, owner=ME)["verdict"] == "finding"
+
+
+def test_o86_a_window_with_no_run_named_counts_any_injection_and_says_so(tmp_path):
+    """O86: a batch's window (no `owner`) is as it was: any open injection holds a service down and any one explains a
+    restart, and the result says the ownership was not checked."""
+    watch, start, _, _ = down_target(tmp_path, owner=ANOTHER)
+    result = watch.window(start)
+    assert result["services"]["providers[0]"]["status"] == "held"
+    assert result["ownership"] == "not_checked"
+    assert "whose they are is not checked" in result["services"]["providers[0]"]["held"]["reason"]
 
 
 # --- HPC: the documents hpcobserve prints ---------------------------------------------------------------------------
