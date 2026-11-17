@@ -13,7 +13,7 @@ from campaign_support import planned_store
 from fault_support import OUTAGE_TARGET, SERVICES, FakeClock, FakeServices, injector_for, write_faults
 
 from expcore.campaign import liveness
-from expcore.campaign.healthgate import HOLD, HealthGate
+from expcore.campaign.healthgate import HOLD, META, HealthGate, parse
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate, _unsettled
 from expcore_onedata.fault_journal import JOURNAL, InjectionJournal, boot_id
@@ -238,7 +238,7 @@ def test_o80_the_gate_holds_the_run_after_an_attempts_failed_injection_uncharged
     assert held.verdict == HOLD
     assert "left by another attempt" in held.detail
     assert store.q("SELECT COUNT(*) AS n FROM attempts")[0]["n"] == 0  # no attempt was begun, so none is charged
-    [outage] = json.loads(store.get_meta("health_outages"))
+    [outage] = parse(store.get_meta(META))
     assert outage["charged"] is False
     assert "no run is charged, this one included" in " ".join(r["detail"] for r in store.q("SELECT detail FROM events"))
     other = HealthGate(store, left_failed(tmp_path / "again", campaign, 5), lambda: next(stamps), timeout_s=30.0)
