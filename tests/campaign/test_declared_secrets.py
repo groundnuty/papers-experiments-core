@@ -16,6 +16,7 @@ from loop_support import FakeProvider
 from record_support import CODE
 from scheduler_support import FakeExecutor, build, settings_for
 
+from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import record_run
 from expcore.campaign.export import export_run_state
 from expcore.campaign.markers import read_marker
@@ -228,3 +229,24 @@ def test_c40_a_string_is_one_secret_and_one_variable_name_not_its_characters(tmp
         value in text for value in (SECRET, OTHER) for text in where_it_is_kept(row, marker, export).values()
     )
     assert "answered with [redacted] and the endpoint answered with [redacted]" in row["diagnostic"]
+
+
+def test_c40_a_refused_declaration_withholds_the_traceback_it_would_have_logged_with_the_secret_in_it(tmp_path):
+    """C40: as `record_attempt` installs the attempt's redactor before it checks it, a declaration refused for a secret
+    too short to redact leaves the harness-defect log with a redactor that cannot be built: the traceback of the
+    ConfigError that escapes the executor, whose source line holds the value, is withheld and not written, and so is a
+    diagnostic after it (recorded as failed)."""
+
+    async def executor(request):
+        request.declare_secrets(secrets=["zq"])  # too short: refused, and not caught
+
+    root = tmp_path / "out"
+    with build(
+        root, plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+    ) as sched:
+        sched.run()
+        states = {row["state"] for row in sched.store.q("SELECT state FROM attempts")}
+    written = log_path(root).read_text(encoding="utf-8")
+    assert states == {"harness_error"}
+    assert "withheld" in written
+    assert "zq" not in written
