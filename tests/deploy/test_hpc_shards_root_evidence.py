@@ -6,17 +6,20 @@ archive is an allow-list of evidence files: nothing from `secrets/`, no file hol
 path, name and token here is invented."""
 
 import argparse
+import dataclasses
 import fcntl
 import hashlib
 import importlib.util
 import json
+import os
+import re
 import shutil
 import sys
 import tarfile
 from pathlib import Path
 
 import pytest
-from copy_back_support import MANIFEST, SCRIPT, make_plan, pull, sha_of, verify
+from copy_back_support import MANIFEST, SCRIPT, make_plan, plan_file, pull, sha_of, verify
 from root_evidence_support import EVIDENCE, NOT_EVIDENCE, PASSPHRASE, TOKEN, make_root, mode_of
 
 DEPLOY = SCRIPT.parent
@@ -306,6 +309,162 @@ def test_verify_copy_warns_of_a_root_archive_the_manifest_does_not_name(shards, 
     (local / "fed-c.root.tar").write_bytes(b"another campaign's")
     assert verify(shards, manifest, local, given) == 0
     assert "fed-c.root.tar is not named by the manifest" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------------------------------------ a shard that moved
+def _moved(plan, tmp_path, label="fed-a"):
+    """The plan after `label` moved to a fresh federation: the same shard, another root (a fleet's `plan` gives it)."""
+    fresh = make_root(tmp_path / "fed" / f"{label}-moved")
+    shard = next(s for s in plan.shards if s.label == label)
+    others = tuple(s for s in plan.shards if s.label != label)
+    return dataclasses.replace(
+        plan, shards=tuple(sorted((*others, dataclasses.replace(shard, root=fresh)), key=lambda s: s.index))
+    )
+
+
+def _aside(plan):
+    return sorted(p.name for p in plan.results.glob("fed-a.*.root.*"))
+
+
+def test_a_shard_that_moved_to_another_federation_does_not_overwrite_its_first_federations_root_archive(
+    shards, tmp_path
+):
+    """O63: the archive is named by the shard's label, and a fleet's shard moves between federations: the collect
+    that finds `<label>.root.*` made of another root puts it aside (`<label>.<12 hex digits>.root.*`, the same bytes),
+    never overwrites it, and lists both pairs in `archives.sha256.json` for `verify-copy`."""
+    plan = _collect(shards, tmp_path, "first")
+    first = {name: (plan.results / name).read_bytes() for name in ("fed-a.root.tar", "fed-a.root.json")}
+    moved = _moved(plan, tmp_path)
+    shards.collect(moved, tmp_path / "second")
+    aside = _aside(plan)
+    assert len(aside) == 2
+    assert all(re.fullmatch(r"fed-a\.[0-9a-f]{12}\.root\.(tar|json)", name) for name in aside)
+    assert [(plan.results / name).read_bytes() for name in aside] == [first["fed-a.root.json"], first["fed-a.root.tar"]]
+    own = json.loads((plan.results / "fed-a.root.json").read_text())
+    assert own["root_id"] != json.loads(first["fed-a.root.json"])["root_id"]
+    listed = {e["name"] for e in json.loads((plan.results / MANIFEST).read_text())["evidence"]}
+    assert {"fed-a.root.tar", "fed-a.root.json", *aside} <= listed
+    assert str(tmp_path) not in first["fed-a.root.json"].decode() + (plan.results / "fed-a.root.json").read_text()
+
+
+def test_the_set_aside_archive_is_checked_by_verify_copy_and_a_second_collect_finds_it_again(shards, tmp_path, capsys):
+    """O63: pulled with the directory, the set-aside pair is checked like the others; a collect that follows lists it as
+    before and sets nothing more aside."""
+    plan = _collect(shards, tmp_path, "first")
+    moved = _moved(plan, tmp_path)
+    shards.collect(moved, tmp_path / "second")
+    before = _aside(plan)
+    shards.collect(moved, tmp_path / "third")
+    assert _aside(plan) == before
+    manifest, local, given = pull(moved, tmp_path)
+    assert verify(shards, manifest, local, given) == 0
+    capsys.readouterr()
+    (local / before[0]).unlink()
+    assert verify(shards, manifest, local, given) == 1
+    assert f"{before[0]}: missing" in capsys.readouterr().err
+
+
+def test_a_set_aside_pair_that_does_not_verify_refuses_the_collect(shards, tmp_path):
+    """O63: an archive put aside that is no longer the one its manifest names is refused, not listed as it is."""
+    plan = _collect(shards, tmp_path, "first")
+    moved = _moved(plan, tmp_path)
+    shards.collect(moved, tmp_path / "second")
+    tar = next(p for p in plan.results.glob("fed-a.*.root.tar"))
+    tar.write_bytes(tar.read_bytes() + b"x")
+    with pytest.raises(shards.ShardsError, match=r"fed-a.*another|root archive put aside"):
+        shards.collect(moved, tmp_path / "third")
+
+
+def test_a_root_archive_of_another_federation_is_not_taken_for_a_gone_roots_own(shards, tmp_path):
+    """O63: the shard moved and its new root is gone too: the archive under its label is the first federation's, so the
+    collect refuses instead of listing it as this root's."""
+    plan = _collect(shards, tmp_path, "first")
+    moved = _moved(plan, tmp_path)
+    shutil.rmtree(moved.shards[0].root)
+    with pytest.raises(shards.ShardsError, match=r"fed-a.*another federation"):
+        shards.collect(moved, tmp_path / "second")
+
+
+def test_the_root_archive_and_its_manifest_are_private_files(shards, tmp_path):
+    """O63: they name the site's nodes and paths: mode 0600 whatever the umask."""
+    plan = _collect(shards, tmp_path)
+    for name in ("fed-a.root.tar", "fed-a.root.json", "fed-b.root.tar", "fed-b.root.json"):
+        assert mode_of(plan.results / name) == 0o600
+
+
+def test_a_shard_marked_running_is_warned_of_and_still_collected(shards, tmp_path, capsys):
+    """O63: a step that runs across the collect is not seen by the marker, which notices only later starts: the
+    collect says so, naming the shard."""
+    plan = make_plan(shards, tmp_path)
+    (plan.results / "fed-b").mkdir(exist_ok=True)
+    (plan.results / "fed-b" / "running.json").write_text("{}")
+    shards.collect(plan, tmp_path / "merge")
+    err = capsys.readouterr().err
+    assert "WARNING: shard fed-b: a step of it is marked running" in err
+    assert "shard fed-a: a step of it is marked running" not in err
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+def test_a_secrets_directory_that_cannot_be_read_refuses_the_collect_rather_than_skipping_the_check(shards, tmp_path):
+    """O63: with `secrets/` unreadable there is nothing to check the archive against: refused, naming the directory."""
+    plan = make_plan(shards, tmp_path)
+    secrets = plan.shards[0].root / "secrets"
+    secrets.chmod(0)
+    try:
+        with pytest.raises(shards.ShardsError, match=r"fed-a.*secrets/ cannot be read"):
+            shards.collect(plan, tmp_path / "merge")
+    finally:
+        secrets.chmod(0o700)
+    assert not list(plan.results.glob("*.root.*"))
+
+
+# ------------------------------------------------------------------------------------------------ collect --roots-only
+def _roots_only(shards, tmp_path, *flags):
+    return shards.main(["collect", "--manifest", str(tmp_path / "shards.toml"), "--roots-only", *flags])
+
+
+def test_roots_only_archives_and_marks_one_shards_root_without_any_shard_archive(shards, tmp_path, capsys):
+    """O63: for a shard about to move while the others are not final: `collect --roots-only --shard L` needs no archive,
+    no `--into`, and writes no `archives.sha256.json`; it publishes `<L>.root.tar`/`.json` (the hash on stderr) and the
+    marker, and `down` then goes."""
+    plan = shards.load_plan(plan_file(tmp_path))  # no shard has an archive
+    assert _roots_only(shards, tmp_path, "--shard", "fed-a") == 0
+    err = capsys.readouterr().err
+    assert (
+        f"shard fed-a: root evidence archived (fed-a.root.tar sha256 {sha_of(plan.results / 'fed-a.root.tar')})" in err
+    )
+    assert not (plan.results / "fed-b.root.tar").exists()
+    assert not (plan.results / MANIFEST).exists()
+    assert json.loads((plan.shards[0].root / "evidence-collected.json").read_text())["root_archive_sha256"] == sha_of(
+        plan.results / "fed-a.root.tar"
+    )
+    assert not (plan.shards[1].root / "evidence-collected.json").exists()
+
+
+def test_roots_only_without_a_shard_takes_every_root(shards, tmp_path):
+    """O63: no `--shard`: every shard's root."""
+    plan = shards.load_plan(plan_file(tmp_path))
+    assert _roots_only(shards, tmp_path) == 0
+    assert sorted(p.name for p in plan.results.glob("*.root.tar")) == ["fed-a.root.tar", "fed-b.root.tar"]
+
+
+@pytest.mark.parametrize(
+    "flags", [["--shard", "nope"], ["--into", "x"], ["--run"]], ids=["an unknown shard", "an --into", "a --run"]
+)
+def test_roots_only_refuses_what_does_not_go_with_it(shards, tmp_path, capsys, flags):
+    """O63: exit 2 and nothing written."""
+    plan = shards.load_plan(plan_file(tmp_path))
+    assert _roots_only(shards, tmp_path, *flags) == 2
+    assert not plan.results.exists() or not list(plan.results.glob("*.root.*"))
+    assert "ERROR" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags", [[], ["--shard", "fed-a"]], ids=["no --into", "--shard without --roots-only"])
+def test_a_full_collect_needs_its_into_and_takes_no_shard(shards, tmp_path, flags):
+    """O63: `--shard` belongs to `--roots-only`; a full collect without `--into` is refused."""
+    make_plan(shards, tmp_path)
+    argv = ["collect", "--manifest", str(tmp_path / "shards.toml"), *flags]
+    assert shards.main(argv) == 2
 
 
 # ------------------------------------------------------------------------------------------------ the marker

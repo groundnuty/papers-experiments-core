@@ -66,10 +66,12 @@ class Down:
         if not discard:
             if stale:
                 why = f"a step of {shown} started after the evidence was collected, so it lacks their journals"
-                remedy = "run `shards.py collect` again while the federation is up"
+                remedy = "run `shards.py collect` (or `collect --roots-only`) again while the federation is up"
             else:
                 why = f"shard results are recorded in this root ({shown}) and its evidence was not collected"
-                remedy = "run `shards.py collect` while the federation is up"
+                remedy = (
+                    "run `shards.py collect` (or `collect --roots-only`, which needs no final shard) while it is up"
+                )
             raise RuntimeError(
                 f"{why}: down would remove the state, facts, link check, render identity and fault journals the "
                 f"post-check needs. Nothing was stopped or removed: {remedy}, pull the results and `verify-copy` them; "

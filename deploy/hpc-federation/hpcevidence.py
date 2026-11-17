@@ -241,8 +241,12 @@ def secret_values(root_fd: int) -> list[bytes]:
     values: list[bytes] = []
     try:
         top = os.open(SECRETS, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW, dir_fd=root_fd)
-    except OSError:
+    except FileNotFoundError:
         return values
+    except OSError as error:
+        raise EvidenceError(
+            f"{SECRETS}/ cannot be read ({type(error).__name__}): no check that no secret is in"
+        ) from None
     stack = [(top, "")]
     while stack:
         directory, prefix = stack.pop()
@@ -251,17 +255,14 @@ def secret_values(root_fd: int) -> list[bytes]:
                 entries = [(entry.name, entry.stat(follow_symlinks=False).st_mode) for entry in listing]
             for name, mode in entries:
                 if stat.S_ISDIR(mode):
-                    try:
-                        stack.append((os.open(name, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW, dir_fd=directory),
-                                      f"{prefix}{name}/"))  # fmt: skip
-                    except OSError:
-                        continue
+                    stack.append((os.open(name, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW, dir_fd=directory),
+                                  f"{prefix}{name}/"))  # fmt: skip
                 elif stat.S_ISREG(mode):
-                    try:
-                        content = _read_secret(directory, name)
-                    except OSError:
-                        continue
-                    values += _values_of(name, content)
+                    values += _values_of(name, _read_secret(directory, name))
+        except OSError as error:
+            raise EvidenceError(
+                f"{SECRETS}/ cannot be read ({type(error).__name__}): no check that no secret is in"
+            ) from None
         finally:
             os.close(directory)
     return [value for value in values if len(value) >= MIN_SECRET]
@@ -342,10 +343,11 @@ def _tar_of(files: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
-def _manifest_of(label: str, tar: bytes, files: dict[str, bytes]) -> bytes:
+def _manifest_of(label: str, tar: bytes, files: dict[str, bytes], root_id: str) -> bytes:
     document = {
         "format": ROOT_FORMAT,
         "label": label,
+        "root_id": root_id,
         "sha256": hashlib.sha256(tar).hexdigest(),
         "bytes": len(tar),
         "files": [
@@ -356,11 +358,12 @@ def _manifest_of(label: str, tar: bytes, files: dict[str, bytes]) -> bytes:
     return (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
 
 
-def archive_root(root: Path, label: str) -> RootArchive:
+def archive_root(root: Path, label: str, root_id: str = "") -> RootArchive:
     """The evidence of the federation's root as bytes (the module's docstring): the digest of the step records first,
     then each file of the allow-list read once with no link followed, then the check that none holds a secret.
-    `RootGone` when the root is not there; EvidenceError naming the file when a required one is missing, one is a link
-    or holds a secret, or the total is too large."""
+    `root_id` (a hash of the root's path, which the manifest records and no path) tells one federation's archive from
+    another's under one shard label (a shard that moved). `RootGone` when the root is not there; EvidenceError naming
+    the file when a required one is missing, one is a link or holds a secret, or the total is too large."""
     try:
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except FileNotFoundError:
@@ -384,9 +387,8 @@ def archive_root(root: Path, label: str) -> RootArchive:
         if any(value in data for value in secrets_found):
             raise EvidenceError(f"{name} holds the content of a file of {SECRETS}/: not archived")
     tar = _tar_of(files)
-    return RootArchive(
-        label, tar, _manifest_of(label, tar, files), hashlib.sha256(tar).hexdigest(), steps, tuple(sorted(files))
-    )
+    manifest = _manifest_of(label, tar, files, root_id)
+    return RootArchive(label, tar, manifest, hashlib.sha256(tar).hexdigest(), steps, tuple(sorted(files)))
 
 
 def _plain_file(path: Path) -> bytes:
@@ -400,12 +402,13 @@ def _plain_file(path: Path) -> bytes:
         raise EvidenceError(f"{path.name} cannot be read ({type(error).__name__})") from None
 
 
-def earlier_archive(results: Path, label: str) -> RootArchive:
-    """The root archive an earlier collect wrote to `results`, for a root that is gone: shown to be the one its manifest
-    names (its SHA-256 and size), to hold exactly the files the manifest lists with their sizes and hashes, and the
-    required ones. EvidenceError otherwise, saying why."""
-    tar = _plain_file(results / f"{label}.root.tar")
-    raw = _plain_file(results / f"{label}.root.json")
+def verified_pair(results: Path, stem: str, label: str, root_id: str | None = None) -> RootArchive:
+    """The root archive `<stem>.root.tar` of `results` and its manifest `<stem>.root.json`, shown to be one
+    another's: the manifest names the archive's SHA-256 and size and this shard's `label` (and, with `root_id`, this
+    federation's root), and lists exactly the files the archive holds with their sizes and hashes, the required ones
+    among them. EvidenceError otherwise, saying which."""
+    tar = _plain_file(results / f"{stem}.root.tar")
+    raw = _plain_file(results / f"{stem}.root.json")
     try:
         manifest = json.loads(raw)
         listed = {entry["name"]: (entry["bytes"], entry["sha256"]) for entry in manifest["files"]}
@@ -415,11 +418,40 @@ def earlier_archive(results: Path, label: str) -> RootArchive:
             held = {m.name: opened.extractfile(m).read() for m in opened.getmembers() if m.isfile()}
         valid = valid and set(held) == set(listed) and all(name in held for name in REQUIRED)
         valid = valid and all(listed[n] == (len(held[n]), hashlib.sha256(held[n]).hexdigest()) for n in held)
+        other = root_id is not None and manifest.get("root_id") != root_id
     except (ValueError, KeyError, TypeError, AttributeError, tarfile.TarError, OSError):
-        valid = False
+        valid, other = False, False
     if not valid:
-        raise EvidenceError(f"{label}.root.tar is not the root archive its manifest {label}.root.json names")
+        raise EvidenceError(f"{stem}.root.tar is not the root archive its manifest {stem}.root.json names")
+    if other:
+        raise EvidenceError(
+            f"{stem}.root.tar is the root archive of another federation (the shard moved), not this one's"
+        )
     return RootArchive(label, tar, raw, hashlib.sha256(tar).hexdigest(), "", tuple(sorted(held)), reused=True)
+
+
+def earlier_archive(results: Path, label: str, root_id: str | None = None) -> RootArchive:
+    """The root archive an earlier collect wrote to `results` for this shard, for a root that is gone: `verified_pair`
+    of `<label>`, which must be this federation's root (`root_id`)."""
+    return verified_pair(results, label, label, root_id)
+
+
+def stem_of(results: Path, label: str, root_id: str) -> str | None:
+    """What `<label>.root.tar` of `results` is, when it is the archive of another federation than `root_id`'s (a shard
+    that moved): the first 12 hex digits of its SHA-256, the name it is set aside under (`<label>.<12 digits>`, which
+    keeps the archive and no path); None when there is none, or it is this root's."""
+    tar, manifest = results / f"{label}.root.tar", results / f"{label}.root.json"
+    if not (os.path.lexists(tar) or os.path.lexists(manifest)):
+        return None
+    try:
+        if json.loads(_plain_file(manifest)).get("root_id") == root_id:
+            return None
+    except (EvidenceError, ValueError, AttributeError):
+        pass
+    try:
+        return hashlib.sha256(_plain_file(tar)).hexdigest()[:12]
+    except EvidenceError:
+        return secrets.token_hex(6)
 
 
 # ------------------------------------------------------------------------------------------------ the marker

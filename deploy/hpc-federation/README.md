@@ -673,6 +673,11 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 | `<label>/pass-env.json`, **when there is one** | the shard's first-step `pass_env` names and values (a site path of the study's artifacts) | what the first step was given, which the archive's `out/` does not hold |
 | `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one, and `collect --run` refuses |
 
+`collect --roots-only [--shard L]` archives and marks the root evidence alone, for a shard about to move while the other
+shards are not final (see "Moving a shard" under the fleet); it writes no `archives.sha256.json`, so a full collect lists
+the archives later (a root archive whose federation the shard has left is put aside under `<label>.<12 hex digits>.root.*`
+and listed too). The archives are mode 0600.
+
 **The root archive and `pass-env.json` are private evidence.** The state file and the facts name nodes and site paths, the
 state file also the account and the administrator's address (no secret, but the site's own), and `pass-env.json` a site
 path. They are for the operator: keep the pulled copies like the journals, and never publish them. `expcore package` can
@@ -961,7 +966,12 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   client runs; one whose step ended is relaunched only with `--shard L --resume`. A shard refused exits 1. A site that
   needs `HPC_STEP_NETWORK` gives it to each federation's own steps (`hpcfed`); a shard's step, on the agent's own job of
   one component, carries none.
-- **Moving a shard.** `down --member fed-k` takes one federation down and frees its shard (its step ends with the
+- **Moving a shard.** First collect the federation's root evidence: `shards.py collect --manifest M --roots-only --shard L`
+  (no archive, no `--into`: the other shards need not be final), since `down --member fed-k` refuses a root a step ran
+  against whose evidence is not collected (or `hpcfed.py down --discard-evidence --discard-reason ...` by hand: recorded).
+  The shard's archive under its label is named by the shard, so the root archive the move leaves (`<label>.root.*`, made of
+  the first federation) is put aside by the next collect as `<label>.<12 hex digits>.root.*` and listed in
+  `archives.sha256.json`, never overwritten. `down --member fed-k` takes one federation down and frees its shard (its step ends with the
   job); `add 1` brings a fresh federation up; `plan` gives it the shard only after its own `up` (data and links
   checked), with the fleet's fingerprint, and only when its `platform.toml` leaves `[placement] reset_shortcut` off, so
   every reset there, the shard's first included, takes the full reads; `step` then starts it with `--resume` from its
