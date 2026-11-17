@@ -548,15 +548,20 @@ def test_c06_up_does_not_say_linked_while_a_rerun_by_hand_holds_the_core_phase_l
 
 
 def test_c06_a_core_rerun_whose_ingested_manifest_changed_since_up_does_not_link_it_again(
-    hpc, shards, tmp_path, ca, other, capsys
+    hpc, shards, tmp_path, ca, capsys
 ):
     """C06, O63: the manifest an ingested space declares was edited after `up` recorded its digest: what `verify-data`
-    read is no longer what the layout declares, so the federation stays `bootstrapped` and the rerun says why."""
+    read is no longer what the layout declares, so the federation stays `bootstrapped` and the rerun says why. The
+    second shard (two shards never share a root, #414) is up over the same artifacts and rerun after the edit too, so
+    that both platform files are rendered from the edited manifest and the shards' fingerprints agree: `plan` then
+    refuses on the phase, which is what the test is about."""
     art = artifacts(tmp_path / "art")
     fed = verified(hpc, tmp_path, ca, art=art)
+    other = verified(hpc, tmp_path, ca, name="other", art=art)
     write_manifest(OTHER, art / "manifests" / "delta.json")
     said: list = []
     assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    rerun(hpc, other, link_check_stand_in([]))
     stays_bootstrapped(shards, tmp_path, fed, other, said, "its manifest is not the one up recorded", capsys)
 
 
