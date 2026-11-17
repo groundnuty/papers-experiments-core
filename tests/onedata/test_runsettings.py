@@ -215,6 +215,26 @@ def test_c06_a_command_line_is_held_with_its_federations_values_by_role_and_its_
     assert apart[0].fingerprint()["toolserver"] != apart[1].fingerprint()["toolserver"]
 
 
+@pytest.mark.parametrize(
+    ("ours", "theirs"),
+    [
+        (("read", "--read-buffer-max-size=1048576"), ("write", "--write-buffer-max-size=1048576")),
+        (("cache", "--cache-size=64"), ("meta", "--meta-size=64")),
+        (("pine", "--host=pine.example.org"), ("birch", "--host=birch.example.org")),
+        (("/srv/root", "/srv/root2/server.toml"), ("/srv/other", "/srv/other2/server.toml")),
+    ],
+)
+def test_c06_a_federations_value_inside_a_longer_name_is_never_replaced_so_two_options_never_become_one(ours, theirs):
+    """C06 (Codex round 2): a value is replaced only where it stands whole. A zone whose host is `read` leaves
+    `--read-buffer-max-size` as written, so it never becomes the same line as `--write-buffer-max-size` on a
+    federation whose zone is `write`, which would merge shards under other settings."""
+    lines = [runsettings.neutral_words([word], [(value, "zone-host")]) for value, word in (ours, theirs)]
+    assert lines[0] != lines[1]
+    assert lines[0] == [ours[1]]
+    whole = runsettings.neutral_words(["--relay=read", "read", "x:read:1"], [("read", "zone-host")])
+    assert whole == ["--relay=<zone-host>", "<zone-host>", "x:<zone-host>:1"]
+
+
 def test_c06_a_new_tool_server_condition_is_refused_at_a_resume_and_is_no_growth(tmp_path, cas):
     """C06, a known limit: a condition added to `[toolserver.conditions]` is a new leaf of the platform's half, which
     the core never counts as growth (only the schema's sections grow), so a campaign that adds a condition needing a

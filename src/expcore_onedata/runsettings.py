@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any
 
@@ -80,14 +81,21 @@ def federation_roles(config: PlatformConfig) -> list[tuple[str, str]]:
 def neutral_words(words: Any, roles: list[tuple[str, str]]) -> list[str]:
     """A command line with every value of its federation's own replaced by its role (`<zone>`, `<providers[0]-id>`,
     `<platform-dir>`), so the same template's line is one line on every federation, and what else it says (an option,
-    a timeout, a limit) is kept as written, in its order. A value of the federation that no role names stays as it is,
-    so such a line keeps two federations apart rather than joining them."""
+    a timeout, a limit) is kept as written, in its order. A value is replaced only where it stands whole, never inside
+    a longer name (`TOKEN_EDGE`): a zone whose host is `read` leaves `--read-buffer-max-size` as written, so another
+    option can never be made the same line. A value of the federation that no role names stays as it is, so such a
+    line keeps two federations apart rather than joining them."""
     out = []
     for word in words:
         for value, role in roles:
-            word = word.replace(value, f"<{role}>")
+            word = re.sub(rf"(?<!{TOKEN_EDGE}){re.escape(value)}(?!{TOKEN_EDGE})", f"<{role}>", word)
         out.append(word)
     return out
+
+
+# A character that continues a name or a host on either side of a value (a letter, a digit, '_', '-', '.'): a value
+# next to one is part of something longer and is left as written.
+TOKEN_EDGE = r"[A-Za-z0-9_.\-]"
 
 
 def tokens_record(tokens: TokenSettings) -> dict[str, Any]:
