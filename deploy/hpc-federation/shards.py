@@ -702,6 +702,16 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _measured(path: Path) -> tuple[int, str]:
+    """The size and the SHA-256 of `path`'s bytes, from one pass over them: the size is what was read, not a stat's."""
+    digest, size = hashlib.sha256(), 0
+    with open(path, "rb") as handle:
+        while chunk := handle.read(CHUNK):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
 def _write_whole(path: Path, write: Callable[[Path], None]) -> None:
     """Write `path` through a draft beside it, fsynced and renamed: a reader sees the old file or the whole new one."""
     draft = path.with_name(path.name + ".part")
@@ -834,16 +844,110 @@ def plan_id(plan: Plan) -> str:
     return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def write_archives_manifest(plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]]) -> Path:
+def _files_under(root: Path, results: Path, label: str) -> list[str]:
+    """Every regular file under `root`, by its name relative to `results` (POSIX, sorted); none when `root` is not
+    there. A link, or anything that is neither a regular file nor a directory, is `ShardsError` naming the shard: a
+    link is never followed, and a pull of a tree holding one would not be of the bytes hashed."""
+    try:
+        top = root.lstat()
+    except FileNotFoundError:
+        return []
+    if not stat.S_ISDIR(top.st_mode):
+        raise ShardsError(f"shard {label}: {root.name} is not a plain directory")
+
+    def raise_it(error: OSError) -> None:
+        raise error
+
+    found: list[str] = []
+    for base, dirs, files in os.walk(root, onerror=raise_it):
+        for name in (*dirs, *files):
+            if not stat.S_ISREG(mode := os.lstat(os.path.join(base, name)).st_mode) and not stat.S_ISDIR(mode):
+                raise ShardsError(f"shard {label}: {name}, under {root.name}/, is not a regular file or a directory")
+        found += [Path(base, name).relative_to(results).as_posix() for name in files]
+    return sorted(found)
+
+
+def newer_snapshot(plan: Plan, shard: Shard, archive_sha: str, scratch: Path) -> Path | None:
+    """The snapshot of `shard` that is newer than its archive (`archive_sha`: what the verified archive's manifest
+    names) and that `--resume` would restore, or None. A snapshot names the archive its step started from (`base`), so
+    one that names this archive was taken by a step that began from it and did not archive: it holds the runs that step
+    reached and the archive lacks (the merge does not have them). Every older one (a snapshot of the step that wrote
+    the archive names an earlier archive or none) holds nothing the archive lacks. The pick is `restore_newest`'s, with
+    this archive as the base: restored into a private directory of `scratch`, which is removed, so that it is the
+    newest that verifies (every file against its hash, the store's integrity, every ended attempt's marker). Needs the
+    core, only for a shard that has a snapshot."""
+    try:
+        with os.scandir(plan.results / shard.label / SNAPSHOTS) as listing:
+            if not any(entry.name.startswith("snap-") for entry in listing):
+                return None
+    except FileNotFoundError:
+        return None
+    spec = {"index": shard.index, "count": shard.count, "label": shard.label}
+    check = Path(tempfile.mkdtemp(prefix=".snapshot-check-", dir=scratch))
+    try:
+        found = restore_newest(plan.results, shard.label, spec, archive_sha, check / "out")
+    except ImportError:
+        raise ShardsError(
+            f"shard {shard.label}: its snapshots are read with the core, which this interpreter cannot import"
+        ) from None
+    finally:
+        remove_tree(check)
+    if found is not None:
+        print(
+            f"shards: WARNING: shard {shard.label}: snapshot {found.name} is newer than its archive (a step resumed "
+            "from the archive was killed before it archived): it holds runs the merge will not; it is in the "
+            f"{ARCHIVES_MANIFEST} to pull and check, and `--resume` continues from it",
+            file=sys.stderr,
+        )
+    return found
+
+
+def evidence_entries(
+    plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]], scratch: Path
+) -> list[dict[str, Any]]:
+    """What lies beside each verified archive and would be lost with the scratch: its archive manifest
+    (`<label>.out.json`), every file under `<label>/journals/` (a spend journal per step: what a step killed outright
+    spent), and the snapshot newer than the archive when there is one (`newer_snapshot`), each as name (relative to the
+    results directory), size and SHA-256 of the bytes read, sorted by name. The archive manifest is shown to name the
+    archive that was verified, so the two listed are a pair. A link among them refuses the collect; so does a file that
+    cannot be read. Snapshots older than the archive are resume material and not listed (README)."""
+    entries: list[dict[str, Any]] = []
+    for shard, (_, manifest) in zip(plan.shards, found, strict=True):
+        try:
+            own = (plan.results / f"{shard.label}.out.json").read_bytes()
+            try:
+                named = json.loads(own).get("sha256")
+            except (ValueError, AttributeError):
+                named = None
+            if named != manifest["sha256"]:
+                raise ShardsError(f"shard {shard.label}: its manifest no longer names the archive that was verified")
+            entries.append({"name": f"{shard.label}.out.json", "bytes": len(own),
+                            "sha256": hashlib.sha256(own).hexdigest()})  # fmt: skip
+            names = _files_under(plan.results / shard.label / JOURNALS, plan.results, shard.label)
+            snapshot = newer_snapshot(plan, shard, manifest["sha256"], scratch)
+            if snapshot is not None:
+                names += _files_under(snapshot, plan.results, shard.label)
+            for name in names:
+                size, digest = _measured(plan.results / name)
+                entries.append({"name": name, "bytes": size, "sha256": digest})
+        except OSError as error:
+            raise ShardsError(f"shard {shard.label}: its evidence could not be read ({type(error).__name__})") from None
+    return sorted(entries, key=lambda entry: entry["name"])
+
+
+def write_archives_manifest(
+    plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]], evidence: Sequence[Mapping[str, Any]]
+) -> Path:
     """`<results>/archives.sha256.json`, written whole beside the archives `verified` read (`found`, in the plan's
-    order): the plan's id and each archive's name, size and SHA-256. The size is the private copy's, whose bytes were
-    hashed, never a step's claim; `verified` raised unless the SHA-256 of those bytes is the manifest's, so that value
-    is theirs. Names are relative and there is no timestamp: collecting one plan twice writes the same bytes."""
+    order): the plan's id, each archive's name, size and SHA-256, and the `evidence` beside them
+    (`evidence_entries`). The size is the private copy's, whose bytes were hashed, never a step's claim; `verified`
+    raised unless the SHA-256 of those bytes is the manifest's, so that value is theirs. Names are relative and there
+    is no timestamp: collecting one plan twice, with nothing changed in its results, writes the same bytes."""
     entries = [
         {"name": f"{shard.label}.out.tar", "bytes": copy.stat().st_size, "sha256": manifest["sha256"]}
         for shard, (copy, manifest) in zip(plan.shards, found, strict=True)
     ]
-    document = {"format": ARCHIVES_FORMAT, "plan_id": plan_id(plan), "archives": entries}
+    document = {"format": ARCHIVES_FORMAT, "plan_id": plan_id(plan), "archives": entries, "evidence": list(evidence)}
     payload = (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
     path = plan.results / ARCHIVES_MANIFEST
     try:
@@ -873,8 +977,9 @@ def final_problem(shard: Shard, manifest: Mapping[str, Any], wanted: str | None)
 def collect(plan: Plan, into: Path) -> list[Path]:
     """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails, and
     when any is not final (`final_problem`), naming it. Once every archive has verified and is final, and before
-    anything is unpacked, `archives.sha256.json` is written beside them for the copy back (`verify-copy`): a refused
-    collect writes none."""
+    anything is unpacked, `archives.sha256.json` is written beside them for the copy back (`verify-copy`): the archives
+    and what lies beside them (`evidence_entries`). A refused collect writes none. Run it once every step has ended: a
+    journal still being written is listed as it was read, and a pull of it later would differ."""
     if into.exists() and any(into.iterdir()):
         raise ShardsError("the directory to collect into must be new or empty")
     wanted = None
@@ -893,7 +998,7 @@ def collect(plan: Plan, into: Path) -> list[Path]:
             found.append(verified(plan.results, shard, into))
             if problem := final_problem(shard, found[-1][1], wanted):
                 raise ShardsError(problem)
-        write_archives_manifest(plan, found)
+        write_archives_manifest(plan, found, evidence_entries(plan, found, into))
     except ShardsError:  # refused whole: nothing of it is left behind
         for leftover in into.glob(".*.out.tar"):
             leftover.unlink()
@@ -923,44 +1028,69 @@ def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
 # Run on the operator's host, possibly without the core: nothing here may import it (a test runs it under `-I -S`).
 @dataclass(frozen=True)
 class CopyCheck:
-    checked: int  # the archives the manifest names
-    problems: tuple[str, ...]  # "<name>: <what is wrong>" for each archive missing or differing
-    extras: tuple[str, ...]  # `*.out.tar` files of the directory that the manifest does not name
+    archives: int  # the archives the manifest names
+    evidence: int  # the files beside them that it names (archive manifests, journals, a snapshot)
+    problems: tuple[str, ...]  # "<name>: <what is wrong>" for each file missing or differing
+    extras: tuple[str, ...]  # files of the directory that look like what the manifest names, and it does not
+
+
+Entry = tuple[str, int, str]  # a file the manifest names: its name, size in bytes and SHA-256
 
 
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
-def _archive_entries(document: object) -> list[tuple[str, int, str]]:
-    """The manifest's archives as (name, bytes, sha256), shown well formed; `ShardsError` otherwise. A name that is not
-    a plain file name is refused before any file is read, and a bad name is never echoed back."""
-    if not isinstance(document, Mapping) or document.get("format") != ARCHIVES_FORMAT:
-        raise ShardsError(f"the manifest is not {ARCHIVES_FORMAT}")
-    archives = document.get("archives")
-    if not isinstance(archives, list) or not archives:
-        raise ShardsError("the manifest names no archive, so it would verify nothing")
-    entries: list[tuple[str, int, str]] = []
-    for n, item in enumerate(archives, 1):
+def _plain_part(part: str) -> bool:
+    return part not in ("", ".", "..") and not any(c in part for c in "\\\0")
+
+
+def _entries(items: object, noun: str, nested: bool, seen: set[str]) -> list[Entry]:
+    """The files of one list of the manifest as (name, bytes, sha256), shown well formed; `ShardsError` otherwise. Every
+    name must be a plain file name, or with `nested` a relative path of plain parts (no empty part, `.`, `..`, absolute
+    form, backslash or NUL), and is refused before any file is read; one is never echoed back. `seen` holds the names of
+    the lists before, so that no name is given twice."""
+    if not isinstance(items, list) or not items:
+        raise ShardsError(f"the manifest names no {noun}, so it would verify nothing of them")
+    entries: list[Entry] = []
+    for n, item in enumerate(items, 1):
         entry = item if isinstance(item, Mapping) else {}
         name, size, digest = entry.get("name"), entry.get("bytes"), entry.get("sha256")
-        if not isinstance(name, str) or name in ("", ".", "..") or any(c in name for c in "/\\\0"):
-            raise ShardsError(f"the manifest's archive {n} has no plain file name")
-        if any(name == seen for seen, _, _ in entries):
+        parts = name.split("/") if isinstance(name, str) else []
+        if not parts or not all(_plain_part(part) for part in parts) or (len(parts) > 1 and not nested):
+            raise ShardsError(f"the manifest's {noun} {n} has no plain {'relative path' if nested else 'file name'}")
+        if name in seen:
             raise ShardsError(f"the manifest names {name} twice")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
             raise ShardsError(f"the manifest gives {name} no size in bytes")
         if not _is_sha256(digest):
             raise ShardsError(f"the manifest gives {name} no SHA-256")
+        seen.add(name)
         entries.append((name, size, digest))
     return entries
 
 
-def _copy_problem(path: Path, size: int, digest: str) -> str | None:
-    """What is wrong with one pulled archive, or None. Only a regular file is one: a link or a directory of the name is
-    never followed, and a pipe never read."""
+def _manifest_entries(document: object) -> tuple[list[Entry], list[Entry]]:
+    """The manifest's archives and its evidence (the files beside them), each shown well formed. A manifest with no
+    evidence is one of an earlier tip, which checked the archives alone: it is refused, not passed on them."""
+    if not isinstance(document, Mapping) or document.get("format") != ARCHIVES_FORMAT:
+        raise ShardsError(f"the manifest is not {ARCHIVES_FORMAT}")
+    seen: set[str] = set()
+    archives = _entries(document.get("archives"), "archive", False, seen)
+    return archives, _entries(document.get("evidence"), "evidence file", True, seen)
+
+
+def _copy_problem(local: Path, name: str, size: int, digest: str) -> str | None:
+    """What is wrong with one pulled file, or None. Only a regular file is one, under directories that are directories:
+    a link or a directory of the name is never followed, nor a link on its way, and a pipe is never read."""
+    here = local
+    *directories, last = name.split("/")
     try:
-        info = path.lstat()
+        for part in directories:
+            here = here / part
+            if not stat.S_ISDIR(here.lstat().st_mode):
+                return "not under a plain directory"
+        info = (here / last).lstat()
     except FileNotFoundError:
         return "missing"
     except OSError:
@@ -970,15 +1100,30 @@ def _copy_problem(path: Path, size: int, digest: str) -> str | None:
     if info.st_size != size:
         return "size differs"
     try:
-        return None if _sha256(path) == digest else "SHA-256 differs"
+        return None if _sha256(here / last) == digest else "SHA-256 differs"
     except OSError:
         return "unreadable"
 
 
+def _extras(local: Path, named: set[str]) -> tuple[str, ...]:
+    """What `local` holds that looks like what the manifest names and it does not: an archive or an archive manifest
+    (`*.out.tar`, `*.out.json`) in the directory, and a file in a shard's `journals/` (a step that ran after `collect`).
+    Only a warning: another campaign's files, or a later step's, are not this pull's to fail."""
+    found = [f.name for f in local.iterdir() if f.name.endswith((".out.tar", ".out.json")) and f.name not in named]
+    for directory in sorted({name.rsplit("/", 1)[0] for name in named if "/journals/" in name}):
+        base = local / directory
+        if base.is_symlink() or not base.is_dir():
+            continue
+        for root, _, files in os.walk(base):
+            found += [relative for f in files if (relative := Path(root, f).relative_to(local).as_posix()) not in named]
+    return tuple(sorted(found))
+
+
 def verify_copy(manifest: Path, local: Path, manifest_sha256: str) -> CopyCheck:
-    """Whether `local` holds every archive `manifest` names, with its size and SHA-256, and whether `manifest` is the
-    file whose hash `collect` printed (`manifest_sha256`); `ShardsError` when it is not, or cannot be used, before any
-    archive is read. Every archive is checked, so one run names them all."""
+    """Whether `local` holds every file `manifest` names (the archives, and what lies beside them: archive manifests,
+    journals, a snapshot), each with its size and SHA-256, and whether `manifest` is the file whose hash `collect`
+    printed (`manifest_sha256`); `ShardsError` when it is not, or cannot be used, before any file is read. Every file is
+    checked, so one run names them all."""
     expected = manifest_sha256.lower()
     if not _is_sha256(expected):
         raise ShardsError("the hash given for the manifest is not a SHA-256 (64 hex digits)")
@@ -992,33 +1137,36 @@ def verify_copy(manifest: Path, local: Path, manifest_sha256: str) -> CopyCheck:
         document = json.loads(raw)
     except ValueError:
         raise ShardsError("the manifest is not JSON") from None
-    entries = _archive_entries(document)
+    archives, evidence = _manifest_entries(document)
     if not local.is_dir():
         raise ShardsError("the local directory does not exist")
     problems = [
-        f"{name}: {why}" for name, size, digest in entries if (why := _copy_problem(local / name, size, digest))
+        f"{name}: {why}"
+        for name, size, digest in (*archives, *evidence)
+        if (why := _copy_problem(local, name, size, digest))
     ]
-    named = {name for name, _, _ in entries}
     try:
-        extras = sorted(p.name for p in local.iterdir() if p.name.endswith(".out.tar") and p.name not in named)
+        extras = _extras(local, {name for name, _, _ in (*archives, *evidence)})
     except OSError as error:
         raise ShardsError(f"the local directory could not be listed ({type(error).__name__})") from None
-    return CopyCheck(len(entries), tuple(problems), tuple(extras))
+    return CopyCheck(len(archives), len(evidence), tuple(problems), extras)
 
 
 def run_verify_copy(args: argparse.Namespace) -> int:
-    """0 when every archive matches (warnings for extras), 1 naming each that does not; a manifest that cannot be used
+    """0 when every file matches (warnings for extras), 1 naming each that does not; a manifest that cannot be used
     is `ShardsError`, which `main` reports as 2."""
     check = verify_copy(args.manifest, args.local_dir, args.manifest_sha256)
     for name in check.extras:
         print(f"shards: verify-copy: WARNING: {name} is not named by the manifest", file=sys.stderr)
     if check.problems:
-        print(f"shards: verify-copy: FAILED: {len(check.problems)} of {check.checked} archives", file=sys.stderr)
+        print(f"shards: verify-copy: FAILED: {len(check.problems)} of {check.archives + check.evidence} files",
+              file=sys.stderr)  # fmt: skip
         for problem in check.problems:
             print(f"  {problem}", file=sys.stderr)
         return 1
-    noun = "archive" if check.checked == 1 else "archives"
-    print(f"shards: verify-copy: ok: {check.checked} {noun}, each with the size and SHA-256 the manifest names")
+    archives = f"{check.archives} {'archive' if check.archives == 1 else 'archives'}"
+    evidence = f"{check.evidence} evidence {'file' if check.evidence == 1 else 'files'}"
+    print(f"shards: verify-copy: ok: {archives} and {evidence}, each with the size and SHA-256 the manifest names")
     return 0
 
 
