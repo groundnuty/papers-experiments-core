@@ -54,6 +54,13 @@ made for each start and removed after it (`expcore.tools.workdir.private_workdir
 where FastMCP reads a `.env` for its own settings and where the server's relative paths would otherwise land in the
 driver's.
 
+The server writes no bytecode either (O84). A Python that imports a module writes its `.pyc` beside it, and the server
+imports from trees a study freezes (its clone, its virtualenv, the interpreter's own library), so a start, a launch or
+a `check` of its manifest, changed the tree it certified: the digest of the frozen artifacts with it. The resolve
+launcher runs the server `-I -B`; every other start ran it with neither `-B` nor the variable. The
+environment this module builds says `PYTHONDONTWRITEBYTECODE=1` on every platform, a managed setting, so both starts
+write nothing.
+
 What the server is started with is built in one place, `server_start`: the command and arguments, the environment, the
 private CA copy and the private directory. The launch starts the server from it, and so does the command line that
 freezes and checks a condition's manifest (`expcore_onedata.toolmanifest`), so a manifest is frozen from the server a
@@ -121,6 +128,8 @@ ENV_TOOLS = "ONEDATA_MCP_TOOLS"
 ENV_INSECURE_TLS = "ONEDATA_ALLOW_INSECURE_TLS"
 ENV_DOTENV = "ONEDATA_MCP_DOTENV"  # `0`: the server reads no `.env` file (O84); only the launch says so
 DOTENV_OFF = "0"
+ENV_BYTECODE = "PYTHONDONTWRITEBYTECODE"  # any non-empty value: the server's Python writes no `.pyc` (O84)
+BYTECODE_OFF = "1"
 MANAGED_ENV = (
     ENV_ZONE_HOST,
     ENV_ZONE_TOKEN,
@@ -129,6 +138,7 @@ MANAGED_ENV = (
     ENV_TOOLS,
     ENV_INSECURE_TLS,
     ENV_DOTENV,
+    ENV_BYTECODE,
     *CA_BUNDLE_ENV,
 )
 OVERRIDDEN_ENV = ("FASTMCP_LOG_LEVEL", "PATH")  # always the launch's own: a caller's value of either is replaced
@@ -179,6 +189,11 @@ def server_environment(
     stops onedata-mcp's own read only, from a version that has the guard; the server's working directory is the other
     half (`expcore.tools.workdir.private_workdir`).
 
+    It sets `PYTHONDONTWRITEBYTECODE=1` on every platform too (O84), a managed setting a caller can neither give nor
+    clear: the server's Python writes no `.pyc` into the clone, the virtualenv or the interpreter's library it imports
+    from, which a start would otherwise change under a study's frozen artifacts. The resolve launcher's `-I` ignores the
+    variable, and its `-B` does the same on that path.
+
     Its certificate check is the platform's `[tls]`: by default the server's own (it verifies with httpx's CAs); with
     `ca_file`, `ca_copy`, the run's own read-only copy of the verified bundle (`tls.write_private_copy`), never the
     configured file, is named by the settings a client reads for its CA file (`CA_BUNDLE_ENV`, of which the server's
@@ -199,6 +214,7 @@ def server_environment(
             ENV_PROVIDER_TOKEN: token.reveal(),
             ENV_TOOLS: ",".join(condition.allow),
             ENV_DOTENV: DOTENV_OFF,
+            ENV_BYTECODE: BYTECODE_OFF,
         }
     )
     if config.tls.insecure:
