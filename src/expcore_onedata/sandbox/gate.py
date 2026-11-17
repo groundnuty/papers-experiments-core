@@ -68,7 +68,12 @@ platform's (O16).
 Connections are kept alive on both sides: each request is still decided by gatepolicy on its own, and logged on its
 own, whatever came before it on the connection; a refusal or an error closes the client's connection. Each client
 connection is served by its own thread and owns its upstream connections: nothing is shared between threads but the
-TLS context and the log.
+TLS context and the log. An upstream connection is kept for the next request only when the request it just carried had
+no body: after a request that carried one (the body handed to the upstream, whatever the method; a complete listing's
+page included) the gate closes the upstream connection once the answer is read, and the next request opens a new one
+(`upstream_closed` "after_body", O85). A kept connection stalled the request after a body of about 1.5 MiB in about
+half the tries (measured against two providers, 17 Nov), and the gate would have waited on it for its whole read
+timeout. This changes only whether a connection is reused: never what is sent, retried, answered or timed out.
 
 Every line the handler of a client connection logs carries that connection's `conn` (unique in this process), and a request's line carries
 `req_headers`: the few request headers that say what client it was (REQ_HEADERS_LOGGED), never any other. A response's line says what its body was
@@ -261,6 +266,7 @@ def _tcp_facts(sock) -> dict:
 # the hop to the gate, and it then waits up to 4 h for the answer. So upstream (Onezone and Oneprovider alike) the gate
 # allows 60 s to connect and hand-shake, plus one transparent retry, and 4 h to read. An earlier gate with an 8 s
 # bound returned a 502 when a TLS handshake to the zone ran out of it under load.
+UPSTREAM_CLOSED_AFTER_BODY = "after_body"  # the fixed word of the line's `upstream_closed` (O85)
 CONNECT_TIMEOUT = 60  # gate config `upstream_connect_timeout_s` overrides
 READ_TIMEOUT = 14400  # not below the client's read timeout: the gate must never fail first
 LOCAL_ERRNOS = {
@@ -1056,7 +1062,9 @@ class Handler(BaseHTTPRequestHandler):
                 conn.response_class = lambda sock, *a, seen=seen, **kw: _CountingResponse(sock, *a, seen=seen, **kw)
                 began = _clock()  # the wait for an answer begins as the request goes: the connect is over
                 conn.request(method, target, body=body, headers=headers)
-                return _checked(conn.getresponse(), seen)
+                resp = _checked(conn.getresponse(), seen)
+                resp.carried_body = bool(body)  # what `_settle` decides reuse by: the body handed to the upstream
+                return resp
             except _Framing as e:
                 self._drop(hcfg)
                 raise _Upstream(e) from e
@@ -1071,10 +1079,16 @@ class Handler(BaseHTTPRequestHandler):
                 _note_wait(rec, kind, began, seen)
         raise AssertionError("unreachable")
 
-    def _settle(self, hcfg: dict, resp) -> None:
-        """After a response is read to its end: the connection goes back to the pool unless the peer is closing it."""
+    def _settle(self, hcfg: dict, resp, rec: dict) -> None:
+        """After a response is read to its end: the connection goes back to the pool unless the peer is closing it or
+        the request it answered carried a body (O85), in which case it is closed here, whatever the status, and the
+        line says so (`upstream_closed`). The closing is the whole of the rule: the request was sent once, its answer
+        is the one relayed, and nothing is re-sent, whatever the connection did meanwhile."""
         if resp.will_close:
             self._drop(hcfg)
+        elif resp.carried_body:
+            self._drop(hcfg)
+            rec["upstream_closed"] = UPSTREAM_CLOSED_AFTER_BODY
 
     def _abort_client(self) -> None:
         """End the client's connection with a reset: a body already begun must not look complete."""
@@ -1352,7 +1366,7 @@ class Handler(BaseHTTPRequestHandler):
                     data = self._buffered(hcfg, resp, rec, None if resp.chunked else resp.length, token)
                     if data is None:
                         return  # refused: answered and logged
-                    self._settle(hcfg, resp)
+                    self._settle(hcfg, resp, rec)
                     try:
                         children, after = walk.page(data)
                     except ValueError as e:
@@ -1499,7 +1513,7 @@ class Handler(BaseHTTPRequestHandler):
             self._drop(hcfg)
             self._abort_client()
         else:
-            self._settle(hcfg, resp)
+            self._settle(hcfg, resp, rec)
         if failure:
             rec.update(
                 status=502,
