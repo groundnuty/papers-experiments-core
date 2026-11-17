@@ -30,6 +30,7 @@ SHARD = re.compile(r"shard-[1-9][0-9]{0,3}")  # a shard's label: its index in th
 # up and linked; its up failed (it may hold a job until its down); down, verified; its down failed or was refused.
 STATUSES = ("claimed", "taken", "made", "up", "failed", "down", "down-failed")
 HOLDS_NOTHING = ("claimed", "taken", "down")  # no job of the fleet's can be held by a member in one of these
+LINKED = "linked"  # a federation's phase once its up has finished (hpcstate.PHASES)
 
 
 class FleetError(RuntimeError):
@@ -204,6 +205,40 @@ def jobs_of(state: Mapping[str, Any]) -> Dict[str, Optional[str]]:
     sandbox = state.get("sandbox") or {}
     own = sandbox.get("job") if sandbox.get("placement") == "separate" else None
     return {"allocation": (state.get("allocation") or {}).get("job"), "sandbox": own}
+
+
+def held_count(member: Mapping[str, Any], facts: Mapping[str, Any]) -> int:
+    """How many held jobs a member may bill for: the distinct ids its state file and the fleet's record name, none for a
+    member in a status that holds nothing (`HOLDS_NOTHING`). Both are read, so a record that kept an id its state lost
+    still counts."""
+    if member["status"] in HOLDS_NOTHING:
+        return 0
+    found = {job for jobs in (facts.get("jobs"), member.get("jobs")) for job in (jobs or {}).values() if job}
+    return len(found)
+
+
+def member_state(member: Mapping[str, Any], facts: Mapping[str, Any]) -> str:
+    """One federation's state in plain words, from the fleet's record and what its root's state file says now (`facts`:
+    its phase, its jobs and its fault relay as `fleet.state_facts` reads them; empty when the root has no readable
+    state): up and ready, up with no relay, failed (or down-failed, or never up) and still HOLDING jobs, by count, with
+    the command that releases them, or down. "Ready" needs the state file to show the federation linked and its relay
+    serving; the label is the fleet's (`fed-k`), never a host."""
+    label, status = member["label"], member["status"]
+    holding = held_count(member, facts)
+    held = f"still HOLDING {holding} job(s): it bills until `fleet.py down --member {label}`"
+    if status == "up":
+        if not facts:
+            return "up, but its state file is missing or unreadable" + (f"; {held}" if holding else "")
+        if facts.get("phase") != LINKED:
+            return f"up, but not linked (phase {facts.get('phase')})" + (f"; {held}" if holding else "")
+        relay = facts.get("relay")
+        if relay == "serving":
+            return "up and ready"
+        return "up with no relay" + ("" if relay == "none" else " (its state file records none)")
+    word = {"failed": "failed", "down-failed": "down FAILED", "made": "made, its up never finished"}.get(status, status)
+    if holding:
+        return f"{word}, {held}"
+    return word if status in HOLDS_NOTHING else f"{word}, no job on record"
 
 
 def sandbox_name(name: str, placement: Optional[str]) -> str:

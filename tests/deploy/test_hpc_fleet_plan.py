@@ -274,8 +274,8 @@ def test_o68_status_says_each_federation_its_job_and_shard_and_runs_nothing(benc
     calls = {label: len(fake.calls) for label, fake in bench.fakes.items()}
     code, printed = bench.run("status")
     assert code == 0
-    assert f"fed-1: up, phase linked, job(s) {', '.join(job_ids('fed-1'))}, shard shard-1" in printed
-    assert "fed-2: failed, phase " in printed
+    assert f"fed-1: up and ready (phase linked, job(s) {', '.join(job_ids('fed-1'))}, shard shard-1)" in printed
+    assert "fed-2: failed, still HOLDING 2 job(s): it bills until `fleet.py down --member fed-2` (phase " in printed
     assert job_ids("fed-2")[0] in printed
     assert "shard-1: on fed-1, its step runs" in printed
     assert "shard-2: unassigned" in printed

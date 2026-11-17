@@ -42,6 +42,7 @@ SETTINGS = {
 }  # shards.py's keys: no argv
 OPTIONAL = ("snapshot_every_s",)
 SCRIPT = Path(__file__).resolve().parent / "shards.py"
+STUDY = "study.toml"  # in the study's root: its conditions are what `injection` reads
 
 
 def read_settings(path: Path) -> Dict[str, Any]:
@@ -111,8 +112,71 @@ def shortcut_on(root: Path) -> bool:
     return isinstance(placement, Mapping) and placement.get("reset_shortcut", False) is not False
 
 
-def readiness(directory: Path, member: Mapping[str, Any]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """(why the federation cannot run a shard now, None), or (None, its platform fingerprint)."""
+def declares(condition: Mapping[str, Any], kind: str) -> bool:
+    """Whether a study's condition names `kind` among its `infrastructure_is_treatment` (a name, or a `{kind, target}`
+    table), as `expcore.campaign.factors` reads them."""
+    entries = condition.get("infrastructure_is_treatment")
+    return isinstance(entries, list) and any(
+        e == kind or (isinstance(e, Mapping) and e.get("kind") == kind) for e in entries
+    )
+
+
+def injection(study: Optional[Path], root: Path) -> Optional[str]:
+    """Why this campaign injects faults on the federation at `root`, so that its fault relay must serve; None when
+    nothing in it does. One of: the study's `study.toml` declares a condition whose treatment is a provider outage
+    (`expcore.errors.PROVIDER_OUTAGE`), or the federation's `platform.toml` sanctions injection (`[faults] sanctioned =
+    true`, the configuration's half of the injector's sanction). Both are read as files, nothing of the study is run. A
+    shard's runs are a share of every condition (the partition is by pair, C28), so a campaign that has one outage
+    condition injects in every shard, whatever tasks the condition names. A `study.toml` that cannot be read counts as
+    injecting (fail closed); one that does not exist counts as none, and the campaign check, which runs the study's own
+    plugin before any shard is assigned, refuses a study with no study file."""
+    from expcore.errors import PROVIDER_OUTAGE
+
+    if study is not None:
+        try:
+            data = tomllib.loads((study / STUDY).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            data = {}
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return "the study's study.toml could not be read, so an outage condition cannot be ruled out"
+        conditions = data.get("conditions")
+        if isinstance(conditions, Mapping) and any(
+            isinstance(c, Mapping) and declares(c, PROVIDER_OUTAGE) for c in conditions.values()
+        ):
+            return "the study declares an outage condition"
+    try:
+        faults = tomllib.loads((root / shards.PLATFORM).read_text(encoding="utf-8")).get("faults")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        faults = None  # `undeclared_spaces` refuses a platform file that cannot be read, before this is asked
+    if isinstance(faults, Mapping) and faults.get("sanctioned") is True:
+        return "its platform.toml sanctions fault injection ([faults] sanctioned = true)"
+    return None
+
+
+def relay_gap(label: str, state: Mapping[str, Any], study: Optional[Path], root: Path) -> Optional[str]:
+    """Why a federation cannot run a shard of this campaign for want of a fault relay, None when it can: the campaign
+    injects faults (`injection`) and the state file `up` wrote does not say `serving` (`hpcstate.relay_of`: `none` for
+    a core without the relay, `unrecorded` for a state with neither). A federation without a serving relay can neither
+    inject nor restore. The relay's state is read from the state file, never from the up log, which is for the
+    operator."""
+    why = injection(study, root)
+    relay = hpcstate.relay_of(dict(state))
+    if why is None or relay == "serving":
+        return None
+    how = (
+        "none: its core has no relay"
+        if relay == "none"
+        else "not recorded: its state file has no relay record, as one an older up wrote, or an up that never got "
+        "there, has not"
+    )
+    return (f"{label}: its fault relay is not serving ({how}), and this campaign injects faults ({why}): a federation "
+            "without a serving relay can neither inject nor restore")  # fmt: skip
+
+
+def readiness(directory: Path, member: Mapping[str, Any],
+              study: Optional[Path] = None) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:  # fmt: skip
+    """(why the federation cannot run a shard now, None), or (None, its platform fingerprint). `study` is the study's
+    root, which says whether the campaign injects faults and so needs the federation's relay."""
     label = member["label"]
     if member["status"] != "up":
         return f"{label}: its up has not finished (it is {member['status']})", None
@@ -129,16 +193,21 @@ def readiness(directory: Path, member: Mapping[str, Any]) -> Tuple[Optional[str]
     missing = shards.undeclared_spaces(label, root)
     if missing is not None:
         return f"{label}: a space's data is not declared (data_manifest, C06): {missing}", None
+    gap = relay_gap(label, state, study, root)
+    if gap is not None:
+        return gap, None
     try:
         return None, platform_fingerprint(root)
     except FleetError as error:
         return f"{label}: {error}", None
 
 
-def assignments(record: Mapping[str, Any], directory: Path) -> Tuple[Dict[str, str], Dict[str, Any], List[str]]:
+def assignments(record: Mapping[str, Any], directory: Path,
+                study: Optional[Path] = None) -> Tuple[Dict[str, str], Dict[str, Any], List[str]]:  # fmt: skip
     """The new assignments ({shard: federation}), the reference fingerprint and what is said; FleetError refuses the
     whole plan: a federation holding a shard that is no longer ready or no longer of the fleet's fingerprint, the first
-    plan's federations of differing fingerprints, or none ready."""
+    plan's federations of differing fingerprints, or none ready. A campaign that injects faults (`injection`, read from
+    `study`) is given only to federations whose fault relay serves."""
     said: List[str] = []
     holders = {s["member"]: s["label"] for s in record["shards"] if s["member"] is not None}
     found: Dict[str, Dict[str, Any]] = {}
@@ -146,7 +215,7 @@ def assignments(record: Mapping[str, Any], directory: Path) -> Tuple[Dict[str, s
         label = member["label"]
         if label not in holders and (member["status"] != "up" or member["held"]):
             continue  # neither holding a shard nor fresh
-        reason, fingerprint = readiness(directory, member)
+        reason, fingerprint = readiness(directory, member, study)
         if reason is not None and label in holders:
             raise FleetError(f"shard {holders[label]}'s federation is not ready: {reason}; `fleet.py down --member "
                              f"{label}` frees the shard for a fresh federation")  # fmt: skip
@@ -168,7 +237,9 @@ def assignments(record: Mapping[str, Any], directory: Path) -> Tuple[Dict[str, s
                 + f" (differing: {', '.join(keys)}); nothing was assigned"
             )
         if not found:
-            raise FleetError("no federation of the fleet is ready to run a shard; nothing was assigned")
+            why = "; ".join(line.removeprefix("not used: ") for line in said)
+            raise FleetError("no federation of the fleet is ready to run a shard; nothing was assigned"
+                             + (f" ({why})" if why else ""))  # fmt: skip
         reference = next(iter(found.values()))
     free = []
     for label, fingerprint in found.items():
@@ -317,7 +388,7 @@ def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], re
         if here and not resume:
             said.append(f"{label}: its step on {holder} has ended; `fleet.py step --shard {label} --resume` relaunches")
             continue
-        reason, fingerprint = readiness(directory, member_of(record, holder))
+        reason, fingerprint = readiness(directory, member_of(record, holder), plan.study)
         if reason is None and sha256(fingerprint) != reference:
             reason = f"{holder}: its platform fingerprint is no longer the fleet's"
         if reason is None and shard["moved"] and shortcut_on(root_of(directory, holder)):

@@ -23,6 +23,8 @@ JOB_ID = re.compile(r"[0-9]{1,12}")
 STEP_ID = re.compile(r"[0-9]{1,12}\.[0-9]{1,9}")
 PLACEMENTS = ("het", "separate")  # where the agent's node is held (hpcsettings.SANDBOX_PLACEMENTS)
 SHA256 = re.compile(r"[0-9a-f]{64}")
+RELAYS = ("serving", "none")  # the login node's fault relay as `up` ended: its heartbeat seen, or this core has none
+UNRECORDED = "unrecorded"  # `relay_of`'s word for a state that says neither: an older up, or one that never got there
 
 
 class StateError(RuntimeError):
@@ -99,7 +101,18 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
     if "data" in state:
         checked_data(state["data"])
     checked_shard_nodes(state.get("shard_nodes", []))
+    if "fault_relay" in state and state["fault_relay"] not in RELAYS:
+        raise StateError(f"{STATE}: fault_relay is not one of {', '.join(RELAYS)}")
     return state
+
+
+def relay_of(state: Dict[str, Any]) -> str:
+    """The fault relay's state as `up` recorded it once the relay beat (`serving`) or found none in its core (`none`);
+    `unrecorded` when the state has neither, as one written by an older up, or by an up that failed before the relay's
+    heartbeat, has none. The `relay` record (the client's pid, kept so `down` can end it) is no answer: it is written at
+    the relay's spawn, before its heartbeat."""
+    found = state.get("fault_relay")
+    return found if found in RELAYS else UNRECORDED
 
 
 def checked_data(data: Any) -> None:
