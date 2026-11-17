@@ -54,11 +54,11 @@ def reading_of(value: Any) -> dict[str, Any] | None:
     is its own, and the core reads nothing in it."""
     if not isinstance(value, dict):
         return None
-    try:
+    try:  # nesting the interpreter cannot dump or load within its recursion limit is a RecursionError, not a ValueError
         text = json.dumps(value, sort_keys=True, allow_nan=False)
-    except (TypeError, ValueError):
+        return json.loads(text) if len(text.encode("utf-8")) <= READING_MAX_BYTES else None
+    except (TypeError, ValueError, RecursionError):
         return None
-    return json.loads(text) if len(text.encode("utf-8")) <= READING_MAX_BYTES else None
 
 
 def current() -> dict[str, Any] | None:
