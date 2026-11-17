@@ -1367,7 +1367,9 @@ declared = parse(tomllib.loads(shown), "my-study/preregistration.toml", "0" * 64
 assert declared == ("egress", "any_guard")
 assert difference(declared, ("any_guard", "egress")) is None  # what the records would run is what is declared
 said = difference(declared, ("egress",))  # only one guard's instrument is listed on the records
-assert "declared but not run: any_guard (it needs two or more guards to have checked the batch; only egress did)" in said
+assert (
+    "declared but not run: any_guard (it needs two or more guards to have checked the batch; only egress did)" in said
+)
 said = difference(declared, ("egress", "process_visibility", "any_guard"))  # one the preregistration never declared
 assert "run but not declared: process_visibility" in said
 ```
