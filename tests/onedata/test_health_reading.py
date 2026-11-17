@@ -6,6 +6,7 @@ detail, which `test_health_text.py` pins; a reading that cannot say never says y
 """
 
 import dataclasses
+import gc
 import json
 import threading
 
@@ -606,24 +607,28 @@ def test_o90_the_gates_post_run_check_of_a_run_whose_restore_failed_reads_nothin
 # --- the pilot's order: the run's check inside its own open injection, the restore after ---------------------------
 
 
-def inside_injection(tmp_path, world, *, extra=None, report_offline=True, down_names=()):
+def inside_injection(tmp_path, world, *, extra=None, report_offline=True, down_names=(), abandon=False):
     """The pilot's executor reads health inside the injection and restores after: the run's pre-run check, its
     exclusive admission, the injector started (its entry open), then the post-run check through the gate; `extra` is
     given the journal and the attempt's own token while the injection is open (to put another's lines there), and
-    `down_names` go down with the target. Return the answer, the try's reading and the entries open at the check."""
+    `down_names` go down with the target; `abandon` drops the injector (its lock goes) before the check, as an executor
+    that returned without restoring would. Return the answer, the try's reading and the entries open at the check."""
     campaign = tmp_path / "campaign"
     campaign.mkdir()
     store, _, _ = planned_store(campaign)
     clock = iter(f"2026-01-01T00:{minute:02d}:00Z" for minute in range(1, 60))
     gate = HealthGate(store, world.health, lambda: next(clock))
     gate.load()
-    injector = injector_for(world.platform, FakeServices())
+    injectors = [injector_for(world.platform, FakeServices())]
     admit = run_admission(world.config)
     journal = InjectionJournal(load_faults(world.platform, world.config).journal)
     with prerun.opened(), liveness.running("camp-a", 5):
         assert gate.before_run("run-a", attempt=1).verdict == GO
         with admit(("provider_outage",), {"provider_outage": TARGET}, threading.Event(), False):
-            injector.start(RUN)
+            injectors[0].start(RUN)
+            if abandon:
+                injectors.clear()
+                gc.collect()
             if report_offline:
                 down(world.fake, "beta", *down_names)
             if extra is not None:
@@ -634,7 +639,8 @@ def inside_injection(tmp_path, world, *, extra=None, report_offline=True, down_n
             for entry in opened:  # whoever's: the test's journal is left settled
                 if entry["id"] != next(item["id"] for item in opened if item["target"] == TARGET):
                     journal.append({"event": "cleared", "id": entry["id"]})
-            assert injector.finish()["ok"] is True  # the restore, after the reading
+            if injectors:
+                assert injectors[0].finish()["ok"] is True  # the restore, after the reading
     return answer, reading, opened
 
 
@@ -718,6 +724,32 @@ def test_o90_a_second_own_entry_that_is_not_in_progress_is_still_unsettled(tmp_p
     a heal's mark, are answered as unsettled beside it."""
     world = four_spaces(tmp_path, fake, faults={})
     answer, reading, _ = inside_injection(tmp_path, world, extra=extra)
+    assert answer.detail.startswith("an injection of providers[2] is unsettled")
+    assert reading == UNREAD
+
+
+def test_o90_an_own_injection_whose_injector_is_gone_is_still_unsettled(tmp_path, fake):
+    """O90: an executor that returned without restoring, its injector dropped, leaves its entry open with no injector
+    holding the target's lock: that is no injection in progress, so the scheduler's post-run check answers it as
+    unsettled, charged to the run, whoever journalled it. The own-entry rule explains only a live injector's."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, opened = inside_injection(tmp_path, world, abandon=True)
+    assert [entry["target"] for entry in opened] == [TARGET]
+    assert answer.detail.startswith("an injection of providers[1] is unsettled")
+    assert answer.charge is True
+    assert reading == UNREAD
+
+
+def a_dropped_injectors_entry(journal, mine):
+    """An entry of the run's own, seen down, that no injector holds the lock of."""
+    injection(journal, "g", OTHER, mine, closed=False)
+
+
+def test_o90_an_own_entry_no_live_injector_holds_is_unsettled_beside_the_one_that_is_held(tmp_path, fake):
+    """O90: the live injector's own entry is explained, and another entry that names this attempt but whose target no
+    injector holds is not."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, _ = inside_injection(tmp_path, world, extra=a_dropped_injectors_entry)
     assert answer.detail.startswith("an injection of providers[2] is unsettled")
     assert reading == UNREAD
 
