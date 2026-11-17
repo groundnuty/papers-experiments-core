@@ -31,6 +31,7 @@ component 0 that names no `--network` is the last to start, and every later one 
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -91,6 +92,7 @@ def agent_site(directory: Path, sif: bytes = b"an invented SIF image\n", shim: b
         "HPC_ONECLIENT_BUNDLE": str(bundle),
         "HPC_ONECLIENT_BUNDLE_SHA256": write_tar(bundle, bundle_members()),
         "HPC_AGENT_WORK_ROOT": str(work_root or directory / "agent-work"),
+        "HPC_CORE_PYTHON": "/shared/venv/bin/python",  # down's sweep of the agent's node reaps with the core's (W2)
     }
 
 
@@ -270,6 +272,28 @@ def parse_srun(argv: list) -> Srun:
     return Srun(argv, env=env, command=command, **found)
 
 
+PYTHON = re.compile(r"python[0-9.]*")  # an interpreter by its file name: python, python3, python3.11
+NO_BYTECODE = ["-I", "-B"]  # what every Python the driver launches is given first (B1, O57)
+
+
+def unflagged(argv) -> list:
+    """Each Python in an argv not followed by `-I -B`: isolated (no launch directory, PYTHON* variable or user site on
+    `sys.path`) and writing no bytecode, which a node step otherwise writes into the core's interpreter in the account's
+    shared home (B1, live slot 5). `-I` ignores PYTHONDONTWRITEBYTECODE, so only the flag stops it."""
+    words = [str(word) for word in argv]
+    return [
+        w
+        for i, w in enumerate(words)
+        if PYTHON.fullmatch(PurePosixPath(w).name) and words[i + 1 : i + 3] != NO_BYTECODE
+    ]
+
+
+def flagged(argv) -> list:
+    """The argv, once every Python in it runs with `-I -B`; any other fails the test, whatever it tests."""
+    assert not unflagged(argv), f"a Python launched without -I -B (B1): {list(argv)}"
+    return list(argv)
+
+
 INTERPRETER = re.compile(r"python[0-9.]*")  # a Python interpreter by its file name: python, python3, python3.11
 RELAY_MODULE = "expcore_onedata.fault_relay"
 
@@ -301,8 +325,9 @@ def isolated(argv) -> list:
 @dataclass
 class FakeSlurm:
     """The login node's view of a cluster with one user's held job. Every command the driver gives it must run each
-    Python with `-I`, and every step must name `/` as its working directory (`--chdir=/`), or the fake fails the test
-    (O58, O57): a step that inherited the login node's working directory would start in the node's shared /tmp."""
+    Python with `-I -B` (`flagged`, `isolated`), and every step must name `/` as its working directory (`--chdir=/`), or
+    the fake fails the test (O58, O57): a step that inherited the login node's working directory would start in the
+    node's shared /tmp."""
 
     nodes: list = field(default_factory=lambda: [f"node{i:02d}" for i in range(1, 9)])
     job_id: str = "4242"
@@ -340,6 +365,8 @@ class FakeSlurm:
     sweep_here: bool = False  # run down's sweep of the agent's node on this host (its tmpfs is here), else answer it
     sweeps: list = field(default_factory=list)  # each sweep step down launched
     leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
+    step_cancel_rc: int = 0  # a step's scancel ends it but exits so (225: as the site's did on a het job, live slot 5)
+    accounting: dict = field(default_factory=dict)  # job id -> what `sacct -o JobID,State,AllocTRES` prints of it
     interconnect_after: int | None = None  # the steps of component 0 with no --network that start before the rest fail
     component_zero_steps: int = 0  # the steps of component 0 that named no --network, so far
     # A command of the login node beyond Slurm's, by its first word (the site's quota command, invented): a test's
@@ -351,7 +378,7 @@ class FakeSlurm:
     def run(self, argv, timeout):
         from hpcslurm import Completed
 
-        argv = isolated(argv)
+        argv = isolated(flagged(argv))
         self.calls.append(argv)
         tool = argv[0]
         if tool == "sbatch":
@@ -369,6 +396,13 @@ class FakeSlurm:
             return Completed(0, self.scontrol_lines(ident), "")
         if argv[:3] == ["scontrol", "show", "hostnames"]:
             return Completed(0, "\n".join(n for n in argv[3].split(",") if n) + "\n", "")
+        if tool == "squeue" and "-s" in argv and "-u" in argv:  # every step of this user's, of every job still known
+            lines = [
+                f"{step} {name}"
+                for name, step in self.steps.items()
+                if self.leader_of(step.split(".")[0]) and not self.gone_job(self.leader_of(step.split(".")[0]))
+            ]
+            return Completed(0, "".join(f"{line}\n" for line in lines), "")
         if tool == "squeue" and "-s" in argv:
             lines = []
             for ident in argv[argv.index("-j") + 1].split(","):  # a job's or a component's own id
@@ -391,11 +425,16 @@ class FakeSlurm:
             self.cancelled.append(target)
             if "." in target:
                 self.steps = {n: s for n, s in self.steps.items() if s != target}
+                if self.step_cancel_rc:
+                    said = f"scancel: error: Kill job error on job step id {target}: Invalid job id specified\n"
+                    return Completed(self.step_cancel_rc, "", said)
             else:  # a job's cancel ends its steps, a leader's those of every component
                 self.steps = {n: s for n, s in self.steps.items() if self.leader_of(s.split(".")[0]) != target}
             return Completed(0, "", "")
         if tool == "sacct":
-            return Completed(0, "", "")
+            ident = argv[argv.index("-j") + 1]
+            wanted = argv[argv.index("-o") + 1] == "JobID,State,AllocTRES"
+            return Completed(0, self.accounting.get(ident, "") if wanted else "", "")
         if RELAY_MODULE in argv and argv[argv.index(RELAY_MODULE) - 1] == "-m":
             verb = argv[argv.index(RELAY_MODULE) + 1]
             self.relay_calls.append(verb)
@@ -474,6 +513,7 @@ class FakeSlurm:
                 "JobId": str(int(ident) + index),
                 **het,
                 "JobName": options.get("--job-name"),
+                "UserId": f"someone({os.getuid()})",
                 "JobState": self.state if ident == self.job_id else self.job_states.get(ident, "RUNNING"),
                 "TimeLimit": options.get("--time"),
                 "Requeue": "0" if "--no-requeue" in options else "1",
@@ -493,7 +533,7 @@ class FakeSlurm:
         return "\n".join(lines) + "\n"
 
     def _step(self, argv) -> Srun:
-        srun = parse_srun(isolated(argv))
+        srun = parse_srun(isolated(flagged(argv)))
         assert srun.chdir == "/", f"a step that names no working directory (O57: --chdir=/): {srun.argv}"
         self.calls.append(list(argv))
         self.sruns.append(srun)
@@ -580,7 +620,7 @@ class FakeSlurm:
         from hpcslurm import Client
 
         if argv[0] == "/usr/bin/env":  # the login node's fault relay, not a step
-            self.relays.append(isolated(argv))
+            self.relays.append(isolated(flagged(argv)))
             self.relay_cwds.append(cwd)
             self.relay_calls.append("serve")
             return Client(9999, 1)

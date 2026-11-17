@@ -192,6 +192,11 @@ class Driver(Down):
             raise RuntimeError("L is not a directory")
         if self.settings.core == "step" and not site.core_python:
             raise RuntimeError('[hpc] core = "step" needs HPC_CORE_PYTHON, the core\'s Python on the nodes')
+        if self.settings.sandbox is not None and not site.core_python:  # the reaper of the sandbox's runs is the core's
+            raise RuntimeError(
+                "the agent's node needs HPC_CORE_PYTHON, the core's Python on the nodes: down's sweep of a node a "
+                "shard step ran on reaps the sandbox's killed runs with the core's reaper"
+            )
         template = self.spec.platform_template
         declared = [space.data_manifest for space in self.spec.spaces if space.data_manifest]
         hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None, declared)

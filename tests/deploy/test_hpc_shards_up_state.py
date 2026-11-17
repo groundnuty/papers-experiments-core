@@ -101,6 +101,7 @@ def test_the_shard_step_lands_on_the_agents_node_where_up_held_it(hpc, shards, t
         "node": "node07",
         "placement": placement,
         "het_group": 1 if placement == "het" else None,
+        "listed": "4243" if placement == "het" else "4343",  # the component's own id, under which its steps are listed
     }
     line = shards.step_argv(plan, shard, fed, SCRIPT)
     assert line[: 3 + len(group)] == ["srun", f"--jobid={job}", *group, "--exact"]
