@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import hpcrelay
+import hpcstate
 from fedlayout import ROOT_MARKER
 from hpcremove import SETTLE_S, only_silly, remove_tree, settle_rmdir
 from hpcsettings import Site
-from hpcslurm import Client
+from hpcslurm import Client, SlurmError
 
 BUNDLE = Path(__file__).resolve().parent / "bundle"
 SHARDS = BUNDLE.parent / "shards.py"  # its `sweep`, on the agent's node at down
@@ -176,12 +177,15 @@ class Down:
         return found[0] if found else None
 
     def stop_services(self, job: str) -> List[str]:
-        """Tear down every service (the providers, then the zone), wait for every step to leave, then check each
-        node; return the services that could not be verified."""
+        """Tear down every service (the providers, then the zone), wait for every step to leave, remove what a step
+        cancelled at the bound left (`remove_after_cancel`), then check each node; return the services that could not
+        be verified."""
         order = [p.name for p in self.spec.providers] + ["zone"]
         unverified = [service for service in order if not self.teardown(service)]
-        self.wait_steps(self.listed_under(job))
-        return unverified + [s for s in order if s not in unverified and not self.node_clean(s)]
+        cancelled = self.wait_steps(self.listed_under(job))
+        swept = [service for service in order if self.remove_after_cancel(service, cancelled)]
+        unverified = [service for service in unverified if service not in swept]
+        return unverified + [s for s in order if s not in unverified and s not in swept and not self.node_clean(s)]
 
     def listed_under(self, job: str) -> List[str]:
         """The ids `squeue -s` lists the held job's steps under: its own, and under `het` its agent's component's own,
@@ -222,15 +226,58 @@ class Down:
         self.set(lambda s: s["services"][service].update(state="removed" if ok else "failed"))
         return ok
 
-    def wait_steps(self, jobs: List[str]) -> None:
+    def wait_steps(self, jobs: List[str]) -> List[str]:
         """Until no step but the batch and extern steps is listed under any of the ids, within the stop's whole bound
-        (one deadline for them all); a step still listed then is cancelled by its own id."""
+        (one deadline for them all); a step still listed then is cancelled by its own id. Returns the names of the
+        steps it cancelled that have left the list since (within the cancel's bound).
+
+        A cancel's own exit status is no verdict: on a heterogeneous job `scancel <leader>.<n>` printed "Invalid job id
+        specified" and exited 225 while it did end the step (live slot 5, K1). Whether the step left the list is."""
         deadline = self.clock() + self.settings.stop_bound_s
         while any(self.slurm.steps(job) for job in jobs) and self.clock() < deadline:
             self.sleep(self.poll_s)
+        cancelled: Dict[str, str] = {}
         for job in jobs:
-            for step_id in self.slurm.steps(job).values():
-                self.slurm.cancel_step(step_id)
+            for name, step_id in self.slurm.steps(job).items():
+                try:
+                    self.slurm.cancel_step(step_id)
+                except SlurmError as error:
+                    self.say(f"the cancel of step {step_id} reported a failure ({error}); its leaving the list decides")
+                cancelled[name] = job
+        deadline = self.clock() + self.timeouts["cancel"]
+        while any(name in self.slurm.steps(job) for name, job in cancelled.items()) and self.clock() < deadline:
+            self.sleep(self.poll_s)
+        return [name for name, job in cancelled.items() if name not in self.slurm.steps(job)]
+
+    def remove_after_cancel(self, service: str, cancelled: List[str]) -> bool:
+        """K1: a service whose step down cancelled (at the stop's bound) and that has left the list was ended outright
+        on the site that showed it (the step's processes killed, no trap run), which leaves its work directory, 2 to
+        2.6 GB of the node's tmpfs, on its node. Only the work directory the state recorded for it, accepted as the
+        bundle makes one (`hpcstate.checked_workdir`), is removed, by teardown.sh in a control step on its node (no
+        service of it runs by then: its step is gone), and shown gone by `node_clean`. Nothing it did not record is
+        removed: a service whose log never named a work directory is left to `no_workdir_left`, which removes nothing.
+        True once the directory is shown gone."""
+        state = self.store.read()
+        record, site = state["services"][service], Site.from_json(state["site"])
+        if (record.get("step") or {}).get("name") not in cancelled or record.get("workdir") is None:
+            return False
+        try:
+            hpcstate.checked_workdir(record["workdir"], site.node_tmp, record["kind"])
+        except hpcstate.StateError as error:
+            self.say(f"{service}: {error}; nothing is removed")
+            return False
+        argv = ["bash", str(BUNDLE / "teardown.sh"), record["kind"], "--workdir", record["workdir"], "--timeout", "0"]
+        name = f"{state['allocation']['name']}-{service}-remove-{record['launch']}"
+        try:
+            self.launcher.control(record["node"], argv, name=name, timeout_s=self.timeouts["step"])
+        except TimeoutError:
+            return False
+        if not self.node_clean(service):  # a removal that failed, or one teardown.sh refused: never shown clean
+            self.say(f"{service}: its step was cancelled, and its work directory is still on its node")
+            return False
+        self.set(lambda s: s["services"][service].update(state="removed"))
+        self.say(f"{service}: its step was cancelled, and the work directory it recorded is removed from its node")
+        return True
 
     def node_clean(self, service: str) -> bool:
         """A read-only control step: the service's work directory is gone from its node. A service never launched is

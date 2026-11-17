@@ -314,6 +314,7 @@ class FakeSlurm:
     sweep_here: bool = False  # run down's sweep of the agent's node on this host (its tmpfs is here), else answer it
     sweeps: list = field(default_factory=list)  # each sweep step down launched
     leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
+    step_cancel_rc: int = 0  # a step's scancel ends it but exits so (225: as the site's did on a het job, live slot 5)
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -360,6 +361,9 @@ class FakeSlurm:
             self.cancelled.append(target)
             if "." in target:
                 self.steps = {n: s for n, s in self.steps.items() if s != target}
+                if self.step_cancel_rc:
+                    said = f"scancel: error: Kill job error on job step id {target}: Invalid job id specified\n"
+                    return Completed(self.step_cancel_rc, "", said)
             else:  # a job's cancel ends its steps, a leader's those of every component
                 self.steps = {n: s for n, s in self.steps.items() if self.leader_of(s.split(".")[0]) != target}
             return Completed(0, "", "")
