@@ -101,6 +101,7 @@ import errno
 import http.client
 import importlib.util
 import io
+import ipaddress
 import itertools
 import json
 import os
@@ -182,11 +183,15 @@ _LISTING_SLOT = threading.BoundedSemaphore(1)
 CLIENT_WRITE_TIMEOUT_S = 60
 
 
+_ECHOED = ("request_line", "reason", "path", "query")  # the log's fields that hold what the client wrote
+
+
 def _log(rec: dict) -> None:
     rec["t"] = time.time()
+    line = {k: _redact_node_names(v) if k in _ECHOED and isinstance(v, str) else v for k, v in rec.items()}  # O73
     try:
         with _LOCK, open(CFG["log"], "a") as f:
-            f.write(json.dumps(rec) + "\n")
+            f.write(json.dumps(line) + "\n")
     except OSError as e:  # never take the request down, but never be silent
         print("GATE LOG FAILED", e, file=sys.stderr, flush=True)
 
@@ -405,37 +410,112 @@ class _Upstream(Exception):
         self.origin = origin_of(cause)
 
 
-_SCAN: dict[tuple[str, ...], re.Pattern[bytes] | None] = {}  # the compiled scan of each list of names, once
+_SCAN: dict[tuple[str, ...], tuple[re.Pattern[bytes] | None, frozenset[bytes], frozenset[bytes]]] = {}
+_V6_TOKEN = re.compile(rb"(?<![0-9A-Fa-f:.])[0-9A-Fa-f:.]{3,45}(?![0-9A-Fa-f:.])")  # a run that may be an IPv6 address
+NODE_MARK = "<node>"  # what a known name becomes in the log's fields that echo the client's request
 
 
-def _scan_pattern(names: tuple[str, ...]) -> re.Pattern[bytes] | None:
-    """The scan of `names` (O73): each a whole name, in any case, longest first, bare or with a port after it. A name
-    is not part of a longer one: a plain name has no word character, dot or hyphen before it and none after (a dot and
-    a word character after it make it the start of a longer name); an IPv6 address has none of those, nor a colon,
-    before it, and is not followed by a colon and a hex digit (a longer address). One pattern per list, built once."""
+def _scan_of(names: tuple[str, ...]) -> tuple[re.Pattern[bytes] | None, frozenset[bytes], frozenset[bytes]]:
+    """The scan of `names` (O73), built once per list: a pattern for the plain names (host names and IPv4 addresses) and
+    the packed IPv6 addresses and IPv4 addresses to compare candidates with. A plain name is a whole name, in any case,
+    longest first, bare or with a port after it: no word character, dot or hyphen before it or word character or
+    hyphen after it, and not the start of a longer name (a dot and a word character after it)."""
     with _LOCK:
         if names not in _SCAN:
-            found = sorted(
-                {n.lower().encode("ascii", "ignore") for n in names if isinstance(n, str) and n}, key=len, reverse=True
-            )
-            plain = b"|".join(re.escape(n) for n in found if b":" not in n)
-            six = b"|".join(re.escape(n) for n in found if b":" in n)
-            parts = []
-            if plain:
-                parts.append(rb"(?<![\w.-])(?:" + plain + rb")(?![\w-])(?!\.\w)")
-            if six:
-                parts.append(rb"(?<![\w:.-])(?:" + six + rb")(?![\w-]|:[0-9A-Fa-f]|\.\w)")
-            _SCAN[names] = re.compile(b"|".join(parts), re.IGNORECASE) if parts else None
+            found = sorted({n.lower() for n in names if isinstance(n, str) and n}, key=len, reverse=True)
+            plain, six, four = [], set(), set()
+            for name in found:
+                try:
+                    address = ipaddress.ip_address(name)
+                except ValueError:
+                    plain.append(re.escape(name.encode("ascii", "ignore")))
+                    continue
+                if address.version == 6:
+                    six.add(address.packed)  # any spelling of it is found by parsing the candidates (`_spans`)
+                else:
+                    four.add(address.packed)
+                    plain.append(re.escape(name.encode("ascii")))
+            pattern = rb"(?<![\w.-])(?:" + b"|".join(plain) + rb")(?![\w-])(?!\.\w)" if plain else None
+            _SCAN[names] = (re.compile(pattern, re.IGNORECASE) if pattern else None, frozenset(six), frozenset(four))
         return _SCAN[names]
 
 
+def _as_the_client_reads(body: bytes) -> bytes:
+    """What a client reads of a body: the strings of a JSON document decoded (an escape such as `\\n`, or a name
+    written with `\\uXXXX`, would otherwise hide it from the raw text), every key and string value on a line of its
+    own; any other body, or a JSON one too deep for the decoder, as it is."""
+    if body.lstrip()[:1] not in (b"{", b"["):
+        return body
+    try:
+        document = json.loads(body)
+    except (ValueError, RecursionError):
+        return body
+    strings, stack = [], [document]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            strings.append(item)
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return "\n".join(strings).encode("utf-8", "replace")
+
+
+def _spans(text: bytes, names: tuple[str, ...]) -> list[tuple[int, int]]:
+    """Where the known names are in `text`, as spans: the plain names by pattern, an IPv6 address in any spelling (its
+    candidates are parsed, so `2001:0db8::2` and `2001:db8:0::2` are one address) and an IPv4 address written as a
+    hexadecimal IPv4-mapped IPv6 address (the dotted form is the plain pattern's)."""
+    pattern, six, four = _scan_of(names)
+    found = [m.span() for m in pattern.finditer(text)] if pattern is not None else []
+    if (six or four) and b":" in text:
+        for match in _V6_TOKEN.finditer(text):
+            token, start = match.group(), match.start()
+            stripped = token.rstrip(b".")
+            if stripped.endswith(b":") and not stripped.endswith(b"::"):
+                stripped = stripped[:-1]
+            if stripped.startswith(b":") and not stripped.startswith(b"::"):  # a prose colon: `peer:2001:db8::2`
+                stripped, start = stripped[1:], start + 1
+            if b":" not in stripped:
+                continue
+            try:
+                address = ipaddress.IPv6Address(stripped.decode("ascii"))
+            except ValueError:
+                continue
+            mapped = address.ipv4_mapped
+            if address.packed in six or (mapped is not None and b"." not in stripped and mapped.packed in four):
+                found.append((start, start + len(stripped)))
+    return sorted(found)
+
+
 def _node_name_hits(body: bytes) -> int:
-    """How many known node names or addresses (`scan_names` of the gate's configuration, O73) a body holds: counted in
-    memory, and nothing of the body, of a match or of its context is kept. 0 when the gate has no names to scan (a
-    Compose federation's). A body is scanned whole: an answer that is no file's content is read whole before it goes."""
+    """How many known node names or addresses (`scan_names` of the gate's configuration, O73) a body holds as its
+    client reads it: counted in memory, and nothing of the body, of a match or of its context is kept. 0 when the gate
+    has no names to scan (a Compose federation's). A body is scanned whole: an answer that is no file's content is read
+    whole before it goes."""
     names = tuple(CFG.get("scan_names") or ())
-    pattern = _scan_pattern(names) if names and body else None
-    return len(pattern.findall(body)) if pattern is not None else 0
+    if not names or not body:
+        return 0
+    return len(_spans(_as_the_client_reads(body), names))
+
+
+def _redact_node_names(value: str) -> str:
+    """`value` with each known node name or address replaced by `NODE_MARK`: for the log's fields that hold what the
+    client wrote, which a published log must not hold whoever wrote it. `value` as it was when there are no names."""
+    names = tuple(CFG.get("scan_names") or ())
+    if not names or not value:
+        return value
+    data = value.encode("utf-8", "replace")
+    spans = _spans(data, names)
+    if not spans:
+        return value
+    out, last = [], 0
+    for start, end in spans:
+        if start >= last:  # a span inside the last one (the dotted tail of a mapped address) is not cut again
+            out += [data[last:start], NODE_MARK.encode()]
+            last = end
+    return b"".join([*out, data[last:]]).decode("utf-8", "replace")
 
 
 def _count_node_names(rec: dict, body: bytes) -> None:
@@ -828,6 +908,9 @@ class Handler(BaseHTTPRequestHandler):
             "request_line": (getattr(self, "raw_requestline", b"") or b"")[:200].decode("latin-1", "replace").strip(),
             "body": "gate",
         }
+        _count_node_names(
+            rec, f"{message or ''}\n{explain or ''}".encode("utf-8", "replace")
+        )  # the page quotes the client
         try:
             super().send_error(code, message, explain)
         finally:
