@@ -81,6 +81,87 @@ statuses = {key: study.models.resolve(key).status for key in study.models}
 assert statuses == {"alpha-stub": "frozen", "beta-stub": "frozen"}  # only frozen settings may start a study run
 ```
 
+### A model entry's keys
+
+`models.toml` holds one `[models.<key>]` table per model. The key names the model everywhere else in the configuration (the plan, the caps and the concurrency refer to keys, never to API ids), and a table refuses a key it does not know, listing the ones it does. What an entry needs depends on its `backend`: `openai_compat` for an OpenAI-compatible chat endpoint, `anthropic` for the Messages API, `stub` for a scripted model that sends nothing (the example study's), or another plain lower-case name for a backend of the study's own, which the plugin's `backend_factory` serves and which the core's rules for its own adapters do not apply to. The table says required (**R**), optional (o) or refused (-).
+
+| Key | `openai_compat` | `anthropic` | `stub` | What it holds |
+|---|---|---|---|---|
+| `backend` | R | R | R | the adapter that serves the entry |
+| `api_id` | R | R | o | the id sent to the endpoint; a stub's is its key |
+| `status` | o | o | o | `frozen`, or `draft`, which is the default; only `frozen` settings may start a study run (B08), and a pilot builds a draft backend on purpose |
+| `base_url` | R | R | - | the endpoint: an http or https URL with a host and a valid port, and no credentials ([below](#base_url-is-required-for-every-backend-the-core-builds-but-the-stub)) |
+| `key_env`, `key_file` | o, at most one | R, exactly one | - | the name of the environment variable that holds the key, or the path of a file that does (`~` is expanded) |
+| `aliases` | o | o | o | other names the server reports for the model; no name may answer to two entries, case aside (P06) |
+| `sampling` | o | o: `temperature`, `top_p`, `top_k` only | - | request settings as a table: `temperature` and `top_p` are numbers, `top_k` an integer |
+| `extra_body` | o | o: `thinking` and `output_config` come from here | - | vendor extras, sent verbatim; never a field the adapter sets itself, never `stream`, and never a key `sampling` also holds |
+| `max_output_tokens` | o | o | o | the model's own maximum per reply, a positive integer: a request carries the lower of it and the study's `max_output_tokens`, and it must be below `context_tokens` |
+| `context_tokens` | o | o | o | the endpoint's context window, a positive integer: checked at admission, and required of every model that is not free once the campaign has a budget |
+| `echo_reasoning_field` | o | - | - | the assistant-message field the model's reasoning is sent back in (B04); a plain name that is not a standard message field |
+| `prompt_cache_ttl` | - | o: `"5m"` or `"1h"` | - | the cache lifetime; without it no cache marker is sent |
+| `price` or `free` | one of the two | one of the two | one of the two | `[models.<key>.price]` ([below](#prices-and-the-budget)), or `free = true` for a model that costs nothing per token; both are refused, and a study run refuses a model with neither |
+| `accepted_fingerprints` | o | - | o | the serving fingerprints that count as one model ([above](#a-model-served-by-several-deployments)) |
+
+The adapter sets the request's `model`, `messages`, `tools`, `max_tokens` and `stream` itself (and on `openai_compat` `tool_choice`, `stream_options` and `seed`, from the run's seed; on `anthropic` `system` and `cache_control`), so an entry that names one in `sampling` or `extra_body` is refused. A key is read when a request is built, never when the table loads, and a message names the variable or the file and never the key (`ModelSpec.read_key`); `ModelTable.require_keys` checks at the start that every model the plan names has a readable one.
+
+**`base_url` is required for every backend the core builds but the stub.** That includes `anthropic`, although a provider has one public address. The core knows no provider's address and has no default for the key: the adapter hands what you wrote to the provider's client as its `base_url`, and the record's route keeps it with any credentials, query and fragment removed. An entry without the key is refused at load with `base_url must be an http or https URL with a host`, the message of a URL that is malformed, so a missing key reads like a typo in a URL nobody wrote. Write the provider's own address, or a gateway's. A campaign's `[endpoints.<model>] base_url` replaces the entry's when a run is sent, and cannot stand in for it, since the entry is checked first, when `models.toml` loads.
+
+**On `anthropic` the reply maximum is also the thinking budget's room.** The Messages API needs `budget_tokens` below `max_tokens`, so an entry whose thinking budget is not below its own `max_output_tokens` is refused at load, and one whose budget is not below the lower of the study's `max_output_tokens` and its own is refused when its backend is built, before anything is sent (B16). Thinking and the answer are spent from that one limit: the `thinking_tokens` of the record's served-model summary counts only what the API reports separately, and is `None` when it reports none, the thinking then being inside the output tokens. For a model held to its reply maximum the budget reserves each tool round's reply at that limit ([below](#prices-and-the-budget)), so room for thinking raises a run's reservation.
+
+A real model's entry, with an invented address, name and prices:
+
+```python
+import tomllib
+
+from expcore.config.loading import ConfigError
+from expcore.config.models import parse_models
+
+HOSTED = """
+[models.hosted-large]
+backend = "anthropic"
+api_id = "vendor-large-1"
+base_url = "https://llm.example.invalid"
+key_env = "HOSTED_KEY"
+status = "frozen"
+max_output_tokens = 8000
+context_tokens = 200000
+prompt_cache_ttl = "5m"
+
+[models.hosted-large.extra_body.thinking]
+type = "enabled"
+budget_tokens = 4000
+
+[models.hosted-large.price]
+input_per_mtok = 1.0
+output_per_mtok = 4.0
+cache_write_per_mtok = 1.25
+cache_read_per_mtok = 0.1
+"""
+hosted = parse_models(tomllib.loads(HOSTED), "models.toml").resolve("hosted-large")
+assert (hosted.backend, hosted.max_output_tokens, hosted.context_tokens) == ("anthropic", 8000, 200000)
+assert hosted.priced and hosted.price.cache_read_per_mtok == 0.1
+assert hosted.output_tokens(16000) == 8000  # a request carries the lower of the study's cap and the entry's own
+assert hosted.extra_body == {"thinking": {"type": "enabled", "budget_tokens": 4000}}
+
+for broken, said in (
+    (
+        HOSTED.replace('base_url = "https://llm.example.invalid"\n', ""),
+        "base_url must be an http or https URL with a host",
+    ),
+    (
+        HOSTED.replace("budget_tokens = 4000", "budget_tokens = 8000"),
+        "budget_tokens (8000) must be smaller than max_output_tokens (8000)",
+    ),
+    (HOSTED.replace('key_env = "HOSTED_KEY"\n', ""), "an anthropic model needs key_env or key_file"),
+):
+    try:
+        parse_models(tomllib.loads(broken), "models.toml")
+    except ConfigError as refused:
+        assert said in str(refused) and str(refused).startswith("models.toml: [models.hosted-large]: ")
+    else:
+        raise AssertionError(f"an entry that {said!r} loaded")
+```
+
 ### The scheduler's kinds
 
 Two keys of `[scheduler]` in `campaign.toml` name the infrastructure kinds the scheduler records its own failures as:
@@ -353,6 +434,13 @@ alpha = study.models.resolve("alpha-stub")
 assert round(bound_usd(alpha, study.campaign.agent.limits), 6) == 0.056384  # (20,000 + 8,192) x 2, per million
 ```
 
+**Work out one run's reservation before you set a ceiling: a ceiling below it admits no run.** The gate starts a run only when what was spent, the reservations of the runs in flight and this run's own fit under every ceiling that applies, `max_usd` for the campaign and the model's own `per_model_usd`, if it has one (`campaign/gate.py`). With nothing spent, a ceiling under one run's bound therefore holds every run of that model from the first assessment, however many runs the plan asks for. The bound is the figure above, at the dearest tier of a tiered price, and it follows from the caps in `[agent]` and the model's context window and reply maximum, so a study sets the caps and the ceiling together. For the example's `alpha-stub`, whose bound is 0.056384 USD, a `max_usd` of 0.05 holds all of its runs. The hold is recorded as a `budget_hold` event with its stop's serial and says what is over, here `the campaign: 0.06 USD (spent 0.00 + in flight 0.00 + this run 0.06) is over the ceiling of 0.05 USD`. It is a hold and not a failure: no run of the model starts, the call's summary lists the hold (`RunSummary.holds`), and a later start assesses the ceilings afresh. Raise the ceiling, or lower the bound with `token_budget`, `max_tool_rounds` or the reply maximum, and run again. `campaign.toml` sets no release file, so a hold there ends only when the figure fits; a `max_usd` of 0 is refused when the budget is built, and a model with no price that is not free is held too, since its cost is unknown.
+
+```python
+# a ceiling of 0.05 USD sits below one run of the example's stub, so the gate would hold every run of it
+assert bound_usd(alpha, study.campaign.agent.limits) > 0.05
+```
+
 ### An attempt a kill interrupted, and a budget hold after a kill
 
 An attempt killed before its result was stored (the dispatcher killed, its host gone) is `interrupted`, and its run is run again. With a budget it is charged what it recorded, not its whole bound (C05): each attempt keeps a **call log** in the store as it runs, a count of the requests it sent, each written before it goes out, and the counts each reply reported, written when it arrives. At the next start, recovery records the basis it is charged on (`spend_basis`):
@@ -405,6 +493,10 @@ assert (loose.tripwire_checked, loose.tripwire_fired_before) == (None, None)  # 
 The basis says what its bound rests on: `tripwire_checked`, the requests of that model in that run that were bounded by bytes and tested against the reply that came back, and `tripwire_exceeded`, `tripwire_unreported` and `tripwire_overlapped`, the replies that reported a prompt above their bound, the replies that left a count out and the requests built while another was in flight, each kept as its own count. `tripwire_fired_before` is true when any of the three is above zero. Report them beside the cost: a tight bound with `tripwire_checked` of 3 and nothing fired rests on three tests, and one with 0 rests on none. The counts are None for a record that lacks them, never 0.
 
 The byte bound rests on three assumptions, derived in [`interfaces.md`](interfaces.md#the-request-given-up): a token stands for at least one byte of the text it was read from, a reply's reported prompt is the whole prompt it was billed, and the history only grows (checked by digest, with the window as the answer when it fails). Every completed request tests the first, and a conversation in which a reply reported more than its bound is bounded by the window from then on, so check `tripwire_exceeded` (the entry's `bound_exceeded`) before trusting an entry. A backend of your own that does not record the bound keeps the window's.
+
+### The platform file and the day-0 command
+
+A study on the Onedata platform writes one `platform.toml`. [`interfaces.md`](interfaces.md#the-platform-layers-configuration-file) lists every table of it, which are required and which are not, the keys each takes, and the rule for credential files: each, the admin's and every user's, is a regular file you own with no group or other permission bit (mode 0600), or the file is refused when it loads. Before a study depends on the federation, run the day-0 checks against it with `uv run python -m expcore_onedata.day0 platform.toml --out <directory>`. The read-only checks (reachability, health, tokens, the content type and the listing of each space) need nothing more. The checks that change state, the refusal of a write on the data path and the placement round trip, report unknown and send nothing until `EXPCORE_LIVE_MUTATE=1` is in the environment, and the outage check, which takes a provider down, also needs `EXPCORE_LIVE_FAULTS=1` and `sanctioned = true` in `[faults]`. The exit status is 0 when every check passed, 1 when one failed, 3 when none failed but something could not be measured (unknown is never a pass), and 2 for a usage or configuration error. [The day-0 section of `interfaces.md`](interfaces.md#the-platform-layers-day-0-command) has each check, what it needs and when it reports unknown.
 
 ### The federation's certificate
 
@@ -795,6 +887,120 @@ A provider's link to a peer can stick with nothing logged, and every read of tha
 The check runs at the campaign's first health call and again every `every_s` (600 s by default). A pair that does not fetch its probe within `timeout_s` (30 s) holds every run from the campaign's start, or, later, closes the health gate: the run whose check found it is an infrastructure outcome and never scored. Either way the whole campaign waits, and the gate's re-checks run the check again until it passes, so the remedy reopens it without restarting the campaign. With `[faults]` and a declared `heal`, the check heals the stuck pair itself between runs ([After an outage](#after-an-outage-the-session-gate-and-the-link-heal), "When stuck pairs heal themselves"). The detail names the pair by position and the remedy: restart the rtransfer link of the pair's reading provider, the one the failure names (`rtransfer_config:restart_link()` in its op-worker; the reader is the platform's local provider for some pairs and another provider for the rest, and it is not the source), or restart that provider's container alone, never a Compose `down`; left alone, a stuck link cleared after about 1,800 s on the first study's federation. A probe whose fetch failed is replaced by a new file in the probe space (`expcore-link-probe-<hash>-g1`, then `-g2`) for the next check, because the provider keeps waiting on the stuck fetch of the old file and a read of it would wait on the same job even once the link works; the old file is deleted, and it is recorded as retired in the probe space (an `expcore-link-retired-` marker file), so no later check reads it even when the deletion failed. When no fresh file can be written either, the pair fails with "no fresh probe for providers[j] to providers[i]: creation failed" until one can. A fault injector's restore checks every pair, not the restored provider's alone, since an outage of one provider can leave a link between two others stuck, and stays unverified until they pass; its failure (`links_stuck`) carries the check's detail, so the provider to restart is each failed pair's reading provider, which need not be the restored one. The check's first run after the probe space was emptied writes the probes and takes some seconds more, and the pairs are checked 8 at once, so 20 pairs take about three rounds of what two took; keep `health_timeout_s` in `campaign.toml` above `visible_timeout_s + timeout_s + evict_timeout_s` of `[link_check]`, 150 s with the defaults. `PlatformHealth.links` holds the last check's record, each pair's seconds and bytes and the transfers it made, for a study that wants it in its own records ([`interfaces.md`](interfaces.md)).
 
 The check leaves files in its probe space for good, so a Day-0 or reset check that lists that space must not take them for strays. `expcore_onedata.linkentries.link_check_entries(listing)` takes the space's listing (the `Entry` objects `Provisioner.children` returns, or `(name, file_id)` pairs) and returns `own`, every entry of the check's two name shapes (`expcore-link-probe-<16 hex>`, with `-g<N>` for a generation from 1, and `expcore-link-retired-<16 hex>-<16 hex>`, in lower-case hex), with `current`, `superseded` and `markers` as its parts, and `other`, everything else. Exclude `own` and judge `other`: a name that only resembles the shapes (`-g0`, upper-case hex, a suffix) is in `other`, so a stray file never hides behind the check's prefix. `current` names each pair's probe, the highest generation (read as the check reads one, up to nine digits) among its files that no marker retires, and `superseded` the other probes, which a later passing check purges, but for a name with ten or more digits of generation, which the check neither reads nor deletes; leave the markers alone, since a marker is what keeps a retired file from being read again. It needs no provider id, and `is_link_check_entry(name)` tests one name.
+
+### What the federation shows late: a new file and a deleted name
+
+Onedata 25.0 is eventually consistent, and two of its lags decide whether the state your study sets up is the state a run starts in. Both were measured on the Compose federation's 25.0 development build (op-worker `f118ed9`), a space held by one provider, its owner, and mirrored by others; the measurements are in `deploy/compose-federation/day0/`. Neither is a fault to fix: each is a reason to wait, with a bound, before the run's clock starts, and to refuse to start when the bound passes.
+
+**A new file is not at once visible through another provider.** A file written through one provider answers `400 posix enoent`, as JSON, through another until that provider sees it, and then it can show at size 0 before it shows at its size (`2026-11-10-federation-facts.md`, `2026-11-12-federation-facts-pending-deletes.md`). How long that takes differs by provider and by run: a mirror took 6.1 s, about 6 s, 6.08 s and 6.60 s in four runs (`2026-11-10-federation-facts.md`, `2026-11-11-federation-facts-posix-and-fuse.md`, `2026-11-14-federation-facts-replication-lag.md`, `2026-11-14-federation-facts-slot.md`) and 3.6 s to 5.1 s in another (`2026-11-12-federation-facts-pending-deletes.md`), while another mirror of the same federation saw the same files in 0.01 s to 0.03 s. So no constant is right, and a study waits for the file itself, on the provider the agent reads through, which is not the writer unless the agent's local provider is the data provider.
+
+The core does this for what it writes. `Provisioner.await_visible(provider, file_ids)` reads each file's `name`, `size` and `parent_id` together through the provider every 0.5 s until its size is the data provider's, bounded by `consistency.VISIBLE_TIMEOUT_S` (120 s), and raises `NotVisible`, naming the provider by its position, past it. Provisioning calls it before it reads or schedules a transfer through another provider, a progressive ingest confirms each part on every provider of its `visible_on` (every provider of the space by default), the link check waits for its probe, and the fault injector's session probe waits on every provider of the probe space. **A step of your own that writes the state a run starts in does not get that wait**: an instrument or an executor that writes files and then lets the run start must itself verify the start state through the agent's local provider, bounded, before the clock starts, and refuse to start past the bound. A measurement must not wait: a probe records what it reads (O08). A refusal before the run starts is an infrastructure outcome, never a result: the core's own ingest raises `InfraError("ingest_failure")`, so the attempt is set aside and run again.
+
+```python
+import os
+import shutil
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+
+from expcore_onedata import consistency
+from expcore_onedata.client import OnezoneClient
+from expcore_onedata.config import load_platform
+from expcore_onedata.provision import Provisioner, resolve_provider_ids
+from expcore_onedata.rangemap import load_placement
+from expcore_onedata.testing import ADMIN_ENV, DATA, Ticker, make_federation, write_with_placement
+
+
+@contextmanager
+def lagging_federation(**lags):
+    """The default fake federation on a clock that moves only when something sleeps, with the lags it is told of."""
+    ticker = Ticker()
+    fake = make_federation(clock=ticker.clock, **lags)
+    workdir = Path(tempfile.mkdtemp())
+    os.environ[ADMIN_ENV] = fake.admin_token
+    try:
+        platform = write_with_placement(workdir)
+        config = load_platform(platform)
+        client = OnezoneClient(config, http=fake.client_http())
+        provisioner = Provisioner(
+            client,
+            config,
+            load_placement(platform, config).settings,
+            provider_ids=resolve_provider_ids(config),
+            log=workdir / "changes.jsonl",
+            clock=ticker.clock,
+            sleep=ticker.sleep,
+        )
+        yield ticker, fake, client, provisioner
+    finally:
+        del os.environ[ADMIN_ENV]
+        shutil.rmtree(workdir)
+
+
+# alpha, the data provider, shows a new file at once; beta shows it only after 6 s, as a mirror did live.
+with lagging_federation(visibility_delay_s=6.0) as (ticker, fake, client, provisioner):
+    fake.add_file("study/arrived.bin", DATA)
+    arrived = fake.id_of("study/arrived.bin")
+    assert provisioner.await_visible("alpha", [arrived]) == 0.0  # the writer needs no wait
+    try:  # a start bounded at 3 s refuses, naming the provider by its position
+        consistency.wait_visible(
+            client, "beta", arrived, size=len(DATA), timeout_s=3.0, clock=ticker.clock, sleep=ticker.sleep
+        )
+    except consistency.NotVisible as refused:
+        assert str(refused).startswith("providers[1]: ") and "within 3 s" in str(refused)
+    else:
+        raise AssertionError("beta showed the file before its lag was over")
+    assert provisioner.await_visible("beta", [arrived]) == 3.0  # the rest of the 6 s, waited for before the run starts
+```
+
+**A delete is asynchronous.** The provider a DELETE went to, the owner, answers a deleted file, and every file under a deleted directory, as `400 posix enoent` at once, and the directory's own attributes for up to a second more, partly emptied. Every other provider keeps showing the old entry, its files and its listing entry for 3 s in four trials and 8 s in two, and then drops them all in the same second (`2026-11-12-federation-facts-pending-deletes.md`). On `canonical` storage a new directory of the same name has the same path on storage, so an old directory's late removal can in principle take the new one's files. That is why the Compose federation's bootstrap never deletes and makes a directory again but keeps a baseline directory and empties it file by file (`deploy/compose-federation/fedcontent.py`), and why the progressive ingest waits as below.
+
+**Whether the loss happens is not settled, so write as if it could.** The live check of 12 Nov tried to reproduce it and could not. Four times a directory of five files of 64 KiB was deleted through the owner and made again under the same name within 0.1 s; the new files kept their size, parent and content (SHA-256) on every provider through a 120 s watch, and on the owner's storage in one trial: 0 of 21 files lost or changed. A single file deleted and made again at once, and a control made again 30 s later, behaved the same. Two cases were not covered: a file larger than 64 KiB, and a delete still working through many files when the name is made again. Neither "it loses files" nor "it is safe" is a recorded fact for a study that works at such sizes.
+
+What the core waits for is the ingest's. It removes a file only through the gate and writes the name again only once its old id answers absent on every provider of the space, on consecutive polls, bounded by `[placement] settle_timeout_s` (300 s by default, two polls in a row every `poll_s`, 2 s); past the bound it raises, and the attempt is set aside as `ingest_failure`. `Provisioner.teardown` confirms only the data provider's absence, which says nothing of the other providers or of the storage, and relies on every scratch name being new: nothing in the core creates a name again after its teardown. A study that resets its dataset by deleting and recreating a name through the provisioner or the REST API has no such wait from the core, and the shape of one is below.
+
+**What a study does.** Never reuse a name within a campaign: give each run's directory or file a name of its own (the run's key in it, say), or keep the directory and replace its files one at a time, as the bootstrap does. If a name must be reused, wait first, bounded, until the old entry answers absent on every provider of the space on consecutive polls, and refuse to go on when the bound passes. Absent is a 404 or exactly `400 posix enoent` (`client.answered_absent`), read with no `attribute` or with `name` among them: `parent_id`, `file_id` and a directory's `size` alone keep answering from a tombstone. A wait that reads the owner alone is over at its first polls, seconds before the mirrors stop showing the entry:
+
+```python
+from expcore_onedata.client import PlatformError, answered_absent
+from expcore_onedata.readretry import ONE_ATTEMPT
+
+
+def absent_on(client, providers, file_id):
+    """True once every provider answers the entry absent; False while one still shows it; anything else raises."""
+    for provider in providers:
+        try:
+            client.get(f"/data/{file_id}", provider=provider, retry=ONE_ATTEMPT)
+        except PlatformError as error:
+            if not answered_absent(error):
+                raise
+        else:
+            return False
+    return True
+
+
+# The fake models one delay for every provider, 8 s here; live the mirrors took 3 s or 8 s.
+with lagging_federation(delete_delay_s=8.0) as (ticker, fake, client, provisioner):
+    fake.add_file("study/old.bin", DATA)
+    old = fake.id_of("study/old.bin")
+    provisioner.mutate("DELETE", f"/data/{old}", provider="alpha")  # alpha is the owner
+    deleted, took = ticker.now, {}
+    for providers in (["alpha"], ["alpha", "beta"]):
+        done = consistency.converge(
+            lambda providers=providers: absent_on(client, providers, old),
+            bool,
+            timeout_s=60.0,
+            poll_s=1.0,
+            consecutive=2,
+            clock=ticker.clock,
+            sleep=ticker.sleep,
+        )
+        assert done.converged  # a wait that does not converge is a refusal to go on, never a guess
+        took[len(providers)] = ticker.now - deleted  # seconds since the DELETE was answered
+    assert took[1] < 8.0 <= took[2]  # the owner alone is over long before the mirror stops showing the entry
+```
+
+A test of such a wait sets `delete_delay_s` and, to see what the wait is for, `lose_recreated=True`, as [the testing module](interfaces.md#the-platform-layers-testing-module) says ("Pending deletes"); the fake's `visibility_delay_s` does the same for a new file ("Per-reader views").
 
 ### A dataset provisioned by storage import on the Onedata platform
 
