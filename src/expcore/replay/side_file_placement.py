@@ -199,14 +199,24 @@ def stage_harness_side_file(
 
     The counterpart of `stage_side_file` for a file that never was in the sandbox's /work: the collector's log, which
     the agent could neither read nor change, is copied from where the sandbox's collection left it. `name` is a
-    declared `pattern`; `path` a regular file (a link is refused: `PlacementError`). Everything after the lookup is
-    `stage_side_file`'s: the copy goes into the attempt directory under its temporary name, hashed as it is copied
-    and fsynced; the record that names `staged.sha256` is written; then `staged.commit()` renames it, and refuses
-    before that. Returns None when nothing lies at `path` (no log: the run's record holds no hash for it). Raises
-    `UndeclaredSideFile` for a name no declaration holds and `SideFileTooLarge` for a file over `MAX_SIDE_FILE_BYTES`,
-    before anything is written into the attempt directory.
+    declared `pattern`; `path` a regular file (a link, a directory or any other kind is refused: `PlacementError`).
+    Everything after the lookup is `stage_side_file`'s: the copy goes into the attempt directory under its temporary
+    name, hashed as it is copied and fsynced; the record that names `staged.sha256` is written; then `staged.commit()`
+    renames it, and refuses before that. Returns None when nothing lies at `path` (no log: the run's record holds no
+    hash for it). Raises `UndeclaredSideFile` for a name no declaration holds and `SideFileTooLarge` for a file over
+    `MAX_SIDE_FILE_BYTES`, before anything is written into the attempt directory.
     """
-    raise NotImplementedError
+    declaration = _declared(side_files, name)
+    source = Path(path)
+    try:
+        mode = source.lstat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not stat.S_ISREG(mode):  # a link, a directory or a FIFO (which would block the open) is never copied
+        raise PlacementError(f"the harness's copy of {declaration.pattern} is not a regular file")
+    run_dir, identity = Path(request.run_dir), request.identity
+    record = run_dir / record_filename(identity.run_key, identity.attempt)
+    return _stage_copy(source, run_dir, declaration, identity.attempt, record)
 
 
 def _declared(side_files: Sequence[SideFile], name: str) -> SideFile:

@@ -615,6 +615,60 @@ instruments = [..., EgressLog(source, declared, nonce)]  # source.egress_log() -
 - **The analysis** (`study.pipeline.analyse_study`): once one analysed record carries the namespace, every analysed run is judged (a run without the snapshot is `not_recorded`), and the preregistered analysis is run again without the flagged runs, each passed as an absent run of reason `excluded`. `StudyAnalysis.egress` holds both (`expcore.egress.sensitivity.EgressAnalysis`: `runs`, `sensitivity`, `refused`); `analysis.json` gains `egress` (counts, each run's verdict, the sensitivity analysis's contrasts and Holm decisions, with each named Holm family's and each declared equivalence family's members and steps under `holm_families` and `equivalence_families` as the primary analysis holds them, or why it was refused); the report gains `## Egress (detected, not prevented)` after the conditions and the shards (`expcore.report_egress`); the terminal summary gains its lines. The sensitivity analysis is shown as the primary one is, after the same checks (`report_families`): with several named Holm families (S17), one table and one set of steps per family under `##### Holm family`, titled "N Holm families, each adjusted on its own" instead of "Holm family of N", and each rerun contrast's terminal line names its family; with equivalence claims (S15, S18), their table, and a declared family's TOST steps, under `####`, without the primary's notes. One flat family has none of that, byte for byte. The mount guard's and both guards' reruns are shown and written the same way. A batch in which no record carries it has none of these, byte for byte.
 - **Limits.** Detection, not prevention: a statically linked program, raw system calls, io_uring and the C library's own resolver pass the shim, which is why the scan is the second line; the scan reads text, so code that builds a name or a call at run time passes it. Under one uid the agent can send forged records to the collector, which add lines (a malformed one makes the log unknown) and never remove one.
 
+### The read log: the `read_log` instrument and its channel
+
+`expcore_onedata.readlog` (O91). A study's canonical scripts (the ones its agent's code tool runs inside the sandbox cell to read the data) log every read they make, and the study's omission scoring rests on that log, so the agent must be able neither to read it nor to rewrite or delete it. The scripts send each record to a collector the harness runs outside the cell; the log is the harness's, and a forged append, which cannot be prevented, is detected (the read-log scan; on a REST data path, the gate's per-file served table, `served.lookup_bytes`).
+
+**The fixed names** (`readlog.paths`; no environment variable, so the agent's code cannot point a script at a collector of its making):
+
+| What | Where |
+|---|---|
+| the socket directory, bound **read-only** into every cell | `/expcore-readlog` |
+| the collector's datagram socket | `/expcore-readlog/sock` |
+| the client module, bound **read-only**, imported by explicit path (cells run `python -I`) | `/expcore-readlog-client/expcore_readlog_client.py` |
+| a collector log line's schema | `expcore-readlog/1` |
+| the instrument and its side file's hash field | `read_log`, `instruments.read_log.side_sha256` |
+
+Both targets are harness-owned: a backend adds them to its own targets (the Apptainer settings' `OWN_TARGETS`) and to `sandbox.inputs.TAKEN`, so a study can neither bind nor name an input at either. A Unix datagram socket takes a send on a read-only bind, as the egress shim's does.
+
+**The client's contract** (`readlog.client`, standard library only, Python 3.8 or later; one file, hashed into the run's facts):
+
+```python
+import importlib.util as u
+
+path = "/expcore-readlog-client/expcore_readlog_client.py"
+spec = u.spec_from_file_location("expcore_readlog_client", path)
+readlog = u.module_from_spec(spec)
+spec.loader.exec_module(readlog)
+
+
+def read_file(item, start, stop):
+    data = fetch(item, start, stop)  # the script's own read of the data
+    readlog.log_read(item, range=[start, stop], bytes=len(data), sha256=sha256_hex(data))  # BEFORE returning it
+    return data  # a log_read that raised never reaches this line: no data is returned, the read is "unread"
+```
+
+- **Log before you return data, and return no data when the call raises.** Every failure raises `ReadLogError`: the socket is missing (ENOENT), nothing listens (ECONNREFUSED), the collector's queue stays full past `SEND_TIMEOUT_S` (2 s), the collector has stopped reading (EPIPE), a field is not one the collector accepts, or the line is longer than 4,096 bytes of ASCII JSON (checked before anything is sent). The log is then an upper bound on what the scripts handed out.
+- **One datagram per record.** The line is `{"v": 1, "op": "read" | "canary", "item", ["range": [start, stop]], ["bytes"], ["sha256"]}`; `item` is the study's id of what was read (1 to 1,024 characters, never a host path), `range` is `[start, stop]` with `stop` excluded, `bytes` and `sha256` describe what was returned.
+- **A send that succeeded only means "queued at the collector".** A later loss (the collector killed with records queued, the log past its cap, a malformed line) makes the run's whole log unknown, never a run with fewer reads.
+- The harness's canary, `log_canary()`, is the log's first record, sent before the agent runs.
+
+**The collector** (`readlog.collector`, a single file the harness runs as `python3 -I collector.py <socket dir> <log file> <nonce> <expected peer uid> [<max log bytes>]`, a sibling of the egress collector that imports neither it nor the package). It prints `readlog collector ready` once it is listening; stamps each line with `seq`, `wall`, `mono` (its own receive time, comparable with the cells' times on the same host) and the sender's pid and uid (SCM_CREDENTIALS); writes a start line (the nonce, the collector's uid, the expected peer uid) and, on SIGTERM, an end line with the counts, after it has stopped receiving (so a send that succeeded was queued before the stop and is drained, and a later one raises) and read what was queued; writes its log `O_EXCL` 0600; keeps the log under a byte cap (default 48 MiB, below the side-file cap) and counts what it could not write (`unwritten`, `cap_reached`); and writes a datagram that is no client line, was cut (`MSG_TRUNC`) or does not parse as a malformed line, by size and SHA-256 only, never its bytes. **The expected peer uid** is an argument because it differs by backend: the driver's own on Apptainer (the socket directory 0700), the declared agent uid on Docker (the directory 0755 and the socket 0666, so that uid can connect). The peer's pid across PID namespaces reads 0 on Docker; it is recorded and never judged.
+
+**The reader** (`readlog.reader.read_log(data, nonce, expected_peer_uid=)`): the log is **intact** only with a start line of this run (its nonce, the expected peer uid), `seq` from 0 without a gap and `mono` never going back, the end line last with counts equal to the lines before it, no malformed line, no datagram left unwritten and no cap reached, the harness's canary as the first record, and every record's sender the expected uid. Otherwise it is **unknown**, with every reason (`log_missing`, `log_empty`, `log_too_large`, `log_unparseable`, `no_start_line`, `nonce_mismatch`, `peer_uid_mismatch`, `not_monotonic`, `not_closed`, `end_counts_differ`, `malformed_datagrams`, `unwritten_datagrams`, `cap_reached`, `foreign_sender`, `bad_record`, `no_canary`), and the records before the first damaged line are kept as a lower bound. **A run with an unknown log reads as unknown reads, never as fewer reads.**
+
+```python
+from expcore_onedata.readlog.instrument import ReadLog
+
+instruments = [..., ReadLog(source, nonce, expected_peer_uid)]  # source.read_log() -> bytes | None
+```
+
+**The instrument** (`ReadLog`, namespace `read_log`) takes the log's bytes, which the sandbox read once after it stopped the collector, as `EgressLog` takes its. Its snapshot: `{"version": 1, "log": "intact" | "unknown", "unknown": [reasons], "canary", "counts": {"reads", "canaries"} | None, "records", "side_sha256", "side_bytes"}`. `counts` is None whenever the log is unknown: unknown is never zero. `records` is the reads the readable part shows, a lower bound for an unknown log. A log that is missing has no side file (`side_sha256` None); one past `MAX_SIDE_FILE_BYTES` is unknown (`side_file_too_large`). **The run's facts** (through the one writer of `infrastructure_facts`, owner `readlog`, key `read_log`; `readlog.facts.fact`): the SHA-256 of the collector and of the client, where the backend ran the collector (`apptainer_helper`, `docker_container`) and the expected peer uid.
+
+**The log as the study's side file.** The study declares `[[study.side_files]] pattern = "read_log.jsonl"`, `hash_field = "instruments.read_log.side_sha256"` (`paths.SIDE_FILE_NAME`, `paths.SIDE_HASH_FIELD`). The log was never in the sandbox's `/work`, so the executor places it from where the collection left it on the harness's disk, with `stage_harness_side_file(request, side_files, name, path)` beside `stage_side_file`: the same temporary dot-name, hashing as it copies, fsync, the record that names `staged.sha256`, then `staged.commit()`. It returns None when no file lies at `path`, refuses a link or a file over `MAX_SIDE_FILE_BYTES`, and never renames a file whose hash the record does not name.
+
+**Limits.** Detection, not prevention: an agent's own code can call the client or the socket directly and forge a read (the read-log scan reads the code the agent ran for those routes, and on REST the served table catches claimed reads never served), and an agent that reads the data some other way than through the scripts leaves no record (a study's design question: such reads score as omissions). **Code that runs in a script's own process can also hide a real read:** it can patch the client module or the standard library's `socket` before the script logs, so the data is returned and nothing is recorded, a false omission that no log check can see (the read-log scan matches the text of the agent's code for the channel's names, a Unix datagram socket and the ways to find the socket, not a patch of the standard library; on a REST data path the gate's per-file served table, which the agent cannot reach, catches a served read the log lacks). The channel is Linux only (a Unix socket cannot cross a bind on Docker for macOS).
+
 ### The mount on HPC, guarded: the `mount_guard` instrument
 
 `expcore.mountguard` and the Apptainer backend's mount helper (O60, #179). On an HPC batch node the agent's cells and oneclient run as one uid, so the token a mount needs cannot be kept from the agent as the Docker sidecar keeps it. The mount path stays there with detection and report, as for egress: oneclient runs on the node outside every cell, a watcher outside the cells logs what touches its token or its process and proves each cell isolated from both, and the core reads that log.
