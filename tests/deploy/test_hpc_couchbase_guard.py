@@ -9,6 +9,7 @@ is refused, and fail at once, stopping the start script, otherwise. Everything s
 
 import base64
 import collections
+import errno
 import http.client
 import importlib.util
 import os
@@ -128,6 +129,42 @@ def test_o53_the_guard_passes_when_this_launchs_administrator_answers_and_an_ano
     assert status == 0, out
     assert "hpcop: Couchbase guard passed" in out
     assert "FAILED" not in out
+
+
+def take_if_free(port):
+    """What a neighbouring run on this node does with `port` when the kernel hands it that port too: listens on it, as
+    its own stand-in would (with the reuse flag http.server sets). None if the port was not free to take."""
+    neighbour = socket.socket()
+    neighbour.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        neighbour.bind((HOST, port))
+        neighbour.listen()
+    except OSError as refused:
+        neighbour.close()
+        if refused.errno != errno.EADDRINUSE:
+            raise
+        return None
+    return neighbour
+
+
+def test_the_port_picked_for_the_stand_in_is_not_free_for_a_neighbouring_run_before_it_listens(launch, processes):
+    """The flake of test_the_guard_prints_the_status_that_failed_it: HPC test steps overlap on one node's loopback, and
+    a neighbour that is handed the picked port in the stand-in's start delay (0.3 s) takes it, so the stand-in's bind
+    fails with EADDRINUSE. The test holds the port from the pick until the stand-in listens: the neighbour is refused
+    and this run does not notice it."""
+    secrets_dir, user, password = launch
+    port = free_port()
+    guard = start_guard(processes, secrets_dir, port)
+    neighbour = take_if_free(port)
+    try:
+        start_fake(processes, port)
+        onepanel_setup(port, user, password)
+        status, out = verdict(guard)
+        assert status == 0, out
+        assert neighbour is None, "a neighbouring run took the picked port"
+    finally:
+        if neighbour is not None:
+            neighbour.close()
 
 
 def test_o53_a_bucket_without_an_administrator_fails_the_start(launch, processes):
