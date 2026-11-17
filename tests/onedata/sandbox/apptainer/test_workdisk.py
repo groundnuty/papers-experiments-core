@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from apptainer_support import LIMITS, TOKEN, make_settings, make_spec, options, start
 from fake_node import FakeNode, FakeProc
+from locked_work import lock, locked_afterwards, needs_unprivileged, not_the_owner
 from sandbox_support import SleptClock
 
 from expcore.errors import InfraError
@@ -291,6 +292,70 @@ def test_o71_the_copy_is_checked_against_the_listing_on_the_device_its_own_exec_
                         input=json.dumps({**request, "listed_device": other}))  # fmt: skip
     assert moved.returncode == 0, moved.stderr
     assert (dest / "out" / "a.txt").read_text() == "a\n"
+
+
+@pytest.fixture
+def unlocked_afterwards(tmp_path):
+    yield from locked_afterwards(lambda: tmp_path)
+
+
+def _lock_in_work(cell, *, root: bool = False):
+    """What an agent can do in /work: leave a file and a directory (with a file in it) with every bit cleared, and,
+    with `root`, clear the bits of /work itself."""
+    work = cell.work_dir()
+    (work / "out" / "locked").mkdir(parents=True)
+    (work / "out" / "ok.txt").write_text("ok\n")
+    (work / "out" / "secret.txt").write_text("secret\n")
+    (work / "out" / "locked" / "inner.txt").write_text("inner\n")
+    lock(work / "out" / "secret.txt")
+    lock(work / "out" / "locked")
+    if root:
+        lock(work)
+    return CmdResult(0, "")
+
+
+@needs_unprivileged
+@pytest.mark.parametrize("root", [False, True])
+def test_o71_a_mode_000_file_and_directory_the_agent_locked_are_collected_out_of_the_image_never_set_aside(
+    node, settings, tmp_path, unlocked_afterwards, root
+):
+    """O71: the copy helper runs as the agent's own uid, so an entry the agent locked (`chmod 000` of a file, of a
+    directory, of /work itself) made the collection an infrastructure failure, set aside instead of scored. It is
+    collected with what it holds."""
+    box = start(node, settings)
+    try:
+        node.cell_handler = lambda cell: _lock_in_work(cell, root=root)
+        box.exec("lock()", 30)
+        done = box.collect(tmp_path / "out", ["out"])  # no InfraError
+        assert done["outputs"] == {"out": True}
+        assert "refused_output" not in done
+        got = tmp_path / "out" / "work" / "out"
+        assert (got / "secret.txt").read_text() == "secret\n"
+        assert (got / "locked" / "inner.txt").read_text() == "inner\n"
+        assert (got / "ok.txt").read_text() == "ok\n"
+    finally:
+        box.stop()
+
+
+@needs_unprivileged
+def test_o71_an_entry_of_the_image_the_helper_cannot_read_is_the_agents_refusal_never_a_set_aside(
+    node, settings, tmp_path, monkeypatch, unlocked_afterwards
+):
+    """O71, O19: where the owner's bits cannot be given back, the entry is named for the scorers (`refused_output`) as
+    every other object the agent made that cannot be copied; none of the outputs is copied, and nothing is set aside."""
+    box = start(node, settings)
+    try:
+        node.cell_handler = lambda cell: _lock_in_work(cell)
+        box.exec("lock()", 30)
+        source = workdisk.wrapper_source()
+        monkeypatch.setattr(workdisk, "wrapper_source", lambda: not_the_owner(source))
+        done = box.collect(tmp_path / "out", ["out"])  # no InfraError
+        assert done["outputs"] == {"out": False}
+        assert done["refused_output"]["by_what"] == {copyout.UNREADABLE: 2}
+        assert sorted(r["path"] for r in done["refused_output"]["refused"]) == ["out/locked", "out/secret.txt"]
+        assert not (tmp_path / "out" / "work").exists()
+    finally:
+        box.stop()
 
 
 # ------------------------------------------------------------------------------------------------ what holds it
