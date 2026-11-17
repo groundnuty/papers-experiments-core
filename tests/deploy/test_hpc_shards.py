@@ -72,6 +72,54 @@ def test_a_manifest_with_one_shard_a_label_twice_or_a_host_like_label_is_refused
         shards.load_plan(_manifest(tmp_path, labels=labels))
 
 
+def _roots_as(tmp_path, first, second):
+    """The manifest of `_manifest` with the two shards' roots written as `first` and `second` (its roots stay)."""
+    path = _manifest(tmp_path)
+    text = path.read_text()
+    for name, written in (("a", first), ("b", second)):
+        text = text.replace(f'root = "{tmp_path / "fed" / name}"', f'root = "{written}"')
+    path.write_text(text)
+    return path
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        pytest.param(lambda t: f"{t}/fed/a", id="the same path"),
+        pytest.param(lambda t: f"{t}/fed/a/", id="a trailing slash"),
+        pytest.param(lambda t: f"{t}/fed/b/../a", id="a parent part"),
+        pytest.param(lambda t: f"{t}/fed/./a", id="a current-directory part"),
+        pytest.param(lambda t: f"{t}/alias", id="a link to it"),
+    ],
+)
+def test_o63_a_manifest_that_gives_two_shards_one_root_is_refused_naming_both_labels_and_no_path(
+    shards, tmp_path, second
+):
+    """O63: two shards at one federation root share one `down` gate: `collect --roots-only` for one writes the marker
+    `down` reads for both, after which the full collect refuses for ever. A root is one by the path it resolves to
+    (a link, a `..` or a `.` part, a trailing slash), so the manifest is refused at load, naming both labels and never a
+    path (a root is the site's)."""
+    (tmp_path / "alias").symlink_to(tmp_path / "fed" / "a")
+    path = _roots_as(tmp_path, f"{tmp_path}/fed/a", second(tmp_path))
+    with pytest.raises(shards.ShardsError, match=r"fed-a.*fed-b") as refused:
+        shards.load_plan(path)
+    assert "/" not in str(refused.value)  # no path, whatever form the root was written in
+
+
+def test_o63_two_roots_that_only_share_a_parent_or_a_prefix_are_two_roots(shards, tmp_path):
+    """O63: the refusal is for one root, not for roots that look alike: `fed/a` and `fed/ab` load."""
+    path = _roots_as(tmp_path, f"{tmp_path}/fed/a", f"{tmp_path}/fed/ab")
+    assert [s.label for s in shards.load_plan(path).shards] == ["fed-a", "fed-b"]
+
+
+def test_o63_a_root_that_does_not_exist_yet_is_compared_by_its_path_as_written(shards, tmp_path):
+    """O63: `plan` may be run before every root exists: a root that cannot be resolved against the file system is
+    compared as the path it names, and the same path twice is still refused."""
+    path = _roots_as(tmp_path, f"{tmp_path}/later/fed", f"{tmp_path}/later/x/../fed")
+    with pytest.raises(shards.ShardsError, match=r"fed-a.*fed-b"):
+        shards.load_plan(path)
+
+
 def test_the_step_line_is_an_exact_step_on_the_sandbox_node_with_the_allowlist_alone(shards, tmp_path):
     """O56: `--exact`, never `--overlap`; the federation's job and sandbox node; an environment of PATH, LC_ALL and the
     federation's root alone; the dispatcher's shard and label."""

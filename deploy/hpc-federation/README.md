@@ -855,7 +855,10 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 `collect --roots-only [--shard L]` archives and marks the root evidence alone, for a shard about to move while the other
 shards are not final (see "Moving a shard" under the fleet); it writes no `archives.sha256.json`, so a full collect lists
 the archives later (a root archive whose federation the shard has left is put aside under `<label>.<12 hex digits>.root.*`
-and listed too). The archives are mode 0600.
+and listed too; a full collect refuses, naming the file, an archive put aside with no manifest beside it, which cannot be
+verified). The archives are mode 0600. **Each shard has a federation root of its own:** the manifest is refused at load when
+two shards' roots are one directory (told by the path they resolve to), naming both labels, since the two would share one
+`down` gate, so `collect --roots-only` for one would unlock it for both and the full collect would then refuse for ever.
 
 **One federation that ran no campaign: `collect --roots-only --root ROOT --into DIR`.** A stop measurement through the
 relay's verbs, say, leaves the state file, the fault journal and the relay's journals in the root and no step record, and

@@ -256,9 +256,9 @@ def shard_manifest(tmp_path: Path, feds: list) -> Path:
     return tmp_path / "shards.toml"
 
 
-def first_shard(shards, tmp_path, fed):
-    """The first shard of a manifest of two shards, both on `fed` (only the first is read)."""
-    return shards.load_plan(shard_manifest(tmp_path, [fed, fed])).shards[0]
+def first_shard(shards, fed):
+    """The first shard of a manifest of two shards, on `fed` (`federation()` reads the one shard it is given)."""
+    return shards.Shard(1, 2, "fed-0", fed.root)
 
 
 def test_o57_plan_refuses_a_federation_whose_ingested_space_has_no_verified_marker(hpc, shards, tmp_path, ca, capsys):
@@ -287,7 +287,7 @@ def test_o57_plan_refuses_a_marker_for_another_manifest_than_the_platform_file_n
     fed = brought_up(hpc, tmp_path, ca, art=art)
     verify_stand_in(hpc, fed, {"delta-space": ONE})
     fed.driver.verify_data()
-    shard = first_shard(shards, tmp_path, fed)
+    shard = first_shard(shards, fed)
     assert shards.federation(shard)["job"]
     write_manifest(OTHER, art / "manifests" / "delta.json")
     with pytest.raises(shards.ShardsError, match=r"ingested space\(s\) have no verified data: delta-space"):
@@ -301,7 +301,7 @@ def test_o57_plan_refuses_a_marker_that_is_for_another_manifest_than_the_one_up_
     fed.driver.verify_data()
     fed.driver.set(lambda s: s["data"]["ingested"]["delta-space"]["verified"].update(manifest=OTHER.digest()))
     with pytest.raises(shards.ShardsError, match="no verified data: delta-space"):
-        shards.federation(first_shard(shards, tmp_path, fed))
+        shards.federation(first_shard(shards, fed))
 
 
 def test_o57_plan_refuses_a_state_that_holds_no_record_of_its_ingested_spaces(hpc, shards, tmp_path, ca):
@@ -309,7 +309,7 @@ def test_o57_plan_refuses_a_state_that_holds_no_record_of_its_ingested_spaces(hp
     fed = brought_up(hpc, tmp_path, ca)
     fed.driver.set(lambda s: s.pop("data"))
     with pytest.raises(shards.ShardsError, match="no record of its ingested spaces"):
-        shards.federation(first_shard(shards, tmp_path, fed))
+        shards.federation(first_shard(shards, fed))
 
 
 def test_o57_plan_takes_a_federation_with_no_ingested_space_as_it_always_did(hpc, shards, tmp_path, ca):
@@ -317,7 +317,7 @@ def test_o57_plan_takes_a_federation_with_no_ingested_space_as_it_always_did(hpc
     asks nothing more of it."""
     fed = brought_up(hpc, tmp_path, ca)
     fed.driver.set(lambda s: s["data"].update(ingested={}))
-    assert shards.federation(first_shard(shards, tmp_path, fed))["job"]
+    assert shards.federation(first_shard(shards, fed))["job"]
 
 
 # -- a rerun of the core's phase on a federation that is linked (C06, O63) --------------------------------------------
@@ -349,29 +349,36 @@ def phase(fed) -> str:
     return fed.driver.store.read()["phase"]
 
 
-def plan(shards, tmp_path, fed) -> int:
-    return shards.main(["plan", "--manifest", str(shard_manifest(tmp_path, [fed, fed]))])
+@pytest.fixture
+def other(hpc, tmp_path, ca):
+    """A second federation, brought up and verified: a manifest's shards never share a root (O63, #414), so `plan` is
+    given two."""
+    return verified(hpc, tmp_path, ca, name="other")
+
+
+def plan(shards, tmp_path, fed, other) -> int:
+    return shards.main(["plan", "--manifest", str(shard_manifest(tmp_path, [fed, other]))])
 
 
 def test_c06_a_core_rerun_on_a_linked_federation_whose_link_check_passes_leaves_it_linked_and_plan_takes_it(
-    hpc, shards, tmp_path, ca, capsys
+    hpc, shards, tmp_path, ca, other, capsys
 ):
     """C06, O63 (live, 17 Nov 2026): `hpcfed.py core` on a finished federation ends in the core's own phase, which set
     `bootstrapped`, and only `up` set `linked`, so `shards.py plan` refused a federation whose rerun had passed every
     check. A rerun whose link check passes restores `linked`, and says so."""
     fed = verified(hpc, tmp_path, ca)
-    assert plan(shards, tmp_path, fed) == 0
+    assert plan(shards, tmp_path, fed, other) == 0
     capsys.readouterr()
     said: list = []
     printed = rerun(hpc, fed, link_check_stand_in([]), said)
     assert "link check: every pair transferred" in printed
     assert phase(fed) == "linked"
     assert any("linked again" in line for line in said)
-    assert plan(shards, tmp_path, fed) == 0
+    assert plan(shards, tmp_path, fed, other) == 0
 
 
 def test_c06_a_core_rerun_on_a_linked_federation_whose_link_check_fails_leaves_it_bootstrapped_and_plan_refuses(
-    hpc, shards, tmp_path, ca, capsys
+    hpc, shards, tmp_path, ca, other, capsys
 ):
     """C06, O63: a rerun that fails its link check leaves no `linked` it did not earn: the federation is `bootstrapped`,
     the failure is raised as it was, and `plan` refuses the federation, saying its up has not finished."""
@@ -382,7 +389,7 @@ def test_c06_a_core_rerun_on_a_linked_federation_whose_link_check_fails_leaves_i
     assert phase(fed) == "bootstrapped"
     assert any("bootstrapped" in line for line in said)
     capsys.readouterr()
-    assert plan(shards, tmp_path, fed) == 2
+    assert plan(shards, tmp_path, fed, other) == 2
     assert "its federation's up has not finished (phase bootstrapped)" in capsys.readouterr().err
 
 
@@ -417,17 +424,17 @@ def test_c06_a_core_rerun_does_not_overwrite_a_phase_that_changed_under_it(hpc, 
     assert phase(fed) == "stopping"
 
 
-def stays_bootstrapped(shards, tmp_path, fed, said: list, why: str, capsys) -> None:
+def stays_bootstrapped(shards, tmp_path, fed, other, said: list, why: str, capsys) -> None:
     """The rerun passed its own checks and the federation is not `linked`: `why` was said, and `plan` refuses it."""
     assert phase(fed) == "bootstrapped"
     assert any(why in line for line in said)
     capsys.readouterr()
-    assert plan(shards, tmp_path, fed) == 2
+    assert plan(shards, tmp_path, fed, other) == 2
     assert "its federation's up has not finished (phase bootstrapped)" in capsys.readouterr().err
 
 
 def test_c06_a_core_rerun_after_the_facts_file_was_removed_does_not_link_the_federation_again(
-    hpc, shards, tmp_path, ca, capsys
+    hpc, shards, tmp_path, ca, other, capsys
 ):
     """C06, O63: with no facts file the core's phase resets every space to its baseline, which empties an ingested space
     whose `verified` marker the state still holds: the rerun passes its own checks and cannot vouch for that data, so
@@ -436,11 +443,11 @@ def test_c06_a_core_rerun_after_the_facts_file_was_removed_does_not_link_the_fed
     fed.driver.layout.facts.unlink()
     said: list = []
     assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
-    stays_bootstrapped(shards, tmp_path, fed, said, "its facts file was missing", capsys)
+    stays_bootstrapped(shards, tmp_path, fed, other, said, "its facts file was missing", capsys)
 
 
 def test_c06_a_core_rerun_whose_layout_has_other_ingested_spaces_than_up_recorded_does_not_link_it_again(
-    hpc, shards, tmp_path, ca, capsys
+    hpc, shards, tmp_path, ca, other, capsys
 ):
     """C06, O63: `up` recorded the ingested spaces the layout declared, and `plan` checks only those: a rerun over a
     layout that declares others (here the state records none) would leave a study space neither read nor verified, so
@@ -449,11 +456,11 @@ def test_c06_a_core_rerun_whose_layout_has_other_ingested_spaces_than_up_recorde
     fed.driver.set(lambda s: s["data"].update(ingested={}))
     said: list = []
     assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
-    stays_bootstrapped(shards, tmp_path, fed, said, "ingested spaces are not the ones this up recorded", capsys)
+    stays_bootstrapped(shards, tmp_path, fed, other, said, "ingested spaces are not the ones this up recorded", capsys)
 
 
 def test_c06_a_core_rerun_over_another_layout_than_up_recorded_does_not_link_it_again(
-    hpc, shards, tmp_path, ca, capsys
+    hpc, shards, tmp_path, ca, other, capsys
 ):
     """C06, O63: the rerun renders the platform file from the layout it is given, and `up` built the federation from
     its own: a rerun over another layout (a wrong `--layout`, a layout edited since, one with no platform template and
@@ -463,11 +470,11 @@ def test_c06_a_core_rerun_over_another_layout_than_up_recorded_does_not_link_it_
     fed.driver.set(lambda s: s["layout"].update(digest="ab" * 32))  # the digest `up` recorded of its layout's bytes
     said: list = []
     assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
-    stays_bootstrapped(shards, tmp_path, fed, said, "its layout is not the one up recorded", capsys)
+    stays_bootstrapped(shards, tmp_path, fed, other, said, "its layout is not the one up recorded", capsys)
 
 
 def test_c06_a_core_rerun_that_cannot_compare_the_ingested_spaces_does_not_link_it_again_and_names_no_path(
-    hpc, shards, tmp_path, ca, capsys
+    hpc, shards, tmp_path, ca, other, capsys
 ):
     """C06, O63: whatever goes wrong while the rerun compares the layout's ingested spaces with the recorded ones (here
     the template cannot be read) is a refusal to link again, in fixed words that name no path: the rerun still runs, and
@@ -485,12 +492,14 @@ def test_c06_a_core_rerun_that_cannot_compare_the_ingested_spaces_does_not_link_
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(hpc.data, "ingested", unreadable_once)
         assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
-    stays_bootstrapped(shards, tmp_path, fed, said, "its ingested spaces could not be compared with the layout", capsys)
+    stays_bootstrapped(
+        shards, tmp_path, fed, other, said, "its ingested spaces could not be compared with the layout", capsys
+    )
     assert not any("/no/such/place" in line for line in said)
 
 
 def test_c06_a_core_rerun_with_another_platform_template_than_up_rendered_does_not_link_it_again(
-    hpc, shards, tmp_path, ca, capsys
+    hpc, shards, tmp_path, ca, other, capsys
 ):
     """C06, O63: the layout's digest covers the layout file and not the platform template beside it. A template edited
     since `up` (here by a comment; in the worst case so that no provider pair is left and no link check runs) is
@@ -501,17 +510,19 @@ def test_c06_a_core_rerun_with_another_platform_template_than_up_rendered_does_n
     template.write_text(template.read_text(encoding="utf-8") + "\n# edited since up\n", encoding="utf-8")
     said: list = []
     assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
-    stays_bootstrapped(shards, tmp_path, fed, said, "its platform template is not the one up rendered", capsys)
+    stays_bootstrapped(shards, tmp_path, fed, other, said, "its platform template is not the one up rendered", capsys)
 
 
-def test_c06_a_core_rerun_with_no_render_identity_to_compare_does_not_link_it_again(hpc, shards, tmp_path, ca, capsys):
+def test_c06_a_core_rerun_with_no_render_identity_to_compare_does_not_link_it_again(
+    hpc, shards, tmp_path, ca, other, capsys
+):
     """C06, O63: a root whose render identity record is gone (or not a record) gives the rerun nothing to compare the
     template with: it stays `bootstrapped`, in fixed words that name no path."""
     fed = verified(hpc, tmp_path, ca)
     (fed.root / "render-identity.json").write_text("[]", encoding="utf-8")
     said: list = []
     assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
-    stays_bootstrapped(shards, tmp_path, fed, said, "its platform template could not be compared", capsys)
+    stays_bootstrapped(shards, tmp_path, fed, other, said, "its platform template could not be compared", capsys)
     assert not any(str(tmp_path) in line for line in said)
 
 
@@ -537,7 +548,7 @@ def test_c06_up_does_not_say_linked_while_a_rerun_by_hand_holds_the_core_phase_l
 
 
 def test_c06_a_core_rerun_whose_ingested_manifest_changed_since_up_does_not_link_it_again(
-    hpc, shards, tmp_path, ca, capsys
+    hpc, shards, tmp_path, ca, other, capsys
 ):
     """C06, O63: the manifest an ingested space declares was edited after `up` recorded its digest: what `verify-data`
     read is no longer what the layout declares, so the federation stays `bootstrapped` and the rerun says why."""
@@ -546,7 +557,7 @@ def test_c06_a_core_rerun_whose_ingested_manifest_changed_since_up_does_not_link
     write_manifest(OTHER, art / "manifests" / "delta.json")
     said: list = []
     assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
-    stays_bootstrapped(shards, tmp_path, fed, said, "its manifest is not the one up recorded", capsys)
+    stays_bootstrapped(shards, tmp_path, fed, other, said, "its manifest is not the one up recorded", capsys)
 
 
 def test_c06_the_core_phase_of_a_federation_that_was_not_linked_does_not_overwrite_a_phase_that_changed_under_it(
