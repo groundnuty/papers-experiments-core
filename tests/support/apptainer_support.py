@@ -17,9 +17,8 @@ from fake_elf import bundle_members, write_tar
 from fake_node import FakeNode
 from sandbox_support import TOKEN, SleptClock
 
-from expcore_onedata.readlog import paths as readlog_paths
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxSpec
-from expcore_onedata.sandbox.apptainer import readlogrun
+from expcore_onedata.sandbox.apptainer import sockets
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
 from expcore_onedata.sandbox.apptainer.settings import ApptainerSettings, Pinned
 from expcore_onedata.sandbox.registry import Registry
@@ -65,8 +64,9 @@ def app_settings(files: Path, **changes: Any) -> ApptainerSettings:
     return ApptainerSettings(**values)
 
 
-def short_dir(prefix: str = "rl") -> Path:
-    """A private directory of the test's whose path leaves room for a run's collector socket in a Unix socket's address.
+def short_dir(prefix: str = "rl", limit: int = SHORT_DIR_BYTES) -> Path:
+    """A private directory of the test's whose path of at most `limit` bytes leaves room for a run's collector socket in
+    a Unix socket's address.
 
     The socket is `<dir>/root/<run id>/readlog-sock/sock` (`make_settings` puts the work root at `<dir>/root`), at most
     107 bytes. A pytest path is too long on a batch node, where the test runner's TMPDIR is a per-run directory, so the
@@ -79,7 +79,7 @@ def short_dir(prefix: str = "rl") -> Path:
         except OSError as error:
             refused.append(f"{base}: {error.strerror}")
             continue
-        if len(os.fsencode(made)) <= SHORT_DIR_BYTES:
+        if len(os.fsencode(made)) <= limit:
             return made
         shutil.rmtree(made)
         refused.append(f"{base}: the path is too long")
@@ -101,23 +101,28 @@ def make_settings(tmp_path: Path, *, limits: Limits = LIMITS, **changes: Any) ->
     )  # fmt: skip
 
 
-READLOG_SOCKET = f"{readlogrun.SOCK_DIR}/{readlog_paths.SOCKET_NAME}"  # in the run's directory
-EGRESS_SOCKET = "egress-sock/sock"  # in the run's directory
+READLOG_SOCKET = f"{sockets.READLOG_SOCK_DIR}/{sockets.SOCKET_NAME}"  # in the run's directory
+EGRESS_SOCKET = f"{sockets.EGRESS_SOCK_DIR}/{sockets.SOCKET_NAME}"  # in the run's directory
+
+
+def settings_with_work_root_bytes(base: Path, size: int, **changes: Any) -> SandboxSettings:
+    """`make_settings` under a directory of `base` named so that the work root, `<base>/<fill>/root`, holds exactly
+    `size` bytes."""
+    fill = size - len("/root") - len(os.fsencode(base)) - 1
+    if fill < 1:
+        raise ValueError(f"{base} leaves no room for a work root of {size} bytes")
+    directory = base / ("p" * fill)
+    directory.mkdir()
+    return make_settings(directory, **changes)
 
 
 def settings_with_socket_bytes(
     base: Path, size: int, *, socket: str = READLOG_SOCKET, **changes: Any
 ) -> SandboxSettings:
-    """`make_settings` under a directory of `base` named so that a collector's socket path (`socket`, in the run's
-    directory), for a run of the default spec (`make_spec`), is exactly `size` bytes:
-    `<base>/<fill>/root/<run id>/<socket>`."""
-    tail = len(f"/root/{DEFAULT_RUN_KEY}-{'0' * 8}/{socket}")
-    fill = size - tail - len(os.fsencode(base)) - 1
-    if fill < 1:
-        raise ValueError(f"{base} leaves no room for a socket path of {size} bytes")
-    directory = base / ("p" * fill)
-    directory.mkdir()
-    return make_settings(directory, **changes)
+    """`make_settings` with a work root that makes a collector's socket path (`socket`, in the run's directory), for a
+    run of the default spec (`make_spec`), exactly `size` bytes: `<work root>/<run id>/<socket>`."""
+    run_id = len(f"{DEFAULT_RUN_KEY}-{'0' * sockets.RUN_SUFFIX_CHARS}")
+    return settings_with_work_root_bytes(base, size - len(f"/{'x' * run_id}/{socket}"), **changes)
 
 
 def make_spec(level: str = "via-gate", *, token: str = TOKEN, lease_key: str | None = None,
@@ -141,4 +146,4 @@ def start(node: FakeNode, settings: SandboxSettings, spec: SandboxSpec | None = 
 
 __all__ = ["DEFAULT_RUN_KEY", "EGRESS_SOCKET", "LEVELS", "LIMITS", "PLACEHOLDER", "PROVIDER", "READLOG_SOCKET", "TOKEN",
            "ZONE", "make_settings", "make_spec", "options", "pinned", "pinned_bundle", "settings_with_socket_bytes",
-           "short_dir", "start"]  # fmt: skip
+           "settings_with_work_root_bytes", "short_dir", "start"]  # fmt: skip

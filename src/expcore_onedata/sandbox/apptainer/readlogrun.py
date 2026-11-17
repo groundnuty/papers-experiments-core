@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING
 from expcore_onedata.readlog import facts, files, paths, reader
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import helpers, layout
+from expcore_onedata.sandbox.apptainer import helpers, layout, sockets
 from expcore_onedata.sandbox.apptainer.settings import Pinned
 from expcore_onedata.sandbox.hostops import describe_stderr
 
@@ -60,7 +60,7 @@ log = logging.getLogger(__name__)
 
 ROLE = "readlog"  # the helper's role: `infra.HELPERS`, `teardown`, the run's record
 READY = "readlog collector ready"  # what the collector prints on stdout once it listens
-DIR, SOCK_DIR, CLIENT_DIR = "readlog", "readlog-sock", "readlog-client"  # in the run's directory, each 0700
+DIR, SOCK_DIR, CLIENT_DIR = "readlog", sockets.READLOG_SOCK_DIR, "readlog-client"  # in the run's directory, each 0700
 COLLECTOR_COPY = "readlog-collector.py"  # the run's copy of the collector, in `readlog/`
 LOG_NAME = "readlog.jsonl"  # the collector's log, in `readlog/`
 COPY = "read-log.jsonl"  # the evidence copy the collection writes beside the egress log: `result["read_log"]`

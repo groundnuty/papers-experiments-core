@@ -100,6 +100,7 @@ from expcore_onedata.sandbox.apptainer import (
     loopback,
     readlogrun,
     runs,
+    sockets,
     workdisk,
     workproof,
 )
@@ -162,8 +163,8 @@ class ApptainerSandbox:
         self.app = settings.apptainer
         self.work_image = self.app is not None and self.app.work_disk == "image"  # O71: /work an ext3 image
         self._sleep, self._clock, self._output_cap, self._mount_factory = sleep, clock, output_cap_bytes, mount_helper
-        key = re.sub(r"[^A-Za-z0-9_.-]", "_", spec.lease_key or spec.run_key)[:48]
-        self.sid = f"{key}-{uuid.uuid4().hex[:8]}"
+        key = re.sub(r"[^A-Za-z0-9_.-]", "_", spec.lease_key or spec.run_key)[: sockets.RUN_KEY_CHARS]
+        self.sid = f"{key}-{uuid.uuid4().hex[: sockets.RUN_SUFFIX_CHARS]}"  # at most `sockets.RUN_ID_MAX_BYTES`
         self.dir = settings.work_root / self.sid
         self.run_tag = f"{AV.RUN_TAG}={self.sid}"
         self.egress_nonce = secrets.token_hex(16)
@@ -354,7 +355,7 @@ class ApptainerSandbox:
         self.run_record()  # before anything exists: whatever is made from here, a reaper or a probe can find
         self.register_creation()
         self.dir.mkdir(mode=0o700)
-        for name in ("work", "tmp", "shm", "cell", "egress", "egress-sock"):
+        for name in ("work", "tmp", "shm", "cell", "egress", sockets.EGRESS_SOCK_DIR):
             (self.dir / name).mkdir(mode=0o700)
         if self.work_image:
             self._make_work_disk()
@@ -409,16 +410,17 @@ class ApptainerSandbox:
         return workdisk.bind(self.dir) if self.work_image else AV.Bind(self.dir / "work", "/work", True)
 
     def _start_collector(self) -> None:
-        egress = self.dir / "egress"
-        argv = [self._host_python(), "-I", "-B", str(egress / "egress-collector.py"), str(self.dir / "egress-sock"),
+        egress, sock_dir = self.dir / "egress", self.dir / sockets.EGRESS_SOCK_DIR
+        argv = [self._host_python(), "-I", "-B", str(egress / "egress-collector.py"), str(sock_dir),
                 str(egress / "egress.jsonl"), self.egress_nonce]  # fmt: skip
         try:
             helpers.start(self.node, "collector", argv, egress, COLLECTOR_READY, noted=self._note_helper,
                           env={AV.RUN_TAG: self.sid}, sleep=self._sleep, clock=self._clock)  # fmt: skip
         except SandboxError as error:
             # a socket path over a Unix socket's limit cannot be bound: the collector ends unready, saying nothing of
-            # why. Said here, not refused up front: a fake node binds no socket, and a start that works must not fail.
-            problem = layout.socket_path_problem(self.dir / "egress-sock" / "sock", "egress")
+            # why. The load bounds the work root, so this is the backstop; it is said here and not refused up front
+            # because the fake node binds no socket, and a start that works must not fail on a path it never binds.
+            problem = sockets.socket_path_problem(sock_dir / sockets.SOCKET_NAME, "egress")
             if problem is None:
                 raise
             raise SandboxError(problem) from error
@@ -585,7 +587,7 @@ class ApptainerSandbox:
             self.work_bind(), AV.Bind(self.dir / "tmp", "/tmp", True),
             AV.Bind(self.dir / "shm", "/dev/shm", True), AV.Bind(cell / "hosts", "/etc/hosts"),
             AV.Bind(cell / "resolv.conf", AV.RESOLV_CONF), AV.Bind(cell / "nsswitch.conf", AV.NSSWITCH_CONF),
-            AV.Bind(self.dir / "egress-sock", AV.EGRESS_DIR), AV.Bind(cell / "egresslog.so", AV.SHIM_TARGET),
+            AV.Bind(self.dir / sockets.EGRESS_SOCK_DIR, AV.EGRESS_DIR), AV.Bind(cell / "egresslog.so", AV.SHIM_TARGET),
             AV.Bind(cell / "ld.so.preload", "/etc/ld.so.preload"),
             *(AV.Bind(cell / f"preload-{n}.so", target) for n, target in enumerate(preloads)),
             *(AV.Bind(cell / f"bind-{n}", b.target) for n, b in enumerate(self.app.binds)),

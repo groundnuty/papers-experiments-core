@@ -257,7 +257,7 @@ rowan = "rowan"
 
 [sandbox]
 backend = "apptainer"
-work_root = "@root@/work"
+work_root = "/tmp/rs-work"
 name_prefix = "@prefix@"
 content_check_file = "dir/check-apptainer.bin"
 trust_paths = ["/etc/ssl/certs/ca-certificates.crt"]

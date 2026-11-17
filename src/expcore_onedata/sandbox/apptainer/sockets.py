@@ -1,0 +1,74 @@
+# Provenance: new
+"""Where a collector's Unix socket is, and how long the work root may be for it to fit (O56, O91).
+
+A collector binds `<work_root>/<run id>/<socket dir>/sock`. A Unix socket's address holds 108 bytes, the last a NUL, so
+the path is at most 107; a collector that cannot bind it ends before it says it is ready, with nothing said of why. The
+bound is held in three places, each saying the length and the limit and never a path:
+
+* at load, `work_root_problem`: the work root may hold at most 107 minus a run id of its longest (57 bytes) and the
+  socket's own suffix, so a plan or any other load of the platform fails at once;
+* at a run's start, `socket_path_problem` with the run's own id: the backstop, and the read-log collector's refusal
+  before anything exists (`layout.check_socket_path`);
+* when the egress collector's start fails, `socket_path_problem` again, so the failure names the cause.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+SOCKET_PATH_MAX_BYTES = 107  # a Unix socket's address holds 108 bytes, the last a NUL
+SOCKET_NAME = "sock"  # both collectors bind this file in their directory (the egress collector's file has it fixed)
+EGRESS_SOCK_DIR = "egress-sock"  # in the run's directory, 0700, empty, bound read-only in every cell
+READLOG_SOCK_DIR = "readlog-sock"  # likewise, when the platform pins the read-log collector
+RUN_KEY_CHARS = 48  # a run id starts with the lease key or the run key, made of ASCII and cut to this many
+RUN_SUFFIX_CHARS = 8  # and ends with "-" and this many hex digits
+RUN_ID_MAX_BYTES = RUN_KEY_CHARS + 1 + RUN_SUFFIX_CHARS  # 57
+
+
+def socket_path_problem(path: Path, what: str) -> str | None:
+    """What is wrong with a collector's socket path, or None when it fits a Unix socket's address: its length and the
+    limit, never the path (`what` names the collector: "egress", "read-log")."""
+    size = len(os.fsencode(path))
+    if size <= SOCKET_PATH_MAX_BYTES:
+        return None
+    return (
+        f"the {what} socket path is {size} bytes, over the {SOCKET_PATH_MAX_BYTES}-byte limit of a Unix socket: "
+        "use a shorter [sandbox] work_root"
+    )
+
+
+def work_root_max_bytes(socket_dir: str) -> int:
+    """The longest work root under which a run of the longest id has its socket in `socket_dir` within the limit."""
+    return SOCKET_PATH_MAX_BYTES - 1 - RUN_ID_MAX_BYTES - len(f"/{socket_dir}/{SOCKET_NAME}")
+
+
+def work_root_problem(size: int, *, readlog: bool) -> str | None:
+    """What is wrong with a work root of `size` bytes, as the end of a sentence about the key, or None when every
+    collector's socket fits under it at the worst case. `readlog` is whether the platform pins the read-log collector:
+    its directory name is one byte longer than the egress collector's, so it sets the bound where it is declared."""
+    for what, socket_dir in (("read-log", READLOG_SOCK_DIR), ("egress", EGRESS_SOCK_DIR)):
+        if what == "read-log" and not readlog:
+            continue
+        limit = work_root_max_bytes(socket_dir)
+        if size > limit:
+            return (
+                f"is {size} bytes, over the {limit} a run's {what} collector socket allows: "
+                f"<work_root>/<run id of at most {RUN_ID_MAX_BYTES} bytes>/{socket_dir}/{SOCKET_NAME} must fit a Unix "
+                f"socket's {SOCKET_PATH_MAX_BYTES} bytes, so use a shorter work_root"
+            )
+    return None
+
+
+__all__ = [
+    "EGRESS_SOCK_DIR",
+    "READLOG_SOCK_DIR",
+    "RUN_ID_MAX_BYTES",
+    "RUN_KEY_CHARS",
+    "RUN_SUFFIX_CHARS",
+    "SOCKET_NAME",
+    "SOCKET_PATH_MAX_BYTES",
+    "socket_path_problem",
+    "work_root_max_bytes",
+    "work_root_problem",
+]

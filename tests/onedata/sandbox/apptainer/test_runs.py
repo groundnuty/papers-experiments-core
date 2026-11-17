@@ -8,7 +8,7 @@ from apptainer_support import EGRESS_SOCKET, make_settings, make_spec, settings_
 from fake_node import FakeNode
 
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
-from expcore_onedata.sandbox.apptainer import runs
+from expcore_onedata.sandbox.apptainer import runs, sockets
 from expcore_onedata.sandbox.apptainer.node import Spawned
 
 
@@ -110,6 +110,16 @@ def test_a_gate_whose_port_was_taken_is_started_again_on_another(node, settings)
         assert len(node.gates) == 2
         assert node.gates[0].config["listen_port"] != node.gates[1].config["listen_port"]
         assert not (box.dir / "gate-secret" / "gate-token").exists()
+    finally:
+        box.stop()
+
+
+def test_a_run_id_is_never_longer_than_the_bound_the_load_counts(node, short_tmp):
+    """O56: the platform's load bounds the work root with a run id of `sockets.RUN_ID_MAX_BYTES` (57); the id of a run
+    with a key far over the cap is exactly that long, never longer."""
+    box = start(node, make_settings(short_tmp), make_spec(lease_key="k" * 200))
+    try:
+        assert len(box.sid) == sockets.RUN_ID_MAX_BYTES == 57
     finally:
         box.stop()
 

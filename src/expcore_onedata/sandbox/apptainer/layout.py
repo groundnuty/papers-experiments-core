@@ -21,10 +21,10 @@ from pathlib import Path
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer.argv import bindable
 from expcore_onedata.sandbox.apptainer.settings import Pinned
+from expcore_onedata.sandbox.apptainer.sockets import socket_path_problem
 
 CHUNK = 1 << 20
 TOOL_SERVER_DIR = "toolserver"  # in the run's directory, 0700, while the run's tool server runs: its HOME (O56)
-SOCKET_PATH_MAX_BYTES = 107  # a Unix socket's address holds 108 bytes, the last a NUL (O09 keeps `socket` out of here)
 Identity = tuple[int, int, int, int, int]
 _HASHED: dict[Identity, str] = {}  # the image's SHA-256 by the identity it had when it was hashed
 _HASHED_LOCK = threading.Lock()
@@ -78,22 +78,9 @@ def check_work_root(path: Path, uid: int) -> None:
         )
 
 
-def socket_path_problem(path: Path, what: str) -> str | None:
-    """What is wrong with a collector's socket path, or None when it fits a Unix socket's address: its length and the
-    limit, never the path. A longer path cannot be bound, so the collector would end before it said it was ready, with
-    nothing said of why; the path is under `work_root/<run id>`, so a long `[sandbox] work_root` is the cause (`what`
-    names the collector: "egress", "read-log")."""
-    size = len(os.fsencode(path))
-    if size <= SOCKET_PATH_MAX_BYTES:
-        return None
-    return (
-        f"the {what} socket path is {size} bytes, over the {SOCKET_PATH_MAX_BYTES}-byte limit of a Unix socket: "
-        "use a shorter [sandbox] work_root"
-    )
-
-
 def check_socket_path(path: Path, what: str) -> None:
-    """Before anything exists: `StartRefused` when the collector's socket path does not fit (`socket_path_problem`)."""
+    """Before anything exists: `StartRefused` when the collector's socket path does not fit a Unix socket's address
+    (`sockets.socket_path_problem`: a long `[sandbox] work_root` is the cause, since the path is under it)."""
     problem = socket_path_problem(path, what)
     if problem is not None:
         raise StartRefused(problem)
@@ -125,5 +112,4 @@ def write_text(path: Path, text: str, *, mode: int = 0o444) -> None:
     path.chmod(mode)
 
 
-__all__ = ["SOCKET_PATH_MAX_BYTES", "check_socket_path", "check_work_root", "copy_pinned", "identity", "pin_image",
-           "sha256_of", "socket_path_problem", "write_text"]  # fmt: skip
+__all__ = ["check_socket_path", "check_work_root", "copy_pinned", "identity", "pin_image", "sha256_of", "write_text"]
