@@ -16,7 +16,8 @@ from fault_support import FakeServices, injector_for
 from health_support import FOURTH, down, four_spaces, up
 
 from expcore.campaign import liveness, prerun
-from expcore.campaign.healthgate import GO, HealthGate
+from expcore.campaign.healthgate import GO, Health, HealthGate
+from expcore.records.instruments import finish_instruments
 from expcore_onedata.admission import run_admission
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_journal import InjectionJournal
@@ -26,15 +27,19 @@ from expcore_onedata.federation import ReportedProvider, SpaceView
 from expcore_onedata.health import compare
 from expcore_onedata.healthreading import (
     FACT,
+    NAMESPACE,
     READING_NOTE,
     UNREAD,
     HealthReading,
+    PostRunHealth,
     SpaceReading,
+    checked,
     noted_reading,
     own_injections,
     own_targets,
     read_space,
     reading_in,
+    reading_in_instruments,
     target_only,
 )
 from expcore_onedata.sandbox import infrafacts
@@ -607,7 +612,20 @@ def test_o90_the_gates_post_run_check_of_a_run_whose_restore_failed_reads_nothin
 # --- the pilot's order: the run's check inside its own open injection, the restore after ---------------------------
 
 
-def inside_injection(tmp_path, world, *, extra=None, report_offline=True, down_names=(), abandon=False):
+class Record:
+    """The part of a record `finish_instruments` writes: its instruments, by namespace."""
+
+    def __init__(self):
+        self.instruments = {}
+
+    def with_instrument(self, namespace, data):
+        self.instruments = {**self.instruments, namespace: data}
+        return self
+
+
+def inside_injection(
+    tmp_path, world, *, extra=None, report_offline=True, down_names=(), abandon=False, instrument=False
+):
     """The pilot's executor reads health inside the injection and restores after: the run's pre-run check, its
     exclusive admission, the injector started (its entry open), then the post-run check through the gate; `extra` is
     given the journal and the attempt's own token while the injection is open (to put another's lines there), and
@@ -633,8 +651,12 @@ def inside_injection(tmp_path, world, *, extra=None, report_offline=True, down_n
                 down(world.fake, "beta", *down_names)
             if extra is not None:
                 extra(journal, liveness.current())
-            answer, _ = gate.after_run("run-a", attempt=1, attempt_id=5)
-            reading = noted_reading()
+            if instrument:  # the record's way: the instrument finishes inside the injection, before the restore
+                record = finish_instruments(Record(), [PostRunHealth(world.health)])
+                answer, reading = record.instruments[NAMESPACE], reading_in_instruments(record.instruments)
+            else:
+                answer, _ = gate.after_run("run-a", attempt=1, attempt_id=5)
+                reading = noted_reading()
             opened = journal.open_entries()
             for entry in opened:  # whoever's: the test's journal is left settled
                 if entry["id"] != next(item["id"] for item in opened if item["target"] == TARGET):
@@ -863,3 +885,74 @@ def test_o90_a_run_whose_facts_hold_no_whole_reading_is_unknown(carried):
     """O90: absent or malformed, the reading is None and `target_only` of it is None, never True."""
     assert reading_in(carried) is None
     assert target_only(reading_in(carried)) is None
+
+
+# --- the reading in the record: an instrument, the full chain, and a reading that is this call's -------------------
+
+
+def test_o90_checked_returns_the_reading_of_its_own_call_and_never_the_pre_run_checks(tmp_path, fake):
+    """O90: `checked` clears the try's note before its one call and reads it back after: a wrapper that never asked the
+    platform leaves no reading, a reading the pre-run check noted is not taken for the call's, the full chain's call
+    returns its own, and outside a try there is none."""
+    world = four_spaces(tmp_path, fake)
+    with prerun.opened() as note:
+        note[READING_NOTE] = four((), (TARGET,)).to_json()  # what the pre-run check noted
+        verdict, reading = checked(lambda: Health(True, "a wrapper that did not ask the platform"))
+        assert (verdict.ok, reading) == (True, None)
+        verdict, reading = checked(world.health)
+        assert verdict.ok is True
+        assert reading == world.health.reading
+        assert reading.spaces
+    assert checked(world.health)[1] is None  # outside a try: the call is made, and there is no note to read it from
+
+
+def test_o90_the_instruments_snapshot_carries_the_reading_inside_the_injection_and_target_only_reads_the_record(
+    tmp_path, fake
+):
+    """O90: the record's way, which the merged batch carries: an instrument listed after the injector finishes before
+    its restore, inside the run's own open injection, makes the one full-chain call, and its snapshot in
+    `record.instruments` holds the verdict and the reading. `target_only` of the reading read from the record alone,
+    after a JSON round trip, is True with the target held."""
+    world = four_spaces(tmp_path, fake, faults={})
+    snapshot, reading, opened = inside_injection(tmp_path, world, instrument=True)
+    assert [entry["target"] for entry in opened] == [TARGET]
+    assert (snapshot["ok"], snapshot["deferred"]) == (False, False)  # the target is reported offline
+    assert reading.held == {TARGET}
+    carried = json.loads(json.dumps({NAMESPACE: snapshot}))
+    assert target_only(reading_in_instruments(carried)) is True
+
+
+def test_o90_the_instruments_full_chain_call_answers_another_attempts_open_injection_as_unknown(tmp_path, fake):
+    """O90: through the full chain the fault gate answers another attempt's open injection first: the snapshot says the
+    check failed, the reading is unread, and the record's `target_only` is None, where the space check alone
+    (`space()`, which skips the gate) would have read the spaces and could have said True or False."""
+
+    def another(journal, _):
+        injection(journal, "other", OTHER, ANOTHER, closed=False)
+
+    world = four_spaces(tmp_path, fake, faults={})
+    snapshot, reading, _ = inside_injection(tmp_path, world, extra=another, instrument=True)
+    assert snapshot["ok"] is False
+    assert reading == UNREAD
+    assert target_only(reading) is None
+
+
+def test_o90_an_instrument_whose_check_raises_leaves_no_reading_and_the_record_says_unknown():
+    """O90: `finish_instruments` records a failed finish as `{"ok": False, "error": ...}`, never dropped or guessed: the
+    record has no reading, and `target_only` of what is read from it is None."""
+
+    def broken():
+        raise OSError("the check could not run")
+
+    record = finish_instruments(Record(), [PostRunHealth(broken)])
+    assert record.instruments[NAMESPACE] == {"ok": False, "error": "OSError"}
+    assert reading_in_instruments(record.instruments) is None
+    assert target_only(reading_in_instruments(record.instruments)) is None
+
+
+@pytest.mark.parametrize(
+    "carried", [None, {}, {NAMESPACE: None}, {NAMESPACE: {"ok": True}}, {NAMESPACE: {"reading": 1}}]
+)
+def test_o90_a_record_with_no_whole_reading_reads_as_unknown(carried):
+    """O90: absent or malformed in the record, the reading is None, never True."""
+    assert reading_in_instruments(carried) is None
