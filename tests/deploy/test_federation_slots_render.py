@@ -280,3 +280,55 @@ def test_o83_a_compose_deployment_is_told_where_the_artifacts_are_by_one_variabl
     for bad in ("artifacts", "/srv/../etc", '/srv/"x', "/srv/\\x"):
         with pytest.raises(ValueError, match=fedtools.ENVIRONMENT):
             fedtools.study_artifacts_from({fedtools.ENVIRONMENT: bad})
+
+
+def up_stubbed(fed, monkeypatch, tmp_path, text):
+    """Compose's `up` over a stand-in for everything it touches, for a layout of `text`; returns the layout and what was
+    called, with the arguments `write_facts` was given."""
+    from types import SimpleNamespace
+
+    layout = fed.layout.Layout(tmp_path / "fed", spec=fed.spec.load_spec(layout_with_template(text, tmp_path)))
+    calls: list = []
+    monkeypatch.setattr(fed.cli, "require_images", lambda: None)
+    monkeypatch.setattr(fed.cli, "project_containers", lambda project: [])
+    monkeypatch.setattr(fed.cli, "project_networks", lambda project: [])
+    for name in ("require_own", "require_ports_free", "require_memory_fits", "prepare", "bring_up"):
+        monkeypatch.setattr(fed.cli, name, lambda *arguments, name=name: calls.append(name))
+    monkeypatch.setattr(fed.cli, "Rest", lambda ca: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(fed.cli, "Bootstrap", lambda rest, layout: SimpleNamespace(ids=SimpleNamespace(spaces={})))
+    monkeypatch.setattr(fed.cli, "Content", lambda boot: SimpleNamespace(reset=lambda timeout: None))
+    monkeypatch.setattr(fed.cli, "write_facts", lambda layout, boot, *given: calls.append(("facts", given)) or "ok")
+    monkeypatch.setattr(fed.cli, "check_after_up", lambda layout, ids: "links")
+    monkeypatch.setattr("expcore_onedata.pin.verify_pin", lambda clone, commit: commit)
+    return layout, calls
+
+
+def test_o83_compose_up_checks_the_study_artifacts_before_it_touches_anything(fed, monkeypatch, tmp_path):
+    """O83: a layout's tool server with no `EXPCORE_FED_STUDY_ARTIFACTS` is refused before the root is prepared or a
+    container started; and one given a directory that cannot run it is refused the same way, naming no path."""
+    layout, calls = up_stubbed(fed, monkeypatch, tmp_path, WITH_TOOLSERVER)
+    monkeypatch.delenv(fed.tools.ENVIRONMENT, raising=False)
+    with pytest.raises(RuntimeError, match=fed.tools.ENVIRONMENT):
+        fed.cli.up(layout)
+    study = artifacts(tmp_path / "artifacts")
+    (study / "venv" / "bin" / "python").chmod(0o644)
+    monkeypatch.setenv(fed.tools.ENVIRONMENT, str(study))
+    with pytest.raises(RuntimeError, match="interpreter") as refused:
+        fed.cli.up(layout)
+    assert str(tmp_path) not in str(refused.value)
+    assert calls == []
+
+
+def test_o83_compose_up_gives_the_facts_the_study_artifacts_only_when_it_was_given_one(fed, monkeypatch, tmp_path):
+    """O83: the directory reaches `write_facts` when the environment names one, and a layout with no tool server and no
+    directory writes its facts by the call it always made."""
+    layout, calls = up_stubbed(fed, monkeypatch, tmp_path, WITH_TOOLSERVER)
+    study = artifacts(tmp_path / "artifacts")
+    monkeypatch.setenv(fed.tools.ENVIRONMENT, str(study))
+    fed.cli.up(layout)
+    assert ("facts", (str(study),)) in calls
+    (tmp_path / "plain").mkdir()
+    plain, calls = up_stubbed(fed, monkeypatch, tmp_path / "plain", MINIMAL)
+    monkeypatch.delenv(fed.tools.ENVIRONMENT, raising=False)
+    fed.cli.up(plain)
+    assert ("facts", ()) in calls

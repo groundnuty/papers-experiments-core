@@ -230,6 +230,7 @@ def up(layout: Layout) -> str:
         )
     study_artifacts = study_artifacts_from(os.environ)  # where a layout's tool server finds its files (O83)
     check_artifacts(layout.spec, study_artifacts)  # before anything is brought up: the server can run from them
+    given = (study_artifacts,) if study_artifacts else ()  # without a directory the facts are written as they were
     fresh = not containers
     if fresh:
         require_ports_free(layout.spec)
@@ -243,7 +244,7 @@ def up(layout: Layout) -> str:
         if not layout.facts.exists():
             Content(boot).reset(TRANSFER_TIMEOUT_S)
             timer.mark("baseline")
-        written = write_facts(layout, boot, study_artifacts)
+        written = write_facts(layout, boot, *given)
         links = check_after_up(layout, dict(boot.ids.spaces))  # last: not ready until every pair transfers (#221)
         timer.mark("links")
     finally:
@@ -267,6 +268,7 @@ def reset_clean(layout: Layout) -> str:
     require_up(layout)
     study_artifacts = study_artifacts_from(os.environ)
     check_artifacts(layout.spec, study_artifacts)
+    given = (study_artifacts,) if study_artifacts else ()
     rest = Rest(layout.ca_pem)
     try:
         boot = Bootstrap(rest, layout)
@@ -275,7 +277,7 @@ def reset_clean(layout: Layout) -> str:
         timer.mark(f"baseline (removed {sum(removed.values())} entries)")
         for leftover in layout.journal.iterdir():
             leftover.unlink()
-        write_facts(layout, boot, study_artifacts)
+        write_facts(layout, boot, *given)
     finally:
         rest.close()
     return timer.summary("reset --clean")
