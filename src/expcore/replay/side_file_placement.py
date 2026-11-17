@@ -206,7 +206,13 @@ def stage_harness_side_file(
     `UndeclaredSideFile` for a name no declaration holds and `SideFileTooLarge` for a file over `MAX_SIDE_FILE_BYTES`,
     before anything is written into the attempt directory.
     """
-    raise NotImplementedError
+    declaration = _declared(side_files, name)
+    source = Path(path)
+    if not os.path.lexists(source):
+        return None
+    run_dir, identity = Path(request.run_dir), request.identity
+    record = run_dir / record_filename(identity.run_key, identity.attempt)
+    return _stage_copy(source, run_dir, declaration, identity.attempt, record)
 
 
 def _declared(side_files: Sequence[SideFile], name: str) -> SideFile:
