@@ -391,8 +391,10 @@ class AttemptRunner:
         self, result: AttemptResult, error: BaseException, redactor: Callable[[], Redactor]
     ) -> AttemptResult:
         """Keep on the result the snapshot an infrastructure error carries (a failed instrument start's), redacted
-        with the attempt's whole redaction context as a record is (C40). One that cannot be kept is recorded as
-        failed, not raised."""
+        with the attempt's redaction context as it stands (C40): the environment's secrets, the models' keys and the
+        registered secrets, and the secrets the executor passed to `record_run` once it has. An executor starts its
+        instruments before `record_run`, so for a failed start a secret named only there is not yet known: register
+        it with `register_secret`. One that cannot be kept is recorded as failed, not raised."""
         kept = snapshot_of(error, redactor)
         return result if kept is None else dataclasses.replace(result, diagnostic=kept)
 

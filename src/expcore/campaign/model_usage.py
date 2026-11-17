@@ -15,12 +15,13 @@ reads them from a snapshot of the store and breaks the budget gate's own figure 
 - the dollars, in `usd`: `measured` (each attempt's counts at the model's price, at the tier each request fell in, a
   free model's known zero), `measured_plus_inflight` (an interrupted attempt's replies, and a request that was sent and
   not answered at its bound), `bound` (the most the attempt's caps let it cost, because its usage is unknown), and
-  `charges` (top-ups, each a request's bound, and the top-up and probe sends a kill lost), then their `total`. The
+  `charges` (top-ups, each a request's bound, and the top-ups a kill lost), then their `total`. The
   basis is the one the dollars were charged on (`AttemptCost.charged_on`), never the one a row records: a row that says
   `measured` and is charged its bound is in `bound`. `bounded_attempts` counts the attempts whose charge holds a bound
   or a top-up, `unpriced_attempts` those of a model with no price, whose `usd` is then `None`;
-- per model, `probes_usd` (what admission's probes were charged) and `usd`: `total`, `analysed` (the analysed
-  attempts) and `not_analysed` (every other class and the probes), so the overhead is beside what scored runs cost.
+- per model, `probes_usd` (what admission's probes were charged, and the probe sends a kill lost) and `usd`:
+  `total`, `analysed` (the analysed attempts) and `not_analysed` (every other class and the probes), so the overhead is
+  beside what scored runs cost.
 
 The classes: `analysed` (the attempt of each analysed run), `left_out` (the done attempt of a run a partial analysis
 leaves out), `infra_fail` and `outage_discarded` (set aside as infrastructure), `harness_error`, `interrupted`,
@@ -185,16 +186,15 @@ def _cell(cells: dict[tuple[str, str], dict[str, Any]], model: str, kind: str) -
     return cells.setdefault((model, kind), _blank())
 
 
-def _charge(cell: dict[str, Any], cost: AttemptCost | None, *, attempt: bool = True) -> None:
+def _charge(cell: dict[str, Any], cost: AttemptCost | None) -> None:
     """Add what an attempt was charged to its class: its basis's bucket without the top-ups, the top-ups apart. An
-    attempt with no cost listed (a running one with no top-up) was charged nothing yet. `attempt` is False for a charge
-    that is no attempt (a top-up a kill lost)."""
+    attempt with no cost listed (a running one with no top-up) was charged nothing yet."""
     if cost is None:
         return
     cell["charged"] = True
-    cell["bounded_attempts"] += int(cost.bounded and attempt)
+    cell["bounded_attempts"] += int(cost.bounded)
     if cost.usd is None:
-        cell["unpriced_attempts"] += int(attempt)
+        cell["unpriced_attempts"] += 1
         cell["unknown"] = True
         return
     base = cost.usd - cost.topup_usd

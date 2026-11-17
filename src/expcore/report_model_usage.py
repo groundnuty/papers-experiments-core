@@ -249,7 +249,7 @@ def provenance_line(usage: Mapping[str, Any] | None) -> list[str]:
     )
     if unknown:
         line += f"; {UNKNOWN} for {', '.join(unknown)} (no price)"
-    running = sum(c["attempts"] for m in usage["models"] for c in m["classes"] if c["class"] == "running")
+    running = sum(c["attempts"] for m in known for c in m["classes"] if c["class"] == "running")
     if running:
         line += f"; {running} attempt(s) still running, counted by their top-ups only"
     return [f"{line}; {pointer}"]

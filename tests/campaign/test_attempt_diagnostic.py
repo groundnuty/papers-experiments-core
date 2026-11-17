@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from campaign_support import LATER, defect, finished, infra, planned_store, run_one
+from record_support import clear_registry
 from scheduler_support import FakeExecutor, build, models_for, settings_for
 
 from expcore.campaign import recovery
@@ -26,7 +27,7 @@ from expcore.campaign.start_diagnostic import EXPORT_KEY, LIMIT_BYTES, snapshot_
 from expcore.errors import CORE_KINDS, InfraError
 from expcore.loop.outcomes import Outcome
 from expcore.records.instruments import start_instruments
-from expcore.records.redact import Redactor
+from expcore.records.redact import Redactor, register_secret
 
 SECRET = "sk-diagnostic-secret-0123456789"
 SEEN = {"checked": "the replica count", "seen": "2 of 3", "wanted": 3}
@@ -278,10 +279,11 @@ def test_c40_an_induction_that_failed_before_any_request_keeps_its_diagnostic_an
     assert (failed["bounded_attempts"], m1["usd"]["total"]) == (0, 0.0)
 
 
-def test_c40_the_runner_redacts_with_the_secrets_the_executor_gave_the_recording(tmp_path):
+def test_c40_the_runner_redacts_with_the_secrets_the_executor_gave_the_recording_once_it_has(tmp_path):
     """C40: the snapshot is redacted with the same redactor the attempt's harness-defect log uses, which the recording
-    replaces with the whole context of the attempt (secrets and secret variables passed to `record_run`): a secret the
-    executor named for the record is gone from the diagnostic too."""
+    replaces with the whole context of the attempt (secrets and secret variables passed to `record_run`) once the
+    executor has called it: a diagnostic of an error raised after that has the secrets the executor named for the
+    record gone too."""
     run_secret = "run-scoped-secret-9876543210"
 
     async def executor(request):
@@ -296,6 +298,28 @@ def test_c40_the_runner_redacts_with_the_secrets_the_executor_gave_the_recording
         marker = read_marker(Path(row["run_dir"]), row["run_key"], row["id"])
     assert run_secret not in row["diagnostic"]
     assert run_secret not in json.dumps(marker.diagnostic)
+    assert "[redacted]" in row["diagnostic"]
+
+
+def test_c40_a_secret_registered_before_a_failed_start_is_redacted_from_its_diagnostic(tmp_path):
+    """C40: an executor starts its instruments before `record_run`, so a secret it names only there is not known when
+    the start fails; one it registers (`register_secret`, as a platform that mints a token does) is read when the
+    snapshot is made, so the diagnostic that quotes it loses it."""
+    token = "minted-at-run-time-0123456789"
+
+    async def executor(request):
+        register_secret(token)
+        start_instruments([Inducer({"seen": f"refused {token}"})], {"run_key": request.run_key})
+
+    try:
+        with build(
+            tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+        ) as sched:
+            sched.run()
+            row = dict(sched.store.q("SELECT * FROM attempts ORDER BY id")[0])
+    finally:
+        clear_registry()  # the registry only grows: leave none behind for the next test
+    assert token not in row["diagnostic"]
     assert "[redacted]" in row["diagnostic"]
 
 
