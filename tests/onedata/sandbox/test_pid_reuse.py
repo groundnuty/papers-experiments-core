@@ -10,6 +10,8 @@ match (a pidfd where the kernel has one). A process it did not signal is never r
 The fake host plays that helper against its fake /proc (`FakeHost._signal_helper`), and a test changes what a pid is
 just before the first signal (`before_first_signal`), which is where the race is."""
 
+import json
+
 import pytest
 from deadline_support import (
     Clock,
@@ -20,7 +22,7 @@ from deadline_support import (
     run_to_the_cap,
     steps,
 )
-from sandbox_support import before_first_signal, make_spec, start_options
+from sandbox_support import around_run, before_first_signal, is_signal, make_spec, start_options
 
 from expcore_onedata.sandbox import deadline
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -100,6 +102,40 @@ def test_o72_a_signal_the_helper_could_not_give_is_never_read_as_quiet(world, sb
     assert sbx._cells.ended["outcome"] == deadline.SURVIVED
 
 
+def test_o72_a_command_that_failed_after_it_signalled_is_judged_by_a_fresh_listing(world, sbx):
+    """O72: the privileged command killed the cell's processes and then failed (timed out) before it answered. What is
+    left is listed anew, so the run goes on: it does not end as `survived_kill` for processes already gone."""
+    pids = cell_processes(world, sbx)
+
+    def kills_then_fails(argv):
+        world.host._run_default(argv)
+        return CmdResult(1, "", "the command timed out before it answered")
+
+    world.host.run_handlers["kill"] = kills_then_fails
+    result = sbx.exec("start_a_worker()", 30)
+    assert result.kill is None
+    assert {pids["python"], pids["child"], pids["grandchild"]} <= killed_pids(world)
+    assert sbx._cells.ended is None
+
+
+def test_o72_an_answer_that_names_another_pid_never_makes_a_worker_in_d_pass_as_quiet(world, sbx):
+    """O72: a worker in D that nothing signalled can run again. An answer that gave its pid as a float, `gone`, would
+    have been read as its pid and marked it done; it is not an answer, so the worker is left, and the run ends."""
+    agent = world.host.containers[sbx.names.agent]
+    world.host.add_stat(7010, "reader", agent.pid, state="D")
+    world.host.add_cgroup(agent, [agent.pid, agent.init_child, 7010])
+
+    def wrapper(original, argv, timeout_s, **kwargs):
+        if is_signal(argv):
+            return CmdResult(0, json.dumps({"results": [{"pid": 7010.5, "outcome": "gone"}]}))
+        return original(argv, timeout_s, **kwargs)
+
+    around_run(world.host, wrapper)
+    sbx.exec("start_a_reader()", 30)
+    assert 7010 not in killed_pids(world)
+    assert sbx._cells.ended["outcome"] == deadline.SURVIVED
+
+
 # ---------------------------------------------------------------------------------- the quiesce before the collection
 def test_o72_the_quiesce_before_the_collection_never_signals_a_pid_another_process_took(world, sbx):
     """O72: the collection's quiesce lists the agent's processes and kills them: a pid given away in between is spared,
@@ -136,7 +172,10 @@ def test_o72_the_kill_at_the_cap_lists_a_process_that_changed_its_command_line_a
     assert pids["child"] not in first
     assert pids["child"] in [pid for kill in later for pid in kill]
     assert result.kill["reason"] == "time_limit"
-    assert mounted.metadata()["cell_deadlines"][-1]["outcome"] == deadline.KILLED
+    record = mounted.metadata()["cell_deadlines"][-1]
+    assert record["outcome"] == deadline.KILLED
+    assert record["steps"][0]["signalled"] == 3  # each of the three, once, by what it was when a signal reached it
+    assert "unreached" not in record["steps"][0]  # none is unreached at the end: the exec'd one was reached since
 
 
 def test_o72_a_cell_process_the_cap_cannot_identify_survives_its_kill_and_the_deadline_escalates(world, mounted):
@@ -155,9 +194,16 @@ class Declining(Processes):
     """A tracker whose kill reaches only some processes, as the privileged half declines one whose identity changed:
     `decline` is how many times each pid in it is declined before it is signalled, and a pid in `always` never is."""
 
-    def __init__(self, *args, decline: dict[int, int] | None = None, always: tuple[int, ...] = (), **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        decline: dict[int, int] | None = None,
+        always: tuple[int, ...] = (),
+        rekey: tuple[int, ...] = (),
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
-        self.decline, self.always = dict(decline or {}), set(always)
+        self.decline, self.always, self.rekey = dict(decline or {}), set(always), set(rekey)
 
     def kill(self, procs: list[dict], timeout_s: float):
         self.given.append(("kill", timeout_s))
@@ -166,6 +212,8 @@ class Declining(Processes):
         for p in procs:
             if p["pid"] in self.always or self.decline.get(p["pid"], 0) > 0:
                 self.decline[p["pid"]] = self.decline.get(p["pid"], 0) - 1
+                if p["pid"] in self.rekey and p["pid"] in self.procs:  # it execed: listed next with a command line
+                    self.procs[p["pid"]]["cmd_sha256"] = "an-exec-ed-program"
                 continue
             reached.append(deadline.key_of(p))
             if p["pid"] not in self.wedged:
@@ -186,6 +234,17 @@ def test_o72_a_process_the_kill_did_not_reach_is_not_recorded_as_signalled_and_i
     assert record["steps"][0]["step"] == "kill"
     assert record["steps"][0]["signalled"] == 0
     assert record["steps"][0]["unreached"] == 2
+
+
+def test_o72_a_process_declined_as_it_execed_and_reached_after_is_not_unreached_when_the_kill_is_recorded():
+    """O72: the same process under two keys (its command line changed between the listings) is one process: reached
+    under the second, it is not counted as unreached under the first."""
+    clock, procs = Clock(), Declining({11: "python", 12: "worker"}, decline={12: 1}, rekey=(12,))
+    esc, _ = escalation(clock)
+    record = deadline.enforce(procs, esc)
+    assert record["outcome"] == deadline.KILLED
+    assert record["steps"][0] == {"step": "kill", "t_s": 0.0, "signalled": 2}
+    assert procs.kills == [[11, 12], [12]]
 
 
 def test_o72_a_process_no_signal_ever_reaches_is_a_survivor_and_never_a_clean_kill():
