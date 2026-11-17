@@ -874,8 +874,27 @@ class Driver(Down):
         }
         return Layout(self.root, self.layout.parent, hpc_spec(self.spec, hosts))
 
+    def move_phase(self, was: str, to: str) -> bool:
+        """Set the state's phase to `to` only if it is still `was`, under the state's lock; whether it was. A `down`
+        that wrote `stopping` meanwhile is never overwritten."""
+        moved: List[bool] = []
+
+        def change(state: Dict[str, Any]) -> None:
+            if state.get("phase") == was:
+                state["phase"] = to
+                moved.append(True)
+
+        self.set(change)
+        return bool(moved)
+
     def core_here(self) -> str:
-        """The core's phase in this process: the bootstrap, the baseline, the facts, platform.toml, the link check."""
+        """The core's phase in this process: the bootstrap, the baseline, the facts, platform.toml, the link check.
+
+        On a federation that is `linked` (`hpcfed.py core` run again on a finished root) the phase is `bootstrapped`
+        from before the core's phase runs, and `linked` again only if it returns, which it does only when its link
+        check passed: `up`'s own condition for `linked`. A rerun that fails, or dies, leaves `bootstrapped`, which
+        `shards.py plan` refuses, and no `linked` it did not earn. On any other state the phase ends `bootstrapped`
+        and only `up` says `linked`."""
         state = self.store.read()
         owner = tuple(state["owner"] or ())
         if len(owner) != 2:
@@ -887,8 +906,20 @@ class Driver(Down):
         # the study's artifacts digest, as up took it: a step on a node has no site variable and never reads the tree
         if state.get(hpcidentity.ARTIFACTS) is not None:
             values[hpcidentity.ARTIFACTS] = state[hpcidentity.ARTIFACTS]
-        out = self.core(self.placed_layout(state), owner, values, environ=self.environ)
-        self.set(lambda s: s.update(phase="bootstrapped"))
+        was_linked = state.get("phase") == "linked"
+        relink = was_linked and self.move_phase("linked", "bootstrapped")
+        if relink:
+            self.say("the federation was linked: it is bootstrapped unless this core phase's link check passes")
+        try:
+            out = self.core(self.placed_layout(state), owner, values, environ=self.environ)
+        except Exception:
+            if relink:
+                self.say("the core's phase failed: the federation stays bootstrapped, which shards plan refuses")
+            raise
+        if not was_linked:
+            self.set(lambda s: s.update(phase="bootstrapped"))
+        elif relink and self.move_phase("bootstrapped", "linked"):
+            self.say("the core's phase and its link check passed: the federation is linked again")
         return out
 
     def verify_data(self) -> str:
