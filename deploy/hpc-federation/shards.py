@@ -73,14 +73,15 @@ no `campaign.lock`, does not verify, or is missing is refused, naming its label:
 scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all
 of scratch after 20 days with no job submitted. The cluster cannot push to the operator's host, so the operator PULLS
 the archives (rsync or scp, run from their host). `collect` writes `<results>/archives.sha256.json` beside them from the
-private copies it verified (`expcore-hpc-archives/1`: a `plan_id`, which is the SHA-256 of the plan's shard count and
-labels in order, and each archive's name, size and SHA-256) and prints that file's own SHA-256 on stderr. `verify-copy`
-takes the pulled manifest, the local directory and that hash (`--manifest-sha256`, required: a manifest pulled with the
-archives proves nothing about itself), and exits 1 naming each archive that is missing, not a regular file, of another
-size or of another SHA-256 (names and reasons only, never a path), 2 for a manifest it cannot use, and 0 when every
-archive matches. An archive of the directory that the manifest does not name is a warning. It uses the standard
-library alone (Python 3.11 or later, for `tomllib`), so it runs on a host without the core; it checks the archives
-only, which are what the merge needs (their `<label>.out.json` files come along in the same pull but are not checked).
+private copies it verified (`expcore-hpc-archives/1`: a `plan_id`, which is the SHA-256 of the plan's study and results
+directories and each shard's index, count, label and root, and each archive's name, size and SHA-256) and prints that
+file's own SHA-256 on stderr. `verify-copy` takes the pulled manifest, the local directory and that hash
+(`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1 naming
+each archive that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only, never
+a path), 2 for a manifest it cannot use, and 0 when every archive matches. An archive of the directory that the manifest
+does not name is a warning. It uses the standard library alone (Python 3.11 or later, for `tomllib`), so it runs on a
+host without the core; it checks the archives only, which are what the merge needs (their `<label>.out.json` files come
+along in the same pull but are not checked).
 
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
@@ -462,11 +463,17 @@ def _read_only(root: Path) -> None:
 
 
 def plan_id(plan: Plan) -> str:
-    """The SHA-256 of the plan's shard count and labels in order: all the shards' own manifests agree on (their spec is
-    an index, a count and a label; the campaign's fingerprint is inside each store, which only the merge reads). No path
-    and no host is in it, and every `collect` of one plan gives the same."""
-    layout = {"count": len(plan.shards), "labels": [shard.label for shard in plan.shards]}
-    return hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    """The SHA-256 of the plan as its manifest declares it: the study and results directories, and each shard's index,
+    count, label and federation root, in order. It names the plan, not the campaign: a shard's own manifest carries only
+    an index, a count and a label, and the campaign's fingerprint travels in each shard's export, which the merge
+    compares (C36). Labels alone would not tell plans apart, since a fleet's shards are always `shard-1` to `shard-N`.
+    It is a hash, so no path is in the manifest, and every `collect` of one plan gives the same."""
+    declared = {
+        "study": str(plan.study),
+        "results": str(plan.results),
+        "shards": [[s.index, s.count, s.label, str(s.root)] for s in plan.shards],
+    }
+    return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def write_archives_manifest(plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]]) -> Path:
