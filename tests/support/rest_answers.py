@@ -32,7 +32,8 @@ def answers(zone: str, provider: str) -> dict[str, tuple[int, str]]:
                 {
                     "error": {
                         "id": "errorUnexpectedEndpointResponse",
-                        "description": f"The peer answered with a redirect to https://{provider}:8443/api/v3/x.",
+                        # a registered domain has no port, so neither has a URL built from it
+                        "description": f"The peer answered with a redirect to https://{provider}/api/v3/x.",
                     }
                 }
             ),
