@@ -2,8 +2,10 @@
 render identity as `study_artifacts_tree_sha256` when the site declares `HPC_STUDY_ARTIFACTS`. It is the SHA-256 of one
 canonical listing: a fixed version prefix, then a record for every regular file (relative path, size, SHA-256), every
 directory (relative path) and every link (relative path, target string, never followed), sorted by the path's bytes.
-Mode, owner and time are not in it, and no path of the directory itself is, in the digest or in an error. Every tree
-here is made by hand under `tmp_path`; nothing runs a real venv."""
+Mode, owner and time are not in it, and no path of the directory itself is, in the digest or in an error. A link whose
+target leaves the directory is refused (the directory is self-contained: its interpreter is in it), resolved as the
+kernel would, link by link, against the tree's own entries and never touching what is outside. Every tree here is made
+by hand under `tmp_path`; nothing runs a real venv."""
 
 import contextlib
 import hashlib
@@ -42,18 +44,23 @@ def put(root: Path, files: dict[str, bytes]) -> Path:
 
 
 def study_tree(root: Path) -> Path:
-    """What a study's artifacts directory holds: its tool server's clone (a `.git` in it), a venv made by hand with the
-    links a real one has (`bin/python` is a link to the interpreter), the data manifests, and an empty directory."""
+    """What a study's artifacts directory holds: its tool server's clone (a `.git` in it), the interpreter installed in
+    it, a venv made by hand with the links a real one has (`bin/python3` is a link to the interpreter, `lib64` to
+    `lib`), the data manifests, and an empty directory. Every link stays inside the tree."""
     put(root, {
         "clone/server.py": b"print('serve')\n",
         "clone/.git/HEAD": b"ref: refs/heads/main\n",
         "clone/.git/index": b"an index\n",
-        "venv/pyvenv.cfg": b"home = /an/interpreter/bin\n",
+        "python/bin/python3.12": b"an interpreter\n",
+        "python/lib/libpython3.12.so.1.0": b"a library\n",
+        "venv/pyvenv.cfg": b"home = ../python/bin\n",
         "venv/lib/python3.12/site-packages/pkg/__init__.py": b"VALUE = 1\n",
         "manifests/space.json": b'{"version": 1}\n',
     })  # fmt: skip
+    (root / "python" / "bin" / "python3").symlink_to("python3.12")  # the interpreter's own links
+    (root / "python" / "lib" / "libpython3.so").symlink_to("libpython3.12.so.1.0")
     (root / "venv" / "bin").mkdir()
-    (root / "venv" / "bin" / "python3").symlink_to("/an/interpreter/bin/python3.12")
+    (root / "venv" / "bin" / "python3").symlink_to("../../python/bin/python3.12")
     (root / "venv" / "bin" / "python").symlink_to("python3")
     (root / "venv" / "lib64").symlink_to("lib")
     (root / "empty").mkdir()
@@ -189,7 +196,7 @@ def _a_venv_package_added(root: Path) -> None:
 def _a_venv_link_retargeted(root: Path) -> None:
     link = root / "venv" / "bin" / "python3"
     link.unlink()
-    link.symlink_to("/another/interpreter/bin/python3.12")
+    link.symlink_to("../../python/bin/python3")  # another way to the same interpreter: another listing
 
 
 def _a_link_added(root: Path) -> None:
@@ -219,25 +226,242 @@ def test_o74_any_change_of_the_tree_gives_another_digest(identity, tmp_path, cha
     assert identity.tree_sha256(root) != before
 
 
-# -- links: recorded by their target string, never followed ---------------------------------------------------------
+# -- links: recorded by their target string, never followed; one that leaves the tree is refused --------------------
+
+# The digest of `study_tree`, as the code before links were checked (3531d3cc) took it: the canonical form of a tree
+# whose links all stay inside did not change when the check was added.
+STUDY_TREE_DIGEST = "ce01443fadbd22e880de62b992578ef503509a1194e777bb1102377b4683809a"
 
 
-def test_o74_a_link_is_recorded_by_its_target_string_and_what_it_points_at_is_never_read(identity, tmp_path):
-    """O74: the venv's `bin/python` is a link to an interpreter outside the tree. The digest holds the target string,
-    not the interpreter's bytes: changing, or removing, what the link points at changes nothing, and a link to a
-    directory outside is not descended (nor is one inside, whose files are counted once, under their own paths)."""
-    outside = put(tmp_path / "outside", {"python3.12": b"an interpreter", "lib/x": b"x"})
+def test_o74_a_tree_with_only_inside_links_has_the_digest_the_code_before_the_check_gave(identity, tmp_path):
+    """O74: pinned. `study_tree` holds `lib64 -> lib`, the venv's `bin/python3` into the interpreter installed in the
+    tree and the interpreter's own links: all inside, all recorded by their target strings, so its digest is the one
+    3531d3cc computed. A change here is a change of the identity every pinned plan holds."""
+    assert identity.tree_sha256(study_tree(tmp_path / "artifacts")) == STUDY_TREE_DIGEST
+
+
+def test_o74_a_link_inside_the_tree_is_recorded_by_its_target_string_and_not_descended(identity, tmp_path):
+    """O74: a link to a directory inside is recorded by its target and not descended (its files are counted once,
+    under their own paths); a link that dangles inside is recorded as it is, and a name that appears where it points is
+    a change of the tree, so the digest moves."""
     root = put(tmp_path / "artifacts", {"d/f": b"in"})
-    (root / "py").symlink_to(outside / "python3.12")
-    (root / "out-dir").symlink_to(outside / "lib")
     (root / "in-dir").symlink_to("d")
     (root / "dangling").symlink_to("nowhere")
+    records = [
+        b"D\0d\0",
+        b"F\0d/f\0" + b"2\0" + sha(b"in").encode() + b"\0",
+        b"L\0dangling\0nowhere\0",
+        b"L\0in-dir\0d\0",
+    ]
     before = identity.tree_sha256(root)
-    (outside / "python3.12").write_bytes(b"another interpreter")
-    (outside / "lib" / "y").write_bytes(b"y")
-    assert identity.tree_sha256(root) == before
-    (outside / "python3.12").unlink()
-    assert identity.tree_sha256(root) == before
+    assert before == sha(PREFIX + b"".join(records))
+    (root / "nowhere").write_bytes(b"now it is there")
+    assert identity.tree_sha256(root) != before
+
+
+def test_o74_an_absolute_link_into_the_tree_is_allowed_by_the_roots_real_path_or_the_path_it_was_given_by(
+    identity, tmp_path
+):
+    """O74: a venv built on the directory holds absolute targets. They are inside when they start, component by
+    component, with the directory's real path or with the path it is declared by (`HPC_STUDY_ARTIFACTS`, when a parent
+    of it is a link); each is recorded as written."""
+    real = tmp_path / "real"
+    put(real / "artifacts", {"venv/lib/x": b"x"})
+    (tmp_path / "alias").symlink_to(real)
+    declared = tmp_path / "alias" / "artifacts"
+    by_real = os.path.realpath(declared) + "/venv/lib"
+    by_declared = f"{declared}/venv/lib"
+    assert by_real != by_declared
+    (declared / "venv" / "lib64-real").symlink_to(by_real)
+    (declared / "venv" / "lib64-declared").symlink_to(by_declared)
+    records = {
+        b"venv": b"D\0venv\0",
+        b"venv/lib": b"D\0venv/lib\0",
+        b"venv/lib/x": b"F\0venv/lib/x\0" + b"1\0" + sha(b"x").encode() + b"\0",
+        b"venv/lib64-declared": b"L\0venv/lib64-declared\0" + by_declared.encode() + b"\0",
+        b"venv/lib64-real": b"L\0venv/lib64-real\0" + by_real.encode() + b"\0",
+    }
+    expected = sha(PREFIX + b"".join(records[name] for name in sorted(records)))
+    assert identity.tree_sha256(declared) == expected
+
+
+def test_o74_a_link_to_the_directory_itself_or_to_a_parent_inside_it_is_allowed(identity, tmp_path):
+    """O74: a link that resolves to the root, or to a directory above it inside, stays in the tree (it is recorded by
+    its target, and the directory is not descended through it)."""
+    root = study_tree(tmp_path / "artifacts")
+    (root / "venv" / "bin" / "up").symlink_to("../..")
+    (root / "venv" / "bin" / "up-to-venv").symlink_to("..")
+    (root / "here").symlink_to(os.path.realpath(root))
+    assert HEX.fullmatch(identity.tree_sha256(root))
+
+
+def test_o74_a_link_resolves_as_the_kernel_resolves_it_not_by_collapsing_dots(identity, tmp_path):
+    """O74: `a/b/d -> ..` is a link to `a`, so `a/b/d/..` is the root, not `a/b`: `fine -> a/b/d/../a/b` reaches
+    `a/b` of the root and is allowed."""
+    root = put(tmp_path / "artifacts", {"a/b/f": b"f"})
+    (root / "a" / "b" / "d").symlink_to("..")
+    (root / "fine").symlink_to("a/b/d/../a/b")
+    assert HEX.fullmatch(identity.tree_sha256(root))
+
+
+def leaves(
+    identity, root: Path, tmp_path: Path, name: str, target: str | None, says: str = "leaves the directory"
+) -> str:
+    """The digest of `root` is refused with a message that starts with the link's path relative to it, says `says`,
+    holds no absolute path and does not echo the link's target (`target`, unless it is a name too short to tell from
+    the message's own text); it never blocks (nothing outside is opened)."""
+    with deadline(), pytest.raises(identity.TreeError) as refused:
+        identity.tree_sha256(root)
+    message = str(refused.value)
+    assert message.startswith(f"{name} ")
+    assert says in message
+    assert str(tmp_path) not in message
+    assert target is None or target not in message
+    assert message.isprintable()
+    return message
+
+
+def outside_place(tmp_path: Path) -> Path:
+    return put(tmp_path / "outside", {"python3.12": b"an interpreter", "lib/x": b"x"})
+
+
+@pytest.mark.parametrize(
+    "what", ["a file", "a directory", "a missing name", "the filesystem's root", "the tree's parent"]
+)
+def test_o74_an_absolute_link_to_a_place_outside_the_tree_is_refused_naming_its_relative_path(identity, tmp_path, what):
+    """O74: the digest holds where a link points and not what is there, so a target outside is a part of the study
+    that is not pinned. Refused, whatever the target is (even a name that does not exist), naming the link's path
+    relative to the directory: never the target and never an absolute path."""
+    outside = outside_place(tmp_path)
+    targets = {"a file": outside / "python3.12", "a directory": outside / "lib", "a missing name": outside / "none",
+               "the filesystem's root": Path("/"), "the tree's parent": tmp_path}  # fmt: skip
+    root = study_tree(tmp_path / "artifacts")
+    (root / "venv" / "bin" / "out").symlink_to(targets[what])
+    leaves(identity, root, tmp_path, "venv/bin/out", None if what == "the filesystem's root" else str(targets[what]))
+
+
+@pytest.mark.parametrize(
+    ("link", "target"),
+    [
+        ("out", "../outside/python3.12"),
+        ("out", ".."),
+        ("out", "nowhere/../../outside/lib"),
+        ("venv/out", "../../outside/lib"),
+        ("venv/out", "lib/../../../outside/lib"),
+        ("venv/bin/out", "./../../../outside/python3.12"),
+        ("venv/bin/out", "../../../.."),
+    ],
+    ids=["file", "parent", "after a missing name", "from a directory", "after a directory", "dot first", "deep"],
+)
+def test_o74_a_link_that_escapes_by_dot_dot_is_refused_naming_its_relative_path(identity, tmp_path, link, target):
+    """O74: a relative target is read from the link's own directory: each `..` goes one directory up, and one that
+    would leave the tree is an escape, whatever lies on the way (a directory, a missing name)."""
+    outside_place(tmp_path)
+    root = study_tree(tmp_path / "artifacts")
+    (root / link).symlink_to(target)
+    leaves(identity, root, tmp_path, link, target)
+
+
+def test_o74_an_absolute_link_that_enters_the_tree_and_leaves_by_dot_dot_is_refused(identity, tmp_path):
+    """O74: the root's path as a prefix is no proof: `<root>/../outside/python3.12` starts inside and ends outside."""
+    outside_place(tmp_path)
+    root = study_tree(tmp_path / "artifacts")
+    target = f"{os.path.realpath(root)}/../outside/python3.12"
+    (root / "out").symlink_to(target)
+    leaves(identity, root, tmp_path, "out", target)
+
+
+@pytest.mark.parametrize("sibling", ["2", "-old", ".bak"])
+def test_o74_an_absolute_link_into_a_sibling_whose_name_starts_with_the_roots_is_refused(identity, tmp_path, sibling):
+    """O74: `/p/artifacts2/f` is not inside `/p/artifacts`: the comparison is by whole components, never by the
+    string's prefix."""
+    root = study_tree(tmp_path / "artifacts")
+    other = put(tmp_path / f"artifacts{sibling}", {"f": b"x"})
+    target = os.path.realpath(other) + "/f"
+    assert target.startswith(os.path.realpath(root))
+    (root / "venv" / "bin" / "sibling").symlink_to(target)
+    leaves(identity, root, tmp_path, "venv/bin/sibling", target)
+
+
+def test_o74_a_chain_of_links_that_ends_outside_is_refused_naming_the_first_link(identity, tmp_path):
+    """O74: `a -> b -> <outside>`: `b` itself leaves the tree, and so does `a`, which reaches the outside through it;
+    the first of them by path is named."""
+    outside = outside_place(tmp_path)
+    root = study_tree(tmp_path / "artifacts")
+    (root / "a").symlink_to("b")
+    (root / "b").symlink_to(outside / "python3.12")
+    leaves(identity, root, tmp_path, "a", str(outside))
+
+
+def test_o74_a_link_that_goes_through_a_link_to_a_parent_leaves_when_the_kernel_would_leave(identity, tmp_path):
+    """O74: `a/b/d -> ..` is a link to `a` (it stays inside), so `esc -> a/b/d/../../x` is `<root's parent>/x`, though
+    collapsing the dots as text gives `a/x`, inside the tree: the link's target is followed as the kernel follows it."""
+    root = put(tmp_path / "artifacts", {"a/b/f": b"f", "a/x": b"x"})
+    (root / "a" / "b" / "d").symlink_to("..")
+    (root / "esc").symlink_to("a/b/d/../../x")
+    leaves(identity, root, tmp_path, "esc", "a/b/d/../../x")
+
+
+def test_o74_a_link_through_a_directory_link_that_leaves_is_refused_where_the_link_that_leaves_is(identity, tmp_path):
+    """O74: `venv/lib64 -> lib` stays inside; `venv/bin/ext -> ../lib64/../../../outside` goes through it, up past the
+    root, and is refused."""
+    outside_place(tmp_path)
+    root = study_tree(tmp_path / "artifacts")
+    (root / "venv" / "bin" / "ext").symlink_to("../lib64/../../../outside/lib")
+    leaves(identity, root, tmp_path, "venv/bin/ext", "../lib64/../../../outside/lib")
+
+
+def chain(root: Path, length: int) -> None:
+    """`c00 -> c01 -> ... -> target`: `length` links in a row ending at a file of the tree."""
+    names = [f"c{number:02d}" for number in range(length)]
+    for name, following in zip(names, [*names[1:], "target"], strict=True):
+        (root / name).symlink_to(following)
+
+
+def test_o74_a_chain_of_forty_links_is_followed_and_one_of_forty_one_is_refused(identity, tmp_path):
+    """O74: the bound is `MAX_LINK_HOPS` (40, the kernel's own limit): the link itself is the first of the links a
+    path passes through. 40 in a row ending at a file are allowed; 41 are refused, naming the first, the only one that
+    needs 41 (the second needs 40)."""
+    assert identity.MAX_LINK_HOPS == 40
+    allowed = put(tmp_path / "allowed", {"target": b"t"})
+    chain(allowed, 40)
+    assert HEX.fullmatch(identity.tree_sha256(allowed))
+    refused = put(tmp_path / "refused", {"target": b"t"})
+    chain(refused, 41)
+    leaves(identity, refused, tmp_path, "c00", "c01", says="more than 40 links")
+
+
+@pytest.mark.parametrize("loop", ["itself", "two"])
+def test_o74_a_loop_of_links_is_refused_by_the_bound(identity, tmp_path, loop):
+    """O74: a link to itself, or two to each other, never resolve: the bound refuses them, naming the first."""
+    root = put(tmp_path / "artifacts", {"f": b"f"})
+    (root / "a").symlink_to("a" if loop == "itself" else "b")
+    if loop == "two":
+        (root / "b").symlink_to("a")
+    leaves(identity, root, tmp_path, "a", None, says="more than 40 links")
+
+
+def test_o74_a_link_to_a_fifo_outside_is_refused_and_the_fifo_is_never_opened(identity, tmp_path):
+    """O74: nothing outside the tree is read to decide: a link to a FIFO (a read-only open of which blocks until a
+    writer comes) is refused at once."""
+    outside = outside_place(tmp_path)
+    os.mkfifo(outside / "pipe")
+    root = study_tree(tmp_path / "artifacts")
+    (root / "pipe").symlink_to(outside / "pipe")
+    leaves(identity, root, tmp_path, "pipe", str(outside))
+
+
+def test_o74_a_refused_link_is_shown_escaped_never_as_a_raw_newline(identity, tmp_path):
+    """O74: the link's path in the message is printable ASCII, as every other path is."""
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    os.symlink("/", os.path.join(os.fsencode(root), b"a\nb\xff"))
+    with pytest.raises(identity.TreeError) as refused:
+        identity.tree_sha256(root)
+    shown = str(refused.value)
+    assert shown.isprintable()
+    assert shown.startswith("a\\nb")
+    assert "leaves the directory" in shown
 
 
 # -- what is refused, and how it is said -------------------------------------------------------------------------------
