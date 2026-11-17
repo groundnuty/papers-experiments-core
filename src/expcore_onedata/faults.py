@@ -47,7 +47,11 @@ is not issued again, and a later `clear`, `finish` or `start` finds the provider
 records the wait as `ready_after_s`, in the `verified` step and in the injection once it served: the seconds from the
 verified identity change to the first reading that showed it serving (0 for a provider that already served). A provider
 the stop never took down is not waited for. The recovery of a crashed run's injection, by `start`, `recover` or the
-fault gate, waits the same way, and its `recovered` reading carries `ready_after_s` too.
+fault gate, waits the same way, and its `recovered` reading carries `ready_after_s` too. **On an HPC federation (O58)** a
+restart waits, inside that wait, for op_worker's domain (null until its Onezone connection is up) before its identity is
+checked, and the restore records how long as `domain_wait_s`, beside `ready_after_s` and in the same places: the
+seconds as the node measured them (0 when no wait was needed). It is present only when the driver reported one: a
+driver with no such wait (Compose) and a status without the figure leave it out, never as a 0 nobody measured.
 
 **The links after a restore (O35).** A provider that serves is not yet a federation whose links transfer: an outage
 can leave a pair between two other providers stuck. Before it stops anything, `start` makes the session gate's probe
@@ -140,7 +144,7 @@ the restore, the step is `deferred` and the admission closes the federation for 
 
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
-The injection's own entry holds `target`, `injected`, `cleared`, `verified` and, once its provider served, `ready_after_s`.
+The injection's own entry holds `target`, `injected`, `cleared`, `verified` and, once its provider served, `ready_after_s` (and, on an HPC federation that reported it, `domain_wait_s`, the part of that wait spent on the provider's domain).
 
 **A link check whose record was not written says so (O35, `linkrecord`).** The restore's link check and each read of the
 pairs a heal makes write `link-check.json` (`fault_serves.recorded`), and one that could not be serialized or whose
@@ -1095,6 +1099,9 @@ class FaultInjector:
             drain.disarm()  # the provider never went down: nothing was left to drain
         verified = done and how in ("restored", "found_restored")
         timed = {} if ready_after_s is None else {"ready_after_s": ready_after_s}
+        waited = self._recovery.restore_record.get("domain_wait_s") if ready_after_s is not None else None
+        if waited is not None:  # only a driver that reported it: never a 0 nobody measured (O58)
+            timed["domain_wait_s"] = waited
         self._injection = {**injection, "cleared": done, "verified": verified, **timed}
         self._record_links(self._recovery.restore_record)
         self._step("cleared", done, how=how)
@@ -1104,6 +1111,7 @@ class FaultInjector:
             identity_changed=after is not None,
             identity_after_sha256=after,
             ready_after_s=ready_after_s,
+            **({} if waited is None else {"domain_wait_s": waited}),
         )
         if done:
             self._drain(admission, own, how, began)  # before the federation goes back to the other runs

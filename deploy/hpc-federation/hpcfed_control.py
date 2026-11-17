@@ -47,8 +47,11 @@ and runs nothing, so two processes never launch two service steps on one work di
 is true only when the service step is listed **and** a control step (`bundle/status.sh`, bounded to 60 s) finds the
 recorded process alive. `identity` is `"<launch>:<pid>:<start>"` while running, else null. `ready` is running and the
 service's own ready marker (written once its checks passed) and, for an owner of shared imported trees, the proof of
-this launch that it holds them read-only (below). A control step that fails or times out is exit 1 with nothing on
-stdout.
+this launch that it holds them read-only (below). A ready launch's status also carries `"domain_wait_s"` when the node
+reported one (O58): the seconds its start waited for op_worker's domain, which op_worker says null until its Onezone
+connection is up; 0 when no wait was needed, left out when none was reported or it is not a finite number of at
+least 0, so a status never holds a figure nobody measured. A control step that fails or times out is exit 1 with
+nothing on stdout.
 
 **The read-only proof of a restarted owner (O59, M3).** `mounts` is None in a core without the shared import; else it
 has `spaces(service)` (the shared trees the service owns, by space name; empty for a service that owns none),
@@ -401,19 +404,20 @@ def _status(target: Target, launcher: Any, state: Any, mounts: Any, out: Any, er
     ready = bool(running and reading.get("ready") is True)
     if ready and target.needs_proof:
         ready = _proven(target, launcher, state, mounts, err)
-    _emit(
-        out,
-        {
-            "service": target.service,
-            "state": target.state,
-            "running": running,
-            "identity": identity,
-            "launch": target.launch,
-            "node": target.node,
-            "step": target.step_name,
-            "ready": ready,
-        },
-    )
+    record = {
+        "service": target.service,
+        "state": target.state,
+        "running": running,
+        "identity": identity,
+        "launch": target.launch,
+        "node": target.node,
+        "step": target.step_name,
+        "ready": ready,
+    }
+    waited = _seconds(reading.get("domain_wait_s")) if ready else None
+    if waited is not None:  # only a ready launch's, and only a figure the node measured (see the docstring)
+        record["domain_wait_s"] = waited
+    _emit(out, record)
     return 0
 
 

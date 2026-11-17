@@ -89,9 +89,11 @@ class StudyPlugin:
       platform's loader for a module `[study] platforms` does not list (`config.platform_loads`), so hiding both
       declarations and listing nothing hides nothing either.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
-      Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, each level's data path and
-      listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign
-      fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
+      Onedata layer's `PlatformConfig.fingerprint()`: every declared setting that shapes a run, such as the TLS mode
+      and CA bundle hash, the spaces, the token lifetime, the sandbox's images, limits and data paths, the tool
+      server's commit and conditions, placement and the fault injector's targets and bounds, and nothing that is one
+      federation's own, so two federations of one template give one). They go into the campaign fingerprint, so a
+      resume under another is refused. Leave it empty for a study without a platform.
     - `platform_legacy`: an earlier form of `platform` that a store may have recorded for these same settings, or None
       (the Onedata layer's `PlatformConfig.legacy_fingerprint()`: each space by its Onezone id, as before a space could
       declare its data). A store whose recorded fingerprint is this campaign's with `platform` in that form resumes
