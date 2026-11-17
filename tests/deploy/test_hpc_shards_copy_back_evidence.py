@@ -313,7 +313,7 @@ def _step(shards, tmp_path, resume, killed=False):
     for name in ("tmpfs", "results"):
         (tmp_path / name).mkdir(exist_ok=True)
     args = argparse.Namespace(
-        study=study, index=1, count=1, label="fed-a", tmpfs=tmp_path / "tmpfs", results=tmp_path / "results",
+        study=study, index=1, count=2, label="fed-a", tmpfs=tmp_path / "tmpfs", results=tmp_path / "results",
         core_src=tmp_path, resume=resume, snapshot_every=3600.0,
     )  # fmt: skip
 
@@ -342,13 +342,14 @@ def _snapshot_names(plan):
 def test_a_shard_whose_step_ended_normally_lists_no_snapshot_though_its_step_took_them(shards, tmp_path, capsys):
     """O63: through the real step: the snapshots it took name no archive (it started from none), so they are older than
     the archive it wrote and hold nothing it lacks. Its journal and archive manifest are listed."""
-    plan = shards.load_plan(plan_file(tmp_path, labels=("fed-a",)))
+    plan = shards.load_plan(plan_file(tmp_path))
+    archived(shards, tmp_path, "fed-b", 2, journals=False)  # the plan's other shard, not the one stepped here
     assert _step(shards, tmp_path, resume=False) == 0
     assert (tmp_path / "results" / "fed-a" / "snapshots" / "snap-000001").is_dir()  # the last, taken after the exit
     capsys.readouterr()
     shards.collect(plan, tmp_path / "merge")
     assert _snapshot_names(plan) == []
-    assert [name for name in _names(plan) if "/journals/" in name]
+    assert len([name for name in _names(plan) if name.startswith("fed-a/journals/")]) == 1
     assert "fed-a.out.json" in _names(plan)
     assert "newer than its archive" not in capsys.readouterr().err
 
@@ -357,14 +358,15 @@ def test_a_step_resumed_from_the_archive_and_killed_leaves_a_snapshot_that_colle
     """O63: through the real step: its snapshots name the archive it resumed from, which is still the shard's archive
     (nothing newer was written), so the newest holds the run the archive lacks: listed, with both steps' journals, and
     the collect warns. The first step's snapshot, older than the archive, is still not."""
-    plan = shards.load_plan(plan_file(tmp_path, labels=("fed-a",)))
+    plan = shards.load_plan(plan_file(tmp_path))
+    archived(shards, tmp_path, "fed-b", 2, journals=False)
     assert _step(shards, tmp_path, resume=False) == 0
     with pytest.raises(Killed):
         _step(shards, tmp_path, resume=True, killed=True)
     capsys.readouterr()
     shards.collect(plan, tmp_path / "merge")
     assert _snapshot_names(plan) == ["snap-000002"]
-    assert len([name for name in _names(plan) if "/journals/" in name]) == 2
+    assert len([name for name in _names(plan) if name.startswith("fed-a/journals/")]) == 2
     seen = capsys.readouterr().err
     assert "snap-000002" in seen
     assert "newer than its archive" in seen
