@@ -35,7 +35,10 @@ same directory, which is how they share its lock. It lies directly in the federa
 describes the federation's links and not a file's, is written there whichever file a check ran through (O35,
 `expcore_onedata.linkrecord`). A table whose journal's parent holds no `platform.toml` is refused, naming the key,
 rather than guess where the record goes: a platform file derived in another directory states the root's journal, by
-an absolute path or one relative to itself.
+an absolute path or one relative to itself. A platform file that lies in a study directory, one that holds
+`study.toml`, as a copy of the federation's kept with the study does, states it by an absolute path only: a relative one
+resolves into the study, whose parent holds that very copy, so the check above would pass vacuously and the lock and
+the record would land in the study; such a table is refused, naming the key and the absolute form to write.
 
 `settle_timeout_s` must exceed the providers' `stop_grace_period` (the Compose file's, 120 s in the federation of
 deploy/compose-federation) by a margin. A stop that hits `command_timeout_s` kills the CLI, not the Docker daemon's
@@ -170,7 +173,7 @@ leaves can defer a check later still), and every check ends within `health_timeo
 too: keep it above `visible_timeout_s + timeout_s + evict_timeout_s`): the core gives up on one that outlives it, but
 its thread runs on and can still start the heal later than the figure counts. A deferral that began before the drain
 (an outage run still running, and another worker's check deferred on it) or for another reason (a run on an ingest
-baseline, or a run's shortcut reset holding the reset lock), a heal that waits for another holder of the federation
+baseline, or a run's reset holding the reset lock), a heal that waits for another holder of the federation
 (the hold `federation_busy`), a heal cut short by its process's end, which the next process settles and heals once
 more, and a heal that fails with a container restart left open, which the next check recovers, owing a session drain
 and holding a settle when none is journalled, before the gate closes, count from the deferral's first answer, so its
@@ -194,6 +197,8 @@ from expcore_onedata.fault_hpc import HPC_EXEC_MARGIN_S, HPC_POLL_S, HPC_STOP_BO
 from expcore_onedata.fault_relay import RelayClient
 from expcore_onedata.linkrecord import ROOT_FILE, federation_root
 
+# What marks a study directory: `expcore.study.config.STUDY_FILE`, which this layer does not import (a test pins both).
+STUDY_FILE = "study.toml"
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # A Compose project name as Compose accepts it. Required, because Compose would otherwise take the name from the
 # environment, the Compose file or its directory, and a target must name the one container its outage stops.
@@ -324,7 +329,16 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
     words = {}
     for key, default in (("command", ("docker", "compose")), ("docker", ("docker",))):
         words[key] = tuple(table.strings(key)) or default
-    journal = (file.parent / table.string("journal")).resolve()
+    declared_journal = table.string("journal")
+    if not Path(declared_journal).is_absolute() and (file.parent / STUDY_FILE).is_file():
+        raise table.fail(
+            "journal",
+            f"is relative, and this platform file lies in a study directory (it is beside {STUDY_FILE}): the journal "
+            f"would resolve into the study, and the federation's lock and link-check record would land there instead "
+            f"of in the federation's root. State the federation's journal in full: "
+            f'journal = "<absolute path of the federation\'s root>/fault-journal" (`up` makes it there)',
+        )
+    journal = (file.parent / declared_journal).resolve()
     if not (federation_root(journal) / ROOT_FILE).is_file():  # the link-check record's place is the root (`linkrecord`)
         raise table.fail(
             "journal",
@@ -630,21 +644,53 @@ def heal_round_s(settings: FaultSettings) -> float:
 def faults_fingerprint(config: PlatformConfig) -> dict[str, Any] | None:
     """`[faults]`'s half of the platform's fingerprint (`PlatformConfig.fingerprint`); None when the file has none.
 
-    What a resume must not change about the fault injector: that it is configured at all (every run is then admitted
-    to the federation, an outage run exclusively), whether it is sanctioned, and which container each target takes
-    down, by the target's label and the SHA-256 of its Compose project and service names, never a name or a path
-    (O12). The bounds of its waits and where its journal lies are how it runs, not what the runs measure, so they are
-    left out.
+    What a resume must not change about the fault injector, and two shards must share (C06): that it is configured at
+    all (every run is then admitted to the federation, an outage run exclusively), whether it is sanctioned, which
+    service each target takes down, by the target's label and the SHA-256 of its backend and service name, never a
+    name (O12), and every bound of its waits, its restore and its heal after its default (`settings`, the derived
+    `heal_timeout_s` when the table leaves it out), each number of its field's type: they decide whether an outage
+    run's restore is verified in time or the run is set aside, and how long the federation stays held. Not here: the
+    journal and the Compose file (paths in the federation's root), the Compose project (each deployment's own name, so
+    two federations of one layout differ in it) and the commands that run Compose and Docker (the host's).
     """
     if "faults" not in load_toml(config.file):
         return None
     settings = load_faults(config.file, config)
-    where = "hpc:" if settings.backend == "hpc" else f"{settings.project}/"  # an HPC service has no project
     targets = {
-        config.provider_label(name): hashlib.sha256(f"{where}{service}".encode()).hexdigest()
+        config.provider_label(name): hashlib.sha256(f"{settings.backend}:{service}".encode()).hexdigest()
         for name, service in settings.services.items()
     }
-    return {"sanctioned": settings.sanctioned, "targets": dict(sorted(targets.items()))}
+    return {
+        "sanctioned": settings.sanctioned,
+        "targets": dict(sorted(targets.items())),
+        "settings": _bounds_record(settings),
+    }
+
+
+def _bounds_record(settings: FaultSettings) -> dict[str, Any]:
+    """The fault injector's bounds as the fingerprint holds them: every one after its default, a whole number of
+    attempts as an integer, every other number as a float, so `2` and `2.0` are one value."""
+    seconds = (
+        "poll_s",
+        "settle_timeout_s",
+        "command_timeout_s",
+        "ready_timeout_s",
+        "admission_timeout_s",
+        "health_wait_s",
+        "gate_timeout_s",
+        "heal_timeout_s",
+        "heal_settle_s",
+        "session_drain_s",
+        "stop_bound_s",
+        "relay_wait_s",
+    )
+    return {
+        "backend": settings.backend,
+        "heal": settings.heal,
+        "heal_container_fallback": settings.heal_container_fallback,
+        "clear_attempts": int(settings.clear_attempts),
+        **{key: float(getattr(settings, key)) for key in seconds},
+    }
 
 
 def compose_driver(

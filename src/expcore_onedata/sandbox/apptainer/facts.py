@@ -5,6 +5,15 @@ Every run's metadata holds `infrastructure_facts` (this list, by key) so a reade
 on the node it ran on. A key is stable; its text explains it. Each departure is the node's (an HPC batch node gives an
 unprivileged user no namespace but setuid Apptainer's and no cgroup of its own), never a choice of the study's. One
 key, `dns_none`, records what a cell resolves and is no departure: a Docker cell resolves the same (measured).
+
+One key is conditional, `mount_refused`: it is listed only for a run whose sandbox refuses a mount data path at its
+start (`ApptainerSandbox._mount_refused`: no mount helper is given, or the platform declares no `[sandbox.mount]`), so a
+mount run, which was not refused, never carries it, nor does any run of a sandbox that would accept one.
+
+One more entry is no departure either: `provider_storage`, the kind of storage the federation's providers keep their
+data on (`tmpfs` or `shared_filesystem`), which the HPC driver declares in `[sandbox.apptainer]` (O57). It sits beside
+the list of keys, only for a platform that declares it, so a Compose federation's runs and an older platform's keep
+their record.
 """
 
 from __future__ import annotations
@@ -81,8 +90,10 @@ FACTS: dict[str, str] = {
     ),
     "apptainer_stderr": "Apptainer's own warnings would be the cell's stderr: it runs with -q, which keeps its errors",
     "mount_refused": (
-        "a mount data path is refused at the start until the mount's helper lands (hook c): a cell would share the "
-        "uid of the oneclient that holds the mount's token"
+        "this sandbox refuses a mount data path at its start: it is given no mount helper (`mount_helper=`, hook c, "
+        "`host_mount_factory()`) or the platform declares no `[sandbox.mount]`; listed only for a run whose sandbox "
+        "refuses one, so a mount run never carries it. The helper accepts proxy I/O only, and refuses a direct "
+        "mount: HPC mounts are proxy-only until the direct-I/O comparison passes"
     ),
 }
 
@@ -90,10 +101,18 @@ FACTS: dict[str, str] = {
 DNS = "none"  # what a cell's name lookups reach (dns_none)
 
 
-def record() -> dict[str, Any]:
-    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up, and its name service. The sandbox's
-    metadata adds the watch's memory reading (`memory`) once it exists."""
-    return {"backend": "apptainer", "facts": sorted(FACTS), "dns": DNS}
+def record(*, mount_refused: bool, provider_storage: str | None = None) -> dict[str, Any]:
+    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up, and its name service.
+    `mount_refused` is listed only when the run's sandbox refuses a mount data path (the module's docstring). When the
+    platform declares where the federation's providers keep their data (`[sandbox.apptainer] provider_storage`, O57),
+    the record carries that kind as `provider_storage`: it shapes a run's I/O timing, so a reader of one run knows it,
+    and a run of a platform that declares none has no such key. The sandbox's metadata adds the watch's memory reading
+    (`memory`) once it exists."""
+    keys = sorted(key for key in FACTS if mount_refused or key != "mount_refused")
+    out: dict[str, Any] = {"backend": "apptainer", "facts": keys, "dns": DNS}
+    if provider_storage is not None:
+        out["provider_storage"] = provider_storage
+    return out
 
 
 __all__ = ["FACTS", "record"]

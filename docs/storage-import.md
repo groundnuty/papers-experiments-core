@@ -94,7 +94,9 @@ this import is read that way, and `hpcimport.direct_storages` gives the mapping 
 the mode in effect is shown per run by the record (O49), never by the layout. A direct mount reads the storage of the
 agent's own provider (`local` in the platform file; O40's start check reads a file that provider holds in full), so
 `direct_io` belongs on a space that provider owns: the layout has no `local`, and the platform template carries it. The
-sandbox node must see the same directory, which the sandbox milestone's step provides.
+sandbox node would have to see the same directory.
+
+**HPC mounts are proxy-only until the direct-I/O comparison passes.** The Apptainer backend's mount helper refuses `io_mode = "direct"` at the start of a run (its check reads a file from a cell before any cell exists, and a provider's storage is on another node), so on an HPC node the agent's mount reads every space through the provider, and `direct_io = true` in the layout declares a mapping that no HPC run reads yet: a study that declares `io_mode = "direct"` has its mount runs refused there. Direct I/O is a Docker-sandbox mode until `deploy/compose-federation/measure_direct_vs_proxy.py` shows, on a live federation, that it places the same bytes per read sequence as proxy (the study guide's "Direct I/O").
 
 Not shown by anything in this repository, and for a live slot: that the mount check finds the service's container as the
 visible child of the setuid starter its supervisor started (it fails closed when it does not); that Onepanel accepts the imported storage with the job

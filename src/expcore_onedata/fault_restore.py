@@ -23,6 +23,12 @@ gate probe of the injection it heals, under the reader's lock, restored and wait
 word and stays open, and recovery (which settles such entries first, `Recovery.recover`) brings it back and checks it.
 The gate's and the heal's readings go into `restore_record`, for the injector's snapshot.
 
+**A link check whose record was not written says so there too (O35).** Every check this settling makes, the restore's
+own and each read of the pairs the heal makes, answers with a matrix that holds why its record was not written, if it
+was not (`LinkMatrix.not_written`, from `fault_serves.recorded`), and the settling puts `link_record: "not_written"`
+and `link_record_reason` (`linkrecord.fact`) into `restore_record`, the latest such check's, so the injector's snapshot
+and its `recovered` step carry it. Nothing is put there when every record was written.
+
 **The settle of a recovered container restart.** A recovery that finds a heal's container restart open (its heal was cut
 short, or ended with a pair failing) first waits out every hold its heal left (one reading then decides: a reader the
 heal never stopped is `never_down` and cleared), brings the reader back, verified (a new identity, serving), and reads
@@ -62,6 +68,7 @@ from expcore_onedata.fault_settings import (
     heal_container_reserve,
     heal_link_reserve,
 )
+from expcore_onedata.linkrecord import fact
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE
 
 log = logging.getLogger("expcore_onedata.fault_recovery")
@@ -349,7 +356,14 @@ class LinkSettling:
         matrix = read(service) if read is not None else None
         if not isinstance(matrix, LinkMatrix):
             raise TypeError("the driver's link check answered no matrix")
+        self._said(matrix)
         return matrix
+
+    def _said(self, matrix: LinkMatrix) -> None:
+        """Have the settling's record take note of a check whose own record was not written (`LinkMatrix.not_written`):
+        its latest such reason, as the optional fact `link_record` (the mutation of `restore_record` is the point)."""
+        if matrix.not_written is not None:
+            self.restore_record.update(fact(matrix.not_written))
 
     def _stuck_links(self, service: str) -> tuple[str | None, LinkMatrix | None]:
         """The link check of every ordered pair after a restore, when the driver has one: as a matrix
@@ -361,6 +375,7 @@ class LinkSettling:
             read = getattr(self._driver, "link_matrix", None)
             matrix = read(service) if read is not None else None
             if isinstance(matrix, LinkMatrix):
+                self._said(matrix)
                 return (None if matrix.ok else matrix.detail), matrix
             check = getattr(self._driver, "restored_links", None)
             return (None if check is None else check(service)), None
