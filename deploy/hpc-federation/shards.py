@@ -611,13 +611,14 @@ def shard_has_results(results: Path, label: str) -> bool:
 def archived_pass_env(results: Path, spec: Mapping[str, Any]) -> dict[str, str] | None:
     """The name and value of each variable the shard's latest archive says its step passed (the `pass_env` of
     `<label>.out.json`, which `archive` writes: none in a manifest of a step that passed nothing), or None when the
-    shard has no archive (a snapshot alone, or nothing). The manifest is read as a regular file, never through a link,
-    and up to `ARCHIVE_MANIFEST_MAX` bytes. `ShardsError` naming the manifest, never a value, when there is an archive
-    and its manifest cannot be read as this shard's, or holds a name or a value a variable may not carry: with the
-    shard's own record gone it is the only one, so what it cannot say is never taken for "nothing was passed"."""
+    shard has no archive manifest (a snapshot alone, nothing, or a first archive killed after its tar was written and
+    before its manifest was, which resumes from its snapshots as it did). The manifest is read as a regular file,
+    never through a link, and up to `ARCHIVE_MANIFEST_MAX` bytes. `ShardsError` naming the manifest, never a value,
+    when it is there and cannot be read as this shard's, or holds a name or a value a variable may not carry: with
+    the shard's own record gone it is the only one, so what it cannot say is never taken for "nothing was passed"."""
     label = str(spec["label"])
     manifest = results / f"{label}.out.json"
-    if not any(os.path.lexists(results / f"{label}.out.{kind}") for kind in ("tar", "json")):
+    if not os.path.lexists(manifest):
         return None
     unreadable = ShardsError(
         f"shard {label}: its archive manifest ({manifest.name}) cannot be read as this shard's, so the variables its "
@@ -648,14 +649,21 @@ def check_pass_env_origin(results: Path, spec: Mapping[str, Any], given: Mapping
     no record (`read_pass_env_origin`) and no results (`shard_has_results`) has had no first step: nothing is compared.
     One with results and no record either had a first step that passed nothing, or has lost the record: its latest
     archive's manifest says which (`archived_pass_env`), and `given` is compared with what that records, values
-    included, so that deleting the record lifts no rule. With a snapshot alone and no archive, the first step passed
-    nothing as far as anything says, so a variable it now passes is one added mid-shard: refused the same way."""
+    included, so that deleting the record lifts no rule. A manifest that cannot be read as the shard's refuses a step
+    that passes nothing, naming the manifest (nothing says what the first step passed); a step that passes variables is
+    refused as it was, for adding them. With a snapshot alone and no archive, the first step passed nothing as far as
+    anything says, so a variable it now passes is one added mid-shard: refused the same way."""
     label = spec["label"]
     recorded = read_pass_env_origin(results, spec)
     if recorded is not None:
         why = f"recorded in {PASS_ENV_ORIGIN}"
     elif shard_has_results(results, str(label)):
-        recorded = archived_pass_env(results, spec) or {}
+        try:
+            recorded = archived_pass_env(results, spec) or {}
+        except ShardsError:
+            if not given:  # nothing says what the first step passed, and this one passes none: refused, naming it
+                raise
+            recorded = {}  # a step that passes variables is refused below, as it was before the manifest was read
         why = (f"recorded in the shard's archive manifest, {PASS_ENV_ORIGIN} being gone" if recorded
                else f"the shard has results and no record of any variable ({PASS_ENV_ORIGIN})")  # fmt: skip
     else:

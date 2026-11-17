@@ -994,6 +994,36 @@ def test_o63_a_shard_that_passed_nothing_resumes_with_nothing_as_before(shards, 
     assert not origin_file(tmp_path).exists()
 
 
+def test_o63_a_shard_killed_after_its_first_archives_tar_and_before_its_manifest_resumes_as_before(
+    shards, tmp_path, monkeypatch
+):
+    """O63: the archive's tar is renamed into place and hashed before its manifest is written, so a step killed
+    between the two leaves a tar and no manifest (its tmpfs, and so the leftover `--archive-left` needs, is gone). A
+    study that declares no variable has no origin either, and the shard resumes from its snapshots as it always did:
+    no manifest is not an unreadable one. A step that does declare variables is refused for adding them, naming only
+    them."""
+    first_step_passing_nothing(shards, tmp_path, monkeypatch)
+    (tmp_path / "results" / "fed-a.out.json").unlink()
+    assert (tmp_path / "results" / "fed-a.out.tar").exists()
+    results = tmp_path / "results"
+    assert shards.check_pass_env_origin(results, SPEC_A, {}) is None
+    with pytest.raises(shards.ShardsError, match=NAME) as refused:
+        shards.check_pass_env_origin(results, SPEC_A, {NAME: VALUE})
+    assert VALUE not in str(refused.value)
+
+
+def test_o63_an_unreadable_manifest_still_names_the_variable_a_step_adds(shards, tmp_path):
+    """O63: with no origin and a manifest that cannot be read (here an empty record), a step that declares a variable
+    is refused for adding it, as it was before the manifest was read; one that declares nothing is refused naming
+    the manifest."""
+    (tmp_path / "results").mkdir()
+    (tmp_path / "results" / "fed-a.out.json").write_text("{}")
+    with pytest.raises(shards.ShardsError, match=NAME):
+        shards.check_pass_env_origin(tmp_path / "results", SPEC_A, {NAME: VALUE})
+    with pytest.raises(shards.ShardsError, match=r"fed-a\.out\.json"):
+        shards.check_pass_env_origin(tmp_path / "results", SPEC_A, {})
+
+
 # -- the origin is never longer than the reader takes --------------------------------------------------------------
 
 
