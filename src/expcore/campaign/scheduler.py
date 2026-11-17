@@ -57,6 +57,7 @@ from expcore.campaign.healthgate import (
     PlatformDeferral,
     deferral_bound,
     exposes_deferral,
+    takes_context,
 )
 from expcore.campaign.holds import ALL, Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
@@ -174,6 +175,8 @@ class Scheduler:
         self.settings.check_kinds(schema)
         # what the admission and the health check declare, read once and before the lock or the store; the admission's is
         # read only when something asks for it (a study's list of platforms, or a health check to hold to it)
+        if health is not None:  # a signature the gate could never call is refused here, not at the first check (O82)
+            takes_context(health)
         asked = health is not None or listed_platforms is not None
         declared = deferral_bound(admission, DECLARED_HOOK, ADMISSION_OWNER) if asked else None
         reported = deferral_bound(health) if health is not None else None

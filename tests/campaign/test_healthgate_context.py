@@ -258,10 +258,8 @@ def test_o82_a_pre_run_and_a_post_run_check_that_meet_each_get_their_own_attempt
     health, outage = results["post"]
     assert health == Health(True, "post_run run-a 1 41")
     assert outage is None
-    assert sorted(check.seen, key=lambda context: context.phase) == [
-        CheckContext("run-a", 2, PRE_RUN),
-        CheckContext("run-a", 1, POST_RUN, 41),
-    ]
+    assert len(check.seen) == 2
+    assert set(check.seen) == {CheckContext("run-a", 2, PRE_RUN), CheckContext("run-a", 1, POST_RUN, 41)}
 
 
 def test_o82_many_checks_at_once_never_see_one_anothers_identity(tmp_path):

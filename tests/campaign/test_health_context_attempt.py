@@ -6,10 +6,12 @@ runner's two call sites (the pre-run check before the attempt's row exists, the 
 
 import threading
 
+import pytest
 from campaign_support import make_schema
 from scheduler_support import FakeExecutor, build, key_of, settings_for
 
 from expcore.campaign.healthgate import POST_RUN, PRE_RUN, Health
+from expcore.config.loading import ConfigError
 
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 SCHEMA = make_schema()
@@ -90,3 +92,14 @@ def test_o82_an_attempt_run_again_under_its_number_is_told_apart_by_its_id(tmp_p
             (PRE_RUN, 1, None),
             (POST_RUN, 1, rows[1][1]),
         ]
+
+
+def test_o82_a_scheduler_refuses_a_check_whose_signature_the_gate_could_never_fill_when_it_is_built(tmp_path):
+    """O82: the refusal is the scheduler's, before its lock and its store, and names the parameter: a check that
+    required an argument of another name used to read as a failed check at every call."""
+
+    def named_otherwise(ctx):
+        return Health(True, "fine")
+
+    with pytest.raises(ConfigError, match="'ctx'"):
+        build(tmp_path, executor=FakeExecutor(), plan=SMALL, health=named_otherwise)
