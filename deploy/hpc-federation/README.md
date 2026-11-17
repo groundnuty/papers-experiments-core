@@ -489,7 +489,7 @@ its own name or the zone's. The readiness calls, the token mint and the registra
 pinned to the loopback (`curl --resolve`), the one name the certificate holds. Onepanel's DNS check resolves through DNS
 alone and reports the declared names `unresolvable`; it is advisory, and `facts.json` records that. From the login
 node the names are reached through the address map `up` writes into the root (`secrets/address-map.json`, 0600),
-which `platform.toml` names; see `DESIGN.md`, "The registered names". The first sandbox slot on a federation brought up
+which `platform.toml` names; see `DESIGN.md`, "The registered names". Every login-side client of the services is built by `hpcboot.service_client`, which refuses a root with no usable map rather than build a client that could reach no name, and `tests/deploy/test_rest_constructors.py` fails on any other construction that is not listed with its reason. The first sandbox slot on a federation brought up
 this way is owed the checks of `DESIGN.md` section 9, item 7.
 
 ## Slots and the tool server (O83)

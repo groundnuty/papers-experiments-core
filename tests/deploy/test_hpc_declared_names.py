@@ -292,9 +292,15 @@ def test_o73_the_platform_file_names_the_map_and_loads_with_declared_urls(hpc, p
     assert config.zone.url == f"https://{ZONE_NAME}:8443"
 
 
-def test_o73_a_root_without_a_map_renders_the_platform_file_as_before(hpc, phase):
-    """O73: no `addresses` line without a map."""
+def test_o73_a_root_of_a_layout_with_no_declared_names_renders_the_platform_file_as_before(hpc, phase):
+    """O73: a layout whose services are at loopback ports (the Compose federation's) has no map, and its platform file
+    has no `addresses` line."""
+    import fedlayout
+    import fedspec
+
+    phase.layout = fedlayout.Layout(phase.root, phase.tmp, fedspec.load_spec(LAYOUT))
     _run(hpc, phase, with_map=False)
+    assert not phase.layout.address_map.exists()
     assert "addresses" not in (phase.root / "platform.toml").read_text(encoding="utf-8")
 
 

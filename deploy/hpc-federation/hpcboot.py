@@ -484,8 +484,8 @@ def verify_ingested(
     than the manifest, in counts alone (empty for one that is exactly it), never a path. A fresh process holds none of
     the ids the bootstrap made, so the spaces' ids are read from facts.json, which `up` wrote; the services' addresses
     are the placed layout's, dialled through the root's address map as the core phase's are (`service_client`, O73:
-    every service's URL carries its declared name, which resolves nowhere on the site). `rest`, `bootstrap` and `data`
-    are the core phase's own, for a stand-in."""
+    every service's URL carries its declared name, which resolves nowhere on the site, so a root with no usable map is
+    refused). `rest`, `bootstrap` and `data` are the core phase's own, for a stand-in."""
     try:
         recorded = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]
         ids = {name: space["id"] for name, space in recorded.items()}
