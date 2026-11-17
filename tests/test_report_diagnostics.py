@@ -2,8 +2,9 @@
 
 The export lists them (`attempt_diagnostics`, only when an attempt kept one); the report gives a section of its own
 after the infrastructure tables with a row of counts per condition, instrument, kind and state, and a row of zeros for
-a condition that had none, so 0 is never mistaken for not reported. What each snapshot says is in the export. A report
-of an export without the key is the text it was.
+a condition that had none, so 0 is never mistaken for not reported. What each snapshot says is in the export. A
+diagnostic withheld because its executor declared no secrets is counted in a column of its own, with the reason in the
+section's notes, and its text is nowhere in the report. A report of an export without the key is the text it was.
 """
 
 from expcore.report import render_report
@@ -14,6 +15,7 @@ RESULT = AnalysisResult((), (), 0.05, {"preregistration_sha256": "e" * 64})
 HEADING = "### Instrument start failures"
 STARTED = {"phase": "start", "instrument": "state_inducer", "diagnostic": {"checked": "replicas", "seen": "2 of 3"}}
 UNKEPT = {"phase": "start", "instrument": "state_inducer", "ok": False, "error": "TypeError"}
+WITHHELD_STUB = {"phase": "start", "ok": False, "error": "Withheld", "why": "the executor declared no secrets"}
 
 
 def run(key: str, condition: str) -> dict:
@@ -72,11 +74,11 @@ def test_c40_the_report_counts_the_failed_starts_per_condition_instrument_kind_a
         ]
     )
     section = section_of(render(data))
-    assert "| Condition | Instrument | Kind | State | Attempts | Charged | Not kept |" in section
+    assert "| Condition | Instrument | Kind | State | Attempts | Charged | Withheld | Not kept |" in section
     assert rows(section) == [
-        "| api-none | - | sandbox | infra_fail | 1 | 1 | 0 |",
-        "| download-write | - | - | - | 0 | 0 | 0 |",
-        "| mount-read | state_inducer | sandbox | infra_fail | 3 | 2 | 1 |",
+        "| api-none | - | sandbox | infra_fail | 1 | 1 | 0 | 0 |",
+        "| download-write | - | - | - | 0 | 0 | 0 | 0 |",
+        "| mount-read | state_inducer | sandbox | infra_fail | 3 | 2 | 0 | 1 |",
     ]
 
 
@@ -94,8 +96,8 @@ def test_c40_a_merged_batchs_rows_name_the_shard():
     section = section_of(render(data))
     assert "| Shard | Condition | Instrument |" in section
     assert [r for r in rows(section) if r.startswith(("| 1 |", "| 2 |"))] == [
-        "| 1 | mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 |",
-        "| 2 | mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 |",
+        "| 1 | mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 0 |",
+        "| 2 | mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 0 |",
     ]
 
 
@@ -105,3 +107,22 @@ def test_c40_a_report_of_an_export_without_the_key_is_the_text_it_was():
     assert HEADING not in plain
     assert "diagnostic" not in plain
     assert render(export(attempt_diagnostics=[])) == plain
+
+
+def test_c40_a_withheld_diagnostic_is_counted_apart_with_its_reason_and_never_its_text():
+    """C40: an attempt whose executor declared no secrets has a stub in the export; the report counts it in Withheld
+    (not in Not kept: it failed to be shown, not to be kept), names no instrument, and says why in the notes."""
+    data = export(
+        attempt_diagnostics=[
+            kept(1, "mount-read", WITHHELD_STUB),
+            kept(2, "mount-read", WITHHELD_STUB, charged=False),
+            kept(3, "mount-read", UNKEPT),
+        ]
+    )
+    section = section_of(render(data))
+    assert "| mount-read | - | sandbox | infra_fail | 2 | 1 | 2 | 0 |" in rows(section)
+    assert "| mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 1 |" in rows(section)
+    notes = " ".join(section.split())
+    assert "declared no secrets" in notes
+    assert "declare_secrets" in notes
+    assert "local log" in notes

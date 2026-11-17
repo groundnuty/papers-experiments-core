@@ -313,6 +313,7 @@ def test_c40_the_runner_redacts_with_the_secrets_the_executor_gave_the_recording
     run_secret = "run-scoped-secret-9876543210"
 
     async def executor(request):
+        request.declare_secrets()
         request.defect_log.redact_with(lambda: Redactor([run_secret]))  # what `record_run` does with its `secrets=`
         start_instruments([Inducer({"seen": f"rejected {run_secret}"})], {"run_key": request.run_key})
 

@@ -88,11 +88,13 @@ def test_c40_a_secret_the_study_declares_before_its_instruments_start_is_redacte
     assert (row["state"], row["charged"], row["infra_kind"]) == ("infra_fail", 1, "sandbox")
 
 
-def test_c40_a_secret_named_only_to_record_run_never_reaches_the_row_the_marker_the_export_or_the_report(tmp_path):
+def test_c40_an_undeclared_executors_diagnostic_is_withheld_from_everything_that_ships_and_kept_in_the_local_log(
+    tmp_path,
+):
     """C40: the rule: never a diagnostic redacted against a partial list of the run's secrets. The executor names a
-    secret only to `record_run`, which a start that fails never reaches: the stored diagnostic, the marker, the export
-    and the report hold no trace of it, the diagnostic is withheld (it says why), and the failed start is still counted
-    by instrument; the attempt is set aside and charged as it was."""
+    secret only to `record_run`, which a failed start never reaches, and never declares: the row, the marker, the export
+    (which a package carries) and the report hold no trace of the diagnostic, only that it was withheld and why; the
+    failed start is still counted; the text is in the campaign's local log (`out/logs`, never merged or packaged)."""
     ran = []
 
     async def executor(request):
@@ -100,24 +102,48 @@ def test_c40_a_secret_named_only_to_record_run_never_reaches_the_row_the_marker_
         ran.append("record_run")  # never reached
         await record_run(request, [], "s", "u", FakeExecutor().config, code=dict(CODE), secrets=[SECRET])
 
+    root = tmp_path / "out"
     settings = settings_for(max_attempts=1)
-    with build(tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings) as scheduler:
+    with build(root, plan=PLAN, executor=FakeExecutor(default=executor), settings=settings) as scheduler:
         scheduler.run()
         row = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
         marker = read_marker(Path(row["run_dir"]), row["run_key"], row["id"])
         export = export_run_state(scheduler.store)
     assert not ran
-    kept = where_it_is_kept(row, marker, export)
-    assert {place: SECRET in text for place, text in kept.items()} == {"row": False, "marker": False, "export": False}
+    shipped = where_it_is_kept(row, marker, export)
+    assert {place: SECRET in text for place, text in shipped.items()} == {
+        "row": False,
+        "marker": False,
+        "export": False,
+    }
+    assert not any("the endpoint answered" in text for text in shipped.values())  # not even the part that is no secret
     report = report_of(export)
     assert SECRET not in report
+    assert "the endpoint answered" not in report
     stored = json.loads(row["diagnostic"])
-    assert (stored["phase"], stored["ok"], stored["error"]) == ("start", False, "Withheld")
-    assert "instrument" not in stored
-    assert "diagnostic" not in stored
-    assert "declare_secrets" in stored["why"]
+    assert stored == {"phase": "start", "ok": False, "error": "Withheld", "why": WITHHELD}
+    assert "no secrets" in stored["why"]
+    assert export["attempt_diagnostics"][0]["diagnostic"] == stored  # what the export says, and all it says
     assert (row["state"], row["charged"], row["infra_kind"]) == ("infra_fail", 1, "sandbox")
-    assert "| - | sandbox | infra_fail | 1 | 1 | 1 |" in report  # counted, with no instrument named, and not kept
+    assert "| - | sandbox | infra_fail | 1 | 1 | 1 | 0 |" in report  # counted, named by no instrument, withheld
+    local = log_path(root).read_text(encoding="utf-8")
+    assert "the endpoint answered with" in local  # kept, where nothing ships
+    assert "state_inducer" in local
+    assert "withheld" in local
+
+
+def test_c40_a_declared_empty_executors_diagnostic_is_shown_in_the_export_and_the_report(tmp_path):
+    """C40: `declare_secrets()` says the run has no secret beyond the environment's: the diagnostic is kept, shown in
+    the export, and the report counts it as kept (not withheld); nothing is written to the local log for it."""
+    root = tmp_path / "out"
+    row, _, export = run_failing_start(root, lambda request: request.declare_secrets())
+    stored = json.loads(row["diagnostic"])
+    assert stored["diagnostic"] == {
+        "seen": f"the endpoint answered with {SECRET}"
+    }  # no secret declared: nothing to hide
+    assert export["attempt_diagnostics"][0]["diagnostic"] == stored
+    assert "| state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 0 |" in report_of(export)
+    assert not log_path(root).exists()
 
 
 def test_c40_declaring_nothing_says_there_is_nothing_more_and_the_diagnostic_is_kept_redacted(tmp_path, monkeypatch):
@@ -389,18 +415,18 @@ def test_c40_the_processs_secrets_stay_redacted_when_record_run_is_given_an_envi
     assert "[redacted]" in row["diagnostic"]
 
 
-def test_c40_an_undeclared_executor_whose_record_run_has_an_environment_of_its_own_still_redacts_the_processs_secrets(
+def test_c40_an_executor_that_declared_and_gave_record_run_an_environment_of_its_own_keeps_the_processs_secrets_out(
     tmp_path, monkeypatch
 ):
-    """C40: `record_attempt` installs on the log a redactor built from the environment `record_run` is given and says
-    the context is whole; the diagnostic of an error raised after it is redacted with the runner's own base too (the
-    process, the models, the registry), so it is never redacted against a partial list, declared or not."""
+    """C40: declared, and `record_attempt` then installs on the log a redactor built from the environment `record_run`
+    is given: the diagnostic of an error raised after it is still redacted with the runner's own base too (the
+    process, the models, the registry), so it is never redacted against the shorter list of the two."""
     credential = "process_credential_5678"
     monkeypatch.setenv("EXAMPLE_API_KEY", credential)
 
     async def executor(request):
-        script = [ModelTurn("done", [], 10, 5, "stop", 0.0)]
-        request.backend.use(script)
+        request.declare_secrets()
+        request.backend.use([ModelTurn("done", [], 10, 5, "stop", 0.0)])
         config = FakeExecutor().config
         await record_run(request, [], "s", "u", config, code=dict(CODE), environ={"UNRELATED": "nothing"})
         raise InfraError("sandbox", "post-run check refused", diagnostic={"seen": f"it quoted {credential}"})
@@ -414,3 +440,34 @@ def test_c40_an_undeclared_executor_whose_record_run_has_an_environment_of_its_o
         export = export_run_state(scheduler.store)
     assert json.loads(row["diagnostic"])["diagnostic"] == {"seen": "it quoted [redacted]"}
     assert credential not in json.dumps(where_it_is_kept(row, marker, export))
+
+
+def test_c40_record_run_alone_is_not_a_declaration_so_an_error_after_it_is_withheld_too(tmp_path):
+    """C40: only `declare_secrets` shows a diagnostic in the export: an executor that built the attempt's context
+    through `record_run` but never declared has its diagnostic withheld, as one that failed before `record_run` does."""
+
+    async def executor(request):
+        request.backend.use([ModelTurn("done", [], 10, 5, "stop", 0.0)])
+        await record_run(request, [], "s", "u", FakeExecutor().config, code=dict(CODE), secrets=[SECRET])
+        raise InfraError("sandbox", "post-run check refused", diagnostic={"seen": f"it quoted {SECRET}"})
+
+    with build(
+        tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+    ) as scheduler:
+        scheduler.run()
+        row = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
+    # an error raised after `record_run` names no instrument and no phase: nothing but that it was withheld, and why
+    assert json.loads(row["diagnostic"]) == {"ok": False, "error": "Withheld", "why": WITHHELD}
+
+
+def test_c40_a_refused_declaration_is_not_a_declaration_so_the_diagnostic_is_withheld(tmp_path):
+    """C40: a declaration refused for a secret too short to redact leaves the executor undeclared: when it catches the
+    refusal and goes on, a failed start's diagnostic is withheld, as for an executor that never declared."""
+
+    def declare(request):
+        with pytest.raises(ConfigError):
+            request.declare_secrets(secrets=["zq"])
+
+    row, marker, export = run_failing_start(tmp_path / "out", declare)
+    assert json.loads(row["diagnostic"])["error"] == "Withheld"
+    assert not any(SECRET in text for text in where_it_is_kept(row, marker, export).values())
