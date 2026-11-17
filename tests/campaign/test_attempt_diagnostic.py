@@ -23,7 +23,7 @@ from expcore.campaign.gate import Budget
 from expcore.campaign.markers import MARKER_NAME, AttemptResult, read_marker, write_marker
 from expcore.campaign.model_usage import usage_of
 from expcore.campaign.selection_ledger import Pricing
-from expcore.campaign.start_diagnostic import EXPORT_KEY, LIMIT_BYTES, snapshot_of
+from expcore.campaign.start_diagnostic import EXPORT_KEY, LIMIT_BYTES, WITHHELD, snapshot_of
 from expcore.errors import CORE_KINDS, InfraError
 from expcore.loop.outcomes import Outcome
 from expcore.records.instruments import start_instruments
@@ -69,6 +69,27 @@ def keys_of(manifest):
 
 def test_c40_a_failed_start_with_a_diagnostic_is_kept_with_its_instrument_and_phase():
     assert snapshot_of(failed_start(), plain()) == STARTED
+
+
+def test_c40_a_diagnostic_is_withheld_when_the_redaction_context_is_not_known_to_be_whole():
+    """C40: never a diagnostic redacted against a partial list of the run's secrets: when the executor has not told the
+    core its secrets (and `record_attempt` has not given the whole context), the snapshot keeps the phase and the
+    instrument and says why it holds no evidence."""
+    kept = snapshot_of(failed_start(), plain(), complete=False)
+    assert kept == {
+        "phase": "start",
+        "instrument": "state_inducer",
+        "ok": False,
+        "error": "Withheld",
+        "why": WITHHELD,
+    }
+    assert "declare_secrets" in kept["why"]
+    assert json.dumps(SEEN) not in json.dumps(kept)
+
+
+def test_c40_a_failed_start_with_nothing_to_redact_is_kept_whatever_the_context():
+    """C40: an instrument that gave no diagnostic has nothing to redact: the phase and the instrument are kept."""
+    assert snapshot_of(failed_start(None), plain(), complete=False) == {"phase": "start", "instrument": "state_inducer"}
 
 
 def test_c40_a_failed_start_without_a_diagnostic_is_kept_as_the_instrument_that_failed():
@@ -199,6 +220,7 @@ def run_failing(root, diagnostic=SEEN):
     export."""
 
     async def executor(request):
+        request.declare_secrets()  # nothing more than the environment's: the redaction context is whole
         start_instruments([Inducer(diagnostic)], {"run_key": request.run_key})
 
     with build(
@@ -260,6 +282,7 @@ def test_c40_an_induction_that_failed_before_any_request_keeps_its_diagnostic_an
     measured attempt of 0 tokens and 0 dollars, never as a bound or as unknown."""
 
     async def executor(request):
+        request.declare_secrets()
         start_instruments([Inducer()], {"run_key": request.run_key})
 
     settings = settings_for(max_attempts=1, budget=Budget(max_usd=50.0))
@@ -308,6 +331,7 @@ def test_c40_a_secret_registered_before_a_failed_start_is_redacted_from_its_diag
     token = "minted-at-run-time-0123456789"
 
     async def executor(request):
+        request.declare_secrets()
         register_secret(token)
         start_instruments([Inducer({"seen": f"refused {token}"})], {"run_key": request.run_key})
 
