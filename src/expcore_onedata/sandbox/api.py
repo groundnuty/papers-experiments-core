@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
+from expcore_onedata.addresses import AddressMap
 from expcore_onedata.sandbox.gatepolicy import PAGED
 
 
@@ -52,18 +53,31 @@ class SecretLike(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class Endpoint:
-    """A host the sandbox reaches through the gate or the mount: name, port and whether it speaks TLS."""
+    """A host the sandbox reaches through the gate or the mount: name, port and whether it speaks TLS.
+
+    `address`, when the platform's `[addresses]` map holds the name (O73), is where to connect: the name is a layout's
+    declared one, which resolves nowhere, and stays what the handshake asks for and the certificate is checked
+    against. It is never the cell's to see: the gate and the mount dial it, no file or variable of a cell holds it."""
 
     host: str
     port: int
     tls: bool = True
+    address: str | None = dataclasses.field(default=None, repr=False)
+
+    @property
+    def dial(self) -> str:
+        """Where a connection to this endpoint goes: its mapped address, or else its host."""
+        return self.address or self.host
 
     @classmethod
-    def from_url(cls, url: str) -> "Endpoint":
-        """The endpoint of a configured URL (scheme, host and perhaps a port: `config.py` guarantees nothing else)."""
+    def from_url(cls, url: str, addresses: AddressMap | None = None) -> "Endpoint":
+        """The endpoint of a configured URL (scheme, host and perhaps a port: `config.py` guarantees nothing else), and
+        with the platform's address map the address its host is dialled at, when the map holds the host."""
         parts = urlsplit(url)
         tls = parts.scheme == "https"
-        return cls(parts.hostname or "", parts.port or (443 if tls else 80), tls)
+        host = parts.hostname or ""
+        address = addresses.address_of(host) if addresses is not None else None
+        return cls(host, parts.port or (443 if tls else 80), tls, address)
 
 
 @dataclasses.dataclass(frozen=True)

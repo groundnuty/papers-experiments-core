@@ -208,6 +208,7 @@ if [[ " $* " == *" --writable "* ]]; then
   # FAKE_RUN_ARGS: record the service's argv, one word per line, and end at once (the bind tests, O57)
   if [[ -n ${FAKE_RUN_ARGS:-} ]]; then printf '%s\n' "$@" > "$FAKE_RUN_ARGS"; exit 0; fi
   R=${*: -2:1}; W=${R%/rootfs}
+  if [[ -n ${FAKE_SERVICE_ARGS:-} ]]; then printf '%s\n' "$@" > "$FAKE_SERVICE_ARGS"; fi   # how the service was started
   for f in stop-requested service-verified rootfs/root/service-ready.lock; do
     if [[ -e $W/$f ]]; then echo "present $f" >> "$FAKE_LOG"; else echo "absent $f" >> "$FAKE_LOG"; fi
   done
@@ -250,6 +251,8 @@ while i < len(args) - 1:
         i += 2
     else:
         i += 1
+if os.environ.get("FAKE_CURL_LOG"):  # every call's arguments, for a test of what a script dialled
+    open(os.environ["FAKE_CURL_LOG"], "a").write(" ".join(args) + "\n")
 state = json.load(open(os.environ["FAKE_CURL_STATE"]))
 creds = None
 if cfg:
@@ -290,7 +293,7 @@ if url.endswith(":8443/api/v3/onezone/configuration"):
 if url.endswith(":8443/api/v3/onezone/user"):
     reply(200 if creds and creds[0] == "admin" else 401, {"userId": state["adminUserId"]})
 if url.endswith(":8443/api/v3/onezone/user/tokens/named") and method == "POST":
-    reply(200 if creds and creds[0] == "admin" else 401, {"token": state.get("token", "token-1")})
+    reply(200 if creds and creds[0] == "admin" else 401, {"token": state.get("token", "minted-registration-token")})
 if url.endswith(":9443/api/v3/onepanel/provider/storages") and method == "GET":
     reply(200, {"ids": ["storage-1"]})
 reply(599, {"unexpected": url})

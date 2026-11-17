@@ -203,6 +203,7 @@ providers.hazel = {{ url = "https://@hazel_host@:@port@", id = "@hazel_id@" }}
 credentials.admin = {{ env = "@admin_env@" }}
 credentials.users = {{ directory_env = "@users_env@" }}
 tls = {{ ca_file = "@root@/ca/federation-ca.pem" }}
+addresses = {{ file = "address-map.json", resolver = "toolshim/resolve_launch.py" }}
 
 [tokens]
 margin_s = 6000
@@ -310,8 +311,14 @@ DOCKER = {
     "manifests/other.json": MANIFEST.replace("read_file", "stat_file"),
     "data-manifests/alpha.json": DATA,
 }
+# the file `up` writes (mode 0600) and `[addresses]` names (O73)
+ADDRESS_MAP = json.dumps(
+    {"format": "expcore-address-map/1", "hosts": {"aspen.invented.test": {"address": "192.0.2.10"}}}
+)
 APPTAINER = {
     "platform.toml": APPTAINER_PLATFORM,
+    "address-map.json": ADDRESS_MAP,
+    "toolshim/resolve_launch.py": "# the resolve launcher, invented\n",
     "data-manifests/alpha.json": DATA,
     "data-manifests/beta.json": DATA,
     "data-manifests/other.json": OTHER_DATA,
@@ -356,6 +363,8 @@ def render(template: dict, root: Path, values: dict, ca: bytes) -> Path:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+        if name == "address-map.json":
+            path.chmod(0o600)  # the platform layer reads no map that others can read
     (root / "ca").mkdir(exist_ok=True)
     (root / "ca" / "federation-ca.pem").write_bytes(ca)
     (root / "fault-journal").mkdir(exist_ok=True)
@@ -556,6 +565,7 @@ C35 = (
     "how a reset reaches a state it then verifies, or how many requests are in flight, and no reading's result: "
     "recorded and compared at every resume (C35)"
 )
+ADDRESSES = "one federation's own paths: the map of its declared names' addresses and the launcher that reads it (O73)"
 USER = "a platform user's name (O12): who holds a plane is the federation's; what it may do is its condition's rights"
 
 OUT = {
@@ -590,6 +600,8 @@ OUT = {
     "sandbox.federation.network": PER_FEDERATION,
     "sandbox.federation.zone": PER_FEDERATION,
     "sandbox.federation.providers": PER_FEDERATION,
+    "addresses.file": ADDRESSES,
+    "addresses.resolver": ADDRESSES,
     "sandbox.apptainer.apptainer": HOST,
     "sandbox.apptainer.image": PATH,
     "sandbox.apptainer.host_python": HOST + " (the node's interpreter for the gate, as the driver's own is)",

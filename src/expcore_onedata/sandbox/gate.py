@@ -17,7 +17,7 @@ in argv[1]:
    "upstream_ca_file": "/etc/gate/federation-ca.pem", "tls_dir": "/etc/gate/tls",
    "listing": "paged|complete", "peer_uid_check": false,
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
-                        "port": 443, "tls": true}},
+                        "port": 443, "tls": true, "dial": "<address to connect to>"}},
    "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
 
 `peer_uid_check` (true or false, false when absent; anything else refuses the start) is for a node whose loopback other
@@ -280,6 +280,9 @@ def _upstream_ctx(verify: bool) -> ssl.SSLContext:
 
 
 def _upstream_conn(h: dict) -> http.client.HTTPConnection:
+    """A connection to the host's upstream: `addr` is the name the handshake asks for, the certificate is checked
+    against and the request's `Host` names; `dial`, when the host has one, is the address the TCP connection goes to
+    (O73: `addr` is then a declared name that resolves nowhere)."""
     if h.get("tls", True):
         conn = http.client.HTTPSConnection(
             h["addr"],
@@ -290,6 +293,11 @@ def _upstream_conn(h: dict) -> http.client.HTTPConnection:
     else:
         conn = http.client.HTTPConnection(
             h["addr"], h.get("port", 80), timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT)
+        )
+    dial = h.get("dial")
+    if dial:  # the connection's own hook for making its socket: the name stays the host, the address is where it goes
+        conn._create_connection = lambda address, timeout, source: socket.create_connection(
+            (dial, address[1]), timeout, source
         )
     conn.connect()
     conn.sock.settimeout(READ_TIMEOUT)  # short connect, then a read timeout that outlasts the client's
@@ -402,16 +410,23 @@ SERVED_PORT = 443  # where a client of the gate dials every name it serves: the 
 def _as_served(text: str, name: str, hcfg: dict) -> str:
     """The text of a failure as the gate's answer gives it to its client: the host it dialled upstream (`addr`, and
     `addr:port`), which a certificate's name mismatch quotes, named as the client knows it, by the name the gate
-    serves on 443 (O69). A gate whose name is the host it dials (Docker's) gives the text unchanged; the log's line
-    keeps the text as it was."""
-    addr = str(hcfg.get("addr") or "")
-    if not addr or addr.lower() == name.lower():
-        return text
+    serves on 443 (O69), and the address it connected to (`dial`, O73) by that name too. A gate whose name is the host it
+    dials (Docker's) gives the text unchanged; the log's line keeps the text as it was.
+
+    A host that is the served name itself but is dialled at a mapped address (O73: the URL's host is the declared name)
+    needs no replacement, yet its port is the nodes' public one, so `name:port` still becomes `name:443`."""
     port = hcfg.get("port", 443 if hcfg.get("tls", True) else 80)
-    with_port = (f"[{addr}]:{port}", f"{addr}:{port}")
-    dialled = re.compile("|".join(re.escape(form) for form in (*with_port, addr)), re.IGNORECASE)  # one pass
-    return dialled.sub(lambda m: f"{name}:{SERVED_PORT}" if m.group(0).lower() in {f.lower() for f in with_port}
-                       else name, text)  # fmt: skip
+    named = name.lower()
+    hosts = [h for h in dict.fromkeys(str(hcfg.get(key) or "") for key in ("addr", "dial")) if h]  # O73: `dial` too
+    bare = [h for h in hosts if h.lower() != named]  # the name itself is not replaced by itself
+    ported = bare + ([name] if hcfg.get("dial") and any(h.lower() == named for h in hosts) else [])  # O73: its port is
+    if not ported:
+        return text
+    with_port = tuple(form for h in ported for form in (f"[{h}]:{port}", f"{h}:{port}"))
+    forms = sorted((*with_port, *bare), key=len, reverse=True)  # the longest first: a host's own port goes with it
+    dialled = re.compile("|".join(re.escape(form) for form in forms), re.IGNORECASE)  # one pass
+    held = {f.lower() for f in with_port}
+    return dialled.sub(lambda m: f"{name}:{SERVED_PORT}" if m.group(0).lower() in held else name, text)
 
 
 _LOST = (
