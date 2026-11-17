@@ -1,6 +1,8 @@
 """Frozen tool manifests: the file format, the comparison with a live server's tools, and the command line (L13)."""
 
 import json
+import os
+import stat
 import sys
 
 import pytest
@@ -8,6 +10,7 @@ import pytest
 from expcore.tools.manifest import FrozenManifest, ManifestError, diff, digest, main, mismatches
 
 SERVER = ["-m", "expcore_onedata.testing.fake_mcp_server"]  # the stand-in MCP server: its module, run with -m
+RECORDING = ["-m", "expcore_onedata.testing.fake_onedata_mcp"]  # the stand-in that records its start (FAKE_MCP_RECORD)
 
 
 def tool(name, description="d", schema=None):
@@ -131,3 +134,31 @@ def test_l13_the_variables_and_the_timeout_reach_the_server_and_the_rest_is_its_
 def test_the_command_line_needs_a_server_command(tmp_path, capsys):
     assert main(["check", str(tmp_path / "t.json")]) == 2
     assert "give the server command" in capsys.readouterr().err
+
+
+def test_o84_the_command_line_starts_the_server_in_a_new_empty_private_directory_each_time(
+    tmp_path, monkeypatch, capsys
+):
+    """O84: `freeze` and `check` start the server in a new, empty directory of mode 0700 of their own, not in the
+    driver's working directory, which here holds a `.env` the server must not find, and remove it once the server has
+    stopped; a second start is another directory. The server inherited the driver's before."""
+    driver = tmp_path / "driver"
+    driver.mkdir()
+    (driver / ".env").write_text("SOME_SETTING=1\n", encoding="utf-8")
+    monkeypatch.chdir(driver)
+    seen_file, out = tmp_path / "seen.json", tmp_path / "tools.json"
+    monkeypatch.setenv("FAKE_MCP_RECORD", str(seen_file))
+    monkeypatch.setenv("ONEDATA_MCP_TOOLS", "echo,add")
+    argv = ["--pass-env", "FAKE_MCP_RECORD", "--pass-env", "ONEDATA_MCP_TOOLS"]
+    directories = []
+    for action in ("freeze", "check"):
+        assert main([action, str(out), *argv, "--", sys.executable, *RECORDING]) == 0
+        seen = json.loads(seen_file.read_text(encoding="utf-8"))
+        assert seen["cwd_entries"] == []
+        assert seen["cwd_mode"] == oct(stat.S_IRWXU)
+        assert seen["cwd_uid"] == os.getuid()
+        assert os.path.realpath(seen["cwd"]) != os.path.realpath(driver)
+        assert not os.path.exists(seen["cwd"])
+        directories.append(seen["cwd"])
+        capsys.readouterr()
+    assert directories[0] != directories[1]
