@@ -35,6 +35,15 @@ def path(root: Path) -> Path:
     return Path(root) / STATE
 
 
+def relay_of(state: Dict[str, Any]) -> str:
+    """The fault relay's state as `up` recorded it once the relay beat (`serving`) or found none in its core (`none`);
+    `unrecorded` when the state has neither, as one written by an older up, or by an up that failed before the relay's
+    heartbeat, has none. The `relay` record (the client's pid, kept so `down` can end it) is no answer: it is written at
+    the relay's spawn, before its heartbeat."""
+    found = state.get("fault_relay")
+    return found if found in RELAYS else UNRECORDED
+
+
 def checked_workdir(value: str, node_tmp: str, kind: str) -> str:
     """A service's work directory as its log names it, accepted only as the bundle makes one: directly under the
     node's tmpfs, `hpcop-<oz|op>.XXXXXX`, no other path. `down` removes what it names, so nothing else may stand
@@ -95,24 +104,15 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
     excluded = state["allocation"].get("excluded_nodes")  # a count (O57): none in a state an older up wrote
     if excluded is not None and not (isinstance(excluded, int) and not isinstance(excluded, bool) and excluded >= 0):
         raise StateError(f"{STATE}: allocation.excluded_nodes is not a count")
+    if "fault_relay" in state and state["fault_relay"] not in RELAYS:
+        raise StateError(f"{STATE}: fault_relay is not one of {', '.join(RELAYS)}")
     sandbox = state.get("sandbox")
     if sandbox is not None:
         checked_sandbox(sandbox)
     if "data" in state:
         checked_data(state["data"])
     checked_shard_nodes(state.get("shard_nodes", []))
-    if "fault_relay" in state and state["fault_relay"] not in RELAYS:
-        raise StateError(f"{STATE}: fault_relay is not one of {', '.join(RELAYS)}")
     return state
-
-
-def relay_of(state: Dict[str, Any]) -> str:
-    """The fault relay's state as `up` recorded it once the relay beat (`serving`) or found none in its core (`none`);
-    `unrecorded` when the state has neither, as one written by an older up, or by an up that failed before the relay's
-    heartbeat, has none. The `relay` record (the client's pid, kept so `down` can end it) is no answer: it is written at
-    the relay's spawn, before its heartbeat."""
-    found = state.get("fault_relay")
-    return found if found in RELAYS else UNRECORDED
 
 
 def checked_data(data: Any) -> None:
