@@ -7,6 +7,7 @@ with that manifest, fails loudly on any difference and records a marker bound to
 `shards.py plan` and `lines` refuse a federation whose ingested spaces have no marker. Slurm is the fake of
 hpc_fed_support, the bootstrap and the space reads are stand-ins, and nothing reaches a cluster."""
 
+import contextlib
 import importlib.util
 import json
 import sys
@@ -486,6 +487,53 @@ def test_c06_a_core_rerun_that_cannot_compare_the_ingested_spaces_does_not_link_
         assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
     stays_bootstrapped(shards, tmp_path, fed, said, "its ingested spaces could not be compared with the layout", capsys)
     assert not any("/no/such/place" in line for line in said)
+
+
+def test_c06_a_core_rerun_with_another_platform_template_than_up_rendered_does_not_link_it_again(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: the layout's digest covers the layout file and not the platform template beside it. A template edited
+    since `up` (here by a comment; in the worst case so that no provider pair is left and no link check runs) is
+    rendered again by the rerun, which would then vouch for a render `up` never made: it stays `bootstrapped` and says
+    why, comparing the template with the hash `up` recorded in `render-identity.json`."""
+    fed = verified(hpc, tmp_path, ca)
+    template = fed.driver.spec.platform_template
+    template.write_text(template.read_text(encoding="utf-8") + "\n# edited since up\n", encoding="utf-8")
+    said: list = []
+    assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its platform template is not the one up rendered", capsys)
+
+
+def test_c06_a_core_rerun_with_no_render_identity_to_compare_does_not_link_it_again(hpc, shards, tmp_path, ca, capsys):
+    """C06, O63: a root whose render identity record is gone (or not a record) gives the rerun nothing to compare the
+    template with: it stays `bootstrapped`, in fixed words that name no path."""
+    fed = verified(hpc, tmp_path, ca)
+    (fed.root / "render-identity.json").write_text("[]", encoding="utf-8")
+    said: list = []
+    assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its platform template could not be compared", capsys)
+    assert not any(str(tmp_path) in line for line in said)
+
+
+def test_c06_up_does_not_say_linked_while_a_rerun_by_hand_holds_the_core_phase_lock(hpc, tmp_path):
+    """C06, O63: `up` says `linked` after its core phase has ended (under `[hpc] core = "step"` the node's step has
+    released the lock by then). A rerun by hand that started in that window reads the `bootstrapped` the step left and
+    is no relink, so `up`'s own write takes the lock too: refused while that rerun runs, `up` fails and the federation
+    stays `bootstrapped`, never `linked` over a rerun whose link check has not ended."""
+    art = artifacts(tmp_path / "art")
+    fed = driver_over(hpc, tmp_path / "fed", study_layout(tmp_path / "layout"))
+    fed.site = site_env(tmp_path / "fed", art)
+    held, real = contextlib.ExitStack(), fed.driver.run_core
+
+    def core_then_a_rerun_starts() -> str:
+        out = real()
+        held.enter_context(fed.driver.store.core_phase())  # the rerun by hand, started once the step released the lock
+        return out
+
+    fed.driver.run_core = core_then_a_rerun_starts
+    with held, pytest.raises(RuntimeError, match=REFUSED):
+        fed.driver.up(hpc.settings.site_from_environment(fed.site))
+    assert phase(fed) == "bootstrapped"
 
 
 def test_c06_a_core_rerun_whose_ingested_manifest_changed_since_up_does_not_link_it_again(
