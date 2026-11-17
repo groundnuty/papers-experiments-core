@@ -1,16 +1,19 @@
 """O56, O17, O34: a cell's bounds on the Apptainer backend, its time, its memory and its disk, and the one cause of a
 kill, from the harness's own evidence on a fake node."""
 
+import asyncio
 import time
 
 import pytest
 from apptainer_support import make_settings, start
-from fake_node import FakeNode
+from fake_node import FakeNode, Unrecorded
 
 from expcore.errors import InfraError
+from expcore.plugin import NO_WAITS
 from expcore_onedata.sandbox import bounds as BD
+from expcore_onedata.sandbox import completion, kinds
 from expcore_onedata.sandbox import deadline as DL
-from expcore_onedata.sandbox import kinds
+from expcore_onedata.sandbox.codetool import CodeExecutionProvider
 from expcore_onedata.sandbox.hostops import CmdResult
 
 
@@ -68,6 +71,32 @@ def test_a_process_that_outlives_its_kill_ends_the_run_as_kill_survived(node, bo
     with pytest.raises(InfraError) as refused:
         box.exec("print('next')", 30)
     assert refused.value.kind == "cell_unkillable"
+
+
+def test_o72_a_cell_that_outlived_its_kill_is_told_what_it_did_and_the_next_call_ends_the_run(node, box):
+    """O72, O34: through the code tool, as on Docker: the cell ran and hit its deadline, and a process of it outlived
+    the kill, so the run is over. The call is the cell's own, a timeout with the output it had kept and the killed
+    exec's check, never a raise in its place (the loop would record a call that ran as skipped); the next call is
+    the one refused, as `cell_unkillable`, naming the deadline of the cell."""
+
+    def stuck(cell):
+        cell.procs[1].unkillable = True
+        _until_dead(cell.procs[0])
+        time.sleep(0.2)
+        return Unrecorded(137, "partial output\n", "")
+
+    node.cell_handler = stuck
+    tool = CodeExecutionProvider(box)
+    told = asyncio.run(tool.execute("python", {"code": "read_a_dead_mount()"}, timeout_s=1.2, ctx=NO_WAITS))
+    assert (told.is_error, told.error_class) == (True, "timeout")
+    assert told.text == "partial output\nthe code did not finish within the time limit and was stopped"
+    assert told.exec_check == completion.UNKNOWN_FACTS
+    assert box.metadata()["cell_deadlines"][0]["cell"] == 1
+    with pytest.raises(InfraError) as refused:
+        asyncio.run(tool.execute("python", {"code": "print('next')"}, timeout_s=30, ctx=NO_WAITS))
+    assert refused.value.kind == "cell_unkillable"
+    assert "cell 1's deadline" in refused.value.detail
+    assert "sweep" not in refused.value.detail
 
 
 def test_a_cell_over_its_memory_limit_is_killed_by_the_watch_as_a_memory_limit(node, box):
