@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from campaign_support import NOW, finished, make_manifest, make_schema
+from root_evidence_support import make_root
 
 from expcore.campaign import out_snapshot
 from expcore.campaign.markers import write_marker
@@ -43,6 +44,8 @@ def plan_file(tmp_path, labels=LABELS):
     ]
     for label in labels:
         lines += ["[[shards]]", f'label = "{label}"', f'root = "{tmp_path / "fed" / label}"']
+        if not (tmp_path / "fed" / label).exists():  # the federation's root, with what a collect archives from it
+            make_root(tmp_path / "fed" / label)
     path = tmp_path / "shards.toml"
     path.write_text("\n".join(lines) + "\n")
     return path
