@@ -5,6 +5,7 @@ import asyncio
 import json
 
 import pytest
+from campaign_support import LATER
 from loop_support import FakeProvider
 from record_support import CODE
 from scheduler_support import FakeExecutor, build, models_for, settings_for
@@ -12,7 +13,8 @@ from scheduler_support import FakeExecutor, build, models_for, settings_for
 from expcore.campaign.after_loop import settle_usage
 from expcore.campaign.attempt_bounds import attempt_costs, bound_usd
 from expcore.campaign.executor import record_run
-from expcore.campaign.gate import Budget
+from expcore.campaign.export import export_run_state
+from expcore.campaign.gate import Budget, BudgetGate
 from expcore.campaign.interrupted_spend import BOUND, MEASURED
 from expcore.campaign.markers import MARKER_NAME, SPEND_BASES, AttemptResult, MarkerError, read_marker, write_marker
 from expcore.config.prices import Price
@@ -92,6 +94,23 @@ def test_c05_an_attempt_that_raises_after_its_loop_is_charged_its_measured_spend
     assert row["spend_basis"] == MEASURED
     assert (cost.usd, cost.bounded, cost.basis) == (pytest.approx(MEASURED_USD), False, None)
     assert cost.usd < bound
+
+
+def test_c05_the_measured_dollars_of_an_attempt_raised_after_its_loop_count_in_the_gate_and_the_export(tmp_path):
+    """C05: such an attempt is charged to no attempt count (it is set aside), but never to no money: what its replies
+    cost is part of the budget gate's spent figure, and its tokens are in the export's discarded usage, complete."""
+    executor = AfterItsLoop()
+    settings = settings_for(max_attempts=1, budget=Budget(max_usd=50.0))
+    with build(tmp_path / "out", plan=PLAN, models=TABLE, executor=executor, settings=settings) as scheduler:
+        scheduler.run()
+        store, limits = scheduler.store, scheduler.agent_config.limits
+        rows = store.q("SELECT state, charged, spend_basis FROM attempts")
+        assert {row["spend_basis"] for row in rows} == {MEASURED}
+        state = BudgetGate(store, {"m1": TABLE.resolve("m1")}, Budget(max_usd=50.0), limits).assess([], LATER)
+        assert state.spent_usd == pytest.approx(len(rows) * MEASURED_USD)  # not len(rows) * the bound
+        [cell] = [c for c in export_run_state(store)["discarded_usage"] if c["state"] == "infra_fail"]
+        assert (cell["attempts"], cell["usage_incomplete_attempts"]) == (len(rows), 0)
+        assert (cell["input_tokens"], cell["output_tokens"]) == (len(rows) * 9_000, len(rows) * 110)
 
 
 @pytest.mark.parametrize(
