@@ -23,7 +23,8 @@ message names an entry by its position (`spaces[1]`), never by its label, name o
 in this layer is named (O12). Loading refuses a label, name or id given twice, a local provider that differs between
 entries (the agent is pinned to one, O03), an entry without its data provider or with one that does not support its
 space, and a token plane scoped to no space. Whenever the `[[spaces]]` form is used, with one entry or several, its
-entries are in the campaign fingerprint (`PlatformConfig.fingerprint`); the one-space form's fingerprint is unchanged.
+entries are in the campaign fingerprint (`PlatformConfig.fingerprint`); the one-space form's space is in it by its
+support, name and prefixes (`support`, `runsettings.support_record`).
 
 **An imported storage** (`import`, in `[space]` or an entry of `[[spaces]]`; O41, `storageimport.py`). The space's data
 provider holds its files on a storage Onedata imported them from (25.0's storage import), not on one they were written

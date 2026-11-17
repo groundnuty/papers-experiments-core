@@ -3,7 +3,9 @@
 
     {"python": "3.12",
      "distributions": {"numpy": "2.5.4", "papers-experiments-core": "0.1.0", ...},
-     "sources": {"papers-experiments-core": {"kind": "vcs", "vcs": "git", "url": "https://...", "commit": "..."}}}
+     "sources": {"papers-experiments-core": {"kind": "core", "commit": "...", "tree": "...", "dirty": false,
+                                             "python_sha256": "..."},
+                 "toy-platform": {"kind": "vcs", "vcs": "git", "url": "https://...", "commit": "..."}}}
 
 The distributions are the core's and those the study names in `[study] requires` (a platform package, a backend),
 with everything they require, transitively: the closure of their `Requires-Dist` over what is installed, which is
@@ -15,14 +17,20 @@ requirement whose marker holds but that is not installed is left out too, since 
 installed beside the study and not required by it (a test runner, a linter, the installer itself) are not part of
 it, so a reader's fresh environment holds exactly these.
 
-`sources` names, for each distribution installed from a direct URL rather than an index (PEP 610 `direct_url.json`),
-where it came from: a version-control URL and commit, an archive URL and hash, or a local directory. A local path is
-never kept (it names the machine), nor are credentials, a query or a fragment of a URL. A distribution installed from
-an index has no entry. An editable install's version does not change when its checkout does, so its entry also holds
-`python_sha256`, a digest of the Python source it imports from: every `*.py` below the directories its `.pth` files
-put on the path (or below its project directory when it has none), by path relative to that directory and content,
-never by where the checkout lies. Editing the checkout or swapping it for another changes the environment. An
-anonymised replication package drops `sources` altogether.
+`sources` names the core by its code, whatever way it was installed: its commit, its git tree, whether that tree was
+dirty and a digest of its Python source (`provenance.core_identity`), read from its checkout or from the identity its
+build wrote into it. The core is 0.1.0 at many commits with the same dependencies, so a version, or a directory
+install's entry, would name no code, and one commit installed editable and from a git URL would record two entries.
+A store recorded before this keeps the core's entry in the earlier form, by how it was installed (`earlier_core`).
+
+For every other distribution, `sources` names, for each one installed from a direct URL rather than an index (PEP 610
+`direct_url.json`), where it came from: a version-control URL and commit, an archive URL and hash, or a local directory.
+A local path is never kept (it names the machine), nor are credentials, a query or a fragment of a URL. A distribution
+installed from an index has no entry. An editable install's version does not change when its checkout does, so its entry
+also holds `python_sha256`, a digest of the Python source it imports from: every `*.py` below the directories its `.pth`
+files put on the path (or below its project directory when it has none), by path relative to that directory and content,
+never by where the checkout lies. Editing the checkout or swapping it for another changes the environment. An anonymised
+replication package drops `sources` altogether.
 
 The campaign fingerprint holds the environment, so a resume under another one is refused (C06). The replay check
 records the environment it ran under, refused unless it is the campaign's, and the analysis refuses a check made
@@ -44,6 +52,8 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import url2pathname
 
 from packaging.requirements import InvalidRequirement, Requirement
+
+from expcore.provenance import core_identity
 
 CORE_DISTRIBUTION = "papers-experiments-core"
 _ROOT = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?:\[[A-Za-z0-9._,\s-]*\])?")
@@ -266,17 +276,52 @@ def closure(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Distri
     return set(_closure(requires, dists))
 
 
-def environment(requires: Iterable[str] = (), *, found: Mapping[str, metadata.Distribution] | None = None) -> dict:
+def environment(
+    requires: Iterable[str] = (),
+    *,
+    found: Mapping[str, metadata.Distribution] | None = None,
+    earlier_core: bool = False,
+) -> dict:
     """The environment of the core and the distributions `requires` names, as described above.
+
+    The core's source is the identity of the core this process runs (`core_identity.current`). With `earlier_core` it
+    is what a core before that recorded instead, from how the core was installed (`source_of`), which a store recorded
+    then is compared with (`is_earlier_form`).
 
     Raises EnvironmentUnknown when the core or a required root is not installed.
     """
     dists = installed() if found is None else found
     asked = _closure(requires, dists)
     versions = {name: str(dists[name].version) for name in sorted(asked)}
-    sources = {name: source for name in sorted(asked) if (source := source_of(dists[name])) is not None}
+    sources = {
+        name: source for name in sorted(asked) if (source := _source(name, dists[name], earlier_core)) is not None
+    }
     python = f"{sys.version_info.major}.{sys.version_info.minor}"
     return {"python": python, "distributions": versions, "sources": sources}
+
+
+def _source(name: str, dist: metadata.Distribution, earlier_core: bool) -> dict[str, Any] | None:
+    """A distribution's entry in `sources`: the core's identity for the core, unless asked for its earlier form."""
+    if name == CORE_DISTRIBUTION and not earlier_core:
+        return core_identity.current().entry()
+    return source_of(dist)
+
+
+def core_entry(env: object) -> Mapping[str, Any] | None:
+    """The core's entry in a recorded environment's `sources`; None when it has none or no `sources`."""
+    sources = env.get("sources") if isinstance(env, Mapping) else None
+    entry = sources.get(CORE_DISTRIBUTION) if isinstance(sources, Mapping) else None
+    return entry if isinstance(entry, Mapping) else None
+
+
+def is_earlier_form(env: object) -> bool:
+    """Whether a recorded environment holds the core in the earlier form, by how it was installed: it has `sources`
+    (an anonymised package's has none, and is no earlier form) and the core's entry there is absent or not the core's
+    identity (`core_identity.KIND`)."""
+    if not isinstance(env, Mapping) or not isinstance(env.get("sources"), Mapping):
+        return False
+    entry = core_entry(env)
+    return entry is None or entry.get("kind") != core_identity.KIND
 
 
 def _closure(requires: Iterable[str], dists: Mapping[str, metadata.Distribution]) -> dict[str, set[str]]:
@@ -341,8 +386,23 @@ def differences(recorded: object, current: Mapping[str, Any], *, sources: bool =
     if sources:
         before, after = recorded.get("sources", {}), current.get("sources", {})
         lines += [
-            f"{name} installed from another source than the one recorded"
+            _source_line(name, recorded, current)
             for name in sorted(set(before) | set(after))
             if before.get(name) != after.get(name)
         ]
     return lines
+
+
+def _source_line(name: str, recorded: Mapping[str, Any], current: Mapping[str, Any]) -> str:
+    """The line for a distribution whose source differs; for the core, what differs, never the commit itself."""
+    if name != CORE_DISTRIBUTION:
+        return f"{name} installed from another source than the one recorded"
+    if is_earlier_form(recorded) and not is_earlier_form(current):
+        return f"{name} recorded by how it was installed, as an earlier core recorded it, and by its commit in use"
+    if is_earlier_form(current) and not is_earlier_form(recorded):
+        return f"{name} recorded by its commit, and by how it was installed in use, as an earlier core recorded it"
+    was, now = core_entry(recorded) or {}, core_entry(current) or {}
+    changed = [key for key in ("commit", "tree", "dirty", "python_sha256") if was.get(key) != now.get(key)]
+    if not changed or is_earlier_form(recorded):
+        return f"{name} installed from another source than the one recorded"
+    return f"{name} is other code than the one recorded: its {', '.join(changed)} differ"

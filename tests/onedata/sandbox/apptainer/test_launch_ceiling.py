@@ -50,8 +50,8 @@ class Launcher:
         self.started = []
 
     @contextlib.asynccontextmanager
-    async def launch(self, ctx, condition, token, *, ceiling_s, extra_env=None, principal=None):
-        self.started.append(SimpleNamespace(condition=condition, ceiling_s=ceiling_s))
+    async def launch(self, ctx, condition, token, *, ceiling_s, extra_env=None, principal=None, process=None):
+        self.started.append(SimpleNamespace(condition=condition, ceiling_s=ceiling_s, process=process))
         yield "the run's tools"
 
 

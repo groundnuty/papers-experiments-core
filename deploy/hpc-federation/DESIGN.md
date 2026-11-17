@@ -88,6 +88,14 @@ sbatch --parsable --job-name=<name> --account --partition --no-requeue --time --
   its gate reaches the providers over the network, as it does in a component. Its steps take its own job id. The two
   jobs are scheduled apart, so the first can run, and bill, while the second waits (bounded as the first), and a
   partition that allows one submitted job per user (reason 5 above) refuses the second.
+- **On a site whose switch plugin gives each job a virtual network identifier, `separate` is the placement to start
+  from** (the second live slot, 16 Nov 2026). There a heterogeneous job's steps on component 0 failed from a point on
+  (`srun: error: task 0 launch failed: Error configuring interconnect`: after the zone and five providers had started,
+  every further step on a service node, so `up` failed at the first provider's registration); a step on component 1
+  ran, and so did the same steps in a job of one component in two earlier runs. With `separate` the services' job has
+  one component. The cause is not established (a count of steps per component, or exhausted identifiers), and the
+  placement was not run live on such a site. The other way round it is a site setting, section 3: `HPC_STEP_NETWORK`.
+  Neither changes a default.
 - **The last resort, a uniform shape sized for S, is not built:** it bills every node at S's shape (below).
 - **S never shares a node with a service:** a component, or a job, placed on a node another holds fails `up`, that
   job cancelled before any step.
@@ -100,6 +108,61 @@ What it bills, with the pilot shape (six service nodes of 5 cores and 11 GB) and
 | `het` or `separate`, S = 11 cores, 18 GB (an 8-core agent) | 33 | 11 | 44 |
 | uniform at 9 cores, 18 GB | 7 × 9 = 63 | (one of the 7) | 63 |
 | uniform at 11 cores, 18 GB | 7 × 11 = 77 | (one of the 7) | 77 |
+
+### A fleet: N federations, one shard on each
+
+A campaign's #154 shards run in parallel, **one shard per federation and one federation per held job**, as many at
+once as the operator allows (`fleet.py`, `fleetrecord.py`, `fleetplan.py`; README, "A fleet of federations"). A
+federation stays what it is above: the fleet is `hpcfed.py up` and `down` run N times, plus `shards.py`'s lines,
+under one record. One federation's job failing ends one shard's step, never another's.
+
+- **How many.** `HPC_FLEET_MAX` in `site.env` is the operator's maximum of federations at once in one fleet, set by
+  the grant and the scratch inode quota; unset refuses. `up N` past it is refused before anything is made; `add K`
+  counts every federation that may still hold a job (a failed `up` may, until its `down`). The inode guard
+  (`hpcquota.guard`, section 11, mandatory with a scratch root) is asked once for N: N concurrent ups would each read the same usage and pass
+  alone, so the fleet reads it against N times one federation's estimate. `HPC_FLEET_PARALLEL` (1 by default) is how
+  many ups or downs run at once.
+- **One process per federation.** A federation's driver changes process-wide state (the umask its secrets are written
+  under), so each `up` and `down` is `hpcfed.py` in a child of its own, with `-I`, from the fleet's 0700 directory,
+  its output in `<fleet>/logs/<label>.<command>.log`. One that fails is reported; the others go on.
+- **The agent's node is a job of its own** (`sandbox_placement = "separate"`). On the site's Slurm, new steps on a
+  heterogeneous job's component 0 failed with an interconnect error once the services had started (a live slot, 16
+  Nov 2026), so the fleet refuses a layout that holds the agent's node as a component. A shard's step then lands in a
+  job of one component and names no `--het-group`.
+- **Names and roots, derived.** Federations are `fed-1` ... `fed-N` and shards `shard-1` ... `shard-N`, from their
+  places, never a site value; each federation's job name is its own `up`'s (`hpcop-<project>-<random>`). Its root is
+  `<fleet>/fed-k/root`, made by an exclusive `mkdir` inside a slot made the same way, so the fleet never adopts a
+  directory; the fleet's own directory is made the same way.
+- **The record (`fleet.json`) is the only list.** Each change is written whole, under its lock, before the action it
+  enables: a federation is recorded before its slot is made, and its root's device and inode once made, so `down`
+  finds whatever `up` reached. The record accepts no root but `<fleet>/fed-k/root`. Nothing is ever found by a search,
+  so a federation another `up` made beside the fleet, in its directory or not, is never looked at.
+- **`down` takes down only what the fleet's `up` made.** Before each federation's `hpcfed.py down`, its root must be
+  the directory the fleet's `mkdir` made (device and inode, no link) and its state file the one that federation's `up`
+  wrote (its `command` names this root, its job name is the one recorded, its agent's job record is named as that
+  `up` names it, and every job id is the one the fleet recorded at its `up`); otherwise it is refused, untouched, and
+  named. The driver's own `down` then cancels its jobs by id and never one whose id now names another job
+  (section 5). A root an `up` never marked (refused in its preflight) is the fleet's empty `mkdir`, which hpcfed's
+  `down` refuses as unmarked: the fleet removes it with `rmdir`, which removes nothing else. Each is verified: the
+  child's exit status and the root gone.
+- **One campaign.** `plan` gives a shard only to a federation whose `up` finished (`linked`: each space's data read
+  back against its manifest, every link checked), whose identity is the fleet's, whose every space declares its data
+  (`data_manifest`, C06) and whose `PlatformConfig.fingerprint()` is the fleet's. The first plan sets that reference,
+  and refuses outright when the federations' fingerprints differ (naming each federation and the differing keys):
+  their shards would never merge (C29). `step` checks all of it again, and that `shards.toml` is the one the record
+  gives, before each launch: a line is never built from a manifest the fleet did not write. It then asks Slurm of the
+  job the line lands in: still known, running, and under the name its federation's `up` gave it, since Slurm reuses
+  ids and a job that ended may have handed its id to another. Each line runs with `--chdir=/`.
+- **Moving a shard (the coordinator's rule).** The shard count is fixed at the fleet's `up`. A shard whose federation
+  is taken down (`down --member`) is released, and given only to a federation brought up after (`add`), never one that
+  held a shard before, with the same checks and an equal fingerprint, its step started with `--resume` from its
+  snapshots or archive (O62). Its first reset there must be full. What the fleet can check is the platform file the
+  step carries into the study: it moves a shard only to a federation whose `platform.toml` leaves `[placement]
+  reset_shortcut` off (the default), under which every reset takes the full reads; one that turns it on is refused.
+  It cannot see a study's own request for one full reset (O51), so a study that turns the shortcut on moves no shard.
+- **Not built:** a fleet's `down` of a failed federation on its own (the operator decides when a failed `up`'s job
+  goes), a watch of each job's walltime, and a fleet across accounts (the maximum is one fleet's, not the account's:
+  two fleets of one account must share it by hand).
 
 ## 2. Sizing: service steps, control steps, and the node
 
@@ -146,8 +209,21 @@ sandbox_placement = "het"                # S as component 1 of a heterogeneous j
 
 ```
 srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name> --export=PATH \
-     [--output=<log>] /usr/bin/env -i <allowlist> <argv>        # stdin </dev/null unless it is the payload
+     [--network=<HPC_STEP_NETWORK>] [--output=<log>] /usr/bin/env -i <allowlist> <argv>  # stdin </dev/null unless the payload
 ```
+
+- **`--network=<value>` is on every step the driver launches when the site sets `HPC_STEP_NETWORK`** (empty by default:
+  no option, and the line is what it was). A control step, a service step, a teardown and a step in either component
+  of a heterogeneous job alike, since the site's switch plugin refused steps of component 0 while a step of component 1
+  ran.
+  The value is one option string of letters, digits and `_ . , = : + -` (at most 128, led by a letter or digit), checked
+  when `site.env` is read, again when the state file's `site` record is read, and again when the argv is made, so it
+  never carries a space or a shell character, and a record's value that is no string (a null, a false, a list) is refused
+  too, never read as none; a refusal names `HPC_STEP_NETWORK` and not the value. It is recorded in
+  the state file with the rest of the site, so `down` and the service verbs use it with no environment. The services
+  talk over TCP and need no virtual network identifier, which `no_vni` withholds; it is the value that ran live on
+  component 0 (section 9, item 6), and its effect on a whole `up` and on component 1 was not seen. The step line that
+  `shards.py lines` prints for a shard is the manifest's own and does not carry the option.
 
 - **The environment is an allowlist**, set on the node by `env -i`, so neither the login environment (srun passes it
   otherwise) nor a site task prolog decides it: `PATH` (`HPC_STEP_PATH` from `site.env`, by default
@@ -205,7 +281,9 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "command": ["<python>", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
-           "billing_weight": null},
+           "billing_weight": null, "step_network": "", "storage_root": "<scratch root, or empty>"},
+  "storage": {"root": "<the site's scratch root>", "parent": "<root>/<allocation name>", "token": "<32 hex>",
+              "providers": {"<provider name>": "<parent>/<provider name>"}},
   "allocation": {
     "name": "hpcop-<project>-<8 hex>",
     "job": "<id>",
@@ -252,6 +330,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   service verbs need no environment. **`command`** is this driver's argv prefix, which `platform.toml`'s `[faults]
   command` holds. **`clients`** are the detached srun clients of the service steps, by step name, which `down` ends
   once their steps are gone. **`owner`** is the job's uid and gid on the nodes (the posix storage's owner).
+- **`storage`** is `null` without a scratch root (`HPC_STORAGE_ROOT`, section 11), else the provider storage `up` makes
+  on scratch, recorded before the first `mkdir`; `down` reads its paths here and nowhere else.
 - **Read and changed through one store** (`hpclaunch.StateStore`): `read()` the whole file; `update(fn)` a
   read-modify-write under `hpc-federation.lock` in the root (`flock`), `fn` taking the state and returning the new one,
   written atomically. Two commands never interleave their writes.
@@ -273,8 +353,11 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 
 1. **Preflight**, touching nothing on the cluster: the layout and its `[hpc]` table; `site.env`'s keys; the root's
    rules and mark (as Compose); the two rootfs tarballs and their `.provenance`; the core's self-check; a shared
-   imported tree's variables and manifest (section 8). A root that holds a state file is refused: `down` first.
-2. **Submit** the held job: `sbatch --parsable --job-name=<allocation name> --account --partition --no-requeue
+   imported tree's variables and manifest (section 8); with a scratch root (`HPC_STORAGE_ROOT`), that root and the
+   inode guard (section 11). A root that holds a state file is refused: `down` first.
+2. **The provider storage** (only with a scratch root, section 11): the state file is created, then the federation's
+   own directory on scratch and one per provider, each by an exclusive `mkdir`, before any job exists.
+   **Submit** the held job: `sbatch --parsable --job-name=<allocation name> --account --partition --no-requeue
    --time --nodes --ntasks-per-node=1 --cpus-per-task --mem --chdir=/ --output=/dev/null --export=NONE --wrap 'exec sleep
    <seconds of --time>'`. **The read-back:** `scontrol show job -o <id>` must report what was asked (TimeLimit,
    Requeue=0, Account, Partition, NumNodes, NumCPUs, MinMemoryNode, JobName); otherwise `up` cancels that one job id
@@ -341,7 +424,13 @@ removed while held would let the next `up` or `down` lock another file of the sa
 
 0. **Stop the fault relay first** (`fault_relay stop --root <root>`, when the core has it), so no service verb launches
    a step while the federation goes down; a relay that will not stop is reported, and `down` goes on. Its directory
-   `<root>/fault-relay/` goes with the root.
+   `<root>/fault-relay/` goes with the root. The stop signals the relay by the pid and start tick of its heartbeat,
+   through a pidfd where the kernel has `pidfd_open` and, on a login node whose kernel has none (Linux before 5.3, which
+   answers ENOSYS), by the same start tick read just before an `os.kill`, so a pid another process took is never
+   signalled. On either path it signals only a process whose command line holds
+   `-m expcore_onedata.fault_relay serve --root <root>` in order, since the heartbeat is a file. A relay whose stop failed is ended as a
+   recorded client in step 4, and `down` checks it again only after that: it is reported unverified only if the second
+   stop still shows a heartbeat.
 1. Read the state file. A recorded job id whose job now carries another name is not ours (Slurm reuses ids): nothing
    is torn down or cancelled. When the id is missing, find the allocation by its name among this user's jobs
    (`squeue -u <user> -h -n <allocation name> -o %i`, an exact name holding `up`'s random part; a heterogeneous job,
@@ -367,7 +456,11 @@ removed while held would let the next `up` or `down` lock another file of the sa
    fails in 0 to 3 (a relay that will not stop, a failed `squeue`, a work directory the driver refuses), the job is
    still cancelled and every client ended; the failure is reported as unverified.** A cancel that fails is raised once
    every job was tried, the clients left (their steps may still run) and the root kept for a second `down`.
-5. Remove the root, as Compose's `down` does, **its marker last**. A file another process holds open becomes a
+5. **Remove the provider storage on scratch** (section 11), when the state records one: only here, once the job is
+   cancelled and gone, every client ended and every service verified clean (a `down` that could not verify one keeps the
+   storage, the root and the state), and while the state that names the storage still exists. A removal that fails keeps
+   the root and the state, the job cancelled all the same, and a second `down` finishes it.
+   Remove the root, as Compose's `down` does, **its marker last**. A file another process holds open becomes a
    silly-rename file, which only its holder's close removes: the removal never removes one, and waits up to 30 s in
    all for them to go. At the bound it fails, saying the job is gone, with the marker kept, so a second `down` finishes
    the removal. A root a removal left unmarked (empty, or of nothing but silly files, with its lifecycle lock beside
@@ -617,7 +710,14 @@ neither script: it starts no work, and it archives from the step's record.
    `scancel` ends component 1. **Found by it:** a step that names no `--het-group` is refused, component 0 included
    (section 1). Not seen yet: how `squeue -s -j <leader>` lists a step of component 0 (read as `<leader>.<n>` or
    `<leader>+0.<n>`), `scancel <component id>.<n>`, and `sacct -j <component id>` for a step's status. **The fallback
-   is a setting:** `sandbox_placement = "separate"`.
+   is a setting:** `sandbox_placement = "separate"`. **Found by the second live slot (16 Nov 2026), on a site whose switch
+   plugin gives each job a virtual network identifier:** in a heterogeneous job, every new step on component 0 failed
+   with `srun: error: task 0 launch failed: Error configuring interconnect` after the zone and five providers had
+   started, the first provider's token mint and delivery were cancelled in 0 s, and `up` failed at that provider's
+   registration; `--network=single_node_vni` failed the same way, `--network=no_vni` ran, and a step on component 1 ran.
+   The same steps ran in a job of one component in two earlier runs. Whether a count of steps per component or exhausted
+   identifiers is the cause is not established. Two settings go round it, neither the default: `HPC_STEP_NETWORK`
+   (section 3) and `sandbox_placement = "separate"` (section 1). Not seen: a whole `up` with either.
 
 ## 10. Who builds what
 
@@ -627,3 +727,136 @@ neither script: it starts no work, and it archives from the step's record.
 | M3 | the imported storage on the shared filesystem, read-only, in the provider's step | section 8 |
 | M4 | `hpcfed_control.py` (`stop`, `start`, `status`, `exec`, behind the hook); `teardown.sh --keep`, `restart.sh`, `exec.sh`, `status.sh`; the sweep's kept mark; the `"hpc"` backend of `[faults]` | sections 4 and 7 |
 | M5 | the agent's node's step and `[sandbox]` in the template (built: `hpcpins`, `shards.py`, O63); its node held by M1 as a heterogeneous job's component or a job of its own | sections 1, 4 and 8 |
+
+## 11. Provider storage on scratch, and the inode guard
+
+The cluster's shared scratch filesystem has room for a federation's data and a limited **inode** quota: a pilot-shape
+federation's data is about 17,500 files, and every federation of an account counts against one quota. With
+`HPC_STORAGE_ROOT` set in `site.env` (an invented `<scratch_root>/hpcop-storage`; `site.env.example`), `up` makes the
+federation's provider storage there, guards the quota before it submits anything, and binds each provider's own
+directory onto its posix storage, and `down` removes it. With none set nothing of this runs: each provider stores on its
+node's tmpfs, and `up` and `down` are what they were. The bind and the guard are built and tested offline; their live
+run is open.
+
+**The inode guard** (`hpcquota.py`; the preflight, before the root, the state or any job exists):
+
+1. Read the account's inode usage and quota through the command `site.env` names, `HPC_QUOTA_CMD`, split as a shell
+   would split it and **run without a shell** on the login node (bounded: 120 s), and read its output with
+   `HPC_QUOTA_PATTERN`, a regular expression with the named groups `used` and `quota`, which must match exactly once and
+   capture each figure whole: a figure the pattern cut out of a longer one (a `1000.5` read as `1000`, a `2G`, a `95%`, a
+   digit run on) is refused, so the characters touching a captured figure may not be a letter, a digit, `_`, `.`, `,`,
+   `+`, `-` or `%`.
+   The repository holds neither the site's tool nor its output: the tests run an invented command and an invented format.
+2. **Estimate** the federation's inodes from its data manifests: every space's manifest once, **files and directories**
+   (each is an inode). A shared import's manifest is its layout's own file; every other space's is the baseline `up`
+   writes (`hpcdata.declared` is the pure read of what `hpcdata.data_manifests` writes once the services are up, and one
+   test pins the two together). A shared import's owner adds nothing on scratch (its storage is the tree, read-only), but
+   the copy a mirror fetches does, so it counts once like every other space; a replica on every mirror is **not**
+   multiplied in (no multiplier is invented), and the 5% below the line is the room for what the estimate leaves out. For
+   the ingest layout (`pilot-shape.toml`) the estimate is a handful of files (its spaces declare no data: `baseline =
+   false`, or one small file), because the study's own ingest is in no manifest `up` knows; for the import layout
+   (`pilot-shape-import.toml`) it is the four imported manifests, about the pilot's 17,500.
+3. **Refuse** when `used + estimate > quota * 95 // 100`, in integers, so a total exactly at the line passes. The message
+   names the used count, the estimate, the quota and the 95% line.
+
+**It fails closed.** The guard refuses `up`, naming why, when: `HPC_QUOTA_CMD` or `HPC_QUOTA_PATTERN` is unset; the
+pattern does not compile or lacks `used` or `quota`; the command cannot run, exits non-zero or does not answer in time;
+the pattern matches the output never or more than once; a figure is no count (including `unlimited`) or is cut out of a
+longer one; the quota is 0.
+**The check is mandatory for a federation bound onto scratch.** `HPC_QUOTA_CHECK=off` with `HPC_STORAGE_ROOT` is
+refused as the site is loaded (`hpcsettings.checked_site`), naming the combination, and again by the guard itself for a
+site however it was built; any value other than `off` is refused at the start whatever else is set. Without a scratch
+root nothing lands on scratch, there is no check, and `off` changes nothing. A site that sets `HPC_STORAGE_ROOT` and
+names no command cannot `up`.
+
+**The directories** (`hpcstorage.py`): below `HPC_STORAGE_ROOT` (a directory only this user can write, owned by this user
+with no group or other write bit, named by its real path since the nodes bind through no link, which is neither the
+federation's root nor inside it, and is no shared tree and holds or lies inside none, since `down` removes below it and
+nothing may be written to a shared tree) `up` makes `<root>/<allocation name>` (0700; the name's random part is the
+allocation's) and in it one directory per provider (0700), each by an exclusive `mkdir`: anything already there refuses
+`up`, and is never adopted. Each directory holds the owner marker `.hpcop-storage-owner` (0600): the allocation's name and
+a random token the state file also holds, and a provider's directory's also names the provider. Each provider's
+directory also holds, beside its marker, the empty directory the provider stores in (`posix`, 0700), made after the
+marker so a failure there leaves a directory `down` can prove; the marker is outside what is bound, so the provider
+never sees it.
+A marker that cannot be written, for want of inodes, removes the empty directory just made. The state file records every path **before** the first `mkdir`, and the
+directories are made after the state exists and before the job is submitted, so a failure here leaves no job billing.
+
+**The bind** (`hpcstorage.provider_args`, `bundle/posixstorage.py`, `configure.sh`, `run_service`):
+
+- `up` gives each provider's batch script one more argument, last, `--storage=<its directory>/posix`, read from the
+  state's record checked whole (`hpcstorage.checked`): a step is never given another provider's directory or a path the
+  record does not name, and a state that names a scratch root and no record starts no provider (it never falls back to
+  tmpfs). The zone takes none. Without a scratch root the argument is absent and every step is what it was.
+- `configure.sh` takes it out of the peers and has `posixstorage.py prepare` check it: a plain absolute path of
+  characters that cannot end a bind option; of `up`'s form for this provider, `<…>/<allocation>/<provider>/posix`; no
+  link at any step of the path (so `up` refuses a scratch root that is not its own real path, before anything is
+  submitted); the bound directory, the provider's and the allocation's each a directory of this user, permission bits
+  0700 (a setgid bit, which a project's scratch passes down, is allowed), that this user can write; the provider's directory holding `up`'s marker that names this provider and this
+  allocation (a regular file of this user, never read through a link); neither inside nor holding the work directory;
+  empty; and not on node-local memory (the mount table: tmpfs or ramfs is refused, since the bind is there to keep the
+  data off the node). The rootfs's `/volumes/posix`, which the bind covers, must be a real directory holding nothing.
+  Only then is the path recorded in the work directory (`posix-storage`, 0600, `<provider><TAB><path>`, by a draft made
+  exclusively and replaced whole). A refusal fails the job, naming what was refused and never the path.
+- **Every start names its storage, from the state.** The first start's `run-node.sh` is given the job's own argument
+  (`provider.sbatch`), and every start again is given it by `hpcfed.py start`, which reads it from the state's record
+  checked whole (`hpcstorage.provider_args`; a state with a scratch root and no record, or an edited one, is refused
+  before anything is recorded or launched) and passes it to `restart.sh`. `run_service` binds the directory, writable,
+  onto `/volumes/posix` (`--bind <path>:/volumes/posix:rw`, after any shared import's read-only binds and before the
+  rootfs) only when the work directory's record names exactly that path: `posixstorage.py binds` checks it again (all
+  but the emptiness and the mount table, since after a first start it holds the provider's data). A record edited to
+  another directory (another federation's, whose marker would pass every other check), a record missing where a start
+  names a storage, and a record present where a start names none each stop the start before the service (`restart.sh`
+  refuses before it takes the work directory over): a provider is never started on another directory or on tmpfs
+  instead. A start that names none over a work directory with no record binds nothing, and the argv is word for word
+  what it was.
+- **Ownership and mode.** Setuid Apptainer without `--fakeroot` runs the cell's processes as the job's user, and
+  `finish.sh` declares the posix storage owned by that uid and gid (`rootUid`, `rootGid`), as on tmpfs, whose
+  `/volumes/posix` is a 0700 directory of the same user: a 0700 directory of this user is what the provider needs, and the
+  node's check refuses one that is not this user's (a uid that differs between the login node and the nodes included).
+- **The same storage in the cell, a different kind in the fingerprint.** The provider sees its storage at
+  `/volumes/posix` either way, so `finish.sh` adds the same `posix-local` storage and `platform.toml` names no storage
+  path. But where a provider stores its data shapes a run's I/O timing, and so possibly its time-cap outcomes, so the
+  rendered file declares the **kind**, `provider_storage = "tmpfs"` or `"shared_filesystem"` in `[sandbox.apptainer]`
+  (`hpcpins.values` fills `@hpc_provider_storage@` from whether `HPC_STORAGE_ROOT` is set: the word, never the root's
+  path): it is in `PlatformConfig.fingerprint` (`sandbox_backend`) and in every run's `backend` and
+  `infrastructure_facts`, so shards on tmpfs and on scratch can never merge by accident, and a test shows the two files
+  differ in that one line. A template that declares the sandbox without the line is refused by `up` before anything is
+  submitted, and the renderer reads the file it wrote back for it. The Compose federation has no such setting, and its
+  fingerprint is unchanged. The data check (`hpcdata.check`, O63) reads each space through its owner's REST, so it reads
+  the space where that provider stores it, on scratch; nothing of it changes.
+- **The work directory never reaches scratch.** The bind exists only in the container's mount namespace; on the node the
+  rootfs's `/volumes/posix` stays the empty mountpoint, so the teardown's removal of the work directory, the next job's
+  sweep of leftovers and the failure path's scrub never touch the storage. Only `down` removes it, from the login node,
+  once the provider has stopped.
+
+**`down` removes exactly what `up` made.** After the job is gone and every service verified clean (section 5, step 5):
+
+- the recorded `storage` must be, character for character, the form `up` writes: the site's recorded scratch root (normal,
+  absolute, not `/`), the allocation's own name below it, the owner token, and a directory of each provider of the layout
+  below that, nothing else. A state edited to name any other path is refused, before anything is touched;
+- the storage's own directory and each provider's are **opened without following a link, held open, and proved** (a real
+  directory of this user that holds this `up`'s marker for it) **before any is removed**, so a bad one stops the whole
+  removal. A directory already at the path when `up` ran (it refused it), one with no marker or another `up`'s, an
+  unrelated directory of this user put in a provider's place (the parent's marker proves nothing of its children), and a
+  link in a directory's place are not `up`'s: nothing is removed and `down` fails saying so, keeping the root and state;
+- each provider's directory is **emptied through its descriptor** (`hpcremove.remove_tree` on `/proc/self/fd/<n>`: never
+  through a link, a link inside is removed and its target never touched, a read-only directory made writable first), then
+  retired (its marker, then the directory by `rmdir` through its parent's descriptor; a failed `rmdir` puts the marker
+  back), then the storage's own directory the same way. A path swapped for a link or another directory after the proof is
+  never followed: the proved directory is the one emptied, and before each `rmdir` (which takes a name) the name is checked to be
+  the directory held (the same device and inode), else the directory keeps its marker, the replacement is left whole and `down` fails.
+  The scratch root must be this user's alone to write (`up` refuses one that is not, and `down` checks it again before removing
+  anything), since another user who could rename its entries could otherwise swap a directory in the instant before an `rmdir`. A concurrent change
+  inside the 0700 tree by this same user is not defended against. An entry in the storage's directory that `up` did not
+  make is kept with the marker, and fails `down` naming how many;
+- **what remains of the recorded paths is then counted** and any entry fails `down` loudly, naming the count (a removal
+  that raised nothing and left entries is caught there). `down` prints `provider storage: <n> directories removed, 0 entries
+  remain`.
+
+The removal is idempotent: a `down` cut short, or one that failed, is finished by the next (the marker goes only when
+nothing else is left, and is put back if the last `rmdir` fails). A `down` over a root with no state file removes
+nothing on scratch: there is no record of what `up` made. A state written before this key (no `storage`, no
+`storage_root`) goes down as it did; a state with the site's `storage_root` and no `storage` (the record deleted, or
+null) is **refused**, since `up` always records what it makes: nothing on scratch is removed and the root and state are
+kept.

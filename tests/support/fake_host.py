@@ -32,10 +32,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fake_elf import elf
+
 from expcore_onedata.sandbox import completion
 from expcore_onedata.sandbox.api import SandboxError
+from expcore_onedata.sandbox.containers import ONECLIENT_BIN
 from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_input
 from expcore_onedata.sandbox.inputs import PROBE_MARK
+from expcore_onedata.sandbox.oneclient_build import SLICE, SLICE_NAME
 
 VALUED = {
     "--name", "--network", "--label", "-l", "--user", "-u", "--cpus", "--memory", "--memory-swap", "--pids-limit",
@@ -48,6 +52,8 @@ CERTIFI_BUNDLE = "/usr/lib/python3/site-packages/certifi/cacert.pem"  # where th
 PID_NS = "pid:[4026531836]"
 ONECLIENT_CONFIG_PATH = "/etc/invented/oneclient.conf"  # where the fake oneclient image keeps the file its help names
 ONECLIENT_CONFIG_SHA256 = hashlib.sha256(b"an invented oneclient configuration file\n").hexdigest()
+ONECLIENT_VERSION_TEXT = "Oneclient: 25.0\nFUSE library: 3.2\n"  # what the fake oneclient image's `--version` prints
+ONECLIENT_BUILD_ID = "ab" * 20  # the GNU build id of the fake oneclient image's binary
 
 
 class Unrecorded(CmdResult):
@@ -217,6 +223,13 @@ class FakeHost:
         self.one_shots: list[FakeContainer] = []  # the `--rm` containers that were run, as they were labelled
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
+        # what a oneclient container answers the sandbox's two reads of its binary (`oneclient_build`, O65): its
+        # `--version`, and the file at ONECLIENT_BIN (bytes, or the whole result the read gets); the test's
+        # `exec_handler` never sees either
+        self.oneclient_version = CmdResult(0, ONECLIENT_VERSION_TEXT)
+        self.oneclient_binary: bytes | CmdResult = elf(
+            interp="/opt/invented/lib/ld.so", needed=("libc.so.6",), build_id=bytes.fromhex(ONECLIENT_BUILD_ID)
+        )
         self.pause_without_freezing = False  # a `docker pause` that answers 0 but leaves the cgroup unfrozen
         self.signal_handlers: dict[str, Callable[[FakeContainer], None]] = {}  # a signal the process handles and lives
         self.base_bundle = "BASE BUNDLE\n"
@@ -527,10 +540,27 @@ class FakeHost:
             return CmdResult(126, "", f"Error response from daemon: container {args[i]} is not running")
         if container.paused:
             return CmdResult(126, "", f"Error response from daemon: container {args[i]} is paused")
+        if container.image in self.oneclient_images and (read := self._oneclient_read(args[i + 1 :])) is not None:
+            return read
         boot = bootstrap_of(args[i + 1 :])
         if boot is None:
             return self.exec_handler(container, args[i + 1 :], stdin)
         return self._run_cell(container, args[i + 1 :], stdin or "", *boot)
+
+    def _oneclient_read(self, argv: list[str]) -> CmdResult | None:
+        """The answer to one of the sandbox's reads of its sidecar's oneclient, as `od -An -v -tx1` of the window prints
+        it (a missing file prints nothing); None for any other command."""
+        if argv == [ONECLIENT_BIN, "--version"]:
+            return self.oneclient_version
+        if len(argv) != 7 or argv[:4] != ["sh", "-c", SLICE, SLICE_NAME] or argv[6] != ONECLIENT_BIN:
+            return None
+        if isinstance(self.oneclient_binary, CmdResult):
+            return self.oneclient_binary
+        offset, size = int(argv[4]), int(argv[5])
+        window = self.oneclient_binary[offset : offset + size]
+        return CmdResult(
+            0, "".join(" " + " ".join(f"{b:02x}" for b in window[n : n + 16]) + "\n" for n in range(0, len(window), 16))
+        )
 
     def _run_cell(self, container: FakeContainer, argv: list[str], stdin: str, nonce: str, size: int, digest: str,
                   python: str) -> CmdResult:  # fmt: skip

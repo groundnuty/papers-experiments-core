@@ -73,12 +73,12 @@ def test_o41_a_bad_import_table_is_refused_at_load_naming_the_key_and_echoing_no
 
 def test_c06_an_imported_storage_enters_the_fingerprint_and_its_absence_leaves_the_old_one(tmp_path):
     """C06, O41: a resume after the data provider's storage changed kind is refused, so the declaration enters the
-    fingerprint: an entry's digest with several spaces, and a `storage_import` key in the one-space form, which keeps
-    its fingerprint unchanged without the key."""
+    fingerprint: an entry's digest with several spaces, and a `storage_import` key in the one-space form, which has
+    none without the key and differs from it in that key alone."""
     plain = load(tmp_path / "a").fingerprint()
-    assert plain == {"tls": {"mode": "verify"}}
+    assert "storage_import" not in plain
     imported = load(tmp_path / "b", one_space({"readonly": True})).fingerprint()
-    assert imported == {"tls": {"mode": "verify"}, "storage_import": {"readonly": True}}
+    assert imported == {**plain, "storage_import": {"readonly": True}}
     writable = load(tmp_path / "c", one_space({"readonly": False})).fingerprint()
     assert writable["storage_import"] == {"readonly": False}
     several = load(tmp_path / "d", lambda d: with_spaces(d, 2)).fingerprint()["spaces"]
