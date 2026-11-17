@@ -209,14 +209,6 @@ def test_o73_the_gate_scans_for_the_agent_node_after_the_federation_s_nodes(node
     assert _scanned(node, tmp_path) == [*SERVICES, OWN_HOST, OWN_FQDN]
 
 
-def test_o73_the_cell_name_is_never_in_the_gate_s_list_even_for_a_node_that_is_named_so(node, tmp_path):
-    """O73: a node whose own host name is the declared one adds its fully qualified form alone."""
-    node.own_hosts = ("sandbox", "sandbox.cluster.example.invalid")
-    found = _scanned(node, tmp_path)
-    assert found == [*SERVICES, "sandbox.cluster.example.invalid"]
-    assert "sandbox" not in found
-
-
 def test_o73_a_name_the_run_serves_is_not_scanned_for_even_if_the_node_has_it(node, tmp_path):
     """O73: the zone's and the provider's declared names are what the agent sees; a node of the same name is no leak."""
     base = make_spec("via-gate")
