@@ -16,6 +16,9 @@ COMMIT = "0123456789abcdef0123456789abcdef01234567"
 BASE = '"space_view", "space_read_data"'
 READ = '"space_view", "space_read_data", "space_view_transfers", "space_view_qos"'
 WRITE = '"space_view", "space_read_data", "space_view_transfers", "space_view_qos", "space_schedule_replication"'
+BASE_SET = {"space_view", "space_read_data"}
+READ_SET = {*BASE_SET, "space_view_transfers", "space_view_qos"}
+WRITE_SET = {*READ_SET, "space_schedule_replication"}
 READ_TOOLS = ["get_file_distribution", "list_space_providers", "get_transfer"]
 WRITE_TOOLS = [*READ_TOOLS, "schedule_file_replication"]
 
