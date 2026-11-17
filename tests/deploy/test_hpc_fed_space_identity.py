@@ -131,8 +131,12 @@ def shard_of(shards, tmp_path, fed):
     lines = [f'{k} = "{tmp_path / k}"' for k in ("study", "core_src", "results", "tmpfs")]
     python = standin_python(tmp_path / "venv", real_platform=True)
     lines += [f'python = "{python}"', 'step_path = "/usr/bin:/bin"', "cpus = 6", 'memory = "18g"']
-    for n in range(2):  # a campaign needs two shards; both are on `fed`, and only the first is read
-        lines += ["[[shards]]", f'label = "fed-{n}"', f'root = "{fed.root}"']
+    roots = (
+        fed.root,
+        tmp_path / "other" / "root",
+    )  # a campaign needs two shards, one root each; only the first is read
+    for n, root in enumerate(roots):
+        lines += ["[[shards]]", f'label = "fed-{n}"', f'root = "{root}"']
     (tmp_path / "shards.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return shards.load_plan(tmp_path / "shards.toml").shards[0]
 
