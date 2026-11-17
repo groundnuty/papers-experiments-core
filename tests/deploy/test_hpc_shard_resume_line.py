@@ -222,6 +222,35 @@ def test_resume_line_refuses_a_mark_that_names_no_step(world):
     refused(world, "names no step")
 
 
+def declare_pass_env(world, names):
+    """The manifest, with `pass_env` declared (a top-level key: before the `[[shards]]`)."""
+    text = world.manifest.read_text(encoding="utf-8")
+    world.manifest.write_text(text.replace('memory = "17g"\n', f'memory = "17g"\npass_env = {json.dumps(names)}\n'),
+                              encoding="utf-8")  # fmt: skip
+
+
+def test_resume_line_pins_the_declared_variables_as_every_other_line_does(world, monkeypatch):
+    """O63: a manifest declaring `pass_env` has its resume line carry each name with the operator's value (an `env -i`
+    word) and `--pass-env NAME`, as `lines` prints them, so a resumed step is passed the same variables."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", "go-ahead")
+    world.snapshot(world.fingerprint())
+    line = flagged(world.line())
+    assert "FAULT_ACK_MODE=go-ahead" in line
+    assert line.count("--pass-env") == 1
+    assert line[line.index("--pass-env") + 1] == "FAULT_ACK_MODE"
+    assert "--resume" in line
+
+
+def test_resume_line_refuses_an_unset_declared_variable_before_it_records_anything(world, monkeypatch):
+    """O63: the operator's value is read before the job and node are recorded in the federation's state: a declared
+    variable that is unset refuses the line, naming it, and the state is as it was."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.delenv("FAULT_ACK_MODE", raising=False)
+    world.snapshot(world.fingerprint())
+    refused(world, "FAULT_ACK_MODE is not set")
+
+
 @pytest.mark.parametrize(
     ("change", "match"),
     [
