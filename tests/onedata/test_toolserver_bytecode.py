@@ -84,6 +84,11 @@ def plant(directory: Path) -> Path:
     return code
 
 
+def stand_in_args(code: Path) -> list[str]:
+    """The server's arguments that run the stand-in script: the resolve launcher wants one after the script's path."""
+    return [str(code / "stand_in.py"), "serve"]
+
+
 def bytecode_under(tree: Path) -> list[str]:
     """Every cache directory and compiled file under `tree`, as paths relative to it."""
     return sorted(str(p.relative_to(tree)) for p in tree.rglob("*") if p.name == "__pycache__" or p.suffix == ".pyc")
@@ -148,7 +153,7 @@ def test_o84_a_real_server_child_started_by_the_platform_writes_no_bytecode_into
     tree and leaves no `__pycache__` and no `.pyc` anywhere in it, with nothing inherited from the test's environment.
     (The launcher runs `-I -B` already, so the HPC case guards that; the Compose case is the one that wrote files.)"""
     code = plant(tmp_path)
-    config = platform(tmp_path, kind, [str(code / "stand_in.py")])
+    config = platform(tmp_path, kind, stand_in_args(code))
     with server_start(config, config.condition("read"), TOKEN) as begun:
         seen = run_child(begun.command, begun.args, begun.env, begun.cwd)
     assert seen == {"dont_write_bytecode": True, "word": "1"}
@@ -160,7 +165,7 @@ def test_o84_the_same_child_without_the_setting_does_write_bytecode(tmp_path):
     writes a `__pycache__` for what it imports, so the empty tree of that test is the setting's doing and not that the
     interpreter or the directory could not have written."""
     code = plant(tmp_path)
-    config = platform(tmp_path, "compose", [str(code / "stand_in.py")])
+    config = platform(tmp_path, "compose", stand_in_args(code))
     with server_start(config, config.condition("read"), TOKEN) as begun:
         env = {name: value for name, value in begun.env.items() if name != BYTECODE}
         seen = run_child(begun.command, begun.args, env, begun.cwd)
