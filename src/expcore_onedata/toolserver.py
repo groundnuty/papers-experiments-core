@@ -63,9 +63,11 @@ executor has before the loop starts.
 
 The server's process. The MCP client spawns it as a child of the driver, in a session of its own, with the client's
 inherited variables of the driver's environment (`HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER`) beside the settings
-here, in the driver's working directory: on Docker that child is a process on the host, outside every container. A
-backend may name where it runs instead (`process`, an `api.ServerProcess`; the Apptainer backend's
-`tool_server_process`, O56): then its `HOME` and working directory are the backend's directory, its settings include
+here, in the launch's own empty directory (O84, above): on Docker that child is a process on the host, outside every
+container. A backend may name where it runs instead (`process`, an `api.ServerProcess`; the Apptainer backend's
+`tool_server_process`, O56): then its `HOME` and working directory are the backend's directory (a new one, mode 0700,
+which holds only the server's `TMPDIR`, so the working directory is as private and as free of a `.env` as the launch's
+own), its settings include
 the backend's (the run's tag), and its environment is named whole: the client's inherited variables that the settings do
 not set are unset by `env -u ... --` before the command, so nothing of the driver's reaches it but `PATH`, and no value,
 the token least of all, is ever an argument (`env -i` would need every value as one).
@@ -448,10 +450,9 @@ class ToolServerLauncher:
                 args,
                 frozen=chosen.manifest,
                 env=env,
-                cwd=None if process is None else process.home,
                 allowed_tools=chosen.allow,
                 start_timeout_s=server.start_timeout_s,
-                cwd=workdir,
+                cwd=workdir if process is None else process.home,  # the backend's own fresh home, 0700 (O56, O84)
             )
             async with ctx.infrastructure_wait(WAIT_KIND):
                 try:
