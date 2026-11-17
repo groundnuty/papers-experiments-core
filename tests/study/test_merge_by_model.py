@@ -283,13 +283,20 @@ def one_merged(base, clean_environment, one_shards) -> Campaign:
 
 
 def treatments(campaign: Campaign) -> list[tuple[str, str, str | None]]:
-    """The (condition, model, kind of fault) of each attempt the campaign scored as its condition's treatment."""
+    """The (condition, model, kind of fault) of each attempt the batch's export scored as its condition's treatment."""
     export = read(campaign, "export.json")
     return sorted(
         (entry["condition"], entry["factors"]["model"], entry["infra_kind"])
         for entry in export["analysed_attempts"]
         if entry["treatment"]
     )
+
+
+def shard_treatments(shard: Campaign) -> list[tuple[str, str, str | None]]:
+    """The same, from a shard's own store: a shard keeps its attempts there, and writes no export of its own."""
+    planned = {key: (condition, model) for key, condition, _, model in shard.planned()}
+    rows = shard.sql("SELECT run_key, infra_kind FROM attempts WHERE treatment = 1")
+    return sorted((*planned[row["run_key"]], row["infra_kind"]) for row in rows)
 
 
 def test_c32_with_one_priced_model_its_shard_ran_on_the_whole_budget_and_the_free_shards_on_none(one_shards):
@@ -305,7 +312,7 @@ def test_c32_with_one_priced_model_its_shard_ran_on_the_whole_budget_and_the_fre
         assert {json.loads(row["factors"])["model"] for row in rows} == {model}
         assert sorted(row["run_key"] for row in rows) == sorted(keys_of_shard(shard.root, index, 3))
         assert {row["status"] for row in rows} == {"done"}
-        assert treatments(shard) == [("relay-down", model, "knowledge")]
+        assert shard_treatments(shard) == [("relay-down", model, "knowledge")]
 
 
 def test_c32_one_priced_and_two_free_models_one_shard_each_merged_give_the_scores_and_analysis_of_one_driver(

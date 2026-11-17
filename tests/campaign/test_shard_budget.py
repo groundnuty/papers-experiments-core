@@ -85,10 +85,17 @@ def test_c32_the_parts_of_max_usd_never_sum_past_it_and_no_priced_shard_is_below
 
 
 def test_c32_a_max_usd_too_small_for_every_priced_shard_to_run_once_is_refused():
-    """C32: the five priced shards together need one run's reservation each."""
+    """C32: the five priced shards together need one run's reservation each; the refusal lists each of them with its
+    model, and not the two shards of the free model."""
     need = 3 * reserve("model-falcon") + 2 * reserve("model-heron")
-    with pytest.raises(ShardError, match=r"less than one run's reservation for each of the 5 shards of priced models"):
+    with pytest.raises(
+        ShardError, match=r"less than one run's reservation for each of the 5 shards of priced models"
+    ) as r:
         shard_budgets(Budget(need * 0.99), LAYOUT, plan(), MODELS, LIMITS)
+    assert str(r.value).endswith(
+        "The priced shards: shard 1 (model model-falcon), shard 2 (model model-falcon), shard 3 (model model-falcon), "
+        "shard 4 (model model-heron), shard 5 (model model-heron)"
+    )
 
 
 def test_c32_a_priced_shard_below_one_runs_reservation_is_refused_even_when_the_total_would_cover_every_shard():
@@ -249,19 +256,30 @@ def test_c32_in_the_one_priced_layout_the_free_shards_run_with_no_budget_and_the
 
 
 @pytest.mark.parametrize("way", FREE_WAYS)
-def test_c32_a_max_usd_below_one_runs_reservation_of_the_one_priced_model_is_refused(way):
+def test_c32_a_max_usd_below_one_runs_reservation_of_the_one_priced_model_is_refused_naming_its_shard_and_model(way):
     """C32: the one priced shard needs one run's reservation of `max_usd` before its first run; a total below it is
-    refused, with the count of priced shards and the reservation, and one a little above it is not: the shard holds all
-    of it. The refusal gives the figures and the count of priced shards; it does not name the model."""
+    refused, with the count of priced shards, the reservation, and the priced shard with its model, and not the free
+    ones; a total a little above it is not refused, and the shard holds all of it."""
     need = reservation_usd(one_priced(way)["model-falcon"], LIMITS)
     refusal = (
         r"\[budget\] max_usd .* less than one run's reservation for each of the 1 shards of priced models together "
         + re.escape(f"({need:.6f} USD)")
     )
-    with pytest.raises(ShardError, match=refusal):
+    with pytest.raises(ShardError, match=refusal) as refused:
         one_priced_parts(way, Budget(need * 0.99))
+    assert str(refused.value).endswith("The priced shards: shard 1 (model model-falcon)")
     barely = need * 1.01
     assert micro_usd(one_priced_parts(way, Budget(barely))[1]["max_usd"]) == micro_usd(barely)
+
+
+def test_c32_a_max_usd_below_the_reservations_of_two_priced_shards_is_refused_naming_both_and_not_the_free_one():
+    """C32: two priced models with one shard each, a free one between them: the refusal lists shards 1 and 3 with their
+    models, in index order, and not shard 2, which costs nothing and needs no reservation."""
+    layout = ModelShards((("model-falcon", 1), ("model-osprey", 1), ("model-heron", 1)))
+    need = reserve("model-falcon") + reserve("model-heron")
+    with pytest.raises(ShardError, match=r"for each of the 2 shards of priced models together") as refused:
+        shard_budgets(Budget(need * 0.99), layout, plan(), MODELS, LIMITS)
+    assert str(refused.value).endswith("The priced shards: shard 1 (model model-falcon), shard 3 (model model-heron)")
 
 
 @pytest.mark.parametrize("way", FREE_WAYS)
