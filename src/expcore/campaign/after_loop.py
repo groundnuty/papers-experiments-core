@@ -26,8 +26,11 @@ what it cost (C26). Anything else is incomplete, and the attempt is charged its 
   interrupted attempt is charged), but its whole bound, the figure it was reserved at;
 - a reply that was billed and could not be read, or one that left its input or output count out.
 
-Measured is never reported where the log cannot support it, and an attempt without a budget keeps no log, so it has no
-guard and never reaches here.
+Every cause the loop has for incomplete usage leaves such a log: a request given up or abandoned is one with no end
+entry, and a reply without a count or one that could not be read is a count missing or a reply not read. The log sees
+what the guard sees, the requests the core's recording makes; an executor that sends requests another way leaves them
+out of it, as of an interrupted attempt's. Measured is never reported where the log cannot support it, and an attempt
+without a budget keeps no log, so it has no guard and never reaches here.
 """
 
 import dataclasses

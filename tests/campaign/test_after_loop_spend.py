@@ -42,6 +42,10 @@ class AfterItsLoop:
     def leak(_executor):
         raise InfraError("sandbox", "a post-run guard found a leak in a tool answer")
 
+    @staticmethod
+    def crash(_executor):
+        raise ValueError("a crash in our own code after the loop")
+
     async def __call__(self, request):
         tool_round = ModelTurn("", [ToolCall("call_first", "look", {})], *TOOL_ROUND, "tool_calls", 0.0)
         request.backend.use([tool_round, ModelTurn("done", [], *ANSWER, "stop", 0.0)])
@@ -96,19 +100,23 @@ def test_c05_an_attempt_that_raises_after_its_loop_is_charged_its_measured_spend
     assert cost.usd < bound
 
 
-def test_c05_the_measured_dollars_of_an_attempt_raised_after_its_loop_count_in_the_gate_and_the_export(tmp_path):
-    """C05: such an attempt is charged to no attempt count (it is set aside), but never to no money: what its replies
-    cost is part of the budget gate's spent figure, and its tokens are in the export's discarded usage, complete."""
-    executor = AfterItsLoop()
+@pytest.mark.parametrize(("raises", "state"), [("leak", "infra_fail"), ("crash", "harness_error")])
+def test_c05_the_measured_dollars_of_an_attempt_raised_after_its_loop_count_in_the_gate_and_the_export(
+    tmp_path, raises, state
+):
+    """C05: such an attempt, an infrastructure failure or a harness defect (kept as a harness error, charged to no
+    attempt count), is never charged to no money: what its replies cost is part of the budget gate's spent figure,
+    and its tokens are in the export's discarded usage, complete."""
+    executor = AfterItsLoop(getattr(AfterItsLoop, raises))
     settings = settings_for(max_attempts=1, budget=Budget(max_usd=50.0))
     with build(tmp_path / "out", plan=PLAN, models=TABLE, executor=executor, settings=settings) as scheduler:
         scheduler.run()
         store, limits = scheduler.store, scheduler.agent_config.limits
         rows = store.q("SELECT state, charged, spend_basis FROM attempts")
-        assert {row["spend_basis"] for row in rows} == {MEASURED}
-        state = BudgetGate(store, {"m1": TABLE.resolve("m1")}, Budget(max_usd=50.0), limits).assess([], LATER)
-        assert state.spent_usd == pytest.approx(len(rows) * MEASURED_USD)  # not len(rows) * the bound
-        cells = [c for c in export_run_state(store)["discarded_usage"] if c["state"] == "infra_fail"]
+        assert {(row["state"], row["spend_basis"]) for row in rows} == {(state, MEASURED)}
+        state_of_gate = BudgetGate(store, {"m1": TABLE.resolve("m1")}, Budget(max_usd=50.0), limits).assess([], LATER)
+        assert state_of_gate.spent_usd == pytest.approx(len(rows) * MEASURED_USD)  # not len(rows) * the bound
+        cells = [c for c in export_run_state(store)["discarded_usage"] if c["state"] == state]
         assert sum(c["attempts"] for c in cells) == len(rows)
         assert sum(c["usage_incomplete_attempts"] for c in cells) == 0
         assert sum(c["input_tokens"] for c in cells) == len(rows) * 9_000

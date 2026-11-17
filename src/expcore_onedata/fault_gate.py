@@ -174,8 +174,8 @@ def _unsettled(entries: list[dict[str, Any]]) -> Health:
     if failed:
         hows = ", ".join(f"{target} ({how if _WORD.fullmatch(how) else 'failed'})" for target, how in failed)
         detail = f"the restore of {hows} failed: the federation is not in its baseline state"
-        charge, note = charge_of(entry for entry in entries if "clear_failed" in entry)
-        return Health(False, with_note(detail, note), charge=charge)  # only its injecting attempt is charged (O80)
+        charge, note = charge_of(entries)  # every open entry: the judged attempt's own is never spared (O80)
+        return Health(False, with_note(detail, note), charge=charge)
     targets = ", ".join(sorted({entry["target"] for entry in entries}))
     detail = f"an injection of {targets} is unsettled: the federation is not in its baseline state"
     charge, note = charge_of(entries)
@@ -333,7 +333,12 @@ class FaultGate:
                             # before anything is restored: a provider it brings back went down in a run it knows nothing
                             # of, and the release below publishes the drain whatever interrupts the recovery
                             exclusive.drain.owe(self._clock(), clock=self._clock, sleep=self._sleep)
-                        self._recovery.recover(defer=True)  # a held settle is a wait, never slept here
+                        try:
+                            self._recovery.recover(defer=True)  # a held settle is a wait, never slept here
+                        except RestoreSettling:
+                            raise
+                        except InfraError as error:  # what an earlier run left open could not be settled
+                            return self._operator(self._left_open(error))
                         if self._relink is not None:  # the pairs of what it restored: the link check made afresh next
                             self._relink()
                     finally:
@@ -352,6 +357,20 @@ class FaultGate:
             return self._operator(Health(False, settling.detail, deferred=True, charge=False))
         except InfraError as error:
             return self._operator(Health(False, error.detail))
+
+    def _left_open(self, error: InfraError) -> Health:
+        """The failure of a recovery of what an earlier run left open, charged to the attempt that made the injection
+        that could not be settled (its target's entry, else every open one) and to no other (O80). An unreadable
+        journal, or none open any more, says nothing of whose it is: charged as it was."""
+        try:
+            open_entries = self._recovery.entries()
+        except (OSError, ValueError):
+            return Health(False, error.detail)
+        entries = [entry for entry in open_entries if entry.get("target") == error.target] or open_entries
+        if not entries:
+            return Health(False, error.detail)
+        charge, note = charge_of(entries)
+        return Health(False, with_note(error.detail, note), charge=charge)
 
     def _operator(self, health: Health) -> Health:
         """`health` led by the reason a failed heal needs an operator (`failed_heal_reason`), when the current stuck
@@ -665,9 +684,9 @@ class FaultGate:
         done = "its record stays until an acquisition of the lock proves it usable"
         if entries:  # it left something open: bring it back, verified, before anything else
             if not self._may_recover:
-                return Health(
-                    False, f"the federation's lock is stuck{at}: {_named(record)} is gone and left an injection open"
-                )
+                charge, note = charge_of(entries)  # only the attempt that made the injection is charged (O80)
+                detail = f"the federation's lock is stuck{at}: {_named(record)} is gone and left an injection open"
+                return Health(False, with_note(detail, note), charge=charge)
             # the holder may have gone, and the lock with it, since the wait ran out: then the recovery runs under it
             exclusive = self._lock.try_acquire(exclusive=True, purpose=RECOVERY)
             try:
@@ -677,7 +696,12 @@ class FaultGate:
                     # still held, by a holder that is gone: nobody else is admitted while it is, and the record is
                     # written first, so an admission that finds the journal settled after it finds the record
                     self._lock.hold_for(self._drain_s)
-                self._recovery.recover(defer=True)  # raises InfraError naming the target when one cannot be settled
+                try:
+                    self._recovery.recover(defer=True)
+                except RestoreSettling:
+                    raise
+                except InfraError as error:  # naming the target when one cannot be settled
+                    return self._operator(self._left_open(error))
             finally:
                 if exclusive is not None:
                     exclusive.close()
