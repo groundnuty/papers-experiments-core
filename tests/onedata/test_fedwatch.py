@@ -499,6 +499,25 @@ def test_o86_a_down_target_whose_injection_is_not_the_runs_is_a_finding(tmp_path
     assert any(why in finding for finding in result["findings"])
 
 
+@pytest.mark.parametrize("owner", [ME, None], ids=["the run's own", "no run named"])
+def test_o86_an_old_open_injection_the_service_ran_through_holds_nothing_down_when_it_later_fails(tmp_path, owner):
+    """O86: an injection stopped before the window and never cleared (its restore unverified) while the service was
+    running again at the window's start does not hold it down: a crash inside the window is another outage, a finding,
+    never `held`, in a run's window and in a batch's alike."""
+    containers = steady()
+    injection(
+        journal_of(tmp_path), ALPHA, clears=None, owner=ME
+    )  # stopped and left open, then the service was restarted
+    watch = compose_watch(containers, tmp_path)
+    start = watch.read()
+    assert start["services"]["providers[0]"]["state"] == "running"
+    containers.by_service[ALPHA] = container("ctr-a", running=False, health=None, exit_code=137)  # it crashed
+    result = watch.window(start, owner=owner)
+    assert result["services"]["providers[0]"]["status"] == "down"
+    assert result["services"]["providers[0]"]["held"] is None
+    assert result["verdict"] == "finding"
+
+
 def test_o86_a_run_that_names_no_attempt_owns_no_injection(tmp_path):
     """O86: a window asked of a process alone (no attempt) cannot tell its injection from another's: none is its own."""
     watch, start, _, _ = down_target(tmp_path, owner=PROCESS_ONLY)

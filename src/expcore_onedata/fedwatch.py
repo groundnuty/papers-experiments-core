@@ -40,9 +40,9 @@ name, and holds no host, address, path or service name. `verdict` is `finding` (
 the injector since #371) names that run's attempt explain a restart or hold a service down. Another attempt's
 leftover, a line written before owners were recorded and an injection outside any attempt explain nothing, so they
 leave a finding; a run that names no attempt owns none. With no `owner` (a batch's window) any injection counts, and
-the result says so (`ownership`). A `held` service is explained by the run's own open injection, wherever it began
-(before the start reading or inside the window): the window comes before its restore, so `held` is read with the
-run's restore outcome.
+the result says so (`ownership`). A `held` service is explained by the run's own open injection that fits the start
+reading: the service was down then too, or the stop was asked inside the window (one the service ran through is
+another outage). The window comes before its restore, so `held` is read with the run's restore outcome.
 """
 
 import json
@@ -392,17 +392,27 @@ class _JournalWindow:
         every = _explaining(self.entries, service, self.first, was_running, _anyone)
         return len(every) - len(_explaining(self.entries, service, self.first, was_running, self.owned))
 
-    def holding(self, service: str) -> list[dict[str, Any]]:
-        """The open injections of the service that hold it down, wherever they began, before the start reading or in
-        the window: its stop was asked, it did not end `never_down`, nothing has cleared it, and it is the run's own
-        when a run is named."""
-        return [] if self.entries is None else [e for e in self.entries if self._holds(e, service) and self.owned(e)]
+    def holding(self, service: str, was_running: bool) -> list[dict[str, Any]]:
+        """The open injections that hold the service down at the window's end, the run's own when a run is named: its
+        stop was asked, it did not end `never_down`, nothing has cleared it, and it is consistent with what the start
+        reading showed: the service was down then (the injection came before the window and held it down across it), or
+        its stop was asked inside the window. An injection stopped before the window that the service was running
+        despite at the start (an uncleared one, its restore unverified) holds nothing down: a service that is down at
+        the end after that is another outage, and explained by none."""
+        if self.entries is None:
+            return []
+        return [e for e in self.entries if self._holds(e, service) and self._fits(e, was_running) and self.owned(e)]
 
-    def strangers(self, service: str) -> int:
-        """How many open injections of the service hold it down and are not the run's own."""
+    def strangers(self, service: str, was_running: bool) -> int:
+        """How many open injections that would hold the service down are not the run's own."""
         if self.entries is None or self.ownership == "not_checked":
             return 0
-        return sum(1 for e in self.entries if self._holds(e, service) and not self.owned(e))
+        return sum(
+            1 for e in self.entries if self._holds(e, service) and self._fits(e, was_running) and not self.owned(e)
+        )
+
+    def _fits(self, entry: Mapping[str, Any], was_running: bool) -> bool:
+        return not was_running or entry["stop_line"] >= self.first
 
     @staticmethod
     def _holds(entry: Mapping[str, Any], service: str) -> bool:
@@ -517,9 +527,10 @@ def _judge(
         restarts = _restarts(member, before, after, change, window)
     findings = [f"restart not explained, {r['reason']}" for r in restarts if not r["explained"]]
     down = after["state"] == "not_running"
-    holding = window.holding(member.service)
+    was_running = bool(before and before["running"])
+    holding = window.holding(member.service, was_running)
     if down and not holding:
-        findings.append(_down_finding(window, member.service))
+        findings.append(_down_finding(window, member.service, was_running))
     if after["state"] == "running" and after["health"] not in (None, "healthy"):
         findings.append(f"its container's health check reports {after['health']} at the window's end")
     status = (
@@ -544,9 +555,9 @@ def _judge(
     }
 
 
-def _down_finding(window: _JournalWindow, service: str) -> str:
+def _down_finding(window: _JournalWindow, service: str, was_running: bool) -> str:
     """Why a service not running at the window's end is a finding: nothing holds it down that the window may count."""
-    strangers = window.strangers(service)
+    strangers = window.strangers(service, was_running)
     if window.ownership == "unattributed":
         return "not running at the window's end, and the run names no attempt, so no open injection of it is its own"
     if strangers:
