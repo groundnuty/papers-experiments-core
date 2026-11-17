@@ -80,9 +80,11 @@ def render(
     sif: bytes = SIF,
     layout: Path = LAYOUT,
     printed: list | None = None,
+    work_root: Path | None = None,
 ) -> Path:
     """The core's phase of `layout` over a root of its own (as `hpcfed.py up` runs it), its pins the site's files
-    `agent_site(…, sif=sif)` as declared; the federation's root. What the phase prints is appended to `printed`."""
+    `agent_site(…, sif=sif)` as declared and its sandbox's work root `work_root` (the step makes it under its tmpfs);
+    the federation's root. What the phase prints is appended to `printed`."""
     import fedlayout
     import fedspec
     import hpcpins
@@ -97,7 +99,12 @@ def render(
     spec = fedspec.load_spec(layout)
     hosts = {s.name: f"{s.name}.{label}.cluster.example.org" for s in spec.services}
     federation = fedlayout.Layout(root, root.parent, hpc.boot.hpc_spec(spec, hosts))
-    site = {**SITE, **agent_site(root.parent / "pins", sif=sif), "SH": "/invented/images", "L": "/invented/logs"}
+    site = {
+        **SITE,
+        **agent_site(root.parent / "pins", sif=sif, work_root=work_root),
+        "SH": "/invented/images",
+        "L": "/invented/logs",
+    }
     pins = hpcpins.values(hpc.settings.site_from_environment(site))
     values = {**hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, root), **pins}
     with pytest.MonkeyPatch.context() as patch:
@@ -508,8 +515,9 @@ def test_o74_a_changed_pin_rendered_by_up_is_refused_by_a_step_expecting_the_old
     """O74, end to end over the two halves: two real renders, one SIF changed; the first's record is the study's
     expected one. The step on the first runs and archives it; the step on the second is refused, naming the pin and the
     fingerprint that holds it, with nothing made."""
-    old = render(hpc, tmp_path / "old" / "root", ca)
-    new = render(hpc, tmp_path / "new" / "root", ca, sif=b"another SIF image\n")
+    old = render(hpc, tmp_path / "old" / "root", ca, work_root=tmp_path / "on-old" / "tmpfs" / "agent-work")
+    new = render(hpc, tmp_path / "new" / "root", ca, sif=b"another SIF image\n",
+                 work_root=tmp_path / "on-new" / "tmpfs" / "agent-work")  # fmt: skip
     expected = (old / FILE).read_text(encoding="utf-8")
     code, _, _ = run_step(shards, step_args(tmp_path / "on-old", expected), old, monkeypatch)
     assert code == 0
