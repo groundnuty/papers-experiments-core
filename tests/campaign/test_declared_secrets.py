@@ -250,3 +250,23 @@ def test_c40_a_refused_declaration_withholds_the_traceback_it_would_have_logged_
     assert states == {"harness_error"}
     assert "withheld" in written
     assert "zq" not in written
+
+
+def test_c40_the_environment_an_executor_declares_is_kept_as_it_is_redacted_from_a_record(tmp_path):
+    """C40: `environ` is the mapping the executor gives `record_run`, which redacts the variables of it named like a
+    secret: declared alone, with no names, the same variables are kept as secrets, so a failed start's diagnostic
+    loses them as the record does, and a short one is refused as it is there."""
+    row, marker, export = run_failing_start(
+        tmp_path / "out", lambda request: request.declare_secrets(environ={"SANDBOX_AUTH_TOKEN": SECRET, "PLAIN": "x"})
+    )
+    assert not any(SECRET in text for text in where_it_is_kept(row, marker, export).values())
+    seen = []
+
+    def refused(request):
+        with pytest.raises(ConfigError, match="SANDBOX_AUTH_TOKEN") as error:
+            request.declare_secrets(environ={"SANDBOX_AUTH_TOKEN": "zq"})
+        seen.append(str(error.value))
+
+    run_failing_start(tmp_path / "again", refused)
+    assert seen
+    assert "zq" not in seen[0]
