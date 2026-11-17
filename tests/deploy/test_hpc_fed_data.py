@@ -58,7 +58,7 @@ def core(hpc, root: Path, label: str, ca: bytes, data=None) -> str:
         patch.setattr(hpc.fedlinks, "check_links", link_check_stand_in([]))
         return hpc.boot.core_phase(
             layout, (5001, 5001), values, environ={},
-            rest=lambda ca_file: SimpleNamespace(close=lambda: None), bootstrap=BootStandIn(label),
+            rest=lambda ca_file, **kwargs: SimpleNamespace(close=lambda: None), bootstrap=BootStandIn(label),
             steps=lambda boot: None, content=lambda boot: SimpleNamespace(reset=lambda timeout: None),
             data=data or data_stand_in(),
         )  # fmt: skip

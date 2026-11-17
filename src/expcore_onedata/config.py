@@ -53,6 +53,11 @@ user_id = "..."                 # the id Onezone gives the user: its privileges,
 ca_file = "federation-ca.pem"   # a CA bundle the federation's certificate chains to; verification stays on
 insecure_tls = true             # or: verification off, for a disposable test federation only; never both
 
+[addresses]                     # optional: where each declared name is dialled, when the names resolve nowhere (O73)
+file = "secrets/address-map.json"  # a private file (mode 0600, yours, no link), relative to this one (addresses.py)
+resolver = "toolshim/resolve_launch.py"  # optional: the launcher a Python tool server is started through, which
+                                #   resolves exactly those names (the server needs python and -m <module> or a script)
+
 [toolserver]
 command = "path/to/executable"
 args = []
@@ -102,6 +107,7 @@ from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.platform_loads import record_platform_load
+from expcore_onedata.addresses import AddressMap, AddressMapError, launch_argv, load_addresses
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.linksettings import LinkCheckSettings, load_link_check
 from expcore_onedata.rights import declares_qos, declares_write, rights_problem
@@ -226,6 +232,11 @@ class PlatformConfig:
     tls: TlsSettings = field(default_factory=TlsSettings)  # every client's one certificate check (`[tls]`)
     spaces_table: bool = False  # the spaces came from [[spaces]], one entry or several, not from [space]/[support]
     link_check: LinkCheckSettings | None = None  # the pre-campaign link check's probe space and bounds (O35)
+    # where each declared name is dialled (`[addresses]`, O73): None dials every URL's host as written. Never in a
+    # record, the fingerprint or a message, and never shown: it holds the nodes' addresses and names.
+    addresses: AddressMap | None = field(default=None, repr=False, compare=False)
+    addresses_file: Path | None = field(default=None, repr=False, compare=False)  # the map's file (O73): a Python tool
+    addresses_resolver: Path | None = field(default=None, repr=False, compare=False)  # server reads it, by this shim
 
     @property
     def probe_space(self) -> Space | None:
@@ -360,6 +371,14 @@ class PlatformConfig:
         if server is None or name not in server.conditions:
             raise ConfigError(f"{self.file}: [toolserver.conditions]: the condition asked for is not declared")
         return server.conditions[name]
+
+
+def _addresses(root: Section, file: Path) -> dict[str, Any]:
+    """The `[addresses]` table's three fields of the platform (O73), or none of them without the table."""
+    if "addresses" not in root.data:
+        return {}
+    found, path, resolver = load_addresses(Section(root.table("addresses"), file, "[addresses]"), file.parent)
+    return {"addresses": found, "addresses_file": path, "addresses_resolver": resolver}
 
 
 def _url(section: Section, key: str) -> str:
@@ -600,6 +619,7 @@ def load_platform(
             "slots",  # read by users.load_slots
             "faults",  # read by faults.load_faults
             "link_check",  # read by linksettings.load_link_check, below
+            "addresses",  # read below: where each declared name is dialled (O73)
         )
     )
     zone = root.section("zone")
@@ -613,7 +633,7 @@ def load_platform(
     if require_secrets:
         _check_fixed_users(users, principals, file, environ)
     spaces = load_spaces(root, providers)
-    return PlatformConfig(
+    config = PlatformConfig(
         file=file,
         zone=Zone(_name(zone, "name", zone.string("name"), "the zone name"), _url(zone, "url")),
         providers=MappingProxyType(providers),
@@ -636,4 +656,13 @@ def load_platform(
         sha256=digest,
         tls=tls,
         link_check=load_link_check(root, providers, spaces),
+        **_addresses(root, file),
     )
+    if config.addresses_resolver is not None and config.toolserver is not None:
+        try:  # the server is started through the launcher: refused at load, where the study can change it (O73)
+            launch_argv(
+                config.toolserver.command, config.toolserver.args, config.addresses_resolver, config.addresses_file
+            )
+        except AddressMapError as error:
+            raise ConfigError(f"{file}: [toolserver]: {error}") from None
+    return config

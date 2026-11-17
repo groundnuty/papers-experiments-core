@@ -74,9 +74,11 @@ from pathlib import Path
 
 from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS
 
+from expcore.config.loading import ConfigError
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
+from expcore_onedata.addresses import AddressMapError, launch_argv
 from expcore_onedata.admission import (
     TOOL_SERVER_STEP,
     TokenStepRefused,
@@ -124,6 +126,23 @@ MANAGED_ENV = (
 )
 
 
+def server_argv(config: PlatformConfig) -> tuple[str, list[str]]:
+    """The server's command and arguments (O73): `[toolserver]`'s as declared, or, for a platform whose names resolve
+    nowhere (`[addresses] resolver`), started through the resolve launcher (`addresses.launch_argv`): the declared
+    interpreter, `-I -B`, the launcher, the private map as an argument, `--`, and the declared arguments. The server
+    then resolves exactly the map's names, to their addresses, and every other host as before; nothing is put in its
+    environment for it (no `PYTHONPATH`, no setting naming the map), every Python of the driver's running `-I -B`; it
+    covers Python servers only."""
+    server = _server(config)
+    if config.addresses_resolver is None or config.addresses_file is None:
+        return server.command, list(server.args)
+    try:
+        wrapped = launch_argv(server.command, server.args, config.addresses_resolver, config.addresses_file)
+    except AddressMapError as error:
+        raise ConfigError(f"{config.file}: [toolserver]: {error}") from None
+    return wrapped[0], wrapped[1:]
+
+
 def server_environment(
     config: PlatformConfig,
     condition: Condition,
@@ -136,6 +155,10 @@ def server_environment(
 
     The one token serves the server's Onezone and Oneprovider settings. The provider is the agent's pinned local one.
     The allow-list is the condition's, and a caller cannot set it or any other managed setting.
+
+    It sets no `ONEDATA_MCP_NODE_NAMES`, on any platform: once the services register the declared names there is no
+    node name to map, so onedata-mcp runs unset and its text is a Compose federation's. A platform whose names resolve
+    nowhere starts the server through the resolve launcher instead (`server_argv`).
 
     Its certificate check is the platform's `[tls]`: by default the server's own (it verifies with httpx's CAs); with
     `ca_file`, `ca_copy`, the run's own read-only copy of the verified bundle (`tls.write_private_copy`), never the
@@ -183,13 +206,16 @@ def _placed(extra: Mapping[str, str] | None, process: ServerProcess | None) -> M
     return {**(extra or {}), **ours}
 
 
-def _spawned(server: ToolServer, env: Mapping[str, str], process: ServerProcess | None) -> tuple[str, list[str]]:
-    """The command and arguments the client spawns: the server's own, or, with a backend's placement, the same behind
-    `env -u <each inherited variable the settings do not set> --`, so that the server's environment is `env` alone."""
+def _spawned(
+    command: str, args: list[str], env: Mapping[str, str], process: ServerProcess | None
+) -> tuple[str, list[str]]:
+    """The command and arguments the client spawns: `command` and `args` (the server's own, or through the resolve
+    launcher, `server_argv`), or, with a backend's placement, the same behind `env -u <each inherited variable the
+    settings do not set> --`, so that the server's environment is `env` alone."""
     if process is None:
-        return server.command, list(server.args)
+        return command, list(args)
     unset = [word for name in inherited_by_the_client() if name not in env for word in ("-u", name)]
-    return "env", [*unset, "--", server.command, *server.args]
+    return "env", [*unset, "--", command, *args]
 
 
 @contextlib.contextmanager
@@ -385,7 +411,7 @@ class ToolServerLauncher:
             _private_bundle(self._config) as ca_copy,  # the run's copy of the verified CA bytes, gone with the server
         ):
             env = server_environment(self._config, chosen, token, _placed(extra_env, process), ca_copy=ca_copy)
-            command, args = _spawned(server, env, process)
+            command, args = _spawned(*server_argv(self._config), env, process)
             provider = McpToolProvider(
                 command,
                 args,

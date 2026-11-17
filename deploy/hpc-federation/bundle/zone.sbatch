@@ -17,8 +17,11 @@
 # --no-requeue: a requeued zone would come back empty, as a new identity.
 # tmpfs counts against --mem: the rootfs (~4 GB) plus Couchbase and the Erlang VMs.
 # No secret is on this command line: only paths, a name and peer addresses.
+# A federation reached by the names its layout declares (O73) adds `--declared=NAME` (the zone's own) and one
+# `--host=NAME=ADDRESS` per service of the federation, itself included, after the peers: configure.sh registers the zone
+# under NAME and writes the hosts file its cell is given (see configure.sh).
 # Usage: sbatch --nodelist=<node-A> --time=<t> --mem=32G [--exclusive] zone.sbatch \
-#          <bundle-dir> <onezone.tar> <zone-name> [<provider-ip> ...]
+#          <bundle-dir> <onezone.tar> <zone-name> [<provider-ip> ...] [--declared=NAME --host=NAME=ADDRESS ...]
 set -euo pipefail
 B=${1:?usage: zone.sbatch <bundle-dir> <onezone.tar> <zone-name> [provider-ip ...]}; shift
 [[ -f $B/lib.sh ]] || { echo "hpcop: no lib.sh in '$B'" >&2; exit 1; }
@@ -62,7 +65,7 @@ fi
 # The ready marker, once finish-zone.sh has passed every check: service-verified holds service.pid as it is now
 # (status.sh reads "ready" from it; a later launch has another service.pid, so a stale marker never matches).
 mark_verified "$W"
-say "zone up at https://$(node_fqdn):8443; holding until teardown or the end of the job"
+say "zone up at https://$(service_name "$W"):8443; holding until teardown or the end of the job"
 status=0; wait "$svc" || status=$?
 # The job's state says how the service ended: a stop teardown.sh asked for is a success, any other end a
 # failure, with the service's own status (1 if it exited 0 by itself).
