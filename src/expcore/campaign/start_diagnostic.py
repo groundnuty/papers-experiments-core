@@ -23,7 +23,7 @@ executor called `declare_secrets` (a call with no argument says it has none beyo
 diagnostic shown in the row, the marker, the export and the report. For any other the snapshot is a stub, `{"phase":
 "start", "ok": false, "error": "Withheld", "why": ...}`: the phase alone, since the instrument's name is the study's
 own word and can be a secret only the executor knows (a failed start that gave no diagnostic is `{"phase": "start"}`).
-The text of a withheld diagnostic goes to the campaign's local log and nowhere else (`private_text`,
+The text of a withheld diagnostic goes to the campaign's local log and nowhere else (`AttemptRunner._keep_withheld`,
 `DefectLog.keep_private`): a store, its snapshot and the markers are merged and packaged, and `out/logs` is the one
 place that is not (`package.spec.LOCAL_ONLY`).
 
