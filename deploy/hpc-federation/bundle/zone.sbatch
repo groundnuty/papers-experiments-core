@@ -17,8 +17,11 @@
 # --no-requeue: a requeued zone would come back empty, as a new identity.
 # tmpfs counts against --mem: the rootfs (~4 GB) plus Couchbase and the Erlang VMs.
 # No secret is on this command line: only paths, a name and peer addresses.
+# A federation reached by the names its layout declares (O70) adds `--declared=NAME` (the zone's own) and one
+# `--host=NAME=ADDRESS` per service of the federation, itself included, after the peers: configure.sh registers the zone
+# under NAME and writes the hosts file its cell is given (see configure.sh).
 # Usage: sbatch --nodelist=<node-A> --time=<t> --mem=32G [--exclusive] zone.sbatch \
-#          <bundle-dir> <onezone.tar> <zone-name> [<provider-ip> ...]
+#          <bundle-dir> <onezone.tar> <zone-name> [<provider-ip> ...] [--declared=NAME --host=NAME=ADDRESS ...]
 set -euo pipefail
 B=${1:?usage: zone.sbatch <bundle-dir> <onezone.tar> <zone-name> [provider-ip ...]}; shift
 [[ -f $B/lib.sh ]] || { echo "hpcop: no lib.sh in '$B'" >&2; exit 1; }

@@ -320,6 +320,34 @@ script stops the service, deletes and redacts every secret (`scrub.py`) and keep
 ends any other way fails the job, with its own status. `--exclusive` keeps other users off a node, at the price of
 the whole node for the job.
 
+## Registered names (O70)
+
+By default a service registers under its node's own FQDN, and its certificate is made for it. A federation reached by
+the names its layout declares registers each service under its declared name instead, so that no node's name, address
+or port 8443 is in anything the agent can read (the scope answer and the no-connection errors carry the registered
+domain). `hpcfed.py up` does this for every layout; by hand, give each batch script the name and every service's
+address:
+
+```bash
+"$B/zone.sbatch" "$B" "$SH/onezone.tar" <zone-name> <provider-address> \
+  --declared=zone.<domain> --host=zone.<domain>=<zone-address> --host=<provider>.<domain>=<provider-address>
+"$B/provider.sbatch" "$B" "$SH/oneprovider.tar" <provider-name> zone.<domain> <admin-email> <zone-address> \
+  --declared=<provider>.<domain> --host=zone.<domain>=<zone-address> --host=<provider>.<domain>=<provider-address>
+```
+
+`configure.sh` then registers the service under `--declared` (`onezone.domainName`, `oneprovider.domain`, the
+generated certificate's domain), writes the work directory's `hosts` (the loopback, the node's own names on its
+address, every `--host`) and `declared-name`, and `run_service` binds the hosts file read-only over `/etc/hosts` with
+`--no-mount bind-paths`: the site's own bind of the node's `/etc/hosts` is off, so `/etc/localtime` is the image's. A
+provider's lookup of a peer crashes when the name does not resolve, so the script refuses, before it writes anything, a
+peer address with no `--host`, a `--host` that is no peer, a name or an address listed twice, and a missing entry for
+its own name or the zone's. The readiness calls, the token mint and the registration read-back dial the declared name
+pinned to the loopback (`curl --resolve`), the one name the certificate holds. Onepanel's DNS check resolves through DNS
+alone and reports the declared names `unresolvable`; it is advisory, and `facts.json` records that. From the login
+node the names are reached through the address map `up` writes into the root (`secrets/address-map.json`, 0600),
+which `platform.toml` names; see `DESIGN.md`, "The registered names". The first sandbox slot on a federation brought up
+this way is owed the checks of `DESIGN.md` section 9, item 7.
+
 ## The driver: `hpcfed.py`
 
 `hpcfed.py` brings a zone and the layout's providers up on batch nodes, and takes them down, from the Compose
@@ -360,11 +388,12 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
 - **The data each space holds** (C06, O63): every template's `[[spaces]]` entry names its `data_manifest`. A shared import's is the manifest its layout names; every other space's is written by `up` into `<root>/data-manifests/` from its baseline, the same for every federation of a layout. Before the link check `up` reads every space back through its owner (directories, sizes, bytes; a shared import by `verify_imports`) and fails, naming the space, when it is not exactly its manifest. So shards on two federations of one layout record one campaign fingerprint (each space by its declared identity and its data, never its Onezone id), and `shards.py plan` refuses federations whose platform files leave a space's data undeclared.
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
-  address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
-  with every peer address, and pipes a registration token from the zone into each provider; copies the zone's
+  address in a control step (`bundle/nodefacts.py`); writes the address map; runs `zone.sbatch` and `provider.sbatch`
+  as service steps, each with every peer address and every service's declared name, and pipes a registration token from the zone into each provider; copies the zone's
   passphrase (0600) and the Onedata test CA's certificates, never its key, into the root (`bundle/zone-export.sh`,
   `hpcca.py`); then bootstraps the federation
-  through the Compose bootstrap over `https://<node FQDN>:8443`, writes its baseline, `facts.json` and
+  through the Compose bootstrap over `https://<declared name>:8443` (the layout's names, dialled through the address
+  map `up` writes into the root), writes its baseline, `facts.json` and
   `platform.toml`, and runs the platform layer's link check, which writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, checks each node
@@ -406,7 +435,7 @@ import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs
 | `hpcop-cb-init.py` | in container | `--watch`: the Couchbase guard; `--wait-listener`: the launcher's wait for our 9443 |
 | `build-rootfs.sh` | job | pull, build the shim with the image's gcc, prep, preload check, tar, SHA-256 |
 | `node-init.sh` | batch step | node checks, leftovers of earlier jobs removed, tarball checks, work directory, per-launch secrets, file default check |
-| `configure.sh`, `run-node.sh`, `run-zone.sh` | batch step | configuration, peers, the service under `supervise.py` |
+| `configure.sh`, `run-node.sh`, `run-zone.sh` | batch step | configuration, peers, the name the service registers under and its hosts file (`--declared`, `--host`, below), the service under `supervise.py` |
 | `finish.sh`, `finish-zone.sh` | batch step | readiness and the guard's verdict, the host-side guard, storage, REST checks, rotation, live default and port check |
 | `check-defaults.sh` | node | fails on an image default, a leaked secret or a listener outside the model |
 | `mint-registration-token.sh`, `deliver-token.sh` | steps | a 1 h single-use registration token, from the zone's job into a 0600 file of the provider's |

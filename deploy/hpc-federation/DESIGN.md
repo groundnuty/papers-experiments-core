@@ -292,12 +292,14 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 4. **Place** (section 1), then one control step per node prints the node's FQDN and its IPv4 address on the
    cluster's network (`nodefacts.py`, Python 3.9-compatible, stdlib only); on S, with `--het-group=1` under `het` and
    S's own job id under `separate`, and on a service node with `--het-group=0` under `het`. Nothing else of `up` runs
-   on S.
-5. **The zone**: a detached service step, `zone.sbatch <bundle> <zone tar> <zone name> <every provider's address>`,
-   run as a step (it holds the service for the step's life, as the standing run did). `up` waits for its log's verdict
+   on S. The state records each service's **declared name** beside its node's, and `up` writes **the address map**
+   into the root (`secrets/address-map.json`, 0600), before any service is launched ("The registered names", below).
+5. **The zone**: a detached service step, `zone.sbatch <bundle> <zone tar> <zone name> <every provider's address>
+   --declared=<its declared name> --host=<name>=<address> ...` (one `--host` per service of the federation, itself
+   included), run as a step (it holds the service for the step's life, as the standing run did). `up` waits for its log's verdict
    (`hpcop: OK zone`, or `FINISH FAILED` or `hpcop: ERROR`, which fail `up`).
-6. **The providers**: one detached service step each, `provider.sbatch <bundle> <provider tar> <name> <zone FQDN>
-   <admin mail> <zone address> <every other provider's address>`; for each, a registration token minted in a control
+6. **The providers**: one detached service step each, `provider.sbatch <bundle> <provider tar> <name> <zone's declared
+   name> <admin mail> <zone address> <every other provider's address> --declared=<its declared name> --host=...`; for each, a registration token minted in a control
    step on the zone's node piped into a delivery step on the provider's (`mint-registration-token.sh |
    deliver-token.sh`, the bundle's, with `--workdir`); then each log's verdict (`hpcop: OK provider`). A provider that
    owns a shared imported tree is also given `--import=SPACE=PATH`, and once every provider is up a control step on
@@ -313,7 +315,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    fingerprint first.
 8. **The core's phase** (`hpcboot.core_phase`), on the login node or in a control step on the zone's node, as `[hpc]
    core` says (section 9). **The bootstrap** is the Compose federation's own `fedboot.Bootstrap` over a layout whose
-   services' URLs are `https://<node FQDN>:8443`: the admin's token, the users, the spaces, the support (on each
+   services' URLs are `https://<declared name>:8443`, its client given the address map: the admin's token, the users, the spaces, the support (on each
    provider's one posix storage, owned by the job's uid, and that storage's LUMA local feed mapping the space and every
    user to that uid, as `onboard.py` does), the members, the baseline content (`fedcontent.Content`). An owner of a
    shared imported space also has its `import-<space>` storage made before any support, and the scan awaited after
@@ -329,6 +331,51 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
     state file as `relay`. One relay per root: it takes a lock.
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
+
+### The registered names (O70)
+
+A layout declares a name for the zone and for each provider, `<service>.<domain>`. On a cluster those names resolve
+nowhere, and the nodes have names and addresses of their own that nothing the agent can read may carry (the zone's
+scope answer, the no-connection errors and the registered domain a client dials all carry what a service registered).
+So every service **registers under its declared name**, and the login node's clients reach it by that name through a
+map. Four parts land together, in this order, since only then does every step have a working check:
+
+1. **The address map.** Once the nodes' facts are read, `up` writes `secrets/address-map.json` (0600; the root's own
+   file, never in a cell, the gate's file, `facts.json` or `gate.json`): each declared name with its node's address and
+   the node's own names (its FQDN and its first label). A node's name or address belongs to one declared name; a
+   service with no address stops `up` before it launches any (`hpcnames.address_map`). `platform.toml` names it
+   (`addresses = { file = "<root>/secrets/address-map.json" }`, first, written once the root holds one). The platform
+   layer's client, the bootstrap's, the gate and the host mount's oneclient dial the mapped address and keep the
+   declared name in the URL, the handshake, the certificate check and `Host`.
+2. **The URLs.** Every URL the driver builds or records for a service is `https://<declared name>:8443`
+   (`placed_layout`): the layout's name, so `federation.is_declared` matches a URL's host to the domain a service
+   reports, and `facts.json`, `platform.toml` and the link check hold the names.
+3. **The registration.** `configure.sh` takes `--declared=<name>` and one `--host=<name>=<address>` per service, and
+   sets `onezone.domainName`, `oneprovider.domain` and `ONEPANEL_GENERATED_CERT_DOMAIN` from the declared name, while
+   the cluster section keeps the node's own names. It writes the work directory's `declared-name` and `hosts`: the
+   loopback, the node's own names on its address, every service's declared name with its address. `run_service` binds
+   `hosts` read-only over `/etc/hosts` with `--no-mount bind-paths` (the site's bind paths drop out, `/etc/localtime`
+   with them, which becomes the image's), so every peer's declared name resolves in the cell; an unresolved peer
+   crashes a provider's lookup of it (`inet:getaddrs`). A restart rebinds the file from the work directory.
+   `configure.sh` refuses, before it writes anything, a peer address with no declared name, a declared name that is
+   no peer, a name or address listed twice, an entry that is not `NAME=ADDRESS`, no entry for its own name and, for a
+   provider, none for the zone's; without `--declared` it registers under the node's FQDN as before. The readiness
+   calls (`finish.sh`, `finish-zone.sh`), the token mint and the line `zone.sbatch` prints name the registered name,
+   pinned to the loopback by `curl --resolve` (the certificate holds it alone). Onepanel's DNS check resolves through
+   DNS alone and will report a layout's name `unresolvable`: it is advisory (deployment acknowledges it), no step of
+   `up` depends on it, and `facts.json` records `dns_check: {advisory, expected: unresolvable, measured: false}`.
+4. **The check and the ordering.** After the bootstrap, `up` reads each service's `/configuration` `domain`
+   (`hpcnames.registered_domains`) and fails, naming the role and its declared name, unless it is the declared name;
+   `facts.json` records it per service (`registered_domain`). A `[sandbox.federation]` table whose names are not those,
+   or declared with no such record, is refused as `platform.toml` is rendered (`hpcnames.check_federation_table`),
+   naming the table's own names alone: the cell resolves only the declared names, and the published client dials the
+   domain a provider registered, so the table is usable only once the providers register them. The tool server's
+   environment gets `ONEDATA_MCP_NODE_NAMES`, built from the same map (every node name and address, with and without
+   the URLs' ports, under the declared name); how a third-party tool server connects to a declared name is open.
+
+What stays as it was: the certificate is the image's generated test certificate for the declared name, signed by the
+image's test CA (section 7 of `up`); the cluster's Erlang names are the node's and use no TLS; the port shim moves
+443 to 8443 for the listed peers, whose declared names resolve to those addresses.
 
 **`up` and `down` each hold the root's lifecycle lock** (`<root>.lifecycle.lock`, beside the root, `flock`, never
 waited for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job
@@ -381,8 +428,9 @@ nodes it could not check.
 ## 6. `platform.toml` for an HPC federation
 
 **Rendered by `up` into the root from the layout's own `platform_template`, by the Compose renderer
-(`fedfacts.write_facts`), with the HPC facts:** `@zone_url@` and `@provider_url.<name>@` are `https://<node
-FQDN>:8443`; the ids are this `up`'s. Every path in the template stays relative to the root, so the same template
+(`fedfacts.write_facts`), with the HPC facts:** `@zone_url@` and `@provider_url.<name>@` are `https://<declared
+name>:8443` (O70; the address map's file is named by an `addresses` line the driver puts first); the ids are this
+`up`'s. Every path in the template stays relative to the root, so the same template
 serves both:
 
 - `tls.ca_file = "ca/federation-ca.pem"` holds the **Onedata test CA** here (each service's web certificate is the
@@ -577,7 +625,7 @@ federation whose step is gone), then releases it.
 
 ## 9. Assumptions a live slot verifies first
 
-1. **The login node reaches every service's 8443** on the nodes' FQDNs. The bootstrap, the link check and the core's
+1. **The login node reaches every service's 8443** at the nodes' addresses, by the declared names (the address map). The bootstrap, the link check and the core's
    platform layer depend on it with `[hpc] core = "login"`. Proven live: node to node (the standing run's cell reached
    every public port). Not proven: login node to node. **The fallback is a setting, not a code change:** `[hpc] core =
    "step"` runs the same phase (`hpcfed.py core`) in a control step on the zone's node, with the core's Python
@@ -602,6 +650,17 @@ federation whose step is gone), then releases it.
    (section 1). Not seen yet: how `squeue -s -j <leader>` lists a step of component 0 (read as `<leader>.<n>` or
    `<leader>+0.<n>`), `scancel <component id>.<n>`, and `sacct -j <component id>` for a step's status. **The fallback
    is a setting:** `sandbox_placement = "separate"`.
+
+7. **The registered names** (O70), not yet run live: the service cells' own hosts file in a `--writable` sandbox
+   (`--no-mount bind-paths` and a file bind onto `/etc/hosts`, which the site's Apptainer accepted for the agent's SIF
+   only); a registered domain unrelated to `cluster.domainName`; the zone's `/configuration` and each provider's
+   answering their declared names; a provider's check of a peer and an rtransfer replication between two providers by
+   their declared names; Onepanel's DNS check, measured; each service's leaf naming only its declared name (and
+   `s3.<name>` on a provider), verified by `curl --resolve` with the exported CA; and **a sandbox slot that records the
+   cell's environment, `/etc/hosts`, `gate.json` and the gate's certificates' names, the agent's typical REST answers,
+   one forced no-connection error, the K1 tools' answers and the transcript, and asserts none holds a node's name or
+   address or `8443`.** The tool server's connection to a declared name is undecided (section 5, "The registered
+   names").
 
 ## 10. Who builds what
 
