@@ -40,7 +40,14 @@ SETTINGS = {
     "cpus",
     "memory",
 }  # shards.py's keys: no argv
-OPTIONAL = ("snapshot_every_s",)
+OPTIONAL = (
+    "snapshot_every_s",
+    "pre_step",
+    "pre_step_timeout_s",
+    "post_run",
+    "post_run_timeout_s",
+    "expect_render_identity",
+)  # the rest of shards.py's optional keys: the study's own guard, post-run script and expected render identity
 SCRIPT = Path(__file__).resolve().parent / "shards.py"
 
 
@@ -53,7 +60,7 @@ def read_settings(path: Path) -> Dict[str, Any]:
         raise FleetError(f"the shard settings could not be read ({type(error).__name__})") from None
     if not set(SETTINGS) <= set(data) <= set(SETTINGS) | set(OPTIONAL):
         keys = ", ".join(sorted(SETTINGS))
-        raise FleetError(f"the shard settings take exactly: {keys}, and perhaps snapshot_every_s; "
+        raise FleetError(f"the shard settings take exactly: {keys}, and perhaps {', '.join(OPTIONAL)}; "
                          "no [[shards]] (the fleet writes them)")  # fmt: skip
     for key, value in data.items():
         if isinstance(value, bool) or not isinstance(value, (str, int, float)):
@@ -233,7 +240,9 @@ def load(path: Path) -> shards.Plan:
 
 def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None) -> List[str]:
     """The login node's srun line of one shard (`shards.step_argv`) on the federation the manifest gives it, which must
-    be `root` when one is given (the federation the fleet's record gives it, and checked)."""
+    be `root` when one is given (the federation the fleet's record gives it, and checked). The plan's scripts (the
+    study's guard, its post-run script, the expected render identity) are hashed here, as `shards.py lines` does: a
+    line is never made from a plan that has not pinned them."""
     return target_of(plan, label, resume, root)[0]
 
 
@@ -244,10 +253,12 @@ def target_of(plan: shards.Plan, label: str, resume: bool,
     if root is not None and shard.root != root:
         raise FleetError(f"{MANIFEST} gives shard {label} another root than the fleet's record: run plan again")
     try:
+        plan = shards.pinned(plan)  # the study's scripts hashed as they are now, as `shards.py plan` and `lines` do
         fed = shards.federation(shard)
+        argv = shards.step_argv(plan, shard, fed, SCRIPT)
     except shards.ShardsError as error:
         raise FleetError(str(error)) from None
-    return shards.step_argv(plan, shard, fed, SCRIPT) + (["--resume"] if resume else []), fed
+    return argv + (["--resume"] if resume else []), fed
 
 
 @dataclass(frozen=True)

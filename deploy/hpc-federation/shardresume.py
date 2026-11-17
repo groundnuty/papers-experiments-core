@@ -291,7 +291,8 @@ def resume_line(
     def refuse(why: str) -> None:
         raise shards.ShardsError(f"shard {label}: {why}; no line is printed")
 
-    plan = shards.pin_pass_env(shards.load_plan(manifest))  # the declared variables, read before anything is recorded
+    # the study's scripts hashed and the declared variables read, as `plan` and `lines` do, before anything is recorded
+    plan = shards.pin_pass_env(shards.pinned(shards.load_plan(manifest)))
     shard = next((s for s in plan.shards if s.label == label), None)
     if shard is None:
         raise shards.ShardsError(f"the manifest has no shard labelled {label}")
