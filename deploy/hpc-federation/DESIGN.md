@@ -592,7 +592,8 @@ map. Four parts land together, in this order, since only then does every step ha
    file, never in a cell, the gate's file, `facts.json` or `gate.json`): each declared name with its node's address and
    the node's own names (its FQDN and its first label). A node's name or address belongs to one declared name; a
    service with no address stops `up` before it launches any (`hpcnames.address_map`). `platform.toml` names it
-   (`addresses = { file = "<root>/secrets/address-map.json" }`, first, written once the root holds one). The platform
+   through the template's own `addresses = @hpc_addresses@` line (section 6), so the render is the template with its
+   slots filled and no line is added to it. The platform
    layer's client, the bootstrap's, the gate and the host mount's oneclient dial the mapped address and keep the
    declared name in the URL, the handshake, the certificate check and `Host`.
 2. **The URLs.** Every URL the driver builds or records for a service is `https://<declared name>:8443`
@@ -715,7 +716,7 @@ nodes it could not check.
 
 **Rendered by `up` into the root from the layout's own `platform_template`, by the Compose renderer
 (`fedfacts.write_facts`), with the HPC facts:** `@zone_url@` and `@provider_url.<name>@` are `https://<declared
-name>:8443` (O73; the address map's file is named by an `addresses` line the driver puts first); the ids are this
+name>:8443` (O73; the address map's file is named by the template's own `addresses = @hpc_addresses@` line, below); the ids are this
 `up`'s. Every path in the template stays relative to the root, so the same template
 serves both:
 
@@ -737,6 +738,16 @@ serves both:
   so a template names the paths of its tool server's venv, clone and manifests under it and a public replication package
   carries no site path. A template that names it without the key is refused at the preflight, naming the variable; an
   unset key is no value, so the renderer would refuse the placeholder too, never write an empty path;
+- **`@hpc_addresses@`**, the value of the template's one top-level `addresses` key (O73): the inline table
+  `{ file = "<root>/secrets/address-map.json", resolver = "<root>/toolshim/resolve_launch.py" }` (without `resolver`
+  until `up` has copied the launcher into the root), which the platform layer reads as `[addresses]`. The slot stands
+  for the value, as `@hpc_direct_storages@` does, so the template shows its key, `addresses = @hpc_addresses@`, which
+  stands before the first table (a key after a table header belongs to that table). `up` writes the map into every HPC
+  federation's root, so its preflight refuses, naming the slot and before it submits anything, a template whose
+  top-level `addresses` key does not take the slot; the render refuses a template that names the slot when the root
+  holds no map, a root with a map when the template has no slot, and a rendered file whose top-level `addresses` is not
+  the table. The render adds, moves and removes no line: it is the template with its slots filled (a study's
+  conformance check holds it to that, but for `[placement]`, which the render completes, below);
 - the values only the HPC driver fills, for a template that names them: **`@hpc_stop_bound_s@`**, `stop_seconds + 90`
   (140 by default, section 7e); **`@hpc_step_launch_wait_s@`**, `[hpc] step_launch_wait_s` (240 by
   default); **`@hpc_command_timeout_s@`**, that and 60 (300); **`@hpc_settle_timeout_s@`**, `stop_bound_s +

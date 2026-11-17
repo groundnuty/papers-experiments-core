@@ -8,6 +8,7 @@
 # [sandbox]'s, which are the site's (hpc_agent_* and hpc_egress_shim* from site.env, each file checked against its
 # declared SHA-256 at up; hpc_egress_collector* the bundle's own). The four data spaces give the link check ten ordered
 # pairs.
+addresses = @hpc_addresses@   # O73: the address map and the resolve launcher, as one inline table that up fills; the platform layer dials each declared name at its mapped address. A top-level key, so before the first table
 zone = { name = "zone", url = "@zone_url@" }
 providers.aspen = { url = "@provider_url.aspen@", id = "@provider_id.aspen@" }
 providers.larch = { url = "@provider_url.larch@", id = "@provider_id.larch@" }

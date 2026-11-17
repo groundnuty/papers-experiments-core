@@ -21,7 +21,16 @@ from types import SimpleNamespace
 
 import pytest
 from fingerprint_support import standin_python
-from hpc_fed_support import LAYOUT, PILOT_TEMPLATE, SITE, agent_site, data_stand_in, hpc_on_path, services_only
+from hpc_fed_support import (
+    LAYOUT,
+    PILOT_TEMPLATE,
+    SITE,
+    agent_site,
+    data_stand_in,
+    hpc_on_path,
+    put_address_map,
+    services_only,
+)
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
 HPC = LAYOUT.parents[1]
@@ -102,6 +111,7 @@ def render(
     import hpcpins
 
     (root / "secrets" / "users").mkdir(parents=True)
+    put_address_map(root)  # `up` writes it before the core's phase
     root.chmod(0o700)  # as `up` makes it
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(ca)

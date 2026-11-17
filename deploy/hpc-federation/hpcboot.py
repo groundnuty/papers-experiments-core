@@ -20,7 +20,10 @@ real addresses (DESIGN.md, sections 5 and 6).
   `@hpc_step_launch_wait_s@` (what a control step may wait to start, `[hpc] step_launch_wait_s`),
   `@hpc_command_timeout_s@` (the floor of every relay verb's bound: that and 60 s), `@hpc_settle_timeout_s@` (above
   the stop and the wait), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of
-  each direct-I/O import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and
+  each direct-I/O import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none),
+  `@hpc_addresses@` (the inline table `{ file, resolver }` that is the value of the template's top-level
+  `addresses = @hpc_addresses@`, O73: the address map's file and the resolve launcher; the render adds no line the
+  template does not have) and
   `@hpc_token_margin_s@`: the least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file
   (`least_margin_s`).
   The site's values come from `hpcpins` (the agent's sandbox's pins and `@study_artifacts@`, the study's own directory
@@ -292,14 +295,16 @@ def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, 
 
 
 def rendered(template: str, filled: Mapping[str, str]) -> str:
-    """The template filled in, and, once the root holds an address map (`hpc_addresses`, its path), `addresses` first:
-    the file where the platform layer's clients find the address each declared name is dialled at (O73). A top-level key
-    of its own, so it may precede every table."""
+    """The template with its `@slots@` replaced, and nothing added, moved or removed (a study's conformance check holds
+    a render to that). Once the root holds an address map (`hpc_addresses`, the table `hpcnames.addresses_value` gives)
+    the template's own `addresses = @hpc_addresses@` is where the platform layer's clients find the address each
+    declared name is dialled at (O73); a map with no such line, or the line with no map, is refused naming the slot."""
+    given = hpcnames.ADDRESSES_SLOT in filled
+    hpcnames.check_addresses_slot(template, map_written=given)
     text = render(template, dict(filled))
-    if "hpc_addresses" not in filled:
-        return text
-    resolver = f", resolver = {json.dumps(filled['hpc_resolver'])}" if "hpc_resolver" in filled else ""
-    return f"addresses = {{ file = {json.dumps(filled['hpc_addresses'])}{resolver} }}\n" + text
+    if given:
+        hpcnames.check_rendered_addresses(text, filled[hpcnames.ADDRESSES_SLOT])
+    return text
 
 
 def registered_of(facts: Mapping[str, Any]) -> Dict[str, str]:
@@ -329,11 +334,9 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
     if layout.address_map.is_file():  # the platform layer's clients dial each declared name at its mapped address
-        values = {**values, "hpc_addresses": str(layout.address_map)}
-        if (
-            layout.toolshim / hpcnames.LAUNCHER
-        ).is_file():  # the launcher `up` copied into the root, for a Python server
-            values["hpc_resolver"] = str(layout.toolshim / hpcnames.LAUNCHER)
+        launcher = layout.toolshim / hpcnames.LAUNCHER  # the one `up` copied into the root, for a Python server
+        table = hpcnames.addresses_value(layout.address_map, launcher if launcher.is_file() else None)
+        values = {**values, hpcnames.ADDRESSES_SLOT: table}
     text = template.read_text(encoding="utf-8")
     require_study_artifacts(text, values.get("study_artifacts"))
     write_platform(layout.platform, text, facts, values)

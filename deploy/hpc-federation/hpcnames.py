@@ -17,11 +17,13 @@ read may carry. So:
 Nothing here prints or records a node's name or address but the map file and the state, which are the root's own.
 """
 
+import json
 import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
+import hpcplacement
 import tomllib
 
 from expcore_onedata.addresses import AddressMap, AddressMapError, build
@@ -60,6 +62,63 @@ def address_map(declared: Mapping[str, str], services: Mapping[str, Mapping[str,
         raise RuntimeError(
             "two services share one node's name or address: a name belongs to one service only"
         ) from None
+
+
+ADDRESSES_SLOT = "hpc_addresses"  # the placeholder a template's `addresses` key takes its value from
+ADDRESSES_NAMED = f"@{ADDRESSES_SLOT}@"
+STAND_IN = "{ slot = true }"  # what the unrendered template's slot reads as, to see where it stands
+
+
+def addresses_value(map_file: Path, resolver: Optional[Path] = None) -> str:
+    """The value of `@hpc_addresses@`: the inline table the platform layer reads as `[addresses]`, naming the map's file
+    and, once the root holds the launcher, the launcher (`resolver`). Strings are JSON's, which a basic string of TOML
+    is; the paths are the root's own (absolute), so a copy of the file beside a study reads the root's map."""
+    parts = [f"file = {json.dumps(str(map_file))}"]
+    if resolver is not None:
+        parts.append(f"resolver = {json.dumps(str(resolver))}")
+    return "{ " + ", ".join(parts) + " }"
+
+
+def at_addresses_key(template: str) -> Optional[bool]:
+    """Whether the slot is the value of the template's top-level `addresses` key, read with the slot as an inline table
+    and every other placeholder as a number (`hpcplacement.filled_in`): a slot in a comment fills no key, and one after
+    a table header would be that table's key. None for a template that is no TOML even so: the render reads the file
+    it writes."""
+    try:
+        document = tomllib.loads(hpcplacement.filled_in(template.replace(ADDRESSES_NAMED, STAND_IN)))
+    except tomllib.TOMLDecodeError:
+        return None
+    return document.get("addresses") == tomllib.loads(f"addresses = {STAND_IN}")["addresses"]
+
+
+def check_addresses_slot(template: Optional[str], *, map_written: bool) -> None:
+    """The platform template and the address map agree (O73): a root that holds a map (`up` writes one into every HPC
+    federation's, so its preflight asks with `map_written`) needs a template whose top-level `addresses` key takes the
+    slot, `addresses = @hpc_addresses@` before the first table, so that the render is the template with its slots
+    filled; a root with none refuses a template that names the slot. RuntimeError, naming the slot, never a path. A
+    layout with no template renders no platform file and is not asked."""
+    if template is None:
+        return
+    named = ADDRESSES_NAMED in template
+    if not map_written and named:
+        raise RuntimeError(
+            f"the platform template names {ADDRESSES_NAMED} and the root holds no address map: nothing fills it"
+        )
+    if map_written and (not named or at_addresses_key(template) is False):
+        raise RuntimeError(
+            f"the platform template must carry the address map's line as `addresses = {ADDRESSES_NAMED}`, a top-level "
+            "key before its first table: up writes the map into every HPC federation's root, and the render adds no "
+            "line the template does not have"
+        )
+
+
+def check_rendered_addresses(rendered: str, value: str) -> None:
+    """The rendered platform file's top-level `addresses` is the table the slot was filled with (`value`): a template
+    the preflight could not read (`at_addresses_key`) that put the slot elsewhere is refused here, naming the slot."""
+    if tomllib.loads(rendered).get("addresses") != tomllib.loads(f"addresses = {value}")["addresses"]:
+        raise RuntimeError(
+            f"{ADDRESSES_NAMED} is not the value of the rendered platform file's top-level `addresses` key"
+        )
 
 
 LAUNCHER = "resolve_launch.py"

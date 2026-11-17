@@ -224,6 +224,8 @@ class Driver(Down):
         hpcplacement.check_template(
             text
         )  # a template declares [placement] holder (O79), which the core has no default for
+        # O73: `up` writes the address map into every root, so the template carries the slot that names it, before a job
+        hpcnames.check_addresses_slot(text, map_written=True)
         # O83: a template that names @study_artifacts@ has its tool server's files checked, and the frozen manifests
         check_launchable(self.spec, site.study_artifacts)  # the names resolve through the launcher here (O73)
         check_artifacts(self.spec, site.study_artifacts, self.root)
