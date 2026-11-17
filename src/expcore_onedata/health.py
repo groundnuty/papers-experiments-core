@@ -36,7 +36,8 @@ belongs to the study (its data) and not to the platform, so a study adds it with
 
 **The content type the data gate streams on is part of this check (O05, O11), with no opt-out.** When any level of
 `[sandbox.data_paths]` is REST, the first call measures it (`precampaign.content_type_check`: the provisioned
-`[sandbox] content_check_file`, read whole and by range through the local provider) before anything but the fault gate,
+`[sandbox] content_check_file`, read whole and by range through the local provider, or `[sandbox]
+content_check_provider` when one is named: O87) before anything but the fault gate,
 so it never measures through a provider an outage run holds down, and the
 check keeps that verdict for the campaign, since a type once answered does not change: a refusal, or a type that could
 not be measured, answers every call after it with its detail, so the gate stays closed and no run is admitted; a pass

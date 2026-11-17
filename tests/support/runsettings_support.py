@@ -298,7 +298,7 @@ read_timeout_s = 30
 """
 
 CHECK_FILE_LINE = 'content_check_file = "dir/check-@space_suffix@.bin"'
-CHECK_PROVIDER_LINE = '\ncontent_check_provider = "birch"'  # a provider that supports the space, not its local one (O87)
+CHECK_PROVIDER_LINE = '\ncontent_check_provider = "birch"'  # supports the space; not the local provider (O87)
 DOCKER = {
     "platform.toml": DOCKER_PLATFORM,
     "ranges.toml": RANGES,

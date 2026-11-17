@@ -105,6 +105,7 @@ from expcore.config.platform_loads import record_platform_load
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.linksettings import LinkCheckSettings, load_link_check
 from expcore_onedata.rights import declares_qos, declares_write, rights_problem
+from expcore_onedata.sandbox.checkprovider import check as check_content_provider
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
@@ -270,6 +271,14 @@ class PlatformConfig:
         """The agent's own provider, the same in every declared space."""
         return self.providers[self.spaces[0].support.local]
 
+    @property
+    def content_check_reader(self) -> Provider:
+        """The provider the pre-campaign content check reads through (`precampaign.py`): `[sandbox]
+        content_check_provider`, a provider that supports the check file's space and holds it whole, or, with none
+        declared, the agent's local provider (O87)."""
+        name = None if self.sandbox is None else self.sandbox.content_check_provider
+        return self.local_provider if name is None else self.providers[name]
+
     def provider_label(self, name: str) -> str:
         """Name a declared provider for a message by its position in the file, `providers[i]`, never by its name."""
         return f"providers[{list(self.providers).index(name)}]"
@@ -301,7 +310,9 @@ class PlatformConfig:
         mount level's I/O mode (O21, O36), the caps of the tables of the bytes served when `[sandbox.served_bytes]` is
         declared (O22), on the Apptainer backend that backend's pins (`sandbox_backend`, O56), and the sandbox's other
         settings that shape a run (`sandbox`: the backend, the images by id, the limits, the mount, the trust paths,
-        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256). With a
+        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256, and, when it is a
+        provider other than the local one, the provider the content check reads through, by its `providers[i]`
+        position: O87). With a
         `[toolserver]`, its pinned commit, its command line (federation-neutral, hashed), its start's bound and each
         condition's allow-list, rights and manifest's SHA-256 (`toolserver`); with a `[placement]`, its data provider by
         label, its range map by digest and the bounds a run's instruments read (`placement`); with `[faults]`, the
@@ -330,6 +341,9 @@ class PlatformConfig:
             if self.sandbox.apptainer is not None:  # O56: a Docker and an Apptainer run are never one experiment
                 out["sandbox_backend"] = self.sandbox.apptainer.record()
             out["sandbox"] = runsettings.sandbox_record(self.sandbox, runsettings.federation_roles(self))
+            reader = runsettings.check_provider_record(self)
+            if reader is not None:  # only a reader other than the local provider: a store older than the key resumes
+                out["sandbox"]["content_check_provider"] = reader
         if self.toolserver is not None:
             roles = runsettings.federation_roles(self)
             out["toolserver"] = runsettings.toolserver_record(self.toolserver, self.file, roles)
@@ -613,6 +627,20 @@ def load_platform(
     if require_secrets:
         _check_fixed_users(users, principals, file, environ)
     spaces = load_spaces(root, providers)
+    sandbox_section = Section(root.table("sandbox"), file, "[sandbox]")
+    sandbox = (
+        load_sandbox(
+            sandbox_section,
+            file.parent,
+            tls=tls,
+            providers=tuple(providers),
+            local=spaces[0].support.local,  # the same in every entry (load_spaces, O03)
+        )
+        if "sandbox" in root.data
+        else None
+    )
+    if sandbox is not None:
+        check_content_provider(sandbox_section, sandbox.content_check_provider, providers, spaces)  # O87
     return PlatformConfig(
         file=file,
         zone=Zone(_name(zone, "name", zone.string("name"), "the zone name"), _url(zone, "url")),
@@ -624,15 +652,7 @@ def load_platform(
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),
         principals=principals,
         toolserver=_toolserver(root.section("toolserver"), file.parent) if "toolserver" in root.data else None,
-        sandbox=load_sandbox(
-            Section(root.table("sandbox"), file, "[sandbox]"),
-            file.parent,
-            tls=tls,
-            providers=tuple(providers),
-            local=spaces[0].support.local,  # the same in every entry (load_spaces, O03)
-        )
-        if "sandbox" in root.data
-        else None,
+        sandbox=sandbox,
         sha256=digest,
         tls=tls,
         link_check=load_link_check(root, providers, spaces),

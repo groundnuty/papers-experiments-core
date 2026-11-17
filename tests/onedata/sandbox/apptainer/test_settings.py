@@ -288,8 +288,8 @@ def test_o57_a_platform_that_declares_no_storage_kind_keeps_the_fingerprint_it_h
 
 
 def test_o87_the_apptainer_backend_reads_the_check_provider_as_the_docker_backend_does(tmp_path):
-    """O87: `content_check_provider` is a `[sandbox]` key of both backends: a layout name, kept for the platform's load to
-    check against its providers and the space; unset it is None, the agent's local provider."""
+    """O87: `content_check_provider` is a `[sandbox]` key of both backends: a layout name, kept for the platform's
+    load to check against its providers and the space; unset it is None, the agent's local provider."""
     assert _load(tmp_path, _document()).content_check_provider is None
     assert _load(tmp_path, {**_document(), "content_check_provider": "owner"}).content_check_provider == "owner"
 

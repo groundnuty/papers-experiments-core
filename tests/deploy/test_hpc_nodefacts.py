@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from hpc_fed_support import hpc_on_path
 
 from expcore_onedata.sandbox.apptainer import hostfacts
 
@@ -64,7 +65,8 @@ INPUTS = [
 @pytest.mark.parametrize(("text", "more"), INPUTS)
 def test_o87_the_node_facts_step_and_the_sandbox_read_the_same_machine_alike(nodefacts, tmp_path, text, more):
     """O87: one reading for the same inputs, in both places, whatever they hold."""
-    assert nodefacts.readings(**machine(tmp_path, text, **more)) == hostfacts.readings(**machine(tmp_path, text, **more))
+    here, there = machine(tmp_path, text, **more), machine(tmp_path, text, **more)
+    assert nodefacts.readings(**here) == hostfacts.readings(**there)
 
 
 def test_o87_the_node_facts_step_carries_the_three_readings(nodefacts, tmp_path):
@@ -82,3 +84,42 @@ def test_o87_a_node_facts_step_whose_reading_fails_still_prints_its_other_facts(
     assert found["kernel"] == "unknown"
     assert set(found["unknown"].values()) == {"RuntimeError"}
     json.dumps(found)  # one JSON object on stdout with the node's other facts
+
+
+@pytest.fixture(scope="module")
+def boot():
+    with hpc_on_path() as modules:
+        yield modules.boot
+
+
+GIVEN = [
+    {"os": {"id": "invented", "version_id": "9.4"}, "glibc": GLIBC, "kernel": KERNEL},
+    {
+        "os": {"id": "unknown", "version_id": "9"},
+        "glibc": "unknown",
+        "kernel": KERNEL,
+        "unknown": {"os.id": "no ID line", "glibc": "ValueError"},
+    },
+    {"os": {"id": "a", "version_id": "1"}, "glibc": GLIBC, "kernel": KERNEL, "extra": "dropped"},
+    {"os": {"id": "unknown", "version_id": "9"}, "glibc": GLIBC, "kernel": KERNEL},  # unknown with no reason
+    {"os": {"id": "a" * 80, "version_id": "1"}, "glibc": GLIBC, "kernel": KERNEL},
+    {"os": {"id": "a", "version_id": "1"}, "glibc": "musl 1.2", "kernel": KERNEL},
+    {"os": {"id": "a", "version_id": "1"}, "glibc": GLIBC, "kernel": KERNEL, "unknown": {"kernel": "x"}},
+    {"os": {"id": "a", "version_id": "1"}, "glibc": GLIBC, "kernel": KERNEL, "unknown": {"other": "x"}},
+    {"os": "rocky"},
+    {},
+    "text",
+    5,
+    ["os"],
+]
+
+
+@pytest.mark.parametrize("given", GIVEN, ids=range(len(GIVEN)))
+def test_o87_the_driver_keeps_a_nodes_readings_in_the_shape_the_sandbox_checks_them_in(boot, given):
+    """O87: what a facts step printed is rebuilt from the known keys alone, or unknown for the same reason in both
+    places, so the state's and a run record's readings read alike."""
+    assert boot.load_readings(given) == hostfacts.checked(given)
+
+
+def test_o87_a_step_that_printed_no_readings_is_unknown_for_that_reason(boot):
+    assert boot.load_readings(None)["unknown"] == dict.fromkeys(boot.READINGS_KEYS, "the step gave none")

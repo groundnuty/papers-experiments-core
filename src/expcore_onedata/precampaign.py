@@ -11,13 +11,16 @@ aside, so the failures cluster in one condition. So before the first run the typ
 REST reads would be cut is refused instead of run.
 
 `content_type_check` reads the provisioned file `[sandbox] content_check_file` through the agent's local provider, the
-one the gate forwards to: whole, which must be answered 200, and its first byte by range, which must be answered 206,
-both typed as the gate requires. Only the heads are read (`OnezoneClient.content_answer`), never the body. With no data
-path over REST the gate streams nothing, so nothing is read and the campaign is admitted. A type that differs, or one
-that cannot be measured (the file is missing, the provider fails), refuses the campaign: unknown is not a pass. The
-detail names the problem, the provider by its position and the type measured, never a configured value.
-`measure_content_type` says besides whether a type was measured at all, so the day-0 check can report a check that
-measured nothing as unknown, never as passed, while the campaign is still admitted when nothing streams.
+one the gate forwards to, or through `[sandbox] content_check_provider` when the study names one (O87): whole, which
+must be answered 200, and its first byte by range, which must be answered 206, both typed as the gate requires. A read
+through a provider that does not hold the file's blocks makes it fetch and keep them, a replica, so a study whose
+states want every file empty at the local provider names the file's owner, which holds it whole; the content endpoint
+of any provider answers the same type. Only the heads are read (`OnezoneClient.content_answer`), never the body. With
+no data path over REST the gate streams nothing, so nothing is read and the campaign is admitted. A type that differs,
+or one that cannot be measured (the file is missing, the provider fails), refuses the campaign: unknown is not a pass.
+The detail names the problem, the provider it read through by its position and the type measured, never a configured
+value. `measure_content_type` says besides whether a type was measured at all, so the day-0 check can report a check
+that measured nothing as unknown, never as passed, while the campaign is still admitted when nothing streams.
 
 Where it runs. The core has no hook at a campaign's start, and a study's `build` must have no side effects, so the
 check runs at the first call of the health gate, which the core makes before any attempt starts. The platform's
@@ -101,7 +104,8 @@ class ContentTypeVerdict:
 
 
 def measure_content_type(config: PlatformConfig, client: OnezoneClient) -> ContentTypeVerdict:
-    """Measure the content type of a file's content, whole and by range, on the local provider; never raise."""
+    """Measure the content type of a file's content, whole and by range, on the provider the check reads through (the
+    local one, or `[sandbox] content_check_provider`); never raise."""
     sandbox = config.sandbox
     if sandbox is None or DataPathMode.REST not in sandbox.data_paths.values():
         return ContentTypeVerdict(False, True, NOTHING_STREAMS)
@@ -110,15 +114,17 @@ def measure_content_type(config: PlatformConfig, client: OnezoneClient) -> Conte
             False, False, f"{REFUSED}: {CHECK_KEY} is not set, so the content type the gate streams on is unknown"
         )
     # The file lies under the root of the first space the data path's token reaches: the only space, or with several
-    # (`[[spaces]]`) the first entry whose `tokens` hold the data path, read through the agent's one local provider.
-    local, space_id = config.local_provider.name, config.space_ids("data_path")[0]
-    label = client.provider_label(local)
+    # (`[[spaces]]`) the first entry whose `tokens` hold the data path, read through the agent's one local provider, or
+    # through `[sandbox] content_check_provider` when the study names one (O87): every request of the check, the root,
+    # each listing, the parent walk and both reads, goes to that one provider.
+    reader, space_id = config.content_check_reader.name, config.space_ids("data_path")[0]
+    label = client.provider_label(reader)
     try:
-        node = consistency.space_root(client, local, space_id, tries=1, retry=ONE_ATTEMPT)
+        node = consistency.space_root(client, reader, space_id, tries=1, retry=ONE_ATTEMPT)
         for part in safe_path(sandbox.content_check_file):
-            node = _child(client, local, node, part)
-        whole = client.content_answer(f"/data/{node}/content", provider=local, first_byte=False)
-        part = client.content_answer(f"/data/{node}/content", provider=local, first_byte=True)
+            node = _child(client, reader, node, part)
+        whole = client.content_answer(f"/data/{node}/content", provider=reader, first_byte=False)
+        part = client.content_answer(f"/data/{node}/content", provider=reader, first_byte=True)
     except (PlatformError, LookupError, ValueError) as error:  # their messages hold labels and positions, no value
         return ContentTypeVerdict(
             False, False, f"{REFUSED}: the content type of {CHECK_KEY} on {label} could not be measured ({error})"

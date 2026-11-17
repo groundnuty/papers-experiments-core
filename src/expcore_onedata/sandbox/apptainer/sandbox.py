@@ -69,7 +69,7 @@ from expcore_onedata.sandbox.api import (
     StartRefused,
 )
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs
+from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, hostfacts, layout, loopback, runs
 from expcore_onedata.sandbox.apptainer.cells import AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.infra import InfraCheck
@@ -306,6 +306,7 @@ class ApptainerSandbox:
         self._started = time.time()
         self._meta.update(host=self.node.node_facts(self.app.apptainer),
                           started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))  # fmt: skip
+        self._meta["infrastructure_facts"]["node"] = hostfacts.of_node(self.node.node_readings)  # O87
         self._checkpoint()
         self._start_collector()
         self._checkpoint()
@@ -805,6 +806,7 @@ class ApptainerSandbox:
         (home / "tmp").mkdir(mode=0o700)  # its TMPDIR: never the node's shared /tmp
         self.record(tool_server_process={"on": "node", "home": "run_directory", "tmpdir": "home", "run_tag": True,
                                          "inherited": ["PATH"]})  # fmt: skip
+        self._note_tool_server_host()
         try:
             yield ServerProcess(home=home, env={AV.RUN_TAG: self.sid, "TMPDIR": str(home / "tmp")})
         finally:
@@ -814,6 +816,15 @@ class ApptainerSandbox:
                     runs.remove_tree(self.dir)  # making its home again after the teardown, which no reaper would take
             except OSError as error:  # the teardown removes the run's directory, this one with it
                 log.error("the tool server's directory could not be removed: %s", describe_error(error))
+
+    def _note_tool_server_host(self) -> None:
+        """O87: the tool server's host's OS release, glibc and kernel, beside the node's, when they differ from it: on
+        the node's own host (the driver's child) they are the node's and nothing is added. Recorded, never refused."""
+        theirs = hostfacts.of_node(self.node.tool_server_readings)
+        with self._meta_lock:
+            facts = self._meta["infrastructure_facts"]
+            if theirs != facts.get("node"):
+                facts["tool_server_host"] = theirs
 
     def record(self, **fields: Any) -> None:
         with self._meta_lock:

@@ -65,7 +65,7 @@ def test_o87_the_last_assignment_of_a_key_wins_as_a_shell_that_sources_the_file_
 
 
 def test_o87_the_file_is_read_as_text_and_never_executed(tmp_path):
-    """O87: a value with shell syntax is no plain value: it is unknown, nothing runs, and the file it names is not made."""
+    """O87: a value with shell syntax is no plain value: unknown, and nothing runs, so the file it names is not made."""
     made = tmp_path / "executed"
     text = f"ID=$(touch {made})\nVERSION_ID=`touch {made}`\n"
     found = read(tmp_path, os_release=os_release(tmp_path, text))

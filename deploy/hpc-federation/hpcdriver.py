@@ -23,7 +23,7 @@ import hpcstorage
 from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
-from hpcboot import core_phase, hpc_spec, hpc_values, load_owner
+from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, load_readings
 from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
 from hpclaunch import Launcher, StateStore
@@ -416,7 +416,8 @@ class Driver(Down):
         state["phase"] = "placed"
 
     def node_facts(self) -> None:
-        """Each node's FQDN, its IPv4 address and the job's uid and gid, from a control step on it."""
+        """Each node's FQDN, its IPv4 address and the job's uid and gid, from a control step on it, and its OS release,
+        glibc and kernel (`readings`, O87: recorded only, a node that gives none is unknown, never refused)."""
         state = self.store.read()
         site, prefix = Site.from_json(state["site"]), state["allocation"]["name"]
         for role in state["roles"]:
@@ -433,9 +434,10 @@ class Driver(Down):
                     f"the node facts of {role} are not a name, an IPv4 address, a uid and a gid (the step's status "
                     f"{done.returncode}; {stderr_tail(done.stderr)})"
                 )
+            readings = load_readings(facts.get("readings"))  # O87: recorded, never refused: unknown, with why
             self.set(
-                lambda s, r=role, f=facts, o=owner: (
-                    s["services"][r].update(fqdn=f["fqdn"], address=f["address"]),
+                lambda s, r=role, f=facts, o=owner, g=readings: (
+                    s["services"][r].update(fqdn=f["fqdn"], address=f["address"], readings=g),
                     s.update(owner=list(o)),
                 )
             )
