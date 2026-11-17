@@ -155,9 +155,12 @@ reserved and never refunded. Probes: the sends of admission's probes, charged at
 replies reported, or a send's bound. Charged at a bound counts the attempts whose charge holds a bound or a top-up. An
 attempt that failed before any request was sent and was charged a measured zero has 0 tokens and 0 dollars. n/a: not
 known, because the model has no price, the prices are not the ones the campaign ran under, a bound cannot be computed
-or a record cannot be read; it is never 0. Spent is the model's total, On analysed attempts that of the attempts the
-analysis uses, and On the rest everything else (attempts that were never scored, runs left out of a partial analysis,
-what a kill lost, probes), so what scored runs cost can be read beside the overhead.
+or a record cannot be read; it is never 0. An attempt still running (a partial analysis) has no spend of its own known
+yet: its dollars are n/a and Spent has only the top-ups it was charged. Top-ups and probes are what the budget gate
+charged: a campaign without a budget has no gate, so both are 0 there, though its endpoints may have billed what
+nothing counted. Spent is the model's total, On analysed attempts that of the attempts the analysis uses, and On the
+rest everything else (attempts that were never scored, runs left out of a partial analysis, what a kill lost, probes),
+so what scored runs cost can be read beside the overhead.
 
 ### Spend by model
 
