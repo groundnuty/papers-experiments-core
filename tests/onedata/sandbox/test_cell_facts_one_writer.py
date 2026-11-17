@@ -7,8 +7,12 @@ the key, before the first read or after it. The Apptainer sandbox's, with the sc
 import pytest
 from sandbox_support import make_spec, start_options
 
-from expcore_onedata.sandbox import cellhost, infrafacts
+from expcore_onedata.sandbox import cellhost, cellresolv, gatepolicy, infrafacts
 from expcore_onedata.sandbox.sandbox import DockerSandbox
+
+# what a started REST run's own table holds: the node's readings, the window, and what the start records (the hash of
+# the resolv.conf a cell read, O56, and the timeout the gate was given, O85)
+STORED = {"node", "federation_window", cellresolv.FACT, gatepolicy.UPSTREAM_READ_TIMEOUT_FACT}
 
 
 def _started(world):
@@ -29,8 +33,8 @@ def test_o89_every_read_carries_the_name_beside_the_other_facts_and_the_run_stor
         for _ in range(2):
             facts = box.metadata()["infrastructure_facts"]
             assert facts["cell_hostname"] == cellhost.CELL_HOSTNAME
-            assert set(facts) == {"node", "cell_hostname", "federation_window"}
-        assert set(box._meta["infrastructure_facts"]) == {"node", "federation_window"}
+            assert set(facts) == {*STORED, "cell_hostname"}
+        assert set(box._meta["infrastructure_facts"]) == STORED
     finally:
         _stopped(world, box)
 
@@ -48,5 +52,19 @@ def test_o89_no_other_writer_takes_the_name_before_the_first_read_or_after_it(wo
         with pytest.raises(infrafacts.FactsConflict, match="cell_hostname"):
             box.record_infrastructure_fact("cell_hostname", "another's", owner="another")
         assert box._meta["infrastructure_facts"] == before
+    finally:
+        _stopped(world, box)
+
+
+def test_o89_no_other_writer_takes_the_resolv_hash_or_the_gates_timeout(world):
+    """O89: the two facts the start records (O56, O85) are declared for their owners, so another writer's attempt at
+    either key is refused after the start has written it, and writes nothing."""
+    box = _started(world)
+    try:
+        for key in (cellresolv.FACT, gatepolicy.UPSTREAM_READ_TIMEOUT_FACT):
+            before = dict(box._meta["infrastructure_facts"])
+            with pytest.raises(infrafacts.FactsConflict, match=key):
+                box.record_infrastructure_fact(key, "another's", owner="another")
+            assert box._meta["infrastructure_facts"] == before
     finally:
         _stopped(world, box)

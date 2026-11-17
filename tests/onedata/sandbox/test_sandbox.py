@@ -22,6 +22,7 @@ from sandbox_support import (
 )
 
 from expcore.errors import InfraError
+from expcore_onedata.sandbox import cellresolv
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
 from expcore_onedata.sandbox.containers import ENV_TOKEN, GATE_TOKEN_PATH, SIDECAR_LOG_DIR, SIDECAR_TOKEN_PATH
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -145,9 +146,9 @@ def where_a_credential_is_visible(world, sbx, token: str) -> list[str]:
 def test_o05_no_credential_is_visible_inside_the_agent_on_any_data_path(world, level):
     """O05: the agent's code must never be able to read a token: not in its environment, its files or its arguments."""
     seen = []
-    world.host.exec_handler = lambda container, argv, stdin: (seen.append((argv, stdin)), CmdResult(0, "blocked 30\n"))[
-        1
-    ]
+    world.host.exec_handler = world.host.reading_resolv(
+        lambda container, argv, stdin: (seen.append((argv, stdin)), CmdResult(0, "blocked 30\n"))[1]
+    )
     sbx = start(world, level)
     sbx.exec("print(1)", 30)
     assert where_a_credential_is_visible(world, sbx, TOKEN) == []
@@ -287,7 +288,9 @@ def test_the_mount_token_belongs_to_the_sidecar_and_the_agent_has_none(world):
     assert TOKEN not in flat(sidecar)
     assert TOKEN not in json.dumps(sidecar.options["_env"])
     assert TOKEN not in json.dumps(agent.options["_env"])
-    assert not agent.options["_files"]
+    assert agent.options["_files"] == {
+        "/etc/resolv.conf": cellresolv.RESOLV_TEXT
+    }  # no file of the agent's holds a token
     assert "--device" not in agent.options
     assert sbx.names.net in agent.networks
     assert "bridge" not in agent.networks
@@ -635,7 +638,7 @@ def test_no_data_path_means_no_gate_no_mount_no_token_and_still_its_own_network(
     assert set(world.host.containers) == {sbx.names.agent}
     agent = world.host.containers[sbx.names.agent]
     assert "_env" not in agent.options or not agent.options["_env"]
-    assert "--mount" not in agent.options
+    assert [m for m in agent.options.get("--mount", []) if "dst=/etc/resolv.conf" not in m] == []  # O56: its one bind
     assert set(world.host.networks) == {sbx.names.net}
     sbx.stop()
     assert nothing_left(world)
@@ -760,7 +763,7 @@ def test_a_failed_start_whose_cleanup_fails_too_is_registered_for_the_next_start
     assert caught.value.sandbox is not None
     assert world.registry.pending() == 1
     world.host.docker = original
-    world.host.exec_handler = lambda container, argv, stdin: CmdResult(0, "blocked 30\n")
+    world.host.exec_handler = world.host.reading_resolv(lambda container, argv, stdin: CmdResult(0, "blocked 30\n"))
     sbx = start(world, "isolated")
     assert world.registry.pending() == 0
     assert sbx.metadata()["pending_cleanups_left"] == 0

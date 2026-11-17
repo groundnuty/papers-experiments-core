@@ -62,6 +62,7 @@ from expcore_onedata import tls
 from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import (
     cellhost,
+    cellresolv,
     copyout,
     directio,
     gatelog,
@@ -396,6 +397,7 @@ class DockerSandbox:
         )  # fmt: skip
         self._cells.init_sleep = self._init_sleep
         self._verify_read_only()
+        self._verify_resolv()
         if share and s.mount.io_mode == DIRECT:
             self._verify_direct_io()
         self._verify_inputs()
@@ -443,11 +445,16 @@ class DockerSandbox:
             "hosts": hosts,
             "listing": self.spec.listing,  # paged, or every listing answered complete (O21)
             "token_file": GATE_TOKEN_PATH,  # where `gate_run_args` binds the run's file of the token, read-only
+            # how long the gate waits for the upstream's next byte, the default's value when none is declared (O85)
+            "upstream_read_timeout_s": self.s.gate_upstream_read_timeout_s,
         }
         if self._ca_copy is not None:
             config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only
         (self.dir / "gate.json").write_text(json.dumps(config), encoding="utf-8")
         (self.dir / "gate.json").chmod(0o444)  # no secret; the gate, root without DAC_OVERRIDE, reads it as anyone
+        # the fact is what the file holds, read back, never what was meant (O85)
+        given = json.loads((self.dir / "gate.json").read_text(encoding="utf-8"))["upstream_read_timeout_s"]
+        self.record_infrastructure_fact(gatepolicy.UPSTREAM_READ_TIMEOUT_FACT, given, owner=infrafacts.GATE)
 
     def _pool_position(self, subnet: str) -> int | None:
         """Which pool of `[sandbox.network] pools`, by position in the file, a subnet was taken from."""
@@ -728,12 +735,22 @@ class DockerSandbox:
             out[path] = bundle
         return out
 
+    def _write_resolv(self) -> Path:
+        """The run's own copy of the neutral /etc/resolv.conf (`cellresolv`, O56), the file the agent's container binds
+        read-only over the engine's own. 0444, so the agent's user reads it whatever the driver's umask; the bind is of
+        this copy and never of a path a study names."""
+        path = self.dir / "resolv.conf"
+        path.write_text(cellresolv.RESOLV_TEXT, encoding="utf-8")
+        path.chmod(0o444)
+        return path
+
     def _start_agent(self, work: Path, share: Path | None, gate_ip: str | None, gate_hosts: list[str]) -> None:
         s, sp = self.s, self.spec
         rest = sp.mode is DataPathMode.REST
         args, env = agent_run_args(
             s, self.names, self._label_args(), image_id=s.agent.id, mode=sp.mode, work=work, share=share,
-            gate_ip=gate_ip, gate_hosts=gate_hosts, ca=self.dir / "tls" / "ca.pem" if rest else None,
+            resolv=self._write_resolv(), gate_ip=gate_ip, gate_hosts=gate_hosts,
+            ca=self.dir / "tls" / "ca.pem" if rest else None,
             trust_bundles=self._trust_bundles() if rest else {}, zone_host=self._agent_zone_host() if rest else None,
             inputs=self._input_copies,
         )  # fmt: skip
@@ -770,6 +787,17 @@ class DockerSandbox:
                 raise SandboxError(f"the {what} is not read-only for the agent")
             proved[what] = True
         self._meta["read_only_verified"] = proved
+
+    def _verify_resolv(self) -> None:
+        """Have a cell read /etc/resolv.conf back and refuse to hand out a sandbox whose agent reads anything but the
+        neutral file, which the engine's own, with the host's search domain, would be (O56). The record keeps the hash the
+        cell read, never the text."""
+        r = self._cells.run(cellresolv.PROBE, 60, record=False)
+        digest, problem = cellresolv.judge(r.exit_code, r.stdout)
+        if problem is not None:
+            log.error("resolv.conf probe: %s (%s)", problem, describe_stderr(r.stderr))
+            raise SandboxError(problem)
+        cellresolv.note(self._facts, digest)  # `metadata()` may be reading it from another thread: the writer's lock
 
     def _verify_direct_io(self) -> None:
         """Show that the direct mount reads the local provider's storage itself, or refuse to hand the sandbox out (O40,

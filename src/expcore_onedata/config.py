@@ -59,8 +59,8 @@ resolver = "toolshim/resolve_launch.py"  # optional: the launcher a Python tool 
                                 #   resolves exactly those names (the server needs python and -m <module> or a script)
 
 [toolserver]
-command = "path/to/executable"
-args = []
+command = "/absolute/path/to/executable"  # absolute, or a bare name found on PATH: never relative (O84)
+args = []                       # a path among them is absolute too: the server starts in an empty directory
 start_timeout_s = 120
 clone = "path"                  # optional, with commit: the checkout the server runs from, verified clean
 commit = "..."
@@ -116,6 +116,7 @@ from expcore_onedata.sandbox.checkprovider import check as check_content_provide
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
+from expcore_onedata.toolpaths import relative_argument, relative_command
 from expcore_onedata.toolrights import agreement_problem
 
 PLATFORM_MODULE = "expcore_onedata.sandbox.kinds"  # the module a study lists in `[study] platforms` for this platform
@@ -323,9 +324,9 @@ class PlatformConfig:
         mount level's I/O mode (O21, O36), the caps of the tables of the bytes served when `[sandbox.served_bytes]` is
         declared (O22), on the Apptainer backend that backend's pins (`sandbox_backend`, O56), and the sandbox's other
         settings that shape a run (`sandbox`: the backend, the images by id, the limits, the mount, the trust paths,
-        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256, and, when it is a
-        provider other than the local one, the provider the content check reads through, by its `providers[i]`
-        position: O87). With a
+        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256, the gate's upstream
+        read timeout only when it is not the default (`gate`: O85), and, when it is a provider other than the local one,
+        the provider the content check reads through, by its `providers[i]` position: O87). With a
         `[toolserver]`, its pinned commit, its command line (federation-neutral, hashed), its start's bound and each
         condition's allow-list, rights and manifest's SHA-256 (`toolserver`); with a `[placement]`, its data provider by
         label, its range map by digest and the bounds a run's instruments read (`placement`); with `[faults]`, the
@@ -590,9 +591,22 @@ def _toolserver(section: Section, base: Path, *, require_manifests: bool = True)
     conditions = section.section("conditions")
     if not conditions.data:
         raise conditions.fail(None, "must declare at least one condition")
+    command, args = section.string("command"), section.strings("args")
+    if relative_command(command):  # the server starts in an empty directory of its own: refused here, not at a launch
+        raise section.fail(
+            "command",
+            "must be an absolute path, or a bare name found on PATH: the tool server starts in an empty directory of "
+            "its own (O84), where a path relative to the working directory resolves to nothing",
+        )
+    if (position := relative_argument(command, args)) is not None:
+        raise section.fail(
+            "args",
+            f"argument {position + 1} is a path relative to the working directory, which resolves to nothing: the tool "
+            "server starts in an empty directory of its own (O84); name it by an absolute path",
+        )
     return ToolServer(
-        section.string("command"),
-        section.strings("args"),
+        command,
+        args,
         float(_number(section, "start_timeout_s", 120.0, minimum=1)),
         (base / clone).resolve() if clone else None,
         commit,

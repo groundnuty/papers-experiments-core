@@ -11,8 +11,8 @@ decides, and the start's proof below is what is relied on).
 
 * **The image** (`make`): `<run>/work/disk.img`, sparse, of `work_disk_bytes` rounded down to 2 MiB, so the file's
   allocated size, which the watch still walks against the cap, never reads over it (huge pages included). The node's
-  `mkfs.ext3 -d` lays it out from a tree holding one directory, `work`, of the driver's uid, and that directory is what
-  the cell sees as `/work`: the driver's, as Docker gives its disk's root to the agent. The image's root and its
+  `mkfs -t ext3 -d` lays it out from a tree holding one directory, `work`, of the driver's uid, and that directory is
+  what the cell sees as `/work`: the driver's, as Docker gives its disk's root to the agent. The image's root and its
   `lost+found` (root's, 0700, so the uid could not list them) stay outside the cell's `/work`.
 * **The proof** (`PROBE`, `judge`, `CHECK`, `judge_check`): before the agent's first cell, a cell writes zeros into
   `/work` until a write fails, at most one chunk past the image's size. The start goes on only when the write failed
@@ -71,6 +71,7 @@ EXPORT = "/expcore-export"  # where a collection's exec binds the run's staging 
 COPY_TAG = "EXPCORE_WORK_COPY"  # a collection exec's environment: `<COPY_TAG>=<sid>`, which the watch never matches
 ALIGN = 2 << 20  # the image's size is a multiple of this: a huge page of tmpfs, so its allocation stays within it
 MKFS_S = 300.0
+IMAGE_FS = "ext3"  # the image's type, always passed as `-t`: e2fsprogs otherwise takes it from the program's name
 VERSION_S = 20.0
 PROBE_BASE_S = 60.0
 PROBE_RATE = 16 << 20  # bytes a second the probe's timeout allows for its fill, past its base
@@ -154,7 +155,9 @@ def bind(run_dir: Path) -> AV.Bind:
 
 def make(node: NodeOps, run_dir: Path, size: int, mkfs: Sequence[str]) -> None:
     """Make the run's image afresh (the module's docstring): a sparse file of `size` bytes laid out by `mkfs -d` from a
-    tree of one directory of the driver's; `SandboxError` naming what failed, never a path."""
+    tree of one directory of the driver's; `SandboxError` naming what failed, never a path. The type is always
+    `-t ext3`: e2fsprogs makes `mke2fs` ext2 and `mkfs.ext4` ext4 when none is given, and `work_disk_mkfs` (the
+    program) is out of the fingerprint (C06), so it may name only where the tool is, never what it makes."""
     image, tree = image_path(run_dir), run_dir / "disk-tree"
     image.unlink(missing_ok=True)
     if os.path.lexists(tree):
@@ -168,7 +171,7 @@ def make(node: NodeOps, run_dir: Path, size: int, mkfs: Sequence[str]) -> None:
     finally:
         os.close(descriptor)
     try:
-        done = node.run([*mkfs, "-q", "-F", "-d", str(tree), str(image)], MKFS_S)
+        done = node.run([*mkfs, "-t", IMAGE_FS, "-q", "-F", "-d", str(tree), str(image)], MKFS_S)
     finally:
         shutil.rmtree(tree)
     if done.returncode != 0:

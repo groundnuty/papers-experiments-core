@@ -52,7 +52,8 @@ nothing in the launch saying so. The environment this module builds says `ONEDAT
 server's guard: with it no `.env` is read), and the server's working directory is a new, empty directory of mode 0700
 made for each start and removed after it (`expcore.tools.workdir.private_workdir`), because the working directory is
 where FastMCP reads a `.env` for its own settings and where the server's relative paths would otherwise land in the
-driver's.
+driver's. So a `[toolserver]` command or argument that is a path relative to the working directory resolves to nothing
+there, and `load_platform` refuses one, naming the key (`toolpaths`, #382).
 
 The server writes no bytecode either (O84). A Python that imports a module writes its `.pyc` beside it, and the server
 imports from trees a study freezes (its clone, its virtualenv, the interpreter's own library), so a start, a launch or

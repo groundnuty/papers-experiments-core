@@ -13,9 +13,11 @@ name, two figures in the answer's `timing`:
   ended first, the usual case).
 
 A verb's steps are the control steps it names with the relay's tag (`fault_relay_late.CONTROL_WORDS`: a stop's
-teardown, a status and its read-only check, an exec, which is a link restart or a ping) and, for a start that launched,
-the service step it recorded in the state file (`<allocation>-<service>-run-<n>`). sacct prints whole seconds in the
-login node's local time, so the figures are good to about a second.
+teardown, a status and its read-only check, an exec, which is a link restart or a ping) and, for a start that launched
+or that took over the step an earlier attempt launched (`own_service_step`), the service step it recorded in the state
+file (`<allocation>-<service>-run-<n>`); a taken-over step began before this verb was issued, so its
+`start_after_issue_s` is negative. sacct prints whole seconds in the login node's local time, so the figures are good
+to about a second.
 
 A figure that cannot be given is None, and `unknown` says why (`not_recorded`, `no_such_step`, `unparsable`); a reading
 that cannot be made says so for the whole answer (`accounting`: `unreadable`, `skipped`; `reason`). A timing never
@@ -26,7 +28,7 @@ import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 from expcore_onedata.compose import CommandResult
 from expcore_onedata.fault_relay_late import CONTROL_WORDS, step_name
@@ -40,6 +42,30 @@ _STATE = re.compile(r"[A-Z_]{1,32}")
 _NOT_RECORDED = ("", "Unknown", "None", "N/A")
 
 Sacct = Callable[[Sequence[str], float], CommandResult]  # (argv, bound) -> the command's end; raises what a runner does
+
+
+class Launch(NamedTuple):
+    """What the federation's state file records of a service's latest launch: its count, its service step's name, the
+    service's state and whether the step's id is recorded (hpcfed records it once the step is listed)."""
+
+    count: Any
+    step: str
+    state: Any
+    listed: bool
+
+
+def own_service_step(before: Launch | None, after: Launch | None) -> str | None:
+    """The service step a start made its own, by the state file read before it and after it, or None. A start that
+    launched one changed the launch count. A start retried after its wait for the step to be listed ran out finds the
+    step an earlier attempt launched listed and takes it over without launching: the count is the same, the state said
+    `starting` with no step id before it and says `running` with one after it, under the same step name. A start that
+    found its service up, or that did not see the step listed either, made none its own."""
+    if before is None or after is None:
+        return None
+    if after.count != before.count:
+        return after.step
+    adopted = before.state == "starting" and not before.listed and after.state == "running" and after.listed
+    return after.step if adopted and after.step == before.step else None
 
 
 def step_names(
