@@ -392,6 +392,32 @@ def test_a_set_aside_pair_that_does_not_verify_refuses_the_collect(shards, tmp_p
         shards.collect(moved, tmp_path / "third")
 
 
+def test_a_set_aside_archive_with_no_manifest_beside_it_refuses_the_collect_naming_the_file(shards, tmp_path):
+    """O63: `<label>.<12 hex digits>.root.tar` with no `.root.json` beside it cannot be verified, and the listing was
+    made from the manifests alone, so it was never listed and `verify-copy` never checked it: the collect refuses,
+    naming the file (never its path)."""
+    plan = _collect(shards, tmp_path, "first")
+    moved = _moved(plan, tmp_path)
+    shards.collect(moved, tmp_path / "second")
+    (manifest,) = plan.results.glob("fed-a.*.root.json")
+    orphan = manifest.with_name(manifest.name.replace(".root.json", ".root.tar"))
+    manifest.unlink()
+    with pytest.raises(shards.ShardsError, match=re.escape(orphan.name)) as refused:
+        shards.collect(moved, tmp_path / "third")
+    assert str(tmp_path) not in str(refused.value)
+    assert "manifest" in str(refused.value)
+
+
+def test_a_root_archive_with_its_manifest_beside_it_is_no_orphan_and_neither_is_the_live_one(shards, tmp_path):
+    """O63: the refusal is for an aside archive alone: the pair a move set aside is listed as before, and
+    `<label>.root.tar` (this federation's own, whose manifest is written with it) is never one."""
+    plan = _collect(shards, tmp_path, "first")
+    moved = _moved(plan, tmp_path)
+    shards.collect(moved, tmp_path / "second")
+    shards.collect(moved, tmp_path / "third")
+    assert len(_aside(plan)) == 2
+
+
 def test_a_root_archive_of_another_federation_is_not_taken_for_a_gone_roots_own(shards, tmp_path):
     """O63: the shard moved and its new root is gone too: the archive under its label is the first federation's, so the
     collect refuses instead of listing it as this root's."""

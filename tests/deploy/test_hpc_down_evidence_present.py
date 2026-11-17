@@ -356,7 +356,7 @@ def test_a_line_appended_to_the_journal_after_the_collect_of_a_day0_only_root_re
 
 def test_the_stale_refusal_of_a_day0_only_root_does_not_say_a_step_started(hpc, tmp_path, site):
     """O63: with no step record there is no step to name: the refusal says something wrote since, and the remedy names
-    `collect --roots-only --shard L`, which needs a plan that names the root."""
+    `collect --roots-only --root R --into DIR` (one federation, no plan) and `--shard L` (a plan naming the root)."""
     rig = _day0_rig(hpc, tmp_path, site)
     rig.collected()
     journal = rig.root / "fault-journal" / "injections.jsonl"
@@ -365,7 +365,9 @@ def test_the_stale_refusal_of_a_day0_only_root_does_not_say_a_step_started(hpc, 
         rig.driver.down()
     assert "something wrote since" in str(late.value)
     assert "a step started" not in str(late.value)
-    assert "verify-copy" not in str(late.value)
+    assert "collect --roots-only --root <root> --into <new directory>" in str(late.value)
+    # the single-root form writes a manifest of the copy, which verify-copy checks
+    assert "verify-copy" in str(late.value)
     rig.root.joinpath("evidence-collected.json").unlink()
     with pytest.raises(
         RuntimeError, match=r"collect --roots-only --shard L.*a shard plan that names this root"

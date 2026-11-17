@@ -81,6 +81,87 @@ statuses = {key: study.models.resolve(key).status for key in study.models}
 assert statuses == {"alpha-stub": "frozen", "beta-stub": "frozen"}  # only frozen settings may start a study run
 ```
 
+### A model entry's keys
+
+`models.toml` holds one `[models.<key>]` table per model. The key names the model everywhere else in the configuration (the plan, the caps and the concurrency refer to keys, never to API ids), and a table refuses a key it does not know, listing the ones it does. What an entry needs depends on its `backend`: `openai_compat` for an OpenAI-compatible chat endpoint, `anthropic` for the Messages API, `stub` for a scripted model that sends nothing (the example study's), or another plain lower-case name for a backend of the study's own, which the plugin's `backend_factory` serves and which the core's rules for its own adapters do not apply to. The table says required (**R**), optional (o) or refused (-).
+
+| Key | `openai_compat` | `anthropic` | `stub` | What it holds |
+|---|---|---|---|---|
+| `backend` | R | R | R | the adapter that serves the entry |
+| `api_id` | R | R | o | the id sent to the endpoint; a stub's is its key |
+| `status` | o | o | o | `frozen`, or `draft`, which is the default; only `frozen` settings may start a study run (B08), and a pilot builds a draft backend on purpose |
+| `base_url` | R | R | - | the endpoint: an http or https URL with a host and a valid port, and no credentials (see the paragraph below the table) |
+| `key_env`, `key_file` | o, at most one | R, exactly one | - | the name of the environment variable that holds the key, or the path of a file that does (`~` is expanded) |
+| `aliases` | o | o | o | other names the server reports for the model; no name may answer to two entries, case aside (P06) |
+| `sampling` | o | o: `temperature`, `top_p`, `top_k` only | - | request settings as a table: `temperature` and `top_p` are numbers, `top_k` an integer |
+| `extra_body` | o | o: `thinking` and `output_config` come from here | - | vendor extras, sent verbatim; never a field the adapter sets itself, never `stream`, and never a key `sampling` also holds |
+| `max_output_tokens` | o | o | o | the model's own maximum per reply, a positive integer: a request carries the lower of it and the study's `max_output_tokens`, and it must be below `context_tokens` |
+| `context_tokens` | o | o | o | the endpoint's context window, a positive integer: checked at admission, and required of every model that is not free once the campaign has a budget |
+| `echo_reasoning_field` | o | - | - | the assistant-message field the model's reasoning is sent back in (B04); a plain name that is not a standard message field |
+| `prompt_cache_ttl` | - | o: `"5m"` or `"1h"` | - | the cache lifetime; without it no cache marker is sent |
+| `price` or `free` | one of the two | one of the two | one of the two | `[models.<key>.price]` ([below](#prices-and-the-budget)), or `free = true` for a model that costs nothing per token; both are refused, and a study run refuses a model with neither |
+| `accepted_fingerprints` | o | - | o | the serving fingerprints that count as one model ([below](#a-model-served-by-several-deployments)) |
+
+The adapter sets the request's `model`, `messages`, `tools`, `max_tokens` and `stream` itself (and on `openai_compat` `tool_choice`, `stream_options` and `seed`, from the run's seed; on `anthropic` `system` and `cache_control`), so an entry that names one in `sampling` or `extra_body` is refused. A key is read when a request is built, never when the table loads, and a message names the variable or the file and never the key (`ModelSpec.read_key`); `ModelTable.require_keys` checks at the start that every model the plan names has a readable one.
+
+**`base_url` is required for every backend the core builds but the stub.** That includes `anthropic`, even where a provider has one public address. The core knows no provider's address and has no default for the key: the adapter hands what you wrote to the provider's client as its `base_url`, and the record's route keeps it with any credentials, query and fragment removed. An entry without the key is refused at load with `base_url must be an http or https URL with a host`, the message of a URL that is malformed, so a missing key reads like a typo in a URL nobody wrote. Write the provider's own address, or a gateway's. A campaign's `[endpoints.<model>] base_url` replaces the entry's when a run is sent, and cannot stand in for it, since the entry is checked first, when `models.toml` loads.
+
+**On `anthropic` the reply maximum is also the thinking budget's room.** The Messages API needs `budget_tokens` below `max_tokens`, so an entry whose thinking budget is not below its own `max_output_tokens` is refused at load, and one whose budget is not below the lower of the study's `max_output_tokens` and its own is refused when its backend is built, before anything is sent (B16). Thinking and the answer are spent from that one limit: the `thinking_tokens` of the record's served-model summary counts only what the API reports separately, and is `None` when it reports none, the thinking then being inside the output tokens. For a model held to its reply maximum the budget reserves each tool round's reply at that limit ([below](#prices-and-the-budget)), so room for thinking raises a run's reservation.
+
+A real model's entry, with an invented address, name and prices:
+
+```python
+import tomllib
+
+from expcore.config.loading import ConfigError
+from expcore.config.models import parse_models
+
+HOSTED = """
+[models.hosted-large]
+backend = "anthropic"
+api_id = "vendor-large-1"
+base_url = "https://llm.example.invalid"
+key_env = "HOSTED_KEY"
+status = "frozen"
+max_output_tokens = 8000
+context_tokens = 200000
+prompt_cache_ttl = "5m"
+
+[models.hosted-large.extra_body.thinking]
+type = "enabled"
+budget_tokens = 4000
+
+[models.hosted-large.price]
+input_per_mtok = 1.0
+output_per_mtok = 4.0
+cache_write_per_mtok = 1.25
+cache_read_per_mtok = 0.1
+"""
+hosted = parse_models(tomllib.loads(HOSTED), "models.toml").resolve("hosted-large")
+assert (hosted.backend, hosted.max_output_tokens, hosted.context_tokens) == ("anthropic", 8000, 200000)
+assert hosted.priced and hosted.price.cache_read_per_mtok == 0.1
+assert hosted.output_tokens(16000) == 8000  # a request carries the lower of the study's cap and the entry's own
+assert hosted.extra_body == {"thinking": {"type": "enabled", "budget_tokens": 4000}}
+
+for broken, said in (
+    (
+        HOSTED.replace('base_url = "https://llm.example.invalid"\n', ""),
+        "base_url must be an http or https URL with a host",
+    ),
+    (
+        HOSTED.replace("budget_tokens = 4000", "budget_tokens = 8000"),
+        "budget_tokens (8000) must be smaller than max_output_tokens (8000)",
+    ),
+    (HOSTED.replace('key_env = "HOSTED_KEY"\n', ""), "an anthropic model needs key_env or key_file"),
+):
+    try:
+        parse_models(tomllib.loads(broken), "models.toml")
+    except ConfigError as refused:
+        assert said in str(refused) and str(refused).startswith("models.toml: [models.hosted-large]: ")
+    else:
+        raise AssertionError(f"an entry that {said!r} loaded")
+```
+
 ### The scheduler's kinds
 
 Two keys of `[scheduler]` in `campaign.toml` name the infrastructure kinds the scheduler records its own failures as:
@@ -353,6 +434,13 @@ alpha = study.models.resolve("alpha-stub")
 assert round(bound_usd(alpha, study.campaign.agent.limits), 6) == 0.056384  # (20,000 + 8,192) x 2, per million
 ```
 
+**Work out one run's reservation before you set a ceiling: a ceiling below it admits no run.** The gate starts a run only when what was spent, the reservations of the runs in flight and this run's own fit under every ceiling that applies, `max_usd` for the campaign and the model's own `per_model_usd`, if it has one (`campaign/gate.py`). With nothing spent, a ceiling under one run's bound therefore holds every run of that model from the first assessment, however many runs the plan asks for. The bound is the figure above, at the dearest tier of a tiered price, and it follows from the caps in `[agent]` and the model's context window and reply maximum, so a study sets the caps and the ceiling together. For the example's `alpha-stub`, whose bound is 0.056384 USD, a `max_usd` of 0.05 holds all of its runs. The hold is recorded as a `budget_hold` event with its stop's serial and says what is over, here `the campaign: 0.06 USD (spent 0.00 + in flight 0.00 + this run 0.06) is over the ceiling of 0.05 USD`. It is a hold and not a failure: no run of the model starts, the call's summary lists the hold (`RunSummary.holds`), and a later start assesses the ceilings afresh. Raise the ceiling, or lower the bound with `token_budget`, `max_tool_rounds` or the reply maximum, and run again. `campaign.toml` sets no release file, so a hold there ends only when the figure fits; a `max_usd` of 0 is refused when the budget is built, and a model with no price that is not free is held too, since its cost is unknown.
+
+```python
+# a ceiling of 0.05 USD sits below one run of the example's stub, so the gate would hold every run of it
+assert bound_usd(alpha, study.campaign.agent.limits) > 0.05
+```
+
 ### An attempt a kill interrupted, and a budget hold after a kill
 
 An attempt killed before its result was stored (the dispatcher killed, its host gone) is `interrupted`, and its run is run again. With a budget it is charged what it recorded, not its whole bound (C05): each attempt keeps a **call log** in the store as it runs, a count of the requests it sent, each written before it goes out, and the counts each reply reported, written when it arrives. At the next start, recovery records the basis it is charged on (`spend_basis`):
@@ -408,6 +496,10 @@ The basis says what its bound rests on: `tripwire_checked`, the requests of that
 
 The byte bound rests on three assumptions, derived in [`interfaces.md`](interfaces.md#the-request-given-up): a token stands for at least one byte of the text it was read from, a reply's reported prompt is the whole prompt it was billed, and the history only grows (checked by digest, with the window as the answer when it fails). Every completed request tests the first, and a conversation in which a reply reported more than its bound is bounded by the window from then on, so check `tripwire_exceeded` (the entry's `bound_exceeded`) before trusting an entry. A backend of your own that does not record the bound keeps the window's.
 
+### The platform file and the day-0 command
+
+A study on the Onedata platform writes one `platform.toml`. [`interfaces.md`](interfaces.md#the-platform-layers-configuration-file) lists every table of it, which are required and which are not, the keys each takes, and the rule for credential files: each, the admin's and every user's, is a regular file you own with no group or other permission bit (mode 0600), or the file is refused when it loads. Before a study depends on the federation, run the day-0 checks against it with `uv run python -m expcore_onedata.day0 platform.toml --out <directory>`. The read-only checks (reachability, health, tokens, the content type and the listing of each space) need no consent. The checks that change state, the refusal of a write on the data path and the placement round trip, report unknown and send nothing until `EXPCORE_LIVE_MUTATE=1` is in the environment, and the outage check, which takes a provider down, also needs `EXPCORE_LIVE_FAULTS=1` and `sanctioned = true` in `[faults]`. The exit status is 0 when every check passed, 1 when one failed, 3 when none failed but something could not be measured (unknown is never a pass), and 2 for a usage or configuration error. [The day-0 section of `interfaces.md`](interfaces.md#the-platform-layers-day-0-command) has each check, what it needs and when it reports unknown.
+
 ### The federation's certificate
 
 On the Onedata platform four clients talk to the federation: the platform layer's REST client, the data gate that carries the agent's REST data path, oneclient in the mount sidecar, and the MCP tool server. All four take their certificate check from one `[tls]` table of `platform.toml`, so no two can check differently. Without the table, every client verifies the federation's certificate against its own default CAs, which is right for a federation with a publicly trusted certificate. A federation whose certificate no default trusts, such as a self-signed one, takes one of two modes:
@@ -431,6 +523,18 @@ An agent on a REST level can use the published Onedata client, `onedatarestfsspe
 The client checks the gate's certificate against the certifi bundle in the agent's image, not against the CA variables the sandbox also sets, so each REST run finds that bundle and mounts it with the run's CA appended. The run's metadata records `certifi` as `run_ca_added`, or `not_in_image` for an image without certifi, which starts all the same, but any client that relies on certifi then cannot verify the gate. An agent that uses another HTTP client, with a CA bundle of its own, needs that bundle's path in the image declared in `[sandbox] trust_paths`, which gets the run's CA the same way.
 
 Two conditions that differ only in the listing mode are two levels of the factor, so they can run side by side in one campaign. The run's metadata records the mode, and `config.fingerprint()` holds every level's kind and mode, so changing a level's data path or its listing between starts is refused like any other change of the experiment. `listing` on a mount or `none` level is refused at load. What else each data path guarantees is in [`interfaces.md`](interfaces.md#the-platform-layers-sandbox).
+
+**Set how long the gate waits on a hung read from what a healthy run measured (O85).** The gate gives up an upstream read that stays silent for `[sandbox.gate] upstream_read_timeout_s` seconds. Left out, that is 14,400 s (4 h, the published client's own read timeout), so the gate never fails a read before the client would, and an agent's read through an outage can last 4 h unless the run's own limits end it first. A shorter value makes the gate the one that ends the read, after that long, with a 502 the agent reads; the gate counts it under `gate_5xx` (or `gate_resets`, when the answer had begun) in the run's gate errors and never sends the request twice. That decides what an agent in an outage sees, so it is part of the experiment: every condition has the platform's one value, a changed value is refused at a resume, and a platform that declares nothing is as it was.
+
+Choose it from your own measurement, never from a guess:
+
+1. Run a healthy campaign slice on the data path and read the slowest relayed request. On the HPC backend that is `infrastructure_facts.rest_request_durations.max_duration_ms` (with `over_10s`, `over_30s` and `over_60s` counting the slow ones); on Docker the same figure is each line's `duration_ms` in `gatelog/requests.jsonl`. Include the largest file your agent reads.
+2. Declare a value several times that longest healthy request, in seconds, rounded up: a healthy read the gate cuts short is the gate's error in every run, not the platform's. A study whose agent should not wait for an outage longer than a few minutes sets a few hundred seconds; one that wants the outage to outlast the run leaves the default.
+3. Read `infrastructure_facts.gate_upstream_read_timeout_s` of any REST run to confirm the gate was given the value you meant (the effective number, the default's included), and keep the measurement beside the campaign, since a later reader needs it to judge the value.
+
+For example, `upstream_read_timeout_s = 600` under `[sandbox.gate]` in `platform.toml` (1 to 86400; the longest healthy read measured was well under 150 s).
+
+A value above 14,400 s changes nothing an agent sees, since the client gives up first. The table is refused where no data path is rest. The gate's 60 s connect timeout is not set here.
 
 ### How the sandbox reaches the federation
 
@@ -488,7 +592,7 @@ These things differ from Docker, and the record says so (`infrastructure_facts`)
 - **The memory reading can be unknown** (`infrastructure_facts.memory`): `within` only when the harness could show it, `unknown` with its reasons when it could not, and never `within` for a run whose code hid memory from it.
 - **A mount data path needs the mount's helper, and is proxy-only.** A sandbox given no helper, or a platform with no `[sandbox.mount]`, refuses a mount run at its start, and the record of a run on such a sandbox lists `mount_refused` among its `infrastructure_facts` (a mount run never does). With the helper the mount runs on the node, guarded and reported ("The mount on HPC", below), and the helper refuses `io_mode = "direct"`: HPC mounts are proxy-only until the direct-I/O comparison passes.
 
-Names resolve as on Docker (`dns: none` in the record): the federation's names resolve from `/etc/hosts` and no other name resolves. A Docker agent's network is `--internal` with `--add-host` entries and no `--dns`, and measured on engine 29.2.1 the engine's embedded resolver answers every outside name with SERVFAIL at once. So the name lookup is no departure; the connect to an outside address is, as the network bullet says (on Docker it fails at once with ENETUNREACH).
+Names resolve as on Docker (`dns: none` in the record): the federation's names resolve from `/etc/hosts` and no other name resolves. Every cell, on either backend, reads the same neutral `/etc/resolv.conf` (no `nameserver`, `search` or `domain` line; a Docker agent's container binds it read-only over the engine's own, which would copy the host's `search` line), and each run records the hash a cell read at its start, `infrastructure_facts.resolv_conf_sha256`, the same value on both. A Docker agent's network is `--internal` with `--add-host` entries and no `--dns`, and measured on engine 29.2.1, before that bind, the engine's embedded resolver answered every outside name with SERVFAIL at once. So the name lookup is no departure; the connect to an outside address is, as the network bullet says (on Docker it fails at once with ENETUNREACH).
 
 The cell's host name is `sandbox` on both backends (O73): `hostname` and `uname -n` in a cell read it, never the batch node's own name or the engine's container id, and `infrastructure_facts.cell_hostname` records it. It is the core's constant, no setting of a study's.
 
@@ -506,7 +610,7 @@ The gate then serves and certifies those names on the cell's loopback, where the
 
 **A tool server on the node.** `platform.tool_server(ctx, sandbox)` works as on Docker: the server is a process of your driver's, outside every cell, which no cell can address. The backend gives it a home of the run's own, its temporary files in it (removed when it stops), and the run's tag, and passes it nothing of the driver's environment but `PATH` (`docs/interfaces.md`, "The Apptainer backend on an HPC batch node"). Since the driver runs on the node, the node must hold the server's command (give an absolute path), its venv and interpreter, the checkout `[toolserver] clone` names and `git`, and the conditions' frozen manifests. Only the checkout is pinned, by its commit; the venv and the interpreter are not. `deploy/hpc-federation` renders no `[toolserver]` into a federation's `platform.toml`.
 
-**The tool server reads no `.env` file and starts in an empty directory (O84).** onedata-mcp read a `.env` when it was imported, searching from its installed package up to `/`, so a `.env` in a directory above it (a home directory several studies share, say) could set a setting your launch left unset. Every launch now gives the server `ONEDATA_MCP_DOTENV=0`, which you cannot set or clear, and starts it in a new empty private directory of its own, which is gone when it stops. Two things follow for your `[toolserver]`: name the command's files by absolute path (a relative one no longer resolves against your working directory), and pin an onedata-mcp commit that carries the guard (an older one ignores the word). Freeze and check a condition's manifest with `python -m expcore_onedata.toolmanifest freeze platform.toml CONDITION` and `check platform.toml CONDITION`: they start the server through the function the launch uses, so it has the allow-list, hosts, `ONEDATA_MCP_DOTENV=0` and empty directory a run's server has, and they refuse `--pass-env` of a variable the launch sets itself. A manifest you froze before with `python -m expcore.tools.manifest` (which started the server in the environment and directory it ran in) is worth freezing again: if the tools are the same the file does not change, and if they differ the condition's hash in the campaign fingerprint changes, so a store started with the earlier manifest is not resumed with it: start a new store. The core command is still the one for a server you start yourself, and now starts it in an empty private directory too. The launch also gives the server `PYTHONDONTWRITEBYTECODE=1`, a setting you cannot set or clear either, so starting it or checking its manifest writes no `.pyc` into your pinned clone, your virtualenv or the interpreter's library, and your frozen artifacts are as you froze them; if your `args` run Python with `-E` or `-I`, add `-B`, since those options make it ignore the variable.
+**The tool server reads no `.env` file and starts in an empty directory (O84).** onedata-mcp read a `.env` when it was imported, searching from its installed package up to `/`, so a `.env` in a directory above it (a home directory several studies share, say) could set a setting your launch left unset. Every launch now gives the server `ONEDATA_MCP_DOTENV=0`, which you cannot set or clear, and starts it in a new empty private directory of its own, which is gone when it stops. Two things follow for your `[toolserver]`: name the command's files by absolute path (a relative one no longer resolves against your working directory, and the platform is refused at load, naming the key, for a `command` with a directory part that does not begin at the root, for an `args` entry that is `.`, `..` or begins `./`, `../` or `~/`, and for the script of a Python server; a path like `conf/server.toml` is not seen by that check, so check yours), and pin an onedata-mcp commit that carries the guard (an older one ignores the word). Freeze and check a condition's manifest with `python -m expcore_onedata.toolmanifest freeze platform.toml CONDITION` and `check platform.toml CONDITION`: they start the server through the function the launch uses, so it has the allow-list, hosts, `ONEDATA_MCP_DOTENV=0` and empty directory a run's server has, and they refuse `--pass-env` of a variable the launch sets itself. A manifest you froze before with `python -m expcore.tools.manifest` (which started the server in the environment and directory it ran in) is worth freezing again: if the tools are the same the file does not change, and if they differ the condition's hash in the campaign fingerprint changes, so a store started with the earlier manifest is not resumed with it: start a new store. The core command is still the one for a server you start yourself, and now starts it in an empty private directory too. The launch also gives the server `PYTHONDONTWRITEBYTECODE=1`, a setting you cannot set or clear either, so starting it or checking its manifest writes no `.pyc` into your pinned clone, your virtualenv or the interpreter's library, and your frozen artifacts are as you froze them; if your `args` run Python with `-E` or `-I`, add `-B`, since those options make it ignore the variable.
 
 Run the campaign's driver on the node that runs the cells, since the gate listens on that node's loopback. The campaign fingerprint holds the backend's pins, so a Docker run and an Apptainer run are never one experiment. It holds the kind of storage the federation's providers use too (`[sandbox.apptainer] provider_storage`, `"tmpfs"` or `"shared_filesystem"`, which the HPC driver renders from whether the site binds the providers' storage onto scratch), and each run's record carries it (`infrastructure_facts.provider_storage`): where a provider stores its data shapes a run's I/O timing, so shards on tmpfs and on scratch are never merged and a campaign never resumes from one onto the other.
 
@@ -802,6 +906,120 @@ The check runs at the campaign's first health call and again every `every_s` (60
 
 The check leaves files in its probe space for good, so a Day-0 or reset check that lists that space must not take them for strays. `expcore_onedata.linkentries.link_check_entries(listing)` takes the space's listing (the `Entry` objects `Provisioner.children` returns, or `(name, file_id)` pairs) and returns `own`, every entry of the check's two name shapes (`expcore-link-probe-<16 hex>`, with `-g<N>` for a generation from 1, and `expcore-link-retired-<16 hex>-<16 hex>`, in lower-case hex), with `current`, `superseded` and `markers` as its parts, and `other`, everything else. Exclude `own` and judge `other`: a name that only resembles the shapes (`-g0`, upper-case hex, a suffix) is in `other`, so a stray file never hides behind the check's prefix. `current` names each pair's probe, the highest generation (read as the check reads one, up to nine digits) among its files that no marker retires, and `superseded` the other probes, which a later passing check purges, but for a name with ten or more digits of generation, which the check neither reads nor deletes; leave the markers alone, since a marker is what keeps a retired file from being read again. It needs no provider id, and `is_link_check_entry(name)` tests one name.
 
+### What the federation shows late: a new file and a deleted name
+
+Onedata 25.0 is eventually consistent, and two of its lags decide whether the state your study sets up is the state a run starts in. Both were measured on the Compose federation's 25.0 development build (op-worker `f118ed9`), a space held by one provider, its owner, and mirrored by others; the measurements are in `deploy/compose-federation/day0/`. Neither is a fault to fix: each is a reason to wait, with a bound, before the run's clock starts, and to refuse to start when the bound passes.
+
+**A new file is not at once visible through another provider.** A file written through one provider answers `400 posix enoent`, as JSON, through another until that provider sees it, and then it can show at size 0 before it shows at its size (`2026-11-10-federation-facts.md`, `2026-11-12-federation-facts-pending-deletes.md`). How long that takes differs by provider and by run: a mirror took 6.1 s, about 6 s, 6.08 s and 6.60 s in four runs (`2026-11-10-federation-facts.md`, `2026-11-11-federation-facts-posix-and-fuse.md`, `2026-11-14-federation-facts-replication-lag.md`, `2026-11-14-federation-facts-slot.md`) and 3.6 s to 5.1 s in another (`2026-11-12-federation-facts-pending-deletes.md`), while another mirror of the same federation saw the same files in 0.01 s to 0.03 s. So no constant is right, and a study waits for the file itself, on the provider the agent reads through, which is not the writer unless the agent's local provider is the data provider.
+
+The core does this for what it writes. `Provisioner.await_visible(provider, file_ids)` reads each file's `name`, `size` and `parent_id` together through the provider every 0.5 s until its size is the data provider's, bounded by `consistency.VISIBLE_TIMEOUT_S` (120 s), and raises `NotVisible`, naming the provider by its position, past it. Provisioning calls it before it reads or schedules a transfer through another provider, a progressive ingest confirms each part on every provider of its `visible_on` (every provider of the space by default), the link check waits for its probe, and the fault injector's session probe waits on every provider of the probe space. **A step of your own that writes the state a run starts in does not get that wait**: an instrument or an executor that writes files and then lets the run start must itself verify the start state through the agent's local provider, bounded, before the clock starts, and refuse to start past the bound. A measurement must not wait: a probe records what it reads (O08). A refusal before the run starts is an infrastructure outcome, never a result: the core's own ingest raises `InfraError("ingest_failure")`, so the attempt is set aside and run again.
+
+```python
+import os
+import shutil
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+
+from expcore_onedata import consistency
+from expcore_onedata.client import OnezoneClient
+from expcore_onedata.config import load_platform
+from expcore_onedata.provision import Provisioner, resolve_provider_ids
+from expcore_onedata.rangemap import load_placement
+from expcore_onedata.testing import ADMIN_ENV, DATA, Ticker, make_federation, write_with_placement
+
+
+@contextmanager
+def lagging_federation(**lags):
+    """The default fake federation on a clock that moves only when something sleeps, with the lags it is told of."""
+    ticker = Ticker()
+    fake = make_federation(clock=ticker.clock, **lags)
+    workdir = Path(tempfile.mkdtemp())
+    os.environ[ADMIN_ENV] = fake.admin_token
+    try:
+        platform = write_with_placement(workdir)
+        config = load_platform(platform)
+        client = OnezoneClient(config, http=fake.client_http())
+        provisioner = Provisioner(
+            client,
+            config,
+            load_placement(platform, config).settings,
+            provider_ids=resolve_provider_ids(config),
+            log=workdir / "changes.jsonl",
+            clock=ticker.clock,
+            sleep=ticker.sleep,
+        )
+        yield ticker, fake, client, provisioner
+    finally:
+        del os.environ[ADMIN_ENV]
+        shutil.rmtree(workdir)
+
+
+# alpha, the data provider, shows a new file at once; beta shows it only after 6 s, as a mirror did live.
+with lagging_federation(visibility_delay_s=6.0) as (ticker, fake, client, provisioner):
+    fake.add_file("study/arrived.bin", DATA)
+    arrived = fake.id_of("study/arrived.bin")
+    assert provisioner.await_visible("alpha", [arrived]) == 0.0  # the writer needs no wait
+    try:  # a start bounded at 3 s refuses, naming the provider by its position
+        consistency.wait_visible(
+            client, "beta", arrived, size=len(DATA), timeout_s=3.0, clock=ticker.clock, sleep=ticker.sleep
+        )
+    except consistency.NotVisible as refused:
+        assert str(refused).startswith("providers[1]: ") and "within 3 s" in str(refused)
+    else:
+        raise AssertionError("beta showed the file before its lag was over")
+    assert provisioner.await_visible("beta", [arrived]) == 3.0  # the rest of the 6 s, waited for before the run starts
+```
+
+**A delete is asynchronous.** The provider a DELETE went to, the owner, answers a deleted file, and every file under a deleted directory, as `400 posix enoent` at once, and the directory's own attributes for up to a second more, partly emptied. Every other provider keeps showing the old entry, its files and its listing entry for 3 s in four trials and 8 s in two, and then drops them all in the same second (`2026-11-12-federation-facts-pending-deletes.md`). On `canonical` storage a new directory of the same name has the same path on storage, so an old directory's late removal can in principle take the new one's files. That is why the Compose federation's bootstrap never deletes and makes a directory again but keeps a baseline directory and empties it file by file (`deploy/compose-federation/fedcontent.py`), and why the progressive ingest waits as below.
+
+**Whether the loss happens is not settled, so write as if it could.** The live check of 12 Nov tried to reproduce it and could not. Four times a directory of five files of 64 KiB was deleted through the owner and made again under the same name within 0.1 s; the new files kept their size, parent and content (SHA-256) on every provider through a 120 s watch, and on the owner's storage in one trial: 0 of 21 files lost or changed. A single file deleted and made again at once, and a control made again 30 s later, behaved the same. Two cases were not covered: a file larger than 64 KiB, and a delete still working through many files when the name is made again. Neither "it loses files" nor "it is safe" is a recorded fact for a study that works at such sizes.
+
+What the core waits for is the ingest's. It removes a file only through the gate and writes the name again only once its old id answers absent on every provider of the space, on consecutive polls, bounded by `[placement] settle_timeout_s` (300 s by default, two polls in a row every `poll_s`, 2 s); past the bound it raises, and the attempt is set aside as `ingest_failure`. `Provisioner.teardown` confirms only the data provider's absence, which says nothing of the other providers or of the storage, and relies on every scratch name being new: nothing in the core creates a name again after its teardown. A study that resets its dataset by deleting and recreating a name through the provisioner or the REST API has no such wait from the core, and the shape of one is below.
+
+**What a study does.** Never reuse a name within a campaign: give each run's directory or file a name of its own (the run's key in it, say), or keep the directory and replace its files one at a time, as the bootstrap does. If a name must be reused, wait first, bounded, until the old entry answers absent on every provider of the space on consecutive polls, and refuse to go on when the bound passes. Absent is a 404 or exactly `400 posix enoent` (`client.answered_absent`), read with no `attribute` or with `name` among them: `parent_id`, `file_id` and a directory's `size` alone keep answering from a tombstone. A wait that reads the owner alone is over at its first polls, seconds before the mirrors stop showing the entry:
+
+```python
+from expcore_onedata.client import PlatformError, answered_absent
+from expcore_onedata.readretry import ONE_ATTEMPT
+
+
+def absent_on(client, providers, file_id):
+    """True once every provider answers the entry absent; False while one still shows it; anything else raises."""
+    for provider in providers:
+        try:
+            client.get(f"/data/{file_id}", provider=provider, retry=ONE_ATTEMPT)
+        except PlatformError as error:
+            if not answered_absent(error):
+                raise
+        else:
+            return False
+    return True
+
+
+# The fake models one delay for every provider, 8 s here; live the mirrors took 3 s or 8 s.
+with lagging_federation(delete_delay_s=8.0) as (ticker, fake, client, provisioner):
+    fake.add_file("study/old.bin", DATA)
+    old = fake.id_of("study/old.bin")
+    provisioner.mutate("DELETE", f"/data/{old}", provider="alpha")  # alpha is the owner
+    deleted, took = ticker.now, {}
+    for providers in (["alpha"], ["alpha", "beta"]):
+        done = consistency.converge(
+            lambda providers=providers: absent_on(client, providers, old),
+            bool,
+            timeout_s=60.0,
+            poll_s=1.0,
+            consecutive=2,
+            clock=ticker.clock,
+            sleep=ticker.sleep,
+        )
+        assert done.converged  # a wait that does not converge is a refusal to go on, never a guess
+        took[len(providers)] = ticker.now - deleted  # seconds since the DELETE was answered
+    assert took[1] < 8.0 <= took[2]  # the owner alone is over long before the mirror stops showing the entry
+```
+
+A test of such a wait sets `delete_delay_s` and, to see what the wait is for, `lose_recreated=True`, as [the testing module](interfaces.md#the-platform-layers-testing-module) says ("Pending deletes"); the fake's `visibility_delay_s` does the same for a new file ("Per-reader views").
+
 ### A dataset provisioned by storage import on the Onedata platform
 
 **Shards on several federations are one campaign only when each space's data is declared.** A space is the same experimental condition across federations when its declared identity and its data identity match. Give each `[[spaces]]` entry the manifest of the data it holds, `data_manifest = "<file>"` (the format `expcore_onedata.importmanifest` writes: every file with its size and SHA-256), and hand the core `platform = config.fingerprint()`: the fingerprint then holds the manifest's content hash in place of the space's Onezone id, which every federation's `up` makes anew, so the shards of two federations holding the same data merge, and a shard whose federation holds one file different is refused at the merge. A space without the key is fingerprinted by its Onezone id, as before, so its shards on two federations never merge. **On an HPC federation, a space your own ingest fills must declare its manifest in the layout.** A space that is neither a baseline space nor an import (`baseline = false`, and its `@data_manifest.<space>@` named by your platform template) holds nothing at `up`, so a manifest made from the baseline would be empty and two federations that ingested different bytes would fingerprint alike. Give the space `data_manifest = "@study_artifacts@/manifests/<space>.json"` in `layouts/<yours>.toml` (or an absolute path), the manifest in the format `expcore_onedata.importmanifest` writes (`manifest_of_tree` from a local copy; the directories count as well as the files), and name your own artifacts in the template under `@study_artifacts@`, which `up` fills from the site's `HPC_STUDY_ARTIFACTS` (a directory on a filesystem both the login node and the agent's node see; a template that uses the placeholder without the key is refused, naming it, so a public replication package carries no site path). `up` renders the path as `@data_manifest.<space>@` and checks neither it nor the space; the order is then `up`, your ingest, `hpcfed.py verify-data` (it reads each such space back through its owner and compares every file's path, size and SHA-256 and every directory with the manifest, exiting 1 on any difference, and records a marker in the federation's state file), and `shards.py plan` refuses a federation whose ingested spaces have no marker. Ingest more after a verification and you run `verify-data` again. The one-space form takes the key in `[space]`: with it, its data identity is in the fingerprint; without it, the fingerprint holds the space's support, name and prefixes but not its data, so declare it whenever your shards run on several federations (the HPC shard driver refuses such a campaign otherwise).
@@ -1005,9 +1223,44 @@ assert not analysis.from_build_analysis  # the example defines `build` alone, so
 assert analysis.plugin.scorer_digest() == plugin.scorer_digest()
 ```
 
-The campaign records the digest of the run's scorers (their names and versions) in its fingerprint, and `analyze` refuses a `build_analysis` whose scorers have another, naming them: change a scorer's `version` when its behaviour changes, as for any scorer, so that this can see it. A store whose snapshot records no valid digest is refused too, since every fingerprint the core writes holds one. Scorers must come out the same in both builders: build them from values both can read (a file of the study, not the platform's settings), and declare `version` on each, since a scorer without one is versioned by the hash of its file and adding `build_analysis` to that file would change it. With `build_analysis` defined the campaign's scorers are the reference, so a scorer changed since the run is refused unless you ask for the re-score with `--rescore`, below. See [what the plugin may define](interfaces.md#the-study-plugin).
+The campaign records the digest of the run's scorers (their names and versions) in its fingerprint, and `analyze` refuses a `build_analysis` whose scorers have another, naming them: change a scorer's `version` when its behaviour changes, as for any scorer, so that this can see it, and let the version cover what the scorer is built from as well as its code (below). A store whose snapshot records no valid digest is refused too, since every fingerprint the core writes holds one. Scorers must come out the same in both builders: build them from values both can read (a file of the study, not the platform's settings), and declare `version` on each, since a scorer without one is versioned by the hash of its file and adding `build_analysis` to that file would change it. With `build_analysis` defined the campaign's scorers are the reference, so a scorer changed since the run is refused unless you ask for the re-score with `--rescore`, below. See [what the plugin may define](interfaces.md#the-study-plugin).
 
-**Correcting a scorer after an HPC batch.** A scorer is found wrong after the batch is copied back, where `build` cannot run. Fix it and change its `version`, in the one function both builders call. The scorer is code, so the replay check is stale: run `check` again on the batch (it builds nothing, so it needs no federation). Then run `analyze my-study --rescore` and `report my-study --rescore`. Without the flag both refuse, naming the scorers. With it the analysis scores every record anew with the corrected scorer, and says so: `scores.json`, the `scorers` of `analysis.json` and the report's `Scorers` line hold the new version, as any re-score does (R13), and `analysis.json` (`rescore`) and one line of the report's Provenance hold the digest the campaign recorded and the digest of the scorers used. They cannot name the scorer that changed, because the campaign records one digest of all its scorers: keep the old version in your own notes or in git. The flag changes nothing when the scorers are the campaign's own, and nothing for a module without `build_analysis`. A store that records no digest is refused with the flag too. Then build the replication package as for any study, with no flag: the decision was recorded at `analyze`, so the package's build, its `make check` and `package-check` honour it, and an anonymised package does too. A differing scorer digest is accepted exactly when the `analysis.json` that ships holds a `rescore` entry equal to what the check works out now, the digests the store recorded and the digest of the scorers in the package's plugin; with no entry, with an entry for other scorers or another store, or with a store that records no digest, the build and the check refuse as `analyze` does, and they never re-ask. The package's outputs are still compared byte for byte with what the records give, so an entry on a batch that re-scored nothing fails as differing, and the package carries the `rescore` entry and the Provenance line, so a reader of it sees the re-score.
+**A scorer's identity covers everything that decides its scores.** The digest is made of each scorer's name and the version it declares, and of nothing else: not its code, not what it is built from. A scorer that declares no version is versioned by the hash of the file its code is in, which covers no reference kept in another file. So the name and version must cover the scorer's code and its reference inputs, such as an answer key or a table of expected values. A scorer reads the reference when it is built, never in `score`, which opens no file by path. If the version names the code alone, `build_analysis` can build the scorer from another reference and the digest still matches: the analysis is not refused and records no re-score, though its scores are not the run's. Fold a hash of the reference into the version, taken from the bytes that are parsed:
+
+```python
+import hashlib
+import json
+
+from expcore.study.plugin import scorers_digest
+
+
+class AnswerKeyScorer:
+    """Accuracy against an answer key that the study keeps in a file, read once when the scorer is built."""
+
+    name = "answer-key"
+    CODE_VERSION = "2"  # change it whenever this class's behaviour changes
+
+    def __init__(self, key_bytes: bytes) -> None:
+        self.key = json.loads(key_bytes)
+        # the version covers the code and the key: the hash is of the bytes that were parsed, not of a second read
+        self.version = f"{self.CODE_VERSION}+key-{hashlib.sha256(key_bytes).hexdigest()[:12]}"
+
+    def score(self, record):
+        submitted = [c for c in record.tool_calls if c["name"] == "submit" and c["status"] == "ok"]
+        answer = submitted[-1]["arguments"].get("answer") if submitted else None
+        return {"outcomes": {"accuracy": float(answer == self.key[record.factors["task"]])}}
+
+
+first_key = json.dumps({"largest-moon": "Titan"}).encode()  # a mistake in the key, found after the batch
+fixed_key = json.dumps({"largest-moon": "Ganymede"}).encode()
+assert AnswerKeyScorer(first_key).version != AnswerKeyScorer(fixed_key).version  # the same code, another key
+assert scorers_digest([AnswerKeyScorer(first_key)]) != scorers_digest([AnswerKeyScorer(fixed_key)])  # so refused
+assert scorers_digest([AnswerKeyScorer(first_key)]) == scorers_digest([AnswerKeyScorer(first_key)])  # the same: equal
+```
+
+The version, hash included, is what `scores.json`, `analysis.json` and the report's `Scorers` line record, so a reader sees which key scored.
+
+**Correcting a scorer after an HPC batch.** A scorer is found wrong after the batch is copied back, where `build` cannot run. Fix it and change its `version`, in the one function both builders call; a reference it is built from, corrected, is a correction of the scorer in the same way, and with its hash folded into the version, as above, the version changes by itself. The scorer is code, so the replay check is stale: run `check` again on the batch (it builds nothing, so it needs no federation). Then run `analyze my-study --rescore` and `report my-study --rescore`. Without the flag both refuse, naming the scorers. With it the analysis scores every record anew with the corrected scorer, and says so: `scores.json`, the `scorers` of `analysis.json` and the report's `Scorers` line hold the new version, as any re-score does (R13), and `analysis.json` (`rescore`) and one line of the report's Provenance hold the digest the campaign recorded and the digest of the scorers used. They cannot name the scorer that changed, because the campaign records one digest of all its scorers: keep the old version in your own notes or in git. The flag changes nothing when the scorers are the campaign's own, and nothing for a module without `build_analysis`. A store that records no digest is refused with the flag too. Then build the replication package as for any study, with no flag: the decision was recorded at `analyze`, so the package's build, its `make check` and `package-check` honour it, and an anonymised package does too. A differing scorer digest is accepted exactly when the `analysis.json` that ships holds a `rescore` entry equal to what the check works out now, the digests the store recorded and the digest of the scorers in the package's plugin; with no entry, with an entry for other scorers or another store, or with a store that records no digest, the build and the check refuse as `analyze` does, and they never re-ask. The package's outputs are still compared byte for byte with what the records give, so an entry on a batch that re-scored nothing fails as differing, and the package carries the `rescore` entry and the Provenance line, so a reader of it sees the re-score.
 
 ### How pairs become a contrast's input
 
@@ -1371,20 +1624,59 @@ Report the primary analysis as it stands and the sensitivity analysis beside it.
 
 If your study's omission scoring rests on which files the agent's scripts read, the scripts run in the agent's own cell, and a log file they write there is the agent's to read, rewrite and delete. The core gives the scripts a channel to a collector outside the cell instead (O91; the contract is in [`interfaces.md`](interfaces.md#the-read-log-the-read_log-instrument-and-its-channel)). Your canonical scripts do three things:
 
-- **Import the client by its fixed path**, `/expcore-readlog-client/expcore_readlog_client.py` (the cell runs `python -I`, so `PYTHONPATH` does nothing; there is no environment variable and no other socket to name).
+- **Import the client by its fixed path**, `/expcore-readlog-client/expcore_readlog_client.py` (the cell runs `python -I`, so `PYTHONPATH` does nothing; there is no environment variable and no other socket to name). A platform that did not declare the channel binds neither the client nor the socket, and both fail closed: the import raises `FileNotFoundError`, and a vendored copy of the client raises `ReadLogError` (no socket, ENOENT). Treat either as unread and return no data, so that a platform template that forgot to declare the channel shows at the first smoke cell and not as runs with silently missing logs.
 - **Log before they return data**, with `log_read(item, range=[start, stop], bytes=n, sha256=...)`: `item` is your own id of what was read, never a host path.
 - **Return no data when `log_read` raises** `ReadLogError`. The read is then "unread": the log is an upper bound on what the scripts handed out.
+- **Run each canonical script as its own process**, `python -I <script> <arguments>`, a program that prints what it returns, and never as a module the agent's code imports into its own process: code in the agent's process could then patch the script's client or `socket` and hide a real read. Patching needs code in the script's process, and only the script's own source runs there. Keep the scripts in a read-only input, never in `/work`, where the agent could change them.
 
 A script looks like this, in your own scripts' words:
 
-    import importlib.util as u
+    import importlib.util
+    import sys
 
-    spec = u.spec_from_file_location("expcore_readlog_client", "/expcore-readlog-client/expcore_readlog_client.py")
-    readlog = u.module_from_spec(spec)
-    spec.loader.exec_module(readlog)
-    data = read_the_bytes(item, start, stop)
-    readlog.log_read(item, range=[start, stop], bytes=len(data), sha256=sha256_of(data))  # raises: no data
-    return data
+    CLIENT = "/expcore-readlog-client/expcore_readlog_client.py"
+
+
+    def load_client():
+        spec = importlib.util.spec_from_file_location("expcore_readlog_client", CLIENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # FileNotFoundError when the platform bound no client
+        return module
+
+
+    def read(item, start, stop):
+        readlog = load_client()  # raises: nothing was read, so nothing is returned
+        data = read_the_bytes(item, start, stop)
+        readlog.log_read(item, range=[start, stop], bytes=len(data), sha256=sha256_of(data))  # raises: no data
+        return data
+
+
+    if __name__ == "__main__":
+        try:
+            sys.stdout.buffer.write(read(item, start, stop))
+        except Exception as error:  # the client is missing, or ReadLogError: unread, nothing is returned
+            sys.exit(f"unread: {error.__class__.__name__}")
+
+On a platform that bound no client (this guide's own run is one), the import is what fails:
+
+```python
+import importlib.util
+
+
+def the_client_is_not_bound_here():
+    spec = importlib.util.spec_from_file_location(
+        "expcore_readlog_client", "/expcore-readlog-client/expcore_readlog_client.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except FileNotFoundError:
+        return True  # the script treats this as unread and returns no data
+    return False
+
+
+assert the_client_is_not_bound_here()
+```
 
 The log reaches your record as a side file you declare: `pattern = "read_log.jsonl"` and `hash_field = "instruments.read_log.side_sha256"` in a `[[study.side_files]]` table ([Side files](#side-files)). Your executor builds `ReadLog(sandbox, nonce, expected_peer_uid)` among the run's instruments, which reads the collector's log once, after the backend has stopped the collector, and puts it beside the record with `stage_harness_side_file` (the log was never in `/work`, so `stage_side_file` does not apply):
 
@@ -1450,7 +1742,7 @@ def stage_the_read_log():
 stage_the_read_log()
 ```
 
-**An unknown log is unknown reads.** The log is intact only with a start line of this run, matching end counts, no cap reached, no malformed line, the canary as its first record and every sender the expected uid. A collector that was killed, a log past its cap or a datagram that was no record gives `"log": "unknown"` with the reasons and `counts` None; score the run's reads as unknown, never as fewer. A forged read cannot be prevented (the agent's own code can call the client), only detected, by the read-log scan and, on a REST data path, by the gate's per-file table of what it served. An agent that reads the data some other way than through your scripts leaves no record: decide in the design whether such a read scores as an omission. Code that runs in a script's own process can patch the client or the standard library so that a real read is not logged: the scan reads the text of the agent's code and does not match a patch of the standard library, but on a REST data path the gate's table of served files shows the read.
+**An unknown log is unknown reads.** The log is intact only with a start line of this run, matching end counts, no cap reached, no malformed line, the canary as its first record and every sender the expected uid. A collector that was killed, a log past its cap or a datagram that was no record gives `"log": "unknown"` with the reasons and `counts` None; score the run's reads as unknown, never as fewer. A forged read cannot be prevented (the agent's own code can call the client), only detected, by the read-log scan and, on a REST data path, by the gate's per-file table of what it served. An agent that reads the data some other way than through your scripts leaves no record: decide in the design whether such a read scores as an omission. Code that runs in a script's own process can patch the client or the standard library so that a real read is not logged, which is why each canonical script runs as its own process (above). **The scan is a heuristic** over the text of the agent's code: it matches the channel's names, Unix datagram sockets, ways to find the socket, and patches of the socket or the client (edits of `sys.modules`, mock patches), and code built at run time passes it. On a REST data path the gate's per-file table of served files, which the agent cannot reach, is the backstop: it shows a read the log lacks.
 
 ### The mount on HPC: guarded and reported, not isolated
 
