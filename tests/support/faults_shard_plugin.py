@@ -112,6 +112,7 @@ class FaultedExecutor:
         shelf = FederationShelf(self.config, self.services)
         instruments: list[Any] = [FactsServed(shelf)]
         identity = {"run_key": request.run_key, "factors": dict(factors), "attempt": request.identity.attempt}
+        request.declare_secrets()  # in this task, before any instrument starts (the injector path uses a thread)
         target = request.treatment_targets.get(PROVIDER_OUTAGE) if PROVIDER_OUTAGE in request.treatment_kinds else None
         injector = None
         if target is None:

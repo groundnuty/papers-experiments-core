@@ -221,6 +221,9 @@ class TinyExecutor:
         shelf = Shelf()
         instruments = [FactsServed(shelf)]  # fresh for every run: an instrument holds one run's reading
         identity = {"run_key": request.run_key, "factors": dict(factors), "attempt": request.identity.attempt}
+        # Before any instrument starts: only then is a failed start's diagnostic kept (redacted), and not withheld. No
+        # argument says this study has no secret beyond the environment's; one that has names it: secrets=[...].
+        request.declare_secrets()
         await asyncio.to_thread(start_instruments, instruments, identity)  # blocking I/O stays off the event loop
         record = await record_run(
             request,

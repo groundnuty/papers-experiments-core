@@ -175,6 +175,7 @@ class OrchardExecutor:
         session = self.platform.session()  # one per run: its log and its instrument are this run's
         instruments = [session.instrument()]
         identity = {"run_key": request.run_key, "factors": dict(factors), "attempt": request.identity.attempt}
+        request.declare_secrets()  # before an instrument starts, or a failed start's diagnostic is withheld
         await asyncio.to_thread(start_instruments, instruments, identity)
         providers = [session.provider(schema=schema_shown(exposure)), FunctionProvider([(SUBMIT, submit)])]
         record = await record_run(request, providers, SYSTEM, user, study.campaign.agent, code=dict(self.context.code))
