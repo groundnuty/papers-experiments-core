@@ -57,6 +57,21 @@ NOTES = textwrap.wrap(
     "shards' figures.",
     width=118,
 )
+ATTEMPT_NOTES = textwrap.wrap(
+    "Every attempt of the export's `retries_by_kind`, added over the conditions; Charged says whether it used one of "
+    "the run's attempts. A model with none has a row of zeros.",
+    width=118,
+)
+REQUEST_NOTES = textwrap.wrap(
+    "From the records the batch holds: each retry the model's requests made before a reply, by the kind of error, and "
+    "the seconds it waited. Records are the attempts that kept one.",
+    width=118,
+)
+SERVED_NOTES = textwrap.wrap(
+    "What the replies of the model's records say they were served by; not reported is a reply that named none, never "
+    "the id that was asked for.",
+    width=118,
+)
 Table = Callable[[Sequence[str], Sequence[Sequence[object]]], list[str]]
 
 
@@ -186,28 +201,21 @@ def section(usage: Mapping[str, Any] | None, export: Mapping[str, Any], table: T
     classes = ["Model", "Attempts of", "Attempts", "Input tokens", "Output tokens", "Cache writes", "Cache reads"]
     classes += ["Usage incomplete", "Charged at a bound", "Measured (USD)", "Measured plus in flight (USD)"]
     classes += ["Bound (USD)", "Top-ups (USD)", "Total (USD)"]
-    summary, by_kind = _request_retries(models)
     lines = [HEADING, "", *NOTES, "", "### Spend by model", "", *table(spend, _spend_rows(models)), ""]
     lines += ["### Attempts, tokens and spend by what became of the attempt", ""]
     lines += [*table(classes, _class_rows(models)), ""]
     lines += ["### Attempts set aside as infrastructure", ""]
-    lines += [
-        "Every attempt of the export's `retries_by_kind`, added over the conditions; Charged says whether it used one"
-    ]
-    lines += ["of the run's attempts. A model with none has a row of zeros.", ""]
+    lines += [*ATTEMPT_NOTES, ""]
     lines += [*table(["Model", "Kind", "State", "Charged", "Attempts"], _attempt_retries(export, models)), ""]
+    if not all("retries" in entry for entry in models):  # figures that carry nothing of the records
+        return lines
+    summary, by_kind = _request_retries(models)
     lines += ["### Requests retried inside an attempt", ""]
-    lines += [
-        "From the records the batch holds: each retry the model's requests made before a reply, by the kind of error,"
-    ]
-    lines += ["and the seconds it waited. Records are the attempts that kept one.", ""]
+    lines += [*REQUEST_NOTES, ""]
     lines += [*table(["Model", "Records", "Turns", "Turns that retried", "Retries", "Wait (s)"], summary), ""]
     lines += [*table(["Model", "Kind", "Retries", "Wait (s)"], by_kind), ""] if by_kind else []
     lines += ["### Served model ids and fingerprints", ""]
-    lines += [
-        "What the replies of the model's records say they were served by; not reported is a reply that named none,"
-    ]
-    lines += ["never the id that was asked for.", ""]
+    lines += [*SERVED_NOTES, ""]
     lines += [*table(["Model", "Served model id", "System fingerprint", "Turns", "Records"], _served_rows(models)), ""]
     return lines
 

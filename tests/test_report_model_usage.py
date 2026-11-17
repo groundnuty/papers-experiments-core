@@ -78,15 +78,15 @@ def record(model, *turns):
 def usage_of_two_models(tmp_path, *, with_records=True):
     """m1 (priced): an analysed run (4.5 USD measured), an attempt that failed at start (measured zero) and an
     interrupted one with no log (its bound, 30 USD); m2 has no price; m3 has no attempt."""
-    store, _, manifest = planned_store(tmp_path)
-    keys = [row.key.text for row in manifest.rows]
+    store, _, manifest = planned_store(tmp_path, models=("m1", "m2"))
+    keys = [row.key.text for row in manifest.rows if "model=m1" in row.key.text]
+    other = [row.key.text for row in manifest.rows if "model=m2" in row.key.text]
     run_one(store, keys[0], finished(**TOKENS))
     zero = {"model_turns": 0, "input_tokens": 0, "output_tokens": 0, "turn_usage": (), "spend_basis": "measured"}
     run_one(store, keys[1], infra("endpoint", "the fault could not be induced", **zero))
     store.begin_attempt(keys[2], NOW, 1, "")
     recover(store, LATER, 3)
-    store.db.execute("UPDATE runs SET f_model='m2' WHERE run_key=?", (keys[3],))
-    run_one(store, keys[3], finished(input_tokens=2_000, output_tokens=300))
+    run_one(store, other[0], finished(input_tokens=2_000, output_tokens=300))
     pricing = Pricing({"m1": PRICED, "m2": UNPRICED, "m3": IDLE}, LIMITS)
     usage = usage_of(store.q, pricing)
     if not with_records:
