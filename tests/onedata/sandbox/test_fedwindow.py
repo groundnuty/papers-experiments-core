@@ -410,6 +410,42 @@ def test_o86_a_cancellation_during_the_closing_read_still_records_the_window_and
     assert not host.containers
 
 
+def test_o86_a_cancellation_during_the_opening_read_creates_nothing_and_keeps_no_share(config, issuer, slots, tmp_path):
+    """O86, O11: cancelled while the window's start is being read, nothing of the run exists (no token, no
+    container) and the admission's share the launch took is given up: the federation can be taken exclusively."""
+    federation = Federation(config)
+    entered, release = threading.Event(), threading.Event()
+
+    class Slow:
+        def read(self):
+            entered.set()
+            release.wait(10)
+            return {}
+
+        def window(self, start):
+            raise AssertionError("the run never began")
+
+    platform, host = build(config, issuer, slots, tmp_path, Slow())
+    lock = FederationLock(federation.settings)
+
+    async def go():
+        async def body(box):
+            raise AssertionError("the body never ran")
+
+        task = asyncio.ensure_future(run_in_loop(platform, federation.settings, body))
+        assert await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+
+    asyncio.run(go())
+    assert not host.containers
+    taken = lock.try_acquire(exclusive=True)
+    assert taken is not None
+    taken.close()
+
+
 async def run_in_loop(platform, settings, body):
     async with admitted(settings, exclusive=False), launching(platform) as box:
         await body(box)

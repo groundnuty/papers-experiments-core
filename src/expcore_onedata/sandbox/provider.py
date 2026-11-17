@@ -651,15 +651,18 @@ class SandboxPlatform:
             raise StartRefused("a read-only input passed to launch was not declared to the platform (inputs.declare)")
         if inputs and inputs_record is None:
             raise ValueError("a run with read-only inputs needs the instrument that keeps them in its record")
-        opened = await self._open_window(ctx)  # nothing of the run exists yet, so no injection it makes is before this
         # held from the admission check until the start thread holds a share of its own, so no shortcut section of the
         # run can seal the admission while the sandbox is authorised and started (O11)
         authorised = retain_to_act()
         sandbox: DockerSandbox | None = None
+        opened: fedwindow.Opened | None = None
         started: asyncio.Future[None] | None = None
         minting: asyncio.Future[RunTokens | None] | None = None
         revoking = lease if mode is not DataPathMode.NONE or condition is not None else None  # its slot's, at the end
         try:
+            # the run's window opens here: nothing of it exists yet, so no injection its body makes is before this, and the
+            # admission's share is held, as it is from the check above to the start thread's own (O11)
+            opened = await self._open_window(ctx)
             async with ctx.infrastructure_wait(WAIT_KIND):
                 key = lease.key if lease is not None else None
                 minted = _counted(self._threads.began(key), self._config, "the sandbox's mint")  # before the thread
