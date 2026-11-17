@@ -196,14 +196,15 @@ class Bench:
     def up(self, count: int, **given: Any) -> tuple[int, str]:
         return self.run("--layout", str(self.layout), "up", str(count), **given)
 
-    def settings(self) -> Path:
-        """The shard settings an operator gives plan: shards.py's keys, no [[shards]]."""
+    def settings(self, *extra: str) -> Path:
+        """The shard settings an operator gives plan: shards.py's keys, no [[shards]]; `extra` are more `key = value`
+        lines (an optional key of shards.py's manifest)."""
         path = self.base / "shard-settings.toml"
         (self.base / "study").mkdir(exist_ok=True)  # the campaign fingerprint is taken on a copy of it (O63)
         python = standin_python(self.base / "venv", real_platform=True)
         lines = [f'{key} = "{self.base / key}"' for key in ("study", "results")]
         lines += [f'python = "{python}"', f'core_src = "{self.base / "src"}"', f'tmpfs = "{self.node_tmp}"']
-        lines += ['step_path = "/usr/bin:/bin"', "cpus = 2", 'memory = "4g"']
+        lines += ['step_path = "/usr/bin:/bin"', "cpus = 2", 'memory = "4g"', *extra]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
 

@@ -339,7 +339,9 @@ class Fleet:
                                                                                                new)))  # fmt: skip
             plan = fleetplan.load(draft)
             holding = {**{s["label"]: s["member"] for s in record["shards"] if s["member"]}, **new}
-            lines = {label: fleetplan.line_of(plan, label, False) for label in sorted(holding)}
+            lines = {label: fleetplan.line_of(plan, label, False, None, self.environ) for label in sorted(holding)}
+            # what each line pins, shown to the operator beside it
+            values = dict(fleetplan.pin(plan, self.environ).pass_env_pins or ())
             fleetplan.check_campaign(plan, sorted(holding))  # one campaign fingerprint, before anything is assigned
             fleetplan.require_core(plan)  # last: it runs the manifest's interpreter; nothing is recorded before it
 
@@ -358,7 +360,8 @@ class Fleet:
         for line in said:
             self.say(line)
         for shard_label in sorted(holding):
-            print(json.dumps({"shard": shard_label, "federation": holding[shard_label], "argv": lines[shard_label]}))
+            entry = {"shard": shard_label, "federation": holding[shard_label], "argv": lines[shard_label]}
+            print(json.dumps({**entry, **({"pass_env": values} if values else {})}))
         return 0 if len(holding) == len(record["shards"]) else 1
 
     def running(self, launch: Mapping[str, Any]) -> Optional[bool]:
@@ -377,7 +380,7 @@ class Fleet:
                 shard_of(record, only)
             if not (self.directory / fleetplan.MANIFEST).is_file():
                 raise FleetError("the fleet has no shards.toml: run plan first")
-            found, said, refused = fleetplan.launches(record, self.directory, only, resume, self.running)
+            found, said, refused = fleetplan.launches(record, self.directory, only, resume, self.running, self.environ)
             logs = self.directory / "logs"
             logs.mkdir(mode=0o700, exist_ok=True)
             for launch in found:

@@ -40,7 +40,16 @@ SETTINGS = {
     "cpus",
     "memory",
 }  # shards.py's keys: no argv
-OPTIONAL = ("snapshot_every_s",)
+OPTIONAL = (
+    "snapshot_every_s",
+    "pre_step",
+    "pre_step_timeout_s",
+    "post_run",
+    "post_run_timeout_s",
+    "expect_render_identity",
+    "pass_env",
+)  # the rest of shards.py's optional keys: the study's own guard, post-run script and expected render identity, and
+# the operator's variables its dispatchers are passed (names only: `pin` reads the values)
 SCRIPT = Path(__file__).resolve().parent / "shards.py"
 
 
@@ -53,16 +62,21 @@ def read_settings(path: Path) -> Dict[str, Any]:
         raise FleetError(f"the shard settings could not be read ({type(error).__name__})") from None
     if not set(SETTINGS) <= set(data) <= set(SETTINGS) | set(OPTIONAL):
         keys = ", ".join(sorted(SETTINGS))
-        raise FleetError(f"the shard settings take exactly: {keys}, and perhaps snapshot_every_s; "
+        raise FleetError(f"the shard settings take exactly: {keys}, and perhaps {', '.join(OPTIONAL)}; "
                          "no [[shards]] (the fleet writes them)")  # fmt: skip
     for key, value in data.items():
-        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        if key == "pass_env":  # a list of names, by shards.py's rule: a secret-looking or the step's own is refused
+            try:
+                shards.pass_env_names(value)
+            except shards.ShardsError as error:
+                raise FleetError(str(error)) from None
+        elif isinstance(value, bool) or not isinstance(value, (str, int, float)):
             raise FleetError(f"the shard setting {key} must be a string or a number")
     return data
 
 
 def _toml(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False) if isinstance(value, str) else repr(value)
+    return json.dumps(value, ensure_ascii=False) if isinstance(value, (str, list)) else repr(value)
 
 
 def manifest_text(settings: Mapping[str, Any], entries: List[Tuple[str, str]]) -> str:
@@ -253,23 +267,52 @@ def check_campaign(plan: shards.Plan, labels: Sequence[str]) -> None:
         raise FleetError(str(error)) from None
 
 
-def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None) -> List[str]:
+def pin(plan: shards.Plan, environ: Optional[Mapping[str, str]] = None) -> shards.Plan:
+    """The plan as `shards.py plan` and `lines` pin it before they print a line: the study's scripts hashed as the
+    study holds them now, and each declared variable's value read from `environ` (the operator's, by default the
+    process's): an unset variable or a value that may not ride on a line refuses it, naming the variable."""
+    try:
+        return shards.pin_pass_env(shards.pinned(plan), environ)
+    except shards.ShardsError as error:
+        raise FleetError(str(error)) from None
+
+
+def check_first_values(plan: shards.Plan, label: str, environ: Optional[Mapping[str, str]] = None) -> None:
+    """A shard's declared variables keep the values its first step passed, on whichever federation a later step runs
+    (`shards.check_pass_env_origin`, in the results directory every shard shares): the values `environ` gives now (the
+    operator's, as `pin` reads them) must be those, else `FleetError` naming the variable and never a value. Nothing is
+    compared for a shard with no first step recorded. `launches` asks before it makes a line to launch: `plan`'s lines
+    are first steps' and launch nothing."""
+    (shard,) = [s for s in plan.shards if s.label == label]
+    spec = {"index": shard.index, "count": shard.count, "label": shard.label}
+    try:
+        shards.check_pass_env_origin(plan.results, spec, dict(pin(plan, environ).pass_env_pins or ()))
+    except shards.ShardsError as error:
+        raise FleetError(str(error)) from None
+
+
+def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None,
+            environ: Optional[Mapping[str, str]] = None) -> List[str]:  # fmt: skip
     """The login node's srun line of one shard (`shards.step_argv`) on the federation the manifest gives it, which must
-    be `root` when one is given (the federation the fleet's record gives it, and checked)."""
-    return target_of(plan, label, resume, root)[0]
+    be `root` when one is given (the federation the fleet's record gives it, and checked). The plan is pinned here
+    (`pin`): a line is never made from a plan that has not hashed the study's scripts and read the declared
+    variables."""
+    return target_of(plan, label, resume, root, environ)[0]
 
 
-def target_of(plan: shards.Plan, label: str, resume: bool,
-              root: Optional[Path] = None) -> Tuple[List[str], Dict[str, Any]]:  # fmt: skip
+def target_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None,
+              environ: Optional[Mapping[str, str]] = None) -> Tuple[List[str], Dict[str, Any]]:  # fmt: skip
     """`line_of`'s line, and the job it lands in as the state names it (`shards.federation`: its id and name)."""
     (shard,) = [s for s in plan.shards if s.label == label]
     if root is not None and shard.root != root:
         raise FleetError(f"{MANIFEST} gives shard {label} another root than the fleet's record: run plan again")
+    plan = pin(plan, environ)
     try:
         fed = shards.federation(shard)
+        argv = shards.step_argv(plan, shard, fed, SCRIPT)
     except shards.ShardsError as error:
         raise FleetError(str(error)) from None
-    return shards.step_argv(plan, shard, fed, SCRIPT) + (["--resume"] if resume else []), fed
+    return argv + (["--resume"] if resume else []), fed
 
 
 @dataclass(frozen=True)
@@ -287,13 +330,14 @@ class Launch:
 
 
 def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], resume: bool,
-             running: Callable[[Mapping[str, Any]], Optional[bool]]
-             ) -> Tuple[List[Launch], List[str], List[str]]:  # fmt: skip
+             running: Callable[[Mapping[str, Any]], Optional[bool]],
+             environ: Optional[Mapping[str, str]] = None) -> Tuple[List[Launch], List[str], List[str]]:  # fmt: skip
     """The steps `fleet.py step` launches, what it skips (said), and what it refuses, each checked again just before:
     the federation still ready, still this fleet's, still of the fleet's fingerprint, and a moved shard's resets there
     full reads. A shard already launched on its federation is launched again only with `resume`, and never while its
     client runs (`running`: True, False, or None when it cannot be told). `fleet.py step` then asks Slurm of each
-    launch's job before it spawns."""
+    launch's job before it spawns. `environ` is the operator's: each line pins the declared variables from it, as it
+    holds them now."""
     plan = load(directory / MANIFEST)
     settings, written = record.get("template"), (directory / MANIFEST).read_text(encoding="utf-8")
     if settings is None or written != manifest_text(settings, entries(record, directory, {})):
@@ -331,7 +375,8 @@ def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], re
         if shard["moved"] and not here:
             note = (f"moved from {shard['last']}: {holder}'s platform.toml leaves [placement] reset_shortcut off, so "
                     "every reset there takes the full reads, its first included")  # fmt: skip
-        argv, fed = target_of(plan, label, again, root_of(directory, holder))
+        check_first_values(plan, label, environ)  # a later step of the shard carries the values its first one did
+        argv, fed = target_of(plan, label, again, root_of(directory, holder), environ)
         found.append(Launch(label, holder, argv, again, note, str(fed["job"]), str(fed["name"])))
     if found:  # a step that launches nothing reads no core; one that would launch asks first, as the plan did
         require_core(plan)
