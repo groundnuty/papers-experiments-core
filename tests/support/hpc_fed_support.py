@@ -374,6 +374,9 @@ def isolated(argv) -> list:
     return list(argv)
 
 
+DEFAULT_STATES = {"PENDING", "RUNNING", "COMPLETING"}  # what `squeue` lists with no `-t` (its documented default)
+
+
 @dataclass
 class OtherJob:
     """A live job of the account that is none of one fake's own: another federation's held job, or a job of no
@@ -470,9 +473,11 @@ class FakeSlurm:
         self.calls.append(argv)
         tool = argv[0]
         if tool == "squeue" and "--me" in argv:  # the account's live jobs: ids, names, states and node lists only
-            assert argv == ["squeue", "--me", "-h", "-o", "%i %j %T %N"], f"the read is not read-only as agreed: {argv}"
+            agreed = "PENDING,RUNNING,CONFIGURING,COMPLETING,SUSPENDED,RESIZING"  # every state holding a node
+            assert argv == ["squeue", "--me", "-h", "-t", agreed, "-o", "%i %j %T %N"], f"not read as agreed: {argv}"
             self.me_reads += 1
-            listed = self.me_rows()
+            states = set(argv[argv.index("-t") + 1].split(",")) if "-t" in argv else DEFAULT_STATES
+            listed = [row for row in self.me_rows() if row.split()[2] in states]  # squeue lists the states asked for
             answer = self.on_me(self.me_reads, listed) if self.on_me is not None else None
             return answer or Completed(0, "".join(f"{row}\n" for row in listed), "")
         if tool == "sbatch":
@@ -621,7 +626,8 @@ class FakeSlurm:
         return rows
 
     def me_rows(self) -> list:
-        """Every row `squeue --me` lists now: this fake's own jobs, its peers', and the account's other jobs."""
+        """Every row `squeue --me` lists now, whatever its state: this fake's own jobs, its peers', and the account's
+        other jobs (`run` keeps the states `squeue` was asked for, as squeue does)."""
         if self.others_by_read:
             others = self.others_by_read[min(self.me_reads, len(self.others_by_read)) - 1]
         else:
