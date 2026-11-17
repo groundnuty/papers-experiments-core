@@ -609,8 +609,9 @@ OUT = {
     "addresses.file": ADDRESSES,
     "addresses.resolver": ADDRESSES,
     "sandbox.apptainer.apptainer": HOST,
-    "sandbox.apptainer.work_disk_mkfs": HOST + " (the node's mkfs, as `apptainer` is: the image is ext3 whichever path "
-    "names the tool, and the run records its version, `work_disk.mkfs`; the mode that uses it, `work_disk`, is in)",
+    "sandbox.apptainer.work_disk_mkfs": HOST + " (the node's mkfs, one program word with no option, refused at load "
+    "otherwise, so it names only where the tool is; the run records its version, `work_disk.mkfs`; the mode that uses "
+    "it, `work_disk`, is in)",
     "sandbox.apptainer.image": PATH,
     "sandbox.apptainer.host_python": HOST + " (the node's interpreter for the gate, as the driver's own is)",
     "sandbox.apptainer.egress_shim": PATH,

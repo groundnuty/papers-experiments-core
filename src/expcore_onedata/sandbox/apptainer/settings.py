@@ -27,7 +27,8 @@ hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: anonymous 
                                  # a cell may add before it is taken as past its limit (hidden.py)
 work_disk = "directory"          # optional (O71): "directory", /work a directory the watch bounds, or "image", /work an
                                  # ext3 image of work_disk_bytes, a write past it refused with ENOSPC (workdisk.py)
-work_disk_mkfs = ["mkfs.ext3"]   # optional: the node's mkfs.ext3 (e2fsprogs 1.43 or later, for -d), for "image"
+work_disk_mkfs = ["mkfs.ext3"]   # optional: the node's mkfs.ext3 (e2fsprogs 1.43 or later, for -d), for "image": ONE
+                                 # program word, a name or an absolute path, never an option (it is no experiment)
 preload =[{ path = "x.so", sha256 = "<64 hex>" }]   # optional (hook b): libraries the cell preloads BEFORE the egress
                                  # shim, so a connect hook's rewrite reaches the shim through RTLD_NEXT
 binds = [{ path = "f", sha256 = "<64 hex>", target = "/etc/x" }]   # optional (hook b): files bound read-only
@@ -58,7 +59,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -69,6 +70,10 @@ from expcore_onedata.sandbox.apptainer.hidden import DEFAULT_MARGIN_BYTES
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
+# a command word that is no option: none starts with "-"
+MKFS_PROGRAM = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]{0,127}")
+DEFAULT_MKFS = ("mkfs.ext3",)
+MKFS_ONE_PROGRAM = "must be exactly one program word (a name or an absolute path), never an option or a second word"
 PROVIDER_STORAGE_KINDS = ("tmpfs", "shared_filesystem")  # where the providers keep their data (O57)
 CELL_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,1023}")
 # the targets the sandbox binds itself, and those under which it binds: an extra bind may be none of them
@@ -119,7 +124,7 @@ class ApptainerSettings:
     oneclient_bundle: Pinned | None = None  # the host mount's oneclient (`hostmount`), a tar pinned by its SHA-256
     provider_storage: str | None = None  # one of PROVIDER_STORAGE_KINDS, or None: the platform does not say
     work_disk: str = WORK_DISKS[0]  # O71: "directory" (the watch alone) or "image" (`workdisk.py`)
-    work_disk_mkfs: tuple[str, ...] = ("mkfs.ext3",)
+    work_disk_mkfs: tuple[str, ...] = DEFAULT_MKFS
 
     def __post_init__(self) -> None:
         low, high = MARGIN_BOUNDS
@@ -130,8 +135,8 @@ class ApptainerSettings:
             raise ValueError(f"provider_storage must be one of {', '.join(PROVIDER_STORAGE_KINDS)}")
         if self.work_disk not in WORK_DISKS:
             raise ValueError(f"work_disk must be one of {', '.join(WORK_DISKS)}")
-        if not self.work_disk_mkfs or any(not COMMAND_WORD.fullmatch(w) for w in self.work_disk_mkfs):
-            raise ValueError("work_disk_mkfs must hold plain command words")
+        if not _is_mkfs_program(self.work_disk_mkfs):
+            raise ValueError(f"work_disk_mkfs {MKFS_ONE_PROGRAM}")
         clash = sorted(set(self.gate_options) & GATE_OWN_KEYS)
         if clash:
             raise ValueError(f"gate_options may not set {clash[0]!r}: the sandbox writes it itself")
@@ -213,15 +218,22 @@ def _margin(section: Section) -> int:
     return value
 
 
+def _is_mkfs_program(words: Sequence[str]) -> bool:
+    """Whether `work_disk_mkfs` is the tool alone: exactly one word, a program's name or an absolute path, that is no
+    option. The file system's type and options shape the image, so no word may carry them (C06: the setting is out of
+    the fingerprint because it can name only where the node's mkfs is)."""
+    return len(words) == 1 and isinstance(words[0], str) and MKFS_PROGRAM.fullmatch(words[0]) is not None
+
+
 def _work_disk(section: Section) -> tuple[str, tuple[str, ...]]:
     mode = section.data.get("work_disk", WORK_DISKS[0])
     if mode not in WORK_DISKS:
         raise section.fail("work_disk", f"must be one of {', '.join(WORK_DISKS)}")
     if "work_disk_mkfs" in section.data and not isinstance(section.data["work_disk_mkfs"], list):
-        raise section.fail("work_disk_mkfs", "must be an array of plain command words")
-    words = section.strings("work_disk_mkfs") or ("mkfs.ext3",)
-    if any(not COMMAND_WORD.fullmatch(word) for word in words):
-        raise section.fail("work_disk_mkfs", "must hold plain command words")
+        raise section.fail("work_disk_mkfs", "must be an array holding one program word")
+    words = section.strings("work_disk_mkfs") if "work_disk_mkfs" in section.data else DEFAULT_MKFS
+    if not _is_mkfs_program(words):
+        raise section.fail("work_disk_mkfs", MKFS_ONE_PROGRAM)
     return mode, words
 
 

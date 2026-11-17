@@ -412,6 +412,33 @@ def test_o71_a_work_disk_setting_that_is_not_one_is_refused_naming_its_key(tmp_p
         _load(tmp_path, _document(**{key: bad}))
 
 
+@pytest.mark.parametrize("bad", [["mke2fs", "-t", "ext4"], ["mkfs.ext3", "-m0"], ["-t"], ["--help"], [], [""]])
+def test_o71_work_disk_mkfs_is_one_program_and_never_an_option(tmp_path, bad):
+    """O71: the file system's type and options shape the image, so the setting is the tool alone, one program word, and
+    never what a study could use to change them: an option-bearing value, a second word or none is refused at load,
+    naming the key. It is out of the fingerprint (C06) because it can name nothing but where the node's mkfs is."""
+    with pytest.raises(ConfigError, match="work_disk_mkfs"):
+        _load(tmp_path, _document(work_disk="image", work_disk_mkfs=bad))
+
+
+@pytest.mark.parametrize(
+    "program", ["mkfs.ext3", "mke2fs", "/usr/sbin/mkfs.ext3", "/opt/site/e2fsprogs-1.47/sbin/mkfs.ext3"]
+)
+def test_o71_work_disk_mkfs_takes_a_program_by_name_or_by_absolute_path(tmp_path, program):
+    """O71: a bare program name or an absolute path loads, and is kept as the one word."""
+    loaded = _load(tmp_path, _document(work_disk="image", work_disk_mkfs=[program])).apptainer
+    assert loaded.work_disk_mkfs == (program,)
+
+
+@pytest.mark.parametrize("words", [("mke2fs", "-t", "ext4"), ("-t",), (), ("a b",)])
+def test_o71_the_settings_refuse_a_work_disk_mkfs_that_is_not_one_program_word(tmp_path, words):
+    """O71: the check is the settings' own, so a platform built in code cannot pass an option either."""
+    from apptainer_support import make_settings
+
+    with pytest.raises(ValueError, match="work_disk_mkfs"):
+        make_settings(tmp_path, work_disk_mkfs=words)
+
+
 def test_o87_the_apptainer_backend_reads_the_check_provider_as_the_docker_backend_does(tmp_path):
     """O87: `content_check_provider` is a `[sandbox]` key of both backends: a layout name, kept for the platform's
     load to check against its providers and the space; unset it is None, the agent's local provider."""
