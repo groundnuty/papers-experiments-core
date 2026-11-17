@@ -475,10 +475,12 @@ happened). `up` could only fail and be torn down, although a minute later every 
   waited for. `up` then reads, at that moment, three sources. **(a)** sacct's rows of the step's job (`sacct -j <job> -n
   -P -o JobID,JobName,State,ExitCode`) for the step id that srun's own client log names (`<run log>.client`: `srun:
   error: Task launch for StepId=<id> failed on node <node>: Can't find an address, check slurm.conf`): exactly one row
-  of that id, under the step's name, State exactly `CANCELLED` (a step a user cancels reads `CANCELLED by <uid>`, exit
-  `0:9` or `0:15`) and ExitCode `0:116`, both as the site printed them twice. The client's log must name that one step
-  and its failure must be the missing address, which means the launch request never left the login node; a task launch
-  that failed otherwise (a socket that timed out) may have reached the node, and is no proof. **(b)** The run log is a
+  of that id, under the step's name, State exactly `CANCELLED` and ExitCode `0:116`, both as the site printed them twice
+  (a step a user cancels reads `CANCELLED by <uid>`, exit `0:9`; a job's batch step cancelled with the job reads plain
+  `CANCELLED`, exit `0:15`: the state alone is not the proof). The client's log must name that one step and its failure
+  must be the missing address, which srun's message reads as a request that was never sent (its message, not something
+  seen on the node); a task launch that failed otherwise (a socket that timed out) may have reached the node, and is no
+  proof. **(b)** The run log is a
   regular file of zero bytes, by a fresh `lstat` read last, and again immediately before the retry is written. A
   missing log proves nothing. The step's id comes from the client's log, not from the state: `up` waits for the
   providers one after the other, so the steps of the later ones were never listed while it waited; an id the state does

@@ -5,13 +5,14 @@ reads the three sources (srun's client log, sacct, the run log) and asks here wh
 Seen live twice on 17 Nov 2026: srun's fan-out on the login node could not find the nodes' addresses, and every
 provider's step was accounted `CANCELLED`, exit `0:116`, within 12 s, its run log made and empty. The client's log
 (`<run log>.client`) held, with the node's name, `srun: error: Task launch for StepId=<id> failed on node <node>: Can't
-find an address, check slurm.conf`. A step a user cancels reads `CANCELLED by <uid>` with `0:9` or `0:15`, so the state
-is matched exactly. A launch is proved failed only when BOTH hold:
+find an address, check slurm.conf`. A step a user cancels reads `CANCELLED by <uid>` with `0:9` (the live probe); a
+job's batch step cancelled with the job reads plain `CANCELLED` with `0:15`. So the state alone is not the proof: the
+exit code `0:116`, the exact id and the client's own line are. A launch is proved failed only when BOTH hold:
 
 - (a) the step, by the exact id the client's log names, is in sacct as exactly `CANCELLED`, exit `0:116`, under the
-  step's own name, and the client's log shows that one step's task launch failing for want of an address: the launch
-  request never left the login node, so the node never heard of it. A task launch failing otherwise (a socket that
-  timed out) may have reached the node, and is no proof;
+  step's own name, and the client's log shows that one step's task launch failing for want of an address, which srun's
+  message reads as a request that was never sent (that is its message, not something seen on the node). A task launch
+  failing otherwise (a socket that timed out) may have reached the node, and is no proof;
 - (b) the run log is a file of zero bytes. The bundle's batch script writes to it first, so a single byte means the
   service may have started.
 
