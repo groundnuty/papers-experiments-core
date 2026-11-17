@@ -350,9 +350,10 @@ MOUNT_SENSITIVITY_NOTES = [
 
 MOUNT_NOT_APPLICABLE_NOTES = [
     "A run with no mount (a REST run, or a run with no data path) is `not_applicable`: its record carries the",
-    "sandbox's statement that the run had none, so it had no mount exposure to be left out for and it stays in this",
-    "rerun. It is never counted as clean, and the egress check, if any, still judges it. A mount run whose record has",
-    "no mount-guard snapshot is `unknown`, and left out, whatever it did.",
+    "sandbox's statement that the run had none, or, with no snapshot at all, the campaign's fingerprint records that",
+    "the run's data path had none. It had no mount exposure to be left out for and it stays in this rerun. It is",
+    "never counted as clean, and the egress check, if any, still judges it. A mount run whose record has no",
+    "mount-guard snapshot is `unknown`, and left out, whatever it did.",
 ]
 
 VISIBILITY_NOTES = [

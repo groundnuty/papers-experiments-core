@@ -102,16 +102,64 @@ class _StubSeen:
 '''  # fmt: skip
 
 
+# A study that mixes data paths: the factor `data_path` (the platform's own name for it) has a REST level, which only
+# `relay-down` uses, and a mount level, and the plugin records the platform's `data_paths` in the campaign fingerprint.
+PATHS_FACTOR = '[factors.data_path]\nlevels = ["api", "mount"]\n\n[identity]'
+PLATFORM = "platform={'data_paths': {'api': {'kind': 'rest'}, 'mount': {'kind': 'mount'}}},"
+
+
+def with_data_paths(study: Path) -> None:
+    """Give the copy of the example the `data_path` factor and the platform fingerprint that maps its levels."""
+    config = study / "study.toml"
+    text = config.read_text(encoding="utf-8")
+    for old, new in (
+        ("[identity]", PATHS_FACTOR),
+        (
+            'order = ["task", "access", "tools", "model", "seed"]',
+            'order = ["task", "access", "tools", "data_path", "model", "seed"]',
+        ),
+        ('access = "direct"\ntools = "basic"\n', 'access = "direct"\ntools = "basic"\ndata_path = "mount"\n'),
+        ('access = "direct"\ntools = "extended"\n', 'access = "direct"\ntools = "extended"\ndata_path = "mount"\n'),
+        ('access = "relay"\ntools = "basic"\n', 'access = "relay"\ntools = "basic"\ndata_path = "api"\n'),
+    ):
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    config.write_text(text, encoding="utf-8")
+    plugin = study / "plugin.py"
+    code = plugin.read_text(encoding="utf-8")
+    assert code.count("        executor=TinyExecutor(context),\n") == 1
+    plugin.write_text(
+        code.replace(
+            "        executor=TinyExecutor(context),\n",
+            f"        executor=TinyExecutor(context),\n        {PLATFORM}\n",
+        ),
+        "utf-8",
+    )
+
+
 def prepared(
-    tmp_path: Path, *, guard: bool, egress: bool = False, rest_task: str | None = None, visibility: bool = False
+    tmp_path: Path,
+    *,
+    guard: bool,
+    egress: bool = False,
+    rest_task: str | None = None,
+    visibility: bool = False,
+    data_paths: bool = False,
 ) -> Path:
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
+    if data_paths:
+        with_data_paths(study)
     if guard:
         plugin = study / "plugin.py"
         text = plugin.read_text(encoding="utf-8")
         assert INSTRUMENTS in text
         added = "instruments = [FactsServed(shelf), MountGuard(_StubWatch(factors['task']), _NONCE)]"
+        if data_paths:  # the guard is listed on the mount runs alone: a REST run's record holds no snapshot
+            added = (
+                "instruments = [FactsServed(shelf), *([MountGuard(_StubWatch(factors['task']), _NONCE)] "
+                "if factors['data_path'] == 'mount' else [])]"
+            )
         if rest_task is not None:  # a campaign that mixes data paths: this task's runs are REST runs, with no mount
             added = (
                 f"instruments = [FactsServed(shelf), NoMount('rest') if factors['task'] == {rest_task!r} "
@@ -130,9 +178,18 @@ def prepared(
 
 
 def checked_study(
-    tmp_path, environment, *, guard: bool, egress: bool = False, rest_task: str | None = None, visibility: bool = False
+    tmp_path,
+    environment,
+    *,
+    guard: bool,
+    egress: bool = False,
+    rest_task: str | None = None,
+    visibility: bool = False,
+    data_paths: bool = False,
 ):
-    study = prepared(tmp_path, guard=guard, egress=egress, rest_task=rest_task, visibility=visibility)
+    study = prepared(
+        tmp_path, guard=guard, egress=egress, rest_task=rest_task, visibility=visibility, data_paths=data_paths
+    )
     code, stderr = cli(environment, "check", str(study / "out" / "runs"), process=True)
     assert code == 0, stderr
     return analyse_study(study)
@@ -252,3 +309,21 @@ def test_o70_a_study_checked_by_all_three_guards_reruns_without_the_runs_any_of_
     report = made[REPORT_FILE].decode()
     assert "## Egress, mount isolation and process visibility together" in report
     assert "#### Preregistered contrasts without the runs any guard leaves out" in report
+
+
+def test_o69_a_rest_arm_that_lists_no_mount_guard_is_not_applicable_by_the_campaigns_recorded_data_paths(
+    tmp_path, clean_environment
+):
+    """O69: the REST level's runs (`relay-down`) hold no mount-guard snapshot at all, as when the guard was listed on
+    the mount runs alone; the campaign fingerprint maps the level to `rest`, so they are not applicable and stay in the
+    rerun, and the mount runs of `lake` (token touched) and `hill` (log never closed) are left out."""
+    analysis = checked_study(tmp_path, clean_environment, guard=True, data_paths=True)
+    rest = {row.run_key for row in analysis.rows if row.factors["data_path"] == "api"}
+    assert rest
+    by_key = {run.run_key: run for run in analysis.mount_guard.runs}
+    assert {(by_key[key].verdict, by_key[key].data_path_from) for key in rest} == {("not_applicable", "campaign")}
+    assert not rest & {run.run_key for run in analysis.mount_guard.left_out}
+    assert {run.verdict for key, run in by_key.items() if key not in rest} >= {"flagged", "unknown"}
+    summary = json.loads(output_bytes(analysis)[ANALYSIS_FILE])["mount_guard"]
+    assert summary["counts"]["not_applicable"] == len(rest)
+    assert not rest & set(summary["sensitivity"]["left_out"])

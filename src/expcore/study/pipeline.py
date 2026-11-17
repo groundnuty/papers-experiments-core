@@ -98,6 +98,7 @@ from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
 from expcore.errors import study_kinds
 from expcore.guards import GuardsAnalysis, guards_analysis
 from expcore.models.route import sdk_version
+from expcore.mountguard.campaign import recorded_data_paths
 from expcore.mountguard.sensitivity import MountGuardAnalysis, mount_guard_analysis
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
@@ -835,14 +836,20 @@ def _analyse_loaded(
         except MergeRefused as error:
             verified.close()
             raise Refused(str(error)) from None
+    recorded_paths = []
     for snapshot in verified.snapshots.values():
         rows = snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
-        changed = differences(campaign_environment(recorded_fingerprint(rows)), check["environment"])
+        fingerprint = recorded_fingerprint(rows)
+        recorded_paths.append(recorded_data_paths(fingerprint))
+        changed = differences(campaign_environment(fingerprint), check["environment"])
         if changed:
             verified.close()
             raise Refused(
                 "the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed)
             )
+    # the data path of each level of `data_path`, as every snapshot's campaign fingerprint records it; none when the
+    # snapshots disagree, so a run the guard might not apply to is then left unknown (O69)
+    data_paths = recorded_paths[0] if recorded_paths and all(p == recorded_paths[0] for p in recorded_paths) else None
     plugin = load_plugin(StudyContext(study, code))
     try:
         export = _export_of(verified, study.manifest)
@@ -866,7 +873,7 @@ def _analyse_loaded(
     except ContrastRefused as error:  # a treatment attempt's None (S10), a failed run's None numerator (S13)
         raise Refused(str(error)) from None
     egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
-    guard = mount_guard_analysis(runs, rows, absent, study.prereg)  # None for a batch whose mount was not guarded
+    guard = mount_guard_analysis(runs, rows, absent, study.prereg, data_paths)  # None for a batch not guarded
     seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
     both = guards_analysis(rows, absent, study.prereg, egress, guard, seen)  # None unless two guards checked the batch
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
@@ -990,6 +997,7 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
                 "flags": list(run.flags), "log": run.log, "unknown": list(run.unknown), "isolation": run.isolation,
                 "unproven": list(run.unproven), "accesses": dict(run.accesses), "traced": run.traced,
                 "data_path": run.not_applicable,  # `rest` or `none` for a run the guard does not apply to, else None
+                "data_path_from": run.data_path_from,  # `record` or `campaign` for such a run, else None
             }
             for run in guard.runs
         ],

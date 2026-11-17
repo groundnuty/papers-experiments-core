@@ -20,7 +20,7 @@ from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
-from expcore.mountguard.flags import FLAGS, NOT_APPLICABLE, VERDICTS, RunMountGuard
+from expcore.mountguard.flags import FLAGS, FROM_CAMPAIGN, NOT_APPLICABLE, VERDICTS, RunMountGuard
 from expcore.mountguard.sensitivity import MountGuardAnalysis
 from expcore.report_notes import MOUNT_GUARD_NOTES, MOUNT_NOT_APPLICABLE_NOTES, MOUNT_SENSITIVITY_NOTES
 
@@ -94,9 +94,15 @@ def mount_guard_lines(
         "with an unproven isolation (a run may have several flags)."
     )
     if n[NOT_APPLICABLE]:
+        by_campaign = sum(1 for run in guard.runs if run.data_path_from == FROM_CAMPAIGN)
+        how = (
+            f" ({by_campaign} by the campaign's recorded data path, their records holding no snapshot)"
+            if by_campaign
+            else ""
+        )
         lines.append(
-            f"{n[NOT_APPLICABLE]} run(s) had no mount, so the guard does not apply to them: they are counted apart, "
-            "never as clean, and stay in the rerun."
+            f"{n[NOT_APPLICABLE]} run(s) had no mount{how}, so the guard does not apply to them: they are counted "
+            "apart, never as clean, and stay in the rerun."
         )
     lines += ["", *_by_condition(guard, table), *_not_clean(guard, table)]
     lines += [f"### Sensitivity analysis: {LEFT_OUT} left out", "", *MOUNT_SENSITIVITY_NOTES, ""]

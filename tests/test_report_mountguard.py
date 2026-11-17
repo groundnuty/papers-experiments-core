@@ -136,10 +136,10 @@ def test_a_refused_rerun_is_said_and_no_table_is_shown():
     assert SENSITIVITY not in report
 
 
-def no_mount(key: str, condition: str = "cond-a", kind: str = "rest") -> RunMountGuard:
-    """A run whose record says it had no mount: the guard does not apply."""
+def no_mount(key: str, condition: str = "cond-a", kind: str = "rest", source: str = "record") -> RunMountGuard:
+    """A run that had no mount, so the guard does not apply: its record says so, or the campaign's fingerprint does."""
     return RunMountGuard(key, 1, condition, "not_applicable", (), "not_applicable", (),
-                         {"token_file": 0, "token_dir": 0}, 0, (), kind)  # fmt: skip
+                         {"token_file": 0, "token_dir": 0}, 0, (), kind, source)  # fmt: skip
 
 
 def mixed(**changes) -> MountGuardAnalysis:
@@ -148,7 +148,7 @@ def mixed(**changes) -> MountGuardAnalysis:
     runs = (
         run("k1", flags=("token_access",), accesses={"token_file": 0, "token_dir": 3}),
         no_mount("k2", "cond-b"),
-        no_mount("k3", "cond-b", "none"),
+        no_mount("k3", "cond-b", "none", "campaign"),
         run("k4"),
     )
     again = analysis(contrast("a-vs-b", "difference", n_pairs=39, estimate=0.21))
@@ -159,7 +159,10 @@ def test_o69_the_runs_with_no_mount_are_counted_and_shown_as_not_applicable_and_
     """O69: the report counts them apart, lists none of them as not clean, and the rerun keeps them."""
     report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=mixed())
     assert "1 of 4 analysed run(s) not clean: 1 flagged for an access" in report
-    assert "2 run(s) had no mount, so the guard does not apply to them" in report
+    assert (
+        "2 run(s) had no mount (1 by the campaign's recorded data path, their records holding no snapshot), so the "
+        "guard does not apply to them" in report
+    )
     by_condition = table_of(report, "### Mount isolation by condition")
     assert by_condition["Condition"][1:6] == ["Analysed", "Clean", "Flagged", "Unknown", "Not applicable"]
     assert by_condition["cond-a"][1:6] == ["2", "1", "1", "0", "0"]
@@ -203,6 +206,8 @@ def test_analysis_json_names_a_run_with_no_mount_not_applicable_with_its_data_pa
     by_key = {entry["run_key"]: entry for entry in summary["runs"]}
     assert (by_key["k2"]["verdict"], by_key["k2"]["data_path"], by_key["k2"]["flags"]) == ("not_applicable", "rest", [])
     assert by_key["k3"]["data_path"] == "none"
+    assert (by_key["k2"]["data_path_from"], by_key["k3"]["data_path_from"]) == ("record", "campaign")
+    assert by_key["k4"]["data_path_from"] is None
     assert by_key["k4"]["data_path"] is None  # a run with a mount
     assert summary["counts"]["not_applicable"] == 2
     assert summary["sensitivity"]["left_out"] == ["k1"]
