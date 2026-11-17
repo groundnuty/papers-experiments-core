@@ -3,6 +3,7 @@ a cluster: the manifest `shards.py collect` writes beside the archives, and `sha
 runs on their own host (standard library only, the core not installed) against what they pulled. Every path and name
 here is invented."""
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -120,6 +121,22 @@ def test_the_manifest_is_the_same_for_every_collect_and_names_no_path(shards, tm
     shards.collect(plan, tmp_path / "second")
     assert (plan.results / MANIFEST).read_bytes() == first
     assert str(tmp_path) not in first.decode()
+
+
+def test_the_plan_id_tells_plans_of_the_same_labels_apart_and_is_the_same_for_one_plan(shards, tmp_path):
+    """O63: a fleet's shards are always shard-1 to shard-N, so labels alone would give every N-shard fleet one id; the
+    study, the results directory and a federation's root each change it, and a plan read again gives the same."""
+    plan = shards.load_plan(_plan_file(tmp_path))
+    first, second = plan.shards
+    elsewhere = tmp_path / "elsewhere"
+    variants = [
+        plan,
+        dataclasses.replace(plan, study=elsewhere),
+        dataclasses.replace(plan, results=elsewhere),
+        dataclasses.replace(plan, shards=(first, dataclasses.replace(second, root=elsewhere))),
+    ]
+    assert len({shards.plan_id(variant) for variant in variants}) == len(variants)
+    assert shards.plan_id(shards.load_plan(_plan_file(tmp_path))) == shards.plan_id(plan)
 
 
 def test_a_collect_that_refuses_a_shard_writes_no_manifest(shards, tmp_path):
