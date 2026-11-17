@@ -184,6 +184,12 @@ class ResetGrant:
         """Whether a reading and a reset made now may take the shortcut."""
         return self.why is None and self.held
 
+    def agent_steps(self) -> tuple[str, ...]:
+        """The steps of the run that use its tokens (its sandbox, its tool server: `admission.token_step`) under way now
+        under the admission this grant holds for: while one is, the run's agent may act, and a reset certifies
+        nothing."""
+        return () if self._admission is None else self._admission.open_steps()
+
     def facts(self) -> dict[str, Any]:
         """The record: the mode, why there is no shortcut, the seconds waited, whether the hold was had, the holders."""
         return {
@@ -288,6 +294,7 @@ def _take(config: PlatformConfig, settings: PlacementSettings) -> ResetGrant:
         )
     if admission.reset is not None and not admission.reset.shared:
         raise AdmissionRefused("a reset needs the run's share of the reset lock, held, to give up")
+    _require_no_agent(admission)
     sealed = admission.seal()  # refused while a worker holds a share: it may be reading, so no shortcut
     keep = admission.retain_for_reset()  # the admission, and its locks, stay held for as long as the hold does
     if keep is None:
@@ -295,7 +302,7 @@ def _take(config: PlatformConfig, settings: PlacementSettings) -> ResetGrant:
             admission.unseal()
         raise AdmissionRefused("the run's admission was let go before its reset could hold the reset lock")
     try:
-        return _hold(admission, federation, faults, settings, sealed, keep)
+        grant = _hold(admission, federation, faults, settings, sealed, keep)
     except BaseException:
         try:
             if sealed:
@@ -303,6 +310,26 @@ def _take(config: PlatformConfig, settings: PlacementSettings) -> ResetGrant:
         finally:
             keep()
         raise
+    try:  # a launch past its admission check before the hold was taken has counted its step by now
+        _require_no_agent(admission)
+    except BaseException:
+        grant.end()
+        raise
+    return grant
+
+
+def _require_no_agent(admission: Admission) -> None:
+    """Refuse a reset while the run's sandbox or tool server is up (a step that uses the run's tokens is under way,
+    `Admission.open_steps`): its agent may be running a cell, calling a tool or reading, and the reset would run beside
+    it. Every way the agent comes to act starts with such a step, and none can start while the reset holds the lock
+    (`require_admission`), so a share the run keeps during its reset is a harness step's."""
+    steps = admission.open_steps()
+    if steps:
+        raise AdmissionRefused(
+            f"the run's {', '.join(steps)} is up (a step that uses the run's tokens has begun and not ended), so its "
+            "agent may act: a reset runs before the run's sandbox and tool server start, or after they stop, never "
+            "beside them; refused before anything was sent"
+        )
 
 
 def _hold(

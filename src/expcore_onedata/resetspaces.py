@@ -76,6 +76,17 @@ LAPSED = (
     "the reset lock's exclusive hold lapsed during the reset: another holder may have acted since, so the reset "
     "certifies nothing from here"
 )
+AGENT_STEP = (
+    "the run's {steps} began during its reset (a step that uses the run's tokens), so its agent may have acted beside "
+    "it: the reset certifies nothing from here"
+)
+
+
+def _voided(grant: ResetGrant) -> str:
+    """Why a reset under `grant` may go no further: its hold lapsed, or a step of the run's agent is under way."""
+    if grant.lapsed:
+        return LAPSED
+    return AGENT_STEP.format(steps=", ".join(grant.agent_steps()))
 
 
 @dataclass(frozen=True)
@@ -188,11 +199,12 @@ class _Space:
         self._started[stage] = self.p.clock()
         self._reads[stage] = self.reset.stage_reads()
 
-    def void(self, stage: str) -> None:
-        """Fail the space at `stage` because the reset lock's hold lapsed (`LAPSED`), whether or not it began it."""
+    def void(self, stage: str, why: str) -> None:
+        """Fail the space at `stage` for `why` (the hold lapsed, or the run's agent may act), whether or not it began
+        it."""
         if stage not in self._started:
             self.begin(stage)
-        self.fail(stage, ProvisionError(LAPSED))
+        self.fail(stage, ProvisionError(why))
 
     def _transfer_reads(self, stage: str) -> dict[str, Any]:
         """The stage's own transfer reads' tally, for its record, when it made any (`transfer_read_retry`)."""
@@ -359,10 +371,10 @@ class SpacesReset:
         }
         for index, stage in enumerate(STAGES):
             started = self._clock()
-            if not grant.lapsed:
+            if not grant.lapsed and not grant.agent_steps():
                 stages[stage](spaces)
-            if grant.lapsed:  # before the stage, or during it: what it did and read certifies nothing
-                self._lapsed(spaces, stage)
+            if grant.lapsed or grant.agent_steps():  # before the stage, or during it: it certifies nothing
+                self._lapsed(spaces, stage, _voided(grant))
             self._walls[stage] = round(self._clock() - started, 3)
             if any(not space.live for space in spaces):
                 following = STAGES[index + 1] if index + 1 < len(STAGES) else None
@@ -374,12 +386,12 @@ class SpacesReset:
             space.close(ok=True)
 
     @staticmethod
-    def _lapsed(spaces: list[_Space], stage: str) -> None:
-        """The hold has lapsed: another holder may act, so every space still live fails the stage it began or would
-        have begun, the last one included, and none begins a later one."""
+    def _lapsed(spaces: list[_Space], stage: str, why: str) -> None:
+        """The hold has lapsed, or the run's agent may act (`why`): every space still live fails the stage it began or
+        would have begun, the last one included, and none begins a later one."""
         for space in spaces:
             if space.live:
-                space.void(stage)
+                space.void(stage, why)
 
     def _record(self, spaces: list[_Space], began: float) -> dict[str, Any]:
         return {
