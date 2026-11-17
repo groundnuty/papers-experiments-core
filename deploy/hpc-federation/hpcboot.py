@@ -237,7 +237,7 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
     layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     template = layout.spec.platform_template
     if template is None:
-        return "facts.json written; the layout names no platform_template, so no platform.toml and no render identity"
+        return "facts.json written; the layout names no platform_template, so no platform.toml"
     text = template.read_text(encoding="utf-8")
     write_platform(layout.platform, text, facts, values)
     hpcidentity.write(layout.root, hpcidentity.build(text, values, layout.platform))

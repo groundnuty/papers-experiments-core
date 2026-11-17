@@ -401,13 +401,15 @@ def test_o74_the_record_is_in_out_when_the_post_run_script_runs(shards, tmp_path
      canonical(identity(template_sha256=sha("x").upper())), canonical(identity(version=3)),
      canonical({**identity(), "/an/invented/path": sha("p")}), canonical({**identity(), "address": "10.1.2.3"}),
      canonical(identity(egress_shim_sha256=None) | {"sandbox_sif_sha256": None}),
-     canonical(identity(sandbox_sif_sha256="/an/invented/path"))],
+     canonical(identity(sandbox_sif_sha256="/an/invented/path")),
+     canonical(identity()).replace("{", '{"template_sha256":"/an/invented/path",', 1)],  # a key twice
 )  # fmt: skip
 def test_o74_a_federation_record_that_is_not_well_formed_refuses_the_step_and_echoes_none_of_it(
     shards, tmp_path, monkeypatch, capsys, bad
 ):
-    """O74: a record that is not JSON, not an object, lacks a required key, holds an undeclared key or a value that is
-    no SHA-256 refuses the step, naming it as the federation's and saying no more of what it holds."""
+    """O74: a record that is not JSON, not an object, lacks a required key, holds an undeclared key, a key twice (the
+    last of which is valid) or a value that is no SHA-256 refuses the step, naming it as the federation's and saying
+    no more of what it holds."""
     root = federation_root(tmp_path, bad)
     code, seen, checks = run_step(shards, step_args(tmp_path, identity()), root, monkeypatch)
     err = capsys.readouterr().err
@@ -416,6 +418,33 @@ def test_o74_a_federation_record_that_is_not_well_formed_refuses_the_step_and_ec
     assert "render identity" in err
     for leak in ("/an/invented/path", "10.1.2.3", "address", "not json at all"):
         assert leak not in err
+
+
+def test_o74_what_the_archive_carries_is_the_validated_record_in_canonical_form_never_other_bytes(
+    shards, tmp_path, monkeypatch
+):
+    """O74: a record `up` did not write byte for byte (here pretty-printed, with an escape in a value) that is valid is
+    archived as its canonical text, so no byte the validation did not see reaches the archive."""
+    value = identity()["template_sha256"]
+    escaped = f"\\u00{ord(value[0]):02x}" + value[1:]  # the same string, spelled with an escape
+    spelled = json.dumps(identity(), indent=2, sort_keys=True).replace(value, escaped)
+    root = federation_root(tmp_path, spelled + "\n")
+    code, _, _ = run_step(shards, step_args(tmp_path, identity()), root, monkeypatch)
+    assert code == 0
+    assert archived(tmp_path) == canonical(identity()).encode()
+
+
+def test_o74_a_record_with_a_key_twice_is_not_archived_when_none_is_expected(shards, tmp_path, monkeypatch, capsys):
+    """O74: with no expected record nothing is refused, but a record whose first value of a key is not a hash is never
+    archived, whatever its last value is: the step says so and runs."""
+    bad = canonical(identity()).replace("{", '{"template_sha256":"/an/invented/path",', 1)
+    root = federation_root(tmp_path, bad)
+    code, _, _ = run_step(shards, step_args(tmp_path, path=None), root, monkeypatch)
+    assert code == 0
+    assert archived(tmp_path) is None
+    err = capsys.readouterr().err
+    assert "render identity" in err
+    assert "/an/invented/path" not in err
 
 
 def test_o74_a_missing_record_with_an_expected_one_refuses(shards, tmp_path, monkeypatch, capsys):
@@ -647,6 +676,8 @@ def test_o74_the_step_s_own_copy_of_the_records_names_is_the_driver_s(hpc, shard
     assert set(shards.RENDER_IDENTITY_PINS) == set(identity_module.PINS) == PINS
     assert set(shards.RENDER_IDENTITY_KEYS) == set(identity_module.KEYS) == KEYS
     assert shards.STUDY_STATE == STUDY_STATE
+    assert shards.canonical_render_identity(identity()) == canonical(identity()).encode()
+    assert identity_module.canonical(identity()) == canonical(identity())
 
 
 def test_o74_collect_accepts_a_shard_whose_out_holds_the_record_in_study_state(shards, tmp_path):

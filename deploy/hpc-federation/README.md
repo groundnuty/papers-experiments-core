@@ -551,8 +551,9 @@ so does a federation with no record in its root, an unreadable or malformed one,
 made. A record is only the file `up` wrote: a `platform.toml` edited by hand afterwards is not seen, and a line edited
 to drop the two words runs unchecked.
 
-Whether or not one is expected, a step that has the federation's record copies the bytes it read at its start into
-`out/study-state/render-identity.json` once the dispatcher has ended, before the post-run script and the archive, so the
+Whether or not one is expected, a step that has the federation's record copies it into
+`out/study-state/render-identity.json` (the record as it validated, in canonical form: the bytes `up` wrote, never
+anything else the file held; a key given twice refuses the record) once the dispatcher has ended, before the post-run script and the archive, so the
 archive, an `out/` kept for `--archive-left`, and a post-run script all see which render the shard ran against. A
 failure to write it is said on stderr and never stops the archive. A federation whose `up` wrote no record (one brought
 up before O74, or a layout with no platform template) and a plan that expects none run as they did and archive none;

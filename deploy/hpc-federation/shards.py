@@ -93,8 +93,9 @@ reads the expected file below the held study root, shows it is the file the plan
 record once from `$EXPCORE_FED_ROOT` (below that root, no link followed, a root of this user's that no group or other
 can write to), and refuses with `PRE_STEP_REFUSED` (73), naming the keys that differ and never a value, when they are
 not equal key by key, when either is not well formed, or when the federation has no record, an unreadable one, or no
-root named. Whether or not one is expected, a step that has the federation's record copies those bytes into
-`out/study-state/render-identity.json` once the dispatcher has ended, before the post-run script and the archive, so
+root named. Whether or not one is expected, a step that has the federation's record copies it, as validated (its
+canonical text: the bytes `up` wrote), into `out/study-state/render-identity.json` once the dispatcher has ended,
+before the post-run script and the archive, so
 the archive carries them; a federation whose `up` wrote none (before O74, or a layout with no platform template) and a
 plan with no expectation run as they did, and archive none. The record is what `up` wrote: a `platform.toml` edited
 by hand afterwards is not seen, and a line edited to drop the two words runs unchecked.
@@ -1444,11 +1445,24 @@ def identity_problem(record: Any) -> str | None:
     return None
 
 
+def no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """`json.loads`'s `object_pairs_hook`: a key given twice is refused, since the last would be all a check saw."""
+    keys = [key for key, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("a key is given twice")
+    return dict(pairs)
+
+
+def canonical_render_identity(record: Mapping[str, str]) -> bytes:
+    """A render identity's canonical text, as hpcidentity.py writes it: sorted keys, no spaces, one newline."""
+    return (json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+
 def parse_render_identity(raw: bytes, name: str) -> dict[str, str]:
-    """The render identity `raw` holds, `ShardsError` naming `name` if it is not one: JSON, an object of exactly the
-    declared keys' kinds (`identity_problem`). The error says nothing of the content."""
+    """The render identity `raw` holds, `ShardsError` naming `name` if it is not one: JSON with no key given twice, an
+    object of exactly the declared keys' kinds (`identity_problem`). The error says nothing of the content."""
     try:
-        record = json.loads(raw)
+        record = json.loads(raw, object_pairs_hook=no_duplicate_keys)
     except (ValueError, RecursionError):
         raise ShardsError(f"{name} is not a well-formed render identity: it is not JSON") from None
     if problem := identity_problem(record):
@@ -1484,10 +1498,11 @@ def read_federation_identity(root: str) -> bytes | None:
 
 
 def check_render_identity(args: argparse.Namespace) -> bytes | None:
-    """The step's first act, before its pre-step guard and everything else: the bytes of the federation's own render
-    identity (`EXPCORE_FED_ROOT`'s record), for the step to put into its out/ (`note_render_identity`); None when the
-    federation has none or its record cannot be taken, which is said on stderr and nothing more, as a federation `up`
-    rendered before the record existed is run as it was.
+    """The step's first act, before its pre-step guard and everything else: the canonical text of the federation's own
+    render identity (`EXPCORE_FED_ROOT`'s record, as validated: the bytes `up` wrote, whatever else the file held is
+    never copied), for the step to put into its out/ (`note_render_identity`); None when the federation has none or its
+    record cannot be taken, which is said on stderr and nothing more, as a federation `up` rendered before the record
+    existed is run as it was.
 
     When the line gives the expected record (`--expect-render-identity REL --expect-render-identity-sha256 HEX`): the
     file is read below the study's root, shown to be the bytes the plan hashed and a well-formed record; the
@@ -1504,9 +1519,11 @@ def check_render_identity(args: argparse.Namespace) -> bytes | None:
             return None
         try:
             raw = read_federation_identity(root)
-            if raw is not None:
+            if raw is None:
+                return None
+            return canonical_render_identity(
                 parse_render_identity(raw, f"the federation's render identity record ({RENDER_IDENTITY})")
-            return raw
+            )
         except ShardsError as error:
             print(f"shards: the federation's render identity is not archived: {error}", file=sys.stderr)
             return None
@@ -1546,11 +1563,11 @@ def check_render_identity(args: argparse.Namespace) -> bytes | None:
         raise StepRefused(
             f"the federation's render identity is not the expected one ({path}): it differs in {', '.join(differing)}"
         )
-    return held
+    return canonical_render_identity(actual)
 
 
 def note_render_identity(out: Path, record: bytes, label: str) -> None:
-    """Put the federation's render identity, the bytes `check_render_identity` took, into the step's out/ as
+    """Put the federation's render identity, the text `check_render_identity` gave, into the step's out/ as
     `study-state/render-identity.json` (mode 0600, no link followed), so the archive carries it. A failure is said and
     never fatal: the results are archived all the same."""
     try:
