@@ -16,10 +16,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from apptainer_support import make_settings as apptainer_settings
+from apptainer_support import make_spec as apptainer_spec
+from apptainer_support import start as apptainer_start
+from fake_node import FakeNode
 from sandbox_support import MOUNT_PATH, make_spec, start_options
 
 from expcore_onedata.sandbox import inputs
 from expcore_onedata.sandbox.api import ReadOnlyInput, SandboxError, StartRefused
+from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 from expcore_onedata.testing import NOW
@@ -360,6 +365,46 @@ def test_o73_an_input_that_is_none_of_the_agents_own_paths_is_taken_as_before(wo
     for target in ("/workspace", "/devtools", "/etc/hostnames", "/etc/ssl/other"):
         [item] = inputs.validate([ReadOnlyInput(scripts, target)], taken)
         assert item.target == target
+
+
+# every path the sandbox binds itself into a cell, on either backend: the name-service files, the egress shim and its
+# preloads, the collector's socket directory and the gate's information file (no input may be, hold or lie under one)
+OWN_BINDS = [
+    "/etc/hosts", "/etc/hostname", AV.RESOLV_CONF, AV.NSSWITCH_CONF, "/etc/ld.so.preload", AV.GATE_INFO,
+    "/etc/expcore", AV.EGRESS_DIR, f"{AV.EGRESS_DIR}/sock", AV.SHIM_TARGET, AV.SHIM_TARGET.rsplit("/", 1)[0],
+    AV.PRELOAD_DIR, f"{AV.PRELOAD_DIR}/0.so",
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("target", OWN_BINDS)
+def test_o20_an_input_may_not_shadow_a_path_the_sandbox_binds_itself_on_both(world, scripts, tmp_path, target):
+    """O20: a study's read-only input can never be, hold or lie under a file the sandbox binds into a cell itself (the
+    name-service files, the egress shim and preloads, the gate's information file): `declare` and the start of each
+    backend refuse it by its position, before anything exists, so no bind of a later input shadows the sandbox's own."""
+    item = ReadOnlyInput(scripts, target)
+    with pytest.raises(StartRefused, match="read-only input 0"):
+        inputs.declare(world.s, {"every-run": [item]})
+    with pytest.raises(StartRefused, match="read-only input 0"):
+        start(world, [item])
+    assert nothing_left(world)
+    there = tmp_path / "apptainer"
+    there.mkdir()
+    spec = dataclasses.replace(apptainer_spec("isolated"), inputs=(item,))
+    with pytest.raises(StartRefused, match="read-only input 0"):
+        apptainer_start(FakeNode(), apptainer_settings(there), spec)
+
+
+@pytest.mark.parametrize("target", [TARGET, "/etc/analysis", "/etc/expcore-notes", "/hpcop-egress-notes", "/srv/etc"])
+def test_o20_an_input_beside_the_sandbox_s_own_paths_still_loads(world, scripts, target):
+    """O20: only a path that is, holds or lies under one the sandbox binds is refused; a neighbour whose name merely
+    starts alike is delivered, as before."""
+    [item] = inputs.declare(world.s, {"every-run": [ReadOnlyInput(scripts, target)]})["every-run"]
+    assert item.target == target
+    box = start(world, [ReadOnlyInput(scripts, target)])
+    try:
+        assert len(agent_mounts(world, box)) >= 1
+    finally:
+        box.stop()
 
 
 def test_o20_an_input_whose_content_left_its_declared_hash_is_refused_before_anything_exists(world, scripts):

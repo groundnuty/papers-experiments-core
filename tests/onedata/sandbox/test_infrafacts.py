@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from expcore_onedata.sandbox import cellhost, fedwindow, hostfacts, infrafacts
+from expcore_onedata.sandbox import cellhost, cellresolv, fedwindow, gatepolicy, hostfacts, infrafacts
 from expcore_onedata.sandbox.apptainer import facts as apptainer_facts
 from expcore_onedata.sandbox.infrafacts import FactsConflict, InfrastructureFacts
 
@@ -229,6 +229,12 @@ def test_o89_the_declared_owners_hold_disjoint_keys_that_the_features_actually_w
     # either key is the one refused, and the helper's literal for the first is the feature's own constant
     assert {cellhost.FACT, "own_node_scan"} <= infrafacts.OWNED[infrafacts.METADATA]
     assert cellhost.FACT == "cell_hostname"
+    # the hash of the resolv.conf a cell read (O56) is written once, at the start, by its own owner
+    assert {cellresolv.FACT} == infrafacts.OWNED[infrafacts.CELL_RESOLV]
+    assert cellresolv.FACT == "resolv_conf_sha256"
+    # the gate's upstream read timeout (O85) is written once, when the gate's configuration is, by the gate's owner
+    assert {gatepolicy.UPSTREAM_READ_TIMEOUT_FACT} == infrafacts.OWNED[infrafacts.GATE]
+    assert gatepolicy.UPSTREAM_READ_TIMEOUT_FACT == "gate_upstream_read_timeout_s"
 
 
 # ---------------------------------------------------------------------------------------------- the scanner

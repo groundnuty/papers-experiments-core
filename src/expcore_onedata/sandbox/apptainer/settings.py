@@ -28,7 +28,8 @@ hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: anonymous 
 work_disk = "directory"          # optional (O71): "directory", /work a directory the watch bounds, or "image", /work an
                                  # ext3 image of work_disk_bytes, a write past it refused with ENOSPC (workdisk.py)
 work_disk_mkfs = ["mkfs.ext3"]   # optional: the node's mkfs.ext3 (e2fsprogs 1.43 or later, for -d), for "image": ONE
-                                 # program word, a name or an absolute path, never an option (it is no experiment)
+                                 # program word, a bare name or an absolute path (never ./x, ../x, a/b), never an
+                                 # option (it is no experiment); the image is ext3 whatever it is called (-t ext3)
 preload =[{ path = "x.so", sha256 = "<64 hex>" }]   # optional (hook b): libraries the cell preloads BEFORE the egress
                                  # shim, so a connect hook's rewrite reaches the shim through RTLD_NEXT
 binds = [{ path = "f", sha256 = "<64 hex>", target = "/etc/x" }]   # optional (hook b): files bound read-only
@@ -74,7 +75,10 @@ COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
 # a command word that is no option: none starts with "-"
 MKFS_PROGRAM = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]{0,127}")
 DEFAULT_MKFS = ("mkfs.ext3",)
-MKFS_ONE_PROGRAM = "must be exactly one program word (a name or an absolute path), never an option or a second word"
+MKFS_ONE_PROGRAM = (
+    "must be exactly one program word: a bare name (no '/') or an absolute path in normal form (no empty, '.' or '..' "
+    "part), never an option, a relative path or a second word"
+)
 PROVIDER_STORAGE_KINDS = ("tmpfs", "shared_filesystem")  # where the providers keep their data (O57)
 CELL_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,1023}")
 # the targets the sandbox binds itself, and those under which it binds: an extra bind may be none of them
@@ -86,7 +90,7 @@ WORK_DISKS = ("directory", "image")  # work_disk: the first is the default (O71)
 # the keys of the gate's configuration the sandbox writes itself (`gaterun.config`): gate_options may set none of them
 GATE_OWN_KEYS = frozenset(
     {"run_key", "verify_ssl", "log", "tls_dir", "hosts", "listing", "token_file", "token", "upstream_ca_file",
-     "listen_host", "listen_port", "tcp_forwards", "scan_names"}
+     "listen_host", "listen_port", "tcp_forwards", "scan_names", "upstream_read_timeout_s"}
 )  # fmt: skip
 
 
@@ -223,10 +227,17 @@ def _margin(section: Section) -> int:
 
 
 def _is_mkfs_program(words: Sequence[str]) -> bool:
-    """Whether `work_disk_mkfs` is the tool alone: exactly one word, a program's name or an absolute path, that is no
-    option. The file system's type and options shape the image, so no word may carry them (C06: the setting is out of
-    the fingerprint because it can name only where the node's mkfs is)."""
-    return len(words) == 1 and isinstance(words[0], str) and MKFS_PROGRAM.fullmatch(words[0]) is not None
+    """Whether `work_disk_mkfs` is the tool alone: exactly one word, a program's bare name or an absolute path, that is
+    no option. The file system's type and options shape the image, so no word may carry them (C06: the setting is out
+    of the fingerprint because it can name only where the node's mkfs is; the image's type is passed by `workdisk.make`
+    itself). A path relative to wherever the driver runs (`./x`, `../x`, `a/b`) names no tool a node can be said to
+    have, and an absolute path with an empty, `.` or `..` part (`/`, `/a/`, `/a/../b`) is not in normal form."""
+    if len(words) != 1 or not isinstance(words[0], str) or MKFS_PROGRAM.fullmatch(words[0]) is None:
+        return False
+    word = words[0]
+    if not word.startswith("/"):
+        return "/" not in word and word not in (".", "..")
+    return all(part not in ("", ".", "..") for part in word[1:].split("/"))
 
 
 def _work_disk(section: Section) -> tuple[str, tuple[str, ...]]:

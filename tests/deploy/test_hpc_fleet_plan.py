@@ -215,16 +215,17 @@ def test_o68_step_never_launches_into_a_job_slurm_no_longer_holds_for_the_federa
 
 
 def test_o68_step_launches_nothing_from_a_shard_manifest_the_record_does_not_give(bench):
-    """O68: shards.toml edited after the plan to give shard-1 fed-2's root (a linked federation of the fleet's): step
-    refuses whole and launches nothing, since a line built from it would land in a job the fleet never checked."""
+    """O68: shards.toml edited after the plan to give shard-1 fed-2's root and shard-2 fed-1's (linked federations of
+    the fleet's, each still one shard's own): step refuses whole and launches nothing, since a line built from it would
+    land in a job the fleet never checked."""
     assert bench.up(2)[0] == 0
     assert plan(bench)[0] == 0
     path = bench.fleet / "shards.toml"
     text = path.read_text(encoding="utf-8")
-    assert text.count(f'root = "{bench.root("fed-1")}"') == 1
-    path.write_text(
-        text.replace(f'root = "{bench.root("fed-1")}"', f'root = "{bench.root("fed-2")}"'), encoding="utf-8"
-    )
+    first, second = f'root = "{bench.root("fed-1")}"', f'root = "{bench.root("fed-2")}"'
+    assert text.count(first) == 1
+    assert text.count(second) == 1
+    path.write_text(text.replace(first, "FIRST").replace(second, first).replace("FIRST", second), encoding="utf-8")
     code, printed = bench.run("step")
     assert code == 2
     assert "the fleet's shards.toml is not the one its record gives" in printed

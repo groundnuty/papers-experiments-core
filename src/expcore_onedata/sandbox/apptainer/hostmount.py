@@ -49,6 +49,7 @@ import logging
 import os
 import secrets
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -389,7 +390,7 @@ class HostMount:
             finally:
                 self._log = _read(self.where.watch_log) if self.watch is not None else None
                 self._snapshot = snapshot(read_log(self._log, self.nonce))
-                text = _read_log_link(self.where.log_dir, directio.LOG_FILE)
+                text = _read_log_link(self.where, directio.LOG_FILE)
                 declared = getattr(self.s.mount, "io_mode", None)
                 self._io_mode = iomode.judge(declared, None if text is None else text.decode("utf-8", "replace"))
 
@@ -431,9 +432,10 @@ class HostMount:
 
     def oneclient_log(self) -> bytes | None:
         """oneclient's INFO log, through glog's link to it in its log directory, as it is now; None when it cannot be
-        read. The read is the driver's, of a directory no cell binds, which the guard's watcher does not watch (it
-        watches the token file and its directory alone), so it may be read during the run (O18, O60)."""
-        return _read_log_link(self.where.log_dir, directio.LOG_FILE)
+        read, or when a link lies on the way to it (`_read_log_link`, #362). The read is the driver's, of a directory
+        no cell binds, which the guard's watcher does not watch (it watches the token file and its directory alone), so
+        it may be read during the run (O18, O60)."""
+        return _read_log_link(self.where, directio.LOG_FILE)
 
     def stop(self) -> None:
         if self.oneclient is not None:  # its last state of the run, before the stop's own unmount and signals
@@ -523,10 +525,11 @@ class HostMount:
         }
 
 
-def _read(path: Path) -> bytes | None:
-    """A file's bytes, never following a link; None when it cannot be read."""
+def _read(path: str | Path, *, dir_fd: int | None = None) -> bytes | None:
+    """A file's bytes, never following a link at its name (in the directory `dir_fd` holds, when given); None when it
+    cannot be read."""
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except OSError:
         return None
     with os.fdopen(descriptor, "rb") as handle:
@@ -536,16 +539,37 @@ def _read(path: Path) -> bytes | None:
             return None
 
 
-def _read_log_link(directory: Path, name: str) -> bytes | None:
-    """oneclient's INFO log through glog's link to it: followed only to a regular file of the same directory, then read
-    without following anything further; None otherwise."""
+def _read_log_link(where: Layout, name: str) -> bytes | None:
+    """oneclient's INFO log through glog's link to it, with no link followed on the way (#362). The path is walked from
+    the run's directory, held as a descriptor: each directory down to the log's is opened from the one before it with
+    `O_NOFOLLOW` (as `runs.remove_inside` walks one), so a link in any of them, `mount-guard` and `oneclient-log`
+    included, or one put there after the run began, makes the log unreadable. No cell can reach these directories
+    (`Layout.protected`), so this is defence in depth. In the last directory the log's own name is followed once, by
+    `readlink`, and only to a bare file name of that directory (glog writes its link relative, so); a target with a
+    directory part, an absolute one or a chain is not followed. The file is then read with `O_NOFOLLOW`, so it is a link
+    at no point. None when anything on the way is a link or is not there, or the file cannot be read."""
     try:
-        target = (directory / name).resolve(strict=True)
-    except (OSError, RuntimeError):
+        names = where.log_dir.relative_to(where.run_dir).parts
+    except ValueError:
         return None
-    if target.parent != directory.resolve():
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = None
+    try:
+        descriptor = os.open(where.run_dir, flags)
+        for part in names:
+            inner = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = inner
+        if stat.S_ISLNK(os.stat(name, dir_fd=descriptor, follow_symlinks=False).st_mode):
+            name = os.readlink(name, dir_fd=descriptor)
+            if name in ("", ".", "..") or os.sep in name:
+                return None
+        return _read(name, dir_fd=descriptor)
+    except OSError:
         return None
-    return _read(target)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def host_mount_factory(*binary: Any, **options: Any) -> MountHelperFactory:

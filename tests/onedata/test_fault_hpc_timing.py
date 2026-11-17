@@ -268,3 +268,56 @@ def test_o58_a_link_restarts_timing_is_in_the_heals_action(tmp_path):
     for action in restarts:
         assert action["timing"]["steps"][0]["start_after_issue_s"] == STALL
     assert all("timing" not in a for a in heal["actions"] if a["action"] != "restart_link")
+
+
+def per_reader_heal(tmp_path, mode):
+    """The four-provider federation whose pair READER -> CRASHED stays stuck after the outage, healed per reader."""
+    platform = write_platform(tmp_path, lambda data: four_providers(data, heal=mode))
+    clock = FakeClock()
+    federation = FakeHpc(clock, LABEL)
+    federation.stuck = {(READER, CRASHED)}
+    driver = driver_over(federation, {"restart_link": timing("exec", STALL, 1.0), "ping": timing("exec", 0.5, 0.0)})
+    return injector_for(platform, driver, target=TARGET, clock=clock), federation
+
+
+@pytest.mark.parametrize("mode", ["link", "link_then_container"])
+def test_o58_a_per_readers_link_restart_has_its_timing_in_the_heals_action(tmp_path, mode):
+    """O58: the all-links sequence recorded where a link restart's time went; the per-reader heal (`_act`) sent the
+    same exec and dropped it. Its `restart_link` action holds the exec's timing (the step that restarted the link began
+    201 s after it was issued), and the ping's, kept by the driver, is no action."""
+    injector, _ = per_reader_heal(tmp_path, mode)
+    injector.start(RUN)
+    assert injector.clear() is True
+    heal = [s for s in injector.snapshot()["steps"] if s["step"] == "heal"][-1]
+    restarts = [a for a in heal["actions"] if a["action"] == "restart_link"]
+    assert [a["provider"] for a in restarts] == [READER]
+    assert restarts[0]["timing"]["steps"][0]["start_after_issue_s"] == STALL
+    assert all("timing" not in a for a in heal["actions"] if a["action"] != "restart_link")
+
+
+def test_o58_a_per_readers_restart_whose_gate_failed_still_has_its_timing(tmp_path):
+    """O58: the restart's timing is where the link restart's time went whatever came after it: the action recorded
+    when the reader's session gate did not pass holds it too."""
+    injector, federation = per_reader_heal(tmp_path, "link")
+    federation.probe.sessions = lambda service, probe: (
+        "providers[3] holds an error for the restored provider" if federation.acted("restart_link") else None
+    )  # the gate passes before the heal and fails after the first link restart
+    injector.start(RUN)
+    assert injector.clear() is False
+    heal = [s for s in injector.snapshot()["steps"] if s["step"] == "heal"][-1]
+    (restart,) = [a for a in heal["actions"] if a["action"] == "restart_link"]
+    assert restart["gate"]["ok"] is False
+    assert restart["timing"]["steps"][0]["start_after_issue_s"] == STALL
+
+
+def test_o58_a_per_readers_restart_that_the_relay_gave_no_timing_for_records_none(tmp_path):
+    """O58: a relay that gave no timing leaves the action as it always was: no `timing` key, none invented."""
+    platform = write_platform(tmp_path, lambda data: four_providers(data, heal="link"))
+    clock = FakeClock()
+    federation = FakeHpc(clock, LABEL)
+    federation.stuck = {(READER, CRASHED)}
+    injector = injector_for(platform, driver_over(federation, {}), target=TARGET, clock=clock)
+    injector.start(RUN)
+    assert injector.clear() is True
+    heal = [s for s in injector.snapshot()["steps"] if s["step"] == "heal"][-1]
+    assert all("timing" not in a for a in heal["actions"])

@@ -60,7 +60,7 @@ from feddocker import (
     require_own,
     require_ports_free,
 )
-from fedfacts import baseline_left_behind, describe, root_parent, write_facts
+from fedfacts import baseline_left_behind, describe, facts_of, root_parent, write_facts
 from fedimport import copy_imports, pending_copies, require_resettable
 from fedlayout import NODE, ROOT_MARKER, Layout
 from fedlinks import check_after_up
@@ -76,6 +76,7 @@ from fedpki import (
 from fedreplicas import evict_replicas
 from fedrest import Rest
 from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, load_spec
+from fedsupport import check_rendered_support
 from fedtools import check_artifacts, study_artifacts_from
 
 ZONE_TIMEOUT_S = 1500.0
@@ -194,7 +195,8 @@ def prepare(layout: Layout) -> None:
 
 
 def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
-    """Start the zone, bootstrap it, start the providers, and settle registration, spaces, support and members."""
+    """Start the zone, bootstrap it, start the providers, and settle registration, spaces, support (read back against
+    the declaration, O35) and members."""
     spec = layout.spec
     compose(layout, "up", "--detach", spec.zone.name)
     boot.wait_zone(ZONE_TIMEOUT_S)
@@ -208,6 +210,7 @@ def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
     boot.ensure_spaces()
     boot.ensure_import_storages()
     boot.ensure_support(SUPPORT_TIMEOUT_S)
+    boot.verify_support()  # each space's providers as the zone lists them, against the layout's declaration (O35)
     for space in spec.spaces:
         if spec.members(space.name):
             boot.ensure_members(space.name)
@@ -292,6 +295,10 @@ def reset_replicas(layout: Layout) -> str:
     try:
         boot = Bootstrap(rest, layout)
         bring_up(layout, boot, timer)
+        if layout.spec.platform_template is not None:
+            # a refused up leaves its file in the root, which require_up accepts: held to the zone again, before any
+            # eviction (O35)
+            check_rendered_support(layout, facts_of(boot))
         evicted = evict_replicas(boot, TRANSFER_TIMEOUT_S)
         timer.mark("replicas")
     finally:

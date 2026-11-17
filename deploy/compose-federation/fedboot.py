@@ -9,6 +9,9 @@ An imported space is held by its owner on an imported POSIX storage of its own, 
 the support (`ensure_import_storages`) and the support names by its storage name, never by its place in a list: a
 provider with two storages lists them in no order a support may rely on. The owner's support of an imported space asks
 for one initial scan of the storage and no later one, which only adds the files it finds; `wait_import` waits for it.
+
+A space's support set is the declared one only if the zone says so: `verify_support`, taken right after
+`ensure_support`, reads each space's providers back and refuses any difference (O35, `fedsupport`).
 """
 
 import json
@@ -23,6 +26,7 @@ from fedlayout import IMPORT_MOUNT, REGULAR_STORAGE, Layout, import_storage_name
 from fedpki import ensure_secret, require_private, write_secret
 from fedrest import PANEL_API, PANEL_USER, PROVIDER_API, ZONE_API, Rest, RestError, basic, bearer, wait_until
 from fedspec import ADMIN, Service, Space
+from fedsupport import SupportRead, extras, listed, missing, refusal, stamp
 from fedtools import slot_users
 
 INVITE_LIFETIME_S = 900
@@ -56,8 +60,8 @@ PANEL_READ_BACKOFF_CAP_S = 10.0  # no wait is longer than this, however many tri
 
 @dataclass
 class Ids:
-    """What the federation gave out: ids by the names this deployment uses, the imported storages by (provider, space)
-    and each imported space's scan record once it completed."""
+    """What the federation gave out: ids by the names this deployment uses, the imported storages by (provider, space),
+    each imported space's scan record once it completed, and each space's support set as `verify_support` read it."""
 
     admin: str = ""
     users: dict[str, str] = field(default_factory=dict)
@@ -65,6 +69,7 @@ class Ids:
     spaces: dict[str, str] = field(default_factory=dict)
     storages: dict[tuple[str, str], str] = field(default_factory=dict)
     scans: dict[str, dict[str, Any]] = field(default_factory=dict)
+    support: dict[str, SupportRead] = field(default_factory=dict)
 
 
 def same_setting(details: dict[str, Any], key: str, wanted: Any) -> bool:
@@ -92,6 +97,7 @@ class Bootstrap:
     """The steps of up and the resets that talk to the federation."""
 
     _sleep: Callable[[float], None] = staticmethod(time.sleep)  # the wait between tries of a panel read; a test's own
+    _clock: Callable[[], float] = staticmethod(time.time)  # the time a support set is read at; a test's own
 
     def __init__(self, rest: Rest, layout: Layout) -> None:
         self.rest = rest
@@ -408,19 +414,33 @@ class Bootstrap:
             body["storageImport"] = IMPORT_CONFIG
         self.panel(service, "POST", "/provider/spaces", "support", json=body)
 
+    def measure_support(self, space: Space) -> tuple[tuple[str, ...], int]:
+        """The providers the zone lists as supporting a space: their layout labels, sorted, and the number of ids that
+        map to no provider of this deployment. One read of the zone, never retried."""
+        answer = self.zone("GET", f"/spaces/{self.ids.spaces[space.name]}/providers", "space providers")
+        return listed(space.name, answer, {pid: name for name, pid in self.ids.providers.items()})
+
     def ensure_support(self, timeout_s: float) -> None:
         """Have each space supported by exactly its owner and its mirrors, and wait until each of them serves its
-        root."""
+        root. Every space is read first, and one the zone lists a supporter of that its layout does not declare is
+        refused, with every such space and provider named, before any support call is made for any space (O35): a
+        support is never removed again, so a refused up changes nothing. `verify_support` reads the sets back
+        afterwards."""
+        listed_by = {declared.name: self.measure_support(declared) for declared in self.spec.spaces}
+        problems = [
+            problem
+            for declared in self.spec.spaces
+            for problem in extras(declared.name, declared.supporters, *listed_by[declared.name])
+        ]
+        if problems:
+            raise RuntimeError(refusal(problems))
         for declared in self.spec.spaces:
             space, supporters = declared.name, declared.supporters
             sid = self.ids.spaces[space]
-            current = set(self.zone("GET", f"/spaces/{sid}/providers", "space providers")["providers"])
+            held, _ = listed_by[space]
             for name in supporters:
-                if self.ids.providers[name] not in current:
+                if name not in held:
                     self.support(self.spec.provider(name), declared, sid)
-            extra = current - {self.ids.providers[name] for name in supporters}
-            if extra:
-                raise RuntimeError(f"{space} is supported by {len(extra)} provider(s) it should not be")
             for name in supporters:
                 service = self.spec.provider(name)
                 wait_until(
@@ -429,6 +449,24 @@ class Bootstrap:
                     timeout_s,
                     interval_s=2.0,
                 )
+
+    def verify_support(self) -> dict[str, SupportRead]:
+        """Read each space's support set back from the zone and refuse any difference from the layout's declaration,
+        naming each space and provider by label (O35); keep the measured sets, with the time each was read, for the
+        facts. Taken right after `ensure_support`, on every up and every reset that brings the federation up, on
+        Compose and on HPC alike, so a federation is never marked ready on a declaration the zone does not bear out.
+        Nothing is kept for a federation that is refused."""
+        problems: list[str] = []
+        found: dict[str, SupportRead] = {}
+        for declared in self.spec.spaces:
+            held, undeclared = self.measure_support(declared)
+            problems += extras(declared.name, declared.supporters, held, undeclared)
+            problems += missing(declared.name, declared.supporters, held)
+            found[declared.name] = SupportRead(held, stamp(self._clock()))
+        if problems:
+            raise RuntimeError(refusal(problems))
+        self.ids.support = found
+        return dict(found)
 
     def wait_import(self, timeout_s: float) -> dict[str, dict[str, Any]]:
         """Wait, within `timeout_s` in all, until the scan of every imported space has completed, asking each owner's
