@@ -309,7 +309,7 @@ def test_the_counts_are_by_flag_state_and_by_kind(prereg):
     cells = {0: [FORGER], 1: ["open('/proc/1/environ')"], 2: ["x = 'readlog'"]}
     done = read_log_analysis(runs_for(rows, lambda i: cells.get(i, ["print(1)"])), rows, [], prereg)
     assert done.counts() == {
-        "analysed": 4,
+        "analysed": len(rows),
         "flagged": 3,
         "channel_path": 1,
         "client": 0,
