@@ -313,6 +313,25 @@ def test_o68_status_says_a_failed_federation_that_holds_nothing_and_one_taken_do
     assert "HOLDING" not in printed
 
 
+def test_o68_status_says_a_down_failed_federation_bills_only_while_its_jobs_are_not_gone(bench):
+    """O68: a down that failed after the jobs were cancelled (the state file's phase is `down`, the root kept) holds
+    nothing and says so; one refused before it touched anything (phase unchanged) still bills and says HOLDING."""
+
+    def operate(label, command, layout, root, log):
+        if command == "down":
+            if label == "fed-1":
+                edit_state(bench, "fed-1", phase="down")  # what hpcdown writes once the jobs are cancelled
+            return 1, "error: down: it failed\n"
+        return bench.federation(label, command, layout, root, log)
+
+    assert bench.up(2)[0] == 0
+    assert bench.run("down", federation=operate)[0] == 1
+    printed = bench.run("status")[1]
+    assert "fed-1: down FAILED, its jobs are gone and its root is kept: `fleet.py down --member fed-1` again" in printed
+    assert "fed-2: down FAILED, still HOLDING 2 job(s): it bills until `fleet.py down --member fed-2`" in printed
+    assert "fed-1: down FAILED, still HOLDING" not in printed
+
+
 def test_o68_plan_says_each_federations_state_before_it_assigns_anything(bench):
     """O68: plan prints the states, on stderr beside its other lines (stdout stays one JSON line per shard), so that a
     failed federation that still bills shows at once, and does so when the plan is refused too."""

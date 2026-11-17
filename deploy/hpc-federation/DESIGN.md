@@ -204,7 +204,8 @@ under one record. One federation's job failing ends one shard's step, never anot
 - **Each federation's state is said plainly.** `status`, and `plan` before it assigns anything, print up and ready, up
   with no relay, failed (or down failed) and still HOLDING jobs by count with the command that releases them, or down
   (`fleetrecord.member_state`). Holding is read from the job ids the state file and the record name, not from the
-  status: a failed member may hold nothing (an up refused in its preflight) or a down-failed one may still bill.
+  status: a failed member may hold nothing (an up refused in its preflight), and a down-failed one still bills unless its
+  state file's phase is `down`, which `hpcdown` writes only once the held jobs are cancelled and every client ended.
 - **Moving a shard (the coordinator's rule).** The shard count is fixed at the fleet's `up`. A shard whose federation
   is taken down (`down --member`) is released, and given only to a federation brought up after (`add`), never one that
   held a shard before, with the same checks and an equal fingerprint, its step started with `--resume` from its

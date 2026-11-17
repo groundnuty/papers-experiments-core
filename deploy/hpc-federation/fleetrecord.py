@@ -209,9 +209,10 @@ def jobs_of(state: Mapping[str, Any]) -> Dict[str, Optional[str]]:
 
 def held_count(member: Mapping[str, Any], facts: Mapping[str, Any]) -> int:
     """How many held jobs a member may bill for: the distinct ids its state file and the fleet's record name, none for a
-    member in a status that holds nothing (`HOLDS_NOTHING`). Both are read, so a record that kept an id its state lost
-    still counts."""
-    if member["status"] in HOLDS_NOTHING:
+    member in a status that holds nothing (`HOLDS_NOTHING`) or whose state file says its down went as far as the jobs
+    (phase `down`: `hpcdown` writes it only once the held jobs are cancelled and every client ended, and keeps the root
+    for a second down). Both sources are read, so a record that kept an id its state lost still counts."""
+    if member["status"] in HOLDS_NOTHING or facts.get("phase") == "down":
         return 0
     found = {job for jobs in (facts.get("jobs"), member.get("jobs")) for job in (jobs or {}).values() if job}
     return len(found)
@@ -238,7 +239,11 @@ def member_state(member: Mapping[str, Any], facts: Mapping[str, Any]) -> str:
     word = {"failed": "failed", "down-failed": "down FAILED", "made": "made, its up never finished"}.get(status, status)
     if holding:
         return f"{word}, {held}"
-    return word if status in HOLDS_NOTHING else f"{word}, no job on record"
+    if status in HOLDS_NOTHING:
+        return word
+    if facts.get("phase") == "down":
+        return f"{word}, its jobs are gone and its root is kept: `fleet.py down --member {label}` again finishes it"
+    return f"{word}, no job on record"
 
 
 def sandbox_name(name: str, placement: Optional[str]) -> str:

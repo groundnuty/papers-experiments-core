@@ -1077,7 +1077,8 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
 - **`status` and the first lines of `plan` say each federation's state in plain words**, by its label (`fed-k`),
   never a host: `up and ready` (linked, its relay serving), `up with no relay`, ``failed, still HOLDING 2 job(s): it
   bills until `fleet.py down --member fed-k` `` (the count is the distinct job ids its state file and the fleet's record
-  name; a failed member whose up was refused before any job says `no job on record`), or `down`. `plan` says them
+  name; a failed member whose up was refused before any job says `no job on record`; a member whose down failed after
+  its jobs were cancelled, the state file's phase `down`, says its jobs are gone and its root is kept), or `down`. `plan` says them
   first, so a refused plan shows a failed federation that still bills. `status` runs nothing and then adds each
   federation's phase and jobs, and each shard's place.
 - **Moving a shard.** `down --member fed-k` takes one federation down and frees its shard (its step ends with the
