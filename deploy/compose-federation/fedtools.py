@@ -51,7 +51,10 @@ def study_artifacts_from(environ: Mapping[str, str]) -> str | None:
 def expand(declared: str, study_artifacts: str | None) -> str:
     """A declared path with `@study_artifacts@` replaced by the directory; refused when none was given."""
     if not study_artifacts:
-        raise RuntimeError(f"the layout's tool server names {STUDY_ARTIFACTS} and no directory was given for it")
+        raise RuntimeError(
+            f"the layout's tool server names {STUDY_ARTIFACTS} and no directory was given for it "
+            f"({ENVIRONMENT} for Compose, HPC_STUDY_ARTIFACTS in site.env for HPC)"
+        )
     return study_artifacts.rstrip("/") + declared[len(STUDY_ARTIFACTS) :]
 
 
