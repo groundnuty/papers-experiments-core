@@ -263,6 +263,18 @@ class FakeHost:
         self.add_process(__import__("os").getpid(), start=777)
 
     @staticmethod
+    def reading_resolv(handler: Callable[[FakeContainer, list[str], str | None], CmdResult]):
+        """`handler` for every program but the start's read of /etc/resolv.conf (O56), which the fake answers from what
+        the container holds, as `_default_exec` does: for a test whose handler answers the other start probes alone."""
+
+        def answering(container: FakeContainer, argv: list[str], stdin: str | None) -> CmdResult:
+            if stdin == RESOLV_PROBE:
+                return FakeHost._default_exec(container, argv, stdin)
+            return handler(container, argv, stdin)
+
+        return answering
+
+    @staticmethod
     def _default_exec(container: FakeContainer, argv: list[str], stdin: str | None) -> CmdResult:
         """The agent's code does nothing, and the read-only probes are refused as a read-only filesystem refuses them:
         the root's and the mount's write, and every change to a read-only input, which the agent can still read and
