@@ -62,8 +62,8 @@ bound, the token margin and the platform's deferral are counted from those bound
 
 `command_timeout_s` is the longest one command may take: 120 s on Compose. With `backend = "hpc"` it is the longest one
 relay verb (a status, a start, a ping) may take, and its default is a step's launch wait and the verb's own work
-(`fault_hpc.HPC_VERB_WORK_S`, 120 s): 300 s, where it was 120 s until one round trip took 104.6 s with launch waits of
-up to 103 s, and 240 s once a launch wait of 180 s is counted would not hold the verb's own control step. It is the
+(`fault_hpc.HPC_VERB_WORK_S`, 120 s): 300 s. It was 120 s until one round trip took 104.6 s with launch waits of up to
+103 s, and a bound of 240 s would not hold the verb's own control step (60 s) with a launch wait of 180 s. It is the
 request's `bound_s`, which the relay hands the verb to run within; a verb past it is answered `timed_out`, which the
 driver reads as a command with no answer, never as done. A declared value is kept as declared. The bound is in the
 faults fingerprint after its default (`_bounds_record`), so a platform that leaves it out and one that declares 300

@@ -538,9 +538,15 @@ driver's launcher and state file; DESIGN.md section 7), which also repeat the mo
 (`expcore_onedata.fault_relay`) and `down` stops it. Tested offline, none of it run live: a kept stop and a start again
 over the same work directory, `exec.sh` beside a running service, and every stop's real duration (from which `[hpc]
 stop_seconds` is to be set) are the live slot's. **Live notes (three provider outages on one federation, 17 Nov):**
-a service ended 26.1 to 33.1 s after its SIGTERM, so every committed layout takes `stop_seconds` 50 (the largest plus
-50 %); relay verb steps started 47 to 103 s after they were issued during a heal and one round trip took 104.6 s, so
-the relay's per-verb bound (`[faults] command_timeout_s` on this backend) is 240 s, not 120 s. The agent's node's step (M5) is not built here. A layout with a shared
+a service ended 26.1 s, 27.1 s and 33.1 s after its SIGTERM, so every committed layout takes `stop_seconds` 50 (the
+largest plus 50 %); relay verb steps started 47 to 103 s after they were issued during a heal and one round trip took
+104.6 s against the relay's 120 s command bound, so every layout also declares `step_launch_wait_s` 180 (103 s plus
+about 75 %), what a control step may wait to start. It is added to every bound that waits on a step's client from its
+start (the stop, status, exec and mount-check steps, `down`'s teardown step, a start's wait to see its service step
+listed, the stop verb's `settle_timeout_s`, a link restart's bound), and the relay's per-verb bound
+(`[faults] command_timeout_s` on this backend) is the launch wait and 120 s of work, 300 s, not 120 s (240 s was
+too little once the launch wait is counted). **The launch wait widens timeouts only**, how long the harness waits
+before it fails closed: it never lengthens an outage or a hold. The agent's node's step (M5) is not built here. A layout with a shared
 import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
 
 ## The scripts
