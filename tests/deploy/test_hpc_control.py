@@ -1213,3 +1213,40 @@ def test_o58_a_service_whose_longest_step_name_the_launcher_would_refuse_is_refu
     assert status == 2
     assert "no name a step can carry" in err
     assert world.launcher.controls == []
+
+
+def test_o86_the_observed_read_takes_what_the_real_stop_and_start_verbs_write_into_the_state(world, clock):
+    """O86: `hpcobserve.read` over a state the real verbs wrote (a stop, then a start): the service's launch, its new
+    step by its id, and the stop the state recorded, reduced to when it was asked for and whether it was confirmed."""
+    stopping_launcher(world)
+    assert verb(world, "stop")[0] == 0
+    world.launcher.on_control = lambda argv: Done()
+    world.launcher.on_service = lambda name: world.launcher.steps.__setitem__(name, "77.5")
+    assert verb(world, "start")[0] == 0
+    state = world.state.read()
+    state["allocation"]["job"] = "77"
+
+    class Slurm:
+        """squeue -s and sacct for job 77, as the steps the verbs left would show them."""
+
+        def run(self, argv, timeout):
+            listed = {"77.1": f"{PREFIX}-zone-run-1", "77.5": f"{PREFIX}-prov-a-run-2"}
+            if argv[0] == "squeue":
+                rows = ["77.batch batch", "77.extern extern", *(f"{i} {n}" for i, n in listed.items())]
+            else:
+                rows = ["77.batch|batch|RUNNING|2026-11-16T09:00:00|Unknown|0:0"]
+                rows += [f"{i}|{n}|RUNNING|2026-11-16T10:00:00|Unknown|0:0" for i, n in listed.items()]
+            return control.hpcslurm.Completed(0, "".join(f"{row}\n" for row in rows), "")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(str(HPC))
+        import hpcobserve
+
+    seen = hpcobserve.read(state, control.hpcslurm.Slurm(Slurm()), now=lambda: 0.0)["services"]["prov-a"]
+    assert (seen["launch"], seen["step"], seen["running"], seen["state_differs"]) == (2, "77.5", True, False)
+    assert seen["started_at"] == "2026-11-16T10:00:00"
+    [stop] = seen["stops"]
+    assert stop["stopped"] is True
+    assert UTC.fullmatch(stop["requested_utc"])
+    assert UTC.fullmatch(stop["confirmed_utc"])
+    assert set(stop) == {"requested_utc", "confirmed_utc", "stopped"}
