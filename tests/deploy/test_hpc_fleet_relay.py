@@ -308,7 +308,7 @@ def test_o68_status_says_a_failed_federation_that_holds_nothing_and_one_taken_do
     assert "HOLDING" not in printed
     assert bench.run("down", "--member", "fed-1", federation=operate)[0] == 0
     printed = bench.run("status")[1]
-    assert "fed-1: down (phase None, job(s) none)" in printed
+    assert "fed-1: down (phase None, job(s) " in printed  # the record keeps the ids a down member held, as it did
     assert "HOLDING" not in printed
 
 

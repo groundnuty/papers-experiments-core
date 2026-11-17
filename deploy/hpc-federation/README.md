@@ -1051,6 +1051,21 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   out, so `plan` also takes the campaign fingerprint beside each assigned shard's `platform.toml`, as `shards.py plan`
   does, and refuses before it assigns or writes anything unless they are all one.
   It also refuses a manifest whose `python` imports a core that names no code (unknown or stale: the note above), before anything is recorded.
+- **A campaign that injects faults is given only federations whose fault relay serves.** A federation without a
+  serving relay can neither inject nor restore. `up` records the relay's state in the federation's state file
+  (`fault_relay`): `serving` once the relay's heartbeat is seen, `none` when the core has no relay. An `up` that fails
+  before the heartbeat, or one of an older core, leaves no record, and no record counts as not serving. The campaign
+  injects when its study's `study.toml` has a condition whose treatment is a `provider_outage`, or a federation's
+  `platform.toml` has `[faults] sanctioned = true` (`fleetplan.injection`; a `study.toml` that cannot be read counts as
+  injecting, one that does not exist as none, and the campaign check refuses a study with no study file). Then `plan`
+  gives such a federation no shard and says why (`not used: fed-k: its fault relay is not serving (none: its core has
+  no relay), and this campaign injects faults ...`), and `step` refuses a planned shard whose federation's state file no
+  longer says `serving`. The state file decides: the `fault relay: serving` or `none` line in a federation's up log is
+  for the operator and is never read. A campaign without either marker is unaffected. The test is the campaign's, not
+  the shard's: a shard's runs are a share of every condition (the partition is by pair), so one outage condition makes
+  every shard inject, whatever tasks the condition names. The record is what `up` saw: a relay that stops afterwards is
+  not noticed here, and a federation an older core brought up has no record, so bring one up again (`down --member`,
+  `add 1`) before it takes such a campaign.
 - **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never
   starts in the directory you ran it from), its client recorded and its output in `<fleet>/logs/`, after checking the
   federation again, that `shards.toml` is the one the record gives, that the manifest's `python` still imports a core
@@ -1059,6 +1074,12 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   client runs; one whose step ended is relaunched only with `--shard L --resume`. A shard refused exits 1. A site that
   needs `HPC_STEP_NETWORK` gives it to each federation's own steps (`hpcfed`); a shard's step, on the agent's own job of
   one component, carries none.
+- **`status` and the first lines of `plan` say each federation's state in plain words**, by its label (`fed-k`),
+  never a host: `up and ready` (linked, its relay serving), `up with no relay`, ``failed, still HOLDING 2 job(s): it
+  bills until `fleet.py down --member fed-k` `` (the count is the distinct job ids its state file and the fleet's record
+  name; a failed member whose up was refused before any job says `no job on record`), or `down`. `plan` says them
+  first, so a refused plan shows a failed federation that still bills. `status` runs nothing and then adds each
+  federation's phase and jobs, and each shard's place.
 - **Moving a shard.** `down --member fed-k` takes one federation down and frees its shard (its step ends with the
   job); `add 1` brings a fresh federation up; `plan` gives it the shard only after its own `up` (data and links
   checked), with the fleet's fingerprint, and only when its `platform.toml` leaves `[placement] reset_shortcut` off, so
@@ -1071,12 +1092,14 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   nothing outside the record is ever looked at. The fleet's directory stays with its record, its logs and each root's
   lifecycle lock (hpcfed never removes one); remove it by hand once `status` shows every federation down.
 
-`tests/deploy/test_hpc_fleet.py` and `test_hpc_fleet_plan.py` run the fleet over a fake cluster per federation, the
+`tests/deploy/test_hpc_fleet.py`, `test_hpc_fleet_plan.py` and `test_hpc_fleet_relay.py` run the fleet over a fake cluster per federation, the
 core's phase the real one over a bootstrap stand-in: several federations, one failing `up`, the maximum and the inode
 guard refusing before anything is made, a `het` layout refused, the bound on ups at once, `down` of all and of one, a
 federation and a job the fleet did not make left untouched (an agent's job record replaced included), the fingerprint
-check, each step on its own federation's agent's job and node and never into a job Slurm no longer holds for it, and a
-shard moved to a fresh federation. Not run live.
+check, each step on its own federation's agent's job and node and never into a job Slurm no longer holds for it, a
+shard moved to a fresh federation, the relay's state read from the state file whichever way the log disagrees, a
+federation with no relay refused for a campaign that injects faults and accepted for one that does not, and a failed
+federation that still holds jobs said by count. Not run live.
 
 ## What the repository's tests cover
 
