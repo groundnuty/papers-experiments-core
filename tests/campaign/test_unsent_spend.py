@@ -163,21 +163,40 @@ class SendsOutsideTheRecording(FakeExecutor):
 
 def test_c05_a_backend_that_started_a_request_the_log_never_saw_keeps_the_bound(tmp_path):
     """C05: a log with no request cannot tell an executor that sent none from one whose requests bypass the recording,
-    so a backend that counts its requests vetoes it: one that started a request is charged the bound."""
+    so the backend's count decides: one that started a request is charged the bound."""
     row, cost, bound = run_once(tmp_path / "out", SendsOutsideTheRecording())
     assert (row["calls_sent"], row["usage_complete"], row["spend_basis"]) == (0, 0, None)
     assert (cost.usd, cost.bounded) == (pytest.approx(bound), True)
 
 
-def test_c05_a_backend_that_keeps_no_count_of_its_requests_follows_the_log(tmp_path):
-    """C05: a backend with no `requests_sent` cannot veto, as for a first-turn refusal (C31): its attempt is charged
-    by its log, nothing here. The residual is an executor that bypasses the recording on such a backend."""
+def test_c05_a_backend_that_keeps_no_count_of_its_requests_cannot_confirm_none_and_keeps_the_bound(tmp_path):
+    """C05: an empty log alone cannot be told from the log of an executor whose requests bypass the recording, so a
+    backend with no `requests_sent` confirms nothing: its attempt that failed at start is charged its bound."""
 
     def uncounted(_me, request):
         del request.backend.requests_sent
 
-    row, cost, _ = run_once(tmp_path / "out", FailsAtStart(induction_failure(), times=99, before=uncounted))
-    assert (row["usage_complete"], row["spend_basis"], cost.usd) == (1, MEASURED, 0.0)
+    row, cost, bound = run_once(tmp_path / "out", FailsAtStart(induction_failure(), times=99, before=uncounted))
+    assert (row["calls_sent"], row["usage_complete"], row["spend_basis"]) == (0, 0, None)
+    assert (cost.usd, cost.bounded) == (pytest.approx(bound), True)
+
+
+class SendsOutsideTheRecordingOnAnUncountedBackend(SendsOutsideTheRecording):
+    """An executor that sends outside the recording, on a backend that keeps no count of its requests."""
+
+    async def __call__(self, request):
+        request.backend.use([ModelTurn("hello", [], 100, 5, "stop", 0.0)])
+        await request.backend.step()
+        del request.backend.requests_sent
+        raise induction_failure()
+
+
+def test_c05_requests_sent_outside_the_recording_on_an_uncounted_backend_keep_the_bound(tmp_path):
+    """C05: the case a count is there for. The endpoint was billed for a request no call log saw, and the backend
+    cannot say so; the attempt is charged its bound, never 0."""
+    row, cost, bound = run_once(tmp_path / "out", SendsOutsideTheRecordingOnAnUncountedBackend())
+    assert (row["calls_sent"], row["usage_complete"], row["spend_basis"]) == (0, 0, None)
+    assert (cost.usd, cost.bounded) == (pytest.approx(bound), True)
 
 
 class StallsOnItsFirstRequest(FakeExecutor):
