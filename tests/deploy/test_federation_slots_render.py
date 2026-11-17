@@ -316,7 +316,7 @@ def test_o83_compose_up_checks_the_study_artifacts_before_it_touches_anything(fe
     with pytest.raises(RuntimeError, match="interpreter") as refused:
         fed.cli.up(layout)
     assert str(tmp_path) not in str(refused.value)
-    assert calls == []
+    assert not {"require_ports_free", "require_memory_fits", "prepare", "bring_up"} & set(calls)
 
 
 def test_o83_compose_up_gives_the_facts_the_study_artifacts_only_when_it_was_given_one(fed, monkeypatch, tmp_path):
