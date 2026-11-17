@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from sandbox_support import MOUNT_PATH, make_spec, start_options
 
+from expcore_onedata.readlog import paths
 from expcore_onedata.sandbox import inputs
 from expcore_onedata.sandbox.api import ReadOnlyInput, SandboxError, StartRefused
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -321,6 +322,18 @@ def test_o20_declaring_inputs_checks_every_path_the_sandbox_reserves(world, scri
         inputs.declare(settings, {"every-run": [ReadOnlyInput(scripts, target)]})
     [item] = inputs.declare(settings, {"every-run": [ReadOnlyInput(scripts, TARGET)]})["every-run"]
     assert item.sha256 == inputs.digest(scripts)["sha256"]
+
+
+@pytest.mark.parametrize("target", [*paths.TARGETS, paths.SOCKET, paths.CLIENT, f"{paths.CLIENT_DIR}/x"])
+def test_o91_the_read_log_channel_s_targets_are_taken_for_an_input_on_both_backends(world, scripts, target):
+    """O91: the read-log channel's socket directory and client directory are the harness's own in every cell, on either
+    backend: an input may not be, hold or lie under either (`inputs.taken_paths` is both backends'), at the campaign's
+    declaration and at the start."""
+    with pytest.raises(StartRefused, match="read-only input 0"):
+        inputs.declare(world.s, {"every-run": [ReadOnlyInput(scripts, target)]})
+    with pytest.raises(StartRefused, match="read-only input 0"):
+        start(world, [ReadOnlyInput(scripts, target)])
+    assert nothing_left(world)
 
 
 def test_o20_an_input_whose_content_left_its_declared_hash_is_refused_before_anything_exists(world, scripts):
