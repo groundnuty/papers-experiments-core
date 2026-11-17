@@ -78,8 +78,9 @@ def install(mapped, real):
 
 
 def main(argv):
-    """`argv` is this script's own: [script, map, "--", ...the server as python would be given it]."""
-    if len(argv) < 5 or argv[2] != "--":
+    """`argv` is this script's own: [script, map, "--", ...the server as python would be given it]. That is four words
+    at least: the shortest server is a bare script with no arguments (`-m` alone is refused below)."""
+    if len(argv) < 4 or argv[2] != "--":
         refuse("usage: resolve_launch.py <address map> -- -m <module> [arguments] | <script> [arguments]")
     mapped = load(argv[1])
     server = argv[3:]
@@ -90,6 +91,8 @@ def main(argv):
         options = {"run_name": "__main__", "alter_sys": True}
     elif server[0].startswith("-"):
         refuse("the server is started by -m <module> or by a script, with no other interpreter option")
+    elif not server[0]:
+        refuse("the script is empty")
     else:
         target, arguments, run = server[0], server[1:], runpy.run_path
         options = {"run_name": "__main__"}

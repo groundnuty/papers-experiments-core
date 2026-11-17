@@ -57,6 +57,7 @@ from expcore_onedata.sandbox.apptainer import workdisk
 from expcore_onedata.sandbox.apptainer.node import LocalNode, Spawned
 from expcore_onedata.sandbox.apptainer.procs import Proc
 from expcore_onedata.sandbox.cellhost import OwnNames
+from expcore_onedata.sandbox.cellresolv import PROBE as RESOLV_PROBE
 from expcore_onedata.sandbox.containers import CERTIFI_PROBE
 from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_input, run_bounded
 from expcore_onedata.sandbox.sandbox import READ_ONLY_PROBE
@@ -66,6 +67,8 @@ CGROUP = "/invented.slice/job_1/step_0/user/task_0"  # the driver's own, where i
 CERTIFI = "/usr/lib/invented/certifi/cacert.pem"
 IMAGE_BUNDLE = "-----BEGIN CERTIFICATE-----\ninvented image bundle\n-----END CERTIFICATE-----\n"
 CANARY_MARK = "canary open"
+# the node's own /etc/resolv.conf, with its search domain and a name server of the site
+NODE_RESOLV = "search node-search.invented.test\nnameserver 192.0.2.53\n"
 READINGS = {"os": {"id": "invented", "version_id": "9.9"}, "glibc": "glibc 2.99", "kernel": "9.99.0-invented"}
 OWN_HOST = "cn-invented-n01"  # the invented agent node's own host name, and its fully qualified form: a site's, private
 OWN_FQDN = "cn-invented-n01.cluster.example.invalid"
@@ -269,6 +272,7 @@ class FakeNode:
         self.mkfs_calls: list[list[str]] = []
         self.mkfs_fails = False
         self.disk_probe_answer: str | None = None  # what the start's probe of a work disk says, if not the image's
+        self.node_resolv_shows = False  # a node whose own /etc/resolv.conf shows in a cell whatever the bind names
         self.disk_check_answer: str | None = None
         self.copy_helper_result: CmdResult | None = None  # what every copy exec of a work disk returns, if not its own
         self.boot: str | None = "00000000-0000-4000-8000-000000000001"  # this boot of the node (`boot_id`)
@@ -652,6 +656,9 @@ class FakeNode:
             return CmdResult(0, CANARY_MARK + "\n" + ("" if self.canary_limits_missing else self.limits_line(cell)))
         if cell.program == READ_ONLY_PROBE.format(path="/ro-probe"):
             return CmdResult(0, "blocked 30\n")
+        if cell.program == RESOLV_PROBE:  # a cell reads its /etc/resolv.conf back and says the hash of the bytes
+            seen = (self.read_in(cell, AV.RESOLV_CONF) or "").encode()
+            return CmdResult(0, f"resolv {hashlib.sha256(seen).hexdigest()}\n")
         if cell.program.startswith(workdisk.PROBE_HEAD):  # a write past the work disk's size
             image = cell.image()
             said = f"enospc {image.holds}" if image is not None else f"unbounded {1 << 30}"
@@ -666,6 +673,14 @@ class FakeNode:
             said = f"{image.holds} 1 ext3" if image is not None else f"{1 << 40} 0 tmpfs"
             return CmdResult(0, (said if self.disk_check_answer is None else self.disk_check_answer) + "\n")
         return CmdResult(0, "")
+
+    def read_in(self, cell: Cell, path: str) -> str | None:
+        """What a cell reads at `path`: the text of the file the exec binds there (the node's own `NODE_RESOLV` for
+        `/etc/resolv.conf` when `node_resolv_shows`, or with no bind), None for another path nothing binds."""
+        source = cell.source(path)
+        if path == AV.RESOLV_CONF and (source is None or self.node_resolv_shows):
+            return NODE_RESOLV
+        return None if source is None else source.read_text(encoding="utf-8")
 
     def limits_line(self, cell: Cell) -> str:
         """What the canary's second line says in a cell: the open-file limit and the cores the cell was given, from the

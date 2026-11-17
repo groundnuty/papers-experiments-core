@@ -458,7 +458,15 @@ def test_o71_work_disk_mkfs_is_one_program_and_never_an_option(tmp_path, bad):
 
 
 @pytest.mark.parametrize(
-    "program", ["mkfs.ext3", "mke2fs", "/usr/sbin/mkfs.ext3", "/opt/site/e2fsprogs-1.47/sbin/mkfs.ext3"]
+    "program",
+    [
+        "mkfs.ext3",
+        "mke2fs",
+        "mkfs.ext4",
+        "/usr/sbin/mkfs.ext3",
+        "/sbin/mke2fs",
+        "/opt/site/e2fsprogs-1.47/sbin/mkfs.ext3",
+    ],
 )
 def test_o71_work_disk_mkfs_takes_a_program_by_name_or_by_absolute_path(tmp_path, program):
     """O71: a bare program name or an absolute path loads, and is kept as the one word."""
@@ -473,6 +481,26 @@ def test_o71_the_settings_refuse_a_work_disk_mkfs_that_is_not_one_program_word(t
 
     with pytest.raises(ValueError, match="work_disk_mkfs"):
         make_settings(tmp_path, work_disk_mkfs=words)
+
+
+NOT_A_NAME_OR_ABSOLUTE_PATH = [
+    ".", "..", "/", "./mkfs.ext3", "../mkfs.ext3", "sbin/mkfs.ext3", "a/b", "mkfs.ext3/",  # relative: not a program
+    "/usr/sbin/", "/usr/../bin/mkfs.ext3", "/usr/./sbin/mkfs.ext3", "//mkfs.ext3", "/usr//sbin/mkfs.ext3",  # not normal
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("bad", NOT_A_NAME_OR_ABSOLUTE_PATH)
+def test_o71_work_disk_mkfs_is_a_bare_program_name_or_an_absolute_path_in_normal_form(tmp_path, bad):
+    """O71: a program the node finds by its name on its `PATH`, or by an absolute path: never one relative to the
+    directory the driver happens to run in (`./x`, `../x`, `a/b`), never a directory or a name that is none (`.`, `..`,
+    `/`), and an absolute path has no empty, `.` or `..` part, since each of those names another file than it shows.
+    Refused at load naming the key, and by the settings themselves (a platform built in code)."""
+    with pytest.raises(ConfigError, match="work_disk_mkfs"):
+        _load(tmp_path, _document(work_disk="image", work_disk_mkfs=[bad]))
+    from apptainer_support import make_settings
+
+    with pytest.raises(ValueError, match="work_disk_mkfs"):
+        make_settings(tmp_path, work_disk_mkfs=(bad,))
 
 
 def test_o87_the_apptainer_backend_reads_the_check_provider_as_the_docker_backend_does(tmp_path):

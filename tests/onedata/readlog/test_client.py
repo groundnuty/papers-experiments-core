@@ -8,6 +8,7 @@ raises, so every failure here must be a `ReadLogError`.
 import ast
 import inspect
 import json
+import os
 import shutil
 import socket
 import sys
@@ -171,6 +172,27 @@ def test_o91_a_collector_that_stopped_reading_raises(server):
     receiving.shutdown(socket.SHUT_RD)
     with pytest.raises(client.ReadLogError):
         client.log_read("x")
+
+
+@needs_unix
+def test_o91_a_platform_that_bound_no_channel_fails_closed_at_the_fixed_target(client_module):
+    """O91: the client file is there (a study vendored it) but the platform declared no channel, so nothing is bound at
+    /expcore-readlog/sock: a script that logs before it returns data raises `ReadLogError` (ENOENT) and returns none,
+    so a template that forgot to declare the channel shows at the first smoke cell, not as runs with missing logs."""
+    if os.path.exists(paths.SOCKET_DIR):
+        pytest.skip(f"this host has a {paths.SOCKET_DIR} of its own")
+    assert client_module.SOCKET == paths.SOCKET  # untouched: the fixed target is all the client knows
+
+    def canonical_read(item):
+        data = b"the bytes the script would return"
+        client_module.log_read(item, bytes=len(data))  # BEFORE returning the data
+        return data
+
+    returned = []
+    with pytest.raises(client_module.ReadLogError) as caught:
+        returned.append(canonical_read("file-1"))
+    assert returned == []  # no data left the script
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
 
 
 @needs_unix

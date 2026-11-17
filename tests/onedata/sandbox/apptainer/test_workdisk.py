@@ -50,7 +50,7 @@ def test_o71_every_cell_binds_a_directory_of_an_ext3_image_of_the_work_disk_size
         image = box.dir / "work" / workdisk.IMAGE_NAME
         made = [argv for argv in node.mkfs_calls if "-V" not in argv]
         assert made
-        assert all(argv[:4] == ["mkfs.ext3", "-q", "-F", "-d"] for argv in made)
+        assert all(argv[:6] == ["mkfs.ext3", "-t", "ext3", "-q", "-F", "-d"] for argv in made)
         assert all(argv[-1] == str(image) for argv in made)
         assert image.stat().st_size == SIZE
         for done in _cell_execs(node):
@@ -59,6 +59,43 @@ def test_o71_every_cell_binds_a_directory_of_an_ext3_image_of_the_work_disk_size
         assert workdisk.bind(box.dir).arg() == f"{image}:/work:image-src=/work"
     finally:
         box.stop()
+
+
+class _MkfsRecorder:
+    """A node that only records what it is asked to run, so no mkfs of this host ever runs (the fake node answers just
+    two program names; any other falls through to the host's own)."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def run(self, argv, timeout_s, **kwargs) -> CmdResult:
+        self.calls.append(list(argv))
+        return CmdResult(0, "")
+
+
+@pytest.mark.parametrize(
+    "program",
+    ["mkfs.ext3", "mke2fs", "mkfs.ext2", "mkfs.ext4", "/usr/sbin/mkfs.ext4", "/opt/site/e2fsprogs/sbin/mke2fs"],
+)
+def test_o71_the_image_is_ext3_whatever_the_program_is_called(tmp_path, program):
+    """O71: e2fsprogs takes the file system's type from the program's NAME unless `-t` gives it (`mke2fs` makes ext2,
+    `mkfs.ext4` ext4; checked with e2fsprogs 1.47: `-t ext3` makes ext3, `has_journal` and no `extent`, whatever the
+    name). `work_disk_mkfs` is out of the fingerprint (C06), so the image's type must never depend on it: the argv
+    carries `-t ext3` right after the program, then the arguments it always had."""
+    (tmp_path / "work").mkdir()
+    node = _MkfsRecorder()
+    workdisk.make(node, tmp_path, SIZE, (program,))
+    (argv,) = node.calls
+    assert argv == [
+        program, "-t", "ext3", "-q", "-F", "-d", str(tmp_path / "disk-tree"), str(workdisk.image_path(tmp_path))
+    ]  # fmt: skip
+
+
+def test_o71_the_version_probe_is_the_programs_own_and_carries_no_type(tmp_path):
+    """O71: `-V` asks the program for its version alone: the type argument belongs to the image's making."""
+    node = _MkfsRecorder()
+    workdisk.mkfs_version(node, ("mke2fs",))
+    assert node.calls == [["mke2fs", "-V"]]
 
 
 def test_o71_the_image_size_is_the_work_disk_rounded_down_so_its_allocation_never_reads_over_the_cap():

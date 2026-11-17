@@ -61,8 +61,9 @@ class Down:
         it stops or cancels anything, a root that holds evidence a run left (`hpcevidence.check_collected`: a step of
         a shard started there, `shards.py step`, or the fault journal, the relay's journals, a shard claim or the
         pilot's wiring has something in it, as after Day-0 measurements with no step) unless `shards.py collect` marked
-        it and the evidence a step, the study or `up` writes (the strict files of `hpcevidence`: the journals, the
-        claims, the step records, the manifests) is still exactly what the marker names
+        it (`collect --roots-only --root R --into DIR` marks a single federation's root with no plan) and the evidence
+        a step, the study or `up` writes (the strict files of `hpcevidence`: the journals, the claims, the step
+        records, the manifests) is still exactly what the marker names
         (`hpcevidence.check_collected`): a step or a run that wrote since, or a changed file, makes it stale. The files
         the running federation rewrites itself (the state, the link check) post-date every run once the collect has
         run, so a change to them is no reason to refuse: down goes on, says which of them changed (names only) and
@@ -90,7 +91,8 @@ class Down:
     def refusal(found: "hpcevidence.Check") -> str:
         """The refusal of a root whose evidence has no current marker, or whose strict evidence changed since it. A root
         with step records names its shards; one that only ran Day-0 measurements names the kinds of evidence it holds
-        (never a file or a path), and the remedy `collect --roots-only`, which needs a plan that names the root."""
+        (never a file or a path), and the remedies `collect --roots-only --root R --into DIR` (one federation, no plan)
+        and `collect --roots-only --shard L` (a plan that names the root)."""
         if found.stale:
             since = "a step started or wrote since" if found.labels else "something wrote since"
             what = (
@@ -102,12 +104,13 @@ class Down:
             remedy = (
                 "end the shard's step, run `shards.py collect` (or `collect --roots-only`) again while it is up"
                 if found.labels
-                else "end whatever still writes the journals, run `shards.py collect --roots-only` again while up"
+                else "end whatever still writes the journals, run `shards.py collect --roots-only --root <root> --into "
+                "<new directory>` again while up (a copy already made is never replaced: a new directory)"
             )
             after = (
                 "pull the results and `verify-copy` them"
                 if found.labels
-                else "pull the results and check each `<label>.root.json`"
+                else "pull that directory and `verify-copy` it with the hash collect printed"
             )
         elif found.labels:
             shards = ", ".join(found.labels)
@@ -117,11 +120,13 @@ class Down:
         else:
             why = f"this root holds evidence a run left in it ({', '.join(found.present)}) and it was not collected"
             remedy = (
-                "run `shards.py collect --roots-only --shard L` (it needs a shard plan that names this root) while it "
+                "run `shards.py collect --roots-only --root <root> --into <new directory>` (one federation, no plan), "
+                "or `shards.py collect --roots-only --shard L` (it needs a shard plan that names this root), while it "
                 "is up (a collect that refuses a file, a link or one holding a secret, leaves only --discard-evidence)"
             )
             after = (
-                "pull the results and check each `<label>.root.json` (`--roots-only` writes no manifest of the copy)"
+                "pull that directory and `verify-copy` it with the hash collect printed (`--shard` writes no manifest "
+                "of the copy: check each `<label>.root.json`)"
             )
         return (
             f"{why}: down would remove the state, facts, link check, render identity and fault journals the "
