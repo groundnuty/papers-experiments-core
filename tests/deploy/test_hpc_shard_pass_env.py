@@ -18,6 +18,7 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
 NAME, VALUE = "FAULT_ACK_MODE", "go-ahead"
+TREE_NAME, TREE = "HPC_STUDY_ARTIFACTS", "/srv/example/artifacts/tree"  # an invented absolute path
 OTHER = "FAULT_REPORT_MODE"
 HOME_NAMES = {"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPTAINER_CONFIGDIR",
               "APPTAINER_CACHEDIR", "UV_CACHE_DIR", "PIP_CACHE_DIR", "PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL",
@@ -143,7 +144,7 @@ def run_line(shards, monkeypatch, line, runner, node=None) -> int:
     """Run a printed line's step as the node would: its `env -i` words are the environment the step reads, and its
     arguments go through `main`'s own parser; only the dispatcher and the core check are stand-ins."""
     environ, argv = node_words(line)
-    for key in (NAME, OTHER, *(node or {})):
+    for key in (NAME, OTHER, TREE_NAME, *(node or {})):
         monkeypatch.delenv(key, raising=False)
     for key, value in {**{k: v for k, v in environ.items() if k not in HOME_NAMES}, **(node or {})}.items():
         monkeypatch.setenv(key, value)
@@ -206,12 +207,13 @@ def test_o63_the_pinned_value_is_the_one_printed_not_the_one_the_operator_has_la
     assert seen["env"][NAME] == VALUE
 
 
-@pytest.mark.parametrize("value", ["", VALUE, "a.b_c:d=e,f+g-h", "Qz" * 64])
+@pytest.mark.parametrize("value", ["", VALUE, "a.b_c:d=e,f+g-h", "Qz" * 64, TREE, "/a.b/c_d-e/f.g", "/" + "p" * 1024])
 def test_o63_a_value_of_the_allowed_characters_is_pinned_and_arrives_whole(
     shards, tmp_path, capsys, monkeypatch, value
 ):
-    """O63: letters, digits and `._:=,+-` (up to 128, empty too) are a value; it survives the line's quoting and the
-    split at the first `=` and reaches the dispatcher as given."""
+    """O63: letters, digits and `._:=,+-` (up to 128, empty too), or an absolute path of letters, digits and `._/-`
+    (up to 1024 after its first slash), are a value; it survives the line's quoting and the split at the first `=`
+    and reaches the dispatcher as given."""
     monkeypatch.setenv(NAME, value)
     line = printed(shards, tmp_path, capsys, "lines", DECLARED)[0]
     run, seen = dispatcher()
@@ -293,6 +295,21 @@ def test_o63_a_value_with_a_disallowed_character_refuses_the_plan_never_echoing_
     assert value not in err
 
 
+@pytest.mark.parametrize("value", ["/qzdir/../etc", "/qzdir/..", "/qzdir/../", "qzdir/rel", "./qzdir", "/qzdir/./x",
+                                   "/qzdir/.", "/qzdir//x", "//qzdir", "/qzdir/my dir", "/qzdir/$HOME", "/qzdir/a;b",
+                                   "/qzdir/a:b", "/qzdir/\u00e9", "/qzdir/" + "p" * 1025, "/", "/\n"])  # fmt: skip
+def test_o63_a_value_that_is_neither_a_plain_word_nor_a_plain_absolute_path_refuses_the_plan(
+    shards, tmp_path, capsys, monkeypatch, value
+):
+    """O63: an absolute path may hold no `..` or `.` part and no `//`, no character outside `A-Za-z0-9._/-` and at most
+    1024 after its first slash; a relative path, one with a space, `$`, `;` or `:` and a bare `/` refuse `plan` and
+    `lines` with nothing printed, naming the variable and never the value."""
+    monkeypatch.setenv(NAME, value)
+    err = refused_plan(shards, tmp_path, capsys, DECLARED)
+    assert f"{NAME}'s value does not match" in err
+    assert "qzdir" not in err
+
+
 # -- the step: exactly what its line pins ---------------------------------------------------------------------------
 
 
@@ -342,6 +359,8 @@ def test_o63_a_step_without_the_option_passes_nothing_and_records_nothing(shards
         ([NAME], {}, f"{NAME} is not set"),  # the line dropped the word that carries the value
         ([NAME], {NAME: "go ahead"}, f"{NAME}'s value does not match"),
         ([NAME], {NAME: "g" * 129}, f"{NAME}'s value does not match"),
+        ([NAME], {NAME: "/qzdir/../etc"}, f"{NAME}'s value does not match"),
+        ([NAME], {NAME: "qzdir/rel"}, f"{NAME}'s value does not match"),
         (["FAULT_API_KEY"], {"FAULT_API_KEY": VALUE}, "looks like a secret"),
         (["HOME"], {}, "sets itself"),
         (["PYTHONPATH"], {}, "sets itself"),
@@ -367,6 +386,7 @@ def test_o63_a_step_refuses_a_line_whose_declaration_is_not_met_with_nothing_mad
     assert says in err
     assert "go ahead" not in err
     assert "gggggggg" not in err
+    assert "qzdir" not in err
     assert seen == {}
     nothing_made(tmp_path)
 
@@ -401,6 +421,58 @@ def test_o63_the_declared_name_is_passed_to_the_post_run_script_with_the_dispatc
     assert shards.step(args, runner=run, core_found=lambda path: True) == 0
     assert manifest_of(tmp_path)["final"] is True
     assert shards.pre_step_env().get(NAME) is None
+
+
+POST_ASSERTS = (
+    "import os\n"
+    f"want = {{{NAME!r}: {VALUE!r}, {TREE_NAME!r}: {TREE!r}}}\n"
+    "raise SystemExit(0 if all(os.environ.get(k) == v for k, v in want.items()) else 9)\n"
+)
+
+
+def test_o63_an_absolute_path_value_reaches_the_dispatcher_and_the_post_run_script_through_the_printed_line(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: the pilot's second use: the study's artifacts directory (an absolute path; `HPC_` is not a name the step
+    manages) declared beside the sanction variable. Through `lines` and the real `step`, both reach the dispatcher and
+    the study's post-run script (which exits non-zero unless it sees both, so its results would be not final), and
+    step.json and the archive's manifest hold both."""
+    study = make_study(tmp_path)
+    (study / "guards").mkdir()
+    (study / "guards" / "post_run.py").write_text(POST_ASSERTS)
+    monkeypatch.setenv(NAME, VALUE)
+    monkeypatch.setenv(TREE_NAME, TREE)
+    extra = f'pass_env = ["{NAME}", "{TREE_NAME}"]\npost_run = "guards/post_run.py"\npost_run_timeout_s = 20'
+    line = printed(shards, tmp_path, capsys, "lines", extra)[0]
+    assert f"{TREE_NAME}={TREE} " in line
+    assert line.count("--pass-env") == 2
+    run, seen = dispatcher()
+    assert run_line(shards, monkeypatch, line, run) == 0
+    both = {NAME: VALUE, TREE_NAME: TREE}
+    assert {k: seen["env"][k] for k in both} == both
+    assert seen["owner"]["pass_env"] == both
+    manifest = manifest_of(tmp_path)
+    assert manifest["pass_env"] == both
+    assert manifest["final"] is True
+    assert manifest["post_run"]["exit_status"] == 0
+    assert set(seen["env"]) - set(shards.ALLOWLIST) - HOME_NAMES - STEP_OWN == set(both)
+
+
+def test_o63_the_post_run_script_that_does_not_see_the_variables_leaves_the_results_not_final(
+    shards, tmp_path, monkeypatch
+):
+    """O63: the post-run assertion above is real: the same script, in a step whose line declared neither variable,
+    exits 9 and the results are archived not final."""
+    study = make_study(tmp_path)
+    (study / "guards").mkdir()
+    (study / "guards" / "post_run.py").write_text(POST_ASSERTS)
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    args = step_args(tmp_path)
+    args.post_run, args.post_run_timeout = "guards/post_run.py", 20.0
+    args.post_run_sha256 = hashlib.sha256(POST_ASSERTS.encode()).hexdigest()
+    run, _ = dispatcher()
+    assert shards.step(args, runner=run, core_found=lambda path: True) == shards.POST_RUN_FAILED
+    assert manifest_of(tmp_path)["final"] is False
 
 
 def test_o63_an_archive_left_on_the_node_carries_the_names_its_step_was_given(shards, tmp_path, monkeypatch):
@@ -460,17 +532,19 @@ def test_o63_collect_refuses_a_shard_that_was_given_a_name_the_plan_does_not_dec
     assert not (tmp_path / "into").exists()
 
 
-def test_o63_collect_refuses_a_record_whose_value_cannot_be_a_value(shards, tmp_path, monkeypatch):
-    """O63: an archive whose manifest holds a value outside the allowed characters (edited by hand) is refused, the
-    value never echoed."""
+@pytest.mark.parametrize("value", ["go ahead", "/qzdir/../x"])
+def test_o63_collect_refuses_a_record_whose_value_cannot_be_a_value(shards, tmp_path, monkeypatch, value):
+    """O63: an archive whose manifest holds a value outside the allowed characters, or a path that climbs (edited by
+    hand), is refused, the value never echoed."""
     plan = two_shards(shards, tmp_path, monkeypatch)
     path = tmp_path / "results" / "fed-b.out.json"
     manifest = json.loads(path.read_text())
-    manifest["pass_env"] = {NAME: "go ahead"}
+    manifest["pass_env"] = {NAME: value}
     path.write_text(json.dumps(manifest))
     with pytest.raises(shards.ShardsError, match=rf"shard fed-b: .*{NAME}") as error:
         shards.collect(plan, tmp_path / "into")
     assert "go ahead" not in str(error.value)
+    assert "qzdir" not in str(error.value)
 
 
 def test_o63_an_older_archive_without_the_record_is_taken_by_a_plan_that_declares_nothing(
