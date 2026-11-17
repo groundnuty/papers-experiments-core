@@ -5,6 +5,7 @@
     <python> -I -B deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
         --results DIR --core-src DIR --job J --step-name S  # inside the step on the sandbox node; `lines` writes it
     <python> -I -B deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
+    <python> -I -B deploy/hpc-federation/shards.py collect --roots-only --root ROOT --into DIR  # one root, no plan
     python3 -I -B deploy/hpc-federation/shards.py verify-copy ARCHIVES_MANIFEST LOCAL_DIR --manifest-sha256 HASH
                                                         # on the operator's host, after the pull, before `down`
     <python> -I -B deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
