@@ -225,9 +225,10 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `B` | the bundle on a filesystem the nodes see (`<shared_root>/hpc-federation/bundle`), `chmod -R go-w` |
 | `SH` | a 0700 directory for the two rootfs tarballs, each with its `.provenance` (SHA-256): single files only (`<scratch_root>/hpcop-images`) |
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
+| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's clone and venv, its manifests), an absolute path with no `..`, on a filesystem the login node sees (`<shared_root>/studies/<study>/artifacts`). `up` digests its tree into the render identity (O74, below); the path is never in the record |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
-repository. The optional keys of the driver and the agent's sandbox are in `site.env.example`; the four of the next
+repository. The optional keys of the driver, the agent's sandbox and the study's artifacts are in `site.env.example`; the four of the next
 section are the provider storage on scratch and its inode guard.
 
 ## Provider storage on scratch, and the inode guard
@@ -432,12 +433,32 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   else: `version` (`expcore-render-identity/1`), `template_sha256` (the template as the renderer read it, before it was
   rendered), `platform_fingerprint_sha256` (the canonical JSON of the rendered file's `PlatformConfig.fingerprint()`,
   hashed as the core hashes a fingerprint) and, for each pin the rendered platform holds, the SHA-256 `up` filled in and
-  checked: `sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256` and `oneclient_bundle_sha256`. A pin
-  the template does not name is not in the record, and no entry is ever empty. It holds no address, id, job, node, path,
-  user or secret. Two federations rendered from one template, with the same pins and the same data (every space
+  checked: `sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256` and `oneclient_bundle_sha256`; and,
+  when `site.env` declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256` (the next bullet). A pin the template
+  does not name, and the digest of a site that declares no directory, are not in the record, and no entry is ever
+  empty. It holds no address, id, job, node, path, user or secret. Two federations rendered from one template, with the same pins and the same data (every space
   declaring its `data_manifest`, as above), have byte-equal records; a changed pin changes its own entry and the
   fingerprint, which holds the Apptainer backend's pins, and an edited template changes the template's. A layout with no
   platform template writes none. `shards.py step` compares it with the record a plan expects (below).
+- **The study's artifacts tree** (O74, `hpcidentity.tree_sha256`): with `HPC_STUDY_ARTIFACTS` set, `up` reads the
+  directory's tree once, in its preflight on the login node before anything is made or submitted, and the record holds
+  its SHA-256 as `study_artifacts_tree_sha256`. The digest is of one canonical listing: `expcore-artifacts-tree/1` and a
+  NUL, then one record per entry, sorted by the entry's relative path as bytes (the whole path, so `a-b` comes before
+  `a/b`) and none for the directory itself: `F NUL path NUL size NUL sha256 NUL` for a regular file, `D NUL path NUL`
+  for a directory, `L NUL path NUL target NUL` for a symbolic link (paths are raw bytes, `/`-separated). The venv is in
+  it. Mode, owner, time and the directory's own path are not, so a copy of the tree at another path has the same digest
+  and no path is in the record. **A link is recorded by its target string and never followed:** a venv's `bin/python`
+  is a link to an interpreter outside the tree, so a rule that refused links would refuse the venv the digest is for;
+  what a link points at is not hashed, so a tree that must hold its interpreter holds a copy of it (a venv made with
+  `--copies`). A **special file** (a FIFO, a socket, a device) is refused, and so is a directory that does not exist,
+  is a file or is itself a link. Every refusal fails `up` before the root is made, naming `HPC_STUDY_ARTIFACTS` and a
+  path relative to the directory (escaped), never an absolute one. The tree is opened below one held descriptor with
+  no link followed and is never written, so a read-only tree reads as any other, and a file that changes while it is
+  read is refused. A file is hashed as it is: a venv whose scripts name the venv's own absolute path (a shebang, a
+  `pyvenv.cfg`) digests differently at another path, so build the tree where it will stay. The digest goes through the
+  state file (`study_artifacts_tree_sha256`, beside the site's `study_artifacts`) to the core's phase, so `[hpc] core =
+  "step"` has it though a node's environment is an allowlist, and the core never reads the tree again. A layout with no
+  platform template writes no record and reads no tree; each federation of a fleet reads the tree itself.
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
@@ -628,8 +649,9 @@ root with no link followed, refuses one that is not the bytes the plan hashed, t
 `$EXPCORE_FED_ROOT/render-identity.json` (read once below that root, no link followed, a root that is this user's and
 that no group or other can write to) and requires both to be well formed and equal, key by key. Any difference refuses
 the step with exit status 73 (`PRE_STEP_REFUSED`), naming the keys that differ (`sandbox_sif_sha256` and
-`platform_fingerprint_sha256` for a changed SIF: the fingerprint holds the pins) and never a value, a hash or a path;
-so does a federation with no record in its root, an unreadable or malformed one, or no `EXPCORE_FED_ROOT`. Nothing is
+`platform_fingerprint_sha256` for a changed SIF: the fingerprint holds the pins; a federation whose artifacts tree
+differs, has one where the plan expects none or none where it expects one, is named by `study_artifacts_tree_sha256`)
+and never a value, a hash or a path; so does a federation with no record in its root, an unreadable or malformed one, or no `EXPCORE_FED_ROOT`. Nothing is
 made. A record is only the file `up` wrote: a `platform.toml` edited by hand afterwards is not seen, and a line edited
 to drop the two words runs unchecked.
 

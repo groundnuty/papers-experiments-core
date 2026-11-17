@@ -282,7 +282,9 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "command": ["<python>", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
-           "billing_weight": null, "step_network": "", "storage_root": "<scratch root, or empty>"},
+           "billing_weight": null, "step_network": "", "study_artifacts": "<directory, or empty>",
+           "storage_root": "<scratch root, or empty>"},
+  "study_artifacts_tree_sha256": "<64 hex: the digest of that directory's tree, taken in the preflight (section 8); absent without one>",
   "storage": {"root": "<the site's scratch root>", "parent": "<root>/<allocation name>", "token": "<32 hex>",
               "providers": {"<provider name>": "<parent>/<provider name>"}},
   "allocation": {
@@ -676,9 +678,21 @@ canonical JSON with sorted keys; `hpcidentity.py`, written by `hpcboot.write_fac
 the renderer read it, before it was rendered; `platform_fingerprint_sha256`, the canonical JSON of the rendered file's
 `PlatformConfig.fingerprint()` hashed as the core hashes a fingerprint (`expcore.campaign.manifest.fingerprint_sha256`);
 and the SHA-256 of each pin the platform holds (`sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256`,
-`oneclient_bundle_sha256`), the very values the preflight checked (`hpcpins`), never read again. It holds no address,
+`oneclient_bundle_sha256`), the very values the preflight checked (`hpcpins`), never read again; and, when `site.env`
+declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256`, the digest of that directory's tree. It holds no address,
 id, job, node, path, user or secret, so it can travel with a shard's results and be committed beside a study. A pin the
-template does not name is left out; a layout with no template writes no record. A manifest's `expect_render_identity`
+template does not name is left out, and so is the artifacts digest of a site with no such directory; a layout with no
+template writes no record. **The artifacts digest** is taken by `up` once, in its preflight on the login node, before
+the root is made or a job submitted (a tree that cannot be digested fails `up` there), kept in the state file and
+handed to the core's phase among its values, so a core step on a node, whose environment is an allowlist, has it and
+never reads the tree. It is the SHA-256 of one canonical listing: `expcore-artifacts-tree/1` and a NUL, then one record
+per entry sorted by its relative path as bytes, none for the directory itself: `F NUL path NUL size NUL sha256 NUL` (a
+regular file), `D NUL path NUL` (a directory), `L NUL path NUL target NUL` (a symbolic link, by its target string, never
+followed: a venv's `bin/python` is a link to an interpreter outside the tree, so refusing links would refuse the venv,
+and the interpreter's own bytes are not in the digest). A special file, or a root that is not a directory of its own, is
+refused, naming `HPC_STUDY_ARTIFACTS` and a path relative to the directory, never an absolute one. No mode, owner, time
+or path of the directory is in it, so a copy elsewhere has the same digest. The tree is read below one held descriptor
+with no link followed and never written (the pilot makes it read-only first). A manifest's `expect_render_identity`
 (a path of the study; the lines carry it with its hash as `--expect-render-identity*`) makes `step` compare the
 federation's record with the expected one before it makes anything, beside the pre-step guard and before it, refusing
 with 73 and naming the keys that differ; and every step writes the record it validated into
