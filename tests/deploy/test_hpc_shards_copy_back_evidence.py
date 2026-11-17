@@ -5,6 +5,7 @@ it: it holds runs the archive lacks) are listed by `shards.py collect` in `archi
 `verify-copy`, because the site's scratch is cleared after the pull. Snapshots that are not newer than the archive are
 resume material and not listed. Every path and name here is invented."""
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -12,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from campaign_support import NOW, finished, make_manifest, make_schema
@@ -295,6 +297,77 @@ def test_a_collect_refused_after_a_snapshot_was_read_leaves_nothing_behind(shard
     with pytest.raises(shards.ShardsError, match="manifest"):
         shards.collect(plan, tmp_path / "merge")
     assert not (tmp_path / "merge").exists()
+
+
+class Killed(BaseException):
+    """The step killed outright: its dispatcher never returns, and nothing is archived."""
+
+
+def _step(shards, tmp_path, resume, killed=False):
+    """One real `shards.step` of a one-shard plan, with a stand-in dispatcher that does what the core's does here:
+    its spend journal (a file of its own), a store with a run ended in it, the lock. `killed` ends it as a kill outright
+    would (no archive; the step's own last snapshot is taken as it unwinds)."""
+    study = tmp_path / "study"
+    study.mkdir(exist_ok=True)
+    (study / "study.toml").write_text("[study]\n")
+    for name in ("tmpfs", "results"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    args = argparse.Namespace(
+        study=study, index=1, count=1, label="fed-a", tmpfs=tmp_path / "tmpfs", results=tmp_path / "results",
+        core_src=tmp_path, resume=resume, snapshot_every=3600.0,
+    )  # fmt: skip
+
+    def dispatcher(argv, env, cwd):
+        out = Path(argv[argv.index("run") + 1]) / "out"
+        Path(argv[argv.index("--spend-journal") + 1]).write_text('{"spent": 1}\n')
+        (out / "runs").mkdir(parents=True, exist_ok=True)
+        (out / "campaign.lock").write_text("")
+        store = Store(out / "state.sqlite", SCHEMA)
+        store.sync_manifest(ROWS)
+        try:
+            _run(store, out, KEYS[1 if resume else 0])
+        finally:
+            store.close()
+        if killed:
+            raise Killed
+        return 0
+
+    return shards.step(args, runner=dispatcher, core_found=lambda path: True)
+
+
+def _snapshot_names(plan):
+    return sorted({name.split("/")[2] for name in _names(plan) if "/snapshots/" in name})
+
+
+def test_a_shard_whose_step_ended_normally_lists_no_snapshot_though_its_step_took_them(shards, tmp_path, capsys):
+    """O63: through the real step: the snapshots it took name no archive (it started from none), so they are older than
+    the archive it wrote and hold nothing it lacks. Its journal and archive manifest are listed."""
+    plan = shards.load_plan(plan_file(tmp_path, labels=("fed-a",)))
+    assert _step(shards, tmp_path, resume=False) == 0
+    assert (tmp_path / "results" / "fed-a" / "snapshots" / "snap-000001").is_dir()  # the last, taken after the exit
+    capsys.readouterr()
+    shards.collect(plan, tmp_path / "merge")
+    assert _snapshot_names(plan) == []
+    assert [name for name in _names(plan) if "/journals/" in name]
+    assert "fed-a.out.json" in _names(plan)
+    assert "newer than its archive" not in capsys.readouterr().err
+
+
+def test_a_step_resumed_from_the_archive_and_killed_leaves_a_snapshot_that_collect_lists(shards, tmp_path, capsys):
+    """O63: through the real step: its snapshots name the archive it resumed from, which is still the shard's archive
+    (nothing newer was written), so the newest holds the run the archive lacks: listed, with both steps' journals, and
+    the collect warns. The first step's snapshot, older than the archive, is still not."""
+    plan = shards.load_plan(plan_file(tmp_path, labels=("fed-a",)))
+    assert _step(shards, tmp_path, resume=False) == 0
+    with pytest.raises(Killed):
+        _step(shards, tmp_path, resume=True, killed=True)
+    capsys.readouterr()
+    shards.collect(plan, tmp_path / "merge")
+    assert _snapshot_names(plan) == ["snap-000002"]
+    assert len([name for name in _names(plan) if "/journals/" in name]) == 2
+    seen = capsys.readouterr().err
+    assert "snap-000002" in seen
+    assert "newer than its archive" in seen
 
 
 # ------------------------------------------------------------------------------------------------ verify-copy
