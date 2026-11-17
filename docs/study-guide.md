@@ -1350,6 +1350,28 @@ Once one analysed record carries it, `analyze` judges every analysed run:
 
 The analysis then runs again without every run that is not clean, and with the egress check or the mount guard it also joins the rerun without every run any guard leaves out, `## Egress, mount isolation and process visibility together` for all three (O70). `report.md` gains `## Process visibility (detected, not prevented)`, `analysis.json` gains `process_visibility`, and `analyze` prints a line per contrast. The check detects, it does not prevent. Hidden memory under the margin (`hidden_memory_margin_bytes`, 128 MiB by default) and a hidden process's shared memory are not told apart from the node's own; the step's memory limit bounds them, and every hidden process ends with its cell. What each field means is in [`interfaces.md`](interfaces.md#processes-hidden-from-the-watch-the-process_visibility-instrument).
 
+### The sensitivity reruns a preregistration declares
+
+Which reruns `analyze` runs depends on which guard instruments your records carry: the egress rerun, the mount guard's, the process-visibility check's, and the one without every run any guard that checked the batch leaves out (`any_guard`, when two or more did). A guard listed on the wrong runs, or on none, would silently give a different set than the one you meant to preregister. Declare the set in `preregistration.toml`, in its hash like the rest, as a `[sensitivity]` table whose `reruns` lists any of `egress`, `mount_guard`, `process_visibility` and `any_guard`, in any order, each at most once (the block below appends one to the example's file and loads it).
+
+`analyze` and `report` then refuse unless the reruns they would run are exactly these, in either direction, and name the difference: a declared rerun that no record supports (no analysed record carries that guard's instrument, or fewer than two guards checked the batch for `any_guard`), and a rerun your records would produce that the preregistration does not declare. A rerun counts as run when its guard checked the batch, whether or not it left a run out: a batch whose every run is clean has no second analysis, and is still the rerun you declared. `reruns = []` declares that none is expected, so a batch that would run one is refused. A preregistration with no `[sensitivity]` table declares nothing and is not checked, as it never was, so a study that does not declare its reruns keeps what it had; `analysis.json` carries `sensitivity_reruns` for a study that does.
+
+```python
+import tomllib
+
+from expcore.stats.prereg import parse
+from expcore.stats.reruns import difference
+
+shown = Path("my-study/preregistration.toml").read_text() + '\n[sensitivity]\nreruns = ["egress", "any_guard"]\n'
+declared = parse(tomllib.loads(shown), "my-study/preregistration.toml", "0" * 64, study.schema).sensitivity_reruns
+assert declared == ("egress", "any_guard")
+assert difference(declared, ("any_guard", "egress")) is None  # what the records would run is what is declared
+said = difference(declared, ("egress",))  # only one guard's instrument is listed on the records
+assert "declared but not run: any_guard (it needs two or more guards to have checked the batch; only egress did)" in said
+said = difference(declared, ("egress", "process_visibility", "any_guard"))  # one the preregistration never declared
+assert "run but not declared: process_visibility" in said
+```
+
 ### The order instruments start and finish in
 
 Instruments nest, like a setup and its teardown. `start_instruments` starts them in list order and `finish_instruments` finishes them in the reverse of it, so **an instrument listed earlier finishes later**. The first listed starts first and finishes last; one listed after another starts after it and finishes before it.
@@ -1657,7 +1679,7 @@ assert "tools-effect-on-rounds" in report.split("## Exploratory contrasts")[1]
 A protocol is frozen when nothing that decides a result can change unnoticed. Before the study's runs:
 
 - Freeze every model: `status = "frozen"` in `models.toml`, with its settings collected. A study run refuses a model that is not frozen.
-- Write `preregistration.toml`: the contrasts, the Holm family, the margins, alpha, the estimators and the bootstrap and power settings. Its hash goes into every analysis and the report.
+- Write `preregistration.toml`: the contrasts, the Holm family, the margins, alpha, the estimators and the bootstrap and power settings, and, when your records carry guard instruments, the sensitivity reruns you expect (`[sensitivity] reruns`, above). Its hash goes into every analysis and the report.
 - Commit the study, and pin the core by tag in its dependencies (`uv add ...@v0.1.0`); every record carries the core version.
 - Then run. The campaign fingerprint holds the hash of every configuration file, the prompts, the tool manifests and the scorers' versions, and a resume under any change is refused.
 

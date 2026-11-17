@@ -1611,6 +1611,31 @@ def equivalence_groups(prereg)  # the declared families when there are any, else
 
 **In the outputs.** `analysis.json` adds, only when the table is declared, `equivalence_families`: per family its `name`, its `members` and its `steps` (`step`, `name`, `p_value` the raw TOST p, `p_holm` the adjusted one, `level`, `reject` whether it is equivalent); each named Holm family's `equivalence` is then `[]`. `report.md` heads the equivalence table "Equivalence families (Holm over two one-sided tests, within each declared equivalence family)", gives each claim's equivalence family (and, with named Holm families, the Holm family of its significance test) beside its margin, raw and adjusted TOST p, interval level, adjusted interval and verdict, then "TOST steps of equivalence family <name>" (each step's claim, TOST p, level as alpha / k, Holm TOST p and verdict) and notes on what each family's adjustment means; the terminal summary writes `Holm TOST p 0.0120 (equivalence family h1)`. The report refuses a result whose equivalence families and decisions disagree (a claim in no family or in two, a step that is not its claim's decision, a member that is no claim, or a Holm family holding a decision), and one whose steps are not Holm's over the family's own claims: it recomputes each family's levels, adjusted TOST p-values and verdicts from its claims' raw TOST p-values at alpha with the analysis's own kernel, and requires each claim's TOST p, Holm TOST p, verdict and interval level to be its step's, so decisions made at another family's size cannot be shown. Without the table, `analysis.json` and `report.md` are byte for byte what they were (`tests/data/analysis-equivalence-within-families.json`, `tests/data/analysis-equivalence-flat.json` and their reports pin both existing layouts).
 
+### Declared sensitivity reruns
+
+`expcore.stats.prereg` and `expcore.stats.reruns` (S19). A preregistration declares which sensitivity reruns it expects, and `analyze` runs exactly those:
+
+```toml
+[sensitivity]
+reruns = ["egress", "mount_guard", "process_visibility", "any_guard"]   # each name at most once, in any order
+```
+
+```python
+# expcore.stats.prereg
+Preregistration.sensitivity_reruns: tuple[str, ...] | None  # the declared names in order; None without the table
+
+# expcore.stats.reruns
+RERUNS = ("egress", "mount_guard", "process_visibility", "any_guard")
+def ran_reruns(egress, mount_guard, visibility, guards) -> tuple[str, ...]  # the reruns whose analysis exists
+def difference(declared, ran) -> str | None  # None when they match, whatever the order; else the message
+```
+
+**What each name is.** `egress`, `mount_guard` and `process_visibility` are the reruns of one guard (its analysis exists once one analysed record carries its instrument), and `any_guard` is the rerun without every run any guard leaves out (`expcore.guards`, O70), which exists once two or more guards checked the batch. **A rerun counts as run when its guard checked the batch, whether or not it left a run out:** with every run clean there is no second analysis, and it is still the declared rerun.
+
+**What is refused.** At load, a `[sensitivity]` that is not a table, has a key other than `reruns`, lacks `reruns`, or whose `reruns` is not an array of the four names, or names one twice; each message names the file, `[sensitivity]` and the key, an unknown name with the closest of the four. At `analyse_study` (so `analyze`, `report` and what builds on them), `Refused` when the reruns the records would produce are not exactly the declared ones, in either direction: it names each declared rerun that cannot run, with why (`no analysed record carries the <guard> instrument`; for `any_guard`, `it needs two or more guards to have checked the batch; only egress did`), each rerun that would run and is not declared, and both lists. A partial analysis is held to the same.
+
+**A preregistration with no `[sensitivity]` table declares nothing and is not checked**, so a study that does not declare its reruns keeps what it had; `reruns = []` declares that none is expected, so a batch that would run one is refused. The table is in `preregistration.toml`, so in its SHA-256 (P04), and a copy made with `with_override(sensitivity_reruns=...)` is checked as the file is and marked `+override`. `analysis.json` carries `sensitivity_reruns` only for a preregistration that declares it, so the output of one that does not is as it was.
+
 ## The platform layer's spaces and reset
 
 `expcore_onedata.spaces`, `provision`, `eviction` and `reset`. A federation study has one space per data owner, each supported by its owner's provider, by the agent's local provider and sometimes by a mirror. `platform.toml` declares them as an array of tables, in place of `[space]` and `[support]` (one form or the other, never both):

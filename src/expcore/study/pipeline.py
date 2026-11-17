@@ -119,6 +119,8 @@ from expcore.replay.side_file_placement import settle_side_files
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.ratio import OMIT_NONE
+from expcore.stats.reruns import difference as reruns_difference
+from expcore.stats.reruns import ran_reruns
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
     MODELS_FILE,
@@ -876,9 +878,24 @@ def _analyse_loaded(
     guard = mount_guard_analysis(runs, rows, absent, study.prereg, data_paths)  # None for a batch not guarded
     seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
     both = guards_analysis(rows, absent, study.prereg, egress, guard, seen)  # None unless two guards checked the batch
+    _require_declared_reruns(study, ran_reruns(egress, guard, seen, both))
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
     return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen)
+
+
+def _require_declared_reruns(study: StudyConfig, ran: tuple[str, ...]) -> None:
+    """Refuse an analysis whose sensitivity reruns are not exactly those the preregistration declares in
+    `[sensitivity] reruns` (S19), in either direction, naming the difference. A preregistration that declares none is
+    not checked."""
+    declared = study.prereg.sensitivity_reruns
+    said = None if declared is None else reruns_difference(declared, ran)
+    if said is not None:
+        raise Refused(
+            f"{study.prereg.source}: the sensitivity reruns this analysis would run are not the ones [sensitivity] "
+            f"reruns declares:\n  {said}\nlist the guard's instrument on the runs it applies to, or change the "
+            "declaration before the analysis"
+        )
 
 
 def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
@@ -930,7 +947,8 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
     Holm decision, with each named family's steps (S17) and each declared equivalence family's (S18). `exploratory_only`
     is true when the preregistration makes no confirmatory claim (S12): there is then no Holm decision, and every
-    contrast is exploratory."""
+    contrast is exploratory. A preregistration that declares its sensitivity reruns (S19) has them under
+    `sensitivity_reruns`."""
     return (
         {
             "preregistration": dict(analysis.result.manifest),
@@ -950,7 +968,14 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         | ({} if analysis.mount_guard is None else {"mount_guard": _mount_guard_summary(analysis.mount_guard)})
         | ({} if analysis.guards is None else {"guards": _guards_summary(analysis.guards)})
         | ({} if analysis.visibility is None else {"process_visibility": _visibility_summary(analysis.visibility)})
+        | _declared_reruns_entry(analysis.study.prereg.sensitivity_reruns)
     )
+
+
+def _declared_reruns_entry(declared: tuple[str, ...] | None) -> dict[str, Any]:
+    """`sensitivity_reruns` (S19): the reruns the preregistration declares, which the analysis ran exactly; nothing for
+    a preregistration that declares none, so its analysis.json is as it was."""
+    return {} if declared is None else {"sensitivity_reruns": list(declared)}
 
 
 def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:

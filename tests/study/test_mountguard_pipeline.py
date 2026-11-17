@@ -11,7 +11,7 @@ from study_support import HEAD, clean_environment, cli
 
 from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
-from expcore.study.pipeline import ANALYSIS_FILE, REPORT_FILE, analyse_study, output_bytes, run_study
+from expcore.study.pipeline import ANALYSIS_FILE, REPORT_FILE, Refused, analyse_study, output_bytes, run_study
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
@@ -145,9 +145,13 @@ def prepared(
     rest_task: str | None = None,
     visibility: bool = False,
     data_paths: bool = False,
+    reruns: list[str] | None = None,
 ) -> Path:
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
+    if reruns is not None:  # the preregistration declares the sensitivity reruns the study expects (S19)
+        declared = study / "preregistration.toml"
+        declared.write_text(declared.read_text("utf-8") + f"\n[sensitivity]\nreruns = {json.dumps(reruns)}\n", "utf-8")
     if data_paths:
         with_data_paths(study)
     if guard:
@@ -186,9 +190,16 @@ def checked_study(
     rest_task: str | None = None,
     visibility: bool = False,
     data_paths: bool = False,
+    reruns: list[str] | None = None,
 ):
     study = prepared(
-        tmp_path, guard=guard, egress=egress, rest_task=rest_task, visibility=visibility, data_paths=data_paths
+        tmp_path,
+        guard=guard,
+        egress=egress,
+        rest_task=rest_task,
+        visibility=visibility,
+        data_paths=data_paths,
+        reruns=reruns,
     )
     code, stderr = cli(environment, "check", str(study / "out" / "runs"), process=True)
     assert code == 0, stderr
@@ -327,3 +338,45 @@ def test_o69_a_rest_arm_that_lists_no_mount_guard_is_not_applicable_by_the_campa
     summary = json.loads(output_bytes(analysis)[ANALYSIS_FILE])["mount_guard"]
     assert summary["counts"]["not_applicable"] == len(rest)
     assert not rest & set(summary["sensitivity"]["left_out"])
+
+
+# --- the reruns a preregistration declares (S19) ---------------------------------------------------------------------
+
+
+def test_s19_an_analysis_that_runs_exactly_the_declared_reruns_goes_through_and_analysis_json_names_them(
+    tmp_path, clean_environment
+):
+    """S19: all four reruns are declared and all four run; analysis.json names the declaration."""
+    declared = ["any_guard", "egress", "mount_guard", "process_visibility"]
+    analysis = checked_study(tmp_path, clean_environment, guard=True, egress=True, visibility=True, reruns=declared)
+    assert analysis.guards is not None
+    assert json.loads(output_bytes(analysis)[ANALYSIS_FILE])["sensitivity_reruns"] == declared
+
+
+def test_s19_a_declared_rerun_no_record_supports_is_refused_naming_it(tmp_path, clean_environment):
+    """S19: only the mount guard is listed, and the preregistration expects egress and the rerun of every guard too."""
+    with pytest.raises(Refused) as raised:
+        checked_study(tmp_path, clean_environment, guard=True, reruns=["mount_guard", "egress", "any_guard"])
+    text = str(raised.value)
+    assert "preregistration.toml" in text
+    assert "declared but not run: egress (no analysed record carries the egress instrument); any_guard" in text
+    assert "only mount_guard did" in text
+    assert "run but not declared" not in text
+
+
+def test_s19_a_rerun_the_records_would_produce_and_the_preregistration_does_not_declare_is_refused(
+    tmp_path, clean_environment
+):
+    with pytest.raises(Refused) as raised:
+        checked_study(tmp_path, clean_environment, guard=True, egress=True, reruns=["mount_guard"])
+    text = str(raised.value)
+    assert "run but not declared: egress, any_guard" in text
+    assert "declared but not run" not in text
+
+
+def test_s19_a_preregistration_that_declares_nothing_is_not_checked_and_analysis_json_is_as_it_was(
+    tmp_path, clean_environment
+):
+    analysis = checked_study(tmp_path, clean_environment, guard=True, egress=True)
+    assert analysis.guards is not None  # reruns run that nothing declared
+    assert "sensitivity_reruns" not in json.loads(output_bytes(analysis)[ANALYSIS_FILE])
