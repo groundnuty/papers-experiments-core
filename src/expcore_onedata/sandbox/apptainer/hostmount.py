@@ -29,6 +29,10 @@ path a cell binds; the cell binds only the mount point, `<run>/mount`, read-only
 reads the log (`mount_watch_log()`) or at `stop()`: the watcher is stopped (SIGTERM: a last poll, `disarmed`, its end
 line), its log read once and judged (`expcore.mountguard`), and oneclient's I/O mode read from its log (`iomode`).
 
+**What the sandbox reads of it** (O17, O18): `infra_state()`, oneclient with its mount and the watcher by role, each
+as it is now or as it was just before the harness stopped it (`apptainer.infra`), and `oneclient_log()`, oneclient's
+INFO log, which the driver may read at any time: the watcher does not watch the log directory.
+
 **`stop()`**: the watch closed; the mount unmounted (`fusermount3 -u`, then oneclient stopped, then a lazy unmount if
 the mount is still in the table); oneclient shown gone; the token file shown gone; any file of oneclient's log that
 holds the token removed; the bundle's copy removed. Each step is tried and the stop raises `SandboxError` naming those
@@ -41,6 +45,7 @@ passed), a platform that declares no bundle, and a bundle that is not the pinned
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import shutil
@@ -60,6 +65,7 @@ from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import helpers
 from expcore_onedata.sandbox.apptainer import oneclient_bundle as OB
+from expcore_onedata.sandbox.apptainer.infra import process_state
 from expcore_onedata.sandbox.apptainer.mounthook import MountHelperFactory
 from expcore_onedata.sandbox.apptainer.node import NodeOps
 from expcore_onedata.sandbox.containers import extra_args_record
@@ -76,6 +82,8 @@ from expcore_onedata.sandbox.oneclient_args import (
     mount_problem,
     short_letters,
 )
+
+log = logging.getLogger(__name__)
 
 MOUNT_WAIT_S = 60.0
 ARMED_WAIT_S = 30.0
@@ -263,6 +271,7 @@ class HostMount:
         self._io_mode: dict[str, Any] | None = None
         self._meta: dict[str, Any] = {}
         self._lock = threading.RLock()
+        self._before: dict[str, dict[str, Any]] = {}  # a role's state just before the harness stopped it (O17)
 
     # ------------------------------------------------------------------------------------------------ start
     def _validate(self) -> None:
@@ -373,6 +382,8 @@ class HostMount:
             self._closed = True
             try:
                 watch = self.watch
+                if watch is not None:  # its last state of the run: the stop that follows is the harness's own
+                    self._before.setdefault("mount_watch", process_state(self.node, watch.process))
                 if watch is not None and self.node.alive(watch.process.pid, watch.process.start) is not False:
                     self._meta["watch_stop"] = helpers.stop(self.node, watch, sleep=self._sleep, clock=self._clock)
             finally:
@@ -389,7 +400,50 @@ class HostMount:
         return self._log
 
     # ------------------------------------------------------------------------------------------------ stop
+    # ------------------------------------------------------------------------------------------------ its state
+    def _mount_state(self) -> dict[str, Any]:
+        process = self.oneclient.process
+        end = process_state(self.node, process)
+        try:
+            end["mount"] = fuse_state(self._mountinfo(), str(self.where.mountpoint), os.getuid())
+        except (OSError, MountTableError):
+            end["mount"] = "unread"
+        return end
+
+    def infra_state(self) -> dict[str, dict[str, Any]]:
+        """oneclient with its mount (`mount`) and the guard's watcher (`mount_watch`), by role, for the sandbox's
+        `infra_check` (`apptainer.infra`, O17): each one's process (`start`) and its state (`end`), now, or just before
+        the harness stopped it (`stopped_by_harness`). Only what has started is listed. The live state is read before
+        the note is looked for, and the note is taken before every stop, so a stop that lands meanwhile is found by its
+        note, never taken for a death."""
+        found: dict[str, dict[str, Any]] = {}
+        for role, helper, now in (("mount", self.oneclient, self._mount_state),
+                                  ("mount_watch", self.watch, None)):  # fmt: skip
+            if helper is None:
+                continue
+            live = now() if now is not None else process_state(self.node, helper.process)  # first, then the note
+            with self._lock:
+                before = self._before.get(role)
+            found[role] = {"start": helper.process.record(), "end": before or live}
+            if before is not None:
+                found[role]["stopped_by_harness"] = True
+        return found
+
+    def oneclient_log(self) -> bytes | None:
+        """oneclient's INFO log, through glog's link to it in its log directory, as it is now; None when it cannot be
+        read. The read is the driver's, of a directory no cell binds, which the guard's watcher does not watch (it
+        watches the token file and its directory alone), so it may be read during the run (O18, O60)."""
+        return _read_log_link(self.where.log_dir, directio.LOG_FILE)
+
     def stop(self) -> None:
+        if self.oneclient is not None:  # its last state of the run, before the stop's own unmount and signals
+            with self._lock:
+                if "mount" not in self._before:
+                    try:
+                        self._before["mount"] = self._mount_state()
+                    except Exception as error:  # unknown, never clean: and the stop's steps run all the same
+                        self._before["mount"] = {"running": None, "exit_status": None, "mount": "unread"}
+                        log.error("oneclient's state before the stop could not be read: %s", describe_error(error))
         errors: list[str] = []
         for what, step in (("watch", self.close_watch), ("unmount", self._unmount_once),
                            ("oneclient", self._stop_oneclient), ("mount", self._mount_gone),

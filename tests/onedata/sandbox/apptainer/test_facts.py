@@ -101,3 +101,34 @@ def test_o60_hpc_mounts_are_proxy_only_a_direct_mount_run_is_refused_with_the_he
             node, dataclasses.replace(settings, mount=direct), make_spec("mounted"), **options(mount_helper=factory)
         )
     assert not node.execs
+
+
+@pytest.mark.parametrize("kind", ["tmpfs", "shared_filesystem"])
+def test_o57_a_run_records_where_the_federation_s_providers_keep_their_storage(tmp_path, kind):
+    """O57: where a provider stores its data shapes a run's I/O timing, so each run's facts and its backend record
+    carry the kind the platform declares (`provider_storage`), and a reader of one run knows which kind it ran on."""
+    box = start(FakeNode(), make_settings(tmp_path, provider_storage=kind), make_spec("via-gate"))
+    try:
+        meta = box.metadata()
+        assert meta["infrastructure_facts"]["provider_storage"] == kind
+        assert meta["backend"]["provider_storage"] == kind
+    finally:
+        box.stop()
+
+
+def test_o57_a_run_of_a_platform_that_declares_no_kind_carries_none(tmp_path):
+    """O57: no declared kind, no key: a Compose federation's runs and an older platform's keep the record they had."""
+    box = start(FakeNode(), make_settings(tmp_path), make_spec("via-gate"))
+    try:
+        meta = box.metadata()
+        assert "provider_storage" not in meta["infrastructure_facts"]
+        assert "provider_storage" not in meta["backend"]
+    finally:
+        box.stop()
+
+
+def test_o57_the_facts_record_echoes_the_kind_only_when_given():
+    """O57: `facts.record` adds `provider_storage` beside the list of keys when given one, and changes nothing else."""
+    given = facts.record(mount_refused=False, provider_storage="shared_filesystem")
+    assert given["provider_storage"] == "shared_filesystem"
+    assert {k: v for k, v in given.items() if k != "provider_storage"} == facts.record(mount_refused=False)

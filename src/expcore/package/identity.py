@@ -22,7 +22,8 @@ hash of the same code, which a reader can recompute, and drops every source:
 
 The mapping from pseudo-commit back to commit is the local campaign itself, which never leaves the author's machine.
 The core's own identity follows the same rule: the only trace of it in a record is `core_version`, a plain version;
-its commit and URL live in the environment's `sources`, which are dropped. A version with a local label (`1.2+g1a2b3c`)
+its commit, git tree and URL live in the environment's `sources`, which are dropped, and in its wheel's build
+identity, which is withheld (`withhold`). A version with a local label (`1.2+g1a2b3c`)
 can spell a commit, so an anonymised build refuses one.
 
 What an anonymised package still shows: the core's distribution name and its code, which the reader must run. So its
@@ -57,8 +58,9 @@ from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.package.spec import PackageError
 from expcore.package.views import streams, views
+from expcore.provenance import environment
 from expcore.provenance.codestamp import STAMP, CodeScope, covered_files, is_sha, write_stamp
-from expcore.provenance.environment import without_sources
+from expcore.provenance.environment import CORE_DISTRIBUTION, EnvironmentUnknown, without_sources
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.redact import Redactor
 from expcore.records.record import RunRecord, decode, is_record_name
@@ -371,13 +373,27 @@ def _url_forms(url: str) -> set[str]:
 def hidden_identity(
     root: Path, code: Mapping[str, Any], env: Mapping[str, Any], records: Collection[str]
 ) -> tuple[frozenset[str], frozenset[str]]:
-    """What an anonymised package may not hold: commit prefixes, and URLs in the forms `find_identity` looks for."""
-    sources = env.get("sources", {})
+    """What an anonymised package may not hold: commit prefixes, and URLs in the forms `find_identity` looks for.
+
+    The environment's sources name the core by its commit and git tree, not by where it was installed from; that
+    source (a repository URL and its commit, `environment.source_of`) names its authors as much, so it is looked for
+    too, read from the installed core."""
+    sources = [*env.get("sources", {}).values(), _core_install_source()]
     commits = {*records, *study_commits(root), code["commit"]}
-    commits |= {s["commit"] for s in sources.values() if is_sha(s.get("commit"))}
-    urls = {s["url"] for s in sources.values() if isinstance(s.get("url"), str)} | study_remotes(root)
+    commits |= {s["commit"] for s in sources if is_sha(s.get("commit"))}
+    commits |= {s["tree"] for s in sources if is_sha(s.get("tree"))}  # the core's git tree, a lookup key too
+    urls = {s["url"] for s in sources if isinstance(s.get("url"), str)} | study_remotes(root)
     forms = frozenset(form for url in urls for form in _url_forms(url))
     return frozenset(commit[:PREFIX_DIGITS] for commit in commits), forms
+
+
+def _core_install_source() -> Mapping[str, Any]:
+    """Where the installed core came from, by its direct URL; empty when it came from an index or cannot be read."""
+    dist = environment.installed().get(CORE_DISTRIBUTION)
+    try:
+        return (environment.source_of(dist) if dist is not None else None) or {}
+    except EnvironmentUnknown:  # an editable core whose checkout cannot be found names no URL to look for
+        return {}
 
 
 def commit_lines(text: str, prefixes: frozenset[str]) -> set[int]:

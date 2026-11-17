@@ -488,7 +488,8 @@ def test_o63_the_default_bound_is_60_seconds_and_a_plan_without_a_guard_prints_w
 
 
 def test_o63_a_line_with_no_guard_is_byte_for_byte_the_line_it_was(shards, tmp_path):
-    """O63: no guard declared: the step's line is the literal it was before the feature existed."""
+    """O63: no guard declared: the step's line is the literal it was before the feature existed, with the `--chdir=/`
+    the fleet's change gave every step (nothing starts in the directory it was run from)."""
     plan = shards.load_plan(manifest(tmp_path, guard=None))
     shard = plan.shards[0]
     line = shards.step_argv(plan, shard, shards.federation(shard), SCRIPT)
@@ -499,7 +500,7 @@ def test_o63_a_line_with_no_guard_is_byte_for_byte_the_line_it_was(shards, tmp_p
                  ("UV_CACHE_DIR", "/.cache/uv"), ("PIP_CACHE_DIR", "/.cache/pip"))]  # fmt: skip
     assert line == [
         "srun", "--jobid=101", "--het-group=1", "--exact", "-N1", "-n1", "-w", "node-s1", "-c", "6", "--mem=18g",
-        "-J", "hpcop-x-1-shard-1", "--export=PATH", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LC_ALL=C",
+        "-J", "hpcop-x-1-shard-1", "--export=PATH", "--chdir=/", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LC_ALL=C",
         f"EXPCORE_FED_ROOT_PARENT={tmp_path / 'fed'}", f"EXPCORE_FED_ROOT={tmp_path / 'fed' / 'a'}", *homeless,
         "PYTHONNOUSERSITE=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
         str(tmp_path / "venv" / "python"), "-I", str(SCRIPT), "step", "--study", str(tmp_path / "study"),
