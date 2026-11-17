@@ -76,6 +76,7 @@ class Bench:
     spawned: list = field(default_factory=list)
     alive: set = field(default_factory=set)
     guard: Any = None  # the inode guard's stand-in: (count, layout, site, environ) -> its words
+    home_guard: Any = None  # the home guard's stand-in: (site) -> its words, "" for none
     real: Any = None  # hpcfed.make_driver as the module has it, before the bench patches it
 
     def __post_init__(self) -> None:
@@ -160,8 +161,11 @@ class Bench:
     def hooks(self, **given: Any) -> Any:
         fleet = self.deploy.fleet
         guard = self.guard or (lambda count, layout, site, environ: f"inode check: stand-in for {count}")
+        home = self.home_guard or (lambda site: "")
         operate = given.get("federation", self.federation)
-        return fleet.Hooks(federation=operate, runner=lambda label: StepRunner(self, label), inode_guard=guard)
+        return fleet.Hooks(
+            federation=operate, runner=lambda label: StepRunner(self, label), inode_guard=guard, home_guard=home
+        )
 
     def run(self, *argv: str, environ: dict | None = None, **given: Any) -> tuple[int, str]:
         """`fleet.py --fleet <fleet> ARGV`, through its own `main`: its exit status and all it printed."""
