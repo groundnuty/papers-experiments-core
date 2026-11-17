@@ -96,7 +96,7 @@ def test_a_layout_that_declares_stop_seconds_says_where_the_figure_comes_from(la
         ({"provider": {"cpus": 4, "memory": "10 GB"}}, "hpc.provider.memory"),
         ({"control": {"cpus": 1}}, "hpc.control.memory: is required"),
         ({"time": "2h"}, "hpc.time"),
-        ({"time": "00:20:00"}, "must exceed twice the stop's bound"),
+        ({"time": "00:20:00", "stop_seconds": 600}, "must exceed twice the stop's bound"),
         ({"core": "elsewhere"}, "hpc.core"),
         ({"nodes": 3}, "hpc.nodes: is not a key"),
     ],

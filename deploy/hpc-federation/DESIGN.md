@@ -174,7 +174,7 @@ provider's posix storage on the same tmpfs (test data only, here).
 ```toml
 [hpc]
 time = "02:00:00"                        # the held job's --time
-stop_seconds = 600                       # a service's graceful stop bound (teardown.sh --timeout)
+stop_seconds = 50                        # a service's graceful stop bound (teardown.sh --timeout); measured, 17 Nov
 core = "login"                           # where the bootstrap and the link check run: "login" or "step" (section 9)
 zone = { cpus = 4, memory = "8g" }       # the zone's service step
 provider = { cpus = 4, memory = "10g" }  # each provider's service step (posix storage on tmpfs included)
@@ -552,16 +552,17 @@ serves both:
   study names the root's journal (`load_faults` refuses a relative one in a study directory);
 - `[faults]` for the HPC backend (M4's loader): `backend = "hpc"`, `stop_bound_s`, `journal`, `[faults.services]`
   naming every provider, and none of `compose_file`, `project`, `command` or `docker`, which that backend refuses;
-  its defaults are `settle_timeout_s = stop_bound_s + 60`, `poll_s` 10 and `relay_wait_s` 30;
+  its defaults are `settle_timeout_s = stop_bound_s + 60`, `poll_s` 10, `relay_wait_s` 30 and `command_timeout_s` 240,
+  the longest one relay verb may take (a Compose table's is 120);
 - **`@study_artifacts@`**, from `site.env`'s `HPC_STUDY_ARTIFACTS` (section 6a): the study's own directory on the nodes,
   so a template names the paths of its tool server's venv, clone and manifests under it and a public replication package
   carries no site path. A template that names it without the key is refused at the preflight, naming the variable; an
   unset key is no value, so the renderer would refuse the placeholder too, never write an empty path;
 - the values only the HPC driver fills, for a template that names them: **`@hpc_stop_bound_s@`**, `stop_seconds + 90`
-  (690 by default, section 7e); **`@hpc_settle_timeout_s@`**, `stop_bound_s + 60`; **`@hpc_command@`**, this
+  (140 by default, section 7e); **`@hpc_settle_timeout_s@`**, `stop_bound_s + 60`; **`@hpc_command@`**, this
   driver's argv prefix as a TOML array; and **`@hpc_token_margin_s@`**, the least `[tokens] margin_s` the platform
   layer's own loader accepts for the rest of the file: `up` writes the file with a provisional margin no rule refuses,
-  reads it with `load_faults` as a campaign would, and writes it again with the least that loader's rule gives (5,340 s
+  reads it with `load_faults` as a campaign would, and writes it again with the least that loader's rule gives (2,950 s
   with M4's defaults), so a measured `stop_seconds`, or a term the loader adds, moves it. A core whose loader cannot
   read the HPC `[faults]` (one without M4's backend) gets the restore's rule over the keys it knows, with the HPC
   settle time and poll;
@@ -731,13 +732,22 @@ so `/etc/hpcop-erlang-env` gives it the job's epmd port and `/root/.erlang.cooki
 distribution reaches the running node over loopback (same uid, so the shim's owner check passes). Output is captured;
 the exit status is the command's.
 
-**(e) The stop's bound:** at most `stop_seconds` (default 600, the bundle's) for the graceful stop, then supervise.py's
-SIGKILL tail (30 s), then the step's end (polled, 60 s at most): **`stop_seconds + 90` s** in all (690 by default). A
-provider stopped in about 30 s live. For backend `"hpc"` (M4's loader): the core bounds `hpcfed.py stop` by
-`settle_timeout_s`, not the 120 s command timeout; `up` renders `stop_bound_s` (section 6), from which
-`settle_timeout_s` defaults to `stop_bound_s + 60` (750), and the least `[tokens] margin_s` that loader accepts, the
-start's stop entering it as its own term (5,340 s with the defaults); `poll_s` defaults to 10 s (every status is a
-step on the one control core);
+**(e) The stop's bound:** at most `stop_seconds` (default 50) for the graceful stop, then supervise.py's SIGKILL tail
+(30 s), then the step's end (polled, 60 s at most): **`stop_seconds + 90` s** in all (140 by default). **The 50 s is
+measured:** three provider outages on one HPC federation (17 Nov) ended a service 26.1 s, 27.1 s and 33.1 s after its
+SIGTERM, and the coordinator's rule is the largest plus 50 % (33.1 x 1.5 = 49.7, so 50); the bundle's own default is
+600. For backend `"hpc"` (M4's loader): the core bounds `hpcfed.py stop` by `settle_timeout_s`, not the command
+timeout; `up` renders `stop_bound_s` (section 6), from which `settle_timeout_s` defaults to `stop_bound_s + 60` (200),
+and the least `[tokens] margin_s` that loader accepts, the start's stop entering it as its own term (2,950 s with the
+defaults); `poll_s` defaults to 10 s (every status is a step on the one control core). **A relay verb's bound is 240
+s** (`[faults] command_timeout_s`, `fault_hpc.HPC_COMMAND_TIMEOUT_S`; a Compose command's stays 120 s): in the same
+outages the relay's verb steps started 47 to 103 s after they were issued during a heal, and one round trip took
+104.6 s against the former 120 s. It is the request's `bound_s`, in the faults fingerprint after its default, and a
+verb past it is answered `timed_out` and read as a command with no answer, never as done. **A control step's bound
+counts its launch wait:** a step's client is waited for from its start, so the stop's control step (`stop_seconds` +
+60 s, 110 s) and `down`'s teardown step (`stop_seconds` + 120 s, 170 s) hold the stop and whatever the step waits to
+start; the measured launch waits of 47 to 103 s plus a 33 s stop come to 136 s, past the first. A stop whose control
+step times out is unconfirmed (never taken as done) and the injector journals it as of unknown outcome;
 `restart_link`'s bound gets 60 s more (the step's launch and the client's end polling), and the heal's reserves count
 it. **`stop_seconds` is to be set from live measurement**: the core journals every stop's evidence, confirmed or not
 (the injection's `injected` line, or its `stop_unknown` line for a stop that answered unconfirmed, key `stop`), so a
