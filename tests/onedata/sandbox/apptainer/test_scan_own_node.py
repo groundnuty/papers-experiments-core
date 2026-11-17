@@ -12,7 +12,7 @@ from apptainer_support import make_settings, make_spec, start
 from fake_node import OWN_FQDN, OWN_HOST, FakeNode
 
 from expcore_onedata.sandbox import cellhost, gate
-from expcore_onedata.sandbox.api import DataPathMode, SandboxSpec
+from expcore_onedata.sandbox.api import DataPathMode, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.apptainer import loopback
 from expcore_onedata.sandbox.apptainer.node import LocalNode
 from expcore_onedata.sandbox.cellhost import OwnNames
@@ -83,27 +83,98 @@ def test_o73_a_name_the_federation_declares_is_never_scanned():
     assert found == ()
 
 
-def test_o73_the_local_node_reads_its_host_name_and_its_fqdn_from_the_system(monkeypatch):
-    """O73: the node is asked for its own names, both as the system says them; a lookup that fails is skipped."""
-    monkeypatch.setattr(loopback.socket, "gethostname", lambda: "CN-Own-N01")
-    monkeypatch.setattr(loopback.socket, "getfqdn", lambda: "cn-own-n01.cluster.example.invalid")
-    assert LocalNode().own_names() == OwnNames(("CN-Own-N01", "cn-own-n01.cluster.example.invalid"))
+def _system(monkeypatch, host, answer):
+    """The node's own system: `gethostname` says `host`; `gethostbyaddr`, asked about that host name, answers the
+    `(primary name, aliases, addresses)` of `answer`, or raises it."""
+    monkeypatch.setattr(loopback.socket, "gethostname", lambda: host)
+
+    def lookup(name):
+        assert name == host, "the lookup is of the node's own host name"
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(loopback.socket, "gethostbyaddr", lookup)
+
+
+def test_o73_the_local_node_reads_its_host_name_and_every_name_its_resolver_gives(monkeypatch):
+    """O73: the node is asked for its own names: its host name, then the resolver's primary name and each alias, as the
+    system says them, none twice in any case. A node of several dotted names has each one scanned (`getfqdn` gave only
+    the first)."""
+    _system(
+        monkeypatch,
+        "CN-Own-N01",
+        ("cn-own-n01.cluster.example.invalid", ["cn-own-n01.ib.example.invalid", "cn-own-n01", ""], ["198.51.100.9"]),
+    )
+    assert LocalNode().own_names() == OwnNames(
+        ("CN-Own-N01", "cn-own-n01.cluster.example.invalid", "cn-own-n01.ib.example.invalid")
+    )
+
+
+@pytest.mark.parametrize("error", [OSError("no resolver"), TimeoutError("slow"), ValueError("odd")])
+def test_o73_a_resolver_that_fails_is_unread_by_its_reason_and_the_host_name_stands_alone(monkeypatch, error):
+    """O73: whatever a lookup raised, the reason recorded is `fqdn_failed`, never the exception's text."""
+    _system(monkeypatch, "CN-Own-N01", error)
+    assert LocalNode().own_names() == OwnNames(("CN-Own-N01",), ("fqdn_failed",))
+    _system(monkeypatch, "CN-Own-N01", loopback.socket.herror(1, "Unknown host"))
+    assert LocalNode().own_names() == OwnNames(("CN-Own-N01",), ("fqdn_failed",))
+
+
+@pytest.mark.parametrize(
+    ("answer", "names"),
+    [
+        (("cn-own-n01", [], ["198.51.100.9"]), ("cn-own-n01",)),
+        (("cn-own-n01", ["cn-own-n01-ib"], []), ("cn-own-n01", "cn-own-n01-ib")),
+        (("198.51.100.9", [], []), ("cn-own-n01", "198.51.100.9")),
+    ],
+)
+def test_o73_an_answer_with_no_qualified_name_says_so_in_unread(monkeypatch, answer, names):
+    """O73: a resolver that gives the host name no dotted name (a hosts file with the short name alone) leaves the one
+    label form scanned, which never matches the node's name followed by a domain. `getfqdn` returned the bare host
+    name then without an error, so the facts said nothing was missed; the reason is `fqdn_unqualified`. An address is
+    no qualified name."""
+    _system(monkeypatch, "cn-own-n01", answer)
+    assert LocalNode().own_names() == OwnNames(names, ("fqdn_unqualified",))
+
+
+def test_o73_a_host_name_that_is_already_qualified_leaves_nothing_unread(monkeypatch):
+    """O73: a kernel host name that holds its domain is a qualified name: nothing is unread and the name stands once."""
+    name = "cn-own-n01.cluster.example.invalid"
+    _system(monkeypatch, name, (name, [], []))
+    assert LocalNode().own_names() == OwnNames((name,))
+
+
+@pytest.mark.parametrize("host", ["", None])
+def test_o73_a_host_name_that_cannot_be_read_is_unread_and_the_resolver_is_not_asked(monkeypatch, host):
+    """O73: with no host name there is nothing to look up: both forms are unread, by reason, and no lookup is made."""
 
     def broken():
-        raise OSError("no resolver")
+        if host is None:
+            raise OSError("no host name")
+        return host
 
-    monkeypatch.setattr(loopback.socket, "getfqdn", broken)
-    assert LocalNode().own_names() == OwnNames(("CN-Own-N01",), ("fqdn_failed",))
     monkeypatch.setattr(loopback.socket, "gethostname", broken)
+
+    def never(_name):
+        raise AssertionError("the resolver was asked with no host name")
+
+    monkeypatch.setattr(loopback.socket, "gethostbyaddr", never)
     assert LocalNode().own_names() == OwnNames((), ("host_name_failed", "fqdn_failed"))
 
 
+def test_o73_the_resolver_s_bound_is_short_and_finite():
+    """O73: the production bound on the lookup is a positive number of seconds that a start can afford."""
+    assert 0 < loopback.FQDN_TIMEOUT_S <= 10
+
+
 def test_o73_a_resolver_that_hangs_costs_the_bound_and_leaves_the_host_name_alone(monkeypatch):
-    """O73: `getfqdn` runs in a thread of its own with a short bound: a resolver that never answers delays a start by
+    """O73: the lookup runs in a thread of its own with a short bound: a resolver that never answers delays a start by
     that bound and no more, the host name is scanned alone, and the reason, not the name, says what was not read."""
     release = threading.Event()
     monkeypatch.setattr(loopback.socket, "gethostname", lambda: "cn-own-n01")
-    monkeypatch.setattr(loopback.socket, "getfqdn", lambda: release.wait(30) and "never.answered.invalid")
+    monkeypatch.setattr(
+        loopback.socket, "gethostbyaddr", lambda _name: release.wait(30) and ("never.answered.invalid", [], [])
+    )
     monkeypatch.setattr(loopback, "FQDN_TIMEOUT_S", 0.2)
     try:
         began = time.monotonic()
@@ -116,11 +187,20 @@ def test_o73_a_resolver_that_hangs_costs_the_bound_and_leaves_the_host_name_alon
 
 def test_o73_a_lookup_that_answers_in_time_is_read_whole_and_a_thread_that_ends_is_not_left_behind(monkeypatch):
     """O73: the bound costs a quick lookup nothing: its answer is read, nothing is unread, no thread of ours stays."""
-    monkeypatch.setattr(loopback.socket, "gethostname", lambda: "cn-own-n01")
-    monkeypatch.setattr(loopback.socket, "getfqdn", lambda: "cn-own-n01.cluster.example.invalid")
+    _system(monkeypatch, "cn-own-n01", ("cn-own-n01.cluster.example.invalid", [], []))
     before = threading.active_count()
     assert loopback.own_names(timeout_s=5) == OwnNames(("cn-own-n01", "cn-own-n01.cluster.example.invalid"))
     assert threading.active_count() == before
+
+
+@pytest.mark.parametrize(
+    ("name", "qualified"),
+    [("cn-own-n01.cluster.example.invalid", True), ("cn-own-n01", False), ("", False), ("198.51.100.9", False),
+     ("2001:db8::1", False)],
+)  # fmt: skip
+def test_o73_a_qualified_name_holds_a_domain_and_is_no_address(name, qualified):
+    """O73: what makes a node's name read as a fully qualified one."""
+    assert cellhost.qualified(name) is qualified
 
 
 def test_o73_the_gate_scans_for_the_agent_node_after_the_federation_s_nodes(node, tmp_path):
@@ -206,3 +286,70 @@ def test_o73_the_node_s_names_are_in_the_spec_of_no_run_and_in_no_record(node, t
         assert OWN_HOST not in repr(spec)
     finally:
         box.stop()
+
+
+def test_o73_the_node_is_asked_once_for_its_names_however_the_start_goes(node, tmp_path):
+    """O73: one lookup serves the refusal check and the gate's list (a lookup is bounded, never repeated)."""
+    _scanned(node, tmp_path)
+    assert node.own_asked == 1
+
+
+def test_o73_a_node_whose_resolver_gives_no_qualified_name_says_so_in_the_run_s_facts(node, tmp_path, monkeypatch):
+    """O73: end to end, a node that reads its own system and finds no dotted name scans its one label form and records
+    `fqdn_unqualified`: the gate's miss of `<label>.<domain>` is no longer a silent one."""
+    _system(monkeypatch, "cn-own-n01", ("cn-own-n01", [], []))
+    node.own_names = loopback.own_names  # this node reads the system, as `LocalNode` does
+    box = start(node, make_settings(tmp_path), _spec())
+    try:
+        assert node.gates[-1].config["scan_names"] == [*SERVICES, "cn-own-n01"]
+        own = box.metadata()["infrastructure_facts"]["own_node_scan"]
+        assert own == {"version": 1, "forms": 1, "unread": ["fqdn_unqualified"]}
+    finally:
+        box.stop()
+
+
+def test_o73_each_dotted_name_the_resolver_gives_is_counted_in_an_answer(node, tmp_path, monkeypatch):
+    """O73: a node of two dotted names (its cluster name and its fabric name) has a leak of either one counted; with
+    the first alone, as `getfqdn` gave, a leak of the other counted 0."""
+    _system(
+        monkeypatch,
+        "cn-own-n01",
+        ("cn-own-n01.cluster.example.invalid", ["cn-own-n01.ib.example.invalid"], ["198.51.100.9"]),
+    )
+    node.own_names = loopback.own_names
+    names = _scanned(node, tmp_path)
+    gate.CFG.clear()
+    gate.CFG["scan_names"] = names
+    try:
+        for leak in (
+            "cn-own-n01.cluster.example.invalid",
+            "https://cn-own-n01.ib.example.invalid:8443/x",
+            "cn-own-n01",
+        ):
+            assert gate._node_name_hits(json.dumps({"domain": leak}).encode()) == 1, leak
+    finally:
+        gate.CFG.clear()
+
+
+@pytest.mark.parametrize(
+    "own",
+    [
+        ("sandbox",),
+        ("Sandbox.cluster.example.invalid",),
+        ("cn-own-n01", " sandbox.cluster.example.invalid "),
+        ("cn-own-n01.cluster.example.invalid", "SANDBOX"),
+    ],
+)
+def test_o73_an_agent_node_named_as_the_cell_is_refused_before_anything_is_created(node, tmp_path, own):
+    """O73: a node whose host name, or the first label of whose fully qualified name, is the declared one would show the
+    cell its own real name and have it counted by nobody: the start is refused before the first directory is made or
+    anything ran, and the message names no node."""
+    node.own_hosts = own
+    settings = make_settings(tmp_path)
+    with pytest.raises(StartRefused, match="agent node") as refused:
+        start(node, settings, _spec())
+    for word in ("cn-own-n01", "cluster.example.invalid"):
+        assert word not in str(refused.value)
+    assert node.execs == []
+    assert node.gates == []
+    assert list(settings.work_root.iterdir()) == []

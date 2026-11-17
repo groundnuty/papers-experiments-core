@@ -197,6 +197,7 @@ class FakeNode:
         self.mount_table_unreadable = False
         self.own_hosts: tuple[str, ...] | Exception = (OWN_HOST, OWN_FQDN)  # what `own_names` answers (O73)
         self.own_unread: tuple[str, ...] = ()  # the reasons a form of them could not be read
+        self.own_asked = 0  # how many times `own_names` was called
         self.readings: Any = READINGS  # what `node_readings` answers (O87); a test sets another, or `readings_error`
         self.readings_error: Exception | None = None
         self.tool_server_host: Any = None  # the tool server's host's readings; None: the node's own host
@@ -306,6 +307,7 @@ class FakeNode:
         return {"kernel": "invented", "apptainer": "apptainer version invented"}
 
     def own_names(self) -> OwnNames:
+        self.own_asked += 1
         if isinstance(self.own_hosts, Exception):
             raise self.own_hosts
         return OwnNames(self.own_hosts, self.own_unread)
