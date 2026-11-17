@@ -91,6 +91,56 @@ FORGING = {
         "import os\nd = [x for x in os.listdir('/') if x.startswith('expcore')]",
         [("channel_path", "/expcore-* prefix")],
     ),
+    "an assignment to a socket attribute": (
+        "import socket\nsocket.socket = FakeSocket",
+        [("channel_patch", "socket or client attribute assignment")],
+    ),
+    "a setattr on the socket module": (
+        "import socket\nsetattr(socket, 'socket', FakeSocket)",
+        [("channel_patch", "socket or client attribute assignment")],
+    ),
+    "an assignment to an attribute of the client module": (
+        "import expcore_readlog_client\nexpcore_readlog_client.log_read = lambda *a, **k: None",
+        [("client", "expcore_readlog_client"), ("channel_patch", "socket or client attribute assignment")],
+    ),
+    "a setattr on the client module": (
+        "setattr(expcore_readlog_client, 'log_read', noop)",
+        [("client", "expcore_readlog_client"), ("channel_patch", "socket or client attribute assignment")],
+    ),
+    "an edit of the table of loaded modules": (
+        "import sys\nsys.modules['m'] = Fake()",
+        [("channel_patch", "sys.modules")],
+    ),
+    "a read of the table of loaded modules": (
+        "import sys\nclient = sys.modules.get('m')",
+        [("channel_patch", "sys.modules")],
+    ),
+    "a reload of a module": (
+        "import importlib\nimportlib.reload(m)",
+        [("channel_patch", "module reload or load by path")],
+    ),
+    "a module loaded from a file path": (
+        "import importlib.util as u\nspec = u.spec_from_file_location('m', p)\nmod = u.module_from_spec(spec)",
+        [("channel_patch", "module reload or load by path")],
+    ),
+    "a module loaded by a source loader": (
+        "from importlib.machinery import SourceFileLoader\nSourceFileLoader('m', p).load_module()",
+        [("channel_patch", "module reload or load by path")],
+    ),
+    "a monkeypatch": (
+        "def run(monkeypatch):\n    monkeypatch.setattr('socket.socket', fake)",
+        [("channel_patch", "patch or mock")],
+    ),
+    "a mock patch": (
+        "from unittest import mock\nwith mock.patch('socket.socket'):\n    run()",
+        [("channel_patch", "patch or mock")],
+    ),
+    "an import of unittest.mock": ("from unittest.mock import patch", [("channel_patch", "patch or mock")]),
+    "an override in builtins": ("import builtins\nbuiltins.open = fake", [("channel_patch", "builtins override")]),
+    "an override through the builtins name of a module": (
+        "__builtins__['open'] = fake",
+        [("channel_patch", "builtins override")],
+    ),
     "environment of any process": (
         "print(open('/proc/self/environ', 'rb').read())",
         [("proc_environ", "/proc/*/environ")],
@@ -140,6 +190,13 @@ ORDINARY = {
     "a listing of the root": "import os\nprint(os.listdir('/'), list(os.scandir('/')))",
     "a network datagram socket by keywords": "socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)",
     "a shell send over the network": "os.system('echo hi | nc -u 127.0.0.1 9')",
+    "an import of a module by name": "import importlib\nm = importlib.import_module('json')",
+    "settings and comparisons of the socket module": (
+        "import socket\nsocket.setdefaulttimeout(3)\nassert socket.AF_INET == 2\nok = socket.timeout is not None"
+    ),
+    "an attribute of an object that has a socket": "self.socket.timeout = 3",
+    "a path added to the module search path": "import sys\nsys.path.insert(0, '/work')",
+    "the unittest module without its mock": "import unittest\nclass Case(unittest.TestCase):\n    pass",
     "a network socket": "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)",
     "a datagram socket of the network family": "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)",
     "a stream socket of the Unix family": "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
