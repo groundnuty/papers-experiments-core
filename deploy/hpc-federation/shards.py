@@ -1793,16 +1793,25 @@ def _copy_problem(local: Path, name: str, size: int, digest: str) -> str | None:
         return "unreadable"
 
 
+def _is_archive_name(name: str) -> bool:
+    """Whether `name` is a shard's archive as the manifest lists it: `<label>.out.tar`, a name of the directory."""
+    return name.endswith(".out.tar") and "/" not in name and len(name) > len(".out.tar")
+
+
 def _extras(local: Path, named: set[str]) -> tuple[str, ...]:
     """What `local` holds that looks like what the manifest names and it does not: an archive or an archive manifest
-    (`*.out.tar`, `*.out.json`) in the directory, and a file in a shard's `journals/` (a step that ran after `collect`).
-    Only a warning: another campaign's files, or a later step's, are not this pull's to fail."""
+    (`*.out.tar`, `*.out.json`) in the directory, and a file in the `journals/` of any shard whose archive the manifest
+    names (a step that ran after `collect`, whether or not the shard had a journal then). Only a warning: another
+    campaign's files, or a later step's, are not this pull's to fail."""
     found = [
         f.name
         for f in local.iterdir()
         if f.name.endswith((".out.tar", ".out.json", *ROOT_SUFFIXES)) and f.name not in named
     ]
     journal_dirs = {"/".join(parts[:2]) for parts in (name.split("/") for name in named) if parts[1:2] == [JOURNALS]}
+    # a shard collected with no journal has none named, and a step that ran after the collect has left one: so the
+    # journals directory of every shard with an archive in the manifest is searched, not only those named by a file
+    journal_dirs |= {f"{name.removesuffix('.out.tar')}/{JOURNALS}" for name in named if _is_archive_name(name)}
     for directory in sorted(journal_dirs):  # `<label>/journals`, once, whatever lies under it
         base = local / directory
         if base.is_symlink() or not base.is_dir():
