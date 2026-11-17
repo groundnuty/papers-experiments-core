@@ -16,23 +16,36 @@ import stat
 from types import SimpleNamespace
 
 import pytest
+from apptainer_support import short_dir
 from readlog_docker_host import Collector
-from readlog_rig import load_client, needs_unix, short_dir
+from readlog_rig import load_client, needs_unix
 from sandbox_support import make_spec, start_options
 
 from expcore_onedata.readlog import files, reader
 from expcore_onedata.readlog.instrument import ReadLog
 from expcore_onedata.sandbox import containers as C
+from expcore_onedata.sandbox.apptainer import sockets
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 
 pytestmark = needs_unix
+
+# Here the real collector runs as a HOST process (a container binds its own path, so in production the host path is no
+# socket address), and binds `<root>/w/<run id>/readlog-sock/sock`: `root` may hold what is left of a Unix socket's 107
+# bytes after "/w/", the longest run id and the socket's own suffix. A pytest path is too long on a batch node, where
+# the runner's TMPDIR is a per-run directory, so `short_dir` tries another base, and fails (never skips) when none fits.
+ROOT_BYTES = (
+    sockets.SOCKET_PATH_MAX_BYTES
+    - len("/w/")
+    - sockets.RUN_ID_MAX_BYTES
+    - len(f"/{sockets.READLOG_SOCK_DIR}/{sockets.SOCKET_NAME}")
+)
 
 
 @pytest.fixture
 def short_world(world):
     """The `world` with a work root of a short path: the collector's socket lives under the run's directory, and a Unix
     socket's path is at most 107 bytes."""
-    root = short_dir()
+    root = short_dir(limit=ROOT_BYTES)
     yield SimpleNamespace(
         host=world.host,
         config=world.config,
