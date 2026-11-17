@@ -110,28 +110,30 @@ def test_o57_up_submits_with_the_nodes_of_the_accounts_other_live_federations_ex
     nodes = rig.state()["allocation"]["nodes"]
     assert len(nodes) == 6
     assert not set(nodes) & excluded
+    assert rig.state()["sandbox"]["node"] not in excluded  # the agent's node keeps off them too
     assert rig.state()["allocation"]["excluded_nodes"] == 6
     assert any("6 node(s)" in line and "excluded" in line for line in rig.said)
     assert all(names_no_node(line) for line in rig.said if "excluded" in line)
     assert rig.calls("squeue")[0] == ME  # read-only, and before anything is submitted
-    order = [c[0] for c in rig.fake.calls]
-    assert order.index("squeue") < order.index("sbatch") < order.index("scontrol")
+    order = [" ".join(c[:3]) if c[0] == "scontrol" else c[0] for c in rig.fake.calls]
+    assert order.index("squeue") < order.index("sbatch") < order.index("scontrol show job")
 
 
-def test_o57_the_services_job_alone_excludes_and_the_agents_component_and_job_do_not(hpc, tmp_path, site):
-    """O57: only the services' job carries `--exclude` (a heterogeneous job's component 1 and the agent's own job
-    under "separate" do not): the agent's node runs no Couchbase, and the exclusion costs capacity."""
+def test_o57_every_component_and_job_of_the_up_excludes_the_same_nodes(hpc, tmp_path, site):
+    """O57: the services' job, the agent's component of a heterogeneous job (Slurm passes no `--exclude` from one
+    component to the next) and the agent's own job under "separate" all keep off the other federations' nodes: an
+    agent's sandbox never runs on a node that hosts an Onedata service, another federation's included."""
     other = [OtherJob("5001", OTHER, "RUNNING", ("node01", "node02"))]
     for index, layout in enumerate((LAYOUT, SEPARATE_LAYOUT)):
         (tmp_path / str(index) / "fed").mkdir(parents=True)
         rig = Rig(hpc, tmp_path / str(index), site, layout, FakeSlurm(others=other, nodes=POOL))
         rig.up()
-        first, *rest = rig.calls("sbatch")
-        cut = first.index(":") if ":" in first else len(first)  # a heterogeneous job's options of component 1 follow
-        assert "--exclude=node01,node02" in first[:cut], layout.stem
-        assert not any(word.startswith("--exclude") for word in first[cut:]), layout.stem
-        assert not any(word.startswith("--exclude") for argv in rest for word in argv), layout.stem
-        assert len(rest) == (1 if layout == SEPARATE_LAYOUT else 0)
+        asked = [word for argv in rig.calls("sbatch") for word in argv]
+        assert asked.count("--exclude=node01,node02") == 2, layout.stem  # a component, or a job, each
+        assert asked.count("--nodes=1") >= 1
+        agent = rig.state()["sandbox"]["node"]
+        assert agent not in ("node01", "node02"), layout.stem
+        assert not set(rig.state()["allocation"]["nodes"]) & {"node01", "node02"}, layout.stem
 
 
 def test_o57_up_with_no_other_federation_live_asks_for_no_exclusion(hpc, tmp_path, site):
@@ -226,6 +228,22 @@ def test_o57_the_refusal_releases_both_held_jobs_when_the_agents_node_is_a_job_o
     with pytest.raises(hpc.slurm.SlurmError, match=r"providers\[0\]"):
         rig.up()
     assert sorted(fake.cancelled) == ["4242", "4343"]
+    assert fake.sruns == []
+
+
+def test_o57_an_agent_placed_on_another_federations_node_is_refused_too(hpc, tmp_path, site):
+    """O57: the agent's node is checked as the services' are: only it is on a node another federation holds (the
+    seventh, the first six being this one's services), and the refusal names the agent and no service."""
+    pending = OtherJob("5001", OTHER, "PENDING")
+    running = OtherJob("5001", OTHER, "RUNNING", ("node07",))
+    fake = FakeSlurm(others_by_read=[[pending], [running]])
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(hpc.slurm.SlurmError) as refused:
+        rig.up()
+    assert "agent" in str(refused.value)
+    assert "zone" not in str(refused.value)
+    assert "providers[" not in str(refused.value)
+    assert fake.cancelled == ["4242"]
     assert fake.sruns == []
 
 
@@ -341,8 +359,9 @@ def test_o57_a_fleets_members_keep_their_services_off_the_nodes_of_the_members_a
     deploy, ca, tmp_path, monkeypatch
 ):
     """O57: a fleet's members are federations of one account on one cluster: each member's `up` reads the others' live
-    jobs (the cluster here is one pool the members' fake Slurms share) and excludes their nodes, so fed-2's services
-    take none of fed-1's, nor fed-3's any of the first two's; the count is in each member's state and in its log."""
+    jobs (the cluster here is one pool the members' fake Slurms share) and excludes their nodes, so fed-2's nodes,
+    its agent's included, are none of fed-1's, nor fed-3's any of the first two's; the count is in each member's state
+    and in its log."""
     import json
 
     bench = make_bench(deploy, tmp_path, ca, monkeypatch)
@@ -358,10 +377,11 @@ def test_o57_a_fleets_members_keep_their_services_off_the_nodes_of_the_members_a
         nodes = set(fake.placed(services, 0))
         assert len(nodes) == 6, label
         assert not nodes & taken, label
+        assert not set(fake.placed(agent, 0)) & taken, label  # an agent never runs beside another federation's node
         recorded = json.loads((bench.root(label) / "hpc-federation.json").read_text(encoding="utf-8"))
         assert recorded["allocation"]["excluded_nodes"] == len(taken)
         log = (bench.fleet / "logs" / f"{label}.up.log").read_text(encoding="utf-8")
-        said = [line for line in log.splitlines() if "excluded" in line]
+        said = [line for line in log.splitlines() if "node(s)" in line and "excluded" in line]
         assert bool(said) == bool(index), label
         assert all(names_no_node(line) for line in said), label
         taken |= nodes | set(fake.placed(agent, 0))
@@ -391,5 +411,7 @@ def test_o57_two_members_that_raced_and_share_a_node_leave_the_later_one_refused
     assert code != 0
     assert second.cancelled == [job_ids("fed-2")[0]] or job_ids("fed-2")[0] in second.cancelled
     assert first.cancelled == []
-    assert "zone" in printed
+    log = (bench.fleet / "logs" / "fed-2.up.log").read_text(encoding="utf-8")
+    assert "zone" in log  # the member's own log has the refusal; the fleet's line is the log's last
+    assert names_no_node(log)
     assert names_no_node(printed)

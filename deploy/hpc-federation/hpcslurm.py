@@ -229,7 +229,9 @@ class Allocation:
     time: str
     time_s: int
     het: Tuple[Shape, ...] = ()
-    exclude: Tuple[str, ...] = ()  # the nodes of other federations' live jobs (hpcexclude): component 0's `--exclude`
+    exclude: Tuple[
+        str, ...
+    ] = ()  # the nodes of other federations' live jobs (hpcexclude): each component's `--exclude`
 
     def shapes(self) -> Tuple[Shape, ...]:
         """Every component's shape, component 0 first."""
@@ -239,8 +241,8 @@ class Allocation:
         """sbatch's argv. A further component follows a `:` and names its account, partition and time again (Slurm
         propagates no partition, nodes or cores to it, and the read-back checks what it recorded) with its own nodes,
         cores and memory; `--wrap` stands once, in component 0's options, as sbatch builds the script once. `--exclude`
-        is component 0's alone, and only when it has nodes to name: without them the argv is what it was before the
-        option existed."""
+        names the same nodes in every component, since Slurm does not pass it from one to the next, and only when there
+        are nodes to name: without them the argv is what it was before the option existed."""
         if not all(NODE.fullmatch(node) for node in self.exclude):
             raise SlurmError("an excluded node's name is not one an sbatch argv may carry")
         exclude = [f"--exclude={','.join(self.exclude)}"] if self.exclude else []
@@ -272,6 +274,7 @@ class Allocation:
                 "--ntasks-per-node=1",
                 f"--cpus-per-task={shape.cpus_per_node}",
                 f"--mem={shape.memory_mib}M",
+                *exclude,
             ]
         return argv
 

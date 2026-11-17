@@ -302,7 +302,7 @@ class Driver(Down):
 
     def allocation(self, state: Mapping[str, Any], site: Site, exclude: Sequence[str] = ()) -> Allocation:
         """The held job: the service nodes, and the agent's node as its component 1 under `het`. `exclude` are the
-        nodes of other federations' live jobs, which only this job (the services') keeps off."""
+        nodes of other federations' live jobs, which each of its components keeps off."""
         node, agent = self.settings.node(), self.settings.sandbox_node()
         het = agent is not None and self.settings.sandbox_placement == "het"
         return Allocation(
@@ -318,8 +318,11 @@ class Driver(Down):
             exclude=tuple(exclude),
         )
 
-    def sandbox_allocation(self, state: Mapping[str, Any], site: Site) -> Optional[Allocation]:
-        """The agent's own held job under `separate` (one node of its own shape), else None."""
+    def sandbox_allocation(
+        self, state: Mapping[str, Any], site: Site, exclude: Sequence[str] = ()
+    ) -> Optional[Allocation]:
+        """The agent's own held job under `separate` (one node of its own shape), else None. It keeps off the same
+        nodes as the services' job: an agent's sandbox never runs on a node that hosts an Onedata service."""
         record, agent = state.get("sandbox"), self.settings.sandbox_node()
         if record is None or agent is None or record["placement"] != "separate":
             return None
@@ -332,6 +335,7 @@ class Driver(Down):
             memory_mib=agent.memory_mib,
             time=self.settings.time,
             time_s=self.settings.time_s,
+            exclude=tuple(exclude),
         )
 
     # -- up -----------------------------------------------------------------------------------------------------------
@@ -368,7 +372,7 @@ class Driver(Down):
         excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
         state = self.store.create(self.initial_state(site, tree, len(excluded)))
         self.make_storage(state)  # recorded above, made before any job exists to bill for it
-        asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site)
+        asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
         held = [(self.submit(asked, "allocation"), asked)]
         if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
             held.append((self.submit(alone, "sandbox"), alone))
@@ -378,7 +382,7 @@ class Driver(Down):
         records = [(job, shape, record) for job, wanted in held for shape, record in zip(
             wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
         placed = self.placed_nodes(records)
-        self.keep_off_other_federations([job for job, _ in held], placed[0], state)
+        self.keep_off_other_federations([job for job, _ in held], placed)
         self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
         self.node_facts()
         self.zone_up()
@@ -414,23 +418,24 @@ class Driver(Down):
             "keeping it pending for lack of others)"
         )
 
-    def keep_off_other_federations(
-        self, jobs: Sequence[str], service_nodes: Sequence[str], state: Mapping[str, Any]
-    ) -> None:
-        """Once the held job runs and before any step, no service node may hold another live federation's job: two
-        ups that read the account's jobs at once both excluded nothing. One that does is refused, every held job of
-        this up cancelled by its own id, and the roles named (the zone, providers[i]), never a host. Fail closed: with
-        the jobs unreadable nothing proves the nodes are this federation's own, and the same release follows."""
+    def keep_off_other_federations(self, jobs: Sequence[str], placed: Sequence[Sequence[str]]) -> None:
+        """Once the held jobs run and before any step, none of this federation's nodes may hold another live
+        federation's job (a service's, or an agent's: an agent never runs beside a service): two ups that read the
+        account's jobs at once both excluded nothing. One that does is refused, every held job of this up cancelled
+        by its own id, and the roles named (the zone, providers[i], the agent), never a host. `placed` is each
+        component's nodes, the services' first. Fail closed: with the jobs unreadable nothing proves the nodes are
+        this federation's own, and the same release follows."""
         try:
-            others = hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs)
+            others = set(hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs))
         except SlurmError as error:
             raise SlurmError(f"{error}; {self.release(jobs)}") from None
-        roles = [r for r in state["roles"] if state["services"][r]["kind"] != "sandbox"]
-        shared = [hpcexclude.role(index) for index, node in enumerate(service_nodes[: len(roles)]) if node in others]
+        held = [(hpcexclude.role(index), node) for index, node in enumerate(placed[0])]
+        held += [(hpcexclude.AGENT, node) for nodes in placed[1:] for node in nodes]
+        shared = [role for role, node in held if node in others]
         if shared:
             raise SlurmError(
-                f"{', '.join(shared)} would run on a node another live federation of this account holds (Couchbase's "
-                f"port is one per node); no service started, and {self.release(jobs)}"
+                f"{', '.join(shared)} would run on a node another live federation of this account holds, and two "
+                f"federations never share one; no service started, and {self.release(jobs)}"
             )
 
     def release(self, jobs: Sequence[str]) -> str:

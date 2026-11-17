@@ -85,6 +85,9 @@ def nodes_of(jobs: Iterable[LiveJob], own: Sequence[str] = ()) -> List[str]:
     return sorted({node for job in jobs if job.job not in own for node in job.nodes})
 
 
+AGENT = "agent"  # the agent's node, which is no service's and never runs beside one (README, "The uid is the boundary")
+
+
 def role(index: int) -> str:
     """The role of the held job's `index`th service node, in its order: the zone, then each provider by its place in
     the layout's `providers` (a name of the layout is never repeated)."""
