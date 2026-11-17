@@ -73,12 +73,12 @@ def test_c40_a_failed_start_with_a_diagnostic_is_kept_with_its_instrument_and_ph
 
 def test_c40_a_diagnostic_is_withheld_when_the_redaction_context_is_not_known_to_be_whole():
     """C40: never a diagnostic redacted against a partial list of the run's secrets: when the executor has not told the
-    core its secrets (and `record_attempt` has not given the whole context), the snapshot keeps the phase and the
-    instrument and says why it holds no evidence."""
+    core its secrets (and `record_attempt` has not given the whole context), the snapshot keeps the phase and says why
+    it holds no evidence; the instrument's name is the study's own word and can be a secret only the executor knows,
+    so it is not kept either."""
     kept = snapshot_of(failed_start(), plain(), complete=False)
     assert kept == {
         "phase": "start",
-        "instrument": "state_inducer",
         "ok": False,
         "error": "Withheld",
         "why": WITHHELD,
@@ -87,9 +87,11 @@ def test_c40_a_diagnostic_is_withheld_when_the_redaction_context_is_not_known_to
     assert json.dumps(SEEN) not in json.dumps(kept)
 
 
-def test_c40_a_failed_start_with_nothing_to_redact_is_kept_whatever_the_context():
-    """C40: an instrument that gave no diagnostic has nothing to redact: the phase and the instrument are kept."""
-    assert snapshot_of(failed_start(None), plain(), complete=False) == {"phase": "start", "instrument": "state_inducer"}
+def test_c40_a_failed_start_with_no_diagnostic_keeps_the_instrument_only_when_the_context_is_whole():
+    """C40: an instrument that gave no diagnostic has nothing to redact, but its name is redacted against the context
+    like any text: without a whole context only the phase is kept, so the start is still counted as a start."""
+    assert snapshot_of(failed_start(None), plain(), complete=False) == {"phase": "start"}
+    assert snapshot_of(failed_start(None), plain(), complete=True) == {"phase": "start", "instrument": "state_inducer"}
 
 
 def test_c40_a_failed_start_without_a_diagnostic_is_kept_as_the_instrument_that_failed():

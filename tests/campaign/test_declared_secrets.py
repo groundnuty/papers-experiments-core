@@ -20,6 +20,7 @@ from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import record_run
 from expcore.campaign.export import export_run_state
 from expcore.campaign.markers import read_marker
+from expcore.campaign.start_diagnostic import WITHHELD
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.models.adapters import ModelTurn, ToolCall
@@ -111,16 +112,12 @@ def test_c40_a_secret_named_only_to_record_run_never_reaches_the_row_the_marker_
     report = report_of(export)
     assert SECRET not in report
     stored = json.loads(row["diagnostic"])
-    assert (stored["phase"], stored["instrument"], stored["ok"], stored["error"]) == (
-        "start",
-        "state_inducer",
-        False,
-        "Withheld",
-    )
+    assert (stored["phase"], stored["ok"], stored["error"]) == ("start", False, "Withheld")
+    assert "instrument" not in stored
     assert "diagnostic" not in stored
     assert "declare_secrets" in stored["why"]
     assert (row["state"], row["charged"], row["infra_kind"]) == ("infra_fail", 1, "sandbox")
-    assert "| state_inducer | sandbox | infra_fail | 1 | 1 | 1 |" in report  # counted, and not kept
+    assert "| - | sandbox | infra_fail | 1 | 1 | 1 |" in report  # counted, with no instrument named, and not kept
 
 
 def test_c40_declaring_nothing_says_there_is_nothing_more_and_the_diagnostic_is_kept_redacted(tmp_path, monkeypatch):
@@ -310,17 +307,18 @@ def test_c40_the_environment_an_executor_declares_is_kept_as_it_is_redacted_from
     assert "zq" not in seen[0]
 
 
-def test_c40_a_withheld_diagnostic_keeps_no_instrument_name_that_is_a_secret(tmp_path, monkeypatch):
-    """C40: withholding keeps the phase and the instrument, and those go through the redactor too: an instrument whose
-    name is the value of a secret of the environment is `[redacted]` in the row, the marker and the export, as it was
-    before diagnostics were withheld."""
-    monkeypatch.setenv("EXAMPLE_API_KEY", "probe_credential_1234")
+def test_c40_a_withheld_snapshot_keeps_no_instrument_name_a_secret_only_record_run_would_name(tmp_path):
+    """C40: the instrument's name is the study's own word, and can be a secret only the executor knows (named to
+    `record_run`, which a failed start never reaches): withheld, the snapshot keeps the phase alone, so the name is in
+    no row, marker, export or report."""
+    name = "executor_only_credential_0123"
 
     class Named(Inducer):
-        namespace = "probe_credential_1234"
+        namespace = name
 
     async def executor(request):
         start_instruments([Named()], {"run_key": request.run_key})  # never declares: the diagnostic is withheld
+        await record_run(request, [], "s", "u", FakeExecutor().config, code=dict(CODE), secrets=[name])
 
     with build(
         tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
@@ -329,9 +327,35 @@ def test_c40_a_withheld_diagnostic_keeps_no_instrument_name_that_is_a_secret(tmp
         row = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
         marker = read_marker(Path(row["run_dir"]), row["run_key"], row["id"])
         export = export_run_state(scheduler.store)
-    assert json.loads(row["diagnostic"])["error"] == "Withheld"
-    assert "probe_credential_1234" not in json.dumps(where_it_is_kept(row, marker, export))
-    assert json.loads(row["diagnostic"])["instrument"] == "[redacted]"
+    assert json.loads(row["diagnostic"]) == {"phase": "start", "ok": False, "error": "Withheld", "why": WITHHELD}
+    assert name not in json.dumps(where_it_is_kept(row, marker, export))
+    assert name not in report_of(export)
+
+
+def test_c40_the_harness_defect_log_is_redacted_with_the_processs_secrets_whatever_environment_record_run_is_given(
+    tmp_path, monkeypatch
+):
+    """C40: `record_attempt` installs on the log a redactor built from the environment `record_run` is given; the log
+    keeps the runner's own base (the process, the models, the registry) beside it, so a crash after `record_run` whose
+    message quotes a process secret is written with it redacted, declared or not."""
+    credential = "process_credential_9012"
+    monkeypatch.setenv("EXAMPLE_API_KEY", credential)
+
+    async def executor(request):
+        request.backend.use([ModelTurn("done", [], 10, 5, "stop", 0.0)])
+        await record_run(
+            request, [], "s", "u", FakeExecutor().config, code=dict(CODE), environ={"UNRELATED": "nothing"}
+        )
+        raise RuntimeError(f"the harness quoted {credential}")  # a defect of the study's own, after the record
+
+    root = tmp_path / "out"
+    with build(
+        root, plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+    ) as scheduler:
+        scheduler.run()
+    written = log_path(root).read_text(encoding="utf-8")
+    assert "the harness quoted" in written
+    assert credential not in written
 
 
 def test_c40_the_processs_secrets_stay_redacted_when_record_run_is_given_an_environment_of_its_own(
