@@ -96,7 +96,7 @@ class Bench:
     data: dict = field(default_factory=dict)  # a federation's data as read back, when not its manifest's
     spawned: list = field(default_factory=list)
     alive: set = field(default_factory=set)
-    starts: dict = field(default_factory=dict)  # pid -> the start tick of the process that holds it now (1: the client's)
+    starts: dict = field(default_factory=dict)  # pid -> the start tick of the process holding it now (1: the client's)
     ended: list = field(default_factory=list)  # each client `end_client` was asked to end, in order
     pool: Any = None  # the nodes of one cluster every federation shares (O57), else each has a cluster of its own
     guard: Any = None  # the inode guard's stand-in: (count, layout, site, environ) -> its words

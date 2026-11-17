@@ -1,5 +1,5 @@
-"""O68: a stuck shard moves to a spare federation through the fleet alone (deploy/hpc-federation/fleet.py `step-stop` and
-`step --resume`; fleetstuck.py).
+"""O68: a stuck shard moves to a spare federation through the fleet alone (deploy/hpc-federation/fleet.py `step-stop`
+and `step --resume`; fleetstuck.py).
 
 `step-stop --shard L` ends the step the fleet launched for L, by the ids the fleet recorded for it and nothing else: its
 srun client by pid, once the pid is shown to be that process still (its start tick), and its Slurm step by its exact
@@ -88,7 +88,7 @@ def leave_mark(bench, deploy, label: str) -> dict:
 
 
 def move_to_a_spare(bench) -> None:
-    """What frees shard-1 of a federation whose step is gone: fed-1 down, a fresh fed-3 up, the plan giving it the shard."""
+    """What frees shard-1 of a federation whose step is gone: fed-1 down, a fresh fed-3 up, the plan giving it it."""
     assert bench.run("down", "--member", "fed-1")[0] == 0
     assert bench.run("add", "1")[0] == 0
     code, printed = plan(bench)
@@ -198,7 +198,8 @@ def test_o68_step_stop_ends_only_the_recorded_client_and_cancels_only_the_record
     assert code == 0, printed
     assert bench.fake("fed-1").cancelled == [mine]
     assert bench.fake("fed-1").steps == {"someone-elses-step": f"{job}.8"}
-    assert bench.fake("fed-2").cancelled == [] and list(bench.fake("fed-2").steps.values()) == [theirs]
+    assert bench.fake("fed-2").cancelled == []
+    assert list(bench.fake("fed-2").steps.values()) == [theirs]
     assert [c.pid for c in bench.ended] == [bench.spawned[0].pid]
     assert bench.spawned[1].pid in bench.alive
     stopped = shard_record(bench, "shard-1")["launches"][-1]["stopped"]
@@ -235,9 +236,10 @@ def test_o68_step_stop_touches_nothing_of_a_job_that_is_not_the_federations(benc
         replaced = json.loads(path.read_text(encoding="utf-8"))
         replaced["allocation"]["name"] = "hpcop-another-federation-0000"
         path.write_text(json.dumps(replaced), encoding="utf-8")
-    code, printed = bench.run("step-stop", "--shard", "shard-1")
+    code, _ = bench.run("step-stop", "--shard", "shard-1")
     assert code != 0
-    assert bench.ended == [] and bench.fake("fed-1").cancelled == []
+    assert bench.ended == []
+    assert bench.fake("fed-1").cancelled == []
     assert mine in bench.fake("fed-1").steps.values()
 
 
@@ -249,7 +251,8 @@ def test_o68_step_stop_that_cannot_cancel_the_step_still_ends_the_client_and_say
     bench.fake("fed-1").step_cancel_rc = 225
     code, printed = bench.run("step-stop", "--shard", "shard-1")
     assert code == 1
-    assert mine in printed and "not cancelled" in printed
+    assert mine in printed
+    assert "not cancelled" in printed
     assert [c.pid for c in bench.ended] == [bench.spawned[0].pid]
     stopped = shard_record(bench, "shard-1")["launches"][-1]["stopped"]
     assert (stopped["step"], stopped["cancelled"]) == (mine, False)
@@ -264,7 +267,8 @@ def test_o68_step_stop_refuses_a_shard_the_fleet_has_no_launch_of(bench, shard):
     code, printed = bench.run("step-stop", "--shard", shard)
     assert code == 2
     assert "error: step-stop:" in printed
-    assert bench.ended == [] and all(f.cancelled == [] for f in bench.fakes.values())
+    assert bench.ended == []
+    assert all(f.cancelled == [] for f in bench.fakes.values())
 
 
 def test_o68_step_stop_needs_the_shard_it_stops(bench):

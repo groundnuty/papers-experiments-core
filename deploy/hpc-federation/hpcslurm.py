@@ -151,6 +151,9 @@ class Client(NamedTuple):
     start: int
 
 
+ALIVE, GONE, ANOTHER = "alive", "gone", "another process"  # what a recorded client is now (`Runner.client_state`)
+
+
 class Process:
     """A running command whose output is kept: wait for it with a bound, read its result, or kill it."""
 
@@ -258,8 +261,17 @@ class Runner:
         start = proc_start(popen.pid)
         return Client(popen.pid, start if start is not None else -1)
 
+    def client_state(self, client: Client) -> str:
+        """What the process a client was recorded as is now: `ALIVE` while its pid holds a process of the recorded start
+        tick; `GONE` when no process (or a zombie) holds the pid; `ANOTHER` when one does with another start tick, or
+        when the client's own tick was never read (-1). A pid is never signalled on less than its start tick."""
+        now = proc_start(client.pid)
+        if now is None:
+            return GONE
+        return ALIVE if client.start >= 0 and now == client.start else ANOTHER
+
     def client_alive(self, client: Client) -> bool:
-        return client.start >= 0 and proc_start(client.pid) == client.start
+        return self.client_state(client) == ALIVE
 
     def clients_of(self, job: str) -> List[Client]:
         return clients_of(job)

@@ -5,6 +5,7 @@
     uv run python deploy/hpc-federation/fleet.py --fleet DIR add K
     uv run python deploy/hpc-federation/fleet.py --fleet DIR plan [--manifest SETTINGS]
     uv run python deploy/hpc-federation/fleet.py --fleet DIR step [--shard L] [--resume]
+    uv run python deploy/hpc-federation/fleet.py --fleet DIR step-stop --shard L
     uv run python deploy/hpc-federation/fleet.py --fleet DIR status
     uv run python deploy/hpc-federation/fleet.py --fleet DIR down [--member L]
 
@@ -25,7 +26,12 @@ Run on the login node with the site's values exported (`set -a; . site.env; set 
   no code (C06: unknown or stale), as `shards.py plan` refuses it; and, for a campaign that injects faults, a
   federation whose fault relay does not serve (`fleetplan.injection`, read from its state file) is given no shard.
 - step: each assigned shard's line launched detached on the login node, its client recorded; the same core check
-  first, when there is a line to launch.
+  first, when there is a line to launch. A step that resumes carries its running mark's nonce as `--over` when the
+  shard has a mark and `shards.py resume-line`'s proof shows the step that holds it gone; one whose step still runs is
+  refused and launched nowhere (`fleetstuck.over_proof`).
+- step-stop: one shard's step ended, by the ids the fleet recorded for it alone: its srun client by pid and start tick,
+  its Slurm step by its exact `<job>.<n>` id; refused whole when the pid is another process now (`fleetstuck.stop`).
+  A stuck shard then moves: `collect`, `down --member`, `add`, `plan`, `step --shard L --resume` (README.md).
 - status: what the record and each root's state file say, each federation's state in plain words (up and ready, up
   with no relay, failed and still HOLDING jobs by count, down); nothing is run. `plan` says the same states first.
 - down: every federation this fleet made, or one, taken down by `hpcfed.py down` and verified gone; a root or state
@@ -49,6 +55,7 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
         sys.path.insert(0, str(_path))
 
 import fleetplan  # noqa: E402
+import fleetstuck  # noqa: E402
 import hpcfed  # noqa: E402
 import hpcquota  # noqa: E402
 import hpcstate  # noqa: E402
@@ -75,7 +82,7 @@ from hpcslurm import Client, Runner, Slurm, SlurmError  # noqa: E402
 
 MAX_VAR, PARALLEL_VAR = "HPC_FLEET_MAX", "HPC_FLEET_PARALLEL"
 CEILING = 64  # no setting of either may pass it
-COMMANDS = ("up", "add", "plan", "step", "status", "down")
+COMMANDS = ("up", "add", "plan", "step", "step-stop", "status", "down")
 UNSAFE = set('"\\') | {chr(c) for c in range(32)} | {chr(127)}  # never in a path the fleet writes into TOML and JSON
 
 
@@ -393,7 +400,8 @@ class Fleet:
                 shard_of(record, only)
             if not (self.directory / fleetplan.MANIFEST).is_file():
                 raise FleetError("the fleet has no shards.toml: run plan first")
-            found, said, refused = fleetplan.launches(record, self.directory, only, resume, self.running, self.environ)
+            found, said, refused = fleetplan.launches(record, self.directory, only, resume, self.running, self.environ,
+                                                      self.prove_over)  # fmt: skip
             logs = self.directory / "logs"
             logs.mkdir(mode=0o700, exist_ok=True)
             for launch in found:
@@ -414,11 +422,25 @@ class Fleet:
                     failed += 1
                 self.record.update(lambda r, c=change, s=launch.shard: shard_of(r, s)["launches"][-1].update(c))
                 done = "FAILED to launch" if change.get("failed") else f"launched (client pid {change['pid']})"
-                self.say(f"{launch.shard} on {launch.member}: {done}{' with --resume' if launch.resume else ''}; "
-                         f"its log {log}" + (f"; {launch.note}" if launch.note else ""))  # fmt: skip
+                how = " with --resume" if launch.resume else ""
+                how += " and --over (the running mark of a step shown gone)" if launch.over else ""
+                self.say(f"{launch.shard} on {launch.member}: {done}{how}; its log {log}"
+                         + (f"; {launch.note}" if launch.note else ""))  # fmt: skip
         for line in said + refused:
             self.say(line)
         return 1 if failed or refused or (only is not None and not found) else 0
+
+    def prove_over(self, plan: Any, label: str, members: Sequence[str]) -> Optional[str]:
+        """`--over`'s nonce for a resuming step, once `shards.py resume-line`'s proof shows the step that holds the
+        shard's running mark gone, asked through the runner of each federation that held or ran the shard."""
+        return fleetstuck.over_proof(plan, label, [self.hooks.runner(member) for member in members])
+
+    def step_stop(self, only: Optional[str]) -> int:
+        """One shard's step ended, by the ids the fleet recorded for it alone (`fleetstuck.stop`)."""
+        if only is None:
+            raise FleetError("step-stop needs --shard: it stops one shard's step, never all")
+        with self.record.lifecycle("step-stop"):
+            return fleetstuck.stop(self.directory, self.record, only, self.hooks.runner, self.say)
 
     def job_ours(self, launch: fleetplan.Launch) -> Optional[str]:
         """Why a launch's job is not the one its federation's up holds, as Slurm records it now; None when it is: the
@@ -459,6 +481,8 @@ class Fleet:
             else:
                 alive = self.running(launches[-1])
                 state = f"on {shard['member']}, its step " + {True: "runs", False: "ended"}.get(alive, "cannot be told")
+                if alive is False and launches[-1].get("stopped"):
+                    state += " (stopped by step-stop)"
             print(f"{shard['label']}: {state}" + (" (moved: its first reset there is full)" if shard["moved"] else ""))
         return 0
 
@@ -533,7 +557,7 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[Mapping[str, st
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("count", nargs="?", type=int, help="how many federations (up, add)")
     parser.add_argument("--manifest", type=Path, help="the shard settings (plan): shards.py's keys, no [[shards]]")
-    parser.add_argument("--shard", help="one shard (step)")
+    parser.add_argument("--shard", help="one shard (step; step-stop needs it)")
     parser.add_argument("--resume", action="store_true", help="launch an ended shard's step again, resuming (step)")
     parser.add_argument("--member", help="one federation (down)")
     args = parser.parse_args(argv)
@@ -553,6 +577,8 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[Mapping[str, st
             return fleet.plan(args.manifest)
         if args.command == "step":
             return fleet.step(args.shard, args.resume)
+        if args.command == "step-stop":
+            return fleet.step_stop(args.shard)
         if args.command == "status":
             return fleet.status()
         return fleet.down(args.member)
