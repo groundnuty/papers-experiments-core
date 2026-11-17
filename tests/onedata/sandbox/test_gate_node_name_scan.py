@@ -182,6 +182,17 @@ def test_o73_the_log_holds_a_count_and_never_a_name_a_body_or_a_context(tmp_path
         (f"{SHORT}.other.example", 0),
         (f"{SERVED} and zone.layout.test", 0),
         ("", 0),
+        # the same IPv6 address in the spellings an answer may print it in (the map holds 2001:db8::2)
+        ("at 2001:0db8:0:0:0:0:0:2", 1),
+        ("at 2001:DB8::2 and [2001:db8:0::2]:8443", 2),
+        ("peer:2001:db8::2 unreachable", 1),
+        ("2001:db8::2.", 1),
+        ("2001:db8::2: refused", 1),
+        ("2001:db8::2:1 and 2001:db8::20 and 12:30:45 and ::1", 0),
+        # an IPv4 node address as an IPv4-mapped IPv6 address, dotted (counted once) or in hex
+        (f"::ffff:{ADDRESS}", 1),
+        ("::ffff:c633:6415", 1),
+        ("::ffff:c633:6416", 0),
     ],
 )
 def test_o73_the_scan_counts_whole_names_with_or_without_a_port_in_any_case(text, hits):
@@ -193,6 +204,96 @@ def test_o73_the_scan_counts_whole_names_with_or_without_a_port_in_any_case(text
         assert gate._node_name_hits(text.encode()) == hits
     finally:
         gate.CFG.clear()
+
+
+@pytest.mark.parametrize(
+    ("body", "hits"),
+    [
+        (r'{"description": "failed:\ncn-r3c07-n12.cluster.example.org"}', 1),  # an escape that ends in a letter
+        (r'{"description": "\u0063n-r3c07-n12.cluster.example.org and \u0031\u0039\u0038.51.100.21"}', 2),
+        (r'{"cn-r3c07-n12.cluster.example.org": ["a\tcn-r3c07-n12", {"k": "198\u002e51\u002e100\u002e21"}]}', 3),
+        (r'{"description": "cn-r3c07-n12.cluster.exam\u0070le.org\/x"}', 1),
+        (r'{"description": "fine", "n": 198}', 0),
+    ],
+)
+def test_o73_a_name_hidden_by_json_escapes_is_counted_as_the_client_reads_it(tmp_path, world, body, hits):
+    """O73: a JSON answer is scanned as its client decodes it: a name that follows `\\n` or `\\t`, whose characters are
+    written as `\\uXXXX`, or that is a key, would be missed by the raw text and is not."""
+    with TlsPeer(tmp_path / "up", SERVED) as upstream:
+        httpd, tls, log = world(upstream)
+        upstream.answer = (503, body.encode())
+        assert _get(httpd, tls)[0] == 503
+        (line,) = _requests(log, 1)
+    assert line.get("node_name_hits", 0) == hits
+
+
+def test_o73_a_body_that_is_not_json_is_scanned_as_it_is(tmp_path, world):
+    """O73: an HTML error page, or a JSON that does not parse, is scanned as it stands."""
+    with TlsPeer(tmp_path / "up", SERVED) as upstream:
+        httpd, tls, log = world(upstream)
+        for text in (f"<html>bad gateway: {NODE}</html>", f'{{"broken": "{NODE}'):
+            upstream.answer = (502, text.encode())
+            assert _get(httpd, tls)[0] == 502
+        lines = _requests(log, 2)
+    assert [line["node_name_hits"] for line in lines] == [1, 1]
+
+
+def test_o73_a_deeply_nested_body_is_scanned_without_failing_the_answer(tmp_path, world):
+    """O73: JSON nested beyond what the decoder allows falls back to the raw text; the answer still reaches the
+    client."""
+    nested = "[" * 5000 + f'"{NODE}"' + "]" * 5000
+    with TlsPeer(tmp_path / "up", SERVED) as upstream:
+        httpd, tls, log = world(upstream)
+        upstream.answer = (503, nested.encode())
+        status, relayed = _get(httpd, tls)
+        (line,) = _requests(log, 1)
+    assert (status, relayed) == (503, nested.encode())
+    assert line.get("node_name_hits") == 1
+
+
+def _raw_request(httpd, tls, data: bytes) -> bytes:
+    """Bytes sent to the gate as they are, over its TLS, and what it answers (a request the parser refuses)."""
+    context = ssl.create_default_context(cafile=str(tls / "ca.pem"))
+    raw = socket.create_connection(("127.0.0.1", httpd.server_port), timeout=20)
+    wrapped = context.wrap_socket(raw, server_hostname=SERVED)
+    wrapped.sendall(data)
+    answer = b""
+    while chunk := wrapped.recv(65536):
+        answer += chunk
+    wrapped.close()
+    return answer
+
+
+def test_o73_the_error_pages_of_the_request_parser_are_scanned_and_the_log_never_holds_a_node_name(tmp_path, world):
+    """O73: an error the parser answers before the gate's own code runs (a bad version) quotes what the client sent in
+    its page: the page is scanned, and neither the line's `reason` nor its `request_line` keeps a known name, whoever
+    wrote it."""
+    with TlsPeer(tmp_path / "up", SERVED) as upstream:
+        httpd, tls, log = world(upstream)
+        page = _raw_request(httpd, tls, f"GET / HTTP/{NODE}\r\n\r\n".encode())
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not [r for r in _log_lines(log) if r.get("event") == "request_error"]:
+            time.sleep(0.05)
+        (line,) = [r for r in _log_lines(log) if r.get("event") == "request_error"]
+    assert NODE.encode() in page  # the parser's page echoes it: this is the path the scan must see
+    assert line["node_name_hits"] >= 1
+    text = log.read_text(encoding="utf-8").lower()
+    for word in NAMES:
+        assert word.lower() not in text, word
+
+
+def test_o73_the_fields_that_echo_the_clients_request_hold_no_known_name(tmp_path, world):
+    """O73: a refused request whose path and query carry a known name is logged without it: `path`, `query`, `reason`
+    and `request_line` are what the client wrote, and the log is published."""
+    with TlsPeer(tmp_path / "up", SERVED) as upstream:
+        httpd, tls, log = world(upstream)
+        status, _ = _get(httpd, tls, f"/api/v3/onezone/{NODE}?probe={ADDRESS}")
+        assert status in (400, 403, 404)
+        _requests(log, 1)
+    text = log.read_text(encoding="utf-8").lower()
+    for word in NAMES:
+        assert word.lower() not in text, word
+    assert "<node>" in text
 
 
 def test_o73_the_gates_own_answers_are_scanned_too(tmp_path, world):
