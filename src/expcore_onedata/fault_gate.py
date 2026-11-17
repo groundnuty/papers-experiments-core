@@ -31,7 +31,10 @@ injection and restores after, does not answer "unsettled" for the entry that att
 (`fault_owner.in_progress_of`: owner exactly the attempt, seen down, no failed restore, no heal's mark, and a live
 injector still holding the target's lock, `_held_down`): the space is
 compared as usual, and the structured reading (`healthreading`) names the target as held. Every other open entry still
-fails the check: another attempt's, one that names no attempt, a failed restore, a heal's restart.
+fails the check: another attempt's, one that names no attempt, a failed restore, a heal's restart. Only a check made
+while the executor is still inside its injection explains it: the scheduler's post-run check, which the runner marks
+(`prerun.EXECUTOR_RETURNED`) once the executor has returned, explains nothing, so a pending restore whose journal line
+was lost, or a reused injector, is still an unsettled injection there.
 
 **It heals stuck pairs its own link check found (O35, `fault_gate_heal`).** Given the link report the rest of the check
 made in the calling thread (`links`), a way to make it check the links again (`relink`) and the providers' services
@@ -422,8 +425,10 @@ class FaultGate:
                 deferred=True,
                 charge=False,
             )
+        note = prerun.current()
+        returned = note is not None and note.get(prerun.EXECUTOR_RETURNED) is True  # the scheduler's post-run check
         try:
-            return self._judged(own=True)[0]
+            return self._judged(own=not returned)[0]
         finally:
             give_up()
 

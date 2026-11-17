@@ -421,6 +421,9 @@ class AttemptRunner:
             note = prerun.current()
             if note is not None:
                 note.pop(prerun.HEALTH_READING, None)  # only a check made from here on leaves the post-run reading
+                note[prerun.EXECUTOR_RETURNED] = (
+                    True  # nothing of the run is in progress now: no leftover is its own work
+                )
             health, outage = p.health.after_run(key, attempt=begun.number, attempt_id=begun.id)
             result = self._keep_reading(result, note, model, key)
             if health.deferred:  # it verified nothing: no result is scored on it, treatment included (C11)

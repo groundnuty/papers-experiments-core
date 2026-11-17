@@ -21,6 +21,9 @@ A platform's post-run check may note a structured reading of the platform under 
 object, see `reading_of`). The attempt runner clears the key before the post-run check and keeps what the check left
 there with the attempt, in its marker (`post_run_health`) and in one event: a reading the pre-run check noted is never
 taken for the post-run check's, and a check that notes none leaves none.
+
+Before the post-run check the runner also notes `EXECUTOR_RETURNED`: once the executor has returned nothing of the run
+is in progress, so a platform's check never explains a state as the run's own work in progress (the fault gate, O90).
 """
 
 import contextlib
@@ -32,6 +35,9 @@ from typing import Any
 _NOTE: ContextVar[dict[str, Any] | None] = ContextVar("expcore_prerun_note", default=None)
 UNCHECKED = "unchecked"  # the key of a note whose campaign has no health check: no pre-run check will write to it
 HEALTH_READING = "health_reading"  # the key a platform's check notes its structured reading of the platform under
+EXECUTOR_RETURNED = (
+    "executor_returned"  # set by the attempt runner before the post-run check: the executor has returned
+)
 READING_MAX_BYTES = 16_384  # the most a reading's JSON text may be for the attempt to keep it
 READING_MAX_DEPTH = 16  # the deepest a reading may nest (a platform's reading is a shallow object)
 READING_MAX_NODES = 4_096  # the most values a reading may hold, walked before anything is serialised
@@ -65,6 +71,10 @@ def _shallow(value: Any) -> bool:
             stack.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list | tuple):
             stack.extend((child, depth + 1) for child in item)
+        else:
+            continue
+        if len(stack) + seen > READING_MAX_NODES:  # a container too wide is refused before it is all walked
+            return False
     return True
 
 
