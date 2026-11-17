@@ -11,7 +11,7 @@ from fake_host import READINGS, FakeHost
 from fake_node import FakeNode
 from sandbox_support import make_spec, start_options
 
-from expcore_onedata.sandbox import hostfacts
+from expcore_onedata.sandbox import cellhost, hostfacts
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 
 
@@ -27,11 +27,11 @@ def stopped(world, box):
 
 def test_o87_a_docker_run_records_its_hosts_readings_in_infrastructure_facts(world):
     """O87: the host's `ID` and `VERSION_ID`, glibc and kernel, where an Apptainer run keeps its node's; the block holds
-    nothing else, and the metadata's `host` (kernel, docker server) is as it was."""
+    nothing else but the cell's host name (O73), and the metadata's `host` (kernel, docker server) is as it was."""
     box = docker_run(world)
     try:
         meta = box.metadata()
-        assert meta["infrastructure_facts"] == {"node": READINGS}
+        assert meta["infrastructure_facts"] == {"node": READINGS, "cell_hostname": cellhost.CELL_HOSTNAME}
         assert meta["host"] == {"kernel": "test-kernel", "docker_server": "0.0"}
     finally:
         stopped(world, box)

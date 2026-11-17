@@ -30,6 +30,7 @@ from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import loopback
 from expcore_onedata.sandbox.apptainer import procs as P
+from expcore_onedata.sandbox.cellhost import OwnNames
 from expcore_onedata.sandbox.hostops import CmdResult, DockerHost, mounts_under, run_bounded
 
 SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434
@@ -166,6 +167,12 @@ class NodeOps(Protocol):
     def boot_id(self) -> str | None:
         """This boot of the node: the kernel's random per-boot UUID (`/proc/sys/kernel/random/boot_id`), which names
         neither the node nor its site; None when it cannot be read. What the work disk's kept proof is for (O71)."""
+        ...
+
+    def own_names(self) -> OwnNames:
+        """The node's own host name and its fully qualified form, as it reports them (O73): for the gate's scan for node
+        names alone, never a record or a message. A form it cannot read, or not in a short bound, is left out and its
+        reason is in `unread`."""
         ...
 
     def node_readings(self) -> dict[str, Any]:
@@ -528,6 +535,9 @@ class LocalNode:
         except OSError:
             return None
         return found if BOOT_ID_FORM.fullmatch(found) else None
+
+    def own_names(self) -> OwnNames:
+        return loopback.own_names()
 
     def node_readings(self) -> dict[str, Any]:
         return hostfacts.readings()
