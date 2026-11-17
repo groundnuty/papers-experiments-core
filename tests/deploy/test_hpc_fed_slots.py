@@ -116,7 +116,11 @@ def test_o83_each_slot_user_has_a_password_file_of_mode_0600_and_no_other_file_o
         assert before[user] == secrets[user]
     assert stat.S_IMODE(layout.users.stat().st_mode) == 0o700
     outside = [p for p in layout.root.rglob("*") if p.is_file() and layout.secrets not in p.parents]
-    assert {p.name for p in outside} == {"facts.json", "platform.toml"}
+    assert {p.name for p in outside} == {
+        "facts.json",
+        "platform.toml",
+        "render-identity.json",
+    }  # hashes, no secret (O74)
     for path in outside:
         text = path.read_text(encoding="utf-8", errors="replace")
         assert not [user for user, password in secrets.items() if password in text], path.name

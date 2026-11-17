@@ -51,6 +51,7 @@ support = { providers = ["oak", "elm"], local = "oak" }
 credentials.admin = { file = "secrets/admin.token" }
 credentials.users = { directory = "secrets/users", pattern = "{user}.pass" }
 principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-reader@" }
+placement = { holder = "oak" }  # the platform layer requires it and the core has no default holder (O79)
 """
 
 SLOTS = f"""
