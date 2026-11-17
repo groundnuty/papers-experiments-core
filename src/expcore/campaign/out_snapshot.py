@@ -60,6 +60,7 @@ MANIFEST = "snapshot.json"
 STORE = "state.sqlite"  # the scheduler's STATE_FILE, under out/
 STORE_FILES = (STORE, f"{STORE}-wal", f"{STORE}-shm", f"{STORE}-journal")  # the live store: its backup stands for them
 RUNS = "runs"
+LOGS = "logs"  # the campaign's local logs under out/ (`defect_log.LOG_DIR`): private evidence, not for any other user
 LEASES = "leases"  # the campaign's lease directory under out/ (`study.pipeline`)
 KEEP = 2  # the newest snapshots kept: a damaged newest one falls back to the one before
 ENDED = ("done", "infra_fail", "harness_error", "outage_discarded")  # states whose attempt wrote its marker (C04)
@@ -111,6 +112,7 @@ def take(
         store = _copy(backup, part / STORE, lambda: crash("backup"))
         ended, named, campaign = _attempts(backup)
         files = _copy_out(out, part, named, crash)
+        _make_logs_private(part)
         missing = sorted(d for d in ended if f"{RUNS}/{d}/{MARKER_NAME}" not in files)
         if missing:
             raise OutSnapshotError(
@@ -221,6 +223,19 @@ def _copy(source: Path, target: Path, halfway: Callable[[], None] | None = None)
     return {"sha256": digest.hexdigest(), "bytes": size}
 
 
+def _make_logs_private(root: Path) -> None:
+    """`logs/` under `root` (a snapshot being taken, an out/ being restored) made the owner's alone: the directory 0700
+    and each file 0600, whatever the process's umask made them. The local log holds the text of a start diagnostic the
+    core withheld from every record, and a snapshot is pulled to the operator's host with the shard's results."""
+    logs = root / LOGS
+    if logs.is_symlink() or not logs.is_dir():
+        return
+    for base, _dirs, names in os.walk(logs):
+        os.chmod(base, 0o700)
+        for name in names:
+            os.chmod(Path(base, name), 0o600)
+
+
 def _hash(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -301,6 +316,7 @@ def restore(snapshot: Path, out: Path) -> dict[str, Any]:
             (out / name).parent.mkdir(parents=True, exist_ok=True)
             if _copy(snapshot / name, out / name)["sha256"] != expected[name]:
                 raise OutSnapshotError(f"{snapshot.name}: {name} is not the file its manifest names")
+        _make_logs_private(out)
         _integrity(snapshot, out / STORE)
         missing = _markers_missing(out)
         if missing:  # take checked it; a snapshot whose manifest was made otherwise is never restored without them

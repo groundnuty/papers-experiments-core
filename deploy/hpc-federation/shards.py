@@ -1194,7 +1194,28 @@ def unpack(tar_path: Path, into: Path, *, label: str | None = None) -> Path:
             raise ShardsError(f"shard {label}: its archive {problem}" if label else f"an archive {problem}")
         into.mkdir(parents=True)
         tar.extractall(into, filter="data")
+    _private_logs(into / "out")
     return into / "out"
+
+
+LOCAL_LOGS = "logs"  # the campaign's local logs under out/ (`expcore.campaign.defect_log.LOG_DIR`)
+
+
+def _private_logs(out: Path) -> None:
+    """`out/logs/` made the operator's alone, whatever the archive recorded and whatever the umask is: the directory
+    0700 and each file in it 0600. The local log holds the text of a start diagnostic that the core withheld from every
+    record, and the archive carries it here as private evidence; `tarfile`'s data filter keeps a file's recorded mode
+    (a node's loose umask included) and gives a directory the umask's, so neither is left to it. A link is never
+    followed or changed."""
+    logs = out / LOCAL_LOGS
+    if logs.is_symlink() or not logs.is_dir():
+        return
+    for base, _dirs, files in os.walk(logs):
+        os.chmod(base, 0o700)
+        for name in files:
+            path = Path(base, name)
+            if not path.is_symlink():
+                os.chmod(path, 0o600)
 
 
 def _read_only(root: Path) -> None:

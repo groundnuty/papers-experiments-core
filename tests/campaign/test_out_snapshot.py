@@ -10,7 +10,7 @@ from campaign_support import NOW, finished, make_manifest, make_schema
 from scheduler_support import build
 
 from expcore.campaign import out_snapshot
-from expcore.campaign.defect_log import write_note
+from expcore.campaign.defect_log import LOG_DIR, write_note
 from expcore.campaign.markers import MARKER_NAME, read_marker, write_marker
 from expcore.campaign.out_snapshot import OutSnapshotError, restore, snapshots, take
 from expcore.campaign.recovery import recover
@@ -120,6 +120,7 @@ def test_l08_the_local_log_stays_private_in_a_snapshot_and_in_its_restore_whatev
     """L08: the campaign's local log holds the text of a withheld start diagnostic, and a snapshot is pulled to the
     operator's host with the shard's results: `logs/` is 0700 and the log 0600 in the snapshot and in the out/ it is
     restored to, as the core's own writer made them and under a umask that would make them readable by others."""
+    assert out_snapshot.LOGS == LOG_DIR
     out, _store = live
     previous = os.umask(0o022)
     try:

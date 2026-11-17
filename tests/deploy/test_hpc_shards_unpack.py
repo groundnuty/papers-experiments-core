@@ -269,7 +269,7 @@ def test_l08_the_local_log_the_core_wrote_and_the_step_archived_is_private_when_
 ):
     """L08: end to end under a loose umask: the core's own writer (`defect_log.write_note`), the step's `archive` of the
     copy's `out/`, and the unpack `collect` and `--resume` extract it with."""
-    from expcore.campaign.defect_log import log_path, write_note
+    from expcore.campaign.defect_log import LOG_DIR, log_path, write_note
     from expcore.records.redact import Redactor
 
     out = tmp_path / "node" / "out"
@@ -283,6 +283,7 @@ def test_l08_the_local_log_the_core_wrote_and_the_step_archived_is_private_when_
         redactor=lambda: Redactor([]),
     )
     assert log_path(out).is_file()
+    assert shards.LOCAL_LOGS == LOG_DIR  # the script has no import of the core, so the name is pinned here
     results = tmp_path / "results"
     results.mkdir()
     shards.archive(out, results, {"index": 1, "count": 1, "label": "fed-a"}, 0)
