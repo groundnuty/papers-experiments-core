@@ -324,7 +324,7 @@ sidecar on the federation's network, derived as `tests/support/mount_live.py` de
 users the sandbox and the tool server lease, each slot's `toolserver` declaring the rights its user holds (`rights`: the
 condition's below, since the check leases from the condition's group, O31); and a `[toolserver]` condition whose
 allow-list has `get_file_distribution`, `list_space_providers`, `schedule_file_replication` and `get_transfer`, with its
-frozen manifest and the rights those tools need and no more (`space_view_transfers` and `space_schedule_replication` beside the baseline, O31: a condition that declares a write right none of its tools uses is refused at load). In the default layout `pine` owns the study space and is the local provider, so the root's file
+frozen manifest and the rights to schedule a replication and to view transfers, and no write right beyond it (`space_schedule_replication` and `space_view_transfers` beside the baseline; O31 refuses at load a condition that declares a write right none of its tools uses). In the default layout `pine` owns the study space and is the local provider, so the root's file
 makes the check unknown, saying so. Derive a file with `birch` local, `pine` taken down and `cedar` the mirror (no
 value below is a secret; every path in `[faults]` is relative to the file; the journal is explained below):
 

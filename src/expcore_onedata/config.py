@@ -68,7 +68,7 @@ commit = "..."
 [toolserver.conditions.<name>]
 allow = ["tool", ...]           # the server-side allow-list of this condition
 rights = ["space_view", ...]    # the platform privileges of its principal and the caveats of its token; it and allow
-                                #   must agree (O31): each tool's right, no write right without a tool that uses it
+                                #   must agree (O31): a write tool's right, no write right without a tool that uses it
 manifest = "path.json"          # the frozen manifest the client checks the server against (L13)
 
 [sandbox]                       # optional: images, network pool, limits, mount, data paths (see sandbox/settings.py)
