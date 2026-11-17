@@ -336,6 +336,23 @@ def test_o79_a_placement_the_render_cannot_complete_is_refused_naming_the_key_an
     assert "nowhere" not in str(refused.value)
 
 
+def test_o79_the_preflight_reads_every_placeholder_as_a_value_of_its_own(pl):
+    """O79: a template whose placeholders stand in keys (`x."@a@"`, `x."@b@"`) is a document with two keys, not one
+    that is "no TOML": filled in alike they would collide, the preflight would skip the template as unreadable and take
+    one with no `[placement]`, which the render then refuses with the federation up. Each placeholder is its own value."""
+    template = BASE + 'x."@provider_id.pine@" = 1\nx."@provider_id.birch@" = 2\n'
+    with pytest.raises(RuntimeError, match=r"declares no \[placement\]"):
+        pl.check_template(template)
+    pl.check_template(template + 'placement = { holder = "pine" }\n')
+
+
+def test_o79_a_template_that_is_no_toml_once_filled_in_is_left_to_the_renderer(pl):
+    """O79: the preflight cannot read a template whose placeholder stands where no value does (`key = @x@ @y@`): it
+    raises nothing, as the pins' check does, and the renderer's read of the file it writes is the check that stands."""
+    pl.check_template("key = @x@ @y@\n")
+    pl.check_template(None)
+
+
 def test_o79_a_template_without_a_holder_writes_no_platform_file(hpc, tmp_path):
     """O79: the render refuses at once, and leaves no platform.toml for a campaign to read."""
     path = tmp_path / "platform.toml"
@@ -400,6 +417,7 @@ EDITS = {
     "no table": lambda text: text.replace(DECLARED, ""),
     "no holder": lambda text: text.replace(DECLARED, "placement = { poll_s = 5.0 }"),
     "a holder that is no provider": lambda text: text.replace(DECLARED, 'placement = { holder = "nowhere" }'),
+    "a spelling the render cannot add to": lambda text: text.replace(DECLARED, 'placement.holder = "aspen"'),
 }
 
 
@@ -415,7 +433,7 @@ def test_o79_up_refuses_a_template_that_declares_no_holder_before_anything_is_su
     reads the sandbox's pins), names the key and never a name the template holds, and submits and writes nothing."""
     assert DECLARED in TEMPLATE
     driver, fake, root = rig(hpc, tmp_path, edit)
-    with pytest.raises(RuntimeError, match=r"\[placement\]|'holder'") as refused:
+    with pytest.raises(RuntimeError, match=r"\[placement\]|'holder'|cannot add") as refused:
         driver.up(hpc.settings.site_from_environment(site))
     assert "nowhere" not in str(refused.value)
     assert not [call for call in fake.calls if call[0] == "sbatch"]
