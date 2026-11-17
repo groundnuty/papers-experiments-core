@@ -36,7 +36,7 @@ read_secret PW "$S/passphrase"; curl_auth_file "$T/admin.cfg" admin "$PW"; unset
 code=$(http GET "$OZ/user" "$T/user.json" "${TLS[@]}" -K "$T/admin.cfg")
 need_2xx "$code" "zone admin GET /user" "$T/user.json"
 ADMIN_ID=$(jsonget "$T/user.json" userId)
-"$HPCOP_PY" -I "$HPCOP_BUNDLE/tokenbody.py" "$NAME" "$ADMIN_ID" "$TTL" "$LIMIT" > "$T/body.json"
+"$HPCOP_PY" -I -B "$HPCOP_BUNDLE/tokenbody.py" "$NAME" "$ADMIN_ID" "$TTL" "$LIMIT" > "$T/body.json"
 code=$(http POST "$OZ/user/tokens/named" "$T/token.json" "${TLS[@]}" -K "$T/admin.cfg" \
   -H 'Content-Type: application/json' --data @"$T/body.json")
 need_2xx "$code" "mint the registration token" "$T/token.json"

@@ -433,7 +433,7 @@ def test_o63_the_dispatcher_records_its_own_end_before_it_exits(shards, tmp_path
     work.mkdir()
     (work / "step.json").write_text(json.dumps({"shard": SPEC, "phase": "running"}))
     (work / ".step.ended.json").write_text(json.dumps({"shard": SPEC, "phase": "archiving"}))
-    code = shards.run_dispatcher([sys.executable, "-I", "-m", "expcore", "--version"], dict(os.environ), work)
+    code = shards.run_dispatcher([sys.executable, "-I", "-B", "-m", "expcore", "--version"], dict(os.environ), work)
     assert json.loads((work / "step.json").read_text()) == {"shard": SPEC, "phase": "archiving"}
     assert shards._ended(work, code) is True
     assert json.loads((work / "step.json").read_text()) == {"shard": SPEC, "phase": "archiving", "exit_status": code}
@@ -444,7 +444,7 @@ def test_o63_a_dispatcher_that_cannot_be_tied_to_its_step_never_starts(shards, t
     71 without running anything."""
     mark = tmp_path / "ran"
     done = subprocess.run(
-        [sys.executable, "-I", "-c", shards.DISPATCHER, "1", sys.executable, "-c", f"open({str(mark)!r}, 'w')"],
+        [sys.executable, "-I", "-B", "-c", shards.DISPATCHER, "1", sys.executable, "-c", f"open({str(mark)!r}, 'w')"],
         capture_output=True, text=True, check=False,
     )  # fmt: skip
     assert (done.returncode, mark.exists()) == (shards.NOT_TIED, False)
@@ -462,10 +462,12 @@ def test_o63_the_dispatcher_ends_as_python_m_expcore_would(shards, tmp_path, wor
     work = tmp_path / "work"
     work.mkdir()
     (work / ".step.ended.json").write_text(json.dumps({"phase": "archiving"}))
-    plain = subprocess.run([sys.executable, "-I", "-m", "expcore", *words], capture_output=True, text=True, cwd=work)
-    dispatcher = [sys.executable, "-I", "-m", "expcore", *words]
+    plain = subprocess.run(
+        [sys.executable, "-I", "-B", "-m", "expcore", *words], capture_output=True, text=True, cwd=work
+    )
+    dispatcher = [sys.executable, "-I", "-B", "-m", "expcore", *words]
     tied = subprocess.Popen(
-        [sys.executable, "-I", "-c", shards.DISPATCHER, str(os.getpid()), *dispatcher],
+        [sys.executable, "-I", "-B", "-c", shards.DISPATCHER, str(os.getpid()), *dispatcher],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=work,
     )  # fmt: skip
     out, err = tied.communicate(timeout=120)

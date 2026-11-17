@@ -12,14 +12,14 @@ kv() { printf '%s=%s\n' "$1" "$2"; }
 
 case ${1:-} in
   --listen)
-    exec "$HPCOP_PY" -I -c 'import socket, sys
+    exec "$HPCOP_PY" -I -B -c 'import socket, sys
 s = socket.socket(); s.settimeout(float(sys.argv[2])); s.bind(("0.0.0.0", int(sys.argv[1]))); s.listen(1)
 try:
     c, a = s.accept(); print("accepted=%s" % a[0]); c.close()
 except socket.timeout:
     print("accepted=none")' "${2:?PORT}" "${3:-120}" ;;
   --dial)
-    exec "$HPCOP_PY" -I -c 'import socket, sys
+    exec "$HPCOP_PY" -I -B -c 'import socket, sys
 try:
     socket.create_connection((sys.argv[1], int(sys.argv[2])), 10).close(); print("dial=ok")
 except OSError as e:
@@ -39,10 +39,10 @@ kv fqdn_addresses "$(getent ahostsv4 "$(hostname -f)" | awk '{print $1}' | sort 
 kv unprivileged_port_start "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)"
 kv proc_hidepid "$(findmnt -n -o OPTIONS --mountpoint /proc | tail -n 1 | tr ',' '\n' | grep -E '^(hidepid|gid)=' | tr '\n' ' ' || echo none)"
 kv apptainer "$(apptainer --version 2>&1)"
-kv python311 "$("$HPCOP_PY" --version 2>&1)"
-kv pidfd "$("$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" check 2>&1 && echo ok)"   # the service's stop needs it
+kv python311 "$("$HPCOP_PY" -I -B --version 2>&1)"
+kv pidfd "$("$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" check 2>&1 && echo ok)"   # the service's stop needs it
 # Live run 4: a node with IPv6 disabled has no ::1; the shim then keeps memcached and moxi on 127.0.0.1 only.
-kv ipv6_loopback "$("$HPCOP_PY" -I -c 'import socket
+kv ipv6_loopback "$("$HPCOP_PY" -I -B -c 'import socket
 try:
     socket.socket(socket.AF_INET6).bind(("::1", 0)); print("usable")
 except OSError as e:

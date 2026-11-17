@@ -1,6 +1,7 @@
 """`down` of the HPC federation (DESIGN.md, section 5): whatever `up` reached, every service torn down (the providers,
-then the zone), every step gone, each node checked, the held job cancelled by its own id, the srun clients ended, and
-the root removed. Mixed into `hpcdriver.Driver`, whose state store, launcher and Slurm it uses.
+then the zone), every step gone, each node checked, the held job cancelled by its own id, the srun clients ended, the
+provider storage on scratch removed and shown gone (hpcstorage), and the root removed. Mixed into `hpcdriver.Driver`,
+whose state store, launcher and Slurm it uses.
 """
 
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import hpcrelay
+import hpcstorage
 from fedlayout import ROOT_MARKER
 from hpcremove import SETTLE_S, only_silly, remove_tree, settle_rmdir
 from hpcsettings import Site
@@ -100,8 +102,37 @@ class Down:
                 "state are kept: run down again to remove them"
             )
         gone = " and ".join(j for j in (job, agent) if j) or "(never submitted, or no longer ours)"
+        stored = self.remove_storage(f"the held job {gone} is gone")
         self.remove_root(f"the held job {gone} is gone" + (f" ({swept})" if swept else ""))
-        return f"down: the held job {gone} is gone, and so is the root" + (f"\n{swept}" if swept else "")
+        return f"down: the held job {gone} is gone, and so is the root" + "".join(
+            f"\n{x}" for x in (swept, stored) if x
+        )
+
+    def remove_storage(self, gone: str) -> str:
+        """The provider storage `up` made on scratch (hpcstorage), removed and shown gone, only here: the held job and
+        every client are gone and every service verified clean, and the state that names the storage still exists. What
+        it printed, empty when `up` recorded none (no scratch root, or a state older than the key). A failure keeps the
+        root and the state for a second down, which finishes what is left: the removal is idempotent."""
+        state = self.store.read()
+        if state.get("storage") is None:
+            if state.get("site", {}).get(
+                "storage_root"
+            ):  # up always records the storage it makes: this one lost its record
+                self.set(lambda s: s.update(phase="down"))
+                raise RuntimeError(
+                    f"{gone}, but the state records a scratch root and no provider storage on it, which up always "
+                    "records: nothing on scratch was removed, and the root and its state are kept; look at the "
+                    "scratch root, then restore the record or remove the scratch root's key from the state"
+                )
+            return ""
+        try:
+            return hpcstorage.remove(state["storage"], state, **self.removal_ops())
+        except (RuntimeError, OSError) as error:
+            self.set(lambda s: s.update(phase="down"))
+            raise RuntimeError(
+                f"{gone}, but the provider storage on scratch could not be removed ({error}); the root and its state "
+                "are kept: run down again to remove it"
+            ) from None
 
     def relay_stopped(self) -> bool:
         """Whether the relay's stop shows no heartbeat beating; a stop that could not be run shows nothing."""

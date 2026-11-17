@@ -22,7 +22,7 @@ RUN=$1 BUNDLE=$2 GATE=$3 ARCH=$4 E=$5 SNAME=$6 SID=$7 ROOT=$8 FID=$9 SHA=${10} Z
 shift 11
 (( $# == 3 )) || { echo "sandbox: ERROR: wants the three providers' FQDNs after the zone's" >&2; exit 2; }
 PF=$3   # the gate's upstream: P3, which did not write the file, so its blocks came over the providers' link
-rec() { python3.11 -I "$RUN/record.py" "$@"; }
+rec() { python3.11 -I -B "$RUN/record.py" "$@"; }
 for f in gate.py gatepolicy.py gateboundary.py; do
   [[ -f $GATE/$f ]] || { echo "sandbox: ERROR: no $f in the gate directory" >&2; exit 2; }
 done
@@ -72,7 +72,7 @@ printf '%s\n' '/hpcop-shim/egresslog.so' > "$D/preload"; chmod 644 "$D/preload"
 # does not exist, outside every path the cell sees.
 nonce=$(rec nonce)
 EGRESS=$(mktemp -d "$D/egress.XXXXXX"); chmod 700 -- "$EGRESS"
-python3.11 -I "$BUNDLE/egress-collector.py" "$EGRESS" "$D/egress.jsonl" "$nonce" > "$D/collector.stdout" 2> "$D/collector.stderr" &
+python3.11 -I -B "$BUNDLE/egress-collector.py" "$EGRESS" "$D/egress.jsonl" "$nonce" > "$D/collector.stdout" 2> "$D/collector.stderr" &
 cpid=$!
 for _ in $(seq 100); do
   grep -q '^egress collector ready$' "$D/collector.stdout" 2> /dev/null && break
@@ -92,8 +92,8 @@ printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serve
 openssl x509 -req -in "$D/gate/leaf.csr" -CA "$D/cell/ca.pem" -CAkey "$D/gate/ca.key" -CAserial "$D/gate/ca.srl" -CAcreateserial \
   -out "$D/tls/$lc.pem" -days 1 -extfile "$D/gate/ext" 2> /dev/null
 rm -f -- "${D:?}/gate/ca.key"
-port=$(python3.11 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-python3.11 -I - "$D/gate/config.json" "$lc" "$PF" "$D" "$port" <<'PY'
+port=$(python3.11 -I -B -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+python3.11 -I -B - "$D/gate/config.json" "$lc" "$PF" "$D" "$port" <<'PY'
 import json, secrets, sys
 path, lc, pf, d, port = sys.argv[1:]
 json.dump({"run_key": secrets.token_hex(8), "verify_ssl": True, "upstream_ca_file": d + "/gate/upstream-ca.pem",
@@ -101,7 +101,7 @@ json.dump({"run_key": secrets.token_hex(8), "verify_ssl": True, "upstream_ca_fil
            "listen_host": "127.0.0.1", "listen_port": int(port),
            "hosts": {lc: {"role": "oneprovider", "addr": pf, "port": 8443, "tls": True}}}, open(path, "w"))
 PY
-python3.11 -I "$GATE/gate.py" "$D/gate/config.json" > "$D/gate/stdout" 2> "$D/gate/stderr" &
+python3.11 -I -B "$GATE/gate.py" "$D/gate/config.json" > "$D/gate/stdout" 2> "$D/gate/stderr" &
 gpid=$!
 for _ in $(seq 100); do
   grep -q 'gate ready' "$D/gate/stdout" 2> /dev/null && break
@@ -125,7 +125,7 @@ BINDS=(-B "$D/cell:/cell:ro" -B "$EGRESS:/hpcop-egress:ro" -B "$D/shim:/hpcop-sh
 # The canary: the first connect through the shim, to the gate and to nothing else (the collector's start and this are
 # the only steps between: nothing else in the cell runs before it). The egress log must open with its record.
 canary=0
-apptainer exec --containall --cleanenv --no-home --pwd / "${BINDS[@]}" "$D/cell.sif" python3 -I -c 'import json, socket, sys
+apptainer exec --containall --cleanenv --no-home --pwd / "${BINDS[@]}" "$D/cell.sif" python3 -I -B -c 'import json, socket, sys
 try:
     socket.create_connection(("127.0.0.1", int(sys.argv[1])), 10).close()
     result = "open"
@@ -137,7 +137,7 @@ echo "sandbox: the egress canary (a connect to the gate) exited $canary" >&2
 t1=$SECONDS
 agent=0
 apptainer exec --containall --cleanenv --no-home --pwd / "${BINDS[@]}" "$D/cell.sif" \
-  python3 /cell/agent.py "$port" "$lc" "$SNAME" "$SID" "$ROOT" "$FID" "$SHA" "$ZF" "$@" \
+  python3 -I -B /cell/agent.py "$port" "$lc" "$SNAME" "$SID" "$ROOT" "$FID" "$SHA" "$ZF" "$@" \
   < /dev/null > "$D/agent.json" 2> "$D/agent.err" || agent=$?
 echo "sandbox: the cell ran $((SECONDS - t1)) s, exit status $agent" >&2
 rec rc "$E/sandbox/agent.rc.json" agent "$agent"
