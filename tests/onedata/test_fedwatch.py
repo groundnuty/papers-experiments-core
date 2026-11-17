@@ -827,3 +827,26 @@ def test_o86_watch_for_builds_the_watch_the_faults_table_describes(fake, tmp_pat
     )
     hpc_watch_of = watch_for(config, hpc, Client(), zone=ZONE, hpc_command=["python", "-I", "x.py"], runner=cluster)
     assert hpc_watch_of.window(hpc_watch_of.read())["verdict"] == "stable"
+
+
+def test_o86_an_hpc_target_down_at_both_ends_by_the_runs_own_open_injection_is_held(tmp_path):
+    """O86: the pilot's federation is HPC: its target's step ended before the window and is still ended at its end,
+    held by the run's own injection, which was made before the read: `held` for the target, `stable` for the rest."""
+    cluster = Cluster(
+        **{
+            ZONE: hpc_record("4242.3", kind="oz"),
+            ALPHA: hpc_record("4242.5"),
+            BETA: hpc_record("4242.6", running=False, stops=1),
+        }
+    )
+    injection(journal_of(tmp_path), BETA, clears=None, owner=ME)
+    watch = hpc_watch(cluster, tmp_path)
+    start = watch.read()
+    assert start["services"]["providers[1]"]["state"] == "not_running"
+    result = watch.window(start, owner=ME)
+    assert result["backend"] == "hpc"
+    assert result["services"]["providers[1]"]["status"] == "held"
+    assert [result["services"][label]["status"] for label in ("zone", "providers[0]")] == ["stable", "stable"]
+    assert (result["verdict"], result["findings"], result["unknown"]) == ("held", [], [])
+    cluster.services[BETA] = hpc_record("4242.6", running=False, stops=1)
+    assert watch.window(start, owner=ANOTHER)["verdict"] == "finding"
