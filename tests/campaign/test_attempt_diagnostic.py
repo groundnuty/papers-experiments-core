@@ -13,13 +13,13 @@ from pathlib import Path
 
 import pytest
 from campaign_support import LATER, defect, finished, infra, planned_store, run_one
-from expcore.campaign.start_diagnostic import EXPORT_KEY, LIMIT_BYTES, snapshot_of
 from scheduler_support import FakeExecutor, build, settings_for
 
 from expcore.campaign import recovery
 from expcore.campaign.export import FORMAT, ExportError, export_run_state
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.markers import MARKER_NAME, AttemptResult, read_marker, write_marker
+from expcore.campaign.start_diagnostic import EXPORT_KEY, LIMIT_BYTES, snapshot_of
 from expcore.errors import CORE_KINDS, InfraError
 from expcore.loop.outcomes import Outcome
 from expcore.records.instruments import start_instruments
@@ -190,7 +190,9 @@ def test_c40_an_attempt_whose_instrument_failed_to_start_keeps_the_diagnostic_an
     assert (row["state"], row["charged"], row["infra_kind"]) == ("infra_fail", 1, "sandbox")
     assert json.loads(row["diagnostic"]) == STARTED
     assert marker.diagnostic == STARTED
-    [entry] = export[EXPORT_KEY]
+    assert [e["attempt_id"] for e in export[EXPORT_KEY]] == sorted(e["attempt_id"] for e in export[EXPORT_KEY])
+    entry = export[EXPORT_KEY][0]  # every run of the plan failed its first attempt, so there is one entry for each
+    assert entry["attempt_id"] == row["id"]
     assert entry["diagnostic"] == STARTED
     assert (entry["run_key"], entry["state"], entry["infra_kind"], entry["charged"]) == (
         row["run_key"],

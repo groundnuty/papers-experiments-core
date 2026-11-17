@@ -166,10 +166,10 @@ def _require_the_plan(joined: Mapping[str, Any], seq_of: Mapping[str, int]) -> N
 
 def _keys_of_the_join(exports: Mapping[int, Mapping[str, Any]], order: Sequence[int]) -> list[str]:
     """The keys of the joined export, in the first shard's order, without the shard's own key. `deployment_shares`
-    and `operator_holds` and `reset_settings` are in when any shard's export has them, where `export_run_state` puts
-    them: after `kinds`, in that order."""
+    and `operator_holds`, `reset_settings`, `lost_in_kill`, `interrupted_spend` and `attempt_diagnostics` are in when
+    any shard's export has them, where `export_run_state` puts them: after `kinds`, in that order."""
     keys = [key for key in exports[order[0]] if key != EXPORT_KEY]
-    optional = (DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY)
+    optional = (DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY, DIAGNOSTICS_KEY)
     for position, extra in enumerate(optional):
         if extra not in keys and any(extra in exports[index] for index in order):
             anchors = [keys.index(key) for key in ("kinds", *optional[:position]) if key in keys]
