@@ -24,6 +24,8 @@ The core itself is recorded by its code, not its version: its commit, its git tr
 
 **Before a new study's first start, list every platform module it uses in `[study] platforms`** (for the Onedata platform, `expcore_onedata.sandbox.kinds`). A study whose build loads a platform through the core's loaders (`load_platform`, `load_faults`) without listing its module is refused at start, naming the module (C11), whether or not it declares a deferral; and `[study] platforms` is part of `study.toml`'s hash, so the list cannot be added to a campaign already started.
 
+**Before a new study's first start, give `accepted_fingerprints` in `models.toml` to every model served by an endpoint that may answer from more than one deployment** (a shared gateway that balances one model id across several vLLM deployments, for example). Without them, a run whose served identity changes is set aside as endpoint infrastructure (`identity_kind`, C16) and run again, and one model's replies have come from two deployments within a single run on a live endpoint, so most long runs on it would be set aside. See [A model served by several deployments](#a-model-served-by-several-deployments).
+
 ### What you implement
 
 The study directory holds four configuration files and the plugin, the Python file `[study] plugin` names. The core imports the plugin and calls `build(context)`, which returns a `StudyPlugin`:

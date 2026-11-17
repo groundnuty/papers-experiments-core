@@ -512,14 +512,26 @@ line (`--run` runs it). The manifest names the site's paths and stays out of the
 has its form). Outage runs (`[faults]`) go through the login node's fault relay (M4), which `up`
 starts.
 
-> **A bare copy of the core without `.git` is refused as `core_src`.** The core names itself by its commit in every
-> campaign's environment (`provenance.core_identity`), read from the git work tree its `src/` lies in, or from the build
-> record of a wheel made from one. A copy of the core's files without `.git` (a tarball, an `rsync` that leaves `.git`
-> out, a `git archive`) has no commit to name: its identity is unknown, and `expcore run`, `check`, `merge` and `analyze`
-> refuse to start on a core whose commit is unknown, with or without the allow-dirty option, so every shard step on it
-> stops at its start with "the core's commit is unknown". Point `core_src` at the `src/` of a `git clone` (or install a
-> wheel built from one into the interpreter's environment), and commit what you run: a checkout with uncommitted changes
-> is refused too unless the command allows dirt, and a campaign run so records the core dirty.
+> **The core on the shared filesystem is a git checkout, or a wheel built with its build identity (C06).** The core
+> names itself by its commit in every campaign's environment (`provenance.core_identity`), read from the git work tree
+> its `src/` lies in, or from `expcore/_build_identity.json`, which the build (`hatch_build.py`, under `uv build` or
+> `hatch build`) writes into a wheel from the checkout it builds from. A copy of the core's files with neither (a
+> `git archive`, a tarball, an `rsync` that leaves `.git` out) has no commit to name: its identity is unknown, and
+> `expcore run`, `check`, `merge` and `analyze` refuse to start on it, with or without the allow-dirty option. Set the
+> core up one of two ways:
+>
+> - **A checkout:** `git clone` the core's repository to a directory the nodes see, check out the commit to pin, make
+>   the interpreter's environment from it (`uv sync`, or `uv venv` and `uv pip install --editable .`), and give
+>   `core_src` as the checkout's `src/`. Commit what you run: a checkout with uncommitted changes is refused too unless
+>   the command allows dirt, and a campaign run so records the core dirty.
+> - **A wheel:** build it from a checkout of that commit (`uv build --wheel`), install it into the interpreter's
+>   environment (`uv pip install --python <venv>/bin/python <wheel>`), and give `core_src` as that environment's
+>   `site-packages` directory.
+>
+> `shards.py plan` and `lines` ask the manifest's `python` which core it imports, and `step` reads its own, before
+> anything is made: an unknown or stale core (an installed one edited since its build) is refused there, naming this
+> remedy. Before, a shard on a `git archive` reached its node, started, and stopped there with "the core's commit is
+> unknown".
 
 **What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the
 step makes its `work_root` (0700) before the dispatcher and refuses one that is a link, another user's, open to others
