@@ -235,7 +235,7 @@ def test_o74_up_with_a_study_artifacts_directory_records_the_digest_of_its_tree_
     """O74: the site declares `HPC_STUDY_ARTIFACTS`: the record holds `study_artifacts_tree_sha256`, the SHA-256 of the
     tree's canonical listing (`hpcidentity.tree_sha256`), beside every other key, and neither the directory's path nor
     any of the path it lies under is anywhere in the file (mode 0600, as the rest)."""
-    tree = artifacts_tree(tmp_path / "studies" / "a-study" / "artifacts")
+    tree = artifacts_tree(tmp_path / "studies" / "a-study" / "leaf-dir")
     root = render(hpc, tmp_path / "a" / "root", ca, tree=tree)
     text = (root / FILE).read_text(encoding="utf-8")
     record = json.loads(text)
@@ -244,7 +244,7 @@ def test_o74_up_with_a_study_artifacts_directory_records_the_digest_of_its_tree_
     assert HEX.fullmatch(record[ARTIFACTS])
     assert text == json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
     assert stat.S_IMODE((root / FILE).stat().st_mode) == 0o600
-    for part in (str(tree), str(tmp_path), "a-study", "artifacts", "/an/interpreter"):
+    for part in (str(tree), str(tmp_path), "a-study", "leaf-dir", "/an/interpreter"):
         assert part not in text
 
 

@@ -181,8 +181,8 @@ def test_o74_a_layout_with_no_platform_template_writes_no_record_so_up_takes_no_
     folder = tmp_path / "layout"
     folder.mkdir()
     text = LAYOUT.read_text(encoding="utf-8")
-    kept = [line for line in text.splitlines() if not line.startswith("platform_template")]
-    assert len(kept) < len(text.splitlines())
+    kept = [line for line in text.splitlines() if not line.startswith(("platform_template", "probe_space"))]
+    assert len(kept) == len(text.splitlines()) - 2  # the probe space needs a template, so it goes with it
     (folder / LAYOUT.name).write_text("\n".join(kept) + "\n", encoding="utf-8")
     site = {k: v for k, v in site.items() if not k.startswith(("HPC_AGENT", "HPC_EGRESS", "HPC_ONECLIENT"))}
     rig = Rig(hpc, tmp_path, {**site, "HPC_STUDY_ARTIFACTS": str(tmp_path / "missing")}, layout=folder / LAYOUT.name)
