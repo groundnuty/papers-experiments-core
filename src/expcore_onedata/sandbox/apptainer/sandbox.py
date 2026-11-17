@@ -371,7 +371,7 @@ class ApptainerSandbox:
             gaterun.write_config(config, gaterun.config(
                 run_key=sp.run_key, tls=self.s.tls, served=served, listing=sp.listing, directory=gate_dir,
                 tls_dir=tls_dir, token_file=token, port=self._gate_port, upstream_ca=self._ca_copy,
-                options=self.app.gate_options,
+                options=self.app.gate_options, scan_names=sp.node_names,
             ))  # fmt: skip
             self._token_files = [token]  # before it exists: every teardown removes it, whatever fails from here
             self.run_record()
@@ -791,6 +791,11 @@ class ApptainerSandbox:
         if self._mount is not None:
             meta["mount"] = self._mount.metadata()
         meta["served_bytes"] = self.served_bytes()
+        counted = meta.pop("rest_node_name_hits", None)
+        if self.spec.node_names and self.spec.mode is DataPathMode.REST:  # O73: scanned, so never silently absent
+            meta["infrastructure_facts"]["rest_node_name_hits"] = counted or gatelog.node_name_hits_unknown(
+                gatelog.GATE_NOT_COLLECTED
+            )
         return meta
 
     # ------------------------------------------------------------------------------------------------ stop

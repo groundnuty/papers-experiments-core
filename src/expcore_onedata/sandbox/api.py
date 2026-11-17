@@ -114,6 +114,9 @@ class SandboxSpec:
     lease_key: str | None = None
     listing: str = PAGED
     inputs: tuple[ReadOnlyInput, ...] = ()
+    # the real names and addresses of the federation's nodes (O73), which the gate scans the answers it relays for:
+    # empty where the names are already the declared ones (Compose). Never shown, never in anything a cell can read.
+    node_names: tuple[str, ...] = dataclasses.field(default=(), repr=False)
 
 
 RAN = "ran"  # the cell was started: its exit code, timeout and kill say how it ended

@@ -142,6 +142,8 @@ class Collection:
         box._meta["gate_stop"] = note
         lines, mark = box.gate_log_lines(), box._meta.get("run_start")
         box._meta["served_bytes"] = gatelog.served(lines, note, box.s.served_caps, run_start=mark)
+        if box.spec.node_names:  # O73: the hits of the gate's scan for the nodes' names, from the same stopped log
+            box._meta["rest_node_name_hits"] = gatelog.node_name_hits(lines, note)
 
     def _copy_gate_log(self, dest: Path) -> Path:
         box = self.box

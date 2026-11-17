@@ -18,6 +18,7 @@ in argv[1]:
    "listing": "paged|complete", "peer_uid_check": false,
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
                         "port": 443, "tls": true, "dial": "<address to connect to>"}},
+   "scan_names": ["<a node's name or address>", ...],
    "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
 
 `peer_uid_check` (true or false, false when absent; anything else refuses the start) is for a node whose loopback other
@@ -402,6 +403,46 @@ class _Upstream(Exception):
         super().__init__(repr(cause))
         self.cause = cause
         self.origin = origin_of(cause)
+
+
+_SCAN: dict[tuple[str, ...], re.Pattern[bytes] | None] = {}  # the compiled scan of each list of names, once
+
+
+def _scan_pattern(names: tuple[str, ...]) -> re.Pattern[bytes] | None:
+    """The scan of `names` (O73): each a whole name, in any case, longest first, bare or with a port after it. A name
+    is not part of a longer one: a plain name has no word character, dot or hyphen before it and none after (a dot and
+    a word character after it make it the start of a longer name); an IPv6 address has none of those, nor a colon,
+    before it, and is not followed by a colon and a hex digit (a longer address). One pattern per list, built once."""
+    with _LOCK:
+        if names not in _SCAN:
+            found = sorted(
+                {n.lower().encode("ascii", "ignore") for n in names if isinstance(n, str) and n}, key=len, reverse=True
+            )
+            plain = b"|".join(re.escape(n) for n in found if b":" not in n)
+            six = b"|".join(re.escape(n) for n in found if b":" in n)
+            parts = []
+            if plain:
+                parts.append(rb"(?<![\w.-])(?:" + plain + rb")(?![\w-])(?!\.\w)")
+            if six:
+                parts.append(rb"(?<![\w:.-])(?:" + six + rb")(?![\w-]|:[0-9A-Fa-f]|\.\w)")
+            _SCAN[names] = re.compile(b"|".join(parts), re.IGNORECASE) if parts else None
+        return _SCAN[names]
+
+
+def _node_name_hits(body: bytes) -> int:
+    """How many known node names or addresses (`scan_names` of the gate's configuration, O73) a body holds: counted in
+    memory, and nothing of the body, of a match or of its context is kept. 0 when the gate has no names to scan (a
+    Compose federation's). A body is scanned whole: an answer that is no file's content is read whole before it goes."""
+    names = tuple(CFG.get("scan_names") or ())
+    pattern = _scan_pattern(names) if names and body else None
+    return len(pattern.findall(body)) if pattern is not None else 0
+
+
+def _count_node_names(rec: dict, body: bytes) -> None:
+    """The request's line says how many node names the answer held, when it held any (`node_name_hits`, an integer)."""
+    hits = _node_name_hits(body)
+    if hits:
+        rec["node_name_hits"] = rec.get("node_name_hits", 0) + hits
 
 
 SERVED_PORT = 443  # where a client of the gate dials every name it serves: the gate's own port, or the 443 mapped to it
@@ -796,12 +837,14 @@ class Handler(BaseHTTPRequestHandler):
         """The gate's own answer, and then its line, so the line has the answer's body bytes; logged whatever the client did meanwhile."""
         rec["body"] = "gate"
         try:
-            self._send_json(code, obj)
+            self._send_json(code, obj, rec=rec)
         finally:
             self._log(rec)
 
-    def _send_json(self, code: int, obj: dict, *, close: bool = True) -> int:
+    def _send_json(self, code: int, obj: dict, *, close: bool = True, rec: dict | None = None) -> int:
         body = json.dumps(obj).encode()
+        if rec is not None:  # the gate's own answer reaches the agent too: it is scanned like an upstream's (O73)
+            _count_node_names(rec, body)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1106,7 +1149,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_whole(self, resp, passed, body: bytes, rec, kind: str) -> tuple[int | None, int, str | None, str]:
         """A checked body and its head, written within CLIENT_WRITE_TIMEOUT_S: (length framed, bytes sent, failure, its
-        origin). A client that stops reading frees its slot: its connection is closed (`client_stalled`)."""
+        origin). A client that stops reading frees its slot: its connection is closed (`client_stalled`). The body is
+        scanned for the nodes' names first (O73), a merged listing's too."""
+        _count_node_names(rec, body)
         self.connection.settimeout(CLIENT_WRITE_TIMEOUT_S)
         rec["body"] = kind
         try:

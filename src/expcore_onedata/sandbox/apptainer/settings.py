@@ -67,7 +67,7 @@ MARGIN_BOUNDS = (1 << 20, 64 << 30)  # hidden_memory_margin_bytes, in bytes
 # the keys of the gate's configuration the sandbox writes itself (`gaterun.config`): gate_options may set none of them
 GATE_OWN_KEYS = frozenset(
     {"run_key", "verify_ssl", "log", "tls_dir", "hosts", "listing", "token_file", "token", "upstream_ca_file",
-     "listen_host", "listen_port", "tcp_forwards"}
+     "listen_host", "listen_port", "tcp_forwards", "scan_names"}
 )  # fmt: skip
 
 
