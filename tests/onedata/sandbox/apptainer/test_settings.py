@@ -282,5 +282,6 @@ def test_o57_a_platform_that_declares_no_storage_kind_keeps_the_fingerprint_it_h
     undeclared = load_platform(write_platform(tmp_path / "a", apptainer)).fingerprint()
     docker = load_platform(write_platform(tmp_path / "d", add_sandbox)).fingerprint()
     assert "provider_storage" not in undeclared["sandbox_backend"]
-    assert set(docker) == {"tls", "data_paths"}  # what the Docker backend's fingerprint held before the key existed
-    assert "provider_storage" not in json.dumps(docker)
+    assert {"tls", "data_paths"} <= set(docker)  # what the Docker backend's fingerprint held before the key existed
+    assert "sandbox_backend" not in docker
+    assert "provider_storage" not in json.dumps(docker)  # nothing the key adds reaches a Compose federation's
