@@ -65,7 +65,8 @@ second federation's Couchbase on a node of the first fails on its bind and its `
 cores and memory, never a whole node, and Slurm packs jobs onto a node that has room: nothing placed two federations
 apart. **Decision: node exclusion, not per-federation ports.** The Couchbase port set is large and fixed in the image;
 a port per federation would patch the shim, the guard and the images, for a placement question that the scheduler can
-answer. `--exclusive` was the other option: it bills a whole node for each service, against a 5-core step.
+answer. Asking the site for whole nodes (`--exclusive`) was the other option: it would change the held job's shape and
+what it bills (above), which this problem does not need.
 
 - **Which jobs.** Every live job of the account (`squeue --me`, read-only, ids, names, states and node lists) whose
   name starts with `hpcop-` (`hpcexclude.JOB_PREFIX`, the one prefix `up` names its jobs by, and the bundle's batch
@@ -74,7 +75,8 @@ answer. `--exclusive` was the other option: it bills a whole node for each servi
   the agent's sandbox never runs on a node that hosts an Onedata service. A pending job holds none, a completing one still
   does.
 - **Before the submit** (section 5, step 2): the nodes of those jobs go to every component of every held job `up`
-  submits as `--exclude` (Slurm passes no such option from one component to the next), and only when there are some, so
+  submits as `--exclude`, named on every component so that nothing depends on Slurm passing it on, and only when there
+  are some, so
   the argv is what it was without them. The count, never a name, is in the state (`allocation.excluded_nodes`) and in what
   `up` says. A read that fails, or a line of such a job that cannot be taken apart, refuses `up` before the state file
   exists: the job is never submitted without the exclusion.

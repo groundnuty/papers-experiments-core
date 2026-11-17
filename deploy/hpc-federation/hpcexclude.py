@@ -24,6 +24,7 @@ from hpcslurm import JOB_LISTED, Slurm, SlurmError
 JOB_PREFIX = "hpcop-"
 LIVE = ["squeue", "--me", "-h", "-o", "%i %j %T %N"]  # id, name, state, node list: nothing else of a job is read
 STATE = re.compile(r"[A-Z_]{2,32}")
+LENIENT = ("PENDING", "COMPLETING")  # states whose node list may be none: not yet placed, or all returned to service
 NODE_LIST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._,\[\]-]{0,4095}")  # a compressed host list: `node[01-03],node07`
 UNREADABLE = "the account's live federation jobs could not be read"
 
@@ -63,18 +64,20 @@ def live_jobs(slurm: Slurm) -> List[LiveJob]:
 
 
 def _nodes(slurm: Slurm, state: str, listed: str) -> List[str]:
-    """The nodes of one row. A job that runs (or is completing, or configuring) holds nodes, so a row without a list
-    that can be expanded refuses; a pending job's list, if it has one that can be expanded, is kept (the scheduler may
-    have set its nodes aside), and its list that is none (`(null)`, empty) is no node."""
-    pending = state == "PENDING"
+    """The nodes of one row. A job that runs (or is configuring) holds nodes, so a row without a list that can be
+    expanded refuses. A pending job's list, if it has one that can be expanded, is kept (the scheduler may have set its
+    nodes aside), and its list that is none (`(null)`, empty) is no node; so is a completing job's empty list, since
+    squeue lists only the nodes not yet returned to service and a job right after a `down` may have none left. A
+    completing job's list that is there and cannot be read refuses."""
+    leniently = state in LENIENT
     if NODE_LIST.fullmatch(listed) is None:
-        if pending:
+        if leniently and (state != "COMPLETING" or not listed):
             return []
         raise SlurmError("a live federation job that holds nodes lists none")
     try:
         return slurm.hostnames(listed)
     except SlurmError:
-        if pending:
+        if state == "PENDING":
             return []
         raise SlurmError("the node list of a live federation job could not be expanded") from None
 

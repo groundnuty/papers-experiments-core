@@ -120,9 +120,9 @@ def test_o57_up_submits_with_the_nodes_of_the_accounts_other_live_federations_ex
 
 
 def test_o57_every_component_and_job_of_the_up_excludes_the_same_nodes(hpc, tmp_path, site):
-    """O57: the services' job, the agent's component of a heterogeneous job (Slurm passes no `--exclude` from one
-    component to the next) and the agent's own job under "separate" all keep off the other federations' nodes: an
-    agent's sandbox never runs on a node that hosts an Onedata service, another federation's included."""
+    """O57: the services' job, the agent's component of a heterogeneous job (named on each, so nothing depends on
+    Slurm passing it on) and the agent's own job under "separate" all keep off the other federations' nodes: an agent's
+    sandbox never runs on a node that hosts an Onedata service, another federation's included."""
     other = [OtherJob("5001", OTHER, "RUNNING", ("node01", "node02"))]
     for index, layout in enumerate((LAYOUT, SEPARATE_LAYOUT)):
         (tmp_path / str(index) / "fed").mkdir(parents=True)
@@ -146,6 +146,15 @@ def test_o57_up_with_no_other_federation_live_asks_for_no_exclusion(hpc, tmp_pat
     assert any("nothing is excluded" in line for line in rig.said)
 
 
+def test_o57_a_completing_job_with_no_node_left_holds_none_and_does_not_refuse_up(hpc, tmp_path, site):
+    """O57: squeue lists a completing job's nodes not yet returned to service, so right after a `down` its list may be
+    empty: that job holds no node, and an `up` straight after it (a fleet's `add`) goes on, excluding nothing."""
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(others=[OtherJob("5001", OTHER, "COMPLETING")]))
+    rig.up()
+    assert not any(word.startswith("--exclude") for argv in rig.calls("sbatch") for word in argv)
+    assert rig.state()["allocation"]["excluded_nodes"] == 0
+
+
 @pytest.mark.parametrize(
     "rows",
     [
@@ -153,6 +162,7 @@ def test_o57_up_with_no_other_federation_live_asks_for_no_exclusion(hpc, tmp_pat
         ["5001 hpcop-x"],  # no state
         ["5001 hpcop-x RUNNING node01 another"],  # more than four words
         ["5001 hpcop-x RUNNING node[01"],  # a node list that is not one
+        ["5001 hpcop-x COMPLETING node[01"],  # a completing job's list that is there and cannot be read
         ["x hpcop-x RUNNING node01"],  # an id that is none
     ],
 )
@@ -409,7 +419,7 @@ def test_o57_two_members_that_raced_and_share_a_node_leave_the_later_one_refused
     second.me_rows = rows
     code, printed = bench.up(2)
     assert code != 0
-    assert second.cancelled == [job_ids("fed-2")[0]] or job_ids("fed-2")[0] in second.cancelled
+    assert sorted(second.cancelled) == sorted(job_ids("fed-2"))  # its services' job and its agent's own
     assert first.cancelled == []
     log = (bench.fleet / "logs" / "fed-2.up.log").read_text(encoding="utf-8")
     assert "zone" in log  # the member's own log has the refusal; the fleet's line is the log's last
