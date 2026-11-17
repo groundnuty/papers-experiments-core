@@ -31,7 +31,8 @@ The log sees what the guard sees: every request the core's recording makes (`rec
 tasks and threads the executor starts with the attempt's context. An executor that sends requests another way leaves
 them out of its record too, and so out of a finished attempt's cost; one that sends every request another way leaves
 a log with no request, which is why such a log charges the bound: it cannot be told from a kill before the first
-request.
+request. (An attempt that raised before its loop ended, rather than one killed, and whose backend's own count of
+its requests is 0, is charged nothing for such a log: `campaign.no_request`.)
 
 Nothing recorded is ever charged less: the measured part is the recorded counts at the model's price, and the
 in-flight request is added at its bound whatever the measured part is, never capped at R. The attempt's top-ups (C26)

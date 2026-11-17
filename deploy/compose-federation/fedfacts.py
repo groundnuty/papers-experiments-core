@@ -3,8 +3,9 @@
 facts.json holds the addresses, ids and names a platform.toml needs, the declared layout's name, digest and memory
 limits, the root's allowed parent and how each imported space is held (its mode, the name of the variable that gave its
 source, its storage and its scan, never the source's path); never a secret, since credentials are named by their
-files. platform.toml is rendered from the layout's template with those facts. `describe` gives the deployment's table
-for the day-0 report.
+files. platform.toml is rendered from the layout's template with those facts, and with the root's own absolute path
+where the template names it (`@hpc_root@`, the HPC render's name; `render_root`). `describe` gives the deployment's
+table for the day-0 report.
 """
 
 import json
@@ -19,6 +20,10 @@ from fedspec import Space, Spec
 from fedtools import check_rendered, require_study_artifacts
 
 PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")
+# The root's placeholder: the name the HPC render fills (`hpcboot.hpc_values`), so one template text names the root on
+# either platform. Only a template that names it has the root checked, filled and recorded.
+ROOT_PLACEHOLDER = "hpc_root"
+TOML_UNSAFE = '"\\'  # a path with one of these, or a non-printable character, cannot stand in a basic string as it is
 
 
 def root_parent(layout: Layout) -> dict:
@@ -27,6 +32,32 @@ def root_parent(layout: Layout) -> dict:
         "path": str(layout.parent),
         "set_by": "default" if layout.parent_is_default else "EXPCORE_FED_ROOT_PARENT",
     }
+
+
+def render_root(layout: Layout) -> str:
+    """The federation's root as `@hpc_root@` is filled with it, or a refusal naming the placeholder and the reason,
+    never the path. The root must be an absolute path of an existing directory that carries this federation's mark,
+    with no symbolic link on any component of its path (its real path is its path, so a copy of the file beside a study
+    reads the root's own files and `down`'s root is the one named) and nothing a TOML basic string cannot hold as it
+    is: the value is written into the file unescaped, and a quote there would end a string."""
+    name, root = f"@{ROOT_PLACEHOLDER}@", layout.root
+    text = str(root)
+    if not os.path.isabs(text):
+        raise RuntimeError(f"{name}: the federation's root must be an absolute path")
+    if os.path.realpath(text) != os.path.normpath(text):
+        raise RuntimeError(
+            f"{name}: the federation's root must not be, or pass through, a symbolic link: set EXPCORE_FED_ROOT and "
+            "EXPCORE_FED_ROOT_PARENT to the real path"
+        )
+    if not root.exists():
+        raise RuntimeError(f"{name}: the federation's root does not exist")
+    if not root.is_dir():
+        raise RuntimeError(f"{name}: the federation's root is not a directory")
+    if any(c in text for c in TOML_UNSAFE) or not text.isprintable():
+        raise RuntimeError(f"{name}: the federation's root has a character in its path that a TOML string cannot hold")
+    if not layout.owned:
+        raise RuntimeError(f"{name}: the federation's root does not carry this federation's mark")
+    return text
 
 
 def baseline_files(spec: Spec) -> dict | None:
@@ -152,16 +183,25 @@ def render(template: str, values: dict[str, str]) -> str:
 
 def write_facts(layout: Layout, boot: Bootstrap, study_artifacts: str | None = None) -> str:
     """Write facts.json, and platform.toml when the layout names a template; say which were written. A template may name
-    `@study_artifacts@`, the directory of the study's own files that `study_artifacts` gives (O83); the written file's
-    slots are checked against the layout's principals (`fedtools.check_rendered`)."""
+    `@study_artifacts@`, the directory of the study's own files that `study_artifacts` gives (O83), and `@hpc_root@`,
+    the root's absolute path (`render_root`, O35): a root that does not pass is refused before anything is written, and
+    facts.json records the `root` it filled, only then. The written file's slots are checked against the layout's
+    principals (`fedtools.check_rendered`)."""
     facts = facts_of(boot)
-    layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     template = layout.spec.platform_template
-    if template is None:
+    text = None if template is None else template.read_text(encoding="utf-8")
+    root = render_root(layout) if text is not None and f"@{ROOT_PLACEHOLDER}@" in text else None
+    if root is not None:
+        facts = {**facts, "root": root}
+    layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if text is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
-    text = template.read_text(encoding="utf-8")
     require_study_artifacts(text, study_artifacts)
-    values = {**placeholders(facts), **({"study_artifacts": study_artifacts} if study_artifacts else {})}
+    values = {
+        **placeholders(facts),
+        **({"study_artifacts": study_artifacts} if study_artifacts else {}),
+        **({ROOT_PLACEHOLDER: root} if root is not None else {}),
+    }
     write_private(layout.platform, render(text, values))
     check_rendered(layout, facts)
     return "facts.json and platform.toml written"

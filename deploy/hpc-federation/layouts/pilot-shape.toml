@@ -19,7 +19,10 @@ probe_space = "link-probes"
 
 [hpc]
 time = "02:00:00"                        # the held job's --time: bring it down well before
-stop_seconds = 600                       # a service's graceful stop bound; settle_timeout_s is derived from it
+# stop_seconds: three provider outages on one HPC federation, 17 Nov: largest service-side stop 33.1 s, plus 50 %
+stop_seconds = 50                        # a service's graceful stop bound; settle_timeout_s is derived from it
+# step_launch_wait_s: a step's creation can wait on the scheduler's controller up to its message timeout (200 s, plus 20 %); 47 to 103 s seen live, 17 Nov
+step_launch_wait_s = 240                 # what a control step may wait to start, added to every bound that waits on its client
 core = "login"                           # where the bootstrap and the link check run: "login", or "step" (DESIGN.md 9)
 zone = { cpus = 4, memory = "8g" }       # live peaks: about 4.0 GB of RSS and the 1.9 GB rootfs on tmpfs
 provider = { cpus = 4, memory = "10g" }  # about 4.8 GB of RSS, the 2.5 GB rootfs and the posix storage on tmpfs

@@ -192,6 +192,20 @@ under one record. One federation's job failing ends one shard's step, never anot
   gives, before each launch: a line is never built from a manifest the fleet did not write. It then asks Slurm of the
   job the line lands in: still known, running, and under the name its federation's `up` gave it, since Slurm reuses
   ids and a job that ended may have handed its id to another. Each line runs with `--chdir=/`.
+- **A campaign that injects faults needs each federation's relay.** A federation without a serving relay can neither
+  inject nor restore a provider, and its `up` still counts as finished. So `readiness` (used by `plan` and again by
+  `step`) refuses, for a campaign that injects faults, a federation whose state file does not say `fault_relay =
+  serving`, naming the federation and the reason. The campaign injects when the study's `study.toml` has a condition
+  whose treatment is a `provider_outage` (`expcore.errors.PROVIDER_OUTAGE`), or the federation's `platform.toml` has
+  `[faults] sanctioned = true`; both are read as files and nothing of the study is run. The test is the campaign's: a
+  shard's runs are a share of every condition (C28), so one outage condition makes every shard inject, and a condition
+  that names tasks is not exempted (the fleet fails closed). A `study.toml` that cannot be read counts as injecting. The
+  record is what `up` saw, so a relay that stops afterwards is not noticed here.
+- **Each federation's state is said plainly.** `status`, and `plan` before it assigns anything, print up and ready, up
+  with no relay, failed (or down failed) and still HOLDING jobs by count with the command that releases them, or down
+  (`fleetrecord.member_state`). Holding is read from the job ids the state file and the record name, not from the
+  status: a failed member may hold nothing (an up refused in its preflight), and a down-failed one still bills unless its
+  state file's phase is `down`, which `hpcdown` writes only once the held jobs are cancelled and every client ended.
 - **Moving a shard (the coordinator's rule).** The shard count is fixed at the fleet's `up`. A shard whose federation
   is taken down (`down --member`) is released, and given only to a federation brought up after (`add`), never one that
   held a shard before, with the same checks and an equal fingerprint, its step started with `--resume` from its
@@ -199,7 +213,7 @@ under one record. One federation's job failing ends one shard's step, never anot
   step carries into the study: it moves a shard only to a federation whose `platform.toml` leaves `[placement]
   reset_shortcut` off (the default), under which every reset takes the full reads; one that turns it on is refused.
   It cannot see a study's own request for one full reset (O51), so a study that turns the shortcut on moves no shard.
-- **The shards' results are copied back before `down`.** The shards' archives, archive manifests, journals and (when newer than the archive) newest snapshot are on the shared filesystem the site's scratch policy cleans, and `down` ends the federation: the operator pulls them to their own host after `collect` and checks them with `shards.py verify-copy` before `down` (section 5, "Before `down`").
+- **The shards' results are copied back before `down`.** The shards' archives, archive manifests, journals, each root's evidence archive and (when newer than the archive) newest snapshot are on the shared filesystem the site's scratch policy cleans, and `down` ends the federation: the operator pulls them to their own host after `collect` and checks them with `shards.py verify-copy` before `down` (section 5, "Before `down`").
 - **Not built:** a fleet's `down` of a failed federation on its own (the operator decides when a failed `up`'s job
   goes), a watch of each job's walltime, and a fleet across accounts (the maximum is one fleet's, not the account's:
   two fleets of one account must share it by hand).
@@ -214,7 +228,8 @@ provider's posix storage on the same tmpfs (test data only, here).
 ```toml
 [hpc]
 time = "02:00:00"                        # the held job's --time
-stop_seconds = 600                       # a service's graceful stop bound (teardown.sh --timeout)
+stop_seconds = 50                        # a service's graceful stop bound (teardown.sh --timeout); measured, 17 Nov
+step_launch_wait_s = 240                 # what a control step may wait to start; added to every bound on its client
 core = "login"                           # where the bootstrap and the link check run: "login" or "step" (section 9)
 zone = { cpus = 4, memory = "8g" }       # the zone's service step
 provider = { cpus = 4, memory = "10g" }  # each provider's service step (posix storage on tmpfs included)
@@ -387,6 +402,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   },
   "clients": {"<step name>": {"pid": 0, "start": 0}},
   "relay": {"pid": 0, "start": 0, "log": "<log dir>/<allocation name>-fault-relay.log"},
+  "fault_relay": "serving | none",
   "data": {"ingested": {"<space>": {"manifest": "<sha256>", "declared": true,
                                     "verified": null}}},
   "shard_nodes": [{"job": "<the operator's job id>", "node": "<node>", "label": "<shard>", "name": "<its job name>"}],
@@ -407,7 +423,12 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 - **`site`** is what `up` read from `site.env` (no secret): every later command reads it here, so `down` and the
   service verbs need no environment. **`command`** is this driver's argv prefix, which `platform.toml`'s `[faults]
   command` holds. **`clients`** are the detached srun clients of the service steps, by step name, which `down` ends
-  once their steps are gone. **`owner`** is the job's uid and gid on the nodes (the posix storage's owner).
+  once their steps are gone. **`relay`** is the fault relay's client (pid, start, log), recorded at its spawn so that
+  `down` can end it whatever happens next; it does not say the relay serves. **`fault_relay`** does: `up` writes
+  `serving` once the relay's heartbeat is seen and `none` when the core has no relay. A state with neither (an older
+  up's, or an up that failed before the heartbeat) reads as `unrecorded` (`hpcstate.relay_of`), which is not serving.
+  The fleet reads it from here, never from the up log. **`owner`** is the job's uid and gid on the nodes (the posix
+  storage's owner).
 - **`data.ingested`** (O57, C06) names each space whose data is the study's own, put there after `up` (section 6a),
   written by `up` from the layout alone: `manifest` is the SHA-256 of the manifest it is to be verified against
   (`Manifest.digest()`: the declared file's, or the empty manifest's for a space that declares none), `declared` whether
@@ -571,7 +592,8 @@ map. Four parts land together, in this order, since only then does every step ha
    file, never in a cell, the gate's file, `facts.json` or `gate.json`): each declared name with its node's address and
    the node's own names (its FQDN and its first label). A node's name or address belongs to one declared name; a
    service with no address stops `up` before it launches any (`hpcnames.address_map`). `platform.toml` names it
-   (`addresses = { file = "<root>/secrets/address-map.json" }`, first, written once the root holds one). The platform
+   through the template's own `addresses = @hpc_addresses@` line (section 6), so the render is the template with its
+   slots filled and no line is added to it. The platform
    layer's client, the bootstrap's, the gate and the host mount's oneclient dial the mapped address and keep the
    declared name in the URL, the handshake, the certificate check and `Host`.
 2. **The URLs.** Every URL the driver builds or records for a service is `https://<declared name>:8443`
@@ -683,6 +705,9 @@ removed while held would let the next `up` or `down` lock another file of the sa
 
 **Before `down`: the copy back, a required step of the operator's, not of `down`'s.** Nothing durable may live only on scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all of scratch after 20 days with no job submitted. The cluster cannot push to the operator's host, so after `shards.py collect` (run once every step has ended) the operator pulls the results directory (rsync or scp, from their host) and runs `shards.py verify-copy MANIFEST LOCAL_DIR --manifest-sha256 HASH` there. **What the required pull covers is what the manifest lists,** per shard: the archive `<label>.out.tar`; its manifest `<label>.out.json`; every file under `<label>/journals/` (a spend journal per step, which holds what a step killed outright spent and which `--resume` counts as `lost_in_kill`, so it is held nowhere else); and the newest snapshot that verifies, only when it is newer than the archive. **Why snapshots are not otherwise required:** a snapshot is a copy of `out/` taken while its step ran, and it names the archive its step started from (`_run_step`: `facts = {"shard": spec, "base": base}`). The snapshots of the step that wrote an archive name an earlier archive or none, and the last of them was taken after the dispatcher exited and before the archive, so the verified archive holds all they do; `--resume` agrees (`restore_newest` returns none for a snapshot whose `base` is not the archive's SHA-256, the archive being newer). **The exception:** a step resumed from the archive and killed before it archived leaves snapshots that name that archive, so the newest holds the runs that step reached, which the archive lacks and the merge will not have; `collect` picks it as `--resume` would (`restore_newest` with the verified archive as the base, restored into a private directory that is removed), warns, and lists every file of it. Plain `collect` does not refuse that state (the merge it prints is of the archive, and the operator may mean to run it): the warning and the manifest keep the snapshot from being lost with the scratch. `collect --run`, which runs the merge at once, refuses in that state (exit 2, naming the shard and the snapshot: resume the shard so its runs reach a new archive, or run `collect` without `--run` and merge the line it prints yourself), because the merge has no flag to leave a shard short and would analyse an incomplete campaign. `collect` writes `archives.sha256.json` beside the archives: the plan's id, then each archive's, and each other file's, relative name, size and SHA-256, read by `collect` (an archive from its private verified copy, never from a step's claim; a link anywhere among the journals or the snapshot refuses the collect), sorted, with no path or timestamp, and prints the file's own hash on stderr; the hash must come from that output, never from the pulled files, or a manifest damaged or swapped in the pull would vouch for itself. `verify-copy` is standard library only and is dispatched before the plan is loaded, so it runs on a host without the core (a test runs it under `python -I -S`); it checks each file as a regular file under plain directories (a link on the way is not followed) and refuses a manifest with no list of the files beside the archives, which an earlier tip wrote. `down` does not see the operator's host and does not check that this was done: the order is the operator's rule, and the README states it as a required step.
 
+
+**`down` and the root's evidence (O63).** `down` removes the root, which holds the files the study's post-check and the facts read, so it does not remove one whose evidence was not collected. The evidence is an allow-list (`hpcevidence.py`): the state, `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml` where present, `shard-claim.json` and `shard-claim.lock` where present (the study's pre-step guard), `data-manifests/*.json` (the manifests each space's data identity in `platform.toml` is the hash of), `shard-steps/*.json`, the whole of `fault-journal/` (its journals, `link-epoch.json`, the holder, drain and intent records and the lock files the pilot's heal flocks: read as they are, never locked) and the fault relay's `late-steps.jsonl` and its request, taken and answer files. Never in it: `secrets/` (the zone's passphrase, the CA key, the admin credential, the users' passwords), any file that holds a token, key or password whatever its name, the relay's heartbeat and lock, the CA, the shim, a provider's data. The state is the one file of the list that holds site values (account, partition, paths, the administrator's mail address) and no credential: the pulled archive is private like the journals. Each file is opened below a descriptor of the root with no link followed and read once, and the tar is built from those bytes; a file that is a link, or that holds the content of a file of `secrets/`, refuses the collect naming it. `collect` publishes `<label>.root.tar` and `<label>.root.json` beside the shard archives and lists both in `archives.sha256.json`, so `verify-copy` checks them. `down` cannot see the results directory: `shards.py step` leaves `shard-steps/<label>.json` in its root (a step ran), and `collect` writes `evidence-collected.json` there once its manifest is written (the root archive's hash, the digest of the step records it read and the hash of each file archived), so `down`, which reads both before it stops anything (`Down.evidence_gate`), refuses a root with records and no current marker, and one where a file a step, the study or `up` writes is no longer what the marker names (a later step, a step still writing the journals when `collect` ran, a line appended, a changed file: it reads the root's evidence again and compares file by file, `hpcevidence.check_collected`; a `down` that began is not gated again). **Two sets.** What is compared strictly is the fault journal, the relay's journals (`late-steps.jsonl` among them), the shard claims, the step records, the data manifests and the files `up` writes once (`facts.json`, `platform.toml`, `render-identity.json`) with the pilot's `day0-wiring.toml`. The self-rewritten set (`SELF_REWRITTEN_FILES`) is the two files the running federation rewrites itself, the state (each state update) and `link-check.json` (each link check); a change to them post-dates every run once `collect` has run, so it does not refuse `down` and needs no second archive: `down` names the files that changed, by name only, in its output and in the state (`evidence_rewritten_after_collect`), and the collect-time copy stays what the post-check reads. Every file of the allow-list is in exactly one set (a test asserts it), and one in neither compares strictly. A check a step runs appends to the fault journal's holds too, so a step still running after the collect refuses `down` through the journal; `--discard-evidence` removes the root without it, the output says so, and the use is recorded in the state file (`evidence_discarded`: time, shards, reason from `--discard-reason`; it goes with the root, so down's output is what outlives it). The archive is named by the shard's label and its manifest records a hash of the root's path (`root_id`, no path): a shard a fleet moves to another federation gets a root archive made of the second, and the first's is put aside as `<label>.<12 hex digits>.root.*` (never overwritten) and listed with the rest; `collect --roots-only [--shard L]` archives and marks the roots alone, for the shard about to move while the others are not final. The root archive, like the shard's `pass-env.json` (listed in the evidence when present), is private: `package.spec.never_selected` keeps both out of any `expcore package`, wherever they lie. A root with no record goes down as before. `collect` itself is atomic: everything is staged in a private directory beside `--into` and the manifest is the last write to the results directory and `--into`.
+
 A job already ended (its `--time`, a failure) skips 2 and 3: Slurm stopped its steps, the bundle's cleanup removed
 what its time allowed, and the next job of ours on a node sweeps what is left (`sweep_leftovers`). `down` says which
 nodes it could not check.
@@ -691,7 +716,7 @@ nodes it could not check.
 
 **Rendered by `up` into the root from the layout's own `platform_template`, by the Compose renderer
 (`fedfacts.write_facts`), with the HPC facts:** `@zone_url@` and `@provider_url.<name>@` are `https://<declared
-name>:8443` (O73; the address map's file is named by an `addresses` line the driver puts first); the ids are this
+name>:8443` (O73; the address map's file is named by the template's own `addresses = @hpc_addresses@` line, below); the ids are this
 `up`'s. Every path in the template stays relative to the root, so the same template
 serves both:
 
@@ -706,16 +731,30 @@ serves both:
   study names the root's journal (`load_faults` refuses a relative one in a study directory);
 - `[faults]` for the HPC backend (M4's loader): `backend = "hpc"`, `stop_bound_s`, `journal`, `[faults.services]`
   naming every provider, and none of `compose_file`, `project`, `command` or `docker`, which that backend refuses;
-  its defaults are `settle_timeout_s = stop_bound_s + 60`, `poll_s` 10 and `relay_wait_s` 30;
+  `step_launch_wait_s` (from the layout's `[hpc]`, 240) and `command_timeout_s` (`step_launch_wait_s + 60`, 300: the
+  floor of every relay verb's own bound; a Compose table's is 120), both declared by `up`; its defaults are
+  `settle_timeout_s = stop_bound_s + step_launch_wait_s + 70`, `poll_s` 10 and `relay_wait_s` 30;
 - **`@study_artifacts@`**, from `site.env`'s `HPC_STUDY_ARTIFACTS` (section 6a): the study's own directory on the nodes,
   so a template names the paths of its tool server's venv, clone and manifests under it and a public replication package
   carries no site path. A template that names it without the key is refused at the preflight, naming the variable; an
   unset key is no value, so the renderer would refuse the placeholder too, never write an empty path;
+- **`@hpc_addresses@`**, the value of the template's one top-level `addresses` key (O73): the inline table
+  `{ file = "<root>/secrets/address-map.json", resolver = "<root>/toolshim/resolve_launch.py" }` (without `resolver`
+  until `up` has copied the launcher into the root), which the platform layer reads as `[addresses]`. The slot stands
+  for the value, as `@hpc_direct_storages@` does, so the template shows its key, `addresses = @hpc_addresses@`, which
+  stands before the first table (a key after a table header belongs to that table). `up` writes the map into every HPC
+  federation's root, so its preflight refuses, naming the slot and before it submits anything, a template whose
+  top-level `addresses` key does not take the slot; the render refuses a template that names the slot when the root
+  holds no map, a root with a map when the template has no slot, and a rendered file whose top-level `addresses` is not
+  the table. The render adds, moves and removes no line: it is the template with its slots filled (a study's
+  conformance check holds it to that, but for `[placement]`, which the render completes, below);
 - the values only the HPC driver fills, for a template that names them: **`@hpc_stop_bound_s@`**, `stop_seconds + 90`
-  (690 by default, section 7e); **`@hpc_settle_timeout_s@`**, `stop_bound_s + 60`; **`@hpc_command@`**, this
+  (140 by default, section 7e); **`@hpc_step_launch_wait_s@`**, `[hpc] step_launch_wait_s` (240 by
+  default); **`@hpc_command_timeout_s@`**, that and 60 (300); **`@hpc_settle_timeout_s@`**, `stop_bound_s +
+  step_launch_wait_s + 70` (450); **`@hpc_command@`**, this
   driver's argv prefix as a TOML array; and **`@hpc_token_margin_s@`**, the least `[tokens] margin_s` the platform
   layer's own loader accepts for the rest of the file: `up` writes the file with a provisional margin no rule refuses,
-  reads it with `load_faults` as a campaign would, and writes it again with the least that loader's rule gives (5,340 s
+  reads it with `load_faults` as a campaign would, and writes it again with the least that loader's rule gives (5,370 s
   with M4's defaults), so a measured `stop_seconds`, or a term the loader adds, moves it. A core whose loader cannot
   read the HPC `[faults]` (one without M4's backend) gets the restore's rule over the keys it knows, with the HPC
   settle time and poll;
@@ -826,8 +865,84 @@ the wait for any request issued before it (the relay runs one at a time, in orde
 about 30 s on every verb, measured live. The relay lists `requests/` the same way; a login-node wait (`up`'s for the
 heartbeat, `stop`'s for it to go) runs on the host that writes the file and is no such poll.
 
+**A verb that outlives the relay's bound (O58).** A verb is a process that launches an `srun` step and waits for it, and
+the controller can stall silently for its message timeout (about 200 s on the site) before it makes the step. Ended
+alone at the bound, the verb left its `srun` orphaned: when the controller caught up the step was made and launched,
+so the verb ran after the relay had answered `timed_out`, and its own cancel path (`hpcslurm.Slurm._finish`) never
+ran. A late stop could land inside a restore, a late `restart_link` inside a heal's settle, up to about twice the
+message timeout after the request. The relay now does three things (`fault_relay_group`, `fault_relay_late`, `hpclate.py`):
+
+- **Each verb runs in a session and process group of its own, and at the bound the whole group is ended:** SIGTERM, a
+  grace of 5 s, then SIGKILL, with the leader reaped only afterwards so the group id is its own. No `srun` client of the
+  verb survives it. The pipes are closed on our side, so a descendant that left the group cannot hold the relay. **A
+  verb that exits before its bound with a child still in its group** (hpcfed failing while it ends its own step, say)
+  has that child ended the same way (only while a live member holds the group), and the relay treats it as a timed-out
+  verb for the watch below; its answer is the verb's own exit status.
+- **The relay stamps the verb's steps.** It derives a tag of 12 hex digits from its own nonce and the request's id and
+  runs `hpcfed.py ... --step-tag <tag> <verb> <service>`; every control step the verb launches is then named
+  `<allocation>-<service>-<word>-<tag>` (`word` of `hpcfed_control.CONTROL_WORDS`: `status` and `mounts` for a status,
+  `stop`, `status` for a start, `exec`), in place of the clock's millisecond. The name is the request's alone: no other
+  request, and no verb run by hand, can share it.
+- **After a timed-out verb, and after any verb that ran 25 s or more, the relay starts a watch.** (hpcfed ends one of
+  its own `srun` clients only after its step's own bound, 30 s at the least, and the controller may still hold that
+  step, which no group kill reaches: the verb has exited by itself. A verb quicker than that cannot have left one
+  pending; a test keeps the threshold below every bound `hpcfed_control` ends a control step at. A verb that ended
+  unknown, or left a child in its group, is watched too.) The watch (`hpcfed.py late-steps <service> --for-verb <verb> --request <id>
+  --window-s 400 --poll-s 5`; a command of its own, outside `fault_hpc.VERBS`, which no request can name; it writes
+  the relay's journal in the root it was given, and nowhere else). The watch is a detached process, so it outlives a relay
+  that stops or dies. For 400 s (twice the controller's message timeout, from the bound) it lists the steps of the
+  federation's own job (`hpclaunch.listings`) every 5 s and cancels any whose name is one of the verb's exact names,
+  by its exact `<job>.<step>` id through `Launcher.cancel`, which refuses an id of another job of the federation's;
+  never by user, name or pattern. At the window's end it reads the accounting (`sacct`) for the same names, to record a
+  step that was made and ended between two looks (`accounted_late`) when its accounted Start is not before the moment
+  the relay answered (`--since`; a step with no accounted Start is counted, since it may have run late), and a step that
+  began before it as `accounted_in_time`, which is no late step: a verb watched for having run long (a stop of a minute)
+  has its own steps in the accounting. Nothing is cancelled that is over.
+
+The answer is still `timed_out` and the injector still reads the verb's outcome as unknown: a stop is waited out and a
+start verified by a changed identity, as before. **The record** is `<root>/fault-relay/late-steps.jsonl` (0600, one JSON
+line per event, fsynced): `watch_opened` (written before the watch starts, so a relay that dies in the window still
+leaves the record that a watch was owed, with `why`: `timed_out`, `unknown`, `left_behind` or `own_bound`), `watch_failed`, `late_step` (the step's name, its id, whether the cancel
+worked and, if not, the error's type; a failed cancel is tried again at the next look), `accounted_late`, `accounted_in_time`, `watch_ended`
+(a watch that exited nonzero) and `watch_closed` with an outcome: `late_steps`, `none_seen` (only when at least one look
+and the accounting were read), `unreadable` (a controller that never answered in the window says nothing about
+whether a step came), `job_gone` or `state_gone`. **A `watch_opened` with no `watch_closed` is a window nobody
+watched to its end.** The cancel is best-effort (a step may have run before it was found, and Slurm gives a cancelled
+step its KillWait, 182 s here, to end); the record is the guarantee. **Not covered, on purpose:** a start's service step
+(`<allocation>-<service>-run-<n>`) is launched detached, in a session of its own, and recorded in the state file by the
+verb; it is the start arriving, which a restore wants, and is never cancelled by name (a later stop or `down` ends
+it). A look that fails half way (the job check, or the agent's job's listing) keeps the step it found and cancels it, and
+a cancel refused as another job's id is said once, never at every look. **A timed-out start's late service step is
+the one thing the watch leaves running:** the federation window the campaign keeps (the study's `fedwatch`) reads a
+provider that restarted during a later run's outage as an unexplained restart, a finding that stops the batch. That
+fails closed, never unseen; the start's `watch_opened` line (its tag, its window, `why: timed_out`) is what attributes
+such a restart to the request afterwards. **Not covered:** a relay that dies mid-verb: no `watch_opened` was written,
+and the verb, in its own session, runs to hpcfed's own bounds.
+
+**Where the time went (O58).** After each verb the relay reads the accounting once (`sacct -j <job>`, bounded to
+10 s and to what is left of the client's wait, never polled) and puts in the answer's `timing`, for each of the verb's
+steps found by its exact name (the control words stamped with the tag, and for a start that launched, the service step
+the state file records for the new launch), two figures: `start_after_issue_s`, the step's accounted Start minus the
+moment the relay issued the verb, and `end_after_answer_s`, its accounted End minus the moment the answer was ready
+(negative when the step ended first, the usual case). A step the controller was slow to make has a large first figure,
+one that ran past the answer a positive second: the stall is the site's, and the record says so. sacct prints whole
+seconds in the login node's local time, so the figures are good to about a second (`resolution_s`). A figure that cannot
+be given is null, with the reason (`not_recorded`, `no_such_step`, `unparsable`), and a reading that cannot be made is
+`accounting`: `unreadable` (`sacct_failed`, `sacct_timeout`, `sacct_not_run`) or `skipped` (`no_job`,
+`no_time_left`); it never fails a verb and never changes its answer. The client puts it on the `CommandResult`
+(`timing`, never compared) and on the `timed_out` exception; `HpcDriver.last_timing` keeps the latest of each kind of
+request, checked and with no names, and the injector journals it where the verb's own evidence goes: a stop's with the
+stop's (`stop.timing`, in `injected` and in `stop_unknown`, where there is no other evidence of the stop), a start's in
+the restore (`start_timing`, in the `verified` step and the injection, served or not), a link restart's in the heal's
+action (`timing`). A status's and a ping's are kept by the driver and journalled by no line. **Reading a figure:** `start_after_issue_s`
+counts from the verb's issue, so for a verb's later step (a status's read-only check, a start's service step after its
+status read) it includes what the verb did before it launched that step; the journalled timing keeps `issued_wall` and
+`answered_wall`, which let a reader take that out. The login node's clock and Slurm's are read as the same, and sacct's
+local time is ambiguous in the hour a clock goes back.
+
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
-`hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` for a verb in
+`hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` (and
+`step_tag=<tag>` when the relay gave one) for a verb in
 `hpcfed_control.VERBS = ("stop", "start", "status", "exec")` and exits with its status; `argv` is what follows `--`
 (for `exec`), else `[]`; `stop_seconds` is the layout's; `mounts` is the read-only proof of a shared import's owner
 (`hpcfed.mount_check`: None in a core without `hpcimport`, section 8). What it is given:
@@ -899,17 +1014,50 @@ so `/etc/hpcop-erlang-env` gives it the job's epmd port and `/root/.erlang.cooki
 distribution reaches the running node over loopback (same uid, so the shim's owner check passes). Output is captured;
 the exit status is the command's.
 
-**(e) The stop's bound:** at most `stop_seconds` (default 600, the bundle's) for the graceful stop, then supervise.py's
-SIGKILL tail (30 s), then the step's end (polled, 60 s at most): **`stop_seconds + 90` s** in all (690 by default). A
-provider stopped in about 30 s live. For backend `"hpc"` (M4's loader): the core bounds `hpcfed.py stop` by
-`settle_timeout_s`, not the 120 s command timeout; `up` renders `stop_bound_s` (section 6), from which
-`settle_timeout_s` defaults to `stop_bound_s + 60` (750), and the least `[tokens] margin_s` that loader accepts, the
-start's stop entering it as its own term (5,340 s with the defaults); `poll_s` defaults to 10 s (every status is a
-step on the one control core);
-`restart_link`'s bound gets 60 s more (the step's launch and the client's end polling), and the heal's reserves count
-it. **`stop_seconds` is to be set from live measurement**: the core journals every stop's evidence, confirmed or not
-(the injection's `injected` line, or its `stop_unknown` line for a stop that answered unconfirmed, key `stop`), so a
-live slot's journal gives each stop's `seconds` and the service's own `service_seconds`.
+**(e) The stop's bound:** at most `stop_seconds` (default 50) for the graceful stop, then supervise.py's SIGKILL tail
+(30 s), then the step's end (polled, 60 s at most): **`stop_seconds + 90` s** in all (140 by default), the service's own
+stop. **The 50 s is measured:** three provider outages on one HPC federation (17 Nov) ended a service 26.1 s, 27.1 s
+and 33.1 s after its SIGTERM, and the coordinator's rule is the largest plus 50 % (33.1 x 1.5 = 49.7, so 50); the
+bundle's own default is 600.
+
+**A control step's bound is its launch wait, then its work (`[hpc] step_launch_wait_s`, 240 s).** A step's client is
+waited for from its start, so a bound on it holds whatever the step waits to start as well as its work. A step's
+creation can wait on the scheduler's controller up to its message timeout (measured 47 to 103 s live, up to 200 s
+possible on the site, with no error), so 240 s is that 200 s plus 20 %. In the outages the relay's verb steps started
+47 to 103 s after they were issued during a heal, and 103 s plus a 33 s stop (136 s) is past a stop step bounded at
+`stop_seconds` + 60 s (110 s): a stop that times out so is unconfirmed, and fails an outage run. The two things are
+therefore apart: `stop_seconds` bounds the service's stop, which was measured, and `step_launch_wait_s` the wait to
+start, added to **every bound that waits on a step's client from its start**: the stop's control step
+(`stop_seconds` + launch wait + 60 s, 350 s), `down`'s teardown step (launch wait + `stop_seconds` + the 30 s kill +
+90 s, 410 s), the status step (launch wait + 60 s), the exec step (launch wait + 300 s), the mount check (launch wait
++ 30 s), a start's wait to see its new service step listed (launch wait + 60 s), and every relay verb's bound. The
+setting is rendered into `[faults]` (`step_launch_wait_s`), where it is in the faults fingerprint with the other
+bounds. **It widens timeouts only:** how long the harness waits before it fails closed. It never lengthens an outage
+or a hold, and a step that starts at once costs nothing. A step's other bounds (`up`'s control steps at 600 s, `down`'s
+node checks) already exceed it. The held job's `time` must exceed twice the stop verb's whole bound (launch wait + stop
+bound, 380 s).
+
+**Each relay verb has a bound of its own,** the longest the verb can run and 30 s, never below the declared floor
+`command_timeout_s` (launch wait + 60 s, 300 s, declared in `platform.toml` beside the launch wait). The longest a verb
+runs is its steps, each at its whole bound with the launch wait in each, and its waits at their whole wait
+(`fault_hpc.verb_inner_worst_s`, which a test runs against this module's own verbs): a **status** is its step and, for
+a restarted shared-import owner, the mount check after it (240 + 60 + 240 + 30 = 570 s, so 600 s); a **start** after an
+unrecorded stop is a status step and then the wait to see its new service step listed (300 + 300 = 600 s, so 630 s); a
+**stop** is its control step (350 s), the wait for the service step to leave the list (60 s) and after a cancel (10 s),
+420 s, so 450 s (`settle_timeout_s`'s default is that, and it is the stop's floor); a **ping** and a **link restart**
+are the exec step, bounded alike for every command (240 + 300 = 540 s, so 570 s). One bound of 300 s was below the
+first, the second and the fourth, and a relay that cuts a verb short times out one about to complete (and, with the
+orphan fix, kills it): a restore after a stop of unknown outcome would then fail when it matters. The bounds are
+recorded in the faults fingerprint, and the heal's reserves, the restore's bound, the token margin (5,370 s with the
+defaults) and the platform's deferral are counted from them (a `max_defer_s` check sees the true figure).
+
+For backend `"hpc"` (M4's loader): the core bounds `hpcfed.py stop` by its verb's bound, not the command timeout; `up`
+renders `stop_bound_s`, `step_launch_wait_s` and `command_timeout_s` (section 6), from which `settle_timeout_s` defaults
+to the stop's own worst case and 30 s (450); `poll_s` defaults to 10 s (every status is a step on the one control core).
+A verb's bound is the request's `bound_s`, and a verb past it is answered `timed_out` and read as a command with no
+answer, never as done. **`stop_seconds` is to be set from live measurement**: the core journals every stop's evidence,
+confirmed or not (the injection's `injected` line, or its `stop_unknown` line for a stop that answered unconfirmed, key
+`stop`), so a live slot's journal gives each stop's `seconds` and the service's own `service_seconds`.
 
 **(f) The state file**: section 4. `services.<name>` gives the job, the step, the node, the work directory and the
 identity; it holds no secret.

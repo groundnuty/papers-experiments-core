@@ -21,7 +21,8 @@ its fault injector recorded as injected in the attempt, and the target rule of i
 declares no target, and is read without the target rule.
 
 A schema-3 marker may also carry `spend_basis`, optional: how an attempt that raised after its model loop was charged
-(`measured` or `bound`, `campaign.after_loop`). It is written only when there is one, so every other marker is as it
+(`measured` or `bound`, `campaign.after_loop`), or `measured` for one that failed before its loop with no request in its
+complete call log (`campaign.no_request`). It is written only when there is one, so every other marker is as it
 was, and a marker without it reads with none.
 
 It may carry `diagnostic` too, optional in the same way: the redacted snapshot a failed instrument start left on the
@@ -118,8 +119,10 @@ class AttemptResult:
     - `spend_basis`: how the usage of an attempt that raised after its model loop was settled (`campaign.after_loop`):
       `measured` when its call log held every request answered and read, so the counts above are what its replies
       reported, or `bound` when the log was unreadable or incomplete, so its usage is unknown and it is charged its
-      bound. None for every other attempt: one with a record, whose counts are the record's, and one that raised
-      during its loop or before it, or that kept no call log (an interrupted attempt's basis is set by recovery).
+      bound. `measured` too for an attempt that failed before its loop ended with no request in its complete call log
+      (`campaign.no_request`): zero tokens and no turn, known. None for every other attempt: one with a record, whose
+      counts are the record's, and one that raised during its loop or before it with a request in its log, or that kept
+      no call log (an interrupted attempt's basis is set by recovery).
     - `diagnostic`: the redacted snapshot of a failed instrument start, or of another infrastructure failure that
       carried a diagnostic (`campaign.start_diagnostic`, C40): a JSON object, None for every other attempt.
     """

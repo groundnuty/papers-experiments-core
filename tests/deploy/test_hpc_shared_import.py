@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import hpc_on_path, manifest_values
+from hpc_fed_support import address_values, hpc_on_path, manifest_values
 
 HPC = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation"
 BUNDLE = HPC / "bundle"
@@ -840,6 +840,7 @@ def rendered(fed, tmp_path) -> str:
     values = {**fed.facts.placeholders(facts), "hpc_root": str(tmp_path)}  # up's: every path into the root absolute
     with hpc_on_path():  # the driver's modules, for the data manifests up writes
         values |= manifest_values(tmp_path, LAYOUT_FILE)
+    values |= address_values(tmp_path)  # up's: the map in the root, named by the template's addresses line
     return fed.facts.render(TEMPLATE.read_text(encoding="utf-8"), values)
 
 

@@ -67,7 +67,8 @@ commit = "..."
 
 [toolserver.conditions.<name>]
 allow = ["tool", ...]           # the server-side allow-list of this condition
-rights = ["space_view", ...]    # the platform privileges of its principal and the caveats of its token
+rights = ["space_view", ...]    # the platform privileges of its principal and the caveats of its token; it and allow
+                                #   must agree (O31): a write tool's right, no write right without a tool that uses it
 manifest = "path.json"          # the frozen manifest the client checks the server against (L13)
 
 [sandbox]                       # optional: images, network pool, limits, mount, data paths (see sandbox/settings.py)
@@ -115,6 +116,7 @@ from expcore_onedata.sandbox.checkprovider import check as check_content_provide
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
+from expcore_onedata.toolrights import agreement_problem
 
 PLATFORM_MODULE = "expcore_onedata.sandbox.kinds"  # the module a study lists in `[study] platforms` for this platform
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
@@ -568,6 +570,9 @@ def _condition(name: str, section: Section, base: Path, *, require_manifest: boo
     problem = rights_problem(rights)
     if problem is not None:
         raise section.fail("rights", problem)
+    disagreement = agreement_problem(allow, rights)  # O31: the agent would see a tool that fails, or a wider token
+    if disagreement is not None:
+        raise section.fail(*disagreement)
     manifest = (base / section.string("manifest")).resolve()
     if require_manifest and not manifest.is_file():
         raise section.fail("manifest", "is not a file; freeze the server's manifest first")

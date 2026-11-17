@@ -255,7 +255,10 @@ class LinkHeal:
         """One link restart of the all-links sequence, recorded by its result word."""
         start = self._utc()
         result = self._sent(label, service)
-        self._record(label, "restart_link", result, start)
+        timing = (getattr(self._driver, "last_timing", None) or {}).get("restart_link")  # where its time went (O58)
+        self._record(
+            label, "restart_link", result, start, **({"timing": dict(timing)} if isinstance(timing, Mapping) else {})
+        )
         return result
 
     def _no_transfers(self, phase: str, *, wait: bool = True) -> bool:

@@ -88,6 +88,36 @@ def test_l08_the_harness_defect_log_is_never_selected_whatever_the_patterns_say(
             select(tree, spec_with(tree, ["study.toml", pattern]))
 
 
+PRIVATE_EVIDENCE = [
+    "results/fed-a.root.tar",
+    "results/fed-a.root.json",
+    "results/fed-a.root.tar.part",
+    "results/fed-a.root.json.part",
+    "results/fed-a/pass-env.json",
+    "pass-env.json",
+]
+
+
+def test_o63_an_hpc_campaigns_private_evidence_is_never_selected_whatever_the_patterns_say(tree):
+    """O63: a federation's root archive and its manifest (node names, site paths, the account's details) and a shard's
+    `pass-env.json` (a site path) are the operator's: wherever they were pulled to, no pattern takes them, the one that
+    names the directory, a glob over everything, or the file itself."""
+    write(tree, dict.fromkeys([*PRIVATE_EVIDENCE, "results/fed-a/journals/one.jsonl"], ""))
+    for pattern in ("results", "results/**", "**/*", "**"):
+        chosen = select(tree, spec_with(tree, ["study.toml", pattern]))
+        assert not [path for path in chosen if ".root." in path or path.endswith("pass-env.json")], pattern
+    assert "results/fed-a/journals/one.jsonl" in select(tree, spec_with(tree, ["results"]))  # the rest is as it was
+    for pattern in (
+        "results/*.root.tar",
+        "results/*.root.json",
+        "results/*.part",
+        "**/pass-env.json",
+        *PRIVATE_EVIDENCE,
+    ):
+        with pytest.raises(PackageError, match="selects no file"):  # naming only them selects nothing
+            select(tree, spec_with(tree, ["study.toml", pattern]))
+
+
 class Plain:
     """A redactor that changes nothing."""
 

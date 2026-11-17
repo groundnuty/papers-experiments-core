@@ -14,6 +14,12 @@ so a test shows each fingerprint was taken beside its own federation's file.
 `plan` and `lines` also ask the same interpreter which core it imports (C06: `shards.identify_core`, `python -I -B -c
 CODE` with no study copy); the stand-in answers that call too, with a known core by default or as a real interpreter
 (`core_python`), and records no call in `calls.txt` for it.
+
+A study's plugin may refuse to be built without a variable the operator declares in the manifest's `pass_env` (the first
+study's refuses without its artifacts directory). The stand-in stands in for such a plugin with `needs`: it ends with
+status 4 when one of those names is not in its environment, and each fingerprint call (refused or not) records the whole
+environment it was given, one JSON object a line in `environments.jsonl`, so a test shows which variable reached the
+program and which never did. The core probe is neither refused for it nor recorded: it builds no plugin.
 """
 
 import json
@@ -38,6 +44,12 @@ if not sys.argv[2]:  # no study copy: the core probe (`shards.identify_core`), w
         os.execv(config["core_python"], [config["core_python"], "-I", "-B", "-c", sys.argv[1]])
     print(json.dumps(config["core"]))
     raise SystemExit(0)
+with open(here / "environments.jsonl", "a", encoding="utf-8") as environments:
+    environments.write(json.dumps(dict(os.environ)) + "\\n")
+absent = [name for name in config["needs"] if name not in os.environ]
+if absent:  # the study's plugin, built without a variable it needs
+    sys.stderr.write("standin: the plugin refuses to be built without " + ", ".join(absent) + "\\n")
+    raise SystemExit(4)
 fingerprint = {"seeds": {"1": True}}
 platform_file = Path(sys.argv[2]) / "platform.toml"
 seen = "none"
@@ -76,11 +88,13 @@ def standin_python(
     fail: int = 0,
     core: dict | None = None,
     core_python: Path | str | None = None,
+    needs: tuple[str, ...] = (),
 ) -> Path:
     """The stand-in's executable in `directory` (made if need be), to name as a manifest's `python`. `fail` is an exit
     status it ends with after writing a message that holds a path to stderr, to show that message is never repeated.
     Asked which core it imports (`python -I -B -c CODE`, no study copy), it prints `core` (`CORE` by default), or, with
-    `core_python`, becomes that interpreter running the same arguments, so a real core's answer is the one given."""
+    `core_python`, becomes that interpreter running the same arguments, so a real core's answer is the one given.
+    Asked for a fingerprint, it ends with status 4 unless each name of `needs` is in its environment."""
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "standin.py").write_text(PROGRAM, encoding="utf-8")
     (directory / "standin.json").write_text(
@@ -91,6 +105,7 @@ def standin_python(
                 "fail": fail,
                 "core": core or CORE,
                 "core_python": str(core_python) if core_python else None,
+                "needs": list(needs),
             }
         ),
         encoding="utf-8",
@@ -110,4 +125,10 @@ def seen_platforms(directory: Path) -> list[str]:
     return calls.read_text(encoding="utf-8").split() if calls.exists() else []
 
 
-__all__ = ["SECTIONS", "seen_platforms", "standin_python"]
+def seen_environments(directory: Path) -> list[dict[str, str]]:
+    """The whole environment each fingerprint call of the stand-in in `directory` was given, in order."""
+    seen = directory / "environments.jsonl"
+    return [json.loads(line) for line in seen.read_text(encoding="utf-8").splitlines()] if seen.exists() else []
+
+
+__all__ = ["SECTIONS", "seen_environments", "seen_platforms", "standin_python"]

@@ -81,7 +81,9 @@ are the same text: no clock, no path and no random number enters it.
   text it was.
 - The fixed prose beside the tables is in `expcore.report_notes`.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
-  the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13).
+  the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13). An
+  analysis that `--rescore` let score with scorers other than the run's (R17) has one more line after the scorers',
+  naming the digest the campaign recorded and the digest of the scorers used; no other report has it.
 """
 
 import json
@@ -979,6 +981,16 @@ def _scorers(scorers: Mapping[str, str] | None) -> str:
     return ", ".join(f"{name} `{version}`" for name, version in sorted((scorers or {}).items())) or UNKNOWN
 
 
+def _rescored(rescore: Mapping[str, Any]) -> str:
+    """The provenance line of a re-score (R17): the digests the campaign's snapshots recorded of its scorers (the keys
+    `expcore.study.analysis_plugin` builds the mapping with) and the digest of the scorers this analysis used."""
+    ran = ", ".join(f"`{digest}`" for digest in rescore["run_scorer_digests"])
+    return (
+        f"- Re-scored (`--rescore`): the campaign ran with scorers of digest {ran}; this analysis scored with "
+        f"`{rescore['analysis_scorer_digest']}` (the scorers above)"
+    )
+
+
 def render_report(
     result: AnalysisResult,
     export: Mapping[str, Any],
@@ -987,6 +999,7 @@ def render_report(
     code: Mapping[str, Any],
     core_version: str | None,
     scorers: Mapping[str, str] | None = None,
+    rescore: Mapping[str, Any] | None = None,
     interval_level: float | None = None,
     egress: EgressAnalysis | None = None,
     mount_guard: MountGuardAnalysis | None = None,
@@ -997,7 +1010,8 @@ def render_report(
     """Render the report as Markdown.
 
     `code` is the code identity (`provenance.codestamp.version`), `scorers` the version of each scorer by name (the
-    report says n/a without them), `interval_level` the level of the contrasts' intervals when the preregistration
+    report says n/a without them), `rescore` the digests of a re-scored analysis (R17; a line of its own in the
+    provenance, none without it), `interval_level` the level of the contrasts' intervals when the preregistration
     states one, `egress` the egress verdicts and the sensitivity analysis of a batch checked for egress (no section
     without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60),
     `guards` the rerun without the runs any guard leaves out (a batch checked by two or more, O60, O76), `visibility`
@@ -1023,6 +1037,10 @@ def render_report(
         f"- Code: commit `{code.get('commit')}`, tree `{code.get('tree_sha256')}` ({state})",
         f"- Core version: {core_version or UNKNOWN}",
         f"- Scorers: {_scorers(scorers)}",
+    ]
+    if rescore is not None:
+        lines.append(_rescored(rescore))
+    lines += [
         f"- Runs: {planned} planned, {len(export['analysed_attempts'])} analysed, "
         f"{len(export['exhausted_runs'])} exhausted (charged infrastructure attempts reached the limit; no scored "
         "attempt), "

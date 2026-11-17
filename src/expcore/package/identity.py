@@ -65,7 +65,17 @@ from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.redact import Redactor
 from expcore.records.record import RunRecord, decode, is_record_name
 from expcore.replay.check import CHECK_FILE, UNEXPECTED, inputs_sha256, recorded_side_files, verify_batch, write_check
-from expcore.study.pipeline import EXPORT_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
+from expcore.study.analysis_plugin import rescore_entry
+from expcore.study.pipeline import (
+    ANALYSIS_FILE,
+    EXPORT_FILE,
+    OUT_DIR,
+    OUTPUT_FILES,
+    RUNS_DIR,
+    Refused,
+    analyse_study,
+    output_bytes,
+)
 
 PREFIX_DIGITS = 12
 SHORTEST_ID = 7  # a commit written short, as provenance headers write the ones they merge from
@@ -283,7 +293,8 @@ def _outputs(files: dict[str, bytes], commit: str, pseudo: str, stage: Path, swa
     campaign fingerprint without the environment's sources, with its hash."""
     lay_out(stage, files)
     try:
-        made = output_bytes(analyse_study(stage, stamped=True))
+        shipped = rescore_entry(files.get(f"{OUT_DIR}/{ANALYSIS_FILE}"))  # the author's decision, as at the check
+        made = output_bytes(analyse_study(stage, stamped=True, shipped_rescore=shipped))
     except Refused as error:
         raise PackageError(f"the anonymised records cannot be analysed: {error}") from None
     for name in OUTPUT_FILES:
