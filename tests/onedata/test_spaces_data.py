@@ -208,11 +208,12 @@ def one_space(tmp_path, name, *, data=None, space_id="sp-1", declare=True):
     return load_platform(write_platform(directory, edit))
 
 
-def test_c06_the_one_space_form_without_a_manifest_keeps_its_fingerprint_exactly(tmp_path):
-    """C06: `[space]` without `data_manifest`: the fingerprint is the one it always was, so every one-space store
-    resumes unchanged and no earlier form is needed."""
+def test_c06_the_one_space_form_without_a_manifest_holds_no_data_identity_and_has_no_earlier_form(tmp_path):
+    """C06: `[space]` without `data_manifest`: the fingerprint holds no data identity of the space (its support,
+    by label, alone: `support`), and no earlier form is needed."""
     config = one_space(tmp_path, "one", declare=False)
-    assert config.fingerprint() == {"tls": {"mode": "verify"}}
+    assert not {"space_data", "spaces", "storage_import"} & set(config.fingerprint())
+    assert config.fingerprint()["support"]["providers"] == ["providers[0]"]
     assert config.legacy_fingerprint() is None
 
 
@@ -223,7 +224,8 @@ def test_c06_one_space_federations_with_the_same_data_merge_and_one_file_differe
     one = one_space(tmp_path, "one")
     same = one_space(tmp_path, "same", space_id="sp-9")
     other = one_space(tmp_path, "other", data=manifest(((FILES[0][0], b"x"), FILES[1])), space_id="sp-7")
-    assert one.fingerprint() == {"tls": {"mode": "verify"}, "space_data": manifest().digest()}
+    assert one.fingerprint()["space_data"] == manifest().digest()
+    assert one.fingerprint() == {**same.fingerprint(), "space_data": manifest().digest()}
     assert leaked_values(json.dumps(one.fingerprint()), tmp_path / "one") == []
     check_fingerprints([shard(1, campaign(one.fingerprint())), shard(2, campaign(same.fingerprint()))])
     with pytest.raises(MergeRefused, match=r"ran another campaign .*\n  platform\.space_data"):

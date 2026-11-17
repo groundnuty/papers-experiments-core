@@ -47,8 +47,11 @@ and runs nothing, so two processes never launch two service steps on one work di
 is true only when the service step is listed **and** a control step (`bundle/status.sh`, bounded to 60 s) finds the
 recorded process alive. `identity` is `"<launch>:<pid>:<start>"` while running, else null. `ready` is running and the
 service's own ready marker (written once its checks passed) and, for an owner of shared imported trees, the proof of
-this launch that it holds them read-only (below). A control step that fails or times out is exit 1 with nothing on
-stdout.
+this launch that it holds them read-only (below). A ready launch's status also carries `"domain_wait_s"` when the node
+reported one (O58): the seconds its start waited for op_worker's domain, which op_worker says null until its Onezone
+connection is up; 0 when no wait was needed, left out when none was reported or it is not a finite number of at
+least 0, so a status never holds a figure nobody measured. A control step that fails or times out is exit 1 with
+nothing on stdout.
 
 **The read-only proof of a restarted owner (O59, M3).** `mounts` is None in a core without the shared import; else it
 has `spaces(service)` (the shared trees the service owns, by space name; empty for a service that owns none),
@@ -86,7 +89,10 @@ never listed and its srun client still runs (`clients`: a launch in flight), and
 state gets `launch` + 1, the step `{"name": "<allocation>-<service>-run-<launch>", "id": null}`, its log (in the site's
 log directory), `starting` and, for an owner, `mounts_proven` false, before the detached service step
 `bundle/restart.sh <kind> --workdir W` is launched; the step's id and `running` are recorded once it is listed (about 60
-s). Not listed in time is exit 1, and the state stays `starting`.
+s). Not listed in time is exit 1, and the state stays `starting`. A provider of a federation whose storage is on scratch
+(O57) is given `--storage=PATH` last, its own directory read from the state's record checked whole
+(`hpcstorage.provider_args`), so its node binds exactly what the state names; a state that names a scratch root and no
+record is refused (exit 1) before anything is recorded or launched.
 
 **exec** runs `bundle/exec.sh <kind> --workdir W -- <argv>` as a control step (bounded to 300 s) and passes its stdout
 and stderr through unchanged; the exit status is the command's (`128 + n` for a signal), 124 when the launcher timed out
@@ -107,6 +113,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import hpcslurm
 import hpcstate
+import hpcstorage
 from hpclaunch import STEP_NAME
 
 VERBS = ("stop", "start", "status", "exec")
@@ -196,7 +203,7 @@ class Target:
             raise Refusal("the allocation or the service has no name a step can carry")  # the longest name made here
         step = record.get("step")
         self.service, self.kind, self.node, self.workdir = service, kind, node, workdir
-        self.prefix, self.site = prefix, site
+        self.prefix, self.site, self.doc = prefix, site, doc
         self.ends = allocation.get("ends")
         self.state = record.get("state")
         self.launch = record.get("launch")
@@ -397,19 +404,20 @@ def _status(target: Target, launcher: Any, state: Any, mounts: Any, out: Any, er
     ready = bool(running and reading.get("ready") is True)
     if ready and target.needs_proof:
         ready = _proven(target, launcher, state, mounts, err)
-    _emit(
-        out,
-        {
-            "service": target.service,
-            "state": target.state,
-            "running": running,
-            "identity": identity,
-            "launch": target.launch,
-            "node": target.node,
-            "step": target.step_name,
-            "ready": ready,
-        },
-    )
+    record = {
+        "service": target.service,
+        "state": target.state,
+        "running": running,
+        "identity": identity,
+        "launch": target.launch,
+        "node": target.node,
+        "step": target.step_name,
+        "ready": ready,
+    }
+    waited = _seconds(reading.get("domain_wait_s")) if ready else None
+    if waited is not None:  # only a ready launch's, and only a figure the node measured (see the docstring)
+        record["domain_wait_s"] = waited
+    _emit(out, record)
     return 0
 
 
@@ -523,6 +531,10 @@ def _start(target: Target, launcher: Any, state: Any, err: Any) -> int:
             return 1
         if reading["alive"]:
             raise Refusal("the service's process runs though its step is not listed: stop it first", 1)
+    try:  # a provider's own storage on scratch (O57), read before anything is recorded; none on tmpfs or for the zone
+        storage = hpcstorage.provider_args(target.doc, target.service) if target.kind == "op" else []
+    except hpcstorage.StorageRefused as refusal:
+        raise Refusal(str(refusal), 1) from None
     launch = int(target.launch or 0) + 1
     name = "%s-%s-run-%d" % (target.prefix, target.service, launch)
     if not STEP_NAME.fullmatch(name):
@@ -541,7 +553,7 @@ def _start(target: Target, launcher: Any, state: Any, err: Any) -> int:
     state.update(claim)  # recorded before the step is launched, so a crash leaves the attempt in the state
     launcher.service(
         target.node,
-        ["bash", str(BUNDLE / "restart.sh"), target.kind, "--workdir", target.workdir],
+        ["bash", str(BUNDLE / "restart.sh"), target.kind, "--workdir", target.workdir, *storage],
         kind=target.kind,
         name=name,
         log=log,

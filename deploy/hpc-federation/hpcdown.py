@@ -1,6 +1,7 @@
 """`down` of the HPC federation (DESIGN.md, section 5): whatever `up` reached, every service torn down (the providers,
-then the zone), every step gone, each node checked, the held job cancelled by its own id, the srun clients ended, and
-the root removed. Mixed into `hpcdriver.Driver`, whose state store, launcher and Slurm it uses.
+then the zone), every step gone, each node checked, the held job cancelled by its own id, the srun clients ended, the
+provider storage on scratch removed and shown gone (hpcstorage), and the root removed. Mixed into `hpcdriver.Driver`,
+whose state store, launcher and Slurm it uses.
 """
 
 import json
@@ -12,10 +13,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import hpcrelay
+import hpcstate
+import hpcstorage
 from fedlayout import ROOT_MARKER
 from hpcremove import SETTLE_S, only_silly, remove_tree, settle_rmdir
 from hpcsettings import Site
-from hpcslurm import Client
+from hpcslurm import Client, SlurmError
 
 BUNDLE = Path(__file__).resolve().parent / "bundle"
 SHARDS = BUNDLE.parent / "shards.py"  # its `sweep`, on the agent's node at down
@@ -70,13 +73,7 @@ class Down:
             return "down: no state file, so no job of up's is left to cancel; the root removed"
         state = self.set(lambda s: s.update(phase="stopping"))
         unverified: List[str] = []
-        if self.relay_available():  # first: no verb may launch a step while the federation goes down
-            try:
-                if not hpcrelay.stop(self.slurm.runner, sys.executable, self.root):
-                    unverified.append("the fault relay")
-            except (RuntimeError, OSError) as error:
-                self.say(f"the fault relay's stop failed: {error}")
-                unverified.append("the fault relay")
+        relay_unstopped = self.relay_available() and not self.relay_stopped()  # first: no verb may launch a step now
         lost: List[str] = []  # a job whose lookup failed: the other is still cancelled, then down fails
         job, info = self.ours(state, "allocation", lost)
         agent, agent_info = self.ours(state, "sandbox", lost) if self.separate(state) else (None, None)
@@ -95,8 +92,16 @@ class Down:
             except (RuntimeError, OSError, TimeoutError) as error:
                 self.say(f"the agent's node could not be swept ({error}); the held job is cancelled all the same")
                 unverified.append("the agent's node")
+        for entry in state.get("shard_nodes", []):  # W1: every other node a shard step of this federation ran on
+            try:
+                swept = "\n".join(filter(None, [swept, self.sweep_shard_node(state, entry)]))
+            except (RuntimeError, OSError, TimeoutError) as error:
+                self.say(f"the node shard {entry['label']} was resumed on could not be swept ({error})")
+                unverified.append(f"the node shard {entry['label']} was resumed on")
         self.cancel_all([j for j, i in ((job, info), (agent, agent_info)) if i is not None], lost)
         unverified += self.end_clients([j for j in (job, agent) if j is not None])
+        if relay_unstopped and not self.relay_stopped():  # its client is ended now: checked again, never read before
+            unverified.append("the fault relay")
         if unverified:
             self.set(lambda s: s.update(phase="down"))
             raise RuntimeError(
@@ -104,23 +109,110 @@ class Down:
                 "state are kept: run down again to remove them"
             )
         gone = " and ".join(j for j in (job, agent) if j) or "(never submitted, or no longer ours)"
+        stored = self.remove_storage(f"the held job {gone} is gone")
         self.remove_root(f"the held job {gone} is gone" + (f" ({swept})" if swept else ""))
-        return f"down: the held job {gone} is gone, and so is the root" + (f"\n{swept}" if swept else "")
+        return f"down: the held job {gone} is gone, and so is the root" + "".join(
+            f"\n{x}" for x in (swept, stored) if x
+        )
+
+    def remove_storage(self, gone: str) -> str:
+        """The provider storage `up` made on scratch (hpcstorage), removed and shown gone, only here: the held job and
+        every client are gone and every service verified clean, and the state that names the storage still exists. What
+        it printed, empty when `up` recorded none (no scratch root, or a state older than the key). A failure keeps the
+        root and the state for a second down, which finishes what is left: the removal is idempotent."""
+        state = self.store.read()
+        if state.get("storage") is None:
+            if state.get("site", {}).get(
+                "storage_root"
+            ):  # up always records the storage it makes: this one lost its record
+                self.set(lambda s: s.update(phase="down"))
+                raise RuntimeError(
+                    f"{gone}, but the state records a scratch root and no provider storage on it, which up always "
+                    "records: nothing on scratch was removed, and the root and its state are kept; look at the "
+                    "scratch root, then restore the record or remove the scratch root's key from the state"
+                )
+            return ""
+        try:
+            return hpcstorage.remove(state["storage"], state, **self.removal_ops())
+        except (RuntimeError, OSError) as error:
+            self.set(lambda s: s.update(phase="down"))
+            raise RuntimeError(
+                f"{gone}, but the provider storage on scratch could not be removed ({error}); the root and its state "
+                "are kept: run down again to remove it"
+            ) from None
+
+    def relay_stopped(self) -> bool:
+        """Whether the relay's stop shows no heartbeat beating; a stop that could not be run shows nothing."""
+        try:
+            return hpcrelay.stop(self.slurm.runner, sys.executable, self.root)
+        except (RuntimeError, OSError) as error:
+            self.say(f"the fault relay's stop failed: {error}")
+            return False
 
     def sweep_agent_node(self, state: Mapping[str, Any]) -> str:
         """`shards.py sweep` in a control step on the agent's node: every shard step's directory of this federation on
         its tmpfs whose step is shown gone is removed, and one holding an out/ that could not be archived is kept and
-        named (the node's tmpfs is the node's, not the job's: no job end removes it). What the sweep printed; nothing
-        without an agent's node. RuntimeError when the sweep fails."""
+        named (the node's tmpfs is the node's, not the job's: no job end removes it); then the sandbox's work root,
+        its killed runs reaped (a dead FUSE mount among them) and itself removed once empty (W1, W2). What the sweep
+        printed; nothing without an agent's node. RuntimeError when the sweep fails."""
         record = state.get("sandbox") or {}
         if not record.get("node"):
             return ""
+        return self.sweep_node(state, record["node"], f"{state['allocation']['name']}-sandbox-sweep")
+
+    def sweep_shard_node(self, state: Mapping[str, Any], entry: Mapping[str, str]) -> str:
+        """The sweep on a node a shard was resumed on (`shard_nodes`, which `shards.py resume-line` records), in the job
+        it was resumed in, which down never cancels: only while that job runs and is still the one recorded (Slurm
+        reuses ids, `ours`); one that ended is said, and its node's leftovers wait for the next shard step there, which
+        reaps them before it uses its work root. The agent's node in the agent's own job was swept already."""
+        sandbox = state.get("sandbox") or {}
+        if entry["node"] == sandbox.get("node") and entry["job"] in (sandbox.get("job"), state["allocation"]["job"]):
+            return ""
+        info = self.slurm.job(entry["job"])
+        if info is None or info.get("JobName") != entry["name"] or info.get("JobState") != "RUNNING":
+            self.say(f"shard {entry['label']} was resumed in job {entry['job']}, which has ended: its node is not "
+                     "swept here (the next shard step there reaps what it left)")  # fmt: skip
+            return ""
+        self.end_shard_steps(state, entry["job"])
+        name = f"{state['allocation']['name']}-shard-{entry['label']}-sweep"
+        return self.sweep_node(state, entry["node"], name, job=entry["job"], live_fails=True)
+
+    def end_shard_steps(self, state: Mapping[str, Any], job: str) -> None:
+        """A step of this federation's shards still running in a job down does not cancel (an operator's, where a
+        shard was resumed) would outlive its federation: each one listed under that job, by the name every step of a
+        shard of this federation carries (`<allocation or agent's job name>-shard-<n>`), is cancelled by its own id,
+        and must leave the list within the cancel's bound; RuntimeError otherwise, so the root and its state are kept
+        for a second down. No other step of that job is touched."""
+        prefixes = [n for n in (state["allocation"]["name"], (state.get("sandbox") or {}).get("name")) if n]
+        shard_step = re.compile("(?:" + "|".join(re.escape(p) for p in prefixes) + r")-shard-[0-9]+")
+        live = {name: step for name, step in self.slurm.steps(job).items() if shard_step.fullmatch(name)}
+        for name, step in live.items():
+            self.say(f"a shard step of this federation ({name}) still runs in job {job}: it is cancelled by its id")
+            try:
+                self.slurm.cancel_step(step)
+            except SlurmError as error:  # its leaving the list decides (wait_steps)
+                self.say(f"the cancel of step {step} reported a failure ({error})")
+        deadline = self.clock() + self.timeouts["cancel"]
+        while any(name in self.slurm.steps(job) for name in live) and self.clock() < deadline:
+            self.sleep(self.poll_s)
+        if any(name in self.slurm.steps(job) for name in live):
+            raise RuntimeError(f"a shard step of this federation is still listed in job {job} after its cancel")
+
+    def sweep_node(
+        self, state: Mapping[str, Any], node: str, name: str, job: Optional[str] = None, live_fails: bool = False
+    ) -> str:
+        """`shards.py sweep` on `node` (in `job`, a recorded resume's, when given), by the core's Python on the nodes
+        (`HPC_CORE_PYTHON`, which up asks for with an agent's node: the reaper of the sandbox's runs is the core's), or
+        the nodes' own for a state an earlier up wrote without it, whose sweep then fails when it finds a work root.
+        `live_fails`: a step of this federation still running there fails the sweep (`--live-fails`), never passes."""
         site = Site.from_json(state["site"])
-        argv = [site.node_python, "-I", "-B", str(SHARDS), "sweep", "--tmpfs", site.node_tmp, "--root", str(self.root)]
-        name = f"{state['allocation']['name']}-sandbox-sweep"
-        done = self.launcher.control(record["node"], argv, name=name, timeout_s=self.timeouts["step"])
+        python = site.core_python or site.node_python
+        argv = [python, "-I", "-B", str(SHARDS), "sweep", "--tmpfs", site.node_tmp, "--root", str(self.root)]
+        argv += ["--live-fails"] if live_fails else []
+        done = self.launcher.control(node, argv, name=name, timeout_s=self.timeouts["step"], job=job)
         if done.returncode != 0:
-            raise RuntimeError(f"its sweep ended with status {done.returncode}")
+            tail = (done.stdout or "").strip().splitlines()[-1:]
+            raise RuntimeError(f"its sweep ended with status {done.returncode}{': ' + tail[0] if tail else ''}")
         return done.stdout.strip()
 
     @staticmethod
@@ -176,12 +268,15 @@ class Down:
         return found[0] if found else None
 
     def stop_services(self, job: str) -> List[str]:
-        """Tear down every service (the providers, then the zone), wait for every step to leave, then check each
-        node; return the services that could not be verified."""
+        """Tear down every service (the providers, then the zone), wait for every step to leave, remove what a step
+        cancelled at the bound left (`remove_after_cancel`), then check each node; return the services that could not
+        be verified."""
         order = [p.name for p in self.spec.providers] + ["zone"]
         unverified = [service for service in order if not self.teardown(service)]
-        self.wait_steps(self.listed_under(job))
-        return unverified + [s for s in order if s not in unverified and not self.node_clean(s)]
+        cancelled = self.wait_steps(self.listed_under(job))
+        swept = [service for service in order if self.remove_after_cancel(service, cancelled)]
+        unverified = [service for service in unverified if service not in swept]
+        return unverified + [s for s in order if s not in unverified and s not in swept and not self.node_clean(s)]
 
     def listed_under(self, job: str) -> List[str]:
         """The ids `squeue -s` lists the held job's steps under: its own, and under `het` its agent's component's own,
@@ -222,15 +317,58 @@ class Down:
         self.set(lambda s: s["services"][service].update(state="removed" if ok else "failed"))
         return ok
 
-    def wait_steps(self, jobs: List[str]) -> None:
+    def wait_steps(self, jobs: List[str]) -> List[str]:
         """Until no step but the batch and extern steps is listed under any of the ids, within the stop's whole bound
-        (one deadline for them all); a step still listed then is cancelled by its own id."""
+        (one deadline for them all); a step still listed then is cancelled by its own id. Returns the names of the
+        steps it cancelled that have left the list since (within the cancel's bound).
+
+        A cancel's own exit status is no verdict: on a heterogeneous job `scancel <leader>.<n>` printed "Invalid job id
+        specified" and exited 225 while it did end the step (live slot 5, K1). Whether the step left the list is."""
         deadline = self.clock() + self.settings.stop_bound_s
         while any(self.slurm.steps(job) for job in jobs) and self.clock() < deadline:
             self.sleep(self.poll_s)
+        cancelled: Dict[str, str] = {}
         for job in jobs:
-            for step_id in self.slurm.steps(job).values():
-                self.slurm.cancel_step(step_id)
+            for name, step_id in self.slurm.steps(job).items():
+                try:
+                    self.slurm.cancel_step(step_id)
+                except SlurmError as error:
+                    self.say(f"the cancel of step {step_id} reported a failure ({error}); its leaving the list decides")
+                cancelled[name] = job
+        deadline = self.clock() + self.timeouts["cancel"]
+        while any(name in self.slurm.steps(job) for name, job in cancelled.items()) and self.clock() < deadline:
+            self.sleep(self.poll_s)
+        return [name for name, job in cancelled.items() if name not in self.slurm.steps(job)]
+
+    def remove_after_cancel(self, service: str, cancelled: List[str]) -> bool:
+        """K1: a service whose step down cancelled (at the stop's bound) and that has left the list was ended outright
+        on the site that showed it (the step's processes killed, no trap run), which leaves its work directory, 2 to
+        2.6 GB of the node's tmpfs, on its node. Only the work directory the state recorded for it, accepted as the
+        bundle makes one (`hpcstate.checked_workdir`), is removed, by teardown.sh in a control step on its node (no
+        service of it runs by then: its step is gone), and shown gone by `node_clean`. Nothing it did not record is
+        removed: a service whose log never named a work directory is left to `no_workdir_left`, which removes nothing.
+        True once the directory is shown gone."""
+        state = self.store.read()
+        record, site = state["services"][service], Site.from_json(state["site"])
+        if (record.get("step") or {}).get("name") not in cancelled or record.get("workdir") is None:
+            return False
+        try:
+            hpcstate.checked_workdir(record["workdir"], site.node_tmp, record["kind"])
+        except hpcstate.StateError as error:
+            self.say(f"{service}: {error}; nothing is removed")
+            return False
+        argv = ["bash", str(BUNDLE / "teardown.sh"), record["kind"], "--workdir", record["workdir"], "--timeout", "0"]
+        name = f"{state['allocation']['name']}-{service}-remove-{record['launch']}"
+        try:
+            self.launcher.control(record["node"], argv, name=name, timeout_s=self.timeouts["step"])
+        except TimeoutError:
+            return False
+        if not self.node_clean(service):  # a removal that failed, or one teardown.sh refused: never shown clean
+            self.say(f"{service}: its step was cancelled, and its work directory is still on its node")
+            return False
+        self.set(lambda s: s["services"][service].update(state="removed"))
+        self.say(f"{service}: its step was cancelled, and the work directory it recorded is removed from its node")
+        return True
 
     def node_clean(self, service: str) -> bool:
         """A read-only control step: the service's work directory is gone from its node. A service never launched is

@@ -3,7 +3,7 @@
 # declares the four data spaces, so the link check covers ten ordered provider pairs, as the pilot's does.
 #
 #   set -a; . deploy/hpc-federation/site.env; set +a
-#   uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
+#   uv run python -I -B deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
 #     --root <a directory on a filesystem the login node and the nodes see> up
 #
 # The ports and memory limits are the Compose federation's and unused here: on HPC every service listens on its node's
@@ -60,7 +60,11 @@ owner = "alder"
 mirrors = ["aspen"]
 
 [spaces.delta-space]                     # stands for the pilot's largest space, 15,340 files; up writes none into it
-owner = "hazel"                          # (its synthetic tree of that count is M3's, on an imported storage)
+owner = "hazel"                          # (its synthetic tree of that count is M3's, on an imported storage). It is
+                                         # this layout's ingested space (README, "An ingested space"): a study that
+                                         # fills it declares `data_manifest = "@study_artifacts@/manifests/<file>.json"`
+                                         # here and runs `hpcfed.py verify-data` after its ingest; with none declared
+                                         # its manifest is the empty one, which verify-data holds it to
 mirrors = ["aspen"]
 baseline = false
 

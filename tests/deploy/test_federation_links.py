@@ -221,6 +221,19 @@ def test_up_whose_record_lock_cannot_be_taken_writes_its_record_and_says_so(fed,
     assert json.loads((tmp_path / fedlinks.REPORT).read_text(encoding="utf-8"))["ok"] is True
 
 
+def test_up_takes_the_record_lock_where_an_exclusive_flock_needs_a_write_descriptor(
+    fed, fedlinks, tmp_path, monkeypatch, nfs_flock_rule
+):
+    """O35: on a filesystem where an exclusive `flock` needs a write descriptor (NFS: live, an HPC federation's NFSv4
+    root, where up said the record's lock could not be taken), up takes the real lock and says nothing of it."""
+    layout = layout_with(fed, tmp_path, monkeypatch, two_providers)
+    passed = PairResult("providers[0]", "providers[1]", True, 0.25, 65536)
+    monkeypatch.setattr(fedlinks, "check_links", lambda config, client: LinkReport(True, "ok", (passed,), 1.0, 2.0))
+    out = fedlinks.check_after_up(layout, {"link-probes": "sp-probe-0009"})
+    assert "lock could not be taken" not in out
+    assert json.loads((tmp_path / fedlinks.REPORT).read_text(encoding="utf-8"))["ok"] is True
+
+
 def test_a_stuck_pair_fails_up_naming_it(fed, fedlinks, tmp_path, monkeypatch):
     """O35: A stuck pair fails up naming it."""
     layout = layout_with(fed, tmp_path, monkeypatch, two_providers)

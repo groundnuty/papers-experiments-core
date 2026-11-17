@@ -830,7 +830,7 @@ def test_o16_the_harnesss_own_stop_of_the_gate_is_no_death_in_a_healthy_rest_run
     written = json.loads((tmp_path / "evidence" / "metadata.json").read_text())
     for meta in (written, sbx.metadata()):
         assert (meta["container_deaths"], meta["infra_death"]) == ([], [])
-    check = sbx.infra_container_check()
+    check = sbx.infra_check()
     assert check["containers"]["gate"]["stopped_by_harness"] is True
     assert check["containers"]["gate"]["end"]["status"] == "running"  # its state just before the harness's stop
     sbx.stop()
@@ -908,7 +908,7 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     meta = sbx.metadata()
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
     assert set(meta["mount"]) == {
-        "io_mode", "options", "extra_args", "image_config", "log_dir_from", "network", "wait_s",
+        "io_mode", "options", "extra_args", "image_config", "log_dir_from", "network", "wait_s", "oneclient_build",
     }  # fmt: skip
     assert meta["mount"]["log_dir_from"] == "sandbox"
     assert meta["mount"]["network"] in ("default bridge", "federation")  # the kind of network, never its name

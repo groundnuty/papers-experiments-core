@@ -5,9 +5,11 @@ real addresses (DESIGN.md, sections 5 and 6).
   the Compose `Service` with the layout's declared name in place of the loopback port (O73: the services register
   under it, and the root's address map says where it is dialled); the Compose bootstrap (`fedboot.Bootstrap`), the
   baseline (`fedcontent.Content`) and the facts (`fedfacts`) then run unchanged, the client given the map.
-- **The storage** is the one posix storage the bundle's `finish.sh` adds to each provider, owned by the job's uid on
-  the node's tmpfs, with Onedata's LUMA local feed: each support also maps the space's default credentials, and every
-  user of the federation, to that uid (as `bundle/onboard.py` does), or the users could reach none of its files. The
+- **The storage** is the one posix storage the bundle's `finish.sh` adds to each provider at `/volumes/posix`, owned by
+  the job's uid, on the node's tmpfs or, with `HPC_STORAGE_ROOT`, bound from the provider's own directory on scratch
+  (`hpcstorage`; the same storage in the cell either way), with Onedata's LUMA local feed: each support also maps the
+  space's default credentials, and every user of the federation, to that uid (as `bundle/onboard.py` does), or the
+  users could reach none of its files. The
   owner of a shared imported space (O59) has a second, `import-<space>`, on its tree on the shared filesystem, made
   with the same ids (`hpcimport.import_storage_extra`) and mapped the same way, on the storage its support names; the
   core's phase waits for the scan, and verifies each space against its manifest (`fedimport.verify_imports`) over the
@@ -18,6 +20,21 @@ real addresses (DESIGN.md, sections 5 and 6).
   (above it), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of each direct-I/O
   import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and `@hpc_token_margin_s@`: the
   least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
+  The site's values come from `hpcpins` (the agent's sandbox's pins and `@study_artifacts@`, the study's own directory
+  on the nodes), and each space's `@data_manifest.<space>@` from `hpcdata` (DESIGN.md, section 6a).
+  A template that declares `[sandbox.apptainer]` also names `@hpc_provider_storage@` (`hpcpins.values`: `tmpfs`, or
+  `shared_filesystem` with a scratch root), which the platform layer records in the campaign fingerprint, and the
+  rendered file is read back for it (`check_provider_storage`): a federation on scratch and one on tmpfs are two
+  experiments.
+- **The render identity** (O74, `hpcidentity`) is written beside it, once the platform file is rendered: the hashes of
+  the template, of the rendered platform's fingerprint and of each pin it holds, and the digest of the study's artifacts
+  tree when the site declares one (`up` took it in its preflight and the state file carries it here), as
+  `render-identity.json` in the root, which a shard's step compares with the one its plan expects.
+- **`[placement]`** is always in the rendered file, complete (`hpcplacement.complete`, O79): the platform layer requires
+  it (`rangemap.load_placement`) and a reader that finds none patches in a default of its own, which is how a setting
+  drifts unseen. The template declares `holder`, the one setting the core has no default for (`up` refuses one that
+  does not, before anything is submitted); the render writes every other setting at the core's default, read from
+  `PlacementSettings`' fields, beside what the template declared.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -30,8 +47,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
+import hpcidentity
 import hpcimport
 import hpcnames
+import hpcpins
+import hpcplacement
 import tomllib
 from fedboot import Bootstrap
 from fedcontent import Content
@@ -45,8 +65,10 @@ from fedtools import check_rendered, require_study_artifacts
 
 from expcore_onedata.addresses import AddressMap
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
+from expcore_onedata.importmanifest import Manifest
 
 HTTPS_PORT = 8443  # every service's public port: its 443, moved by the port shim
+PROVIDER_STORAGE = "hpc_provider_storage"  # the value hpcpins.values fills: the providers' storage kind (O57)
 HPC_STORAGE = "posix-local"  # the posix storage bundle/finish.sh adds to every provider, owned by the job's uid
 ZONE_TIMEOUT_S = 900.0
 PROVIDER_TIMEOUT_S = 900.0
@@ -226,19 +248,30 @@ def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int,
     }
 
 
+def check_provider_storage(rendered: str, values: Mapping[str, str]) -> None:
+    """Refuse a rendered file whose `[sandbox.apptainer]` does not declare the providers' storage kind the site has
+    (`values["hpc_provider_storage"]`, O57; `hpcpins.check_declared_kind`): the kind is in the campaign fingerprint, so
+    a file that leaves it out, or hard-codes another, would let shards on tmpfs and on scratch merge."""
+    hpcpins.check_declared_kind(rendered, values.get(PROVIDER_STORAGE))
+
+
 def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, str]) -> str:
     """Write the platform file: the Compose placeholders from the facts, the HPC ones, and the token margin last, the
-    least the platform layer accepts for the rest of the file. Returns the text written."""
+    least the platform layer accepts for the rest of the file, and `[placement]` complete (`hpcplacement.complete`) in
+    both. Returns the text written. The kind of storage the providers have is checked in the first render, before
+    anything is written (`check_provider_storage`)."""
     filled = {**placeholders(facts), **values, "hpc_token_margin_s": str(PROVISIONAL_MARGIN_S)}
     text = rendered(template, filled)
+    check_provider_storage(text, values)
     # O73: a `[sandbox.federation]` table is usable only once the providers registered the declared names, which the
     # facts record: refused here, before the file is written or loaded
     hpcnames.check_federation_table(text, registered_of(facts))
+    text = hpcplacement.complete(text)
     write_private(path, text)
     if "@hpc_token_margin_s@" not in template:
         return text
     filled["hpc_token_margin_s"] = str(least_margin_s(path, text, float(values["hpc_settle_timeout_s"])))
-    text = rendered(template, filled)
+    text = hpcplacement.complete(rendered(template, filled))
     write_private(path, text)
     return text
 
@@ -267,7 +300,8 @@ def registered_of(facts: Mapping[str, Any]) -> Dict[str, str]:
 
 
 def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> str:
-    """facts.json, and platform.toml from the layout's template with the HPC values."""
+    """facts.json, and platform.toml from the layout's template with the HPC values, and the render identity of that
+    platform (O74): the template is read once, and what is hashed is the text that was rendered."""
     facts = facts_of(boot)
     registered = getattr(boot, "registered", None)
     if registered:  # O73: what each service reported as its domain; with the DNS check, which is advisory
@@ -288,10 +322,11 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
     text = template.read_text(encoding="utf-8")
     require_study_artifacts(text, values.get("study_artifacts"))
     write_platform(layout.platform, text, facts, values)
+    hpcidentity.write(layout.root, hpcidentity.build(text, values, layout.platform))
     check_rendered(
         layout, facts
     )  # O83: the slots the file declares, against the layout's principals; as a campaign loads it
-    return "facts.json and platform.toml written"
+    return f"facts.json and platform.toml written; {hpcidentity.FILE} written"
 
 
 def direct_storages_value(layout: Layout, boot: Bootstrap, environ: Mapping[str, str]) -> str:
@@ -320,8 +355,9 @@ def core_phase(
     data: Callable[[Bootstrap], Callable[[str], Any]] = hpcdata.content_reader,
 ) -> str:
     """Bootstrap the federation, write its baseline, each space's data manifest, its facts and platform.toml, verify
-    every shared import against its manifest over the rendered file and every other space's data against its own (read
-    back through `data`, O63), and run the link check; return what up prints, or raise naming the step that failed. The
+    every shared import against its manifest over the rendered file and every baseline space's data against its own
+    (read back through `data`, O63; an ingested space's after the ingest, `verify_ingested`), and run the link check;
+    return what up prints, or raise naming the step that failed. The
     services must be up, and the root must hold the zone's passphrase and the CA. `environ` is where the imports'
     variables are read (this process's when None): a core step's own is an allowlist that carries none."""
     passphrase = layout.passphrase(layout.spec.zone.name)
@@ -343,17 +379,50 @@ def core_phase(
             hpcnames.check_registered(hpcnames.declared_names(layout.spec), registered)
         if not layout.facts.exists():
             content(boot).reset(TRANSFER_TIMEOUT_S)
-        manifests = hpcdata.data_manifests(layout, env)
+        manifests = hpcdata.data_manifests(layout, env, values)
         filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env),
                   **hpcdata.values(manifests)}  # fmt: skip
         written = write_facts(layout, boot, filled)
+        if layout.spec.platform_template is not None:
+            hpcdata.check_rendered(
+                layout, manifests
+            )  # only a manifest up renders is checked: no path of the template's own
         # before the link check, so a platform file that leaves the sharing out fails up with no link record written
         verify(layout, env, timeout_s=VERIFY_TIMEOUT_S)
         held = hpcdata.check(layout, manifests, data(boot))  # no space is ready on a claim: its data is read back
+        # (an ingested space holds nothing yet: `verify_ingested` reads it back after the ingest)
         checked = links(layout, dict(boot.ids.spaces))
     finally:
         client.close()
     return f"{written}\n{held}\n{checked}"
+
+
+def verify_ingested(
+    layout: Layout,
+    owner: Tuple[int, int],
+    manifests: Mapping[str, Manifest],
+    *,
+    rest: Callable[[Path], Any] = Rest,
+    bootstrap: Callable[[Any, Layout, Tuple[int, int]], Bootstrap] = HpcBootstrap,
+    data: Callable[[Bootstrap], Callable[[str], Any]] = hpcdata.content_reader,
+) -> Dict[str, str]:
+    """Read each ingested space back through its owner and compare it with its manifest (O57): what makes each other
+    than the manifest, in counts alone (empty for one that is exactly it), never a path. A fresh process holds none of
+    the ids the bootstrap made, so the spaces' ids are read from facts.json, which `up` wrote; the services' addresses
+    are the placed layout's. `rest`, `bootstrap` and `data` are the core phase's own, for a stand-in."""
+    try:
+        recorded = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]
+        ids = {name: space["id"] for name, space in recorded.items()}
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        why = type(error).__name__
+        raise RuntimeError(f"{layout.facts.name} cannot be read as the facts up writes ({why})") from None
+    client = rest(layout.ca_pem)
+    try:
+        boot = bootstrap(client, layout, owner)
+        boot.ids.spaces.update(ids)
+        return hpcdata.verify(manifests, data(boot))
+    finally:
+        client.close()
 
 
 def load_owner(text: str) -> Optional[Tuple[int, int]]:

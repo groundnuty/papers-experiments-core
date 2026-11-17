@@ -10,17 +10,20 @@ files the stage before it wrote.
    allowlist alone): the step makes the sandbox's work root and copies the root's `platform.toml` beside the study's
    `study.toml`; its dispatcher `python -I -m expcore run` runs every run in the Apptainer sandbox with `[sandbox]` as
    that file has it, on a fake node (`fake_mount_node`), with a spend journal and snapshots.
-3. Shard fed-a killed outright after its first snapshot, with an attempt that began after it ended and one in flight,
-   then `step --resume`: the killed step's directory on the node removed, the snapshot restored, what the journal holds
-   that it lacks counted once as `lost_in_kill`.
+3. Shard fed-a killed outright after a snapshot of its first two attempts ended and its third in flight, with an
+   attempt that began after it ended and one in flight, then `step --resume`: the killed step's directory on the node
+   removed, the snapshot restored, what the journal holds that it lacks counted once as `lost_in_kill`.
 4. `shards.py collect --run` (which runs `expcore merge`), then `check`, `analyze` and `report` on the merge.
 5. `hpcfed.py down` on each: the relay stopped, the agent's node swept, the held job cancelled, the root gone.
 
 Nothing here reaches a cluster, a container or a model. The kill is timed by holds the study's plugin reads
 (`hpc_rehearsal_plugin`), never by sleeping: the step's own snapshot thread looks for a run's end every 30 s
-(`shards.POLL_S`), and the manifest's `snapshot_every_s` is past the rehearsal, so the first snapshot is the one taken
-at its first look, and the next could come no sooner than 30 s after it; the kill comes within seconds of it, and the
-module checks that no second snapshot was taken. That look is why the module takes about a minute.
+(`shards.POLL_S`), and the manifest's `snapshot_every_s` is past the rehearsal, so a snapshot is taken at a look that
+finds a run ended since the last one. The second attempt is held over the first look, on every run of the module, so
+that look takes a snapshot with that attempt in flight, which the kill must not follow; the fixture accepts the snapshot
+of the next look, which holds the first two attempts ended and the held third in flight. The kill comes within seconds
+of it, and the module checks that it is still the newest. Those two looks are why the module takes about a minute and
+a half.
 """
 
 import contextlib
@@ -41,9 +44,11 @@ from hpc_rehearsal_support import (
     Control,
     Federation,
     StepLine,
+    attempt_starts_in,
     attempts_in,
     deploy_modules,
     hpcfed,
+    journaled_starts,
     kill_outright,
     link_check_stand_in,
     make_ca,
@@ -63,12 +68,12 @@ from expcore_onedata.config import load_platform
 __all__ = ["clean_environment"]  # a fixture the stages below use, imported from the support module
 
 pytestmark = [
-    pytest.mark.benchmark,  # a minute of wall time: the step's own snapshot thread looks every 30 s
+    pytest.mark.benchmark,  # a minute and a half of wall time: the step's snapshot thread looks every 30 s
     pytest.mark.skipif(not HAS_OPENSSL, reason="the zone's CA is made with openssl"),
 ]
 
 KILLED, WHOLE = LABELS  # fed-a is killed outright and resumed; fed-b runs to its end
-SNAPSHOT_AT, KILL_AT = 3, 5  # the attempts of fed-a's first life that are held: the snapshot, then the kill
+PINNED_AT, SNAPSHOT_AT, KILL_AT = 2, 3, 5  # fed-a's first life holds: the first look, then the snapshot, then the kill
 SERVICES = ["zone", "aspen", "larch", "rowan", "alder", "hazel"]
 
 
@@ -100,6 +105,9 @@ def federations(deploy, shared, tmp_path_factory) -> dict[str, Federation]:
         for label in LABELS:
             fed = Federation(label, tmp_path_factory.mktemp(label), shared.node_tmp, ca)
             hpcfed(deploy, fed, "up", fed.site())
+            hpcfed(
+                deploy, fed, "verify-data", fed.site()
+            )  # the layout's ingested space is empty: shown, so plan may run
             feds[label] = fed
     for fed in feds.values():
         fed.pairs = pairs
@@ -161,6 +169,17 @@ def test_up_starts_the_login_nodes_fault_relay_last_and_records_it(federations, 
 
 
 # ------------------------------------------------------------------------------------------------ stage 2: the plan
+@pytest.mark.parametrize("label", LABELS)
+def test_o57_verify_data_after_up_read_the_ingested_space_back_and_recorded_the_marker_plan_needs(federations, label):
+    """O57: the layout's one ingested space is verified after `up` (`hpcfed.py verify-data`, over the same stand-in
+    for a federation's spaces), and the state file holds its marker, bound to the manifest `up` recorded."""
+    fed = federations[label]
+    assert fed.codes["verify-data"] == 0, fed.printed["verify-data"]
+    record = state_of(fed)["data"]["ingested"]
+    assert list(record) == ["delta-space"]
+    assert record["delta-space"]["verified"]["manifest"] == record["delta-space"]["manifest"]
+
+
 @pytest.fixture(scope="module")
 def plan(deploy, federations, shared):
     """The study, the manifest over the roots `up` wrote, and each shard's line as `shards.py plan` prints it."""
@@ -196,7 +215,7 @@ def test_plan_puts_each_shards_step_on_its_federations_agent_node_in_component_1
         }
         assert homeless["HOME"] == "/dev/null/hpcop-home"  # no home of the account's, nor any (O57)
         assert homeless["PYTHONNOUSERSITE"] == "1"
-        assert line.command[2:4] == [str(Path(line.command[2])), "step"]
+        assert line.command[1:5] == ["-I", "-B", str(Path(line.command[3])), "step"]  # isolated, no bytecode (O58)
         assert line.command[line.command.index("--index") + 1] == str(index)
         fed.fake._step([*line.srun, "/usr/bin/env", "-i", *(f"{k}={v}" for k, v in line.env.items()), *line.command])
 
@@ -208,37 +227,72 @@ class Shards:
 
     codes: dict[str, int] = field(default_factory=dict)
     logs: dict[str, Path] = field(default_factory=dict)
+    accepted: str = ""  # the snapshot the fixture waited for: the first two attempts ended, the held third in flight
     snapshot_at_kill: list[Path] = field(default_factory=list)
     snapshot_attempts: list[tuple[str, str]] = field(default_factory=list)
+    snapshot_starts: set[tuple[str, str]] = field(default_factory=set)  # (run_key, started_utc) of the newest one's
     journals_at_kill: list[str] = field(default_factory=list)
+    journaled: set[tuple[str, str]] = field(default_factory=set)  # the same, of every attempt the killed life journaled
     archive_at_kill: bool = False
     left_at_kill: list[str] = field(default_factory=list)  # the killed step's directory on the agent's node
     left_after_resume: list[str] = field(default_factory=list)
+    campaign_check: str | None = "not run"  # what resume-line's campaign check said of the killed shard (None: passed)
 
     def printed(self, life: str) -> str:
         return self.logs[life].read_text(encoding="utf-8", errors="replace")
 
 
+def campaign_check(deploy, plan) -> str | None:
+    """resume-line's check of the killed shard's newest snapshot against the study beside its federation's platform
+    file (`shardresume.check_campaign`); None when it passes, else its refusal."""
+    resume = deploy.shards._sibling("shardresume")
+    loaded = deploy.shards.load_plan(plan.manifest)
+    shard = next(s for s in loaded.shards if s.label == KILLED)
+
+    def refuse(why):
+        raise deploy.shards.ShardsError(why)
+
+    try:
+        resume.check_campaign(deploy.shards, loaded, shard, refuse)
+    except deploy.shards.ShardsError as error:
+        return str(error)
+    return None
+
+
 @pytest.fixture(scope="module")
-def shards(plan, federations, shared) -> Shards:
-    """fed-b's step runs to its end while fed-a's first life is held at its third attempt until the step's first
-    snapshot holds that attempt in flight, released, held again at its fifth, and killed outright; then fed-a's step is
-    run again with `--resume`."""
+def shards(deploy, plan, federations, shared) -> Shards:
+    """fed-b's step runs to its end while fed-a's first life is held at its second attempt over the step's first look,
+    which takes a snapshot with that attempt in flight, then released and held at its third until the next look takes
+    a snapshot holding the third in flight with the two before it ended; that one accepted, the third is released, the
+    fifth held, and the step killed outright; then fed-a's step is run again with `--resume`. What the kill left is
+    read before the resume, which prunes the older snapshots."""
     found, control = Shards(), shared.control
     snapdir = plan.results / KILLED / "snapshots"
-    for n in (SNAPSHOT_AT, KILL_AT):
+    for n in (PINNED_AT, SNAPSHOT_AT, KILL_AT):
         control.hold(KILLED, n)
     found.logs = {life: plan.logs / f"{life}.log" for life in (f"{KILLED}-1", f"{KILLED}-2", WHOLE)}
     killed = plan.lines[KILLED].start(found.logs[f"{KILLED}-1"])
     whole = plan.lines[WHOLE].start(found.logs[WHOLE])
     try:
+        # the first look comes with the second attempt in flight on every run of the module, not only on a slow host's
+        control.wait_held(KILLED, PINNED_AT, killed)
+        wait_for(lambda: any(snapdir.glob("snap-*")), killed, 150.0, "the snapshot of the first look")
+        control.release(KILLED, PINNED_AT)
         control.wait_held(KILLED, SNAPSHOT_AT, killed)
 
-        def snapshot_with_the_held_attempt() -> bool:
+        def snapshot_of_the_held_third() -> bool:
+            """The newest snapshot holds the first two attempts ended and the held third in flight (and no other);
+            an earlier one does not, and the next look takes the one that does."""
             taken = sorted(snapdir.glob("snap-*"))
-            return bool(taken) and any(state == "running" for _, state in attempts_in(taken[-1]))
+            if not taken:
+                return False
+            states = [state for _, state in attempts_in(taken[-1])]
+            if not (len(states) == SNAPSHOT_AT and states.count("running") == 1 and states[-1] == "running"):
+                return False
+            found.accepted = taken[-1].name
+            return True
 
-        wait_for(snapshot_with_the_held_attempt, killed, 150.0, "a snapshot holding the held attempt")
+        wait_for(snapshot_of_the_held_third, killed, 150.0, "a snapshot of the two ended attempts and the held third")
         control.release(KILLED, SNAPSHOT_AT)
         control.wait_held(KILLED, KILL_AT, killed)
         found.snapshot_at_kill = sorted(snapdir.glob("snap-*"))
@@ -247,7 +301,10 @@ def shards(plan, federations, shared) -> Shards:
         found.codes[f"{KILLED}-1"] = killed.returncode
         found.archive_at_kill = (plan.results / f"{KILLED}.out.tar").exists()
         found.snapshot_attempts = attempts_in(found.snapshot_at_kill[-1])
+        found.snapshot_starts = attempt_starts_in(found.snapshot_at_kill[-1])
+        found.journaled = journaled_starts(plan.results / KILLED / "journals" / found.journals_at_kill[0])
         found.left_at_kill = sorted(p.name for p in shared.node_tmp.glob(f"expcore-shard-{KILLED}.*"))
+        found.campaign_check = campaign_check(deploy, plan)
         control.clear()  # the second life holds nothing
         again = plan.lines[KILLED].start(found.logs[f"{KILLED}-2"], "--resume")
         found.codes[f"{KILLED}-2"] = wait_step(again)
@@ -260,15 +317,16 @@ def shards(plan, federations, shared) -> Shards:
     return found
 
 
-def test_every_step_ends_and_fed_a_was_killed_outright_after_exactly_one_snapshot(shards):
-    """The kill left the snapshot taken while attempt 3 was in flight and nothing newer (the rehearsal's timing: a
-    second snapshot here would make what follows another case, so it fails the module rather than pass another way),
-    one journal, and no archive."""
+def test_every_step_ends_and_fed_a_was_killed_outright_with_the_held_thirds_snapshot_the_newest(shards):
+    """The kill left the snapshot the fixture accepted, taken while attempt 3 was in flight and the two before it
+    ended, as the newest (the rehearsal's timing: a snapshot taken after it, at attempt 3's end, would make what
+    follows another case, so it fails the module rather than pass another way), one journal, and no archive."""
     assert shards.codes[f"{KILLED}-1"] < 0, shards.printed(f"{KILLED}-1")
-    assert [p.name for p in shards.snapshot_at_kill] == ["snap-000001"]
+    assert shards.snapshot_at_kill[-1].name == shards.accepted, [p.name for p in shards.snapshot_at_kill]
     assert len(shards.journals_at_kill) == 1
     assert not shards.archive_at_kill
     states = [state for _, state in shards.snapshot_attempts]
+    assert len(states) == SNAPSHOT_AT, states
     assert states.count("running") == 1, states
     assert states[-1] == "running"
     assert shards.codes[f"{KILLED}-2"] == 0, shards.printed(f"{KILLED}-2")
@@ -289,9 +347,16 @@ def test_the_resume_removed_the_killed_steps_directory_on_the_agents_node(shards
     assert "an earlier step's directory on this node is removed" in shards.printed(f"{KILLED}-2")
 
 
+def test_o63_resume_lines_campaign_check_passes_on_the_store_a_real_dispatcher_pinned(shards):
+    """O63: the killed shard's newest snapshot holds the store its real dispatcher wrote; resume-line's check finds it
+    pins exactly the fingerprint the study pins beside its federation's rendered platform file (computed by the
+    manifest's Python on a copy, the restored store in its out/), so a valid resume is never refused for it."""
+    assert shards.campaign_check is None, shards.campaign_check
+
+
 def test_the_resume_restores_the_snapshot_and_counts_what_the_journal_holds_beyond_it_once(shards):
     printed = shards.printed(f"{KILLED}-2")
-    assert f"shards: shard {KILLED} resumes from snapshot snap-000001" in printed
+    assert f"shards: shard {KILLED} resumes from snapshot {shards.accepted}" in printed
     assert "counted as lost_in_kill" in printed
 
 
@@ -318,9 +383,31 @@ def test_collect_merges_both_shards_and_every_command_on_the_merge_succeeds(merg
     assert [(s["index"], s["label"]) for s in batch["shards"]] == [(1, KILLED), (2, WHOLE)]
 
 
-def test_the_merged_export_carries_the_kills_lost_spend_with_its_basis_and_the_interrupted_attempt(merged):
+@pytest.mark.parametrize("label", LABELS)
+def test_o74_up_wrote_each_federations_render_identity_0600_and_each_shards_out_carries_it_once_per_step(
+    plan, merged, federations, label
+):
+    """O74: `up` wrote `render-identity.json` in each root (mode 0600); each shard's collected `out/` holds that record
+    in `study-state/`, one file per step: the shard that ran to its end one, the shard killed outright and resumed two
+    (the first life's, which its snapshot carried, and the resume's own, under another name)."""
+    record = federations[label].root / "render-identity.json"
+    assert stat.S_IMODE(record.stat().st_mode) == 0o600
+    kept = sorted((plan.results.parent / "collected" / label / "out" / "study-state").glob("render-identity.*.json"))
+    assert len(kept) == (2 if label == KILLED else 1)
+    assert [path.read_bytes() for path in kept] == [record.read_bytes()] * len(kept)
+
+
+def test_the_merged_export_carries_the_kills_lost_spend_with_its_basis_and_the_interrupted_attempt(merged, shards):
+    """O63: the attempts begun after the restored snapshot are the lost spend, each counted once: the snapshot holds
+    none of them, and with them it holds every attempt the killed life journaled, no more. That holds whichever
+    snapshot the resume found; the shape checked after it is the case this module sets up (attempt 4 ended, 5 in
+    flight)."""
     export = merged.read("export.json")
     lost = export[LOST_KEY]
+    starts = [(entry["run_key"], entry["started_utc"]) for entry in lost if entry["kind"] == "attempt"]
+    assert len(set(starts)) == len(starts), starts
+    assert not set(starts) & shards.snapshot_starts
+    assert set(starts) | shards.snapshot_starts == shards.journaled
     assert [(entry["kind"], entry["ended"]) for entry in lost] == [("attempt", True), ("attempt", False)]
     assert {entry["shard"] for entry in lost} == {1}
     assert lost[1]["basis"] == "measured"
@@ -382,6 +469,7 @@ def other_build(deploy, plan, shards, merged, federations, shared, tmp_path_fact
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(deploy.fedlinks, "check_links", link_check_stand_in([]))
         hpcfed(deploy, fed, "up", fed.site())
+        hpcfed(deploy, fed, "verify-data", fed.site())
     base = shared.base / "other"
     study = make_study(base / "studies", shared.control.path)
     (base / "results").mkdir()
@@ -428,7 +516,7 @@ def downed(deploy, federations, merged, other_build) -> dict[str, Federation]:
 def test_down_stops_the_relay_first_cancels_the_held_job_and_removes_the_root(downed, label):
     fed = downed[label]
     assert fed.codes["down"] == 0, fed.printed["down"]
-    assert fed.fake.calls[0][1:5] == ["-B", "-m", "expcore_onedata.fault_relay", "stop"]
+    assert fed.fake.calls[0][1:6] == ["-I", "-B", "-m", "expcore_onedata.fault_relay", "stop"]
     assert fed.fake.cancelled == [JOBS[label][0]]
     assert fed.fake.steps == {}
     assert not fed.root.exists()
@@ -446,8 +534,7 @@ def test_down_swept_the_agents_node_and_left_no_step_directory_there(downed, sha
 
 
 def test_the_sandbox_left_no_run_record_on_either_agent_node(downed):
-    """The resumed dispatcher's first sandbox reaped what the killed one left; every other run's teardown removed its
-    own record."""
+    """The resumed dispatcher's first sandbox reaped what the killed one left, and every other run's teardown removed
+    its own record; so down's sweep found the work root empty, and removed it (W1, live slot 5)."""
     for fed in downed.values():
-        assert sorted(p.name for p in fed.work_root.iterdir()) == ["_runs"], fed.label
-        assert not list((fed.work_root / "_runs").iterdir()), fed.label
+        assert not fed.work_root.exists(), fed.label

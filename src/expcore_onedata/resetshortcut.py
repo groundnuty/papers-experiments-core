@@ -30,6 +30,15 @@ stage (`grant_lapsed`); a job since the reading names a file that is no listed f
 error's type). The record (`occupancy_reads`) says the mode, why, the grant (`resetgrant.ResetGrant.facts`), the
 reading's start and size, and what was re-read. **A hold that lapses after the narrowed reads** (the admission let go
 during the reset) fails the stage that finds it: those reads certify nothing.
+
+**The full reads on request.** A caller that needs one reset read in full (`SpaceReset.run(full_reason=...)`,
+`ResetPlan.full_reason`) asks for it inside its exclusive section, so the section still keeps every reader out for
+the reset: leaving the section out gives the full reads too, and the reset takes the hold itself (O66). The record
+says `full`, keeps the core's own why where the core gives the full reads anyway and says `requested` where it would
+have given the shortcut, and holds the caller's reason beside it (`full_reason`). With no `full_reason` the record is
+what it always was. The
+record is published, so the reason is a short code (`checked_reason`, `shortcode.checked_code`): no path, host, address
+or sentence, and none of the names the platform's configuration gives (O12).
 """
 
 from collections.abc import Collection, Mapping
@@ -38,9 +47,11 @@ from typing import TYPE_CHECKING, Any
 from expcore_onedata import consistency
 from expcore_onedata.admission import Federation
 from expcore_onedata.client import PlatformError
+from expcore_onedata.config import PlatformConfig
 from expcore_onedata.occupancy import Listing
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.rangemap import PlacementSettings
+from expcore_onedata.shortcode import CODE_FORM, checked_code
 from expcore_onedata.transferrecord import Unreadable
 
 if TYPE_CHECKING:  # the reset imports this module; only the interfaces are used here
@@ -49,14 +60,32 @@ if TYPE_CHECKING:  # the reset imports this module; only the interfaces are used
 
 SHORTCUT, FULL = "shortcut", "full"  # the mode of the occupancy and quiet stages' reads
 OFF, NOT_PLANNED, OUTSIDE_GRANT, OTHER_FEDERATION = "off", "not_planned", "outside_grant", "other_federation"
+REQUESTED = "requested"  # the caller asked for the full reads (`full_reason`) where the shortcut would have been given
 GRANT_LAPSED, NOT_ON_A_FILE, TRANSFERS_UNREAD = "grant_lapsed", "transfer_not_on_a_file", "transfers_unread"
 UNREAD = (Unreadable, PlatformError, consistency.WaitTimeout)  # a walk that cannot be read: the full reads
+REASON_FORM = CODE_FORM  # a caller's reason for the full reads: a short code (`shortcode.py`)
 
 
-def initial(settings: PlacementSettings, planned: "Holdings | None", federation: Federation | None) -> dict[str, Any]:
+def checked_reason(reason: object, config: PlatformConfig) -> str:
+    """A caller's reason for the full reads, as it goes into the published record: a short code that holds none of the
+    names `config` gives, by the one rule every reason the core publishes follows (`shortcode.checked_code`, which
+    `tool_admission.shared_admission`'s reason follows too). Raise ValueError otherwise. A name the study chose and
+    the configuration does not hold is the study's to keep out, as in any field it writes."""
+    return checked_code(reason, config, what="full_reason", says="why the reset reads in full")
+
+
+def initial(
+    settings: PlacementSettings,
+    planned: "Holdings | None",
+    federation: Federation | None,
+    full_reason: str | None = None,
+) -> dict[str, Any]:
     """The mode a reset starts with, and the record of it: the shortcut only with the setting on and a planner's reading
     made inside an exclusive section of this reset's `federation` that still holds (`resetgrant.ResetGrant.shortcut`);
-    a section of another federation's lock excludes none of this one's readers (`other_federation`)."""
+    a section of another federation's lock excludes none of this one's readers (`other_federation`). A caller's
+    `full_reason` asks for the full reads: the core's own why stays where it gives them anyway, and is `requested`
+    where it would have given the shortcut, and the caller's text is recorded beside it (`full_reason`). The section
+    and its grant are the caller's, held as without it; with no `full_reason` the record is what it always was."""
     grant = None if planned is None else planned.grant
     reads: dict[str, Any] = {
         "mode": FULL,
@@ -64,6 +93,8 @@ def initial(settings: PlacementSettings, planned: "Holdings | None", federation:
         "grant": None if grant is None else grant.facts(),
         "reading": None if planned is None else _reading_facts(planned),
     }
+    if full_reason is not None:
+        reads["full_reason"] = full_reason
     if not settings.reset_shortcut:
         reads["why"] = OFF
     elif planned is None:
@@ -76,6 +107,8 @@ def initial(settings: PlacementSettings, planned: "Holdings | None", federation:
         reads["why"] = OTHER_FEDERATION
     elif not grant.held:
         reads["why"] = OUTSIDE_GRANT
+    elif full_reason is not None:
+        reads["why"] = REQUESTED
     else:
         reads["mode"] = SHORTCUT
     return reads
