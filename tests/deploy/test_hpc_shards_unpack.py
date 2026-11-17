@@ -148,7 +148,7 @@ def test_a_normal_archive_unpacks_as_before_links_inside_out_kept(shards, tmp_pa
             ("out/runs/same", HARDLINK, "out/runs/r.json"),
         ],
     )
-    out = shards.unpack(archive, tmp_path / "into", label="fed-a")
+    out = shards.unpack(archive, tmp_path / "into")
     assert out == tmp_path / "into" / "out"
     assert (out / "campaign.lock").read_bytes() == b"content"
     assert os.readlink(out / "runs" / "newest") == "r.json"
@@ -166,7 +166,7 @@ def test_an_into_that_exists_is_still_refused_whatever_the_archive_holds(shards,
     _write(archive, [OUT, ("out/campaign.lock", FILE, None)])
     (tmp_path / "into").mkdir()
     with pytest.raises(FileExistsError):
-        shards.unpack(archive, tmp_path / "into", label="fed-a")
+        shards.unpack(archive, tmp_path / "into")
 
 
 def test_collect_refuses_a_shard_whose_archive_has_a_member_outside_out_and_extracts_none_of_it(shards, tmp_path):
