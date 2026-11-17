@@ -22,7 +22,7 @@ from hpc_support import FEDERATION, write_hpc_platform, write_state
 from expcore.campaign import prerun
 from expcore.errors import InfraError
 from expcore_onedata.admission import FederationBusy, run_admission
-from expcore_onedata.compose import CommandResult, DriverError
+from expcore_onedata.compose import RESTART_LINK_SCRIPT, CommandResult, DriverError
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_hpc import HpcDriver, Request
@@ -287,6 +287,41 @@ def test_o58_a_request_the_relay_took_and_never_answered_is_unknown_never_done(t
         with pytest.raises(DriverError, match="did not finish"):
             driver.start(SERVICE)
         assert driver.restart_link(SERVICE) == "command_timeout"
+
+
+def test_o58_a_verb_past_its_relay_bound_is_unknown_and_fails_closed(tmp_path):
+    """O58: each HPC verb is bounded at its own inner worst case and 30 s (a status 600 s, a start 630 s, a ping 570 s:
+    `fault_hpc.verb_bounds`, never below the declared floor of 300 s; it was 120 s until three provider outages on
+    one HPC federation showed relay steps starting 47 to 103 s after they were issued). The relay hands the verb that
+    bound; a verb the runner cuts at it is answered `timed_out`, and the driver reads it as a command with no answer,
+    never as done: a status raises, a start raises, a ping is no pong, and no verb is retried."""
+    platform = write_hpc_platform(
+        tmp_path, stop_bound_s=None, settle_timeout_s=None, step_launch_wait_s=None, command_timeout_s=None
+    )
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    assert (settings.step_launch_wait_s, settings.command_timeout_s) == (240.0, 300.0)
+    asked = []
+
+    def overrun(argv, *, timeout_s):
+        asked.append((argv[len(PREFIX) :], timeout_s))
+        raise subprocess.TimeoutExpired(argv, timeout_s)
+
+    relay, clock = relay_of(tmp_path, overrun), FakeClock()
+    client = RelayClient(tmp_path, wait_s=settings.relay_wait_s, clock=clock, sleep=serving(relay, clock))
+    driver = hpc_driver(settings, probe=lambda service: True, transport=client)
+    with relay.holding():
+        with pytest.raises(DriverError, match="did not finish within 600 s"):
+            driver.observe(SERVICE)
+        with pytest.raises(DriverError, match="did not finish within 630 s"):
+            driver.start(SERVICE)
+        assert driver.ping(SERVICE) is False
+        assert driver.restart_link(SERVICE) == "command_timeout"
+    assert asked == [
+        (["status", SERVICE], 600.0),
+        (["start", SERVICE], 630.0),
+        (["exec", SERVICE, "--", "/usr/sbin/op_worker", "ping"], 570.0),
+        (["exec", SERVICE, "--", "bash", "-c", RESTART_LINK_SCRIPT], 570.0),
+    ]
 
 
 def test_o58_an_outage_whose_stop_the_relay_never_answers_is_journalled_unknown_and_stays_open(tmp_path):

@@ -20,15 +20,28 @@ SIZE = re.compile(r"([1-9][0-9]{0,6})([mg])")
 TIME = re.compile(r"(?:([0-9]{1,2})-)?([0-9]{1,2}):([0-9]{2}):([0-9]{2})")
 SLURM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")  # an account or a partition
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}")
-HPC_KEYS = ("time", "stop_seconds", "core", "zone", "provider", "control", "sandbox", "sandbox_placement")
+HPC_KEYS = (
+    "time",
+    "stop_seconds",
+    "step_launch_wait_s",
+    "core",
+    "zone",
+    "provider",
+    "control",
+    "sandbox",
+    "sandbox_placement",
+)
 SIZE_KEYS = ("cpus", "memory")
 CORE_PLACES = ("login", "step")  # where the bootstrap and the link check run (DESIGN.md, section 9)
 # Where the agent's node is held (DESIGN.md, section 1): "het", the last component of a heterogeneous job, sized on its
 # own; "separate", a held job of its own, the fallback should a site refuse the first.
 SANDBOX_PLACEMENTS = ("het", "separate")
+DEFAULT_STEP_LAUNCH_WAIT_S = 240  # `[hpc] step_launch_wait_s`: see DEFAULTS
+VERB_WORK_S = 60  # what a relay verb does beside waiting for its step to start: its step's own bound, a status's 60 s
 KILL_TAIL_S = 30  # supervise.py's SIGKILL tail after the graceful stop's bound (lib.sh, stop_service)
 STEP_END_S = 60  # the longest the driver polls for a stopped service's step to leave squeue -s
-SETTLE_SLACK_S = 60  # what settle_timeout_s keeps beyond the stop's bound
+SETTLE_SLACK_S = 70  # what settle_timeout_s keeps beyond the stop's bound and the launch wait: the stop verb's
+# own tail past its control step (the wait for the step to leave the list and after a cancel: 40 s) and a 30 s margin
 STEP_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"  # HPC_STEP_PATH's default
 SANDBOX_SPARE_CPUS = 2  # beside the agent's cores on its node: the gate, the dispatcher and the egress collector
 SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatcher, the collector, the store, the SIF
@@ -64,7 +77,14 @@ DEFAULTS = {
     # 2.5 GB rootfs, plus its posix storage on the same tmpfs; the largest control step (a token's delivery) about
     # 180 MB, killed under 100 MB.
     "time": "02:00:00",
-    "stop_seconds": 600,
+    # Three provider outages on one HPC federation (17 Nov): the largest service-side stop after SIGTERM was 33.1 s
+    # (the others 27.1 s and 26.1 s), plus 50 %.
+    "stop_seconds": 50,
+    # How long a control step may wait to start before its own work begins, which every bound that waits on a step's
+    # client from its start adds. A step's creation can wait on the scheduler's controller, up to its message timeout
+    # (200 s on a site that sets it so, with no error); relay verb steps were measured starting 47 to 103 s after they
+    # were issued during a heal. 240 s is that 200 s plus 20 %. It widens timeouts only.
+    "step_launch_wait_s": DEFAULT_STEP_LAUNCH_WAIT_S,
     "core": "login",
     "zone": {"cpus": 4, "memory": "8g"},
     "provider": {"cpus": 4, "memory": "10g"},
@@ -123,6 +143,7 @@ class HpcSettings:
 
     time_s: int
     stop_seconds: int
+    step_launch_wait_s: int
     core: str
     zone: Size
     provider: Size
@@ -180,14 +201,25 @@ class HpcSettings:
 
     @property
     def stop_bound_s(self) -> int:
-        """The longest a stop takes in all (DESIGN.md, section 7e): the graceful bound, supervise.py's SIGKILL tail,
-        and the poll for the step's end."""
+        """The longest the service's own stop takes (DESIGN.md, section 7e): the graceful bound, supervise.py's SIGKILL
+        tail, and the poll for the step's end. It holds no launch wait: that is `step_launch_wait_s`'s."""
         return self.stop_seconds + KILL_TAIL_S + STEP_END_S
 
     @property
+    def stop_verb_bound_s(self) -> int:
+        """The longest a stop verb takes in all: the control step's launch wait and then the stop's own bound."""
+        return self.step_launch_wait_s + self.stop_bound_s
+
+    @property
+    def command_timeout_s(self) -> int:
+        """The `[faults] command_timeout_s` an HPC platform declares: the longest one relay verb may take, a control
+        step's launch wait and the verb's own work (`VERB_WORK_S`)."""
+        return self.step_launch_wait_s + VERB_WORK_S
+
+    @property
     def settle_timeout_s(self) -> int:
-        """The least `[faults] settle_timeout_s` an HPC platform declares: above the stop's whole bound."""
-        return self.stop_bound_s + SETTLE_SLACK_S
+        """The least `[faults] settle_timeout_s` an HPC platform declares: above the stop verb's whole bound."""
+        return self.stop_verb_bound_s + SETTLE_SLACK_S
 
 
 def _size(value: Any, key: str) -> Size:
@@ -254,6 +286,9 @@ def load_settings(table: Optional[Mapping[str, Any]], agent: Optional[AgentLimit
     stop = merged["stop_seconds"]
     if isinstance(stop, bool) or not isinstance(stop, int) or not 30 <= stop <= 3600:
         raise SettingsError("hpc.stop_seconds: must be a whole number of seconds from 30 to 3600")
+    launch_wait = merged["step_launch_wait_s"]
+    if isinstance(launch_wait, bool) or not isinstance(launch_wait, int) or not 0 <= launch_wait <= 3600:
+        raise SettingsError("hpc.step_launch_wait_s: must be a whole number of seconds from 0 to 3600")
     core = merged["core"]
     if core not in CORE_PLACES:
         raise SettingsError("hpc.core: must be " + " or ".join(f'"{place}"' for place in CORE_PLACES))
@@ -262,6 +297,7 @@ def load_settings(table: Optional[Mapping[str, Any]], agent: Optional[AgentLimit
     settings = HpcSettings(
         time_s=_seconds(merged["time"]),
         stop_seconds=stop,
+        step_launch_wait_s=launch_wait,
         core=core,
         zone=_size(merged["zone"], "zone"),
         provider=_size(merged["provider"], "provider"),
@@ -269,8 +305,11 @@ def load_settings(table: Optional[Mapping[str, Any]], agent: Optional[AgentLimit
         sandbox=_sandbox(merged, agent),
         sandbox_placement=merged["sandbox_placement"],
     )
-    if settings.time_s <= 2 * settings.stop_bound_s:
-        raise SettingsError("hpc.time: must exceed twice the stop's bound (stop_seconds + 90 s), or down cannot finish")
+    if settings.time_s <= 2 * settings.stop_verb_bound_s:
+        raise SettingsError(
+            "hpc.time: must exceed twice the stop's bound (step_launch_wait_s + stop_seconds + 90 s), or down cannot "
+            "finish"
+        )
     return settings
 
 

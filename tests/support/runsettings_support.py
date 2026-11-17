@@ -206,7 +206,7 @@ tls = {{ ca_file = "@root@/ca/federation-ca.pem" }}
 addresses = {{ file = "address-map.json", resolver = "toolshim/resolve_launch.py" }}
 
 [tokens]
-margin_s = 6000
+margin_s = 9000
 
 [[spaces]]
 label = "alpha"
@@ -245,6 +245,7 @@ backend = "hpc"
 journal = "@root@/fault-journal"
 stop_bound_s = 690
 relay_wait_s = 30
+step_launch_wait_s = 240
 
 [faults.services]
 aspen = "aspen"
@@ -523,6 +524,7 @@ IN = {
                                                               "heal_container_fallback = false")),
     "faults.stop_bound_s": edit("apptainer", platform("stop_bound_s = 690", "stop_bound_s = 691")),
     "faults.relay_wait_s": edit("apptainer", platform("relay_wait_s = 30", "relay_wait_s = 31")),
+    "faults.step_launch_wait_s": edit("apptainer", platform("step_launch_wait_s = 240", "step_launch_wait_s = 241")),
     "space.name": edit("docker", platform('name = "alpha-space"', 'name = "alpha-other"')),
     "placement.clock_skew_allowance_s": edit("docker", platform("clock_skew_allowance_s = 5.0",
                                                                 "clock_skew_allowance_s = 6.0")),
