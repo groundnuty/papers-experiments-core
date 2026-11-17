@@ -378,7 +378,8 @@ class FakeSlurm:
     # entry left succeeds. Keys of an entry: `log` (what the run log holds, "" by default), `no_log` (no run log at
     # all), `state` and `exit` (the accounted step's, "CANCELLED" and "0:116"), `no_row` (accounting holds no row),
     # `row_id` (the id accounting shows, when not the step's), `client` (the client log's text instead), `reason` (the
-    # failure's reason in the client log), `client_id` (the StepId the client log names, when not the step's).
+    # failure's reason in the client log), `client_id` (the StepId the client log names, when not the step's), `listed`
+    # (squeue lists the step, as it did for about 12 s live, until a test makes it vanish).
     launch_failures: dict = field(default_factory=dict)
     step_rows: dict = field(default_factory=dict)  # job id -> the `JobID|JobName|State|ExitCode` rows sacct prints
     sacct_steps: Callable | None = None  # a test's own answer to that sacct query, `(argv) -> Completed`, or raises
@@ -671,6 +672,8 @@ class FakeSlurm:
         self.next_step += 1
         step = f"{self.listing_of(srun)}.{self.next_step}"
         self.logs[service] = srun.output
+        if how.get("listed"):
+            self.steps[srun.name] = step
         if not how.get("no_log"):
             Path(srun.output).write_text(how.get("log", ""), encoding="utf-8")
         reason = how.get("reason", "Can't find an address, check slurm.conf")
