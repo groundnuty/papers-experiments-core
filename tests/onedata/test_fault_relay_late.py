@@ -142,9 +142,9 @@ def test_o58_a_verb_that_times_out_is_answered_timed_out_and_a_watch_is_opened_b
     tag, key = opened["tag"], opened["request"]
     assert TAG.fullmatch(tag)
     assert re.fullmatch(r"[0-9a-f]{32}", key)
-    assert started["argv"] == watch_argv(
-        PREFIX, tag, "stop", SERVICE, key, journal_path(root), LATE_WINDOW_S, LATE_POLL_S
-    )
+    assert opened["why"] == "timed_out"
+    assert started["argv"] == watch_argv(PREFIX, tag, "stop", SERVICE, key, LATE_WINDOW_S, LATE_POLL_S)
+    assert "--journal" not in started["argv"]  # hpcfed knows the relay's journal from the root: no path to mis-spell
     assert started["env"] == ENVIRONMENT
     assert stat.S_IMODE(journal_path(root).stat().st_mode) == 0o600
     assert journal_path(root) == relay_dir(root) / JOURNAL
@@ -297,3 +297,38 @@ def zombie(pid):
     except OSError:
         return True
     return stat[stat.rfind(")") + 2 :].split()[0] in ("Z", "X")
+
+
+LEAVER = """
+import subprocess, sys, os
+here = os.path.dirname(os.path.abspath(__file__))
+child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(300)"])
+with open(os.path.join(here, "child.pid"), "w", encoding="utf-8") as handle:
+    handle.write(str(child.pid))
+print("failed with a step waiting")
+sys.exit(7)
+"""
+
+
+def test_o58_a_verb_that_fails_with_its_srun_still_waiting_is_answered_with_its_status_and_a_watch_is_opened(tmp_path):
+    """O58: the verb exits nonzero before its bound with its srun still waiting on the controller (hpcfed's own cancel
+    path failed): the answer is its exit status, as ever; the srun is ended with the rest of its group; and the watch is
+    opened for the steps it may already have asked for, as for a verb at its bound."""
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    write_state(root, tuple(SERVICES.values()))
+    script = tmp_path / "hpcfed.py"
+    script.write_text(LEAVER, encoding="utf-8")
+    watchers = Watchers(root)
+    relay = Relay(root, [sys.executable, "-I", str(script)], environ=ENVIRONMENT, watcher=watchers)
+    with relay.holding():
+        end = ask(root, relay, Request("stop", SERVICE), timeout_s=20)
+    assert end == CommandResult(7, "failed with a step waiting\n", "")
+    child = int((tmp_path / "child.pid").read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not zombie(child):
+        time.sleep(0.05)
+    assert zombie(child), "the verb's child outlived the verb"
+    (started,) = watchers.started
+    (opened,) = started["journal"]
+    assert (opened["event"], opened["verb"], opened["why"]) == ("watch_opened", "stop", "left_behind")

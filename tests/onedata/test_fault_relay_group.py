@@ -125,3 +125,58 @@ def test_o58_a_descendant_that_holds_the_verbs_pipes_never_holds_the_relay(tmp_p
     escaped = int(pidfile.read_text(encoding="utf-8"))
     children.append(escaped)
     assert alive(escaped)  # it left the group on purpose: ended by the fixture, never by the relay
+
+
+LEAVER = textwrap.dedent(
+    """
+    import subprocess, sys
+    child = subprocess.Popen([sys.executable, "-I", "-c", sys.argv[2]], start_new_session=sys.argv[3] == "detached")
+    with open(sys.argv[1], "w", encoding="utf-8") as handle:
+        handle.write(f"{child.pid}\\n")
+    sys.exit(int(sys.argv[4]))
+    """
+)
+
+
+def run_leaver(tmp_path, children, how="grouped", status=1, **options):
+    """A stand-in verb that starts a child and exits at once with `status`, as an hpcfed that fails with its srun
+    waiting does; what `run_clean` answers, the child's pid, and the calls `on_stragglers` got."""
+    script, pidfile, calls = tmp_path / "leaver.py", tmp_path / "child.pid", []
+    script.write_text(LEAVER, encoding="utf-8")
+    runner = run_clean(ENVIRONMENT, on_stragglers=lambda: calls.append(True), **options)
+    done = runner([sys.executable, "-I", str(script), str(pidfile), SLEEPER, how, str(status)], timeout_s=30)
+    pid = int(pidfile.read_text(encoding="utf-8"))
+    children.append(pid)
+    return done, pid, calls
+
+
+def test_o58_a_verb_that_exits_with_its_child_still_running_leaves_nothing_behind_and_is_answered_as_it_ended(
+    tmp_path, children
+):
+    """O58: hpcfed can fail (a squeue error while it ends its own step) with its srun still waiting on the controller:
+    the verb exits, the relay answers its status as ever, and what it left in its group is ended, said to the relay
+    (`on_stragglers`) so that it opens the watch for the steps the srun may still make."""
+    done, pid, calls = run_leaver(tmp_path, children, status=1)
+    assert done == CommandResult(1, "", "")
+    assert gone_within(pid, 3.0), "a child the verb left in its group outlived the verb (an orphaned srun)"
+    assert calls == [True]
+
+
+def test_o58_a_verb_that_leaves_nothing_in_its_group_says_nothing_to_the_relay(tmp_path):
+    """O58: the ordinary end: no child, no call."""
+    calls = []
+    code = "print('ok')"
+    done = run_clean(ENVIRONMENT, on_stragglers=lambda: calls.append(True))(
+        [sys.executable, "-I", "-c", code], timeout_s=30
+    )
+    assert done == CommandResult(0, "ok\n", "")
+    assert calls == []
+
+
+def test_o58_a_child_that_left_the_group_on_purpose_is_not_a_straggler(tmp_path, children):
+    """O58: a start's service client is launched in a session of its own and recorded in the state file; it is the
+    start, never ended by the relay, and no watch is owed for it."""
+    done, pid, calls = run_leaver(tmp_path, children, how="detached", status=0)
+    assert done == CommandResult(0, "", "")
+    assert alive(pid)
+    assert calls == []

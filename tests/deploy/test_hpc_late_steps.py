@@ -13,8 +13,9 @@ import json
 from pathlib import Path
 
 import pytest
-from expcore_onedata.fault_relay_late import JOURNAL, LATE_POLL_S, LATE_WINDOW_S, step_tag, watch_argv
 from hpc_fed_support import LAYOUT, SITE, FakeProcess, FakeSlurm, agent_site, hpc_on_path
+
+from expcore_onedata.fault_relay_late import JOURNAL, LATE_POLL_S, LATE_WINDOW_S, step_tag, watch_argv
 
 PREFIX = "hpcop-demo-ab12cd34"
 JOB = "4242"
@@ -73,6 +74,7 @@ class Cluster:
         self.unreadable = self.accounting_unreadable = False
         self.cancel_error: Exception | None = None
         self.gone_at: int | None = None
+        self.gone_fails_at: int | None = None  # the check that the job exists fails at this look
 
     def steps(self, job):
         self.asked.append(job)
@@ -84,6 +86,8 @@ class Cluster:
         return dict(self.listed if job == JOB else self.other_jobs.get(job, {}))
 
     def gone(self, job):
+        if self.gone_fails_at is not None and self.gone_fails_at <= self.polls <= self.gone_fails_at + 1:
+            raise self.error("squeue failed")
         return self.gone_at is not None and self.polls >= self.gone_at
 
     def accounted(self, job):
@@ -271,6 +275,38 @@ def test_o58_a_failed_cancel_is_journalled_and_tried_again_at_the_next_look(hpc,
     assert tried[0]["error"] == "SlurmError"
     assert tried[-1]["cancelled"] is True
     assert cluster.cancelled == [f"{JOB}.7"]
+
+
+def test_o58_a_look_whose_job_check_fails_still_cancels_the_step_it_found(hpc, tmp_path):
+    """O58: the listing showed the late step and the check that the job still exists failed (an intermittent
+    controller): the step found is cancelled at that look, not at a later one that may find it ended."""
+    cluster = Cluster(hpc.slurm)
+    cluster.timeline = appears(name("stop"), f"{JOB}.7", 2)
+    cluster.gone_fails_at = 2
+    _, lines, _ = run_watch(hpc, tmp_path, cluster)
+    assert cluster.cancelled == [f"{JOB}.7"]
+    (late,) = events(lines, "late_step")
+    assert late["cancelled"] is True
+
+
+def test_o58_a_listing_that_fails_after_the_step_was_found_keeps_what_was_found(hpc, tmp_path):
+    """O58: the held job and the agent's own job are listed one after the other; the second listing fails, and the step
+    the first showed is still cancelled at that look."""
+    sandbox = {"placement": "separate", "job": "5151"}
+    cluster = Cluster(hpc.slurm)
+    cluster.timeline = appears(name("stop"), f"{JOB}.7", 1)
+    steps = cluster.steps
+
+    def listing(job):
+        found = steps(job)
+        if job == "5151":
+            raise cluster.error("squeue -s did not answer")
+        return found
+
+    cluster.steps = listing
+    _, lines, _ = run_watch(hpc, tmp_path, cluster, store=Store(sandbox), window_s=5.0)
+    assert cluster.cancelled == [f"{JOB}.7"]
+    assert events(lines, "late_step")[0]["cancelled"] is True
 
 
 def test_o58_the_watch_ends_early_once_the_held_job_is_gone(hpc, tmp_path):
@@ -471,9 +507,8 @@ def federation(hpc, tmp_path, site):
     return type("Federation", (), {"fake": fake, "root": root, "state": state, "service": service, "prefix": prefix})
 
 
-def late_argv(federation, tag=TAG, verb="stop", window_s=0.2, poll_s=0.05, journal=None):
-    path = journal or federation.root / "fault-relay" / JOURNAL
-    argv = watch_argv(federation.prefix, tag, verb, federation.service, REQUEST, path, window_s, poll_s)
+def late_argv(federation, tag=TAG, verb="stop", window_s=0.2, poll_s=0.05):
+    argv = watch_argv(federation.prefix, tag, verb, federation.service, REQUEST, window_s, poll_s)
     return argv[argv.index("hpcfed.py") + 1 :]  # hpcfed's own arguments: what follows the script
 
 
@@ -504,20 +539,14 @@ def test_o58_the_relays_own_watch_command_cancels_the_late_step_by_its_exact_id_
     [
         lambda argv: [*argv[: argv.index("--step-tag") + 1], "not-a-tag", *argv[argv.index("--step-tag") + 2 :]],
         lambda argv: [*argv[: argv.index("--request") + 1], "x", *argv[argv.index("--request") + 2 :]],
-        lambda argv: [
-            *argv[: argv.index("--journal") + 1],
-            "/tmp/elsewhere.jsonl",
-            *argv[argv.index("--journal") + 2 :],
-        ],
+        lambda argv: [*argv[: argv.index("--window-s") + 1], "-1", *argv[argv.index("--window-s") + 2 :]],
         lambda argv: [*argv[: argv.index("--for-verb") + 1], "down", *argv[argv.index("--for-verb") + 2 :]],
     ],
-    ids=["tag", "request", "journal", "verb"],
+    ids=["tag", "request", "window", "verb"],
 )
-def test_o58_the_watch_command_refuses_a_tag_a_request_a_journal_or_a_verb_it_was_not_built_for(
-    hpc, federation, change
-):
-    """O58: the command appends only to the relay's own journal and watches only the four verbs' names: anything else is
-    refused (exit 2) before it looks at Slurm."""
+def test_o58_the_watch_command_refuses_a_tag_a_request_a_window_or_a_verb_it_was_not_built_for(hpc, federation, change):
+    """O58: the command watches only the four verbs' names, for a tag and a request id of the relay's making and a
+    window within bounds: anything else is refused (exit 2) before it looks at Slurm."""
     calls = len(federation.fake.calls)
     assert hpc.cli.main(change(late_argv(federation)), {}, federation.fake) == 2
     assert [call for call in federation.fake.calls[calls:] if call[0] in ("squeue", "scancel", "sacct")] == []
