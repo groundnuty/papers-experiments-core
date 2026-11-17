@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import signal
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -92,9 +93,11 @@ class Collection:
             )
             death = {"role": role, "condition": box.spec.mode.value, "cause": ID.UNDETERMINED}
             death.update(category="infrastructure", basis=basis, problems=[f"the {role} is not running"])
-            # a gate the watch killed for its memory hit its own limit, as on Docker: a defect of the component (O70)
+            # a gate the watch killed for its memory hit its own limit, as on Docker: a defect of the component (O70);
+            # a signal that succeeded does not show it did the killing (a gate that had exited is a zombie until
+            # reaped, and takes the signal), so only a gate SIGKILL ended is the watch's
             killed = box._watch.gate_kill() if role == "gate" and alive is False and box._watch is not None else None
-            if killed is not None:
+            if killed is not None and status == 128 + signal.SIGKILL:
                 death["cause"] = ID.COMPONENT_DEFECT
                 death["basis"] = (
                     f"the harness's watch killed the gate: its resident memory was {killed['amount']} bytes, over its "

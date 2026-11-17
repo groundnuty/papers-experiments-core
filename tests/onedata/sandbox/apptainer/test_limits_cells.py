@@ -244,6 +244,33 @@ def test_o70_a_gate_past_its_memory_limit_is_killed_and_its_death_is_a_component
         box.stop()
 
 
+def test_o70_a_gate_that_exited_by_itself_before_the_watch_s_signal_stays_undetermined(node, tmp_path):
+    """O70: a signal sent to a gate that had already exited (a zombie, not yet reaped) succeeds without ending it: the
+    death is the watch's only when the exit status says SIGKILL ended it, never from the signal's success alone."""
+    box = _box(node, tmp_path)
+    try:
+        gate = node.gates[-1].proc
+        real = node.signal
+
+        def exited_first(pid, start, sig):
+            if pid == gate.pid and sig == signal.SIGKILL:
+                gate.alive, gate.exit_status = False, 0
+                return True
+            return real(pid, start, sig)
+
+        node.signal = exited_first
+        gate.rss = 2 << 30
+        assert _until(lambda: not gate.alive)
+        time.sleep(0.2)
+        (death,) = box.collect(tmp_path / "out", [])["deaths"]
+        assert (death["cause"], death["basis"]) == (
+            ID.UNDETERMINED,
+            "the gate's process ended during the run (exit status 0)",
+        )
+    finally:
+        box.stop()
+
+
 def test_o70_a_gate_that_died_on_its_own_stays_undetermined(node, tmp_path):
     """O70: only a death the watch's own signal caused is the watch's: a gate killed from outside is as it was."""
     box = _box(node, tmp_path)

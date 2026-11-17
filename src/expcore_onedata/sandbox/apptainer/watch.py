@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.apptainer.hidden import DEFAULT_MARGIN_BYTES, Hidden, HiddenCheck
 from expcore_onedata.sandbox.apptainer.limits import LimitsCheck, Probe
 from expcore_onedata.sandbox.apptainer.limitspoll import LimitsPoll
@@ -216,18 +217,24 @@ class Watch:
             self.peak_bytes = max(self.peak_bytes, total)
             if self._cell is not None:
                 self._cell_peak = max(self._cell_peak, total)
-        if self._limits is not None:
+        tasks = None
+        if self._limits is not None:  # read before any kill: a poll that kills still shows what it saw (O70)
             self._limits.check_gate(found)
+            tasks = self._limits.sample(members)
+            self._limits.check_affinity(members)
+        over_pids = tasks is not None and self._limits is not None and tasks > self._limits.check.pids
         if members and total > self._limit:
-            if self._kill(members, "memory_limit", "memory", total, self._limit) == 0:
+            sent = self._kill(members, "memory_limit", "memory", total, self._limit)
+            if sent == 0:
                 with self._lock:  # nothing was signalled: never a reading of `over`
                     self._hidden.unreached()
+            if over_pids:  # the same signal ended them: the pids limit was past too
+                self._kill(members, KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids, sent=sent)
             return
-        if members and self._limits is not None and self._limits.over_pids(members):
+        if over_pids:
+            self._kill(members, KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids)
             return
         self._check_hidden(found, members, before, after)
-        if self._limits is not None:
-            self._limits.check_affinity(members)
         if self._clock() >= self._next_walk:
             self._measure_spaces(members)
 
@@ -324,10 +331,12 @@ class Watch:
     def _kill(
         self, members: list[Proc], reason: str, what: str, amount: int, limit: int, *,
         figures: Mapping[str, int] | None = None, scope: str = "cell", why: str | None = None, attributed: bool = True,
+        sent: int | None = None,
     ) -> int:  # fmt: skip
         """SIGKILL every process of the run through its pidfd, and record it against the running cell; how many were
-        signalled."""
-        sent = sum(1 for p in members if self._node.signal(p.pid, p.start, signal.SIGKILL) is True)
+        signalled. `sent`: the signal already went (one kill's reason beside another's): only the record is made."""
+        if sent is None:
+            sent = sum(1 for p in members if self._node.signal(p.pid, p.start, signal.SIGKILL) is True)
         with self._lock:
             event = {
                 "cell": self._cell,

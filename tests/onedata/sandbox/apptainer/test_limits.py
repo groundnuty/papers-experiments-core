@@ -2,6 +2,8 @@
 were shown: a reading is never within, pinned or set when it was not."""
 
 import signal
+import threading
+import time
 
 import pytest
 from fake_node import OWN_NS, FakeNode
@@ -315,3 +317,59 @@ def test_o70_every_key_of_the_record_is_present_before_anything_was_read():
         assert found[name]["unknown"], name
     assert found["cpus"]["effective_set"] is None
     assert found["cpus"]["effective_count"] is None
+
+
+def test_o70_a_poll_that_kills_for_memory_still_records_the_tasks_and_cores_it_saw(node, tmp_path):
+    """O70: a poll that ends in a kill read the run's tasks and cores first, so the record never keeps the canary's
+    `within` and `pinned` for a cell that was over its pids and outside its cores in the poll that killed it."""
+    ns = node.new_namespace()
+    node._new_proc(ns, "python3", environ=(TAG,), rss=200 << 20, threads=40, cores=frozenset({0, 1, 2}))
+    check = _check()
+    check.note_probe(L.Probe(64, 64, frozenset({0, 1})))
+    watch = _watch(node, tmp_path, check, limit=100 << 20)
+    watch.begin_cell(1, "n")
+    watch.poll()
+    assert watch.end_cell()["kills"][0]["reason"] == "memory_limit"
+    found = watch.limits_record()
+    assert found["pids"]["max_seen"] == 40
+    assert (found["cpus"]["reading"], found["cpus"]["widened_processes"]) == ("widened", 1)
+
+
+def test_o70_a_poll_over_both_memory_and_pids_is_over_for_both(node, tmp_path):
+    """O70: one SIGKILL ends the cell for both reasons: the memory kill first (the cell's cause), the pids kill beside
+    it with the processes the same signal reached, and each reading is `over`."""
+    ns = node.new_namespace()
+    for _ in range(2):
+        node._new_proc(ns, "python3", environ=(TAG,), rss=60 << 20, threads=40)
+    watch = _watch(node, tmp_path, _check(), limit=100 << 20)
+    watch.begin_cell(1, "n")
+    watch.poll()
+    kills = watch.end_cell()["kills"]
+    assert [k["reason"] for k in kills] == ["memory_limit", "pids_limit"]
+    assert kills[1]["signalled"] == kills[0]["signalled"] == 2
+    pids = watch.limits_record()["pids"]
+    assert (pids["reading"], pids["kills"], pids["max_seen"]) == ("over", 1, 80)
+    assert watch.reading()["reading"] == "over"
+
+
+def test_o70_the_gate_s_kill_is_published_before_a_collection_can_read_the_gate_dead(node, tmp_path):
+    """O70: the collection reads the watch's gate kill after seeing the gate dead; the signal and the record are one
+    step to it, so it never finds the gate dead and no kill (which would leave the death `undetermined`)."""
+    gate = node._new_proc(OWN_NS, "python3", role="helper", rss=32 << 20)
+    watch = _watch(node, tmp_path, _check(has_gate=True, gate=Spawned(gate.pid, gate.start)))
+    asked: list = []
+    signal_now = node.signal
+
+    def racing(pid, start, sig):
+        sent = signal_now(pid, start, sig)
+        reader = threading.Thread(target=lambda: asked.append(watch.gate_kill()))
+        reader.start()
+        racing.reader = reader
+        time.sleep(0.2)  # the window between the signal and the record
+        return sent
+
+    node.signal = racing
+    watch.poll()
+    racing.reader.join(5)
+    assert asked[0] is not None
+    assert asked[0]["signalled"] is True

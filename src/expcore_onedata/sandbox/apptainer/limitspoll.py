@@ -17,7 +17,6 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.apptainer.limits import LimitsCheck, Probe
 from expcore_onedata.sandbox.apptainer.node import NodeOps
 from expcore_onedata.sandbox.apptainer.procs import Proc
@@ -37,20 +36,16 @@ class LimitsPoll:
     ) -> None:
         self.check, self._node, self._lock, self._kill = check, node, lock, kill
         self.gate_kills: list[dict[str, Any]] = []
+        self._gate_lock = threading.Lock()  # a gate's check, signal and record are one step to `gate_kill`
 
     def unreadable(self, cell_running: bool) -> None:
         """A poll that could not list `/proc` (the watch's lock is held)."""
         self.check.unreadable_poll(cell_running)
 
-    def over_pids(self, members: Sequence[Proc]) -> bool:
-        """The tasks of the run's processes against `pids`: over it, the running cell's processes are killed as
-        `pids_limit`. Whether the poll killed (one that did goes no further: its processes are gone)."""
+    def sample(self, members: Sequence[Proc]) -> int | None:
+        """The tasks of the run's processes now (the watch kills when they are past `pids`); None without a process."""
         with self._lock:
-            tasks, limit = self.check.observe_tasks(members), self.check.pids
-        if tasks is None or tasks <= limit:
-            return False
-        self._kill(list(members), KC.PIDS_LIMIT, "pids", tasks, limit)
-        return True
+            return self.check.observe_tasks(members)
 
     def check_affinity(self, members: Sequence[Proc]) -> None:
         """The cores of every task of every process of the run against the effective set: recorded, never a kill."""
@@ -68,27 +63,28 @@ class LimitsPoll:
         gate = self.check.gate
         if gate is None:
             return
-        with self._lock:
-            if self.check.gate_ended:
+        with self._gate_lock:  # the collection reads a dead gate's kill (`gate_kill`) only after this step is whole
+            with self._lock:
+                if self.check.gate_ended:
+                    return
+            row = next((p for p in found if p.pid == gate.pid and p.start == gate.start), None)
+            ended = None if row is not None and row.rss is not None else self._node.alive(gate.pid, gate.start)
+            with self._lock:
+                over = self.check.note_gate(row, ended)
+            if over is None:
                 return
-        row = next((p for p in found if p.pid == gate.pid and p.start == gate.start), None)
-        ended = None if row is not None and row.rss is not None else self._node.alive(gate.pid, gate.start)
-        with self._lock:
-            over = self.check.note_gate(row, ended)
-        if over is None:
-            return
-        sent = self._node.signal(gate.pid, gate.start, signal.SIGKILL) is True
-        with self._lock:
-            self.gate_kills.append({
-                "reason": "gate_memory", "what": "gate", "amount": over, "limit": self.check.gate_limit,
-                "signalled": sent, "utc": dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds"),
-            })  # fmt: skip
+            sent = self._node.signal(gate.pid, gate.start, signal.SIGKILL) is True
+            with self._lock:
+                self.gate_kills.append({
+                    "reason": "gate_memory", "what": "gate", "amount": over, "limit": self.check.gate_limit,
+                    "signalled": sent, "utc": dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds"),
+                })  # fmt: skip
         log.info("the run's watch killed the gate: its memory was over its limit")
 
     def gate_kill(self) -> dict[str, Any] | None:
         """The watch's kill of the gate that signalled it; None when there was none (the gate's death is then no doing
-        of the watch's)."""
-        with self._lock:
+        of the watch's). It waits for a gate check under way, so a gate seen dead has its kill's record."""
+        with self._gate_lock, self._lock:
             return next((dict(k) for k in self.gate_kills if k["signalled"] is True), None)
 
     def note_probe(self, probe: Probe | None) -> None:
