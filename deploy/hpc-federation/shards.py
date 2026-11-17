@@ -166,8 +166,7 @@ naming each file that is missing, not a regular file, of another size or of anot
 never a path), 2 for a manifest it cannot use (one without the list of files beside the archives is an earlier tip's,
 which checked the archives alone), and 0 when every file matches. A file of the directory that the manifest does not
 name (an archive, an archive manifest, a journal) is a warning. It uses the standard library alone (Python 3.11 or
-later, for `tomllib`), so it runs on a host without the core. `collect` does not: it reads each shard's snapshots as
-`--resume` does, so it needs the core importable by its interpreter, and exits 2 naming the shard when it is not.
+later, for `tomllib`), so it runs on a host without the core.
 
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
@@ -882,8 +881,7 @@ def newer_snapshot(plan: Plan, shard: Shard, archive_sha: str, scratch: Path) ->
     reached and the archive lacks (the merge does not have them). Every older one (a snapshot of the step that wrote
     the archive names an earlier archive or none) holds nothing the archive lacks. The pick is `restore_newest`'s, with
     this archive as the base: restored into a private directory of `scratch`, which is removed, so that it is the
-    newest that verifies (every file against its hash, the store's integrity, every ended attempt's marker). Needs the
-    core, only for a shard that has a snapshot."""
+    newest that verifies (every file against its hash, the store's integrity, every ended attempt's marker)."""
     try:
         with os.scandir(plan.results / shard.label / SNAPSHOTS) as listing:
             if not any(entry.name.startswith("snap-") for entry in listing):
@@ -894,10 +892,6 @@ def newer_snapshot(plan: Plan, shard: Shard, archive_sha: str, scratch: Path) ->
     check = Path(tempfile.mkdtemp(prefix=".snapshot-check-", dir=scratch))
     try:
         found = restore_newest(plan.results, shard.label, spec, archive_sha, check / "out")
-    except ImportError:
-        raise ShardsError(
-            f"shard {shard.label}: its snapshots are read with the core, which this interpreter cannot import"
-        ) from None
     finally:
         remove_tree(check)
     if found is not None:

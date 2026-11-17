@@ -581,9 +581,7 @@ starts.
 **Copy the shards' results back and verify them: required, after `collect` and before `down`.** Nothing durable may live only
 on the cluster's scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all of scratch after 20 days with no job submitted (take your site's own limits; these are the ones this
 step was written against). The cluster cannot push to your host, so you pull. Run `collect` once every step has ended
-(a journal still being written is listed as `collect` read it) and with the core importable by its interpreter, as the
-commands below run it (`uv run python -I`): it reads each shard's snapshots as `--resume` does, and exits 2 naming the
-shard when it cannot import the core. It writes `archives.sha256.json` in `<results>` and
+(a journal still being written is listed as `collect` read it). It writes `archives.sha256.json` in `<results>` and
 prints that file's SHA-256 on stderr, after the merge line; keep that line. From your own host, pull the whole results
 directory and check it:
 

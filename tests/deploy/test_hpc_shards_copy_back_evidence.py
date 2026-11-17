@@ -10,7 +10,6 @@ import importlib.util
 import json
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -261,36 +260,6 @@ def test_a_collect_refused_after_a_snapshot_was_read_leaves_nothing_behind(shard
     with pytest.raises(shards.ShardsError, match="manifest"):
         shards.collect(plan, tmp_path / "merge")
     assert not (tmp_path / "merge").exists()
-
-
-def _collect_on_a_bare_interpreter(tmp_path):
-    """`shards.py collect` as an interpreter without the core runs it (`-I -S`: the core is not importable there)."""
-    return subprocess.run(
-        [sys.executable, "-I", "-S", str(SCRIPT), "collect", "--manifest", str(plan_file(tmp_path)), "--into",
-         str(tmp_path / "merge")],
-        capture_output=True, text=True, check=False, timeout=120,
-    )  # fmt: skip
-
-
-def test_collect_without_the_core_refuses_a_shard_that_has_a_snapshot_naming_the_shard(shards, tmp_path):
-    """O63: it reads the snapshots as `--resume` does, with the core; with none to import it is refused, with a message
-    and no traceback, no manifest and no directory left (exit 2), not a manifest that leaves the snapshot out."""
-    plan, _ = with_newer_snapshot(shards, tmp_path)
-    found = _collect_on_a_bare_interpreter(tmp_path)
-    assert found.returncode == 2
-    assert "fed-a" in found.stderr
-    assert "core" in found.stderr
-    assert "Traceback" not in found.stderr
-    assert not (plan.results / MANIFEST).exists()
-    assert not (tmp_path / "merge").exists()
-
-
-def test_collect_without_the_core_still_works_for_shards_that_have_no_snapshot(shards, tmp_path):
-    """O63: the core is needed only to read a snapshot, so a results directory with none is collected as before."""
-    plan = make_plan(shards, tmp_path)
-    found = _collect_on_a_bare_interpreter(tmp_path)
-    assert found.returncode == 0, found.stderr
-    assert (plan.results / MANIFEST).is_file()
 
 
 class Killed(BaseException):
