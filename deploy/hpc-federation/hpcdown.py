@@ -72,13 +72,7 @@ class Down:
             return "down: no state file, so no job of up's is left to cancel; the root removed"
         state = self.set(lambda s: s.update(phase="stopping"))
         unverified: List[str] = []
-        if self.relay_available():  # first: no verb may launch a step while the federation goes down
-            try:
-                if not hpcrelay.stop(self.slurm.runner, sys.executable, self.root):
-                    unverified.append("the fault relay")
-            except (RuntimeError, OSError) as error:
-                self.say(f"the fault relay's stop failed: {error}")
-                unverified.append("the fault relay")
+        relay_unstopped = self.relay_available() and not self.relay_stopped()  # first: no verb may launch a step now
         lost: List[str] = []  # a job whose lookup failed: the other is still cancelled, then down fails
         job, info = self.ours(state, "allocation", lost)
         agent, agent_info = self.ours(state, "sandbox", lost) if self.separate(state) else (None, None)
@@ -99,6 +93,8 @@ class Down:
                 unverified.append("the agent's node")
         self.cancel_all([j for j, i in ((job, info), (agent, agent_info)) if i is not None], lost)
         unverified += self.end_clients([j for j in (job, agent) if j is not None])
+        if relay_unstopped and not self.relay_stopped():  # its client is ended now: checked again, never read before
+            unverified.append("the fault relay")
         if unverified:
             self.set(lambda s: s.update(phase="down"))
             raise RuntimeError(
@@ -137,6 +133,14 @@ class Down:
                 f"{gone}, but the provider storage on scratch could not be removed ({error}); the root and its state "
                 "are kept: run down again to remove it"
             ) from None
+
+    def relay_stopped(self) -> bool:
+        """Whether the relay's stop shows no heartbeat beating; a stop that could not be run shows nothing."""
+        try:
+            return hpcrelay.stop(self.slurm.runner, sys.executable, self.root)
+        except (RuntimeError, OSError) as error:
+            self.say(f"the fault relay's stop failed: {error}")
+            return False
 
     def sweep_agent_node(self, state: Mapping[str, Any]) -> str:
         """`shards.py sweep` in a control step on the agent's node: every shard step's directory of this federation on

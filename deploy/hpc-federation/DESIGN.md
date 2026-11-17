@@ -348,7 +348,13 @@ removed while held would let the next `up` or `down` lock another file of the sa
 
 0. **Stop the fault relay first** (`fault_relay stop --root <root>`, when the core has it), so no service verb launches
    a step while the federation goes down; a relay that will not stop is reported, and `down` goes on. Its directory
-   `<root>/fault-relay/` goes with the root.
+   `<root>/fault-relay/` goes with the root. The stop signals the relay by the pid and start tick of its heartbeat,
+   through a pidfd where the kernel has `pidfd_open` and, on a login node whose kernel has none (Linux before 5.3, which
+   answers ENOSYS), by the same start tick read just before an `os.kill`, so a pid another process took is never
+   signalled. On either path it signals only a process whose command line holds
+   `-m expcore_onedata.fault_relay serve --root <root>` in order, since the heartbeat is a file. A relay whose stop failed is ended as a
+   recorded client in step 4, and `down` checks it again only after that: it is reported unverified only if the second
+   stop still shows a heartbeat.
 1. Read the state file. A recorded job id whose job now carries another name is not ours (Slurm reuses ids): nothing
    is torn down or cancelled. When the id is missing, find the allocation by its name among this user's jobs
    (`squeue -u <user> -h -n <allocation name> -o %i`, an exact name holding `up`'s random part; a heterogeneous job,
@@ -402,8 +408,9 @@ serves both:
 - **storages are found by name**, never by place in a list: finish.sh's `posix-local` for a provider's support, and
   `import-<space>` for an owner's support of an imported space (M3: such an owner has two); the LUMA mappings are
   made on the storage the support names;
-- `[faults] journal = "fault-journal"`, when the template declares faults, so the link-check record lands in the root
-  (`linkrecord.record_path`);
+- `[faults] journal = "<root>/fault-journal"` in full (`@hpc_root@/fault-journal` in the template), when the template
+  declares faults, so the link-check record lands in the root (`linkrecord.record_path`) and a copy of the file beside a
+  study names the root's journal (`load_faults` refuses a relative one in a study directory);
 - `[faults]` for the HPC backend (M4's loader): `backend = "hpc"`, `stop_bound_s`, `journal`, `[faults.services]`
   naming every provider, and none of `compose_file`, `project`, `command` or `docker`, which that backend refuses;
   its defaults are `settle_timeout_s = stop_bound_s + 60`, `poll_s` 10 and `relay_wait_s` 30;
