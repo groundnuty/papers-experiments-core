@@ -123,6 +123,34 @@ FORGING = {
         "import runpy\nout = runpy.run_module('script')",
         [("channel_patch", "in-process script run")],
     ),
+    "a patch with spaces around the dots, then a script run by exec": (
+        "import socket\nsocket.socket .send = lambda self, data, *a, **k: len(data)\n"
+        "exec(compile(open('/inputs/scripts/read_item.py').read(), '/inputs/scripts/read_item.py', 'exec'), {})",
+        [
+            ("channel_patch", "socket or client attribute assignment"),
+            ("channel_patch", "in-process script run"),
+        ],
+    ),
+    "a table of loaded modules with spaces around the dot": (
+        "import sys\nsys . modules['m'] = Fake()",
+        [("channel_patch", "sys.modules")],
+    ),
+    "a reload with a space before the dot": (
+        "import importlib\nimportlib .reload(m)",
+        [("channel_patch", "module reload or load by path")],
+    ),
+    "a mock patch with spaces around the dot": (
+        "from unittest import mock\nwith mock . patch('socket.socket'):\n    run()",
+        [("channel_patch", "patch or mock")],
+    ),
+    "a script's source read and run by exec of a path": (
+        "from pathlib import Path\nexec(Path('/inputs/scripts/read_item.py').read_text())",
+        [("channel_patch", "in-process script run")],
+    ),
+    "a script's source run by eval of compile": (
+        "eval(compile(open(p).read(), p, 'exec'))",
+        [("channel_patch", "in-process script run")],
+    ),
     "an assignment to an attribute of the client module": (
         "import expcore_readlog_client\nexpcore_readlog_client.log_read = lambda *a, **k: None",
         [("client", "expcore_readlog_client"), ("channel_patch", "socket or client attribute assignment")],
@@ -225,6 +253,8 @@ ORDINARY = {
         "import socket\nname = socket.socket.__name__\nassert socket.socket.send is not None\n"
         "assert socket.socket.__name__ == 'socket'"
     ),
+    "exec and eval of a string": "exec('x = 1')\nvalue = eval('1 + 1')",
+    "an open that is not run": "text = open('/work/notes.txt').read()\nprint(len(text))",
     "a network socket": "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)",
     "a datagram socket of the network family": "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)",
     "a stream socket of the Unix family": "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",

@@ -29,8 +29,9 @@ string `code` property, run or not) and finds:
 - `channel_patch`: a patch of the client or of `socket` that would hide a real read: an assignment to or a `setattr` on
   an attribute of `socket` or of the client module, a use of `sys.modules`, an `importlib.reload` or a load of a module
   from a file (`spec_from_file_location`, `module_from_spec`, `SourceFileLoader`), `monkeypatch`, `mock.patch` or
-  `unittest.mock`, `builtins` or `__builtins__`, and `runpy`, which runs a script in the agent's own process, where a
-  patch reaches it (the assignment is flagged to any depth, `socket.socket.send = ...`, and for `_socket` too);
+  `unittest.mock`, `builtins` or `__builtins__`, and a script run in the agent's own process, where a patch reaches
+  it (`runpy`, or `exec` or `eval` of the source of a file the cell opens); the assignment is flagged to any depth
+  (`socket.socket.send = ...`, `_socket` too), and the patterns allow space around a dot;
 - `channel_name`: the bare word `readlog`, in any case and set off from letters and digits (`readLogFile` is not it),
   where nothing above names the channel in the cell (a directory listing filtered by it, say). A study should not name
   its own scripts or functions `readlog`.
@@ -129,21 +130,25 @@ _DISCOVERY = {
 }
 # What code in a cell patches to hide a real read: `socket` or the client by attribute, the loaded modules, a module
 # reloaded or loaded from a file, a mock, and the builtins
+_DOT = r"\s*\.\s*"  # Python allows space around the dot of an attribute: `socket.socket .send`
 _PATCHES = {
     "socket or client attribute assignment": re.compile(
-        r"(?<![\w.])(?:_?socket|expcore_readlog_client)(?:\.\w+)+\s*=(?!=)"
+        rf"(?<![\w.])(?:_?socket|expcore_readlog_client)(?:{_DOT}\w+)+\s*=(?!=)"
         r"|\bsetattr\(\s*(?:_?socket|expcore_readlog_client)\b"
     ),
-    "sys.modules": re.compile(r"\bsys\.modules\b"),
+    "sys.modules": re.compile(rf"\bsys{_DOT}modules\b"),
     "module reload or load by path": re.compile(
-        r"\bimportlib\.reload\b|(?<![\w.])reload\s*\(|\bspec_from_file_location\b|\bmodule_from_spec\b"
+        rf"\bimportlib{_DOT}reload\b|(?<![\w.])reload\s*\(|\bspec_from_file_location\b|\bmodule_from_spec\b"
         r"|\bSourceFileLoader\b|\bload_source\b|\bload_module\b"
     ),
     "patch or mock": re.compile(
-        r"\bmonkeypatch\b|\bmock\.patch\b|\bunittest\.mock\b|\bfrom\s+unittest\s+import\s+mock\b"
+        rf"\bmonkeypatch\b|\bmock{_DOT}patch\b|\bunittest{_DOT}mock\b|\bfrom\s+unittest\s+import\s+mock\b"
     ),
     "builtins override": re.compile(r"\bbuiltins\b|__builtins__"),
-    "in-process script run": re.compile(r"\brunpy\b"),
+    # a script run in the agent's own process: by runpy, or by exec or eval of the source of a file it opens
+    "in-process script run": re.compile(
+        r"\brunpy\b|\b(?:exec|eval)\s*\(\s*(?:compile\s*\(\s*)?(?:open\s*\(|(?:pathlib\s*\.\s*)?Path\s*\()|\bexecfile\b"
+    ),
 }
 
 

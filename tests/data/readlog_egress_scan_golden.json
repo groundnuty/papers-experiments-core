@@ -304,6 +304,55 @@
    },
    {
     "cells": 1,
+    "flagged": true,
+    "hits": [
+     {
+      "cell": 0,
+      "flag": true,
+      "kind": "network_call",
+      "what": "socket"
+     }
+    ],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
     "flagged": false,
     "hits": [],
     "hits_cut": false,
@@ -600,6 +649,20 @@
       "what": "socket"
      }
     ],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
     "hits_cut": false,
     "version": 1
    },
@@ -710,7 +773,7 @@
    "version": 1
   },
   "whole": {
-   "cells": 80,
+   "cells": 88,
    "flagged": true,
    "hits": [
     {
@@ -786,25 +849,13 @@
      "what": "socket"
     },
     {
-     "cell": 63,
+     "cell": 31,
      "flag": true,
      "kind": "network_call",
      "what": "socket"
     },
     {
-     "cell": 66,
-     "flag": true,
-     "kind": "network_call",
-     "what": "socket"
-    },
-    {
-     "cell": 70,
-     "flag": true,
-     "kind": "network_call",
-     "what": "socket"
-    },
-    {
-     "cell": 71,
+     "cell": 69,
      "flag": true,
      "kind": "network_call",
      "what": "socket"
@@ -816,19 +867,37 @@
      "what": "socket"
     },
     {
-     "cell": 73,
+     "cell": 76,
      "flag": true,
      "kind": "network_call",
      "what": "socket"
     },
     {
-     "cell": 74,
+     "cell": 79,
      "flag": true,
      "kind": "network_call",
      "what": "socket"
     },
     {
-     "cell": 77,
+     "cell": 80,
+     "flag": true,
+     "kind": "network_call",
+     "what": "socket"
+    },
+    {
+     "cell": 81,
+     "flag": true,
+     "kind": "network_call",
+     "what": "socket"
+    },
+    {
+     "cell": 82,
+     "flag": true,
+     "kind": "network_call",
+     "what": "socket"
+    },
+    {
+     "cell": 85,
      "flag": true,
      "kind": "network_call",
      "what": "socket"
@@ -1144,6 +1213,55 @@
    {
     "cells": 1,
     "flagged": false,
+    "hits": [
+     {
+      "cell": 0,
+      "flag": false,
+      "kind": "network_call",
+      "what": "socket"
+     }
+    ],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
     "hits": [],
     "hits_cut": false,
     "version": 1
@@ -1439,6 +1557,20 @@
       "what": "socket"
      }
     ],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
+    "hits_cut": false,
+    "version": 1
+   },
+   {
+    "cells": 1,
+    "flagged": false,
+    "hits": [],
     "hits_cut": false,
     "version": 1
    },
@@ -1549,7 +1681,7 @@
    "version": 1
   },
   "whole": {
-   "cells": 80,
+   "cells": 88,
    "flagged": false,
    "hits": [
     {
@@ -1625,25 +1757,13 @@
      "what": "socket"
     },
     {
-     "cell": 63,
+     "cell": 31,
      "flag": false,
      "kind": "network_call",
      "what": "socket"
     },
     {
-     "cell": 66,
-     "flag": false,
-     "kind": "network_call",
-     "what": "socket"
-    },
-    {
-     "cell": 70,
-     "flag": false,
-     "kind": "network_call",
-     "what": "socket"
-    },
-    {
-     "cell": 71,
+     "cell": 69,
      "flag": false,
      "kind": "network_call",
      "what": "socket"
@@ -1655,19 +1775,37 @@
      "what": "socket"
     },
     {
-     "cell": 73,
+     "cell": 76,
      "flag": false,
      "kind": "network_call",
      "what": "socket"
     },
     {
-     "cell": 74,
+     "cell": 79,
      "flag": false,
      "kind": "network_call",
      "what": "socket"
     },
     {
-     "cell": 77,
+     "cell": 80,
+     "flag": false,
+     "kind": "network_call",
+     "what": "socket"
+    },
+    {
+     "cell": 81,
+     "flag": false,
+     "kind": "network_call",
+     "what": "socket"
+    },
+    {
+     "cell": 82,
+     "flag": false,
+     "kind": "network_call",
+     "what": "socket"
+    },
+    {
+     "cell": 85,
      "flag": false,
      "kind": "network_call",
      "what": "socket"
