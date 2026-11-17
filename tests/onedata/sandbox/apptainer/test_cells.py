@@ -132,6 +132,45 @@ def test_o72_hidden_memory_no_one_cell_can_be_told_to_hold_ends_the_run_as_infra
     assert box.metadata()["infrastructure_facts"]["memory"]["reading"] == "unknown"
 
 
+def test_o72_a_run_ended_because_its_cell_could_not_be_isolated_says_so_in_its_infrastructure_facts(
+    node, box, tmp_path
+):
+    """O72: the run-level fact a campaign counts such runs by: `infrastructure_facts.run_ended` names the scope `run`,
+    `attributed: false`, and the kill's reason, what and why, and it is there after the collection was refused. A
+    run that went on has no such fact."""
+    assert "run_ended" not in box.metadata()["infrastructure_facts"]
+    node._new_proc(node.new_namespace(), "python3", environ=("EXPCORE_SANDBOX=other-run-ffff0000",))
+
+    def hiding(cell):
+        node._new_proc(cell.pidns, "python3", hidden=True, anon=768 << 20)
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "", "")
+
+    node.cell_handler = hiding
+    box.exec("hide_and_grow()", 30)
+    with pytest.raises(InfraError):
+        box.collect(tmp_path / "out")
+    ended = box.metadata()["infrastructure_facts"]["run_ended"]
+    assert set(ended) == {"scope", "attributed", "reason", "what", "why"}
+    assert (ended["scope"], ended["attributed"]) == ("run", False)
+    assert (ended["reason"], ended["what"]) == ("memory_limit", "memory_hidden")
+    assert "another run's cell is charged to the same cgroup" in ended["why"]
+
+
+def test_o72_a_cell_s_own_memory_kill_leaves_no_run_ended_fact(node, box):
+    """O72: a memory kill that is the cell's own, with the run going on, is no `run_ended`: only a run the watch ended
+    because it could not tell whose memory it was is counted as one."""
+
+    def greedy(cell):
+        cell.procs[1].rss = 200 << 20
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "", "")
+
+    node.cell_handler = greedy
+    box.exec("x = bytearray(200 << 20)", 30)
+    assert "run_ended" not in box.metadata()["infrastructure_facts"]
+
+
 def test_o56_a_cell_whose_hidden_process_holds_memory_is_killed_as_over_its_limit(node, box):
     """O56: the HPC probe's E3: a cell process that makes itself non-dumpable and grows to 768 MiB is not in /proc,
     so the visible sum stays small; the cgroup charges it, and the run's record never reads it within its limit: the
