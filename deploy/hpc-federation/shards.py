@@ -187,7 +187,8 @@ LOCK_NAME = "campaign.lock"  # expcore.campaign.lock.LOCK_NAME: the merge refuse
 ALLOWLIST = ("PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT")
 CORE_MISMATCH = 97  # the step's interpreter imports another core than the one it was given
 ARCHIVE_FAILED = 75  # the dispatcher ended but its out/ could not be archived: kept on the node's tmpfs
-PRE_STEP_REFUSED = 73  # a script the study declared refused the step, or could not be run as declared: nothing made
+PRE_STEP_REFUSED = 73  # a script the study declared refused the step, or could not be run as declared, or the
+# federation's render identity is not the expected one (or could not be compared with it): nothing made
 POST_RUN_FAILED = 74  # the dispatcher exited 0 and the study's post-run script did not: archived, marked not final
 PRE_STEP_TIMEOUT_S = 60.0  # a guard's bound when the manifest names none
 PRE_STEP_MAX_S = 600.0  # the longest bound a manifest may give a guard
@@ -213,6 +214,20 @@ OWNER_POST = ".step.post.json"  # the same with the post-run script's record, wr
 RUNNING, ARCHIVING = "running", "archiving"  # the step's phase: its dispatcher runs; it ended and out/ is whole
 ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not be archived, so it is kept
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
+# The federation's render identity (O74): the record `hpcfed.py up` writes in its root (hpcidentity.py: hashes and a
+# version, no address, id, path or secret). This file runs alone on a node, so it keeps its own copy of the names; a
+# test compares them with hpcidentity's.
+RENDER_IDENTITY = "render-identity.json"
+RENDER_IDENTITY_VERSION = "expcore-render-identity/1"
+RENDER_IDENTITY_PINS = (
+    "sandbox_sif_sha256",
+    "egress_shim_sha256",
+    "egress_collector_sha256",
+    "oneclient_bundle_sha256",
+)
+RENDER_IDENTITY_KEYS = ("version", "template_sha256", "platform_fingerprint_sha256", *RENDER_IDENTITY_PINS)
+STUDY_STATE = "study-state"  # in a step's out/: what the step records of the federation it ran against
+SHA256_TEXT = re.compile(r"[0-9a-f]{64}")
 
 
 # The step's HOME, and every directory a tool writes under one, until it has made its directory on the tmpfs: a path
@@ -272,6 +287,8 @@ class Plan:
     post_run: str | None = None  # the study's post-run script: a path relative to its root
     post_run_sha256: str | None = None  # its SHA-256, recorded by `pinned`
     post_run_timeout_s: float = POST_RUN_TIMEOUT_S
+    expect_render_identity: str | None = None  # the render identity the plan expects: a path relative to the study
+    expect_render_identity_sha256: str | None = None  # its SHA-256, recorded by `pinned`
 
 
 # ------------------------------------------------------------------------------------------------ the manifest
@@ -292,7 +309,8 @@ def load_plan(path: Path) -> Plan:
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
     keys = {"study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory", "shards"}
-    optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s", "post_run", "post_run_timeout_s"}
+    optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s", "post_run", "post_run_timeout_s",
+                "expect_render_identity"}  # fmt: skip
     if not keys <= set(data) <= keys | optional:
         raise ShardsError(
             f"the manifest's keys must be: {', '.join(sorted(keys))}, and perhaps {', '.join(sorted(optional))}"
@@ -309,6 +327,8 @@ def load_plan(path: Path) -> Plan:
         bounds[key] = data.get(f"{key}_timeout_s", default)
         if problem := bound_problem(bounds[key], maximum):
             raise ShardsError(f"{key}_timeout_s {problem}")
+    if "expect_render_identity" in data and (problem := guard_path_problem(data["expect_render_identity"])):
+        raise ShardsError(f"expect_render_identity {problem}")
     for key in ("study", "core_src", "results", "tmpfs"):
         if not isinstance(data[key], str) or not data[key].startswith("/"):
             raise ShardsError(f"{key} must be an absolute path")
@@ -333,7 +353,7 @@ def load_plan(path: Path) -> Plan:
     return Plan(Path(data["study"]), str(data["python"]), Path(data["core_src"]), Path(data["results"]),
                 Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
                 float(every), data.get("pre_step"), None, float(bounds["pre_step"]), data.get("post_run"), None,
-                float(bounds["post_run"]))  # fmt: skip
+                float(bounds["post_run"]), data.get("expect_render_identity"))  # fmt: skip
 
 
 def federation(shard: Shard) -> dict[str, Any]:
@@ -430,6 +450,12 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
             raise ShardsError("the post-run script is not pinned: no line is made from a plan that has not hashed it")
         step += ["--post-run", plan.post_run, "--post-run-sha256", plan.post_run_sha256,
                  "--post-run-timeout", f"{plan.post_run_timeout_s:g}"]  # fmt: skip
+    if plan.expect_render_identity is not None:  # and the record the federation's render must be: `step` compares first
+        if plan.expect_render_identity_sha256 is None:
+            raise ShardsError("the expected render identity is not pinned: no line is made from a plan that has not "
+                              "hashed it")  # fmt: skip
+        step += ["--expect-render-identity", plan.expect_render_identity, "--expect-render-identity-sha256",
+                 plan.expect_render_identity_sha256]  # fmt: skip
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
@@ -490,7 +516,11 @@ def read_below(root_fd: int, path: str, name: str) -> bytes:
 
 def read_in_study(study: Path, key: str, path: str) -> bytes:
     """The bytes of the study's declared script `path` (`key` says which), read below the study's root."""
-    name = f"{HOOKS[key][0]} {path}"
+    return read_study_file(study, f"{HOOKS[key][0]} {path}", path)
+
+
+def read_study_file(study: Path, name: str, path: str) -> bytes:
+    """The bytes of the file `path` of the study (`name` says what it is in a message), read below the study's root."""
     try:
         fd = os.open(study, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError:
@@ -502,14 +532,20 @@ def read_in_study(study: Path, key: str, path: str) -> bytes:
 
 
 def pinned(plan: Plan) -> Plan:
-    """The plan with the SHA-256 of each declared script (its pre-step guard, its post-run script) recorded, from the
-    study as it is now: `plan` and `lines` call it, so that a script that leaves the study, is a link or is missing
-    refuses them before a line is printed. The same plan when none is declared."""
+    """The plan with the SHA-256 of each declared script (its pre-step guard, its post-run script) and of the expected
+    render identity recorded, from the study as it is now: `plan` and `lines` call it, so that a file that leaves the
+    study, is a link or is missing, or an expected record that is not well formed, refuses them before a line is
+    printed. The same plan when none is declared."""
     found = {}
     for key in HOOKS:
         path = getattr(plan, key)
         if path is not None:
             found[f"{key}_sha256"] = hashlib.sha256(read_in_study(plan.study, key, path)).hexdigest()
+    if plan.expect_render_identity is not None:
+        name = expected_identity_name(plan.expect_render_identity)
+        raw = read_study_file(plan.study, name, plan.expect_render_identity)
+        parse_render_identity(raw, name)
+        found["expect_render_identity_sha256"] = hashlib.sha256(raw).hexdigest()
     return replace(plan, **found)
 
 
@@ -664,7 +700,7 @@ def collect(plan: Plan, into: Path) -> list[Path]:
         raise ShardsError("the directory to collect into must be new or empty")
     wanted = None
     if plan.post_run is not None:  # the script the plan declares, as the study holds it now
-        wanted = pinned(replace(plan, pre_step=None)).post_run_sha256
+        wanted = pinned(replace(plan, pre_step=None, expect_render_identity=None)).post_run_sha256
     created = not into.exists()
     into.mkdir(parents=True, exist_ok=True)
     try:
@@ -1364,6 +1400,152 @@ def note_post_run(work: Path, post: Mapping[str, Any]) -> None:
               file=sys.stderr)  # fmt: skip
 
 
+# ------------------------------------------------------------------------------------------------ the render identity
+def expected_identity_name(path: str) -> str:
+    return f"the expected render identity {path}"
+
+
+def identity_problem(record: Any) -> str | None:
+    """Why `record` is not a render identity (hpcidentity.py), or None: a JSON object with the version, the template's
+    and the platform fingerprint's hashes, perhaps some of the pins' hashes, and nothing else. It says what kind of
+    thing is wrong and never what the record holds."""
+    if not isinstance(record, dict):
+        return "it is not a JSON object"
+    if not {"version", "template_sha256", "platform_fingerprint_sha256"} <= set(record):
+        return "an entry it must hold is missing"
+    if not set(record) <= set(RENDER_IDENTITY_KEYS):
+        return "it holds an entry that is not declared"
+    for key, value in record.items():
+        if key == "version":
+            if not isinstance(value, str) or not re.fullmatch(r"expcore-render-identity/[0-9]{1,6}", value):
+                return "its version is not one"
+        elif not isinstance(value, str) or not SHA256_TEXT.fullmatch(value):
+            return "an entry is no SHA-256"
+    return None
+
+
+def parse_render_identity(raw: bytes, name: str) -> dict[str, str]:
+    """The render identity `raw` holds, `ShardsError` naming `name` if it is not one: JSON, an object of exactly the
+    declared keys' kinds (`identity_problem`). The error says nothing of the content."""
+    try:
+        record = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise ShardsError(f"{name} is not a well-formed render identity: it is not JSON") from None
+    if problem := identity_problem(record):
+        raise ShardsError(f"{name} is not a well-formed render identity: {problem}")
+    return record
+
+
+def read_federation_identity(root: str) -> bytes | None:
+    """The bytes of the render identity `up` wrote in the federation's root `root`: None when the root holds none, and
+    `ShardsError` when it cannot be taken: a root that cannot be opened, is not this user's or can be written by its
+    group or others, or a record that is a link, not a regular file, over the size a record can be, or unreadable.
+    It is read below the held root, no link followed, once."""
+    name = f"the federation's render identity record ({RENDER_IDENTITY})"
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        raise ShardsError(f"{name} cannot be read: the federation's root cannot be opened") from None
+    try:
+        info = os.fstat(root_fd)
+        if info.st_uid != os.getuid():
+            raise ShardsError(f"{name} cannot be trusted: the federation's root is not this user's")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise ShardsError(f"{name} cannot be trusted: the federation's root can be written by its group or others")
+        try:
+            os.lstat(RENDER_IDENTITY, dir_fd=root_fd)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise ShardsError(f"{name} cannot be read") from None
+        return read_below(root_fd, RENDER_IDENTITY, name)
+    finally:
+        os.close(root_fd)
+
+
+def check_render_identity(args: argparse.Namespace) -> bytes | None:
+    """The step's first act, before its pre-step guard and everything else: the bytes of the federation's own render
+    identity (`EXPCORE_FED_ROOT`'s record), for the step to put into its out/ (`note_render_identity`); None when the
+    federation has none or its record cannot be taken, which is said on stderr and nothing more, as a federation `up`
+    rendered before the record existed is run as it was.
+
+    When the line gives the expected record (`--expect-render-identity REL --expect-render-identity-sha256 HEX`): the
+    file is read below the study's root, shown to be the bytes the plan hashed and a well-formed record; the
+    federation's record must exist, be well formed and be the expected one, key by key. `StepRefused` otherwise,
+    naming the keys that differ (never a value, a path or a hash) or what could not be read."""
+    path, wanted = (getattr(args, f"expect_render_identity{s}", None) for s in ("", "_sha256"))
+    root = os.environ.get("EXPCORE_FED_ROOT")
+    if path is None:
+        if wanted is not None:
+            raise StepRefused(
+                "--expect-render-identity-sha256 belongs to an --expect-render-identity, which is not given"
+            )
+        if not root:
+            return None
+        try:
+            raw = read_federation_identity(root)
+            if raw is not None:
+                parse_render_identity(raw, f"the federation's render identity record ({RENDER_IDENTITY})")
+            return raw
+        except ShardsError as error:
+            print(f"shards: the federation's render identity is not archived: {error}", file=sys.stderr)
+            return None
+    name = expected_identity_name(path)
+    if problem := guard_path_problem(path):
+        raise StepRefused(f"{name} {problem}")
+    if not isinstance(wanted, str) or not SHA256_TEXT.fullmatch(wanted):
+        raise StepRefused(f"{name} has no SHA-256 from the plan: --expect-render-identity-sha256 is 64 hex digits")
+    try:
+        study_fd = os.open(os.path.abspath(args.study), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        raise StepRefused(f"the study's root cannot be opened, so {name} cannot be read") from None
+    try:
+        raw = read_below(study_fd, path, name)
+    except ShardsError as error:
+        raise StepRefused(str(error)) from None
+    finally:
+        os.close(study_fd)
+    if hashlib.sha256(raw).hexdigest() != wanted:
+        raise StepRefused(f"{name} is not the file the plan hashed")
+    try:
+        expected = parse_render_identity(raw, name)
+        if not root:
+            raise ShardsError(
+                f"EXPCORE_FED_ROOT names no federation, so its render identity cannot be compared with {name}"
+            )
+        held = read_federation_identity(root)
+        if held is None:
+            raise ShardsError(
+                f"the federation has no render identity record ({RENDER_IDENTITY}) in its root to compare with {name}: "
+                "its up wrote none"
+            )
+        actual = parse_render_identity(held, f"the federation's render identity record ({RENDER_IDENTITY})")
+    except ShardsError as error:
+        raise StepRefused(str(error)) from None
+    if differing := [key for key in RENDER_IDENTITY_KEYS if expected.get(key) != actual.get(key)]:
+        raise StepRefused(
+            f"the federation's render identity is not the expected one ({path}): it differs in {', '.join(differing)}"
+        )
+    return held
+
+
+def note_render_identity(out: Path, record: bytes, label: str) -> None:
+    """Put the federation's render identity, the bytes `check_render_identity` took, into the step's out/ as
+    `study-state/render-identity.json` (mode 0600, no link followed), so the archive carries it. A failure is said and
+    never fatal: the results are archived all the same."""
+    try:
+        folder = out / STUDY_STATE
+        folder.mkdir(exist_ok=True)
+        if folder.is_symlink() or not folder.is_dir():
+            raise OSError(errno.ENOTDIR, "not a directory")
+        descriptor = os.open(folder / RENDER_IDENTITY, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(record)
+    except OSError as error:
+        print(f"shards: ERROR: shard {label}'s render identity could not be written into out/{STUDY_STATE}/ "
+              f"({type(error).__name__}); its archive will not carry it", file=sys.stderr)  # fmt: skip
+
+
 def step(
     args: argparse.Namespace,
     *,
@@ -1373,11 +1555,14 @@ def step(
 ) -> int:
     """One shard on its node (the module's docstring): copy, restore, run, archive, clean up; the dispatcher's exit
     status. `snapshots` says when `out/` is snapshotted; by default every `--snapshot-every` seconds and at each run's
-    end, into `<results>/<label>/snapshots/`. Its first act is the study's pre-step guard, when its line declares one
-    (`start_hooks`): nothing is made, removed or read before it, and `PRE_STEP_REFUSED` ends a step it refuses. A
+    end, into `<results>/<label>/snapshots/`. Its first acts are the check of the federation's render identity against
+    the one the line expects (`check_render_identity`) and then the study's pre-step guard, when its line declares one
+    (`start_hooks`): nothing is made, removed or read before them, and `PRE_STEP_REFUSED` ends a step they refuse. The
+    federation's render identity is copied into `out/study-state/` once the dispatcher has ended. A
     declared post-run script runs after the dispatcher exits 0 and before the archive (`run_post_run`): a step whose
     script does not pass archives its results marked not final and ends with `POST_RUN_FAILED`."""
     try:
+        identity = check_render_identity(args)  # the federation's render is the plan's, before the study's own guard
         guard, post_hook = start_hooks(args)
     except StepRefused as error:
         print(f"shards: ERROR: {error}; the step is refused, with nothing made", file=sys.stderr)
@@ -1464,6 +1649,8 @@ def step(
         if not out.is_dir():
             print(f"shards: shard {args.label} left no out/ to archive (exit status {status})", file=sys.stderr)
             return status
+        if identity is not None:  # before the post-run script and the archive, so both see the out/ that is archived
+            note_render_identity(out, identity, args.label)
         post = None
         if post_hook is not None:  # the dispatcher has exited and the federation is up: the study's own check
             try:
@@ -1521,6 +1708,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--post-run", dest="post_run", default=None)  # the study's post-run script: all three
     one.add_argument("--post-run-sha256", dest="post_run_sha256", default=None)
     one.add_argument("--post-run-timeout", dest="post_run_timeout", type=float, default=None)
+    one.add_argument("--expect-render-identity", dest="expect_render_identity", default=None)  # with its hash: both
+    one.add_argument("--expect-render-identity-sha256", dest="expect_render_identity_sha256", default=None)
     left = sub.add_parser("sweep")
     left.add_argument("--tmpfs", type=Path, required=True)
     left.add_argument("--root", required=True)
@@ -1553,6 +1742,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if plan.post_run is not None:
                 record["post_run"] = {"path": plan.post_run, "sha256": plan.post_run_sha256,
                                       "timeout_s": plan.post_run_timeout_s}  # fmt: skip
+            if plan.expect_render_identity is not None:
+                record["expect_render_identity"] = {"path": plan.expect_render_identity,
+                                                    "sha256": plan.expect_render_identity_sha256}  # fmt: skip
             print(json.dumps(record) if args.command == "plan" else shlex.join(line))
         return 0
     except ShardsError as error:
