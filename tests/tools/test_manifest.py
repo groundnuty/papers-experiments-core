@@ -122,7 +122,7 @@ def test_l13_the_variables_and_the_timeout_reach_the_server_and_the_rest_is_its_
         seen.update(path=path, params=params, timeout_s=timeout_s)
         return 0
 
-    monkeypatch.setattr("expcore.tools.manifest._freeze", freeze)
+    monkeypatch.setattr("expcore.tools.manifest.freeze_server", freeze)
     monkeypatch.setenv("TOYLAB_HOME", "/srv/toylab")
     argv = ["freeze", str(tmp_path / "t.json"), "--pass-env", "TOYLAB_HOME", "--timeout", "7", "--"]
     assert main([*argv, "toy-server", "--flag", "--", "rest"]) == 0

@@ -50,8 +50,14 @@ module was imported, searching from the directory of its installed package up to
 the package (on a cluster account, its shared home) could set any `ONEDATA_*` setting the launch left unset, with
 nothing in the launch saying so. The environment this module builds says `ONEDATA_MCP_DOTENV=0` on every platform (the
 server's guard: with it no `.env` is read), and the server's working directory is a new, empty directory of mode 0700
-made for each start and removed after it (`_private_workdir`), because the working directory is where FastMCP reads
-a `.env` for its own settings and where the server's relative paths would otherwise land in the driver's.
+made for each start and removed after it (`expcore.tools.workdir.private_workdir`), because the working directory is
+where FastMCP reads a `.env` for its own settings and where the server's relative paths would otherwise land in the
+driver's.
+
+What the server is started with is built in one place, `server_start`: the command and arguments, the environment, the
+private CA copy and the private directory. The launch starts the server from it, and so does the command line that
+freezes and checks a condition's manifest (`expcore_onedata.toolmanifest`), so a manifest is frozen from the server a
+run has, never from one configured by what the driver's own environment and directory happen to hold.
 
 The checks (`_prepare` before the spawn, `_recheck` after the stop) read Onezone in worker threads, and each holds a share
 of the run's federation admission while it runs (`expcore_onedata.admission_share`, O11): a launch cancelled while one
@@ -70,11 +76,13 @@ import sys
 import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
+from typing import Protocol
 
 from expcore.config.loading import ConfigError
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
+from expcore.tools.workdir import private_workdir
 from expcore_onedata.addresses import AddressMapError, launch_argv
 from expcore_onedata.admission import (
     TOOL_SERVER_STEP,
@@ -123,6 +131,7 @@ MANAGED_ENV = (
     ENV_DOTENV,
     *CA_BUNDLE_ENV,
 )
+OVERRIDDEN_ENV = ("FASTMCP_LOG_LEVEL", "PATH")  # always the launch's own: a caller's value of either is replaced
 
 
 def server_argv(config: PlatformConfig) -> tuple[str, list[str]]:
@@ -142,10 +151,16 @@ def server_argv(config: PlatformConfig) -> tuple[str, list[str]]:
     return wrapped[0], wrapped[1:]
 
 
+class Revealable(Protocol):
+    """What the server's environment asks of a token: its value, and nothing else."""
+
+    def reveal(self) -> str: ...
+
+
 def server_environment(
     config: PlatformConfig,
     condition: Condition,
-    token: MintedToken,
+    token: Revealable,
     extra: Mapping[str, str] | None = None,
     *,
     ca_copy: Path | None = None,
@@ -162,7 +177,7 @@ def server_environment(
     It sets `ONEDATA_MCP_DOTENV=0` on every platform, the launcher's included (O84): the server reads no `.env` file, so
     nothing it is configured with comes from a file the launch does not name, and a caller cannot change it. The word
     stops onedata-mcp's own read only, from a version that has the guard; the server's working directory is the other
-    half (`_private_workdir`).
+    half (`expcore.tools.workdir.private_workdir`).
 
     Its certificate check is the platform's `[tls]`: by default the server's own (it verifies with httpx's CAs); with
     `ca_file`, `ca_copy`, the run's own read-only copy of the verified bundle (`tls.write_private_copy`), never the
@@ -205,17 +220,30 @@ def _private_bundle(config: PlatformConfig) -> Iterator[Path | None]:
         yield write_private_copy(content, Path(directory))
 
 
+@dataclasses.dataclass(frozen=True)
+class ServerStart:
+    """What the tool server child is started with: its command and arguments, its whole environment beyond the SDK's
+    few defaults, and its working directory."""
+
+    command: str
+    args: list[str]
+    env: dict[str, str]
+    cwd: Path
+
+
 @contextlib.contextmanager
-def _private_workdir() -> Iterator[Path]:
-    """The server's working directory (O84): a new, empty directory of this launch's own, mode 0700 whatever the
-    driver's umask, made for each start beside the run's other private files (`_private_bundle`'s: `mkdtemp`, owner only)
-    and removed with what the server left in it when the server has stopped. The server inherits nothing from the
-    driver's working directory, a `.env` in it included (FastMCP reads one there), and never finds one in the directory
-    it starts in."""
-    with tempfile.TemporaryDirectory(prefix="expcore-toolserver-") as directory:
-        path = Path(directory)
-        path.chmod(0o700)
-        yield path
+def server_start(
+    config: PlatformConfig, condition: Condition, token: Revealable, extra: Mapping[str, str] | None = None
+) -> Iterator[ServerStart]:
+    """Build what the server of a condition is started with, and keep what it needs until the server has stopped: the
+    run's private copy of the CA bundle, when the platform has one (`_private_bundle`), and a new, empty, private
+    working directory (`private_workdir`, O84). The launch and the manifest tool both start the server from this, so
+    the server's environment (`server_environment`, a caller's `extra` refused where it clashes with the managed
+    settings), its command (`server_argv`) and its directory are one definition, not two that can drift."""
+    with _private_bundle(config) as ca_copy, private_workdir() as workdir:
+        env = server_environment(config, condition, token, extra, ca_copy=ca_copy)
+        command, args = server_argv(config)
+        yield ServerStart(command, args, env, workdir)
 
 
 def _server(config: PlatformConfig) -> ToolServer:
@@ -390,19 +418,16 @@ class ToolServerLauncher:
         server, chosen = _server(self._config), self._config.condition(condition)
         with (
             token_step(TOOL_SERVER_STEP),  # ended only once the re-verification at teardown has ended
-            _private_bundle(self._config) as ca_copy,  # the run's copy of the verified CA bytes, gone with the server
-            _private_workdir() as workdir,  # the server's own empty directory, gone with it (O84)
+            server_start(self._config, chosen, token, extra_env) as begun,  # its CA copy and directory, gone with it
         ):
-            env = server_environment(self._config, chosen, token, extra_env, ca_copy=ca_copy)
-            command, args = server_argv(self._config)
             provider = McpToolProvider(
-                command,
-                args,
+                begun.command,
+                begun.args,
                 frozen=chosen.manifest,
-                env=env,
+                env=begun.env,
                 allowed_tools=chosen.allow,
                 start_timeout_s=server.start_timeout_s,
-                cwd=workdir,
+                cwd=begun.cwd,
             )
             async with ctx.infrastructure_wait(WAIT_KIND):
                 try:
