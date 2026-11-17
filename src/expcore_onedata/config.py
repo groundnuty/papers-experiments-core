@@ -302,10 +302,11 @@ class PlatformConfig:
         declared (O22), on the Apptainer backend that backend's pins (`sandbox_backend`, O56), and the sandbox's other
         settings that shape a run (`sandbox`: the backend, the images by id, the limits, the mount, the trust paths,
         the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256). With a
-        `[toolserver]`, its pinned commit, its start's bound and each condition's allow-list, rights and manifest's
-        SHA-256 (`toolserver`); with a `[placement]`, its data provider by label and its range map by digest
-        (`placement`); with `[faults]`, the fault injector's sanction, targets and every bound of its waits and its heal
-        (`faults`, `fault_settings.faults_fingerprint`).
+        `[toolserver]`, its pinned commit, its command line (federation-neutral, hashed), its start's bound and each
+        condition's allow-list, rights and manifest's SHA-256 (`toolserver`); with a `[placement]`, its data provider by
+        label, its range map by digest and the bounds a run's instruments read (`placement`); with `[faults]`, the
+        fault injector's sanction, targets and every bound of its waits and its heal (`faults`,
+        `fault_settings.faults_fingerprint`).
 
         The fingerprint of a store recorded before these settings were in it differs: such a store is refused at its
         resume, naming what changed, and a merge never joins it with a shard of this form (C06).
@@ -328,9 +329,10 @@ class PlatformConfig:
                 out["served_bytes"] = self.sandbox.served_caps.record()
             if self.sandbox.apptainer is not None:  # O56: a Docker and an Apptainer run are never one experiment
                 out["sandbox_backend"] = self.sandbox.apptainer.record()
-            out["sandbox"] = runsettings.sandbox_record(self.sandbox)
+            out["sandbox"] = runsettings.sandbox_record(self.sandbox, runsettings.federation_roles(self))
         if self.toolserver is not None:
-            out["toolserver"] = runsettings.toolserver_record(self.toolserver, self.file)
+            roles = runsettings.federation_roles(self)
+            out["toolserver"] = runsettings.toolserver_record(self.toolserver, self.file, roles)
         placement = runsettings.placement_record(self)
         if placement is not None:
             out["placement"] = placement

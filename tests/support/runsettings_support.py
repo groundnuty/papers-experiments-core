@@ -62,7 +62,8 @@ revocation_settle_s = 330
 
 [toolserver]
 command = "@root@/venv/bin/server"
-args = ["--relay", "https://@zone_host@:@port@"]
+args = ["--relay", "https://@zone_host@:@port@", "--provider", "@pine_id@", "--config", "@root@/server.toml",
+        "--max-rows", "50"]
 start_timeout_s = 120
 clone = "@root@/clone"
 commit = "{COMMIT}"
@@ -120,7 +121,7 @@ gate_memory_bytes = 1073741824
 [sandbox.mount]
 path = "/data"
 io_mode = "proxy"
-extra_args = ["--provider-timeout=60"]
+extra_args = ["--provider-timeout=60", "--space-id=@space_id@"]
 
 [sandbox.data_paths]
 mounted = "mount"
@@ -406,6 +407,9 @@ IN = {
     "tokens.max_ttl_s": edit("docker", platform("max_ttl_s = 86400", "max_ttl_s = 86399")),
     "tokens.revocation_settle_s": edit("docker", platform("revocation_settle_s = 330", "revocation_settle_s = 331")),
     "toolserver.commit": edit("docker", platform(COMMIT, "f" * 40)),
+    "toolserver.command": edit("docker", platform('command = "@root@/venv/bin/server"',
+                                                  'command = "@root@/venv/bin/other"')),
+    "toolserver.args": edit("docker", platform('"--max-rows", "50"', '"--max-rows", "51"')),
     "toolserver.start_timeout_s": edit("docker", platform("start_timeout_s = 120", "start_timeout_s = 121")),
     "toolserver.conditions": edit("docker", platform("[toolserver.conditions.reader]",
                                                      "[toolserver.conditions.lookup]")),
@@ -439,7 +443,7 @@ IN = {
     "sandbox.mount.io_mode": edit("docker", platform('io_mode = "proxy"', 'io_mode = "direct"\n'
                                                      'direct_check_file = "alpha-space/f"\n'
                                                      'storages = { "st1" = "/srv/storage-1" }')),
-    "sandbox.mount.extra_args": edit("docker", platform('["--provider-timeout=60"]', '["--provider-timeout=61"]')),
+    "sandbox.mount.extra_args": edit("docker", platform('"--provider-timeout=60"', '"--provider-timeout=61"')),
     "sandbox.data_paths": edit("docker", platform('mounted = "mount"\n', 'mounted = "mount"\nbare = "none"\n')),
     "sandbox.data_paths.*.kind": edit("docker", platform('mounted = "mount"', 'mounted = "none"')),
     "sandbox.data_paths.*.listing": edit("docker", platform('listing = "paged"', 'listing = "complete"')),
@@ -521,7 +525,7 @@ IN_REASONS = {
     "support": "the providers that hold the space and the agent's own, by label",
     "spaces": "each [[spaces]] entry's declared identity, in its digest (C06)",
     "tokens": "a run's token lifetime: a token that expires fails the run's last check of its tool plane (O06)",
-    "toolserver": "the tool server's code (its commit), its start's bound, each condition's tools, rights, manifest",
+    "toolserver": "the tool server's code (commit), command line (federation-neutral), start bound and conditions",
     "sandbox": "what the agent runs in and is held to: images by id, limits, mount, interpreter, user, grace, pins",
     "sandbox.data_paths": "each level's data path, listing and I/O mode (O21, O36)",
     "sandbox.served_bytes": "the caps of a run's tables of the bytes served, which bound its evidence (O22)",
@@ -557,10 +561,6 @@ OUT = {
     "credentials.users.pattern": SECRET,
     **{f"principals.{plane}.username": USER for plane in ("data_path", "toolserver", "service")},
     **{f"principals.{plane}.user_id": PER_FEDERATION for plane in ("data_path", "toolserver", "service")},
-    "toolserver.command": PATH,
-    "toolserver.args": "carries the federation's address and the host's paths beside any option, so no part of it is "
-                       "one experiment's; a known limit: a server's own options are in only through its commit and "
-                       "its manifest, and with no commit pinned the manifest alone names it",
     "toolserver.clone": PATH,
     "sandbox.work_root": PATH,
     "sandbox.name_prefix": HOST,

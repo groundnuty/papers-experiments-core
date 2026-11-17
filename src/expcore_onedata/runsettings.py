@@ -44,6 +44,52 @@ def digest_of(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def federation_roles(config: PlatformConfig) -> list[tuple[str, str]]:
+    """Each value of the file that is its federation's own, paired with the role that names it in every federation:
+    the zone's and each provider's URL and host, each provider's, space's and fixed user's id, the link check's space
+    id, the tool server's clone and the platform file's directory. Longest first, so a URL is replaced before its host,
+    and a host that several roles share is the plain role `host`."""
+    from urllib.parse import urlsplit  # only here: what a word of a command line holds of the federation
+
+    roles: dict[str, str] = {}
+
+    def add(value: str | None, role: str) -> None:
+        if value:
+            roles[value] = role if roles.get(value, role) == role else "host"
+
+    add(config.zone.url, "zone")
+    add((urlsplit(config.zone.url).hostname or "").lower(), "zone-host")
+    for name, provider in config.providers.items():
+        label = config.provider_label(name)
+        add(provider.url, label)
+        add(provider.host, f"{label}-host")
+        add(provider.id, f"{label}-id")
+    for entry in config.spaces:
+        add(entry.space.id, f"{entry.position}-id")
+    if config.link_check is not None:
+        add(config.link_check.space.id, "link_check-id")
+    for plane in ("data_path", "toolserver", "service"):
+        principal = getattr(config.principals, plane)
+        add(None if principal is None else principal.user_id, f"principals.{plane}-id")
+    if config.toolserver is not None and config.toolserver.clone is not None:
+        add(str(config.toolserver.clone), "clone")
+    add(str(config.file.parent), "platform-dir")
+    return sorted(roles.items(), key=lambda item: -len(item[0]))
+
+
+def neutral_words(words: Any, roles: list[tuple[str, str]]) -> list[str]:
+    """A command line with every value of its federation's own replaced by its role (`<zone>`, `<providers[0]-id>`,
+    `<platform-dir>`), so the same template's line is one line on every federation, and what else it says (an option,
+    a timeout, a limit) is kept as written, in its order. A value of the federation that no role names stays as it is,
+    so such a line keeps two federations apart rather than joining them."""
+    out = []
+    for word in words:
+        for value, role in roles:
+            word = word.replace(value, f"<{role}>")
+        out.append(word)
+    return out
+
+
 def tokens_record(tokens: TokenSettings) -> dict[str, Any]:
     """`[tokens]` after its defaults: the lifetime rule of a run's tokens and the settle of a revocation (O06, C19). A
     token that outlives its run by less fails the run's last check of its tool plane, so every number is in."""
@@ -72,10 +118,11 @@ def support_record(config: PlatformConfig) -> dict[str, Any]:
     }
 
 
-def sandbox_record(sandbox: SandboxSettings) -> dict[str, Any]:
+def sandbox_record(sandbox: SandboxSettings, roles: list[tuple[str, str]]) -> dict[str, Any]:
     """`[sandbox]`'s settings that shape a run beside its data paths, served caps and Apptainer pins (which keep their
     own keys): the backend; on Docker every image by its pinned id (on Apptainer the SIF is in its pins); every limit;
-    the mount's path in the agent, its I/O mode and oneclient's extra arguments (by their SHA-256); the paths in the
+    the mount's path in the agent, its I/O mode and oneclient's extra arguments (by the SHA-256 of their federation-
+    neutral form, `neutral_words`: a `--space-id` is its space's role, never its id); the paths in the
     agent's image that trust the run's CA; the agent's user and interpreter; the kill's grace at a cell's deadline; and
     the agent's placeholder token by its SHA-256. Not here: the work root, the name prefix, the label namespace, the
     privilege command and earlyoom's name for the driver (the host's own), the network pools and `[sandbox.federation]`
@@ -102,7 +149,11 @@ def sandbox_record(sandbox: SandboxSettings) -> dict[str, Any]:
         },
         "mount": None
         if mount is None
-        else {"path": mount.path, "io_mode": mount.io_mode, "extra_args_sha256": digest_of(list(mount.extra_args))},
+        else {
+            "path": mount.path,
+            "io_mode": mount.io_mode,
+            "extra_args_sha256": digest_of(neutral_words(mount.extra_args, roles)),
+        },
         "trust_paths": sorted(set(sandbox.trust_paths)),
         "agent_uid": int(sandbox.agent_uid),
         "python": sandbox.python,
@@ -111,14 +162,15 @@ def sandbox_record(sandbox: SandboxSettings) -> dict[str, Any]:
     }
 
 
-def toolserver_record(server: ToolServer, file: Any) -> dict[str, Any]:
-    """`[toolserver]`'s settings that shape a run: the pinned commit of its checkout (None when none is pinned), the
-    longest its start may take, and each condition, keyed by its name's SHA-256 (a message never names a condition,
-    O12, and the key still binds the name to its settings whatever the file's order), with its allow-list, its rights
-    and its frozen manifest's SHA-256. Not here: the command, its arguments and the clone's path, which are the
-    host's (a path, and in the arguments often the federation's address); the code they start is the commit's, and
-    what it serves is the manifest, which the client holds the server to (L13). A manifest that cannot be read is
-    refused naming its condition's position, never its path."""
+def toolserver_record(server: ToolServer, file: Any, roles: list[tuple[str, str]]) -> dict[str, Any]:
+    """`[toolserver]`'s settings that shape a run: the pinned commit of its checkout (None when none is pinned), its
+    command and arguments, which start it and can set its own options (a timeout, a limit), by the SHA-256 of their
+    federation-neutral form (`neutral_words`: the federation's addresses, ids, the clone's and the platform file's
+    directory replaced by their roles), the longest its start may take, and each condition, keyed by its name's
+    SHA-256 (a message never names a condition, O12, and the key still binds the name to its settings whatever the
+    file's order), with its allow-list, its rights and its frozen manifest's SHA-256. Not here: the clone's path, the
+    host's; the code it holds is the commit's. A manifest that cannot be read is refused naming its condition's
+    position, never its path."""
     conditions: dict[str, Any] = {}
     for index, (name, condition) in enumerate(server.conditions.items()):
         try:
@@ -135,6 +187,7 @@ def toolserver_record(server: ToolServer, file: Any) -> dict[str, Any]:
         }
     return {
         "commit": server.commit,
+        "command_sha256": digest_of(neutral_words([server.command, *server.args], roles)),
         "start_timeout_s": float(server.start_timeout_s),
         "conditions": conditions,
     }
@@ -184,6 +237,8 @@ def placement_record(config: PlatformConfig) -> dict[str, Any] | None:
 __all__ = [
     "PLACEMENT_IN_RUN",
     "digest_of",
+    "federation_roles",
+    "neutral_words",
     "placement_record",
     "sandbox_record",
     "support_record",

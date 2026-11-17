@@ -30,7 +30,7 @@ from expcore.campaign.manifest import compare_fingerprints
 from expcore.config import loading
 from expcore.config.loading import ConfigError
 from expcore_onedata import config as config_module
-from expcore_onedata import fault_settings, linksettings, rangemap, spaces, tls, users
+from expcore_onedata import fault_settings, linksettings, rangemap, runsettings, spaces, tls, users
 from expcore_onedata.config import load_platform
 from expcore_onedata.sandbox import settings as sandbox_settings
 from expcore_onedata.sandbox.apptainer import settings as apptainer_settings
@@ -189,6 +189,30 @@ def test_c06_a_store_recorded_before_the_settings_were_in_the_fingerprint_is_ref
     absent = "absent when the campaign started"
     assert any(line.startswith(f"platform.tokens.margin_s: {absent}") for line in compared.refused)
     assert any(line.startswith("platform.sandbox.limits.cpus: absent") for line in compared.refused)
+
+
+def test_c06_a_command_line_is_held_with_its_federations_values_by_role_and_its_options_as_written(tmp_path, cas):
+    """C06: the tool server's command line and oneclient's extra arguments hold the federation's own values (its
+    zone's URL, a provider's id, a space's id, the platform file's directory) by their role, so one template's line is
+    one line on every federation, while an option is kept as written; a value of the federation no role names stays
+    as it is, so such a line keeps two federations apart rather than joining them."""
+    one, two = (load(DOCKER, tmp_path / f"fed-{i}" / "root", cas[0], values) for i, values in enumerate(FEDERATIONS))
+    lines = [
+        runsettings.neutral_words([c.toolserver.command, *c.toolserver.args, *c.sandbox.mount.extra_args],
+                                  runsettings.federation_roles(c))
+        for c in (one, two)
+    ]  # fmt: skip
+    assert lines[0] == lines[1]
+    assert lines[0] == [
+        "<platform-dir>/venv/bin/server", "--relay", "<zone>", "--provider", "<providers[0]-id>", "--config",
+        "<platform-dir>/server.toml", "--max-rows", "50", "--provider-timeout=60", "--space-id=<spaces[0]-id>",
+    ]  # fmt: skip
+    foreign = [platform('"--max-rows", "50"', '"--max-rows", "50", "--mirror", "https://mirror-@space_suffix@.org"')]
+    apart = [
+        load(edited(DOCKER, foreign), tmp_path / f"apart-{i}" / "root", cas[0], values)
+        for i, values in enumerate(FEDERATIONS)
+    ]
+    assert apart[0].fingerprint()["toolserver"] != apart[1].fingerprint()["toolserver"]
 
 
 def test_c06_a_new_tool_server_condition_is_refused_at_a_resume_and_is_no_growth(tmp_path, cas):
