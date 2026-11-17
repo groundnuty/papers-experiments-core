@@ -224,3 +224,63 @@ def test_two_oneclient_bundles_give_two_campaign_fingerprints(tmp_path, fake):
     assert {**prints[1], "sandbox_backend": {**prints[1]["sandbox_backend"], "oneclient_bundle_sha256": "d" * 64}} == (
         prints[0]
     )
+
+
+KINDS = ("tmpfs", "shared_filesystem")
+
+
+def test_o57_the_providers_storage_kind_is_declared_validated_and_recorded(tmp_path):
+    """O57: `provider_storage` says where the federation's providers keep their data, tmpfs or the shared filesystem:
+    the record holds the word, and a word that is neither is refused naming the key and never the value."""
+    for kind in KINDS:
+        loaded = _load(tmp_path, _document(provider_storage=kind))
+        assert loaded.apptainer.provider_storage == kind
+        assert loaded.apptainer.record()["provider_storage"] == kind
+    for bad in ("scratch", "TMPFS", "", 1, True, ["tmpfs"]):
+        with pytest.raises(ConfigError, match="provider_storage") as refused:
+            _load(tmp_path, _document(provider_storage=bad))
+        if isinstance(bad, str) and bad:
+            assert bad not in str(refused.value)
+
+
+def test_o57_two_layouts_differing_only_in_the_storage_kind_give_two_fingerprints(tmp_path, fake):
+    """O57: where the providers keep their data shapes a run's I/O timing, so a tmpfs federation and a scratch one are
+    two experiments: the kind is in the campaign fingerprint, and it is the only thing that tells these two apart."""
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.testing import write_platform
+
+    prints = {}
+    for kind in KINDS:
+        directory = tmp_path / kind
+        directory.mkdir()
+
+        def apptainer(data, kind=kind):
+            data["sandbox"] = _document(provider_storage=kind)
+
+        prints[kind] = load_platform(write_platform(directory, apptainer)).fingerprint()
+    tmpfs, shared = prints["tmpfs"], prints["shared_filesystem"]
+    assert tmpfs != shared
+    assert tmpfs["sandbox_backend"]["provider_storage"] == "tmpfs"
+    assert shared["sandbox_backend"]["provider_storage"] == "shared_filesystem"
+    assert {**shared, "sandbox_backend": {**shared["sandbox_backend"], "provider_storage": "tmpfs"}} == tmpfs
+
+
+def test_o57_a_platform_that_declares_no_storage_kind_keeps_the_fingerprint_it_had(tmp_path, fake):
+    """O57: a Compose federation (the Docker backend) has no such setting, and an Apptainer platform that declares none
+    leaves the key out of the record: neither fingerprint changes, so a store started before the key resumes."""
+    import json
+
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.testing import write_platform
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "d").mkdir()
+
+    def apptainer(data):
+        data["sandbox"] = _document()
+
+    undeclared = load_platform(write_platform(tmp_path / "a", apptainer)).fingerprint()
+    docker = load_platform(write_platform(tmp_path / "d", add_sandbox)).fingerprint()
+    assert "provider_storage" not in undeclared["sandbox_backend"]
+    assert set(docker) == {"tls", "data_paths"}  # what the Docker backend's fingerprint held before the key existed
+    assert "provider_storage" not in json.dumps(docker)

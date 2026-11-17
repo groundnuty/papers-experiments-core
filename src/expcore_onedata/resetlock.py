@@ -1,14 +1,15 @@
 # Provenance: new
-"""A shared admission's share of `federation.reset`, the lock a shortcut reset takes exclusively (O11, O51).
+"""A shared admission's share of `federation.reset`, the lock every reset takes exclusively (O11, O51, O66).
 
 Every shared admission of a federation with `[faults]` (a campaign run's, through `admission.run_admission`, and a
 tool's outside a campaign, through `tool_admission.shared_admission`) holds `federation.reset` shared beside its share
-of `federation.lock`, for as long as it holds the admission. A reset that skips the per-file reads of files a planner's
-reading showed empty (`resetgrant.py`) needs to know that no reader can place bytes while it runs, and an on-demand
-read leaves no transfer record to find: so it takes `federation.reset` exclusively, which no shared admission can hold
-alongside. This module is that share, as one admission holds it: `ResetShare`.
+of `federation.lock`, for as long as it holds the admission. A reset evicts and reads block maps, so it needs to know
+that no reader can act while it runs (and one that skips the per-file reads of files a planner's reading showed empty
+needs to know no reader placed bytes, which an on-demand read does without a transfer record): so every reset takes
+`federation.reset` exclusively (`resetgrant.py`), which no shared admission can hold alongside. This module is that
+share, as one admission holds it: `ResetShare`.
 
-**Its states.** `shared` (its share held), `given_up` (let go for the admission's own shortcut reset: the run's agent
+**Its states.** `shared` (its share held), `given_up` (let go for the admission's own reset: the run's agent
 has not started, so it is safe), `exclusive` (the lock taken exclusively, on a descriptor of its own) and `closed` (the
 admission let go). A flock is never converted in place: `LOCK_SH` to `LOCK_EX` on one descriptor is not atomic on Linux
 (the kernel drops the old lock before it waits for the new one, so a waiter may slip in between, and a non-blocking
@@ -19,7 +20,7 @@ lapses: an outage run, which needs that lock exclusively, stays out for the whol
 **Who held it.** Each hold of the share writes a line to `reset-holds.jsonl` beside the fault journal, in the format of
 the tools' record (`shared_holds.SharedHolds`, `name=RESET_HOLDS`): the process as the lease pool names a holder (boot
 id, pid and start time), whether it is a campaign attempt, and when it began; and a second line when it is let go. A
-shortcut reset whose wait runs out names the live holders from it, and the gone ones as `holder_gone`. A hold that
+reset refused at its bound names the live holders from it, and the gone ones as `holder_gone`. A hold that
 cannot be recorded is refused (`injector_failure`): the record is what tells a reset that a holder died, and a hold
 nobody can see is not one. An end that cannot be recorded is told of and leaves the line open; the next exclusive
 holder ends it.
@@ -111,7 +112,7 @@ class ResetShare:
             log.warning("the end of a share of the reset lock could not be recorded", exc_info=True)
 
     def give_up(self) -> None:
-        """Let the share go for the owner's own shortcut reset (`shared` to `given_up`). Raise RuntimeError unless it is
+        """Let the share go for the owner's own reset (`shared` to `given_up`). Raise RuntimeError unless it is
         held: a reset gives up only a share it has."""
         with self._lock:
             if self._state != SHARED or self._held is None:
@@ -169,7 +170,7 @@ class ResetShare:
                     return
             if deadline is not None and time.monotonic() >= deadline:
                 raise self._busy(
-                    "the share of the reset lock could not be taken back after a shortcut reset: another reset held "
+                    "the share of the reset lock could not be taken back after a reset: another reset held "
                     "it exclusively past the bound of the wait"
                 )
             time.sleep(self._poll_s)

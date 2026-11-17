@@ -1,4 +1,4 @@
-"""Child processes for the tests of the reset lock (`federation.reset`) that a shortcut reset takes exclusively."""
+"""Child processes for the tests of the reset lock (`federation.reset`) that every reset takes exclusively."""
 
 import asyncio
 import fcntl
@@ -44,6 +44,33 @@ def run_and_hang(platform: str, out: str, point: str) -> None:
     assert admit is not None
     with admit((), {}, threading.Event(), False):
         asyncio.run(_hang(config, out, point))
+
+
+def _publish(path: str, text: str) -> None:
+    """Write a file whole, so the other process never reads it half-written."""
+    partial = Path(f"{path}.partial")
+    partial.write_text(text, encoding="utf-8")
+    os.replace(partial, path)
+
+
+def hold_until_told(platform: str, held: str, release: str, releasing: str) -> None:
+    """In a child process: take a campaign run's shared admission the way the campaign does (`run_admission`), its
+    share of `federation.reset` with it, write `held` (this pid), wait for `release` to appear, and write `releasing`
+    (this host's monotonic instant, just before the admission is let go) before letting it go."""
+    from expcore_onedata.admission import run_admission
+    from expcore_onedata.config import load_platform
+
+    config = load_platform(Path(platform), require_secrets=False)
+    admit = run_admission(config)
+    assert admit is not None
+    with admit((), {}, threading.Event(), False):
+        _publish(held, str(os.getpid()))
+        deadline = time.monotonic() + 120
+        while not Path(release).exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("the parent never told the holder to let go")
+            time.sleep(0.02)
+        _publish(releasing, repr(time.monotonic()))
 
 
 def hold_and_fork(platform: str, out: str) -> None:

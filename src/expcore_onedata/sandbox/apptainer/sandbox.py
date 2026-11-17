@@ -19,7 +19,9 @@ Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded fir
   proves the watch sees a cell's processes, or the start fails;
 * REST: the core's gate on 127.0.0.1 (`gaterun.py`), with the token in its memory alone; the cell resolves the zone's
   and the provider's names to the loopback and trusts the run's CA; its `ONEDATA_TOKEN` is the placeholder (O23);
-* a mount: refused until the helper of hook (c) is given (`mounthook.py`);
+* a mount: oneclient on the node, outside every cell, by the helper of hook (c) (`mounthook.py`, `hostmount.py`); a
+  mount run is refused at its start without the helper, without `[sandbox.mount]`, and by the helper itself for a
+  direct mount (HPC mounts are proxy-only until the direct-I/O comparison passes);
 * no name server: every cell binds a `resolv.conf` that names none and an `nsswitch.conf` whose hosts are `files`, so
   the C library resolves the names of `/etc/hosts` alone: the federation's, as Docker's `--add-host` gives them
   (`facts.py`, `dns_none`);
@@ -126,7 +128,10 @@ class ApptainerSandbox:
             "data_path": spec.mode.value,
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,
             "backend": self.app.record() if self.app is not None else {"backend": "apptainer"},
-            "infrastructure_facts": facts.record(),
+            "infrastructure_facts": facts.record(
+                mount_refused=self._mount_refused(),
+                provider_storage=self.app.provider_storage if self.app is not None else None,
+            ),
             "images": {},
             "tls": settings.tls.record(),
             "certifi": None,
@@ -202,6 +207,12 @@ class ApptainerSandbox:
                 log.error("cleanup after a failed start was incomplete: %s", describe_error(error))
             raise
 
+    def _mount_refused(self) -> bool:
+        """Whether a mount data path is refused here: no helper is given or the platform declares no `[sandbox.mount]`.
+        The run's facts list `mount_refused` exactly when this holds; the helper's own refusals (a direct mount, a run
+        without a token) come after it, at the helper's start."""
+        return self._mount_factory is None or self.s.mount is None
+
     def _validate(self) -> None:
         sp, s = self.spec, self.s
         if self.app is None:
@@ -210,7 +221,7 @@ class ApptainerSandbox:
             raise StartRefused("the run key must be 1 to 200 printable ASCII characters without spaces")
         if (sp.token is None) != (sp.mode is DataPathMode.NONE):
             raise StartRefused("a data path takes the data-path token, and no data path takes none")
-        if sp.mode is DataPathMode.MOUNT and (self._mount_factory is None or s.mount is None):
+        if sp.mode is DataPathMode.MOUNT and self._mount_refused():
             raise StartRefused(MOUNT_REFUSED)
         if sp.mode is not DataPathMode.NONE and sp.provider is None:
             raise StartRefused("a data path needs the agent's local provider")
