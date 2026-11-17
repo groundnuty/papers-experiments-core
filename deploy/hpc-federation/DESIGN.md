@@ -469,18 +469,19 @@ serves both:
   read the HPC `[faults]` (one without M4's backend) gets the restore's rule over the keys it knows, with the HPC
   settle time and poll.
 
-**Slots and a tool server (O83).** The core starts a tool server only for a slot's user, and no layout declared one, so
-the tool-server arm could not run here. A layout's `[slots.<name>]` pairs two of its principals and `[toolserver]` declares
-the server (`fedslots.py`, shared with Compose, which provisioned no slot either), and the HPC driver adds nothing to
-provisioning: the users are principals, so section 5's bootstrap makes the zone user, its 0600 password file and its
-memberships, and `HpcBootstrap.support` maps every principal to the job's uid. One function (`fedtools.additions`) writes
-`[slots.*]` and `[toolserver]` after the template's text, from the layout's declarations and the facts' ids, and
-`write_platform` appends it; a template that declares either is refused. The manifests are copied into the root and named
-by absolute path (the file is copied beside a study); `@study_artifacts@` is `HPC_STUDY_ARTIFACTS` (`Site.study_artifacts`,
-recorded in the state file for a hand-run `core` step; an unset key is no value, so a placeholder is never written empty).
-`preflight` refuses a site without it and artifacts the server cannot run from before a job is held, and `write_facts`
-loads the written file as a campaign does (`fedtools.check_rendered`), so a federation is not ready on a file the core
-refuses. A layout with no slot takes none of these paths.
+**Slots and a tool server (O83).** The core starts a tool server only for a slot's user, and no federation provisioned one,
+so the tool-server arm could not run here. The users are ordinary principals of the layout and a platform template
+declares the slots and the server (`layouts/pilot-shape-slots.platform.toml.template`), so the HPC driver adds nothing to
+provisioning: section 5's bootstrap makes the zone user, its 0600 password file and its memberships, and
+`HpcBootstrap.support` maps every principal to the job's uid. The shared bootstrap treats a slot user that exists as
+read-only (`fedboot.audit_slot_users`: verified, recorded `matched`, or refused naming the user and the attribute), the
+slot users being those the template declares, read as it stands (`fedtools.slot_users`). `@user_id.<name>@` is the facts' id
+for every principal; `@study_artifacts@` is `HPC_STUDY_ARTIFACTS` (`Site.study_artifacts`, recorded in the state file for a
+hand-run `core` step; an unset key is no value, so a placeholder is never written empty). `preflight` refuses a site
+without it when the template names it, and artifacts the server cannot run from, before a job is held
+(`fedtools.check_artifacts`); `write_facts` loads the written file as a campaign does and checks its slots against the
+layout (`fedtools.check_rendered`), so a federation is not ready on a file the core refuses or one whose rights are not
+what was provisioned. A template with no `[slots]` takes none of these paths.
 
 The core's platform layer (gate, health, link check, faults) points at `<root>/platform.toml` wherever it runs,
 provided it reaches the services' 8443 and reads the root. A layout's link check covers the pairs its

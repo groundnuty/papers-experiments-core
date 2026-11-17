@@ -86,9 +86,6 @@ generated `layouts/storage-import.compose.yaml` and `layouts/storage-import.plat
 | `[spaces.<name>] import` | a table `{ readonly, source_env }` for a space its owner holds on an imported POSIX storage: `readonly` says whether the platform may write to it, `source_env` names the environment variable that holds the host directory of the dataset, never a path; the space must declare `baseline = false` (see "An imported space") |
 | `[spaces.<name>] agent_visible` | `false` for a space the day-0 checks alone use: no user of the agent may be a member, and it is never the study space |
 | `[principals.<user>] privileges`, `spaces` | a fixed user's exact privileges, in the study space unless `spaces` names others |
-| `[slots.<name>] data_path`, `toolserver` | O83: the two principals a leased slot gives a run: the user whose token reads the data (exactly `space_view` and `space_read_data`) and the user whose token the tool server gets (exactly its conditions' rights); each a declared principal, in one slot only, `agent` true, a member of the same spaces as every other slot user |
-| `[toolserver] command`, `args`, `clone`, `commit`, `start_timeout_s` | O83: the server the slots' users run: a Python interpreter and `-m <module>` (the launcher of O73 starts it), the pinned checkout and its forty-digit commit; each path under `@study_artifacts@` |
-| `[toolserver.conditions.<name>] allow`, `rights`, `manifest` | O83: the condition's allow-list, the rights a slot's tool-server user holds exactly, and its frozen manifest under `@study_artifacts@` |
 | `[principals.<user>] agent` | `false` for a user the agent's tokens are never minted for (the harness's or the day-0 checks'); only such a user may join a space with `agent_visible = false` |
 
 Every key is checked when the file is read, and a refusal names the file and the key: names are unique and usable as
@@ -96,21 +93,24 @@ Compose services and domain labels, ports lie in 1024-65535 and never clash, eve
 provider, the study space and every member's space are declared, and nothing but `127.0.0.1` can be named as an
 address. The images stay the two pinned ones whatever the layout says.
 
-**Slots and a tool server (O83).** A slot is a lease key that gives a run two users, and the tool server runs as one of
-them; neither federation made them before, and the day-0 slots used a copy of the layout and a platform file by hand.
-`[slots.<name>]` pairs two `[principals.<user>]`, so `up` provisions a slot's users as it provisions every principal: the
-zone user, its password in a 0600 file of `secrets/users/` (never replaced), and its membership of each declared space
-with exactly the declared privileges, read back directly and effectively. `[toolserver]` and its conditions say what the
-server is and which rights each condition's token holds; a condition's rights must be exactly some slot's tool-server
-user's privileges, so no condition lacks a slot to lease. The layout is checked, when read, by the rules the platform
-layer applies to the same slots, and `platform.toml` gets `[slots.*]` and `[toolserver]` after the template's text
-(`fedtools.additions`, the function the HPC driver calls too; a template that declares them itself is refused), with each
-condition's frozen manifest copied into `toolserver/manifests/` of the root. Paths lie under `@study_artifacts@`, which a
-Compose deployment gives as `EXPCORE_FED_STUDY_ARTIFACTS` (an absolute path of plain characters, no `..`) and the HPC
-driver from `HPC_STUDY_ARTIFACTS`; `up` and `reset --clean` refuse, before anything is touched, an interpreter that does
-not run, a clone that is not at the pinned commit and a manifest that is not its condition's allow-list. The file is then
-loaded as a campaign loads it, its slots as the lease pool reads them. A layout with no slot renders what it always did.
-`deploy/hpc-federation/layouts/pilot-shape-slots.toml` is an example.
+**Slots and a tool server (O83).** A slot gives a run two users and the tool server runs as one of them; neither federation
+made them before, and the day-0 slots used a copy of the layout and a platform file by hand. A slot's users are ordinary
+`[principals.<user>]`, so `up` provisions them as it provisions every principal: the zone user, its password in a 0600 file
+of `secrets/users/` (never replaced), and its membership of each declared space with exactly the declared privileges, read
+back directly and effectively. The platform template declares the slots and the server (`[slots.<name>.data_path]` and
+`.toolserver`, each a `username` and `user_id = "@user_id.<username>@"`, the tool-server user's `rights`; `[toolserver]` and
+its conditions, with paths under `@study_artifacts@`). A **slot user that already exists is never changed**: made by hand or
+by an earlier up, it is verified, recorded `matched` in `facts.json` (`slot_users`) with nothing sent for it, or refused
+naming the user and the attribute (`password`, `membership of <space>`, `direct privileges in <space>`, `effective
+privileges in <space>`, `spaces`, `group`, `cluster`); a fixed principal is converged as it always was. The written file is
+loaded as a campaign loads it, and checked against the layout's principals (`fedtools.check_rendered`): a slot user that is
+no principal, an id that is not the facts', a data-path user with more than the baseline, and `rights` that are not exactly
+the privileges the layout gave the tool-server user are refused, so what the file says is what was provisioned.
+`@study_artifacts@` is the directory of the study's own files, `EXPCORE_FED_STUDY_ARTIFACTS` here (an absolute path of plain
+characters, no `..`) and `HPC_STUDY_ARTIFACTS` for the HPC driver; `up` and `reset --clean` refuse, before anything is touched,
+a template that names it with none given, a command that is no executable file, a clone that is not at the pinned commit and
+a frozen manifest that is not its condition's allow-list. `deploy/hpc-federation/layouts/pilot-shape-slots.toml` and its
+template are an example.
 
 A space the agent must never reach, such as one only the day-0 checks write to, is declared `agent_visible = false`.
 No user of the agent is a member of it, so no token the agent holds reaches it whatever its caveats, and the data-path
@@ -338,7 +338,7 @@ uv run python -m expcore_onedata.day0 /mnt/volume2/expcore-federation/platform.t
 what the agent meets, so it runs against a platform file the root's is not. The file needs a space whose data provider
 is not the agent's local provider, with a third provider beside them; a sanctioned `[faults]` table (the injector's,
 whose journal and Compose project are required); a `[sandbox]` table with a level that maps to the mount and the
-sidecar on the federation's network, derived as `tests/support/mount_live.py` derives the mount test's; `[slots]` (a layout may declare them, O83, "Slots and a tool server"), whose
+sidecar on the federation's network, derived as `tests/support/mount_live.py` derives the mount test's; `[slots]` (a platform template may declare them, O83, "Slots and a tool server"), whose
 users the sandbox and the tool server lease, each slot's `toolserver` declaring the rights its user holds (`rights`: the
 condition's below, since the check leases from the condition's group, O31); and a `[toolserver]` condition whose
 allow-list has `get_file_distribution`, `list_space_providers`, `schedule_file_replication` and `get_transfer`, with its

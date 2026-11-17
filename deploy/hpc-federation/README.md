@@ -225,7 +225,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `B` | the bundle on a filesystem the nodes see (`<shared_root>/hpc-federation/bundle`), `chmod -R go-w` |
 | `SH` | a 0700 directory for the two rootfs tarballs, each with its `.provenance` (SHA-256): single files only (`<scratch_root>/hpcop-images`) |
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
-| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's interpreter and venv, the pinned clone and the frozen manifests), an absolute path of plain characters with no `..`, on a filesystem the login node and the agent's node both see; the layout's `@study_artifacts@` (O83) |
+| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's interpreter and venv, the pinned clone and the frozen manifests), an absolute path of plain characters with no `..`, on a filesystem the login node and the agent's node both see; a platform template's `@study_artifacts@` (O83) |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository.
@@ -351,28 +351,28 @@ this way is owed the checks of `DESIGN.md` section 9, item 7.
 
 ## Slots and the tool server (O83)
 
-The tool-server arm needs a slot's users, and a layout declares them: `layouts/pilot-shape-slots.toml` is the pilot's
-shape with two slots, one for a read-only condition and one for a writing one, and a `[toolserver]` (its declarations are
-the Compose federation's own, `deploy/compose-federation/README.md`, "Slots and a tool server"). A slot pairs two
-principals, so `up` provisions its users with the Compose bootstrap's own steps: the zone user, its password in a 0600
-file of `secrets/users/` (in no cell, `gate.json`, fact, record, log or message), its membership of each declared space
-with exactly the declared privileges, and the storage mapping to the job's uid that every principal gets. `platform.toml`
-then holds `[slots.*]` (each user's id from the facts, each tool-server user's `rights` its privileges) and
-`[toolserver]` after the template's text, written by the function the Compose renderer calls too, so one layout renders
-the same tables on both platforms; the template declares neither. A layout with no slot renders the file it always did.
+The tool-server arm needs a slot's users. `layouts/pilot-shape-slots.toml` is the pilot's shape with the four users of two
+slots as ordinary principals, and its template, `pilot-shape-slots.platform.toml.template`, is the pilot's with the
+slots and a `[toolserver]` after it (the Compose federation's own form, `deploy/compose-federation/README.md`, "Slots
+and a tool server"). `up` provisions the users with the Compose bootstrap's own steps: the zone user, its password in a
+0600 file of `secrets/users/` (in no cell, `gate.json`, fact, record, log or message), its membership of each declared
+space with exactly the declared privileges, and the storage mapping to the job's uid that every principal gets. **A slot
+user that already exists is verified and never changed**: exactly as declared, it is recorded `matched` in `facts.json`
+with nothing sent; any difference is refused naming the user and the attribute. The template's `[slots]` takes each id as
+`@user_id.<username>@` from the facts, and the written file is checked against the layout (a slot user that is no
+principal, `rights` that are not exactly the privileges the layout gave the user, a data-path user with more than the
+baseline are refused) and loaded as a campaign loads it, so `up` fails there, not at the first run.
 
 The tool server runs from the study's artifacts directory, `HPC_STUDY_ARTIFACTS` in `site.env`, which the pilot fills
 with its interpreter and venv, the pinned onedata-mcp clone and one frozen manifest per condition
 (`python -m expcore.tools.manifest freeze`, run with the condition's allow-list). Before any job is held `up` refuses a
-site without the variable, an interpreter that is no executable file, a clone that is not at the pinned commit with no
-change to a tracked file, and a manifest that is not its condition's (edited, or showing other tools than the
-allow-list); each message names the condition by its position and no path. The core's phase copies the manifests into
-`<root>/toolserver/manifests/` and names the copies by absolute path, as every path of the file, so a copy of
-`platform.toml` beside a study reads the root's own. The server is started through the resolve launcher (`<interpreter>
--I -B resolve_launch.py <map> -- -m <module>`, "Registered names"). The file is then loaded as a campaign loads it, its
-slots as the lease pool reads them, and `up` fails there, not at the first run, on a missing credential, a condition no
-slot serves or a slot user of other spaces than the file's. Owed to the next HPC slot: a B2 run whose tool calls
-succeed, whose rights refusals match Compose's for the same layout, and whose visible-names counts are zero.
+site without the variable when the template names it, a command that is no executable file, a clone that is not at the
+pinned commit with no change to a tracked file, and a manifest that is not its condition's (edited, or showing other
+tools than the allow-list); each message names the condition by its position and no path. The server is started through
+the resolve launcher (`<interpreter> -I -B resolve_launch.py <map> -- -m <module>`, "Registered names"), so `command` is a
+Python interpreter and `args` start with `-m <module>`: a console script behind `/usr/bin/env` is refused when the file is
+loaded. Owed to the next HPC slot: a B2 run whose tool calls succeed, whose rights refusals match Compose's for the same
+layout, and whose visible-names counts are zero.
 
 ## The driver: `hpcfed.py`
 
@@ -549,9 +549,10 @@ allowed). `tests/deploy/test_hpc_fed_plan.py`, `test_hpc_fed_updown.py` and `tes
 against a fake Slurm (O57): the layout's sizes and the held job's shape, the submit read-back, every step's form and
 allowlist, a hung client and a step past its bound, the state file, `up`'s placement, peers and token pipes, `down`
 after a whole or a partial `up`, the core's phase writing `platform.toml` and the ten-pair link-check record, and
-`zone-export.sh` on a stand-in work directory. `tests/deploy/test_hpc_fed_slots.py` (O83) provisions a layout's slots with
-the Compose bootstrap and the HPC one over a fake zone each, renders the pilot's slot layout through the core's phase and
-loads the file with its map, slots and tool server, and runs the driver's preflight over the site's study directory. `tests/deploy/test_hpc_oneclient_bundle.py` builds the oneclient bundle
+`zone-export.sh` on a stand-in work directory. `tests/deploy/test_hpc_fed_slots.py` and `test_hpc_fed_slots_provision.py` (O83) provision a layout's slots with
+the Compose bootstrap and the HPC one over a fake zone each (an existing slot user matched or refused, never changed),
+render the pilot's slot layout through the core's phase and load the file with its map, slots and tool server, and run the
+driver's preflight over the site's study directory. `tests/deploy/test_hpc_oneclient_bundle.py` builds the oneclient bundle
 from invented images against a fake Docker (O65): the closure inside the image, the scratch container's discipline, a
 reproducible tar and the self-check's refusals. The bundle's wider offline suite reads files copied out of the two pinned images
 (patch drift, the images' binaries under the shim) and is not in the repository; neither are those files.

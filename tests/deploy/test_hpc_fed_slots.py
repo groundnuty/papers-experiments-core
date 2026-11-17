@@ -442,3 +442,16 @@ def test_o83_a_site_with_no_study_directory_fills_no_placeholder_for_it(hpc, sit
     assert "study_artifacts" not in hpcpins.values(hpc.settings.site_from_environment(site))
     filled = hpcpins.values(hpc.settings.site_from_environment({**site, "HPC_STUDY_ARTIFACTS": "/srv/study"}))
     assert filled["study_artifacts"] == "/srv/study"
+
+
+def test_o83_the_slot_layouts_template_is_the_pilots_template_with_the_slots_and_the_tool_server_after_it():
+    """O83: the example's template adds the tables and changes nothing of the pilot's, so a change to the pilot's
+    template (a pin, a table) cannot leave the example behind."""
+    pilot = (HPC / "layouts" / "pilot-shape.platform.toml.template").read_text(encoding="utf-8")
+    slots = (HPC / "layouts" / "pilot-shape-slots.platform.toml.template").read_text(encoding="utf-8")
+
+    def body(text):  # the header comment is the one line that differs
+        return text[text.index("zone = {") :]
+
+    assert body(slots).startswith(body(pilot).rstrip("\n"))
+    assert "[slots.slot-1.data_path]" in body(slots)[len(body(pilot).rstrip("\n")) :]
