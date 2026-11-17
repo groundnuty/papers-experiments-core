@@ -116,3 +116,13 @@ def test_the_counts_are_by_flag_state_and_by_kind(prereg):
         "channel_patch": 0,
         "channel_name": 1,
     }
+
+
+def test_the_counts_by_kind_include_a_kind_found_beyond_the_hit_cap(prereg):
+    """O91: the stored hits are cut at MAX_HITS, the counts by kind are not."""
+    rows = rows_of_pairs(2)
+    long_run = ["open('/proc/self/environ')"] * 200 + ["p = '/expcore-readlog/sock'"]
+    done = read_log_analysis(runs_for(rows, lambda i: long_run if i == 0 else ["print(1)"]), rows, [], prereg)
+    assert done.runs[0].scan["hits_cut"] is True
+    counts = done.counts()
+    assert (counts["flagged"], counts["channel_path"], counts["proc_environ"]) == (1, 1, 1)

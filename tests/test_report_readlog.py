@@ -166,6 +166,7 @@ def test_s20_analysis_json_holds_every_run_s_hits_and_the_sensitivity_analysis()
         ("unix_datagram", "AF_UNIX+SOCK_DGRAM", 0),
     ]
     assert summary["scan_version"] == 1
+    assert k1["kinds"] == ["channel_path", "unix_datagram"]
     assert summary["sensitivity"]["left_out"] == ["k1", "k2"]
 
 

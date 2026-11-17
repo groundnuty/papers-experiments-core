@@ -1199,6 +1199,7 @@ def _read_log_summary(scanned: ReadLogAnalysis) -> dict[str, Any]:
         "runs": [
             {
                 "run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "flagged": run.flagged,
+                "kinds": list(run.kinds),
                 "hits": [{"cell": h["cell"], "kind": h["kind"], "what": h["what"]} for h in run.scan["hits"]],
                 "hits_cut": run.scan["hits_cut"],
             }

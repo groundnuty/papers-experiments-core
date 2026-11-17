@@ -41,7 +41,7 @@ KEYS = ("reruns",)
 
 
 def names_problem(names: object) -> str | None:
-    """Why `names` is not a declaration of reruns (a list of the four names, none twice); None when it is one."""
+    """Why `names` is not a declaration of reruns (a list of the five names, none twice); None when it is one."""
     if not isinstance(names, list | tuple) or not all(isinstance(name, str) for name in names):
         return f"must be an array of names from {', '.join(RERUNS)}"
     for name in names:

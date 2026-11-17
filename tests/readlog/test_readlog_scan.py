@@ -63,6 +63,7 @@ def test_ordinary_code_and_a_canonical_script_run_by_its_path_are_not_flagged(ce
         "cells": 1,
         "hits": [],
         "hits_cut": False,
+        "kinds": [],
         "flagged": False,
     }
 
@@ -118,10 +119,30 @@ def test_more_hits_than_the_cap_are_cut_and_say_so(monkeypatch):
     monkeypatch.setattr(scan, "MAX_HITS", 1)
     done = scan_cells(["open('/proc/1/environ')\nx = '/expcore-readlog'"])
     assert (len(done["hits"]), done["hits_cut"], done["flagged"]) == (1, True, True)
+    assert done["kinds"] == ["channel_path", "proc_environ"]  # the kinds are of every hit, the cut ones included
+
+
+def test_a_kind_found_only_beyond_the_cap_is_still_a_kind_of_the_run():
+    """O91: 200 cells of one kind and a 201st of another: the stored hits are the first 200, and the run's kinds, which
+    the report and analysis.json count by, name both."""
+    cells = ["open('/proc/self/environ')"] * scan.MAX_HITS + ["p = '/expcore-readlog/sock'"]
+    done = scan_cells(cells)
+    assert (done["cells"], done["flagged"], done["hits_cut"]) == (scan.MAX_HITS + 1, True, True)
+    assert {hit["kind"] for hit in done["hits"]} == {"proc_environ"}
+    assert done["kinds"] == ["channel_path", "proc_environ"]
+    run = record(cells=cells)
+    assert judge(run, "cond-a").kinds == ("channel_path", "proc_environ")
 
 
 def test_a_run_with_no_cells_is_clean():
-    assert scan_cells([]) == {"version": scan.SCAN_VERSION, "cells": 0, "hits": [], "hits_cut": False, "flagged": False}
+    assert scan_cells([]) == {
+        "version": scan.SCAN_VERSION,
+        "cells": 0,
+        "hits": [],
+        "hits_cut": False,
+        "kinds": [],
+        "flagged": False,
+    }
 
 
 def test_the_scan_has_a_version_of_its_own_and_the_egress_scans_does_not_move_with_it(monkeypatch):

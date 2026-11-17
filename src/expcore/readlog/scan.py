@@ -29,7 +29,8 @@ string `code` property, run or not) and finds:
 - `channel_patch`: a patch of the client or of `socket` that would hide a real read: an assignment to or a `setattr` on
   an attribute of `socket` or of the client module, a use of `sys.modules`, an `importlib.reload` or a load of a module
   from a file (`spec_from_file_location`, `module_from_spec`, `SourceFileLoader`), `monkeypatch`, `mock.patch` or
-  `unittest.mock`, and `builtins` or `__builtins__`;
+  `unittest.mock`, `builtins` or `__builtins__`, and `runpy`, which runs a script in the agent's own process, where a
+  patch reaches it (the assignment is flagged to any depth, `socket.socket.send = ...`, and for `_socket` too);
 - `channel_name`: the bare word `readlog`, in any case and set off from letters and digits (`readLogFile` is not it),
   where nothing above names the channel in the cell (a directory listing filtered by it, say). A study should not name
   its own scripts or functions `readlog`.
@@ -98,6 +99,7 @@ NAMES = (
     (CHANNEL_PATCH, "module reload or load by path"),
     (CHANNEL_PATCH, "patch or mock"),
     (CHANNEL_PATCH, "builtins override"),
+    (CHANNEL_PATCH, "in-process script run"),
     (CHANNEL_NAME, "readlog"),
 )
 
@@ -129,7 +131,8 @@ _DISCOVERY = {
 # reloaded or loaded from a file, a mock, and the builtins
 _PATCHES = {
     "socket or client attribute assignment": re.compile(
-        r"(?<![\w.])(?:socket|expcore_readlog_client)\.\w+\s*=(?!=)|\bsetattr\(\s*(?:socket|expcore_readlog_client)\b"
+        r"(?<![\w.])(?:_?socket|expcore_readlog_client)(?:\.\w+)+\s*=(?!=)"
+        r"|\bsetattr\(\s*(?:_?socket|expcore_readlog_client)\b"
     ),
     "sys.modules": re.compile(r"\bsys\.modules\b"),
     "module reload or load by path": re.compile(
@@ -140,6 +143,7 @@ _PATCHES = {
         r"\bmonkeypatch\b|\bmock\.patch\b|\bunittest\.mock\b|\bfrom\s+unittest\s+import\s+mock\b"
     ),
     "builtins override": re.compile(r"\bbuiltins\b|__builtins__"),
+    "in-process script run": re.compile(r"\brunpy\b"),
 }
 
 
@@ -232,10 +236,12 @@ def scan_cells(cells: Sequence[str]) -> dict[str, Any]:
         index, what = split
         found.append({"cell": index, "kind": UNIX_DATAGRAM, "what": what})
         found.sort(key=lambda hit: (hit["cell"], NAMES.index((hit["kind"], hit["what"]))))
+    held = {hit["kind"] for hit in found}
     return {
         "version": SCAN_VERSION,
         "cells": len(cells),
         "hits": found[:MAX_HITS],
         "hits_cut": len(found) > MAX_HITS,
+        "kinds": [kind for kind in KINDS if kind in held],  # of every hit, the ones past MAX_HITS included
         "flagged": bool(found),
     }

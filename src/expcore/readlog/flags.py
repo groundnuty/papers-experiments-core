@@ -37,8 +37,8 @@ class RunReadLog:
 
     @property
     def kinds(self) -> tuple[str, ...]:
-        """The kinds of hit the run has, in the order of `KINDS`."""
-        held = {hit["kind"] for hit in self.scan["hits"]}
+        """The kinds of hit the run has, in the order of `KINDS`, of every hit: the ones past the stored cap too."""
+        held = set(self.scan["kinds"])
         return tuple(kind for kind in KINDS if kind in held)
 
 
