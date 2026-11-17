@@ -25,9 +25,10 @@ Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded fir
 * a mount: oneclient on the node, outside every cell, by the helper of hook (c) (`mounthook.py`, `hostmount.py`); a
   mount run is refused at its start without the helper, without `[sandbox.mount]`, and by the helper itself for a
   direct mount (HPC mounts are proxy-only until the direct-I/O comparison passes);
-* no name server: every cell binds a `resolv.conf` that names none and an `nsswitch.conf` whose hosts are `files`, so
-  the C library resolves the names of `/etc/hosts` alone: the federation's, as Docker's `--add-host` gives them
-  (`facts.py`, `dns_none`);
+* no name server: every cell binds the neutral `resolv.conf` (`cellresolv`: no name server, no search or domain line,
+  the file a Docker agent binds too) and an `nsswitch.conf` whose hosts are `files`, so the C library resolves the
+  names of `/etc/hosts` alone: the federation's, as Docker's `--add-host` gives them (`facts.py`, `dns_none`); the
+  start has a cell read the file back, and the run records its hash (`resolv_conf_sha256`);
 * every cell one `apptainer exec --containall` (`cells.py`, `argv.py`), the root of the image and every bind but
   `/work`, `/tmp` and `/dev/shm` read-only, proved at the start as on Docker, with the read-only inputs (O20).
 * every cell's command under `prlimit --nofile=N:N` and `taskset -c <cores>` (`limits.py`, O70): the open-file limit
@@ -61,7 +62,17 @@ from expcore.config.loading import ConfigError
 from expcore.egress import Declaration, declaration
 from expcore_onedata import tls as TLS
 from expcore_onedata.fault_drain import GATE, MOUNT
-from expcore_onedata.sandbox import cellhost, gatelog, gatepolicy, hostfacts, infrafacts, inputs, kinds, tokenfiles
+from expcore_onedata.sandbox import (
+    cellhost,
+    cellresolv,
+    gatelog,
+    gatepolicy,
+    hostfacts,
+    infrafacts,
+    inputs,
+    kinds,
+    tokenfiles,
+)
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
@@ -354,6 +365,7 @@ class ApptainerSandbox:
         self._start_cells()
         self._canary()
         self._verify_read_only()
+        self._verify_resolv()
         self._verify_work_disk()
         self._verify_inputs()
         self._new_refusals()  # whatever the start's own steps met is not the agent's first cell's
@@ -630,6 +642,18 @@ class ApptainerSandbox:
             log.error("read-only probe of the root said %r (%s)", r.stdout.strip(), describe_stderr(r.stderr))
             raise SandboxError("the root is not read-only for the agent")
         self._meta["read_only_verified"] = {"root": True}
+
+    def _verify_resolv(self) -> None:
+        """O56: a cell reads its /etc/resolv.conf back, and the start fails unless it is the neutral file the cell binds
+        (`cellresolv`), as on Docker; the record keeps the hash the cell read, never the text. A bind that did not take
+        would show the node's own file, with its search domain and name server."""
+        r = self._cells.run(cellresolv.PROBE, PROBE_S, record=False)
+        digest, problem = cellresolv.judge(r.exit_code, r.stdout)
+        if problem is not None:
+            log.error("resolv.conf probe: %s (%s)", problem, describe_stderr(r.stderr))
+            raise SandboxError(problem)
+        with self._meta_lock:
+            cellresolv.note(self._meta, digest)
 
     def _verify_work_disk(self) -> None:
         """O71: the work disk proved before the agent's first cell, or the start fails. The first start of this driver

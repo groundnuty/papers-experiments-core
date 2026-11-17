@@ -62,6 +62,7 @@ from expcore_onedata import tls
 from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import (
     cellhost,
+    cellresolv,
     copyout,
     directio,
     gatelog,
@@ -396,6 +397,7 @@ class DockerSandbox:
         )  # fmt: skip
         self._cells.init_sleep = self._init_sleep
         self._verify_read_only()
+        self._verify_resolv()
         if share and s.mount.io_mode == DIRECT:
             self._verify_direct_io()
         self._verify_inputs()
@@ -728,12 +730,22 @@ class DockerSandbox:
             out[path] = bundle
         return out
 
+    def _write_resolv(self) -> Path:
+        """The run's own copy of the neutral /etc/resolv.conf (`cellresolv`, O56), the file the agent's container binds
+        read-only over the engine's own. 0444, so the agent's user reads it whatever the driver's umask; the bind is of
+        this copy and never of a path a study names."""
+        path = self.dir / "resolv.conf"
+        path.write_text(cellresolv.RESOLV_TEXT, encoding="utf-8")
+        path.chmod(0o444)
+        return path
+
     def _start_agent(self, work: Path, share: Path | None, gate_ip: str | None, gate_hosts: list[str]) -> None:
         s, sp = self.s, self.spec
         rest = sp.mode is DataPathMode.REST
         args, env = agent_run_args(
             s, self.names, self._label_args(), image_id=s.agent.id, mode=sp.mode, work=work, share=share,
-            gate_ip=gate_ip, gate_hosts=gate_hosts, ca=self.dir / "tls" / "ca.pem" if rest else None,
+            resolv=self._write_resolv(), gate_ip=gate_ip, gate_hosts=gate_hosts,
+            ca=self.dir / "tls" / "ca.pem" if rest else None,
             trust_bundles=self._trust_bundles() if rest else {}, zone_host=self._agent_zone_host() if rest else None,
             inputs=self._input_copies,
         )  # fmt: skip
@@ -770,6 +782,18 @@ class DockerSandbox:
                 raise SandboxError(f"the {what} is not read-only for the agent")
             proved[what] = True
         self._meta["read_only_verified"] = proved
+
+    def _verify_resolv(self) -> None:
+        """Have a cell read /etc/resolv.conf back and refuse to hand out a sandbox whose agent reads anything but the
+        neutral file, which the engine's own, with the host's search domain, would be (O56). The record keeps the hash the
+        cell read, never the text."""
+        r = self._cells.run(cellresolv.PROBE, 60, record=False)
+        digest, problem = cellresolv.judge(r.exit_code, r.stdout)
+        if problem is not None:
+            log.error("resolv.conf probe: %s (%s)", problem, describe_stderr(r.stderr))
+            raise SandboxError(problem)
+        with self._meta_lock:  # `metadata()` may be reading it from another thread
+            cellresolv.note(self._meta, digest)
 
     def _verify_direct_io(self) -> None:
         """Show that the direct mount reads the local provider's storage itself, or refuse to hand the sandbox out (O40,

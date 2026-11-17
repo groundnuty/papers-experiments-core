@@ -81,13 +81,15 @@ FACTS: dict[str, str] = {
         "the cgroup counts with the run's tmpfs files, are bounded by the step's limit alone"
     ),
     "dns_none": (
-        "a cell has no name server: its /etc/resolv.conf names none and its /etc/nsswitch.conf looks hosts up in "
-        "files alone, so the C library resolves the names of /etc/hosts (the federation's, on the loopback) and no "
-        "other; a program with a resolver of its own can still send a query, which is egress like any other. This "
-        "is no departure from Docker: the agent's network there is --internal with --add-host entries and no --dns; "
-        "the engine's embedded resolver (127.0.0.11) answers every outside name with SERVFAIL at once (no addresses, "
-        "no timeout), the --add-host names resolve only through /etc/hosts, and a connect to an outside address "
-        "fails at once with ENETUNREACH (no default route); measured on engine 29.2.1"
+        "a cell has no name server: its /etc/resolv.conf is the neutral file a Docker agent binds too (no nameserver, "
+        "search or domain line) and its /etc/nsswitch.conf looks hosts up in files alone, so the C library resolves "
+        "the names of /etc/hosts (the federation's, on the loopback) and no other; a program with a resolver of its "
+        "own can still send a query, which is egress like any other. This is no departure from Docker: the agent's "
+        "network there is --internal with --add-host entries and no --dns, and its sandbox binds the same "
+        "resolv.conf (O56, resolv_conf_sha256 in the record of both). Measured on engine 29.2.1, before that bind, "
+        "the engine's embedded resolver (127.0.0.11) answered every outside name with SERVFAIL at once (no "
+        "addresses, no timeout), the --add-host names resolved only through /etc/hosts, and a connect to an "
+        "outside address failed at once with ENETUNREACH (no default route)"
     ),
     "disk_watch": (
         "/work, /tmp and /dev/shm are directories on the node's tmpfs, charged to the step's memory: the watch "
