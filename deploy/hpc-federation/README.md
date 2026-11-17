@@ -857,6 +857,43 @@ shards are not final (see "Moving a shard" under the fleet); it writes no `archi
 the archives later (a root archive whose federation the shard has left is put aside under `<label>.<12 hex digits>.root.*`
 and listed too). The archives are mode 0600.
 
+**One federation that ran no campaign: `collect --roots-only --root ROOT --into DIR`.** A stop measurement through the
+relay's verbs, say, leaves the state file, the fault journal and the relay's journals in the root and no step record, and
+has no shard plan (a plan names at least two shards), so neither plan form reaches it. This form takes the one root and no
+`--manifest`; `--root` together with `--manifest`, `--shard` or `--run` is refused, and so is `--root` without
+`--roots-only` or without `--into`. It archives the root's evidence **exactly as the plan form does** (the same allow-list,
+never `secrets/`; a link, or a file that holds the content of a secret, refuses it, naming the file and never the value)
+to `DIR/federation.root.tar` and `DIR/federation.root.json`, mode 0600, and lists the pair in `DIR/archives.sha256.json`
+(0600) of a **root-only form** that `verify-copy` accepts: `{"format": "expcore-hpc-root-archives/1", "evidence": [...]}`,
+where `evidence` names exactly the `.root.tar` and the `.root.json` of one stem, each with size and SHA-256, and no other key
+(the full form `expcore-hpc-archives/1`, which refuses an empty list of archives, is unchanged). The manifest's SHA-256 is
+the only line of stdout, for `verify-copy --manifest-sha256`; the rest goes to stderr. **Last,** once the copy is in `DIR`,
+it writes `evidence-collected.json` in the root, which is what lets `down` go on. If the marker cannot be written the collect
+fails (exit 2) **and the copy stays in `DIR`**, never removed: the error can come after the marker's rename (the sync of the
+root's directory), when the root already holds a current marker, so a copy deleted then would leave the marker and no
+evidence. The same command run again says `already collected` and exits 0 if the marker landed; otherwise collect into a new
+directory. A root that holds step records is collected
+with a warning: the shards' own archives are not part of this form.
+
+`DIR` must be new, or empty and private (0700), and may never be the root, inside it (`down` removes the root with whatever
+is in it) or above it; a link is refused. **A copy is never replaced.** The same command run again while the evidence is
+unchanged and `DIR` holds its copy says so, exits 0 and rewrites nothing. If a journal line was written after the collect (a
+relay verb's late-step watch, or another verb), `down` refuses the root as changed, and the evidence is collected again into
+a **new** directory, which is then the copy to pull; the first directory stays as it was. A root that is not there, is a link
+(never followed), is not a directory or holds no `hpc-federation.json` as a plain file is refused with nothing made.
+
+**The order for a stop measurement on a single federation is: collect, pull, verify-copy, then `down`, and never
+`--discard-evidence`,** which removes the root without its evidence:
+
+```sh
+# on the login node, from a private 0700 directory of ours, while the federation is up and the relay's verbs have ended
+python3 -I -B deploy/hpc-federation/shards.py collect --roots-only --root ROOT --into DIR   # prints the manifest's SHA-256
+# on your host: pull DIR, then check it against that hash
+python3 -I -B deploy/hpc-federation/shards.py verify-copy LOCAL/archives.sha256.json LOCAL --manifest-sha256 HASH
+# only then, on the login node:
+hpcfed.py down ...
+```
+
 **The root archive and `pass-env.json` are private evidence.** The state file and the facts name nodes and site paths, the
 state file also the account and the administrator's address (no secret, but the site's own), and `pass-env.json` a site
 path. They are for the operator: keep the pulled copies like the journals, and never publish them. `expcore package` can
@@ -881,10 +918,10 @@ empty directories, a lock and a heartbeat). A root after `up` alone, or a failed
 as it always did, so an emergency teardown is never blocked. A root with evidence and **no current marker** is refused,
 naming its shards (or, with no step record, the kinds of evidence it holds: the fault journal, the relay's journals, a
 shard claim, the day-0 wiring; never a file), and stays whole so that a `collect` can still read it; **`shards.py collect
---roots-only --shard L` marks a root with no step record** (it works from the shard plan, which must name the root; a
-plan has at least two shards, so a single federation's Day-0 root needs a manifest that names another shard too), and a
-root no plan names, or one the collect refuses (a link, a special file, a file holding a secret), is removed with
-`--discard-evidence`. A Day-0 run leaves evidence in the root only through the injector's journal and the relay's files,
+--roots-only --root ROOT --into DIR` marks a single federation's root with no plan** (above), **and `--roots-only --shard
+L` marks one a shard plan names** (a plan has at least two shards); a root the collect refuses (a link, a special file, a
+file holding a secret) is removed with `--discard-evidence`, and for a stop measurement that is never the way out of a
+missing collect. A Day-0 run leaves evidence in the root only through the injector's journal and the relay's files,
 which need a platform with `[faults]`: its own report, and the checks that only read, are written under its `--out`
 directory, never in the root, so `down` does not see them.
 The runbook order stays **collect, pull and verify, then `down`.** `down` reads the root's evidence again and compares it
