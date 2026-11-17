@@ -83,7 +83,7 @@ def test_o72_the_record_of_a_cell_that_hit_its_deadline_says_it_ran_and_timed_ou
     record = recorded(sbx)
     cell, _ = record.tool_calls
     assert (cell["status"], cell["error_class"]) == ("error", "timeout")
-    assert cell["text"] == f"{KEPT}the code did not finish within the time limit and was stopped"
+    assert cell["text"] == f"timeout: {KEPT}the code did not finish within the time limit and was stopped"
     assert cell["raw_text"] == cell["text"]
     assert cell["exec_check"] == completion.UNKNOWN_FACTS
     assert cell["detail"] == ""

@@ -1,0 +1,316 @@
+{
+ "schema_version": "expcore-record/3",
+ "run_key": "task=task-a|model=model-a|seed=0",
+ "factors": {
+  "task": "task-a",
+  "model": "model-a",
+  "seed": 0
+ },
+ "attempt": 1,
+ "treatment_kinds": [],
+ "route": {
+  "backend": "stub",
+  "model": "stub",
+  "base_url": null,
+  "seed": 0,
+  "seed_honoured": false,
+  "synthetic_tokens": true,
+  "settings_sent_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "settings": {
+   "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a": {}
+  }
+ },
+ "prompt": {
+  "system": {
+   "text": "be brief",
+   "sha256": "b0d336336bae9756708102764ccc977778d8c408df38d7050d69f9e4d22c9a43",
+   "template_sha256": null,
+   "slots": null
+  },
+  "user": {
+   "text": "do the task",
+   "sha256": "abe1e9e3f801509e9c0712b32eb6f7b1bfd3a910e1c38eaa578c884790dc08e8",
+   "template_sha256": null,
+   "slots": null
+  },
+  "tools_sha256": "7e9c606832571639e67f26076992167f38f88c1d990f24a952779b27ca59c577"
+ },
+ "tools": [
+  {
+   "name": "python",
+   "description": "Run Python code in the sandbox and return what it printed. State does not carry between calls.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "code": {
+      "type": "string",
+      "description": "Python source to run."
+     }
+    },
+    "required": [
+     "code"
+    ],
+    "additionalProperties": false
+   },
+   "terminal": false
+  }
+ ],
+ "agent_config": {
+  "limits": {
+   "max_tool_rounds": 10,
+   "time_cap_s": 1.5,
+   "token_budget": 100000,
+   "output_cap_chars": 200,
+   "max_output_tokens": 4096
+  },
+  "malformed_policy": "report",
+  "ceiling_s": 4.5,
+  "ceiling_kind": "ceiling",
+  "min_call_s": 1.0,
+  "ceiling_factor": 3.0,
+  "cleanup_deadline_s": 10.0,
+  "terminal_tools": []
+ },
+ "agent_config_sha256": "2d0995bc35dfd9a09e6284e0eb174cf68f0b230f5158417940241a718fd83bcf",
+ "code": {
+  "commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "dirty": false,
+  "source": "git",
+  "stale": false,
+  "why": null,
+  "tree_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+ },
+ "core_version": "0.1.0",
+ "transcript": [
+  {
+   "index": 0,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_1_0",
+      "name": "python",
+      "arguments": {
+       "code": "print('partial output'); open('/data/x').read()"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1_0",
+      "type": "function",
+      "function": {
+       "name": "python",
+       "arguments": "{\"code\": \"print('partial output'); open('/data/x').read()\"}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_1_0",
+     "content": "timeout: partial output\nthe code did not finish within the time limit and was stopped"
+    }
+   ],
+   "request_sha256": "f86f4da3c86618770cf5929aaba0accd8bd097e6421f5f69ad7ec16f2fb3edc3",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 4,
+    "output_tokens": 15,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  },
+  {
+   "index": 1,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_2_0",
+      "name": "python",
+      "arguments": {
+       "code": "print('next')"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_2_0",
+      "type": "function",
+      "function": {
+       "name": "python",
+       "arguments": "{\"code\": \"print('next')\"}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_2_0",
+     "content": "skipped: not completed: this call failed and the attempt ended"
+    }
+   ],
+   "request_sha256": "481e2765ed09346f5a7bb5623fc0bd05febe446226ed2cc8fc413fc20e1b73eb",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 40,
+    "output_tokens": 7,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  }
+ ],
+ "failed_request": null,
+ "tool_calls": [
+  {
+   "turn": 0,
+   "round": 1,
+   "call_id": "call_1_0",
+   "name": "python",
+   "arguments": {
+    "code": "print('partial output'); open('/data/x').read()"
+   },
+   "status": "error",
+   "text": "timeout: partial output\nthe code did not finish within the time limit and was stopped",
+   "raw_text": "timeout: partial output\nthe code did not finish within the time limit and was stopped",
+   "raw_chars": 85,
+   "truncated": false,
+   "error_class": "timeout",
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true,
+   "elapsed_s": 0.0,
+   "exec_check": {
+    "source_whole": null,
+    "exit_status": null,
+    "nonce_matched": false
+   }
+  },
+  {
+   "turn": 1,
+   "round": 2,
+   "call_id": "call_2_0",
+   "name": "python",
+   "arguments": {
+    "code": "print('next')"
+   },
+   "status": "failed",
+   "text": "skipped: not completed: this call failed and the attempt ended",
+   "raw_text": "skipped: not completed: this call failed and the attempt ended",
+   "raw_chars": 62,
+   "truncated": false,
+   "error_class": "skipped",
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "infrastructure: cell_unkillable",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true,
+   "elapsed_s": 0.0
+  }
+ ],
+ "clock": [
+  [
+   "start",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "end",
+   1000.0
+  ]
+ ],
+ "outcome": {
+  "name": "infrastructure",
+  "detail": "the run was ended at cell 1's deadline (survived_kill): a process of the cell outlived its kill; the cell's own result stands: nothing more runs",
+  "infra_kind": "cell_unkillable",
+  "error_type": null,
+  "defect": null,
+  "treatment": false
+ },
+ "totals": {
+  "rounds": 2,
+  "malformed_calls": 0,
+  "malformed_events": [],
+  "tokens_used": 66,
+  "usage_incomplete": false,
+  "agent_s": 0.0,
+  "elapsed_s": 0.0,
+  "infra_wait_s": 0.0,
+  "infra_wait_by_kind": {},
+  "cleanup_s": 0.0,
+  "cleanup_timed_out": false,
+  "abandoned_threads": 0,
+  "final_text": null
+ },
+ "instruments": {},
+ "scores": {},
+ "redacted_paths": []
+}

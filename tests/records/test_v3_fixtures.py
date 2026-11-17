@@ -466,7 +466,7 @@ def test_o72_the_eleventh_fixture_pins_a_cell_that_hit_its_deadline_and_a_run_th
     record = load_record(eleventh[0])
     cell, refused = record.tool_calls
     assert (cell["name"], cell["status"], cell["error_class"], cell["detail"]) == ("python", "error", "timeout", "")
-    assert cell["text"] == "partial output\nthe code did not finish within the time limit and was stopped"
+    assert cell["text"] == "timeout: partial output\nthe code did not finish within the time limit and was stopped"
     assert cell["exec_check"] == {"source_whole": None, "exit_status": None, "nonce_matched": False}
     assert (refused["status"], refused["error_class"], refused["detail"]) == (
         "failed",
