@@ -384,7 +384,7 @@ def test_o74_a_step_with_no_expectation_and_no_record_runs_as_it_did_and_archive
 
 def test_o74_the_record_is_in_out_when_the_post_run_script_runs(shards, tmp_path, monkeypatch):
     """O74: the record is copied once the dispatcher has ended, before the post-run script and the archive: a script
-    that reads it from `out/study-state/` passes, and an out/ kept for `--archive-left` holds it already."""
+    that reads it from `out/study-state/` passes."""
     post = f"import pathlib, sys\npathlib.Path(sys.argv[2], '{STUDY_STATE}', '{FILE}').read_text()\n"
     root = federation_root(tmp_path, identity())
     args = step_args(tmp_path, identity(), post_run="post.py", post_run_sha256=sha(post), post_run_timeout=20.0)
