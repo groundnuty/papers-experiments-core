@@ -28,10 +28,10 @@ from expcore.models.adapters import ModelBackend
 from expcore.models.factory import build_backend
 from expcore.plugin import ToolProvider
 from expcore.prompt.templates import RenderedPrompt
-from expcore.records.build import DefectSink, PromptText, RunIdentity, record_attempt, redactor_for
+from expcore.records.build import DefectSink, PromptText, RunIdentity, model_secrets, record_attempt, redactor_for
 from expcore.records.injections import injected_targets
 from expcore.records.record import RunRecord
-from expcore.records.redact import Redactor
+from expcore.records.redact import Redactor, secret_env_names
 from expcore.records.schema import first_turn_rule, outcome_from_entry, target_rule, unread_replies
 
 
@@ -151,10 +151,11 @@ class RunRequest:
         own task, once or more; a secret already declared is not declared again.
 
         `secrets` are values; `secret_env` are names of variables whose values are secrets whatever the names, read
-        from `environ` (the process's by default) **now** and kept as values. `environ` says where to read those names
-        and nothing else: the secrets of the process (a variable named like one, a model's key) stay redacted, and a
-        later declaration with another `environ` takes nothing away. A name with no value is ignored. A string is one
-        secret or one name, not its characters.
+        from `environ` (the process's by default) **now** and kept as values. A given `environ` is the mapping the
+        executor gives `record_run`: what that redacts from it (the variables named like a secret, the models' keys)
+        is kept here too. It never replaces the process: the secrets of the process (a variable named like one, a
+        model's key) stay redacted, and a later declaration with another `environ` takes nothing away. A name with no
+        value is ignored. A string is one secret or one name, not its characters.
 
         A secret too short to redact (a value, or the value of a variable) is refused here with a `ConfigError` that
         names the variable and never shows the value, as `record_attempt` refuses it: nothing of this call is kept, and
@@ -172,7 +173,11 @@ class RunRequest:
             # leaves the log one that cannot be built, which withholds the traceback of the ConfigError
             self.defect_log.redact_with(checked)
         checked()  # refuses a secret too short to redact, naming the variable
-        read = tuple(shown[name] for name in names if shown.get(name, "").strip())
+        if environ is None:  # the process's own secrets are read by the redactor itself: only the names declared
+            read = tuple(shown[name] for name in names if shown.get(name, "").strip())
+        else:  # the mapping the executor gives `record_run`: what that redacts from it is kept here too, as values
+            keys = model_secrets(self.backend, self.models, shown)[1]
+            read = (*(shown[name] for name in secret_env_names(shown, names)), *keys)
         held = tuple(dict.fromkeys([*self.declared.secrets, *given, *read]))
         self.declared.secrets = held
         if self.defect_log is not None:
