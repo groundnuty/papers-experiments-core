@@ -11,9 +11,11 @@ provider with two storages lists them in no order a support may rely on. The own
 for one initial scan of the storage and no later one, which only adds the files it finds; `wait_import` waits for it.
 """
 
+import json
+import os
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +23,7 @@ from fedlayout import IMPORT_MOUNT, REGULAR_STORAGE, Layout, import_storage_name
 from fedpki import ensure_secret, require_private, write_secret
 from fedrest import PANEL_API, PANEL_USER, PROVIDER_API, ZONE_API, Rest, RestError, basic, bearer, wait_until
 from fedspec import ADMIN, Service, Space
+from fedtools import slot_users
 
 INVITE_LIFETIME_S = 900
 IMPORT_POLL_S = 5.0
@@ -35,6 +38,10 @@ SCAN_KEYS = (  # onepanel's auto_storage_import_info_model
     "failedFiles",
     "totalScans",
 )
+SLOT_CREATED, SLOT_MATCHED = (
+    "created",
+    "matched",
+)  # what a slot user's provisioning found: made here, or there and exact
 SCAN_STATES = {"enqueued", "running", "aborting", "completed", "failed", "aborted"}
 SCAN_ENDED_BADLY = {"failed", "aborted"}
 # One scan when the space is supported, none after it (continuous scan off), and a forced scan would only add files:
@@ -92,6 +99,65 @@ class Bootstrap:
         self.spec = layout.spec
         self.ids = Ids()
         self._admin_token: str | None = None
+
+    # -- slot users (O83): made when missing, never changed when there -----------------------------------------------
+
+    @property
+    def slot_planes(self) -> dict[str, str]:
+        """The slot users the layout's platform template declares (`fedtools.slot_users`), by principal name. They are
+        ordinary principals, provisioned by the steps below; the difference is that one that exists is never changed."""
+        if "_slot_planes" not in self.__dict__:
+            self.__dict__["_slot_planes"] = slot_users(self.layout.spec)
+        return self.__dict__["_slot_planes"]
+
+    @property
+    def slot_status(self) -> dict[str, str]:
+        """What `audit_slot_users` found of each slot user: `created` (this bootstrap made it) or `matched` (it existed,
+        exactly as declared, and nothing was sent for it)."""
+        return self.__dict__.setdefault("_slot_status", {})
+
+    @property
+    def _existing(self) -> set[str]:
+        return self.__dict__.setdefault("_existing_slot_users", set())
+
+    @property
+    def _pending_file(self):
+        """The root's record of the slot users this bootstrap made and has not finished: written before a user is made,
+        cleared once the audit has passed. A rerun after an up that stopped midway (a panel answering 500) finishes them
+        as it finishes any principal; a slot user that is not in it was there before, and stays read-only. Names only,
+        in the root's private directory."""
+        return self.layout.secrets / "slot-users.pending"
+
+    def _pending(self) -> set[str]:
+        try:
+            names = json.loads(self._pending_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        except (OSError, ValueError):
+            raise RuntimeError("the root's record of slot users made and not finished cannot be read") from None
+        return set(names) if isinstance(names, list) and all(isinstance(n, str) for n in names) else set()
+
+    def _record_pending(self, names: set[str]) -> None:
+        path = self._pending_file
+        if not names:
+            path.unlink(missing_ok=True)
+            return
+        scratch = path.with_name(f".{path.name}.{os.getpid()}.part")
+        descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(sorted(names)))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(scratch, path)
+
+    @staticmethod
+    def refuse_slot(user: str, attribute: str, why: str) -> RuntimeError:
+        """The refusal of a slot user that exists and differs from what the layout declares: it names the principal and
+        the attribute, and says it was never changed (the layout's names are public; a secret is never in it)."""
+        return RuntimeError(
+            f"slot user {user}: {attribute}: {why}; an existing slot user is never changed here (remove it, or the "
+            "federation, and up makes it anew)"
+        )
 
     # -- credentials ---------------------------------------------------------------------------------------------------
 
@@ -176,22 +242,40 @@ class Bootstrap:
     def ensure_users(self) -> None:
         """Make each fixed user once, with a password of its own in its 0600 file, and read its id."""
         for user in (principal.name for principal in self.spec.principals):
-            password = ensure_secret(self.layout.password(user))
+            path = self.layout.password(user)
+            kept = path.exists()
+            password = ensure_secret(path)
             own = basic(user, password)
             try:
                 self.ids.users[user] = self.zone("GET", "/user", "user", auth=own)["userId"]
+                if user in self.slot_planes and user not in self._pending():
+                    self._existing.add(user)  # it was there before this call: read-only from here on
                 continue
             except RestError as error:
                 if error.status not in (401, 403):
                     raise
             body = {"username": user, "password": password, "groups": []}
-            self.rest.json(
-                "POST",
-                self.spec.zone.url + PANEL_API + "/zone/users",
-                label="zone panel users",
-                headers=basic(PANEL_USER, self.admin_password()),
-                json=body,
-            )
+            if user in self.slot_planes:  # recorded before it is made, so an up that stops midway can finish it
+                self._record_pending(self._pending() | {user})
+            try:
+                self.rest.json(
+                    "POST",
+                    self.spec.zone.url + PANEL_API + "/zone/users",
+                    label="zone panel users",
+                    headers=basic(PANEL_USER, self.admin_password()),
+                    json=body,
+                )
+            except RestError as error:
+                if user in self.slot_planes and error.status is not None and error.status < 500:
+                    self._record_pending(self._pending() - {user})  # the zone made nothing: it was never ours
+                    if not kept:
+                        path.unlink(missing_ok=True)  # a password this call made for a user it could not make
+                    raise self.refuse_slot(
+                        user,
+                        "password",
+                        "the zone has no such user that the root's password file opens, and refused to make one",
+                    ) from None
+                raise
             self.ids.users[user] = self.zone("GET", "/user", "user", auth=own)["userId"]
 
     def ensure_registration_tokens(self) -> None:
@@ -374,6 +458,9 @@ class Bootstrap:
         members = set(self.zone("GET", f"/spaces/{sid}/users", "space users")["users"])
         for user, wanted in ((p.name, p.privileges) for p in self.spec.members(space)):
             uid = self.ids.users[user]
+            if user in self._existing:  # an existing slot user is verified, never joined or changed (O83)
+                self.verify_slot_member(space, sid, user, uid, wanted, members)
+                continue
             if uid not in members:
                 token = self.temporary_invite({"inviteType": "userJoinSpace", "spaceId": sid})
                 own = basic(user, ensure_secret(self.layout.password(user)))
@@ -387,3 +474,40 @@ class Bootstrap:
                 held = self.zone("GET", f"/spaces/{sid}/{kind}/{uid}/privileges", "member privileges")["privileges"]
                 if sorted(held) != sorted(wanted):
                     raise RuntimeError(f"a fixed user of {space} holds other {kind} privileges than declared")
+
+    def verify_slot_member(
+        self, space: str, sid: str, user: str, uid: str, wanted: Sequence[str], members: set[str]
+    ) -> None:
+        """An existing slot user's membership of a space as read: it must be a member, holding exactly the declared
+        privileges, directly and effectively. Reads only; a difference is refused naming the user and the attribute."""
+        if uid not in members:
+            raise self.refuse_slot(user, f"membership of {space}", "it is not a member of that space")
+        for kind, label in (("users", "direct privileges"), ("effective_users", "effective privileges")):
+            held = self.zone("GET", f"/spaces/{sid}/{kind}/{uid}/privileges", "member privileges")["privileges"]
+            if sorted(held) != sorted(wanted):
+                raise self.refuse_slot(user, f"{label} in {space}", "they are not exactly the declared ones")
+
+    def audit_slot_users(self) -> dict[str, str]:
+        """After the members: each slot user the template declares is `created` (made by this bootstrap, its privileges
+        set as declared) or, when it existed, checked to be exactly as declared and recorded `matched`, with nothing
+        sent for it. An existing user's groups, clusters and spaces are read (as the user): it must be in no group or
+        cluster and a member of exactly the declared spaces. A difference is refused, naming the user and the
+        attribute."""
+        for user in sorted(self.slot_planes):
+            principal = next((p for p in self.spec.principals if p.name == user), None)
+            if principal is None:
+                continue  # a template naming a user the layout lacks is refused when the file is rendered
+            if user not in self._existing:
+                self.slot_status[user] = SLOT_CREATED
+                self._record_pending(self._pending() - {user})  # made, and its memberships verified as declared
+                continue
+            own = basic(user, ensure_secret(self.layout.password(user)))
+            declared = {self.ids.spaces[name] for name in principal.spaces}
+            if set(self.zone("GET", "/user/spaces", "user spaces", auth=own)["spaces"]) != declared:
+                raise self.refuse_slot(user, "spaces", "it is a member of other spaces than the declared ones")
+            if self.zone("GET", "/user/groups", "user groups", auth=own)["groups"]:
+                raise self.refuse_slot(user, "group", "it is a member of a group")
+            if self.zone("GET", "/user/effective_clusters", "user clusters", auth=own)["clusters"]:
+                raise self.refuse_slot(user, "cluster", "it is a member of a cluster")
+            self.slot_status[user] = SLOT_MATCHED
+        return dict(self.slot_status)

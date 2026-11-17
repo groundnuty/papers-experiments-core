@@ -545,7 +545,10 @@ def test_o57_the_run_takes_its_storage_bind_from_the_function_alone_and_a_failur
     body = body[: body.index("\n}\n")]
     assert 'storage_binds "$W" "$storage") || die' in body
     assert body.index('import_binds "$W"') < body.index('storage_binds "$W"') < body.index("exec ")
-    exec_line = body[body.index("exec ") :]
+    exec_line = body[
+        body.index('\n  exec "$HPCOP_PY"') :
+    ]  # the command itself: the hosts bind of the declared names (O73)
+    assert '"${naming[@]}"' in exec_line  # is an array of its own, set above, never a word of this line
     assert exec_line.index('"${binds[@]}"') < exec_line.index('"$R"')
     assert not re.search(r"--bind[ =]", exec_line)
 

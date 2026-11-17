@@ -27,7 +27,7 @@ CA=${CA:-$R/volumes/persistence_backup/etc/oz_panel/OnedataTestWebServerCa.pem}
 [[ -f $CA && -r $CA ]] || die "cannot read the CA file $CA"
 [[ -e $R/root/service-ready.lock ]] || die "the zone in $W is not ready yet"
 
-FQDN=$(node_fqdn)
+FQDN=$(service_name "$W")   # the zone's registered name (its certificate's): the node's own, or its declared one
 OZ=https://$FQDN:8443/api/v3/onezone
 TLS=(--cacert "$CA" --resolve "$FQDN:8443:127.0.0.1")
 T=$(mktemp -d "$W/tmp/mint.XXXXXX"); trap 'rm -rf -- "$T"' EXIT

@@ -13,6 +13,12 @@ tool of the manifest it lacks, and any allow-list name it lacks fails the start.
 
     python -m expcore.tools.manifest freeze OUT [--pass-env NAME ...] -- COMMAND [ARG ...]
     python -m expcore.tools.manifest check FROZEN [--pass-env NAME ...] -- COMMAND [ARG ...]
+
+The command line starts the server as the provider will: with exactly the variables `--pass-env` names (and the SDK's
+few defaults), in a new, empty directory of mode 0700 for each start, removed once the server has stopped (O84), so the
+server does not read the driver's working directory. It is for a server the study starts itself. A condition of the
+Onedata layer's tool server is frozen and checked by `python -m expcore_onedata.toolmanifest`, which starts it with
+the environment the launch builds for it (settings this command line cannot know).
 """
 
 import argparse
@@ -29,6 +35,8 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import PaginatedRequestParams
+
+from expcore.tools.workdir import private_workdir
 
 PAGE_LIMIT = 100  # a server that keeps returning cursors is broken
 
@@ -173,13 +181,14 @@ async def live_manifest(params: StdioServerParameters, *, timeout_s: float = 120
     }
 
 
-def _params(command: Sequence[str], pass_env: Sequence[str]) -> StdioServerParameters:
-    """Build the launch parameters; environment variables are copied by name so no value is on the command line."""
+def _params(command: Sequence[str], pass_env: Sequence[str], cwd: Path) -> StdioServerParameters:
+    """Build the launch parameters: the server starts in `cwd`; environment variables are copied by name so no value is
+    on the command line."""
     env = {name: os.environ[name] for name in pass_env if name in os.environ}
-    return StdioServerParameters(command=command[0], args=list(command[1:]), env=env or None)
+    return StdioServerParameters(command=command[0], args=list(command[1:]), env=env or None, cwd=cwd)
 
 
-def _freeze(out: Path, params: StdioServerParameters, timeout_s: float) -> int:
+def freeze_server(out: Path, params: StdioServerParameters, timeout_s: float) -> int:
     """Write the frozen manifest of the server the parameters launch."""
     frozen = FrozenManifest.from_live(asyncio.run(live_manifest(params, timeout_s=timeout_s)))
     out.write_text(frozen.dump(), encoding="utf-8")
@@ -187,7 +196,7 @@ def _freeze(out: Path, params: StdioServerParameters, timeout_s: float) -> int:
     return 0
 
 
-def _check(path: Path, params: StdioServerParameters, timeout_s: float) -> int:
+def check_server(path: Path, params: StdioServerParameters, timeout_s: float) -> int:
     """Compare a live server with a frozen manifest; exit 1 and list the differences when they are not equal."""
     frozen = FrozenManifest.load(path)
     live = asyncio.run(live_manifest(params, timeout_s=timeout_s))
@@ -223,10 +232,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not command:
         print("error: give the server command after --", file=sys.stderr)
         return 2
-    params = _params(command, args.pass_env)
     try:
-        run = _freeze if args.action == "freeze" else _check
-        return run(args.file, params, args.timeout)
+        run = freeze_server if args.action == "freeze" else check_server
+        with private_workdir() as cwd:
+            return run(args.file, _params(command, args.pass_env, cwd), args.timeout)
     except (ManifestError, OSError, TimeoutError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

@@ -83,6 +83,22 @@ def die(msg, result=None):
     sys.exit(1)
 
 
+def registered_name(workdir):
+    """The name the service is registered under, which its certificate holds: the work directory's `declared-name`
+    when configure.sh wrote one (O73), else the node's own FQDN, as before."""
+    path = os.path.join(workdir, "declared-name")
+    if not os.path.lexists(path):
+        return subprocess.run(["hostname", "-f"], capture_output=True, text=True, check=True).stdout.strip()
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        die(f"{path} is not a regular file of yours")
+    with open(path, encoding="ascii") as handle:
+        value = handle.readline().strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+", value):
+        die(f"{path} holds no fully qualified name")
+    return value
+
+
 def note(method, path, status, body):
     """One HTTP call as data, appended to the evidence file (0600)."""
     if EVIDENCE_FILE is None:
@@ -247,7 +263,7 @@ def main(argv):
             die("the evidence directory is not a private directory of yours")
         EVIDENCE_FILE = os.path.join(opts["evidence"], "http-%s.jsonl" % os.path.basename(workdir).split(".", 1)[1])
     rootfs = os.path.join(workdir, "rootfs")
-    fqdn = subprocess.run(["hostname", "-f"], capture_output=True, text=True, check=True).stdout.strip()
+    fqdn = registered_name(workdir)
     ca = os.path.join(rootfs, "volumes/persistence_backup/etc/op_panel/OnedataTestWebServerCa.pem")
     payload = json.loads(sys.stdin.readline())
     sid = payload["space_id"]

@@ -34,7 +34,7 @@ T=$(mktemp -d "$W/tmp/finish.XXXXXX"); trap 'rm -rf -- "$T"' EXIT
 read_secret CBU "$S/couchbase-user"; read_secret CBP "$S/couchbase-password"
 if (( RESTART )); then WHEN='after a restart'; else WHEN="after onepanel's Couchbase setup"; fi
 cb_guard "$T" "$CBU" "$CBP" "$WHEN"; unset CBP
-FQDN=$(node_fqdn)
+FQDN=$(service_name "$W")   # the name the service is registered under (its certificate's): the node's own, or its declared one
 CA=$R/volumes/persistence_backup/etc/op_panel/OnedataTestWebServerCa.pem
 [[ -s $CA ]] || die "no Onedata test CA at $CA"
 if (( ! RESTART )); then

@@ -1,0 +1,106 @@
+# The pilot's shape with the tool-server arm (O83): pilot-shape.toml, and the four users of two slots (the leased users of
+# a run). They are ordinary principals: the bootstrap makes each zone user, its 0600 password file and its membership of
+# the four data spaces with exactly these privileges, on Compose and on HPC alike, and never changes one that exists. The
+# template beside it declares the slots that pair them and the tool server that runs from the study's artifacts
+# directory (HPC_STUDY_ARTIFACTS in site.env); a rendered slot that disagrees with these principals is refused. Every
+# name is invented; the commit in the template is the onedata-mcp pin of docs/inventory.md.
+#
+#   set -a; . deploy/hpc-federation/site.env; set +a
+#   uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape-slots.toml \
+#     --root <a directory on a filesystem the login node and the nodes see> up
+#
+# The ports and memory limits are the Compose federation's and unused here: on HPC every service listens on its node's
+# 8443 (and a provider on 6665), and the [hpc] table sizes the steps. The layout's users and spaces are what Compose
+# provisions too, but this layout's template is the HPC one (its @hpc_*@ placeholders have no value on Compose): a Compose
+# federation of the same users names a template of its own (deploy/compose-federation/README.md, "Slots and a tool server").
+
+project = "expcore-hpc-slots"
+domain = "expcore-hpc-slots.test"
+study_space = "alpha-space"
+memory_limit = "6g"
+platform_template = "pilot-shape-slots.platform.toml.template"
+probe_space = "link-probes"
+
+[hpc]
+time = "02:00:00"                        # the held job's --time: bring it down well before
+stop_seconds = 600                       # a service's graceful stop bound; settle_timeout_s is derived from it
+core = "login"                           # where the bootstrap and the link check run: "login", or "step" (DESIGN.md 9)
+zone = { cpus = 4, memory = "8g" }       # live peaks: about 4.0 GB of RSS and the 1.9 GB rootfs on tmpfs
+provider = { cpus = 4, memory = "10g" }  # about 4.8 GB of RSS, the 2.5 GB rootfs and the posix storage on tmpfs
+control = { cpus = 1, memory = "1g" }    # every node's reserve for control steps (a token's delivery peaked at 180 MB)
+sandbox_placement = "het"                # the agent's node: its own component of the held job, or "separate", a
+                                         # held job of its own (DESIGN.md 1)
+# The agent's node (M5) is sized by the template's [sandbox.limits]: an 8-core, 17 GiB step (the least for those
+# limits) plus the control reserve. `sandbox = { cpus = ..., memory = ... }` here may size it larger, never smaller.
+
+[zone]
+port = 29743
+
+[providers.aspen]                        # the agent's local provider: it supports every data space
+port = 29744
+
+[providers.larch]
+port = 29745
+
+[providers.rowan]
+port = 29746
+
+[providers.alder]
+port = 29747
+
+[providers.hazel]
+port = 29748
+
+[spaces.alpha-space]                     # the study space: owned by larch, mirrored by aspen and rowan
+owner = "larch"
+mirrors = ["aspen", "rowan"]
+
+[spaces.beta-space]
+owner = "rowan"
+mirrors = ["aspen"]
+
+[spaces.gamma-space]
+owner = "alder"
+mirrors = ["aspen"]
+
+[spaces.delta-space]                     # stands for the pilot's largest space, 15,340 files; up writes none into it
+owner = "hazel"                          # (its synthetic tree of that count is M3's, on an imported storage)
+mirrors = ["aspen"]
+baseline = false
+
+[spaces.link-probes]                     # the link check's probes: no agent user is a member, up writes nothing
+owner = "aspen"
+mirrors = ["larch", "rowan", "alder", "hazel"]
+agent_visible = false
+baseline = false
+support_bytes = 1073741824
+
+[principals.alpha-reader]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
+
+[principals.alpha-tools]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
+
+[principals.alpha-health]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
+
+# The leased users of a run: the user whose token reads the data and the user whose token the tool server gets. The
+# template pairs them in [slots]; a data-path user holds exactly the baseline, a tool-server user its condition's rights.
+[principals.slot1-data]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
+
+[principals.slot1-tools]
+privileges = ["space_view", "space_read_data", "space_view_transfers", "space_view_qos"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
+
+[principals.slot2-data]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
+
+[principals.slot2-tools]
+privileges = ["space_view", "space_read_data", "space_view_transfers", "space_view_qos", "space_schedule_replication"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
