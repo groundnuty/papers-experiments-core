@@ -106,12 +106,13 @@ def test_the_collector_has_bounds_of_its_own_so_the_agent_cannot_make_it_eat_the
 
 
 def test_the_collector_command_is_the_cores_command_line_with_the_expected_peer_the_declared_agent_uid(s, names):
-    """`python3 -I collector.py <socket dir> <log file> <nonce> <expected peer uid>`, with the container's paths."""
+    """`python -I -B collector.py <socket dir> <log file> <nonce> <expected peer uid>`, with the container's paths."""
     args = collector(s, names)
     assert ("--entrypoint", "python") in pairs(args)
     command = args[args.index(s.gate.id) + 1 :]
     assert command == [
         "-I",
+        "-B",
         f"{C.READLOG_PROGRAM_DIR}/collector.py",
         C.READLOG_SOCKET_DIR,
         f"{C.READLOG_LOG_DIR}/{C.READLOG_LOG_NAME}",

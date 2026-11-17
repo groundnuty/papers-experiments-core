@@ -1,6 +1,6 @@
 """The read-log channel on the Docker backend with the REAL collector process, client and reader (the container alone is
-the fake host's): the collector the sandbox started runs as `python -I collector.py` on the bound host directories, the
-canary goes through the real client to its real socket, and the reader judges the log the collection read.
+the fake host's): the collector the sandbox started runs as `python -I -B collector.py` on the bound host directories,
+the canary goes through the real client to its real socket, and the reader judges the log the collection read.
 
 What one process can show: a send from the declared agent uid (here this process's own, set as the agent uid) appears
 with that uid, and a send from any other uid than the declared one makes the log unknown. That an agent of ANOTHER
@@ -134,8 +134,8 @@ def test_o91_the_collector_that_runs_is_the_pinned_copy_the_run_recorded(short_w
     """O91: the collector that runs is the pinned copy the run recorded."""
     sbx = start(short_world)
     ran = real.proc.args
-    assert ran[1] == "-I"
-    assert ran[2] == str(sbx.dir / "readlog" / "program" / C.READLOG_PROGRAM_NAME)
+    assert ran[1:3] == ["-I", "-B"]  # isolated, no bytecode (O58), as the sandbox's own command asks
+    assert ran[3] == str(sbx.dir / "readlog" / "program" / C.READLOG_PROGRAM_NAME)
     recorded = sbx.metadata()["infrastructure_facts"]["read_log"]
     assert recorded["collector_sha256"] == files.sha256_of(files.collector_file())
     assert files.sha256_of(sbx.dir / "readlog" / "program" / C.READLOG_PROGRAM_NAME) == recorded["collector_sha256"]

@@ -462,8 +462,9 @@ def collector_run_args(
     """`docker run` for the read-log collector: the gate's sibling, with no network, a read-only root, every capability
     dropped, no new privilege and the DRIVER's uid and gid, so that the harness reads and removes what it writes.
 
-    It runs the pinned `collector.py` (`readlog.collector`) as `python -I collector.py <socket dir> <log file> <nonce>
-    <expected peer uid>`, with the run's nonce and the declared agent uid, the only uid a record may come from: the
+    It runs the pinned `collector.py` (`readlog.collector`) as `python -I -B collector.py <socket dir> <log file>
+    <nonce> <expected peer uid>` (isolated, and writing no bytecode: the O58 rule for every interpreter the core
+    launches), with the run's nonce and the declared agent uid, the only uid a record may come from: the
     reader makes a log with a record from another uid unknown. Its program is bound read-only, its socket directory and
     its log directory read-write; the agent's container gets the first of those two read-only and never the second
     (`agent_run_args`). The image is the gate's (the same interpreter), by its pinned id, and the bounds are the
@@ -476,7 +477,7 @@ def collector_run_args(
         *bind(dirs.program, READLOG_PROGRAM_DIR),
         *bind(dirs.sockets, READLOG_SOCKET_DIR, readonly=False),
         *bind(dirs.log, READLOG_LOG_DIR, readonly=False),
-        *("--entrypoint", "python", image_id, "-I", f"{READLOG_PROGRAM_DIR}/{READLOG_PROGRAM_NAME}"),
+        *("--entrypoint", "python", image_id, "-I", "-B", f"{READLOG_PROGRAM_DIR}/{READLOG_PROGRAM_NAME}"),
         READLOG_SOCKET_DIR,
         f"{READLOG_LOG_DIR}/{READLOG_LOG_NAME}",
         nonce,

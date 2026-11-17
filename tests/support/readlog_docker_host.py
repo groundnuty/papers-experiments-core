@@ -99,8 +99,9 @@ class Collector:
     def _spawn(self, container: FakeContainer, command: list[str]) -> None:
         """The real collector, with the container's paths turned into the host directories bound there."""
         nonce, uid = command[-2], command[-1]
+        options = command[: command.index(f"{C.READLOG_PROGRAM_DIR}/{C.READLOG_PROGRAM_NAME}")]  # `-I -B`, as built
         argv = [
-            sys.executable, "-I", str(Path(self._binds[C.READLOG_PROGRAM_DIR]) / C.READLOG_PROGRAM_NAME),
+            sys.executable, *options, str(Path(self._binds[C.READLOG_PROGRAM_DIR]) / C.READLOG_PROGRAM_NAME),
             self._binds[C.READLOG_SOCKET_DIR], str(self.log_path), nonce, uid,
         ]  # fmt: skip
         self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
