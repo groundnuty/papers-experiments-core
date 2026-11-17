@@ -50,14 +50,16 @@ def site(tmp_path) -> dict[str, metadata.Distribution]:
     return {d.metadata["Name"]: d for d in dists}
 
 
-def test_c06_the_environment_is_the_closure_of_the_core_and_the_study_requirements_over_what_is_installed(site):
+def test_c06_the_environment_is_the_closure_of_the_core_and_the_study_requirements_over_what_is_installed(
+    site, committed_core
+):
     """C06: what the fingerprint holds: the core, what it requires, and what `[study] requires` adds, transitively; a
     requirement that is not installed (its marker did not apply), one behind an extra nobody asked for, and a tool
-    installed beside the study are left out."""
+    installed beside the study are left out. The core's source is the identity of the core running, always."""
     alone = environment(found=site)
     assert alone["distributions"] == {CORE_DISTRIBUTION: "0.1.0", "numlib": "1.4.2"}
     assert alone["python"].count(".") == 1
-    assert alone["sources"] == {}
+    assert alone["sources"] == {CORE_DISTRIBUTION: committed_core.entry()}
     with_platform = environment(["toy-platform"], found=site)
     assert set(with_platform["distributions"]) == {CORE_DISTRIBUTION, "numlib", "toy-platform", "wirelib"}
     with_extra = environment(["Toy_Platform[fancy]"], found=site)
@@ -94,9 +96,10 @@ def test_c06_a_required_distribution_that_is_not_installed_cannot_be_recorded(si
         environment(found=site)
 
 
-def test_c06_a_direct_url_source_keeps_its_commit_and_drops_credentials_and_local_paths(tmp_path):
-    """C06: a source is recorded so that a resume after the core moved to another commit is refused, but it never
-    keeps a credential, a query or a path of the machine."""
+def test_c06_a_direct_url_source_keeps_its_commit_and_drops_credentials_and_local_paths(tmp_path, committed_core):
+    """C06: a source is recorded so that a resume after a distribution moved to another commit is refused, but it never
+    keeps a credential, a query or a path of the machine. The core is recorded by its identity, not by its direct URL;
+    the earlier form, which a store an earlier core recorded holds, is the direct URL's, as that core recorded it."""
     where = tmp_path / "site"
     vcs = {
         "url": "https://user:token@code.example.org/lab/core?x=1#frag",
@@ -119,7 +122,8 @@ def test_c06_a_direct_url_source_keeps_its_commit_and_drops_credentials_and_loca
         ),
     }
     sources = environment(found=found)["sources"]
-    assert sources[CORE_DISTRIBUTION] == {
+    assert sources[CORE_DISTRIBUTION] == committed_core.entry()
+    assert environment(found=found, earlier_core=True)["sources"][CORE_DISTRIBUTION] == {
         "kind": "vcs",
         "vcs": "git",
         "url": "https://code.example.org/lab/core",

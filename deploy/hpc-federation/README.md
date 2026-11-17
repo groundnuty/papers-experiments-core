@@ -498,6 +498,15 @@ line (`--run` runs it). The manifest names the site's paths and stays out of the
 has its form). Outage runs (`[faults]`) go through the login node's fault relay (M4), which `up`
 starts.
 
+> **A bare copy of the core without `.git` is refused as `core_src`.** The core names itself by its commit in every
+> campaign's environment (`provenance.core_identity`), read from the git work tree its `src/` lies in, or from the build
+> record of a wheel made from one. A copy of the core's files without `.git` (a tarball, an `rsync` that leaves `.git`
+> out, a `git archive`) has no commit to name: its identity is unknown, and `expcore run`, `check`, `merge` and `analyze`
+> refuse to start on a core whose commit is unknown, with or without the allow-dirty option, so every shard step on it
+> stops at its start with "the core's commit is unknown". Point `core_src` at the `src/` of a `git clone` (or install a
+> wheel built from one into the interpreter's environment), and commit what you run: a checkout with uncommitted changes
+> is refused too unless the command allows dirt, and a campaign run so records the core dirty.
+
 **What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the
 step makes its `work_root` (0700) before the dispatcher and refuses one that is a link, another user's, open to others
 or not under `--tmpfs`. It copies the federation's `platform.toml` beside the study's `study.toml` in its copy, where
