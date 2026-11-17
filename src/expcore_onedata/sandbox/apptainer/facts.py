@@ -102,8 +102,8 @@ FACTS: dict[str, str] = {
         "site's apptainer.conf allows setuid-mount extfs, fuse2fs otherwise) is the node's. Its pages are charged to "
         "the step's memory as they are written, up to its size (the start's probe fills one whole image once, given "
         "back before the agent's first cell); the watch still walks the image file's allocated "
-        "size. /work holds no lost+found, which Docker's disk does. The outputs are copied out by the copy helper in "
-        "an exec of the image, with every refusal of Docker's copy"
+        "size. It is ext3 where Docker's disk is ext4, and /work holds no lost+found, which Docker's disk does. The "
+        "outputs are copied out by the copy helper in an exec of the image, with every refusal of Docker's copy"
     ),
     "work_disk_unverified": (
         'the run asked for the work disk image (work_disk = "image") and its start had not yet shown a write past '

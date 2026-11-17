@@ -150,7 +150,9 @@ class Teardown:
             box._ca_copy.unlink(missing_ok=True)  # configuration, not evidence
         token = box.spec.token.reveal().encode() if box.spec.token is not None else b""
         image = workdisk.image_path(box.dir)
-        dropped = bool(token) and os.path.lexists(image)  # its files' blocks need not be contiguous: never scanned
+        # the run's image (never an agent's file of that name in a directory run): its files' blocks need not be
+        # contiguous, so it cannot be scanned for the token
+        dropped = box.work_image and bool(token) and os.path.lexists(image)
         if dropped:
             image.unlink()
         removed = scrub(box.dir, token)

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from apptainer_support import LIMITS, TOKEN, make_settings, make_spec, options, start
 from fake_node import FakeNode, FakeProc
+from sandbox_support import SleptClock
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox import copyout
@@ -317,6 +318,29 @@ def test_o71_the_teardown_kills_a_copy_of_the_collection_left_running(node, sett
     assert not box.dir.exists()
 
 
+def test_o71_a_holder_started_while_the_sweep_kills_is_found_by_a_fresh_listing(node, tmp_path):
+    """O71: one holder starts another as it is killed (a launcher still running): the sweep lists again until a fresh
+    listing shows none, so the second is killed too; a zombie, which holds nothing, never keeps it waiting."""
+    image = tmp_path / "work" / workdisk.IMAGE_NAME
+    first, later = _holder(node, image), []
+    zombie = _holder(node, image, state="Z", unkillable=True)
+    signal = node.signal
+
+    def forking(pid, start, sig):
+        sent = signal(pid, start, sig)
+        if pid == first.pid and not later:
+            later.append(_holder(node, image))
+        return sent
+
+    node.signal = forking
+    clock = SleptClock()
+    assert workdisk.end_holders(node, image, "sid-00000000", sleep=clock.sleep, clock=clock) == 2
+    assert not first.alive
+    assert later
+    assert not later[0].alive
+    assert zombie.state == "Z"
+
+
 def test_o71_a_holder_that_cannot_be_shown_gone_fails_the_teardown_and_keeps_the_record(node, settings):
     """O71: one that no kill ends is never passed over: the directory and the record stay for a next try."""
     box = start(node, settings)
@@ -356,6 +380,22 @@ def test_o71_a_kept_run_drops_the_image_it_cannot_show_free_of_the_token(node, s
     assert kept.is_dir()
     assert not (kept / "work" / workdisk.IMAGE_NAME).exists()
     assert box.metadata()["evidence_kept"]["work_disk_image_dropped"] is True
+
+
+def test_o71_a_kept_directory_run_keeps_an_agent_s_file_named_as_the_image(node, tmp_path):
+    """O71, O05: with the directory, `/work/disk.img` is the agent's own file: a kept run keeps it (the token scan reads
+    it), and nothing says an image was dropped."""
+    settings = make_settings(tmp_path)
+    box = start(node, settings)
+    (box.dir / "work" / workdisk.IMAGE_NAME).write_bytes(b"the agent's own file\n")
+    with open(box.dir / "gate" / "requests.jsonl", "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": "leak", "value": TOKEN}) + "\n")
+    with pytest.raises(InfraError):
+        box.collect(tmp_path / "out")
+    box.stop()
+    kept = settings.work_root / "_kept_evidence" / box.sid
+    assert (kept / "work" / workdisk.IMAGE_NAME).read_bytes() == b"the agent's own file\n"
+    assert "work_disk_image_dropped" not in box.metadata()["evidence_kept"]
 
 
 # ------------------------------------------------------------------------------------------------ the record

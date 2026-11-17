@@ -285,22 +285,25 @@ def end_holders(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> int:
-    """Kill every process of the uid whose command line names `image` or that carries the run's `COPY_TAG`, and show
-    each gone: how many there were. `SandboxError` when they cannot be listed or one is not shown gone (unknown is never
-    gone)."""
-    tags = (str(image), f"{COPY_TAG}={sid}")
-    found = node.processes(tags)
-    if found is None:
-        raise SandboxError("the processes that may hold the run's work disk could not be listed")
-    holders = [p for p in found if p.tags & set(tags)]
-    for proc in holders:
-        node.signal(proc.pid, proc.start, signal.SIGKILL)
-    until = clock() + GONE_WAIT_S
-    while any(node.alive(p.pid, p.start) is not False for p in holders):
+    """Kill every process of the uid whose command line names `image` or that carries the run's `COPY_TAG`, listing
+    again until a fresh listing shows none (one may start another while it is killed), within `GONE_WAIT_S`: how many
+    were killed. A zombie holds nothing and is left to its parent. `SandboxError` when they cannot be listed or one is
+    still listed at the deadline (unknown is never gone)."""
+    tags = {str(image), f"{COPY_TAG}={sid}"}
+    until, killed = clock() + GONE_WAIT_S, set()
+    while True:
+        found = node.processes(tuple(tags))
+        if found is None:
+            raise SandboxError("the processes that may hold the run's work disk could not be listed")
+        holders = [p for p in found if p.tags & tags and p.state != "Z"]
+        if not holders:
+            return len(killed)
         if clock() >= until:
             raise SandboxError("a process that holds the run's work disk could not be shown gone")
+        for proc in holders:
+            if node.signal(proc.pid, proc.start, signal.SIGKILL) is True:
+                killed.add((proc.pid, proc.start))
         sleep(GONE_POLL_S)
-    return len(holders)
 
 
 __all__ = [
