@@ -54,11 +54,12 @@ def test_billing_is_the_larger_of_cores_and_the_weight_times_the_memory_per_node
 
 
 def test_the_settle_time_exceeds_the_stops_whole_bound(hpc):
-    """O57: a stop takes at most stop_seconds, the 30 s SIGKILL tail and 60 s for its step to leave: settle_timeout_s
-    is above that, derived from the layout, never a constant."""
+    """O57: a stop takes at most stop_seconds, the 30 s SIGKILL tail and 60 s for its step to leave, after the step's
+    launch wait; settle_timeout_s is above that and the stop verb's own tail (70 s: the waits for the step to leave the
+    list and after a cancel, and a margin), derived from the layout, never a constant."""
     assert hpc.settings.load_settings(None).settle_timeout_s == 450
     settings = hpc.settings.load_settings({"stop_seconds": 120, "step_launch_wait_s": 100})
-    assert (settings.stop_bound_s, settings.settle_timeout_s) == (210, 370)
+    assert (settings.stop_bound_s, settings.settle_timeout_s) == (210, 380)
 
 
 LAYOUTS = sorted(LAYOUT.parent.glob("*.toml"))
