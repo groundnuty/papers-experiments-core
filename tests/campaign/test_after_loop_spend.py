@@ -108,6 +108,7 @@ def test_c05_an_attempt_that_raises_after_its_loop_is_charged_its_measured_spend
 def test_c05_a_raise_after_the_loop_charges_the_bound_when_the_log_is_unreadable_or_incomplete(tmp_path, damage, why):
     """C05: measured spend is reported only where the log supports it. A log that cannot be read, holds no request,
     leaves a request without its reply or a reply without its counts charges the attempt's bound, and says so."""
+
     def damaged_then_leak(me):
         me.scheduler.store.transact(lambda: me.scheduler.store.db.execute(damage))  # the log as the guard left it
         AfterItsLoop.leak(me)
