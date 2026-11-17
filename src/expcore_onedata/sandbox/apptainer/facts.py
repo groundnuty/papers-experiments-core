@@ -75,7 +75,30 @@ FACTS: dict[str, str] = {
         "/work, /tmp and /dev/shm are directories on the node's tmpfs, charged to the step's memory: the watch "
         "walks them every disk_poll_s and kills the run's processes when one is past its size or its inode count "
         "(disk_limit), where Docker refuses the write with ENOSPC; a directory the cell makes unreadable to its own "
-        "uid is unknown to the walk and taken as past its size"
+        "uid is unknown to the walk and taken as past its size. The node gives an unprivileged user no file system "
+        'of a size of their own (no loop mount, no root); work_disk = "image" gives /work one (work_disk_image)'
+    ),
+    "disk_watch_tmp": (
+        "/tmp and /dev/shm are directories on the node's tmpfs, charged to the step's memory: the watch walks them "
+        "every disk_poll_s and kills the run's processes when one is past its size or its inode count (disk_limit), "
+        "where Docker refuses the write with ENOSPC; a directory the cell makes unreadable to its own uid is unknown "
+        "to the walk and taken as past its size. /work is the run's work disk image (work_disk_image)"
+    ),
+    "work_disk_image": (
+        "/work is a directory of an ext3 image of work_disk_bytes (rounded down to 2 MiB) that the run makes with "
+        "the node's mkfs.ext3 on its tmpfs and every cell binds (-B <image>:/work:image-src=/work), so a write past "
+        "its size is refused with ENOSPC and nothing is killed, as on Docker: at the start a cell wrote past the "
+        "size of an image made the same way and got ENOSPC, and the run's own image was shown a file system of its "
+        "own of at most that size, or the start failed. How Apptainer mounts it (the kernel's driver where the "
+        "site's apptainer.conf allows setuid-mount extfs, fuse2fs otherwise) is the node's. Its pages are charged to "
+        "the step's memory as they are written, up to its size (the start's probe fills one whole image once, given "
+        "back before the agent's first cell); the watch still walks the image file's allocated "
+        "size. /work holds no lost+found, which Docker's disk does. The outputs are copied out by the copy helper in "
+        "an exec of the image, with every refusal of Docker's copy"
+    ),
+    "work_disk_unverified": (
+        'the run asked for the work disk image (work_disk = "image") and its start had not yet shown a write past '
+        "/work's size refused with ENOSPC: a record that holds this key is of a start that did not complete"
     ),
     "cpu_pids_nofile": "cpus, pids, nofile and the gate's memory limit are recorded and not enforced per container",
     "no_freezer": (
@@ -91,12 +114,20 @@ FACTS: dict[str, str] = {
 
 
 DNS = "none"  # what a cell's name lookups reach (dns_none)
+# the keys of each work disk (O71): a run records its own and none of the others'; the directory's record is the one
+# every run had before the image existed
+WORK_DISK_KEYS = {
+    "directory": ("disk_watch",),
+    "image_unverified": ("disk_watch_tmp", "work_disk_unverified"),
+    "image": ("disk_watch_tmp", "work_disk_image"),
+}
 
 
-def record() -> dict[str, Any]:
-    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up, and its name service. The sandbox's
-    metadata adds the watch's memory reading (`memory`) once it exists."""
-    return {"backend": "apptainer", "facts": sorted(FACTS), "dns": DNS}
+def record(work_disk: str = "directory") -> dict[str, Any]:
+    """The run's `infrastructure_facts`: every key of its work disk (`WORK_DISK_KEYS`), sorted, for a reader to look up,
+    and its name service. The sandbox's metadata adds the watch's memory reading (`memory`) once it exists."""
+    others = {key for keys in WORK_DISK_KEYS.values() for key in keys} - set(WORK_DISK_KEYS[work_disk])
+    return {"backend": "apptainer", "facts": sorted(set(FACTS) - others), "dns": DNS}
 
 
-__all__ = ["FACTS", "record"]
+__all__ = ["FACTS", "WORK_DISK_KEYS", "record"]

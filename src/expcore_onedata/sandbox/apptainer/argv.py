@@ -13,12 +13,13 @@ file systems and the site's configured bind paths out, so the cell sees the imag
 the node's. Its network is the node's: there is no network namespace for an unprivileged user (`facts.py`).
 
 The binds: `/work`, `/tmp` and `/dev/shm` from the run's directory (a cell's own `/tmp` would be gone at its end, where
-Docker's container keeps it for the run); read-only, `/etc/hosts` (the federation's names on loopback, where the gate
-listens), `/etc/resolv.conf` naming no name server and `/etc/nsswitch.conf` looking hosts up in files alone (so no
-name is looked up by DNS), `/etc/expcore/gate.json` (the gate's address, port and names, for a connect hook to read
-where a cleared environment cannot drop it), the run's CA and trust bundles, the egress collector's socket directory,
-the egress shim, the libraries of hook (b), `/etc/ld.so.preload` naming them all, the read-only inputs and the files of
-hook (b).
+Docker's container keeps it for the run), `/work` a directory of the run's ext3 image instead with `work_disk = "image"`
+(`-B <image>:/work:image-src=/work`, `workdisk.py`, O71); read-only, `/etc/hosts` (the federation's names on loopback,
+where the gate listens), `/etc/resolv.conf` naming no name server and `/etc/nsswitch.conf` looking hosts up in files
+alone (so no name is looked up by DNS), `/etc/expcore/gate.json` (the gate's address, port and names, for a connect hook
+to read where a cleared environment cannot drop it), the run's CA and trust bundles, the egress collector's socket
+directory, the egress shim, the libraries of hook (b), `/etc/ld.so.preload` naming them all, the read-only inputs and
+the files of hook (b).
 """
 
 from __future__ import annotations
@@ -49,13 +50,17 @@ NSSWITCH_TEXT = "".join(
 
 @dataclass(frozen=True)
 class Bind:
-    """A path of the node bound into the cell at `target`, read-only unless `writable`."""
+    """A path of the node bound into the cell at `target`, read-only unless `writable`; with `image_src`, the source is
+    an ext3 image and that directory of it is bound, read/write (`workdisk.py`, O71)."""
 
     source: Path
     target: str
     writable: bool = False
+    image_src: str | None = None
 
     def arg(self) -> str:
+        if self.image_src is not None:
+            return f"{self.source}:{self.target}:image-src={self.image_src}"
         return f"{self.source}:{self.target}" + ("" if self.writable else ":ro")
 
 

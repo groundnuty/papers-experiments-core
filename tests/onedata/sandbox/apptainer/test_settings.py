@@ -224,3 +224,25 @@ def test_two_oneclient_bundles_give_two_campaign_fingerprints(tmp_path, fake):
     assert {**prints[1], "sandbox_backend": {**prints[1]["sandbox_backend"], "oneclient_bundle_sha256": "d" * 64}} == (
         prints[0]
     )
+
+
+def test_o71_work_disk_defaults_to_the_directory_and_is_recorded_only_when_it_is_the_image(tmp_path):
+    """O71: `work_disk` is "directory" (the watch alone) unless set; the record names it only when it is "image", so
+    a fingerprint made before the key existed is unchanged, while an image run is another experiment."""
+    loaded = _load(tmp_path, _document())
+    assert loaded.apptainer.work_disk == "directory"
+    assert loaded.apptainer.work_disk_mkfs == ("mkfs.ext3",)
+    assert "work_disk" not in loaded.apptainer.record()
+    assert _load(tmp_path, _document(work_disk="directory")).apptainer.record() == loaded.apptainer.record()
+    image = _load(tmp_path, _document(work_disk="image", work_disk_mkfs=["/usr/sbin/mkfs.ext3"])).apptainer
+    assert image.work_disk == "image"
+    assert image.work_disk_mkfs == ("/usr/sbin/mkfs.ext3",)
+    assert image.record() == {**loaded.apptainer.record(), "work_disk": "image"}  # the tool is no experiment
+
+
+@pytest.mark.parametrize(("key", "bad"), [("work_disk", "loop"), ("work_disk", 1), ("work_disk_mkfs", ["mkfs ext3"]),
+                                          ("work_disk_mkfs", "mkfs.ext3")])  # fmt: skip
+def test_o71_a_work_disk_setting_that_is_not_one_is_refused_naming_its_key(tmp_path, key, bad):
+    """O71: the mode is one of the two, and mkfs plain command words."""
+    with pytest.raises(ConfigError, match=key):
+        _load(tmp_path, _document(**{key: bad}))

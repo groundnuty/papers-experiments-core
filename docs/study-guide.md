@@ -468,7 +468,7 @@ How a run works there:
 
 These things differ from Docker, and the record says so (`infrastructure_facts`):
 - **A memory kill ends the whole cell.** Docker's kernel kills the cell's largest process alone, so a cell whose child was killed may finish there; here every process of the cell is killed. Either way the cell is told it was killed (`memory_limit`) and the run goes on.
-- **A disk past its size kills the cell** (`disk_limit`), where on Docker the write is refused with ENOSPC and the agent's code sees the error, with no kill.
+- **A disk past its size kills the cell** (`disk_limit`). On Docker the write is refused with ENOSPC and the agent's code sees the error, with no kill. To get that for `/work`, set `work_disk = "image"` in `[sandbox.apptainer]` (O71). `/work` is then an ext3 image of `work_disk_bytes`, and a write past it is refused with ENOSPC as on Docker. The start proves this in a cell, or fails. `/tmp` and `/dev/shm` are still the watch's. The default stays `"directory"` until a live run proves the image on your site's nodes, and an image run is another experiment in the campaign fingerprint.
 - **`cpus`, `pids` and `nofile` are recorded, not enforced.**
 - **The network is the node's.** The agent can reach the internet, so declare the `egress` instrument (below).
 - **The memory reading can be unknown** (`infrastructure_facts.memory`): `within` only when the harness could show it, `unknown` with its reasons when it could not, and never `within` for a run whose code hid memory from it.

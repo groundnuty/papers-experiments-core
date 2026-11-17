@@ -4,13 +4,14 @@
 In order: every process of the run is killed and shown gone (none should be: each cell's end showed its own gone), so
 nothing changes `/work` while it is copied (there is no freezer here, `facts.py`); the helpers' state is read while they
 run, so a gate or a collector that ended during the run is a death of infrastructure; the named outputs are copied as on
-Docker (`copyout.copy_tree`: never a link, a special file, a hard link out of the tree, another file system or more
-than the work disk holds; what the agent made so is refused for the scorers, the harness's own failure raises
-`InfraError` of kind `output_collection`); the read-only inputs are hashed again; the gate is stopped (SIGTERM, so it
-writes its close lines) and the bytes it served counted once (O22), its log copied; the collector is stopped (it writes
-its end line) and its log read once, kept for the egress instrument and copied. Every file of evidence the collection
-writes is scanned for the data-path token: one that holds it is removed and the collection fails, since a secret is
-never evidence (O05). A mount run's guard closes its window here and its log is copied too (O60, `hostmount`).
+Docker (`copyout.copy_tree`: never a link, a special file, a hard link out of the tree, another file system or more than
+the work disk holds; what the agent made so is refused for the scorers, the harness's own failure raises `InfraError` of
+kind `output_collection`), out of the run's ext3 image by the copy helper in execs of it with `work_disk = "image"`,
+every refusal the same (`workdisk.collect`, O71); the read-only inputs are hashed again; the gate is stopped (SIGTERM,
+so it writes its close lines) and the bytes it served counted once (O22), its log copied; the collector is stopped (it
+writes its end line) and its log read once, kept for the egress instrument and copied. Every file of evidence the
+collection writes is scanned for the data-path token: one that holds it is removed and the collection fails, since a
+secret is never evidence (O05). A mount run's guard closes its window here and its log is copied too (O60, `hostmount`).
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ from expcore_onedata.fault_drain import GATE
 from expcore_onedata.sandbox import copyout, gatelog, inputs, kinds
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox.api import DataPathMode, SandboxError
-from expcore_onedata.sandbox.apptainer import helpers
+from expcore_onedata.sandbox.apptainer import argv as AV
+from expcore_onedata.sandbox.apptainer import helpers, runs, workdisk
 from expcore_onedata.sandbox.sandbox import TEARDOWN_TROUBLE
 
 if TYPE_CHECKING:
@@ -98,15 +100,38 @@ class Collection:
 
     def _outputs(self, dest: Path, outputs: Sequence[str]) -> dict[str, bool]:
         box = self.box
-        copies = [(rel, dest / "work" / rel) for rel in outputs]
         try:
-            copied = copyout.copy_tree(box.node, box.dir / "work", copies, max_bytes=box.s.limits.work_disk_bytes)
+            if box.work_image:
+                copied = self._image_outputs(dest, outputs)
+            else:
+                copies = [(rel, dest / "work" / rel) for rel in outputs]
+                copied = copyout.copy_tree(box.node, box.dir / "work", copies, max_bytes=box.s.limits.work_disk_bytes)
         except copyout.UnsafeOutput as unsafe:  # the agent's own doing: for the scorers, never a set-aside
             box._meta["refused_output"] = copyout.record(unsafe.refused)
             return dict.fromkeys(outputs, False)
         except SandboxError as failed:
             raise kinds.collection_error("the run's outputs", str(failed)) from None
         return {rel: copied[rel] is not None for rel in outputs}
+
+    def _image_outputs(self, dest: Path, outputs: Sequence[str]) -> dict[str, dict[str, int] | None]:
+        """The named outputs out of the run's image (`workdisk.collect`): the copy helper in one-shot execs of the image
+        that bind its `/work` and the run's staging directory and carry the run's tag, each after the image is checked
+        (O13); the staging directory is removed whatever happens."""
+        box = self.box
+        staging = box.dir / "export"
+        runs.remove_tree(staging)
+        staging.mkdir(mode=0o700)
+        binds = [box.work_bind(), AV.Bind(staging, workdisk.EXPORT, True)]
+        host = workdisk.ImageCopyHost(
+            box.node, python=box.app.python, before_exec=box.image_unchanged, image=workdisk.image_path(box.dir),
+            staging=staging,
+            argv_of=lambda command: AV.exec_argv(box.app.apptainer, box.app.image.path, binds, {AV.RUN_TAG: box.sid},
+                                                 command),
+        )  # fmt: skip
+        try:
+            return workdisk.collect(host, staging, dest / "work", outputs, max_bytes=box.s.limits.work_disk_bytes)
+        finally:
+            runs.remove_tree(staging)
 
     def _inputs_unchanged(self) -> None:
         box = self.box

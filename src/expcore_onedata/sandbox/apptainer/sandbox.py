@@ -13,6 +13,8 @@ Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded fir
 (`runs.py`), so a driver killed outright is reaped by the next start and its key held by the probe:
 
 * `work/`, `tmp/` and `shm/`: the cell's `/work`, `/tmp` and `/dev/shm`, kept across cells, bounded by the watch;
+  with `work_disk = "image"`, `work/` holds the run's ext3 image instead, a directory of which is the cell's `/work`,
+  a write past its size refused with ENOSPC as on Docker, proven before the agent's first cell (`workdisk.py`, O71);
 * the egress collector (`egress-collector.py`, a pinned copy), started first, on a fresh 0700 socket directory that
   every cell binds read-only at `/hpcop-egress`; the pinned egress shim, preloaded in every cell through a bound
   `/etc/ld.so.preload`; a canary connect from inside a cell opens the collector's log before anything else runs, and
@@ -56,7 +58,7 @@ from expcore_onedata.sandbox import gatelog, gatepolicy, inputs, kinds, tokenfil
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs
+from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs, workdisk
 from expcore_onedata.sandbox.apptainer.cells import AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
@@ -115,6 +117,7 @@ class ApptainerSandbox:
     ) -> None:
         self.node, self.s, self.spec, self.registry = node, settings, spec, registry
         self.app = settings.apptainer
+        self.work_image = self.app is not None and self.app.work_disk == "image"  # O71: /work an ext3 image
         self._sleep, self._clock, self._output_cap, self._mount_factory = sleep, clock, output_cap_bytes, mount_helper
         key = re.sub(r"[^A-Za-z0-9_.-]", "_", spec.lease_key or spec.run_key)[:48]
         self.sid = f"{key}-{uuid.uuid4().hex[:8]}"
@@ -126,7 +129,7 @@ class ApptainerSandbox:
             "data_path": spec.mode.value,
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,
             "backend": self.app.record() if self.app is not None else {"backend": "apptainer"},
-            "infrastructure_facts": facts.record(),
+            "infrastructure_facts": facts.record("image_unverified" if self.work_image else "directory"),
             "images": {},
             "tls": settings.tls.record(),
             "certifi": None,
@@ -229,6 +232,8 @@ class ApptainerSandbox:
                 raise StartRefused(str(error)) from None
         if self.app.gate_options.get(gaterun.PEER_CHECK_KEY) is True and not gaterun.PEER_CHECK.is_file():
             raise StartRefused("gate_options asks for the gate's peer-uid check, and this core's gate does not have it")
+        if self.work_image and workdisk.image_size(s.limits.work_disk_bytes) < workdisk.ALIGN:
+            raise StartRefused('work_disk = "image" needs [sandbox.limits] work_disk_bytes of at least 2 MiB')
         self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s), storages=inputs.storage_paths(s))
         layout.check_work_root(s.work_root, os.getuid())
         self._image_identity = layout.pin_image(self.app.image)  # O13, before anything exists
@@ -266,6 +271,8 @@ class ApptainerSandbox:
         self.dir.mkdir(mode=0o700)
         for name in ("work", "tmp", "shm", "cell", "egress", "egress-sock"):
             (self.dir / name).mkdir(mode=0o700)
+        if self.work_image:
+            self._make_work_disk()
         cell = self.dir / "cell"
         layout.copy_pinned(self.app.egress_shim, cell / "egresslog.so", "the egress shim")
         layout.copy_pinned(self.app.egress_collector, self.dir / "egress" / "egress-collector.py",
@@ -292,11 +299,23 @@ class ApptainerSandbox:
         self._start_cells()
         self._canary()
         self._verify_read_only()
+        self._verify_work_disk()
         self._verify_inputs()
         self._new_refusals()  # whatever the start's own steps met is not the agent's first cell's
 
     def _host_python(self) -> str:
         return self.app.host_python or sys.executable
+
+    def _make_work_disk(self) -> None:
+        """The run's ext3 image (`workdisk.make`), recorded unverified until its probe holds (`_verify_work_disk`)."""
+        size = workdisk.image_size(self.s.limits.work_disk_bytes)
+        self._meta["work_disk"] = {"mode": "image", "size_bytes": size, "enospc_verified": False,
+                                   "mkfs": workdisk.mkfs_version(self.node, self.app.work_disk_mkfs)}  # fmt: skip
+        workdisk.make(self.node, self.dir, size, self.app.work_disk_mkfs)
+
+    def work_bind(self) -> AV.Bind:
+        """The cell's `/work`: the run's directory, or a directory of its image (O71)."""
+        return workdisk.bind(self.dir) if self.work_image else AV.Bind(self.dir / "work", "/work", True)
 
     def _start_collector(self) -> None:
         egress = self.dir / "egress"
@@ -384,8 +403,7 @@ class ApptainerSandbox:
 
     def _probe_argv(self, command: Sequence[str]) -> list[str]:
         """A one-shot exec of the image for the harness's own reads: `/work` alone bound, no shim, no egress."""
-        return AV.exec_argv(self.app.apptainer, self.app.image.path, [AV.Bind(self.dir / "work", "/work", True)], {},
-                            command)  # fmt: skip
+        return AV.exec_argv(self.app.apptainer, self.app.image.path, [self.work_bind()], {}, command)
 
     def _trust_bundles(self) -> dict[str, Path]:
         """Each declared trust path and the image's certifi bundle (O23), with the run's CA appended."""
@@ -421,7 +439,7 @@ class ApptainerSandbox:
         layout.write_text(cell / "nsswitch.conf", AV.NSSWITCH_TEXT)
         layout.write_text(cell / "ld.so.preload", AV.preload_text([*preloads, AV.SHIM_TARGET]))
         binds = [
-            AV.Bind(self.dir / "work", "/work", True), AV.Bind(self.dir / "tmp", "/tmp", True),
+            self.work_bind(), AV.Bind(self.dir / "tmp", "/tmp", True),
             AV.Bind(self.dir / "shm", "/dev/shm", True), AV.Bind(cell / "hosts", "/etc/hosts"),
             AV.Bind(cell / "resolv.conf", AV.RESOLV_CONF), AV.Bind(cell / "nsswitch.conf", AV.NSSWITCH_CONF),
             AV.Bind(self.dir / "egress-sock", AV.EGRESS_DIR), AV.Bind(cell / "egresslog.so", AV.SHIM_TARGET),
@@ -494,6 +512,28 @@ class ApptainerSandbox:
             log.error("read-only probe of the root said %r (%s)", r.stdout.strip(), describe_stderr(r.stderr))
             raise SandboxError("the root is not read-only for the agent")
         self._meta["read_only_verified"] = {"root": True}
+
+    def _verify_work_disk(self) -> None:
+        """O71: a cell writes past `/work`'s size and must be refused with ENOSPC at most at it (`workdisk.judge`), or
+        the start fails; the image, which the probe filled, is then made again by the same command, and a cell shows it
+        a file system of its own of at most its size (`workdisk.judge_check`). Only then does the record say so."""
+        if not self.work_image:
+            return
+        size = workdisk.image_size(self.s.limits.work_disk_bytes)
+        r = self._cells.run(workdisk.probe_source(size), workdisk.probe_timeout_s(size), record=False)
+        held = workdisk.judge(r.stdout, r.exit_code, size)
+        if held is None:
+            log.error("the work disk's probe said %r (%s)", r.stdout.strip()[:80], describe_stderr(r.stderr))
+            raise SandboxError("a write past /work's size is not refused with ENOSPC for the agent")
+        workdisk.make(self.node, self.dir, size, self.app.work_disk_mkfs)  # the probed image's pages given back
+        r = self._cells.run(workdisk.CHECK, PROBE_S, record=False)
+        total = workdisk.judge_check(r.stdout, r.exit_code, size)
+        if total is None:
+            log.error("the work disk's check said %r (%s)", r.stdout.strip()[:80], describe_stderr(r.stderr))
+            raise SandboxError("the run's /work is not a file system of its own of at most its size")
+        with self._meta_lock:
+            self._meta["work_disk"].update(enospc_verified=True, held_bytes=held, filesystem_bytes=total, remade=True)
+            self._meta["infrastructure_facts"] = facts.record("image")
 
     def _snapshot_inputs(self) -> list[tuple[Path, str]]:
         """Copy each read-only input into the run's directory, hash it, and take every write bit away (O20)."""

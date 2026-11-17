@@ -4,11 +4,12 @@
 On every path that ends a sandbox, a failed start's included, in this order, each step run whatever an earlier one
 raised: the run's file of the token (first: a secret is never evidence, and a later step that hangs must find none);
 every process of the run's cells, killed and shown gone; the watch; the mount's helper (hook c); the gate and the
-collector, each shown gone (`helpers.stop`); then the run's directory, removed and shown gone, or, when the run is kept
-as evidence (a failed collection, a deadline that ended the run), moved to `work_root/_kept_evidence` once its token
-file and its copy of the CA bundle are gone. The run's record (`runs.py`) is dropped last, and only when all of it is
-shown gone: a teardown that is not complete raises `SandboxError` naming each step that failed, and leaves the record
-for a next try, the reaper and the probe.
+collector, each shown gone (`helpers.stop`); with a work disk image (O71), every process whose command line names the
+image, killed and shown gone (`workdisk.end_holders`); then the run's directory, removed and shown gone, or, when the
+run is kept as evidence (a failed collection, a deadline that ended the run), moved to `work_root/_kept_evidence` once
+its token file and its copy of the CA bundle are gone, and its image too, which cannot be shown free of the token. The
+run's record (`runs.py`) is dropped last, and only when all of it is shown gone: a teardown that is not complete raises
+`SandboxError` naming each step that failed, and leaves the record for a next try, the reaper and the probe.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import SandboxError
-from expcore_onedata.sandbox.apptainer import helpers, runs
+from expcore_onedata.sandbox.apptainer import helpers, runs, workdisk
 from expcore_onedata.sandbox.hostops import describe_error
 
 if TYPE_CHECKING:
@@ -90,6 +91,9 @@ class Teardown:
                     self.gone.add(role)
                     if role == "gate":
                         box.note_end(GATE)
+            if box.work_image:
+                self.step = "work disk"
+                self._do(errors, self.step, self._work_disk)
             if not errors:  # a helper or a cell not shown gone may still write there: the directory stays
                 self.step = "run directory"
                 self._do(errors, self.step, self._directory)
@@ -126,6 +130,11 @@ class Teardown:
 
         return stop
 
+    def _work_disk(self) -> None:
+        box = self.box
+        if os.path.lexists(workdisk.image_path(box.dir)):
+            workdisk.end_holders(box.node, workdisk.image_path(box.dir), sleep=box._sleep, clock=box._clock)
+
     def _directory(self) -> None:
         box = self.box
         if not os.path.lexists(box.dir):
@@ -139,13 +148,19 @@ class Teardown:
             raise SandboxError("the run directory is left where it is: a copy of the data-path token is in it")
         if box._ca_copy is not None:
             box._ca_copy.unlink(missing_ok=True)  # configuration, not evidence
-        removed = scrub(box.dir, box.spec.token.reveal().encode() if box.spec.token is not None else b"")
+        token = box.spec.token.reveal().encode() if box.spec.token is not None else b""
+        image = workdisk.image_path(box.dir)
+        dropped = bool(token) and os.path.lexists(image)  # its files' blocks need not be contiguous: never scanned
+        if dropped:
+            image.unlink()
+        removed = scrub(box.dir, token)
         kept = box.s.work_root / KEPT
         kept.mkdir(mode=0o700, exist_ok=True)
         os.rename(box.dir, kept / box.sid)
         with box._meta_lock:
             box._meta["evidence_kept"] = {"under": "sandbox.work_root", "directory_id": box.sid.rsplit("-", 1)[-1],
-                                          "relocated": True, "files_holding_the_token_removed": removed}  # fmt: skip
+                                          "relocated": True, "files_holding_the_token_removed": removed,
+                                          **({"work_disk_image_dropped": True} if dropped else {})}  # fmt: skip
 
 
 def scrub(root: Path, token: bytes) -> int:
