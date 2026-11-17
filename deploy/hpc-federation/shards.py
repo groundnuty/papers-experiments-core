@@ -94,9 +94,9 @@ step's record says its script passed.
 **Which render a shard runs against: the render identity (O74).** `hpcfed.py up` writes `render-identity.json` in the
 federation's root (`hpcidentity.py`): mode 0600, canonical JSON, nothing but SHA-256s and a version: the template as it
 was read before it was rendered, the rendered platform's fingerprint, each pin the platform holds (the agent's SIF,
-the egress shim, the egress collector, oneclient's bundle), and, when the site declares `HPC_STUDY_ARTIFACTS`, the
-digest of that directory's tree (`study_artifacts_tree_sha256`; no path of the directory). A manifest that declares
-`expect_render_identity`, a path
+the egress shim, the egress collector, oneclient's bundle, the REST layout's 443 mapper), and, when the site declares
+`HPC_STUDY_ARTIFACTS`, the digest of that directory's tree (`study_artifacts_tree_sha256`; no path of the directory). A
+manifest that declares `expect_render_identity`, a path
 of the study (`render-identity.expected.json` at its root, say: a federation's record copied there), makes every line
 carry `--expect-render-identity REL --expect-render-identity-sha256 HEX` (`plan` and `lines` read the file by the
 guard's path rules, refuse one that is not a well-formed record, and record its hash; with none declared the line and
@@ -270,6 +270,7 @@ RENDER_IDENTITY_PINS = (
     "egress_shim_sha256",
     "egress_collector_sha256",
     "oneclient_bundle_sha256",
+    "gateport_sha256",
 )
 RENDER_IDENTITY_ARTIFACTS = "study_artifacts_tree_sha256"  # in the record only when the site declares the directory
 RENDER_IDENTITY_KEYS = (
