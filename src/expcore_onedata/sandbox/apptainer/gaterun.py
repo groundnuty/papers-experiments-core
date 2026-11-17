@@ -105,7 +105,8 @@ def write_token(path: Path, token: str) -> None:
 
 
 def argv(python: str, config_path: Path) -> list[str]:
-    """The gate's command line: the node's interpreter, isolated, the core's gate and its configuration's path."""
+    """The gate's command line: the node's interpreter, isolated and writing no bytecode (`-I -B`: the core's
+    interpreter may live in the account's shared home), the core's gate and its configuration's path."""
     return [python, "-I", "-B", str(GATE_PY), str(config_path)]
 
 
