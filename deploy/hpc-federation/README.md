@@ -370,8 +370,9 @@ site without the variable when the template names it, a command that is no execu
 pinned commit with no change to a tracked file, and a manifest that is not its condition's (edited, or showing other
 tools than the allow-list); each message names the condition by its position and no path. The server is started through
 the resolve launcher (`<interpreter> -I -B resolve_launch.py <map> -- -m <module>`, "Registered names"), so `command` is a
-Python interpreter and `args` start with `-m <module>`: a console script behind `/usr/bin/env` is refused when the file is
-loaded. Owed to the next HPC slot: a B2 run whose tool calls succeed, whose rights refusals match Compose's for the same
+Python interpreter and `args` start with `-m <module>`: a console script behind `/usr/bin/env` is refused by `up`'s
+preflight, before any job is held, and when the file is loaded, saying to use `<venv>/bin/python` with `args = ['-m',
+'<module>', ...]`. Owed to the next HPC slot: a B2 run whose tool calls succeed, whose rights refusals match Compose's for the same
 layout, and whose visible-names counts are zero.
 
 ## The driver: `hpcfed.py`
