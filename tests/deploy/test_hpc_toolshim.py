@@ -88,6 +88,22 @@ def test_o73_the_server_started_as_the_platform_says_reaches_a_declared_name_at_
         ]
 
 
+def test_o73_a_script_given_with_no_arguments_reaches_a_declared_name_through_the_launcher(tmp_path):
+    """O73 (#381): the same start for a server that is a bare script, `[toolserver] args = [script]`: the command line
+    the platform builds, `<interpreter> -I -B resolve_launch.py <map> -- <script>`, runs the script, and `sys.argv`
+    holds nothing after it. The launcher refused this form as a usage error (an argument count one too high), though
+    `launch_argv` builds it and the module's docstring documents it."""
+    client = tmp_path / "client.py"
+    client.write_text(CLIENT, encoding="utf-8")
+    with TlsPeer(tmp_path / "pki", ZONE) as peer:
+        config = _config(tmp_path, peer, server=(str(client),))
+        assert server_argv(config)[1][-2:] == ["--", str(client)]
+        done = _run_server(config, peer)
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == "200 []"
+        assert peer.sni == [ZONE]
+
+
 def test_o73_without_the_launcher_the_same_server_cannot_resolve_the_declared_name(tmp_path):
     """O73: it is the launcher that resolves the name: a platform with the map and no `resolver` starts the server as
     declared, and the name fails to resolve."""
@@ -114,7 +130,9 @@ def test_o73_the_certificate_is_still_checked_for_the_declared_name(tmp_path):
             data["toolserver"].update(command=sys.executable, args=[str(client)])
 
         config = load_platform(write_platform(tmp_path, edit))
-        assert _run_server(config, peer).returncode != 0
+        done = _run_server(config, peer)
+        assert done.returncode not in (0, 78), done.stderr  # the client ran and failed; the launcher did not refuse it
+        assert "CERTIFICATE_VERIFY_FAILED" in done.stderr
         assert peer.requests == []
 
 
@@ -280,6 +298,7 @@ def test_o73_a_map_the_launcher_may_not_use_stops_the_start_naming_nothing(tmp_p
     done = _launch(paths[why], [str(server)], tmp_path=tmp_path)
     assert done.returncode == 78
     assert done.stdout == ""
+    assert "usage" not in done.stderr  # the map is what stopped it: the bare script is a form the launcher accepts
     assert not ran.exists()
     assert not re.search(r"layout\.test|192\.0\.2|\.json|/tmp|" + re.escape(str(tmp_path)), done.stderr)
 
@@ -290,6 +309,42 @@ def test_o73_a_server_the_launcher_cannot_run_is_refused(tmp_path, server):
     done = _launch(_map(tmp_path / "map.json", {ZONE: "192.0.2.10"}), server, tmp_path=tmp_path)
     assert done.returncode == 78
     assert done.stdout == ""
+
+
+def test_o73_the_launcher_runs_a_bare_script_with_no_arguments(tmp_path):
+    """O73 (#381): `resolve_launch.py <map> -- <script>`, the form the module's docstring gives with nothing after the
+    script, runs it as `__main__` with `sys.argv` holding the script alone, and prints nothing of its own."""
+    script = tmp_path / "bare.py"
+    script.write_text("import json, sys\nprint(json.dumps([__name__, sys.argv]))\n", encoding="utf-8")
+    done = _launch(_map(tmp_path / "map.json", {ZONE: "192.0.2.10"}), [str(script)], tmp_path=tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == ["__main__", [str(script)]]
+    assert done.stderr == ""
+
+
+@pytest.mark.parametrize("shape", ["nothing", "map only", "no separator", "separator after the script", "no server"])
+def test_o73_the_launcher_still_needs_a_map_a_separator_and_a_server(tmp_path, shape):
+    """O73 (#381): the count the launcher checks is `<map> -- <server>`, and a bare script is the shortest server: a
+    script with no separator, the separator after it, no server and no map are usage errors (exit 78), and the script
+    never runs."""
+    map_path = _map(tmp_path / "map.json", {ZONE: "192.0.2.10"})
+    ran = tmp_path / "ran"
+    script = tmp_path / "script.py"
+    script.write_text(f"open({str(ran)!r}, 'w').close()\n", encoding="utf-8")
+    given = {
+        "nothing": [],
+        "map only": [str(map_path)],
+        "no separator": [str(map_path), str(script)],
+        "separator after the script": [str(map_path), str(script), "--"],
+        "no server": [str(map_path), "--"],
+    }[shape]
+    done = subprocess.run(
+        [sys.executable, "-I", "-B", str(LAUNCHER), *given], capture_output=True, text=True, timeout=60, cwd=tmp_path
+    )
+    assert done.returncode == 78
+    assert done.stdout == ""
+    assert "usage" in done.stderr
+    assert not ran.exists()
 
 
 def test_o73_the_launcher_imports_nothing_of_the_core_and_prints_nothing_of_its_own():
