@@ -6,7 +6,8 @@ A backend writes it once, when the collector is up:
     sandbox.record_infrastructure_fact(facts.KEY, facts.fact(...), owner=facts.OWNER)
 
 so a reader of one run's record knows which collector and which client ran, where, and which sender uid it accepted.
-The key is the first owner's (`infrafacts`): no other writer may take it.
+The key is declared for this owner in `infrafacts.OWNED`, so a stray write by another owner is the one refused, even
+before this one has written.
 """
 
 import re

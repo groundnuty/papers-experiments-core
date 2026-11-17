@@ -57,6 +57,7 @@ def received(receiving):
 
 
 def test_o91_a_record_is_one_ascii_json_line_with_its_fields(client_module):
+    """O91: a record is one ascii json line with its fields."""
     line = client_module.encode("read", "file-7", range=[0, 4096], bytes=4096, sha256=SHA)
     assert isinstance(line, bytes)
     line.decode("ascii")
@@ -72,6 +73,7 @@ def test_o91_a_record_is_one_ascii_json_line_with_its_fields(client_module):
 
 
 def test_o91_a_non_ascii_item_is_escaped_so_the_line_stays_ascii(client_module):
+    """O91: a non ascii item is escaped so the line stays ascii."""
     line = client_module.encode("read", "café-\U0001f600")
     line.decode("ascii")
     assert json.loads(line)["item"] == "café-\U0001f600"
@@ -123,6 +125,7 @@ def test_o91_the_cap_is_checked_against_the_bytes_that_would_be_sent_not_the_cha
 
 @needs_unix
 def test_o91_one_send_is_one_datagram(server):
+    """O91: one send is one datagram."""
     receiving, client, _ = server
     client.log_read("a")
     client.log_read("b", bytes=3)
@@ -141,6 +144,7 @@ def test_o91_an_over_long_line_is_refused_before_anything_is_sent(server):
 
 @needs_unix
 def test_o91_a_missing_socket_raises(client_module):
+    """O91: a missing socket raises."""
     root = short_dir()
     try:
         client_module.SOCKET = str(root / "no-such-socket")
@@ -171,6 +175,7 @@ def test_o91_a_collector_that_stopped_reading_raises(server):
 
 @needs_unix
 def test_o91_a_file_that_is_no_socket_raises(client_module):
+    """O91: a file that is no socket raises."""
     root = short_dir()
     try:
         not_a_socket = Path(root / "sock")

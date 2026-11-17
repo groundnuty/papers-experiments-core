@@ -12,6 +12,7 @@ SHA_A, SHA_B = "ab" * 32, "cd" * 32
 
 
 def test_o91_the_fact_holds_the_four_things_a_reader_of_one_run_needs():
+    """O91: the fact holds the four things a reader of one run needs."""
     value = facts.fact(
         collector_sha256=SHA_A, client_sha256=SHA_B, placement="apptainer_helper", expected_peer_uid=1000
     )
@@ -39,6 +40,7 @@ def test_o91_the_fact_holds_the_four_things_a_reader_of_one_run_needs():
     ],
 )
 def test_o91_a_fact_that_is_not_well_formed_is_refused(bad):
+    """O91: a fact that is not well formed is refused."""
     fields = {
         "collector_sha256": SHA_A,
         "client_sha256": SHA_B,
@@ -51,9 +53,15 @@ def test_o91_a_fact_that_is_not_well_formed_is_refused(bad):
 
 
 def test_o91_the_fact_goes_through_the_runs_one_writer_under_its_own_owner():
-    """O89: the key is the first owner's: another writer is refused, the owner may write again."""
+    """O91: the key is declared for the channel in `infrafacts.OWNED` (O89): another writer is refused from the start,
+    before the channel has written it, and the owner may write again."""
+    assert infrafacts.OWNED[facts.OWNER] == {facts.KEY}
+    assert infrafacts.READLOG == facts.OWNER
     meta: dict = {}
     writer = infrafacts.InfrastructureFacts(meta, threading.RLock())
+    with pytest.raises(infrafacts.FactsConflict):
+        writer.write("another", {facts.KEY: {"stray": True}})
+    assert writer.get(facts.KEY) is None
     value = facts.fact(
         collector_sha256=SHA_A, client_sha256=SHA_B, placement="apptainer_helper", expected_peer_uid=1000
     )
@@ -65,6 +73,7 @@ def test_o91_the_fact_goes_through_the_runs_one_writer_under_its_own_owner():
 
 
 def test_o91_the_shipped_files_are_the_packages_own_and_hash_as_their_bytes():
+    """O91: the shipped files are the packages own and hash as their bytes."""
     assert files.collector_file().name == "collector.py"
     assert files.client_file().name == "client.py"
     for path in (files.collector_file(), files.client_file()):

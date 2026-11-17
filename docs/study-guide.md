@@ -1401,49 +1401,56 @@ from expcore.replay.side_files import SideFile
 from expcore_onedata.readlog import paths
 from expcore_onedata.readlog.instrument import ReadLog
 
-NONCE, UID = "ab" * 16, 1000
-lines = [
-    {
-        "event": "start",
-        "format": paths.FORMAT,
-        "nonce": NONCE,
-        "pid": 7,
-        "uid": UID,
-        "peer_uid": UID,
-        "max_bytes": 1 << 20,
-    },
-    {"event": "record", "peer": {"pid": 9, "uid": UID}, "rec": {"v": 1, "op": "canary", "item": "canary"}},
-    {"event": "record", "peer": {"pid": 9, "uid": UID}, "rec": {"v": 1, "op": "read", "item": "file-1", "bytes": 10}},
-    {"event": "end", "records": 2, "malformed": 0, "unwritten": 0, "cap_reached": False},
-]
-for seq, line in enumerate(lines):
-    line.update(seq=seq, wall=1.0 + seq, mono=1.0 + seq)
-collected = b"".join((json.dumps(line, sort_keys=True) + "\n").encode() for line in lines)  # the collector's log
+
+def stage_the_read_log():
+    NONCE, UID = "ab" * 16, 1000
+    lines = [
+        {
+            "event": "start",
+            "format": paths.FORMAT,
+            "nonce": NONCE,
+            "pid": 7,
+            "uid": UID,
+            "peer_uid": UID,
+            "max_bytes": 1 << 20,
+        },
+        {"event": "record", "peer": {"pid": 9, "uid": UID}, "rec": {"v": 1, "op": "canary", "item": "canary"}},
+        {
+            "event": "record",
+            "peer": {"pid": 9, "uid": UID},
+            "rec": {"v": 1, "op": "read", "item": "file-1", "bytes": 10},
+        },
+        {"event": "end", "records": 2, "malformed": 0, "unwritten": 0, "cap_reached": False},
+    ]
+    for seq, line in enumerate(lines):
+        line.update(seq=seq, wall=1.0 + seq, mono=1.0 + seq)
+    collected = b"".join((json.dumps(line, sort_keys=True) + "\n").encode() for line in lines)  # the collector's log
+
+    class StoppedCollector:
+        def read_log(self):  # what the sandbox kept of the log, once, after it stopped the collector
+            return collected
+
+    snapshot = ReadLog(StoppedCollector(), NONCE, UID).finish()
+    assert snapshot["log"] == "intact" and snapshot["counts"] == {"reads": 1, "canaries": 1}
+    assert snapshot["side_sha256"] == hashlib.sha256(collected).hexdigest()
+
+    declared = [SideFile(paths.SIDE_FILE_NAME, paths.SIDE_HASH_FIELD)]
+    where = Path(tempfile.mkdtemp())
+    (where / "collected").write_bytes(collected)  # where the collection left the log on the harness's disk
+    request = SimpleNamespace(run_dir=where / "try1", identity=SimpleNamespace(run_key="task=read|seed=1", attempt=1))
+    staged = stage_harness_side_file(request, declared, paths.SIDE_FILE_NAME, where / "collected")
+    assert staged is not None and staged.sha256 == snapshot["side_sha256"]
+    (request.run_dir / record_filename("task=read|seed=1", 1)).write_text(
+        json.dumps({"instruments": {"read_log": snapshot}})
+    )
+    staged.commit()  # the rename, once the record names the hash
+    assert (request.run_dir / paths.SIDE_FILE_NAME).read_bytes() == collected
 
 
-class StoppedCollector:
-    def read_log(self):  # what the sandbox kept of the log, once, after it stopped the collector
-        return collected
-
-
-snapshot = ReadLog(StoppedCollector(), NONCE, UID).finish()
-assert snapshot["log"] == "intact" and snapshot["counts"] == {"reads": 1, "canaries": 1}
-assert snapshot["side_sha256"] == hashlib.sha256(collected).hexdigest()
-
-declared = [SideFile(paths.SIDE_FILE_NAME, paths.SIDE_HASH_FIELD)]
-where = Path(tempfile.mkdtemp())
-(where / "collected").write_bytes(collected)  # where the collection left the log on the harness's disk
-request = SimpleNamespace(run_dir=where / "try1", identity=SimpleNamespace(run_key="task=read|seed=1", attempt=1))
-staged = stage_harness_side_file(request, declared, paths.SIDE_FILE_NAME, where / "collected")
-assert staged is not None and staged.sha256 == snapshot["side_sha256"]
-(request.run_dir / record_filename("task=read|seed=1", 1)).write_text(
-    json.dumps({"instruments": {"read_log": snapshot}})
-)
-staged.commit()  # the rename, once the record names the hash
-assert (request.run_dir / paths.SIDE_FILE_NAME).read_bytes() == collected
+stage_the_read_log()
 ```
 
-**An unknown log is unknown reads.** The log is intact only with a start line of this run, matching end counts, no cap reached, no malformed line, the canary as its first record and every sender the expected uid. A collector that was killed, a log past its cap or a datagram that was no record gives `"log": "unknown"` with the reasons and `counts` None; score the run's reads as unknown, never as fewer. A forged read cannot be prevented (the agent's own code can call the client), only detected, by the read-log scan and, on a REST data path, by the gate's per-file table of what it served. An agent that reads the data some other way than through your scripts leaves no record: decide in the design whether such a read scores as an omission.
+**An unknown log is unknown reads.** The log is intact only with a start line of this run, matching end counts, no cap reached, no malformed line, the canary as its first record and every sender the expected uid. A collector that was killed, a log past its cap or a datagram that was no record gives `"log": "unknown"` with the reasons and `counts` None; score the run's reads as unknown, never as fewer. A forged read cannot be prevented (the agent's own code can call the client), only detected, by the read-log scan and, on a REST data path, by the gate's per-file table of what it served. An agent that reads the data some other way than through your scripts leaves no record: decide in the design whether such a read scores as an omission. Code that runs in a script's own process can patch the client or the standard library so that a real read is not logged: the scan reads the text of the agent's code and does not match a patch of the standard library, but on a REST data path the gate's table of served files shows the read.
 
 ### The mount on HPC: guarded and reported, not isolated
 

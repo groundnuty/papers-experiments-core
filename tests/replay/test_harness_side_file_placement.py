@@ -66,6 +66,7 @@ def failures(batch):
 
 
 def test_o91_the_helper_stages_a_harness_file_under_a_dot_name_and_returns_its_sha256(request_of, harness_file, batch):
+    """O91: the helper stages a harness file under a dot name and returns its sha256."""
     staged = stage_harness_side_file(request_of, DECLARED, LOG.pattern, harness_file)
     assert staged is not None
     assert staged.sha256 == digest(CONTENT)
@@ -101,23 +102,29 @@ def test_o91_a_path_with_no_file_is_no_side_file(request_of, tmp_path):
 
 
 def test_o91_a_name_no_declaration_holds_is_refused_before_the_disk_is_touched(request_of, tmp_path):
+    """O91: a name no declaration holds is refused before the disk is touched."""
     with pytest.raises(UndeclaredSideFile, match="declares no side file named"):
         stage_harness_side_file(request_of, DECLARED, "other.jsonl", tmp_path / "never-looked-at")
     assert not request_of.run_dir.exists()
 
 
-def test_o91_a_link_is_refused_and_so_is_a_directory(request_of, harness_file, tmp_path):
-    """O91: only a regular file is copied; a link to one is not followed."""
+def test_o91_a_link_a_directory_and_a_fifo_are_refused(request_of, harness_file, tmp_path):
+    """O91: only a regular file is copied; a link to one is not followed, and a directory or a FIFO is refused."""
     link = tmp_path / "link.jsonl"
     os.symlink(harness_file, link)
     with pytest.raises(PlacementError):
         stage_harness_side_file(request_of, DECLARED, LOG.pattern, link)
     with pytest.raises(PlacementError):
         stage_harness_side_file(request_of, DECLARED, LOG.pattern, tmp_path)
+    fifo = tmp_path / "fifo.jsonl"
+    os.mkfifo(fifo)
+    with pytest.raises(PlacementError):  # opening a FIFO would block: it is refused before it is opened
+        stage_harness_side_file(request_of, DECLARED, LOG.pattern, fifo)
     assert not request_of.run_dir.exists() or list(request_of.run_dir.iterdir()) == []
 
 
 def test_o91_a_file_over_the_cap_is_refused_and_leaves_nothing(request_of, harness_file, monkeypatch):
+    """O91: a file over the cap is refused and leaves nothing."""
     monkeypatch.setattr(side_module, "MAX_SIDE_FILE_BYTES", len(CONTENT) - 1)
     with pytest.raises(SideFileTooLarge, match="MAX_SIDE_FILE_BYTES"):
         stage_harness_side_file(request_of, DECLARED, LOG.pattern, harness_file)
@@ -125,6 +132,7 @@ def test_o91_a_file_over_the_cap_is_refused_and_leaves_nothing(request_of, harne
 
 
 def test_o91_the_path_may_be_a_string_or_a_path(request_of, harness_file):
+    """O91: the path may be a string or a path."""
     staged = stage_harness_side_file(request_of, DECLARED, LOG.pattern, str(harness_file))
     assert staged is not None
     assert staged.sha256 == digest(CONTENT)

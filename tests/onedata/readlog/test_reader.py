@@ -98,6 +98,7 @@ def test_o91_a_killed_collector_leaves_a_log_with_no_end_line_which_is_unknown_a
 
 @pytest.mark.parametrize("data", [None, b""])
 def test_o91_a_missing_or_empty_log_is_unknown_never_a_run_that_read_nothing(data):
+    """O91: a missing or empty log is unknown never a run that read nothing."""
     reading = reading_of(data)
     assert not reading.intact
     assert reading.problems == ((reader_module.MISSING,) if data is None else (reader_module.EMPTY,))
@@ -105,11 +106,13 @@ def test_o91_a_missing_or_empty_log_is_unknown_never_a_run_that_read_nothing(dat
 
 
 def test_o91_a_log_past_the_size_limit_is_not_read():
+    """O91: a log past the size limit is not read."""
     reading = reading_of(log(RECORDS), max_bytes=100)
     assert reading.problems == (reader_module.TOO_LARGE,)
 
 
 def test_o91_a_log_of_another_run_is_unknown():
+    """O91: a log of another run is unknown."""
     reading = read_log(log(RECORDS, nonce="ff" * 16), NONCE, expected_peer_uid=PEER_UID)
     assert reading.problems == (reader_module.NOT_THIS_RUN,)
 
@@ -128,6 +131,7 @@ def test_o91_a_log_that_hit_its_cap_is_unknown():
 
 
 def test_o91_an_end_line_that_does_not_say_the_cap_was_not_reached_is_unknown():
+    """O91: an end line that does not say the cap was not reached is unknown."""
     out = lines(RECORDS)
     del out[-1]["cap_reached"]
     assert reader_module.CAP_REACHED in reading_of(encode(out)).problems
@@ -148,6 +152,7 @@ def test_o91_a_collector_told_another_peer_uid_than_the_harness_expects_is_unkno
 
 
 def test_o91_a_sender_with_no_credentials_is_foreign():
+    """O91: a sender with no credentials is foreign."""
     out = lines(RECORDS)
     out[2]["peer"] = {"pid": None, "uid": None}
     assert reader_module.FOREIGN in reading_of(encode(out)).problems
@@ -174,6 +179,7 @@ def test_o91_a_log_with_a_start_and_an_end_and_nothing_between_has_no_canary():
 
 
 def test_o91_the_reasons_are_each_named_once_in_the_order_found():
+    """O91: the reasons are each named once in the order found."""
     out = lines(RECORDS, malformed=2, sender_uid=PEER_UID + 1)
     problems = reading_of(encode(out)).problems
     assert len(problems) == len(set(problems))
@@ -195,5 +201,6 @@ def test_o91_the_reasons_are_each_named_once_in_the_order_found():
     ],
 )
 def test_o91_a_record_line_that_is_not_a_client_record_is_a_bad_record(rec):
+    """O91: a record line that is not a client record is a bad record."""
     out = lines([rec])
     assert reader_module.BAD_RECORD in reading_of(encode(out)).problems

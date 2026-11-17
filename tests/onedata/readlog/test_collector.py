@@ -133,6 +133,7 @@ def test_o91_a_killed_collector_gives_an_unknown_log_and_the_client_then_fails_c
 
 
 def test_o91_the_log_is_created_exclusively_with_mode_0600_and_a_log_that_exists_is_refused(rig):
+    """O91: the log is created exclusively with mode 0600 and a log that exists is refused."""
     rig.start()
     assert stat.S_IMODE(rig.log.stat().st_mode) == 0o600
     rig.stop()
@@ -143,6 +144,7 @@ def test_o91_the_log_is_created_exclusively_with_mode_0600_and_a_log_that_exists
 
 
 def test_o91_the_start_line_names_the_nonce_the_format_and_the_peer_uid_it_was_told(rig):
+    """O91: the start line names the nonce the format and the peer uid it was told."""
     rig.start()
     rig.stop()
     start = lines_of(rig)[0]

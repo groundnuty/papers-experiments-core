@@ -4,6 +4,7 @@ from expcore_onedata.readlog import paths
 
 
 def test_o91_the_cell_targets_are_fixed_and_separate():
+    """O91: the cell targets are fixed and separate."""
     assert paths.SOCKET_DIR == "/expcore-readlog"
     assert paths.SOCKET == "/expcore-readlog/sock"
     assert paths.CLIENT_DIR == "/expcore-readlog-client"
@@ -17,6 +18,7 @@ def test_o91_the_cell_targets_are_fixed_and_separate():
 
 
 def test_o91_the_names_of_the_log_and_the_record_are_fixed():
+    """O91: the names of the log and the record are fixed."""
     assert paths.FORMAT == "expcore-readlog/1"
     assert paths.NAMESPACE == "read_log"
     assert paths.SIDE_HASH_FIELD == "instruments.read_log.side_sha256"

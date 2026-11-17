@@ -37,6 +37,7 @@ def finished(data, **options):
 
 
 def test_o91_an_intact_log_gives_exact_counts_and_the_hash_of_its_bytes():
+    """O91: an intact log gives exact counts and the hash of its bytes."""
     data = log(READS)
     made, source = finished(data)
     assert made == {
@@ -54,6 +55,7 @@ def test_o91_an_intact_log_gives_exact_counts_and_the_hash_of_its_bytes():
 
 
 def test_o91_a_log_of_a_run_that_read_nothing_is_intact_with_zero_reads():
+    """O91: a log of a run that read nothing is intact with zero reads."""
     made, _ = finished(log([]))
     assert made["log"] == "intact"
     assert made["counts"] == {"reads": 0, "canaries": 1}
@@ -75,6 +77,7 @@ def test_o91_a_log_with_no_end_line_is_unknown_with_no_counts_and_still_has_its_
 
 @pytest.mark.parametrize("data", [None, b""])
 def test_o91_a_missing_or_empty_log_is_unknown_has_no_side_file_when_missing_and_is_never_zero(data):
+    """O91: a missing or empty log is unknown has no side file when missing and is never zero."""
     made, _ = finished(data)
     assert made["log"] == "unknown"
     assert made["counts"] is None
@@ -86,6 +89,7 @@ def test_o91_a_missing_or_empty_log_is_unknown_has_no_side_file_when_missing_and
 
 
 def test_o91_a_log_with_no_canary_is_unknown_and_says_the_canary_was_missing():
+    """O91: a log with no canary is unknown and says the canary was missing."""
     made, _ = finished(log(READS, with_canary=False))
     assert made["log"] == "unknown"
     assert made["canary"] is False
@@ -94,6 +98,7 @@ def test_o91_a_log_with_no_canary_is_unknown_and_says_the_canary_was_missing():
 
 
 def test_o91_a_log_of_another_run_or_another_peer_rule_is_unknown():
+    """O91: a log of another run or another peer rule is unknown."""
     assert finished(log(READS), nonce="ee" * 16)[0]["unknown"] == [reader.NOT_THIS_RUN]
     assert finished(log(READS), expected_peer_uid=PEER_UID + 1)[0]["unknown"] == [
         reader.WRONG_PEER_RULE,
@@ -102,6 +107,7 @@ def test_o91_a_log_of_another_run_or_another_peer_rule_is_unknown():
 
 
 def test_o91_every_reason_the_reader_finds_is_listed_once():
+    """O91: every reason the reader finds is listed once."""
     out = lines(READS, malformed=2, unwritten=4, cap_reached=True, sender_uid=PEER_UID + 1)
     made, _ = finished(encode(out))
     assert made["log"] == "unknown"
@@ -126,12 +132,14 @@ def test_o91_the_collectors_cap_is_below_the_side_file_cap():
 
 
 def test_o91_the_snapshot_of_a_reading_is_a_function_of_the_reading_and_the_bytes():
+    """O91: the snapshot of a reading is a function of the reading and the bytes."""
     data = log(READS)
     reading = reader.read_log(data, NONCE, expected_peer_uid=PEER_UID)
     assert snapshot(reading, data) == finished(data)[0]
 
 
 def test_o91_the_instrument_is_a_core_instrument_in_its_own_namespace():
+    """O91: the instrument is a core instrument in its own namespace."""
     instrument = ReadLog(Source(None), NONCE, PEER_UID)
     assert instrument.namespace == "read_log" == paths.NAMESPACE
     assert isinstance(instrument, Instrument)
@@ -144,16 +152,20 @@ def test_o91_the_instrument_is_a_core_instrument_in_its_own_namespace():
     [("", PEER_UID), (None, PEER_UID), (NONCE, -1), (NONCE, "1000"), (NONCE, True), (NONCE, 2**33)],
 )
 def test_o91_the_instrument_refuses_a_nonce_or_uid_that_is_not_one(nonce, uid):
+    """O91: the instrument refuses a nonce or uid that is not one."""
     with pytest.raises((TypeError, ValueError)):
         ReadLog(Source(None), nonce, uid)
 
 
 def test_o91_the_instrument_refuses_a_source_that_cannot_read_a_log():
+    """O91: the instrument refuses a source that cannot read a log."""
     with pytest.raises(TypeError, match="read_log"):
         ReadLog(object(), NONCE, PEER_UID)
 
 
 def test_o91_a_source_that_raises_is_not_hidden():
+    """O91: a source that raises is not hidden."""
+
     class Broken:
         def read_log(self):
             raise OSError("gone")
@@ -163,11 +175,13 @@ def test_o91_a_source_that_raises_is_not_hidden():
 
 
 def test_o91_a_source_that_returns_text_is_refused():
+    """O91: a source that returns text is refused."""
     with pytest.raises(TypeError, match="bytes"):
         finished("a string, not bytes")
 
 
 def test_o91_the_study_declares_the_side_file_by_the_names_in_paths():
+    """O91: the study declares the side file by the names in paths."""
     assert paths.SIDE_HASH_FIELD == "instruments.read_log.side_sha256"
     snap = finished(log(READS))[0]
     record = {"instruments": {paths.NAMESPACE: snap}}
