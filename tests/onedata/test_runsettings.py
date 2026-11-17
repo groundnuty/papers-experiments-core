@@ -160,7 +160,7 @@ def test_o87_an_apptainer_platform_with_spaces_takes_the_check_provider_of_the_f
 def test_o85_the_gates_upstream_read_timeout_is_in_the_fingerprint_only_when_it_is_not_the_default(
     tmp_path, cas, template, declared
 ):
-    """O85, C06: `[sandbox.gate] upstream_read_timeout_s` decides when an agent's REST read fails in an outage, so a
+    """C06, O85: `[sandbox.gate] upstream_read_timeout_s` decides when an agent's REST read fails in an outage, so a
     value other than the default is in `sandbox.gate` (as a float, so `3600` and `3600.0` are one value); the default
     written either way, and no table, leave the fingerprint as it was before the key (a store started before it
     resumes). It is the same on both backends."""

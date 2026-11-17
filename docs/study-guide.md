@@ -432,6 +432,21 @@ The client checks the gate's certificate against the certifi bundle in the agent
 
 Two conditions that differ only in the listing mode are two levels of the factor, so they can run side by side in one campaign. The run's metadata records the mode, and `config.fingerprint()` holds every level's kind and mode, so changing a level's data path or its listing between starts is refused like any other change of the experiment. `listing` on a mount or `none` level is refused at load. What else each data path guarantees is in [`interfaces.md`](interfaces.md#the-platform-layers-sandbox).
 
+**Set how long the gate waits on a hung read from what a healthy run measured (O85).** The gate gives up an upstream read that stays silent for `[sandbox.gate] upstream_read_timeout_s` seconds. Left out, that is 14,400 s (4 h, the published client's own read timeout), so the gate never fails a read before the client would, and an agent's read through an outage can last 4 h unless the run's own limits end it first. A shorter value makes the gate the one that ends the read, after that long, with a 502 the agent reads; the gate counts it under `gate_5xx` (or `gate_resets`, when the answer had begun) in the run's gate errors and never sends the request twice. That decides what an agent in an outage sees, so it is part of the experiment: every condition has the platform's one value, a changed value is refused at a resume, and a platform that declares nothing is as it was.
+
+Choose it from your own measurement, never from a guess:
+
+1. Run a healthy campaign slice on the data path and read the slowest relayed request. On the HPC backend that is `infrastructure_facts.rest_request_durations.max_duration_ms` (with `over_10s`, `over_30s` and `over_60s` counting the slow ones); on Docker the same figure is each line's `duration_ms` in `gatelog/requests.jsonl`. Include the largest file your agent reads.
+2. Declare a value several times that longest healthy request, in seconds, rounded up: a healthy read the gate cuts short is the gate's error in every run, not the platform's. A study whose agent should not wait for an outage longer than a few minutes sets a few hundred seconds; one that wants the outage to outlast the run leaves the default.
+3. Read `infrastructure_facts.gate_upstream_read_timeout_s` of any REST run to confirm the gate was given the value you meant (the effective number, the default's included), and keep the measurement beside the campaign, since a later reader needs it to judge the value.
+
+```toml
+[sandbox.gate]
+upstream_read_timeout_s = 600    # 1 to 86400; the longest healthy read measured was well under 150 s
+```
+
+A value above 14,400 s changes nothing an agent sees, since the client gives up first. The table is refused where no data path is rest. The gate's 60 s connect timeout is not set here.
+
 ### How the sandbox reaches the federation
 
 The agent's container never reaches the federation itself. It sits on an internal Docker network of its own, drawn from `[sandbox.network] pools`, with no route out and no peer but the data gate on the REST path. On the mount path its one way to the data is the read-only mount, and every hop of that path belongs to another container or to the host:

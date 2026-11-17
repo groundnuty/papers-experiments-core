@@ -131,16 +131,16 @@ refuses the default names another. A value equal to the run's
 token refuses the start.
 
 `upstream_read_timeout_s` (O85) is how long the data gate waits for the upstream to send the next byte of an answer
-before it gives the read up, which the agent sees as a 502 `badGateway` and the gate's line records with `error_origin`
-`gate`. It decides when an agent's REST read fails while the platform hangs, so it is declared, never a constant the
-agent cannot see: at the default, 14,400 s, the gate never gives up before the official client's own read timeout
-(4 h) and an agent's read through an outage ends at the run's own limits; a shorter value makes the gate the one that
-ends it, after that long, and a value above 14,400 s changes nothing an agent sees (the client gives up first). The
-value is written into the gate's configuration on both backends (`gate.json` on Docker, `gaterun.config` on Apptainer,
-where `gate_options` may not set it), each REST run records it (`infrastructure_facts.gate_upstream_read_timeout_s`),
-and the campaign fingerprint holds it when it is not the default (`runsettings.sandbox_record`), so a resume or a merge
-under another value is refused and a platform that declares nothing is as it was. It is refused without a rest level,
-where no gate runs.
+before it gives the read up, which the agent sees as a 502 `badGateway` and the gate's line records with
+`error_origin` `gate`. It decides when an agent's REST read fails while the platform hangs, so it is declared, never a
+constant the agent cannot see: at the default, 14,400 s, the gate never gives up before the official client's own read
+timeout (4 h), so a hung read can last that long unless the run's own limits end it first; a shorter value makes the
+gate the one that ends it, after that long, and a value above 14,400 s changes nothing an agent sees (the client gives
+up first). The value is written into the gate's configuration on both backends (`gate.json` on Docker,
+`gaterun.config` on Apptainer, where `gate_options` may not set it), each REST run records it
+(`infrastructure_facts.gate_upstream_read_timeout_s`), and the campaign fingerprint holds it when it is not the
+default (`runsettings.sandbox_record`), so a resume or a merge under another value is refused and a platform that
+declares nothing is as it was. It is refused without a rest level, where no gate runs.
 
 The certificate check of the data gate's upstream and of oneclient is not declared here either: it is the platform's one
 `[tls]` setting (`tls.py`), which `load_platform` hands to `load_sandbox` and which every client of the federation
