@@ -115,7 +115,7 @@ class _Run:
     def __init__(self, tracker: Tracker, esc: Escalation) -> None:
         self.tracker, self.esc = tracker, esc
         self.seen: set[tuple[Any, Any, Any]] = set()  # the processes a signal reached
-        self.unreached: set[tuple[Any, Any, Any]] = set()  # asked for and not reached by it, not yet reached since
+        self.unreached: set[tuple[Any, Any]] = set()  # the (pid, start) of what was asked for and is not reached yet
         self.doing: str | None = None  # the command under way, named when it raises
         self.reached = KILLED  # the most severe step taken: no outcome is less (`reach`, `done`)
         self.t0 = esc.clock()
@@ -158,7 +158,9 @@ class _Run:
             asked = {key_of(p) for p in fresh}
             done = asked if answer is None else asked & set(answer)
             self.seen.update(done)
-            self.unreached = (self.unreached | asked) - self.seen
+            # by pid and start, not by key: a process declined as it execed and reached under its new command line is
+            # one process, and is no longer unreached
+            self.unreached = (self.unreached | {key[:2] for key in asked}) - {key[:2] for key in self.seen}
             return len(done)
         return 0
 

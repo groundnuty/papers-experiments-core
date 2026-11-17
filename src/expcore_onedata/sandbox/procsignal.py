@@ -60,13 +60,25 @@ class Signalled:
         return [proc for proc in procs if not self.reached(proc)]
 
 
-def _answer(text: str) -> dict[int, str] | None:
-    """The outcomes in the root half's answer, by pid; None when the answer is not one."""
+def _answer(text: str, asked: Sequence[int]) -> dict[int, str] | None:
+    """The outcomes in the root half's answer, by pid, when it is the answer to this request: one entry for each pid
+    asked, in the order asked, each with that integer pid (never one coerced from another type) and a text outcome.
+    Anything else is not an answer, and reaches nobody: a pid read as another one's could mark a process done."""
     try:
         results = json.loads(text)["results"]
-        return {int(entry["pid"]): str(entry["outcome"]) for entry in results}
     except (ValueError, KeyError, TypeError):
         return None
+    if not isinstance(results, list) or len(results) != len(asked):
+        return None
+    outcomes: dict[int, str] = {}
+    for entry, pid in zip(results, asked, strict=True):
+        if not isinstance(entry, dict):
+            return None
+        got, outcome = entry.get("pid"), entry.get("outcome")
+        if isinstance(got, bool) or not isinstance(got, int) or got != pid or not isinstance(outcome, str):
+            return None
+        outcomes[pid] = outcome
+    return outcomes
 
 
 def signal_processes(host: HostOps, procs: Sequence[Mapping[str, Any]], name: str, timeout_s: float) -> Signalled:
@@ -81,7 +93,7 @@ def signal_processes(host: HostOps, procs: Sequence[Mapping[str, Any]], name: st
     )
     if done.returncode != 0:
         return Signalled({}, failed=f"exit {done.returncode}: {done.stderr.strip()[:200]}")
-    outcomes = _answer(done.stdout)
+    outcomes = _answer(done.stdout, [target["pid"] for target in targets])
     if outcomes is None:
         return Signalled({}, failed="the answer was not read")
     return Signalled(outcomes)

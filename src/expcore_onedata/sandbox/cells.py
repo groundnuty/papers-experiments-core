@@ -349,7 +349,9 @@ class CellRunner:
                 listed.update((p["pid"], p["start"]) for p in fresh)
                 reached.update((p["pid"], p["start"]) for p in done)
                 seen.update(DL.key_of(p) for p in done)
-                if sent.failed is not None:  # the command failed as a whole: none was reached, asking again won't help
+                if sent.failed is not None:  # it failed as a whole, perhaps after signalling: asking again won't help
+                    left = self.agent_processes()  # so what is left is listed anew, never taken from before the signals
+                    listed = None if left is None else listed
                     break
                 if done:  # what no signal reached is not waited for: it is listed again at once
                     TD._wait_gone(self._host, done, 10.0, 0.2)
