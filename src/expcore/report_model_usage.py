@@ -238,8 +238,9 @@ def provenance_line(usage: Mapping[str, Any] | None) -> list[str]:
     probes = sum(m["probes_usd"] for m in known)
     analysed = sum(m["usd"]["analysed"] for m in known)
     rest = sum(m["usd"]["not_analysed"] for m in known)
+    whole = "on the models with a price" if unknown else "in all"  # never "in all" beside a model whose spend is n/a
     line = (
-        f"- Spend: {total:.6f} USD in all: {basis['measured']:.6f} measured, "
+        f"- Spend: {total:.6f} USD {whole}: {basis['measured']:.6f} measured, "
         f"{basis['measured_plus_inflight']:.6f} measured plus requests in flight, {basis['bound']:.6f} at a bound, "
         f"{basis['charges']:.6f} in top-ups, {probes:.6f} in probes; {analysed:.6f} on the analysed attempts and "
         f"{rest:.6f} on the rest"

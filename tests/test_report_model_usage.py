@@ -147,7 +147,7 @@ def test_c39_the_provenance_lists_say_which_figures_are_measured_and_which_are_b
     """C39: one line in the report's provenance gives the spend and how much of it is measured and how much bound."""
     text = render(export(), usage_of_two_models(tmp_path))
     [line] = [line for line in text.split("## ", 2)[1].splitlines() if line.startswith("- Spend")]
-    assert "34.500000 USD" in line
+    assert "34.500000 USD on the models with a price" in line  # m2 has no price: not "in all"
     assert "4.500000 measured" in line
     assert "30.000000 at a bound" in line
     assert "n/a for m2" in line
