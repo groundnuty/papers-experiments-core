@@ -23,8 +23,10 @@ statements; a default value belongs to the function it is the default of) and th
 and a second site in a function that already has one is a change the count shows.
 
 Known limits, none of which the tree has: a client reached through `getattr`, `importlib` or `__import__`, a class that
-subclasses one of the client classes by an alias imported from another module, and a client run as a shell command
-(`curl` in `bundle/`), which no Python scan sees.
+subclasses one of the client classes by an alias imported from another module, a factory called as an attribute
+(`self.rest(...)`) or through another name (`make = rest; make(ca)`), a client class bound to another name
+(`Factory = Rest`, which is itself a site), and a client run as a shell command (`curl` in `bundle/`), which no Python
+scan sees.
 """
 
 import ast
