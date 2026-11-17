@@ -258,7 +258,7 @@ class HpcDriver:
         )
         self.last_timing: dict[str, dict[str, Any]] = {}  # the latest checked timing of each kind of request
 
-    def _send(self, request: Request, timeout_s: float) -> CommandResult:
+    def _via_transport(self, request: Request, timeout_s: float) -> CommandResult:
         """Send a request through the transport and keep the relay's timing of it (`last_timing`), from its answer or
         from the timeout that was its answer; every exception goes on as it came."""
         kind = request.command if request.verb == "exec" and request.command else request.verb
@@ -280,7 +280,7 @@ class HpcDriver:
         """Send a request; raise DriverError, naming only the step, when it is refused, cannot be sent, has no answer in
         its bound, or its command failed."""
         try:
-            done = self._send(request, timeout_s)
+            done = self._via_transport(request, timeout_s)
         except subprocess.TimeoutExpired:
             raise DriverError(f"the command to {step} did not finish within {timeout_s:g} s") from None
         except OSError as error:
@@ -296,7 +296,7 @@ class HpcDriver:
         self.last_stop = None
         step, request = "stop the service", Request("stop", service)
         try:
-            done = self._send(request, self._stop_timeout_s)
+            done = self._via_transport(request, self._stop_timeout_s)
         except subprocess.TimeoutExpired:
             raise DriverError(f"the command to {step} did not finish within {self._stop_timeout_s:g} s") from None
         except OSError as error:
@@ -332,7 +332,7 @@ class HpcDriver:
     def _exec(self, service: str, command: str, timeout_s: float) -> CommandResult:
         """Run one allowed command inside the service; raise `subprocess.TimeoutExpired` or OSError as the transport
         does, and DriverError when the request is refused before anything was sent."""
-        return self._send(Request("exec", service, command), timeout_s)
+        return self._via_transport(Request("exec", service, command), timeout_s)
 
     def ping(self, service: str) -> bool:
         """Whether the op-worker node in the service answers `pong` to its runner's `ping`. A command that fails,
