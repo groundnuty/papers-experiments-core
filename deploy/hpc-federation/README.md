@@ -489,7 +489,10 @@ its own name or the zone's. The readiness calls, the token mint and the registra
 pinned to the loopback (`curl --resolve`), the one name the certificate holds. Onepanel's DNS check resolves through DNS
 alone and reports the declared names `unresolvable`; it is advisory, and `facts.json` records that. From the login
 node the names are reached through the address map `up` writes into the root (`secrets/address-map.json`, 0600),
-which `platform.toml` names; see `DESIGN.md`, "The registered names". The first sandbox slot on a federation brought up
+which `platform.toml` names through its template's own line, `addresses = @hpc_addresses@` (a slot like `@hpc_root@`:
+the render is the template with its slots filled, and adds no line; the slot is the whole inline table `{ file, resolver }`
+and the line stands before the template's first table; `up` refuses a template without it before it submits anything,
+and the render refuses the slot where the root holds no map); see `DESIGN.md`, "The registered names". The first sandbox slot on a federation brought up
 this way is owed the checks of `DESIGN.md` section 9, item 7.
 
 ## Slots and the tool server (O83)

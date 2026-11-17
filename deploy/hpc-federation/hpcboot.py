@@ -18,8 +18,11 @@ real addresses (DESIGN.md, sections 5 and 6).
   may name: `@hpc_root@` (the root, so every path into it is absolute and a copy of the file beside a study reads the
   root's files), `@hpc_stop_bound_s@` (a stop's whole bound, `[hpc] stop_seconds` + 90 s), `@hpc_settle_timeout_s@`
   (above it), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of each direct-I/O
-  import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and `@hpc_token_margin_s@`: the
-  least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
+  import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none), `@hpc_addresses@` (the inline
+  table `{ file, resolver }` that is the value of the template's top-level `addresses = @hpc_addresses@`, O73: the
+  address map's file and the resolve launcher; the render adds no line the template does not have) and
+  `@hpc_token_margin_s@`: the least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file
+  (`least_margin_s`).
   The site's values come from `hpcpins` (the agent's sandbox's pins and `@study_artifacts@`, the study's own directory
   on the nodes), and each space's `@data_manifest.<space>@` from `hpcdata` (DESIGN.md, section 6a).
   A template that declares `[sandbox.apptainer]` also names `@hpc_provider_storage@` (`hpcpins.values`: `tmpfs`, or
