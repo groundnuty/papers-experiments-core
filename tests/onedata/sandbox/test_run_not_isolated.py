@@ -5,7 +5,10 @@ infrastructure kind (`retries_by_kind`, "Infrastructure failures by condition an
 campaign count these runs apart from every other sandbox failure."""
 
 import pytest
+from campaign_support import infra, planned_store, run_one
 
+from expcore import report
+from expcore.campaign.export import export_run_state
 from expcore.errors import infra_kinds, is_treatable, uncharged_kinds
 from expcore_onedata.sandbox import kinds
 
@@ -55,3 +58,32 @@ def test_o72_infrastructure_that_ended_no_run_stays_a_sandbox_failure(scope):
     error = kinds.kill_error({**kill, **({} if scope is None else {"scope": scope})})
     assert error is not None
     assert error.kind == "sandbox"
+
+
+def test_o72_the_export_and_the_report_count_these_runs_per_condition_under_the_kind(tmp_path):
+    """O72: three attempts ended `cell_not_isolated`, two in one condition and one in another, and one ended as any
+    other sandbox failure. The export counts each under its own kind and condition, and the report's table of
+    infrastructure failures by condition and kind has a row for the kind in each, apart from the `sandbox` row."""
+    store, schema, manifest = planned_store(tmp_path, models=("m1", "m2"))
+    chosen = {}
+    for row in manifest.rows:
+        chosen.setdefault(schema.condition_of(row.key), []).append(row.key.text)
+    (first, first_keys), (second, second_keys) = list(chosen.items())[:2]
+    run_one(store, first_keys[0], infra(kinds.CELL_NOT_ISOLATED, "the watch ended the run"), max_attempts=10)
+    run_one(store, first_keys[0], infra(kinds.CELL_NOT_ISOLATED, "the watch ended the run"), max_attempts=10)
+    run_one(store, second_keys[0], infra(kinds.CELL_NOT_ISOLATED, "the watch ended the run"), max_attempts=10)
+    run_one(store, second_keys[0], infra("sandbox", "a container died"), max_attempts=10)
+    data = export_run_state(store)
+    assert kinds.CELL_NOT_ISOLATED in data["kinds"]
+    counted = {(row["condition"], row["kind"]): row["set_aside"] for row in data["infrastructure_by_condition"]}
+    assert counted[(first, kinds.CELL_NOT_ISOLATED)] == 2
+    assert counted[(second, kinds.CELL_NOT_ISOLATED)] == 1
+    assert counted[(second, "sandbox")] == 1
+    lines = report._infrastructure(data, [first, second])
+    rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in lines if line.startswith("|")]
+    shown = {
+        (row[0], row[1]): row[3] for row in rows[1:]
+    }  # the header is the first row; the set-aside column is the fourth
+    assert shown[(first, kinds.CELL_NOT_ISOLATED)] == "2"
+    assert shown[(second, kinds.CELL_NOT_ISOLATED)] == "1"
+    assert shown[(second, "sandbox")] == "1"

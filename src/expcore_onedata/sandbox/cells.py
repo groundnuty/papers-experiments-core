@@ -322,8 +322,11 @@ class CellRunner:
                 self._meta.setdefault("quiesced", []).append({"cell": cell, **state})
         if not self.quiet(state):
             log.error("a process of a cell outlived its exec and its kill: the run is ended as %s", DL.SURVIVED)
+            why = "a process of the cell outlived its exec and its kill"
             with self.meta_lock:
-                self.ended = self.ended or self._unknown("a process of the cell outlived its exec and its kill")
+                if self.ended is None:  # the run's ending is the sweep's, said apart from the cell's own result (O72)
+                    self.ended = self._unknown(why, by=DL.SWEEP, cell=cell)
+                    self._meta["run_ended"] = {"by": DL.SWEEP, "cell": cell, "outcome": DL.SURVIVED, "why": why}
             return None
         return state["killed"]
 
@@ -411,11 +414,14 @@ class CellRunner:
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
         return (lambda: self._stop_after(record)) if outcome in DL.STOPS else None
 
-    def _unknown(self, why: str) -> dict[str, Any]:
+    def _unknown(self, why: str, **facts: Any) -> dict[str, Any]:
         """The record of a deadline whose outcome is not known: `survived_kill`, since unknown is never a clean kill. It
-        is the most severe outcome (`deadline.SEVERITY`), so never below a step the escalation took."""
+        is the most severe outcome (`deadline.SEVERITY`), so never below a step the escalation took. `facts` say what
+        else ended the run, when it was not a deadline (`by`, the cell it followed)."""
         esc = self._escalation
-        return {"grace_s": esc.grace_s, "margin_s": esc.margin_s, "outcome": DL.SURVIVED, "why": why, "steps": []}
+        return {
+            "grace_s": esc.grace_s, "margin_s": esc.margin_s, "outcome": DL.SURVIVED, "why": why, "steps": [], **facts,
+        }  # fmt: skip
 
     @property
     def decide_s(self) -> float:
