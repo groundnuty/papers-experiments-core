@@ -22,7 +22,8 @@ Nothing here reaches a cluster, a container or a model. The kill is timed by hol
 finds a run ended since the last one. The second attempt is held over the first look, on every run of the module, so
 that look takes a snapshot with that attempt in flight, which the kill must not follow; the fixture accepts the snapshot
 of the next look, which holds the first two attempts ended and the held third in flight. The kill comes within seconds
-of it, and the module checks that it is still the newest. Those two looks are why the module takes about a minute and a half.
+of it, and the module checks that it is still the newest. Those two looks are why the module takes about a minute and
+a half.
 """
 
 import contextlib
