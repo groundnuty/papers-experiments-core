@@ -59,28 +59,24 @@ def test_o31_a_write_right_that_is_not_the_tools_is_no_substitute(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("tool", "right"),
-    [
-        ("get_transfer", VIEW_TRANSFERS),
-        ("list_space_transfers", VIEW_TRANSFERS),
-        ("get_qos_requirement", VIEW_QOS),
-        ("get_file_qos_summary", VIEW_QOS),
-    ],
+    "tool", ["get_transfer", "list_space_transfers", "get_qos_requirement", "get_file_qos_summary"]
 )
-def test_o31_a_view_tool_without_its_view_right_is_refused(tmp_path, tool, right):
-    """O31: a view tool whose view privilege is missing answers every call with a refusal."""
-    text = refused(tmp_path, ["get_file_distribution", tool], BASELINE)
-    assert right in text
-    assert tool in text
+def test_o31_a_view_tool_without_its_view_right_is_not_refused_because_that_need_is_only_inferred(tmp_path, tool):
+    """O31: the view privileges are read from their names, not recorded per tool, so a refusal on them would rest on
+    a guess; the rows stay in the table and wait for a live run that records each."""
+    assert load(tmp_path, ["get_file_distribution", tool], BASELINE).condition("read").allow == (
+        "get_file_distribution",
+        tool,
+    )
 
 
 @pytest.mark.parametrize("tool", ["create_file", "create_directory", "delete_file", "set_file_metadata", "move_file"])
 def test_o31_a_file_writing_tool_is_refused_because_no_condition_can_grant_its_privilege(tmp_path, tool):
-    """O31: a tool-server user never holds `space_write_data` (the token check refuses it), so these tools fail on
-    every call whatever the condition declares, a write right included."""
+    """O31: a tool-server user is never granted `space_write_data` (the token check refuses it), so these tools fail
+    on every call whatever the condition declares, a write right included."""
     text = refused(tmp_path, [tool], [*BASELINE, MANAGE_QOS])
     assert tool in text
-    assert "space_write_data" in text
+    assert "a tool-server user is never granted space_write_data (tokencheck)" in text
 
 
 def test_o31_a_write_right_that_no_allowed_tool_uses_is_refused_naming_the_right(tmp_path):
@@ -170,3 +166,53 @@ def test_o31_the_default_test_world_still_loads(tmp_path):
     """O31: its two conditions use the stand-in server's tools, which the table does not know."""
     config = load_platform(write_platform(tmp_path), require_secrets=False)
     assert set(config.toolserver.conditions) == {"read", "manage"}
+
+
+# A real study's two conditions, as it declares them: the platform file must load them exactly as written.
+READ_BASIC = {
+    "allow": ["get_file_attributes", "get_file_metadata"],
+    "rights": ["space_view", "space_read_data"],
+}
+WRITE_QOS = {
+    "allow": [
+        "add_file_qos_requirement",
+        "get_file_attributes",
+        "get_file_distribution",
+        "get_file_metadata",
+        "get_file_qos_summary",
+        "get_qos_requirement",
+        "get_transfer",
+        "list_space_providers",
+        "list_space_transfers",
+        "remove_qos_requirement",
+        "schedule_file_replication",
+    ],
+    "rights": [
+        "space_view",
+        "space_read_data",
+        "space_view_transfers",
+        "space_view_qos",
+        "space_manage_qos",
+        "space_schedule_replication",
+    ],
+}
+
+
+def test_o31_a_real_studys_read_only_and_writing_conditions_load_as_declared(tmp_path):
+    """O31: acceptance: the conditions of the first federation study (a basic reader of attributes and metadata, and a
+    writer of QoS requirements and replications with their views) are neither refused nor changed by the check."""
+
+    def edit(data):
+        conditions = data["toolserver"]["conditions"]
+        manifest = conditions["read"]["manifest"]
+        conditions.clear()
+        conditions["read-basic"] = {**READ_BASIC, "manifest": manifest}
+        conditions["write-qos"] = {**WRITE_QOS, "manifest": manifest}
+
+    config = load_platform(write_platform(tmp_path, edit), require_secrets=False)
+    reader, writer = config.condition("read-basic"), config.condition("write-qos")
+    assert (reader.allow, reader.rights) == (tuple(READ_BASIC["allow"]), tuple(sorted(READ_BASIC["rights"])))
+    assert (writer.allow, writer.rights) == (tuple(WRITE_QOS["allow"]), tuple(sorted(WRITE_QOS["rights"])))
+    assert not reader.writes
+    assert writer.writes
+    assert writer.manages_qos

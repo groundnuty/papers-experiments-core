@@ -7,11 +7,11 @@ from pathlib import Path
 import pytest
 
 from expcore_onedata.rights import BASELINE_RIGHTS, KNOWN_RIGHTS, WRITE_RIGHTS
-from expcore_onedata.toolrights import DATA_WRITE, OMCP_PIN, TOOL_NEEDS, agreement_problem
+from expcore_onedata.toolrights import DATA_WRITE, ENFORCED, OMCP_PIN, TOOL_NEEDS, agreement_problem
 
 ROOT = Path(__file__).resolve().parents[2]
 PINNED = json.loads((ROOT / "tests" / "data" / "omcp-pinned-tools.json").read_text(encoding="utf-8"))
-MUTATING = {*WRITE_RIGHTS, DATA_WRITE}
+VIEW_RIGHTS = {"space_view_transfers", "space_view_qos"}
 
 
 def inventory_pin():
@@ -36,12 +36,20 @@ def test_o31_the_table_holds_every_tool_of_the_pinned_server_and_no_other():
 
 
 def test_o31_the_tools_that_write_are_the_ones_the_server_marks_as_such():
-    """O31: the server's own list of its mutating tools (`WRITE_TOOL_NAMES`) is the annotated-destructive set, and
-    those tools, and only those, need a privilege that changes something."""
-    destructive = {name for name, kind in PINNED["tools"].items() if kind == "destructive"}
-    assert destructive == set(PINNED["write_tool_names"])
+    """O31: the server's own list of its mutating tools (`WRITE_TOOL_NAMES`) is exactly the tools whose rows need a
+    right that changes something, so a tool the server marks as mutating cannot go unjudged."""
+    writing = {name for name, needs in TOOL_NEEDS.items() if ENFORCED & set(needs)}
+    assert writing == set(PINNED["write_tool_names"])
+    assert set(PINNED["write_tool_names"]) <= set(PINNED["tools"])
+
+
+def test_o31_only_the_view_rows_are_documented_and_not_enforced():
+    """O31: a refusal rests on what the repository records (a write right, and the privilege no tool-server user is
+    granted). The view rows are inferred from the privilege names, so they are kept and not enforced, and the baseline
+    rows have no need at all, until a live run records each one."""
+    assert {*WRITE_RIGHTS, DATA_WRITE} == ENFORCED
     for name, needs in TOOL_NEEDS.items():
-        assert bool(MUTATING & set(needs)) == (name in destructive), name
+        assert set(needs) - ENFORCED <= VIEW_RIGHTS, name
 
 
 def test_o31_a_tool_needs_known_rights_or_the_one_no_condition_may_hold():
@@ -65,6 +73,12 @@ def test_o31_nothing_is_wrong_when_the_tools_and_the_rights_agree():
     assert agreement_problem(["echo"], [*BASELINE_RIGHTS, "space_manage_qos"]) is None
 
 
+def test_o31_a_view_tool_without_its_view_right_is_not_refused_because_that_need_is_only_inferred():
+    """O31: refusing it would rest on a guess (the privilege's name), so it waits for a live run that records it."""
+    views = ["get_transfer", "list_space_transfers", "get_qos_requirement", "get_file_qos_summary"]
+    assert agreement_problem(views, BASELINE_RIGHTS) is None
+
+
 @pytest.mark.parametrize(
     ("allow", "rights", "key", "words"),
     [
@@ -74,7 +88,12 @@ def test_o31_nothing_is_wrong_when_the_tools_and_the_rights_agree():
             "rights",
             ["space_schedule_replication", "schedule_file_replication"],
         ),
-        (["create_file"], BASELINE_RIGHTS, "allow", ["create_file", "space_write_data"]),
+        (
+            ["create_file"],
+            BASELINE_RIGHTS,
+            "allow",
+            ["create_file", "a tool-server user is never granted space_write_data (tokencheck)"],
+        ),
         (["get_file_distribution"], [*BASELINE_RIGHTS, "space_manage_qos"], "rights", ["space_manage_qos"]),
     ],
 )
