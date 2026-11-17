@@ -190,7 +190,11 @@ def phase(hpc, tmp_path):
     spec = fedspec.load_spec(LAYOUT)
     hosts = {s.name: DECLARED[s.name] for s in spec.services}
     layout = fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
-    (root / "secrets" / "zone.passphrase").write_text("A1b2C3d4E5f6G7h8", encoding="utf-8")
+    files = {"secrets/zone.passphrase": "A1b2C3d4E5f6G7h8", "secrets/admin.token": "an-admin-token"}
+    files.update({f"secrets/users/{p.name}.pass": "a-password" for p in spec.principals})
+    for name, value in files.items():
+        (root / name).write_text(value, encoding="utf-8")
+        (root / name).chmod(0o600)
     (root / "ca" / "federation-ca.pem").write_text(tls.make_federation_ca(tmp_path / "pki").ca.read_text("ascii"))
     return SimpleNamespace(root=root, layout=layout, spec=spec, tmp=tmp_path)
 
