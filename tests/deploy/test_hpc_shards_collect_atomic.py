@@ -62,7 +62,7 @@ REFUSED = {
 def test_a_refusal_inside_the_unpack_of_a_later_shard_leaves_the_new_into_absent_and_writes_nothing(
     shards, tmp_path, what
 ):
-    """G9: shard 1 unpacks cleanly, shard 2's archive is refused while it is unpacked (it verified against its
+    """O63 (G9): shard 1 unpacks cleanly, shard 2's archive is refused while it is unpacked (it verified against its
     manifest, so no earlier check saw it): `--into` is never made, the first tree is gone with the private directory,
     the manifest is not written (it was, before its unpack loop) and no root archive or marker was published."""
     plan = make_plan(shards, tmp_path)
@@ -76,7 +76,7 @@ def test_a_refusal_inside_the_unpack_of_a_later_shard_leaves_the_new_into_absent
 
 
 def test_a_refusal_inside_the_unpack_leaves_an_existing_empty_into_as_it_was(shards, tmp_path):
-    """G9: `--into` made beforehand (0700, empty) is still there, still empty, still 0700, with no tree in it."""
+    """O63 (G9): `--into` made beforehand (0700, empty) is still there, still empty, still 0700, with no tree in it."""
     plan = make_plan(shards, tmp_path)
     _replace_archive(plan.results, "fed-b", REFUSED["a member that is not under out/"])
     into = tmp_path / "merge"
@@ -94,7 +94,7 @@ def test_a_refusal_inside_the_unpack_leaves_an_existing_empty_into_as_it_was(sha
 def test_the_command_exits_2_after_a_refusal_in_the_unpack_and_prints_no_hash_and_no_merge_line(
     shards, tmp_path, capsys
 ):
-    """G9: what an operator sees: exit 2, the refusal on stderr, nothing on stdout (no merge line to run) and no
+    """O63 (G9): what an operator sees: exit 2, the refusal on stderr, nothing on stdout (no merge line to run) and no
     `archives manifest ... sha256` line to pull against."""
     make_plan(shards, tmp_path)
     _replace_archive(tmp_path / "results", "fed-b", REFUSED["a member that is not under out/"])
@@ -108,7 +108,7 @@ def test_the_command_exits_2_after_a_refusal_in_the_unpack_and_prints_no_hash_an
 
 
 def test_a_refusal_before_any_unpack_still_leaves_everything_as_found(shards, tmp_path):
-    """G9: the earlier refusals (a shard that is not final, a root that is not whole) leave no more than they did."""
+    """O63 (G9): the earlier refusals (a shard not final, a root not whole) leave no more than they did."""
     plan = make_plan(shards, tmp_path)
     (plan.shards[0].root / "facts.json").unlink()
     results_before, parent_before = _listing(plan.results), sorted(p.name for p in tmp_path.iterdir())
@@ -118,7 +118,7 @@ def test_a_refusal_before_any_unpack_still_leaves_everything_as_found(shards, tm
 
 
 def test_a_successful_collect_moves_the_trees_in_whole_read_only_and_leaves_no_private_directory(shards, tmp_path):
-    """G9: each shard's `out/` is in `--into` as it was unpacked, read-only; the private directory beside it is
+    """O63 (G9): each shard's `out/` is in `--into` as it was unpacked, read-only; the private directory beside it is
     gone; the private copies of the archives were never in `--into`."""
     plan = make_plan(shards, tmp_path)
     before = sorted(p.name for p in tmp_path.iterdir())
@@ -133,7 +133,7 @@ def test_a_successful_collect_moves_the_trees_in_whole_read_only_and_leaves_no_p
 def test_the_manifest_is_written_last_after_the_trees_and_the_root_archives_and_before_the_markers(
     shards, tmp_path, monkeypatch
 ):
-    """G9: when `archives.sha256.json` is written, `--into` holds every tree and the results directory every root
+    """O63 (G9): when `archives.sha256.json` is written, `--into` holds every tree and the results directory every root
     archive; the markers in the roots (what unlocks `down`) come only after it, so a failure leaves `down` refusing. It
     is written through a draft that is fsynced and renamed (`_write_whole`)."""
     plan = make_plan(shards, tmp_path)
@@ -160,8 +160,8 @@ def test_the_manifest_is_written_last_after_the_trees_and_the_root_archives_and_
 def test_a_manifest_that_cannot_be_written_puts_the_into_back_as_found_and_writes_no_marker(
     shards, tmp_path, monkeypatch
 ):
-    """G9: the one failure after the trees are moved is the manifest's own write (a full disk): `--into` is made as it
-    was found, no marker is written, and the refusal names the manifest."""
+    """O63 (G9): the one failure after the trees are moved is the manifest's own write (a full disk): `--into` is
+    made as it was found, no marker is written, and the refusal names the manifest."""
     plan = make_plan(shards, tmp_path)
     real = shards._write_whole
 
@@ -181,7 +181,7 @@ def test_a_manifest_that_cannot_be_written_puts_the_into_back_as_found_and_write
 
 
 def test_the_hash_collect_prints_is_the_hash_of_the_manifest_it_wrote(shards, tmp_path, capsys):
-    """G9: printed on stderr after the merge line, once everything else is done; equal to the file's SHA-256."""
+    """O63 (G9): printed on stderr after the merge line, once everything else is done; equal to the file's SHA-256."""
     make_plan(shards, tmp_path)
     assert shards.main(["collect", "--manifest", str(plan_file(tmp_path)), "--into", str(tmp_path / "merge")]) == 0
     out, err = capsys.readouterr()
