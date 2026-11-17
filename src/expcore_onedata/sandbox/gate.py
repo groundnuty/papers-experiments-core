@@ -411,17 +411,22 @@ def _as_served(text: str, name: str, hcfg: dict) -> str:
     """The text of a failure as the gate's answer gives it to its client: the host it dialled upstream (`addr`, and
     `addr:port`), which a certificate's name mismatch quotes, named as the client knows it, by the name the gate
     serves on 443 (O69), and the address it connected to (`dial`, O70) by that name too. A gate whose name is the host it
-    dials (Docker's) gives the text unchanged; the log's line keeps the text as it was."""
+    dials (Docker's) gives the text unchanged; the log's line keeps the text as it was.
+
+    A host that is the served name itself but is dialled at a mapped address (O70: the URL's host is the declared name)
+    needs no replacement, yet its port is the nodes' public one, so `name:port` still becomes `name:443`."""
     port = hcfg.get("port", 443 if hcfg.get("tls", True) else 80)
+    named = name.lower()
     hosts = [h for h in dict.fromkeys(str(hcfg.get(key) or "") for key in ("addr", "dial")) if h]  # O70: `dial` too
-    hosts = [h for h in hosts if h.lower() != name.lower()]
-    if not hosts:
+    bare = [h for h in hosts if h.lower() != named]  # the name itself is not replaced by itself
+    ported = bare + ([name] if hcfg.get("dial") and any(h.lower() == named for h in hosts) else [])  # O70: its port is
+    if not ported:
         return text
-    with_port = tuple(form for h in hosts for form in (f"[{h}]:{port}", f"{h}:{port}"))
-    forms = sorted((*with_port, *hosts), key=len, reverse=True)  # the longest first: a host's own port goes with it
+    with_port = tuple(form for h in ported for form in (f"[{h}]:{port}", f"{h}:{port}"))
+    forms = sorted((*with_port, *bare), key=len, reverse=True)  # the longest first: a host's own port goes with it
     dialled = re.compile("|".join(re.escape(form) for form in forms), re.IGNORECASE)  # one pass
-    ported = {f.lower() for f in with_port}
-    return dialled.sub(lambda m: f"{name}:{SERVED_PORT}" if m.group(0).lower() in ported else name, text)
+    held = {f.lower() for f in with_port}
+    return dialled.sub(lambda m: f"{name}:{SERVED_PORT}" if m.group(0).lower() in held else name, text)
 
 
 _LOST = (

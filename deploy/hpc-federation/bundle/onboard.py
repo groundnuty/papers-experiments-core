@@ -14,6 +14,7 @@ import glob
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import stat
@@ -27,6 +28,22 @@ TIMEOUT = 120
 def die(msg: str) -> None:
     print(f"onboard: ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def registered_name(workdir: str) -> str:
+    """The name the service is registered under, which its certificate holds: the work directory's `declared-name`
+    when configure.sh wrote one (O70), else the node's own FQDN, as before."""
+    path = os.path.join(workdir, "declared-name")
+    if not os.path.lexists(path):
+        return subprocess.run(["hostname", "-f"], capture_output=True, text=True, check=True).stdout.strip()
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        die(f"{path} is not a regular file of yours")
+    with open(path, encoding="ascii") as handle:
+        value = handle.readline().strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+", value):
+        die(f"{path} holds no fully qualified name")
+    return value
 
 
 def private_dir(path: str) -> bool:
@@ -100,7 +117,7 @@ def main(argv: List[str]) -> int:
         die("stdin must be a JSON object with space_id and token")
     workdir = find_workdir(explicit)
     rootfs = os.path.join(workdir, "rootfs")
-    fqdn = subprocess.run(["hostname", "-f"], capture_output=True, text=True, check=True).stdout.strip()
+    fqdn = registered_name(workdir)
     panel = Panel(
         fqdn,
         os.path.join(rootfs, "volumes/persistence_backup/etc/op_panel/OnedataTestWebServerCa.pem"),
