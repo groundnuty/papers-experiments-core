@@ -59,6 +59,9 @@ APPTAINER_FAILED = (
 )
 EXEC = "apptainer exec"  # the exec a completion cause names on this backend (`completion.Completion.runner`)
 RUN_ENDED = "watch_ended_run"  # the outcome of the `ended` record the watch makes when a cell cannot be isolated
+# what the run's infrastructure facts keep of that end (`infrastructure_facts.run_ended`): a run-level fact, so a
+# campaign can count the runs the watch ended for a cell it could not isolate
+RUN_ENDED_FACT = ("scope", "attributed", "reason", "what", "why")
 HIDDEN_BASIS = (
     "the harness's watch killed the run's processes: the cgroup charged {amount} bytes more anonymous memory during "
     "the cell than any process /proc shows explains, past the margin of {limit}, and memory the watch cannot see is "
@@ -116,10 +119,12 @@ class AppCellRunner(CellRunner):
         watch.on_run_end = self.run_ended_by_watch
 
     def run_ended_by_watch(self, event: dict[str, Any]) -> None:
-        """The watch ended the run (`scope: run`, O69): every later exec and the collection are refused (`ended`)."""
+        """The watch ended the run (`scope: run`, O72): every later exec and the collection are refused (`ended`)."""
         with self.meta_lock:
-            self.ended = self.ended or {"outcome": RUN_ENDED, "scope": "run", "reason": event.get("reason"),
-                                        "what": event.get("what"), "why": event.get("why")}  # fmt: skip
+            self.ended = self.ended or {
+                "outcome": RUN_ENDED, "scope": "run", "attributed": event.get("attributed", True),
+                "reason": event.get("reason"), "what": event.get("what"), "why": event.get("why"),
+            }  # fmt: skip
 
     # ------------------------------------------------------------------------------------------------ no earlyoom here
     def sample_pids(self) -> None:

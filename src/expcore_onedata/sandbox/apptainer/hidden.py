@@ -25,7 +25,7 @@ turn are never counted twice. A growth that passes so for `HIDDEN_CONFIRM`
 polls in a row is the running cell's when no other cell's namespace is in the cgroup. Memory the watch
 cannot see is taken as past the limit: the watch kills the run's processes as `memory_limit`, of `memory_hidden`
 (`watch.Watch`), once per cell. With another run's cell in the cgroup it cannot be told whose it is: the cell cannot
-be isolated, so the watch ends the run (`scope: run`, `attributed: false`, O69), and the reading is unknown
+be isolated, so the watch ends the run (`scope: run`, `attributed: false`, O72), and the reading is unknown
 (`unattributed`), never `over`, since the memory may be the other run's; the run is not counted as hiding.
 
 The second signal, `hidden_process`: a visible process of the run's cell whose `children` files list a pid that `/proc`

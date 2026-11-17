@@ -316,7 +316,7 @@ class Watch:
 
     def _end_run(self, members: list[Proc], hidden: Hidden) -> None:
         """Hidden memory past the margin that cannot be told the running cell's (another run's cell is in the cgroup):
-        the cell cannot be isolated, so its processes are killed and the run ended (`on_run_end`, O69), its reading
+        the cell cannot be isolated, so its processes are killed and the run ended (`on_run_end`, O72), its reading
         left unknown (`unattributed`), never `over`."""
         if self.ended is None:
             self._kill(members, "memory_limit", "memory_hidden", hidden.grown_bytes, hidden.allowance_bytes,

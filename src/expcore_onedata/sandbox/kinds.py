@@ -11,7 +11,7 @@ never from an exit code. Their categories map to the core's vocabulary of infras
   `unattributed_kill`, retried within the attempt limit.
 
 Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). The platform's own kinds are registered here,
-when this module is first imported. Six are the sandbox's and the ingest's, and none is treatable:
+when this module is first imported. Seven are the sandbox's and the ingest's, and none is treatable:
 
 - `data_gate_integrity`: the data gate's refusal of an answer it cannot pass to the agent (a redirect, an encoded body,
   its token in a header or a body, an answer larger than it checks whole, a complete listing larger than it serves
@@ -39,6 +39,11 @@ when this module is first imported. Six are the sandbox's and the ingest's, and 
   (`deadline.py`, O34). The harness could not bound the cell, and the run's mount or sandbox is gone: the run says
   nothing about the agent or the manipulation, so it is set aside, and no condition may declare it, an outage's
   included. A cell killed cleanly at its deadline is the agent's own time limit, never this kind.
+- `cell_not_isolated`: the Apptainer backend's watch ended the run because memory past a limit could not be told
+  this cell's, another run's cell being charged to the same cgroup (`scope: run`, `attributed: false`, O72). The
+  memory may be the other run's, so the run says nothing about the agent or the manipulation: it is set aside and
+  costs an attempt as a `sandbox` failure does, no condition may declare it, and it is counted apart, so a campaign
+  sees how many runs ended so (the run's own record of it is `infrastructure_facts.run_ended`).
 - `io_mode_integrity`: the mount run's effective oneclient I/O mode, as oneclient's own start lines and detection
   lines show it (`iomode`, O49), was not the mode the run declared, or the log could not say. The run ran in another
   mode, or in none that can be shown, so it says nothing about the manipulation: set aside and never scored as the
@@ -131,6 +136,15 @@ register_infra_kind(
     treatable=False,
 )
 
+CELL_NOT_ISOLATED = "cell_not_isolated"
+register_infra_kind(
+    CELL_NOT_ISOLATED,
+    "the watch ended the run because memory past a limit could not be told this cell's (another run's cell was charged "
+    "to the same cgroup, so it may be that run's): the run says nothing about the agent or the manipulation, and is "
+    "counted apart from every other sandbox failure",
+    treatable=False,
+)
+
 IO_MODE_INTEGRITY = "io_mode_integrity"
 register_infra_kind(
     IO_MODE_INTEGRITY,
@@ -164,11 +178,12 @@ def deadline_error(kill: Mapping[str, Any] | None) -> InfraError | None:
 def run_ended_error(record: Mapping[str, Any]) -> InfraError:
     """The error of every later cell of a run a cell's deadline ended (O34), and of its collection once the sandbox was
     stopped: kind `cell_unkillable`, with how that deadline ended. A run the Apptainer backend's watch ended, because
-    what passed a limit could not be told one cell's (`scope: run`, O69), is kind `sandbox` instead: set aside."""
+    what passed a limit could not be told one cell's (`scope: run`, O72), is kind `cell_not_isolated` instead: set
+    aside, and counted apart from every other sandbox failure."""
     if record.get("scope") == "run":
         why = record.get("why") or "what passed a limit could not be told one cell's"
         reason = record.get("reason")
-        return InfraError("sandbox", f"the run was ended by the watch ({reason}: {why}): nothing more runs")
+        return InfraError(CELL_NOT_ISOLATED, f"the run was ended by the watch ({reason}: {why}): nothing more runs")
     outcome = record.get("outcome", "unknown")
     return InfraError(CELL_UNKILLABLE, f"the run was ended at a cell's deadline ({outcome}): nothing more runs")
 
@@ -183,6 +198,8 @@ def kill_error(kill: Mapping[str, Any] | None) -> InfraError | None:
     kind = kind_of(kill.get("category"))
     if kind is None:
         return None
+    if kill.get("scope") == "run":  # the kill that ended the run because the cell could not be isolated (O72)
+        kind = CELL_NOT_ISOLATED
     return InfraError(
         kind, f"the agent's code was killed ({kill.get('reason', 'unknown')}): {kill.get('basis', '')}"[:600]
     )
@@ -239,6 +256,7 @@ def declared_deferral_from_config(path: "str | os.PathLike[str]") -> "DeferralBo
 
 
 __all__ = [
+    "CELL_NOT_ISOLATED",
     "CELL_UNKILLABLE",
     "DATA_GATE_INTEGRITY",
     "FEDERATION_BUSY",

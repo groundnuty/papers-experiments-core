@@ -218,7 +218,7 @@ def cell(sandbox: DockerSandbox, code: str, timeout_s: float) -> dict:
 def harness_launch(ctx: dict, code: str, timeout_s: float = 60) -> dict:
     """Run a launcher in the agent's container as the agent's uid, beside the cells (`docker exec`, the harness's own)
     and return its JSON line or what went wrong. What it starts is in the agent's container, so the next cell's sweep
-    kills it (O69): no cell runs while a replayer reads."""
+    kills it (O72): no cell runs while a replayer reads."""
     sandbox, uid = ctx["sandbox"], str(ctx["agent_uid"])
     done = ctx["host"].docker(
         "exec", "-u", f"{uid}:{uid}", "-w", "/work", sandbox.names.agent, sandbox.s.python, "-c", code,
@@ -294,7 +294,7 @@ def replay(ctx: dict, mode: str, fixture: dict, log: Log) -> None:
     before = merged(view.blocks(file_id, local))
     agent, uid = sandbox.names.agent, str(ctx["agent_uid"])
     # the resident replayer is started by the harness, as the agent's uid, never by a cell: a cell's processes end
-    # with it (O69), and the replayer must outlive the launch to read on each ack (no cell runs until it has ended)
+    # with it (O72), and the replayer must outlive the launch to read on each ack (no cell runs until it has ended)
     launched = harness_launch(
         ctx,
         LAUNCH.format(child=REPLAYER, mode=mode, path=fixture["inside"], prog=f"/work/{tag}.jsonl",
