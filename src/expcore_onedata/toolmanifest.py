@@ -16,13 +16,15 @@ the command and arguments of `[toolserver]` (the resolve launcher included), the
 builds for the condition, and a new, empty directory of mode 0700 for each start, removed once the server has stopped.
 
 `freeze` writes the manifest to the file the condition declares (`manifest` in `[toolserver.conditions]`), which need
-not exist yet. `check` compares the live server with that file.
+not exist yet. `check` compares the live server with that file, and says so when it is missing. The platform loads
+without its manifests, so one condition is frozen or checked before the others are frozen.
 
 `--pass-env` is for the variables a study's server needs and the launch's caller passes (`extra_env`); it refuses every
 variable the launch sets itself (`toolserver.MANAGED_ENV` and `toolserver.OVERRIDDEN_ENV`), the word that stops the
-`.env` read among them, and a name the environment does not hold. The server's tools do not depend on its token, so
-without `--token-env` both token settings hold a fixed placeholder that is no token of any run; a server that checks
-its token when it starts takes the value of a variable named by `--token-env` (never a value on the command line).
+`.env` read among them, and a name the environment does not hold. The tool list is taken not to depend on the server's
+token (only the stand-in server has been shown to behave so), so without `--token-env` both token settings hold a fixed
+placeholder that is no token of any run; a server that checks its token when it starts takes the value of a variable
+named by `--token-env` (never a value on the command line).
 
 Each exits 0 on success, 1 on a mismatch (`check`, listed on standard error) and 2 on an error. It starts the server
 and reads its tools; it contacts no federation, and it does not verify the pinned checkout that a launch verifies.
@@ -70,7 +72,7 @@ def _run(args: argparse.Namespace) -> int:
         raise ValueError(f"--pass-env cannot pass {', '.join(fixed)}: the launch sets these itself")
     extra = {name: _value(name, "--pass-env") for name in args.pass_env}
     token = _Token(FREEZE_TOKEN if args.token_env is None else _value(args.token_env, "--token-env"))
-    config = load_platform(args.platform, require_secrets=False, require_manifests=args.action == "check")
+    config = load_platform(args.platform, require_secrets=False, require_manifests=False)  # one condition at a time
     condition = config.condition(args.condition)  # refuses a platform with no [toolserver], and an undeclared name
     server = config.toolserver
     if server is None:

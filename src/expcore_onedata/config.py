@@ -529,7 +529,7 @@ def _check_fixed_users(
 
 def _condition(name: str, section: Section, base: Path, *, require_manifest: bool = True) -> Condition:
     """Read one condition: allow-list, rights, manifest. `section` is known in messages by its position. The manifest
-    must be a file unless `require_manifest` is off, which only the command that freezes it uses."""
+    must be a file unless `require_manifest` is off, which only the manifest command line uses."""
     _name(section, None, name, "its name")
     section.reject_unknown(("allow", "rights", "manifest"))
     allow, rights = section.strings("allow"), section.strings("rights")
@@ -584,7 +584,7 @@ def load_platform(
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
 
     Each condition's manifest must be a file (L13), unless `require_manifests` is off, which `python -m
-    expcore_onedata.toolmanifest freeze` uses to read the platform whose manifest it is about to write.
+    expcore_onedata.toolmanifest` uses to read a platform some of whose manifests it is about to write.
 
     While a study's build is open it records that it ran, with `PLATFORM_MODULE` and the file (`platform_loads`).
     """

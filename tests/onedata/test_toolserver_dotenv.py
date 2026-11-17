@@ -318,6 +318,7 @@ def test_o84_freeze_writes_the_tools_the_condition_allows_to_the_manifest_it_dec
     config, _, _ = launching(tmp_path, fake, frozen, events, "compose")
     declared = config.condition("manage").manifest
     declared.unlink()
+    assert manifest_tool(config, "check", condition="manage") == 2  # nothing to check against yet
     assert manifest_tool(config, "freeze", condition="manage") == 0
     assert [t["name"] for t in FrozenManifest.load(declared).tools] == sorted(config.condition("manage").allow)
     assert manifest_tool(config, "check", condition="manage") == 0
