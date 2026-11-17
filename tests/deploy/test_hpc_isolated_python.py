@@ -248,6 +248,40 @@ def python_findings(source: str) -> list[str]:
     return found
 
 
+SRC = DEPLOY.parent / "src"  # the core's own code, which the driver and the sandbox launch on the nodes
+# The Python launches of the core's own code that run on a node, each by the file it is in (the sandbox's gate, the
+# mount watcher, the egress collector, the completion check and the copy-out): each must exist, so the scan below
+# cannot go silent because a launch moved. They are the only `-I` displays in `src/`.
+SRC_LAUNCHES = {
+    "expcore_onedata/sandbox/apptainer/gaterun.py": 1,
+    "expcore_onedata/sandbox/apptainer/hostmount.py": 1,
+    "expcore_onedata/sandbox/apptainer/sandbox.py": 1,
+    "expcore_onedata/sandbox/completion.py": 1,
+    "expcore_onedata/sandbox/copyout.py": 1,
+}
+
+
+def isolated_launches(source: str) -> tuple[int, list[str]]:
+    """How many list or tuple displays of Python source hold an `-I` word, and which of them do not hold `-B` in the
+    same run of option words (`-I -B`, in either order): `<line>: <the display>`. Any argv that isolates an interpreter
+    must also stop it writing bytecode, so a launch added to `src/` with `-I` alone fails here."""
+    count, found = 0, []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.List | ast.Tuple):
+            continue
+        run: list[object] = []
+        for word in [*node.elts, None]:
+            if isinstance(word, ast.Constant) and word.value in BOTH:
+                run.append(word.value)
+                continue
+            if "-I" in run:
+                count += 1
+                if set(run) != BOTH:
+                    found.append(f"{node.lineno}: {ast.unparse(node)}")
+            run = []
+    return count, found
+
+
 # An interpreter as a word: `$HPCOP_PY` or `$HPCT_PYTHON`, bare or quoted, `python`, `python3` or `python3.x`, or a
 # path to one in a `bin/` (`"$dir/venv/bin/python"`), followed by the next word.
 SHELL_PYTHON = re.compile(
@@ -323,6 +357,17 @@ def test_o58_the_scans_find_a_python_without_isolation_and_a_launch_that_names_n
     )
     assert [len(python_findings(text)) for text in python_bad] == [1] * len(python_bad)
     assert python_findings(python_good) == []
+    src_bad = [
+        '[python, "-I", "-c", "x"]',
+        '(py, "-I", "-m", "m")',
+        '[*a, "-B", x, "-I", "y"]',
+        '[sys.executable, "-I"]',
+    ]
+    assert [isolated_launches(text) for text in src_bad] == [
+        (1, [f"1: {ast.unparse(ast.parse(t).body[0].value)}"]) for t in src_bad
+    ]
+    src_good = '[python, "-I", "-B", "-c", "x"]\n(py, "-B", "-I", "m")\n["-m", "pytest"]\n("-I-ish", "x")\n'
+    assert isolated_launches(src_good) == (2, [])
     assert [len(shell_findings(text)) for text in shell_bad] == [1] * len(shell_bad)
     assert shell_findings(shell_good) == []
 
@@ -337,6 +382,22 @@ def test_o58_every_python_argv_the_driver_builds_runs_isolated_and_every_slurm_l
     that names a Python (`sys.executable`, a `python*` file name, a variable named `python` or `*_python`) puts `-I`
     right after it, and every `srun` or `sbatch` argv carries `--chdir=`. A new one that misses either fails here."""
     assert python_findings(path.read_text(encoding="utf-8")) == []
+
+
+def test_o58_every_python_the_core_launches_on_a_node_runs_isolated_and_writes_no_bytecode():
+    """O58: the gate, the mount watcher, the egress collector, the completion check and the copy-out of `src/` run an
+    interpreter on a batch node with `-I` and `-B` together, as the driver's own launches do: `-I` alone still writes
+    `__pycache__` into a checkout or a tree the node shares. Every `-I` display of `src/` is scanned, and the five
+    launches are all found (a scan that finds none of them would pass for the wrong reason)."""
+    counts, findings = {}, {}
+    for path in sorted(SRC.rglob("*.py")):
+        count, bad = isolated_launches(path.read_text(encoding="utf-8"))
+        if count:
+            counts[path.relative_to(SRC).as_posix()] = count
+        if bad:
+            findings[path.relative_to(SRC).as_posix()] = bad
+    assert counts == SRC_LAUNCHES
+    assert findings == {}
 
 
 @pytest.mark.parametrize("path", deploy_files("*.sh", "*.sbatch"), ids=lambda p: p.relative_to(DEPLOY).as_posix())
