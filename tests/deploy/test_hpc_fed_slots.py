@@ -24,7 +24,6 @@ from hpc_fed_support import (
 )
 from slots_support import (
     BASE_SET,
-    COMMIT,
     READ_SET,
     WITH_TOOLSERVER,
     WRITE_SET,
@@ -233,7 +232,7 @@ def test_o83_every_slot_user_is_mapped_to_the_jobs_uid_on_a_providers_storage_li
     boot.luma = lambda service, method, path, body: sent.append(body)
     boot.storage_for = lambda service, space: "posix-local"
     monkeypatch.setattr(hpc.fedboot.Bootstrap, "support", lambda self, service, space, sid: None)  # not under test
-    boot.support(boot.spec.provider("aspen"), boot.spec.space("alpha-space"), "sid-alpha-space")
+    boot.support(boot.spec.provider("oak"), boot.spec.space("alpha-space"), "sid-alpha-space")
     mapped = {body["onedataUser"]["onedataUserId"] for body in sent if "onedataUser" in body}
     assert {f"uid-{user}" for user in SLOT_USERS} <= mapped
     assert {f"uid-{p.name}" for p in boot.spec.principals} | {"uid-admin"} == mapped
@@ -396,7 +395,7 @@ def test_o83_the_pilots_platform_file_has_the_slots_and_a_tool_server_the_launch
         ("slot2-data", "slot2-tools"),
     ]
     assert [s.tool_server.user_id for s in slots.slots] == ["uid-slot1-tools", "uid-slot2-tools"]
-    assert config.toolserver.commit == COMMIT
+    assert config.toolserver.commit == phase.spec.toolserver.commit
     command, args = server_argv(config)
     assert command == f"{phase.study}/venv/bin/python"
     assert args == ["-I", "-B", str(phase.root / "toolshim" / "resolve_launch.py"), str(phase.layout.address_map), "--",
@@ -430,7 +429,7 @@ def test_o83_a_tool_server_the_launcher_cannot_start_is_refused_when_the_platfor
     original = path.read_text(encoding="utf-8")
     for old, new in (
         (f'command = "{phase.study}/venv/bin/python"', f'command = "{phase.study}/bin/server"'),
-        ('args = ["-m", "onedata_mcp"]', 'args = ["onedata_mcp"]'),
+        ('args = ["-m", "onedata_mcp"]', 'args = ["-c", "import onedata_mcp"]'),
     ):
         assert old in original
         path.write_text(original.replace(old, new), encoding="utf-8")
