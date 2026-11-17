@@ -721,7 +721,10 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   does. A federation that is not linked, is not the one the fleet made, or leaves a space's data undeclared
   (`data_manifest`) gets no shard; a shard whose federation failed stays unassigned. **The first plan refuses outright
   when the federations' platform fingerprints differ** (another zone image's CA, another SIF, another data manifest):
-  their shards would never merge. It names each federation and the differing keys.
+  their shards would never merge. It names each federation and the differing keys. **A federation whose layout has an
+  ingested space** (the pilot's `delta-space`) is planned only once its data is verified: run `hpcfed.py --layout L
+  --root <fleet>/fed-k/root verify-data` on each, after the study's ingest and before `plan` (the fleet has no verb
+  for it); until then `plan` refuses it, naming the space.
 - **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never
   starts in the directory you ran it from), its client recorded and its output in `<fleet>/logs/`, after checking the
   federation again, that `shards.toml` is the one the record gives, and that Slurm still holds the job the line lands
