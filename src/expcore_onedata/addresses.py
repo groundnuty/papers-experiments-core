@@ -17,7 +17,7 @@ file = "secrets/address-map.json"   # relative to this file; a private file of y
 
 ```json
 {"format": "expcore-address-map/1",
- "hosts": {"zone.layout.test": {"address": "192.0.2.10", "nodes": ["node-a.cluster.example.org", "node-a"]}}}
+ "hosts": {"<declared name>": {"address": "<the node's address>", "nodes": ["<the node's own names>"]}}}
 ```
 
 `address` is where the declared name is dialled; `nodes` are the node's own names, which nothing agent-visible may
