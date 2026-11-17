@@ -36,6 +36,7 @@ from fedspec import STUDY_ARTIFACTS, Space
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.importmanifest import Manifest, ManifestFile, load_manifest, write_manifest
+from expcore_onedata.linkentries import is_link_check_entry
 
 MANIFESTS = "data-manifests"  # in the root: each non-imported space's manifest
 WORKERS = 16
@@ -180,6 +181,17 @@ def differences(tree: Tree, manifest: Manifest) -> str:
     return ", ".join(said)
 
 
+def without_link_check_files(tree: Tree) -> Tuple[Tree, int]:
+    """The probe space's tree without the files the link check writes there (O35), and how many were left out. Those
+    are the check's own, not data: its probes and its retirement markers, the two name shapes
+    `expcore_onedata.linkentries.is_link_check_entry` tells (the check names its files by the same module's definition,
+    never a pattern of ours). The name is matched against a file's whole path, so only a file in the space's root is the
+    check's; a directory, a near miss of a name and every other file stay in the tree, and stay differences."""
+    files, directories = tree
+    own = {path for path in files if is_link_check_entry(path)}
+    return ({path: found for path, found in files.items() if path not in own}, directories), len(own)
+
+
 def check_rendered(layout: Layout, manifests: Mapping[str, Path]) -> None:
     """Refuse a rendered platform.toml whose entry for a space names another `data_manifest` than the one `up` rendered
     for it (`manifests`): a template that writes a path of its own would leave the data the campaign's fingerprint holds
@@ -210,18 +222,28 @@ def check_rendered(layout: Layout, manifests: Mapping[str, Path]) -> None:
 def check(layout: Layout, manifests: Mapping[str, Path], read: Callable[[str], Tree]) -> str:
     """Refuse a federation any of whose spaces that are neither shared imports nor ingested does not hold exactly its
     manifest (`read(space)` gives its tree, read back through its owner): RuntimeError naming the space, never a path.
-    What up prints. An ingested space holds nothing yet: `verify` checks it after the ingest."""
+    What up prints. An ingested space holds nothing yet: `verify` checks it after the ingest.
+
+    The probe space (`probe_space` of the layout) holds the files the link check writes into it, which its manifest, the
+    empty baseline, does not declare. `up` checks the data before the link check, so the first run finds none; a rerun
+    of this phase (`hpcfed.py core`, a resume) finds them, and they are left out (`without_link_check_files`) and
+    counted in what is printed. Nothing else is left out of it, and no other space is read that way."""
     imported = {s.name for s in layout.shared_imports()}  # verify_imports showed these
     waiting = ingested(layout)
-    checked = 0
+    probe, left_out, checked = layout.spec.probe_space, None, 0
     for space in layout.spec.spaces:
         if space.name in imported or space.name in waiting:
             continue
-        found = differences(read(space.name), load_manifest(manifests[space.name]))
+        tree = read(space.name)
+        if space.name == probe:
+            tree, left_out = without_link_check_files(tree)
+        found = differences(tree, load_manifest(manifests[space.name]))
         if found:
             raise RuntimeError(f"{space.name} does not hold the data its manifest declares ({found}): not ready")
         checked += 1
     said = f"data: every space that is not ingested holds the data its manifest declares ({checked} space(s))"
+    if left_out is not None:
+        said += f"; {left_out} link-check file(s) left out of the probe space ({probe})"
     if waiting:
         names = ", ".join(waiting)
         said += f"; {len(waiting)} ingested space(s) await(s) `hpcfed.py verify-data` after the ingest: {names}"

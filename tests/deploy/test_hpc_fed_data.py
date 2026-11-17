@@ -210,11 +210,11 @@ def test_o63_the_core_phase_rerun_on_a_root_after_a_link_check_passes_its_data_c
         return report
 
     first = core(hpc, root, "fed-a", ca, data=holding(spaces), links=link_check)
-    assert f"0 link-check file(s) left out of the probe space ({PROBE_SPACE})" in first
     assert pairs[-1]
     assert len(spaces[PROBE_SPACE]) == len(pairs[-1])  # the check wrote a probe for each pair
     (root / "link-check.json").unlink()
-    again = core(hpc, root, "fed-a", ca, data=holding(spaces), links=link_check)
+    again = core(hpc, root, "fed-a", ca, data=holding(spaces), links=link_check)  # refused: the probes were "data"
+    assert f"0 link-check file(s) left out of the probe space ({PROBE_SPACE})" in first
     assert f"{len(pairs[-1])} link-check file(s) left out of the probe space ({PROBE_SPACE})" in again
     assert (root / "link-check.json").is_file()
 
