@@ -26,8 +26,9 @@ real addresses (DESIGN.md, sections 5 and 6).
   rendered file is read back for it (`check_provider_storage`): a federation on scratch and one on tmpfs are two
   experiments.
 - **The render identity** (O74, `hpcidentity`) is written beside it, once the platform file is rendered: the hashes of
-  the template, of the rendered platform's fingerprint and of each pin it holds, as `render-identity.json` in the root,
-  which a shard's step compares with the one its plan expects.
+  the template, of the rendered platform's fingerprint and of each pin it holds, and the digest of the study's artifacts
+  tree when the site declares one (`up` took it in its preflight and the state file carries it here), as
+  `render-identity.json` in the root, which a shard's step compares with the one its plan expects.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """

@@ -300,7 +300,9 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "command": ["<python>", "-I", "-B", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
-           "billing_weight": null, "step_network": "", "storage_root": "<scratch root, or empty>"},
+           "billing_weight": null, "step_network": "", "study_artifacts": "<directory, or empty>",
+           "storage_root": "<scratch root, or empty>"},
+  "study_artifacts_tree_sha256": "<64 hex: the digest of that directory's tree, taken in the preflight (section 8); absent without one>",
   "storage": {"root": "<the site's scratch root>", "parent": "<root>/<allocation name>", "token": "<32 hex>",
               "providers": {"<provider name>": "<parent>/<provider name>"}},
   "allocation": {
@@ -767,9 +769,25 @@ canonical JSON with sorted keys; `hpcidentity.py`, written by `hpcboot.write_fac
 the renderer read it, before it was rendered; `platform_fingerprint_sha256`, the canonical JSON of the rendered file's
 `PlatformConfig.fingerprint()` hashed as the core hashes a fingerprint (`expcore.campaign.manifest.fingerprint_sha256`);
 and the SHA-256 of each pin the platform holds (`sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256`,
-`oneclient_bundle_sha256`), the very values the preflight checked (`hpcpins`), never read again. It holds no address,
+`oneclient_bundle_sha256`), the very values the preflight checked (`hpcpins`), never read again; and, when `site.env`
+declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256`, the digest of that directory's tree. It holds no address,
 id, job, node, path, user or secret, so it can travel with a shard's results and be committed beside a study. A pin the
-template does not name is left out; a layout with no template writes no record. A manifest's `expect_render_identity`
+template does not name is left out, and so is the artifacts digest of a site with no such directory; a layout with no
+template writes no record. **The artifacts digest** is taken by `up` once, in its preflight on the login node, before
+the root is made or a job submitted (a tree that cannot be digested fails `up` there), kept in the state file and
+handed to the core's phase among its values, so a core step on a node, whose environment is an allowlist, has it and
+never reads the tree. It is the SHA-256 of one canonical listing: `expcore-artifacts-tree/1` and a NUL, then one record
+per entry sorted by its relative path as bytes, none for the directory itself: `F NUL path NUL size NUL sha256 NUL` (a
+regular file), `D NUL path NUL` (a directory), `L NUL path NUL target NUL` (a symbolic link, by its target string, never
+followed, so what it points at must be in the tree to be pinned: the directory is self-contained, its interpreter
+installed in it and its venv built on it, and a link whose resolved target leaves it is refused. A link is resolved as
+the kernel resolves it, against the tree's own entries alone: a component that is a link is replaced by its target, `..`
+goes up one and one at the root is an escape, an absolute target must begin, by whole components, with the root's real
+path or the path it was declared by, and a path may pass through 40 links at most, so a loop is refused; a link that
+dangles inside is allowed and recorded, and a tree whose links stay inside has its earlier digest). A special file, or a
+root that is not a directory of its own, is refused, naming `HPC_STUDY_ARTIFACTS` and a path relative to the directory, never an absolute one. No mode, owner, time
+or path of the directory is in it, so a copy elsewhere has the same digest. The tree is read below one held descriptor
+with no link followed and never written (the pilot makes it read-only first). A manifest's `expect_render_identity`
 (a path of the study; the lines carry it with its hash as `--expect-render-identity*`) makes `step` compare the
 federation's record with the expected one before it makes anything, beside the pre-step guard and before it, refusing
 with 73 and naming the keys that differ; and every step writes the record it validated into
@@ -862,8 +880,11 @@ run is open.
    test pins the two together). A shared import's owner adds nothing on scratch (its storage is the tree, read-only), but
    the copy a mirror fetches does, so it counts once like every other space; a replica on every mirror is **not**
    multiplied in (no multiplier is invented), and the 5% below the line is the room for what the estimate leaves out. For
-   the ingest layout (`pilot-shape.toml`) the estimate is a handful of files (its spaces declare no data: `baseline =
-   false`, or one small file), because the study's own ingest is in no manifest `up` knows; for the import layout
+   the ingest layout (`pilot-shape.toml`) the estimate is a handful of files while its ingested space declares no
+   manifest (`baseline = false`, nothing the study will put there is known to `up`); a study that declares it
+   (`data_manifest = "@study_artifacts@/..."`, which `up` loads and records, section 6a) has that manifest counted too,
+   from the site's `HPC_STUDY_ARTIFACTS`: the pilot's largest space is 15,340 files (`hpcdata.declared` takes it through
+   `ingested_manifests`, so the estimate and the manifest `up` verifies the space against are one count); for the import layout
    (`pilot-shape-import.toml`) it is the four imported manifests, about the pilot's 17,500.
 3. **Refuse** when `used + estimate > quota * 95 // 100`, in integers, so a total exactly at the line passes. The message
    names the used count, the estimate, the quota and the 95% line.
