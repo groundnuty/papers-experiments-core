@@ -4,7 +4,7 @@
 batch is analysed after copy-back. A plugin module may also define `build_analysis(context)`: the analysis paths
 (`analyse_study`, so `analyze`, `report`, `regenerate` and a package's check) call it, and fall back to `build` without
 it. It is never called for a run. The campaign fingerprint records the run plugin's `scorer_digest`, and an analysis
-built by `build_analysis` is refused when its scorers' digest is another one.
+built by `build_analysis` is refused when its scorers' digest is another one, or when a snapshot records none.
 
 The example is copied, and its plugin gains both builders: each notes its call in a file the test names, `build` fails
 when the test says the federation is gone, and `build_analysis` gives the scorers the test asks for.
@@ -24,14 +24,15 @@ from expcore.campaign.shard import ShardSpec
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
 from expcore.study import analysis_plugin, pipeline
-from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, scorer_notes
+from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, require_run_scorers
 from expcore.study.config import load_study
 from expcore.study.pipeline import Refused, analyse_study, output_bytes, regenerate, run_study
 from expcore.study.plugin import StudyContext, StudyPlugin, load_plugin
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
-SRC = Path(__file__).resolve().parents[2] / "src" / "expcore"
+ROOT = Path(__file__).resolve().parents[2]
+SCANNED = (ROOT / "src", ROOT / "deploy")  # every Python file the repository ships
 LOG = "TINY_BUILD_LOG"  # the file each builder notes its call in
 GONE = "TINY_NO_FEDERATION"  # "1": `build` fails, as it does where the federation no longer exists
 SCORERS = "TINY_ANALYSIS_SCORERS"  # which scorers `build_analysis` gives: same, other, extra or none
@@ -190,16 +191,17 @@ class References(ast.NodeVisitor):
 
 
 def test_r17_only_the_analysis_loads_build_analysis_and_only_the_analysis_loader_names_it():
-    """R17: no module of the core but the loader's own names the analysis loader, its constant or `"build_analysis"`,
-    except `_analyse_loaded` (and the import it needs), so a run path that reached it would be a new reference here."""
+    """R17: no Python file of the repository (the core, the Onedata layer, the deploy scripts) but the loader's own
+    names the analysis loader, its constant or `"build_analysis"`, except `_analyse_loaded` (and the import it
+    needs), so a run path that reached it would be a new reference here."""
     users: dict[str, set[str]] = {}
-    for path in sorted(SRC.rglob("*.py")):
+    for path in sorted(p for root in SCANNED for p in root.rglob("*.py")):
         seen = References()
         seen.visit(ast.parse(path.read_text(encoding="utf-8")))
         if seen.found:
-            users[path.relative_to(SRC).as_posix()] = seen.found
-    assert users.pop("study/analysis_plugin.py", None) is not None
-    assert users == {"study/pipeline.py": {"<module>", "_analyse_loaded"}}
+            users[path.relative_to(ROOT).as_posix()] = seen.found
+    assert users.pop("src/expcore/study/analysis_plugin.py", None) is not None
+    assert users == {"src/expcore/study/pipeline.py": {"<module>", "_analyse_loaded"}}
 
 
 def test_r17_an_analysis_builds_where_the_run_plugin_cannot_and_regenerates_what_it_wrote(
@@ -270,7 +272,6 @@ def test_r17_the_refusal_is_the_guards_alone_the_same_scorers_under_build_pass_u
         analyse_study(copy.root)
     monkeypatch.setattr(analysis_plugin, "BUILD_ANALYSIS", "no_such_builder")
     analysis = analyse_study(copy.root)
-    assert analysis.notes == ()
     assert analysis.scorers == {"tiny": "1"}
 
 
@@ -326,26 +327,28 @@ def forget_scorer_digest(campaign: Campaign) -> None:
         connection.close()
 
 
-def test_r17_a_store_without_the_digest_skips_the_comparison_and_the_analysis_says_so(
-    copy, monkeypatch, clean_environment, capsys
+def test_r17_a_store_that_records_no_scorer_digest_is_refused_for_a_build_analysis_and_not_for_a_build(
+    copy, monkeypatch, clean_environment
 ):
-    """R17: an old store has nothing to compare with: the analysis goes on, its notes say the check was skipped (on
-    stderr from `analyze` and `report`, in no output file), and an analysis under another scorer is then not refused."""
+    """R17: every fingerprint the core writes holds the digest, so a store without one was changed or is damaged, and
+    the scorers of a `build_analysis` cannot be shown to be the run's: `analyze` refuses, with nothing written, even
+    when they are the same. Built by `build`, which is never compared, the same store analyses as before."""
     forget_scorer_digest(copy)
     assert cli(clean_environment, "check", str(copy.runs))[0] == 0  # the check snapshots the store as it is
-    monkeypatch.setenv(SCORERS, "other")
-    analysis = analyse_study(copy.root)
-    assert len(analysis.notes) == 1
-    assert "records no scorer digest" in analysis.notes[0]
-    assert "build_analysis" in analysis.notes[0]
-    assert not DIGEST.search(analysis.notes[0])
-    status, errors = cli(clean_environment, "analyze", str(copy.root))
-    assert status == 0
-    assert "analyze: " + analysis.notes[0] in errors
-    written = "".join(
-        (copy.root / "out" / name).read_text(encoding="utf-8") for name in ("analysis.json", "scores.json")
-    )
-    assert "records no scorer digest" not in written
+    for name in ("scores.json", "analysis.json", "export.json", "report.md"):
+        (copy.root / "out" / name).unlink()
+    for which in ("same", "other"):
+        monkeypatch.setenv(SCORERS, which)
+        status, errors = cli(clean_environment, "analyze", str(copy.root))
+        assert status == 1
+        assert "1 of 1 snapshot of the store records no valid scorer digest" in errors
+        assert "build_analysis" in errors
+        assert not DIGEST.search(errors)
+        assert not (copy.root / "out" / "scores.json").exists()
+        with pytest.raises(Refused):
+            analyse_study(copy.root)
+    monkeypatch.setattr(analysis_plugin, "BUILD_ANALYSIS", "no_such_builder")
+    assert analyse_study(copy.root).scorers == {"tiny": "1"}
 
 
 # --- the comparison itself, over what each snapshot of a store records -----------------------------------------------
@@ -361,38 +364,48 @@ def digest_of(*scorers: Scorer) -> str:
     return StudyPlugin(None, list(scorers), {}, {}).scorer_digest()  # type: ignore[arg-type]
 
 
-def test_r17_every_snapshot_that_records_a_digest_is_compared_and_one_that_differs_refuses():
+def test_r17_every_snapshot_is_compared_and_one_that_differs_refuses():
     """R17: a merged batch has a snapshot for each shard: all agree, or the analysis is refused naming the scorers."""
     mine = [Scorer("tiny", "1")]
     recorded = {"scorer_digest": digest_of(*mine)}
-    assert scorer_notes(mine, "plugin.py", [recorded, recorded]) == ()
+    assert require_run_scorers(mine, "plugin.py", [recorded]) is None
+    assert require_run_scorers(mine, "plugin.py", [recorded, recorded]) is None
     with pytest.raises(ScorersDiffer) as refused:
-        scorer_notes(mine, "plugin.py", [recorded, {"scorer_digest": digest_of(Scorer("tiny", "2"))}])
+        require_run_scorers(mine, "plugin.py", [recorded, {"scorer_digest": digest_of(Scorer("tiny", "2"))}])
     assert "'tiny'" in str(refused.value)
     assert "plugin.py" in str(refused.value)
     assert not DIGEST.search(str(refused.value))
 
 
-def test_r17_a_snapshot_that_records_none_is_said_and_never_makes_the_others_unchecked():
-    """R17: no fingerprint, one without the digest, or a malformed one is a snapshot with nothing to compare; the
-    rest are compared as they are, and the note counts the ones that could not be."""
+def test_r17_a_snapshot_that_records_no_valid_digest_refuses_and_counts_them():
+    """R17: no snapshot, no fingerprint, one without the digest, a malformed one (not 64 lower-case hex digits, not a
+    string) are all a refusal, never a pass, even beside snapshots that agree; the message counts the snapshots and
+    shows no digest."""
     mine = [Scorer("tiny", "1")]
     recorded = {"scorer_digest": digest_of(*mine)}
-    (note,) = scorer_notes(mine, "plugin.py", [])  # no snapshot read at all: nothing was compared, and it says so
-    assert "no snapshot" in note
-    for blank in (None, {}, {"scorer_digest": "not a digest"}, {"scorer_digest": 7}):
-        (note,) = scorer_notes(mine, "plugin.py", [blank])
-        assert "1 of 1 snapshot" in note
-        (note,) = scorer_notes(mine, "plugin.py", [recorded, blank])
-        assert "1 of 2 snapshots" in note
-        with pytest.raises(ScorersDiffer):
-            scorer_notes([Scorer("tiny", "2")], "plugin.py", [recorded, blank])
+    with pytest.raises(ScorersDiffer, match="no snapshot of the store was read"):
+        require_run_scorers(mine, "plugin.py", [])
+    upper = {"scorer_digest": recorded["scorer_digest"].upper()}
+    for blank in (None, {}, {"scorer_digest": "not a digest"}, {"scorer_digest": 7}, upper):
+        with pytest.raises(ScorersDiffer, match=r"1 of 1 snapshot of the store records no valid scorer digest"):
+            require_run_scorers(mine, "plugin.py", [blank])
+        with pytest.raises(ScorersDiffer, match=r"1 of 2 snapshots of the store record no valid scorer digest") as two:
+            require_run_scorers(mine, "plugin.py", [recorded, blank])
+        assert not DIGEST.search(str(two.value))
+
+
+def test_r17_another_digest_is_named_by_its_scorers_even_beside_a_snapshot_with_none():
+    """R17: when one snapshot differs and another records none, the refusal that names the scorers comes first."""
+    mine = [Scorer("tiny", "2")]
+    other = {"scorer_digest": digest_of(Scorer("tiny", "1"))}
+    with pytest.raises(ScorersDiffer, match="gives the scorers 'tiny'"):
+        require_run_scorers(mine, "plugin.py", [None, other])
 
 
 def test_r17_several_scorers_are_named_in_the_order_the_plugin_gives_them():
     """R17: the refusal names every scorer of the analysis plugin once, and says which builder gave them."""
     scorers = [Scorer("second", "1"), Scorer("first", "1")]
     with pytest.raises(ScorersDiffer) as refused:
-        scorer_notes(scorers, "plugin.py", [{"scorer_digest": "0" * 64}])
+        require_run_scorers(scorers, "plugin.py", [{"scorer_digest": "0" * 64}])
     assert "'second', 'first'" in str(refused.value)
     assert "build_analysis" in str(refused.value)

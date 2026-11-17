@@ -16,8 +16,9 @@ The guard is the one way the two builders cannot score differently. The campaign
 snapshot record, holds the run plugin's `scorer_digest`: the SHA-256 of its scorers' names and versions
 (`plugin.scorers_digest`). An analysis built by `build_analysis` is refused unless its scorers have that digest, and
 the refusal names them, never a digest or a version. An analysis built by `build` is not compared: it is the run's
-own builder, and re-scoring with a scorer that has changed since (R13) is what it is for. A store from before the
-fingerprint held a digest has nothing to compare with: the analysis goes on and says so in `StudyAnalysis.notes`.
+own builder, and re-scoring with a scorer that has changed since (R13) is what it is for. A snapshot that records no
+valid digest is refused as well: every fingerprint the core writes holds one (`build_fingerprint` requires it), so
+such a store was changed or is damaged, and a pass would let the analysis score with scorers the run never had.
 """
 
 import re
@@ -58,22 +59,23 @@ def load_analysis_plugin(context: StudyContext) -> AnalysisPlugin:
     return AnalysisPlugin(call_builder(context, module, BUILD_ANALYSIS, scorers_only=True), True)
 
 
-def scorer_notes(
-    scorers: Sequence[Any], plugin_file: str, recorded: Sequence[Mapping[str, Any] | None]
-) -> tuple[str, ...]:
-    """Compare the analysis plugin's scorers with what each snapshot of the store recorded of the run's, and return the
-    notes the analysis carries; raise `ScorersDiffer` when a snapshot records another digest.
+def require_run_scorers(scorers: Sequence[Any], plugin_file: str, recorded: Sequence[Mapping[str, Any] | None]) -> None:
+    """Refuse unless the analysis plugin's scorers have the digest every snapshot of the store recorded of the run's;
+    raise `ScorersDiffer`, naming the scorers and never a digest or a version.
 
     `recorded` holds the campaign fingerprint of each snapshot the analysis reads (one for a campaign, one per shard of
-    a merged batch), or None for a snapshot that records none. A snapshot with no `scorer_digest`, or one that is not a
-    SHA-256 digest, has nothing to compare with: the others are compared as they are, and one note says how many were
-    not. Without any, the note says the scorers were not compared at all.
+    a merged batch). A snapshot whose fingerprint is missing, has no `scorer_digest` or holds one that is not a SHA-256
+    digest is refused too: every fingerprint the core writes holds one, so such a store was changed or is damaged, and
+    the scorers cannot be shown to be the run's. A snapshot that differs is named before one that records none.
     """
     if not recorded:
-        return (f"{BUILD_ANALYSIS}'s scorers were not compared with the run's: no snapshot of the store was read",)
+        raise ScorersDiffer(
+            f"{plugin_file}: {BUILD_ANALYSIS}'s scorers cannot be shown to be the run's: "
+            "no snapshot of the store was read"
+        )
     held = [fingerprint.get(SCORER_DIGEST) if isinstance(fingerprint, Mapping) else None for fingerprint in recorded]
     digests = [d for d in held if isinstance(d, str) and _DIGEST.fullmatch(d)]
-    if digests and any(d != scorers_digest(scorers) for d in digests):
+    if any(d != scorers_digest(scorers) for d in digests):
         names = ", ".join(repr(scorer_name(s)) for s in scorers)
         raise ScorersDiffer(
             f"{plugin_file}: {BUILD_ANALYSIS} gives the scorers {names}, but the campaign was run with other scorers "
@@ -81,10 +83,10 @@ def scorer_notes(
             "gives, with the same names and versions"
         )
     missing = len(held) - len(digests)
-    if not missing:
-        return ()
-    noun, verb = ("snapshot", "records") if len(held) == 1 else ("snapshots", "record")
-    return (
-        f"{BUILD_ANALYSIS}'s scorers were not compared with the run's: {missing} of {len(held)} {noun} of the store "
-        f"{verb} no scorer digest",
-    )
+    if missing:
+        noun, verb = ("snapshot", "records") if len(held) == 1 else ("snapshots", "record")
+        raise ScorersDiffer(
+            f"{plugin_file}: {BUILD_ANALYSIS}'s scorers cannot be shown to be the run's: {missing} of {len(held)} "
+            f"{noun} of the store {verb} no valid scorer digest (every campaign fingerprint the core writes holds one, "
+            "so this store was changed or is damaged)"
+        )

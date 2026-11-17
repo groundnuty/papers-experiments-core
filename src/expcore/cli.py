@@ -284,10 +284,7 @@ def _check(args: argparse.Namespace) -> int:
 
 
 def _analysis(args: argparse.Namespace) -> StudyAnalysis:
-    analysis = analyse_study(args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, partial=args.partial)
-    for note in analysis.notes:  # what the analysis went on without: said here, since no output file holds it (R17)
-        print(f"{args.command}: {note}", file=sys.stderr)
-    return analysis
+    return analyse_study(args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, partial=args.partial)
 
 
 def _analyze(args: argparse.Namespace) -> int:

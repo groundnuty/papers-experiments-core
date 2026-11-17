@@ -41,8 +41,8 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   scorer and a new check (a scorer is code the identity covers).
   The plugin it scores with is the module's `build_analysis` where the study defines one, which needs no platform, and
   its `build` otherwise (`analysis_plugin`, R17); a run never builds with `build_analysis`. An analysis built by it is
-  refused unless its scorers are the digest the campaign fingerprint recorded, and a store that records none goes on,
-  with a note in `StudyAnalysis.notes` that no output file carries, so the outputs are the same bytes either way.
+  refused, before any record is scored, unless its scorers have the digest every snapshot's campaign fingerprint
+  recorded, so the outputs are the same bytes whichever builder served the analysis.
 - `output_bytes` is the one place the bytes of `export.json`, `scores.json`, `analysis.json` and `report.md` are made;
   `write_analysis` and `write_report` write them and `regenerate` compares them with the files in `out/`, which is
   what a replication package's `make check` runs. Every time in them comes from the records and the store, every
@@ -125,7 +125,7 @@ from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.ratio import OMIT_NONE
 from expcore.stats.rows import AbsentRun, Row
-from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, scorer_notes
+from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, require_run_scorers
 from expcore.study.config import (
     MODELS_FILE,
     OUT_DIR,
@@ -179,7 +179,6 @@ class StudyAnalysis:
     mount_guard: MountGuardAnalysis | None = None  # a batch whose mount was guarded: the same, of the mount (O60)
     guards: GuardsAnalysis | None = None  # a batch checked by both: the rerun without the runs either leaves out
     visibility: VisibilityAnalysis | None = None  # a batch watched for hidden processes: the same, of those (O56)
-    notes: tuple[str, ...] = ()  # what the analysis could not check and went on without: in no output file (R17)
 
 
 def out_dir(study: StudyConfig | StudyIdentity) -> Path:
@@ -903,10 +902,10 @@ def _analyse_loaded(
                 "the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed)
             )
     loaded = load_analysis_plugin(StudyContext(study, code))  # the one place a `build_analysis` is built (R17)
-    plugin, notes = loaded.plugin, ()
+    plugin = loaded.plugin
     if loaded.from_build_analysis:  # the run's own `build` is not compared: re-scoring after a scorer change is R13
         try:
-            notes = scorer_notes(plugin.scorers, study.plugin_file.name, fingerprints)
+            require_run_scorers(plugin.scorers, study.plugin_file.name, fingerprints)
         except ScorersDiffer as error:
             verified.close()
             raise Refused(str(error)) from None
@@ -937,9 +936,7 @@ def _analyse_loaded(
     seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
-    return StudyAnalysis(
-        study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen, notes
-    )
+    return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen)
 
 
 def _checked_environment(batch: Path) -> Any:
