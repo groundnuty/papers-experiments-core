@@ -19,7 +19,7 @@ from deadline_support import (
     stopped_step,
 )
 from fake_host import FakeHost
-from sandbox_support import FAST, around_run, make_spec, start_options
+from sandbox_support import FAST, around_run, is_signal, make_spec, start_options
 
 from expcore_onedata.sandbox import deadline, kinds, teardown
 from expcore_onedata.sandbox.api import SandboxError
@@ -250,7 +250,7 @@ def inspects_of(given, container: str) -> list[float | None]:
 
 
 def kills_of(given) -> list[float]:
-    return [timeout for argv, timeout in given if argv[:3] == ["kill", "-s", "KILL"]]
+    return [timeout for argv, timeout in given if is_signal(argv, "KILL")]
 
 
 @pytest.mark.parametrize(
