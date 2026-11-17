@@ -475,11 +475,9 @@ Names resolve as on Docker (`dns: none` in the record): the federation's names r
 
 **Give a REST level on HPC the layout's names (O69).** Without more, a REST cell is given the hosts of the URLs of `[zone]` and the local provider, which on an HPC federation are the nodes' FQDNs on port 8443: site details that would reach the agent's environment, its `/etc/hosts`, the gate's certificates and any error text its client prints, and that differ from what a Compose agent sees. Declare the names in `[sandbox.federation]`, as on Docker but without `network`:
 
-```toml
-[sandbox.federation]                 # Apptainer: the names the gate serves the agent, on 443; a rest level is required
-zone = "zone.<layout domain>"
-providers.<local> = "<local>.<layout domain>"
-```
+    [sandbox.federation]                 # Apptainer: the names the gate serves the agent, on 443; a rest level is required
+    zone = "zone.<layout domain>"
+    providers.<local> = "<local>.<layout domain>"
 
 The gate then serves and certifies those names on the cell's loopback, where the cell dials them on 443, and dials the URLs behind them. The record says `gate.names: declared`.
 
