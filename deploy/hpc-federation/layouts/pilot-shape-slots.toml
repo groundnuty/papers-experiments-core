@@ -10,8 +10,9 @@
 #     --root <a directory on a filesystem the login node and the nodes see> up
 #
 # The ports and memory limits are the Compose federation's and unused here: on HPC every service listens on its node's
-# 8443 (and a provider on 6665), and the [hpc] table sizes the steps. The same file brings the federation up under
-# Compose (deploy/compose-federation/federation.py --layout), which ignores [hpc].
+# 8443 (and a provider on 6665), and the [hpc] table sizes the steps. The layout's users and spaces are what Compose
+# provisions too, but this layout's template is the HPC one (its @hpc_*@ placeholders have no value on Compose): a Compose
+# federation of the same users names a template of its own (deploy/compose-federation/README.md, "Slots and a tool server").
 
 project = "expcore-hpc-slots"
 domain = "expcore-hpc-slots.test"
