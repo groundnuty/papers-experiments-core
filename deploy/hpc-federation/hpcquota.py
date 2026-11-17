@@ -7,11 +7,12 @@ The site's tool and its output are never in this repository. `site.env` names th
 shell would split it and run without one, on the login node) and the regular expression that reads its output
 (`HPC_QUOTA_PATTERN`, with the named groups `used` and `quota`); the tests run an invented command and format.
 
-**Failing closed.** The guard applies whenever `HPC_STORAGE_ROOT` is set (nothing of the federation lands on scratch
-without it). Anything that leaves the quota unread refuses `up`, naming why: no command or pattern set, a pattern that
-does not compile or lacks a group, a command that cannot run, exits non-zero or does not answer, an output the pattern
-matches never or more than once, a figure that is no count, a quota of 0 or "unlimited". Only `HPC_QUOTA_CHECK=off`,
-which `up` says it honoured, skips the check; unset is not off.
+**Failing closed, and mandatory.** The guard applies whenever `HPC_STORAGE_ROOT` is set, since the providers' storage
+is then bound onto scratch (nothing of the federation lands on scratch without it). Anything that leaves the quota
+unread refuses `up`, naming why: no command or pattern set, a pattern that does not compile or lacks a group, a command
+that cannot run, exits non-zero or does not answer, an output the pattern matches never or more than once, a figure
+that is no count, a quota of 0 or "unlimited". No override skips it: `HPC_QUOTA_CHECK=off` with a scratch root is
+refused as the site is loaded (`hpcsettings.checked_site`), and again here for a site however it was built.
 
 **The estimate** is every space's manifest counted once, files and directories (each is an inode), a shared import's
 manifest being the layout's own file and every other space's the baseline `up` writes (`hpcdata.declared`, the one count
@@ -56,7 +57,7 @@ def pattern_of(site: Site) -> "re.Pattern[str]":
     if not site.quota_pattern:
         raise QuotaRefused(
             "HPC_QUOTA_PATTERN is not set, so the inode quota cannot be read: give the regular expression, with the "
-            "named groups used and quota, that reads the command's output (or set HPC_QUOTA_CHECK=off)"
+            "named groups used and quota, that reads the command's output (the check is mandatory on scratch)"
         )
     try:
         found = re.compile(site.quota_pattern)
@@ -71,8 +72,8 @@ def command_of(site: Site) -> list:
     """The quota command as an argv: `HPC_QUOTA_CMD` split as a shell would split it, never passed to one."""
     if not site.quota_cmd:
         raise QuotaRefused(
-            "HPC_QUOTA_CMD is not set, so the inode quota cannot be read: name the site's command (or set "
-            f"HPC_QUOTA_CHECK={QUOTA_CHECK_OFF} to skip the check)"
+            "HPC_QUOTA_CMD is not set, so the inode quota cannot be read: name the site's command (the check is "
+            "mandatory on scratch)"
         )
     try:
         argv = shlex.split(site.quota_cmd)
@@ -106,7 +107,7 @@ def parse_quota(text: str, pattern: "re.Pattern[str]") -> Tuple[int, int]:
                 "longer number touches it): HPC_QUOTA_PATTERN must capture the whole figure"
             )
     if quota == 0:
-        raise QuotaRefused("a quota of 0 sets no line to check against (HPC_QUOTA_CHECK=off skips the check)")
+        raise QuotaRefused("a quota of 0 sets no line to check against")
     return used, quota
 
 
@@ -134,8 +135,6 @@ def read_quota(runner: Any, site: Site, timeout_s: float = QUOTA_TIMEOUT_S) -> T
 def check_inodes(runner: Any, site: Site, estimate: int, timeout_s: float = QUOTA_TIMEOUT_S) -> str:
     """Refuse a federation whose estimate, added to the usage, passes 95% of the quota; what `up` says otherwise. The
     comparison is in integers, so a total exactly at the line passes: used + estimate <= quota * 95 // 100."""
-    if site.quota_check == QUOTA_CHECK_OFF:
-        return f"inode check: skipped (HPC_QUOTA_CHECK={QUOTA_CHECK_OFF}): the inode quota was not read"
     used, quota = read_quota(runner, site, timeout_s)
     line = quota * LINE_PERCENT // 100
     figures = f"used {used}, estimate {estimate}, quota {quota}, {LINE_PERCENT}% line {line}"
@@ -147,10 +146,16 @@ def check_inodes(runner: Any, site: Site, estimate: int, timeout_s: float = QUOT
     return f"inode check: {figures}: under the line"
 
 
-def guard(runner: Any, site: Site, layout: Any, environ: Mapping[str, str]) -> str:
-    """`up`'s check: nothing without a scratch root; else the estimate from the layout's manifests against the quota."""
+def guard(runner: Any, site: Site, layout: Any, environ: Mapping[str, str], federations: int = 1) -> str:
+    """`up`'s check: nothing without a scratch root; else, always, the estimate from the layout's manifests against the
+    quota. A site with a scratch root and `HPC_QUOTA_CHECK=off` is refused, never taken as a skip. `federations` is how
+    many federations of this layout come up at once (`fleet.py`): the usage is read once, against that many estimates,
+    since each of that many separate ups would read the same usage."""
     if not site.storage_root:
         return ""
     if site.quota_check == QUOTA_CHECK_OFF:
-        return check_inodes(runner, site, 0)
-    return check_inodes(runner, site, sum(estimate_inodes(layout, environ).values()))
+        raise QuotaRefused(
+            f"HPC_QUOTA_CHECK={QUOTA_CHECK_OFF} with HPC_STORAGE_ROOT: the inode check of a federation bound onto "
+            "scratch cannot be turned off; nothing was submitted"
+        )
+    return check_inodes(runner, site, federations * sum(estimate_inodes(layout, environ).values()))

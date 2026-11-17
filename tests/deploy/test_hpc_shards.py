@@ -32,7 +32,8 @@ def _manifest(tmp_path, **changes):
     for n, root in enumerate(roots, 1):
         root.mkdir(parents=True)
         state = {"format": "expcore-hpc-federation/1", "allocation": {"job": str(100 + n), "name": f"hpcop-x-{n}"},
-                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked"}  # fmt: skip
+                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked",
+                 "data": {"ingested": {}}}  # fmt: skip
         (root / "platform.toml").write_text('[space]\nname = "s"\ndata_manifest = "m.json"\n')  # its data declared
         if changes.get("placement") == "separate":
             state["sandbox"] = {"placement": "separate", "node": f"node-s{n}", "job": str(200 + n),
@@ -255,7 +256,8 @@ def test_collect_verifies_and_unpacks_every_shard_read_only_and_names_the_merge(
     assert (outs[0] / "campaign.lock").is_file()
     assert not os.access(outs[0] / "runs" / "r.json", os.W_OK)
     line = shards.merge_argv(plan, outs)
-    assert line[1:6] == ["-I", "-B", "-m", "expcore", "merge"]
+    assert line[1:6] == ["-I", "-B", "-m", "expcore", "merge"]  # isolated, no bytecode written (O58)
+    assert line[6] == str(plan.study / "out")
     assert line[7:] == [str(o) for o in outs]
 
 
@@ -394,3 +396,56 @@ def test_a_sandbox_record_without_its_node_is_refused_whatever_else_names_one(sh
     state_file.write_text(json.dumps(state))
     with pytest.raises(shards.ShardsError, match="no sandbox node"):
         shards.federation(plan.shards[0])
+
+
+@pytest.mark.parametrize("python", ["venv/bin/python", "./python"])
+def test_o57_a_manifest_whose_python_is_a_relative_path_is_refused(shards, tmp_path, python):
+    """O57: a shard's step starts in `/` (`--chdir=/`); a relative interpreter would resolve there, or, launched
+    without it, in the node's shared /tmp: only an absolute one, on the filesystem the nodes see, is taken."""
+    manifest = _manifest(tmp_path)
+    text = manifest.read_text().replace(f'python = "{tmp_path / "venv" / "python"}"', f'python = "{python}"')
+    manifest.write_text(text)
+    with pytest.raises(shards.ShardsError, match="python must be an absolute path"):
+        shards.load_plan(manifest)
+
+
+def test_o57_the_step_line_starts_the_step_in_the_root_directory(shards, tmp_path):
+    """O57: the shard's step names its working directory, `/`, before its environment, so it never starts in the
+    login node's directory or the node's shared /tmp."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    line = shards.step_argv(plan, plan.shards[0], shards.federation(plan.shards[0]), SCRIPT)
+    assert "--chdir=/" in line[: line.index("/usr/bin/env")]
+
+
+def test_o58_collect_runs_the_merge_isolated_in_its_own_private_directory(shards, tmp_path, monkeypatch, capsys):
+    """O58: `collect --run` starts the merge as `<python> -I -B -m expcore merge`, in the directory it collected into
+    (0700, ours), never in the directory it was launched from, which may hold another user's modules."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    for shard in plan.shards:
+        _archived(shards, tmp_path, shard.label, shard.index)
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    seen = {}
+
+    def run(argv, **keywords):
+        seen.update(argv=list(argv), **keywords)
+        return argparse.Namespace(returncode=0)
+
+    monkeypatch.setattr(shards.subprocess, "run", run)
+    into = tmp_path / "merge"
+    assert shards.main(["collect", "--manifest", str(tmp_path / "shards.toml"), "--into", str(into), "--run"]) == 0
+    assert seen["argv"][:6] == [plan.python, "-I", "-B", "-m", "expcore", "merge"]
+    assert seen["cwd"] == into
+    assert oct(into.stat().st_mode & 0o777) == "0o700"
+    capsys.readouterr()
+
+
+def test_o58_collect_refuses_a_directory_to_collect_into_that_others_may_enter(shards, tmp_path):
+    """O58: the merge runs in the directory collected into, so an existing one open to others is refused."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    into = tmp_path / "merge"
+    into.mkdir()
+    into.chmod(0o777)
+    with pytest.raises(shards.ShardsError, match="private directory"):
+        shards.collect(plan, into)

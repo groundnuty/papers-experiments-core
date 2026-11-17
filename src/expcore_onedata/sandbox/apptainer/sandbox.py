@@ -5,9 +5,10 @@ helper processes on the node, over an injectable `NodeOps` (O56).
 `ApptainerSandbox` is the platform layer's `Sandbox` (`api.py`), and also what `SandboxPlatform` (`provider.py`) and the
 code tool call of a sandbox beyond that protocol: `start`/`begin`/`abandon`, `exec`, `mark_run_start`, `collect`,
 `stop`, `metadata`, `record`, `read_only_inputs`, `settle_deadline`, `gate_refusals`, `served_bytes`,
-`mount_io_mode`, `session_kinds`, `session_ends`, `teardown_left`, `keep_evidence`, `stopped`; for the egress
-instrument (`expcore.egress.EgressLog`) `egress_log`, `egress_declaration` and `egress_nonce`; and for the process
-visibility instrument (`expcore.visibility.ProcessVisibility`) `process_visibility`.
+`mount_io_mode`, `session_kinds`, `session_ends`, `teardown_left`, `keep_evidence`, `stopped`, `tool_server_process`;
+for the egress instrument (`expcore.egress.EgressLog`) `egress_log`, `egress_declaration` and `egress_nonce`; for the
+process visibility instrument (`expcore.visibility.ProcessVisibility`) `process_visibility`; and for a study's reading
+after the run, with Docker's names and shapes (`api.InfraReadings`), `infra_check`, `mount_log` and `mount_errors`.
 
 Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded first in `work_root/_runs/<sid>.json`
 (`runs.py`), so a driver killed outright is reaped by the next start and its key held by the probe:
@@ -33,6 +34,7 @@ What departs from the Docker sandbox is recorded in every run's metadata (`facts
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
@@ -45,7 +47,8 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+import warnings
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -56,11 +59,20 @@ from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import gatelog, gatepolicy, inputs, kinds, tokenfiles
 from expcore_onedata.sandbox import termination as TERM
-from expcore_onedata.sandbox.api import DataPathMode, ExecResult, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
+from expcore_onedata.sandbox.api import (
+    DataPathMode,
+    ExecResult,
+    ReadOnlyInput,
+    SandboxError,
+    SandboxSpec,
+    ServerProcess,
+    StartRefused,
+)
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs
 from expcore_onedata.sandbox.apptainer.cells import AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
+from expcore_onedata.sandbox.apptainer.infra import InfraCheck
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
 from expcore_onedata.sandbox.apptainer.node import NodeOps
 from expcore_onedata.sandbox.apptainer.teardown import Teardown
@@ -78,6 +90,7 @@ from expcore_onedata.sandbox.containers import (
     trust_targets,
 )
 from expcore_onedata.sandbox.hostops import describe_error, describe_stderr
+from expcore_onedata.sandbox.oneclient_log import summarize as summarize_oneclient_log
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import READ_ONLY_PROBE, RUN_KEY, RUN_START_POLLS
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -85,6 +98,7 @@ from expcore_onedata.sandbox.settings import SandboxSettings
 log = logging.getLogger(__name__)
 
 COLLECTOR_READY = "egress collector ready"
+LOG_UNREAD = "the oneclient log could not be read"
 GATE_ATTEMPTS = 3  # a free port another process took before the gate bound it: tried again with another
 PROBE_S = 60.0
 CANARY = (
@@ -128,7 +142,10 @@ class ApptainerSandbox:
             "data_path": spec.mode.value,
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,
             "backend": self.app.record() if self.app is not None else {"backend": "apptainer"},
-            "infrastructure_facts": facts.record(mount_refused=self._mount_refused()),
+            "infrastructure_facts": facts.record(
+                mount_refused=self._mount_refused(),
+                provider_storage=self.app.provider_storage if self.app is not None else None,
+            ),
             "images": {},
             "tls": settings.tls.record(),
             "certifi": None,
@@ -161,6 +178,7 @@ class ApptainerSandbox:
         self.keep_evidence = False
         self.collection = Collection(self)
         self.teardown = Teardown(self)
+        self.infra = InfraCheck(self)
 
     # ------------------------------------------------------------------------------------------------ start
     @classmethod
@@ -718,6 +736,85 @@ class ApptainerSandbox:
             return {"mount": False}
         return {"mount": True, **self._mount.metadata().get("io_mode", {})}
 
+    # ------------------------------------------------------------------------------------------------ the readings
+    def infra_check(self) -> dict[str, Any]:
+        """The state of the run's other infrastructure by role, in Docker's shape (`apptainer.infra`, O17): the
+        collector, the gate, a mount's oneclient with its mount and the guard's watcher."""
+        return self.infra.check()
+
+    def infra_container_check(self) -> dict[str, Any]:
+        """Deprecated, as on Docker: `infra_check()`, which gives the same answer."""
+        warnings.warn(
+            "infra_container_check() is deprecated: call infra_check(), which both backends have",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.infra_check()
+
+    def mount_log(self) -> dict[str, Any] | None:
+        """oneclient's INFO log from the host mount's log directory, `{"text": ...}` with the token replaced by
+        `<token>`, or `{"unavailable": reason}`; None without a mount (`api.InfraReadings`). It may be read during
+        the run: the guard does not watch the log directory, and no cell reaches it (O60)."""
+        if self.spec.mode is not DataPathMode.MOUNT:
+            return None
+        read = getattr(self._mount, "oneclient_log", None)
+        found = read() if read is not None else None
+        if found is None:
+            return {"unavailable": LOG_UNREAD}
+        text = found.decode("utf-8", "replace")
+        token = self.spec.token.reveal() if self.spec.token is not None else ""
+        return {"text": text.replace(token, "<token>") if token else text}
+
+    def mount_errors(self) -> dict[str, Any] | None:
+        """oneclient's warnings and errors by origin (`oneclient_log.summarize` of `mount_log()`'s text), its
+        `{"unavailable": reason}`, or None without a mount: Docker's `mount_errors()` (O18)."""
+        found = self.mount_log()
+        if found is None or "text" not in found:
+            return found
+        return summarize_oneclient_log(found["text"])
+
+    def sidecar_errors(self) -> dict[str, Any] | None:
+        """Deprecated, as on Docker: `mount_errors()`, which gives the same answer."""
+        warnings.warn(
+            "sidecar_errors() is deprecated: call mount_errors(), which both backends have",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.mount_errors()
+
+    @contextlib.contextmanager
+    def tool_server_process(self) -> Iterator[ServerProcess]:
+        """Where the run's tool server runs on the node (O56): a process of the driver's, as Docker's is one on the
+        host, outside every cell and in the node's PID namespace, which no cell can address. Its `HOME` and working
+        directory are `toolserver/` of the run's directory (0700, refused if it is there already, and removed once the
+        server has stopped, or by a teardown that keeps the run as evidence, before it keeps it: what the server wrote
+        there is no evidence, and may hold its token), its `TMPDIR` a directory in it, and it carries the run's tag,
+        so the reaper of a dead driver kills it and the lease's probe holds the key while it lives, as for the gate.
+        The launcher names its whole environment (`toolserver.ToolServerLauncher.launch`); the metadata records how
+        it ran, by name, never a value."""
+        if self._stopped:
+            raise SandboxError("the sandbox has stopped: its run has no tool server")
+        home = self.dir / layout.TOOL_SERVER_DIR
+        try:
+            home.mkdir(mode=0o700)
+        except FileExistsError:
+            raise SandboxError(
+                "the directory of the run's tool server is there already: its last one is not gone"
+            ) from None
+        home.chmod(0o700)  # whatever the driver's umask
+        (home / "tmp").mkdir(mode=0o700)  # its TMPDIR: never the node's shared /tmp
+        self.record(tool_server_process={"on": "node", "home": "run_directory", "tmpdir": "home", "run_tag": True,
+                                         "inherited": ["PATH"]})  # fmt: skip
+        try:
+            yield ServerProcess(home=home, env={AV.RUN_TAG: self.sid, "TMPDIR": str(home / "tmp")})
+        finally:
+            try:
+                runs.remove_tree(home)
+                if self._stopped:  # a stop that completed left no run directory: one there now is the server's
+                    runs.remove_tree(self.dir)  # making its home again after the teardown, which no reaper would take
+            except OSError as error:  # the teardown removes the run's directory, this one with it
+                log.error("the tool server's directory could not be removed: %s", describe_error(error))
+
     def record(self, **fields: Any) -> None:
         with self._meta_lock:
             self._meta.update(fields)
@@ -764,6 +861,9 @@ class ApptainerSandbox:
             )  # fmt: skip
         if self._mount is not None:
             meta["mount"] = self._mount.metadata()
+        if not self._stopped and self._cells is not None:  # as Docker's: the run's other infrastructure, now
+            check = self.infra_check()
+            meta["container_deaths"], meta["infra_death"] = check["deaths"], check["death"]
         meta["served_bytes"] = self.served_bytes()
         return meta
 

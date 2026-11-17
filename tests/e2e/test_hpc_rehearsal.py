@@ -100,6 +100,9 @@ def federations(deploy, shared, tmp_path_factory) -> dict[str, Federation]:
         for label in LABELS:
             fed = Federation(label, tmp_path_factory.mktemp(label), shared.node_tmp, ca)
             hpcfed(deploy, fed, "up", fed.site())
+            hpcfed(
+                deploy, fed, "verify-data", fed.site()
+            )  # the layout's ingested space is empty: shown, so plan may run
             feds[label] = fed
     for fed in feds.values():
         fed.pairs = pairs
@@ -161,6 +164,17 @@ def test_up_starts_the_login_nodes_fault_relay_last_and_records_it(federations, 
 
 
 # ------------------------------------------------------------------------------------------------ stage 2: the plan
+@pytest.mark.parametrize("label", LABELS)
+def test_o57_verify_data_after_up_read_the_ingested_space_back_and_recorded_the_marker_plan_needs(federations, label):
+    """O57: the layout's one ingested space is verified after `up` (`hpcfed.py verify-data`, over the same stand-in
+    for a federation's spaces), and the state file holds its marker, bound to the manifest `up` recorded."""
+    fed = federations[label]
+    assert fed.codes["verify-data"] == 0, fed.printed["verify-data"]
+    record = state_of(fed)["data"]["ingested"]
+    assert list(record) == ["delta-space"]
+    assert record["delta-space"]["verified"]["manifest"] == record["delta-space"]["manifest"]
+
+
 @pytest.fixture(scope="module")
 def plan(deploy, federations, shared):
     """The study, the manifest over the roots `up` wrote, and each shard's line as `shards.py plan` prints it."""
@@ -196,7 +210,7 @@ def test_plan_puts_each_shards_step_on_its_federations_agent_node_in_component_1
         }
         assert homeless["HOME"] == "/dev/null/hpcop-home"  # no home of the account's, nor any (O57)
         assert homeless["PYTHONNOUSERSITE"] == "1"
-        assert line.command[1:5] == ["-I", "-B", str(Path(line.command[3])), "step"]
+        assert line.command[1:5] == ["-I", "-B", str(Path(line.command[3])), "step"]  # isolated, no bytecode (O58)
         assert line.command[line.command.index("--index") + 1] == str(index)
         fed.fake._step([*line.srun, "/usr/bin/env", "-i", *(f"{k}={v}" for k, v in line.env.items()), *line.command])
 
@@ -344,6 +358,20 @@ def test_collect_merges_both_shards_and_every_command_on_the_merge_succeeds(merg
     assert [(s["index"], s["label"]) for s in batch["shards"]] == [(1, KILLED), (2, WHOLE)]
 
 
+@pytest.mark.parametrize("label", LABELS)
+def test_o74_up_wrote_each_federations_render_identity_0600_and_each_shards_out_carries_it_once_per_step(
+    plan, merged, federations, label
+):
+    """O74: `up` wrote `render-identity.json` in each root (mode 0600); each shard's collected `out/` holds that record
+    in `study-state/`, one file per step: the shard that ran to its end one, the shard killed outright and resumed two
+    (the first life's, which its snapshot carried, and the resume's own, under another name)."""
+    record = federations[label].root / "render-identity.json"
+    assert stat.S_IMODE(record.stat().st_mode) == 0o600
+    kept = sorted((plan.results.parent / "collected" / label / "out" / "study-state").glob("render-identity.*.json"))
+    assert len(kept) == (2 if label == KILLED else 1)
+    assert [path.read_bytes() for path in kept] == [record.read_bytes()] * len(kept)
+
+
 def test_the_merged_export_carries_the_kills_lost_spend_with_its_basis_and_the_interrupted_attempt(merged):
     export = merged.read("export.json")
     lost = export[LOST_KEY]
@@ -408,6 +436,7 @@ def other_build(deploy, plan, shards, merged, federations, shared, tmp_path_fact
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(deploy.fedlinks, "check_links", link_check_stand_in([]))
         hpcfed(deploy, fed, "up", fed.site())
+        hpcfed(deploy, fed, "verify-data", fed.site())
     base = shared.base / "other"
     study = make_study(base / "studies", shared.control.path)
     (base / "results").mkdir()

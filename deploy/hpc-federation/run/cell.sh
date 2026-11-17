@@ -7,5 +7,5 @@ ZW=$(wlog "$(svc_log Z)")
 [[ -n $ZW ]] || die "no zone work directory in its log"
 cd /
 say "=== agent cell on S at $(date -u +%T)"
-st Z -c1 --mem=300M python3.11 -I "$RUN/fed_zone.py" --workdir "$ZW" gate-token < /dev/null 2> "$L/gate-token.err" \
-  | python3 -I "$RUN/pick.py" gate | cell_step
+st Z -c1 --mem=300M python3.11 -I -B "$RUN/fed_zone.py" --workdir "$ZW" gate-token < /dev/null 2> "$L/gate-token.err" \
+  | python3 -I -B "$RUN/pick.py" gate | cell_step

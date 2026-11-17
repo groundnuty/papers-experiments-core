@@ -240,17 +240,15 @@ def test_output_that_is_not_one_used_count_and_one_quota_is_refused(hpc, tmp_pat
     refused(hpc, tmp_path, site, Quota(hpc, text=text), why)
 
 
-def test_a_quota_command_that_is_not_set_is_refused_unless_the_check_is_off(hpc, tmp_path, site):
-    """O57: with the scratch root set, no command means no check, and that is refused naming the variable; only the
-    documented override HPC_QUOTA_CHECK=off turns the check off, and then the command is never run."""
+def test_a_quota_command_that_is_not_set_is_refused_and_the_override_does_not_apply_on_scratch(hpc, tmp_path, site):
+    """O57: with the scratch root set, no command means no check, and that is refused naming the variable; the
+    override HPC_QUOTA_CHECK=off does not apply to a federation bound onto scratch, so it is refused as the site is
+    loaded, naming the combination (test_hpc_storage_bind.py has the rest)."""
     refused(hpc, tmp_path, {k: v for k, v in site.items() if k != "HPC_QUOTA_CMD"}, Quota(hpc), "HPC_QUOTA_CMD")
     refused(hpc, tmp_path, {k: v for k, v in site.items() if k != "HPC_QUOTA_PATTERN"}, Quota(hpc), "HPC_QUOTA_PATTERN")
-    quota = Quota(hpc)
     off = {k: v for k, v in site.items() if k not in ("HPC_QUOTA_CMD", "HPC_QUOTA_PATTERN")}
-    rig = Rig(hpc, tmp_path, {**off, "HPC_QUOTA_CHECK": "off"}, quota)
-    assert rig.up().startswith("core: the link check passed")
-    assert quota.calls == []
-    assert any("HPC_QUOTA_CHECK=off" in line for line in rig.said)
+    with pytest.raises(hpc.settings.SettingsError, match=r"HPC_QUOTA_CHECK=off.*HPC_STORAGE_ROOT"):
+        hpc.settings.site_from_environment({**off, "HPC_QUOTA_CHECK": "off"})
 
 
 @pytest.mark.parametrize("value", ["0", "no", "OFF", "false", "on", " off"])

@@ -105,3 +105,6 @@ egress_collector = "@hpc_egress_collector@"  # bundle/egress-collector.py of thi
 egress_collector_sha256 = "@hpc_egress_collector_sha@"
 oneclient_bundle = "@hpc_oneclient_bundle@"  # the host mount's oneclient (oneclient_bundle.py), for the mount level
 oneclient_bundle_sha256 = "@hpc_oneclient_bundle_sha@"
+provider_storage = "@hpc_provider_storage@"  # O57: where the providers keep their data, "tmpfs" or "shared_filesystem"
+                                             # (up fills it from HPC_STORAGE_ROOT): it shapes a run's I/O timing, so the
+                                             # campaign fingerprint holds it and two kinds of storage never merge

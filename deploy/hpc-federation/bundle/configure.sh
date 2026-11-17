@@ -12,7 +12,13 @@
 #   W/imports                        a provider's shared imported trees (O59), when it owns imported spaces: each
 #                                    --import=SPACE=PATH is checked by importstorage.py, its empty mountpoint made in
 #                                    the rootfs, and run_service binds the tree there read-only. Never for the zone.
+#   W/posix-storage                  a provider's posix storage on the shared scratch filesystem (O57), when its job
+#                                    was given one (--storage=PATH, up's own directory for it): checked by
+#                                    posixstorage.py and recorded, and run_service binds it, writable, onto
+#                                    /volumes/posix at every start. Without it the storage is the rootfs's own
+#                                    /volumes/posix, on the node's tmpfs. Never for the zone.
 # Usage: configure.sh op --workdir W <provider-name> <zone-fqdn> <admin-email> [peer-ip ...] [--import=SPACE=PATH ...]
+#                     [--storage=PATH]
 #        configure.sh oz --workdir W <zone-name> [peer-ip ...]
 source "$(dirname "$0")/lib.sh"
 component "${1:-}"; shift
@@ -25,6 +31,8 @@ R=$W/rootfs; S=$(secrets_dir "$W")
 FQDN=$(node_fqdn); SHORT=${FQDN%%.*}; DOMAIN=${FQDN#*.}
 split_imports IMPORTS ARGS "$@"; set -- "${ARGS[@]}"
 if [[ $COMP == oz && ${#IMPORTS[@]} -gt 0 ]]; then die "the zone mounts no import: only a provider holds an imported space"; fi
+split_storage STORAGE ARGS "$@"; set -- "${ARGS[@]}"
+if [[ $COMP == oz && -n $STORAGE ]]; then die "the zone has no posix storage: only a provider binds one"; fi
 if [[ $COMP == op ]]; then
   (( $# >= 3 )) || die "usage: configure.sh op --workdir W <provider-name> <zone-fqdn> <admin-email> [peer-ip ...]"
   NAME=$1 ZONE=$2 MAIL=$3; shift 3
@@ -53,6 +61,10 @@ chmod 644 -- "$R/etc/hpcop-peers"
 if (( ${#IMPORTS[@]} > 0 )); then
   "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/importstorage.py" prepare --workdir "$W" "${IMPORTS[@]}" \
     || die "a shared imported tree was refused: nothing was prepared for it (see above)"
+fi
+if [[ -n $STORAGE ]]; then
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/posixstorage.py" prepare --workdir "$W" --provider "$NAME" "$STORAGE" \
+    || die "the provider's posix storage on scratch was refused: nothing was prepared for it (see above)"
 fi
 
 EPMD=$(pick_epmd_port)

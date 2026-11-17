@@ -53,7 +53,7 @@ from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_st
 
 log = logging.getLogger(__name__)
 
-HELPER = Path(__file__).with_name("copyhelper.py")  # its source runs as root under this interpreter, `-I -c`
+HELPER = Path(__file__).with_name("copyhelper.py")  # its source runs as root under this interpreter, `-I -B -c`
 MAX_PATH_BYTES = 2048  # of a path relative to the root: a deeper copy would near the kernel's PATH_MAX and fail midway
 SHOWN_REFUSALS = 16  # how many refusals a record names; it counts them all
 SHOWN_NAME_CHARS = 256  # how much of a refused path a record shows

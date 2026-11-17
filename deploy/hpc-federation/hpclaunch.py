@@ -161,7 +161,9 @@ class Launcher:
         # never the account's home: none at all, until the bundle's scripts point it into the service's own work
         # directory on the node's tmpfs, once they know it (lib.sh, home_in)
         env = allowlist(site.step_path, site.node_tmp, home_env(NO_HOME))
-        return Step(job, node, name, size.cpus, size.memory_mib, env, tuple(argv), output, group, component)
+        return Step(
+            job, node, name, size.cpus, size.memory_mib, env, tuple(argv), output, group, component, site.step_network
+        )
 
     def control(
         self, node: str, argv: Sequence[str], *, name: str, timeout_s: float, job: Optional[str] = None

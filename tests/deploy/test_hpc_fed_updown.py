@@ -164,6 +164,87 @@ def test_o57_no_step_of_up_or_down_can_fall_back_to_the_accounts_home(hpc, tmp_p
         assert flags == ["1", "/dev/null", "1"], srun.name
 
 
+def scripts_of(sruns) -> set:
+    """The bundle script (or helper) each step runs, by file name: a step's command is `<interpreter> <script> ...`."""
+    return {Path(word).name for s in sruns for word in s.command[:4] if word.endswith((".sbatch", ".sh", ".py"))}
+
+
+def test_o57_every_step_up_and_down_launch_names_the_sites_network_option_when_it_gives_one(hpc, tmp_path, site):
+    """O57: HPC_STEP_NETWORK=<value> puts `--network=<value>` on every srun the driver launches, whatever the step: a
+    service, a token's mint and delivery, the node facts, a teardown, the sweep of the agent's node, and a step in
+    either component of the heterogeneous job (found live: a heterogeneous job's steps on component 0 failed with "Error
+    configuring interconnect" on a site whose switch plugin gives each job a virtual network identifier)."""
+    rig = Rig(hpc, tmp_path, {**site, "HPC_STEP_NETWORK": "no_vni"})
+    rig.up()
+    assert rig.state()["site"]["step_network"] == "no_vni"
+    rig.driver.down()
+    found = scripts_of(rig.fake.sruns)
+    assert {"zone.sbatch", "provider.sbatch", "mint-registration-token.sh", "deliver-token.sh", "teardown.sh"} <= found
+    assert {"nodefacts.py", "shards.py"} <= found  # the node facts, and down's sweep of the agent's node
+    assert rig.fake.spawned
+    assert {s.het_group for s in rig.fake.sruns} == {0, 1}  # the services' component and the agent's
+    assert {s.network for s in rig.fake.sruns} == {"no_vni"}
+    assert all(s.network == "no_vni" for s in rig.fake.spawned)
+
+
+def test_o57_down_in_a_shell_without_the_variable_launches_its_steps_with_the_recorded_option(hpc, tmp_path, site):
+    """O57: the option is recorded in the state file with the rest of the site, so `down` and the service verbs, run
+    where site.env was not sourced, launch their steps with it all the same."""
+    rig = Rig(hpc, tmp_path, {**site, "HPC_STEP_NETWORK": "no_vni"})
+    rig.up()
+    rig.fake.sruns.clear()
+    words = ["--layout", str(LAYOUT), "--root", str(rig.root)]
+    assert hpc.cli.main([*words, "down"], {}, runner=rig.fake) == 0
+    assert "teardown.sh" in scripts_of(rig.fake.sruns)
+    assert {s.network for s in rig.fake.sruns} == {"no_vni"}
+
+
+def test_o57_without_the_variable_no_step_names_a_network_option(hpc, tmp_path, site):
+    """O57: a site that sets no HPC_STEP_NETWORK is unchanged: no srun of up or down carries `--network`."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    assert rig.state()["site"]["step_network"] == ""
+    rig.driver.down()
+    assert rig.fake.sruns
+    assert {s.network for s in rig.fake.sruns} == {None}
+    assert not any(word.startswith("--network") for call in rig.fake.calls for word in call)
+
+
+COMPONENT_ZERO_STEPS_BEFORE_THE_FIRST_MINT = 12  # six nodes' facts and six services: the next step failed live
+
+
+def test_o57_up_on_a_site_that_refuses_component_zero_steps_without_a_network_option_fails_without_one(
+    hpc, tmp_path, site
+):
+    """O57: the site's switch plugin refused a heterogeneous job's steps on component 0 from a point on ("srun: error:
+    task 0 launch failed: Error configuring interconnect"), after the zone and five providers had started, so the
+    first token's mint and delivery were refused and `up` failed at a provider's registration; the fake does the same
+    to every such step that names no --network, and a step on component 1 never."""
+    fake = FakeSlurm(interconnect_after=COMPONENT_ZERO_STEPS_BEFORE_THE_FIRST_MINT)
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(RuntimeError, match="aspen's registration failed"):
+        rig.up()
+    refused = [s for s in fake.sruns if s.refused]
+    assert refused
+    assert all(s.het_group == 0 and s.name.endswith(("-mint", "-deliver")) for s in refused)
+    assert len(fake.spawned) == 6  # the zone and five providers had started
+
+
+def test_o57_up_on_a_site_that_refuses_component_zero_steps_finishes_with_the_network_option(hpc, tmp_path, site):
+    """O57: the same site and the same fake, with HPC_STEP_NETWORK=no_vni: every step names it, none is refused, and
+    `up` reaches the link check; the agent's component's steps, which the site never refused, carry it too."""
+    fake = FakeSlurm(interconnect_after=COMPONENT_ZERO_STEPS_BEFORE_THE_FIRST_MINT)
+    rig = Rig(hpc, tmp_path, {**site, "HPC_STEP_NETWORK": "no_vni"}, fake=fake)
+    assert rig.up().startswith("core: the link check passed")
+    assert rig.state()["phase"] == "linked"
+    assert fake.delivered == PROVIDERS
+    rig.driver.down()  # whose teardown steps on component 0 the site would have refused too
+    assert not any(s.refused for s in fake.sruns)
+    assert fake.component_zero_steps == 0  # every step of component 0 named the option
+    assert {s.network for s in fake.sruns} == {"no_vni"}
+    assert fake.cancelled == ["4242"]
+
+
 def test_each_provider_is_registered_by_a_token_piped_from_the_zone_before_its_verdict(hpc, tmp_path, site):
     """O57: each provider is registered by a token piped from the zone before its verdict."""
     rig = Rig(hpc, tmp_path, site)
@@ -189,7 +270,7 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_r
     assert owner == (5001, 5001)
     assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("690", "750")
     command = json.loads(values["hpc_command"])
-    assert command[1:3] == ["-I", "-B"]
+    assert command[1:3] == ["-I", "-B"]  # isolated (O58): the relay runs every verb through it
     assert command[3:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
 
 
@@ -667,7 +748,23 @@ def test_up_starts_the_fault_relay_last_with_no_environment_but_its_own_and_wait
     command = rig.state()["command"]
     assert argv[cut:] == ["-m", "expcore_onedata.fault_relay", "serve", "--root", str(rig.root), "--", *command]
     assert rig.fake.relay_calls[:2] == ["serve", "alive"]
+    assert rig.fake.relay_cwds == [str(rig.root)]  # it works in the root, never where up was launched (O58)
     assert rig.state()["relay"]["pid"] == 9999
+
+
+def test_o58_an_up_whose_root_a_link_reaches_is_refused_before_anything_is_submitted(hpc, tmp_path, site):
+    """O58: the relay works in the root and never starts in one a symbolic link reaches (the root's own name or a
+    directory above it), so up refuses such a root in its preflight, before any job is submitted, rather than once
+    the federation is up."""
+    (tmp_path / "real" / "fed").mkdir(parents=True)  # the root's parent is no link: one above it is
+    (tmp_path / "linked").symlink_to(tmp_path / "real")
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver = hpc.cli.make_driver(LAYOUT, str(tmp_path / "linked" / "fed" / "root"), runner=rig.fake)
+    rig.driver.relay_available = lambda: True
+    with pytest.raises(RuntimeError, match="reached through a symbolic link"):
+        rig.up()
+    assert rig.fake.submitted == {}
+    assert not (tmp_path / "real" / "fed" / "root").exists()
 
 
 def test_an_up_whose_relay_never_beats_fails_and_ends_the_relay(hpc, tmp_path, site):
