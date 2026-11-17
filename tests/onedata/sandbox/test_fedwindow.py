@@ -582,6 +582,50 @@ def test_o86_a_file_that_cannot_be_written_is_logged_and_never_fails_the_run(
     assert not host.containers
 
 
+def test_o86_a_write_that_fails_in_any_way_leaves_the_window_recorded_and_the_sandbox_stopped(
+    config, issuer, slots, tmp_path, monkeypatch
+):
+    """O86: persisting runs before the stop, so it raises nothing, an error that is no `OSError` included (a stale
+    handle on a shared file system): the window stays what the watch said, never "interrupted", the sandbox is stopped
+    and nothing is raised; whether the body returned or was cancelled."""
+
+    def explode(source, target):
+        raise RuntimeError("a stale handle")
+
+    monkeypatch.setattr(fedwindow, "os", SimpleNamespace(replace=explode))
+    federation = Federation(config)
+    platform, host = build(config, issuer, slots, tmp_path, federation.watch)
+    evidence = tmp_path / "evidence"
+
+    async def body(box):
+        box.collect(evidence)
+
+    box = run(platform, federation.settings, body)
+    assert window_of(box)["verdict"] == "stable"
+    assert not host.containers
+    assert not [path for path in evidence.iterdir() if path.name.startswith(".")]  # no partial file is left
+
+    seen = []
+
+    async def cancelled():
+        async def waiting(box):
+            seen.append(box)
+            box.collect(tmp_path / "second")
+            await asyncio.sleep(60)
+
+        task = asyncio.ensure_future(run_in_loop(platform, federation.settings, waiting))
+        while not seen:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancelled())
+    assert window_of(seen[0])["unknown"] == [fedwindow.CANCELLED]
+    assert not host.containers
+
+
 def test_o86_a_platform_with_no_watch_records_the_gap_on_both_backends_and_writes_no_file(
     config, issuer, slots, tmp_path
 ):

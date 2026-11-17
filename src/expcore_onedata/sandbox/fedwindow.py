@@ -33,6 +33,7 @@ and its window shows the target not running at its end, never stable.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -111,20 +112,28 @@ def pending() -> dict[str, Any]:
 
 def persist(sandbox: Evidence, facts: Mapping[str, Any]) -> None:
     """Write the facts as `federation-window.json` beside the `metadata.json` of every directory the sandbox's `collect`
-    wrote its evidence into, atomically. A directory that is gone is skipped and one that cannot be written is logged
-    (the error's type), neither raised: the window is also in the sandbox's metadata, and the run goes on (O86)."""
-    text = json.dumps(facts, indent=1)
-    for directory in sandbox.evidence_dirs():
-        if not directory.is_dir():
-            continue
+    wrote its evidence into, atomically. Never raises an `Exception`, whatever the file system does (a stale handle on
+    a shared one included): it runs before the sandbox's stop, which nothing may skip. A directory that is gone is
+    skipped, and one that cannot be written is logged (the error's type) and left without a partial file: the window is
+    also in the sandbox's metadata, and the run goes on (O86)."""
+    try:
+        text, directories = json.dumps(facts, indent=1), sandbox.evidence_dirs()
+    except Exception as error:
+        log.error("the federation's window could not be written beside the run's evidence (%s)", type(error).__name__)
+        return
+    for directory in directories:
         temporary = directory / f".{FILE}.tmp"
         try:
+            if not directory.is_dir():
+                continue
             temporary.write_text(text, encoding="utf-8")
             os.replace(temporary, directory / FILE)
-        except OSError as error:
+        except Exception as error:
             log.error(
                 "the federation's window could not be written beside the run's evidence (%s)", type(error).__name__
             )
+            with contextlib.suppress(Exception):
+                temporary.unlink(missing_ok=True)
 
 
 def interrupted(error: BaseException) -> dict[str, Any]:
