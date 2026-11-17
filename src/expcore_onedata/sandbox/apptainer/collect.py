@@ -76,7 +76,7 @@ class Collection:
         result["egress_log"] = EGRESS_COPY if self.egress_bytes is not None else None
         if box._readlog.enabled:  # a platform without the channel has no key of it (O91)
             written.append(self._readlog(dest))
-            result["readlog_log"] = readlogrun.COPY if self.readlog_bytes is not None else None
+            result["read_log"] = readlogrun.COPY if self.readlog_bytes is not None else None
         if box.spec.mode is DataPathMode.MOUNT:
             written.append(self._mount_watch(dest))
             result["mount_watch_log"] = MOUNT_WATCH_COPY if written[-1] is not None else None

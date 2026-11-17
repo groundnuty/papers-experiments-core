@@ -126,7 +126,7 @@ it declares it in its own platform file.
 - **The canary:** before the agent runs, a cell sends the canary through the real client; it is the log's first
   record, and a start whose cell cannot send it fails.
 - **The collection** stops the collector on SIGTERM (it drains what is queued and writes its end line), reads the log
-  once, copies it as `readlog.jsonl` and scans it for the token like every file of evidence.
+  once, copies it as `read-log.jsonl` and scans it for the token like every file of evidence.
 - **What the cell can and cannot do:** the cell runs with `--containall`, so it cannot see or signal the collector and
   never sees the log. Under one uid it can still send forged datagrams to the socket: they add lines and never remove
   one. A collector that dies mid-run (killed, or out of its log's cap) leaves a log without its end line, which reads as

@@ -177,9 +177,10 @@ def test_o91_the_read_log_collector_is_pinned_and_recorded_only_when_declared(tm
 @pytest.mark.parametrize("bad", ["E" * 64, "e" * 63, "e" * 65, "", 5, True, ["e" * 64]])
 def test_o91_the_read_log_collector_pin_must_be_64_lower_case_hex_digits(tmp_path, bad):
     """O91: the pin is a SHA-256; the message names the key, never the value."""
-    with pytest.raises(ConfigError, match="readlog_collector_sha256") as caught:
+    message = "key 'readlog_collector_sha256' must be 64 lower-case hexadecimal digits"
+    with pytest.raises(ConfigError, match=message) as caught:
         _load(tmp_path, _document(readlog_collector_sha256=bad))
-    assert str(bad) not in str(caught.value) or bad == ""
+    assert "eeee" not in str(caught.value).lower()  # never the value
 
 
 def test_a_preload_entry_is_pinned_and_kept_in_order(tmp_path):

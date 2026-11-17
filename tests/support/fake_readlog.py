@@ -48,12 +48,21 @@ class FakeReadLog:
     execs_before: int
     seq: int = 0
     records: int = 0
+    handle: Any = None  # the log, opened once as the real collector does (O_EXCL, 0600) and held until it ends
+
+    def __post_init__(self) -> None:
+        descriptor = os.open(self.log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_CLOEXEC, 0o600)
+        self.handle = os.fdopen(descriptor, "w", encoding="ascii", buffering=1)
 
     def write(self, event: str, **fields: Any) -> None:
+        """A line through the open handle: a log unlinked or replaced since is still written to the file the collector
+        opened, as the real collector's is, and the path then holds no log."""
         line = dict(fields, event=event, seq=self.seq, wall=time.time(), mono=time.monotonic())
-        with open(self.log, "a", encoding="ascii") as handle:
-            handle.write(json.dumps(line, sort_keys=True, separators=(",", ":")) + "\n")
+        self.handle.write(json.dumps(line, sort_keys=True, separators=(",", ":")) + "\n")
         self.seq += 1
+
+    def close(self) -> None:
+        self.handle.close()
 
     def record(self, rec: dict[str, Any], *, pid: int = 77, uid: int | None = None) -> None:
         """A record as the collector writes it for a datagram of this sender."""
@@ -96,6 +105,7 @@ def signalled(node: FakeNode, proc: FakeProc, sig: int) -> None:
     collector = next(c for c in node.readlogs if c.proc is proc)
     if sig == signal.SIGTERM:
         collector.write("end", records=collector.records, malformed=0, unwritten=0, cap_reached=False)
+    collector.close()
     proc.alive, proc.exit_status = False, 0 if sig == signal.SIGTERM else 128 + sig
 
 

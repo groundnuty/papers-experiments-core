@@ -25,7 +25,8 @@ from expcore_onedata.sandbox.api import ReadOnlyInput, SandboxError, StartRefuse
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.hostops import CmdResult
 
-LOG = "readlog.jsonl"
+LOG = "readlog.jsonl"  # the collector's own log, in `readlog/`
+COPY = "read-log.jsonl"  # the collection's evidence copy of it
 
 
 @pytest.fixture
@@ -162,8 +163,8 @@ def test_o91_the_log_is_read_once_after_the_collector_stopped_and_copied_into_th
         node.readlog_collector().record({"v": 1, "op": "read", "item": "file-1", "bytes": 9})
         done = box.collect(tmp_path / "out")
         data = box.read_log()
-        assert done["readlog_log"] == LOG
-        assert (tmp_path / "out" / LOG).read_bytes() == data
+        assert done["read_log"] == COPY
+        assert (tmp_path / "out" / COPY).read_bytes() == data
         lines = [json.loads(line) for line in data.splitlines()]
         assert lines[-1]["event"] == "end"
         assert lines[-1]["records"] == 2
@@ -204,7 +205,7 @@ def test_o91_a_log_that_cannot_be_read_is_unknown_never_a_run_that_read_nothing(
     try:
         (box.dir / "readlog" / LOG).unlink()
         done = box.collect(tmp_path / "out")
-        assert done["readlog_log"] is None
+        assert done["read_log"] is None
         assert box.read_log() is None
         snapshot = instrument(box).finish()
         assert snapshot["log"] == "unknown"
@@ -224,7 +225,7 @@ def test_o91_a_log_that_holds_the_token_is_removed_and_fails_the_collection(node
         with pytest.raises(InfraError) as failed:
             box.collect(tmp_path / "out")
         assert failed.value.kind == "output_collection"
-        assert not (tmp_path / "out" / LOG).exists()
+        assert not (tmp_path / "out" / COPY).exists()
         assert box.read_log() is None
     finally:
         box.stop()
@@ -297,7 +298,7 @@ def test_o91_a_platform_that_declares_no_collector_has_no_channel_and_no_log(nod
             assert paths.CLIENT_DIR not in done.binds
         assert set(box.infra_check()["containers"]) == {"collector", "gate"}
         done = box.collect(tmp_path / "out")
-        assert "readlog_log" not in done
+        assert "read_log" not in done
         assert box.read_log() is None
         assert "readlog_stop" not in box.metadata()
         assert facts.KEY not in box.metadata().get("infrastructure_facts", {})
