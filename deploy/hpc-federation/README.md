@@ -512,6 +512,27 @@ line (`--run` runs it). The manifest names the site's paths and stays out of the
 has its form). Outage runs (`[faults]`) go through the login node's fault relay (M4), which `up`
 starts.
 
+**Copy the archives back and verify them: required, after `collect` and before `down`.** Nothing durable may live only
+on the cluster's scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all of scratch after 20 days with no job submitted (take your site's own limits; these are the ones this
+step was written against). The cluster cannot push to your host, so you pull. `collect` writes
+`archives.sha256.json` beside the archives in `<results>` and prints that file's SHA-256 on stderr, after the merge
+line; keep that line. From your own host, pull the results directory and check it:
+
+```bash
+rsync -a <login node>:<results>/ <local dir>/    # or scp -r: the archives, their .out.json files and the manifest
+python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha256.json <local dir> \
+    --manifest-sha256 <the hash collect printed>
+```
+
+`verify-copy` uses the standard library alone (Python 3.11 or later), so it runs on a host where the core is not
+installed: take `shards.py` from a checkout. It exits 0 only when the manifest is the file whose hash `collect` printed
+(a manifest pulled with the archives proves nothing about itself, so the hash is required) and every archive it names
+is in the directory with its size and SHA-256. It exits 1 naming each archive that is missing, not a regular file,
+cut short or changed, and 2 for a manifest it cannot use. An `*.out.tar` in the directory that the manifest does not
+name is a warning. It checks the archives, which are what the merge needs; the `<label>.out.json` files and each
+shard's journals and snapshots in `<results>` come along in the same pull and are evidence too, but are not checked.
+**Do not run `down` until it exits 0**: `down` cannot see your host and does not check that you did.
+
 > **A bare copy of the core without `.git` is refused as `core_src`.** The core names itself by its commit in every
 > campaign's environment (`provenance.core_identity`), read from the git work tree its `src/` lies in, or from the build
 > record of a wheel made from one. A copy of the core's files without `.git` (a tarball, an `rsync` that leaves `.git`
@@ -584,6 +605,8 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" plan --manifest <sh
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" status
 uv run python -I deploy/hpc-federation/shards.py collect --manifest "$F/shards.toml" --into <a new directory> --run
+# REQUIRED before down: pull the manifest's `results` directory to your own host and run verify-copy with the hash
+# collect printed (above, in the section on a shard's archive)
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
 ```
 
