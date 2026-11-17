@@ -25,7 +25,8 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
     started and again at every teardown (`_write_token_file`, `_remove_token_files`); a run killed outright before that
     leaves it until the next start on the root removes it (`reap.reap_token_files`). Each secret is bound with
     `--mount`, which refuses a missing source where `-v` makes a directory of it (`containers.bind`);
-  * the read-log channel, when the spec asks for it (`readlog_channel`, Linux only): a collector container with no
+  * the read-log channel, when the platform pins its collector (`readlog_collector_sha256`; `readlog_channel`, Linux
+    only): a collector container with no
     network that the agent's scripts log their reads to through a socket directory bound read-only into the agent. Its
     log is bound into the collector alone, read once at the collection after the collector was stopped with SIGTERM
     (so that it writes its end line), scanned for the token and exposed as `read_log()`;
@@ -226,6 +227,7 @@ class DockerSandbox:
         self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
         # the read-log channel (`readlog_channel`): the nonce the collector is told, the one sender uid it accepts (the
         # declared agent uid: a cell runs as it), what the start made, and the log as the collection read it
+        self._readlog_pin = settings.readlog_collector_sha256  # None: this run has no channel
         self.readlog_nonce = secrets.token_hex(16)
         self.readlog_expected_peer_uid = settings.agent_uid
         self._readlog: RL.Prepared | None = None
@@ -313,8 +315,15 @@ class DockerSandbox:
             raise StartRefused("the listing mode must be paged or complete, and complete is for a REST data path only")
         if cellhost.is_node_name(sp.node_names):  # O73: the neutral host name is never a node's
             raise StartRefused(cellhost.REFUSAL)
-        if sp.read_log and not _linux():
-            raise StartRefused("the read-log channel passes a Unix socket through a bind, which only a Linux host does")
+        if self._readlog_pin is not None:
+            if not _linux():
+                raise StartRefused(
+                    "the read-log channel passes a Unix socket through a bind, which only a Linux host does"
+                )
+            if not RL.pin_matches(self._readlog_pin):  # before anything exists: no run on another collector than pinned
+                raise StartRefused(
+                    "[sandbox] readlog_collector_sha256 is not the read-log collector of this core: its SHA-256 differs"
+                )
         if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
             try:  # the bytes the record names by their hash, read once: the containers get these and never the path
                 self._ca_bytes = s.tls.bundle()
@@ -335,7 +344,7 @@ class DockerSandbox:
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
         images = {"agent": s.agent}
-        if mode is DataPathMode.REST or self.spec.read_log:
+        if mode is DataPathMode.REST or self._readlog_pin is not None:
             images["gate"] = s.gate  # the read-log collector runs on the gate's image, pinned like the gate's own
         if mode is DataPathMode.MOUNT:
             images["oneclient"] = s.oneclient
@@ -402,7 +411,7 @@ class DockerSandbox:
             "attempts": tries,
         }
         self._checkpoint()
-        if self.spec.read_log:
+        if self._readlog_pin is not None:
             self._start_readlog()  # before the agent: its socket directory is bound into it, and its canary follows
             self._checkpoint()
         gate_ip = self._start_gate() if mode is DataPathMode.REST else None
@@ -721,7 +730,7 @@ class DockerSandbox:
         that exits, or does not say it is ready, refuses the start."""
         names, s = self.names, self.s
         self._register_container(names.readlog)
-        made = RL.prepare(self.dir, agent_uid=s.agent_uid)
+        made = RL.prepare(self.dir, agent_uid=s.agent_uid, pin=self._readlog_pin)
         self._readlog = made
         args = collector_run_args(
             s, names, self._label_args(), made.dirs, s.gate.id, uid=made.uid, gid=made.gid, nonce=self.readlog_nonce
@@ -761,8 +770,9 @@ class DockerSandbox:
 
     def read_log(self) -> bytes | None:
         """The collector's log as the collection read it, once, after the collector had stopped; None before that, for a
-        run without the channel, and when it could not be read or held the token (`readlog.instrument.ReadLogSource`).
-        A log that is None is UNKNOWN reads, never a run that read nothing."""
+        run without the channel, for a collector that ended before the collection stopped it, and when the log could
+        not be read or held the token (`readlog.instrument.ReadLogSource`). A log that is None is UNKNOWN reads, never a
+        run that read nothing."""
         return self._readlog_bytes
 
     def _stop_readlog(self) -> None:
@@ -770,11 +780,17 @@ class DockerSandbox:
         still running after `READLOG_POLLS` reads is killed, so that its log is stable when it is read, and shows no end
         line. The stop is the harness's own, marked as such before the signal (no death in the run's record).
         `readlog_stop` in the metadata says what happened: `term` (the signal was delivered), `ended_on_term`, `killed`,
-        and `stopped` (the container was shown not running, the condition of reading its log)."""
-        note = self._meta["readlog_stop"] = {"term": False, "ended_on_term": False, "killed": False, "stopped": False}
+        `stopped` (the container was shown not running, the condition of reading its log) and `ended_before_collection`
+        (it was not running when the harness came to stop it: killed, stopped from outside or crashed, whatever the
+        end line says, so its log is not read as this run's)."""
+        note = self._meta["readlog_stop"] = {
+            "term": False, "ended_on_term": False, "killed": False, "stopped": False, "ended_before_collection": False,
+        }  # fmt: skip
         try:
             self._stop_on_purpose("readlog")
-            if self._readlog_running() is not False:  # one that is already gone has nothing to signal
+            if self._readlog_running() is False:  # not the harness's stop: nothing to signal, and no log to trust
+                note["ended_before_collection"] = True
+            else:
                 sent = self.host.docker("kill", "-s", "TERM", self.names.readlog, check=False, timeout=30)
                 note["term"] = sent.returncode == 0
                 note["ended_on_term"] = self._readlog_exited()
@@ -803,28 +819,56 @@ class DockerSandbox:
 
     def _collect_readlog(self, dest: Path, result: dict[str, Any]) -> None:
         """Stop the collector, read its log ONCE from the run's own directory (never from the running container),
-        scan it for the token, and copy it into the evidence: `readlog_log` in the result names the copy, or is None when
-        the log could not be read (unknown, never none). A log that holds the data-path token is removed with its
-        source (a secret is never evidence, `_remove_token_files`), and the collection fails (O05). A second collection
-        finds the collector gone and writes the bytes it already read."""
+        scan it for the token, and copy it into the evidence: `read_log` in the result names the copy, or is None when
+        the log is not read (unknown reads, never none).
+
+        A collector that was not running when the collection came to stop it ended on its own account (killed, stopped
+        from outside, crashed): its log is not read, whatever its end line says, and its death is the run's
+        infrastructure failure (`infra_check`). A log that holds the data-path token is removed with its source (a
+        secret is never evidence, `_remove_token_files`) and the collection fails (O05). A second collection finds the
+        collector gone and writes the bytes it already read."""
         if self._readlog_token_hit:
             raise kinds.collection_error("the run's evidence", "the read log held the data-path token")
         if not self._readlog_collected:
             self._stop_readlog()
             self._readlog_collected = True
-            self._readlog_bytes = self._read_log_once() if self._meta["readlog_stop"].get("stopped") else None
+            stop = self._meta["readlog_stop"]
+            trusted = stop.get("stopped") and not stop.get("ended_before_collection")
+            self._readlog_bytes = self._read_log_once() if trusted else None
             token = self.spec.token.reveal().encode() if self.spec.token is not None else b""
             if self._readlog_bytes is not None and token and token in self._readlog_bytes:
-                path = RL.log_path(self._readlog.dirs)
                 self._readlog_bytes, self._readlog_token_hit = None, True
-                self._token_files.append(path)  # every teardown removes it again, and a kept run is never moved with it
-                self._remove_token_files(path)
+                self._remove_log_with_token()
                 raise kinds.collection_error("the run's evidence", "the read log held the data-path token")
         if self._readlog_bytes is None:
-            result["readlog_log"] = None
+            result["read_log"] = None
             return
         (dest / RL.COPY_NAME).write_bytes(self._readlog_bytes)
-        result["readlog_log"] = RL.COPY_NAME
+        result["read_log"] = RL.COPY_NAME
+
+    def _remove_log_with_token(self) -> None:
+        """Remove the collector's log, verified, as a copy of the token: registered first, so that every teardown
+        removes it again and a kept run is never moved with it (`_remove_token_files`, `_token_files_left`)."""
+        path = RL.log_path(self._readlog.dirs)
+        if path not in self._token_files:
+            self._token_files.append(path)
+        self._remove_token_files(path)
+
+    def _scrub_readlog(self, errors: list[str]) -> None:
+        """A run kept as evidence holds no secret (O05), whatever stopped its collection: the collector's log, read and
+        scanned by `_collect_readlog` or not (a collection that failed first never got to it), is scanned for the token
+        here, once the collector's container is gone and the file cannot grow, and removed when it holds it or cannot be
+        scanned."""
+        token = self.spec.token.reveal().encode() if self.spec.token is not None else b""
+        if RL.holds_token(self._readlog.dirs, token) is False:
+            return
+        try:
+            self._remove_log_with_token()
+        except SandboxError as e:
+            errors.append(str(e))
+        except Exception as e:
+            log.error("the read log could not be removed from the kept run: %s", describe_error(e))
+            errors.append(f"a teardown step failed ({type(e).__name__})")
 
     def _read_log_once(self) -> bytes | None:
         try:
@@ -1784,6 +1828,8 @@ class DockerSandbox:
                     "relocated": False,
                 }
         self._teardown_step = "run directory"
+        if self.keep_evidence and self._readlog is not None:
+            self._scrub_readlog(errors)  # the collector is gone: its log cannot grow, and a secret is never evidence
         if self._mounts_may_be_live(unmount_errors):
             # a directory is never moved, renamed or removed while a mount under it may be live: the mount would go with
             # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)

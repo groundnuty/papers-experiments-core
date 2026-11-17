@@ -27,6 +27,10 @@ placeholder_token = "placeholder"  # optional: the agent's ONEDATA_TOKEN on a re
 kill_grace_s = 5                # optional, 1 to 60: how long a cell's processes have to end after their kill at its
                                 # deadline before the mount is aborted or the sandbox stopped (deadline.py, O34); the
                                 # whole escalation lasts at most two graces and 20 s past the cap (deadline.margin_s)
+readlog_collector_sha256 = "<64 hex>"  # optional (O91): the SHA-256 of the core's own readlog/collector.py. Declared,
+                                # the read-log channel is on for every run (a collector container beside the agent's,
+                                # Linux only); a core whose collector hashes differently refuses the start, and without
+                                # the key a run has no channel and the record is what it was
 
 [sandbox.images.agent]          # also the gate's image unless [sandbox.images.gate] names another
 name = "image:tag"              # a tag or an id, only ever resolved to the id below
@@ -145,7 +149,7 @@ from types import MappingProxyType
 from expcore.config.loading import ConfigError, Section
 from expcore_onedata.sandbox import checkprovider as CP
 from expcore_onedata.sandbox.api import DataPathMode
-from expcore_onedata.sandbox.apptainer.settings import ApptainerSettings, load_apptainer
+from expcore_onedata.sandbox.apptainer.settings import SHA256, ApptainerSettings, load_apptainer
 from expcore_onedata.sandbox.gatelog import DEFAULT_CAPS, Caps
 from expcore_onedata.sandbox.gatepolicy import LISTINGS, PAGED
 from expcore_onedata.sandbox.hostops import strict_networks
@@ -282,6 +286,9 @@ class SandboxSettings:
     kill_grace_s: float = KILL_GRACE_S  # a cell's processes' time to end after the kill at its deadline (O34)
     backend: str = "docker"  # `[sandbox] backend`: docker, or apptainer with `apptainer` (O56)
     apptainer: ApptainerSettings | None = None  # `[sandbox.apptainer]`, exactly when the backend is apptainer
+    # `[sandbox] readlog_collector_sha256` (O91): the read-log collector the core must hold, by its SHA-256. Declared,
+    # a Docker run has the read-log channel; None: none. On Apptainer the pin is `ApptainerSettings`', never here.
+    readlog_collector_sha256: str | None = None
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -591,6 +598,16 @@ def _kill_grace(section: Section) -> float:
     return grace
 
 
+def _readlog_pin(section: Section) -> str | None:
+    """`readlog_collector_sha256` (O91): 64 lower-case hex digits, or absent (no channel); a value is never echoed."""
+    if "readlog_collector_sha256" not in section.data:
+        return None
+    value = section.data["readlog_collector_sha256"]
+    if not isinstance(value, str) or not SHA256.fullmatch(value):
+        raise section.fail("readlog_collector_sha256", "must be 64 lower-case hexadecimal digits")
+    return value
+
+
 def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
     """Read an optional list of command words (a path or an option), with no space or control character."""
     words = section.strings(key) if key in section.data else default
@@ -606,7 +623,15 @@ def _apptainer_sandbox(
     Docker backend's images, network, user, privilege command and earlyoom are refused, since nothing here would read
     them; `[sandbox.federation]` is read for its names alone (O69, `_apptainer_federation`). A mount level needs
     `[sandbox.mount]`'s path and `[sandbox.apptainer]`'s oneclient bundle (the host mount's oneclient, pinned)."""
-    for key in (*DOCKER_ONLY, "sudo", "agent_uid", "earlyoom_comm", "python", "label_namespace"):
+    for key in (
+        *DOCKER_ONLY,
+        "sudo",
+        "agent_uid",
+        "earlyoom_comm",
+        "python",
+        "label_namespace",
+        "readlog_collector_sha256",
+    ):
         if key in section.data:
             raise section.fail(key, 'is read by the Docker backend alone, and backend is "apptainer"')
     app = load_apptainer(section.section("apptainer"), base)
@@ -688,6 +713,7 @@ def load_sandbox(
         "placeholder_token",
         "kill_grace_s",
         "backend",
+        "readlog_collector_sha256",
     )
     if "users" in section.data:  # one pool of leased users: a second one here would lease a user the slots also hold
         raise section.fail(
@@ -762,6 +788,7 @@ def load_sandbox(
         federation=federation,
         placeholder_token=_placeholder(section),
         kill_grace_s=_kill_grace(section),
+        readlog_collector_sha256=_readlog_pin(section),
     )
 
 

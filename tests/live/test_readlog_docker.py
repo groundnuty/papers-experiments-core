@@ -23,7 +23,7 @@ if os.environ.get("EXPCORE_LIVE_DOCKER") != "1":
 if not sys.platform.startswith("linux"):
     pytest.skip("the read-log channel passes a Unix socket through a bind: Linux only", allow_module_level=True)
 
-from expcore_onedata.readlog import paths, reader
+from expcore_onedata.readlog import files, paths, reader
 from expcore_onedata.readlog.instrument import ReadLog
 from expcore_onedata.sandbox import hostops
 from expcore_onedata.sandbox.api import DataPathMode, SandboxSpec
@@ -64,8 +64,9 @@ def host(config):
 
 @pytest.fixture
 def sandbox(config, host):
-    spec = SandboxSpec(run_key=f"live-readlog-{os.getpid()}", mode=DataPathMode.NONE, read_log=True)
-    started = DockerSandbox.start(host, config.sandbox, spec)
+    pinned = dataclasses.replace(config.sandbox, readlog_collector_sha256=files.sha256_of(files.collector_file()))
+    spec = SandboxSpec(run_key=f"live-readlog-{os.getpid()}", mode=DataPathMode.NONE)
+    started = DockerSandbox.start(host, pinned, spec)
     try:
         yield started
     finally:
@@ -162,8 +163,9 @@ def test_a_collector_killed_during_the_run_gives_an_unknown_log_and_the_client_f
     assert after.startswith("refused"), after  # nothing listens: the script gets no data
     done = sandbox.collect(tmp_path)
     assert [d["role"] for d in done["deaths"]] == ["readlog"]
+    assert sandbox.read_log() is None  # it ended before the collection: no log to trust
     found = reader.read_log(
         sandbox.read_log(), sandbox.readlog_nonce, expected_peer_uid=sandbox.readlog_expected_peer_uid
     )
     assert not found.intact
-    assert reader.NOT_CLOSED in found.problems
+    assert reader.MISSING in found.problems

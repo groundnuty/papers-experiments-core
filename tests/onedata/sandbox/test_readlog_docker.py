@@ -19,7 +19,7 @@ import pytest
 from fake_host import bound_files
 from readlog_docker_host import LOG, Collector
 from readlog_logs import read
-from sandbox_support import TOKEN, make_spec, start_options
+from sandbox_support import TOKEN, fail_copies, make_spec, start_options
 
 from expcore.errors import InfraError
 from expcore_onedata.readlog import facts, files, paths, reader
@@ -39,9 +39,16 @@ def collector(world):
     stand_in.close()
 
 
-def start(world, level="isolated", *, read_log=True, **spec):
-    made = dataclasses.replace(make_spec(world, level), read_log=read_log, **spec)
-    return DockerSandbox.start(world.host, world.s, made, **start_options(world))
+def pin(settings):
+    """The platform's `readlog_collector_sha256` for this core's own collector: the channel is on exactly then."""
+    return dataclasses.replace(settings, readlog_collector_sha256=files.sha256_of(files.collector_file()))
+
+
+def start(world, level="isolated", *, pinned=True, settings=None, **spec):
+    settings = settings if settings is not None else (pin(world.s) if pinned else world.s)
+    return DockerSandbox.start(
+        world.host, settings, dataclasses.replace(make_spec(world, level), **spec), **start_options(world)
+    )
 
 
 def nothing_left(world) -> bool:
@@ -57,14 +64,15 @@ def terms(world) -> list[tuple]:
 
 
 def test_a_run_without_the_channel_has_no_collector_no_bind_and_no_log(world, collector, tmp_path):
-    sbx = start(world, read_log=False)
+    sbx = start(world, pinned=False)
     assert set(world.host.containers) == {sbx.names.agent}
     destinations = {dst for _, dst in bound_files(world.host.containers[sbx.names.agent].options)}
     assert paths.SOCKET_DIR not in destinations
     assert paths.CLIENT_DIR not in destinations
     assert sbx.read_log() is None
     assert "read_log" not in sbx.metadata()
-    assert "readlog_log" not in sbx.collect(tmp_path / "out")
+    assert "read_log" not in sbx.collect(tmp_path / "out")
+    assert "readlog" not in json.dumps(sbx.metadata()["infrastructure_facts"])
     sbx.stop()
 
 
@@ -112,9 +120,9 @@ def test_o91_the_agent_has_the_socket_directory_and_the_client_read_only_and_nev
     agent = world.host.containers[sbx.names.agent]
     specs = {dict(p.split("=", 1) for p in m.split(",") if "=" in p)["dst"]: m for m in agent.options["--mount"]}
     own = sbx.dir / "readlog"
-    assert f"src={own / 'sock'}," in specs[paths.SOCKET_DIR]
+    assert f"src={sbx.dir / 'readlog-sock'}," in specs[paths.SOCKET_DIR]
     assert specs[paths.SOCKET_DIR].endswith(",readonly")
-    assert f"src={own / 'client'}," in specs[paths.CLIENT_DIR]
+    assert f"src={sbx.dir / 'readlog-client'}," in specs[paths.CLIENT_DIR]
     assert specs[paths.CLIENT_DIR].endswith(",readonly")
     for source, _ in bound_files(agent.options):
         bound = Path(source)
@@ -132,7 +140,7 @@ def test_o91_the_collector_binds_its_program_read_only_and_its_directories_and_n
     own = sbx.dir / "readlog"
     assert binds == {
         C.READLOG_PROGRAM_DIR: str(own / "program"),
-        C.READLOG_SOCKET_DIR: str(own / "sock"),
+        C.READLOG_SOCKET_DIR: str(sbx.dir / "readlog-sock"),
         C.READLOG_LOG_DIR: str(own / "log"),
     }
     sbx.stop()
@@ -143,25 +151,28 @@ def test_o91_the_directories_have_the_modes_the_peer_rule_needs_and_the_copies_a
 ):
     sbx = start(world)
     own = sbx.dir / "readlog"
-    mode = {name: stat.S_IMODE((own / name).stat().st_mode) for name in ("program", "sock", "log", "client")}
+    places = {
+        "program": own / "program", "sock": sbx.dir / "readlog-sock", "log": own / "log",
+        "client": sbx.dir / "readlog-client",
+    }  # fmt: skip
+    mode = {name: stat.S_IMODE(place.stat().st_mode) for name, place in places.items()}
+    assert stat.S_IMODE(own.stat().st_mode) == 0o700  # the collector's directory: nothing but the driver's uid in it
     assert mode["log"] == 0o700  # the collector's own, never the agent's
     assert mode["sock"] == (0o700 if os.getuid() == world.s.agent_uid else 0o755)
     assert mode["client"] == 0o755  # the agent's uid reads it through the bind
     for copy, source in (
         (own / "program" / C.READLOG_PROGRAM_NAME, files.collector_file()),
-        (own / "client" / paths.CLIENT_NAME, files.client_file()),
+        (places["client"] / paths.CLIENT_NAME, files.client_file()),
     ):
         assert stat.S_IMODE(copy.stat().st_mode) == 0o444
         assert copy.read_bytes() == source.read_bytes()
-    assert sorted(p.name for p in (own / "client").iterdir()) == [paths.CLIENT_NAME]
+    assert sorted(p.name for p in places["client"].iterdir()) == [paths.CLIENT_NAME]
     sbx.stop()
 
 
 def test_o91_a_driver_that_is_the_agent_uid_gets_an_owner_only_socket_directory(world, collector):
-    settings = dataclasses.replace(world.s, agent_uid=os.getuid())
-    spec = dataclasses.replace(make_spec(world, "isolated"), read_log=True)
-    sbx = DockerSandbox.start(world.host, settings, spec, **start_options(world))
-    assert stat.S_IMODE((sbx.dir / "readlog" / "sock").stat().st_mode) == 0o700
+    sbx = start(world, settings=dataclasses.replace(pin(world.s), agent_uid=os.getuid()))
+    assert stat.S_IMODE((sbx.dir / "readlog-sock").stat().st_mode) == 0o700
     assert world.host.containers[sbx.names.readlog].command[-1] == str(os.getuid())
     sbx.stop()
 
@@ -215,8 +226,8 @@ def test_o91_the_collection_stops_the_collector_with_sigterm_and_reads_its_log_o
     done = sbx.collect(tmp_path / "out")
     data = sbx.read_log()
     assert terms(world) == [("signalled", sbx.names.readlog, "TERM")]
-    assert done["readlog_log"] == LOG
-    assert (tmp_path / "out" / LOG).read_bytes() == data
+    assert done["read_log"] == RL.COPY_NAME == "read-log.jsonl"
+    assert (tmp_path / "out" / RL.COPY_NAME).read_bytes() == data
     stop = sbx.metadata()["readlog_stop"]
     assert (stop["term"], stop["ended_on_term"], stop["killed"], stop["stopped"]) == (True, True, False, True)
     found = reading(sbx)
@@ -232,8 +243,9 @@ def test_o91_a_second_collection_reuses_the_log_it_read_and_signals_nothing_agai
     sbx.collect(tmp_path / "one")
     done = sbx.collect(tmp_path / "two")
     assert len(terms(world)) == 1
-    assert done["readlog_log"] == LOG
-    assert (tmp_path / "two" / LOG).read_bytes() == (tmp_path / "one" / LOG).read_bytes() == sbx.read_log()
+    assert done["read_log"] == RL.COPY_NAME
+    assert (tmp_path / "two" / RL.COPY_NAME).read_bytes() == (tmp_path / "one" / RL.COPY_NAME).read_bytes()
+    assert (tmp_path / "two" / RL.COPY_NAME).read_bytes() == sbx.read_log()
     sbx.stop()
 
 
@@ -255,9 +267,34 @@ def test_o91_a_collector_killed_during_the_run_gives_an_unknown_log_and_is_a_dea
     done = sbx.collect(tmp_path / "out")
     assert [d["role"] for d in done["deaths"]] == ["readlog"]
     assert done["deaths"][0]["category"] == "infrastructure"
+    assert done["read_log"] is None
+    assert sbx.read_log() is None  # a collector that ended before the collection stopped it has no log to trust
+    assert sbx.metadata()["readlog_stop"]["ended_before_collection"] is True
     found = reading(sbx)
     assert not found.intact
-    assert reader.NOT_CLOSED in found.problems
+    assert reader.MISSING in found.problems
+    sbx.stop()
+
+
+def test_o91_a_collector_stopped_from_outside_with_sigterm_gives_an_unknown_log_not_an_intact_one(
+    world, collector, tmp_path
+):
+    """Codex round 1: SIGTERM from outside makes the collector drain and write a valid end line, which the reader
+    calls intact; the run's log must still be unknown, the collector having ended on its own account."""
+    sbx = start(world)
+    collector.records = [read("file-1")]
+    assert world.host.docker("kill", "-s", "TERM", sbx.names.readlog).returncode == 0
+    assert collector.log_path.exists()  # the stand-in wrote a complete log, end line included
+    done = sbx.collect(tmp_path / "out")
+    assert [d["role"] for d in done["deaths"]] == ["readlog"]
+    assert terms(world) == [("signalled", sbx.names.readlog, "TERM")]  # the outside one: the harness sent none
+    stop = sbx.metadata()["readlog_stop"]
+    assert (stop["term"], stop["ended_before_collection"], stop["stopped"]) == (False, True, True)
+    assert done["read_log"] is None
+    assert sbx.read_log() is None
+    snapshot = ReadLog(sbx, sbx.readlog_nonce, sbx.readlog_expected_peer_uid).finish()
+    assert snapshot["log"] == "unknown"
+    assert snapshot["counts"] is None
     sbx.stop()
 
 
@@ -284,9 +321,9 @@ def test_o91_a_log_that_cannot_be_read_is_none_and_the_reader_calls_it_unknown(w
     collector.writes_log = False
     sbx = start(world)
     done = sbx.collect(tmp_path / "out")
-    assert done["readlog_log"] is None
+    assert done["read_log"] is None
     assert sbx.read_log() is None
-    assert not (tmp_path / "out" / LOG).exists()
+    assert not (tmp_path / "out" / RL.COPY_NAME).exists()
     assert reader.MISSING in reader.read_log(sbx.read_log(), sbx.readlog_nonce, expected_peer_uid=10001).problems
     sbx.stop()
 
@@ -299,7 +336,7 @@ def test_o91_a_log_that_is_a_link_is_not_read(world, collector, tmp_path):
     sbx = start(world)
     (sbx.dir / "readlog" / "log" / LOG).symlink_to(decoy)
     done = sbx.collect(tmp_path / "out")
-    assert done["readlog_log"] is None
+    assert done["read_log"] is None
     assert sbx.read_log() is None
     sbx.stop()
 
@@ -308,7 +345,7 @@ def test_o91_a_log_larger_than_a_collector_writes_is_not_read_as_a_prefix(world,
     monkeypatch.setattr(RL, "MAX_READ_BYTES", 64)
     sbx = start(world)
     done = sbx.collect(tmp_path / "out")
-    assert done["readlog_log"] is None
+    assert done["read_log"] is None
     assert sbx.read_log() is None
     sbx.stop()
 
@@ -321,7 +358,7 @@ def test_o05_o91_a_log_that_holds_the_token_is_removed_with_its_source_and_fails
     with pytest.raises(InfraError) as failed:
         sbx.collect(tmp_path / "out")
     assert failed.value.kind == "output_collection"
-    assert not (tmp_path / "out" / LOG).exists()
+    assert not (tmp_path / "out" / RL.COPY_NAME).exists()
     assert not collector.log_path.exists()  # the source goes too: a failed collection keeps the run directory
     assert sbx.read_log() is None
     with pytest.raises(InfraError):  # and it fails the same way again
@@ -331,7 +368,7 @@ def test_o05_o91_a_log_that_holds_the_token_is_removed_with_its_source_and_fails
     assert kept.is_dir()
     held = [p for p in kept.rglob("*") if p.is_file() and TOKEN.encode() in p.read_bytes()]
     assert held == []
-    assert not (tmp_path / "again" / LOG).exists()
+    assert not (tmp_path / "again" / RL.COPY_NAME).exists()
 
 
 def test_o05_the_collector_s_configuration_shows_no_token_on_a_rest_run(world, collector):
@@ -371,7 +408,7 @@ def test_o91_the_channel_is_refused_on_a_host_that_is_not_linux(world, collector
     with pytest.raises(StartRefused, match="Linux"):
         start(world)
     assert nothing_left(world)
-    start(world, read_log=False).stop()  # a run without the channel is not affected
+    start(world, pinned=False).stop()  # a run without the channel is not affected
 
 
 @pytest.mark.parametrize("target", [paths.SOCKET_DIR, paths.CLIENT_DIR, paths.SOCKET, paths.CLIENT])
@@ -403,3 +440,69 @@ def test_o91_a_collector_that_never_wrote_a_log_reads_as_unknown_through_the_ins
     assert snapshot["log"] == "unknown"
     assert snapshot["counts"] is None
     sbx.stop()
+
+
+def test_o91_a_platform_that_pins_another_collector_refuses_the_start_before_anything_exists(world, collector):
+    other = dataclasses.replace(world.s, readlog_collector_sha256="0" * 64)
+    with pytest.raises(StartRefused, match="readlog_collector_sha256 is not the read-log collector of this core"):
+        start(world, settings=other)
+    assert nothing_left(world)
+    assert collector.container is None
+
+
+def test_o91_without_the_pin_there_is_no_collector_no_bind_no_fact_and_no_metadata(world, collector, tmp_path):
+    sbx = start(world, "via-gate", pinned=False)
+    assert set(world.host.containers) == {sbx.names.agent, sbx.names.gate}
+    assert not (sbx.dir / "readlog").exists()
+    assert not (sbx.dir / "readlog-sock").exists()
+    meta = sbx.metadata()
+    assert "read_log" not in meta
+    assert "readlog_stop" not in meta
+    assert "read_log" not in meta.get("infrastructure_facts", {})
+    sbx.collect(tmp_path / "out")
+    sbx.stop()
+
+
+def failed_collection(world, sbx, tmp_path):
+    """A collection that fails at its copy of the outputs, before it reaches the collector."""
+    (sbx.dir / "work" / "out.txt").write_text("x", encoding="utf-8")
+    undo = fail_copies(world.host)
+    with pytest.raises(InfraError, match="copying"):
+        sbx.collect(tmp_path / "e", outputs=["out.txt"])
+    undo()
+    assert sbx._readlog_collected is False  # it never got to the collector
+
+
+def test_o05_o91_a_failed_collection_never_keeps_a_log_that_holds_the_token_in_the_evidence(world, collector, tmp_path):
+    """Codex round 1: the log is scanned when the collector is stopped and read, which a collection that fails
+    earlier never reaches; the kept run must still hold no secret, so the teardown scans the log and removes one
+    that holds it."""
+    sbx = start(world, "via-gate")
+    collector.log_path.write_bytes(b'{"event": "record", "rec": {"item": "' + TOKEN.encode() + b'"}}\n')
+    failed_collection(world, sbx, tmp_path)
+    sbx.stop()
+    kept = world.s.work_root / "_kept_evidence" / sbx.sid
+    assert (kept / "work" / "out.txt").read_text() == "x"  # the rest of the evidence is kept
+    assert not (kept / "readlog" / "log" / LOG).exists()
+    assert [p for p in kept.rglob("*") if p.is_file() and TOKEN.encode() in p.read_bytes()] == []
+
+
+def test_o05_o91_a_log_the_teardown_cannot_scan_is_not_kept_either(world, collector, tmp_path):
+    """A link where the log is cannot be read without following it: a secret is never evidence, so it goes."""
+    sbx = start(world, "via-gate")
+    target = tmp_path / "elsewhere.jsonl"
+    target.write_text("{}\n")
+    collector.log_path.symlink_to(target)
+    failed_collection(world, sbx, tmp_path)
+    sbx.stop()
+    assert not os.path.lexists(world.s.work_root / "_kept_evidence" / sbx.sid / "readlog" / "log" / LOG)
+    assert target.read_text() == "{}\n"  # only the link went
+
+
+def test_o91_a_failed_collection_keeps_a_log_without_the_token_with_the_evidence(world, collector, tmp_path):
+    sbx = start(world, "via-gate")
+    collector.log_path.write_bytes(b'{"event": "start"}\n')
+    failed_collection(world, sbx, tmp_path)
+    sbx.stop()
+    kept = world.s.work_root / "_kept_evidence" / sbx.sid / "readlog" / "log" / LOG
+    assert kept.read_bytes() == b'{"event": "start"}\n'

@@ -51,9 +51,9 @@ def real(short_world):
 
 
 def start(world, *, agent_uid=None):
-    settings = world.s if agent_uid is None else dataclasses.replace(world.s, agent_uid=agent_uid)
-    spec = dataclasses.replace(make_spec(world, "isolated"), read_log=True)
-    return DockerSandbox.start(world.host, settings, spec, **start_options(world))
+    pinned = dataclasses.replace(world.s, readlog_collector_sha256=files.sha256_of(files.collector_file()))
+    settings = pinned if agent_uid is None else dataclasses.replace(pinned, agent_uid=agent_uid)
+    return DockerSandbox.start(world.host, settings, make_spec(world, "isolated"), **start_options(world))
 
 
 def records(sbx) -> list[dict]:
@@ -77,7 +77,7 @@ def test_o91_a_send_from_the_declared_agent_uid_appears_with_that_uid_and_the_lo
     assert {line["peer"]["uid"] for line in lines if line["event"] == "record"} == {os.getuid()}
     assert lines[0]["peer_uid"] == os.getuid()
     assert lines[0]["nonce"] == sbx.readlog_nonce
-    assert (tmp_path / "out" / done["readlog_log"]).read_bytes() == sbx.read_log()
+    assert (tmp_path / "out" / done["read_log"]).read_bytes() == sbx.read_log()
     snapshot = ReadLog(sbx, sbx.readlog_nonce, sbx.readlog_expected_peer_uid).finish()
     assert snapshot["log"] == "intact"
     assert snapshot["counts"]["reads"] == 2
@@ -108,7 +108,7 @@ def test_o91_the_socket_is_world_writable_in_a_directory_others_can_search_and_t
         pytest.skip("the declared agent uid is the driver's: the directory is owner-only")
     sbx = start(short_world)
     own = sbx.dir / "readlog"
-    assert stat.S_IMODE((own / "sock").stat().st_mode) == 0o755
+    assert stat.S_IMODE((sbx.dir / "readlog-sock").stat().st_mode) == 0o755
     assert stat.S_IMODE(os.stat(real.socket_path).st_mode) == 0o666
     assert stat.S_IMODE(real.log_path.stat().st_mode) == 0o600
     assert stat.S_IMODE((own / "log").stat().st_mode) == 0o700  # nothing but the collector's uid can list it
@@ -138,9 +138,10 @@ def test_o91_a_collector_killed_during_the_run_gives_an_unknown_log_and_the_clie
         client.log_read("file-2")
     done = sbx.collect(tmp_path / "out")
     assert [d["role"] for d in done["deaths"]] == ["readlog"]
+    assert sbx.read_log() is None  # it ended before the collection: no log to trust
     found = reader.read_log(sbx.read_log(), sbx.readlog_nonce, expected_peer_uid=os.getuid())
     assert not found.intact
-    assert reader.NOT_CLOSED in found.problems
+    assert reader.MISSING in found.problems
     sbx.stop()
 
 
