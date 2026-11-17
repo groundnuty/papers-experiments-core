@@ -490,6 +490,8 @@ claims its launch, and is `ready` only once a status has run `hpcimport.mount_ch
 report against the spaces it owns: the start returns once its step is listed, before the service holds its mounts, so
 the proof is taken by the first status that finds it otherwise ready, and recorded for that launch alone.
 
+**A restart's identity check waits for the domain (O58).** `finish.sh --restart` compares the provider id and the domain that op_worker's `/configuration` reports with `identity.json`, before anything is rotated. op_worker answers `domain` from the provider record it reads over its Onezone connection, so for a moment after its REST listener answers it says null (live: a restart's check ran 1.9 s before the connection came up, and compared the word null with the recorded domain of a service that had not changed). `finish.sh` therefore polls `/configuration` first (`wait_domain` in `lib.sh`, every `HPCOP_POLL_S`, 1 s) until `domain` is neither null nor empty, under **one deadline with `wait_ready`: 1800 s from `finish.sh`'s start**, `wait_ready`'s own bound (`HPCOP_READY_SECONDS`, validated, for a test to shorten), so the wait takes what `wait_ready` left; there is always one read, and the deadline is checked between requests, so the wait can end one request (`http`'s 120 s bound) past it. The first non-empty answer ends the wait whatever it holds and the check runs unchanged: another non-null domain fails as `the service's identity changed across the restart`; a domain still null at the deadline fails as `stayed null`, so a start that lacks Onezone is not read as a changed deployment; an answer with no `domain` field, or one that is not JSON, fails at once, and so does a service that exited meanwhile. A first start waits the same way and records the identity only from a real domain. `jsonget` never prints a JSON null as a word: with no `--default` it prints nothing and exits 3 (2 is a field that is not there), so no script compares or records "null" as an id, a domain, a user id or a token.
+
 **(c) STATUS** `hpcfed.py status <service>`: one JSON line, no secret: `{"service", "state", "running", "ready",
 "identity", "launch", "node", "step"}`. `running` is true only when the service step is listed in `squeue -s` **and**
 a control step on the node (`status.sh`) finds the recorded service process alive with its recorded start tick.
@@ -529,7 +531,7 @@ service steps through `zone.sbatch` and `provider.sbatch` unchanged):
   in `stop-requested` it must remove neither, and end with status 0.
 - `wait_ready` demands a fresh deployment (`Congratulations! New`) and the guard's first-start flow. A restart over an
   existing deployment prints neither: `restart.sh` needs its own readiness (`service-ready.lock`, `/configuration`
-  answering, the guard's verdict for a restart) and the live default and port checks again. The guard's behaviour on a
+  answering with a domain, the guard's verdict for a restart) and the live default and port checks again. The guard's behaviour on a
   restart is untested.
 - **`sweep_leftovers` removes a work directory whose `owner.pid` process has ended**, and a stop ends it. A stopped
   service's directory would then be removed by the next `node-init.sh` of ours on that node (another federation's,
