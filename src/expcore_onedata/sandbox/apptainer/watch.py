@@ -232,6 +232,8 @@ class Watch:
             return
         if over_pids:
             self._kill(members, KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids)
+            with self._lock:  # this poll returns before the hidden check: the cell's memory was not read at it
+                self._hidden.unchecked()
             return
         self._check_hidden(found, members, before, after)
         if self._clock() >= self._next_walk:

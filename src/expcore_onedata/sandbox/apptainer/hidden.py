@@ -40,7 +40,9 @@ namespace when its exec returns ends every hidden process (`facts.py`).
 
 The run's reading is `over` when a kill of the watch's for memory reached a process, `unknown` with every reason that
 held (a kill that reached none among them), or `within`. A cell killed for hidden memory counts as one whatever its
-kill reached.
+kill reached. A poll that kills the cell for its `pids` returns before this check, the cgroup's assessment and the scan
+of the cell's children both: the cell's memory was not read at it, so the reading is `unknown` for `hidden_unchecked`,
+never `within` (a hidden child that the same poll would have found does not read as none).
 Not thread-safe: the watch calls it under its lock, and makes the node's reads outside it.
 """
 
@@ -66,6 +68,7 @@ CHILDREN_UNREADABLE = "children_unreadable"
 UNATTRIBUTED = "unattributed"
 MARGIN_AT_START = "margin_exceeded_at_start"
 KILL_REACHED_NONE = "kill_reached_none"  # the watch's kill for hidden memory signalled no process
+HIDDEN_UNCHECKED = "hidden_unchecked"  # a poll ended at a kill for another limit before it looked for hidden memory
 
 
 @dataclass(frozen=True)
@@ -226,6 +229,12 @@ class HiddenCheck:
         """A kill of the watch's for visible memory that signalled no process: the cell's memory is unknown."""
         if self._cell is not None:
             self._cell_reasons.add(KILL_REACHED_NONE)
+
+    def unchecked(self) -> None:
+        """A poll that ended at a kill for another limit (`pids`) before the hidden-memory check ran: the cell's memory
+        was not read at it, so its reading is unknown."""
+        if self._cell is not None:
+            self._cell_reasons.add(HIDDEN_UNCHECKED)
 
     def note_children(self, hidden: set[int], unreadable: bool) -> None:
         """What the running cell's visible processes' children showed at one poll."""

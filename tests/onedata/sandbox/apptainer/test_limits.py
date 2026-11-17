@@ -56,6 +56,38 @@ def test_o70_a_run_over_its_pids_limit_has_its_processes_killed_as_a_pids_limit(
     assert (pids["declared"], pids["reading"], pids["max_seen"], pids["kills"]) == (64, "over", 80, 1)
 
 
+def test_o70_a_poll_that_kills_for_pids_leaves_the_memory_reading_unknown_never_within(node, tmp_path):
+    """O70: the kill for `pids` returns before the hidden-memory check (the cgroup's assessment and the scan of the
+    cell's children), so that poll did not read the cell's memory: with a hidden child a visible parent names, the
+    run's memory reading was `within` with no hidden process. It is `unknown` with `hidden_unchecked`; the pids
+    reading, which the kill reached, stays `over`."""
+    ns = node.new_namespace()
+    procs = [node._new_proc(ns, "python3", environ=(TAG,), threads=40) for _ in range(2)]
+    node._new_proc(ns, "python3", hidden=True, anon=4 << 20, parent=procs[0].pid)
+    watch = _watch(node, tmp_path, _check())
+    watch.begin_cell(2, "n")
+    watch.poll()
+    found = watch.end_cell()
+    assert [k["reason"] for k in found["kills"]] == ["pids_limit"]
+    assert (found["memory"]["reading"], found["memory"]["unknown"]) == ("unknown", ["hidden_unchecked"])
+    assert watch.visibility()["memory"] == "unknown"
+    assert watch.limits_record()["pids"]["reading"] == "over"
+
+
+def test_o70_a_poll_that_does_not_kill_for_pids_still_reads_the_cell_s_memory(node, tmp_path):
+    """O70: the control of the case above: the same cell under its `pids` limit has its hidden child found, so its
+    memory reading is `unknown` for `hidden_process` and not for a poll that did not look."""
+    ns = node.new_namespace()
+    procs = [node._new_proc(ns, "python3", environ=(TAG,), threads=1) for _ in range(2)]
+    node._new_proc(ns, "python3", hidden=True, anon=4 << 20, parent=procs[0].pid)
+    watch = _watch(node, tmp_path, _check())
+    watch.begin_cell(2, "n")
+    watch.poll()
+    found = watch.end_cell()
+    assert found["kills"] == []
+    assert (found["memory"]["reading"], found["memory"]["unknown"]) == ("unknown", ["hidden_process"])
+
+
 def test_o70_the_tasks_at_the_limit_are_within_it(node, tmp_path):
     """O70: a count equal to `pids` is allowed (Docker refuses the fork past it); the reading is within with the
     count it showed."""
