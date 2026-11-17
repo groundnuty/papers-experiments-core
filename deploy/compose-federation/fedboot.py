@@ -422,15 +422,22 @@ class Bootstrap:
 
     def ensure_support(self, timeout_s: float) -> None:
         """Have each space supported by exactly its owner and its mirrors, and wait until each of them serves its
-        root. A space the zone lists a supporter of that its layout does not declare is refused, naming it, before any
-        support call is made for it (O35); `verify_support` reads the sets back afterwards."""
+        root. Every space is read first, and one the zone lists a supporter of that its layout does not declare is
+        refused, with every such space and provider named, before any support call is made for any space (O35): a
+        support is never removed again, so a refused up changes nothing. `verify_support` reads the sets back
+        afterwards."""
+        listed_by = {declared.name: self.measure_support(declared) for declared in self.spec.spaces}
+        problems = [
+            problem
+            for declared in self.spec.spaces
+            for problem in extras(declared.name, declared.supporters, *listed_by[declared.name])
+        ]
+        if problems:
+            raise RuntimeError(refusal(problems))
         for declared in self.spec.spaces:
             space, supporters = declared.name, declared.supporters
             sid = self.ids.spaces[space]
-            held, undeclared = self.measure_support(declared)
-            problems = extras(space, supporters, held, undeclared)
-            if problems:
-                raise RuntimeError(refusal(problems))
+            held, _ = listed_by[space]
             for name in supporters:
                 if name not in held:
                     self.support(self.spec.provider(name), declared, sid)

@@ -324,7 +324,7 @@ evicts from the mirrors only, whose storage is regular.
 
 **The facts.** Each space's entry in `facts.json` has `supported_by`, the layout's declaration, and `supported_by_measured`
 with `support_read_at`, what Onezone listed and when (up refuses unless the two are equal, so a ready federation's
-entry holds the same providers twice, the measured ones sorted); and `import`, `null` or `{ readonly, source_env,
+entry holds the same providers twice, the measured ones sorted; `reset --replicas` writes no facts, so the time is that of the last `up` or `reset --clean`); and `import`, `null` or `{ readonly, source_env,
 storage, scan }`: the variable's name, never the directory it names. `describe` adds `; imported (read-only) from $NAME` (or `(writable)`) to
 the space's row.
 
