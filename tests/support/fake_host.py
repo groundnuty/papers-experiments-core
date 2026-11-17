@@ -23,6 +23,7 @@ docker reported an exit it never saw).
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,11 @@ ONECLIENT_BUILD_ID = "ab" * 20  # the GNU build id of the fake oneclient image's
 
 class Unrecorded(CmdResult):
     """What `docker exec` returned for a cell, as it is: no completion record is added (O55)."""
+
+
+def is_signal_helper(argv: Sequence[str]) -> bool:
+    """The root half of a signal (`killhelper.py`), run as `PYTHON -I -c SOURCE TERM|KILL` with its request on stdin."""
+    return bool(argv) and argv[0] == sys.executable and "-c" in argv and argv[-1] in ("TERM", "KILL")
 
 
 def bootstrap_of(argv: Sequence[str]) -> tuple[str, int, str, str] | None:
@@ -300,6 +306,9 @@ class FakeHost:
             return self.mountinfo()
         if path in self.files:
             return self.files[path]
+        named = re.fullmatch(r"/proc/(\d+)/cmdline", path)
+        if named and int(named[1]) in self.alive:  # a process that was given none has the command line `proc-<pid>`
+            return f"proc-{named[1]}\0"
         raise FileNotFoundError(path)
 
     def readlink(self, path: str | Path) -> str:
@@ -352,12 +361,57 @@ class FakeHost:
             self.calls.append(("run", tuple(argv), sudo))
             if sudo:
                 self.sudo_commands.append(argv)
+            if is_signal_helper(argv):  # never run for real: its pids are this fake's, and the real /proc is the host's
+                return self._signal_helper(argv, input)
             handler = self.run_handlers.get(argv[0])
             if handler is not None:
                 return handler(argv)
             if argv[0] == sys.executable and "-c" in argv:  # the copy helper, run for real
                 return self.real(argv, input)
             return self._run_default(argv)
+
+    def _signal_helper(self, argv: list[str], request: str | None) -> CmdResult:
+        """The root half of a signal (`killhelper.py`, O72) played against this fake's /proc: each target is signalled
+        only while it is the process the listing saw (its start tick and the digest of its command line), and what
+        was signalled is then run as the plain `kill -s SIGNAL PID...` the tests read, through `run_handlers["kill"]`
+        when one is set (its failure is the whole command's, as a failed `sudo` is). The answer is the helper's own,
+        an outcome for every target."""
+        results, matched = [], []
+        for target in json.loads(request or "{}").get("targets", []):
+            outcome = self._identity_outcome(target["pid"], target["start"], target["cmd_sha256"])
+            results.append({"pid": target["pid"], "outcome": outcome})
+            if outcome == "signalled":
+                matched.append(target["pid"])
+        if matched:
+            plain = ["kill", "-s", argv[-1], *map(str, matched)]
+            self.calls.append(("run", tuple(plain), True))
+            self.sudo_commands.append(plain)
+            handler = self.run_handlers.get("kill")
+            done = handler(plain) if handler is not None else self._run_default(plain)
+            if done.returncode != 0:
+                return CmdResult(done.returncode, "", done.stderr)
+        return CmdResult(0, json.dumps({"results": results}))
+
+    def _identity_outcome(self, pid: int, start: str, digest: str | None) -> str:
+        from expcore_onedata.sandbox import procsignal  # not before it exists: the old code never calls the helper
+
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return "refused"
+        if digest is None:
+            return "unreadable"
+        try:
+            stat = self.read_text(f"/proc/{pid}/stat")
+            command = self.read_text(f"/proc/{pid}/cmdline")
+        except FileNotFoundError:
+            return "gone"
+        except OSError:
+            return "unreadable"
+        fields = stat[stat.rfind(")") + 2 :].split()
+        if fields[19] != start:
+            return "replaced"
+        if fields[0] in ("Z", "X"):
+            return "gone"
+        return "signalled" if procsignal.digest_of(command) == digest else "changed"
 
     def _run_default(self, argv: list[str]) -> CmdResult:
         match argv[0]:

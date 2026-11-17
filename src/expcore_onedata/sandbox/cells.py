@@ -25,6 +25,10 @@ of the container but its init and the init's `sleep`, as the quiesce kills them)
 that cannot be shown gone, or a listing that fails, ends the run as `survived_kill`, as a process that outlives its
 kill at the cap does (O34): the next cell would find it running.
 
+Every signal goes only to the process that was listed (`procsignal`, `killhelper`, O72): the listing carries each
+process's start tick and the digest of its command line, and a pid that ended and was reused since is never signalled.
+A process no signal reached is not marked done: it is listed again, and while one is alive it is never quiet.
+
 A cell runs under the completion bootstrap (`completion.py`, O55): its program is checked whole in the container before
 it runs, and a record written after the interpreter's exit carries this exec's nonce and the exit status. The record's
 lines are taken out of the streams as they are read, so the output is the program's own; what it showed is the
@@ -46,6 +50,7 @@ from expcore_onedata.sandbox import bounds as BD
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import earlyoom as EO
 from expcore_onedata.sandbox import killcause as KC
+from expcore_onedata.sandbox import procsignal as PS
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox.api import NOT_STARTED, RAN, ExecResult
 from expcore_onedata.sandbox.completion import Completion, ExecIncomplete
@@ -189,9 +194,12 @@ class _CellProcesses:
             log.error("the processes of a cell could not be listed at its deadline: %s", describe_error(e))
             return None
 
-    def kill(self, procs: list[dict], timeout_s: float) -> None:
-        pids = [str(p["pid"]) for p in procs]
-        TD._sudo(self._runner._host, "kill", "-s", "KILL", *pids, timeout_s=min(KILL_S, timeout_s))
+    def kill(self, procs: list[dict], timeout_s: float) -> list[tuple]:
+        """SIGKILL each process, only while it is the one listed (`procsignal`, O72). The deadline's keys of the ones
+        reached; one that was not (its command line changed, its identity could not be read, the command failed) is not
+        among them, so the deadline lists it again and tries once more, and never counts it as signalled."""
+        sent = PS.signal_processes(self._runner._host, procs, "KILL", min(KILL_S, timeout_s))
+        return [DL.key_of(p) for p in procs if sent.reached(p)]
 
     def fallback(self) -> list[dict] | None:
         """After a step of the deadline raised: the sandbox's quiesce kills what is left; what it left, None when the
@@ -323,31 +331,40 @@ class CellRunner:
         return state["killed"]
 
     def _kill_all(self, reason: str) -> dict[str, Any]:
-        """`quiesce` without its record."""
+        """`quiesce` without its record. A process is signalled only while it is the one listed (`procsignal`, O72): one
+        the signal did not reach (its command line changed, its identity could not be read, the command failed) is
+        listed again, with what it is then, in the next round, and is never marked done; one still alive at the end
+        that no signal reached is not quiet, however the signals went for the rest."""
         state: dict[str, Any] = {"reason": reason, "killed": None, "left": None}
         try:
-            killed, left, seen, unsent = 0, [], set(), False
+            listed, seen, reached, left = set(), set(), set(), []
             for _ in range(QUIESCE_ROUNDS):
                 procs = self.agent_processes()
                 if procs is None:
-                    killed = None
+                    listed = None
                     break
                 left = procs
-                fresh = [p for p in procs if (p["pid"], p["start"]) not in seen]
+                fresh = [p for p in procs if DL.key_of(p) not in seen]
                 if not fresh:
                     break
-                sent = TD._sudo(self._host, "kill", "-s", "KILL", *[str(p["pid"]) for p in fresh], timeout_s=20.0)
-                unsent = unsent or sent.returncode != 0  # not known to have reached each of them
-                seen.update((p["pid"], p["start"]) for p in fresh)
-                killed += len(fresh)
-                left = TD._wait_gone(self._host, fresh, 10.0, 0.2)
+                sent = PS.signal_processes(self._host, fresh, "KILL", 20.0)
+                done = [p for p in fresh if sent.reached(p)]
+                listed.update((p["pid"], p["start"]) for p in fresh)
+                reached.update((p["pid"], p["start"]) for p in done)
+                seen.update(DL.key_of(p) for p in done)
+                if sent.failed is not None:  # it failed as a whole, perhaps after signalling: asking again won't help
+                    left = self.agent_processes()  # so what is left is listed anew, never taken from before the signals
+                    listed = None if left is None else listed
+                    break
+                if done:  # what no signal reached is not waited for: it is listed again at once
+                    TD._wait_gone(self._host, done, 10.0, 0.2)
             else:
                 left = self.agent_processes()
-                killed = None if left is None else killed
-            if killed is not None:
-                state.update(killed=killed, **_left_record(left))
-                if unsent and state["left_alive"]:
-                    state.update(killed=None, error="a kill command failed and a process is left")
+                listed = None if left is None else listed
+            if listed is not None:
+                state.update(killed=len(listed), **_left_record(left))
+                if any((p["pid"], p["start"]) not in reached for p in left):
+                    state.update(killed=None, error="a signal did not reach a process that is left")
         except Exception as e:
             state.update(killed=None, left=None, error=describe_error(e))
         return state
