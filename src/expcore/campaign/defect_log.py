@@ -41,27 +41,24 @@ _lock = threading.Lock()
 
 
 class Chained:
-    """Several redactors applied one after the other: what is redacted loses every one's secrets, so it is never
-    redacted against the shorter list of any of them (the attempt's own context, which `record_attempt` narrows to the
-    environment `record_run` was given, and the runner's base: the process, the models, the registry)."""
+    """Several redactors in one: what is redacted loses every one's secrets, so it is never redacted against the
+    shorter list of any of them (the attempt's own context, which `record_attempt` narrows to the environment
+    `record_run` was given, and the runner's base: the process, the models, the registry). It is one pass over the
+    union of their secrets (`Redactor.union`), longest first, and not one redactor after the other, which would replace
+    a shorter secret inside a longer one and leave the rest of the longer one in what is shown (C40)."""
 
-    def __init__(self, *redactors: Redactor):
-        self._redactors = redactors
+    def __init__(self, *redactors: "Redactor | Chained"):
+        ones = [r._one if isinstance(r, Chained) else r for r in redactors]  # a chain may hold a chain
+        self._one = ones[0] if len(ones) == 1 else Redactor.union(*ones)
 
     def with_lines(self) -> "Chained":
-        return Chained(*(redactor.with_lines() for redactor in self._redactors))
+        return Chained(self._one.with_lines())
 
     def text(self, value: str) -> str:
-        for redactor in self._redactors:
-            value = redactor.text(value)
-        return value
+        return self._one.text(value)
 
     def structure(self, obj: Any) -> tuple[Any, list[str]]:
-        paths: list[str] = []
-        for redactor in self._redactors:
-            obj, changed = redactor.structure(obj)
-            paths += changed
-        return obj, paths
+        return self._one.structure(obj)
 
 
 def log_path(root: Path) -> Path:
@@ -167,10 +164,10 @@ class DefectLog:
 
     def build_redactor(self) -> Chained:
         """The redactor of the attempt's redaction context as it stands now: the runner's own base and the one
-        installed after it (the executor's `declare_secrets`, or the whole context `record_attempt` gave it), one after
-        the other, so it is never the shorter of the two: `record_attempt` builds its own from the environment
-        `record_run` was given. What else of the attempt is kept redacted (the diagnostic of a failed instrument start,
-        C40) uses it too, and knows what the log does at that moment."""
+        installed after it (the executor's `declare_secrets`, or the whole context `record_attempt` gave it), in one
+        pass over both lists, so it is never the shorter of the two: `record_attempt` builds its own from the
+        environment `record_run` was given. What else of the attempt is kept redacted (the diagnostic of a failed
+        instrument start, C40) uses it too, and knows what the log does at that moment."""
         return Chained(self._base(), self._redactor()) if self._redactor is not self._base else Chained(self._base())
 
     def __call__(self, error: BaseException, defect: HarnessDefect) -> Path | None:

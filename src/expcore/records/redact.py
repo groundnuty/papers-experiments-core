@@ -213,6 +213,19 @@ class Redactor:
         return Redactor(self._values, keys=self._keys, short=self._short, lines=True)
 
     @classmethod
+    def union(cls, *redactors: "Redactor") -> "Redactor":
+        """One redactor that replaces everything each of `redactors` does, the longest secret first across all of them.
+        Applied one after the other, a redactor that holds a shorter secret would replace it inside a longer secret
+        of another and leave the rest of that one (a URL that embeds a key, its user and its host), which one pass over
+        the union never does. A key is redacted by name, and a secret by each of its lines, when any of them does."""
+        return cls(
+            [value for redactor in redactors for value in redactor._values],
+            keys=any(redactor._keys for redactor in redactors),
+            short=[value for redactor in redactors for value in redactor._short],
+            lines=any(redactor._lines for redactor in redactors),
+        )
+
+    @classmethod
     def from_environment(
         cls,
         environ: Mapping[str, str] | None = None,

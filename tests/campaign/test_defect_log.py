@@ -322,7 +322,8 @@ def test_c40_a_chain_redacts_a_longer_secret_whole_whichever_redactor_holds_the_
     key = "process-api-key-0123456789"
     url = f"https://alice-private:{key}@private-host.example"
     shorter, longer = Redactor([key]), Redactor([key, url])
-    for chain in (Chained(shorter, longer), Chained(longer, shorter), Chained(shorter, Redactor([url]))):
+    nested = Chained(Chained(shorter), Redactor([url]))  # the attempt chains the log's own chain with a pin
+    for chain in (Chained(shorter, longer), Chained(longer, shorter), Chained(shorter, Redactor([url])), nested):
         assert chain.text(f"connected to {url}") == "connected to [redacted]"
         assert chain.with_lines().text(f"connected to {url}") == "connected to [redacted]"
         redacted, paths = chain.structure({"seen": f"connected to {url}", "key": key})
