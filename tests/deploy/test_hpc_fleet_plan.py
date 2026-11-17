@@ -9,7 +9,7 @@ import hashlib
 import json
 
 import pytest
-from fingerprint_support import seen_platforms
+from fingerprint_support import seen_environments, seen_platforms
 from hpc_fed_support import data_stand_in
 from hpc_fleet_support import another_ca, fleet_modules, job_ids, make_bench, make_ca
 from tls_support import HAS_OPENSSL
@@ -443,6 +443,55 @@ def test_o63_step_refuses_whole_when_a_declared_variable_is_no_longer_set_and_la
     assert code == 2
     assert f"{TREE_NAME} is not set" in printed
     assert bench.spawned == []
+
+
+def needing(bench):
+    """The settings' study plugin refuses to be built without the declared variables; the directory in which the
+    program that builds it records the environment of each of its calls."""
+    bench.needs = (NAME, TREE_NAME)
+    return bench.base / "venv"
+
+
+def test_o63_plan_builds_a_plugin_that_needs_a_declared_variable_with_the_values_its_lines_pin(bench):
+    """O63: a study's plugin may refuse to be built without a variable the settings declare in `pass_env`, so the
+    campaign fingerprint `plan` takes before it assigns a shard could never be taken. The program that takes it is
+    given the declared variables, valued as the lines pin them (from the environment `fleet.py` runs in), once for
+    each assigned shard."""
+    assert bench.up(2)[0] == 0
+    venv = needing(bench)
+    code, printed, lines = planned(bench, operator(bench), PASS_ENV)
+    assert code == 0, printed
+    assert [(env[NAME], env[TREE_NAME]) for env in seen_environments(venv)] == [(VALUE, TREE)] * 2
+    assert [entry["pass_env"] for entry in lines.values()] == [{NAME: VALUE, TREE_NAME: TREE}] * 2
+
+
+def test_o63_plan_gives_the_plugin_no_variable_the_settings_do_not_declare(bench):
+    """O63: nothing else of the operator's environment, nor of the site's, reaches the program that builds the
+    plugin."""
+    assert bench.up(2)[0] == 0
+    venv = needing(bench)
+    code, printed, _ = planned(bench, operator(bench, NOT_DECLARED_VAR="x", FAULT_API_KEY="y"), PASS_ENV)
+    assert code == 0, printed
+    taken = seen_environments(venv)
+    assert len(taken) == 2
+    for env in taken:
+        assert not [name for name in ("NOT_DECLARED_VAR", "FAULT_API_KEY", "HPC_FLEET_MAX") if name in env]
+
+
+def test_o63_plan_refuses_an_unset_declared_variable_before_it_builds_the_plugin_naming_only_the_variable(bench):
+    """O63: the values are read before any program is run: a declared variable the operator does not hold refuses the
+    whole `plan`, naming it and showing no value, with nothing assigned and the plugin never built."""
+    assert bench.up(2)[0] == 0
+    venv = needing(bench)
+    environ = operator(bench)
+    del environ[TREE_NAME]
+    code, printed, lines = planned(bench, environ, PASS_ENV)
+    assert code == 2
+    assert f"{TREE_NAME} is not set" in printed
+    assert TREE not in printed
+    assert lines == {}
+    assert seen_environments(venv) == []
+    assert all(member is None for member in assigned(bench).values())
 
 
 @pytest.mark.parametrize(
