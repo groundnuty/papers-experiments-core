@@ -379,6 +379,27 @@ VISIBILITY_SENSITIVITY_NOTES = [
     "detected about it, never for its outcome.",
 ]
 
+READ_LOG_NOTES = [
+    "A study's canonical scripts log every read they make to the read-log channel, a datagram socket the harness binds",
+    "read-only into the cell, and the log is the study's evidence of what was read. **Its weakness is code of the",
+    "agent's own in the same cell:** it can send a datagram of its own, so an item it never read looks read, or patch",
+    "the client or `socket` before it runs a canonical script in its process, so a real read is never logged. Nothing",
+    "prevents either. A run is flagged here when the code of one of its code cells names the channel (its socket, the",
+    "client module or its bound path), builds a Unix datagram socket, reads a process's environment, searches for the",
+    "socket, or patches `socket`, the client or the loaded modules. A canonical script run by its path names none of",
+    "these. **This is a heuristic over text and the second line of detection.** Code that builds a name at run time,",
+    "decodes it, or copies a canonical script and edits its logging passes it, so a run that is not flagged is not",
+    "shown to have an unforged log; it also flags a cell that names a Unix family and a datagram type for unrelated",
+    "sockets. On a REST data path the gate's per-file served table (O22) is the backstop that does not read code.",
+]
+
+READ_LOG_SENSITIVITY_NOTES = [
+    "The preregistered analysis again, without the flagged runs: each one is left out as an absent run (`excluded`),",
+    "so its pairs count as `Unpaired or left out` and its arm's runs as `Left out`. The analysis above stands; this",
+    "says whether its conclusions hold without the runs whose code reached for the read-log channel. A run is left",
+    "out for what was detected about it, never for its outcome.",
+]
+
 GUARDS_NOTES = [
     "This batch was checked by both guards, the egress check and the mount guard, and each section above reruns the",
     "analysis without its own runs. This one reruns it without every run either leaves out: flagged or unknown to",
@@ -396,10 +417,16 @@ GUARDS_SENSITIVITY_NOTES = [
 ]
 
 
-def any_guard_notes(names: str) -> list[str]:
+READ_LOG_STATE_NOTES = [
+    "The read-log scan's state of a run is `flagged` when its code names the read-log channel or a way to it, and",
+    "`clean` otherwise; it has no unknown state, and a run it flags is left out whatever the other guards found.",
+]
+
+
+def any_guard_notes(names: str, read_log: bool = False) -> list[str]:
     """The notes of the combined section of a batch checked by guards other than egress and the mount guard alone:
-    `names` lists the guards that checked it (O76)."""
-    return [
+    `names` lists the guards that checked it (O76); `read_log` adds what the read-log scan's state is (S20)."""
+    notes = [
         f"This batch was checked by {names}, and each section above reruns the analysis without its own runs. This one",
         "reruns it without every run any of them leaves out: flagged or unknown to any, so a run unknown to one guard",
         "and clean to the others is left out. A guard that does not apply to a run leaves it out for nothing: a run",
@@ -409,6 +436,7 @@ def any_guard_notes(names: str) -> list[str]:
         "static-scan hit and `unknown` for an unknown log alone; its mount and its process visibility are those",
         "guards' verdicts.",
     ]
+    return [*notes, *READ_LOG_STATE_NOTES] if read_log else notes
 
 
 def any_guard_sensitivity_notes(either: str) -> list[str]:

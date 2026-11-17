@@ -105,7 +105,7 @@ from expcore.config.models import ModelSpec
 from expcore.config.platform_loads import watching_platform_loads
 from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
 from expcore.errors import study_kinds
-from expcore.guards import GuardsAnalysis, guards_analysis
+from expcore.guards import READ_LOG, GuardsAnalysis, guards_analysis
 from expcore.models.route import sdk_version
 from expcore.mountguard.campaign import recorded_data_paths
 from expcore.mountguard.sensitivity import MountGuardAnalysis, mount_guard_analysis
@@ -113,6 +113,8 @@ from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
 from expcore.provenance.core_check import require_core
 from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_earlier_form
+from expcore.readlog.scan import SCAN_VERSION
+from expcore.readlog.sensitivity import ReadLogAnalysis, read_log_analysis
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore, scorer_name, scorer_version
@@ -190,6 +192,9 @@ class StudyAnalysis:
     )
     visibility: VisibilityAnalysis | None = None  # a batch watched for hidden processes: the same, of those (O56)
     rescore: Mapping[str, Any] | None = None  # `--rescore` let through scorers other than the run's: the digests (R17)
+    read_log: ReadLogAnalysis | None = (
+        None  # a batch whose records carry `read_log`: the scan's verdicts and rerun (S20)
+    )
 
 
 def out_dir(study: StudyConfig | StudyIdentity) -> Path:
@@ -962,12 +967,13 @@ def _analyse_loaded(
     egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
     guard = mount_guard_analysis(runs, rows, absent, study.prereg, data_paths, study.data_path_factor)  # O75
     seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
-    both = guards_analysis(rows, absent, study.prereg, egress, guard, seen)  # None unless two guards checked the batch
-    _require_declared_reruns(study, ran_reruns(egress, guard, seen, both))
+    scanned = read_log_analysis(runs, rows, absent, study.prereg)  # None for a batch with no `read_log` record (S20)
+    both = guards_analysis(rows, absent, study.prereg, egress, guard, seen, scanned)  # None unless two guards checked
+    _require_declared_reruns(study, ran_reruns(egress, guard, seen, both, scanned))
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
     return StudyAnalysis(
-        study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen, rescored
+        study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen, rescored, scanned
     )
 
 
@@ -1068,6 +1074,7 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         | ({} if analysis.mount_guard is None else {"mount_guard": _mount_guard_summary(analysis.mount_guard)})
         | ({} if analysis.guards is None else {"guards": _guards_summary(analysis.guards)})
         | ({} if analysis.visibility is None else {"process_visibility": _visibility_summary(analysis.visibility)})
+        | ({} if analysis.read_log is None else {"read_log": _read_log_summary(analysis.read_log)})
         | _declared_reruns_entry(analysis.study.prereg.sensitivity_reruns)
         | ({} if analysis.rescore is None else {"rescore": dict(analysis.rescore)})
     )
@@ -1146,7 +1153,8 @@ def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
         "by_condition": guards.by_condition(),
         "runs": [
             {"run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "egress": run.egress,
-             "mount": run.mount, "visibility": run.visibility, "left_out_by": run.by}
+             "mount": run.mount, "visibility": run.visibility, "left_out_by": run.by,
+             **({"read_log": run.read_log} if READ_LOG in guards.guards else {})}
             for run in guards.runs
         ],
         "sensitivity": None
@@ -1180,6 +1188,31 @@ def _visibility_summary(seen: VisibilityAnalysis) -> dict[str, Any]:
     }  # fmt: skip
 
 
+def _read_log_summary(scanned: ReadLogAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of a batch whose records carry the `read_log` instrument (S20): the scan's version,
+    each analysed run's verdict (its hits, by cell, kind and fixed name, never the cell's text) and the sensitivity
+    analysis without the flagged runs, or why there is none."""
+    sensitivity = scanned.sensitivity
+    return {
+        "scan_version": SCAN_VERSION,
+        "counts": scanned.counts(),
+        "runs": [
+            {
+                "run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "flagged": run.flagged,
+                "kinds": list(run.kinds),
+                "hits": [{"cell": h["cell"], "kind": h["kind"], "what": h["what"]} for h in run.scan["hits"]],
+                "hits_cut": run.scan["hits_cut"],
+            }
+            for run in scanned.runs
+        ],
+        "sensitivity": None
+        if sensitivity is None
+        else {"left_out": [run.run_key for run in scanned.flagged], "contrasts": sensitivity.contrasts,
+              **_holm_entries(sensitivity)},
+        "sensitivity_refused": scanned.refused,
+    }  # fmt: skip
+
+
 def report_text(analysis: StudyAnalysis) -> str:
     """The Markdown report of an analysis (`expcore.report`)."""
     return render_report(
@@ -1195,6 +1228,7 @@ def report_text(analysis: StudyAnalysis) -> str:
         mount_guard=analysis.mount_guard,
         guards=analysis.guards,
         visibility=analysis.visibility,
+        read_log=analysis.read_log,
     )
 
 
