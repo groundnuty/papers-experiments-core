@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from locked_work import LocalHost, lock, locked_afterwards, needs_unprivileged, not_the_owner
+from locked_work import LocalHost, as_root, lock, locked_afterwards, needs_unprivileged, not_the_owner
 
 from expcore_onedata.sandbox import copyout
 from expcore_onedata.sandbox.hostops import run_bounded
@@ -243,3 +243,23 @@ def test_o71_a_locked_file_with_another_link_is_refused_never_restored(tmp_path)
     assert done.returncode == 0, done.stderr
     assert {e.name: e.kind for e in entries if e.name in ("a", "b")} == {"a": "x", "b": "x"}
     assert stat.S_IMODE((tmp_path / "out" / "b").lstat().st_mode) == 0
+
+
+def test_o71_a_locked_file_with_another_link_is_unreadable_to_a_root_helper_too_and_one_with_a_link_is_not(tmp_path):
+    """O71: the same outcome on every backend. Docker's helper is root, which reads a mode-000 file whatever its mode,
+    so a locked file with another link is refused by its mode and links, not by what the helper could open. A locked
+    file with one link is the root's to read (listed as a file, nothing changed), and where nothing is asked to be
+    restored (the gate's own file) no file is refused for it."""
+    (tmp_path / "out").mkdir()
+    for name in ("a", "single"):
+        (tmp_path / "out" / name).write_text(f"{name}\n", encoding="utf-8")
+    os.link(tmp_path / "out" / "a", tmp_path / "out" / "b")
+    lock(tmp_path / "out" / "a")
+    lock(tmp_path / "out" / "single")
+    source = as_root(copyout.HELPER.read_text(encoding="utf-8"))
+    done, entries = _list(tmp_path, source)
+    assert done.returncode == 0, done.stderr
+    assert {e.name: e.kind for e in entries if e.name in ("a", "b", "single")} == {"a": "x", "b": "x", "single": "f"}
+    assert [stat.S_IMODE((tmp_path / "out" / n).lstat().st_mode) for n in ("a", "single")] == [0, 0]
+    done, entries = _list(tmp_path, source, restore=False)
+    assert {e.name: e.kind for e in entries if e.name in ("a", "b")} == {"a": "f", "b": "f"}

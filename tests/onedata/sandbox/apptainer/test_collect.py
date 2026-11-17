@@ -181,6 +181,7 @@ def test_o71_a_gate_log_the_helper_cannot_read_is_infrastructure_and_is_never_re
         assert failed.value.kind == "output_collection"
         assert stat.S_IMODE(log.lstat().st_mode) == 0
     finally:
+        log.chmod(0o600)  # the teardown reads the gate's log
         box.stop()
 
 

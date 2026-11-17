@@ -17,6 +17,7 @@ import pytest
 from expcore_onedata.sandbox.hostops import CmdResult, run_bounded
 
 AS_ANOTHER_UID = "import os\nos.geteuid = lambda: 2**31 - 7\n"
+AS_ROOT = "import os\nos.geteuid = lambda: 0\n"
 needs_unprivileged = pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 entry: nothing to restore")
 
 
@@ -47,6 +48,13 @@ def locked_afterwards(tree: Callable[[], Path]) -> Iterator[None]:
 def not_the_owner(source: str) -> str:
     """The copy helper's `source` as run by another uid (the module's docstring)."""
     return AS_ANOTHER_UID + source
+
+
+def as_root(source: str) -> str:
+    """The copy helper's `source` as Docker's helper runs it, as root: it reads whatever the modes say and restores
+    nothing. Only the listing's classification of a file by its mode and links is shown by it (this process is not
+    root, so it still cannot open what is locked)."""
+    return AS_ROOT + source
 
 
 class LocalHost:

@@ -15,9 +15,10 @@ not left to fail the run's collection, when the request sets `restore_locked` (o
 file or directory that lacks the owner's read bit (a directory also its search bit) it gives that bit back, nothing
 else, through a descriptor of the entry opened without following a link and checked against what was listed, on the
 listed file system only, and never to a file with another link (a mode belongs to the inode, which another name may
-hold outside the listed tree). An entry the helper cannot read, its root included, is listed as kind `x` and not
+hold outside the listed tree): such a locked file is listed as kind `x` on every backend, root included, so that Docker
+and Apptainer give the same outcome. An entry the helper cannot read, its root included, is listed as kind `x` and not
 descended into: the caller refuses it as the agent's own unreadable output (O71). The copy then finds every listed
-object readable. As root, the helper reads whatever the modes say and changes none.
+object readable. As root, the helper otherwise reads whatever the modes say and changes none.
 
 `copy`: one output, from `root` through the names `parts`, to the new path `dest`. Every directory on the way and every
 entry copied must be the object the listing showed: its device, inode, kind and size are compared with `ancestors`
@@ -91,19 +92,25 @@ def write(out, info, depth, name, kind=None):
 
 def readable(directory, name, info, device, restoring):
     """Whether the helper can read the file or directory `name` of `directory` (the root's path, `directory` None),
-    which `info` describes. With `restoring`, an entry the helper's own uid owns and that lacks the owner's read bit
-    (a directory's search bit too) first gets it back (`restore`): unless it is a file with another link. Anything but
-    a file or a directory, an entry of another file system and every entry as root are not this function's to judge:
-    True. An entry of another uid is not the helper's to change: a file is tried; a directory is judged by the open
-    that follows (one that opens but cannot be searched is not covered: no agent can make an entry of another uid)."""
+    which `info` describes. With `restoring` (the agent's own `/work`), a file the agent locked (no owner read bit) that
+    has another link is unreadable here whoever runs the helper, root included: a mode change belongs to the inode,
+    which another name may hold outside the tree, so it is never given back, and root's reading it is not a reason to
+    treat it differently from the unprivileged helper (the same outcome on every backend). An entry the helper's own
+    uid owns that lacks the owner's read bit (a directory's search bit too) otherwise first gets it back (`restore`).
+    Anything but a file or a directory, an entry of another file system and every other entry as root are not this
+    function's to judge: True. An entry of another uid is not the helper's to change: a file is tried; a directory is
+    judged by the open that follows (one that opens but cannot be searched is not covered: no agent can make an entry
+    of another uid)."""
     bits = OWNER_BITS.get(stat.S_IFMT(info.st_mode))
-    if bits is None or info.st_dev != device or os.geteuid() == 0:
+    if bits is None or info.st_dev != device:
+        return True
+    if restoring and stat.S_ISREG(info.st_mode) and info.st_nlink > 1 and not info.st_mode & 0o400:
+        return False
+    if os.geteuid() == 0:
         return True
     if info.st_uid != os.geteuid():
         return stat.S_ISDIR(info.st_mode) or opens(directory, name)
-    if info.st_mode & bits == bits:
-        return True
-    return restoring and (stat.S_ISDIR(info.st_mode) or info.st_nlink == 1) and restore(directory, name, info, bits)
+    return info.st_mode & bits == bits or (restoring and restore(directory, name, info, bits))
 
 
 def opens(directory, name):
