@@ -263,6 +263,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import secrets
 import shlex
@@ -1073,13 +1074,60 @@ def verified(results: Path, shard: Shard, scratch: Path) -> tuple[Path, dict[str
     return copy, manifest
 
 
-def unpack(tar_path: Path, into: Path) -> Path:
-    """Unpack an archive's `out/` into `into` (new), refusing any member outside it (`tarfile`'s data filter)."""
-    into.mkdir(parents=True)
+def _in_out(path: str) -> bool:
+    return path == "out" or path.startswith("out/")
+
+
+def _link_stays_in_out(member: tarfile.TarInfo) -> bool:
+    """A link's target is relative, has no `..` after a name (`a/../b` is `b` only while `a` is not a link) and lands in
+    `out/`: from the link's directory for a symbolic link, from the archive's root for a hard link."""
+    target = member.linkname
+    names = [part for part in target.split("/") if part not in ("", ".")]
+    ascent = next((n for n, part in enumerate(names) if part != ".."), len(names))  # the leading `..` parts
+    if not target or target.startswith("/") or ".." in names[ascent:]:
+        return False
+    base = (
+        "" if member.islnk() else posixpath.dirname(posixpath.normpath(member.name))
+    )  # `tarfile` drops a trailing `/`
+    return _in_out(posixpath.normpath(posixpath.join(base, target)))
+
+
+def archive_problem(members: Sequence[tarfile.TarInfo]) -> str | None:
+    """Why an archive is not an `out/` and nothing else, as a short class that carries nothing the archive wrote, or
+    None. `tarfile`'s data filter judges a member against the directory unpacked into, so it lets `out/../x` and a link
+    to `../x` land beside `out/`; here `out/` is the boundary. A member's name has no `..` and is `out` (a directory)
+    or under `out/`, a link stays in `out/` (`_link_stays_in_out`), and no member's path (a hard link's target too)
+    passes through a link of the archive, in whatever order, so that every link sits in a real directory."""
+    if not members:
+        return "holds something besides out/"
+    links = {posixpath.normpath(m.name) for m in members if m.issym() or m.islnk()}
+
+    def through_a_link(path: str) -> bool:
+        parent = posixpath.dirname(posixpath.normpath(path))
+        while parent and parent not in links:
+            parent = posixpath.dirname(parent)
+        return bool(parent)
+
+    for member in members:
+        if ".." in member.name.split("/"):
+            return "has a member name with a '..' component"
+        if not _in_out(member.name) or (posixpath.normpath(member.name) == "out" and not member.isdir()):
+            return "holds something besides out/"
+        if (member.issym() or member.islnk()) and not _link_stays_in_out(member):
+            return "has a link that leaves out/"
+        if through_a_link(member.name) or (member.islnk() and through_a_link(member.linkname)):
+            return "has a member written through a link"
+    return None
+
+
+def unpack(tar_path: Path, into: Path, *, label: str | None = None) -> Path:
+    """Unpack an archive's `out/` into `into` (new). An archive with a member that leaves `out/` (`archive_problem`) is
+    refused whole, before `into` is made or anything is extracted, naming the shard `label` and the kind of problem,
+    never a member. `tarfile`'s data filter stays on, for the rest it refuses (special files, absolute links)."""
     with tarfile.open(tar_path) as tar:
-        names = tar.getnames()
-        if not names or any(n != "out" and not n.startswith("out/") for n in names):
-            raise ShardsError("an archive holds something besides out/")
+        if problem := archive_problem(tar.getmembers()):
+            raise ShardsError(f"shard {label}: its archive {problem}" if label else f"an archive {problem}")
+        into.mkdir(parents=True)
         tar.extractall(into, filter="data")
     return into / "out"
 
@@ -1301,7 +1349,7 @@ def collect(plan: Plan, into: Path, refuse_newer: bool = False) -> list[Path]:
         raise
     outs = []
     for shard, (tar_path, _) in zip(plan.shards, found, strict=True):
-        out = unpack(tar_path, into / shard.label)
+        out = unpack(tar_path, into / shard.label, label=shard.label)
         tar_path.unlink()
         if not (out / LOCK_NAME).is_file():
             raise ShardsError(f"shard {shard.label}: its unpacked out/ has no {LOCK_NAME}")
@@ -1743,7 +1791,7 @@ def resume_into(args: argparse.Namespace, spec: Mapping[str, Any], base: str | N
     if (args.results / f"{args.label}.out.tar").exists():
         shard = Shard(args.index, args.count, args.label, Path("/"))
         tar_path, _ = verified(args.results, shard, work)
-        shutil.move(unpack(tar_path, work / "previous"), out)
+        shutil.move(unpack(tar_path, work / "previous", label=args.label), out)
         tar_path.unlink()
         if (out / out_snapshot.STORE).is_file():
             rebase_run_dirs(out / out_snapshot.STORE, out / out_snapshot.RUNS)
