@@ -43,8 +43,9 @@ declares: variables of the operator's the study needs in its dispatcher's enviro
 fault sanction (`pass_env = ["NAME", ...]`, names only). `plan`, `lines` and `resume-line` read each name's value from
 the operator's environment (`pin_pass_env`) before anything is printed or recorded, and refuse, naming the variable and
 never the value, a name that looks like a secret (KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL, AUTH) or is one the
-step sets itself (`PASS_ENV_OWN`, anything of EXPCORE_ or PYTHON), a variable that is unset and a value outside
-`[A-Za-z0-9._:=,+-]` (at most 128). Each line pins the value as an `env -i` word `NAME=VALUE` and declares it as
+step sets itself (`PASS_ENV_OWN`, anything of EXPCORE_ or PYTHON), a variable that is unset and a value that is
+neither a plain word (`[A-Za-z0-9._:=,+-]`, at most 128) nor an absolute path of `[A-Za-z0-9._/-]` with no `..` or
+`.` part and no `//` (`pass_env_path_ok`). Each line pins the value as an `env -i` word `NAME=VALUE` and declares it as
 `--pass-env NAME`; `step` (`check_pass_env`, its first act) passes the dispatcher exactly those, refusing with
 `PRE_STEP_REFUSED` a declaration its line gives no plain value for, and records each name and value in `step.json` and
 the archive's manifest. The post-run script runs in the dispatcher's environment and sees them; the guard does not.
@@ -325,9 +326,11 @@ def home_env(home: str) -> dict[str, str]:
 
 # The manifest's `pass_env` (O63): variables of the operator's the study needs in its dispatcher's environment, such as
 # the operator's half of a fault sanction. A name is plain upper case, is no secret by its look and is none the step
-# sets itself; a value is a short word of plain characters, so that no path, secret or shell syntax rides on a line.
+# sets itself; a value is a short word of plain characters or an absolute path of plain characters with no climbing, so
+# that no secret or shell syntax rides on a line.
 PASS_ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 PASS_ENV_VALUE = re.compile(r"[A-Za-z0-9._:=,+-]{0,128}")
+PASS_ENV_PATH = re.compile(r"/[A-Za-z0-9._/-]{1,1024}")
 PASS_ENV_SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH", re.IGNORECASE)
 PASS_ENV_OWN_PREFIXES = ("EXPCORE_", "PYTHON")
 PASS_ENV_OWN = frozenset({*ALLOWLIST, "HOME", "TMPDIR", *home_env(NO_HOME)})  # the step's own: never a declared one
@@ -395,12 +398,25 @@ def pass_env_name_problem(name: Any) -> str | None:
     return None
 
 
+def pass_env_path_ok(value: str) -> bool:
+    """Whether `value` is an absolute path of plain characters (`^/[A-Za-z0-9._/-]{1,1024}$`) with no `..` or `.`
+    part and no `//`: a name of a place a study may use, never a way up out of it."""
+    return (
+        PASS_ENV_PATH.fullmatch(value) is not None
+        and "//" not in value
+        and not any(part in (".", "..") for part in value.split("/"))
+    )
+
+
 def pass_env_value_problem(name: str, value: Any) -> str | None:
-    """Why `value` cannot be the value of the declared variable `name`, or None. The message names the variable and
+    """Why `value` cannot be the value of the declared variable `name`, or None: a plain word
+    (`^[A-Za-z0-9._:=,+-]{0,128}$`) or an absolute path (`pass_env_path_ok`). The message names the variable and
     never the value."""
-    if not isinstance(value, str) or PASS_ENV_VALUE.fullmatch(value) is None:
-        return f"pass_env variable {name}'s value does not match ^[A-Za-z0-9._:=,+-]{{0,128}}$"
-    return None
+    plain = isinstance(value, str) and PASS_ENV_VALUE.fullmatch(value) is not None and value not in (".", "..")
+    if plain or (isinstance(value, str) and pass_env_path_ok(value)):  # `.` and `..` are climbing, not words
+        return None
+    return (f"pass_env variable {name}'s value does not match a plain word (^[A-Za-z0-9._:=,+-]{{0,128}}$) or a plain "
+            "absolute path (^/[A-Za-z0-9._/-]{1,1024}$, no `..` or `.` part, no `//`)")  # fmt: skip
 
 
 def pass_env_names(declared: Any) -> tuple[str, ...]:

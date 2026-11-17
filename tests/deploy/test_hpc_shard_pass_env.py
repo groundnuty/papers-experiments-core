@@ -297,7 +297,8 @@ def test_o63_a_value_with_a_disallowed_character_refuses_the_plan_never_echoing_
 
 @pytest.mark.parametrize("value", ["/qzdir/../etc", "/qzdir/..", "/qzdir/../", "qzdir/rel", "./qzdir", "/qzdir/./x",
                                    "/qzdir/.", "/qzdir//x", "//qzdir", "/qzdir/my dir", "/qzdir/$HOME", "/qzdir/a;b",
-                                   "/qzdir/a:b", "/qzdir/\u00e9", "/qzdir/" + "p" * 1025, "/", "/\n"])  # fmt: skip
+                                   "/qzdir/a:b", "/qzdir/\u00e9", "/qzdir/" + "p" * 1025, "/", "/\n", ".",
+                                   ".."])  # fmt: skip
 def test_o63_a_value_that_is_neither_a_plain_word_nor_a_plain_absolute_path_refuses_the_plan(
     shards, tmp_path, capsys, monkeypatch, value
 ):

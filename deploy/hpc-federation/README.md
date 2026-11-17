@@ -783,8 +783,10 @@ A name matches `^[A-Z][A-Z0-9_]{0,63}$`, contains none of KEY, TOKEN, SECRET, PA
 (any case, anywhere in it) and is none the step sets itself: the allowlist's, `HOME`, `TMPDIR`, the XDG, Apptainer, uv,
 pip and git variables of its own home, anything starting `EXPCORE_` or `PYTHON`. `plan` and `lines` read each value
 from the environment they run in before any line is printed (`resume-line` the same, before it records its node); a
-variable that is unset, or whose value is not `^[A-Za-z0-9._:=,+-]{0,128}$` (so no space, slash, quote or shell
-character), refuses them naming the variable and never the value. Each line then pins the value: an `env -i` word
+variable that is unset, or whose value is neither a plain word (`^[A-Za-z0-9._:=,+-]{0,128}$`, but not `.` or `..`) nor
+an absolute path (`^/[A-Za-z0-9._/-]{1,1024}$`, such as `/srv/example/artifacts/tree`, with no `..` or `.` part and no
+`//`), so that no space, quote, `$`, `;` or other shell character rides on a line, refuses them naming the variable
+and never the value. Each line then pins the value: an `env -i` word
 `NAME=VALUE` after the step's own, and `--pass-env NAME` at the end of the step's arguments; `plan` prints
 `pass_env: {NAME: VALUE}` beside each line. What the operator's environment holds when the step starts is not read, so
 a step cannot gain or change one. With no `pass_env` the lines and the plan are what they were, word for word.
