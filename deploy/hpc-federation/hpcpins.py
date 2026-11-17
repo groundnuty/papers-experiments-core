@@ -13,12 +13,13 @@ bundle's own, so `values` hashes this checkout's copy.
 The template's `[sandbox.apptainer]` also declares where the federation's providers keep their data, `provider_storage
 = "@hpc_provider_storage@"` (O57): `values` fills the one word the site's settings give (`provider_storage`: the shared
 filesystem when the site has a scratch root, `HPC_STORAGE_ROOT`, else the nodes' tmpfs, never the root's path), and
-`check` refuses a template that declares the sandbox without it, since it would give a scratch federation a
-fingerprint a tmpfs one has: where a provider stores its data shapes a run's I/O timing, so shards on the two can
-never merge. The renderer reads the file it writes back (`hpcboot.check_provider_storage`).
+`check` refuses a template that declares the sandbox without it, or with it only in a comment, since it would give a
+scratch federation the fingerprint a tmpfs one has: where a provider stores its data shapes a run's I/O timing, so
+shards on the two can never merge. The renderer reads the file it writes back (`hpcboot.check_provider_storage`).
 """
 
 import hashlib
+import re
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -26,6 +27,12 @@ from hpcsettings import Site
 
 TMPFS, SHARED_FILESYSTEM = "tmpfs", "shared_filesystem"  # the platform layer's PROVIDER_STORAGE_KINDS, in this order
 STORAGE_KIND = "hpc_provider_storage"  # the placeholder of `[sandbox.apptainer] provider_storage` (O57)
+# The template's declaration of the Apptainer sandbox (its table's header, with or without a subtable, or a dotted key)
+# and of the providers' storage kind (a key at the start of a line: a comment never declares it).
+APPTAINER_DECLARED = re.compile(
+    r"^[ \t]*(?:\[[ \t]*sandbox[ \t]*\.[ \t]*apptainer[ \t]*[\].]|sandbox[ \t]*\.[ \t]*apptainer[ \t]*\.)", re.M
+)
+KIND_DECLARED = re.compile(r'^[ \t]*provider_storage[ \t]*=[ \t]*"([^"\n]*)"[ \t]*(?:#.*)?$', re.M)
 COLLECTOR = Path(__file__).resolve().parent / "bundle" / "egress-collector.py"
 CHUNK = 1 << 20
 # Each placeholder a template may name, the site variable that fills it and the Site field that holds it. A name holds
@@ -69,17 +76,28 @@ def provider_storage(site: Site) -> str:
     return SHARED_FILESYSTEM if site.storage_root else TMPFS
 
 
+def check_storage_kind(site: Site, template: str) -> None:
+    """Refuse a template that declares the Apptainer sandbox and does not declare the providers' storage kind as the
+    site has it (O57): the placeholder `@hpc_provider_storage@`, or that kind's own word. A key in a comment declares
+    nothing, and literal pins do not excuse the key. The renderer reads the file it writes back for the same
+    (`hpcboot.check_provider_storage`): this is the refusal before anything is submitted."""
+    if APPTAINER_DECLARED.search(template) is None:
+        return
+    declared = KIND_DECLARED.findall(template)
+    if not any(value in (f"@{STORAGE_KIND}@", provider_storage(site)) for value in declared):
+        raise RuntimeError(
+            "the platform template declares the agent's sandbox without the providers' storage kind as this site has "
+            f'it: add provider_storage = "@{STORAGE_KIND}@" to its [sandbox.apptainer] (a federation on scratch and '
+            "one on tmpfs would otherwise share a campaign fingerprint)"
+        )
+
+
 def check(site: Site, template: Optional[str]) -> None:
     """Refuse a site that leaves a placeholder of the template unfilled, or whose declared file is missing or has
     another SHA-256 than the one declared; the message names the variable, never the path. A template that names the
-    agent's sandbox and leaves out the providers' storage kind (`@hpc_provider_storage@`) is refused too (O57)."""
+    agent's sandbox and does not declare the providers' storage kind (`check_storage_kind`) is refused too (O57)."""
     wanted = named(template or "")
-    if wanted and f"@{STORAGE_KIND}@" not in (template or ""):
-        raise RuntimeError(
-            "the platform template declares the agent's sandbox without the providers' storage kind: add "
-            f'provider_storage = "@{STORAGE_KIND}@" to its [sandbox.apptainer] (a federation on scratch and one on '
-            "tmpfs would otherwise share a campaign fingerprint)"
-        )
+    check_storage_kind(site, template or "")
     for name in wanted:
         variable, attribute = PLACEHOLDERS[name]
         if not getattr(site, attribute):

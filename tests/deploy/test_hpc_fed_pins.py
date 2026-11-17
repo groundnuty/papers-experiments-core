@@ -298,6 +298,7 @@ def test_o63_a_copy_of_the_rendered_file_beside_a_study_reads_the_roots_secrets_
 # -- the storage kind of the providers (O57) ---------------------------------------------------------------------------
 
 KIND_LINE = 'provider_storage = "@hpc_provider_storage@"'
+PLAIN_SITE = {**SITE, "SH": "/invented/images", "L": "/invented/logs"}  # a tmpfs site, no agent files
 
 
 def edited_layout(folder: Path, edit) -> Path:
@@ -331,15 +332,63 @@ def test_o57_the_driver_s_two_kinds_are_the_words_the_core_accepts(pins):
     assert (pins.TMPFS, pins.SHARED_FILESYSTEM) == PROVIDER_STORAGE_KINDS
 
 
-def test_o57_up_refuses_a_template_that_declares_the_sandbox_and_not_the_storage_kind(hpc, tmp_path, site):
-    """O57: a template whose `[sandbox.apptainer]` names the site's pins and leaves the kind out would give a scratch
-    federation the fingerprint of a tmpfs one: `up` refuses it before anything is submitted, naming the key."""
-    layout = edited_layout(tmp_path / "layout", lambda text: text.replace(KIND_LINE, ""))
-    rig = Rig(hpc, tmp_path, layout=layout)
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda text: text.replace(KIND_LINE, ""),  # left out
+        lambda text: text.replace(KIND_LINE, "# " + KIND_LINE),  # named only in a comment
+        lambda text: text.replace(KIND_LINE, 'provider_storage = "shared_filesystem"'),  # another kind than the site's
+    ],
+    ids=["left-out", "in-a-comment", "another-kind"],
+)
+def test_o57_up_refuses_a_template_that_declares_the_sandbox_and_not_the_storage_kind_before_it_submits(
+    hpc, tmp_path, site, edit
+):
+    """O57: a template whose `[sandbox.apptainer]` leaves the kind out, names it only in a comment or hard-codes the
+    other kind would give a scratch federation the fingerprint of a tmpfs one (the site here has no scratch root): `up`
+    refuses it before anything is submitted, naming the key."""
+    rig = Rig(hpc, tmp_path, layout=edited_layout(tmp_path / "layout", edit))
     with pytest.raises(RuntimeError, match="provider_storage"):
         rig.up(site)
     assert not [c for c in rig.fake.calls if c[0] == "sbatch"]
     assert not (rig.root / "hpc-federation.json").exists()
+
+
+LITERAL_SANDBOX = f'[sandbox.apptainer]\nimage = "/invented/agent.sif"\nimage_sha256 = "{"a" * 64}"\n'
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        LITERAL_SANDBOX,  # literal pins, no placeholder at all: the preflight still sees the sandbox
+        LITERAL_SANDBOX + '# provider_storage = "@hpc_provider_storage@"\n',
+        LITERAL_SANDBOX + 'provider_storage = "scratch"\n',
+        LITERAL_SANDBOX + 'provider_storage = "shared_filesystem"\n',  # not this site's
+        "[sandbox.apptainer.gate_options]\nkey = 1\n",  # a subtable declares the table
+        'sandbox.apptainer.image = "/invented/agent.sif"\n',  # a dotted key too
+    ],
+    ids=["literal-pins", "comment-only", "unknown-word", "other-kind", "subtable", "dotted-key"],
+)
+def test_o57_the_preflight_reads_the_template_s_declaration_not_its_placeholders(pins, hpc, template):
+    """O57: `check` looks for the declaration itself: a template of literal pins is refused like one of placeholders."""
+    tmpfs_site = hpc.settings.site_from_environment(PLAIN_SITE)
+    with pytest.raises(RuntimeError, match="provider_storage"):
+        pins.check(tmpfs_site, template)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        LITERAL_SANDBOX + 'provider_storage = "tmpfs"  # this site\'s own\n',
+        LITERAL_SANDBOX + 'provider_storage = "@hpc_provider_storage@"\n',
+        'zone = { name = "zone" }\n# [sandbox.apptainer] is in a comment here\n',  # no sandbox declared
+    ],
+    ids=["its-own-word", "placeholder", "no-sandbox"],
+)
+def test_o57_the_preflight_accepts_the_site_s_own_kind_and_a_template_with_no_sandbox(pins, hpc, template):
+    """O57: the placeholder and the site's own word declare the kind; a template that declares no Apptainer sandbox is
+    not asked for one."""
+    pins.check(hpc.settings.site_from_environment(PLAIN_SITE), template)
 
 
 def test_o57_a_template_with_no_sandbox_declares_no_kind_and_needs_none(hpc, tmp_path, site):
