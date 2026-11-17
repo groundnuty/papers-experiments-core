@@ -155,6 +155,7 @@ STRICT_CHANGES = {
     "the platform file": "platform.toml",
     "the render identity": "render-identity.json",
     "the pilot's wiring": "day0-wiring.toml",
+    "the ingest's evidence": "ingest-evidence.json",
 }
 
 
