@@ -27,14 +27,17 @@ Compose (`up`, `reset --replicas` and `down`; see "An imported space").
   admin's access token and the declared users, writes one registration token per provider, starts the providers, waits
   until each is online, makes the spaces, has each supported by exactly its owner and its mirrors (a provider's panel
   reads, which can answer 500 for a while after its start, are tried again up to five times with a wait of 1, 2, 4 and
-  8 s; a write never is), makes the users
+  8 s; a write never is), then reads every space's support set back from Onezone and refuses any difference from the
+  layout's declaration, naming the space and the provider by layout label (`space <name>: supported by <provider> but
+  the platform doesn't declare it`, `space <name>: declares <provider> but it doesn't support the space`; an id that is
+  no provider of this deployment is only counted, as an undeclared provider), makes the users
   members of their spaces with exactly their privileges, writes the baseline files into every space that keeps them (all
   but those declared `baseline = false`), and writes `facts.json` and, from the layout's platform template,
   `platform.toml`. Last, it runs the platform layer's link check through that `platform.toml` (`fedlinks.py`, #221):
   each ordered (reading provider, source) pair of providers sharing a space must fetch a probe, a file of its own, from
   the layout's `probe_space` within the bound, or up fails naming the pair and the remedy; the report is written as `link-check.json` in the root, beside `facts.json`, atomically, by the platform layer's own writer (`expcore_onedata.linkrecord`): a fault injector's restore, a heal and the health gate's routine check write the same file after each of their all-pairs checks, whichever platform file they ran through (the root is the parent of the `[faults] journal` the file names), so it is always the latest check's whole report (one check at a time makes it, under a lock file `link-check.lock` beside it). Run on a federation that is up,
-  it starts what is stopped and checks every step again, the links included, and writes no baseline file (see "The
-  baseline" for changing a space's `baseline` key).
+  it starts what is stopped and checks every step again, the links and the support sets included, and writes no
+  baseline file (see "The baseline" for changing a space's `baseline` key).
 - **reset --clean** returns the deployment to clean: it starts what is stopped, checks every step again, removes
   everything in every space, ingested datasets included, and writes the baseline files again into the spaces that keep
   them; a space declared `baseline = false` is left empty. The providers, spaces and users keep their ids, so
@@ -193,7 +196,7 @@ stay under `@study_artifacts@`; `@hpc_root@` is for the root's own.
   | `<service>/persistence` | each service's state; up seeds the certificates and the CA into it before the first start |
   | `<provider>/storage` | each provider's POSIX storage |
   | `<owner>/import/<space>` | a writable import's copy of its dataset, made by up once (see "An imported space") |
-  | `facts.json` | what an integrator needs to write `platform.toml`: addresses, ids, names, where the credentials are, and the `root` a template's `@hpc_root@` was filled with; no secret |
+  | `facts.json` | what an integrator needs to write `platform.toml`: addresses, ids, names, where the credentials are, and the `root` a template's `@hpc_root@` was filled with; no secret. Each space's entry holds its declared `supported_by` and, beside it, `supported_by_measured` (the providers Onezone listed, by layout label) and `support_read_at` (the UTC time they were read) |
   | `link-check.json`, `link-check.lock` | the latest all-pairs link check's report (up's, and a restore's, a heal's and the health gate's routine check's, which write it too, through any platform file that names this root's `fault-journal`), and the lock that orders the checks that write it; no secret |
   | `platform.toml` (0600) | rendered from the layout's template, next to the CA and the secrets it names by relative path, or by absolute path where the template writes `@hpc_root@` |
   | `fault-journal/` | the fault injector's journal, when the fault test runs; every platform file of this federation names it in `[faults] journal`, and its parent, this root, is where the link-check record is written (`platform.toml` must be in that parent, or the table is refused at load) |
@@ -316,8 +319,10 @@ in an imported space unlinks the file from the import directory on a writable st
 file there, so a later scan imports it again under a new id. Run `down`, then `up`. `reset --replicas` is unchanged: it
 evicts from the mirrors only, whose storage is regular.
 
-**The facts.** Each space's entry in `facts.json` has `import`, `null` or `{ readonly, source_env, storage, scan }`: the
-variable's name, never the directory it names. `describe` adds `; imported (read-only) from $NAME` (or `(writable)`) to
+**The facts.** Each space's entry in `facts.json` has `supported_by`, the layout's declaration, and `supported_by_measured`
+with `support_read_at`, what Onezone listed and when (up refuses unless the two are equal, so a ready federation's
+entry holds the same providers twice, the measured ones sorted); and `import`, `null` or `{ readonly, source_env,
+storage, scan }`: the variable's name, never the directory it names. `describe` adds `; imported (read-only) from $NAME` (or `(writable)`) to
 the space's row.
 
 **The slot.** `layouts/storage-import.toml` declares `alpha-import` (imported, read-only, from

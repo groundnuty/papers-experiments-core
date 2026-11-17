@@ -194,7 +194,8 @@ def prepare(layout: Layout) -> None:
 
 
 def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
-    """Start the zone, bootstrap it, start the providers, and settle registration, spaces, support and members."""
+    """Start the zone, bootstrap it, start the providers, and settle registration, spaces, support (read back against
+    the declaration, O35) and members."""
     spec = layout.spec
     compose(layout, "up", "--detach", spec.zone.name)
     boot.wait_zone(ZONE_TIMEOUT_S)
@@ -208,6 +209,7 @@ def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
     boot.ensure_spaces()
     boot.ensure_import_storages()
     boot.ensure_support(SUPPORT_TIMEOUT_S)
+    boot.verify_support()  # each space's providers as the zone lists them, against the layout's declaration (O35)
     for space in spec.spaces:
         if spec.members(space.name):
             boot.ensure_members(space.name)

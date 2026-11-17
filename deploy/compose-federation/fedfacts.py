@@ -1,10 +1,11 @@
 """What up writes into the root for an integrator, and what the day-0 report records of a deployment.
 
 facts.json holds the addresses, ids and names a platform.toml needs, the declared layout's name, digest and memory
-limits, the root's allowed parent and how each imported space is held (its mode, the name of the variable that gave its
-source, its storage and its scan, never the source's path); never a secret, since credentials are named by their
-files. platform.toml is rendered from the layout's template with those facts, and with the root's own absolute path
-where the template names it (`@hpc_root@`, the HPC render's name; `render_root`). `describe` gives the deployment's
+limits, the root's allowed parent, each space's declared supporters beside the ones the zone listed (by layout label,
+with the time read) and how each imported space is held (its mode, the name of the variable that gave its source, its
+storage and its scan, never the source's path); never a secret, since credentials are named by their files.
+platform.toml is rendered from the layout's template with those facts, and with the root's own absolute path where the
+template names it (`@hpc_root@`, the HPC render's name; `render_root`). `describe` gives the deployment's
 table for the day-0 report.
 """
 
@@ -99,6 +100,14 @@ def import_facts(space: Space, ids: Ids) -> dict | None:
     }
 
 
+def support_facts(ids: Ids, space: str) -> dict:
+    """A space's support set as `verify_support` read it from the zone (O35): its providers by layout label, sorted, and
+    the time it was read, beside the declared `supported_by`. Nothing for a space no read was kept for, so facts built
+    by a bootstrap that never measured are what they always were."""
+    read = getattr(ids, "support", {}).get(space)
+    return {} if read is None else {"supported_by_measured": list(read.providers), "support_read_at": read.read_at}
+
+
 def facts_of(boot: Bootstrap) -> dict:
     """What an integrator needs to write platform.toml: addresses, ids, names and where the credentials are.
 
@@ -122,6 +131,7 @@ def facts_of(boot: Bootstrap) -> dict:
                 "owner": s.owner,
                 "mirrors": list(s.mirrors),
                 "supported_by": list(s.supporters),
+                **support_facts(ids, s.name),
                 "agent_visible": s.agent_visible,
                 "baseline": s.baseline,
                 "import": import_facts(s, ids),
