@@ -139,17 +139,28 @@ def test_o57_each_provider_step_is_given_its_own_recorded_storage_directory_and_
 
 def test_o57_without_a_scratch_root_each_provider_step_is_word_for_word_as_before(hpc, tmp_path):
     """O57: no HPC_STORAGE_ROOT, no storage argument: each provider's step is the bundle's batch script, the tarball,
-    its name, the zone's name, the admin's mail, the zone's address and every other provider's, exactly."""
+    its name, the zone's name, the admin's mail, the zone's address and every other provider's, exactly, then what the
+    layout's declared names add (O73): the zone's name is its declared one, the provider's own `--declared` and a
+    `--host` for each service of the federation, and nothing about storage."""
     site = make_site(tmp_path, scratch=False)
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     bundle = hpc.driver.BUNDLE
+    domain = "expcore-hpc-pilot.test"
+    hosts = sorted(
+        [f"--host=zone.{domain}=10.0.0.1", *(f"--host={n}.{domain}=10.0.0.{i + 2}" for i, n in enumerate(PROVIDERS))]
+    )
     for index, name in enumerate(PROVIDERS):
         peers = [f"10.0.0.{i}" for i in range(2, 7) if i != index + 2]
-        assert rig.provider_steps()[name] == [
+        before = [
             "bash", str(bundle / "provider.sbatch"), str(bundle), f"{site['SH']}/oneprovider.tar", name,
-            "node01.cluster.example.org", "admin@example.org", "10.0.0.1", *peers,
+            f"zone.{domain}", "admin@example.org", "10.0.0.1", *peers,
         ]  # fmt: skip
+        step = rig.provider_steps()[name]
+        assert step[: len(before)] == before
+        assert step[len(before)] == f"--declared={name}.{domain}"
+        assert sorted(step[len(before) + 1 :]) == hosts
+        assert not [word for word in step if word.startswith("--storage")]
     assert rig.state()["storage"] is None
 
 
@@ -410,7 +421,7 @@ def real_core(hpc, label, data=None, content=None):
             patch.setattr(hpc.fedlinks, "check_links", link_check_stand_in([]))
             return hpc.boot.core_phase(
                 layout, owner, values, environ=environ or {},
-                rest=lambda ca_file: SimpleNamespace(close=lambda: None), bootstrap=BootStandIn(label),
+                rest=lambda ca_file, **kwargs: SimpleNamespace(close=lambda: None), bootstrap=BootStandIn(label),
                 steps=lambda boot: None,
                 content=content or (lambda boot: SimpleNamespace(reset=lambda timeout: None)),
                 data=data or data_stand_in(),

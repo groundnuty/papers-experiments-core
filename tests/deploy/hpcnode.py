@@ -290,12 +290,10 @@ if url.endswith(":8443/configuration"):
     reply(200, body)
 if url.endswith(":8443/api/v3/onezone/configuration"):
     reply(200, {"name": "zone-a", "domain": state["domain"]})
-if url.endswith(":8443/api/v3/onezone/user/tokens/named") and method == "POST":
-    reply(201, {"token": "minted-registration-token"})
 if url.endswith(":8443/api/v3/onezone/user"):
     reply(200 if creds and creds[0] == "admin" else 401, {"userId": state["adminUserId"]})
 if url.endswith(":8443/api/v3/onezone/user/tokens/named") and method == "POST":
-    reply(200 if creds and creds[0] == "admin" else 401, {"token": state.get("token", "token-1")})
+    reply(200 if creds and creds[0] == "admin" else 401, {"token": state.get("token", "minted-registration-token")})
 if url.endswith(":9443/api/v3/onepanel/provider/storages") and method == "GET":
     reply(200, {"ids": ["storage-1"]})
 reply(599, {"unexpected": url})

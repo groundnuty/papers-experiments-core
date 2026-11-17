@@ -697,7 +697,7 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
     out = hpc.boot.core_phase(
         layout, (5001, 5001), {**hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, root),
                                **pin_values(tmp_path / "agent")},
-        rest=lambda ca: SimpleNamespace(close=lambda: None),
+        rest=lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
         bootstrap=lambda rest, layout, owner: SimpleNamespace(layout=layout, ids=ids, spec=layout.spec),
         steps=lambda boot: None,
         content=lambda boot: SimpleNamespace(reset=lambda timeout: None),

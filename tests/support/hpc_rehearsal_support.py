@@ -190,7 +190,7 @@ def driver_maker(deploy: Deploy, fed: Federation) -> Any:
         )
         driver.verify = functools.partial(  # `verify-data`: each ingested space read back as the same stand-in holds it
             boot.verify_ingested,
-            rest=lambda ca: SimpleNamespace(close=lambda: None),
+            rest=lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
             bootstrap=BootStandIn(fed.label),
             data=fed.data,
         )
