@@ -225,6 +225,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `B` | the bundle on a filesystem the nodes see (`<shared_root>/hpc-federation/bundle`), `chmod -R go-w` |
 | `SH` | a 0700 directory for the two rootfs tarballs, each with its `.provenance` (SHA-256): single files only (`<scratch_root>/hpcop-images`) |
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
+| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's venv, clone and data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository. The optional keys of the driver and the agent's sandbox are in `site.env.example`; the four of the next
@@ -232,16 +233,18 @@ section are the provider storage on scratch and its inode guard.
 
 ## Provider storage on scratch, and the inode guard
 
-The shared scratch filesystem has room for a federation's data and a limited inode quota (a pilot-shape federation's
-data is about 17,500 files, and every federation of an account counts against one quota). `DESIGN.md`, section 11, is
-the full contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
+With `HPC_STORAGE_ROOT` set, each provider stores its data (its posix storage, `/volumes/posix` in its cell) in a
+directory of its own on the shared scratch filesystem instead of its node's tmpfs, and the inode guard is mandatory. The
+shared scratch filesystem has room for a federation's data and a limited inode quota (a pilot-shape federation's data is
+about 17,500 files, and every federation of an account counts against one quota). `DESIGN.md`, section 11, is the full
+contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
 
 | Key | What |
 |---|---|
-| `HPC_STORAGE_ROOT` | an existing directory on the scratch filesystem that only you can write (`<scratch_root>/hpcop-storage`, `mkdir -m 700`: owned by you, no group or other write bit, which `up` and `down` both check), neither inside the federation's root nor a shared tree. With none, nothing below runs |
+| `HPC_STORAGE_ROOT` | an existing directory on the scratch filesystem that only you can write (`<scratch_root>/hpcop-storage`, `mkdir -m 700`: owned by you, no group or other write bit, which `up` and `down` both check), neither inside the federation's root nor a shared tree, and named by its real path (no symbolic link on the way, which `up` refuses: the nodes bind through none). With none, nothing below runs |
 | `HPC_QUOTA_CMD` | the site's command that prints the account's inode usage and quota (`<quota tool> --inodes <scratch_root>`), split as a shell would split it and **run without a shell** on the login node |
 | `HPC_QUOTA_PATTERN` | a regular expression with the named groups `used` and `quota` that reads its output and matches **exactly once** (`inodes used (?P<used>[0-9,]+) of (?P<quota>[0-9,]+)` reads an invented line); you write it for the real output, which this repository never holds |
-| `HPC_QUOTA_CHECK` | `off` skips the check, and `up` says so; the only value, and unset is not off |
+| `HPC_QUOTA_CHECK` | **refused with `HPC_STORAGE_ROOT`**: the check is mandatory for a federation bound onto scratch, so the site is not loaded with both. Without a scratch root there is no check, and `off` (its only value) changes nothing |
 
 - **`up` checks before it submits anything:** it reads the usage and the quota through the command, estimates the
   federation's inodes from its data manifests (every space's manifest once, files and directories; a shared import's
@@ -250,14 +253,30 @@ the full contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   exactly at the line passes. **It fails closed:** a command or pattern that is not set, a pattern that does not compile or
   lacks a group, a command that cannot run, fails or does not answer in 120 s, an output the pattern does not match exactly
   once, a figure that is no count (`unlimited` is none) or that the pattern cut out of a longer one (`1000.5`, `2G`: the
-  pattern must capture the whole figure) and a quota of 0 all refuse `up`, naming why; only
-  `HPC_QUOTA_CHECK=off` turns the check off. For the ingest layout the estimate is a handful (its spaces declare no data);
+  pattern must capture the whole figure) and a quota of 0 all refuse `up`, naming why; nothing turns the check off.
+  For the ingest layout the estimate is a handful (its spaces declare no data);
   for `layouts/pilot-shape-import.toml` it is the four imported manifests.
 - **`up` then makes the federation's storage:** below `HPC_STORAGE_ROOT`, one directory of its own named for its allocation
   (0700) and one per provider, each by an exclusive `mkdir` that never adopts what is already there and each holding an
-  owner marker, recorded in the state file before the first is made. **Not built yet:** the bundle's bind of each directory onto its
-  provider's `/volumes/posix`; until it is, a provider's posix storage is on its node's tmpfs and the directories are
-  empty. The guard and the removal are written for that bind.
+  owner marker, recorded in the state file before the first is made, and in each provider's, beside its marker, the
+  empty directory it stores in (`posix`, 0700).
+- **Each provider stores there:** its job is given that directory (`--storage=PATH`, from the state's record checked
+  whole), `configure.sh` has `bundle/posixstorage.py` check it (the form `up` makes for this provider, no link on the
+  way, 0700 and yours (a setgid bit the scratch passes down is allowed), the marker naming the provider and the
+  allocation, empty and not on the node's memory) and
+  record it in the work directory, and the service binds it writable onto `/volumes/posix` at every start, `hpcfed.py
+  start` included, which gives the start the same path again from the state: the bind happens only when the record
+  names exactly it. A refusal stops the start: a provider never falls back to tmpfs or another directory. The provider runs as you in its
+  cell, so 0700 is all it needs, and it never sees the marker, which stays beside the bound directory. Its storage is at
+  the same path in the cell, so it is declared to Onedata as before (`finish.sh`), and the data check reads each space
+  through its owner, wherever that stores it. Without `HPC_STORAGE_ROOT` the provider's step and the service's argv are
+  word for word what they were.
+- **The storage kind is part of the experiment.** Where a provider stores its data shapes a run's I/O timing, so the
+  rendered `platform.toml` declares `provider_storage = "shared_filesystem"` (`"tmpfs"` without a scratch root) in
+  `[sandbox.apptainer]`, never the root's path. The platform fingerprint and each run's facts carry it, so shards on
+  tmpfs and on scratch never merge, and a campaign cannot resume from one onto the other. A platform template that
+  declares the agent's sandbox must name it (`provider_storage = "@hpc_provider_storage@"`, as `layouts/pilot-shape`'s
+  does): `up` refuses one that does not, before anything is submitted. The Compose federation has no such setting.
 - **`down` removes exactly those directories,** after the job is gone and every service verified clean, and counts what
   remains: any entry fails it loudly, with the root and the state kept for a second `down`. It reads the paths from the
   state file alone, refuses a record that is not the exact form `up` writes (a state with the scratch root and no record
@@ -265,6 +284,8 @@ the full contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   this `up`'s marker (a provider's directory replaced by another of yours included), a link in a directory's place, an
   entry it did not make. Each directory is held open and proved before any is removed, and emptied through its
   descriptor, so a path swapped afterwards is never followed. A link inside a directory is removed, never followed.
+  The bind lives only in the provider's container, so the teardown's removal of its work directory never reaches the
+  storage on scratch: only `down` removes it, after the provider has stopped.
 
 ## A shared imported tree
 
@@ -335,23 +356,27 @@ sbatch --account="$HPC_ACCOUNT" --partition="$HPC_PARTITION" --no-requeue --time
   --mem=24G --output="$L/build-oz-%j.log" --wrap "bash $B/build-rootfs.sh oz $SH/onezone.tar"
 # 1. The zone on node A, listing every provider's address as a peer.
 ZJ=$(sbatch --parsable --account="$HPC_ACCOUNT" --partition="$HPC_PARTITION" --nodelist=<node-A> --time=03:30:00 \
-  --mem=32G --output="$L/hpcop-zone-%j.log" "$B/zone.sbatch" "$B" "$SH/onezone.tar" <zone-name> <provider-address>)
+  --mem=32G --chdir=/ --output="$L/hpcop-zone-%j.log" "$B/zone.sbatch" "$B" "$SH/onezone.tar" <zone-name> \
+  <provider-address>)
 # 2. A provider on node B, registered to the zone with a single-use token that travels only through the pipe.
 PJ=$(sbatch --parsable --account="$HPC_ACCOUNT" --partition="$HPC_PARTITION" --nodelist=<node-B> --time=03:00:00 \
-  --mem=32G --output="$L/hpcop-provider-%j.log" "$B/provider.sbatch" "$B" "$SH/oneprovider.tar" <provider-name> \
-  <zone-fqdn> <admin-email> <zone-address>)
-srun --jobid="$ZJ" --overlap --export=PATH -n1 -c1 --mem=200M bash "$B/mint-registration-token.sh" <provider-name> \
-  </dev/null | srun --jobid="$PJ" --overlap --export=PATH -n1 -c1 --mem=1G bash "$B/deliver-token.sh"
+  --mem=32G --chdir=/ --output="$L/hpcop-provider-%j.log" "$B/provider.sbatch" "$B" "$SH/oneprovider.tar" \
+  <provider-name> <zone-fqdn> <admin-email> <zone-address>)
+srun --jobid="$ZJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=200M bash "$B/mint-registration-token.sh" \
+  <provider-name> </dev/null | srun --jobid="$PJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=1G \
+  bash "$B/deliver-token.sh"
 # 3. Teardown: providers first, then the zone.
-srun --jobid="$PJ" --overlap --export=PATH -n1 -c1 --mem=100M bash "$B/teardown.sh" op </dev/null
-srun --jobid="$ZJ" --overlap --export=PATH -n1 -c1 --mem=100M bash "$B/teardown.sh" oz </dev/null
+srun --jobid="$PJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=100M bash "$B/teardown.sh" op </dev/null
+srun --jobid="$ZJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=100M bash "$B/teardown.sh" oz </dev/null
 scancel "$PJ" "$ZJ"
 ```
 
 The token delivery step needs about 1 GB: the seventh live run's step was killed for memory under `--mem=100M`.
 Each batch job runs its service from the batch step itself (`node-init.sh`, `configure.sh`, `run-*.sh`,
 `finish*.sh`), so polling costs no job steps; read a work directory's `run.log` with
-`srun --jobid=<job> --overlap --export=PATH -n1 cat <workdir>/run.log </dev/null`. On a failed start the batch
+`srun --jobid=<job> --overlap --export=PATH --chdir=/ -n1 cat <workdir>/run.log </dev/null`. Give every `srun` and
+`sbatch` a `--chdir=/`: a step or job otherwise starts in the directory it was called from, or, where that does not
+exist on the node, in the node's shared `/tmp`. On a failed start the batch
 script stops the service, deletes and redacts every secret (`scrub.py`) and keeps the logs for
 `HPCOP_INSPECT_SECONDS`. A job whose service stopped at `teardown.sh`'s request ends with status 0; a service that
 ends any other way fails the job, with its own status. `--exclusive` keeps other users off a node, at the price of
@@ -366,11 +391,18 @@ fake Slurm; not run live.**
 
 ```bash
 set -a; . deploy/hpc-federation/site.env; set +a
-uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
   --root <a directory on a filesystem the login node and the nodes see> describe   # the plan and what it bills
-uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> up
-uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> down
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> up
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> verify-data   # after the study's ingest
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> down
 ```
+
+Run them as shown, `python -I -B`, from the checkout or another directory of ours, never a shared one such as the
+login node's `/tmp`: `uv run` takes the project of the working directory when it has a `pyproject.toml`, and builds it.
+Every Python the driver itself launches runs with `-I -B` (the fault relay among them, in the federation's root), so
+the working directory never reaches its `sys.path` and no bytecode is written beside what it imports (`DESIGN.md`,
+section 3).
 
 - **The layout** is a `deploy/compose-federation` layout (its providers, spaces, principals, probe space and platform
   template) with an `[hpc]` table of sizes, which Compose ignores: the held job's `--time`, each service step's cores
@@ -385,6 +417,18 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   back as the services' job is, and `down` releases both. The state file's `sandbox` record names its node, its job
   and its het group, which M5's shard step takes. With the pilot's shape and a memory weight of 0.5 this bills about
   42 units per hour, against 63 for one uniform 18 GB shape (`DESIGN.md`, section 1).
+- **A site whose switch plugin gives each job a virtual network identifier (VNI)** (HPE Slingshot's does) refused a
+  heterogeneous job's steps on component 0 from a point on, in the second live slot (16 Nov 2026): after the zone and
+  five providers had started, every further step on a service node failed with `srun: error: task 0 launch failed:
+  Error configuring interconnect`, so `up` failed at the first provider's registration. A step on component 1 ran,
+  `--network=no_vni` ran on component 0 and `--network=single_node_vni` failed like no option, and the same steps ran
+  in a held job of one component in two earlier live runs. Whether a count of steps per component or exhausted
+  identifiers is the cause is not established. **Two ways round it, neither the default (another site is unchanged by
+  either):** `HPC_STEP_NETWORK=no_vni` in `site.env`, which puts `--network=no_vni` on every step the driver launches
+  (the services talk over TCP and need no VNI), and `sandbox_placement = "separate"` in the layout, which makes the
+  services' job a job of one component. **On such a site, start from `separate`:** it changes nothing about the steps,
+  where `no_vni` does, though it needs a second held job the partition may refuse. Not yet seen live on such a site: a
+  whole `up` with either, and a step on component 1 with `no_vni`.
 - **The agent's sandbox** (O63): the pilot's template declares the Apptainer sandbox, whose limits size the agent's
   node (an 8-core, 17 GiB step), and names the site's values as placeholders `up` fills from `site.env`:
   `HPC_AGENT_SIF`, `HPC_EGRESS_SHIM` and `HPC_ONECLIENT_BUNDLE` (the mount level's oneclient, O65) with their
@@ -394,7 +438,19 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   is the bundle's own, hashed from this checkout. The rendered file's pins are in the campaign fingerprint
   (`sandbox_backend`), no path is. Every path `up` renders into the root is absolute (`@hpc_root@`), so a copy of the
   file (the one a shard step places beside a study) reads the root's secrets, CA and journal.
-- **The data each space holds** (C06, O63): every template's `[[spaces]]` entry names its `data_manifest`. A shared import's is the manifest its layout names; every other space's is written by `up` into `<root>/data-manifests/` from its baseline, the same for every federation of a layout. Before the link check `up` reads every space back through its owner (directories, sizes, bytes; a shared import by `verify_imports`) and fails, naming the space, when it is not exactly its manifest. So shards on two federations of one layout record one campaign fingerprint (each space by its declared identity and its data, never its Onezone id), and `shards.py plan` refuses federations whose platform files leave a space's data undeclared.
+- **The data each space holds** (C06, O63, O57): every template's `[[spaces]]` entry names its `data_manifest`. A shared import's is the manifest its layout names; a baseline space's is written by `up` into `<root>/data-manifests/` from its baseline, the same for every federation of a layout; an ingested space's is the one it declares (below). Before the link check `up` reads every baseline space back through its owner (directories, sizes, bytes; a shared import by `verify_imports`) and fails, naming the space, when it is not exactly its manifest. So shards on two federations of one layout record one campaign fingerprint (each space by its declared identity and its data, never its Onezone id), and `shards.py plan` refuses federations whose platform files leave a space's data undeclared.
+- **An ingested space** is one whose data is the study's own, put there after `up`: `baseline = false`, no `import`, and its `@data_manifest.<space>@` named by the template (a probe space, which nothing names, is not one). Its baseline is empty, so a manifest made from that would fingerprint two federations that ingested different bytes alike; it **declares its manifest** instead, `data_manifest = "@study_artifacts@/manifests/<space>.json"` (or an absolute path) on the space in the layout, and `up` renders that path for the space. The file is in the core's import-manifest format (`expcore_onedata.importmanifest`: `{"version": 1, "files": [{"path", "size", "sha256"}, ...], "directories": [...]}`, files and directories sorted by path, every parent directory listed; `manifest_of_tree` makes one from a local copy of the data); `PlatformConfig.fingerprint()` takes `Manifest.digest()`, the SHA-256 of its canonical JSON, as for any `data_manifest`. A space that declares none is held to the empty manifest, so ingested bytes fail the check below; a template that writes a `data_manifest` path of its own is refused at `up`, since only the manifests `up` renders are checked. `up` checks it neither way (the space holds nothing yet) and prints which spaces await the check. **The order is `up`, the study's ingest, `verify-data`, `shards.py plan`:** `hpcfed.py verify-data` reads each ingested space back through its owner, compares every file's path, size and SHA-256 and every directory with the manifest, and exits 1, naming the space and how many files differ, on any difference; on a pass it records, in the state file (`data.ingested.<space>.verified`), a marker bound to the manifest's digest. `shards.py plan` and `lines` refuse a federation whose ingested spaces have no marker, whose marker is for another manifest than `up` recorded or the platform file names now, or whose state predates the record. A later ingest needs another `verify-data`: nothing watches the space after it. `verify-data` runs on the login node (it reaches the services' 8443 from there, as `core = "login"` does).
+- **The render identity** (O74, `hpcidentity.py`): once `platform.toml` is rendered, `up` writes
+  `<root>/render-identity.json` (mode 0600, canonical JSON, sorted keys), which holds hashes and a version and nothing
+  else: `version` (`expcore-render-identity/1`), `template_sha256` (the template as the renderer read it, before it was
+  rendered), `platform_fingerprint_sha256` (the canonical JSON of the rendered file's `PlatformConfig.fingerprint()`,
+  hashed as the core hashes a fingerprint) and, for each pin the rendered platform holds, the SHA-256 `up` filled in and
+  checked: `sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256` and `oneclient_bundle_sha256`. A pin
+  the template does not name is not in the record, and no entry is ever empty. It holds no address, id, job, node, path,
+  user or secret. Two federations rendered from one template, with the same pins and the same data (every space
+  declaring its `data_manifest`, as above), have byte-equal records; a changed pin changes its own entry and the
+  fingerprint, which holds the Apptainer backend's pins, and an edited template changes the template's. A layout with no
+  platform template writes none. `shards.py step` compares it with the record a plan expects (below).
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
@@ -402,7 +458,8 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   passphrase (0600) and the Onedata test CA's certificates, never its key, into the root (`bundle/zone-export.sh`,
   `hpcca.py`); then bootstraps the federation
   through the Compose bootstrap over `https://<node FQDN>:8443`, writes its baseline, `facts.json` and
-  `platform.toml`, and runs the platform layer's link check, which writes `link-check.json` in the root; last, when
+  `platform.toml` and its render identity (`render-identity.json`), and runs the platform layer's link check, which
+  writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, checks each node
   for the recorded work directory, sweeps the agent's node (`shards.py sweep`, a control step there: every shard step's
@@ -411,11 +468,13 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   `up`: it finds them there), then removes the provider storage on scratch that `up` recorded, when there is one, and
   shows by a count that none of it remains (the previous section), and removes the root. After a partial `up` it finds the
   job by its recorded id, or by its allocation's exact name.
-- **Every step** is `srun --jobid --exact` with a name, its size and `/usr/bin/env -i PATH=... LC_ALL=C TMPDIR=<node
-  tmpfs>`; no step uses `--overlap`; a control step's srun client is ended only once its step is gone from `squeue
-  -s`, and one still listed at its bound is cancelled by its own id.
+- **Every step** is `srun --jobid --exact` with a name, its size, `--chdir=/` and `/usr/bin/env -i PATH=... LC_ALL=C
+  TMPDIR=<node tmpfs>` (and `--network=<value>` when `site.env` sets `HPC_STEP_NETWORK`, on every step `up`, `down` and
+  the service verbs launch; the line `shards.py lines` prints for a shard step is the manifest's own and does not carry
+  it), and every Python in it runs with `-I -B`; no step uses `--overlap`; a control step's srun client is ended only
+  once its step is gone from `squeue -s`, and one still listed at its bound is cancelled by its own id.
 - **The site** comes from `site.env` (`HPC_ACCOUNT`, `HPC_PARTITION`, `SH`, `L`, and optionally `HPC_STEP_PATH`,
-  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, and the four keys of the
+  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, `HPC_STUDY_ARTIFACTS`, and the four keys of the
   provider storage on scratch), recorded in the state file at `up` (of the storage keys, only `HPC_STORAGE_ROOT`), so `down` and the service verbs need no environment. The bundle is this checkout's own, which must lie on a
   filesystem the nodes see. The first `python3.11` on `HPC_STEP_PATH` must be the node's own, not a uv-installed one:
   the bundle's `supervise.py` needs `os.pidfd_open`.
@@ -445,6 +504,7 @@ import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs
 | `build-rootfs.sh` | job | pull, build the shim with the image's gcc, prep, preload check, tar, SHA-256 |
 | `node-init.sh` | batch step | node checks, leftovers of earlier jobs removed, tarball checks, work directory, per-launch secrets, file default check |
 | `configure.sh`, `run-node.sh`, `run-zone.sh` | batch step | configuration, peers, the service under `supervise.py` |
+| `importstorage.py`, `posixstorage.py` | batch step | a shared imported tree's read-only bind (O59); a provider's own storage directory on scratch, checked and bound onto `/volumes/posix` (O57) |
 | `finish.sh`, `finish-zone.sh` | batch step | readiness and the guard's verdict, the host-side guard, storage, REST checks, rotation, live default and port check |
 | `check-defaults.sh` | node | fails on an image default, a leaked secret or a listener outside the model |
 | `mint-registration-token.sh`, `deliver-token.sh` | steps | a 1 h single-use registration token, from the zone's job into a 0600 file of the provider's |
@@ -472,10 +532,20 @@ line, whose environment is an allowlist (`PATH`, `LC_ALL` and the federation's r
 the stamped study to the node's tmpfs (the store's lock refuses a network filesystem), checks the interpreter imports
 the core it was given, runs `python -m expcore run STUDY --shard i/N --shard-label L`, and once the dispatcher has
 exited writes the copy's `out/` whole to `<results>/<label>.out.tar` with a manifest. `shards.py collect --manifest
-shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only and prints the `python -m expcore merge`
-line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's docstring
-has its form). Outage runs (`[faults]`) go through the login node's fault relay (M4), which `up`
+shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only into DIR (a new or empty 0700 directory of
+ours) and prints the `<python> -I -B -m expcore merge` line (`--run` runs it in DIR). The manifest names the site's
+paths and stays out of the repository (the script's docstring has its form). Outage runs (`[faults]`) go through the
+login node's fault relay (M4), which `up`
 starts.
+
+> **A bare copy of the core without `.git` is refused as `core_src`.** The core names itself by its commit in every
+> campaign's environment (`provenance.core_identity`), read from the git work tree its `src/` lies in, or from the build
+> record of a wheel made from one. A copy of the core's files without `.git` (a tarball, an `rsync` that leaves `.git`
+> out, a `git archive`) has no commit to name: its identity is unknown, and `expcore run`, `check`, `merge` and `analyze`
+> refuse to start on a core whose commit is unknown, with or without the allow-dirty option, so every shard step on it
+> stops at its start with "the core's commit is unknown". Point `core_src` at the `src/` of a `git clone` (or install a
+> wheel built from one into the interpreter's environment), and commit what you run: a checkout with uncommitted changes
+> is refused too unless the command allows dirt, and a campaign run so records the core dirty.
 
 **What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the
 step makes its `work_root` (0700) before the dispatcher and refuses one that is a link, another user's, open to others
@@ -488,6 +558,107 @@ shard's, of its own campaign; it refuses while one still runs) and by `down`'s s
 dispatcher ended and whose `out/` was not archived (exit 75, or killed before the archive) is kept and named:
 `--resume` refuses while it is there, and `shards.py step ... --archive-left` archives it with the same manifest and that
 step's exit status, then removes it, unless an archive was published after that step started.
+
+**The study's own refusals: a pre-step guard.** A study that refuses a campaign it must not run (one worker, each
+planned model's cap exactly 1, a federation root of its own) can have every shard step assert that again, from its
+stamped `campaign.toml`, before the step makes anything. The manifest declares one script of the study:
+
+    pre_step = "guards/pre_step.py"   # a path relative to the study's root
+    pre_step_timeout_s = 60           # optional, with pre_step: above 0, at most 600 (60 by default)
+
+`shards.py plan` and `lines` read the file and record its SHA-256 (`plan` prints `{path, sha256, timeout_s}` as
+`pre_step` beside each line), and each line then ends in `--pre-step REL --pre-step-sha256 HEX --pre-step-timeout S`.
+They refuse a path that is absolute, has an empty, `.` or `..` part, or goes through a link, a file that is a link, is
+not a regular file, is missing or is over 1 MiB, printing nothing; a plan that has not pinned the guard makes no line.
+`collect` never reads it. With no `pre_step` the lines and the plan are what they were, word for word.
+
+`step` runs the guard first, before the core check, before a `--resume` removes a killed step's directory, and before
+it makes the sandbox's work root, its own directory on the tmpfs, the journals or an archive. It opens the study's root
+(`--study`, the stamped copy: the step's tmpfs copy does not exist yet) once and holds it, and refuses a root that is
+not a directory of this user's or that group or others can write to. It reads the guard part by part below that
+descriptor with no link followed, refuses a file whose SHA-256 is not the one on the line, and runs those bytes, never
+the file read a second time: `<python> -I -B - <label> <campaign.toml>`, the script on the interpreter's stdin. The
+guard's `sys.argv[1]` is the shard's label and `sys.argv[2]` names the stamped `campaign.toml` through the held root
+(a path under `/proc/self/fd`, good in the guard only), and its working directory is that same root, so a root renamed
+after the check is never the one it runs in. It runs with the same interpreter as the step, in an environment of the
+step's allowlist (`PATH`, `LC_ALL`, `EXPCORE_FED_ROOT_PARENT`, `EXPCORE_FED_ROOT`) and its no-home variables and nothing
+else, and in a session of its own, killed with everything it started when it does not end within its bound or when the
+step is told to stop. Its stdout and stderr are the step's. A non-zero exit, a signal, a timeout, a hash that is not the
+plan's or a guard that cannot be read refuses the step with exit status 73 (`PRE_STEP_REFUSED`), naming the guard and
+why, and leaves nothing made. A step that passes records `pre_step: {path, sha256, exit_status}` in its `step.json`
+and in its archive's manifest (`<label>.out.json`).
+
+The guard rides on the generated line, so running a line directly runs it; nothing in `lines` skips it. What it does
+not cover: a line edited by hand to drop the three `--pre-step` words runs without it, and `step --archive-left`, which
+starts no work and makes no directory, ignores them, so a refusing guard cannot strand the only whole `out/` of a step
+(the archive carries the record of the guard that step ran). The guard is the study's own code, hashed as it was when
+the plan was made (run `lines` again after editing it); it is not a sandbox, and it asserts only what its own file reads.
+
+**The study's own check of its results: a post-run script.** The same shape for the check that needs the live
+federation, such as the study's owner check of what the shard left in it:
+
+    post_run = "guards/post_run.py"   # a path relative to the study's root, with the guard's path rules
+    post_run_timeout_s = 300          # optional, with post_run: above 0, at most 1800 (300 by default)
+
+`plan` and `lines` record its SHA-256 too (`plan` prints `post_run: {path, sha256, timeout_s}`), and each line ends
+with `--post-run REL --post-run-sha256 HEX --post-run-timeout S` after the guard's words. `step` reads and hashes it
+with the guard, before anything is made: a script that is a link, missing or not the plan's hash refuses the step with
+73, so a campaign is never spent on a check that cannot run. It holds the bytes and runs them once the dispatcher has
+exited 0, while the federation is up, and before `archive()`: `<python> -I -B - <label> <out/> <exit status>`, so
+`sys.argv[1:]` is the shard's label, the path of the study copy's `out/` on the node's tmpfs and the dispatcher's exit
+status (`0`). Its working directory is the study copy's root on the tmpfs and its environment is the dispatcher's own
+(the allowlist, the step's home and TMPDIR), in a session of its own, killed at its bound or when the step is told to
+stop. It may read `out/` and the federation, and it may write into `out/`, which is archived afterwards.
+
+An exit 0 makes the shard's results **final**. A non-zero exit, a signal, a timeout, or a dispatcher that did not exit 0
+(the script is then not run) leaves them **not final**. They are archived all the same, so nothing is lost: the
+manifest says `final: false` and the script's record with its reason, the archived `out/` holds `NOT-FINAL.json` (written into the archive itself, so a full tmpfs cannot leave it out), and
+the step ends with exit status 74 (`POST_RUN_FAILED`) when the dispatcher's own status was 0, the dispatcher's otherwise.
+A step's record (`step.json`) and its manifest hold `post_run: {path, sha256, ran, exit_status, final}` (and a `reason`
+when not final); with none declared the record, the manifest and the archive are what they were. `collect` refuses a
+shard that is not final, naming it and the reason, before it unpacks anything, and, when the plan declares a post-run
+script, a shard whose manifest does not say `final: true` with that script's hash (a line that dropped the words). The
+core's `python -m expcore merge` refuses an `out/` holding `NOT-FINAL.json`, naming the shard. `--resume` starts from a
+not-final archive as from any other, without the mark, and decides afresh; `step --archive-left` of an `out/` kept on the
+node archives it final only when the step's record says its script passed, and not final (with the mark) otherwise, so a
+step killed before its script passed is never archived as final.
+
+**Which render a shard runs against: the render identity (O74).** A shard is one experimental condition across
+federations only when every federation was rendered alike, and nothing but the merge, after the spend, said otherwise.
+`up` records what it rendered (see `up` above), so a plan can say which render it expects. Copy a federation's record
+into the study as the expected one, commit it with the study, and declare it in the manifest:
+
+    cp <root>/render-identity.json <study>/render-identity.expected.json
+    expect_render_identity = "render-identity.expected.json"   # a path relative to the study's root, the guard's rules
+
+`plan` and `lines` read the file (the guard's path rules; a file that is not a well-formed record refuses them, printing
+nothing), record its SHA-256 (`plan` prints `expect_render_identity: {path, sha256}` beside each line), and each line
+then ends in `--expect-render-identity REL --expect-render-identity-sha256 HEX`, after the post-run words. With none
+declared the lines and the plan are what they were, word for word. `collect` never reads it.
+
+`step` compares first, before the pre-step guard (a script of the study) and before the core check, a resume's
+removals, the work root, its own directory, the journals or an archive. It reads the expected file below the study's
+root with no link followed, refuses one that is not the bytes the plan hashed, takes the federation's own record from
+`$EXPCORE_FED_ROOT/render-identity.json` (read once below that root, no link followed, a root that is this user's and
+that no group or other can write to) and requires both to be well formed and equal, key by key. Any difference refuses
+the step with exit status 73 (`PRE_STEP_REFUSED`), naming the keys that differ (`sandbox_sif_sha256` and
+`platform_fingerprint_sha256` for a changed SIF: the fingerprint holds the pins) and never a value, a hash or a path;
+so does a federation with no record in its root, an unreadable or malformed one, or no `EXPCORE_FED_ROOT`. Nothing is
+made. A record is only the file `up` wrote: a `platform.toml` edited by hand afterwards is not seen, and a line edited
+to drop the two words runs unchecked.
+
+Whether or not one is expected, a step that has the federation's record writes it into
+`out/study-state/render-identity.<step id>.json` (the record as it validated, in canonical form: the bytes `up` wrote,
+never anything else the file held; a key given twice refuses the record) at its start: after a `--resume` has restored
+its `out/` and before the dispatcher starts. The file is the step's own (its name holds the UTC time and four random
+bytes of that step, and it is made new, mode 0600), so a resumed shard keeps the record of every step that ran, each
+under the render it ran under, and none overwrites an earlier one. Being in `out/` from the start, it is in every
+snapshot (a snapshot copies each file of `out/`), in the `out/` of a step killed mid-shard, in an `out/` kept for
+`--archive-left`, in the archive, and where a post-run script can read it. A step that cannot write it does not start
+(exit 2, nothing spent). A dispatcher that leaves nothing in `out/` but the record leaves no `out/` to archive, as one
+that leaves none. A federation whose `up` wrote no record (one brought up before O74, or a layout with no platform
+template) and a plan that expects none run as they did and write none; `collect` and the core's `merge` take an
+`out/` with the directory as it is (the merge reads `out/runs` alone).
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into
@@ -522,6 +693,75 @@ another shard (by its whole spec, so the same label in another partition too) or
 snapshot holds the whole of `out/` but the live store's own files, which its backup stands for, and copies it whole
 each time: size `snapshot_every_s` to what the shared filesystem can take.
 
+## A fleet of federations (`fleet.py`)
+
+A campaign's shards run in parallel, one shard per federation and one federation per held job (O68; DESIGN.md,
+section 1, "A fleet"). `fleet.py` brings N federations up from one layout, gives each a shard, launches each shard's
+step and takes them all down. Run it on the login node, from a private 0700 directory of yours, with `-I`. Its
+layout holds each agent's node as a job of its own, `[hpc] sandbox_placement = "separate"`: on the site's Slurm, steps
+on a heterogeneous job's services failed with an interconnect error (a live slot), so `up` refuses a `het` layout.
+`layouts/pilot-shape-separate.toml` is that layout: `layouts/pilot-shape.toml` with that one line changed (a test reads
+both and refuses any other difference), beside the same platform template, so use it as it is:
+
+```bash
+set -a; . deploy/hpc-federation/site.env; set +a
+F=<an absolute path, not there yet, on the filesystem the login node and the nodes see>
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" --layout deploy/hpc-federation/layouts/pilot-shape-separate.toml up 4
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" plan --manifest <shard settings>
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" status
+uv run python -I deploy/hpc-federation/shards.py collect --manifest "$F/shards.toml" --into <a new directory> --run
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
+```
+
+- **How many.** `HPC_FLEET_MAX` (in `site.env`) is your maximum of federations at once in one fleet, which the grant
+  and the scratch inode quota set; with none set, `up` refuses. `up N` past it is refused before anything is made, and
+  `add K` counts every federation that may still hold a job (a failed one may, until its `down`). The inode guard is the
+  core's own (`hpcquota`, mandatory with `HPC_STORAGE_ROOT`: an override, an unset command or a quota that cannot be read
+  refuses the fleet as it refuses one `up`), asked once for all N by the fleet: the account's usage against N times one
+  federation's estimate (each federation's own `up` then checks its own estimate again, as it always does). Without a scratch root nothing is on scratch, and the fleet says it made no check.
+  `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once. The maximum is one fleet's: two fleets of
+  one account share the grant by hand.
+- **What `up` makes.** The fleet's directory (new: never adopted), and federations `fed-1` ... `fed-N`, each its own
+  root `<fleet>/fed-k/root`, state file and held job, each brought up by `hpcfed.py up` in a process of its own (its
+  output in `<fleet>/logs/fed-k.up.log`). The fleet's record, `<fleet>/fleet.json`, holds each one's root, its job's
+  name and its shard, and is the only list the other commands act on. **A failed `up` leaves the others up:** it is
+  reported with any job it may still hold, and `down --member fed-k` releases it.
+- **`plan`** takes the shard settings, `shards.py`'s manifest keys without `[[shards]]` (its docstring has them), gives
+  `shard-k` to `fed-k`, writes `<fleet>/shards.toml` for `collect` and prints each shard's line as `shards.py plan`
+  does. A federation that is not linked, is not the one the fleet made, or leaves a space's data undeclared
+  (`data_manifest`) gets no shard; a shard whose federation failed stays unassigned. **The first plan refuses outright
+  when the federations' platform fingerprints differ** (another zone image's CA, another SIF, another data manifest):
+  their shards would never merge. It names each federation and the differing keys. **A federation whose layout has an
+  ingested space** (the pilot's `delta-space`) is planned only once its data is verified: run `hpcfed.py --layout L
+  --root <fleet>/fed-k/root verify-data` on each, after the study's ingest and before `plan` (the fleet has no verb
+  for it); until then `plan` refuses it, naming the space.
+- **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never
+  starts in the directory you ran it from), its client recorded and its output in `<fleet>/logs/`, after checking the
+  federation again, that `shards.toml` is the one the record gives, and that Slurm still holds the job the line lands
+  in, running, under the name its federation's `up` gave it (Slurm reuses ids). A shard is not launched again while its
+  client runs; one whose step ended is relaunched only with `--shard L --resume`. A shard refused exits 1. A site that
+  needs `HPC_STEP_NETWORK` gives it to each federation's own steps (`hpcfed`); a shard's step, on the agent's own job of
+  one component, carries none.
+- **Moving a shard.** `down --member fed-k` takes one federation down and frees its shard (its step ends with the
+  job); `add 1` brings a fresh federation up; `plan` gives it the shard only after its own `up` (data and links
+  checked), with the fleet's fingerprint, and only when its `platform.toml` leaves `[placement] reset_shortcut` off, so
+  every reset there, the shard's first included, takes the full reads; `step` then starts it with `--resume` from its
+  snapshots or archive. A federation that ran a shard is never given another.
+- **`down`** takes down every federation the fleet made (or `--member` one), each by `hpcfed.py down` (which cancels
+  its jobs by id) and each verified: the exit status and its root gone. A root that is not the directory the fleet
+  made, or whose state file is another federation's (another job name, an agent's job record not the one its `up`
+  held, a job id other than the one the fleet recorded), is refused, left untouched and named, and `down` exits 1;
+  nothing outside the record is ever looked at. The fleet's directory stays with its record, its logs and each root's
+  lifecycle lock (hpcfed never removes one); remove it by hand once `status` shows every federation down.
+
+`tests/deploy/test_hpc_fleet.py` and `test_hpc_fleet_plan.py` run the fleet over a fake cluster per federation, the
+core's phase the real one over a bootstrap stand-in: several federations, one failing `up`, the maximum and the inode
+guard refusing before anything is made, a `het` layout refused, the bound on ups at once, `down` of all and of one, a
+federation and a job the fleet did not make left untouched (an agent's job record replaced included), the fingerprint
+check, each step on its own federation's agent's job and node and never into a job Slurm no longer holds for it, and a
+shard moved to a fresh federation. Not run live.
+
 ## What the repository's tests cover
 
 `tests/deploy/test_hpc_*.py` run the Couchbase guard against the stand-in, the password rules, a 3.8 parse of every
@@ -534,9 +774,13 @@ allowlist, a hung client and a step past its bound, the state file, `up`'s place
 after a whole or a partial `up`, the core's phase writing `platform.toml` and the ten-pair link-check record, and
 `zone-export.sh` on a stand-in work directory. `tests/deploy/test_hpc_inode_guard.py` and `test_hpc_fed_storage.py` run
 the provider storage on scratch (O57) against the same fake Slurm, with an invented quota command and a temporary
-directory for scratch: usage under, at and one past the 95% line, every way a quota can fail to be read, the override, the
-estimate against the manifests `up` writes, the directories `up` makes and records first, and `down` removing exactly the
-recorded ones, shown gone by a count, never following a link and never touching what `up` did not make.
+directory for scratch: usage under, at and one past the 95% line, every way a quota can fail to be read, the override
+refused on scratch, the estimate against the manifests `up` writes, the directories `up` makes and records first, and
+`down` removing exactly the recorded ones, shown gone by a count, never following a link and never touching what `up` did
+not make. `test_hpc_storage_bind.py` and `test_hpc_posix_storage.py` run the bind: each provider's step given its own
+directory and, without the key, word for word as before; the node's checks and refusals; the service's argv with the bind
+and without; two platform fingerprints for a tmpfs and a scratch federation, differing in the storage kind alone; and the
+data check reading the storage on scratch.
 `tests/deploy/test_hpc_oneclient_bundle.py` builds the oneclient bundle
 from invented images against a fake Docker (O65): the closure inside the image, the scratch container's discipline, a
 reproducible tar and the self-check's refusals. The bundle's wider offline suite reads files copied out of the two pinned images

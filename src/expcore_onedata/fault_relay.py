@@ -13,6 +13,17 @@ request names the relay it is for (the `nonce` of its heartbeat), the federation
 file `hpc-federation.json`), one verb of `fault_hpc.VERBS`, one service, for an exec one command of
 `fault_hpc.EXEC_COMMANDS` (a name, never an argv), its command's bound and its deadline.
 
+**How a request and its answer cross hosts.** The client runs on a compute node and the relay on the login node, over
+one shared file system (NFS). A node's NFS client keeps a negative entry for a name it looked up while the file was
+missing, and keeps failing that lookup until the directory's attributes expire (30 s with the default `acdirmin`),
+however soon the file was created. A client that polled `answers/<id>.json` by path made that first lookup before the
+relay had answered, so every verb cost about 30 s whatever its own time. So a poll that waits for a file another host
+creates lists the directory (`os.scandir`: an `opendir` revalidates the directory and drops its stale negative
+entries) and opens the file only once the listing shows its exact name, never a stat or an open of the path first. The
+client does this for its answer, in a fresh listing on every poll; the relay lists `requests/` for its requests the same
+way. The heartbeat is read once per admission and once per try, and `up`'s wait for it and `stop`'s wait for it to go
+run on the host that writes it: none of them is a poll for a file another host creates.
+
 **What the relay runs.** Only the four verbs of its own federation: it claims a request by renaming it into `taken/`
 (so no two relays, or one relay twice, run it), and refuses, with a word and nothing run, anything else: a request for
 another relay (an earlier one: a restart never replays an old request), an id it has taken before (`replayed`: a
@@ -68,7 +79,7 @@ BEAT_S = 5.0
 RELAY_STALE_S = 30.0  # a heartbeat older than this, by the reader's wall clock, is a relay not answering
 RELAY_MODULE = "expcore_onedata.fault_relay"  # the relay runs as `-m RELAY_MODULE serve --root <root>`: how it is told
 RELAY_NOTE = "fault_relay"  # the try's note key: what the fault gate's pre-run check saw of the relay
-POLL_S = 0.5  # between two looks for an answer, or for a request
+POLL_S = 0.5  # between two listings that look for an answer
 OUTPUT_CAP = 65536  # the most of a command's output an answer carries, per stream
 MIN_RUN_S = 1.0  # a request with less than this left before its deadline is refused, never started
 ENVIRONMENT = ("PATH", "HOME", "LANG", "LC_ALL", "USER", "LOGNAME", "SLURM_CONF")
@@ -116,6 +127,17 @@ def _read(path: Path) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     return record if isinstance(record, dict) else None
+
+
+def _listed(directory: Path, name: str) -> bool:
+    """Whether a fresh listing of `directory` shows a file called exactly `name`; False when it cannot be listed (the
+    next poll lists it again). `os.scandir` opens the directory on every call, which revalidates it on an NFS client;
+    nothing here looks `name` up by path, so no negative entry is left for it."""
+    try:
+        with os.scandir(directory) as entries:
+            return any(entry.name == name for entry in entries)
+    except OSError:
+        return False
 
 
 def _private_dir(path: Path) -> None:
@@ -215,12 +237,14 @@ class RelayClient:
             "deadline": self._wall() + waited,
         }
         _write(directory / "requests" / f"{key}.json", record)
+        answers, name = directory / "answers", f"{key}.json"
         began = self._clock()
         while True:
-            answer = _read(directory / "answers" / f"{key}.json")
+            # the answer's path is looked up only once a listing has shown its name (see the module docstring)
+            answer = _read(answers / name) if _listed(answers, name) else None
             if answer is not None:
                 with contextlib.suppress(OSError):
-                    (directory / "answers" / f"{key}.json").unlink()
+                    (answers / name).unlink()
                 return _answered(answer, key, live["nonce"], timeout_s)
             if self._clock() - began >= waited:
                 break

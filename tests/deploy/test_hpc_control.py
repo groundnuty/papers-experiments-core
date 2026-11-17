@@ -20,8 +20,9 @@ HPC = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation"
 spec = importlib.util.spec_from_file_location("hpcfed_control", HPC / "hpcfed_control.py")
 control = sys.modules.get("hpcfed_control") or importlib.util.module_from_spec(spec)
 sys.modules["hpcfed_control"] = control
-with pytest.MonkeyPatch.context() as _patch:  # it imports the driver's own modules (hpcstate, hpclaunch, hpcslurm)
-    _patch.syspath_prepend(str(HPC))
+with pytest.MonkeyPatch.context() as _patch:  # it imports the driver's own modules (hpcstate, hpclaunch, hpcslurm,
+    _patch.syspath_prepend(str(HPC.parent / "compose-federation"))  # hpcstorage, whose hpcremove needs fedlayout), on
+    _patch.syspath_prepend(str(HPC))  # the paths hpcfed.py, the one that imports it, puts first
     spec.loader.exec_module(control)
 
 PREFIX = "hpcop-demo-ab12cd34"

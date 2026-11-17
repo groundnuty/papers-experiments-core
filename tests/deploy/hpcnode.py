@@ -205,6 +205,8 @@ FAKE_APPTAINER = r"""#!/bin/bash
 # The service (exec --writable ... ROOTFS /root/hpcop-start.sh) logs which markers existed when it started, prints the
 # guard's verdict, becomes ready and waits for SIGTERM; any other use is exec.sh's: log the arguments, count stdin.
 if [[ " $* " == *" --writable "* ]]; then
+  # FAKE_RUN_ARGS: record the service's argv, one word per line, and end at once (the bind tests, O57)
+  if [[ -n ${FAKE_RUN_ARGS:-} ]]; then printf '%s\n' "$@" > "$FAKE_RUN_ARGS"; exit 0; fi
   R=${*: -2:1}; W=${R%/rootfs}
   for f in stop-requested service-verified rootfs/root/service-ready.lock; do
     if [[ -e $W/$f ]]; then echo "present $f" >> "$FAKE_LOG"; else echo "absent $f" >> "$FAKE_LOG"; fi

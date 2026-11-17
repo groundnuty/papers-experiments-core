@@ -31,7 +31,7 @@ qos_scan = "listing"            # how the reset finds QoS requirements: "listing
 qos_fulfil_timeout_s = 120      # the longest the reset waits for a run's QoS requirement to be fulfilled before deleting it
 reset_concurrency = 4           # the spaces a reset of several spaces works on at once (`resetspaces.py`)
 reset_shortcut = false          # re-read only held and transferred files after the eviction (`resetgrant.py`; needs [faults])
-reset_exclusive_wait_s = 60     # the longest a shortcut reset waits for the reset lock before it does the full reads
+reset_exclusive_wait_s = 60     # no longer used: a reset waits within [faults] admission_timeout_s, then refuses
 provider_concurrency = 16       # the most of a reset's per-file reads in flight at one provider, every space together
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
@@ -103,7 +103,9 @@ class PlacementSettings:
     # A reset given a planner's reading made under the reset lock's exclusive hold re-reads only the files the reading
     # showed held and those a transfer touched since (`resetgrant.py`, O51); off, every file is read.
     reset_shortcut: bool = False
-    reset_exclusive_wait_s: float = 60.0  # the bounded wait for that hold; past it the reset reads every file
+    # Accepted and checked, and no longer used (O66): every reset waits for the reset lock within `[faults]
+    # admission_timeout_s` and refuses at that bound, rather than doing the full reads beside another holder.
+    reset_exclusive_wait_s: float = 60.0
     # The most reads of a reset's readings (block maps; the QoS scans' root, pages, summaries and records) in flight at
     # one provider, every space and planner reading of the process together (`readslots.py`, O46, O51).
     provider_concurrency: int = 16
@@ -111,9 +113,11 @@ class PlacementSettings:
     def reset_settings(self) -> dict[str, Any]:
         """The settings the core records at a start and compares at a resume, `StudyPlugin(reset_settings=...)` (C35).
 
-        Every field after its default, as `placement.<name>`: numbers and text only. They are in no fingerprint, since
-        they change how placement and the reset work and not what an agent sees, so a campaign resumed after one
-        changed (or after a default changed under a file that never declared it) says so. The data provider's name is
+        Every field after its default, as `placement.<name>`: numbers and text only. Those that change only how
+        placement and the reset work are in no fingerprint, so a campaign resumed after one changed (or after a default
+        changed under a file that never declared it) says so; those a run's own instruments read inside its attempt
+        (`runsettings.PLACEMENT_IN_RUN`) are in the fingerprint as well, so a resume under another of them is refused
+        before this comparison is made. The data provider's name is
         left out, since the record travels with the export and the replication package, which name no provider. The
         map is not here either: `Placement.reset_settings()` adds it, as its digest.
         """
