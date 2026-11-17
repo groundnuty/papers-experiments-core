@@ -245,6 +245,7 @@ def test_o70_the_core_s_rest_client_is_given_the_map_when_the_root_holds_one(hpc
     (kwargs,) = built
     assert isinstance(kwargs["addresses"], AddressMap)
     assert kwargs["addresses"].address_of(ZONE_NAME) == ADDRESS["zone"]
+    phase.layout.address_map.unlink()
     built, _ = _run(hpc, phase, with_map=False)
     assert built == [{}]
 
