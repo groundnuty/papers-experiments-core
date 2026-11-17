@@ -83,6 +83,7 @@ class Bench:
     core: Any = None  # what the manifest's interpreter says of its core (`shards.identify_core`'s report), or the
     # error it raises; a core with a known commit that is not stale until a test says otherwise
     asked: list = field(default_factory=list)  # the plan of each time the core was asked
+    no_relay: set = field(default_factory=set)  # the federations whose up finds no fault relay in its core (O68)
 
     def __post_init__(self) -> None:
         self.real = self.deploy.hpc.cli.make_driver
@@ -130,6 +131,7 @@ class Bench:
         made = self.real(layout, str(root), self.fake(label), self.environ, agent=agent)
         made.sleep = made.slurm.sleep = lambda seconds: None
         made.poll_s = made.slurm.poll_s = 0.0
+        made.relay_available = lambda: label not in self.no_relay  # every federation serves one unless a test says not
         made.core = functools.partial(
             self.deploy.hpc.boot.core_phase,
             rest=lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
