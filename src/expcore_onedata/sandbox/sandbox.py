@@ -1226,6 +1226,13 @@ class DockerSandbox:
         """Add facts to the metadata (the lease, the token records: never a value)."""
         self._meta.update(fields)
 
+    def record_infrastructure_fact(self, key: str, value: Any) -> None:
+        """Add one fact to the run's `infrastructure_facts` (the platform's own observation: the federation's window,
+        O86), the table the Apptainer backend always has and a Docker run has once it holds one. Plain JSON, never a
+        secret."""
+        with self._meta_lock:
+            self._meta.setdefault("infrastructure_facts", {})[key] = value
+
     def collect(self, dest_dir: str | Path, outputs: Sequence[str] = ()) -> dict[str, Any]:
         """Stop whatever of the agent's still runs, then copy out the run's evidence and the named files of /work.
 

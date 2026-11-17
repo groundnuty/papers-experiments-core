@@ -819,6 +819,11 @@ class ApptainerSandbox:
         with self._meta_lock:
             self._meta.update(fields)
 
+    def record_infrastructure_fact(self, key: str, value: Any) -> None:
+        """Add one fact beside the departures in `infrastructure_facts` (as Docker's: the federation's window, O86)."""
+        with self._meta_lock:
+            self._meta.setdefault("infrastructure_facts", {})[key] = value
+
     def note_end(self, kind: str) -> None:
         with self._meta_lock:
             self._ends.setdefault(kind, time.monotonic())
