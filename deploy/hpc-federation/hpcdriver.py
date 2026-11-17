@@ -918,6 +918,8 @@ class Driver(Down):
 
     def core_here(self) -> str:
         """The core's phase in this process: the bootstrap, the baseline, the facts, platform.toml, the link check.
+        It holds the root's core-phase lock (`StateStore.core_phase`) from its first read of the state to its last write
+        of the phase: a second one is refused while it runs.
 
         On a federation that is `linked` (`hpcfed.py core` run again on a finished root) the phase is `bootstrapped`
         from before the core's phase runs, and `linked` again only if it returns, which it does only when its link
@@ -925,6 +927,11 @@ class Driver(Down):
         fails, or dies, leaves `bootstrapped`, which `shards.py plan` refuses, and no `linked` it did not earn. On any
         other state the phase ends `bootstrapped` and only `up` says `linked`. Either way a phase another command
         wrote meanwhile (a `down`'s `stopping`) is never overwritten."""
+        with self.store.core_phase():
+            return self.core_phase_locked()
+
+    def core_phase_locked(self) -> str:
+        """`core_here` with the core-phase lock held."""
         state = self.store.read()
         owner = tuple(state["owner"] or ())
         if len(owner) != 2:
