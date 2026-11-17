@@ -428,9 +428,26 @@ class Driver(Down):
         self.export_zone()
         out = self.run_core()
         with self.store.core_phase("the end of this up"):  # no rerun by hand is in flight: its check has not ended
-            self.set(lambda s: s.update(phase="linked"))
+            self.link()
         retried = self.retried()
         return f"{out}\n{retried}\n{self.start_relay()}" if retried else f"{out}\n{self.start_relay()}"
+
+    def link(self) -> None:
+        """`up`'s last write, with the core-phase lock held: `bootstrapped` becomes `linked`, and nothing else does. A
+        phase another command wrote since `up`'s own core phase ended (a `down`'s `stopping`) is never overwritten, and
+        a core phase that began after it and did not end (its link check failed, or it died: `core_unfinished`) is
+        no check `up` may say `linked` over. Either fails `up` in fixed words and leaves the state as it was."""
+        state = self.store.read()
+        if state.get("core_unfinished"):
+            raise RuntimeError(
+                "a core phase run on this federation after up's own did not end (its link check failed, or it died): "
+                "the federation stays bootstrapped, which shards plan refuses; down, then up again"
+            )
+        if not self.move_phase("bootstrapped", "linked"):
+            raise RuntimeError(
+                f"the federation's phase is not bootstrapped (it is {self.store.read().get('phase')}): up does not "
+                "say linked"
+            )
 
     def other_federations_nodes(self) -> List[str]:
         """The nodes of every live job of the account that carries the federation prefix (`hpcexclude`, DESIGN.md
@@ -985,12 +1002,16 @@ class Driver(Down):
         relink = was_linked and self.move_phase("linked", "bootstrapped")
         if relink:
             self.say("the federation was linked: it is bootstrapped unless this core phase's link check passes")
+        # marked before it runs and cleared only when it returns, so one that fails, or dies, leaves the mark `up`'s own
+        # last write reads (`link`); a phase refused before it starts (no owner, a mount not proved) is never marked
+        self.set(lambda s: s.update(core_unfinished=True))
         try:
             out = self.core(placed, owner, values, environ=self.environ)
         except Exception:
             if relink:
                 self.say("the core's phase failed: the federation stays bootstrapped, which shards plan refuses")
             raise
+        self.set(lambda s: s.update(core_unfinished=False))
         if not was_linked:
             self.move_phase(before, "bootstrapped")  # a `down`'s `stopping`, written meanwhile, is kept
         elif relink and why is not None:
