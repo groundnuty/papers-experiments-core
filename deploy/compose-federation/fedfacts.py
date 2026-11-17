@@ -16,6 +16,7 @@ from fedboot import Bootstrap, Ids
 from feddocker import gib
 from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout, import_storage_name
 from fedspec import Space, Spec
+from fedtools import additions, attach, check_rendered
 
 PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")
 
@@ -107,6 +108,7 @@ def facts_of(boot: Bootstrap) -> dict:
             }
             for p in spec.principals
         },
+        **slot_facts(spec),
         "credentials": {
             "admin_access_token_file": "secrets/admin.token",
             "user_password_directory": "secrets/users",
@@ -117,6 +119,14 @@ def facts_of(boot: Bootstrap) -> dict:
         "paths_relative_to": "the directory holding this file",
         "root_parent": root_parent(boot.layout),
     }
+
+
+def slot_facts(spec: Spec) -> dict:
+    """The slots a layout declares, by name, with the principals that are their users (O83); nothing for a layout with
+    none, so its facts are what they always were. The principals' own entries hold each user's id and privileges."""
+    if not spec.slots:
+        return {}
+    return {"slots": {s.name: {"data_path": s.data_path, "toolserver": s.toolserver} for s in spec.slots}}
 
 
 def placeholders(facts: dict) -> dict[str, str]:
@@ -140,14 +150,17 @@ def render(template: str, values: dict[str, str]) -> str:
     return PLACEHOLDER.sub(lambda m: values[m.group(1)], template)
 
 
-def write_facts(layout: Layout, boot: Bootstrap) -> str:
-    """Write facts.json, and platform.toml when the layout names a template; say which were written."""
+def write_facts(layout: Layout, boot: Bootstrap, study_artifacts: str | None = None) -> str:
+    """Write facts.json, and platform.toml when the layout names a template; say which were written. A layout that
+    declares slots gets them, and its tool server, in platform.toml (`fedtools`), from the study's artifacts."""
     facts = facts_of(boot)
     layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     template = layout.spec.platform_template
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
-    write_private(layout.platform, render(template.read_text(encoding="utf-8"), placeholders(facts)))
+    text = render(template.read_text(encoding="utf-8"), placeholders(facts))
+    write_private(layout.platform, attach(text, additions(layout, facts, study_artifacts)))
+    check_rendered(layout)
     return "facts.json and platform.toml written"
 
 

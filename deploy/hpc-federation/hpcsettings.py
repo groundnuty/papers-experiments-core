@@ -46,7 +46,10 @@ AGENT_PINS = {
     "HPC_EGRESS_SHIM_SHA256": "egress_shim_sha256",
     "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
 }
-AGENT_VARIABLES = {**AGENT_PATHS, **AGENT_PINS}
+# The study's own artifacts (its tool server's venv, clone and manifests) on the filesystem the login node and the
+# agent's node see: the directory a platform template (or a space's `data_manifest`) names as `@study_artifacts@`.
+STUDY_PATHS = {"HPC_STUDY_ARTIFACTS": "study_artifacts"}
+OPTIONAL_VARIABLES = {**AGENT_PATHS, **AGENT_PINS, **STUDY_PATHS}  # each may be left out of site.env
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
     # 2.5 GB rootfs, plus its posix storage on the same tmpfs; the largest control step (a token's delivery) about
@@ -327,6 +330,9 @@ class Site:
     oneclient_bundle: str = ""
     oneclient_bundle_sha256: str = ""
     agent_work_root: str = ""
+    # The directory of the study's own artifacts, which `@study_artifacts@` stands for in a template; empty when the
+    # site declares none, and then a template that names it is refused.
+    study_artifacts: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -340,7 +346,7 @@ class Site:
             "core_python": self.core_python,
             "admin_mail": self.admin_mail,
             "billing_weight": self.billing_weight,
-            **{attribute: getattr(self, attribute) for attribute in AGENT_VARIABLES.values()},
+            **{attribute: getattr(self, attribute) for attribute in OPTIONAL_VARIABLES.values()},
         }
 
     @classmethod
@@ -379,7 +385,7 @@ def checked_site(site: Site) -> Site:
     weight = site.billing_weight
     if weight is not None and (isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0):
         raise SettingsError("HPC_BILLING_MEM_WEIGHT: must be a positive number")
-    for variable, attribute in AGENT_PATHS.items():
+    for variable, attribute in {**AGENT_PATHS, **STUDY_PATHS}.items():
         if getattr(site, attribute):
             _absolute(getattr(site, attribute), variable)
     for variable, attribute in AGENT_PINS.items():
@@ -413,6 +419,6 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             core_python=environ.get("HPC_CORE_PYTHON") or "",
             admin_mail=environ.get("HPC_ADMIN_MAIL") or defaults.admin_mail,
             billing_weight=billing,
-            **{attribute: environ.get(variable) or "" for variable, attribute in AGENT_VARIABLES.items()},
+            **{attribute: environ.get(variable) or "" for variable, attribute in OPTIONAL_VARIABLES.items()},
         )
     )

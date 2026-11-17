@@ -199,6 +199,12 @@ class Layout:
         return self.root / "toolshim"
 
     @property
+    def toolserver(self) -> Path:
+        """The tool server's own directory in the root (O83): the frozen manifests of its conditions, copied from the
+        study's artifacts, which `platform.toml` names, so a copy of that file beside a study reads the root's own."""
+        return self.root / "toolserver"
+
+    @property
     def ca_pem(self) -> Path:
         return self.root / "ca" / "federation-ca.pem"
 

@@ -22,6 +22,7 @@ import hpcstate
 from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
+from fedtools import check_artifacts
 from hpcboot import core_phase, hpc_spec, hpc_values, load_owner
 from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
@@ -180,7 +181,11 @@ class Driver(Down):
         if self.settings.core == "step" and not site.core_python:
             raise RuntimeError('[hpc] core = "step" needs HPC_CORE_PYTHON, the core\'s Python on the nodes')
         template = self.spec.platform_template
-        hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None)
+        tool = self.spec.toolserver  # O83: its paths are under @study_artifacts@, which the site must fill
+        hpcpins.check(
+            site, template.read_text(encoding="utf-8") if template is not None else None, tool.named() if tool else ()
+        )
+        check_artifacts(self.spec, site.study_artifacts)  # the interpreter, the pinned clone and the frozen manifests
         if self.settings.sandbox is not None:
             self.say(
                 f"the layout declares the agent's node ({self.settings.sandbox_placement}): it is held and placed, and "

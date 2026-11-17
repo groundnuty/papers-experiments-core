@@ -13,7 +13,7 @@ bundle's own, so `values` hashes this checkout's copy.
 
 import hashlib
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 from hpcsettings import Site
 
@@ -29,6 +29,10 @@ PLACEHOLDERS = {
     "hpc_oneclient_bundle": ("HPC_ONECLIENT_BUNDLE", "oneclient_bundle"),
     "hpc_oneclient_bundle_sha": ("HPC_ONECLIENT_BUNDLE_SHA256", "oneclient_bundle_sha256"),
     "hpc_agent_work_root": ("HPC_AGENT_WORK_ROOT", "agent_work_root"),
+    "study_artifacts": ("HPC_STUDY_ARTIFACTS", "study_artifacts"),
+}
+WHY = {  # what names a placeholder, where the default (the template's [sandbox]) is not it
+    "study_artifacts": "a platform template or the layout's tool server names @study_artifacts@ (site.env)",
 }
 FILES = {  # file -> its pin
     "hpc_agent_sif": "hpc_agent_sif_sha",
@@ -53,16 +57,16 @@ def named(template: str) -> list:
     return [name for name in PLACEHOLDERS if name in found]
 
 
-def check(site: Site, template: Optional[str]) -> None:
-    """Refuse a site that leaves a placeholder of the template unfilled, or whose declared file is missing or has
-    another SHA-256 than the one declared; the message names the variable, never the path."""
-    wanted = named(template or "")
+def check(site: Site, template: Optional[str], also: Sequence[str] = ()) -> None:
+    """Refuse a site that leaves a placeholder of the template (or of `also`, other text that names them: the layout's
+    tool server paths) unfilled, or whose declared file is missing or has another SHA-256 than the one declared; the
+    message names the variable, never the path."""
+    wanted = named("\n".join([template or "", *also]))
     for name in wanted:
         variable, attribute = PLACEHOLDERS[name]
         if not getattr(site, attribute):
-            raise RuntimeError(
-                f"{variable} is not set: the platform template's [sandbox] names it (site.env, the agent's sandbox)"
-            )
+            why = WHY.get(name, "the platform template's [sandbox] names it (site.env, the agent's sandbox)")
+            raise RuntimeError(f"{variable} is not set: {why}")
     for name, pin in FILES.items():
         if name not in wanted:
             continue
@@ -76,6 +80,7 @@ def check(site: Site, template: Optional[str]) -> None:
 
 
 def values(site: Site) -> Dict[str, str]:
-    """The placeholders' values: the site's, as declared, and the bundle's collector with its SHA-256."""
-    found = {name: getattr(site, attribute) for name, (_, attribute) in PLACEHOLDERS.items()}
+    """The placeholders' values: the site's, as declared (one it does not declare is no value, so the renderer refuses a
+    placeholder nothing filled), and the bundle's collector with its SHA-256."""
+    found = {name: getattr(site, attr) for name, (_, attr) in PLACEHOLDERS.items() if getattr(site, attr)}
     return {**found, OWN[0]: str(COLLECTOR), OWN[1]: sha256_of(COLLECTOR)}

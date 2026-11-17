@@ -41,6 +41,7 @@ from fedlayout import Layout, import_storage_name
 from fedlinks import check_after_up
 from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
+from fedtools import additions, attach, check_rendered
 
 from expcore_onedata.addresses import AddressMap
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
@@ -224,11 +225,12 @@ def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int,
     }
 
 
-def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, str]) -> str:
+def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, str], extra: str = "") -> str:
     """Write the platform file: the Compose placeholders from the facts, the HPC ones, and the token margin last, the
-    least the platform layer accepts for the rest of the file. Returns the text written."""
+    least the platform layer accepts for the rest of the file. `extra` is the layout's `[slots]` and `[toolserver]`
+    (`fedtools.additions`), which follow the template's text. Returns the text written."""
     filled = {**placeholders(facts), **values, "hpc_token_margin_s": str(PROVISIONAL_MARGIN_S)}
-    text = rendered(template, filled)
+    text = rendered(template, filled, extra)
     # O73: a `[sandbox.federation]` table is usable only once the providers registered the declared names, which the
     # facts record: refused here, before the file is written or loaded
     hpcnames.check_federation_table(text, registered_of(facts))
@@ -236,16 +238,16 @@ def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, 
     if "@hpc_token_margin_s@" not in template:
         return text
     filled["hpc_token_margin_s"] = str(least_margin_s(path, text, float(values["hpc_settle_timeout_s"])))
-    text = rendered(template, filled)
+    text = rendered(template, filled, extra)
     write_private(path, text)
     return text
 
 
-def rendered(template: str, filled: Mapping[str, str]) -> str:
-    """The template filled in, and, once the root holds an address map (`hpc_addresses`, its path), `addresses` first:
-    the file where the platform layer's clients find the address each declared name is dialled at (O73). A top-level key
-    of its own, so it may precede every table."""
-    text = render(template, dict(filled))
+def rendered(template: str, filled: Mapping[str, str], extra: str = "") -> str:
+    """The template filled in, with the layout's own tables (`extra`) after it and, once the root holds an address map
+    (`hpc_addresses`, its path), `addresses` first: the file where the platform layer's clients find the address each
+    declared name is dialled at (O73). A top-level key of its own, so it may precede every table."""
+    text = attach(render(template, dict(filled)), extra)
     if "hpc_addresses" not in filled:
         return text
     resolver = f", resolver = {json.dumps(filled['hpc_resolver'])}" if "hpc_resolver" in filled else ""
@@ -283,7 +285,10 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
             layout.toolshim / hpcnames.LAUNCHER
         ).is_file():  # the launcher `up` copied into the root, for a Python server
             values["hpc_resolver"] = str(layout.toolshim / hpcnames.LAUNCHER)
-    write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values)
+    # O83: the layout's slots and tool server, with the frozen manifests in the root, named by the root's absolute path
+    extra = additions(layout, facts, values.get("study_artifacts"), absolute_root=values["hpc_root"])
+    write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values, extra)
+    check_rendered(layout)  # the file as a campaign loads it, its slots as the lease pool does: refused here, not then
     return "facts.json and platform.toml written"
 
 
