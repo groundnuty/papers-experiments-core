@@ -9,12 +9,12 @@ refuses a root that holds evidence a run left (`present_evidence`) and no curren
 
 **An allow-list, never a deny-list.** The archive holds the files named in `EVIDENCE_FILES` and the files of
 `EVIDENCE_TREES` whose names match, and nothing else: not `secrets/`, not any file that holds a token, key or password
-by whatever name, not the relay's heartbeat and lock, not the CA, the
-shim or a provider's data. Every file is opened below a descriptor of the root with `O_NOFOLLOW` and read once, as
-bytes; the archive is built from those bytes, so a link anywhere among the evidence is refused and never followed, and
-what was checked is what is archived. As a last check no archived file may hold the content of a file of `secrets/`
-(its whole stripped content, or the value of a `KEY=value` line of a `.env` file): such a file is refused, naming it
-and never the value.
+by whatever name, not the relay's heartbeat and lock, not the core phase's lock (`core-phase.lock`, which holds
+nothing), not the CA, the shim or a provider's data. Every file is opened below a descriptor of the root with
+`O_NOFOLLOW` and read once, as bytes; the archive is built from those bytes, so a link anywhere among the evidence is
+refused and never followed, and what was checked is what is archived. As a last check no archived file may hold the
+content of a file of `secrets/` (its whole stripped content, or the value of a `KEY=value` line of a `.env` file):
+such a file is refused, naming it and never the value.
 
 **Evidence present, not a step run.** `down` cannot see the results directory, so what gates it is what the root
 holds. A root that only ran Day-0 measurements has no shard step, and holds evidence all the same when the platform
