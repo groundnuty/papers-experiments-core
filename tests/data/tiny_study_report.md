@@ -157,8 +157,7 @@ attempt that failed before any request was sent and was charged a measured zero 
 known, because the model has no price, the prices are not the ones the campaign ran under, a bound cannot be computed
 or a record cannot be read; it is never 0. Spent is the model's total, On analysed attempts that of the attempts the
 analysis uses, and On the rest everything else (attempts that were never scored, runs left out of a partial analysis,
-what a kill lost, probes), so what scored runs cost can be read beside the overhead. A batch merged from shards adds
-its shards' figures.
+what a kill lost, probes), so what scored runs cost can be read beside the overhead.
 
 ### Spend by model
 
