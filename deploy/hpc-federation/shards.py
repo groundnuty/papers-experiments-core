@@ -309,6 +309,16 @@ def home_env(home: str) -> dict[str, str]:
     }
 
 
+# The manifest's `pass_env` (O63): variables of the operator's the study needs in its dispatcher's environment, such as
+# the operator's half of a fault sanction. A name is plain upper case, is no secret by its look and is none the step
+# sets itself; a value is a short word of plain characters, so that no path, secret or shell syntax rides on a line.
+PASS_ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+PASS_ENV_VALUE = re.compile(r"[A-Za-z0-9._:=,+-]{0,128}")
+PASS_ENV_SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH", re.IGNORECASE)
+PASS_ENV_OWN_PREFIXES = ("EXPCORE_", "PYTHON")
+PASS_ENV_OWN = frozenset({*ALLOWLIST, "HOME", "TMPDIR", *home_env(NO_HOME)})  # the step's own: never a declared one
+
+
 class ShardsError(Exception):
     """A manifest, a federation's state or a shard's archive that cannot be used; the message names what."""
 
@@ -342,6 +352,8 @@ class Plan:
     post_run_timeout_s: float = POST_RUN_TIMEOUT_S
     expect_render_identity: str | None = None  # the render identity the plan expects: a path relative to the study
     expect_render_identity_sha256: str | None = None  # its SHA-256, recorded by `pinned`
+    pass_env: tuple[str, ...] = ()  # the variables the manifest declares: names only
+    pass_env_pins: tuple[tuple[str, str], ...] | None = None  # each name's value, read by `pin_pass_env`
 
 
 # ------------------------------------------------------------------------------------------------ the manifest
@@ -354,16 +366,72 @@ def _label_ok(index: int, count: int, label: str) -> None:
         raise ShardsError(f"shard {index}: {error}") from None
 
 
+def pass_env_name_problem(name: Any) -> str | None:
+    """Why `name` cannot be a variable the step passes to its dispatcher (the message names it), or None: a plain
+    upper-case name, none that looks like a secret (KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL, AUTH, anywhere in
+    it), and none the step sets itself (its allowlist, its home and TMPDIR, anything of EXPCORE_ or PYTHON)."""
+    if not isinstance(name, str) or PASS_ENV_NAME.fullmatch(name) is None:
+        shown = repr(name[:70] if isinstance(name, str) else name)
+        return f"pass_env name {shown} must match ^[A-Z][A-Z0-9_]{{0,63}}$"
+    if PASS_ENV_SECRET.search(name):
+        return (f"pass_env name {name} looks like a secret (it contains KEY, TOKEN, SECRET, PASSWORD, PASSWD, "
+                "CREDENTIAL or AUTH): a secret never rides on a line")  # fmt: skip
+    if name in PASS_ENV_OWN or name.startswith(PASS_ENV_OWN_PREFIXES):
+        return f"pass_env name {name} is one the step sets itself"
+    return None
+
+
+def pass_env_value_problem(name: str, value: Any) -> str | None:
+    """Why `value` cannot be the value of the declared variable `name`, or None. The message names the variable and
+    never the value."""
+    if not isinstance(value, str) or PASS_ENV_VALUE.fullmatch(value) is None:
+        return f"pass_env variable {name}'s value does not match ^[A-Za-z0-9._:=,+-]{{0,128}}$"
+    return None
+
+
+def pass_env_names(declared: Any) -> tuple[str, ...]:
+    """The manifest's `pass_env`, checked: a list of names, each of `pass_env_name_problem`'s rule and each once."""
+    if not isinstance(declared, list):
+        raise ShardsError("pass_env must be a list of variable names")
+    for name in declared:
+        if problem := pass_env_name_problem(name):
+            raise ShardsError(problem)
+    for name in declared:
+        if declared.count(name) > 1:
+            raise ShardsError(f"pass_env names {name} twice")
+    return tuple(declared)
+
+
+def pin_pass_env(plan: Plan, environ: Mapping[str, str] | None = None) -> Plan:
+    """The plan with the operator's value of each declared variable recorded, from `environ` (the process's own by
+    default): `plan` and `lines` and `resume-line` call it before they print or record anything, so that a step's
+    line carries each value and cannot change or gain one. `ShardsError` naming the variable, never its value, when
+    one is unset or its value is not a plain word. It is not part of `pinned`, which `collect` calls: `collect` reads
+    no environment of the operator's. The same plan when none is declared."""
+    if not plan.pass_env:
+        return plan
+    environ = os.environ if environ is None else environ
+    pins = []
+    for name in plan.pass_env:
+        if name not in environ:
+            raise ShardsError(f"pass_env variable {name} is not set in the operator's environment")
+        if problem := pass_env_value_problem(name, environ[name]):
+            raise ShardsError(problem)
+        pins.append((name, environ[name]))
+    return replace(plan, pass_env_pins=tuple(pins))
+
+
 def load_plan(path: Path) -> Plan:
     """Read and check the manifest: every key present, absolute paths, at least two shards, labels by the core's rule
-    and each once."""
+    and each once. The optional `pass_env` names the operator's variables a step passes to its dispatcher (names
+    only; their values are read by `pin_pass_env`)."""
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
     keys = {"study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory", "shards"}
     optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s", "post_run", "post_run_timeout_s",
-                "expect_render_identity"}  # fmt: skip
+                "expect_render_identity", "pass_env"}  # fmt: skip
     if not keys <= set(data) <= keys | optional:
         raise ShardsError(
             f"the manifest's keys must be: {', '.join(sorted(keys))}, and perhaps {', '.join(sorted(optional))}"
@@ -382,6 +450,7 @@ def load_plan(path: Path) -> Plan:
             raise ShardsError(f"{key}_timeout_s {problem}")
     if "expect_render_identity" in data and (problem := guard_path_problem(data["expect_render_identity"])):
         raise ShardsError(f"expect_render_identity {problem}")
+    declared = pass_env_names(data["pass_env"]) if "pass_env" in data else ()
     for key in sorted({"study", "python", "core_src", "results", "tmpfs"}):  # a step starts in / (`--chdir=/`)
         if not isinstance(data[key], str) or not data[key].startswith("/"):
             raise ShardsError(f"{key} must be an absolute path")
@@ -406,7 +475,7 @@ def load_plan(path: Path) -> Plan:
     return Plan(Path(data["study"]), str(data["python"]), Path(data["core_src"]), Path(data["results"]),
                 Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
                 float(every), data.get("pre_step"), None, float(bounds["pre_step"]), data.get("post_run"), None,
-                float(bounds["post_run"]), data.get("expect_render_identity"))  # fmt: skip
+                float(bounds["post_run"]), data.get("expect_render_identity"), pass_env=declared)  # fmt: skip
 
 
 def federation(shard: Shard) -> dict[str, Any]:
@@ -558,6 +627,11 @@ def step_argv(
     `resume` and `over` are `resume-line`'s."""
     env = [f"PATH={plan.step_path}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={shard.root.parent}",
            f"EXPCORE_FED_ROOT={shard.root}", *(f"{k}={v}" for k, v in home_env(NO_HOME).items())]  # fmt: skip
+    if plan.pass_env:  # the operator's variables the manifest declares: each name once, with its pinned value
+        if plan.pass_env_pins is None or tuple(name for name, _ in plan.pass_env_pins) != plan.pass_env:
+            raise ShardsError("the declared pass_env variables are not pinned: no line is made from a plan that has "
+                              "not read their values")  # fmt: skip
+        env += [f"{name}={value}" for name, value in plan.pass_env_pins]
     step = [plan.python, "-I", "-B", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
             "--results", str(plan.results), "--core-src", str(plan.core_src),
@@ -582,6 +656,8 @@ def step_argv(
                               "hashed it")  # fmt: skip
         step += ["--expect-render-identity", plan.expect_render_identity, "--expect-render-identity-sha256",
                  plan.expect_render_identity_sha256]  # fmt: skip
+    for name in plan.pass_env:  # the declaration: `step` passes a name only when its line says so, with its value
+        step += ["--pass-env", name]
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
@@ -706,10 +782,12 @@ def archive(
     exit_status: int,
     pre_step: Mapping[str, Any] | None = None,
     post_run: Mapping[str, Any] | None = None,
+    pass_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Write `out/` whole to `<results>/<label>.out.tar` and its manifest; the manifest, as written. `pre_step`, the
     record of the guard the step ran (`start_hooks`), and `post_run`, the record of the post-run script, are in it only
-    when there is one; with a post-run record it also says `final`, whether that script passed."""
+    when there is one; with a post-run record it also says `final`, whether that script passed. `pass_env` is the
+    name and value of each variable the step passed to its dispatcher (`check_pass_env`), in it when there is one."""
     label = str(spec["label"])
     tar_path = results / f"{label}.out.tar"
     files = sum(1 for p in out.rglob("*") if p.is_file() and not p.is_symlink())
@@ -743,6 +821,7 @@ def archive(
         "exit_status": exit_status,
         **({"pre_step": dict(pre_step)} if pre_step is not None else {}),
         **({"post_run": dict(post_run), "final": post_run.get("final") is True} if post_run is not None else {}),
+        **({"pass_env": dict(pass_env)} if pass_env else {}),
     }
     _write_whole(results / f"{label}.out.json", lambda d: d.write_text(json.dumps(manifest, sort_keys=True) + "\n"))
     return manifest
@@ -819,9 +898,29 @@ def final_problem(shard: Shard, manifest: Mapping[str, Any], wanted: str | None)
     return None
 
 
+def pass_env_problem(shard: Shard, manifest: Mapping[str, Any], declared: Sequence[str]) -> str | None:
+    """Why a verified shard's results are not to be merged for the variables its step was given, or None: the plan's
+    `pass_env` names exactly the variables its manifest records, each with a value a variable may carry. `step` never
+    reads the plan, so a line that dropped a declared name (or gained one) is shown here, as a line that dropped the
+    post-run script is (`final_problem`). The message names the variable, never its value."""
+    record = manifest.get("pass_env")
+    given = record if isinstance(record, Mapping) else {}
+    for name in declared:
+        if name not in given:
+            return (f"shard {shard.label}: its step was not given {name}, which the plan declares in pass_env (a line "
+                    "that dropped it): its results are not taken")  # fmt: skip
+    for name, value in given.items():
+        if name not in declared:
+            return f"shard {shard.label}: its step was given {name}, which the plan does not declare in pass_env"
+        if pass_env_value_problem(str(name), value):
+            return f"shard {shard.label}: its manifest records a value of {name} that pass_env may not carry"
+    return None
+
+
 def collect(plan: Plan, into: Path) -> list[Path]:
-    """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails, and
-    when any is not final (`final_problem`), naming it."""
+    """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails, when
+    any is not final (`final_problem`) and when any step was not given the plan's `pass_env` (`pass_env_problem`),
+    naming it."""
     if into.exists() and any(into.iterdir()):
         raise ShardsError("the directory to collect into must be new or empty")
     wanted = None
@@ -838,7 +937,9 @@ def collect(plan: Plan, into: Path) -> list[Path]:
         found = []
         for shard in plan.shards:
             found.append(verified(plan.results, shard, into))
-            if problem := final_problem(shard, found[-1][1], wanted):
+            if problem := final_problem(shard, found[-1][1], wanted) or pass_env_problem(
+                shard, found[-1][1], plan.pass_env
+            ):
                 raise ShardsError(problem)
     except ShardsError:  # refused whole: nothing of it is left behind
         for leftover in into.glob(".*.out.tar"):
@@ -1352,7 +1453,9 @@ def archive_left(args: argparse.Namespace) -> int:
     post = dict(post) if isinstance(post, Mapping) else None
     if post is not None and post.get("final") is not True:  # its script did not pass, or the step ended before it did
         post["reason"] = post.get("reason") or "the step ended before its post-run script passed"
-    manifest = archive(out, args.results, spec, int(status), guard if isinstance(guard, Mapping) else None, post)
+    passed = left.owner.get("pass_env")  # the variables that step was given, which its manifest records
+    manifest = archive(out, args.results, spec, int(status), guard if isinstance(guard, Mapping) else None, post,
+                       passed if isinstance(passed, Mapping) else None)  # fmt: skip
     remove_tree(left.path)
     print(f"shards: shard {args.label}'s kept out/ archived: {manifest['files']} files, sha256 {manifest['sha256']}")
     return 0
@@ -1878,6 +1981,26 @@ def note_render_identity(out: Path, record: bytes, step_id: str) -> None:
         ) from None
 
 
+def check_pass_env(args: argparse.Namespace) -> dict[str, str]:
+    """The variables this step's line declares (`--pass-env NAME`, once each) with the value its `env -i` words gave
+    each, checked again as `lines` checked them: a name that is plain, looks like no secret and is none the step sets
+    itself, set in this step's environment, with a value of plain characters. These, and no other variable of the
+    node's, go to the dispatcher. `StepRefused` naming the variable, never its value; a line that declares none gives
+    an empty record."""
+    passed: dict[str, str] = {}
+    for name in getattr(args, "pass_env", None) or []:
+        if problem := pass_env_name_problem(name):
+            raise StepRefused(problem)
+        if name in passed:
+            raise StepRefused(f"pass_env names {name} twice")
+        if name not in os.environ:
+            raise StepRefused(f"pass_env variable {name} is not set in the step's environment: its line gave no value")
+        if problem := pass_env_value_problem(name, os.environ[name]):
+            raise StepRefused(problem)
+        passed[name] = os.environ[name]
+    return passed
+
+
 def step(
     args: argparse.Namespace,
     *,
@@ -1889,19 +2012,24 @@ def step(
     """One shard on its node (the module's docstring): copy, restore, run, archive, clean up; the dispatcher's exit
     status. `snapshots` says when `out/` is snapshotted; by default every `--snapshot-every` seconds and at each run's
     end, into `<results>/<label>/snapshots/`. `node` is what the reaper of the sandbox's work root acts on (the
-    Apptainer backend's `NodeOps`; `LocalNode` by default). Its first acts are the check of the federation's render
-    identity against the one the line expects (`check_render_identity`) and then the study's pre-step guard, when its
-    line declares one (`start_hooks`): nothing is made, removed or read before them, and `PRE_STEP_REFUSED` ends a step
-    they refuse. The federation's render identity is written into `out/study-state/` before the dispatcher starts,
+    Apptainer backend's `NodeOps`; `LocalNode` by default). Its first acts are the check of the variables its line
+    declares (`check_pass_env`), the check of the federation's render identity against the one the line expects
+    (`check_render_identity`) and then the study's pre-step guard, when its line declares one (`start_hooks`): nothing
+    is made, removed or read before them, and `PRE_STEP_REFUSED` ends a step they refuse. The variables the line
+    declares go to the dispatcher, and so to a post-run script, which runs in its environment, and to nothing else.
+    The federation's render identity is written into `out/study-state/` before the dispatcher starts,
     after a resume has restored its `out/`, in a file of this step's own (`note_render_identity`). A declared post-run
     script runs after the dispatcher exits 0 and before the archive (`run_post_run`): a step whose script does not
     pass archives its results marked not final and ends with `POST_RUN_FAILED`."""
     try:
+        passed = check_pass_env(args)  # what the line declares, before anything of the study's runs
         identity = check_render_identity(args)  # the federation's render is the plan's, before the study's own guard
         guard, post_hook = start_hooks(args)
     except StepRefused as error:
         print(f"shards: ERROR: {error}; the step is refused, with nothing made", file=sys.stderr)
         return PRE_STEP_REFUSED
+    if passed:
+        print(f"shards: passed {', '.join(passed)} to shard {args.label}'s dispatcher (names only)", file=sys.stderr)
     if guard is not None:
         print(f"shards: pre-step guard {guard['path']} (sha256 {guard['sha256']}) passed for shard {args.label}",
               file=sys.stderr)  # fmt: skip
@@ -1930,7 +2058,7 @@ def step(
         clear_leftovers(args.tmpfs, spec, os.environ.get("EXPCORE_FED_ROOT"), args.results)
     mark = claim_running(args, spec)  # no other step of the shard runs anywhere from here until this one ends
     try:
-        return _run_step(args, spec, runner, snapshots, node, identity, guard, post_hook)
+        return _run_step(args, spec, runner, snapshots, node, identity, guard, post_hook, passed)
     finally:
         release_running(args, mark)
 
@@ -1944,12 +2072,13 @@ def _run_step(
     identity: bytes | None,
     guard: Mapping[str, Any] | None,
     post_hook: Hook | None,
+    passed: Mapping[str, str],
 ) -> int:
     """`step` once its checks passed and it holds the shard's running mark: its directory on the tmpfs first (so a
     sweep finds a step of ours here before its work root is used), the sandbox's work root made and its killed runs
-    reaped, then copy, restore, run, archive, clean up. `identity`, `guard` and `post_hook` are what the step's first
-    acts found (the federation's render identity as validated, the pre-step guard that passed, the post-run script
-    declared)."""
+    reaped, then copy, restore, run, archive, clean up. `identity`, `guard`, `post_hook` and `passed` are what the
+    step's first acts found (the federation's render identity as validated, the pre-step guard that passed, the
+    post-run script declared, the variables its line gave the dispatcher with their values)."""
     from expcore.campaign import out_snapshot
 
     snapdir = args.results / args.label / SNAPSHOTS
@@ -1961,6 +2090,7 @@ def _run_step(
         owner = {"format": OWNER_FORMAT, "shard": spec, "pid": os.getpid(), "start": _start_of(os.getpid()),
                  "root": os.environ.get("EXPCORE_FED_ROOT"), "results": str(args.results), "base": base,
                  "phase": RUNNING, **({"pre_step": guard} if guard is not None else {}),
+                 **({"pass_env": dict(passed)} if passed else {}),
                  **({"post_run": {"path": post_hook.path, "sha256": post_hook.sha256, "ran": False, "exit_status": None,
                                   "final": False}} if post_hook is not None else {})}  # fmt: skip
         (work / OWNER).write_text(json.dumps(owner, sort_keys=True) + "\n", encoding="utf-8")
@@ -1988,6 +2118,7 @@ def _run_step(
         for name in ("home", "tmp", *(f"home/{sub}" for sub in HOME_DIRS)):
             (work / name).mkdir(mode=0o700)
         env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
+        env |= passed  # the line's declared variables; the step's own below can never be one of them
         env |= {**home_env(str(work / "home")), "TMPDIR": str(work / "tmp")}  # never the account's ~
         env["PYTHONDONTWRITEBYTECODE"] = "1"  # B1: for a Python the dispatcher's children start without -I -B
         journals = args.results / args.label / JOURNALS
@@ -2031,7 +2162,7 @@ def _run_step(
                       file=sys.stderr)  # fmt: skip
             settle_quietly(out)  # a script that read the store may leave its -shm
         try:
-            manifest = archive(out, args.results, spec, status, guard, post)
+            manifest = archive(out, args.results, spec, status, guard, post, passed)
         except (OSError, tarfile.TarError) as error:  # the only whole out/ is the tmpfs copy: kept, never removed
             keep = True
             mark = {"shard": spec, "exit_status": status, "error": type(error).__name__}
@@ -2092,6 +2223,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--post-run-timeout", dest="post_run_timeout", type=float, default=None)
     one.add_argument("--expect-render-identity", dest="expect_render_identity", default=None)  # with its hash: both
     one.add_argument("--expect-render-identity-sha256", dest="expect_render_identity_sha256", default=None)
+    one.add_argument("--pass-env", dest="pass_env", action="append", default=None, metavar="NAME",
+                     help="a variable the manifest declares: its value is among the line's env words")  # fmt: skip
     left = sub.add_parser("sweep")
     left.add_argument("--tmpfs", type=Path, required=True)
     left.add_argument("--root", required=True)
@@ -2123,7 +2256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"a campaign on {len(plan.shards)} federations is one only where each declares every space's data "
                 f"(data_manifest in its platform.toml, C06); undeclared: {'; '.join(missing)}"
             )
-        plan = pinned(plan)  # each declared script read and hashed before any line is printed
+        plan = pin_pass_env(pinned(plan))  # each declared script hashed, each declared variable read, before any line
         script = Path(__file__).resolve()
         for shard in plan.shards:
             fed = federation(shard)
@@ -2138,6 +2271,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if plan.expect_render_identity is not None:
                 record["expect_render_identity"] = {"path": plan.expect_render_identity,
                                                     "sha256": plan.expect_render_identity_sha256}  # fmt: skip
+            if plan.pass_env_pins:
+                record["pass_env"] = dict(plan.pass_env_pins)
             print(json.dumps(record) if args.command == "plan" else shlex.join(line))
         return 0
     except ShardsError as error:
