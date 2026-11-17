@@ -320,6 +320,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any
 
+from expcore.campaign import liveness
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError, uncharged_kinds
 from expcore.records.injections import FAULT_NAMESPACE
@@ -783,6 +784,7 @@ class FaultInjector:
                 "service": self._service,
                 "identity_sha256": before_sha256,
                 "holder": holder(),
+                "owner": liveness.owner(),  # the attempt this context runs: the verdicts charge by it (O80)
                 **({} if self._gate_probe is None else {"gate_probe": self._gate_probe}),
             }
             self._journal.append({"event": "injecting", "id": entry, **line})

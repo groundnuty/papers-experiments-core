@@ -57,6 +57,7 @@ def new_service(kind: str) -> Dict[str, Any]:
         "kind": kind,
         "node": None,
         "fqdn": None,
+        "declared": None,  # the name the service registers under and is reached by (O73); fqdn is the node's own
         "address": None,
         "ports": ports,
         "workdir": None,
@@ -93,6 +94,7 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
         checked_sandbox(sandbox)
     if "data" in state:
         checked_data(state["data"])
+    checked_shard_nodes(state.get("shard_nodes", []))
     return state
 
 
@@ -122,6 +124,25 @@ def checked_data(data: Any) -> None:
             )
         ):
             raise StateError(f"{where}.ingested: a space's verified marker is not the driver's")
+
+
+NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}")  # as `hpcslurm.Slurm.hostnames` accepts one
+
+
+def checked_shard_nodes(entries: Any) -> None:
+    """The nodes a shard step of this federation was resumed on, outside its own jobs (`shards.py resume-line`
+    records each, W1): down steps into the job each names, on its node, so each must be what Slurm gives."""
+    if not isinstance(entries, list):
+        raise StateError(f"{STATE}: shard_nodes is not a list")
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"job", "node", "label", "name"}:
+            raise StateError(f"{STATE}: a shard_nodes entry is not {{job, node, label, name}}")
+        if not (isinstance(entry["job"], str) and JOB_ID.fullmatch(entry["job"])):
+            raise StateError(f"{STATE}: a shard_nodes entry's job is not a Slurm job id")
+        if not (isinstance(entry["node"], str) and NODE_NAME.fullmatch(entry["node"])):
+            raise StateError(f"{STATE}: a shard_nodes entry's node is not a node name")
+        if not all(isinstance(entry[key], str) and entry[key] for key in ("label", "name")):
+            raise StateError(f"{STATE}: a shard_nodes entry has no label or job name")
 
 
 def checked_sandbox(sandbox: Any) -> None:

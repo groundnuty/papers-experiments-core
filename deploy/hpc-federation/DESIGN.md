@@ -249,7 +249,8 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   and curl among them (`status.sh`, which writes nothing, points them there without making it: `home_at`); a shard step's dispatcher gets them in the step's own directory (`shards.py step`). Nothing else, and never a secret. The bundle's helpers
   then run on the first `python3.11` on that `PATH` (`lib.sh`'s default `HPCOP_PY`), which must be the node's own:
   `supervise.py`, which holds every service, needs `os.pidfd_open`, which uv's standalone Python lacks. Only the core's
-  step (`HPC_CORE_PYTHON`) runs a venv's Python.
+  step and `down`'s sweep of a node a shard step ran on (`HPC_CORE_PYTHON`), and the shard step itself (its
+  manifest's `python`), run a venv's Python.
 - **Every write on a node is under the node's tmpfs**, never Slurm's per-job `$TMPDIR`: on the site that is a link
   into a shared filesystem with a file quota. The allowlist sets `TMPDIR` itself, and the bundle refuses a `TMPDIR`
   that is a link (`lib.sh`). Work directories are the bundle's `mktemp -d <tmpfs>/hpcop-<oz|op>.XXXXXX` (0700); the
@@ -275,8 +276,15 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   the standard library's. Launch `up`, `down` and the verbs as `python -I -B deploy/hpc-federation/hpcfed.py ...` from a
   directory of ours (the checkout) all the same, never a shared one: `uv run` takes the project of the working directory
   when it has a `pyproject.toml`, and builds it.
-- **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python a
-  step or the driver launches takes `-I -B` (above), the relay's among them, and `shards.py collect --run` its merge.
+- **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python the
+  driver and the shard driver launch, on a node or on the login node, takes `-I -B` (the bundle's `"$HPCOP_PY"`, the
+  fault relay, the shard step, its dispatcher and its `expcore run`, the merge, and the sandbox's gate, collector,
+  mount watcher and copy helper on the node). `-I` alone ignores `PYTHONDONTWRITEBYTECODE`, so only the flag stops
+  it: live slot 5 found a shard step's first import of a stdlib module writing its `.pyc` into the core's interpreter,
+  which uv had installed under the account's home, shared by every job and agent of the account. **Install the venv's
+  interpreter under the site directory** (`UV_PYTHON_INSTALL_DIR=<site dir>/python` before `uv sync`), never in the
+  shared home, so a node step that writes there by any other path still writes into the site's own tree. The fake Slurm
+  of the tests fails any command that runs a Python without both flags.
 - **The core the driver imports is recorded**: `up` writes the resolved paths of `expcore_onedata`, `fedlayout` and
   `hpcfed` into the state file, and refuses to run when `expcore_onedata` is not imported from this checkout's `src`.
   The core's step (`[hpc] core = "step"`) makes the same check on the node and exits 97 on a mismatch, which fails
@@ -340,6 +348,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "relay": {"pid": 0, "start": 0, "log": "<log dir>/<allocation name>-fault-relay.log"},
   "data": {"ingested": {"<space>": {"manifest": "<sha256>", "declared": true,
                                     "verified": null}}},
+  "shard_nodes": [{"job": "<the operator's job id>", "node": "<node>", "label": "<shard>", "name": "<its job name>"}],
   "phase": "preflight | submitted | placed | zone | providers | bootstrapped | linked | stopping | down"
 }
 ```
@@ -349,6 +358,11 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   its step with `--jobid=<sandbox.job>`, plus `--het-group=<sandbox.het_group>` when that is not `null`; S's facts
   (FQDN, address) are in `services.sandbox`, the role's record. `down` cancels `sandbox.job` itself only under
   `separate`; under `het` the leader's cancel ends S's component.
+- **`shard_nodes`** (absent until one is recorded) are the nodes a shard of this federation was resumed on outside its
+  own jobs, each in the operator's held job it was resumed in: `shards.py resume-line` records one, under the root's
+  lifecycle lock, before it prints the line that starts the step there. `down` sweeps each such node in that job, only
+  while the job runs and still carries the recorded name (Slurm reuses ids), and never cancels it; the launcher runs a
+  step in such a job on its recorded node alone.
 - **`site`** is what `up` read from `site.env` (no secret): every later command reads it here, so `down` and the
   service verbs need no environment. **`command`** is this driver's argv prefix, which `platform.toml`'s `[faults]
   command` holds. **`clients`** are the detached srun clients of the service steps, by step name, which `down` ends
@@ -407,12 +421,14 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 4. **Place** (section 1), then one control step per node prints the node's FQDN and its IPv4 address on the
    cluster's network (`nodefacts.py`, Python 3.9-compatible, stdlib only); on S, with `--het-group=1` under `het` and
    S's own job id under `separate`, and on a service node with `--het-group=0` under `het`. Nothing else of `up` runs
-   on S.
-5. **The zone**: a detached service step, `zone.sbatch <bundle> <zone tar> <zone name> <every provider's address>`,
-   run as a step (it holds the service for the step's life, as the standing run did). `up` waits for its log's verdict
+   on S. The state records each service's **declared name** beside its node's, and `up` writes **the address map**
+   into the root (`secrets/address-map.json`, 0600), before any service is launched ("The registered names", below).
+5. **The zone**: a detached service step, `zone.sbatch <bundle> <zone tar> <zone name> <every provider's address>
+   --declared=<its declared name> --host=<name>=<address> ...` (one `--host` per service of the federation, itself
+   included), run as a step (it holds the service for the step's life, as the standing run did). `up` waits for its log's verdict
    (`hpcop: OK zone`, or `FINISH FAILED` or `hpcop: ERROR`, which fail `up`).
-6. **The providers**: one detached service step each, `provider.sbatch <bundle> <provider tar> <name> <zone FQDN>
-   <admin mail> <zone address> <every other provider's address>`; for each, a registration token minted in a control
+6. **The providers**: one detached service step each, `provider.sbatch <bundle> <provider tar> <name> <zone's declared
+   name> <admin mail> <zone address> <every other provider's address> --declared=<its declared name> --host=...`; for each, a registration token minted in a control
    step on the zone's node piped into a delivery step on the provider's (`mint-registration-token.sh |
    deliver-token.sh`, the bundle's, with `--workdir`); then each log's verdict (`hpcop: OK provider`). A provider that
    owns a shared imported tree is also given `--import=SPACE=PATH`, and once every provider is up a control step on
@@ -428,7 +444,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    fingerprint first.
 8. **The core's phase** (`hpcboot.core_phase`), on the login node or in a control step on the zone's node, as `[hpc]
    core` says (section 9). **The bootstrap** is the Compose federation's own `fedboot.Bootstrap` over a layout whose
-   services' URLs are `https://<node FQDN>:8443`: the admin's token, the users, the spaces, the support (on each
+   services' URLs are `https://<declared name>:8443`, its client given the address map: the admin's token, the users, the spaces, the support (on each
    provider's one posix storage, owned by the job's uid, and that storage's LUMA local feed mapping the space and every
    user to that uid, as `onboard.py` does), the members, the baseline content (`fedcontent.Content`). An owner of a
    shared imported space also has its `import-<space>` storage made before any support, and the scan awaited after
@@ -453,6 +469,66 @@ A failed `up` leaves its state file: what it placed is recorded, and `down` rele
 **`verify-data`** (login node, after the study's ingest; section 6a) is no part of `up` and touches no job: it reads
 the state file, and reads each ingested space back through its owner. It is its own branch of the command line, never
 the `else` of `down`.
+
+### The registered names (O73)
+
+A layout declares a name for the zone and for each provider, `<service>.<domain>`. On a cluster those names resolve
+nowhere, and the nodes have names and addresses of their own that nothing the agent can read may carry (the zone's
+scope answer, the no-connection errors and the registered domain a client dials all carry what a service registered).
+So every service **registers under its declared name**, and the login node's clients reach it by that name through a
+map. Four parts land together, in this order, since only then does every step have a working check:
+
+1. **The address map.** Once the nodes' facts are read, `up` writes `secrets/address-map.json` (0600; the root's own
+   file, never in a cell, the gate's file, `facts.json` or `gate.json`): each declared name with its node's address and
+   the node's own names (its FQDN and its first label). A node's name or address belongs to one declared name; a
+   service with no address stops `up` before it launches any (`hpcnames.address_map`). `platform.toml` names it
+   (`addresses = { file = "<root>/secrets/address-map.json" }`, first, written once the root holds one). The platform
+   layer's client, the bootstrap's, the gate and the host mount's oneclient dial the mapped address and keep the
+   declared name in the URL, the handshake, the certificate check and `Host`.
+2. **The URLs.** Every URL the driver builds or records for a service is `https://<declared name>:8443`
+   (`placed_layout`): the layout's name, so `federation.is_declared` matches a URL's host to the domain a service
+   reports, and `facts.json`, `platform.toml` and the link check hold the names.
+3. **The registration.** `configure.sh` takes `--declared=<name>` and one `--host=<name>=<address>` per service, and
+   sets `onezone.domainName`, `oneprovider.domain` and `ONEPANEL_GENERATED_CERT_DOMAIN` from the declared name, while
+   the cluster section keeps the node's own names. It writes the work directory's `declared-name` and `hosts`: the
+   loopback, the node's own names on its address, every service's declared name with its address. `run_service` binds
+   `hosts` read-only over `/etc/hosts` with `--no-mount bind-paths` (the site's bind paths drop out, `/etc/localtime`
+   with them, which becomes the image's), so every peer's declared name resolves in the cell; an unresolved peer
+   crashes a provider's lookup of it (`inet:getaddrs`). A restart rebinds the file from the work directory.
+   `configure.sh` refuses, before it writes anything, a peer address with no declared name, a declared name that is
+   no peer, a name or address listed twice, an entry that is not `NAME=ADDRESS`, no entry for its own name and, for a
+   provider, none for the zone's; without `--declared` it registers under the node's FQDN as before. The readiness
+   calls (`finish.sh`, `finish-zone.sh`), the token mint and the line `zone.sbatch` prints name the registered name,
+   pinned to the loopback by `curl --resolve` (the certificate holds it alone). Onepanel's DNS check resolves through
+   DNS alone and will report a layout's name `unresolvable`: it is advisory (deployment acknowledges it), no step of
+   `up` depends on it, and `facts.json` records `dns_check: {advisory, expected: unresolvable, measured: false}`.
+4. **The check and the ordering.** After the bootstrap, `up` reads each service's `/configuration` `domain`
+   (`hpcnames.registered_domains`) and fails, naming the role and its declared name, unless it is the declared name;
+   `facts.json` records it per service (`registered_domain`). A `[sandbox.federation]` table whose names are not those,
+   or declared with no such record, is refused as `platform.toml` is rendered (`hpcnames.check_federation_table`),
+   naming the table's own names alone: the cell resolves only the declared names, and the published client dials the
+   domain a provider registered, so the table is usable only once the providers register them.
+5. **The tool server.** It is given **no `ONEDATA_MCP_NODE_NAMES`**: once the services register the declared names
+   there is nothing to map, so onedata-mcp runs unset on both platforms and its text is a Compose federation's (the
+   registration is the fix, since raw REST answers reach the agent without passing through it). It still has to reach
+   the declared names, which resolve nowhere on a node. It runs as a process of the driver's, from a venv and a
+   checkout the driver cannot name, so a cell with the agent's hosts file (a bind of those paths) is no option. A
+   Python server is started through the **resolve launcher** (`toolshim/resolve_launch.py`): `up` copies it into the
+   root, `platform.toml` names it (`[addresses] resolver`), and `toolserver.server_argv` starts the server as
+   `<the declared interpreter> -I -B <launcher> <map> -- -m <module> ...` (every Python of the driver's runs
+   isolated, so there is no `PYTHONPATH` and no `sitecustomize`, and nothing is shadowed). The launcher wraps
+   `socket.getaddrinfo` so that exactly the names of the private map resolve, to their addresses, and every other host
+   as before, never consulting the environment (the map is an argument), then runs the server with `runpy`; the URL,
+   the handshake, the certificate check and `Host` stay the declared name. A map it may not use (readable by others, a
+   link, garbled) stops the start with exit 78, naming nothing. A `[toolserver]` it cannot start (not a Python
+   interpreter, no `-m <module>` or script) is refused when the platform is loaded. It covers Python servers only, and
+   `-I` applies to the server too; a C preload would cover any process but is a built file pinned in `site.env`.
+   **Fallback, not built:** the same `ONEDATA_MCP_NODE_NAMES` mapping set on both platforms, only if the registration
+   cannot land before the pilot's freeze.
+
+What stays as it was: the certificate is the image's generated test certificate for the declared name, signed by the
+image's test CA (section 7 of `up`); the cluster's Erlang names are the node's and use no TLS; the port shim moves
+443 to 8443 for the listed peers, whose declared names resolve to those addresses.
 
 **`up` and `down` each hold the root's lifecycle lock** (`<root>.lifecycle.lock`, beside the root, `flock`, never
 waited for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job
@@ -484,7 +560,14 @@ removed while held would let the next `up` or `down` lock another file of the sa
    the zone), each bounded by `stop_seconds`; then wait until no step but `batch` and `extern` is listed in `squeue -s`
    under the held job's id and, under `het`, its component 1's own id (S's steps, a shard step's among them, are listed
    there alone), one deadline for both (ending each service step's srun client only then); a step still listed at the
-   bound is cancelled by its own id.
+   bound is cancelled by its own id. **A cancel's own exit status is no verdict:** on a heterogeneous job `scancel
+   <leader>.<n>` printed "Invalid job id specified" and exited 225 while it did end the step (live slot 5); whether the
+   step left the list decides. **A cancel on that site was an outright kill** (the step's processes ended within a
+   second, no trap ran), which left each such service's work directory (2 to 2.6 GB of the node's tmpfs) on its node:
+   once a cancelled step has left the list, `down` removes the work directory the state recorded for that service, and
+   only one the bundle makes (`hpcstate.checked_workdir`), by `teardown.sh <kind> --workdir W --timeout 0` in a
+   control step on its node, and step 3 shows it gone. Nothing the state did not record is removed: a service whose
+   log never named a work directory is left to `leftovers.py`, which only counts.
 3. One read-only control step per node checks that no recorded work directory is left on it. A service whose step
    was launched but whose log never named a work directory (seen live: a zone that failed in node-init before making
    one) is clean only when both are shown: its step has ended (listed no more, once seen listed, or cancelled by its
@@ -516,8 +599,9 @@ nodes it could not check.
 ## 6. `platform.toml` for an HPC federation
 
 **Rendered by `up` into the root from the layout's own `platform_template`, by the Compose renderer
-(`fedfacts.write_facts`), with the HPC facts:** `@zone_url@` and `@provider_url.<name>@` are `https://<node
-FQDN>:8443`; the ids are this `up`'s. Every path in the template stays relative to the root, so the same template
+(`fedfacts.write_facts`), with the HPC facts:** `@zone_url@` and `@provider_url.<name>@` are `https://<declared
+name>:8443` (O73; the address map's file is named by an `addresses` line the driver puts first); the ids are this
+`up`'s. Every path in the template stays relative to the root, so the same template
 serves both:
 
 - `tls.ca_file = "ca/federation-ca.pem"` holds the **Onedata test CA** here (each service's web certificate is the
@@ -543,7 +627,36 @@ serves both:
   reads it with `load_faults` as a campaign would, and writes it again with the least that loader's rule gives (5,340 s
   with M4's defaults), so a measured `stop_seconds`, or a term the loader adds, moves it. A core whose loader cannot
   read the HPC `[faults]` (one without M4's backend) gets the restore's rule over the keys it knows, with the HPC
-  settle time and poll.
+  settle time and poll;
+- **`[placement]`, always and complete** (O79; `hpcplacement.py`): the platform layer requires the table
+  (`rangemap.load_placement`), and a reader that found the render without one patched in a default of its own;
+  defaults supplied separately by each tool are how a setting drifts unseen. The core has no default for `holder`
+  (the file-wide data provider; every `[[spaces]]` entry names its own, which the provisioner uses), so the template
+  declares it, a provider the file declares, with a comment saying why, and `up` refuses a template that declares no
+  holder (or a holder that is no provider of the file), or declares the table in a spelling the render cannot add to,
+  naming the key and never a value, in its preflight (which runs the render's own completion over the template), before
+  anything is submitted. The render, in both of its passes, keeps what the template declares and writes every other
+  setting at the core's default, read from the fields of `PlacementSettings` (the one place the numbers are, so a field
+  added there is in the next render with no change here), each with its own TOML type. The missing settings are added
+  where the template declares the table (inside one `placement = { ... }` line of the root, or after one
+  `[placement]` header: TOML cannot add to an inline table from elsewhere, nor reopen a table, so any other spelling is
+  refused) and the result is read back as TOML, which must be the declared document plus exactly the added settings or
+  the render fails and writes nothing. No tool adds a table to the render or reads it with a default of its own:
+  `shards.py step` copies the file as it is, and `load_placement` still refuses a file without the table.
+
+**Slots and a tool server (O83).** The core starts a tool server only for a slot's user, and no federation provisioned one,
+so the tool-server arm could not run here. The users are ordinary principals of the layout and a platform template
+declares the slots and the server (`layouts/pilot-shape-slots.platform.toml.template`), so the HPC driver adds nothing to
+provisioning: section 5's bootstrap makes the zone user, its 0600 password file and its memberships, and
+`HpcBootstrap.support` maps every principal to the job's uid. The shared bootstrap treats a slot user that exists as
+read-only (`fedboot.audit_slot_users`: verified, recorded `matched`, or refused naming the user and the attribute), the
+slot users being those the template declares, read as it stands (`fedtools.slot_users`). `@user_id.<name>@` is the facts' id
+for every principal; `@study_artifacts@` is `HPC_STUDY_ARTIFACTS` (`Site.study_artifacts`, recorded in the state file for a
+hand-run `core` step; an unset key is no value, so a placeholder is never written empty). `preflight` refuses a site
+without it when the template names it, and artifacts the server cannot run from, before a job is held
+(`fedtools.check_artifacts`); `write_facts` loads the written file as a campaign does and checks its slots against the
+layout (`fedtools.check_rendered`), so a federation is not ready on a file the core refuses or one whose rights are not
+what was provisioned. A template with no `[slots]` takes none of these paths.
 
 The core's platform layer (gate, health, link check, faults) points at `<root>/platform.toml` wherever it runs,
 provided it reaches the services' 8443 and reads the root. A layout's link check covers the pairs its
@@ -777,8 +890,13 @@ against its declared SHA-256 before the cluster is touched, the work root, and t
 into the root is rendered absolute. M5 launches its shard's step on `sandbox.node` with `--jobid=<sandbox.job>`, plus
 `--het-group=<sandbox.het_group>` when that is not `null`; the step makes the sandbox's work root on S's tmpfs and copies
 the root's `platform.toml` beside the study's `study.toml`. The driver holds, reads back and places S, runs its node
-facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`: each shard step's directory of this
-federation whose step is gone), then releases it.
+facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`, by `HPC_CORE_PYTHON`, which `up` asks for
+with an agent's node: each shard step's directory of this federation whose step is gone; then the Apptainer run reaper
+over the sandbox's work root, each dead run's mounts unmounted, `fusermount3 -u` then `-uz`, shown gone by the mount
+table, before its directory and record go, and the work root removed once empty and no step directory is on the node),
+on S and on every node `shard_nodes` records, then releases it. A sweep that cannot reap (its leftovers, or a Python
+without the core) fails, and `down` keeps the root. The next shard step on a node reaps the same way before it uses its
+work root, and refuses when it cannot.
 
 **The render identity (O74).** What `up` rendered is recorded as hashes alone in `<root>/render-identity.json` (mode 0600,
 canonical JSON with sorted keys; `hpcidentity.py`, written by `hpcboot.write_facts` beside `platform.toml`, so for
@@ -830,7 +948,7 @@ neither script: it starts no work, and it archives from the step's record.
 
 ## 9. Assumptions a live slot verifies first
 
-1. **The login node reaches every service's 8443** on the nodes' FQDNs. The bootstrap, the link check and the core's
+1. **The login node reaches every service's 8443** at the nodes' addresses, by the declared names (the address map). The bootstrap, the link check and the core's
    platform layer depend on it with `[hpc] core = "login"`. Proven live: node to node (the standing run's cell reached
    every public port). Not proven: login node to node. **The fallback is a setting, not a code change:** `[hpc] core =
    "step"` runs the same phase (`hpcfed.py core`) in a control step on the zone's node, with the core's Python
@@ -862,6 +980,18 @@ neither script: it starts no work, and it archives from the step's record.
    The same steps ran in a job of one component in two earlier runs. Whether a count of steps per component or exhausted
    identifiers is the cause is not established. Two settings go round it, neither the default: `HPC_STEP_NETWORK`
    (section 3) and `sandbox_placement = "separate"` (section 1). Not seen: a whole `up` with either.
+
+7. **The registered names** (O73), not yet run live: the service cells' own hosts file in a `--writable` sandbox
+   (`--no-mount bind-paths` and a file bind onto `/etc/hosts`, which the site's Apptainer accepted for the agent's SIF
+   only); a registered domain unrelated to `cluster.domainName`; the zone's `/configuration` and each provider's
+   answering their declared names; a provider's check of a peer and an rtransfer replication between two providers by
+   their declared names; Onepanel's DNS check, measured; each service's leaf naming only its declared name (and
+   `s3.<name>` on a provider), verified by `curl --resolve` with the exported CA; and **a sandbox slot that records the
+   cell's environment, `/etc/hosts`, `gate.json` and the gate's certificates' names, the agent's typical REST answers,
+   one forced no-connection error, the K1 tools' answers and the transcript, and asserts none holds a node's name or
+   address or `8443`.** The tool server's connection to a declared name through the resolve launcher (section 5,
+   "The registered names", item 5) is tested offline in a real child process only: on a node, with onedata-mcp's own
+   venv and interpreter, it is owed too.
 
 ## 10. Who builds what
 

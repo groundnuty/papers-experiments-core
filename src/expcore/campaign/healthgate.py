@@ -74,10 +74,19 @@ platform answers `charge=True` for a failure the judged attempt left itself.
 admission (`expcore.campaign.attempt`: a platform's hook that holds a resource from before the attempt until after
 its post-run check), can see that the run still holds it, and that it runs inside its attempt
 (`expcore.campaign.liveness`), which the pre-run check and the dispatcher's own check do not.
+
+**A check can be told the attempt it judges** (O82, `expcore.campaign.health_context`). Checks of several runs and
+phases are inside the one check at the same moment, so a check that decides whom a failure is charged to (a marker the
+attempt left) cannot tell its own post-run check from another attempt's pre-run check by where it is called from: the
+gate hands it a `CheckContext` (run key, attempt number, phase, and the attempt's id after its row exists) as the
+argument `context`, when its signature declares a parameter of that name, and calls every other check with no argument
+as always. The dispatcher's own check, which judges no attempt, receives None. The context is passed down each call,
+never kept on the gate.
 """
 
 import contextlib
 import contextvars
+import functools
 import json
 import math
 import threading
@@ -87,6 +96,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
 from expcore.campaign.deferral import Deferral, deferral_alarms, operator_reason, parse_deferral
+from expcore.campaign.health_context import POST_RUN, PRE_RUN, CheckContext, takes_context
 from expcore.campaign.store import Store
 from expcore.config.loading import ConfigError
 
@@ -115,10 +125,25 @@ class HealthCheck(Protocol):
     A check may also declare the longest it can stay deferred, with a method `max_deferral_s()` answering a
     `DeferralBound` or None (`deferral_bound`); the protocol leaves it out, so a check without it is still one. A check
     that wraps the platform's passes the method on: where the platform declares a deferral of its own, a check without
-    it, or with a smaller bound, is refused when the scheduler is built (`SchedulerConfig.check_declared_deferral`)."""
+    it, or with a smaller bound, is refused when the scheduler is built (`SchedulerConfig.check_declared_deferral`).
+
+    A check that decides whom a failure is charged to can be told the attempt it judges: a `ContextHealthCheck`
+    declares a parameter named `context` and receives a `CheckContext` (O82); one that declares none is called with no
+    argument, as it always was."""
 
     def __call__(self) -> Health:
         """Return the platform's health."""
+        ...
+
+
+class ContextHealthCheck(Protocol):
+    """A health check that is told which attempt it judges: it declares a parameter named `context`
+    (`expcore.campaign.health_context`), and the gate calls it `check(context=...)` with the `CheckContext` of the
+    attempt (None when the check judges none: the dispatcher's own check, or a call that names no attempt). It is a
+    `HealthCheck` in every other way, `max_deferral_s` included."""
+
+    def __call__(self, *, context: CheckContext | None) -> Health:
+        """Return the platform's health, judging the attempt `context` names."""
         ...
 
 
@@ -318,7 +343,7 @@ class HealthGate:
     def __init__(
         self,
         store: Store,
-        check: HealthCheck,
+        check: HealthCheck | ContextHealthCheck,
         clock: Callable[[], str],
         *,
         recheck_s: float = 30.0,
@@ -327,6 +352,7 @@ class HealthGate:
     ):
         if recheck_s <= 0 or timeout_s <= 0 or max_defer_s <= 0:
             raise ValueError("recheck_s, timeout_s and max_defer_s must be positive")
+        self._takes_context = takes_context(check)  # an ambiguous signature is refused here, not at the first call
         self.store, self.check, self.clock = store, check, clock
         self.recheck_s, self.timeout_s, self.max_defer_s = recheck_s, timeout_s, max_defer_s
         self.deferral = Deferral(store, clock)
@@ -444,8 +470,11 @@ class HealthGate:
 
     # --- the checks of a run ----------------------------------------------------------------------------------------
 
-    def _ask(self, stop: threading.Event | None) -> Health | None:
+    def _ask(self, stop: threading.Event | None, context: CheckContext | None = None) -> Health | None:
         """Run the check in a thread of its own and wait for its answer at most `timeout_s`.
+
+        A check that takes a `context` is called with this call's (None for a check that judges no attempt): it is
+        bound into the call here, never kept on the gate, which every worker's checks share.
 
         Return what it said; a check that does not answer in time reads as down and its late answer is thrown away.
         Return None when `stop` is set before it answers: the campaign is ending and nobody is waiting for it. A check
@@ -460,9 +489,11 @@ class HealthGate:
             box: dict[str, Any] = {"done": threading.Event(), "deadline": time.monotonic() + self.timeout_s}
             self._out.append(box)
 
+        call = functools.partial(self.check, context=context) if self._takes_context else self.check
+
         def go() -> None:
             try:
-                box["health"] = read_health(self.check)
+                box["health"] = read_health(call)
             finally:
                 box["done"].set()
 
@@ -475,7 +506,7 @@ class HealthGate:
                 return Health(False, f"the health check did not answer within {self.timeout_s:g} s: counted as down")
         return box["health"]
 
-    def _read_at_gate(self) -> tuple[Health, dict[str, Any] | None]:
+    def _read_at_gate(self, context: CheckContext | None) -> tuple[Health, dict[str, Any] | None]:
         """Run a post-run check and take the gate's state the instant it returns: the open outage's record or None.
 
         The check runs outside the lock, since it may take as long as its timeout. The gate is read with the answer in
@@ -483,21 +514,25 @@ class HealthGate:
         the timeout alone: the end of the campaign does not cut it short, because the result it judges is finished and
         must not be relabelled as infrastructure for want of an answer.
         """
-        health = self._ask(None)
+        health = self._ask(None, context)
         assert health is not None  # only an ending campaign gives no answer, and none is passed
         with self._lock:
             return health, self._open
 
-    def before_run(self, run_key: str) -> PreRun:
+    def before_run(self, run_key: str, *, attempt: int | None = None) -> PreRun:
         """Check before an attempt. A closed gate holds the run without a check; a passing check lets it go unless the
         gate closed while the check was out; a deferred check defers the run and leaves the gate as it is; a failing
         check closes the gate and charges this run, or holds it when the check charges no one (`Health.charge`) or
-        another run closed the gate first."""
+        another run closed the gate first.
+
+        `attempt` is the number the try will have (`CheckContext.attempt`): a check that takes the context is given
+        `CheckContext(run_key, attempt, PRE_RUN)`, or None when no attempt is named."""
+        context = None if attempt is None else CheckContext(run_key, attempt, PRE_RUN)
         if self._open is not None:
             return PreRun(HOLD, "the gate is closed")
         if self._stop is not None and self._stop.is_set():
             return PreRun(HOLD, "the campaign is ending")
-        answer = self._ask(self._stop)
+        answer = self._ask(self._stop, context)
         if answer is None:
             return PreRun(HOLD, "the campaign is ending")  # nothing is charged for a shutdown
         with self._lock:
@@ -518,10 +553,20 @@ class HealthGate:
             return PreRun(HOLD, "another run's failed check closed the gate first")
         return PreRun(FOUND, detail) if health.charge else PreRun(HOLD, detail)
 
-    def after_run(self) -> tuple[Health, dict[str, Any] | None]:
+    def after_run(
+        self, run_key: str | None = None, *, attempt: int | None = None, attempt_id: int | None = None
+    ) -> tuple[Health, dict[str, Any] | None]:
         """Check after an attempt: the health, and the outage record if the gate was closed when the check returned. A
-        check that passes ends the current deferral, as a pre-run pass does, so a later one counts from its own start."""
-        health, outage = self._read_at_gate()
+        check that passes ends the current deferral, as a pre-run pass does, so a later one counts from its own start.
+
+        The attempt judged is named by `run_key`, `attempt` and `attempt_id` (`CheckContext`), given together or not at
+        all: a check that takes the context is given `CheckContext(run_key, attempt, POST_RUN, attempt_id)`, or None
+        when none is named."""
+        given = (run_key is not None, attempt is not None, attempt_id is not None)
+        if any(given) and not all(given):
+            raise ValueError("after_run takes the run_key, the attempt and the attempt_id together, or none of them")
+        context = CheckContext(run_key, attempt, POST_RUN, attempt_id) if all(given) else None
+        health, outage = self._read_at_gate(context)
         if health.ok:
             self.deferral.end()
         return health, outage

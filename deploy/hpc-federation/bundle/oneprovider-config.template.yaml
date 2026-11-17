@@ -24,7 +24,7 @@ cluster:
 oneprovider:
   register: true
   name: "@PROVIDER_NAME@"
-  domain: "@NODE_FQDN@"
+  domain: "@DECLARED_NAME@"
   tokenProvisionMethod: "fromFile"
   tokenFile: "/root/.hpcop/registration-token"
   adminEmail: "@ADMIN_EMAIL@"

@@ -248,11 +248,17 @@ class AttemptSpend:
         (C05); a row without one refuses the first, loudly."""
         self.ledger, self.attempt_id, self.run_key, self.model = ledger, attempt_id, run_key, model
         self.calls_logged = calls_logged
+        self.loop_ended = False  # the recording's loop returned: an exception after this is not one during the loop
         self.unaccounted = False  # a reply left a count out: from then on the cap does not bound the run
         self.maximum = ledger.maximum(model)
         self.reserved_capped = reserved_capped  # the run was admitted with the reservation by the reply maximum
         # what the next send of the current request was cleared with by a top-up; None: the run's reservation covers it
         self.cleared: float | None = None
+
+    def after_loop(self) -> None:
+        """Take note that the attempt's loop has ended (`spend.after_loop`): the call log is complete up to it, so an
+        executor that raises after this is charged what the log measured (`campaign.after_loop`)."""
+        self.loop_ended = True
 
     async def before_request(self) -> None:
         """Top up a request that follows a reply without usage, or end the attempt as a budget hold. A run reserved

@@ -462,10 +462,8 @@ def test_o63_the_dispatcher_ends_as_python_m_expcore_would(shards, tmp_path, wor
     work = tmp_path / "work"
     work.mkdir()
     (work / ".step.ended.json").write_text(json.dumps({"phase": "archiving"}))
-    plain = subprocess.run(
-        [sys.executable, "-I", "-B", "-m", "expcore", *words], capture_output=True, text=True, cwd=work
-    )
     dispatcher = [sys.executable, "-I", "-B", "-m", "expcore", *words]
+    plain = subprocess.run(dispatcher, capture_output=True, text=True, cwd=work)
     tied = subprocess.Popen(
         [sys.executable, "-I", "-B", "-c", shards.DISPATCHER, str(os.getpid()), *dispatcher],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=work,

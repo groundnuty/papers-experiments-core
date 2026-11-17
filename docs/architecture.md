@@ -22,7 +22,7 @@ src/expcore/
   config/        TOML loading and validation; the model table
   models/        backend protocol, OpenAI-compatible, Anthropic, stub; retry; served-model check
   loop/          agent loop, tool box, output capping, outcome vocabulary
-  tools/         MCP stdio client, frozen manifest, allow-list
+  tools/         MCP stdio client, frozen manifest, allow-list, private working directory
   prompt/        templates with named slots
   records/       record schema, atomic write, read-back, secret redaction
   replay/        offline replay and the replay check
@@ -36,6 +36,7 @@ src/expcore_onedata/
   tokens.py      minting, examination, rights per condition
   sandbox/       containers, data gate, mount sidecar, networks, teardown, kill causes
   toolserver.py  onedata-mcp launch with a frozen allow-list per condition
+  toolmanifest.py freeze and check a condition's manifest from the server started as the launch starts it
   provision.py   scoped create and teardown of study data; replicate and evict, each confirmed by the block map
   placement.py   block-map arithmetic: what a provider holds, what is missing
   rangemap.py    the declared per-file, per-provider byte-range map and the [placement] settings
