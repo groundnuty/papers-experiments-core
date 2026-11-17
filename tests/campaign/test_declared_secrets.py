@@ -50,13 +50,26 @@ class Inducer:
         return {}
 
 
-def run_failing_start(root, declare, *quoted):
+class SilentInducer:
+    """An instrument whose start fails and gives no diagnostic: nothing was seen that it would say."""
+
+    namespace = "state_inducer"
+
+    def start(self, identity):
+        raise InfraError("sandbox", "refused")
+
+    def finish(self):
+        return {}
+
+
+def run_failing_start(root, declare, *quoted, instrument=None):
     """A campaign whose executor runs `declare(request)`, then starts an instrument that fails quoting the secret (or
-    the values given); return the first attempt's row, its marker and the export."""
+    the values given), or `instrument()` when one is given; return the first attempt's row, its marker and the
+    export."""
 
     async def executor(request):
         declare(request)
-        start_instruments([Inducer(*quoted)], {"run_key": request.run_key})
+        start_instruments([Inducer(*quoted) if instrument is None else instrument()], {"run_key": request.run_key})
 
     settings = settings_for(max_attempts=1)
     with build(root, plan=PLAN, executor=FakeExecutor(default=executor), settings=settings) as scheduler:
@@ -126,7 +139,7 @@ def test_c40_an_undeclared_executors_diagnostic_is_withheld_from_everything_that
     assert "no secrets" in stored["why"]
     assert export["attempt_diagnostics"][0]["diagnostic"] == stored  # what the export says, and all it says
     assert (row["state"], row["charged"], row["infra_kind"]) == ("infra_fail", 1, "sandbox")
-    assert "| - | sandbox | infra_fail | 1 | 1 | 1 | 0 |" in report  # counted, named by no instrument, withheld
+    assert "| - | sandbox | infra_fail | 1 | 1 | 0 | 1 | 0 | 0 |" in report  # counted, no instrument, withheld
     local = log_path(root).read_text(encoding="utf-8")
     assert "the endpoint answered with" in local  # kept, where nothing ships
     assert "state_inducer" in local
@@ -143,7 +156,34 @@ def test_c40_a_declared_empty_executors_diagnostic_is_shown_in_the_export_and_th
         "seen": f"the endpoint answered with {SECRET}"
     }  # no secret declared: nothing to hide
     assert export["attempt_diagnostics"][0]["diagnostic"] == stored
-    assert "| state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 0 |" in report_of(export)
+    assert "| state_inducer | sandbox | infra_fail | 1 | 1 | 1 | 0 | 0 | 0 |" in report_of(export)  # shown
+    assert not log_path(root).exists()
+
+
+@pytest.mark.parametrize(
+    ("declare", "instrument", "row_of_the_report"),
+    [
+        (lambda request: None, "-", "| - | sandbox | infra_fail | 1 | 1 | 0 | 0 | 1 | 0 |"),
+        (
+            lambda request: request.declare_secrets(),
+            "state_inducer",
+            "| state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 0 | 1 | 0 |",
+        ),
+    ],
+    ids=["undeclared", "declared"],
+)
+def test_c40_a_failed_start_that_gave_no_diagnostic_is_counted_as_having_none_neither_withheld_nor_unkept(
+    tmp_path, declare, instrument, row_of_the_report
+):
+    """C40: the count gap of the report: whatever the executor declared, a start that gave no diagnostic has nothing to
+    show and nothing to withhold. The snapshot is the phase alone (the instrument too once the executor declared), the
+    report counts it in the "No diagnostic" column and in no other, and no note is written to the local log."""
+    root = tmp_path / "out"
+    row, _, export = run_failing_start(root, declare, instrument=SilentInducer)
+    stored = json.loads(row["diagnostic"])
+    assert stored == ({"phase": "start"} if instrument == "-" else {"phase": "start", "instrument": instrument})
+    assert export["attempt_diagnostics"][0]["diagnostic"] == stored
+    assert row_of_the_report in report_of(export)
     assert not log_path(root).exists()
 
 
