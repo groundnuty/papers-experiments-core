@@ -58,7 +58,12 @@ _COUNTS = ("attempts", *_TOKENS, "usage_incomplete_attempts", "bounded_attempts"
 
 
 def usage_of(
-    query: Query, pricing: Pricing | None, *, left_out: Collection[str] = (), why: str | None = None
+    query: Query,
+    pricing: Pricing | None,
+    *,
+    left_out: Collection[str] = (),
+    why: str | None = None,
+    models: Iterable[str] = (),
 ) -> dict[str, Any]:
     """What each model spent, from the store `query` reads (a store's or a snapshot's `q`), by class of attempt.
 
@@ -91,8 +96,7 @@ def usage_of(
             _charge(cell, by_id.get(row["id"]))
     if found is not None:
         _add_lost(cells, found)
-    models = _models(rows, pricing)
-    entries = [_entry(model, pricing, cells, found) for model in models]
+    entries = [_entry(model, pricing, cells, found) for model in _models(rows, pricing, models)]
     return {"format": FORMAT, "dollars": {"known": found is not None, "reason": reason}, "models": entries}
 
 
@@ -178,9 +182,9 @@ def _whole(lost: Mapping[str, Any]) -> bool:
     return lost.get("usage_complete") is None or bool(lost["usage_complete"])
 
 
-def _models(rows: Sequence[Any], pricing: Pricing | None) -> list[str]:
+def _models(rows: Sequence[Any], pricing: Pricing | None, planned: Iterable[str]) -> list[str]:
     """The plan's models, and any other the store holds, sorted: a model with no attempt is listed with zeros."""
-    named = {row["model"] for row in rows} | (set() if pricing is None else set(pricing.models))
+    named = {row["model"] for row in rows} | set(planned) | (set() if pricing is None else set(pricing.models))
     return sorted(named)
 
 
@@ -226,6 +230,31 @@ def _model_usd(entry: Mapping[str, Any]) -> dict[str, float] | None:
     analysed = float(sum(c["usd"]["total"] for c in entry["classes"] if c["class"] == "analysed"))
     other = float(sum(c["usd"]["total"] for c in entry["classes"] if c["class"] != "analysed")) + probes
     return {"total": analysed + other, "analysed": analysed, "not_analysed": other}
+
+
+def prices_apply(pricing: Pricing, fingerprint: Mapping[str, Any] | None) -> str | None:
+    """Why the study's prices cannot be taken for the ones a store's campaign ran under (`Pricing.mismatch`); None when
+    they can. A store that records no campaign fingerprint has nothing to show it by, so no dollar is given for it."""
+    if fingerprint is None:
+        return "the store records no campaign fingerprint, so the study's prices cannot be shown to be the campaign's"
+    return pricing.mismatch(fingerprint)
+
+
+def usage_of_batch(
+    stores: Sequence[tuple[Query, Mapping[str, Any] | None]],
+    pricing: Pricing,
+    *,
+    left_out: Collection[str] = (),
+    records: Iterable[Any] = (),
+) -> dict[str, Any]:
+    """What a batch spent and what served and retried its requests: each store's figures (a query over its snapshot,
+    with the campaign fingerprint it records) added, in the order given, and what the verified `records` say attached.
+    The study's prices apply to a store only where they are shown to be the campaign's (`prices_apply`)."""
+    parts = []
+    for query, fingerprint in stores:
+        why = prices_apply(pricing, fingerprint)
+        parts.append(usage_of(query, None if why else pricing, left_out=left_out, why=why, models=pricing.models))
+    return attach_observed(merge_usage(parts), observed_by_model(records))
 
 
 def merge_usage(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

@@ -77,6 +77,7 @@ from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifes
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
 from expcore.campaign.merged import read_held, verify_merged, verify_queried
+from expcore.campaign.model_usage import usage_of_batch
 from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec
@@ -179,6 +180,9 @@ class StudyAnalysis:
         None  # a batch checked by two or more guards: the rerun without the runs any leaves out
     )
     visibility: VisibilityAnalysis | None = None  # a batch watched for hidden processes: the same, of those (O56)
+    # what each model spent, by what became of the attempt and on which basis, and what its records say of the served
+    # model and the retries (`campaign.model_usage`, C39); None for an analysis built without it
+    model_usage: Mapping[str, Any] | None = None
 
 
 def out_dir(study: StudyConfig | StudyIdentity) -> Path:
@@ -910,6 +914,7 @@ def _analyse_loaded(
     try:
         export = _export_of(verified, study.manifest)
         _require_campaign(export, verified)
+        usage = _model_usage(study, verified)
     finally:
         verified.close()
     rows, scores, runs = [], {}, []
@@ -935,7 +940,22 @@ def _analyse_loaded(
     _require_declared_reruns(study, ran_reruns(egress, guard, seen, both))
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
-    return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen)
+    return StudyAnalysis(
+        study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen, usage
+    )
+
+
+def _model_usage(study: StudyConfig, verified: VerifiedBatch) -> dict[str, Any]:
+    """What each model spent and what served and retried its requests (C39), from the snapshots the check held and the
+    records it replayed: the budget gate's own figures, charged by the study's prices where the campaign's fingerprint
+    shows them to be the ones it ran under, the shards of a merged batch added in shard order."""
+    stores = []
+    for _, snapshot in sorted(verified.snapshots.items(), key=lambda item: (item[0] is not None, item[0] or 0)):
+        fingerprint = recorded_fingerprint(snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,)))
+        stores.append((snapshot.q, fingerprint))
+    return usage_of_batch(
+        stores, pricing_of(study), left_out=frozenset(verified.excluded), records=verified.records.values()
+    )
 
 
 def _require_declared_reruns(study: StudyConfig, ran: tuple[str, ...]) -> None:
@@ -1034,6 +1054,7 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         | ({} if analysis.mount_guard is None else {"mount_guard": _mount_guard_summary(analysis.mount_guard)})
         | ({} if analysis.guards is None else {"guards": _guards_summary(analysis.guards)})
         | ({} if analysis.visibility is None else {"process_visibility": _visibility_summary(analysis.visibility)})
+        | ({} if analysis.model_usage is None else {"model_usage": analysis.model_usage})
         | _declared_reruns_entry(analysis.study.prereg.sensitivity_reruns)
     )
 
@@ -1159,6 +1180,7 @@ def report_text(analysis: StudyAnalysis) -> str:
         mount_guard=analysis.mount_guard,
         guards=analysis.guards,
         visibility=analysis.visibility,
+        model_usage=analysis.model_usage,
     )
 
 
