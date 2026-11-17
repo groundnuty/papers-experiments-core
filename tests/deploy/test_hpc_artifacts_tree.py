@@ -350,12 +350,23 @@ def test_o74_an_absolute_link_to_a_place_outside_the_tree_is_refused_naming_its_
         ("venv/out", "lib/../../../outside/lib"),
         ("venv/bin/out", "./../../../outside/python3.12"),
         ("venv/bin/out", "../../../.."),
+        ("out", "../artifacts/venv/lib"),
     ],
-    ids=["file", "parent", "after a missing name", "from a directory", "after a directory", "dot first", "deep"],
+    ids=[
+        "file",
+        "parent",
+        "after a missing name",
+        "from a directory",
+        "after a directory",
+        "dot first",
+        "deep",
+        "and back in",
+    ],
 )
 def test_o74_a_link_that_escapes_by_dot_dot_is_refused_naming_its_relative_path(identity, tmp_path, link, target):
     """O74: a relative target is read from the link's own directory: each `..` goes one directory up, and one that
-    would leave the tree is an escape, whatever lies on the way (a directory, a missing name)."""
+    would leave the tree is an escape, whatever lies on the way (a directory, a missing name), and even when the target
+    comes back into the tree (`../artifacts/venv/lib` names a place of the tree): any step that leaves is refused."""
     outside_place(tmp_path)
     root = study_tree(tmp_path / "artifacts")
     (root / link).symlink_to(target)
