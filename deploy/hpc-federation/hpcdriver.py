@@ -422,7 +422,8 @@ class Driver(Down):
         self.providers_up()
         self.export_zone()
         out = self.run_core()
-        self.set(lambda s: s.update(phase="linked"))
+        with self.store.core_phase("the end of this up"):  # no rerun by hand is in flight: its check has not ended
+            self.set(lambda s: s.update(phase="linked"))
         retried = self.retried()
         return f"{out}\n{retried}\n{self.start_relay()}" if retried else f"{out}\n{self.start_relay()}"
 
@@ -903,15 +904,26 @@ class Driver(Down):
     def relink_refusal(self, state: Mapping[str, Any]) -> Optional[str]:
         """Why a rerun on a `linked` federation cannot say `linked` again, whatever its own checks find, or None. The
         rerun never reads an ingested space, and `shards.py plan` takes the markers `verify-data` left as read. So a
-        rerun that found no facts file (the core's phase then resets every space's content, an ingested one's too), one
-        over another layout than the one `up` recorded (it renders the platform file from the layout it is given, and
-        a layout with no platform template runs no link check), or one whose ingested spaces or manifests are not what
-        `up` recorded, does not vouch for them. Whatever goes wrong while comparing is a refusal too, in fixed words:
-        the rerun still runs, and no error here names a path or ends in a traceback."""
+        rerun that found no facts file (the core's phase then resets every space's content, an ingested one's too),
+        one over another layout than the one `up` recorded or another platform template than the one it rendered (it
+        renders the platform file from what it is given, and one with no provider pair runs no link check), or one
+        whose ingested spaces or manifests are not what `up` recorded, does not vouch for them. Whatever goes wrong
+        while comparing is a refusal too, in fixed words: the rerun still runs, and no error here names a path or
+        ends in a traceback."""
         if not self.layout.facts.exists():
             return "its facts file was missing, so the core's phase reset every space's content"
         if self.spec.digest != (state.get("layout") or {}).get("digest"):
             return "its layout is not the one up recorded"
+        if self.spec.platform_template is not None:  # the layout's digest covers the layout file, not the template
+            try:
+                recorded_hash = json.loads((self.root / hpcidentity.FILE).read_text(encoding="utf-8"))[
+                    "template_sha256"
+                ]
+                current_hash = hpcidentity.sha256_text(self.spec.platform_template.read_text(encoding="utf-8"))
+            except (OSError, ValueError, KeyError, TypeError):
+                return "its platform template could not be compared with the one up rendered"
+            if recorded_hash != current_hash:
+                return "its platform template is not the one up rendered"
         recorded = (state.get("data") or {}).get("ingested")
         if recorded is None:
             return "its state holds no record of the ingested spaces (its up predates it)"

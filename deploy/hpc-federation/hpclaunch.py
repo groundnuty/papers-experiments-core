@@ -90,13 +90,14 @@ class StateStore:
             os.close(descriptor)
 
     @contextlib.contextmanager
-    def core_phase(self) -> Iterator[None]:
+    def core_phase(self, what: str = "this one") -> Iterator[None]:
         """Hold the root's core-phase lock for a whole core phase (`up`'s own, here or in the node's step, and a
-        rerun by `hpcfed.py core`), never waiting for it: a second one is refused at once, naming the state, and
-        writes nothing. Two overlapping reruns are no rerun of a `linked` federation to the second, which reads the
-        `bootstrapped` the first left, so the first could link the federation over the second's failed check. The
-        lock file is in the root, closed when the phase ends and removed with the root by `down`, which holds no core
-        phase; the kernel lets it go with a process that dies. It holds nothing, so it is no evidence of the root."""
+        rerun by `hpcfed.py core`) and for `up`'s own last write, of `linked`, never waiting for it: a second one is
+        refused at once, naming the state (`what` is what is refused), and writes nothing. Two overlapping reruns are
+        no rerun of a `linked` federation to the second, which reads the `bootstrapped` the first left, so the first
+        could link the federation over the second's failed check. The lock file is in the root, closed when the phase
+        ends and removed with the root by `down`, which holds no core phase; the kernel lets it go with a process that
+        dies. It holds nothing, so it is no evidence of the root."""
         self.read()  # no state, no federation: the state's own refusal
         descriptor = os.open(self.root / CORE_PHASE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
@@ -105,7 +106,7 @@ class StateStore:
             except BlockingIOError:
                 phase = self.read().get("phase")
                 raise hpcstate.StateError(
-                    f"a core phase is already running on this federation (phase {phase}): this one is refused and "
+                    f"a core phase is already running on this federation (phase {phase}): {what} is refused and "
                     "changed nothing"
                 ) from None
             yield
