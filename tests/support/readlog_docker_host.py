@@ -9,7 +9,7 @@ bound socket directory), so the real socket, the real client and the real reader
 
 Knobs a test sets before the start: `ready` (the container says it is ready), `exits_before_ready`, `canary` (the
 canary cell's answer, stand-in mode), `ignores_term`, `complete` (a TERM writes an end line), `writes_log` (the
-stand-in leaves a log at all). `execs` holds each
+stand-in leaves a log at all), `end_on_kill` (a kill leaves an end line), `term_loses_race`. `execs` holds each
 `docker exec` the fake saw, with its arguments (the user the cell ran as among them).
 """
 
@@ -41,6 +41,8 @@ class Collector:
         self.ignores_term = False
         self.complete = True
         self.writes_log = True
+        self.end_on_kill = False  # a collector that needed the kill and still left an end line
+        self.term_loses_race = False  # it ends by itself just before the harness's TERM, which then fails
         self.records: list[dict] = []
         self.execs: list[tuple[list[str], str | None]] = []
         self.container: FakeContainer | None = None
@@ -120,11 +122,16 @@ class Collector:
         self.host.calls.append(("signalled", container.name, sig))
         if sig == "TERM" and self.ignores_term:
             return CmdResult(0, container.name + "\n")
+        if sig == "TERM" and self.term_loses_race:  # it has just ended on someone else's TERM: nothing to signal
+            self._write_log(end=True, uid=int(container.command[-1]), nonce=container.command[-2])
+            container.running = False
+            self.host.alive.discard(container.pid)
+            return CmdResult(1, "", f"container {container.name} is not running")
         if self.proc is not None:
             self.proc.send_signal(signal.SIGTERM if sig == "TERM" else signal.SIGKILL)
             container.exit_code = self.proc.wait(timeout=30)
         elif self.writes_log:
-            end = sig == "TERM" and self.complete
+            end = self.complete if sig == "TERM" else self.end_on_kill
             self._write_log(end=end, uid=int(container.command[-1]), nonce=container.command[-2])
         container.running = False
         self.host.alive.discard(container.pid)

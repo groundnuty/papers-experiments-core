@@ -229,6 +229,7 @@ def test_o91_the_collection_stops_the_collector_with_sigterm_and_reads_its_log_o
     assert done["read_log"] == RL.COPY_NAME == "read-log.jsonl"
     assert (tmp_path / "out" / RL.COPY_NAME).read_bytes() == data
     stop = sbx.metadata()["readlog_stop"]
+    assert stop["ran_until_stop"] is True
     assert (stop["term"], stop["ended_on_term"], stop["killed"], stop["stopped"]) == (True, True, False, True)
     found = reading(sbx)
     assert found.intact, found.problems
@@ -267,12 +268,12 @@ def test_o91_a_collector_killed_during_the_run_gives_an_unknown_log_and_is_a_dea
     done = sbx.collect(tmp_path / "out")
     assert [d["role"] for d in done["deaths"]] == ["readlog"]
     assert done["deaths"][0]["category"] == "infrastructure"
-    assert done["read_log"] is None
-    assert sbx.read_log() is None  # a collector that ended before the collection stopped it has no log to trust
-    assert sbx.metadata()["readlog_stop"]["ended_before_collection"] is True
+    assert sbx.metadata()["readlog_stop"]["ran_until_stop"] is False
+    assert done["read_log"] == RL.COPY_NAME  # a log that already reads unknown is kept as evidence
+    assert (tmp_path / "out" / RL.COPY_NAME).read_bytes() == sbx.read_log()
     found = reading(sbx)
-    assert not found.intact
-    assert reader.MISSING in found.problems
+    assert not found.intact  # and still reads unknown: no end line
+    assert reader.NOT_CLOSED in found.problems
     sbx.stop()
 
 
@@ -280,7 +281,7 @@ def test_o91_a_collector_stopped_from_outside_with_sigterm_gives_an_unknown_log_
     world, collector, tmp_path
 ):
     """Codex round 1: SIGTERM from outside makes the collector drain and write a valid end line, which the reader
-    calls intact; the run's log must still be unknown, the collector having ended on its own account."""
+    calls intact; the log is withheld, the collector not having ended under the harness's own stop."""
     sbx = start(world)
     collector.records = [read("file-1")]
     assert world.host.docker("kill", "-s", "TERM", sbx.names.readlog).returncode == 0
@@ -289,7 +290,7 @@ def test_o91_a_collector_stopped_from_outside_with_sigterm_gives_an_unknown_log_
     assert [d["role"] for d in done["deaths"]] == ["readlog"]
     assert terms(world) == [("signalled", sbx.names.readlog, "TERM")]  # the outside one: the harness sent none
     stop = sbx.metadata()["readlog_stop"]
-    assert (stop["term"], stop["ended_before_collection"], stop["stopped"]) == (False, True, True)
+    assert (stop["ran_until_stop"], stop["term"], stop["ended_on_term"], stop["stopped"]) == (False, False, False, True)
     assert done["read_log"] is None
     assert sbx.read_log() is None
     snapshot = ReadLog(sbx, sbx.readlog_nonce, sbx.readlog_expected_peer_uid).finish()
@@ -298,14 +299,34 @@ def test_o91_a_collector_stopped_from_outside_with_sigterm_gives_an_unknown_log_
     sbx.stop()
 
 
-def test_o91_a_collector_that_ignores_sigterm_is_killed_and_its_log_reads_unknown(world, collector, tmp_path):
+def test_o91_a_collector_that_ignores_sigterm_is_killed_and_its_log_reads_unknown_and_is_kept(
+    world, collector, tmp_path
+):
     collector.ignores_term = True
     sbx = start(world)
-    sbx.collect(tmp_path / "out")
+    done = sbx.collect(tmp_path / "out")
     stop = sbx.metadata()["readlog_stop"]
+    assert stop["ran_until_stop"] is True
     assert (stop["term"], stop["ended_on_term"], stop["killed"], stop["stopped"]) == (True, False, True, True)
     assert not reading(sbx).intact
     assert reader.NOT_CLOSED in reading(sbx).problems
+    assert done["read_log"] == RL.COPY_NAME  # it already reads unknown: kept as evidence
+    sbx.stop()
+
+
+def test_o91_a_collector_that_needed_the_kill_and_left_a_clean_looking_log_has_it_withheld(world, collector, tmp_path):
+    """One rule for both backends: a stop that was not clean never gives a log that reads intact."""
+    collector.ignores_term = True
+    collector.end_on_kill = True  # the stand-in writes a complete log, end line included, when it is killed
+    sbx = start(world)
+    done = sbx.collect(tmp_path / "out")
+    assert sbx.metadata()["readlog_stop"]["killed"] is True
+    assert collector.log_path.exists()  # the file is complete: it would read intact
+    assert reader.read_log(collector.log_path.read_bytes(), sbx.readlog_nonce, expected_peer_uid=10001).intact
+    assert done["read_log"] is None
+    assert sbx.read_log() is None
+    assert not (tmp_path / "out" / RL.COPY_NAME).exists()
+    assert reader.MISSING in reading(sbx).problems
     sbx.stop()
 
 
@@ -506,3 +527,20 @@ def test_o91_a_failed_collection_keeps_a_log_without_the_token_with_the_evidence
     sbx.stop()
     kept = world.s.work_root / "_kept_evidence" / sbx.sid / "readlog" / "log" / LOG
     assert kept.read_bytes() == b'{"event": "start"}\n'
+
+
+def test_o91_a_collector_that_ends_by_itself_just_before_the_harness_s_term_is_not_a_clean_stop(
+    world, collector, tmp_path
+):
+    """Opus round 2: it ran when the harness came to stop it, but the TERM was not delivered: a log that would read
+    intact is withheld, as when something else stopped it earlier."""
+    collector.term_loses_race = True
+    sbx = start(world)
+    done = sbx.collect(tmp_path / "out")
+    stop = sbx.metadata()["readlog_stop"]
+    assert (stop["ran_until_stop"], stop["term"], stop["ended_on_term"], stop["killed"]) == (True, False, False, False)
+    assert stop["stopped"] is True
+    assert reader.read_log(collector.log_path.read_bytes(), sbx.readlog_nonce, expected_peer_uid=10001).intact
+    assert done["read_log"] is None
+    assert sbx.read_log() is None
+    sbx.stop()

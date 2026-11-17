@@ -68,6 +68,7 @@ from expcore.config.loading import ConfigError
 from expcore_onedata import tls
 from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.readlog import facts as readlog_facts
+from expcore_onedata.readlog import reader as readlog_reader
 from expcore_onedata.sandbox import (
     cellhost,
     cellresolv,
@@ -777,31 +778,32 @@ class DockerSandbox:
 
     def read_log(self) -> bytes | None:
         """The collector's log as the collection read it, once, after the collector had stopped; None before that, for a
-        run without the channel, for a collector that ended before the collection stopped it, and when the log could
-        not be read or held the token (`readlog.instrument.ReadLogSource`). A log that is None is UNKNOWN reads, never a
-        run that read nothing."""
+        run without the channel, when the log could not be read or held the token, and when it would read intact though
+        its collector did not end cleanly under the harness's stop (`_collect_readlog`;
+        `readlog.instrument.ReadLogSource`). A log that is None is UNKNOWN reads, never a run that read nothing."""
         return self._readlog_bytes
 
     def _stop_readlog(self) -> None:
         """SIGTERM the collector and wait for it to exit, so that it drains what is queued and writes its end line; one
         still running after `READLOG_POLLS` reads is killed, so that its log is stable when it is read, and shows no end
         line. The stop is the harness's own, marked as such before the signal (no death in the run's record).
-        `readlog_stop` in the metadata says what happened: `term` (the signal was delivered), `ended_on_term`, `killed`,
-        `stopped` (the container was shown not running, the condition of reading its log) and `ended_before_collection`
-        (it was not running when the harness came to stop it: killed, stopped from outside or crashed, whatever the
-        end line says, so its log is not read as this run's)."""
+        `readlog_stop` in the metadata says what happened, as the Apptainer backend's does: `ran_until_stop` (the
+        collector was shown running when the harness came to stop it), `term` (the signal was delivered),
+        `ended_on_term`, `killed`, and `stopped` (the container was shown not running, the condition of reading its
+        log). Only a collector that ran until this stop and ended on SIGTERM ended cleanly (`_collect_readlog`)."""
         note = self._meta["readlog_stop"] = {
-            "term": False, "ended_on_term": False, "killed": False, "stopped": False, "ended_before_collection": False,
+            "ran_until_stop": False, "term": False, "ended_on_term": False, "killed": False, "stopped": False,
         }  # fmt: skip
         try:
             self._stop_on_purpose("readlog")
-            if self._readlog_running() is False:  # not the harness's stop: nothing to signal, and no log to trust
-                note["ended_before_collection"] = True
-            else:
+            running = self._readlog_running()
+            note["ran_until_stop"] = running is True  # True only while it ran until this stop; unknown is not running
+            if running is not False:  # one that is already gone has nothing to signal
                 sent = self.host.docker("kill", "-s", "TERM", self.names.readlog, check=False, timeout=30)
                 note["term"] = sent.returncode == 0
-                note["ended_on_term"] = self._readlog_exited()
-                if not note["ended_on_term"]:
+                exited = self._readlog_exited()
+                note["ended_on_term"] = note["term"] and exited  # a TERM that was not delivered ended nothing
+                if not exited:
                     self.host.docker("kill", "-s", "KILL", self.names.readlog, check=False, timeout=30)
                     note["killed"] = True
                     self._readlog_exited()
@@ -829,9 +831,12 @@ class DockerSandbox:
         scan it for the token, and copy it into the evidence: `read_log` in the result names the copy, or is None when
         the log is not read (unknown reads, never none).
 
-        A collector that was not running when the collection came to stop it ended on its own account (killed, stopped
-        from outside, crashed): its log is not read, whatever its end line says, and its death is the run's
-        infrastructure failure (`infra_check`). A log that holds the data-path token is removed with its source (a
+        One rule for both backends: when the collector did not end cleanly under the harness's OWN stop (it was not
+        running when the collection came to stop it, because something else killed it, stopped it or it crashed, or
+        it needed the kill, or could not be shown gone), a log that would read INTACT is withheld (None, no copy: it
+        reads `log_missing`, unknown), since a lost collector is never a clean log however complete its bytes look;
+        a log that already reads unknown (a killed collector's has no end line) is kept as evidence, with its own
+        reasons. A collector's death is the run's infrastructure failure (`infra_check`). A log that holds the data-path token is removed with its source (a
         secret is never evidence, `_remove_token_files`) and the collection fails (O05). A second collection finds the
         collector gone and writes the bytes it already read."""
         if self._readlog_token_hit:
@@ -839,9 +844,7 @@ class DockerSandbox:
         if not self._readlog_collected:
             self._stop_readlog()
             self._readlog_collected = True
-            stop = self._meta["readlog_stop"]
-            trusted = stop.get("stopped") and not stop.get("ended_before_collection")
-            self._readlog_bytes = self._read_log_once() if trusted else None
+            self._readlog_bytes = self._read_stopped_log()
             token = self.spec.token.reveal().encode() if self.spec.token is not None else b""
             if self._readlog_bytes is not None and token and token in self._readlog_bytes:
                 self._readlog_bytes, self._readlog_token_hit = None, True
@@ -876,6 +879,22 @@ class DockerSandbox:
         except Exception as e:
             log.error("the read log could not be removed from the kept run: %s", describe_error(e))
             errors.append(f"a teardown step failed ({type(e).__name__})")
+
+    def _read_stopped_log(self) -> bytes | None:
+        """The log of the stopped collector, read once, or None: not read when the container was not shown stopped (its
+        file could still grow), and withheld when the stop was not clean and the log would read intact."""
+        stop = self._meta["readlog_stop"]
+        if not stop.get("stopped"):
+            return None
+        data = self._read_log_once()
+        clean = stop.get("ran_until_stop") is True and stop.get("ended_on_term") is True
+        if data is None or clean:
+            return data
+        found = readlog_reader.read_log(data, self.readlog_nonce, expected_peer_uid=self.readlog_expected_peer_uid)
+        if found.intact:
+            log.error("the read-log collector did not end cleanly under the harness's stop: its log is withheld")
+            return None
+        return data
 
     def _read_log_once(self) -> bytes | None:
         try:

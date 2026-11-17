@@ -163,9 +163,9 @@ def test_a_collector_killed_during_the_run_gives_an_unknown_log_and_the_client_f
     assert after.startswith("refused"), after  # nothing listens: the script gets no data
     done = sandbox.collect(tmp_path)
     assert [d["role"] for d in done["deaths"]] == ["readlog"]
-    assert sandbox.read_log() is None  # it ended before the collection: no log to trust
+    assert sandbox.read_log() is not None  # it already reads unknown, so it is kept as evidence
     found = reader.read_log(
         sandbox.read_log(), sandbox.readlog_nonce, expected_peer_uid=sandbox.readlog_expected_peer_uid
     )
     assert not found.intact
-    assert reader.MISSING in found.problems
+    assert reader.NOT_CLOSED in found.problems
