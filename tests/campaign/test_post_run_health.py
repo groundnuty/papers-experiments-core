@@ -52,6 +52,25 @@ class Noting:
         return Health(True, "fine")
 
 
+class Seeing:
+    """A health check that notes whether the attempt's executor had returned when it was called."""
+
+    def __init__(self):
+        self.seen = []
+
+    def __call__(self):
+        self.seen.append(prerun.current().get(prerun.EXECUTOR_RETURNED))
+        return Health(True, "fine")
+
+
+def test_o90_the_runner_tells_the_post_run_check_alone_that_the_executor_has_returned(tmp_path):
+    """O90: nothing of a run is in progress once its executor has returned: the try's note says so before the post-run
+    check and not before the pre-run check, so a platform never explains a leftover as a run in progress."""
+    check = Seeing()
+    run_one(tmp_path, check)
+    assert check.seen == [None, True]
+
+
 def run_one(tmp_path, check):
     """One run of one condition with `check` as its health check; return the store, the executor and the attempts'
     markers read back by their run directory and the store's id of each attempt."""

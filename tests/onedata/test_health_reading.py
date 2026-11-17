@@ -624,7 +624,7 @@ class Record:
 
 
 def inside_injection(
-    tmp_path, world, *, extra=None, report_offline=True, down_names=(), abandon=False, instrument=False
+    tmp_path, world, *, extra=None, report_offline=True, down_names=(), abandon=False, instrument=False, returned=False
 ):
     """The pilot's executor reads health inside the injection and restores after: the run's pre-run check, its
     exclusive admission, the injector started (its entry open), then the post-run check through the gate; `extra` is
@@ -651,6 +651,10 @@ def inside_injection(
                 down(world.fake, "beta", *down_names)
             if extra is not None:
                 extra(journal, liveness.current())
+            if (
+                returned
+            ):  # the executor has returned, as the scheduler's post-run check finds it: nothing is in progress
+                prerun.note(prerun.EXECUTOR_RETURNED, True)
             if instrument:  # the record's way: the instrument finishes inside the injection, before the restore
                 record = finish_instruments(Record(), [PostRunHealth(world.health)])
                 answer, reading = record.instruments[NAMESPACE], reading_in_instruments(record.instruments)
@@ -790,6 +794,21 @@ def test_o90_an_own_injection_whose_injector_is_gone_is_still_unsettled(tmp_path
 def a_dropped_injectors_entry(journal, mine):
     """An entry of the run's own, seen down, that no injector holds the lock of."""
     injection(journal, "g", OTHER, mine, closed=False)
+
+
+def test_o90_after_the_executor_has_returned_the_runs_own_open_entry_is_unsettled_though_its_injector_lives(
+    tmp_path, fake
+):
+    """O90: the scheduler's post-run check runs after the executor returned, when no injection of the run can be in
+    progress: an own entry still open, seen down, with its injector alive and holding its lock (a pending restore
+    whose `clear_failed` line was never written, a reused injector), is a failed restore, never explained. The same
+    state inside the executor, before it has returned, is the held target (`test_o90_inside_its_own_injection_...`)."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, opened = inside_injection(tmp_path, world, returned=True)
+    assert [entry["target"] for entry in opened] == [TARGET]
+    assert answer.detail.startswith("an injection of providers[1] is unsettled")
+    assert answer.charge is True
+    assert reading == UNREAD
 
 
 def test_o90_an_own_entry_no_live_injector_holds_is_unsettled_beside_the_one_that_is_held(tmp_path, fake):
