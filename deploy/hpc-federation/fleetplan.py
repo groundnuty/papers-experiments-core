@@ -419,7 +419,7 @@ def current_plan(record: Mapping[str, Any], directory: Path) -> shards.Plan:
     settings, written = record.get("template"), (directory / MANIFEST).read_text(encoding="utf-8")
     if settings is None or written != manifest_text(settings, entries(record, directory, {})):
         raise FleetError(f"the fleet's {MANIFEST} is not the one its record gives (edited, or a plan cut short): run "
-                         "plan again; nothing was launched")  # fmt: skip
+                         "plan again; nothing was launched or stopped")  # fmt: skip
     return plan
 
 

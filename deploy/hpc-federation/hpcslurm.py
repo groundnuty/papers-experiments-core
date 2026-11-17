@@ -674,19 +674,29 @@ class Slurm:
 
     # -- steps --------------------------------------------------------------------------------------------------------
 
-    def steps(self, job: str) -> Dict[str, str]:
-        """The job's steps listed now, as name to step id (the batch and extern steps left out)."""
+    def step_listing(self, job: str) -> List[Tuple[str, str]]:
+        """The job's steps listed now, as (step id, name) in listing order, one for each step (the batch and extern
+        steps left out): Slurm lists as many steps of one name as were started."""
         done = self.runner.run(["squeue", "-s", "-j", job, "-h", "-o", "%i %j"], self.command_timeout_s)
         if done.returncode != 0:
             if "Invalid job id" in done.stderr:
-                return {}
+                return []
             raise SlurmError(f"squeue -s failed with status {done.returncode}: {done.stderr.strip()[:300]}")
-        found = {}
+        found = []
         for line in done.stdout.splitlines():
             match = STEP_LINE.fullmatch(line.strip())
             if match and not match.group(1).endswith((".batch", ".extern")):
-                found[match.group(2)] = match.group(1)
+                found.append((match.group(1), match.group(2)))
         return found
+
+    def steps(self, job: str) -> Dict[str, str]:
+        """The job's steps listed now, as name to step id (the batch and extern steps left out); of two steps of one
+        name the later is kept (`steps_named` lists them all)."""
+        return {name: step_id for step_id, name in self.step_listing(job)}
+
+    def steps_named(self, job: str, name: str) -> List[str]:
+        """The ids of every step of the job listed under `name` now, in listing order."""
+        return [step_id for step_id, listed in self.step_listing(job) if listed == name]
 
     def cancel_step(self, step_id: str) -> None:
         """Cancel one step by the id squeue -s lists it under: `<job>.<n>`, or a component's `<leader>+<k>.<n>`."""

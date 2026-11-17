@@ -872,7 +872,7 @@ its federation's root when a step starts (the shard's spec and a count; a step t
 SHA-256 of each archived file. `hpcfed.py down` reads the root first, before it stops or cancels anything. What counts as
 evidence is what a run, a step or the operator leaves: **any step record, a file of `fault-journal/` with a line in it
 (at any depth), a file of the relay's journals (`late-steps.jsonl`, a request, a taken request, an answer) that is not
-empty, `shard-claim.json` (or its lock) that is not empty, and the pilot's `day0-wiring.toml`**; so a root that only ran
+empty, `shard-claim.json` (or its lock) that is not empty, the pilot's `day0-wiring.toml` and the study's `ingest-evidence.json`** (a non-empty one: what its `ingest run --out <root>/ingest-evidence.json` wrote); so a root that only ran
 Day-0 measurements, with no shard step, is refused too. An empty file (the injector's lock files, say) is no evidence, and
 a link or a special file where the journal is counts, since it proves no absence, and so does a file with a line in it at any depth (a tree nested past the archive's bound, or with an odd name, counts for what it holds). **What `up` alone
 writes does not count:** the state, `platform.toml`, `facts.json`, `render-identity.json`, the data manifests and the link
@@ -1330,13 +1330,19 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
      the shard is not held by a federation of this fleet whose root and state are the ones its `up` made, when the
      job's id now names another job (Slurm reuses ids), or when **the recorded pid holds another process now** (the
      client ended and the pid was reused: the whole stop is refused, and the step is yours to look at with `squeue`).
+     **A step is cancelled only while the recorded client is alive, and only when exactly one step carries the
+     name:** the name is not the fleet's alone (a line run by hand, `shards.py lines` or `resume-line`, has the same
+     one), and a live client is what vouches that the step listed is the one it runs. With the client gone and a step
+     of the name listed, or with two of that name, nothing is cancelled and the message names the ids: cancel the stuck
+     one by hand (`scancel <job>.<n>`). With the client gone and no step listed, there is nothing to stop.
      The stop is written to the fleet's record (`stopped`: the step's id, whether it was cancelled and the client
      ended) before it acts and again with what happened; `status` then says `its step ended (stopped by step-stop)`.
      A step that ignores TERM keeps running for Slurm's KillWait after the cancel (182 s on this site): the stop does
      not wait, and `step --resume` refuses until the step is no longer listed. A step ended from outside leaves its
      running mark (a step removes it only when it ends by itself, `shards.release_running`).
-  2. Move the shard as in "Moving a shard": `shards.py collect --roots-only --shard L`, `down --member fed-k`,
-     `add 1`, `plan`.
+  2. Wait until `squeue` no longer lists the step (the stop does not wait out KillWait, and a step still dying may
+     write to the root after `down`'s evidence check, which `down` then removes with the root). Then move the shard as
+     in "Moving a shard": `shards.py collect --roots-only --shard L`, `down --member fed-k`, `add 1`, `plan`.
   3. `fleet.py --fleet "$F" step --shard L --resume` launches it on the spare with `--resume` and `--over <the mark's
      nonce>`, which lets the new step take the mark over on another node (`shards.claim_running`), after the proof
      above. Without a mark, or with a holder that still runs, there is no `--over`: the first never needs one, and the

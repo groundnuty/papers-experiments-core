@@ -217,8 +217,9 @@ under one record. One federation's job failing ends one shard's step, never anot
   fleet recorded for it and nothing else: its srun client (pid and start tick, `Runner.client_state`: a pid that holds
   another process now is never signalled, and refuses the whole stop) and its Slurm step, whose `<job>.<n>` id is not
   known at the spawn and is read at the stop, from the job the federation's state names, by the one step name the fleet
-  gave it, then cancelled through the federation's launcher (which refuses another job's step) and recorded. It never
-  cancels by name or user. The shard then moves as above, and its `--resume` step carries the nonce of the running mark
+  gave it, then cancelled through the federation's launcher (which refuses another job's step) and recorded, only while the
+  recorded client is alive and exactly one step carries the name (the name is not the fleet's alone: a line run by
+  hand has it too, and a live client is what vouches for the step). It never cancels by name or user. The shard then moves as above, and its `--resume` step carries the nonce of the running mark
   the killed step left (`--over`, which `shards.claim_running` takes only for the mark it names), after the proof
   `shards.py resume-line` takes and the fleet reuses (`shardresume.check_no_live_step`: no step of the user's carries the
   shard's step name, and the step the mark names is listed nowhere), asked through every federation that held or ran the

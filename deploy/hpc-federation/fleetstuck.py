@@ -3,19 +3,23 @@ section 1, "A fleet"). The fleet's two parts of it:
 
 **`step-stop --shard L`** (`stop`) ends the step the fleet launched for L, by the ids the fleet recorded for it and
 nothing else: the srun client on the login node, by the pid and start tick its launch recorded, and the Slurm step it
-runs, by its exact `<job>.<n>` id. The id is not known when the client is spawned, so it is read now, from the job the
-federation's state names (`Launcher.listed`: the step carries the one name the fleet gave it, `shards.step_name`, which
-no other step has) and recorded in the fleet's record before anything is cancelled. Nothing is signalled or cancelled
-unless every one of these holds: the shard is held by a federation of the fleet whose root and state are the ones its
-up made (`fleetrecord.identity`); `shards.toml` is the one the record gives and names that federation's root; the job
-the step lands in is still named as the federation's up named it (Slurm reuses ids); and the pid still holds the
-process recorded (`Runner.client_state`: its start tick). A pid that holds another process now refuses the whole stop:
-the client ended, so nothing of the fleet's is left to signal, and the step is for the operator to look at. The step is
-cancelled through the federation's launcher (`Launcher.cancel`, which refuses a step of any other job), then the client
-is ended, verified (`Runner.end_client`: SIGTERM, then SIGKILL, each only while the process is still the recorded one),
-as `down` does. Slurm lists a cancelled step until its KillWait ends; the stop does not wait for it, and `step --resume`
-refuses while the step is listed. The stop is written into the launch's entry of the fleet's record before it acts and
-again with what happened (`stopped`: the client's state, the step's id, whether it was cancelled and the client ended).
+runs, by its exact `<job>.<n>` id. The id is not known when the client is spawned, so it is read now: the federation's
+state names its jobs, the fleet gave the step one name (`shards.step_name`), and `Slurm.steps_named` lists every step of
+that name in those jobs. The name is not the fleet's alone (`shards.py lines` and `resume-line` give a step run by hand
+the same name), so the id is cancelled only when exactly one step carries the name and the recorded client is still
+alive: a live client is what vouches that the step listed is the one it runs. With the client gone and a step of the
+name listed, or with two steps of the name, nothing is cancelled and the operator is told the ids to look at. Nothing
+is signalled or cancelled unless every one of these holds: the shard is held by a federation of the fleet whose root
+and state are the ones its up made (`fleetrecord.identity`); `shards.toml` is the one the record gives and names that
+federation's root; the job the step lands in is still named as the federation's up named it (Slurm reuses ids); and the
+pid still holds the process recorded (`Runner.client_state`: its start tick). A pid that holds another process now
+refuses the whole stop: the client ended, so nothing of the fleet's is left to signal, and the step is for the
+operator to look at. The step is cancelled through the federation's launcher (`Launcher.cancel`, which refuses a step
+of any other job), then the client is ended, verified (`Runner.end_client`: SIGTERM, then SIGKILL, each only while the
+process is still the recorded one), as `down` does. Slurm lists a cancelled step until its KillWait ends; the stop does
+not wait for it, and `step --resume` refuses while the step is listed. The stop is written into the launch's entry of
+the fleet's record before it acts and again with what happened (`stopped`: the step's id, whether it was cancelled and
+the client ended).
 
 **`step --resume` over a killed step's mark** (`over_proof`): a step killed outright leaves its running mark
 (`<results>/<label>/running.json`), and a step on another federation may take it over only with its nonce as `--over`
@@ -32,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence
 
 import fleetplan
+import hpclaunch
 import hpcstate
 import shardresume
 import shards
@@ -114,20 +119,32 @@ def stop(directory: Path, store: Record, label: str, runner_of: Callable[[str], 
                          "cancelled; look at its step in job "
                          f"{fed['listed']} with squeue and cancel it by hand if it still runs")  # fmt: skip
     slurm = Slurm(runner)
-    launcher = Launcher(slurm, StateStore(target["root"]), None)  # `listed` and `cancel` read the state file alone
+    store_of_state = StateStore(target["root"])
+    launcher = Launcher(slurm, store_of_state, None)  # `cancel` reads the state file alone
     try:
         job = slurm.job(fed["job"])
-        step = None if job is None else launcher.listed(name)  # a job Slurm no longer knows runs no step
+        found = []  # every step of the name in every job the federation's state names (none in a job Slurm lost)
+        for held in () if job is None else hpclaunch.listings(store_of_state.read()):
+            found += slurm.steps_named(held, name)
     except (*ERRORS, hpcstate.StateError, ValueError) as error:
         raise FleetError(f"job {fed['job']} could not be looked up ({type(error).__name__}): nothing signalled or "
                          "cancelled") from None  # fmt: skip
     if job is not None and job.get("JobName") != fed["name"]:
         raise FleetError(f"job {fed['job']} now names another job than {holder}'s: never stepped into; nothing "
                          "signalled or cancelled")  # fmt: skip
+    if len(found) > 1:  # the name is no key: a step started by hand carries it too
+        raise FleetError(f"{len(found)} steps carry {label}'s step name ({', '.join(found)}) and the fleet cannot tell "
+                         "which is its launch's: nothing signalled or cancelled; cancel the stuck one "
+                         "by hand")  # fmt: skip
+    step = found[0] if found else None
     if state != ALIVE and step is None:
         say(f"{label} on {holder}: nothing to stop: its client has ended and no step of it is listed")
         return 0
-    stopped: Dict[str, Any] = {"client": state, "step": step, "cancelled": False, "ended": state != ALIVE}
+    if state != ALIVE:  # only a live recorded client vouches that a step of the name is the fleet's launch
+        raise FleetError(f"{label}'s recorded client has ended, so it vouches for no step, and step {step} carries its "
+                         "step name but may be one the fleet did not launch (a line run by hand has the same name): "
+                         "nothing cancelled; cancel it by hand if it is the stuck one")  # fmt: skip
+    stopped: Dict[str, Any] = {"step": step, "cancelled": False, "ended": False}  # the client is alive here
     index = target["index"]
 
     def record(current: Dict[str, Any]) -> None:
@@ -141,14 +158,12 @@ def stop(directory: Path, store: Record, label: str, runner_of: Callable[[str], 
             stopped["cancelled"] = True
         except (*ERRORS, hpcstate.StateError) as error:
             problems.append(f"step {step} not cancelled ({error}): it may still run in job {fed['job']}")
-    if state == ALIVE:
-        stopped["ended"] = bool(runner.end_client(client))
-        if not stopped["ended"]:
-            problems.append(f"client pid {client.pid} did not end")
+    stopped["ended"] = bool(runner.end_client(client))
+    if not stopped["ended"]:
+        problems.append(f"client pid {client.pid} did not end")
     store.update(record)
     parts = [] if step is None else [f"step {step} " + ("cancelled" if stopped["cancelled"] else "not cancelled")]
-    parts.append("client " + ("ended" if state == ALIVE and stopped["ended"] else "had ended" if state != ALIVE
-                              else "not ended"))  # fmt: skip
+    parts.append("client " + ("ended" if stopped["ended"] else "not ended"))
     say(f"{label} on {holder}: stopped: {'; '.join(parts)}")
     if stopped["cancelled"]:
         say(f"{label}: Slurm lists a cancelled step until its KillWait ends; `step --resume` refuses until it is gone")

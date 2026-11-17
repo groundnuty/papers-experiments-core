@@ -481,8 +481,11 @@ class Fleet:
             else:
                 alive = self.running(launches[-1])
                 state = f"on {shard['member']}, its step " + {True: "runs", False: "ended"}.get(alive, "cannot be told")
-                if alive is False and launches[-1].get("stopped"):
-                    state += " (stopped by step-stop)"
+                stopped = launches[-1].get("stopped")
+                if alive is False and stopped:
+                    uncancelled = stopped.get("step") is not None and not stopped.get("cancelled")
+                    but = ", but its step was not cancelled" if uncancelled else ""
+                    state += f" (stopped by step-stop{but})"
             print(f"{shard['label']}: {state}" + (" (moved: its first reset there is full)" if shard["moved"] else ""))
         return 0
 
