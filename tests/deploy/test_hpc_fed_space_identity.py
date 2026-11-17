@@ -21,6 +21,8 @@ from hpc_fed_support import LAYOUT, hpc_on_path
 from hpc_ingested_support import ONE, artifacts, driver_over, held, ingested_state, site_env, study_layout
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
+from expcore_onedata.linkcheck import LinkReport, PairResult
+
 SCRIPT = LAYOUT.parents[1] / "shards.py"
 
 
@@ -170,6 +172,39 @@ def test_c06_a_rerun_after_a_space_was_deleted_does_not_link_again_and_clears_th
     assert any("delta-space" in line and "not the one up recorded" in line for line in said)
     assert ingested_state(fed)["delta-space"]["verified"] is None
     assert ingested_state(fed)["delta-space"]["space_id"] == old  # up's record is never rewritten
+
+
+def failing_links(config, client):
+    """`fedlinks.check_links` finding a pair that does not transfer."""
+    pair = PairResult("providers[0]", "providers[1]", False, reason="the fetch failed")
+    return LinkReport(False, "providers[0] <- providers[1]: the fetch failed", (pair,), 1.0, 2.0)
+
+
+def test_c06_a_rerun_that_fails_after_the_space_was_made_again_still_clears_the_marker(hpc, tmp_path, ca):
+    """C06, O63 (Codex, 17 Nov 2026, review of this fix): the core's phase made the space again and wrote its new ID,
+    then its link check failed: the failure bypassed the comparison, so the old marker stayed in the state. The marker
+    of a space whose ID is not the recorded one is cleared however the phase ends."""
+    fed = verified(hpc, tmp_path, ca)
+    fed.zone.delete("delta-space")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(hpc.fedlinks, "check_links", failing_links)
+        with pytest.raises(RuntimeError, match="the link check failed"):
+            fed.driver.core_here()
+    assert phase(fed) == "bootstrapped"
+    assert ingested_state(fed)["delta-space"]["verified"] is None
+
+
+def test_c06_a_later_rerun_that_passes_clears_a_marker_the_failed_one_could_not(hpc, tmp_path, ca):
+    """C06, O63: the comparison is made after every core phase that ends, not only a relinking one: a federation that is
+    already `bootstrapped` whose space was made again loses the marker it still holds when a rerun passes."""
+    fed = verified(hpc, tmp_path, ca)
+    marker = ingested_state(fed)["delta-space"]["verified"]
+    fed.driver.set(lambda s: s.update(phase="bootstrapped"))  # as a failed rerun left it
+    fed.zone.delete("delta-space")
+    rerun(hpc, fed)
+    assert phase(fed) == "bootstrapped"
+    assert marker is not None
+    assert ingested_state(fed)["delta-space"]["verified"] is None
 
 
 def test_c06_a_rerun_that_finds_every_space_as_it_was_links_again_and_the_marker_stays(hpc, tmp_path, ca):

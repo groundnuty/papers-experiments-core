@@ -1050,12 +1050,16 @@ class Driver(Down):
         try:
             out = self.core(placed, owner, values, environ=self.environ)
         except Exception:
+            self.clear_moved_markers()  # it may have made a space again and written its new ID before it failed
             if relink:
                 self.say("the core's phase failed: the federation stays bootstrapped, which shards plan refuses")
             raise
         self.set(lambda s: s.update(core_unfinished=False))
-        if relink:  # the core's phase made a space that was missing again by name: its facts are read after it ran
-            why = self.refuse_moved_spaces() or why
+        moved = (
+            self.refuse_moved_spaces()
+        )  # the core's phase made a space that was missing again by name: read after it
+        if relink:
+            why = moved or why
         if not was_linked:
             self.move_phase(before, "bootstrapped")  # a `down`'s `stopping`, written meanwhile, is kept
         elif relink and why is not None:
@@ -1076,6 +1080,14 @@ class Driver(Down):
         if spaces:
             self.forget_markers(spaces)
         return said
+
+    def clear_moved_markers(self) -> None:
+        """`refuse_moved_spaces` for a core phase that failed: what it finds goes nowhere (the phase's own error is the
+        one raised), and a state that cannot be read or written now is said, never allowed to hide that error."""
+        try:
+            self.refuse_moved_spaces()
+        except Exception:
+            self.say("the ingested spaces' markers could not be checked after the core's phase failed")
 
     def verify_data(self) -> str:
         """After the study's ingest, show that each ingested space holds exactly the data its manifest declares (O57,
