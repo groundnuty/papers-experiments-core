@@ -64,9 +64,15 @@ def test_o63_a_template_may_name_study_artifacts_and_up_renders_the_sites_path(h
     env = site_env(base, base / "artifacts" / "study")
     values = hpc.pins.values(hpc.settings.site_from_environment(env))
     facts = {"zone": {"url": "u"}, "study_space": "s", "providers": {}, "spaces": {}, "principals": {}}
-    template = 'tool_server = "@study_artifacts@/venv/bin/python"\nclone = "@study_artifacts@/clone"\n'
-    text = hpc.boot.write_platform(tmp_path / "platform.toml", template, facts, values)
-    assert text == f'tool_server = "{base}/artifacts/study/venv/bin/python"\nclone = "{base}/artifacts/study/clone"\n'
+    template = (
+        'tool_server = "@study_artifacts@/venv/bin/python"\nclone = "@study_artifacts@/clone"\n'
+        'providers.aspen = { url = "u", id = "i" }\nplacement = { holder = "aspen" }\n'
+    )  # a render always carries a complete [placement] (O79), whose holder is a provider of the file
+    text = hpc.boot.write_platform(tmp_path / "platform.toml", template, facts, values).splitlines()
+    assert text[:2] == [
+        f'tool_server = "{base}/artifacts/study/venv/bin/python"',
+        f'clone = "{base}/artifacts/study/clone"',
+    ]
 
 
 def test_o63_up_hands_the_core_the_key_as_study_artifacts_and_records_it_in_the_state(hpc, tmp_path):
