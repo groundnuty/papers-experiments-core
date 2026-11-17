@@ -804,7 +804,7 @@ class RelayWhoseStopFails(FakeSlurm):
 
     def run(self, argv, timeout):
         argv = list(argv)
-        if argv[1:5] == ["-B", "-m", "expcore_onedata.fault_relay", "stop"]:
+        if argv[1:6] == ["-I", "-B", "-m", "expcore_onedata.fault_relay", "stop"]:
             ended = any(client.pid == 9999 for client in self.ended_clients)
             if not ended and self.raises:
                 self.relay_calls.append("stop")

@@ -542,7 +542,7 @@ storage_binds() {  # <workdir> [--storage=PATH]: the `apptainer exec` arguments 
     fi
     return 0
   fi
-  "$HPCOP_PY" -I "$HPCOP_BUNDLE/posixstorage.py" binds --workdir "$1" "$2"
+  "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/posixstorage.py" binds --workdir "$1" "$2"
 }
 
 run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exec) in the foreground of this process

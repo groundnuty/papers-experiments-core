@@ -504,7 +504,7 @@ def test_o63_a_line_with_no_guard_is_byte_for_byte_the_line_it_was(shards, tmp_p
         "-J", "hpcop-x-1-shard-1", "--export=PATH", "--chdir=/", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LC_ALL=C",
         f"EXPCORE_FED_ROOT_PARENT={tmp_path / 'fed'}", f"EXPCORE_FED_ROOT={tmp_path / 'fed' / 'a'}", *homeless,
         "PYTHONNOUSERSITE=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
-        str(tmp_path / "venv" / "python"), "-I", str(SCRIPT), "step", "--study", str(tmp_path / "study"),
+        str(tmp_path / "venv" / "python"), "-I", "-B", str(SCRIPT), "step", "--study", str(tmp_path / "study"),
         "--index", "1", "--count", "2", "--label", "fed-a", "--tmpfs", str(tmp_path / "tmpfs"),
         "--results", str(tmp_path / "results"), "--core-src", str(tmp_path / "core" / "src"),
         "--snapshot-every", "900",
