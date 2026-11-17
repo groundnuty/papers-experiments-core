@@ -9,7 +9,8 @@ import os
 import re
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
+from down_rig_support import Rig, make_site
+from hpc_fed_support import LAYOUT, hpc_on_path
 from root_evidence_support import record_step
 
 
@@ -24,37 +25,7 @@ def hpc():
 
 @pytest.fixture
 def site(tmp_path):
-    images, logs = tmp_path / "images", tmp_path / "logs"
-    images.mkdir()
-    logs.mkdir()
-    for name in ("onezone.tar", "oneprovider.tar"):
-        (images / name).write_bytes(b"tar")
-        (images / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
-    (tmp_path / "fed").mkdir()
-    return {**SITE, **agent_site(tmp_path / "agent"), "SH": str(images), "L": str(logs)}
-
-
-class Rig:
-    """A driver over the fake Slurm, up once, the core's phase recorded instead of run."""
-
-    def __init__(self, hpc, tmp_path, site):
-        self.hpc, self.fake, self.root = hpc, FakeSlurm(), tmp_path / "fed" / "root"
-        self.driver = hpc.cli.make_driver(LAYOUT, str(self.root), runner=self.fake)
-        self.driver.sleep = lambda s: None
-        self.driver.poll_s = 0.0
-        self.driver.slurm.sleep = lambda s: None
-        self.driver.slurm.poll_s = 0.0
-        self.driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
-        self.driver.relay_available = lambda: False
-        self.driver.up(hpc.settings.site_from_environment(site))
-        (self.root / "facts.json").write_text("{}")  # what the core's phase writes, which this rig stands in for
-        self.fake.calls.clear()
-
-    def collected(self, label="shard-1"):
-        """What `collect` leaves in the root once it has archived it: the marker naming the archive of the evidence
-        as it is now, as `hpcevidence` writes it."""
-        held = self.hpc.evidence.archive_root(self.root, label)
-        self.hpc.evidence.write_marker(self.root, label, held.sha256, held.steps_sha256)
+    return make_site(tmp_path)
 
 
 def test_down_refuses_a_root_with_a_step_record_and_no_marker_before_it_stops_anything(hpc, tmp_path, site):
@@ -118,9 +89,9 @@ def test_down_refuses_when_a_second_shard_started_after_the_evidence_was_collect
 
 
 def test_down_refuses_when_the_evidence_changed_after_it_was_collected_though_no_step_started(hpc, tmp_path, site):
-    """O63: a step that was running when `collect --roots-only` ran goes on writing the fault journal, the link check
-    and the relay's files until its job is cancelled: the marker names the archive's hash, and a root whose evidence no
-    longer archives to it is refused, so nothing a running step wrote after the collect goes with the root."""
+    """O63: a step that was running when `collect --roots-only` ran goes on writing the fault journal and the relay's
+    files until its job is cancelled: the marker names the hash of each file archived, and a root where a journal is no
+    longer what it names is refused, so nothing a running step wrote after the collect goes with the root."""
     rig = Rig(hpc, tmp_path, site)
     record_step(rig.root, "shard-1")
     rig.collected()

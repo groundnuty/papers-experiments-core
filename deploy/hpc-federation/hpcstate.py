@@ -113,6 +113,7 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
         checked_data(state["data"])
     checked_shard_nodes(state.get("shard_nodes", []))
     checked_discards(state.get("evidence_discarded", []))
+    checked_rewritten(state.get("evidence_rewritten_after_collect", []))
     return state
 
 
@@ -177,6 +178,22 @@ def checked_discards(entries: Any) -> None:
             raise StateError(
                 f"{STATE}: an evidence_discarded entry is not {{at, shards, changed_since_collect, reason}}"
             )
+
+
+def checked_rewritten(entries: Any) -> None:
+    """Each `down` that found files the federation rewrites itself changed since `collect` (O63): when it was, the
+    shards the root's evidence was collected for, and the names of those files (never a value of one), which are no
+    reason to refuse and are not evidence a second archive would add to."""
+    if not isinstance(entries, list):
+        raise StateError(f"{STATE}: evidence_rewritten_after_collect is not a list")
+    for entry in entries:
+        ok = isinstance(entry, dict) and set(entry) == {"at", "shards", "files"}
+        ok = ok and isinstance(entry["at"], str)
+        ok = ok and all(
+            isinstance(entry[key], list) and all(isinstance(n, str) for n in entry[key]) for key in ("shards", "files")
+        )
+        if not ok:
+            raise StateError(f"{STATE}: an evidence_rewritten_after_collect entry is not {{at, shards, files}}")
 
 
 def checked_sandbox(sandbox: Any) -> None:

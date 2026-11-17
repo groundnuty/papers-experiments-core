@@ -207,8 +207,9 @@ its name relative to `<results>`, size and SHA-256 from the bytes `collect` read
 directory beside `--into`, checks it all, and only then moves the trees in, publishes the root archives and writes the
 manifest last; a refusal leaves `--into` as it was and writes no manifest. Then it writes `evidence-collected.json`
 into each root, which `hpcfed.py down` requires of a root a step ran against (`shard-steps/<label>.json`, which `step`
-leaves there): `down` refuses one without it, or whose evidence is no longer what the marked archive holds, unless
-`--discard-evidence`.
+leaves there): `down` refuses one without it, or where a file a step or the study writes is no longer what the marker
+names (it holds the hash of each file archived), unless `--discard-evidence`; the state and the link check, which the
+running federation rewrites itself, are named by `down` and never refused.
 `verify-copy` takes the pulled manifest, the local directory and that
 hash (`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1
 naming each file that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only,
@@ -1559,7 +1560,7 @@ def _mark_roots(plan: Plan, archives: Sequence[Any]) -> None:
         if held.reused:  # its root is gone: there is nothing to mark
             continue
         try:
-            module.write_marker(shard.root, shard.label, held.sha256, held.steps_sha256)
+            module.write_marker(shard.root, shard.label, held.sha256, held.steps_sha256, held.hashes)
         except (OSError, module.EvidenceError) as error:
             print(
                 f"shards: WARNING: shard {shard.label}: the collected-evidence marker could not be written in its root "

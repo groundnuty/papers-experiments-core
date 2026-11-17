@@ -821,12 +821,24 @@ can name a site's details before they are known.
 
 **`down` refuses a root whose evidence was not collected.** `shards.py step` leaves `shard-steps/<label>.json` in its
 federation's root when a step starts (the shard's spec and a count; a step that cannot write it does not start), and
-`collect` writes `evidence-collected.json` there, naming the root archive's SHA-256 and the digest of those records.
-`hpcfed.py down` reads them first, before it stops or cancels anything: a root with step records and **no current marker**
-is refused, naming the shards, and stays whole so that a `collect` can still read it. The marker names the root archive's hash, and `down` archives the root's evidence again to compare:
-a step that started after the collect (a resume), a running step that goes on writing the journals (the collect ran
-while it ran), or any changed evidence file makes the marker stale, and `down` refuses until the step has ended and
-`collect` is run again (a `down` that began and failed halfway is not gated again). A root where no step ever
+`collect` writes `evidence-collected.json` there, naming the root archive's SHA-256, the digest of those records and the
+SHA-256 of each archived file. `hpcfed.py down` reads them first, before it stops or cancels anything: a root with step
+records and **no current marker** is refused, naming the shards, and stays whole so that a `collect` can still read it.
+The runbook order stays **collect, pull and verify, then `down`.** `down` reads the root's evidence again and compares it
+with the marker file by file, **strictly only for the evidence a step or the study writes:** the fault journal
+(`fault-journal/`), the relay's journals (`fault-relay/`, `late-steps.jsonl` among them), the shard claims
+(`shard-claim.json` and its lock), the step records (`shard-steps/`), the data manifests, and the files `up` writes once
+(`facts.json`, `platform.toml`, `render-identity.json`) with the pilot's `day0-wiring.toml`. A step that started after
+the collect (a resume), a running step that goes on writing the journals (the collect ran while it ran), a line appended
+to a journal, or any other change to one of them makes the marker stale, and `down` refuses, naming the files, until the
+step has ended and `collect` is run again (a `down` that began and failed halfway is not gated again). **The
+federation's own files are not refused:** the state (`hpc-federation.json`) and the link check (`link-check.json`) are
+rewritten while the federation runs (by state updates, and by each link check), so they post-date every run once
+`collect` has run. `down` goes on, says in its output which of them changed after the collect (names only), and records
+it in the state (`evidence_rewritten_after_collect`: the time in UTC, the shards, the names); the copy `collect` took
+stays what the post-check reads, so no second archive is made. A link check a step makes also appends to the fault
+journal's holds, so a step still running after the collect is refused through the journal all the same.
+`pass-env.json` is in the results, not in the root: `verify-copy` checks it. A root where no step ever
 ran goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
 down's output then says which shards' evidence was discarded, and **every use is recorded in the federation's state file**
 (`evidence_discarded`: the time in UTC, the shards, whether their evidence had been collected and changed since, and
