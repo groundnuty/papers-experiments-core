@@ -16,15 +16,23 @@ campaign. A platform whose admission depends on the note declares that it needs 
 that platform's admission reads when the refusal at load never saw the declaration (an admission a study wrapped
 without it). The post-run check runs inside the same try and sees the note too, so a platform notes from its pre-run
 check alone.
+
+A platform's post-run check may note a structured reading of the platform under `HEALTH_READING` (a small JSON
+object, see `reading_of`). The attempt runner clears the key before the post-run check and keeps what the check left
+there with the attempt, in its marker (`post_run_health`) and in one event: a reading the pre-run check noted is never
+taken for the post-run check's, and a check that notes none leaves none.
 """
 
 import contextlib
+import json
 from collections.abc import Iterator
 from contextvars import ContextVar
 from typing import Any
 
 _NOTE: ContextVar[dict[str, Any] | None] = ContextVar("expcore_prerun_note", default=None)
 UNCHECKED = "unchecked"  # the key of a note whose campaign has no health check: no pre-run check will write to it
+HEALTH_READING = "health_reading"  # the key a platform's check notes its structured reading of the platform under
+READING_MAX_BYTES = 16_384  # the most a reading's JSON text may be for the attempt to keep it
 
 
 @contextlib.contextmanager
@@ -37,6 +45,20 @@ def opened(*, checked: bool = True) -> Iterator[dict[str, Any]]:
         yield note
     finally:
         _NOTE.reset(token)
+
+
+def reading_of(value: Any) -> dict[str, Any] | None:
+    """The structured reading `value` is, as a detached copy, or None when it is not one: a JSON object (a dict whose
+    contents are plain JSON values) of at most `READING_MAX_BYTES` of text. The attempt keeps the reading its post-run
+    check noted under `HEALTH_READING` in its marker and in an event (`expcore.campaign.attempt`); a platform's reading
+    is its own, and the core reads nothing in it."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        text = json.dumps(value, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return json.loads(text) if len(text.encode("utf-8")) <= READING_MAX_BYTES else None
 
 
 def current() -> dict[str, Any] | None:

@@ -51,7 +51,7 @@ from expcore_onedata.fault_owner import attempt_of
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
 from expcore_onedata.tokens import Plane
 
-READING_NOTE = "health_reading"  # the key of the try's note (`expcore.campaign.prerun`) the latest reading is put under
+READING_NOTE = prerun.HEALTH_READING  # the key of the try's note the latest reading is put under: the core keeps it
 FACT = "post_run_health"  # the key a reading has among a run's facts, owned by `sandbox.infrafacts.HEALTH`
 _POSITION = re.compile(r"spaces\[(0|[1-9][0-9]*)\]")
 _ASKED = ("stopping", "injected", "stop_unknown")  # a journal line that says the stop of the target was asked for
