@@ -156,12 +156,20 @@ of scratch after 20 days with no job submitted. The cluster cannot push to the o
 manifest `<label>.out.json`; every file under `<label>/journals/` (a spend journal per step, which holds what a step
 killed outright spent and `--resume` counts as `lost_in_kill`); and the newest snapshot that verifies, when it is NEWER
 than the archive (`newer_snapshot`: a step resumed from the archive was killed before it archived, so its snapshot names
-that archive and holds runs the archive lacks, which the merge does not see). Every other snapshot is resume material,
+that archive and holds runs the archive lacks, which the merge does not see); and, per federation, its **root
+evidence**: `<label>.root.tar` and `<label>.root.json` (the state, `platform.toml`, `facts.json`, the link check, the
+render identity, the fault journal's and the relay's journals: an allow-list, never a secret, `hpcevidence.py`), which
+`down` would remove with the root. Every other snapshot is resume material,
 superseded by the verified archive (a snapshot of the step that wrote an archive names an earlier one or none, and was
 taken before it), and is not required. The manifest has the plan's `plan_id` (the SHA-256 of the plan's study and
 results directories and each shard's index, count, label and root), then the archives and the other files, each with
 its name relative to `<results>`, size and SHA-256 from the bytes `collect` read, sorted, with no path and no timestamp;
-`collect` prints the file's own SHA-256 on stderr. `verify-copy` takes the pulled manifest, the local directory and that
+`collect` prints the file's own SHA-256 on stderr. `collect` is atomic (G9): it stages every shard in a private
+directory beside `--into`, checks it all, and only then moves the trees in, publishes the root archives and writes the
+manifest last; a refusal leaves `--into` as it was and writes no manifest. Then it writes `evidence-collected.json`
+into each root, which `hpcfed.py down` requires of a root a step ran against (`shard-steps/<label>.json`, which `step`
+leaves there): `down` refuses one without it, or whose step records changed since, unless `--discard-evidence`.
+`verify-copy` takes the pulled manifest, the local directory and that
 hash (`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1
 naming each file that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only,
 never a path), 2 for a manifest it cannot use (one without the list of files beside the archives is an earlier tip's,
@@ -1098,7 +1106,9 @@ def _unpack_shards(plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]], 
     for shard, (tar_path, _) in zip(plan.shards, found, strict=True):
         try:
             out = unpack(tar_path, stage / shard.label)
-        except (tarfile.TarError, OSError) as error:  # a refusal of the tar module, not unpack's own
+        except ShardsError as error:  # unpack's own refusal, which does not name the shard
+            raise ShardsError(f"shard {shard.label}: {error}") from None
+        except (tarfile.TarError, OSError) as error:  # a refusal of the tar module
             raise ShardsError(
                 f"shard {shard.label}: its archive could not be unpacked ({type(error).__name__})"
             ) from None

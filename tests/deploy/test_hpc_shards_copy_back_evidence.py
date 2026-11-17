@@ -60,11 +60,15 @@ def _journal_names(label):
 
 # ------------------------------------------------------------------------------------------------ collect's evidence
 def test_the_manifest_lists_each_shards_journals_and_archive_manifest_with_their_hashes(shards, tmp_path):
-    """O63: every file under `<label>/journals/` and `<label>.out.json`, with its relative name, size and SHA-256, the
-    names sorted, taken from the files and never from a step's claim."""
+    """O63: every file under `<label>/journals/`, `<label>.out.json` and (beside them) each root archive and its
+    manifest, with its relative name, size and SHA-256, the names sorted, taken from the files and never from a
+    step's claim."""
     plan = make_plan(shards, tmp_path)
     shards.collect(plan, tmp_path / "merge")
     wanted = sorted(["fed-a.out.json", "fed-b.out.json", *_journal_names("fed-a"), *_journal_names("fed-b")])
+    wanted = sorted(
+        [*wanted, *(f"{label}.{kind}" for label in ("fed-a", "fed-b") for kind in ("root.tar", "root.json"))]
+    )
     assert _evidence(plan) == [
         {"name": name, "bytes": (plan.results / name).stat().st_size, "sha256": sha_of(plan.results / name)}
         for name in wanted
@@ -91,7 +95,8 @@ def test_a_shard_with_no_journals_directory_lists_its_archive_manifest_alone(sha
     archived(shards, tmp_path, "fed-a", 1, journals=False)
     archived(shards, tmp_path, "fed-b", 2)
     shards.collect(plan, tmp_path / "merge")
-    assert _names(plan) == sorted(["fed-a.out.json", "fed-b.out.json", *_journal_names("fed-b")])
+    roots = [f"{label}.{kind}" for label in ("fed-a", "fed-b") for kind in ("root.tar", "root.json")]
+    assert _names(plan) == sorted(["fed-a.out.json", "fed-b.out.json", *_journal_names("fed-b"), *roots])
 
 
 def test_a_journal_in_a_subdirectory_is_listed_by_its_relative_name(shards, tmp_path):
