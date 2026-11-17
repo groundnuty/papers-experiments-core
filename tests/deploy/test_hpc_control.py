@@ -15,6 +15,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from observe_lag_support import Clock as SlurmClock
+from observe_lag_support import Cluster as SlurmCluster
+from observe_lag_support import Step as SlurmStep
 
 HPC = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation"
 spec = importlib.util.spec_from_file_location("hpcfed_control", HPC / "hpcfed_control.py")
@@ -1250,3 +1253,57 @@ def test_o86_the_observed_read_takes_what_the_real_stop_and_start_verbs_write_in
     assert UTC.fullmatch(stop["requested_utc"])
     assert UTC.fullmatch(stop["confirmed_utc"])
     assert set(stop) == {"requested_utc", "confirmed_utc", "stopped"}
+
+
+def lagging_read(world, steps, clock):
+    """`hpcobserve.read` over the state the real verbs left, with Slurm's accounting as the fake `steps` show it."""
+    state = world.state.read()
+    state["allocation"]["job"] = "77"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(str(HPC))
+        import hpcobserve
+
+        slurm = control.hpcslurm.Slurm(
+            SlurmCluster(clock, *steps), command_timeout_s=5, sleep=clock.sleep, clock=clock.monotonic
+        )
+        return hpcobserve.read(state, slurm, now=lambda: 0.0)["services"]
+
+
+def test_o86_a_stop_the_real_verb_recorded_is_waited_for_until_accounting_shows_it_ended(world, clock):
+    """O86: the state the real `stop` verb wrote on the service's first launch (its own step name, launch, `stopped`
+    and stop evidence, not a hand-made record) is what makes the observed read wait: squeue no longer lists the step,
+    accounting shows it running for 5 s, and the read reads it ended after 6 s, with the wait recorded. The zone, which
+    runs, is read without one."""
+    stopping_launcher(world)
+    assert verb(world, "stop")[0] == 0
+    clock_of_slurm = SlurmClock()
+    steps = [
+        SlurmStep("77.2", f"{PREFIX}-prov-a-run-1", stopped=True, lag=5.0),
+        SlurmStep("77.1", f"{PREFIX}-zone-run-1"),
+    ]
+    seen = lagging_read(world, steps, clock_of_slurm)
+    assert (seen["prov-a"]["running"], seen["prov-a"]["state"], seen["prov-a"]["unknown"]) == (False, "CANCELLED", None)
+    assert (seen["prov-a"]["launch"], seen["prov-a"]["step"]) == (1, "77.2")
+    assert seen["prov-a"]["accounting_wait_s_used"] == 6.0
+    assert (seen["zone"]["running"], seen["zone"]["accounting_wait_s_used"]) == (True, 0.0)
+    assert clock_of_slurm.slept == [2.0, 2.0, 2.0]
+
+
+def test_o86_a_service_the_real_verbs_stopped_and_started_again_is_not_waited_for(world, clock):
+    """O86: a stop and a start leave one stop in the state and `launch` 2 with state `running`: that stop says nothing
+    of the new step, so a new step accounting has no record of yet is read as it is, at once, never `accounting_lag`."""
+    stopping_launcher(world)
+    assert verb(world, "stop")[0] == 0
+    world.launcher.on_control = lambda argv: Done()
+    world.launcher.on_service = lambda name: world.launcher.steps.__setitem__(name, "77.5")
+    assert verb(world, "start")[0] == 0
+    assert len(world.state.read()["services"]["prov-a"]["stops"]) == 1
+    clock_of_slurm = SlurmClock()
+    steps = [
+        SlurmStep("77.5", f"{PREFIX}-prov-a-run-2", stopped=True, lag=1e9, before="none"),
+        SlurmStep("77.1", f"{PREFIX}-zone-run-1"),
+    ]
+    seen = lagging_read(world, steps, clock_of_slurm)["prov-a"]
+    assert (seen["launch"], seen["step"], seen["accounting_wait_s_used"]) == (2, "77.5", 0.0)
+    assert seen["unknown"] != "accounting_lag"
+    assert clock_of_slurm.slept == []

@@ -17,8 +17,9 @@ Under `expcore-shard/2` every shard runs every model, so an equal share of each 
 
 **Refused**, naming the shard, the model and the figures: a model with no price that is not free (its runs cannot be
 reserved, so no share of the money can be set); `max_usd` smaller than one run's reservation for every priced shard
-together; a priced shard whose share of `max_usd`, or of a ceiling above 0, is below one run's reservation, which would
-hold that shard before its first run. A study is refused at load (`study.config`), and a shard again at its start.
+together (listing each priced shard with its model); a priced shard whose share of `max_usd`, or of a ceiling above 0,
+is below one run's reservation, which would hold that shard before its first run. A study is refused at load
+(`study.config`), and a shard again at its start.
 """
 
 from collections.abc import Mapping
@@ -66,9 +67,11 @@ def shard_budgets(
     total = micro_usd(budget.max_usd)
     need = sum(Fraction(reserve[owner[i][0]]) for i in weights)
     if need > Fraction(total, _MICRO):
+        priced = ", ".join(f"shard {i} (model {owner[i][0]})" for i in weights)
         raise ShardError(
             f"[budget] max_usd {budget.max_usd:g} is less than one run's reservation for each of the {len(weights)} "
-            f"shards of priced models together ({float(need):.6f} USD), so some shard could never run; raise it"
+            f"shards of priced models together ({float(need):.6f} USD), so some shard could never run; raise it. "
+            f"The priced shards: {priced}"
         )
     whole = sum(weights.values())
     shares = {i: (int(total * weight / whole) if whole else 0) for i, weight in weights.items()}

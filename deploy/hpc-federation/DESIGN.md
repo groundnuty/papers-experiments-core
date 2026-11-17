@@ -57,6 +57,42 @@ zone (it also runs the holding `sleep`, which costs nothing), then one node per 
 boundary on a node (bundle README). Later milestones add nodes with roles of their own (the agent's cell, which must
 never share a node with a service) by appending them; the order of the existing roles does not change.
 
+### Two federations of one account
+
+**One service per node holds across federations too, and `up` enforces it** (issue 398). The services have no network
+namespace and Couchbase's guard watches the fixed port 8091 (`bundle/lib.sh`), matching listeners by uid only, so a
+second federation's Couchbase on a node of the first fails on its bind and its `up` fails closed. The held job asks for
+cores and memory, never a whole node, and Slurm packs jobs onto a node that has room: nothing placed two federations
+apart. **Decision: node exclusion, not per-federation ports.** The Couchbase port set is large and fixed in the image;
+a port per federation would patch the shim, the guard and the images, for a placement question that the scheduler can
+answer. Asking the site for whole nodes (`--exclusive`) was the other option: it would change the held job's shape and
+what it bills (above), which this problem does not need.
+
+- **Which jobs.** Every live job of the account (`squeue --me`, read-only, ids, names, states and node lists) whose
+  name starts with `hpcop-` (`hpcexclude.JOB_PREFIX`, the one prefix `up` names its jobs by, and the bundle's batch
+  scripts carry): the held job, the agent's own job (`-sandbox`), the older scripts' `hpcop-zone` and `hpcop-provider`. A
+  job is read whole, a heterogeneous job's components together, so another federation's agent's node is one of its nodes:
+  the agent's sandbox never runs on a node that hosts an Onedata service. A pending job holds none, a completing one still
+  does.
+- **Before the submit** (section 5, step 2): the nodes of those jobs go to every component of every held job `up`
+  submits as `--exclude`, named on every component so that nothing depends on Slurm passing it on, and only when there
+  are some, so
+  the argv is what it was without them. The count, never a name, is in the state (`allocation.excluded_nodes`) and in what
+  `up` says. A read that fails, or a line of such a job that cannot be taken apart, refuses `up` before the state file
+  exists: the job is never submitted without the exclusion.
+- **After the allocation, before any step** (step 3): a second read; any of this federation's nodes (a service's or the
+  agent's) in another live federation's jobs (this up's own jobs left out by their ids) refuses `up`. Its held jobs are
+  cancelled by their ids, none of the placement is recorded, and the refusal names the roles (`zone`, `providers[i]`,
+  `agent`), never a host. A failed second read refuses and releases the same way. Two ups that read before either
+  submitted are the case: the one whose job runs later sees the other's nodes and is refused, and both are when both
+  ran before either read again.
+- **Too few nodes.** Slurm keeps a job pending, or sbatch refuses it, when the exclusion leaves none that fits. `up`
+  waits no longer than the queue bound it always had (30 min, step 3) and its message says that it excluded N nodes of
+  other live federations; an sbatch refusal says the same, the nodes' names Slurm repeats removed. What the site's
+  sbatch does is not known (a live slot sees it).
+- **A fleet** (below) is N such federations: each member's `up` reads the others' jobs, so members brought up one after
+  another take distinct nodes by this rule alone; members brought up at once may race and the later one is refused.
+
 ### The agent's node: a component of its own
 
 The agent's node S (M5, section 8) needs about the agent's memory, work and tmp bytes plus 4 GB for the gate, the
@@ -120,7 +156,10 @@ under one record. One federation's job failing ends one shard's step, never anot
   the grant and the scratch inode quota; unset refuses. `up N` past it is refused before anything is made; `add K`
   counts every federation that may still hold a job (a failed `up` may, until its `down`). The inode guard
   (`hpcquota.guard`, section 11, mandatory with a scratch root) is asked once for N: N concurrent ups would each read the same usage and pass
-  alone, so the fleet reads it against N times one federation's estimate. `HPC_FLEET_PARALLEL` (1 by default) is how
+  alone, so the fleet reads it against N times one federation's estimate. The home guard (`hpcquota.home_guard`,
+  section 11, whenever the site sets its keys) is asked once too, ahead of it, at `up` and at `add`: it has no estimate to
+  multiply, so one read answers for all N, and a full home refuses the call before the fleet's directory, a slot or a job
+  is made. `HPC_FLEET_PARALLEL` (1 by default) is how
   many ups or downs run at once.
 - **One process per federation.** A federation's driver changes process-wide state (the umask its secrets are written
   under), so each `up` and `down` is `hpcfed.py` in a child of its own, with `-I`, from the fleet's 0700 directory,
@@ -160,6 +199,7 @@ under one record. One federation's job failing ends one shard's step, never anot
   step carries into the study: it moves a shard only to a federation whose `platform.toml` leaves `[placement]
   reset_shortcut` off (the default), under which every reset takes the full reads; one that turns it on is refused.
   It cannot see a study's own request for one full reset (O51), so a study that turns the shortcut on moves no shard.
+- **The shards' results are copied back before `down`.** The shards' archives, archive manifests, journals and (when newer than the archive) newest snapshot are on the shared filesystem the site's scratch policy cleans, and `down` ends the federation: the operator pulls them to their own host after `collect` and checks them with `shards.py verify-copy` before `down` (section 5, "Before `down`").
 - **Not built:** a fleet's `down` of a failed federation on its own (the operator decides when a failed `up`'s job
   goes), a watch of each job's walltime, and a fleet across accounts (the maximum is one fleet's, not the account's:
   two fleets of one account must share it by hand).
@@ -320,7 +360,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
     "cpus_per_node": 5, "memory_mib_per_node": 11264, "time": "02:00:00",
     "readback": {"JobName": "...", "TimeLimit": "...", "Requeue": "0", "Account": "...", "Partition": "...",
                  "NumNodes": "...", "NumCPUs": "...", "MinMemoryNode": "..."},
-    "started": "<Slurm's StartTime>", "ends": "<Slurm's EndTime>"
+    "started": "<Slurm's StartTime>", "ends": "<Slurm's EndTime>",
+    "excluded_nodes": 0
   },
   "sandbox": {
     "placement": "het | separate", "name": "<allocation name> (het) | <allocation name>-sandbox (separate)",
@@ -403,9 +444,10 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    refused: `down` first.
 2. **The provider storage** (only with a scratch root, section 11): the state file is created, then the federation's
    own directory on scratch and one per provider, each by an exclusive `mkdir`, before any job exists.
-   **Submit** the held job: `sbatch --parsable --job-name=<allocation name> --account --partition --no-requeue
-   --time --nodes --ntasks-per-node=1 --cpus-per-task --mem --chdir=/ --output=/dev/null --export=NONE --wrap 'exec sleep
-   <seconds of --time>'`. **The read-back:** `scontrol show job -o <id>` must report what was asked (TimeLimit,
+   **Read the account's other live federations' nodes** (section 1, "Two federations of one account"), before the state
+   file is made: read-only, and a failed read refuses. **Submit** the held job: `sbatch --parsable --job-name=<allocation
+   name> --account --partition --no-requeue --time --nodes --ntasks-per-node=1 --cpus-per-task --mem
+   [--exclude=<those nodes>] --chdir=/ --output=/dev/null --export=NONE --wrap 'exec sleep <seconds of --time>'`. **The read-back:** `scontrol show job -o <id>` must report what was asked (TimeLimit,
    Requeue=0, Account, Partition, NumNodes, NumCPUs, MinMemoryNode, JobName); otherwise `up` cancels that one job id
    and fails, naming the field. sbatch's stderr is kept apart from the id it prints. With the agent's node under
    `het`, the same sbatch has a second component (section 1), and **each component's record** is read back (one per
@@ -417,7 +459,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 3. **Wait for it to run** (each job, under `separate`), bounded (30 min); at the bound, or if it ends first, it is
    cancelled by its id. **The read-back runs again on the running job**: a scheduler that allocated more than the
    pending request showed is caught there, and the job cancelled before any step; so is a component, or a job, on
-   another count of nodes than asked, or on a node another holds.
+   another count of nodes than asked, or on a node another holds, and so is a node another live federation of the
+   account holds (the second read, section 1): the job is cancelled before any step and the roles named.
 4. **Place** (section 1), then one control step per node prints the node's FQDN and its IPv4 address on the
    cluster's network (`nodefacts.py`, Python 3.9-compatible, stdlib only); on S, with `--het-group=1` under `het` and
    S's own job id under `separate`, and on a service node with `--het-group=0` under `het`. Nothing else of `up` runs
@@ -427,7 +470,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    --declared=<its declared name> --host=<name>=<address> ...` (one `--host` per service of the federation, itself
    included), run as a step (it holds the service for the step's life, as the standing run did). `up` waits for its log's verdict
    (`hpcop: OK zone`, or `FINISH FAILED` or `hpcop: ERROR`, which fail `up`).
-6. **The providers**: one detached service step each, `provider.sbatch <bundle> <provider tar> <name> <zone's declared
+6. **The providers**: one detached service step each, launched `launch_stagger_s` (1 s) apart (below), `provider.sbatch <bundle> <provider tar> <name> <zone's declared
    name> <admin mail> <zone address> <every other provider's address> --declared=<its declared name> --host=...`; for each, a registration token minted in a control
    step on the zone's node piped into a delivery step on the provider's (`mint-registration-token.sh |
    deliver-token.sh`, the bundle's, with `--workdir`); then each log's verdict (`hpcop: OK provider`). A provider that
@@ -463,6 +506,52 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
     every verb it runs inherits it; then `fault_relay alive` (`-I -B` too) polled until it beats (30 s at
     most; a relay that never beats fails `up` and is ended). It is recorded in the state file as `relay`. One relay
     per root: it takes a lock.
+
+**A launch that failed at launch (O57; live 17 Nov 2026, twice).** Five provider steps launched in the same second
+failed together: srun's fan-out on the login node could not find the nodes' addresses, each step was accounted
+`CANCELLED` with exit `0:116` after about 12 s, and the services' run logs were empty (the bundle's first write never
+happened). `up` could only fail and be torn down, although a minute later every node resolved. Two changes:
+
+- **The providers are launched `launch_stagger_s` apart**: a declared bound of the driver (`hpcdriver.LAUNCH_STAGGER_S`,
+  1 s), a pause between two launches, never before the first provider's or after the last. It is recorded in the state
+  file as `launch.stagger_s`.
+- **A service is launched once more, only when both proofs hold** (`hpclaunchproof.py`; the zone's launch and each
+  provider's). The one failure considered is the one `up` always raised: the step ended before its log said what `up`
+  waited for. `up` then reads, at that moment, three sources. **(a)** sacct's rows of the step's job (`sacct -j <job> -n
+  -P -o JobID,JobName,State,ExitCode`) for the step id that srun's own client log names (`<run log>.client`: `srun:
+  error: Task launch for StepId=<id> failed on node <node>: Can't find an address, check slurm.conf`): exactly one row
+  of that id, under the step's name, State exactly `CANCELLED` and ExitCode `0:116`, both as the site printed them twice
+  (a step a user cancels reads `CANCELLED by <uid>`, exit `0:9`; a job's batch step cancelled with the job reads plain
+  `CANCELLED`, exit `0:15`: the state alone is not the proof). The client's log must name that one step and its failure
+  must be the missing address, which srun's message reads as a request that was never sent (its message, not something
+  seen on the node); a task launch that failed otherwise (a socket that timed out) may have reached the node, and is no
+  proof. **(b)** The run log is a
+  regular file of zero bytes, by a fresh `lstat` read last, and again immediately before the retry is written. A
+  missing log proves nothing. The step's id comes from the client's log, not from the state: `up` waits for the
+  providers one after the other, so the steps of the later ones were never listed while it waited; an id the state does
+  hold must be the same. A step sacct cannot show (the command fails, times out, prints nothing, or no row is the
+  step's) is no proof, and `up` fails with its own error, never sacct's.
+
+  The retry is **one**, counted in the state file (`services.<name>.launch_retries`), never in the process. A second
+  failure of the same service, a step still listed when its bound runs out (it may be running), a run log holding a
+  single byte, and a log that says it failed all stop `up` exactly as before. A retry is written to the state **before**
+  the launch, with its proofs: `launch` (the launch that failed), `step`, `step_id`, `sacct_state`, `sacct_exit`,
+  `run_log_bytes`, and `failure`, a class (`task-launch-no-address`) and never the client's line, which names a node. It
+  is said while `up` runs and printed in `up`'s output (`launch retried: ...`). The new launch has the next launch
+  number, so its step, run log and client log are new files (`...-run-2`); the first launch's client stays recorded and
+  `down` ends it. **The retry waits first**: `launch_retry_backoff_s`
+  (`hpcdriver.LAUNCH_RETRY_BACKOFF_S`, 60 s; recorded as `launch.retry_backoff_s`), since live the nodes resolved
+  again a minute after the failure, and a retry 15 to 30 s after it (three polls with the step gone) would have failed
+  for the same reason. **Each service's backoff counts from its own step's End**, read from the same sacct row as the
+  proofs (`End` is one of its fields; the row's `step_end` is recorded), and `up` sleeps only until End + the backoff,
+  which is nothing when that is already past: the services are awaited one after another, and five providers that
+  failed in the same second wait about one backoff in all (58 s of 60, the three polls having used some), not five. A
+  service that failed later waits what is left of its own. sacct prints End in the local time of the node that prints
+  it, so it is read in this node's local time and **believed only between this process's launch of the step (less
+  10 s) and now (plus 10 s)**: an End that is "Unknown", empty, not a time, in another zone or on another clock takes
+  the whole backoff from now, never zero. The seconds waited are recorded (`waited_s`). Proof (b) is read again after
+  the wait, or when there is none, and immediately before the retry is written and the service launched: a run log
+  that gained a byte meanwhile cancels the retry (said, nothing recorded, `up` fails as before).
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
@@ -591,6 +680,8 @@ removed while held would let the next `up` or `down` lock another file of the sa
    the removal. A root a removal left unmarked (empty, or of nothing but silly files, with its lifecycle lock beside
    it) is finished by a second `down` too, by `rmdir` alone; any other unmarked root is refused. The service logs stay
    in the log directory (no secret: the bundle redacts them), named in the run's output.
+
+**Before `down`: the copy back, a required step of the operator's, not of `down`'s.** Nothing durable may live only on scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all of scratch after 20 days with no job submitted. The cluster cannot push to the operator's host, so after `shards.py collect` (run once every step has ended) the operator pulls the results directory (rsync or scp, from their host) and runs `shards.py verify-copy MANIFEST LOCAL_DIR --manifest-sha256 HASH` there. **What the required pull covers is what the manifest lists,** per shard: the archive `<label>.out.tar`; its manifest `<label>.out.json`; every file under `<label>/journals/` (a spend journal per step, which holds what a step killed outright spent and which `--resume` counts as `lost_in_kill`, so it is held nowhere else); and the newest snapshot that verifies, only when it is newer than the archive. **Why snapshots are not otherwise required:** a snapshot is a copy of `out/` taken while its step ran, and it names the archive its step started from (`_run_step`: `facts = {"shard": spec, "base": base}`). The snapshots of the step that wrote an archive name an earlier archive or none, and the last of them was taken after the dispatcher exited and before the archive, so the verified archive holds all they do; `--resume` agrees (`restore_newest` returns none for a snapshot whose `base` is not the archive's SHA-256, the archive being newer). **The exception:** a step resumed from the archive and killed before it archived leaves snapshots that name that archive, so the newest holds the runs that step reached, which the archive lacks and the merge will not have; `collect` picks it as `--resume` would (`restore_newest` with the verified archive as the base, restored into a private directory that is removed), warns, and lists every file of it. Plain `collect` does not refuse that state (the merge it prints is of the archive, and the operator may mean to run it): the warning and the manifest keep the snapshot from being lost with the scratch. `collect --run`, which runs the merge at once, refuses in that state (exit 2, naming the shard and the snapshot: resume the shard so its runs reach a new archive, or run `collect` without `--run` and merge the line it prints yourself), because the merge has no flag to leave a shard short and would analyse an incomplete campaign. `collect` writes `archives.sha256.json` beside the archives: the plan's id, then each archive's, and each other file's, relative name, size and SHA-256, read by `collect` (an archive from its private verified copy, never from a step's claim; a link anywhere among the journals or the snapshot refuses the collect), sorted, with no path or timestamp, and prints the file's own hash on stderr; the hash must come from that output, never from the pulled files, or a manifest damaged or swapped in the pull would vouch for itself. `verify-copy` is standard library only and is dispatched before the plan is loaded, so it runs on a host without the core (a test runs it under `python -I -S`); it checks each file as a regular file under plain directories (a link on the way is not followed) and refuses a manifest with no list of the files beside the archives, which an earlier tip wrote. `down` does not see the operator's host and does not check that this was done: the order is the operator's rule, and the README states it as a required step.
 
 A job already ended (its `--time`, a failure) skips 2 and 3: Slurm stopped its steps, the bundle's cleanup removed
 what its time allowed, and the next job of ours on a node sweeps what is left (`sweep_leftovers`). `down` says which
@@ -887,7 +978,10 @@ last, recorded in the state file as the service `sandbox` (kind `sandbox`, no wo
 (`sandbox_placement = "het"`) or as a held job of its own (`"separate"`; section 1). `[sandbox]` is in the pilot's
 template (O63), with placeholders `up` fills from `site.env` (`hpcpins`: the SIF and the egress shim, each checked
 against its declared SHA-256 before the cluster is touched, the work root, and the bundle's collector), and every path
-into the root is rendered absolute. M5 launches its shard's step on `sandbox.node` with `--jobid=<sandbox.job>`, plus
+into the root is rendered absolute. The REST arm (#384) is a layout of its own, `pilot-shape-rest.toml`, whose template
+adds a content check file, a REST level and the 443 mapper as the one preload, pinned by `@hpc_gateport@` and
+`@hpc_gateport_sha@` (`HPC_GATEPORT`, `HPC_GATEPORT_SHA256`) and checked by the same preflight, only when its template
+names them. M5 launches its shard's step on `sandbox.node` with `--jobid=<sandbox.job>`, plus
 `--het-group=<sandbox.het_group>` when that is not `null`; the step makes the sandbox's work root on S's tmpfs and copies
 the root's `platform.toml` beside the study's `study.toml`. The driver holds, reads back and places S, runs its node
 facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`, by `HPC_CORE_PYTHON`, which `up` asks for
@@ -904,7 +998,8 @@ canonical JSON with sorted keys; `hpcidentity.py`, written by `hpcboot.write_fac
 the renderer read it, before it was rendered; `platform_fingerprint_sha256`, the canonical JSON of the rendered file's
 `PlatformConfig.fingerprint()` hashed as the core hashes a fingerprint (`expcore.campaign.manifest.fingerprint_sha256`);
 and the SHA-256 of each pin the platform holds (`sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256`,
-`oneclient_bundle_sha256`), the very values the preflight checked (`hpcpins`), never read again; and, when `site.env`
+`oneclient_bundle_sha256`, and `gateport_sha256` for the REST layout), the very values the preflight checked
+(`hpcpins`), never read again; and, when `site.env`
 declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256`, the digest of that directory's tree. It holds no address,
 id, job, node, path, user or secret, so it can travel with a shard's results and be committed beside a study. A pin the
 template does not name is left out, and so is the artifacts digest of a site with no such directory; a layout with no
@@ -1045,6 +1140,40 @@ refused as the site is loaded (`hpcsettings.checked_site`), naming the combinati
 site however it was built; any value other than `off` is refused at the start whatever else is set. Without a scratch
 root nothing lands on scratch, there is no check, and `off` changes nothing. A site that sets `HPC_STORAGE_ROOT` and
 names no command cannot `up`.
+
+**The home guard** (`hpcquota.home_guard`; the preflight, ahead of the inode guard). The account's home is small and
+shared by every agent of the account: a checkout and its venv left in it run to thousands of files, and a full home
+breaks every agent at once. Nothing of the federation is stored there, so this guard has no estimate and no multiplier,
+and it does not depend on `HPC_STORAGE_ROOT`.
+
+1. Read the home's usage and limits through `HPC_HOME_QUOTA_CMD`, split as a shell would split it and **run without a
+   shell** on the login node (bounded: 120 s), with `HPC_HOME_QUOTA_PATTERN`: a regular expression with the named
+   groups `files_used`, `files_limit`, `bytes_used` and `bytes_limit`, matching exactly once and capturing each figure
+   whole (the same rule as the inode guard's: no letter, digit, `_`, `.`, `,`, `+`, `-` or `%` may touch a captured
+   figure). Files and bytes are separate figures with their own limit; the bytes are in the tool's unit, the same for
+   the used figure and the limit, since only their ratio is compared (no unit is named in a message). The limit
+   captured is the one that **binds**: a tool may print a soft column that reads 0 beside the hard limit, and a limit
+   of 0 is refused, so a pattern on the soft column cannot pass a full home. The command is generic: the home need not
+   be on the filesystem the scratch quota tool reads, and a site's own script may print the figures. The repository
+   holds neither the site's tool nor its output.
+2. **Refuse** when `files_used > files_limit * 95 // 100` or `bytes_used > bytes_limit * 95 // 100`, in integers, so a
+   figure exactly at the line passes. The message names each figure that is past (its used figure, its limit and the
+   95% line) and that nothing was submitted.
+
+**It guards whenever a key is set**, and fails closed as the inode guard does: a command set without its pattern or a
+pattern without its command, a pattern that does not compile or lacks one of the four groups, a command that cannot
+run, exits non-zero or does not answer, an output the pattern matches never or more than once, a figure that is no
+whole count (or is too large to be one: 10^15 files, 10^19 bytes) or is cut out of a longer one, and a limit of 0 all
+refuse `up`, naming why. **With neither key set there is no check** and `up` says nothing of the home (the inode
+guard's rule, which guards only when `HPC_STORAGE_ROOT` is set: a site is expected to set the keys, and the docs say
+so). `HPC_HOME_QUOTA_CHECK=off` (the one value; anything else is refused when the site is loaded, and unset is not off)
+skips the check, whatever else is set, and `up` says so (`home check: skipped: HPC_HOME_QUOTA_CHECK=off`).
+
+**A message holds figures and variable names only.** A home quota tool's stderr and its command line name the user and
+the home's path, which the inode guard's messages may repeat for the scratch tool (a bounded tail of stderr) and these do
+not: a failed command is named by its exit status alone, a command that could not run by its exception's class, a
+pattern that does not compile by the compiler's own reason. The three keys are not recorded in the state file
+(`Site.to_json`): `down` needs none of them, and a command line that names the user belongs in no record.
 
 **The directories** (`hpcstorage.py`): below `HPC_STORAGE_ROOT` (a directory only this user can write, owned by this user
 with no group or other write bit, named by its real path since the nodes bind through no link, which is neither the

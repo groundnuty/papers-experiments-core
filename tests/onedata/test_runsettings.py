@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 from runsettings_support import (
     APPTAINER,
+    CHECK_FILE_LINE,
+    CHECK_PROVIDER_LINE,
     DOCKER,
     FEDERATIONS,
     HAND_READ,
@@ -123,6 +125,37 @@ def test_c06_the_backends_of_the_sandbox_and_the_fault_injector_are_in_the_finge
     assert (docker["faults"]["settings"]["backend"], hpc["faults"]["settings"]["backend"]) == ("compose", "hpc")
 
 
+def test_o87_the_check_provider_is_in_the_fingerprint_by_position_only_when_it_is_not_the_local_one(tmp_path, cas):
+    """O87: no key, or the local provider named, leaves the fingerprint as it was before the key (a store started
+    before it resumes); another provider adds `content_check_provider` to `sandbox` as its `providers[i]`, a position,
+    never its name, so two federations rendered from one template still give one fingerprint."""
+    edits = [platform(CHECK_FILE_LINE, CHECK_FILE_LINE + CHECK_PROVIDER_LINE)]
+    base = load(DOCKER, tmp_path / "base", cas[0]).fingerprint()
+    assert "content_check_provider" not in base["sandbox"]
+    prints = [load(edited(DOCKER, edits), tmp_path / f"fed-{i}", cas[0], values).fingerprint()
+              for i, values in enumerate(FEDERATIONS)]  # fmt: skip
+    assert prints[0]["sandbox"]["content_check_provider"] == "providers[1]"
+    assert prints[0] == prints[1]
+    assert "birch" not in json.dumps(prints[0])
+
+
+def test_o87_an_apptainer_platform_with_spaces_takes_the_check_provider_of_the_first_data_path_space(tmp_path, cas):
+    """O87: the Apptainer backend's `[sandbox]` with `[[spaces]]` is checked through `load_platform`: a provider of the
+    first space is read through and in the fingerprint by position; one that supports another space alone is refused,
+    naming the key."""
+    anchor = 'content_check_file = "dir/check-apptainer.bin"'  # the template carries the check file (O69)
+
+    def with_provider(name):
+        return edited(APPTAINER, [platform(anchor, anchor + f'\ncontent_check_provider = "{name}"')])
+
+    loaded = load(with_provider("larch"), tmp_path / "ok", cas[0])
+    assert loaded.content_check_reader.name == "larch"
+    assert loaded.fingerprint()["sandbox"]["content_check_provider"] == "providers[1]"
+    with pytest.raises(ConfigError, match="content_check_provider") as raised:
+        load(with_provider("rowan"), tmp_path / "other", cas[0])  # supports the second space alone
+    assert "rowan" not in str(raised.value).replace(str(tmp_path), "")
+
+
 @pytest.mark.parametrize(
     ("template", "edits"),
     [
@@ -140,11 +173,12 @@ def test_c06_the_backends_of_the_sandbox_and_the_fault_injector_are_in_the_finge
         ("docker", [platform('providers = ["pine", "birch", "cedar"]\nlocal', 'providers = ["cedar", "pine", "birch"]\n'
                                                                               'local')]),
         ("docker", [platform('served = { kind = "rest", listing = "paged" }', 'served = "rest"')]),
+        ("docker", [platform(CHECK_FILE_LINE, CHECK_FILE_LINE + '\ncontent_check_provider = "pine"')]),
         ("apptainer", [platform("hidden_memory_margin_bytes = 134217728\n", ""),
                        platform("memory_poll_s = 0.1\n", "")]),
     ],
     ids=["tokens", "fault-numbers", "fault-heal", "limits", "grace-placeholder", "agent", "trust-order",
-         "allow-order", "support-order", "listing", "apptainer"],
+         "allow-order", "support-order", "listing", "check-provider-local", "apptainer"],
 )  # fmt: skip
 def test_c06_a_setting_at_its_default_and_one_left_out_or_written_otherwise_give_one_fingerprint(
     tmp_path, cas, template, edits

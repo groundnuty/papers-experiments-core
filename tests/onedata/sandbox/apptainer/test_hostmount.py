@@ -12,6 +12,7 @@ from apptainer_support import TOKEN, make_settings, make_spec, options, pinned_b
 from fake_mount_node import FakeMountNode
 from sandbox_support import SleptClock
 
+from expcore.mountguard import MountGuard, mount_guard_for
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer import hostmount as HM
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
@@ -363,6 +364,8 @@ def test_through_the_sandbox_every_cell_binds_the_mount_point_alone_and_the_coll
             assert not any(source.startswith(guard) for source, _ in done.binds.values())
             assert TOKEN not in " ".join(done.argv)
         assert box.mount_guard_nonce == mount.nonce
+        assert box.data_path_kind == "mount"
+        assert isinstance(mount_guard_for(box), MountGuard)  # a mount run is guarded, never not applicable
         node.cell()
         result = box.collect(tmp_path / "out")
         assert result["mount_watch_log"] == "mount-watch.jsonl"

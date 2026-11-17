@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fingerprint_support import standin_python
 from hpc_fed_support import LAYOUT, data_stand_in, hpc_on_path, pin_values
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
@@ -122,6 +123,9 @@ def shards():
     sys.modules["hpc_shards_data"] = module
     try:
         spec.loader.exec_module(module)
+        # The manifests here name an interpreter that does not exist; the core it imports is asked in
+        # test_hpc_shards_core_identity.py (C06), with real interpreters.
+        module.identify_core = lambda plan: {"known": True, "stale": False, "why": None}
         yield module
     finally:
         sys.modules.pop("hpc_shards_data", None)
@@ -138,8 +142,9 @@ def manifest(tmp_path, platforms, *, phase="linked", same_root=False) -> Path:
                  "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         (root / "platform.toml").write_text(text)
-    lines = [f'{k} = "{tmp_path / k}"' for k in ("study", "python", "core_src", "results", "tmpfs")]
-    lines += ['step_path = "/usr/bin"', "cpus = 6", 'memory = "18g"']
+    (tmp_path / "study").mkdir(exist_ok=True)  # the campaign fingerprint is taken on a copy of it (O63)
+    lines = [f'{k} = "{tmp_path / k}"' for k in ("study", "core_src", "results", "tmpfs")]
+    lines += [f'python = "{standin_python(tmp_path / "venv")}"', 'step_path = "/usr/bin"', "cpus = 6", 'memory = "18g"']
     for label, root in zip(("fed-a", "fed-b"), roots, strict=True):
         lines += ["[[shards]]", f'label = "{label}"', f'root = "{root}"']
     (tmp_path / "shards.toml").write_text("\n".join(lines) + "\n")

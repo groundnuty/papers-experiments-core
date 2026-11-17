@@ -41,6 +41,7 @@ OFFSET = re.compile(r"[0-9]{1,6}")
 # A value of srun's --network (HPC_STEP_NETWORK): letters, digits and `_ . , = : + -`, led by a letter or digit, so no
 # shell character, space or option of its own reaches the argv. It names no plugin's words: other sites take others.
 NETWORK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.,=:+-]{0,127}")
+NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}")  # a node name, as `Slurm.hostnames` accepts one
 
 
 SLURM_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}")  # sacct's own, zone-less
@@ -48,6 +49,17 @@ SLURM_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
 ENDED_STATES = (
     "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "DEADLINE", "PREEMPTED", "BOOT_FAIL"
 )  # fmt: skip
+
+
+# What `Slurm.step_observed` says when the two reads do not settle a step. These are what Slurm's accounting being
+# behind explains (a step just stopped: squeue no longer lists it and sacct has not caught up, or the reverse);
+# `accounting_behind` names them, so a caller that knows the step was stopped can wait for them and for nothing else.
+UNSEEN = "the step is not listed by squeue and accounting holds no record of it"
+UNLISTED_RUNNING = "accounting says the step runs and squeue does not list it"
+UNLISTED_NOT_ENDED = "the accounting state of the step is not known, or has no end time"
+LISTED_ENDED = "squeue lists the step and accounting records it as an ended one"
+LISTED_NOT_ENDED = "the accounting state of the step is not known"
+BEHIND = (UNSEEN, UNLISTED_RUNNING, UNLISTED_NOT_ENDED, LISTED_ENDED, LISTED_NOT_ENDED)
 
 
 ACCOUNT_ID = re.compile(
@@ -93,6 +105,15 @@ def _unknown_step(reason: str) -> Dict[str, Any]:
     return {**_step_answer(None, None, None, None, None), "unknown": reason}
 
 
+def accounting_behind(answer: Mapping[str, Any]) -> bool:
+    """Whether a `Slurm.step_observed` answer is one that Slurm's accounting being behind explains, for a caller that
+    knows the step was stopped: the step reads as running (squeue lists it, or no row of accounting says otherwise), or
+    is unknown for a reason of `BEHIND` (not listed and not recorded, recorded as running or as not ended, listed and
+    recorded as ended). An ended step is no lag, and nor is a command that failed or answered something unreadable, a
+    step recorded twice or listed under another name, or an id that is not a step id: each keeps its own reason."""
+    return answer.get("running") is True or (answer.get("running") is None and answer.get("unknown") in BEHIND)
+
+
 def valid_network(value: object) -> bool:
     """Whether a step's network option can be used: the empty string (no option), or a string `NETWORK` matches. Any
     other type is no option: a state record is data, and a false or a null must not read as none."""
@@ -101,6 +122,14 @@ def valid_network(value: object) -> bool:
 
 class SlurmError(RuntimeError):
     """A Slurm command that failed, or a job or step that is not what was asked for."""
+
+
+def scrubbed(text: str, names: Sequence[str]) -> str:
+    """`text` with each of `names` (nodes) replaced by `<node>`, the longest first, so that what Slurm says of a request
+    that excluded nodes never carries one into a message."""
+    for name in sorted(names, key=len, reverse=True):
+        text = text.replace(name, "<node>")
+    return text
 
 
 class StepTimeout(SlurmError, TimeoutError):
@@ -270,6 +299,9 @@ class Allocation:
     time: str
     time_s: int
     het: Tuple[Shape, ...] = ()
+    exclude: Tuple[
+        str, ...
+    ] = ()  # the nodes of other federations' live jobs (hpcexclude): each component's `--exclude`
 
     def shapes(self) -> Tuple[Shape, ...]:
         """Every component's shape, component 0 first."""
@@ -278,7 +310,12 @@ class Allocation:
     def argv(self) -> List[str]:
         """sbatch's argv. A further component follows a `:` and names its account, partition and time again (Slurm
         propagates no partition, nodes or cores to it, and the read-back checks what it recorded) with its own nodes,
-        cores and memory; `--wrap` stands once, in component 0's options, as sbatch builds the script once."""
+        cores and memory; `--wrap` stands once, in component 0's options, as sbatch builds the script once. `--exclude`
+        names the same nodes in every component, so that nothing depends on Slurm passing it on, and only when there
+        are nodes to name: without them the argv is what it was before the option existed."""
+        if not all(NODE.fullmatch(node) for node in self.exclude):
+            raise SlurmError("an excluded node's name is not one an sbatch argv may carry")
+        exclude = [f"--exclude={','.join(self.exclude)}"] if self.exclude else []
         argv = [
             "sbatch",
             "--parsable",
@@ -291,6 +328,7 @@ class Allocation:
             "--ntasks-per-node=1",
             f"--cpus-per-task={self.cpus_per_node}",
             f"--mem={self.memory_mib}M",
+            *exclude,
             "--chdir=/",
             "--output=/dev/null",
             "--export=NONE",
@@ -306,6 +344,7 @@ class Allocation:
                 "--ntasks-per-node=1",
                 f"--cpus-per-task={shape.cpus_per_node}",
                 f"--mem={shape.memory_mib}M",
+                *exclude,
             ]
         return argv
 
@@ -498,8 +537,17 @@ class Slurm:
     # -- the held job ------------------------------------------------------------------------------------------------
 
     def submit(self, asked: Allocation) -> str:
-        """Submit the held job; return its id. sbatch's stderr is kept apart from the id it prints."""
-        done = self._call(asked.argv())
+        """Submit the held job; return its id. sbatch's stderr is kept apart from the id it prints. A request that
+        excluded nodes which sbatch refuses says how many it excluded, and no node name of sbatch's own words stays."""
+        try:
+            done = self._call(asked.argv())
+        except SlurmError as error:
+            if not asked.exclude:
+                raise
+            raise SlurmError(
+                f"{scrubbed(str(error), asked.exclude)}; the request excluded {len(asked.exclude)} node(s) of other "
+                "live federations of this account, which may leave none that fit"
+            ) from None
         line = done.stdout.strip()
         match = JOB_LINE.fullmatch(line)
         if match is None:
@@ -560,9 +608,10 @@ class Slurm:
         if records and name is not None and records[0].get("JobName") != name:
             raise SlurmError(f"job {job} carries another job's name: not the job submitted, and not cancelled")
 
-    def wait_running(self, job: str, timeout_s: float, name: Optional[str] = None) -> Dict[str, str]:
+    def wait_running(self, job: str, timeout_s: float, name: Optional[str] = None, note: str = "") -> Dict[str, str]:
         """Wait for the held job (every component of it) to run; at the bound, or if it ends first, cancel it by its
-        id and fail. With `name`, a job that carries another is never cancelled (`_ours`)."""
+        id and fail. With `name`, a job that carries another is never cancelled (`_ours`). `note` ends the failure at
+        the bound: what the caller knows that may keep the job waiting."""
         deadline = self.clock() + timeout_s
         while True:
             records = self.components(job) or []
@@ -576,7 +625,7 @@ class Slurm:
                 raise SlurmError(f"the held job is {(ended or ['gone'])[0]} before it ran")
             if self.clock() >= deadline:
                 self.cancel(job)
-                raise SlurmError(f"the held job did not start within {timeout_s:.0f} s; it was cancelled")
+                raise SlurmError(f"the held job did not start within {timeout_s:.0f} s; it was cancelled{note}")
             self.sleep(self.poll_s)
 
     def hostnames(self, nodelist: str) -> List[str]:
@@ -644,6 +693,20 @@ class Slurm:
                 return 128 + killed if killed else status  # a step a signal ended never reads as a success
         return None
 
+    def step_rows(self, job: str) -> Optional[str]:
+        """sacct's rows of a job's steps, `JobID|JobName|State|ExitCode|End` one per line, as sacct prints them: the
+        state (`CANCELLED by <uid>` is a step a user cancelled), the exit code (`exit:signal`) and the end (local
+        time of the node that prints it) raw, where `step_status` folds the code. None when sacct fails, does not
+        answer or cannot run: no row is no proof, and the caller keeps its own failure (`up`'s launch retry,
+        `hpclaunchproof`)."""
+        try:
+            done = self.runner.run(
+                ["sacct", "-j", job, "-n", "-P", "-o", "JobID,JobName,State,ExitCode,End"], self.command_timeout_s
+            )
+        except (SlurmError, OSError):
+            return None
+        return done.stdout if done.returncode == 0 else None
+
     def step_observed(self, step_id: str, name: Optional[str] = None) -> Dict[str, Any]:
         """One step as Slurm itself shows it now, by its EXACT id: read-only (`squeue -s` and `sacct`, nothing that
         changes a job or a step), and never a guess. The answer has `running` (True, False or None), `state` (the
@@ -673,18 +736,17 @@ class Slurm:
         if not rows:
             if step_id in listed:  # squeue lists it and accounting has not recorded it yet
                 return _step_answer(True, "RUNNING", None, None, None)
-            return _unknown_step("the step is not listed by squeue and accounting holds no record of it")
+            return _unknown_step(UNSEEN)
         state, started, ended, code = rows[0]
         if step_id in listed:
             if state == "RUNNING":
                 return _step_answer(True, state, started, None, None)
-            reason = "squeue lists the step and accounting records it as an ended one"
-            return _unknown_step(reason if state in ENDED_STATES else "the accounting state of the step is not known")
+            return _unknown_step(LISTED_ENDED if state in ENDED_STATES else LISTED_NOT_ENDED)
         if state in ENDED_STATES and ended is not None:
             return _step_answer(False, state, started, ended, code)
         if state == "RUNNING":
-            return _unknown_step("accounting says the step runs and squeue does not list it")
-        return _unknown_step("the accounting state of the step is not known, or has no end time")
+            return _unknown_step(UNLISTED_RUNNING)
+        return _unknown_step(UNLISTED_NOT_ENDED)
 
     def _listed_steps(self, job: str) -> Dict[str, str]:
         """The job's steps squeue -s lists now, as id to name (the batch and extern steps left out); a job Slurm no

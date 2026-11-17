@@ -9,6 +9,7 @@ is refused, and fail at once, stopping the start script, otherwise. Everything s
 
 import base64
 import collections
+import errno
 import http.client
 import importlib.util
 import os
@@ -31,10 +32,34 @@ ALNUM = string.ascii_letters + string.digits
 WAIT_S = 20
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
+class Started(list):
+    """The subprocesses one test started, and the loopback ports it picked for them: both end with the test.
+
+    A port is picked by binding port 0 and read from the socket, which the test then keeps bound (not listening) until
+    the process that will listen on it takes the socket over. A port that was only looked up and closed would be free
+    for the node's other processes in the meantime: HPC test steps overlap on one node's loopback, and the kernel hands
+    out one range of ports to bind(0) and to the source of every outgoing connect.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.held: dict[int, socket.socket] = {}
+
+    def reserve_port(self) -> int:
+        # No SO_REUSEADDR: with it, another socket could be bound to the same port while neither listens.
+        held = socket.socket()
+        held.bind((HOST, 0))
+        port = held.getsockname()[1]
+        self.held[port] = held
+        return port
+
+    def hand_over(self, port) -> socket.socket:
+        """The held socket, no longer ours to close at the end of the test."""
+        return self.held.pop(port)
+
+    def release_ports(self) -> None:
+        while self.held:
+            self.held.popitem()[1].close()
 
 
 def write_secret(path: Path, value: str) -> None:
@@ -56,21 +81,32 @@ def launch(tmp_path):
 
 @pytest.fixture
 def processes():
-    started: list[subprocess.Popen] = []
+    started = Started()
     yield started
-    for process in started:
-        if process.poll() is None:
-            process.kill()
-        process.wait(timeout=10)
+    try:
+        for process in started:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)
+    finally:
+        started.release_ports()
 
 
 def start_fake(processes, port, *, lifetime=30.0, provisioned=None, anon_admin=False):
-    """The stand-in, opening its port after 0.3 s; returns once it listens."""
-    env = {**os.environ, "FAKE_CB_ANON_ADMIN": "1" if anon_admin else "0"}
+    """The stand-in, opening its port after 0.3 s; returns once it listens.
+
+    The port is one of processes.reserve_port()'s: the stand-in inherits its socket and listens on it after the delay,
+    so the port is never free in between. This test's own copy is closed as soon as the stand-in has the socket, as
+    both share one socket and a listener that outlived the stand-in would break the tests of its end."""
+    held = processes.hand_over(port)
+    env = {**os.environ, "FAKE_CB_ANON_ADMIN": "1" if anon_admin else "0", "FAKE_CB_LISTEN_FD": str(held.fileno())}
     argv = [sys.executable, "-I", str(FAKE), str(port), "0.3", str(lifetime)]
     if provisioned is not None:
         argv.append(provisioned)
-    fake = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, text=True)
+    try:
+        fake = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, text=True, pass_fds=(held.fileno(),))
+    finally:
+        held.close()
     processes.append(fake)
     assert fake.stdout is not None
     assert fake.stdout.readline().strip() == "listening"
@@ -120,7 +156,7 @@ def test_o53_the_guard_passes_when_this_launchs_administrator_answers_and_an_ano
     """O53: the guard passes only on both requests: this launch's administrator gets 200 and is named, and an
     anonymous GET /settings/web gets 401."""
     secrets_dir, user, password = launch
-    port = free_port()
+    port = processes.reserve_port()
     guard = start_guard(processes, secrets_dir, port)
     start_fake(processes, port)
     onepanel_setup(port, user, password)
@@ -130,11 +166,47 @@ def test_o53_the_guard_passes_when_this_launchs_administrator_answers_and_an_ano
     assert "FAILED" not in out
 
 
+def take_if_free(port):
+    """What a neighbouring run on this node does with `port` when the kernel hands it that port too: listens on it, as
+    its own stand-in would (with the reuse flag http.server sets). None if the port was not free to take."""
+    neighbour = socket.socket()
+    neighbour.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        neighbour.bind((HOST, port))
+        neighbour.listen()
+    except OSError as refused:
+        neighbour.close()
+        if refused.errno != errno.EADDRINUSE:
+            raise
+        return None
+    return neighbour
+
+
+def test_the_port_picked_for_the_stand_in_is_not_free_for_a_neighbouring_run_before_it_listens(launch, processes):
+    """The flake of test_the_guard_prints_the_status_that_failed_it: HPC test steps overlap on one node's loopback, and
+    a neighbour that is handed the picked port in the stand-in's start delay (0.3 s) takes it, so the stand-in's bind
+    fails with EADDRINUSE. The test holds the port from the pick until the stand-in listens: the neighbour is refused
+    and this run does not notice it."""
+    secrets_dir, user, password = launch
+    port = processes.reserve_port()
+    guard = start_guard(processes, secrets_dir, port)
+    neighbour = take_if_free(port)
+    try:
+        start_fake(processes, port)
+        onepanel_setup(port, user, password)
+        status, out = verdict(guard)
+        assert status == 0, out
+        assert neighbour is None, "a neighbouring run took the picked port"
+    finally:
+        if neighbour is not None:
+            neighbour.close()
+
+
 def test_o53_a_bucket_without_an_administrator_fails_the_start(launch, processes):
     """O53: the third live run's incident. cluster-init skipped the administrator with exit status 0, bucket-create
     ran, and Couchbase served with none: the guard fails as soon as the bucket shows."""
     secrets_dir, user, password = launch
-    port = free_port()
+    port = processes.reserve_port()
     guard = start_guard(processes, secrets_dir, port)
     start_fake(processes, port)
     onepanel_setup(port, user, password, create_administrator=False)
@@ -148,7 +220,7 @@ def test_o53_a_bucket_without_an_administrator_fails_the_start(launch, processes
 def test_o53_an_anonymous_admin_request_that_is_answered_fails_the_start(launch, processes):
     """O53: our administrator answers, but so does an anonymous caller: anyone can act as the administrator."""
     secrets_dir, user, password = launch
-    port = free_port()
+    port = processes.reserve_port()
     guard = start_guard(processes, secrets_dir, port)
     start_fake(processes, port, anon_admin=True)
     onepanel_setup(port, user, password)
@@ -161,7 +233,7 @@ def test_o53_an_anonymous_admin_request_that_is_answered_fails_the_start(launch,
 def test_o53_an_administrator_that_is_not_this_launchs_fails_the_start(launch, processes):
     """O53: Couchbase already has an administrator, someone else's: ours is refused (401) and the start fails."""
     secrets_dir, _, _ = launch
-    port = free_port()
+    port = processes.reserve_port()
     other = "cbffffffffffff:" + "".join(secrets.choice(ALNUM) for _ in range(24))
     guard = start_guard(processes, secrets_dir, port)
     start_fake(processes, port, provisioned=other)
@@ -173,7 +245,7 @@ def test_o53_an_administrator_that_is_not_this_launchs_fails_the_start(launch, p
 def test_o53_couchbase_stopping_before_it_has_an_administrator_fails_the_start(launch, processes):
     """O53: our listener goes away while Couchbase still has no administrator: no verdict of 'passed' is possible."""
     secrets_dir, _, _ = launch
-    port = free_port()
+    port = processes.reserve_port()
     guard = start_guard(processes, secrets_dir, port)
     start_fake(processes, port, lifetime=1.0)
     status, out = verdict(guard)
@@ -185,7 +257,7 @@ def test_o53_couchbase_stopping_before_it_has_an_administrator_fails_the_start(l
 def test_o53_no_administrator_within_the_guards_time_fails_the_start(launch, processes):
     """O53: Couchbase listens but onepanel never runs its setup: the guard fails at its deadline, not later."""
     secrets_dir, _, _ = launch
-    port = free_port()
+    port = processes.reserve_port()
     guard = start_guard(processes, secrets_dir, port, timeout=2)
     start_fake(processes, port)
     started = time.monotonic()
@@ -200,13 +272,13 @@ def test_o53_an_error_of_the_guard_itself_is_a_failed_verdict(launch, processes)
     silent pass."""
     secrets_dir, _, _ = launch
     write_secret(secrets_dir / "couchbase-password", "")
-    guard = start_guard(processes, secrets_dir, free_port())
+    guard = start_guard(processes, secrets_dir, processes.reserve_port())
     status, out = verdict(guard)
     assert status == 2, out
     assert "the guard itself failed: ValueError" in out
 
 
-def test_o53_a_failed_verdict_stops_the_start_script_at_once(launch, tmp_path):
+def test_o53_a_failed_verdict_stops_the_start_script_at_once(launch, tmp_path, processes):
     """O53: the guard sends SIGTERM to the start script that started it (its parent, START_PID), whose trap stops
     every component: a Couchbase with no administrator does not run on. Here the start script is a shell whose trap
     records the signal; the guard fails on its first look, as it does when its own secrets are unreadable."""
@@ -220,7 +292,8 @@ def test_o53_a_failed_verdict_stops_the_start_script_at_once(launch, tmp_path):
         "sleep 20\n"
         'echo "not stopped" > "$1"\n'
     )
-    argv = ["bash", "-c", script, "start", str(marker), sys.executable, str(GUARD), str(secrets_dir), str(free_port())]
+    port = processes.reserve_port()
+    argv = ["bash", "-c", script, "start", str(marker), sys.executable, str(GUARD), str(secrets_dir), str(port)]
     shell = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
     assert shell.returncode == 143, shell.stdout + shell.stderr
     assert marker.read_text(encoding="ascii").strip() == "TERM"

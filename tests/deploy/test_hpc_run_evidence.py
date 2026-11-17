@@ -824,7 +824,7 @@ def evidence_lines(text):
 def watch(launch, processes, **fake):
     """The guard against the stand-in, with onepanel's setup played: its exit status and every line it printed."""
     secrets_dir, user, password = launch
-    port = guard_tests.free_port()
+    port = processes.reserve_port()
     guard = guard_tests.start_guard(processes, secrets_dir, port)
     guard_tests.start_fake(processes, port, **fake)
     guard_tests.onepanel_setup(port, user, password)

@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import hpcdata
+import hpcexclude
 import hpcidentity
 import hpcimport
+import hpclaunchproof
 import hpcnames
 import hpcpins
 import hpcplacement
@@ -28,10 +30,10 @@ from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
 from fedtools import check_artifacts, check_launchable
-from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, verify_ingested
+from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, load_readings, verify_ingested
 from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
-from hpclaunch import Launcher, StateStore
+from hpclaunch import Launcher, StateStore, client_log
 from hpcsettings import HpcSettings, Site
 from hpcslurm import READBACK, Allocation, Client, Shape, Slurm, SlurmError
 
@@ -52,10 +54,18 @@ IPV4 = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}")
 PASSPHRASE = re.compile(r"[A-Za-z0-9]{16,128}")
 GONE_POLLS = 3
 STDERR_TAIL = 300  # the most of a step's stderr a message repeats
+LAUNCH_STAGGER_S = 1.0  # declared bound: the pause between two provider launches, so five do not start in one second
+LAUNCH_RETRY_BACKOFF_S = 60.0  # declared bound: the wait between a launch proved failed and its one retry (the live
+# nodes resolved again "a minute later")
 
 
 class CoreMismatch(RuntimeError):
     """The core an interpreter imports is not this checkout's."""
+
+
+class StepGone(RuntimeError):
+    """A service's step ended before its log said what `up` waited for: the one failure `await_start` weighs a retry
+    for, and the same failure `up` has always raised (its message is unchanged)."""
 
 
 def stderr_tail(text: str, limit: int = STDERR_TAIL) -> str:
@@ -89,6 +99,10 @@ class Driver(Down):
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     poll_s: float = 5.0
+    launch_stagger_s: float = LAUNCH_STAGGER_S  # recorded in the state file by `initial_state`
+    launch_retry_backoff_s: float = LAUNCH_RETRY_BACKOFF_S  # recorded there too
+    wall: Callable[[], float] = time.time  # the login node's wall clock, to read a step's End against (a stand-in's)
+    launched_wall: Dict[str, float] = field(default_factory=dict)  # service -> the wall time of its last launch here
     core_paths: Dict[str, str] = field(default_factory=dict)
     relay_available: Callable[[], bool] = hpcrelay.available
     environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
@@ -212,12 +226,22 @@ class Driver(Down):
         check_artifacts(self.spec, site.study_artifacts, self.root)
         # every declared manifest loads now, so a mistake in one fails before a job is held
         hpcdata.ingested_manifests(self.layout, hpcdata.study_values(site.study_artifacts))
+        self.check_home(site)
         self.check_scratch(site)
         if self.settings.sandbox is not None:
             self.say(
                 f"the layout declares the agent's node ({self.settings.sandbox_placement}): it is held and placed, and "
                 "only its node facts step runs on it here (M5's shard step runs the agent)"
             )
+
+    def check_home(self, site: Site) -> None:
+        """The account's home guard (hpcquota.home_guard; DESIGN.md section 11): when the site sets its command or its
+        pattern, the home's files and bytes are read and the federation refused when either is past 95% of its limit,
+        or when they cannot be read, before anything is submitted; `HPC_HOME_QUOTA_CHECK=off` skips it, and `up` says
+        so. It does not depend on a scratch root, and says nothing when no key is set."""
+        said = hpcquota.home_guard(self.slurm.runner, site)
+        if said:
+            self.say(said)
 
     def check_scratch(self, site: Site) -> None:
         """The provider storage's scratch root, and the inode guard (hpcquota; DESIGN.md section 11): with a scratch
@@ -239,14 +263,15 @@ class Driver(Down):
         self.layout.ca_pem.parent.mkdir(exist_ok=True)
         self.layout.journal.mkdir(exist_ok=True)
 
-    def initial_state(self, site: Site, tree: Optional[str] = None) -> Dict[str, Any]:
+    def initial_state(self, site: Site, tree: Optional[str] = None, excluded: int = 0) -> Dict[str, Any]:
         """The state file as `up` first writes it. `tree` is the digest of the study's artifacts directory
         (`study_artifacts_tree`), kept under `hpcidentity.ARTIFACTS` so the core's phase, here or in a step on a node
         whose environment is an allowlist, is handed the digest `up` took and never reads the directory again; the
-        key is left out when there is none."""
+        key is left out when there is none. `excluded` is how many nodes of the account's other live federations the
+        held job excludes (`other_federations_nodes`), a count and never a name."""
         roles = self.settings.roles(tuple(p.name for p in self.spec.providers))
         node = self.settings.node()
-        name = f"hpcop-{self.spec.project[:40]}-{secrets.token_hex(4)}"
+        name = f"{hpcexclude.JOB_PREFIX}{self.spec.project[:40]}-{secrets.token_hex(4)}"
         state = {
             "format": hpcstate.FORMAT,
             "project": self.spec.project,
@@ -264,12 +289,18 @@ class Driver(Down):
                 "readback": None,
                 "started": None,
                 "ends": None,
+                "excluded_nodes": excluded,
             },
             "sandbox": self.sandbox_record(name),
             "storage": hpcstorage.plan(site, name, [p.name for p in self.spec.providers]),
             "roles": [role.name for role in roles],
             "services": {role.name: hpcstate.new_service(role.kind) for role in roles},
             "clients": {},
+            "launch": {
+                "stagger_s": self.launch_stagger_s,
+                "retry_backoff_s": self.launch_retry_backoff_s,
+                "retry_limit": hpclaunchproof.RETRY_LIMIT,
+            },
             "owner": None,
             # the spaces the study ingests into, each to be verified after its ingest (`verify_data`); plan reads it
             "data": {"ingested": hpcdata.ingested_record(self.layout, hpcdata.study_values(site.study_artifacts))},
@@ -302,8 +333,9 @@ class Driver(Down):
             "ends": None,
         }
 
-    def allocation(self, state: Mapping[str, Any], site: Site) -> Allocation:
-        """The held job: the service nodes, and the agent's node as its component 1 under `het`."""
+    def allocation(self, state: Mapping[str, Any], site: Site, exclude: Sequence[str] = ()) -> Allocation:
+        """The held job: the service nodes, and the agent's node as its component 1 under `het`. `exclude` are the
+        nodes of other federations' live jobs, which each of its components keeps off."""
         node, agent = self.settings.node(), self.settings.sandbox_node()
         het = agent is not None and self.settings.sandbox_placement == "het"
         return Allocation(
@@ -316,10 +348,14 @@ class Driver(Down):
             time=self.settings.time,
             time_s=self.settings.time_s,
             het=(Shape(1, agent.cpus, agent.memory_mib),) if het and agent is not None else (),
+            exclude=tuple(exclude),
         )
 
-    def sandbox_allocation(self, state: Mapping[str, Any], site: Site) -> Optional[Allocation]:
-        """The agent's own held job under `separate` (one node of its own shape), else None."""
+    def sandbox_allocation(
+        self, state: Mapping[str, Any], site: Site, exclude: Sequence[str] = ()
+    ) -> Optional[Allocation]:
+        """The agent's own held job under `separate` (one node of its own shape), else None. It keeps off the same
+        nodes as the services' job: an agent's sandbox never runs on a node that hosts an Onedata service."""
         record, agent = state.get("sandbox"), self.settings.sandbox_node()
         if record is None or agent is None or record["placement"] != "separate":
             return None
@@ -332,6 +368,7 @@ class Driver(Down):
             memory_mib=agent.memory_mib,
             time=self.settings.time,
             time_s=self.settings.time_s,
+            exclude=tuple(exclude),
         )
 
     # -- up -----------------------------------------------------------------------------------------------------------
@@ -365,18 +402,20 @@ class Driver(Down):
         return digest
 
     def bring_up(self, site: Site, tree: Optional[str] = None) -> str:
-        state = self.store.create(self.initial_state(site, tree))
+        excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
+        state = self.store.create(self.initial_state(site, tree, len(excluded)))
         self.make_storage(state)  # recorded above, made before any job exists to bill for it
-        asked, alone = self.allocation(state, site), self.sandbox_allocation(state, site)
+        asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
         held = [(self.submit(asked, "allocation"), asked)]
         if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
             held.append((self.submit(alone, "sandbox"), alone))
         for job, wanted in held:
-            self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name)
+            self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name, note=self.queue_note(wanted))
         # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
         records = [(job, shape, record) for job, wanted in held for shape, record in zip(
             wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
         placed = self.placed_nodes(records)
+        self.keep_off_other_federations([job for job, _ in held], placed)
         self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
         self.node_facts()
         self.zone_up()
@@ -384,7 +423,67 @@ class Driver(Down):
         self.export_zone()
         out = self.run_core()
         self.set(lambda s: s.update(phase="linked"))
-        return f"{out}\n{self.start_relay()}"
+        retried = self.retried()
+        return f"{out}\n{retried}\n{self.start_relay()}" if retried else f"{out}\n{self.start_relay()}"
+
+    def other_federations_nodes(self) -> List[str]:
+        """The nodes of every live job of the account that carries the federation prefix (`hpcexclude`, DESIGN.md
+        section 1), read before the held job is submitted, to be excluded from it: two federations' services of one
+        account on one node would share Couchbase's fixed port. A read that fails refuses, and nothing is submitted:
+        the held job never goes without the exclusion. The line says how many, never which."""
+        try:
+            nodes = hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm))
+        except SlurmError as error:
+            raise SlurmError(f"{error}; refusing to submit without keeping off the other federations' nodes") from None
+        if nodes:
+            self.say(f"{len(nodes)} node(s) of the account's other live federation jobs are excluded from the held job")
+        else:
+            self.say("no other live federation job of the account holds a node: nothing is excluded")
+        return nodes
+
+    @staticmethod
+    def queue_note(wanted: Allocation) -> str:
+        """What the queue bound's failure adds for a job that excluded nodes: Slurm keeps a job pending when what is
+        left does not fit it, and the bound is the one `up` always had."""
+        if not wanted.exclude:
+            return ""
+        return (
+            f" (it excluded {len(wanted.exclude)} node(s) of other live federations of this account: Slurm may be "
+            "keeping it pending for lack of others)"
+        )
+
+    def keep_off_other_federations(self, jobs: Sequence[str], placed: Sequence[Sequence[str]]) -> None:
+        """Once the held jobs run and before any step, none of this federation's nodes may hold another live
+        federation's job (a service's, or an agent's: an agent never runs beside a service): two ups that read the
+        account's jobs at once both excluded nothing. One that does is refused, every held job of this up cancelled
+        by its own id, and the roles named (the zone, providers[i], the agent), never a host. `placed` is each
+        component's nodes, the services' first. Fail closed: with the jobs unreadable nothing proves the nodes are
+        this federation's own, and the same release follows."""
+        try:
+            others = set(hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs))
+        except SlurmError as error:
+            raise SlurmError(f"{error}; {self.release(jobs)}") from None
+        held = [(hpcexclude.role(index), node) for index, node in enumerate(placed[0])]
+        held += [(hpcexclude.AGENT, node) for nodes in placed[1:] for node in nodes]
+        shared = [role for role, node in held if node in others]
+        if shared:
+            raise SlurmError(
+                f"{', '.join(shared)} would run on a node another live federation of this account holds, and two "
+                f"federations never share one; no service started, and {self.release(jobs)}"
+            )
+
+    def release(self, jobs: Sequence[str]) -> str:
+        """Cancel each held job of this up by its own id, and say so; a cancel that fails is said, and `down` finishes
+        it."""
+        failed = []
+        for job in jobs:
+            try:
+                self.slurm.cancel(job)
+            except SlurmError:
+                failed.append(job)
+        if failed:
+            return f"cancelling job(s) {', '.join(failed)} failed: run down to release them"
+        return f"the held job(s) {', '.join(jobs)} were cancelled"
 
     def make_storage(self, state: Mapping[str, Any]) -> None:
         """The providers' storage directories on scratch, as the state records them (hpcstorage.create); none without a
@@ -473,8 +572,10 @@ class Driver(Down):
         state["phase"] = "placed"
 
     def node_facts(self) -> None:
-        """Each node's FQDN, its IPv4 address and the job's uid and gid, from a control step on it; then each service's
-        declared name, and the address map the login node's clients dial them through (`write_address_map`)."""
+        """Each node's FQDN, its IPv4 address and the job's uid and gid, from a control step on it, and its OS release,
+        glibc and kernel (`readings`, O87: recorded only, a node that gives none is unknown, never refused); then each
+        service's declared name, and the address map the login node's clients dial them through
+        (`write_address_map`)."""
         state = self.store.read()
         site, prefix = Site.from_json(state["site"]), state["allocation"]["name"]
         declared = hpcnames.declared_names(self.spec)
@@ -492,9 +593,10 @@ class Driver(Down):
                     f"the node facts of {role} are not a name, an IPv4 address, a uid and a gid (the step's status "
                     f"{done.returncode}; {stderr_tail(done.stderr)})"
                 )
+            readings = load_readings(facts.get("readings"))  # O87: recorded, never refused: unknown, with why
             self.set(
-                lambda s, r=role, f=facts, o=owner: (
-                    s["services"][r].update(fqdn=f["fqdn"], address=f["address"], declared=declared.get(r)),
+                lambda s, r=role, f=facts, o=owner, g=readings: (
+                    s["services"][r].update(fqdn=f["fqdn"], address=f["address"], declared=declared.get(r), readings=g),
                     s.update(owner=list(o)),
                 )
             )
@@ -521,6 +623,7 @@ class Driver(Down):
         name = f"{state['allocation']['name']}-{service}-run-{launch}"
         log = str(Path(state["site"]["logs"]) / f"{name}.log")
         step = {"name": name, "id": None}
+        self.launched_wall[service] = self.wall()
         self.set(lambda s: s["services"][service].update(launch=launch, step=step, log=log, state="starting"))
         record = state["services"][service]
         self.launcher.service(record["node"], argv, kind=record["kind"], name=name, log=log)
@@ -549,10 +652,82 @@ class Driver(Down):
             absent = absent + 1 if listed is None and (seen or dead) else 0
             if absent >= GONE_POLLS:
                 self.set(lambda s: s["services"][service].update(state="failed"))
-                raise RuntimeError(f"{service}'s step ended before its log said '{wanted}'")
+                raise StepGone(f"{service}'s step ended before its log said '{wanted}'")
             if self.clock() >= deadline:
                 raise RuntimeError(f"{service} did not say '{wanted}' within {self.timeouts['service']:.0f} s")
             self.sleep(self.poll_s)
+
+    def await_start(self, service: str, wanted: str, argv: Sequence[str]) -> str:
+        """The service's log once it holds `wanted` (`wait_log`), after a launch that failed at launch is repeated ONCE.
+
+        The only failure considered is `StepGone`: the step ended before its log said anything it waited for. It is
+        launched again only when `launch_proof` shows, from three sources read now, that nothing of it ran (both
+        proofs, `hpclaunchproof`). Then what is left of `launch_retry_backoff_s` passes, counted from the step's own End
+        (the cause was transient: live, the nodes resolved again a minute later; `backoff`), the run log is read once
+        more, and only if it is still empty is the retry written to the state, with its proofs, and the service
+        launched. Every other failure, a second failure of the
+        same service, and a deadline that ran out (the step may be running) are raised as they always were."""
+        try:
+            return self.wait_log(service, wanted)
+        except StepGone:
+            retry = self.launch_proof(service)
+            if retry is None:
+                raise
+            retry["waited_s"] = self.backoff(service, retry)
+            if not self.record_retry(service, retry):
+                raise
+        self.launch(service, argv)
+        return self.wait_log(service, wanted)
+
+    def backoff(self, service: str, retry: Dict[str, Any]) -> float:
+        """Wait out what is left of `launch_retry_backoff_s` counted from the step's own End, read from the sacct row
+        of the proofs; the whole of it from now when that End is unreadable or not to be believed (`failure_time`).
+        Providers that failed together then wait one backoff in all, not one each. Returns the seconds waited."""
+        now = self.wall()
+        failed_at = hpclaunchproof.failure_time(retry["step_end"], self.launched_wall.get(service), now)
+        wait = hpclaunchproof.backoff_wait(self.launch_retry_backoff_s, failed_at, now)
+        how = "from its End" if failed_at is not None else "from now: its End is not to be read"
+        self.say(f"{service}: its launch failed before anything ran; waiting {wait:g} s ({how})")
+        if wait > 0:
+            self.sleep(wait)
+        return wait
+
+    def launch_proof(self, service: str) -> Optional[Dict[str, Any]]:
+        """The proofs that this service's last launch failed before anything of it ran, or None. Never a second
+        retry: that is read from the state file, which outlives this process. The run log is read last."""
+        record = self.store.read()["services"][service]
+        if len(record.get("launch_retries") or []) >= hpclaunchproof.RETRY_LIMIT or not record["step"]:
+            return None
+        name, log = record["step"]["name"], str(record["log"])
+        client = hpclaunchproof.read_client_log(Path(client_log(log)))
+        try:
+            rows = self.launcher.accounted_steps(record["node"], name)
+        except hpcstate.StateError:
+            rows = None
+        found = hpclaunchproof.prove(
+            name, record["step"].get("id"), client, rows, hpclaunchproof.run_log_size(Path(log))
+        )
+        return None if found is None else {"launch": record["launch"], **found}
+
+    def record_retry(self, service: str, retry: Dict[str, Any]) -> bool:
+        """Write the retry and its proofs to the state, once the run log is seen empty again (proof (b), after the
+        backoff and immediately before the launch); False (nothing written) when it holds a byte now, or is gone."""
+        log = Path(self.store.read()["services"][service]["log"])
+        if hpclaunchproof.run_log_size(log) != 0:
+            self.say(f"{service}: its run log is not empty now; not launched again")
+            return False
+        self.set(lambda s: s["services"][service].setdefault("launch_retries", []).append(retry))
+        self.say(hpclaunchproof.evidence(service, retry) + "; launching it once more")
+        return True
+
+    def retried(self) -> str:
+        """`up`'s evidence of its retries: one line per retry, as the state records it; nothing when there was none."""
+        services = self.store.read()["services"]
+        return "\n".join(
+            hpclaunchproof.evidence(name, entry)
+            for name, record in services.items()
+            for entry in record.get("launch_retries") or []
+        )
 
     def record_workdir(self, service: str, text: str) -> str:
         state = self.store.read()
@@ -571,9 +746,11 @@ class Driver(Down):
         tar = str(Path(site.images) / "onezone.tar")
         peers = [services[p.name]["address"] for p in self.spec.providers]
         argv = ["bash", str(BUNDLE / "zone.sbatch"), str(BUNDLE), tar, self.spec.project[:40], *peers]
-        self.launch("zone", [*argv, f"--declared={services['zone']['declared']}", *self.host_args(state)])
+        # the one command, with its O73 names, that is launched and, if it fails at launch, launched again (O57)
+        launched = [*argv, f"--declared={services['zone']['declared']}", *self.host_args(state)]
+        self.launch("zone", launched)
         self.say("zone launched; waiting for its verdict")
-        self.record_workdir("zone", self.wait_log("zone", VERDICT["oz"]))
+        self.record_workdir("zone", self.await_start("zone", VERDICT["oz"], launched))
         self.set(lambda s: (s["services"]["zone"].update(state="running"), s.update(phase="zone")))
 
     def providers_up(self) -> None:
@@ -582,7 +759,8 @@ class Driver(Down):
         site, services = Site.from_json(state["site"]), state["services"]
         zone, tar = services["zone"], str(Path(site.images) / "oneprovider.tar")
         names = [p.name for p in self.spec.providers]
-        for name in names:
+        argvs: Dict[str, List[str]] = {}
+        for index, name in enumerate(names):
             peers = [services[p]["address"] for p in names if p != name]
             argv = ["bash", str(BUNDLE / "provider.sbatch"), str(BUNDLE), tar, name, zone["declared"], site.admin_mail]
             # --import=SPACE=PATH for each tree it owns, none for a mirror
@@ -591,10 +769,16 @@ class Driver(Down):
             naming = [f"--declared={services[name]['declared']}", *self.host_args(state)]
             # --storage=PATH, its own directory on scratch, bound onto /volumes/posix; none without a scratch root
             storage = hpcstorage.provider_args(state, name)
-            self.launch(name, [*argv, zone["address"], *peers, *naming, *imports, *storage])
-        self.say(f"{len(names)} provider(s) launched; registering each")
+            # the one command a provider is launched with and, if it fails at launch, launched again with (O57)
+            argvs[name] = [*argv, zone["address"], *peers, *naming, *imports, *storage]
+            if (
+                index and self.launch_stagger_s > 0
+            ):  # between two launches: five srun fan-outs in one second failed live
+                self.sleep(self.launch_stagger_s)
+            self.launch(name, argvs[name])
+        self.say(f"{len(names)} provider(s) launched, {self.launch_stagger_s:g} s apart; registering each")
         for name in names:
-            self.register(name, self.record_workdir(name, self.wait_log(name, TOKEN_WAIT)))
+            self.register(name, self.record_workdir(name, self.await_start(name, TOKEN_WAIT, argvs[name])))
         for name in names:
             self.wait_log(name, VERDICT["op"])
             self.set(lambda s, n=name: s["services"][n].update(state="running"))
