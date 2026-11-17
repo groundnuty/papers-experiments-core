@@ -571,3 +571,21 @@ def test_c40_what_the_executor_declared_stays_in_a_shown_diagnostics_redaction_w
         scheduler.run()
         row = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
     assert json.loads(row["diagnostic"])["diagnostic"] == {"seen": "it quoted [redacted]"}
+
+
+def test_c40_a_declared_secret_that_contains_one_the_environment_holds_is_redacted_whole_from_the_diagnostic(
+    tmp_path, monkeypatch
+):
+    """C40: a declared URL that embeds a key the process's environment already names is redacted whole from the
+    diagnostic that ships (the row, the marker, the export and the report), as the record is: the shorter secret
+    replaced first must not leave the user and the host of the longer one behind."""
+    key = "process-api-key-0123456789"
+    url = f"https://alice-private:{key}@private-host.example"
+    monkeypatch.setenv("SERVICE_API_KEY", key)
+    monkeypatch.setenv("SERVICE_ENDPOINT", url)
+    row, marker, export = run_failing_start(
+        tmp_path / "out", lambda request: request.declare_secrets(secret_env=["SERVICE_ENDPOINT"]), url
+    )
+    assert json.loads(row["diagnostic"])["diagnostic"] == {"seen": "the endpoint answered with [redacted]"}
+    shipped = [*where_it_is_kept(row, marker, export).values(), report_of(export)]
+    assert not any(piece in text for text in shipped for piece in (key, "alice-private", "private-host.example"))

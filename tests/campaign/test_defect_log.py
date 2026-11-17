@@ -11,7 +11,7 @@ from loop_support import FakeProvider
 from record_support import CODE
 from scheduler_support import FakeExecutor, attempts_of, build, key_of
 
-from expcore.campaign.defect_log import HARNESS_LOG, log_path, write_defect
+from expcore.campaign.defect_log import HARNESS_LOG, Chained, log_path, write_defect
 from expcore.campaign.executor import record_run
 from expcore.config.loading import ConfigError
 from expcore.loop.outcomes import harness_defect_of
@@ -313,3 +313,18 @@ def test_c17_a_custom_sink_that_raises_never_costs_the_record_and_stops_dispatch
     assert record.outcome["defect"]["exception"] == "LookupError"
     markers = [json.loads(p.read_text(encoding="utf-8")) for p in (tmp_path / "runs").rglob("*marker.json")]
     assert [m["result"]["outcome"]["name"] for m in markers if m["run_key"] == crashed] == ["harness_defect"]
+
+
+def test_c40_a_chain_redacts_a_longer_secret_whole_whichever_redactor_holds_the_shorter_one_it_contains():
+    """C40: redactors chained one after the other must not leave a piece of a long secret because an earlier one
+    replaced a shorter secret inside it: a URL holding a key that another redactor already names is redacted whole,
+    in text and in a structure, in either order, and with each line of a multi-line secret too."""
+    key = "process-api-key-0123456789"
+    url = f"https://alice-private:{key}@private-host.example"
+    shorter, longer = Redactor([key]), Redactor([key, url])
+    for chain in (Chained(shorter, longer), Chained(longer, shorter), Chained(shorter, Redactor([url]))):
+        assert chain.text(f"connected to {url}") == "connected to [redacted]"
+        assert chain.with_lines().text(f"connected to {url}") == "connected to [redacted]"
+        redacted, paths = chain.structure({"seen": f"connected to {url}", "key": key})
+        assert redacted == {"seen": "connected to [redacted]", "key": "[redacted]"}
+        assert paths, "a structure that was changed says where"
