@@ -12,7 +12,6 @@ import socket
 import threading
 from collections.abc import Callable, Iterable, Iterator
 
-from expcore_onedata.sandbox import cellhost
 from expcore_onedata.sandbox.cellhost import OwnNames
 
 LOOPBACK = "127.0.0.1"
@@ -48,11 +47,11 @@ def own_names(timeout_s: float | None = None) -> OwnNames:
     """The node's own names as the system says them: its host name (`gethostname`) and the names its resolver gives that
     host name (`gethostbyaddr`: the primary name and every alias), each once in any case. The lookup is bounded
     (`FQDN_TIMEOUT_S`): on a timeout or a failure the host name stands alone, and the reason, never a name, is in
-    `unread`. When no name read holds a domain the reason is `fqdn_unqualified` too: the scan then holds a one-label
-    name, which never matches that name followed by its domain, and the record says so. (`getfqdn` was not used: it
-    returns the first name with a dot, or else the bare host name without an error, so a node of several dotted names
-    had one scanned and one with none looked read.) For the gate's scan (`cellhost.scan_names`), never recorded: a
-    site's name."""
+    `unread`. A resolver that gives no name with a domain answers without an error, and its names are returned as they
+    are: that the scan then holds a one-label name is said by the run's facts (`cellhost.lacks_domain`), where the names
+    the scan keeps are known. (`getfqdn` was not used: it returns the first name with a dot, or else the bare host name
+    without an error, so a node of several dotted names had one scanned and one with none looked read.) For the gate's
+    scan (`cellhost.scan_names`), never recorded: a site's name."""
     bound = FQDN_TIMEOUT_S if timeout_s is None else timeout_s
     names: list[str] = []
     unread: list[str] = []
@@ -75,8 +74,6 @@ def own_names(timeout_s: float | None = None) -> OwnNames:
     elif answer is not None:
         primary, aliases, _addresses = answer
         add([primary, *aliases])
-    if not why and not any(cellhost.qualified(n) for n in names):
-        unread.append("fqdn_unqualified")
     return OwnNames(tuple(names), tuple(unread))
 
 

@@ -500,8 +500,8 @@ must not read (the gate's count of node names, `rest_node_name_hits` in `docs/in
 and a Compose cell, which reads its own container's name, does not show it. The core gives every cell on both backends
 one fixed, neutral host name, `sandbox` (`expcore_onedata/sandbox/cellhost.py`, a constant of the core and no setting):
 each `apptainer exec` carries `--uts --hostname sandbox`, and the Docker agent's container is created with
-`--hostname sandbox`. A federation with a node of that name, or an agent node whose own host name is that, is refused at
-the start. The gate's scan for node names
+`--hostname sandbox`. A federation with a node of that name, or, for a run that scans for node names, an agent node whose own host name is that, is
+refused at the start. The gate's scan for node names
 (`rest_node_name_hits`) holds the agent node's own host name instead, in its fully qualified and one-label forms, read
 from the node at the start (`NodeOps.own_names`), after the federation's nodes' names, so a leak of the name the cell
 no longer shows is still counted; never `sandbox`, which is the allowed name and would count false hits. The fully
@@ -509,8 +509,8 @@ qualified names are a resolver lookup (`gethostbyaddr` of the host name: the pri
 scanned whole and by its first label), so it is bounded: 5 s in a thread of its own, after which the host name is
 scanned alone, and a start waits no longer for a resolver that hangs. The run's facts (`own_node_scan`) say how many
 forms were scanned and, by reason alone (`fqdn_timeout`, `fqdn_failed`, `host_name_failed`, and `fqdn_unqualified` when
-the resolver gave no name with a domain, so a leak of the node's name followed by its domain would not be counted),
-what was not read, never a name. A live slot should show `own_node_scan.unread` empty.
+no name the scan keeps has a domain, which a loopback alias or a declared name does not give, so a leak of the node's
+name followed by its domain would not be counted), what was not read, never a name. A live slot should show `own_node_scan.unread` empty.
 
 **`/etc/hostname`:** the sandbox binds none of its own. From Apptainer's source (read on its `main` branch, not on this
 site's release), `--uts` with a `--hostname` makes Apptainer write an `/etc/hostname` of the name and bind it, and it

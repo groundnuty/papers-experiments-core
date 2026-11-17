@@ -380,7 +380,10 @@ class ApptainerSandbox:
             return ()
         own = self._own
         scanned = cellhost.scan_names(self.spec.node_names, own.names, declared=served)
-        self._own_scan = {"version": 1, "forms": len(scanned) - len(self.spec.node_names), "unread": list(own.unread)}
+        unread = list(own.unread)
+        if not unread and cellhost.lacks_domain(own.names, declared=served):  # a reason given already says why
+            unread.append(cellhost.UNQUALIFIED)
+        self._own_scan = {"version": 1, "forms": len(scanned) - len(self.spec.node_names), "unread": unread}
         return scanned
 
     def _declared(self) -> tuple[str, str] | None:

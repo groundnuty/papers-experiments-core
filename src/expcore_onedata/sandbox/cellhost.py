@@ -33,7 +33,12 @@ from typing import Any
 
 CELL_HOSTNAME = "sandbox"
 FACT = "cell_hostname"  # the key of the run's `infrastructure_facts`
-LOCAL_NAMES = frozenset({"localhost", "localhost.localdomain"})  # nobody's name: scanned, they would count false hits
+# the names a stock hosts file gives the loopback addresses: nobody's name, and scanned they would count false hits
+LOCAL_NAMES = frozenset(
+    {"localhost", "localhost.localdomain", "localhost4", "localhost4.localdomain4", "localhost6",
+     "localhost6.localdomain6", "ip6-localhost", "ip6-loopback"}
+)  # fmt: skip
+UNQUALIFIED = "fqdn_unqualified"  # in `OwnNames.unread` of a run: no name the scan keeps of the node has a domain
 LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")  # one DNS label: what a host name without a domain is
 REFUSAL = (
     "the cells' fixed host name is also the name of a node of the federation: a node's own name may not be the neutral "
@@ -48,9 +53,7 @@ REFUSAL_OWN = (
 @dataclass(frozen=True)
 class OwnNames:
     """What a node says of its own names: the names it could read (its host name, its fully qualified name) and the
-    reasons, never a name, that a form could not be read (`host_name_failed`, `fqdn_failed`, `fqdn_timeout`, and
-    `fqdn_unqualified` when the resolver gave no name with a domain: the scan then holds the one-label form alone, which
-    never matches that name followed by its domain)."""
+    reasons, never a name, that a form could not be read (`host_name_failed`, `fqdn_failed`, `fqdn_timeout`)."""
 
     names: tuple[str, ...] = ()
     unread: tuple[str, ...] = ()
@@ -88,9 +91,9 @@ def scan_names(node_names: Iterable[str], own: Iterable[str], declared: Iterable
     address is kept whole."""
     found = list(node_names)
     seen = {n.lower() for n in found}
-    skip = {CELL_HOSTNAME, *LOCAL_NAMES, *(d.lower() for d in declared)}
+    skip = _skipped(declared)
     for raw in own:
-        name = raw.strip().lower().rstrip(".")
+        name = _clean(raw)
         if not name or name in skip:
             continue
         for form in (name, *_first_label(name)):
@@ -98,6 +101,24 @@ def scan_names(node_names: Iterable[str], own: Iterable[str], declared: Iterable
                 found.append(form)
                 seen.add(form)
     return tuple(found)
+
+
+def _clean(raw: str) -> str:
+    return raw.strip().lower().rstrip(".")
+
+
+def _skipped(declared: Iterable[str]) -> set[str]:
+    """The names of the agent node that the scan never holds: the cell's, loopback's and the federation's declared."""
+    return {CELL_HOSTNAME, *LOCAL_NAMES, *(d.lower() for d in declared)}
+
+
+def lacks_domain(own: Iterable[str], declared: Iterable[str] = ()) -> bool:
+    """Whether none of the agent node's own names that the scan keeps (`scan_names`) is fully qualified: then it holds a
+    one-label name, which never matches that name followed by its domain, and the run's facts say so (`UNQUALIFIED`).
+    Decided over the names kept, not over every name read: a loopback alias with a domain, or a name the federation
+    declares, is no domain of the node's."""
+    skip = _skipped(declared)
+    return not any(qualified(name) for name in map(_clean, own) if name and name not in skip)
 
 
 def _first_label(name: str) -> tuple[str, ...]:
@@ -111,6 +132,6 @@ def note(meta: MutableMapping[str, Any], name: str = CELL_HOSTNAME) -> None:
 
 
 __all__ = [
-    "CELL_HOSTNAME", "FACT", "LOCAL_NAMES", "REFUSAL", "REFUSAL_OWN", "OwnNames", "is_node_name", "note", "qualified",
-    "scan_names", "valid",
+    "CELL_HOSTNAME", "FACT", "LOCAL_NAMES", "REFUSAL", "REFUSAL_OWN", "UNQUALIFIED", "OwnNames", "is_node_name",
+    "lacks_domain", "note", "qualified", "scan_names", "valid",
 ]  # fmt: skip
