@@ -189,6 +189,7 @@ def test_o34_a_cell_whose_deadline_decides_before_the_loop_cuts_is_its_own_timeo
     with pytest.raises(InfraError) as ended:
         asyncio.run(go())
     (result,) = results
+    assert result.outcome.name == "time_cap"  # the agent's time is used up at its cell's cap: the loop's own ending
     (call,) = result.tool_calls
     assert (call.status, call.error_class, call.detail) == ("error", "timeout", "")
     assert "did not finish within the time limit" in call.text
