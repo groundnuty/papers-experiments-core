@@ -53,8 +53,11 @@ NOTES = textwrap.wrap(
     "has no price, the prices are not the ones the campaign ran under, a bound cannot be computed or a record cannot "
     "be read; it is never 0. Spent is the model's total, On analysed attempts that of the attempts the analysis uses, "
     "and On the rest everything else (attempts that were never scored, runs left out of a partial analysis, what a "
-    "kill lost, probes), so what scored runs cost can be read beside the overhead. A batch merged from shards adds its "
-    "shards' figures.",
+    "kill lost, probes), so what scored runs cost can be read beside the overhead.",
+    width=118,
+)
+SHARD_NOTES = textwrap.wrap(
+    "A batch merged from shards adds its shards' figures: each shard's start probes its own models and pays for it.",
     width=118,
 )
 ATTEMPT_NOTES = textwrap.wrap(
@@ -201,7 +204,8 @@ def section(usage: Mapping[str, Any] | None, export: Mapping[str, Any], table: T
     classes = ["Model", "Attempts of", "Attempts", "Input tokens", "Output tokens", "Cache writes", "Cache reads"]
     classes += ["Usage incomplete", "Charged at a bound", "Measured (USD)", "Measured plus in flight (USD)"]
     classes += ["Bound (USD)", "Top-ups (USD)", "Total (USD)"]
-    lines = [HEADING, "", *NOTES, "", "### Spend by model", "", *table(spend, _spend_rows(models)), ""]
+    notes = [*NOTES, *SHARD_NOTES] if export.get("shards") else NOTES  # an unsharded report names no shard
+    lines = [HEADING, "", *notes, "", "### Spend by model", "", *table(spend, _spend_rows(models)), ""]
     lines += ["### Attempts, tokens and spend by what became of the attempt", ""]
     lines += [*table(classes, _class_rows(models)), ""]
     lines += ["### Attempts set aside as infrastructure", ""]

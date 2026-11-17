@@ -44,11 +44,12 @@ class DiagnosticUnreadable(ValueError):
 def snapshot_of(error: BaseException, redactor: Callable[[], Redactor]) -> dict[str, Any] | None:
     """The snapshot an attempt keeps of an error, redacted with `redactor()`; None when the error has nothing to keep
     (it is no infrastructure error, or it names no instrument and carries no diagnostic). Never raises."""
-    if not isinstance(error, InfraError) or (error.diagnostic is None and error.origin is None):
+    given, origin = getattr(error, "diagnostic", None), getattr(error, "origin", None)  # a subclass may skip the base
+    if not isinstance(error, InfraError) or (given is None and origin is None):
         return None
-    head = dict(error.origin or {})
+    head: dict[str, Any] = {}
     try:
-        given = error.diagnostic
+        head = dict(origin or {})
         if given is not None and not isinstance(given, Mapping):
             raise TypeError("a diagnostic is a JSON object")
         text = json.dumps(head if given is None else {**head, "diagnostic": given}, sort_keys=True, allow_nan=False)

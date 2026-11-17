@@ -8,7 +8,10 @@ reads them from a snapshot of the store and breaks the budget gate's own figure 
 **Figures.** For each model of the plan, and for each class of attempt (`CLASSES`) that has one:
 - the attempts and the tokens their rows recorded (input, output, cache writes and reads). A count the endpoint did not
   report is no 0: such an attempt is counted in `usage_incomplete_attempts` (a row whose totals are known to be short,
-  one with a count missing, one still running), and the tokens are the sum of what was reported;
+  one with a count missing, one still running), and the tokens are the sum of what was reported. An interrupted attempt
+  has no counts in its row: where its call log is trusted (its recorded basis is still the log's, as the gate charges
+  it) the tokens are the replies' it recorded, so they agree with the dollars, and it is incomplete only if a request
+  was in flight or closed by a failed send; a lost attempt's are the replies its journal recorded;
 - the dollars, in `usd`: `measured` (each attempt's counts at the model's price, at the tier each request fell in, a
   free model's known zero), `measured_plus_inflight` (an interrupted attempt's replies, and a request that was sent and
   not answered at its bound), `bound` (the most the attempt's caps let it cost, because its usage is unknown), and
@@ -37,7 +40,7 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any
 
 from expcore.campaign.attempt_bounds import BILLED_STATES, LOST_STATE, AttemptCost
-from expcore.campaign.interrupted_spend import BOUND, INFLIGHT, MEASURED
+from expcore.campaign.interrupted_spend import BOUND, INFLIGHT, MEASURED, CallLog, basis_of, read_log, trusted_log
 from expcore.campaign.selection_ledger import Pricing, Query, charges_of
 from expcore.campaign.store import column_for
 
@@ -54,6 +57,7 @@ CLASSES = (
 )
 BUCKETS = (MEASURED, INFLIGHT, BOUND, "charges")  # where an attempt's dollars are counted, then their `total`
 _TOKENS = ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens")
+_LOG = ("calls_sent", "calls_usage", "spend_basis")  # an interrupted attempt's call log and the basis it records
 _COUNTS = ("attempts", *_TOKENS, "usage_incomplete_attempts", "bounded_attempts", "unpriced_attempts")
 _DECIMALS = 12  # a sum of dollars is kept to a millionth of a millionth: no float noise in the bytes of an output
 
@@ -94,9 +98,10 @@ def usage_of(
         kind = _class_of(row["state"], row["run_key"], left_out)
         cell = _cell(cells, row["model"], kind)
         cell["attempts"] += 1
-        for name in _TOKENS:
-            cell[name] += row[name] or 0
-        cell["usage_incomplete_attempts"] += int(_incomplete(row))
+        counts, incomplete = _counted(row)
+        for name, count in zip(_TOKENS, counts, strict=True):
+            cell[name] += count
+        cell["usage_incomplete_attempts"] += int(incomplete)
         if found is not None:
             _charge(cell, by_id.get(row["id"]))
     if found is not None:
@@ -109,7 +114,7 @@ def _attempt_rows(query: Query) -> list[Any]:
     """Every attempt that has or may have spent tokens, with its model and its counts, in attempt order. A snapshot made
     before a column existed is read without it."""
     columns = {row["name"] for row in query("PRAGMA table_info(attempts)")}
-    counts = ", ".join(f"a.{c}" if c in columns else f"NULL AS {c}" for c in _TOKENS)
+    counts = ", ".join(f"a.{c}" if c in columns else f"NULL AS {c}" for c in (*_TOKENS, *_LOG))
     states = (*BILLED_STATES, "running")
     marks = ",".join("?" * len(states))
     return list(
@@ -127,6 +132,26 @@ def _class_of(state: str, run_key: str, left_out: Collection[str]) -> str:
     if state == "done":
         return "left_out" if run_key in left_out else "analysed"
     return state
+
+
+def _counted(row: Any) -> tuple[tuple[int, ...], bool]:
+    """The four token counts of an attempt and whether its usage is not known whole: the row's, or for an interrupted
+    attempt whose call log the gate trusts, the replies' that log recorded."""
+    log = trusted_log(row) if row["state"] == "interrupted" else None
+    if log is not None:
+        return _log_counts(log)
+    return tuple(row[name] or 0 for name in _TOKENS), _incomplete(row)
+
+
+def _log_counts(log: CallLog) -> tuple[tuple[int, ...], bool]:
+    """The sum of the counts of the replies a call log holds; whole only if no request is in flight and none was closed
+    by a failed send (its tokens are unknown: its top-up paid for it) or a reply that could not be read."""
+    totals = [0, 0, 0, 0]
+    for entry in log.answered:
+        if isinstance(entry, tuple):
+            for place, count in enumerate(entry):
+                totals[place] += count or 0
+    return tuple(totals), log.in_flight > 0 or not all(isinstance(entry, tuple) for entry in log.answered)
 
 
 def _incomplete(row: Any) -> bool:
@@ -174,17 +199,25 @@ def _add_lost(cells: dict[tuple[str, str], dict[str, Any]], found: Any) -> None:
         for lost in found.ledger.counted[name]["attempts"]:
             cell = _cell(cells, lost["model"], "lost_in_kill")
             cell["attempts"] += 1
-            for token in _TOKENS:
-                cell[token] += lost.get(token) or 0
-            unreported = lost.get("input_tokens") is None or lost.get("output_tokens") is None
-            cell["usage_incomplete_attempts"] += int(lost["state"] == "running" or unreported or not _whole(lost))
+            counts, incomplete = _lost_counted(lost)
+            for token, count in zip(_TOKENS, counts, strict=True):
+                cell[token] += count
+            cell["usage_incomplete_attempts"] += int(incomplete)
     for cost in found.costs:
         if cost.state == LOST_STATE:
             _charge(_cell(cells, cost.model, "lost_in_kill"), cost)
 
 
-def _whole(lost: Mapping[str, Any]) -> bool:
-    return lost.get("usage_complete") is None or bool(lost["usage_complete"])
+def _lost_counted(lost: Mapping[str, Any]) -> tuple[tuple[int, ...], bool]:
+    """The tokens of a lost attempt and whether they are not whole: the counts its journal saw it end with, or, for one
+    whose end it did not see, the replies of its journaled call log when that log is whole enough to charge by."""
+    if lost["state"] == "running":
+        log = read_log(lost.get("calls_sent"), lost.get("calls_usage"))
+        if log is not None and basis_of(log) in (MEASURED, INFLIGHT):
+            return _log_counts(log)
+    unreported = lost.get("input_tokens") is None or lost.get("output_tokens") is None
+    whole = lost.get("usage_complete") is None or bool(lost["usage_complete"])
+    return tuple(lost.get(token) or 0 for token in _TOKENS), lost["state"] == "running" or unreported or not whole
 
 
 def _models(rows: Sequence[Any], pricing: Pricing | None, planned: Iterable[str]) -> list[str]:
