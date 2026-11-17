@@ -10,6 +10,7 @@ import os
 import re
 
 import pytest
+from mcp_node_names import server_reads
 from tls_peer import TlsPeer
 
 from expcore.config.loading import ConfigError
@@ -113,27 +114,6 @@ def test_o70_a_map_that_cannot_be_used_is_refused_without_a_name_or_an_address(t
     assert not re.search(r"layout\.test|192\.0\.2|cluster\.example", str(refused.value))
 
 
-def _server_reads(names: dict[str, str]) -> dict[str, str]:
-    """onedata-mcp's reading of ONEDATA_MCP_NODE_NAMES (`config.get_node_names`): a key is a host name or an address,
-    bare, `host:port` or `[ipv6]:port`; a value a non-empty name; one host never under two names."""
-    bracketed = re.compile(r"\[(?P<host>[^\[\]]+)\](?::\d{1,5})?")
-    host_port = re.compile(r"(?P<host>[^:]+):\d{1,5}")
-    read: dict[str, str] = {}
-    for key, declared in names.items():
-        host = key.strip().lower()
-        for pattern in (bracketed, host_port):
-            found = pattern.fullmatch(key.strip())
-            if found:
-                host = found.group("host").lower()
-                break
-        assert host
-        assert not any(c.isspace() or c in "/\\\"'" for c in host)
-        assert isinstance(declared, str)
-        assert declared.strip()
-        assert read.setdefault(host, declared) == declared  # one host never under two names
-    return read
-
-
 def test_o70_the_node_names_map_every_real_name_and_address_with_and_without_a_port_to_its_declared_name():
     """O70: `ONEDATA_MCP_NODE_NAMES` holds each node's names and addresses, bare and with the port, an IPv6 address
     bare and in brackets, each under its declared name, and a declared name under itself so a port after it goes."""
@@ -143,7 +123,7 @@ def test_o70_the_node_names_map_every_real_name_and_address_with_and_without_a_p
     assert found[NODE_B] == found[f"{ADDRESS_B}:8443"] == ALPHA
     assert found[V6] == found[f"[{V6}]:8443"] == BETA
     assert found[ZONE] == found[f"{ZONE}:8443"] == ZONE
-    assert _server_reads(found)  # valid by the server's own rules, and no host under two names
+    assert server_reads(found)  # valid by the server's own rules, and no host under two names
     assert AddressMap.from_document(DOCUMENT).node_names() == {  # no port asked: bare names alone
         k: v for k, v in found.items() if ":" not in k or k == V6
     }
