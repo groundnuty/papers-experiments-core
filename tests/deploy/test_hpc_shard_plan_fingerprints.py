@@ -182,6 +182,38 @@ def test_o63_a_study_that_cannot_be_copied_refuses_naming_the_shard(shards, tmp_
     assert str(tmp_path) not in err
 
 
+KEPT = "evidence the plan must never overwrite\n"
+
+
+@pytest.mark.parametrize("command", ["plan", "lines"])
+@pytest.mark.parametrize("kind", ["a link to a file", "a dangling link", "a file"])
+def test_o63_a_study_holding_a_platform_file_of_its_own_is_refused_and_nothing_is_written_through_it(
+    shards, tmp_path, capsys, command, kind
+):
+    """O63: the copy of the study is given the federation's `platform.toml` by `copyfile`, which follows a link at the
+    destination: a study whose own `platform.toml` is a link to a file (or to nothing) had that target overwritten by
+    `plan` and `lines`. As `step` does, they refuse a `platform.toml` of the study's own (a link, dangling or not, or a
+    file) before copying anything, naming the shard and the file, and the target is as it was."""
+    study = tmp_path / "study"
+    study.mkdir()
+    evidence, absent = tmp_path / "evidence.json", tmp_path / "absent.json"
+    evidence.write_text(KEPT)
+    link = study / "platform.toml"
+    if kind == "a link to a file":
+        link.symlink_to(evidence)
+    elif kind == "a dangling link":
+        link.symlink_to(absent)
+    else:
+        link.write_text(KEPT)
+    code, out, err = run(shards, manifest(tmp_path, study=study), capsys, command)
+    assert (code, out) == (2, "")
+    assert "shard fed-a: the study holds a platform.toml of its own" in err
+    assert str(tmp_path) not in err
+    assert evidence.read_text() == KEPT
+    assert not absent.exists()  # a write through a dangling link creates its target
+    assert seen_platforms(tmp_path / "venv") == []  # nothing of the study was run
+
+
 def test_o63_the_real_interpreter_takes_the_same_fingerprint_of_a_real_study_beside_each_platform_file(
     shards, tmp_path, capsys
 ):
