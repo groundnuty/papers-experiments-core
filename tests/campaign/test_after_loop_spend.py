@@ -72,12 +72,13 @@ class DuringItsLoop(AfterItsLoop):
 
 
 def run_once(root, executor, *, budget=True, **options):
+    """Run the campaign with an executor that raises on every attempt; return the first attempt's row and cost."""
     settings = settings_for(max_attempts=1, **({"budget": Budget(max_usd=50.0)} if budget else {}))
     with build(root, plan=PLAN, models=TABLE, executor=executor, settings=settings, **options) as scheduler:
         executor.scheduler = scheduler
         scheduler.run()
-        [row] = scheduler.store.q("SELECT * FROM attempts")
-        [cost] = attempt_costs(scheduler.store, {"m1": TABLE.resolve("m1")}, scheduler.agent_config.limits)
+        row = scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0]
+        cost = attempt_costs(scheduler.store, {"m1": TABLE.resolve("m1")}, scheduler.agent_config.limits)[0]
         return dict(row), cost, bound_usd(TABLE.resolve("m1"), scheduler.agent_config.limits)
 
 

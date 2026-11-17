@@ -21,7 +21,8 @@ its fault injector recorded as injected in the attempt, and the target rule of i
 declares no target, and is read without the target rule.
 
 A schema-3 marker may also carry `spend_basis`, optional: how an attempt that raised after its model loop was charged
-(`measured` or `bound`, `campaign.after_loop`). A marker written before it reads with none.
+(`measured` or `bound`, `campaign.after_loop`). It is written only when there is one, so every other marker is as it
+was, and a marker without it reads with none.
 """
 
 import json
@@ -216,7 +217,8 @@ def write_marker(run_dir: Path, run_key: str, attempt_id: int, result: AttemptRe
         "attempt_id": attempt_id,
         "result": {
             "outcome": _outcome_json(result.outcome),
-            **{f: getattr(result, f) for f in _RESULT_FIELDS},
+            **{f: getattr(result, f) for f in _RESULT_FIELDS if f != "spend_basis"},
+            **({} if result.spend_basis is None else {"spend_basis": result.spend_basis}),  # only when there is one
             "treatment_kinds": list(result.treatment_kinds),
             "treatment_targets": dict(result.treatment_targets),
             "injected_targets": list(result.injected_targets),
