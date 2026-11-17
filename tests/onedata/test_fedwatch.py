@@ -483,8 +483,8 @@ def test_o86_a_target_down_at_both_ends_by_the_runs_own_open_injection_is_held_n
     ("owner", "why"),
     [
         (ANOTHER, "not this run's"),
-        (None, "no open injection of it that this run owns"),
-        (PROCESS_ONLY, "not this run's"),
+        (None, "that are not this run's"),
+        (PROCESS_ONLY, "that are not this run's"),
     ],
     ids=["another attempt's", "ownerless", "a process alone"],
 )

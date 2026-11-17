@@ -27,9 +27,14 @@ the window is written at the launch's exit as `federation-window.json` beside `m
 or cannot be written is logged and skipped, never a failure of the run; a run that was never collected has the window
 in its metadata alone. The file is the facts as `metadata()` holds them, plain JSON.
 
-**The limit.** The window is the run's only when the injection comes after the read and the restore before the window:
-an executor whose `running` encloses the launch takes its target down before the read and restores after the window,
-and its window shows the target not running at its end, never stable.
+**Whose injection.** `launch` takes the run's owner token (`liveness.owner()`) in its own context when it reads the
+window's start, and passes it to `window()`: only an injection that names this attempt explains a restart or holds a
+service down. Both executor orders are judged: with the injector's `running` inside the launch the restore is before the
+window and the restart reads `restarted`, labelled `outage`; with the injection before the launch and the restore after
+it (the pilot's order) the target is down at both ends and reads `held`, explained, every other service `stable`. The
+restore of a held service comes after the window, so the facts point at the injector's `restore_verified`
+(`restore`): a held service whose restore failed is no pass. Another attempt's injection, and a journal line that
+records no owner, explain nothing: a finding.
 """
 
 import asyncio

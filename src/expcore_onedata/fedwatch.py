@@ -33,7 +33,16 @@ one restart (the reason says "at least"); the injections of the window still hav
 
 **The result** keys services by `zone` and `providers[i]` (the provider's position in platform.toml), never by a
 name, and holds no host, address, path or service name. `verdict` is `finding` (any finding), else `unknown`, else
-`restarted` (a restart or an outage, each explained), else `stable`.
+`held` (a service not running at the window's end that an open injection holds down, explained), else `restarted`
+(a restart, each explained), else `stable`.
+
+**Whose an injection is.** `window(start, owner=...)` is a run's window: only the injections whose `owner` (written by
+the injector since #371) names that run's attempt explain a restart or hold a service down. Another attempt's
+leftover, a line written before owners were recorded and an injection outside any attempt explain nothing, so they
+leave a finding; a run that names no attempt owns none. With no `owner` (a batch's window) any injection counts, and
+the result says so (`ownership`). A `held` service is explained by the run's own open injection, wherever it began
+(before the start reading or inside the window): the window comes before its restore, so `held` is read with the
+run's restore outcome.
 """
 
 import json
