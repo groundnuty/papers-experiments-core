@@ -428,6 +428,7 @@ def test_roots_only_archives_and_marks_one_shards_root_without_any_shard_archive
     no `--into`, and writes no `archives.sha256.json`; it publishes `<L>.root.tar`/`.json` (the hash on stderr) and the
     marker, and `down` then goes."""
     plan = shards.load_plan(plan_file(tmp_path))  # no shard has an archive
+    plan.results.mkdir()
     assert _roots_only(shards, tmp_path, "--shard", "fed-a") == 0
     err = capsys.readouterr().err
     assert (
@@ -444,6 +445,7 @@ def test_roots_only_archives_and_marks_one_shards_root_without_any_shard_archive
 def test_roots_only_without_a_shard_takes_every_root(shards, tmp_path):
     """O63: no `--shard`: every shard's root."""
     plan = shards.load_plan(plan_file(tmp_path))
+    plan.results.mkdir()
     assert _roots_only(shards, tmp_path) == 0
     assert sorted(p.name for p in plan.results.glob("*.root.tar")) == ["fed-a.root.tar", "fed-b.root.tar"]
 
