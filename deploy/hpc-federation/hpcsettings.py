@@ -36,7 +36,8 @@ CORE_PLACES = ("login", "step")  # where the bootstrap and the link check run (D
 # Where the agent's node is held (DESIGN.md, section 1): "het", the last component of a heterogeneous job, sized on its
 # own; "separate", a held job of its own, the fallback should a site refuse the first.
 SANDBOX_PLACEMENTS = ("het", "separate")
-DEFAULT_STEP_LAUNCH_WAIT_S = 180  # `[hpc] step_launch_wait_s`: see DEFAULTS
+DEFAULT_STEP_LAUNCH_WAIT_S = 240  # `[hpc] step_launch_wait_s`: see DEFAULTS
+VERB_WORK_S = 60  # what a relay verb does beside waiting for its step to start: its step's own bound, a status's 60 s
 KILL_TAIL_S = 30  # supervise.py's SIGKILL tail after the graceful stop's bound (lib.sh, stop_service)
 STEP_END_S = 60  # the longest the driver polls for a stopped service's step to leave squeue -s
 SETTLE_SLACK_S = 60  # what settle_timeout_s keeps beyond the stop's bound
@@ -74,9 +75,10 @@ DEFAULTS = {
     # Three provider outages on one HPC federation (17 Nov): the largest service-side stop after SIGTERM was 33.1 s
     # (the others 27.1 s and 26.1 s), plus 50 %.
     "stop_seconds": 50,
-    # How long a control step may wait to start (Slurm's launch of an srun step) before its own work begins, which every
-    # bound that waits on a step's client from its start adds. Measured on the same outages: relay verb steps started 47
-    # to 103 s after they were issued during a heal; 180 s is 103 s plus about 75 %. It widens timeouts only.
+    # How long a control step may wait to start before its own work begins, which every bound that waits on a step's
+    # client from its start adds. A step's creation can wait on the scheduler's controller, up to its message timeout
+    # (200 s on a site that sets it so, with no error); relay verb steps were measured starting 47 to 103 s after they
+    # were issued during a heal. 240 s is that 200 s plus 20 %. It widens timeouts only.
     "step_launch_wait_s": DEFAULT_STEP_LAUNCH_WAIT_S,
     "core": "login",
     "zone": {"cpus": 4, "memory": "8g"},
@@ -202,6 +204,12 @@ class HpcSettings:
     def stop_verb_bound_s(self) -> int:
         """The longest a stop verb takes in all: the control step's launch wait and then the stop's own bound."""
         return self.step_launch_wait_s + self.stop_bound_s
+
+    @property
+    def command_timeout_s(self) -> int:
+        """The `[faults] command_timeout_s` an HPC platform declares: the longest one relay verb may take, a control
+        step's launch wait and the verb's own work (`VERB_WORK_S`)."""
+        return self.step_launch_wait_s + VERB_WORK_S
 
     @property
     def settle_timeout_s(self) -> int:

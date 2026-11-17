@@ -290,14 +290,16 @@ def test_o58_a_request_the_relay_took_and_never_answered_is_unknown_never_done(t
 
 
 def test_o58_a_verb_past_the_relays_300_s_bound_is_unknown_and_fails_closed(tmp_path):
-    """O58: the HPC driver's relay verb is bounded at 300 s (`command_timeout_s`: a control step's launch wait of 180 s
-    and 120 s of work; it was 120 s until three provider outages on one HPC federation showed relay steps starting 47
+    """O58: the HPC driver's relay verb is bounded at 300 s (`command_timeout_s`: a control step's launch wait of 240 s
+    and 60 s of work; it was 120 s until three provider outages on one HPC federation showed relay steps starting 47
     to 103 s after they were issued, one round trip taking 104.6 s). The relay hands the verb that bound; a verb the
     runner cuts at it is answered `timed_out`, and the driver reads it as a command with no answer, never as done: a
     status raises, a start raises, a ping is no pong, and no verb is retried."""
-    platform = write_hpc_platform(tmp_path, stop_bound_s=None, settle_timeout_s=None, step_launch_wait_s=None)
+    platform = write_hpc_platform(
+        tmp_path, stop_bound_s=None, settle_timeout_s=None, step_launch_wait_s=None, command_timeout_s=None
+    )
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
-    assert (settings.step_launch_wait_s, settings.command_timeout_s) == (180.0, 300.0)
+    assert (settings.step_launch_wait_s, settings.command_timeout_s) == (240.0, 300.0)
     asked = []
 
     def overrun(argv, *, timeout_s):

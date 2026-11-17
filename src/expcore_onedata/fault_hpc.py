@@ -37,7 +37,7 @@ measurement is.
 
 **The stop's own bound.** A service's stop waits for its graceful end, then the kill, then the step's end: up to
 `stop_seconds` plus about 90 s, 140 s with the layout's default of 50 s (DESIGN.md section 7 (e)), and the stop's
-control step may wait to start before that (`step_launch_wait_s`, 180 s). The driver bounds `stop` by `stop_timeout_s`
+control step may wait to start before that (`step_launch_wait_s`, 240 s). The driver bounds `stop` by `stop_timeout_s`
 (`[faults] settle_timeout_s` for this backend, refused below the two together at load), not by the command timeout: a
 stop that runs past the command timeout would otherwise always be one of unknown outcome. A stop that does time out is
 the Compose case: the injector journals it `stop_unknown` and the restore waits for it to show down (`faults.py`, "A
@@ -101,17 +101,18 @@ EXEC_COMMANDS: Mapping[str, tuple[str, ...]] = {
 # after its SIGTERM, the largest plus 50 %), supervise.py's kill tail (30 s) and the step's end (60 s).
 HPC_STOP_BOUND_S = 140.0
 # How long a control step may wait to start before its own work begins (`[faults] step_launch_wait_s`, the layout's
-# `[hpc] step_launch_wait_s`). The same three outages showed relay verb steps starting 47 to 103 s after they were
-# issued during a heal; 180 s is 103 s plus about 75 %. Every bound that waits on a step's client from its start adds
-# it, and it widens timeouts only (how long the harness waits before failing closed), never an outage or a hold.
-HPC_STEP_LAUNCH_WAIT_S = 180.0
+# `[hpc] step_launch_wait_s`). A step's creation can wait on the scheduler's controller, up to its message timeout
+# (200 s on a site that sets it so, with no error); the three outages (17 Nov) showed relay verb steps starting 47 to
+# 103 s after they were issued during a heal. 240 s is that 200 s plus 20 %. Every bound that waits on a step's client
+# from its start adds it, and it widens timeouts only (how long the harness waits before failing closed), never an
+# outage or a hold.
+HPC_STEP_LAUNCH_WAIT_S = 240.0
 # What a relay verb does besides waiting to start: its control step's own bound (60 s, `STATUS_TIMEOUT_S` of
-# deploy/hpc-federation/hpcfed_control.py; a start waits 60 s for its service step to be listed) and 60 s for the
-# verb's own reads and the client's end.
-HPC_VERB_WORK_S = 120.0
+# deploy/hpc-federation/hpcfed_control.py; a start waits 60 s for its service step to be listed).
+HPC_VERB_WORK_S = 60.0
 # What one relay verb (a status, a start, a ping) may take: [faults] command_timeout_s on this backend, a step's
-# launch wait and the verb's work, 300 s. The same outages put one round trip at 104.6 s against the 120 s a command
-# had until then (Compose's, which keeps it); 240 s was too small once a launch wait of 180 s is counted.
+# launch wait and the verb's work, 300 s, where a command had 120 s (Compose's, which keeps it) until one round trip
+# took 104.6 s with launch waits of up to 103 s. `up` declares it in the platform file, derived from the launch wait.
 HPC_COMMAND_TIMEOUT_S = HPC_STEP_LAUNCH_WAIT_S + HPC_VERB_WORK_S
 HPC_EXEC_MARGIN_S = 60.0  # what an exec's client's end adds to the command's own bound (the launch wait: apart)
 HPC_POLL_S = 10.0  # every status is a Slurm step on the node's one control core: read every 10 s, not every 2

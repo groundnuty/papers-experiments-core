@@ -11,7 +11,7 @@ The hook, in `hpcfed.py`'s command dispatch:
         return hpcfed_control.run(verb, service, argv, launcher=launcher, state=state, stop_seconds=stop_seconds,
                                   step_launch_wait_s=step_launch_wait_s, mounts=mounts)
 
-`run(verb, service, argv, *, launcher, state, stop_seconds=50, step_launch_wait_s=180, mounts=None, out=None,
+`run(verb, service, argv, *, launcher, state, stop_seconds=50, step_launch_wait_s=240, mounts=None, out=None,
 err=None)` returns the exit status. `argv` is what followed `--` for exec, and empty for the other verbs; `out` and
 `err` are this process's standard output and error when None. **A control step's bound is its launch wait and then its
 work** (`step_launch_wait_s`, the layout's `[hpc]`): a step's client is waited for from its start, so a step Slurm
@@ -131,9 +131,9 @@ MUTATING = ("stop", "start")  # one at a time per federation, under VERBS_LOCK
 VERBS_LOCK = "hpc-federation.verbs.lock"  # in the root, beside M1's state lock and lifecycle lock
 
 # Every bound below that waits on a step's client from its start also waits for the step to start: `step_launch_wait_s`
-# (the layout's `[hpc]`, 180 by default) is added to it at the call, so a step that Slurm starts late is not cut off
+# (the layout's `[hpc]`, 240 by default) is added to it at the call, so a step that Slurm starts late is not cut off
 # before its own work has begun. The figures here are the work's own.
-DEFAULT_LAUNCH_WAIT_S = 180  # the layout's default (hpcsettings.DEFAULTS), for a caller that passes none
+DEFAULT_LAUNCH_WAIT_S = 240  # the layout's default (hpcsettings.DEFAULTS), for a caller that passes none
 STATUS_TIMEOUT_S = 60  # the status control step's own bound
 EXEC_TIMEOUT_S = 300  # the exec control step's own bound
 MOUNT_CHECK_TIMEOUT_S = 30  # the read-only proof's control step (it reads the service's mounts, nothing more)

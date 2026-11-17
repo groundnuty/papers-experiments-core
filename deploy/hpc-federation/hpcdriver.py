@@ -132,8 +132,8 @@ class Driver(Down):
             lines.append(f"node {index}: {role.name} ({role.kind}), its step {size.cpus} cores, {size.memory_mib} MiB")
         lines.append(f"control reserve on every node: {s.control.cpus} core(s), {s.control.memory_mib} MiB")
         lines.append(
-            f"stop bound {s.stop_bound_s} s; step launch wait {s.step_launch_wait_s} s; settle_timeout_s "
-            f"{s.settle_timeout_s} s; core phase: {s.core}"
+            f"stop bound {s.stop_bound_s} s; step launch wait {s.step_launch_wait_s} s; relay verb bound "
+            f"{s.command_timeout_s} s; settle_timeout_s {s.settle_timeout_s} s; core phase: {s.core}"
         )
         if weight is not None:
             billing = s.billing_per_hour(len(roles), weight)
@@ -674,7 +674,12 @@ class Driver(Down):
         s, site = self.settings, Site.from_json(state["site"])
         # the agent's sandbox's values, as up recorded the site (its files' pins checked in the preflight)
         rendered = hpc_values(
-            state["command"], s.stop_bound_s, s.settle_timeout_s, self.root, step_launch_wait_s=s.step_launch_wait_s
+            state["command"],
+            s.stop_bound_s,
+            s.settle_timeout_s,
+            self.root,
+            step_launch_wait_s=s.step_launch_wait_s,
+            command_timeout_s=s.command_timeout_s,
         )
         values = {**rendered, **hpcpins.values(site)}
         # the study's artifacts digest, as up took it: a step on a node has no site variable and never reads the tree

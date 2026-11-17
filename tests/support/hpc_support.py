@@ -20,7 +20,7 @@ from typing import Any
 from fault_support import SERVICES, FakeClock
 
 from expcore_onedata.compose import OP_WORKER, RESTART_LINK_SCRIPT, CommandResult
-from expcore_onedata.fault_hpc import HpcDriver, VerbCommand
+from expcore_onedata.fault_hpc import HpcDriver, VerbCommand, link_restart_bound_s
 from expcore_onedata.fault_matrix import LinkMatrix, PairState
 from expcore_onedata.testing import write_platform
 
@@ -224,7 +224,14 @@ class FakeHpc:
 def hpc_driver(federation: FakeHpc, *, timeout_s: float = 10.0, stop_timeout_s: float | None = None) -> HpcDriver:
     """The real HPC driver over the fake federation: the verbs run as commands through it, and its probe."""
     transport = VerbCommand([TOOL], federation)
-    return HpcDriver(transport, timeout_s=timeout_s, stop_timeout_s=stop_timeout_s, probe=federation.probe)
+    # the fake federation's steps start at once (no launch wait), so a link restart is bounded at 210 s here
+    return HpcDriver(
+        transport,
+        timeout_s=timeout_s,
+        stop_timeout_s=stop_timeout_s,
+        link_timeout_s=link_restart_bound_s(0.0),
+        probe=federation.probe,
+    )
 
 
 FEDERATION = "hpcop-study-0a1b2c3d"  # an allocation's name, as `up` makes it (DESIGN.md section 4)
@@ -254,7 +261,8 @@ def hpc_table(**changes: Any) -> dict[str, Any]:
         "stop_bound_s": 4,
         "settle_timeout_s": 5,
         "relay_wait_s": 1,
-        "step_launch_wait_s": 0,  # the fake clock's steps start at once; the default (180 s) is the settings tests'
+        "step_launch_wait_s": 0,  # the fake clock's steps start at once; the default (240 s) is the settings tests'
+        "command_timeout_s": 120,  # and a command keeps the Compose figure the fakes were written for
         "poll_s": 1,
         "ready_timeout_s": 5,
         "clear_attempts": 2,

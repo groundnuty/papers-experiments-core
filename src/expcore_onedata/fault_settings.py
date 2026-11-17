@@ -48,9 +48,11 @@ outcome"). The grace period is in the Compose file, which platform.toml does not
 value below it: whoever raises the grace, or lowers `settle_timeout_s`, keeps this bound. The default is the grace
 period plus `SETTLE_MARGIN_S`.
 
-`step_launch_wait_s` (the HPC backend's, rendered by `up` from the layout's `[hpc]`; 180 s by default) is how long a
-control step may wait to start before its own work begins: three provider outages on one HPC federation (17 Nov)
-showed relay verb steps starting 47 to 103 s after they were issued during a heal, 103 s plus about 75 %. Every bound
+`step_launch_wait_s` (the HPC backend's, rendered by `up` from the layout's `[hpc]`; 240 s by default) is how long a
+control step may wait to start before its own work begins: a step's creation can wait on the scheduler's controller up
+to its message timeout (200 s on a site that sets it so, with no error), and three provider outages on one HPC
+federation (17 Nov) showed relay verb steps starting 47 to 103 s after they were issued during a heal. 240 s is the
+200 s plus 20 %. Every bound
 that waits on a step's client from its start adds it: the stop's control step, `down`'s teardown step, the status,
 exec and mount-check steps and a start's wait to see its service step listed (`deploy/hpc-federation`), and here the
 stop verb's `settle_timeout_s` (which must exceed `stop_bound_s` + `step_launch_wait_s`, and by default is that and
@@ -62,13 +64,14 @@ bound, the token margin and the platform's deferral are counted from those bound
 
 `command_timeout_s` is the longest one command may take: 120 s on Compose. With `backend = "hpc"` it is the longest one
 relay verb (a status, a start, a ping) may take, and its default is a step's launch wait and the verb's own work
-(`fault_hpc.HPC_VERB_WORK_S`, 120 s): 300 s. It was 120 s until one round trip took 104.6 s with launch waits of up to
-103 s, and a bound of 240 s would not hold the verb's own control step (60 s) with a launch wait of 180 s. It is the
-request's `bound_s`, which the relay hands the verb to run within; a verb past it is answered `timed_out`, which the
-driver reads as a command with no answer, never as done. A declared value is kept as declared. The bound is in the
-faults fingerprint after its default (`_bounds_record`), so a platform that leaves it out and one that declares 300
-are one federation, and one that declares 120 is another. A link restart's bound is not this one: it is the launch
-wait, the RPC's bound, its margin and the exec's client's end (`link_command_s`).
+(`fault_hpc.HPC_VERB_WORK_S`, 60 s): 300 s. It was 120 s until one round trip took 104.6 s with launch waits of up to
+103 s. `up` declares it in the platform file, derived the same way from the layout's launch wait, so the federation's
+fingerprint holds both figures. It is the request's `bound_s`, which the relay hands the verb to run within; a verb
+past it is answered `timed_out`, which the driver reads as a command with no answer, never as done. A declared value
+is kept as declared. The bound is in the faults fingerprint after its default (`_bounds_record`), so a platform that
+leaves it out and one that declares 300 are one federation, and one that declares 120 is another. A link restart's
+bound is not this one: it is the launch wait, the RPC's bound, its margin and the exec's client's end
+(`link_command_s`).
 
 `ready_timeout_s` is the longest a restored provider may take to serve before its restore counts as unverified. A
 restore whose identity changed is not yet a provider that serves: in the federation of deploy/compose-federation the
