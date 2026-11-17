@@ -14,7 +14,7 @@ found; and the rerun in the tables the primary analysis uses (rendered by the ca
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from expcore.guards import EGRESS, MOUNT, VISIBILITY, GuardedRun, GuardsAnalysis
+from expcore.guards import EGRESS, MOUNT, NOT_APPLICABLE, VISIBILITY, GuardedRun, GuardsAnalysis
 from expcore.report_notes import GUARDS_NOTES, GUARDS_SENSITIVITY_NOTES, any_guard_notes, any_guard_sensitivity_notes
 
 TITLES = {EGRESS: "egress", MOUNT: "mount isolation", VISIBILITY: "process visibility"}  # the section's title
@@ -57,6 +57,11 @@ def by_alone(guards: GuardsAnalysis, counts: dict[str, int]) -> str:
     )
 
 
+def not_applicable_kept(guards: GuardsAnalysis) -> bool:
+    """Whether a guard does not apply to some run of the batch: such a run is kept, and never said to be clean to it."""
+    return any(NOT_APPLICABLE in run.states.values() for run in guards.runs)
+
+
 def _by_condition(guards: GuardsAnalysis, table: Callable[..., list[str]]) -> list[str]:
     keys = guards.count_keys()
     rows = [[condition, *(counts[key] for key in keys)] for condition, counts in guards.by_condition().items()]
@@ -76,6 +81,9 @@ def _row(guards: GuardsAnalysis, run: GuardedRun) -> list[Any]:
 
 def _left_out(guards: GuardsAnalysis, table: Callable[..., list[str]]) -> list[str]:
     lines = [f"### Runs {either(guards)} guard leaves out", ""]
+    if not guards.left_out and not_applicable_kept(guards):
+        none = f"None: no analysed run is left out by {either(guards)} guard; a run a guard does not apply to is kept, "
+        return [*lines, none + "never counted as clean to it.", ""]
     if not guards.left_out:
         return [*lines, f"None: every analysed run is clean to {every(guards)} guards.", ""]
     header = ["Run key", "Attempt", "Condition", *(COLUMNS[g] for g in guards.guards), "Left out by"]
@@ -101,6 +109,9 @@ def guards_lines(
     lines += [f"### Sensitivity analysis: {left_out_label(guards)}, left out", "", *rerun, ""]
     if guards.refused is not None:
         return [*lines, f"Not computed: the analysis refused the rerun ({guards.refused}).", ""]
+    if guards.sensitivity is None and not_applicable_kept(guards):
+        none = f"No run is left out by {either(guards)} guard, so the analysis without the others is the one above."
+        return [*lines, none, ""]
     if guards.sensitivity is None:
         return [
             *lines,
@@ -120,6 +131,8 @@ def summary_lines(guards: GuardsAnalysis, rerun: Callable[[Any, str], list[str]]
     prefix = f"{every(guards)}-guards sensitivity"
     if guards.refused is not None:
         return [*lines, f"{prefix}: not computed ({guards.refused})"]
+    if guards.sensitivity is None and not_applicable_kept(guards):
+        return [*lines, f"{prefix}: no run left out, the same as the analysis above"]
     if guards.sensitivity is None:
         return [*lines, f"{prefix}: every run clean to {every(guards)}, the same as the analysis above"]
     return lines + rerun(guards.sensitivity, prefix)

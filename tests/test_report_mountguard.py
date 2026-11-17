@@ -421,7 +421,10 @@ def test_o70_the_terminal_summary_of_three_guards_says_all_guards():
     )
     assert any(line.startswith("all guards, cond-b: 2 of 2 left out") for line in lines)
     assert lines[-1].startswith("all-guards sensitivity a-vs-b: estimate 0.15")
-    quiet = summary_lines(analysis(contrast("a-vs-b", "difference")), None, None, combined_all(sensitivity=None))
+    from expcore.guards import GuardedRun, GuardsAnalysis
+
+    clean = GuardsAnalysis((GuardedRun("k1", 1, "cond-a", "clean", "clean", "clean"),), None)
+    quiet = summary_lines(analysis(contrast("a-vs-b", "difference")), None, None, clean)
     assert quiet[-1] == "all-guards sensitivity: every run clean to all, the same as the analysis above"
 
 
@@ -437,3 +440,19 @@ def test_o70_analysis_json_names_the_guards_that_checked_the_batch_and_each_runs
     legacy = _guards_summary(combined())
     assert legacy["guards"] == ["egress", "mount"]
     assert legacy["runs"][0]["visibility"] is None
+
+
+def test_o70_a_batch_whose_runs_are_clean_or_not_applicable_never_says_every_run_is_clean_to_the_guards():
+    """O70: a run the mount guard does not apply to is kept, and the combined text does not call it clean to it."""
+    from expcore.guards import GuardedRun, GuardsAnalysis
+
+    runs = (GuardedRun("k1", 1, "cond-a", "clean", "clean"), GuardedRun("k2", 1, "cond-a", "clean", "not_applicable"))
+    kept = GuardsAnalysis(runs, None)
+    report = render(analysis(contrast("a-vs-b", "difference")), guards=kept)
+    assert "None: no analysed run is left out by either guard; a run a guard does not apply to is kept" in report
+    assert "No run is left out by either guard, so the analysis without the others is the one above." in report
+    assert "clean to both" not in report
+    lines = summary_lines(analysis(contrast("a-vs-b", "difference")), None, None, kept)
+    assert lines[-1] == "both-guards sensitivity: no run left out, the same as the analysis above"
+    clean = GuardsAnalysis((GuardedRun("k1", 1, "cond-a", "clean", "clean"),), None)  # no such run: as it was
+    assert "Every run is clean to both guards" in render(analysis(contrast("a-vs-b", "difference")), guards=clean)
