@@ -2,11 +2,13 @@
 their spend journals and their archive manifests in a results directory, and the pull of that directory to the
 operator's host. Every path and name here is invented."""
 
+import argparse
 import hashlib
 import json
 import shutil
 from pathlib import Path
 
+import pytest
 from campaign_support import NOW, finished, make_manifest, make_schema
 
 from expcore.campaign import out_snapshot
@@ -138,3 +140,58 @@ def with_newer_snapshot(shards, tmp_path, label="fed-a", index=1):
     snapshot = take_snapshot(tmp_path, store, out, label, archive_sha(tmp_path, label), index=index)
     store.close()
     return plan, snapshot
+
+
+class Killed(BaseException):
+    """The step killed outright: its dispatcher never returns, and nothing is archived."""
+
+
+def step_shard(shards, tmp_path, resume, killed=False):
+    """One real `shards.step` of a one-shard plan, with a stand-in dispatcher that does what the core's does here:
+    its spend journal (a file of its own), a store with a run ended in it, the lock. `killed` ends it as a kill outright
+    would (no archive; the step's own last snapshot is taken as it unwinds)."""
+    study = tmp_path / "study"
+    study.mkdir(exist_ok=True)
+    (study / "study.toml").write_text("[study]\n")
+    for name in ("tmpfs", "results"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    args = argparse.Namespace(
+        study=study,
+        index=1,
+        count=2,
+        label="fed-a",
+        tmpfs=tmp_path / "tmpfs",
+        results=tmp_path / "results",
+        core_src=tmp_path,
+        resume=resume,
+        snapshot_every=3600.0,
+    )
+
+    def dispatcher(argv, env, cwd):
+        out = Path(argv[argv.index("run") + 1]) / "out"
+        Path(argv[argv.index("--spend-journal") + 1]).write_text('{"spent": 1}\n')
+        (out / "runs").mkdir(parents=True, exist_ok=True)
+        (out / "campaign.lock").write_text("")
+        store = Store(out / "state.sqlite", SCHEMA)
+        store.sync_manifest(ROWS)
+        try:
+            ended_run(store, out, KEYS[1 if resume else 0])
+        finally:
+            store.close()
+        if killed:
+            raise Killed
+        return 0
+
+    return shards.step(args, runner=dispatcher, core_found=lambda path: True)
+
+
+def resumed_and_killed(shards, tmp_path):
+    """The plan of two shards in the state this is all about: `fed-b` archived, and `fed-a` stepped to its archive, then
+    resumed from it and killed outright after a run it took a snapshot of, so that its newest snapshot names the archive
+    it holds and the archive lacks that run. Through the real `shards.step`."""
+    plan = shards.load_plan(plan_file(tmp_path))
+    archived(shards, tmp_path, "fed-b", 2, journals=False)
+    assert step_shard(shards, tmp_path, resume=False) == 0
+    with pytest.raises(Killed):
+        step_shard(shards, tmp_path, resume=True, killed=True)
+    return plan
