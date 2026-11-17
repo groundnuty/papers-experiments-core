@@ -102,11 +102,13 @@ from expcore.mountguard.campaign import recorded_data_paths
 from expcore.mountguard.sensitivity import MountGuardAnalysis, mount_guard_analysis
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
-from expcore.provenance.environment import EnvironmentUnknown, differences, environment
+from expcore.provenance.core_check import require_core
+from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_earlier_form
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore, scorer_name, scorer_version
 from expcore.replay.check import (
+    CHECK_FILE,
     BatchNotVerified,
     require_current_check,
     verify_batch,
@@ -134,6 +136,7 @@ from expcore.study.config import (
     read_study_identity,
     shard_budgets_of,
 )
+from expcore.study.core_legacy import earlier_core_fingerprint, earlier_core_hint
 from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
 from expcore.study.platform_deferral import platform_deferrals
@@ -208,6 +211,18 @@ def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:
     """The environment of the study's code: the core and what `[study] requires` names, with their requirements."""
     try:
         return environment(study.requires)
+    except EnvironmentUnknown as error:
+        raise Refused(f"{study.root}: {error}") from None
+
+
+def environment_like(study: StudyConfig | StudyIdentity, recorded: object) -> dict[str, Any]:
+    """The environment in use, in the form `recorded` holds the core in: by how it was installed for a campaign an
+    earlier core recorded (`study.core_legacy`), which its own resume, check, analysis and package compare it with,
+    else by its identity, as `study_environment` gives it."""
+    if not is_earlier_form(recorded):
+        return study_environment(study)
+    try:
+        return environment(study.requires, earlier_core=True)
     except EnvironmentUnknown as error:
         raise Refused(f"{study.root}: {error}") from None
 
@@ -331,6 +346,7 @@ def _run_campaign(
     whose threads refuse the study's own `InfraError` kinds as unknown ones, and a config no one has checked.
     """
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
+    require_core("run", allow_dirty=allow_dirty)  # the core is held to the rule the study's code is (P01)
     declared = platform_deferrals(study)  # from each platform's own configuration, before any study code runs (C11)
     # the study's build, from its plugin's import to what the pipeline derives from it, is watched for the platform
     # loaders it runs, and the watch ends before the scheduler starts: it holds no build open for the campaign's length
@@ -367,7 +383,8 @@ def _run_campaign(
             _say_lost(scheduler.lost_counted)
             return scheduler.run()
     except FingerprintMismatch as refused:
-        hint = _counted_key_locations(study, read_fingerprint(out / STATE_FILE))
+        recorded = read_fingerprint(out / STATE_FILE)
+        hint = _counted_key_locations(study, recorded) + earlier_core_hint(recorded, refused.differences)
         if not hint:
             raise
         raise FingerprintMismatch(refused.differences, hint=hint) from None
@@ -384,9 +401,12 @@ def _build(
     leases = None if plugin.probe is None else LeasePool(out_dir(study) / "leases", plugin.lease_keys, plugin.probe)
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
     fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
-    store = out_dir(study) / STATE_FILE
-    if plugin.platform_legacy is not None and store.is_file():  # C06: a store of the earlier form
-        fingerprint = legacy_fingerprint_of(read_fingerprint(store), fingerprint, plugin.platform_legacy)
+    recorded = _store_fingerprint(out_dir(study) / STATE_FILE)
+    fingerprint = earlier_core_fingerprint(  # C06: a store an earlier core recorded
+        recorded, fingerprint, lambda: environment_like(study, campaign_environment(recorded))
+    )
+    if plugin.platform_legacy is not None and recorded is not None:  # C06: a store of the earlier form
+        fingerprint = legacy_fingerprint_of(recorded, fingerprint, plugin.platform_legacy)
     manifest, started = study.manifest, None
     if isinstance(shard, SelectionSpec):
         try:
@@ -400,6 +420,17 @@ def _build(
         manifest, settings, started = _shard_of(study, plugin, settings, shard)
         print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
     return plugin, leases, settings, fingerprint, manifest, started
+
+
+def _store_fingerprint(store: Path) -> dict[str, Any] | None:
+    """The fingerprint a store records, for a start to present it in the form the store holds; None without a store,
+    or when a dispatcher is writing it as it is copied (the scheduler then refuses the start under its lock)."""
+    if not store.is_file():
+        return None
+    try:
+        return read_fingerprint(store)
+    except StoreChanged:
+        return None
 
 
 def _say_lost(counted: Mapping[str, Any] | None) -> None:
@@ -538,17 +569,17 @@ def _check_batch_of(
 ) -> dict[str, Any]:
     """Snapshot the store and replay the batch of a study, with its own infrastructure kinds in scope."""
     code = require_known("replay check", code_root or study.root, study.scope, allow_dirty=allow_dirty)
+    require_core("replay check", allow_dirty=allow_dirty)
     directory = Path(batch)
     if not directory.is_dir():
         raise Refused(f"{directory}: no batch of records here; run the study first")
-    env = study_environment(study)
     store = out_dir(study) / STATE_FILE
     if (out_dir(study) / MERGE_FILE).is_file():
         if store.is_file():
             raise Refused(
                 f"{out_dir(study)}: holds a merged batch ({MERGE_FILE}) and a campaign store; use one or the other"
             )
-        return _check_merged(study, directory, code, env, partial)
+        return _check_merged(study, directory, code, partial)
     if not store.is_file():
         raise Refused(f"{store}: no campaign store here; run the study first")
     lock, in_place = _hold_for_check(store, partial)
@@ -557,6 +588,7 @@ def _check_batch_of(
             recorded = read_fingerprint(store, in_place=in_place)
         except StoreChanged as error:
             raise Refused(str(error)) from None
+        env = environment_like(study, campaign_environment(recorded))
         changed = differences(campaign_environment(recorded), env)
         if changed:
             raise Refused(
@@ -646,9 +678,7 @@ def _settle_merged_side_files(study: StudyIdentity, batch: Path) -> None:
         print(f"check: {settled}", file=sys.stderr)
 
 
-def _check_merged(
-    study: StudyIdentity, directory: Path, code: Mapping[str, Any], env: Mapping[str, Any], partial: bool
-) -> dict[str, Any]:
+def _check_merged(study: StudyIdentity, directory: Path, code: Mapping[str, Any], partial: bool) -> dict[str, Any]:
     """The replay check of a merged batch: merge.json is bound by its hash, each shard's snapshot is compared with the
     hash merge.json names and read under the environment in use, merge.json is rebuilt from the snapshots and the
     study's plan and must be that document (`campaign.merged`), and the records are replayed as one batch.
@@ -666,6 +696,8 @@ def _check_merged(
         held = read_held(out, merged, pricing)
     except MergeRefused as error:
         raise Refused(str(error)) from None
+    first = held[min(held)].fingerprint if held else None  # one form of the core in every shard, or refused below
+    env = environment_like(study, campaign_environment(first))
     for shard in held.values():
         changed = differences(campaign_environment(shard.fingerprint), env)
         if changed:
@@ -813,7 +845,9 @@ def _analyse_loaded(
     if not batch.is_dir():
         raise Refused(f"{out}: no campaign here; run the study first")
     code = code_version(code_root or study.root, study.scope, use_git=not stamped)
-    env = study_environment(study)
+    if not stamped:  # a package's check runs on the core its wheels install, pinned by hash (`core_check`)
+        require_core("analysis", allow_dirty=allow_dirty)
+    env = environment_like(study, _checked_environment(batch))
     try:
         check = require_current_check(
             batch,
@@ -899,6 +933,16 @@ def _require_declared_reruns(study: StudyConfig, ran: tuple[str, ...]) -> None:
             f"reruns declares:\n  {said}{missing}\nlist the guard's instrument on the runs it applies to, or change "
             "the declaration before the analysis"
         )
+
+
+def _checked_environment(batch: Path) -> Any:
+    """The environment a batch's stored check records, for the analysis to compute the one in use in its form; None
+    when there is no readable check, which `require_current_check` then refuses, naming why."""
+    try:
+        check = json.loads((batch / CHECK_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return check.get("environment") if isinstance(check, dict) else None
 
 
 def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
