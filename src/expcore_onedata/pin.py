@@ -14,6 +14,7 @@ configuration; nothing here searches the file system for a clone.
 import subprocess
 from pathlib import Path
 
+from expcore.provenance.gitobjects import git_env
 from expcore_onedata.config import ToolServer
 
 GIT_TIMEOUT_S = 30.0
@@ -24,10 +25,19 @@ class PinError(RuntimeError):
 
 
 def _git(clone: Path, *args: str) -> str:
-    """Run git in the checkout and return its stdout; raise PinError, without the output, when it fails."""
+    """Run git in the checkout and return its stdout; raise PinError, without the output, when it fails.
+
+    The launch check must not write what it checks: git runs with no optional locks, so its `status` does not refresh
+    `.git/index`, and with the user's global and the system git configuration read as empty (O81).
+    """
     try:
         done = subprocess.run(
-            ["git", "-C", str(clone), *args], check=True, capture_output=True, text=True, timeout=GIT_TIMEOUT_S
+            ["git", "-C", str(clone), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_S,
+            env=git_env(isolate_config=True),
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise PinError(f"git {args[0]} failed in the tool-server checkout ({type(error).__name__})") from None

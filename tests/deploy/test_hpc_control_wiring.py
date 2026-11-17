@@ -459,7 +459,7 @@ def test_o58_the_relay_up_starts_beats_and_the_stop_down_runs_ends_it(hpc, tmp_p
     root = tmp_path / "root"
     root.mkdir(mode=0o700)
     log = tmp_path / "relay.log"
-    command = [sys.executable, "-B", "/nowhere/hpcfed.py", "--layout", "L", "--root", str(root)]
+    command = [sys.executable, "-I", "-B", "/nowhere/hpcfed.py", "--layout", "L", "--root", str(root)]
     recorded = []
     environ = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path)}
     runner = Runner()

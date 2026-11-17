@@ -75,9 +75,9 @@ def test_o59_a_shared_import_enters_the_fingerprint_and_a_plain_one_keeps_its_ol
     """O59, C06: a resume after the tree stopped being shared is refused, so the declaration is in the fingerprint,
     and only when made: every earlier import's fingerprint is what it was."""
     plain = load(tmp_path / "a", one_space({"readonly": True})).fingerprint()
-    assert plain == {"tls": {"mode": "verify"}, "storage_import": {"readonly": True}}
+    assert plain["storage_import"] == {"readonly": True}
     shared = load(tmp_path / "b", one_space({"readonly": True, "shared": True})).fingerprint()
-    assert shared == {"tls": {"mode": "verify"}, "storage_import": {"readonly": True, "shared": True}}
+    assert shared == {**plain, "storage_import": {"readonly": True, "shared": True}}
     unshared = load(tmp_path / "c", one_space({"readonly": True, "shared": False})).fingerprint()
     assert unshared == plain
     base = load(tmp_path / "d", second_entry({"readonly": True})).fingerprint()["spaces"]

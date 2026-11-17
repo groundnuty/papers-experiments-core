@@ -84,6 +84,7 @@ class FakeHpc:
         self.serves_after = 0
         self.unreadable: set[str] = set()
         self.not_ready: set[str] = set()  # services that run but whose own checks have not passed
+        self.domain_wait: dict[str, Any] = {}  # service -> the `domain_wait_s` its ready status carries (O58)
         self.stuck: set[tuple[str, str]] = set()
         self.link_fixes: dict[str, tuple[tuple[str, str], ...]] = {}
         self.container_fixes: set[str] = set()
@@ -147,6 +148,8 @@ class FakeHpc:
         identity = f"{entry['launch']}:{4000 + entry['launch']}:{900 + entry['launch']}"
         ready = entry["running"] and service not in self.not_ready
         record = {"service": service, "running": entry["running"], "identity": identity, "ready": ready}
+        if ready and service in self.domain_wait:
+            record["domain_wait_s"] = self.domain_wait[service]
         return CommandResult(0, json.dumps(record) + "\n")
 
     def _stop(self, service: str, argv: Sequence[str], timeout_s: float) -> CommandResult:

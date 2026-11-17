@@ -356,25 +356,29 @@ def folder(tmp_path, name):
 
 
 def test_c06_the_platform_fingerprint_holds_the_faults_sanction_and_targets_by_label_and_digest_never_a_name(tmp_path):
-    """C06, O12: with `[faults]` the platform's half of the campaign fingerprint gains the sanction and the container
-    of each target, by its label and the SHA-256 of its Compose project and service; no name, path or service appears
-    in it, and a
-    platform.toml without `[faults]` keeps the fingerprint it had."""
+    """C06, O12: with `[faults]` the platform's half of the campaign fingerprint gains the sanction, the service of
+    each target, by its label and the SHA-256 of its backend and service (never the Compose project, each
+    deployment's own name), and every bound of the injector's waits; no name, path or service appears in it, and a
+    platform.toml without `[faults]` has no `faults`."""
     platform = write_faults(folder(tmp_path, "faults"))
     fingerprint = load_platform(platform, require_secrets=False).fingerprint()
     services = {LOCAL_TARGET: SERVICES["alpha"], OUTAGE_TARGET: SERVICES["beta"]}
-    digests = {label: hashlib.sha256(f"stack-a/{service}".encode()).hexdigest() for label, service in services.items()}
-    assert fingerprint == {"tls": {"mode": "verify"}, "faults": {"sanctioned": True, "targets": digests}}
+    digests = {label: hashlib.sha256(f"compose:{service}".encode()).hexdigest() for label, service in services.items()}
+    assert (fingerprint["faults"]["sanctioned"], fingerprint["faults"]["targets"]) == (True, digests)
+    assert fingerprint["faults"]["settings"]["backend"] == "compose"
     text = json.dumps(fingerprint)
     assert [value for value in [*configured_values(tmp_path / "faults"), *SERVICES.values()] if value in text] == []
+    assert "stack-a" not in text
     plain = load_platform(write_platform(folder(tmp_path, "plain")), require_secrets=False).fingerprint()
-    assert plain == {"tls": {"mode": "verify"}}
+    assert "faults" not in plain
 
 
-def test_c06_a_campaign_does_not_resume_under_another_target_service_or_sanction_and_does_under_other_waits(tmp_path):
-    """C06: a resume that takes another service or project's container down for a target, changes the sanction, or
-    adds or drops `[faults]`,
-    is refused naming the platform's faults; one that changes only how long the injector waits resumes."""
+def test_c06_a_campaign_does_not_resume_under_another_target_service_sanction_or_wait_and_does_under_another_project(
+    tmp_path,
+):
+    """C06: a resume that takes another service down for a target, changes the sanction or a bound of the injector's
+    waits, or adds or drops `[faults]`, is refused naming the platform's faults; one that names the same services in
+    another Compose project (another deployment of one layout) resumes."""
     schema, manifest = make_schema(), make_manifest(make_schema())
     configs = {
         "started": write_faults(folder(tmp_path, "a")),
@@ -394,12 +398,18 @@ def test_c06_a_campaign_does_not_resume_under_another_target_service_or_sanction
         store.close()
 
     resume("started")
-    resume("other waits")
-    for label in ("other service", "other project", "unsanctioned", "no faults"):
+    resume("other project")
+    for label in ("other service", "unsanctioned", "no faults"):
         with pytest.raises(FingerprintMismatch) as caught:
             resume(label)
         assert all(line.startswith("platform.faults") for line in caught.value.differences), label
         assert "store-three" not in str(caught.value)
+    with pytest.raises(FingerprintMismatch) as caught:
+        resume("other waits")
+    assert {line.split(":")[0] for line in caught.value.differences} == {
+        "platform.faults.settings.admission_timeout_s", "platform.faults.settings.poll_s",
+        "platform.faults.settings.settle_timeout_s", "platform.tokens.margin_s",
+    }  # fmt: skip
     resume("started")
 
 

@@ -23,6 +23,9 @@ source "$SITE_ENV"
 for key in HPC_JOB B SH L GATE_DIR NODE_Z NODE_P1 NODE_P2 NODE_P3 NODE_S ADDR_Z ADDR_P1 ADDR_P2 ADDR_P3; do
   [[ -n ${!key:-} && ${!key} != *'<'* ]] || die "site.env: $key is not filled in (see site.env.example)"
 done
+for key in B SH L GATE_DIR; do  # every step starts in / (st's --chdir=/): a relative path would resolve there
+  [[ ${!key} == /* ]] || die "site.env: $key must be an absolute path"
+done
 SVC_CPUS=${SVC_CPUS:-8}        # a service step: its cores and memory (overlap steps may sum past the job's memory)
 SVC_MEM=${SVC_MEM:-19G}
 ZONE_NAME=${ZONE_NAME:-expcore-zone}
@@ -33,7 +36,7 @@ HPC_USER=${USER:-$(id -un)}
 : "${E:?E must name the run evidence directory, a 0700 directory on a filesystem every node sees (run/README.md)}"
 [[ -d $E && ! -L $E && -O $E && $(stat -c %a -- "$E") == 700 ]] || die "E is not a private (0700) directory of yours"
 
-rec() { python3 -I "$RUN/record.py" "$@"; }                # how evidence files are written (record.py)
+rec() { python3 -I -B "$RUN/record.py" "$@"; }                # how evidence files are written (record.py)
 # <step>: that step's evidence directory, made once per run: a step that ran already cannot run again into this run,
 # where its earlier files would stand beside the new ones (the cell is the one step repeated: fresh_step_dir).
 ev() {
@@ -69,12 +72,13 @@ svc_log() {                                                 # <role>: the batch 
 wlog() { sed -n 's/^hpcop: work directory \(\/[^ ]*\)$/\1/p' "$1" | head -1; }
 fqdn_of() { sed -n "s/^ok: configured o[zp] '[^']*' on \([A-Za-z0-9.-]*\) with .*/\1/p" "$1" | head -1; }
 
-# <role> <srun options> <command...>: one step on that role's node. No environment is passed (--export=PATH); a step
-# whose stdin is not the payload ends in </dev/null at the call.
+# <role> <srun options> <command...>: one step on that role's node, in / (--chdir=/: never this shell's directory,
+# nor the node's shared /tmp where that does not exist there). No environment is passed (--export=PATH); a step whose
+# stdin is not the payload ends in </dev/null at the call.
 st() {
   local node
   node=$(node_of "$1"); shift
-  srun --jobid="$HPC_JOB" --overlap --export=PATH -w "$node" -N1 -n1 "$@"
+  srun --jobid="$HPC_JOB" --overlap --export=PATH --chdir=/ -w "$node" -N1 -n1 "$@"
 }
 
 # <rc file> <name> <command...>: a step that outlives this shell (setsid nohup), whose exit status is recorded when it
@@ -132,7 +136,7 @@ cell_step() {
   zf=$(fqdn_of "$(svc_log Z)") p1=$(fqdn_of "$(svc_log P1)") p2=$(fqdn_of "$(svc_log P2)") p3=$(fqdn_of "$(svc_log P3)")
   [[ -n $zf && -n $p1 && -n $p2 && -n $p3 ]] || die "a service's FQDN is not in its log"
   fresh_step_dir sandbox   # cell.sh repeats the cell: the summary reads only this attempt's files
-  srun --jobid="$HPC_JOB" --overlap --export=PATH -w "$NODE_S" -N1 -n1 -c4 --mem=16G \
+  srun --jobid="$HPC_JOB" --overlap --export=PATH --chdir=/ -w "$NODE_S" -N1 -n1 -c4 --mem=16G \
     bash "$RUN/sandbox.sh" "$RUN" "$B" "$GATE_DIR" "$SH/oneprovider-docker.tar" "$E" "$SPACE_NAME" "$sid" "$root" "$fid" "$sha" \
     "$zf" "$p1" "$p2" "$p3" 2>&1 | tee "$L/sandbox.out"
   rc=${PIPESTATUS[0]}
