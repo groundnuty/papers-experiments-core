@@ -113,7 +113,8 @@ def health(ctx: Context) -> Result:
     """The platform's own health check: the providers supporting the space equal the declared set."""
     if ctx.config.principals.service is None:
         return unknown("no [principals] service user is declared, so the health check cannot mint its token")
-    platform = PlatformHealth(ctx.config, ctx.client, ctx.issuer, clock=ctx.now)
+    # Without the link check (O35): it writes probes and evicts them, and a day-0 reading check changes nothing.
+    platform = PlatformHealth(ctx.config, ctx.client, ctx.issuer, clock=ctx.now, links=False)
     verdict = platform()
     if verdict.ok:
         return passed(verdict.detail)
@@ -146,7 +147,7 @@ def tokens(ctx: Context) -> Result:
     Each token is the one a run mints (`TokenIssuer.mint_run_tokens`): scoped to every space its plane reaches
     (`space_ids`), with its principal's rights checked in each of them, so with several spaces a refusal names the
     space by its position and each plane's facts list the positions it reaches. Every condition's token is minted as a
-    run mints it too, a read-only condition's included (O39): its user must hold no Onezone admin privilege, and
+    run mints it too, a read-only condition's included (O88): its user must hold no Onezone admin privilege, and
     Onezone's scope of the token must be exactly the plane's spaces, so a fixed tool-server user who is a member of
     another space fails the check, and so does one who is a member of a cluster."""
     principals = ctx.config.principals

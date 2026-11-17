@@ -14,7 +14,7 @@ again against the condition's exact caveat set, and reads the token's principal'
 effective, requiring exactly the condition's declared rights, no more and no less. An unexamined or drifted token, a
 token minted for another condition's rights, and a principal whose privileges changed since the token was minted
 cannot start the plane: every condition's token carries the same caveats, a read-only condition's as a writing one's
-(O39), so only the privileges tell them apart, and only they keep a read-only condition from writing. The token carries
+(O88), so only the privileges tell them apart, and only they keep a read-only condition from writing. The token carries
 no data-access caveat, so its user is its boundary: the launcher also reads Onezone's scope of the token, which must be
 exactly the tool-server plane's spaces, the user's Onezone admin privileges, which must be none, and the clusters the
 user is an effective member of, read as the token, which must be none (`tokenscope`), and reads all three again at
@@ -46,8 +46,22 @@ and the spawn) and around the stop. What the agent triggers through the tools, a
 is the agent's own time and is never an infrastructure wait. Health polling before dispatch is the scheduler's
 (C11, `PlatformHealth`) and is not a wait either.
 
+The checks (`_prepare` before the spawn, `_recheck` after the stop) read Onezone in worker threads, and each holds a share
+of the run's federation admission while it runs (`expcore_onedata.admission_share`, O11): a launch cancelled while one
+runs stops waiting for it, and its run may leave its admission, but the federation stays held until the thread has ended,
+so nothing of a run acts on the federation after its admission ends.
+
 `ctx` is anything with `infrastructure_wait(kind)`: the `CallContext` of a tool call, or the attempt's timer, which an
 executor has before the loop starts.
+
+The server's process. The MCP client spawns it as a child of the driver, in a session of its own, with the client's
+inherited variables of the driver's environment (`HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER`) beside the settings
+here, in the driver's working directory: on Docker that child is a process on the host, outside every container. A
+backend may name where it runs instead (`process`, an `api.ServerProcess`; the Apptainer backend's
+`tool_server_process`, O56): then its `HOME` and working directory are the backend's directory, its settings include
+the backend's (the run's tag), and its environment is named whole: the client's inherited variables that the settings do
+not set are unset by `env -u ... --` before the command, so nothing of the driver's reaches it but `PATH`, and no value,
+the token least of all, is ever an argument (`env -i` would need every value as one).
 """
 
 import asyncio
@@ -59,14 +73,25 @@ import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
 
+from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS
+
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
-from expcore_onedata.admission import require_admission
+from expcore_onedata.admission import (
+    TOOL_SERVER_STEP,
+    TokenStepRefused,
+    begin_token_step,
+    current_admission,
+    require_admission,
+    token_step,
+)
+from expcore_onedata.admission_share import ThreadShare
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, ToolServer
 from expcore_onedata.credentials import Principal
 from expcore_onedata.pin import verify_configured
+from expcore_onedata.sandbox.api import ServerProcess
 from expcore_onedata.tls import CA_BUNDLE_ENV, write_private_copy
 from expcore_onedata.tokencheck import ExaminationFailed, PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, token_window, tool_server_spec
@@ -74,6 +99,8 @@ from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, token_window
 WAIT_KIND = "toolserver_lifecycle"
 INTEGRITY_KIND = TOOL_PLANE_INTEGRITY  # the kind of every failure of the plane's integrity checks; not treatable
 EVENT_RIGHTS_CHANGED = "tool_plane_rights_changed"
+# the plane's two checks, each a step that uses the run's token (`admission.begin_token_step`), as a refusal names them
+CHECK_BEFORE_START, CHECK_AT_STOP = "the tool server's check before its start", "the tool server's check at its stop"
 
 # Where the platform records an event: called with the event's kind and a detail that holds no configured name, token or
 # id (a condition or a slot is named by its position). The launcher and the slots' minting (`users.SlotTokens`) share
@@ -137,6 +164,33 @@ def server_environment(
     elif ca_copy is not None:
         env.update(dict.fromkeys(CA_BUNDLE_ENV, str(ca_copy)))
     return env
+
+
+def inherited_by_the_client() -> tuple[str, ...]:
+    """The variables of the driver's environment the MCP client gives every server it spawns, beside the ones it is
+    given (`mcp.client.stdio.get_default_environment`)."""
+    return tuple(DEFAULT_INHERITED_ENV_VARS)
+
+
+def _placed(extra: Mapping[str, str] | None, process: ServerProcess | None) -> Mapping[str, str] | None:
+    """The caller's settings with a backend's placement added: its `HOME` and its own settings, which a caller cannot
+    set, as it cannot set the managed ones."""
+    if process is None:
+        return extra
+    ours = {**process.env, "HOME": str(process.home)}
+    clash = sorted(set(extra or {}) & set(ours))
+    if clash:
+        raise ValueError(f"the tool server's {', '.join(clash)} is the backend's, not the caller's to set")
+    return {**(extra or {}), **ours}
+
+
+def _spawned(server: ToolServer, env: Mapping[str, str], process: ServerProcess | None) -> tuple[str, list[str]]:
+    """The command and arguments the client spawns: the server's own, or, with a backend's placement, the same behind
+    `env -u <each inherited variable the settings do not set> --`, so that the server's environment is `env` alone."""
+    if process is None:
+        return server.command, list(server.args)
+    unset = [word for name in inherited_by_the_client() if name not in env for word in ("-u", name)]
+    return "env", [*unset, "--", server.command, *server.args]
 
 
 @contextlib.contextmanager
@@ -207,6 +261,52 @@ def _recheck(
     issuer.check_clusters(spec, token.reveal())
 
 
+async def _in_counted_thread(config: PlatformConfig, what: str, check: Callable[..., None], *args: object) -> None:
+    """Run one of the plane's checks (`what`, in words), which examine the run's token and read Onezone, in a worker
+    thread that, for its whole life, is counted as the tool server's step on the run's admission
+    (`admission.begin_token_step`) and holds a share of that admission (`admission_share.ThreadShare`). Both are taken
+    here, before the thread exists, the share first, so the admission the count is taken on stays held, and the
+    thread gives both up when the check ends, on success or an exception, the share last; a thread that never began
+    has its share given up when its task is done.
+
+    On a platform with `[faults]` a check is refused before its thread starts, holding nothing, when the run's admission
+    is not held or no share of it can be taken (it is being let go, or the run's shortcut section has sealed it):
+    `TokenStepRefused`, naming it, failing closed (O35, O11). A cancellation of the await does not stop the thread, so
+    the count and the share outlive a launch that leaves without it: no restore heals while it still examines the
+    token (O35), and the federation stays held until it has ended (O11); the thread's failure is then never
+    unretrieved. A thread the event loop's shutdown kept from ever starting leaves the count open, so the restore fails
+    closed. Without `[faults]` there is no admission: nothing is counted, shared or refused."""
+    admission = current_admission()  # read once: the share is taken from it before the count, so it stays held
+    give_up = admission.try_retain() if admission is not None else None
+    try:  # refuses when the run's admission is not held, and then any share taken is given back
+        end = begin_token_step(TOOL_SERVER_STEP, config, what)
+    except BaseException:
+        if give_up is not None:
+            give_up()
+        raise
+    if admission is not None and give_up is None:  # held, but being let go or sealed: no share, so it never starts
+        end()
+        raise TokenStepRefused(config, TOOL_SERVER_STEP, what)
+    share = ThreadShare(give_up or (lambda: None))  # the thread, not this coroutine, lets the federation go (O11)
+
+    def work() -> None:
+        if not share.begin():  # its share was given up for it already: the check never runs
+            end()
+            return
+        try:
+            check(*args)
+        finally:
+            try:
+                end()
+            finally:
+                share.end()  # last: the federation stays held until the thread has ended
+
+    running = asyncio.ensure_future(asyncio.to_thread(work))
+    running.add_done_callback(lambda done: done.cancelled() or done.exception())
+    running.add_done_callback(lambda _: share.never_ran())
+    await asyncio.shield(running)
+
+
 class ToolServerLauncher:
     """Starts the tool server of a condition for a run, stops it again, and checks at the end that its plane held.
 
@@ -223,7 +323,9 @@ class ToolServerLauncher:
         """Re-verify the tool plane after the server stopped; raise InfraError of kind tool_plane_integrity unless it held."""
         label = self._config.condition_label(condition)
         try:
-            await asyncio.to_thread(_recheck, self._issuer, self._config, chosen, token, ceiling_s)
+            await _in_counted_thread(
+                self._config, CHECK_AT_STOP, _recheck, self._issuer, self._config, chosen, token, ceiling_s
+            )
         except PrivilegesMismatch as changed:
             detail = f"{label}: the tool plane's rights changed during the run: {changed}"
             error = InfraError(INTEGRITY_KIND, detail)
@@ -245,40 +347,60 @@ class ToolServerLauncher:
         ceiling_s: float,
         extra_env: Mapping[str, str] | None = None,
         principal: Principal | None = None,
+        process: ServerProcess | None = None,
     ) -> AsyncIterator[McpToolProvider]:
         """Start the server for a condition and yield its tool provider; stop it on leaving.
 
         `principal` is the leased slot's tool-server user (`SandboxPlatform.tool_server` passes it): a token minted for
         any other user is refused before anything starts, so the plane's principal is the run's own slot's (C19).
 
+        `process` is where a backend runs the server (`SandboxPlatform.tool_server` passes the sandbox's
+        `tool_server_process()` when it has one, O56): its home and working directory, and its settings, which
+        `extra_env` may not set (`ValueError`); the server's environment is then named whole (the module's
+        docstring). Without it the server's process is as it always was.
+
         The start and the stop are each inside `ctx.infrastructure_wait("toolserver_lifecycle")`. A token that fails its
         examination, a principal whose privileges differ from the condition's rights, and a read of either that fails
         (an outage included) raise `InfraError` of kind `tool_plane_integrity` before the server is started; a server
         that fails to start is the server's own. `ceiling_s` is the same value the token was minted for, so a token that
-        cannot last the run fails here.
+        cannot last the run fails here; the platform's `tool_server` passes the ceiling its launch minted for and
+        refuses another.
 
         On leaving, after the server has stopped, the principal's privileges and the token are checked again: a
         change from the condition's declared rights records `tool_plane_rights_changed` and raises `InfraError` of kind
         `tool_plane_integrity`, which replaces any exception of the run's body, because the run is set aside whatever
         it did.
+
+        From before its first check to the end of that last one, the launch is a step of the run that uses its token,
+        counted on the run's admission (`admission.token_step`), so the fault injector's restore can tell that it
+        still runs and that a heal might outlast the token (O35). On a platform with `[faults]` each check starts only
+        under the run's admission, held then: one that is not held refuses the check before it starts, naming it
+        (`admission.TokenStepRefused`), and that refusal is raised, at the start or at the stop.
         """
         if principal is not None and token.subject != principal.user_id:
             raise ValueError("the tool-server token was not minted for the leased slot's tool-server user")
         require_admission(self._config)  # a platform with a fault injector: the run holds the federation (O11)
         server, chosen = _server(self._config), self._config.condition(condition)
-        with _private_bundle(self._config) as ca_copy:  # the run's copy of the verified CA bytes, gone with the server
-            env = server_environment(self._config, chosen, token, extra_env, ca_copy=ca_copy)
+        with (
+            token_step(TOOL_SERVER_STEP),  # ended only once the re-verification at teardown has ended
+            _private_bundle(self._config) as ca_copy,  # the run's copy of the verified CA bytes, gone with the server
+        ):
+            env = server_environment(self._config, chosen, token, _placed(extra_env, process), ca_copy=ca_copy)
+            command, args = _spawned(server, env, process)
             provider = McpToolProvider(
-                server.command,
-                server.args,
+                command,
+                args,
                 frozen=chosen.manifest,
                 env=env,
+                cwd=None if process is None else process.home,
                 allowed_tools=chosen.allow,
                 start_timeout_s=server.start_timeout_s,
             )
             async with ctx.infrastructure_wait(WAIT_KIND):
                 try:
-                    await asyncio.to_thread(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
+                    await _in_counted_thread(
+                        self._config, CHECK_BEFORE_START, _prepare, self._issuer, self._config, chosen, token, ceiling_s
+                    )
                 except TokenRefused as refused:
                     label = self._config.condition_label(condition)
                     raise _integrity_failure(label, "before the start", refused) from None

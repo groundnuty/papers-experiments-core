@@ -87,7 +87,7 @@ def sandbox_data() -> dict[str, Any]:
             "shm_bytes": 1 << 26,
             "work_disk_bytes": 1 << 28,
         },
-        "mount": {"path": MOUNT_PATH},
+        "mount": {"path": MOUNT_PATH, "io_mode": "proxy"},  # a mount table declares how oneclient reaches storage (O36)
         "data_paths": {**LEVELS, COMPLETE_LEVEL: {"kind": "rest", "listing": "complete"}},
         "content_check_file": CHECK_FILE,
     }

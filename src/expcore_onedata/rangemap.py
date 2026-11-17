@@ -27,8 +27,12 @@ transfer_settle_s = 30.0        # the wait between two observations of the trans
 transfer_settle_polls = 4       # the most observations of the listing before it counts as not settled (2 or more)
 clock_skew_allowance_s = 5.0    # added to the providers' clock offsets that widen the run's window (O08)
 concurrency = 16                # the most requests a bulk operation has in flight at once (eviction, block maps, reset)
-qos_scan = "summaries"          # how the reset finds QoS requirements: "summaries" (a read per leaf) or "listing" (O33)
+qos_scan = "listing"            # how the reset finds QoS requirements: "listing" or "summaries" (a read per leaf, O33)
 qos_fulfil_timeout_s = 120      # the longest the reset waits for a run's QoS requirement to be fulfilled before deleting it
+reset_concurrency = 4           # the spaces a reset of several spaces works on at once (`resetspaces.py`)
+reset_shortcut = false          # re-read only held and transferred files after the eviction (`resetgrant.py`; needs [faults])
+reset_exclusive_wait_s = 60     # no longer used: a reset waits within [faults] admission_timeout_s, then refuses
+provider_concurrency = 16       # the most of a reset's per-file reads in flight at one provider, every space together
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
@@ -41,12 +45,14 @@ Every message names the file and the key and never echoes a value. `trace_reads`
 the study runs its own code on a local copy and the map records every byte that code read.
 """
 
+import hashlib
 import io
+import json
 import math
 import os
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -62,10 +68,13 @@ PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")
 # threshold, which with these defaults is every full chunk, is sent on a new connection (`OnezoneClient.mutate`).
 DEFAULT_CHUNK_BYTES = 16 << 20
 DEFAULT_FRESH_CONNECTION_BYTES = 16 << 20
-# How the reset finds a space's QoS requirements (O33): `summaries`, a summary per leaf on every provider (the default
-# until the listing's two live facts are verified, `tests/live/test_qos_listing.py`), or `listing`, one recursive
-# listing with `effQosInheritancePath` and a summary per entry a requirement is on.
+# How the reset finds a space's QoS requirements (O33): `listing` (the default), one recursive listing with
+# `effQosInheritancePath` and a summary per entry a requirement is on, or `summaries`, a summary per leaf on every
+# provider. The listing became the default after the 14 Nov 2026 live slot showed it takes `include_directories` and
+# finds a requirement added through another provider (`resetqos.py`); it is in no fingerprint, so a study's store
+# does not depend on it.
 QOS_SCANS = ("summaries", "listing")
+DEFAULT_QOS_SCAN = "listing"
 
 
 @dataclass(frozen=True)
@@ -79,15 +88,40 @@ class PlacementSettings:
     consecutive_polls: int = 2
     request_timeout_s: float = 900.0
     chunk_bytes: int = DEFAULT_CHUNK_BYTES
-    fresh_connection_bytes: int = DEFAULT_FRESH_CONNECTION_BYTES  # a write this large: a new connection
     probe_attempts: int = 3
     probe_backoff_s: float = 1.0
     transfer_settle_s: float = 30.0  # at least the lag of a provider's transfer listing behind a new job
     transfer_settle_polls: int = 4
     clock_skew_allowance_s: float = 5.0  # beyond the providers' estimated clock offsets
     concurrency: int = 16  # the named bound on a bulk operation's requests in flight (eviction, block maps, reset)
-    qos_scan: str = QOS_SCANS[0]  # how the reset finds QoS requirements (`resetqos.py`); see QOS_SCANS
+    qos_scan: str = DEFAULT_QOS_SCAN  # how the reset finds QoS requirements (`resetqos.py`); see QOS_SCANS
     qos_fulfil_timeout_s: float = 120.0  # the reset's wait for a requirement to be fulfilled (`resetremove.py`)
+    # Last, so a caller that passes the settings positionally keeps the order it had before #196 (O25): every field
+    # added later goes at the end of the class.
+    fresh_connection_bytes: int = DEFAULT_FRESH_CONNECTION_BYTES  # a write this large: a new connection
+    reset_concurrency: int = 4  # the spaces a reset of several works on at once (`resetspaces.py`)
+    # A reset given a planner's reading made under the reset lock's exclusive hold re-reads only the files the reading
+    # showed held and those a transfer touched since (`resetgrant.py`, O51); off, every file is read.
+    reset_shortcut: bool = False
+    # Accepted and checked, and no longer used (O66): every reset waits for the reset lock within `[faults]
+    # admission_timeout_s` and refuses at that bound, rather than doing the full reads beside another holder.
+    reset_exclusive_wait_s: float = 60.0
+    # The most reads of a reset's readings (block maps; the QoS scans' root, pages, summaries and records) in flight at
+    # one provider, every space and planner reading of the process together (`readslots.py`, O46, O51).
+    provider_concurrency: int = 16
+
+    def reset_settings(self) -> dict[str, Any]:
+        """The settings the core records at a start and compares at a resume, `StudyPlugin(reset_settings=...)` (C35).
+
+        Every field after its default, as `placement.<name>`: numbers and text only. Those that change only how
+        placement and the reset work are in no fingerprint, so a campaign resumed after one changed (or after a default
+        changed under a file that never declared it) says so; those a run's own instruments read inside its attempt
+        (`runsettings.PLACEMENT_IN_RUN`) are in the fingerprint as well, so a resume under another of them is refused
+        before this comparison is made. The data provider's name is
+        left out, since the record travels with the export and the replication package, which name no provider. The
+        map is not here either: `Placement.reset_settings()` adds it, as its digest.
+        """
+        return {f"placement.{item.name}": getattr(self, item.name) for item in fields(self) if item.name != "holder"}
 
 
 @dataclass(frozen=True)
@@ -123,6 +157,29 @@ class RangeMap:
         """Return the bytes the map asks to be placed, over all rows."""
         return sum(length for row in self.rows for _, length in row.ranges)
 
+    def canonical(self) -> str:
+        """The map in one form that does not depend on how the file wrote it (C35): a JSON array of the rows sorted by
+        space, file and receiving provider, each an object of `file`, `provider`, `ranges` (the merged
+        `[offset, length]` pairs) and `space`, with the keys sorted and no spaces. The same rows in another order, or
+        ranges written unmerged, give the same text. Nothing else of the platform hashes the map, so this is its
+        definition."""
+        rows = sorted(self.rows, key=lambda row: (row.space, row.file, row.provider))
+        entries = [
+            {
+                "file": row.file,
+                "provider": row.provider,
+                "ranges": [[offset, length] for offset, length in merged(row.ranges)],
+                "space": row.space,
+            }
+            for row in rows
+        ]
+        return json.dumps(entries, sort_keys=True, separators=(",", ":"))
+
+    def digest(self) -> str:
+        """The SHA-256, in lower-case hexadecimal, of the UTF-8 bytes of `canonical()`: all that is recorded of the map,
+        since a row names a file and a provider and the record is shipped with the export."""
+        return hashlib.sha256(self.canonical().encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True)
 class Placement:
@@ -130,6 +187,15 @@ class Placement:
 
     settings: PlacementSettings
     map: RangeMap
+
+    def reset_settings(self) -> dict[str, Any]:
+        """What a study gives its plugin as `StudyPlugin(reset_settings=...)` (C35): the settings
+        (`PlacementSettings.reset_settings`) and the map as one setting, `placement.range_map_sha256`, its digest.
+
+        The map decides which bytes a state places, so a resume after it changed starts from another state, which is
+        what the core's warning is for; the digest says that it changed and never what it holds, since a row names a
+        file and a provider."""
+        return {**self.settings.reset_settings(), "placement.range_map_sha256": self.map.digest()}
 
 
 def safe_path(path: str) -> tuple[str, ...]:
@@ -251,14 +317,27 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "concurrency",
             "qos_scan",
             "qos_fulfil_timeout_s",
+            "reset_concurrency",
+            "reset_shortcut",
+            "reset_exclusive_wait_s",
+            "provider_concurrency",
         )
     )
     holder = table.string("holder")
     if holder not in config.providers:
         raise table.fail("holder", "must be a provider declared in [providers]")
-    qos_scan = table.optional_string("qos_scan") or QOS_SCANS[0]
+    qos_scan = table.optional_string("qos_scan") or DEFAULT_QOS_SCAN
     if qos_scan not in QOS_SCANS:
         raise table.fail("qos_scan", f"must be one of {', '.join(QOS_SCANS)}")
+    shortcut = table.data.get("reset_shortcut", False)
+    if not isinstance(shortcut, bool):
+        raise table.fail("reset_shortcut", "must be true or false")
+    if shortcut and "faults" not in root.data:
+        raise table.fail(
+            "reset_shortcut",
+            "needs a [faults] table: the shortcut rests on the federation's reset lock, which only a "
+            "federation with [faults] has",
+        )
     settings = PlacementSettings(
         holder=holder,
         poll_s=_number(table, "poll_s", 2.0, minimum=0.001),
@@ -278,6 +357,10 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         concurrency=_number(table, "concurrency", 16, minimum=1, integer=True),
         qos_scan=qos_scan,
         qos_fulfil_timeout_s=_number(table, "qos_fulfil_timeout_s", 120.0, minimum=0),
+        reset_concurrency=_number(table, "reset_concurrency", 4, minimum=1, integer=True),
+        reset_shortcut=shortcut,
+        reset_exclusive_wait_s=_number(table, "reset_exclusive_wait_s", 60.0, minimum=0),
+        provider_concurrency=_number(table, "provider_concurrency", 16, minimum=1, integer=True),
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))

@@ -45,10 +45,12 @@ scenario, the scratch's teardown included, and the injector takes that admission
 Failed: the target answered while it was down, it could not be restored or did not answer or read back after the
 restore, the scratch was not shown gone, a measurement raised, or the sandbox's teardown or the tool plane's check at
 its stop failed. A space whose provider is not shown back (not
-cleared, or not answering REST again) halts the spaces after it, and so does a space whose start could not settle an
-injection an earlier run left open, or left one open: nothing of that space was stopped, but a provider may still be
-down, so the check fails naming it by its position. A start that fails with nothing open (a service that cannot be read
-before the stop) only leaves that space unknown. Unknown: anything the check could not do or measure,
+cleared, or not answering REST again) halts the spaces after it, and so does a space whose injector could not settle an
+injection an earlier run left open, or left one open: nothing of that space was prepared or stopped, but a provider may
+still be down, so the check fails naming it by its position. The injector's recovery of such an injection runs before
+anything is prepared, so a provider an earlier run left stopped is restarted first and the space then runs as usual,
+with what was settled recorded as `earlier_injection` (#178). A start that fails with nothing open (a service that
+cannot be read before the stop) only leaves that space unknown. Unknown: anything the check could not do or measure,
 with the reason: a mount the platform declares and that was not read, a tool not called, or the sandbox or the tool
 server not started (starting them needs `Context.agent_host`, which `EXPCORE_LIVE_DOCKER=1` gives the runner). What a
 cell answered is a fact, never a failure.

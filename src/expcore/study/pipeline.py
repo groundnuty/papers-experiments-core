@@ -5,14 +5,17 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 (`runs/<digest>/try<N>/`, one record and one outcome marker each), and what `analyse_study` writes (`export.json`,
 `scores.json`, `analysis.json`).
 
-- `run_study` opens or resumes the campaign and runs the scheduler. Its code identity is computed once, from the study
-  directory and the scope study.toml names, and every record carries it. Its environment (the distributions the
-  study's code imports, `provenance.environment`) goes into the campaign fingerprint, so a resume under another one
-  is refused (C06). Each hold is said on stderr once, as it begins, changes or ends, with when dispatch resumes, so a
-  run waiting out a pause is not silent. With a `shard` (#154) it runs that shard's part of the plan: the fingerprint
-  is still computed from the totals, of the whole plan, and only then are the caps and the budget replaced by the
-  shard's shares and the plugin's environment identity read, once. A shard says its environment on stderr as it
-  starts (`campaign.shard_run.environment_block`), so a host that differs from the others shows before it runs.
+- `run_study` loads a study directory and calls `run_built_study`, the one public way into a campaign, which a study
+  that builds its own `StudyConfig` (a smoke cut, a selection) calls too. It checks the config (`config.check_study`),
+  holds the study's own kinds in scope, then opens or resumes the campaign and runs the scheduler. The code identity
+  is computed once, from the study directory and the scope study.toml names, and every record carries it. The
+  environment (the distributions the study's code imports, `provenance.environment`) goes into the campaign
+  fingerprint, so a resume under another one is refused (C06). Each hold is said on stderr once, as it begins,
+  changes or ends, with when dispatch resumes, so a run waiting out a pause is not silent. With a `shard` (#154) it
+  runs that shard's part of the plan: the fingerprint is still computed from the totals, of the whole plan, and only
+  then are the caps and the budget replaced by the shard's shares and the plugin's environment identity read, once.
+  A shard says its environment on stderr as it starts (`campaign.shard_run.environment_block`), so a host that
+  differs from the others shows before it runs.
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
@@ -43,6 +46,7 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 """
 
 import collections
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -50,22 +54,32 @@ import math
 import os
 import sys
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.campaign.executor import default_backend_factory
-from expcore.campaign.export import export_run_state, export_text
+from expcore.campaign.export import (
+    EXPORT_FINGERPRINT,
+    NOT_RECORDED,
+    ExportError,
+    export_run_state,
+    export_text,
+    stored_fingerprint_sha256,
+    verify_export_fingerprint,
+)
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
+from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
 from expcore.campaign.merged import read_held, verify_merged, verify_queried
 from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
+from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import MERGE_FILE, ModelShards, ShardError, ShardSpec, by_model, check_identity, pair_of
 from expcore.campaign.shard_run import (
@@ -76,17 +90,24 @@ from expcore.campaign.shard_run import (
     share_settings_by_model,
 )
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.campaign.storecopy import StoreChanged
 from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
+from expcore.config.platform_loads import watching_platform_loads
+from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
 from expcore.errors import study_kinds
+from expcore.guards import GuardsAnalysis, guards_analysis
 from expcore.models.route import sdk_version
+from expcore.mountguard.sensitivity import MountGuardAnalysis, mount_guard_analysis
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
-from expcore.provenance.environment import EnvironmentUnknown, differences, environment
+from expcore.provenance.core_check import require_core
+from expcore.provenance.environment import EnvironmentUnknown, differences, environment, is_earlier_form
 from expcore.records.build import CORE_DISTRIBUTION
 from expcore.records.record import RunRecord
 from expcore.records.rescore import rescore, scorer_name, scorer_version
 from expcore.replay.check import (
+    CHECK_FILE,
     BatchNotVerified,
     require_current_check,
     verify_batch,
@@ -95,24 +116,32 @@ from expcore.replay.check import (
     write_check,
 )
 from expcore.replay.native import has_native_parser
+from expcore.replay.side_file_placement import settle_side_files
 from expcore.report import render_report
-from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
+from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
+from expcore.stats.ratio import OMIT_NONE
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
     MODELS_FILE,
     OUT_DIR,
     StudyConfig,
     StudyIdentity,
+    check_study,
     find_study_root,
     import_platforms,
     load_study,
     read_study_identity,
     shard_budgets_of,
 )
+from expcore.study.core_legacy import earlier_core_fingerprint, earlier_core_hint
 from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
+from expcore.study.platform_deferral import platform_deferrals
+from expcore.study.platform_legacy import legacy_fingerprint_of
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
+from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
+from expcore.visibility.sensitivity import VisibilityAnalysis, visibility_analysis
 
 RUNS_DIR = "runs"
 MARKER_PATTERN = "*attempt-marker.json"
@@ -141,6 +170,10 @@ class StudyAnalysis:
     rows: tuple[Row, ...]
     result: AnalysisResult
     scorers: Mapping[str, str]  # the version of each scorer that scored the records, by name
+    egress: EgressAnalysis | None = None  # a batch checked for egress: the verdicts and the sensitivity analysis
+    mount_guard: MountGuardAnalysis | None = None  # a batch whose mount was guarded: the same, of the mount (O60)
+    guards: GuardsAnalysis | None = None  # a batch checked by both: the rerun without the runs either leaves out
+    visibility: VisibilityAnalysis | None = None  # a batch watched for hidden processes: the same, of those (O56)
 
 
 def out_dir(study: StudyConfig | StudyIdentity) -> Path:
@@ -177,6 +210,18 @@ def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:
         raise Refused(f"{study.root}: {error}") from None
 
 
+def environment_like(study: StudyConfig | StudyIdentity, recorded: object) -> dict[str, Any]:
+    """The environment in use, in the form `recorded` holds the core in: by how it was installed for a campaign an
+    earlier core recorded (`study.core_legacy`), which its own resume, check, analysis and package compare it with,
+    else by its identity, as `study_environment` gives it."""
+    if not is_earlier_form(recorded):
+        return study_environment(study)
+    try:
+        return environment(study.requires, earlier_core=True)
+    except EnvironmentUnknown as error:
+        raise Refused(f"{study.root}: {error}") from None
+
+
 def campaign_environment(fingerprint: Mapping[str, Any] | None) -> Any:
     """The environment a campaign's fingerprint records; None when it records none."""
     return None if fingerprint is None else fingerprint.get("environment")
@@ -207,15 +252,69 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
     )
 
 
+def campaign_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """The campaign fingerprint a start of the study at `path` pins (C06), without starting it or opening a store:
+    its configuration checked and its code vouched for as `run` holds them (`require_known`, no dirty code), its plugin
+    loaded with the study's kinds in scope, and `fingerprint_of` of both, in the earlier form of a store `out/` already
+    holds when the platform keeps one (C06), as `_build` makes it. The HPC shard driver's
+    `resume-line` (deploy/hpc-federation/shardresume.py) compares it with what a shard's snapshot pins before a node
+    is taken for its resume."""
+    study = load_study(path)
+    check_study(study)
+    with study_kinds(study.kinds):
+        code = require_known("run", study.root, study.scope, allow_dirty=False)
+        plugin = load_plugin(StudyContext(study, code))
+        fingerprint = fingerprint_of(study, plugin)
+        store = out_dir(study) / STATE_FILE
+        if plugin.platform_legacy is not None and store.is_file():  # C06: a store of the earlier form, as `_build`
+            fingerprint = legacy_fingerprint_of(read_fingerprint(store), fingerprint, plugin.platform_legacy)
+        return fingerprint
+
+
 def run_study(
     path: str | os.PathLike[str],
     *,
     allow_dirty: bool = False,
     code_root: str | os.PathLike[str] | None = None,
     crash_hook: Callable[[str, str], None] | None = None,
-    shard: ShardSpec | None = None,
+    shard: Spec | None = None,
+    after: Sequence[str | os.PathLike[str]] = (),
+    spend_journal: str | os.PathLike[str] | None = None,
 ) -> RunSummary:
-    """Open or resume the study's campaign and run the scheduler until nothing more can start.
+    """Load the study at `path` and run its campaign: `run_built_study` of what `load_study` returned.
+
+    Every argument but the path is `run_built_study`'s. A study that builds its own configuration, a smoke cut to
+    fewer conditions or a selection, has no directory to name and calls `run_built_study` with it.
+    """
+    return run_built_study(
+        load_study(path),
+        allow_dirty=allow_dirty,
+        code_root=code_root,
+        crash_hook=crash_hook,
+        shard=shard,
+        after=after,
+        spend_journal=spend_journal,
+    )
+
+
+def run_built_study(
+    study: StudyConfig,
+    *,
+    allow_dirty: bool = False,
+    code_root: str | os.PathLike[str] | None = None,
+    crash_hook: Callable[[str, str], None] | None = None,
+    shard: Spec | None = None,
+    after: Sequence[str | os.PathLike[str]] = (),
+    spend_journal: str | os.PathLike[str] | None = None,
+) -> RunSummary:
+    """Open or resume the campaign of a `StudyConfig` and run the scheduler until nothing more can start.
+
+    The one way into a campaign, for a study read from disk (`run_study` loads it and calls this) and for one that
+    built its configuration in code (`dataclasses.replace` of a loaded study's campaign or tasks: a smoke, a
+    selection). It first holds the config to what the loader holds a study to (`config.check_study`), refusing with a
+    `ConfigError` naming the key before any store, lease or code identity is touched, then holds the study's own kinds
+    in scope for the whole run (`errors.study_kinds`), so the attempts end in them and every thread the run starts,
+    the executor's included, sees them. Calling the private `_run_campaign` instead skips both.
 
     Refuses code that cannot be vouched for (unknown, stale, or dirty unless `allow_dirty`). The scheduler returns when
     no run is in flight and every pending run is held by something that will not end by itself (a budget, a stop):
@@ -223,11 +322,26 @@ def run_study(
     when it supplies none. `crash_hook` is the scheduler's own test seam for killing the process at a chosen point of
     an attempt. With `shard` the campaign is that shard of N: its part of the plan, its shares of the caps and the
     budget, and the environment identity the plugin gives, kept in the store (`campaign.shard_run`); a shard that has
-    no run, or whose share of a total is nothing, is refused before the store is touched.
+    no run, or whose share of a total is nothing, is refused before the store is touched. A `SelectionSpec` runs the
+    selected runs instead (C38, `study.selection_start`), after the earlier selections `after` names when sequential:
+    the same entry for a selection of a study read from disk and of one built in code, so either keeps the study's
+    kinds in scope. With `spend_journal`, a new file, the dispatcher journals what it spends there, and first counts
+    what the other journals beside it hold that the store lacks (a store copied back after a kill, O62:
+    `campaign.lost_spend`).
+
+    The store is `<study.root>/out`, and the campaign fingerprint covers the plan (the schema, tasks, models and
+    seeds), so a cut config refuses to resume the store of the whole study (C06): run a smoke from a copy of the study
+    directory, or from one whose `out/` is not the real campaign's.
     """
-    study = load_study(path)
+    if not isinstance(study, StudyConfig):
+        raise TypeError(
+            f"run_built_study takes a StudyConfig, not {type(study).__name__}; run_study takes the path of a study "
+            "directory"
+        )
+    check_study(study)
+    journal = None if spend_journal is None else Path(spend_journal)
     with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
-        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard)
+        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard, [Path(p) for p in after], journal)
 
 
 def _run_campaign(
@@ -235,20 +349,27 @@ def _run_campaign(
     allow_dirty: bool,
     code_root: str | os.PathLike[str] | None,
     crash_hook: Callable[[str, str], None] | None,
-    shard: ShardSpec | None = None,
+    shard: Spec | None = None,
+    after: Sequence[Path] = (),
+    spend_journal: Path | None = None,
 ) -> RunSummary:
-    """Run the campaign of a loaded study, with its own infrastructure kinds in scope."""
+    """Internal: the body of `run_built_study`, which is the one to call.
+
+    It runs the campaign of a study whose kinds are already in scope (`errors.study_kinds`) and whose configuration is
+    already checked (`config.check_study`), and does neither itself: a caller that reaches it directly gets a run
+    whose threads refuse the study's own `InfraError` kinds as unknown ones, and a config no one has checked.
+    """
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
-    plugin = load_plugin(StudyContext(study, code))
+    require_core("run", allow_dirty=allow_dirty)  # the core is held to the rule the study's code is (P01)
+    declared = platform_deferrals(study)  # from each platform's own configuration, before any study code runs (C11)
+    # the study's build, from its plugin's import to what the pipeline derives from it, is watched for the platform
+    # loaders it runs, and the watch ends before the scheduler starts: it holds no build open for the campaign's length
+    with watching_platform_loads() as loaded:
+        plugin, leases, settings, fingerprint, manifest, started = _build(study, code, shard, after)
     out = out_dir(study)
-    leases = None if plugin.probe is None else LeasePool(out / "leases", plugin.lease_keys, plugin.probe)
-    settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
-    fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
-    manifest, started = study.manifest, None
-    if shard is not None:
-        manifest, settings, started = _shard_of(study, plugin, settings, shard)
-        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
-    options = {} if crash_hook is None else {"crash_hook": crash_hook}
+    options: dict[str, Any] = {} if crash_hook is None else {"crash_hook": crash_hook}
+    if spend_journal is not None:
+        options["spend_journal"] = spend_journal
     try:
         with Scheduler(
             out,
@@ -267,14 +388,74 @@ def _run_campaign(
             backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
             on_hold=_say_hold,
             shard=started,
+            reset_settings=plugin.reset_settings,
+            platform_deferrals=declared,
+            listed_platforms=study.platforms,
+            platform_loads=tuple(loaded),  # what the build loaded through the core's loaders, whatever the plugin hides
             **options,
         ) as scheduler:
+            _say_lost(scheduler.lost_counted)
             return scheduler.run()
     except FingerprintMismatch as refused:
-        hint = _counted_key_locations(study, read_fingerprint(out / STATE_FILE))
+        recorded = read_fingerprint(out / STATE_FILE)
+        hint = _counted_key_locations(study, recorded) + earlier_core_hint(recorded, refused.differences)
         if not hint:
             raise
         raise FingerprintMismatch(refused.differences, hint=hint) from None
+
+
+def _build(
+    study: StudyConfig, code: Mapping[str, Any], shard: Spec | None, after: Sequence[Path]
+) -> tuple[StudyPlugin, LeasePool | None, SchedulerConfig, dict[str, Any], Manifest, ShardStart | None]:
+    """The study's plugin and what the pipeline derives from it before a scheduler starts: the lease pool, the
+    scheduler's settings, the campaign's fingerprint, and the manifest and the start of a shard or a selection. This is
+    the study's build, which runs the study's own code (`run_built_study` watches it for platform loaders)."""
+    plugin = load_plugin(StudyContext(study, code))
+    leases = None if plugin.probe is None else LeasePool(out_dir(study) / "leases", plugin.lease_keys, plugin.probe)
+    settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
+    fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
+    recorded = _store_fingerprint(out_dir(study) / STATE_FILE)
+    fingerprint = earlier_core_fingerprint(  # C06: a store an earlier core recorded
+        recorded, fingerprint, lambda: environment_like(study, campaign_environment(recorded))
+    )
+    if plugin.platform_legacy is not None and recorded is not None:  # C06: a store of the earlier form
+        fingerprint = legacy_fingerprint_of(recorded, fingerprint, plugin.platform_legacy)
+    manifest, started = study.manifest, None
+    if isinstance(shard, SelectionSpec):
+        try:
+            manifest, settings, started = selection_start(
+                study, settings, shard, fingerprint=fingerprint, environment=_identity_of(study, plugin), after=after
+            )
+        except ShardError as error:
+            raise Refused(str(error)) from None
+        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
+    elif shard is not None:
+        manifest, settings, started = _shard_of(study, plugin, settings, shard)
+        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
+    return plugin, leases, settings, fingerprint, manifest, started
+
+
+def _store_fingerprint(store: Path) -> dict[str, Any] | None:
+    """The fingerprint a store records, for a start to present it in the form the store holds; None without a store,
+    or when a dispatcher is writing it as it is copied (the scheduler then refuses the start under its lock)."""
+    if not store.is_file():
+        return None
+    try:
+        return read_fingerprint(store)
+    except StoreChanged:
+        return None
+
+
+def _say_lost(counted: Mapping[str, Any] | None) -> None:
+    """Say what this start counted of the spend journals beside its own (O62), when it counted anything lost."""
+    if not counted or not (counted["attempts"] or counted["charges_usd"]):
+        return
+    charges = ", ".join(f"{model} {usd:.6f} USD" for model, usd in counted["charges_usd"].items()) or "none"
+    print(
+        f"run: the store lacked spend that the spend journals hold ({counted['journals']} journal(s)): "
+        f"{counted['attempts']} attempt(s), and top-ups and probe sends of {charges}; counted as lost_in_kill",
+        file=sys.stderr,
+    )
 
 
 def _counted_key_locations(study: StudyConfig, recorded: Mapping[str, Any] | None) -> str:
@@ -401,29 +582,40 @@ def _check_batch_of(
 ) -> dict[str, Any]:
     """Snapshot the store and replay the batch of a study, with its own infrastructure kinds in scope."""
     code = require_known("replay check", code_root or study.root, study.scope, allow_dirty=allow_dirty)
+    require_core("replay check", allow_dirty=allow_dirty)
     directory = Path(batch)
     if not directory.is_dir():
         raise Refused(f"{directory}: no batch of records here; run the study first")
-    env = study_environment(study)
     store = out_dir(study) / STATE_FILE
     if (out_dir(study) / MERGE_FILE).is_file():
         if store.is_file():
             raise Refused(
                 f"{out_dir(study)}: holds a merged batch ({MERGE_FILE}) and a campaign store; use one or the other"
             )
-        return _check_merged(study, directory, code, env, partial)
-    if store.is_file():  # without a store, take_snapshot refuses below
-        changed = differences(campaign_environment(read_fingerprint(store)), env)
+        return _check_merged(study, directory, code, partial)
+    if not store.is_file():
+        raise Refused(f"{store}: no campaign store here; run the study first")
+    lock, in_place = _hold_for_check(store, partial)
+    try:
+        try:
+            recorded = read_fingerprint(store, in_place=in_place)
+        except StoreChanged as error:
+            raise Refused(str(error)) from None
+        env = environment_like(study, campaign_environment(recorded))
+        changed = differences(campaign_environment(recorded), env)
         if changed:
             raise Refused(
                 f"{store}: the campaign ran under another environment than this check would; check under the "
                 "campaign's environment:\n  " + "\n  ".join(changed)
             )
-    import_what_the_records_need(study, directory)
-    try:
-        running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
-    except SnapshotError as error:
-        raise Refused(str(error)) from None
+        import_what_the_records_need(study, directory)
+        try:
+            running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial, in_place=in_place)
+        except SnapshotError as error:
+            raise Refused(str(error)) from None
+    finally:
+        lock.release()
+    _settle_side_files(study, directory)
     check = verify_batch(
         directory, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
     )
@@ -432,9 +624,74 @@ def _check_batch_of(
     return check
 
 
-def _check_merged(
-    study: StudyIdentity, directory: Path, code: Mapping[str, Any], env: Mapping[str, Any], partial: bool
-) -> dict[str, Any]:
+def _hold_for_check(store: Path, partial: bool) -> tuple[ReaderLock, bool]:
+    """How the check reads the store: a reader's hold of its lock and whether to read it in place (R16).
+
+    A finished store (no dispatcher holds it, its directory read-only too) is held as a reader, so no dispatcher
+    starts while it is read, and read from a private copy (False). A store a dispatcher holds is being written, so no
+    copy of its files is one state: the check is refused unless `partial`, and then the store is backed up in place
+    over a read-only connection (True), the one consistent read of a live store. A store whose lock file is missing
+    or cannot be opened or locked cannot be shown to have no writer, so it is refused, `partial` or not.
+    """
+    lock = ReaderLock(store.parent)
+    try:
+        return lock.acquire(), False
+    except CampaignLocked as error:
+        if not partial:
+            raise Refused(
+                f"{store}: {error}; a dispatcher holds the store while it runs: check it once the dispatcher has "
+                "stopped, or pass --partial to check the store as it stands"
+            ) from None
+        return lock, True
+    except LockMissing as error:
+        raise Refused(
+            f"{store}: {error}; a campaign's out/ keeps the lock file its dispatcher made: copy out/ whole"
+        ) from None
+    except LockUnavailable as error:
+        raise Refused(f"{store}: {error}; the store cannot be shown to have no dispatcher") from None
+
+
+def _settle_side_files(study: StudyIdentity, batch: Path) -> None:
+    """Finish or remove what a kill left of the placement of a declared side file in the batch (R15), and say so.
+
+    A temporary file no record names is removed only while this process holds the lock of the campaign the batch belongs
+    to (the batch lies under the study's `out/`, so a copy named with `--study` is not that campaign's): with no
+    dispatcher alive no attempt can be staging a file of its own, and none can start before the lock is released. A lock
+    that cannot be taken (a campaign runs, the file system refuses `flock`, or the lock file is read-only, as in a
+    campaign fetched read-only), or a batch that is not the study's own, leaves such a file where it is; a rename that a
+    record names is finished either way. A study that declares no side file is not touched at all.
+    """
+    if not study.side_files:
+        return
+    lock = DispatchLock(out_dir(study))
+    if Path(batch).resolve().is_relative_to(out_dir(study).resolve()):
+        # a dispatcher is alive, or the lock file cannot be opened for writing (a campaign fetched read-only, R16):
+        # either way only what the records name is finished
+        with contextlib.suppress(CampaignLocked, PermissionError):
+            lock.acquire()
+    try:
+        for settled in settle_side_files(batch, study.side_files, remove_unnamed=lock.held):
+            print(f"check: {settled}", file=sys.stderr)
+    finally:
+        lock.release()
+
+
+def _settle_merged_side_files(study: StudyIdentity, batch: Path) -> None:
+    """Finish what a kill left of the placement of a declared side file in a merged batch (R15, #304), and say so.
+
+    Only a rename that a record names is finished (the hash is the record's, so it is safe whenever it is made), and
+    only a copy of a file already in place is removed. A file no record names is left: removing it needs the campaign's
+    lock as a proof that no attempt is staging, and a merged batch has none to take (it holds no store, `check` makes
+    no `campaign.lock` beside it, R16, and nothing prevents a campaign from being started in its out/ later); the
+    merge that wrote the batch dropped such files from its copy. Only `batch`, the merged batch's `runs/`, is walked:
+    merge.json, the shards' snapshots and the shards themselves are never touched. A directory that cannot be written
+    is reported as left, and the pairing of the check then says what is missing.
+    """
+    for settled in settle_side_files(batch, study.side_files):
+        print(f"check: {settled}", file=sys.stderr)
+
+
+def _check_merged(study: StudyIdentity, directory: Path, code: Mapping[str, Any], partial: bool) -> dict[str, Any]:
     """The replay check of a merged batch: merge.json is bound by its hash, each shard's snapshot is compared with the
     hash merge.json names and read under the environment in use, merge.json is rebuilt from the snapshots and the
     study's plan and must be that document (`campaign.merged`), and the records are replayed as one batch.
@@ -447,9 +704,13 @@ def _check_merged(
     raw = (out / MERGE_FILE).read_bytes()
     try:
         merged = read_merge(raw, out / MERGE_FILE)
-        held = read_held(out, merged)
+        loaded = load_study(study.root) if merged["rule"] == RULE_SELECTION else None
+        pricing = None if loaded is None else pricing_of(loaded)  # a selection's spend is checked again (C38)
+        held = read_held(out, merged, pricing)
     except MergeRefused as error:
         raise Refused(str(error)) from None
+    first = held[min(held)].fingerprint if held else None  # one form of the core in every shard, or refused below
+    env = environment_like(study, campaign_environment(first))
     for shard in held.values():
         changed = differences(campaign_environment(shard.fingerprint), env)
         if changed:
@@ -458,10 +719,11 @@ def _check_merged(
                 "campaign's environment:\n  " + "\n  ".join(changed)
             )
     try:
-        verify_merged(merged, held, load_study(study.root).manifest)
+        verify_merged(merged, held, (loaded or load_study(study.root)).manifest, pricing)
     except MergeRefused as error:
         raise Refused(str(error)) from None
     import_what_the_records_need(study, directory)
+    _settle_merged_side_files(study, directory)
     check = verify_batch(
         directory, code=code, hashed_only=[MARKER_PATTERN], environment=env, side_files=study.side_files
     )
@@ -520,9 +782,17 @@ def _write_text(path: Path, text: str) -> None:
 
 
 def _finite(value: Any) -> Any:
-    """Reduce a value to JSON data: dataclasses and mappings to dicts, sequences to lists, NaN and infinity to None."""
+    """Reduce a value to JSON data: dataclasses and mappings to dicts, sequences to lists, NaN and infinity to None.
+
+    A dataclass field whose metadata sets `OMIT_NONE` is left out while it is None (a ratio contrast's per-arm columns,
+    S13; a contrast's smallest effect of interest, S16), so a record that declares none is written byte for byte as
+    before the field existed; every other field is written, None as null."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {f.name: _finite(getattr(value, f.name)) for f in dataclasses.fields(value)}
+        return {
+            f.name: _finite(getattr(value, f.name))
+            for f in dataclasses.fields(value)
+            if not (f.metadata.get(OMIT_NONE) and getattr(value, f.name) is None)
+        }
     if isinstance(value, Mapping):
         return {str(k): _finite(v) for k, v in value.items()}
     if isinstance(value, list | tuple):
@@ -588,7 +858,9 @@ def _analyse_loaded(
     if not batch.is_dir():
         raise Refused(f"{out}: no campaign here; run the study first")
     code = code_version(code_root or study.root, study.scope, use_git=not stamped)
-    env = study_environment(study)
+    if not stamped:  # a package's check runs on the core its wheels install, pinned by hash (`core_check`)
+        require_core("analysis", allow_dirty=allow_dirty)
+    env = environment_like(study, _checked_environment(batch))
     try:
         check = require_current_check(
             batch,
@@ -610,7 +882,7 @@ def _analyse_loaded(
     if verified.merge is not None:  # what merge.json says must be what its snapshots say, for this plan
         try:
             queries = {index: snapshot.q for index, snapshot in verified.snapshots.items() if index is not None}
-            verify_queried(verified.merge, queries, out, study.manifest)
+            verify_queried(verified.merge, queries, out, study.manifest, pricing_of(study))
         except MergeRefused as error:
             verified.close()
             raise Refused(str(error)) from None
@@ -625,9 +897,10 @@ def _analyse_loaded(
     plugin = load_plugin(StudyContext(study, code))
     try:
         export = _export_of(verified, study.manifest)
+        _require_campaign(export, verified)
     finally:
         verified.close()
-    rows, scores = [], {}
+    rows, scores, runs = [], {}, []
     for entry in export["analysed_attempts"]:
         where = (entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
         record = verified.record_for(*where)
@@ -637,12 +910,29 @@ def _analyse_loaded(
         scores[entry["run_key"]] = scored.scores
         task = study.tasks[str(entry["factors"]["task"])]
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))
+        runs.append((record, entry["condition"]))
+    absent = _absent_runs(export)
     try:
-        result = analyse(rows, study.prereg, _absent_runs(export))
-    except TreatmentOutcomesRefused as error:
+        result = analyse(rows, study.prereg, absent)
+    except ContrastRefused as error:  # a treatment attempt's None (S10), a failed run's None numerator (S13)
         raise Refused(str(error)) from None
+    egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
+    guard = mount_guard_analysis(runs, rows, absent, study.prereg)  # None for a batch whose mount was not guarded
+    both = guards_analysis(rows, absent, study.prereg, egress, guard)  # None unless both guards checked the batch
+    seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
-    return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)
+    core = sdk_version(CORE_DISTRIBUTION)
+    return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen)
+
+
+def _checked_environment(batch: Path) -> Any:
+    """The environment a batch's stored check records, for the analysis to compute the one in use in its form; None
+    when there is no readable check, which `require_current_check` then refuses, naming why."""
+    try:
+        check = json.loads((batch / CHECK_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return check.get("environment") if isinstance(check, dict) else None
 
 
 def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
@@ -659,25 +949,159 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
     return join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
 
 
+def _require_campaign(export: Mapping[str, Any], verified: VerifiedBatch) -> None:
+    """Refuse an export that is not of the campaign the analysis read: its campaign fingerprint's hash must be that of
+    every snapshot, and, for a merged batch, the `fingerprint` merge.json names (C36). A snapshot that records no
+    fingerprint has nothing to compare with."""
+    held = [stored_fingerprint_sha256(snapshot) for snapshot in verified.snapshots.values()]
+    if verified.merge is not None:
+        held.append(verified.merge["fingerprint"])
+    try:
+        for expected in held:
+            if expected is not None:
+                verify_export_fingerprint(export, expected)
+    except ExportError as error:
+        raise Refused(str(error)) from None
+
+
+def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
+    """The Holm decisions `analysis.json` holds: `holm`, every member's decision as its own family made it, and,
+    only for several named families (S17), `holm_families`, each family's name, members, steps and equivalence
+    decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named.
+    Only for declared equivalence families (S18), `equivalence_families`: each one's name, members and steps over
+    their TOST p-values; a study that declares none keeps its analysis.json byte for byte. A sensitivity analysis
+    (egress, the mount guard, both) holds the same entries of its own result beside its `left_out` and `contrasts`."""
+    entries: dict[str, Any] = {"holm": result.holm}
+    if result.holm_families:
+        entries["holm_families"] = result.holm_families
+    if result.equivalence_families:
+        entries["equivalence_families"] = result.equivalence_families
+    return entries
+
+
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds: the preregistration, the code, the core, each condition's planned runs and how they
     ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
-    Holm decision. `exploratory_only` is true when the preregistration makes no confirmatory claim (S12): there is then
-    no Holm decision, and every contrast is exploratory."""
+    Holm decision, with each named family's steps (S17) and each declared equivalence family's (S18). `exploratory_only`
+    is true when the preregistration makes no confirmatory claim (S12): there is then no Holm decision, and every
+    contrast is exploratory."""
+    return (
+        {
+            "preregistration": dict(analysis.result.manifest),
+            "exploratory_only": analysis.result.exploratory_only,
+            "alpha": analysis.result.alpha,
+            "code": {key: analysis.code.get(key) for key in ("commit", "tree_sha256", "dirty")},
+            "core_version": analysis.core_version,
+            "scorers": dict(analysis.scorers),
+            "partial": analysis.export["partial"],
+            "running_attempts": analysis.export["running_attempts"],
+            "excluded_attempts": analysis.export["excluded_attempts"],
+            "conditions": condition_accounting(analysis.export),
+            "contrasts": analysis.result.contrasts,
+            **_holm_entries(analysis.result),
+        }
+        | ({} if analysis.egress is None else {"egress": _egress_summary(analysis.egress)})
+        | ({} if analysis.mount_guard is None else {"mount_guard": _mount_guard_summary(analysis.mount_guard)})
+        | ({} if analysis.guards is None else {"guards": _guards_summary(analysis.guards)})
+        | ({} if analysis.visibility is None else {"process_visibility": _visibility_summary(analysis.visibility)})
+    )
+
+
+def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of a batch checked for egress (#179): each analysed run's verdict (its flags, its
+    log's state and reasons, its outside destinations by address and port, its static-scan hits) and the sensitivity
+    analysis without the flagged runs (its Holm decisions and, as the primary analysis's, its named and equivalence
+    families, S17 and S18), or why there is none."""
+    sensitivity = egress.sensitivity
     return {
-        "preregistration": dict(analysis.result.manifest),
-        "exploratory_only": analysis.result.exploratory_only,
-        "alpha": analysis.result.alpha,
-        "code": {key: analysis.code.get(key) for key in ("commit", "tree_sha256", "dirty")},
-        "core_version": analysis.core_version,
-        "scorers": dict(analysis.scorers),
-        "partial": analysis.export["partial"],
-        "running_attempts": analysis.export["running_attempts"],
-        "excluded_attempts": analysis.export["excluded_attempts"],
-        "conditions": condition_accounting(analysis.export),
-        "contrasts": analysis.result.contrasts,
-        "holm": analysis.result.holm,
-    }
+        "counts": egress.counts(),
+        "runs": [
+            {
+                "run_key": run.run_key,
+                "attempt": run.attempt,
+                "condition": run.condition,
+                "flags": list(run.flags),
+                "log": run.log,
+                "unknown": list(run.unknown),
+                "outside": [
+                    {key: entry.get(key) for key in ("address", "port", "type", "attempts")} for entry in run.outside
+                ],
+                "scan": dict(run.scan),
+            }
+            for run in egress.runs
+        ],
+        "sensitivity": None
+        if sensitivity is None
+        else {"left_out": [run.run_key for run in egress.flagged], "contrasts": sensitivity.contrasts,
+              **_holm_entries(sensitivity)},
+        "sensitivity_refused": egress.refused,
+    }  # fmt: skip
+
+
+def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of a batch whose mount was guarded (O60): each analysed run's verdict (its flags, its
+    log's and its isolation's state and reasons, its accesses and tracers) and the sensitivity analysis without the
+    runs that are not clean, or why there is none."""
+    sensitivity = guard.sensitivity
+    return {
+        "counts": guard.counts(),
+        "runs": [
+            {
+                "run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "verdict": run.verdict,
+                "flags": list(run.flags), "log": run.log, "unknown": list(run.unknown), "isolation": run.isolation,
+                "unproven": list(run.unproven), "accesses": dict(run.accesses), "traced": run.traced,
+            }
+            for run in guard.runs
+        ],
+        "sensitivity": None
+        if sensitivity is None
+        else {"left_out": [run.run_key for run in guard.left_out], "contrasts": sensitivity.contrasts,
+              **_holm_entries(sensitivity)},
+        "sensitivity_refused": guard.refused,
+    }  # fmt: skip
+
+
+def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of a batch checked by both guards (O60): the runs either leaves out, overall and per
+    condition, each run as both found it, and the rerun without the left-out runs, or why there is none."""
+    sensitivity = guards.sensitivity
+    return {
+        "counts": guards.counts(),
+        "by_condition": guards.by_condition(),
+        "runs": [
+            {"run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "egress": run.egress,
+             "mount": run.mount, "left_out_by": run.by}
+            for run in guards.runs
+        ],
+        "sensitivity": None
+        if sensitivity is None
+        else {"left_out": [run.run_key for run in guards.left_out], "contrasts": sensitivity.contrasts,
+              **_holm_entries(sensitivity)},
+        "sensitivity_refused": guards.refused,
+    }  # fmt: skip
+
+
+def _visibility_summary(seen: VisibilityAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of a batch watched for hidden processes (O56): each analysed run's verdict (its flags,
+    its memory reading and why it is unknown, its hidden processes and cells killed for hidden memory, the watch's
+    figures) and the sensitivity analysis without the runs that are not clean, or why there is none."""
+    sensitivity = seen.sensitivity
+    return {
+        "counts": seen.counts(),
+        "runs": [
+            {
+                "run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "verdict": run.verdict,
+                "flags": list(run.flags), "memory": run.memory, "unknown": list(run.unknown),
+                "hidden_process": run.hidden_process, "hidden_memory": run.hidden_memory, "figures": dict(run.figures),
+            }
+            for run in seen.runs
+        ],
+        "sensitivity": None
+        if sensitivity is None
+        else {"left_out": [run.run_key for run in seen.left_out], "contrasts": sensitivity.contrasts,
+              **_holm_entries(sensitivity)},
+        "sensitivity_refused": seen.refused,
+    }  # fmt: skip
 
 
 def report_text(analysis: StudyAnalysis) -> str:
@@ -690,6 +1114,10 @@ def report_text(analysis: StudyAnalysis) -> str:
         core_version=analysis.core_version,
         scorers=analysis.scorers,
         interval_level=analysis.study.prereg.bootstrap.ci_level,
+        egress=analysis.egress,
+        mount_guard=analysis.mount_guard,
+        guards=analysis.guards,
+        visibility=analysis.visibility,
     )
 
 
@@ -735,5 +1163,24 @@ def regenerate(
         if not target.is_file():
             problems.append(f"{name}: missing")
         elif target.read_bytes() != made:
-            problems.append(f"{name}: differs from what the records give")
+            why = _export_difference(analysis.export, target.read_bytes()) if name == EXPORT_FILE else None
+            problems.append(f"{name}: {why or 'differs from what the records give'}")
     return problems
+
+
+def _export_difference(derived: Mapping[str, Any], held: bytes) -> str | None:
+    """Say how a saved export that differs from the derived one differs in the campaign fingerprint, if it does: it is
+    of another campaign (or its entry is not the hash of its fingerprint), or it records none (an export from before the
+    key, which is read as it was and only said so, C36). None when the fingerprint is not what differs."""
+    try:
+        saved = json.loads(held)
+    except ValueError:
+        return None
+    if not isinstance(saved, dict):
+        return None
+    expected = derived.get(EXPORT_FINGERPRINT)
+    try:
+        said = verify_export_fingerprint(saved, None if expected is None else expected["sha256"])
+    except ExportError as error:
+        return str(error)
+    return f"differs from what the records give ({NOT_RECORDED})" if said == NOT_RECORDED and expected else None

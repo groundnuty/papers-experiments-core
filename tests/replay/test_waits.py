@@ -4,9 +4,12 @@ import asyncio
 import copy
 
 import pytest
+from loop_support import ClockSleep, FakeClock
+from record_support import record_run
 from replay_scenarios import SCENARIOS
 
 from expcore.records.record import RunRecord, decode
+from expcore.records.seal import seal
 from expcore.replay.clock import ReplayClock
 from expcore.replay.divergence import Halt, ReplayDivergence
 from expcore.replay.replay import replay_record
@@ -89,6 +92,123 @@ def test_r03_a_cut_at_the_ceiling_replays_as_infrastructure_of_the_ceiling_kind(
     replayed = replay_record(record)
     assert replayed.outcome == record.outcome
     assert replayed.totals["infra_wait_by_kind"] == record.totals["infra_wait_by_kind"] != {}
+
+
+def test_r03_a_ceiling_a_study_set_is_recorded_as_set_and_replays_as_the_cut_it_made():
+    """R03: a `[agent] ceiling_s` below the default of three times the cap bounds the run; the record keeps the
+    ceiling in force and no factor, since none was given, and the replay rebuilds that configuration and ends the run
+    at the same cut."""
+    clock = FakeClock()
+
+    async def queued(_args, ctx):
+        async with ctx.infrastructure_wait("lease_queue"):
+            while True:
+                clock.advance(100)
+                await asyncio.sleep(0)
+
+    record = record_run(
+        [[("echo", {})], "never"], {"echo": queued}, clock=clock, sleep=ClockSleep(clock), ceiling_s=450.0
+    )
+    assert (record.agent_config["ceiling_s"], record.agent_config["ceiling_factor"]) == (450.0, None)
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "ceiling")
+    assert "450 s" in record.outcome["detail"]
+    assert replay_record(record).outcome == record.outcome
+
+
+def test_l16_a_call_whose_own_expiry_was_judged_as_the_loops_cut_replays_as_that_cut():
+    """L16: the expiry of a tool call's bound at the agent's time left is recorded as the cut it stands for, with the
+    watch reading a cut takes, so the replay (which holds the call until that reading) ends the same way."""
+    record = SCENARIOS["tool_expiry_cut"][0]()
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("time_cap", None)
+    assert record.tool_calls[0]["status"] == "cut"
+    assert "watch" in [label for label, _ in record.clock]
+    replayed = replay_record(record)
+    assert replayed.outcome == record.outcome
+    assert replayed.clock == record.clock
+
+
+def test_l17_a_call_that_outlasts_the_declared_bound_replays_as_the_knowledge_failure_it_was():
+    """L17: the call's expiry at the declared bound came while the agent had time left, so the loop took no reading for
+    it; the replay raises the recorded failure the same way and reads the clock as the run did. The second call of the
+    reply is answered as skipped, with no elapsed time."""
+    record = SCENARIOS["tool_bound_expiry"][0]()
+    assert record.agent_config["tool_server_call_bound_s"] == 60
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "knowledge")
+    assert "within 60 s" in record.outcome["detail"]
+    started, skipped = record.tool_calls
+    assert (started["status"], started["elapsed_s"]) == ("failed", 60)
+    assert (skipped["status"], "elapsed_s" in skipped) == ("skipped", False)
+    assert "watch" not in [label for label, _ in record.clock]
+    replayed = replay_record(record)
+    assert replayed.dumps() == record.dumps()
+
+
+def test_l17_a_call_whose_time_left_is_shorter_than_the_declared_bound_replays_as_the_loops_cut():
+    """L17: with the bound past the agent's time left the call was handed the time left, its expiry at it was the
+    loop's cut, a time cap with the call recorded as cut and the watch reading that cut it, and the replay ends the same
+    way."""
+    record = SCENARIOS["tool_bound_past_the_time_left"][0]()
+    assert record.agent_config["tool_server_call_bound_s"] == 500
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("time_cap", None)
+    assert record.tool_calls[0]["status"] == "cut"
+    assert record.tool_calls[0]["elapsed_s"] == 300
+    assert "watch" in [label for label, _ in record.clock]
+    assert replay_record(record).dumps() == record.dumps()
+
+
+def test_l17_a_call_cut_after_the_declared_bound_passed_replays_as_the_same_knowledge_failure():
+    """L17: the loop's cut at the time left came a moment after the bound had passed, and the loop judged it by the
+    bound: the call is `cut` with the watch reading that cut it and the attempt `knowledge` infrastructure. The ending
+    is derived from the call's two readings and the configuration, so the replay, which holds the call until that
+    reading, reaches it too."""
+    record = SCENARIOS["tool_bound_cut"][0]()
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "knowledge")
+    assert "within 60 s" in record.outcome["detail"]
+    call = record.tool_calls[0]
+    assert (call["status"], call["elapsed_s"]) == ("cut", 61)
+    assert "outlasted the bound" in call["text"]
+    assert "watch" in [label for label, _ in record.clock]
+    assert replay_record(record).dumps() == record.dumps()
+
+
+def test_l17_a_code_cell_cut_after_the_declared_bound_replays_as_the_agents_time_cap():
+    """L17: the same hold under the same bound, by a tool that is no tool server: the loop's cut at the time left is the
+    agent's time cap, the call is `cut` without a judgement by the bound, and the record says the bound reached no tool.
+    The replay, which is told by the record which tools are tool servers, ends the same way."""
+    record = SCENARIOS["tool_bound_code_cell_cut"][0]()
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("time_cap", None)
+    call = record.tool_calls[0]
+    assert (call["status"], call["elapsed_s"], call["detail"]) == ("cut", 61, "")
+    assert "outlasted the bound" not in call["text"]
+    assert record.agent_config["tool_server_tools"] == []
+    assert replay_record(record).dumps() == record.dumps()
+
+
+def test_l17_the_replay_takes_the_tool_servers_from_the_record_and_a_list_edited_to_say_otherwise_diverges():
+    """L17: the tools a declared bound reached are part of the configuration the record pins, and the replay's loop
+    judges a cut call by them. A record whose list was edited and sealed again no longer reaches the ending it
+    recorded: the call is the agent's time cap, with the text of a cut call, where the record says it was a hang of the
+    tool, which is where the replay first differs."""
+    data = record_of("tool_bound_cut")
+    assert data["agent_config"]["tool_server_tools"] == ["echo"]
+    data["agent_config"]["tool_server_tools"] = []
+    seal(data)
+    diverges(data, "tool_calls[0].text")
+
+
+def test_l17_a_changed_list_of_tool_servers_is_a_divergence_of_the_configuration_hash():
+    """L17: the list is in `agent_config`, which the record's digest pins: an edit alone fails before the loop runs."""
+    data = record_of("tool_bound_cut")
+    data["agent_config"]["tool_server_tools"] = []
+    diverges(data, "agent_config_sha256")
+
+
+def test_l17_a_changed_declared_bound_is_a_divergence_of_the_configuration():
+    """L17: the bound is part of the configuration the record pins, so replaying a record whose bound was edited fails
+    before the loop runs, at the hash of the configuration."""
+    data = record_of("tool_bound_expiry")
+    data["agent_config"]["tool_server_call_bound_s"] = 30
+    diverges(data, "agent_config_sha256")
 
 
 def test_r03_a_cleanup_that_timed_out_is_served_from_the_label_of_the_reading_that_ended_it():

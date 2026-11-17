@@ -18,10 +18,10 @@ provider answers its old entry absent. 25.0 was measured to delete a directory a
 when a name is deleted and recreated at once (#29); the wait is applied to every removed file as a precaution.
 
 **Every id change is recorded** (`Baseline.ids`) and journalled: a JSON-lines file kept across runs, each line pushed to
-disk before the next step, so the ids of a run whose record was lost can still be mapped to files. An id event holds
-the file's label, what happened (`removed`, `created`, `restored`), the phase, the old and the new id, the clock and the
-file's mtime and ctime as the data provider gives them (None when it gives none; `attributes_ok` false when they could
-not be read).
+disk before the next step (a last line a crash cut short is cut off before the next is written), so the ids of a run
+whose record was lost can still be mapped to files. An id event holds the file's label, what happened (`removed`,
+`created`, `restored`), the phase, the old and the new id, the clock and the file's mtime and ctime as the data provider
+gives them (None when it gives none; `attributes_ok` false when they could not be read).
 """
 
 import hashlib
@@ -36,6 +36,7 @@ from typing import Any
 
 from expcore_onedata import consistency
 from expcore_onedata.client import PlatformError, answered_absent
+from expcore_onedata.fault_journal import make_directories
 from expcore_onedata.ingestplan import IngestPlan, PlannedFile
 from expcore_onedata.provision import Entry, NotPlaced, Provisioner, ProvisionError
 from expcore_onedata.rangemap import safe_path
@@ -69,6 +70,31 @@ def plain(file_id: str) -> str:
     return file_id
 
 
+def fsync_directory(directory: Path) -> None:
+    """Push a directory's entries to disk: a file created in it survives a host crash only once this has returned."""
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _cut_torn_tail(handle: Any) -> None:
+    """Cut off a last line without its newline, which a crash in the middle of an append leaves, and push the cut to
+    disk; the handle is the journal opened for appending and reading, in bytes."""
+    end = handle.seek(0, os.SEEK_END)
+    if end == 0:
+        return
+    handle.seek(end - 1)
+    if handle.read(1) == b"\n":
+        return
+    handle.seek(0)
+    kept = handle.read().rfind(b"\n") + 1
+    handle.truncate(kept)
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
 class RestoreFailed(ProvisionError):
     """Some planned files could not be brought back to their baseline; every other one was. `files` holds each file's
     result by label, a failed one as `{"ok": False, "error", "detail"}`."""
@@ -89,6 +115,7 @@ class Baseline:
         self.lock = threading.Lock()  # the schedule's thread and the caller's both record
         self.ids: list[dict[str, Any]] = []
         self.last_id: dict[str, str] = {}  # label -> the id its file had last, removed or not
+        self._path_durable = False  # this baseline's first line synced the journal's path (`journal`)
 
     # -- the record ------------------------------------------------------------------------------------------------
     def stamp(self) -> dict[str, Any]:
@@ -96,12 +123,24 @@ class Baseline:
         return {"clock": round(self._p.clock(), 3), "utc": utc(self._now())}
 
     def journal(self, **fields: Any) -> None:
-        """Append one line to the journal and push it to disk: an id change must outlive a crash."""
-        self._journal.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock, open(self._journal, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"space": self._p.space.position, **fields}, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        """Append one line to the journal and push it to disk: an id change must outlive a crash. A last line a crash
+        cut short is cut off first, so the new line is never glued to it (readers skip a torn last line, and a mark
+        glued to one would be skipped with it). This baseline's first line also syncs the journal's directory and every
+        one above it, whether or not it made them: a writer killed before it synced them, or in the middle of making
+        them, left entries a host crash can still lose, with the journal and its marks."""
+        with self.lock:
+            make_directories(self._journal.parent)  # each one it makes is durable in its parent
+            with open(self._journal, "a+b") as handle:
+                _cut_torn_tail(handle)
+                line = json.dumps({"space": self._p.space.position, **fields}, sort_keys=True) + "\n"
+                handle.write(line.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            if not self._path_durable:  # the journal's entry and every directory's above it, whoever made them
+                here = self._journal.parent.resolve()  # a relative journal's working directory and its parents too
+                for directory in (here, *here.parents):
+                    fsync_directory(directory)
+                self._path_durable = True
 
     def read_journal(self) -> None:
         """Take each planned file's last id from the journal, a crashed run's included. A torn last line, which a
@@ -152,6 +191,12 @@ class Baseline:
             size += len(block)
         if Digest(size, hasher.hexdigest()) != Digest(planned.size, planned.sha256):
             raise ProvisionError(f"{self._p.where}{planned.label}: its staged source no longer has the plan's hash")
+
+    def check_sources(self) -> None:
+        """Every planned file's staged copy is there, at the plan's size and SHA-256: checked whole before anything is
+        removed, so no file goes while the copy of another that would follow it is damaged or gone."""
+        for planned in self._plan.files:
+            self.check_source(planned)
 
     def check_directory(self, planned: PlannedFile) -> None:
         """A planned file's directory exists: the ingest creates none, so the namespace stays the baseline's."""

@@ -10,6 +10,7 @@ The data path of a run is one of three kinds. The study's `data_path` factor nam
 """
 
 import dataclasses
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -111,7 +112,20 @@ class ExecResult:
     """What the agent's code did: its output, its exit code, how long it ran, and, when it was killed, why.
 
     `status` is `RAN`, or `NOT_STARTED` for a cell that too little time was left to start: it ran nothing, so it has no
-    timeout and no kill, and what the time running out means is the loop's own rule."""
+    timeout and no kill, and what the time running out means is the loop's own rule.
+
+    `timed_out` says that a bound of the sandbox's own ended the cell, with `record=False` as with a cell of the
+    agent's, and `bound` says which (`bounds.CELL_TIMER`, `CONTAINER_TIMEOUT` or `HOST_CALL`); it is None exactly when
+    `timed_out` is False. An exit 137 or 124 from the container's `timeout` at its limit reads as the bound's, and one a
+    cell gave itself (`os.kill(os.getpid(), 9)`) before that limit as its own exit, not a timeout (`bounds`, O39).
+
+    `output_cut` is what the sandbox cut of the cell's output, which it keeps up to a cap per stream: for each stream it
+    cut, the bytes the cell wrote (`produced`) and the bytes kept (`kept`); None when nothing was cut (O43).
+
+    `exec_check` is what the cell's completion record showed (O55, `completion.py`): `source_whole`, whether its program
+    arrived whole in the container; `exit_status`, the status the record saw; `nonce_matched`, whether a record of this
+    exec came on both streams. An exec not known to have completed that no timeout or kill explains is never a result:
+    `exec` raises `completion.ExecIncomplete`. None for a cell that was not started."""
 
     stdout: str
     stderr: str
@@ -121,6 +135,11 @@ class ExecResult:
     kill: dict[str, Any] | None = None  # the cause of a kill or timeout, from the kernel's counters (killcause.py)
     status: str = RAN
     gate_refusals: tuple[str, ...] = ()  # the data gate's own refusals during the cell (gatelog.refusals)
+    bound: str | None = None  # the sandbox's bound that ended the cell, when `timed_out` (bounds.py)
+    # the streams of the cell the sandbox cut (O43): `{"stdout": {"produced": n, "kept": m}, ...}`, only those it cut
+    output_cut: dict[str, dict[str, int]] | None = None
+    # what the cell's completion record showed (O55): `{"source_whole": ..., "exit_status": ..., "nonce_matched": ...}`
+    exec_check: dict[str, Any] | None = None
 
 
 @runtime_checkable
@@ -147,3 +166,42 @@ class Sandbox(Protocol):
     def metadata(self) -> dict[str, Any]:
         """The facts of the run for its record: images by id, limits, the data path, kills, deaths. Never a secret."""
         ...
+
+
+@runtime_checkable
+class InfraReadings(Protocol):
+    """What a study reads of a run's infrastructure after its loop, by the same names and in the same shapes on every
+    backend (`DockerSandbox`, `ApptainerSandbox`). Read them while the sandbox is up, after its collection or before.
+
+    `infra_check()` is `{"containers": {role: {"start", "end", "problems", ...}}, "deaths": [...], "death": [...]}`:
+    the state of each of the run's other components by role (Docker's gate and mount sidecar; on an HPC node the
+    gate, the egress collector, the mount's oneclient with its mount and the mount guard's watcher) against what it was
+    when it came up, each death with `role`, `condition`, `cause`, `category`, `basis` and `problems`
+    (`infradeath`), and the problems of the deaths that are infrastructure. A component the harness stopped itself is
+    judged by its state just before that stop. `start` and `end` hold each backend's own evidence (a container's state,
+    or a process's and a mount's), and a state that cannot be read is a problem, never a clean one (O17).
+
+    `mount_log()` is oneclient's INFO log, `{"text": ...}` with the data-path token replaced by `<token>`, or
+    `{"unavailable": reason, ...}` when it could not be read; None without a mount. `mount_errors()` is the summary of
+    that same text (`oneclient_log.summarize`, which `oneclient_log.platform_errors` counts), the same `unavailable`
+    answer, or None (O18). Both may be read during the run: on an HPC node the read is the driver's, of a file in a
+    directory no cell reaches, which the mount guard does not watch (O60).
+    """
+
+    def infra_check(self) -> dict[str, Any]: ...
+
+    def mount_log(self) -> dict[str, Any] | None: ...
+
+    def mount_errors(self) -> dict[str, Any] | None: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class ServerProcess:
+    """Where a backend runs a run's tool server, when it names it (`SandboxPlatform.tool_server` asks the sandbox's
+    `tool_server_process()`; the Apptainer backend's, O56): `home`, a directory of the run's own, which the server
+    takes as its `HOME` and starts in, and `env`, the settings beside the launcher's (the run's tag). With one, the
+    launcher names the server's whole environment (`toolserver.ToolServerLauncher.launch`). Docker's sandbox names
+    none, and its server's process is as it always was."""
+
+    home: Path
+    env: Mapping[str, str]

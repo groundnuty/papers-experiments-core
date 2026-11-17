@@ -43,6 +43,39 @@ not be measured, answers every call after it with its detail, so the gate stays 
 lets every call answer as the space check does. With no REST data path nothing is read. The composition is
 `precampaign.PreCampaignHealth`, built here, so a study that uses this check cannot leave the measurement out.
 
+**So is the link check (O35, `linkcheck.py`), after the content type and the space, with no opt-out.** At the first
+call every ordered (reader, source) pair a run can fetch through must fetch its probe from the `[link_check]` probe space within
+the bound; a pair that cannot, or that could not be tested, fails the call, named in the detail with its remedy. Unlike
+the content type its verdict is not kept: a stuck link is remedied while the campaign waits, so the check runs again at
+every call after a failure, and whenever its last run is older than `[link_check] every_s` (600 s by default). A failure
+at the first call holds every run until a re-check of the closed gate passes; one later, a link that stuck
+mid-campaign, closes the gate, sets the run whose check found it aside as infrastructure and holds the whole campaign
+the same way. With `[faults]` and a declared `heal`, a stuck pair the check finds is healed by the fault gate around it,
+between runs and under its own exclusive admission (`fault_gate_heal`), and the call answers healthy only once the
+check passes again; `gate_heal` holds the latest such heal's record. A federation with no pair (every space supported
+by the local provider alone) has nothing to check; one
+with pairs and no `[link_check]` always fails. `links` holds the last report: each pair's seconds and bytes and the
+transfers the check made. `monotonic` and `sleep` are its clock and its pauses, a test's `Ticker`. The check writes
+probes and evicts them, so a caller that must change nothing, day-0's read-only `health` check alone, builds this with
+`links=False`; a campaign's health gate never does.
+
+**With `[faults]` every link check this makes also writes the federation's record (O35).** The report is written as
+`link-check.json` in the federation's root, atomically and in the format `up` writes, whichever platform file the
+check ran through (the root is the `[faults] journal`'s parent), by the same rules as a restore's and a heal's checks
+(`fault_serves.recorded`: the latest check's verdict, a check that raises or whose record cannot be written leaving no
+older record standing, one check at a time under the record's lock), so the record is the check's, not the one `up`
+wrote before an outage. Without `[faults]` no root is declared and nothing is written. The record is advisory: it
+never changes a verdict and takes no federation lock. A check whose record could not be written (its lock not taken, or
+the write refused) says so beyond a log line: `link_record` holds `{"link_record": "not_written", "link_record_reason":
+"lock_not_taken" | "write_failed"}` for the latest check (None when its record was written), and the try's note
+(`expcore.campaign.prerun`, key `linkrecord.LINK_RECORD_NOTE`) holds it for the run whose pre-run check it was, which an
+executor reads with `prerun.current()` to put it in the run's record. Neither exists when the record was written.
+
+**So is every preallocated ingest's baseline (O44, `ingesthealth.py`), when the study names the ingests' journals**
+(`ingest_journals`): before anything else, with no request to the federation, the check fails while a space's baseline
+is marked unhealthy, or open by a run that is gone, so no run is admitted until `ProgressiveIngest.recover` verifies it
+whole. A study whose conditions use a preallocated ingest passes every journal they write to.
+
 **While `[tls] insecure_tls` is on, every reading warns** that no client of the federation checks its certificate, a
 setting for disposable test federations only (`tls.py`). The warning is appended to the detail, so the campaign's
 health record and day-0's report carry it; it does not change the verdict.
@@ -51,18 +84,24 @@ health record and day-0's report carry it; it does not change the verdict.
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from pathlib import Path
 
-from expcore.campaign.healthgate import Health, HealthCheck
+from expcore.campaign import prerun
+from expcore.campaign.healthgate import DeferralBound, Health, HealthCheck
 from expcore.config.loading import ConfigError
 from expcore_onedata.admission import fault_settings_of
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_recovery import FaultDriver
-from expcore_onedata.fault_serves import provider_serves
-from expcore_onedata.fault_settings import compose_driver
+from expcore_onedata.fault_serves import provider_serves, recorded
+from expcore_onedata.fault_settings import FaultSettings, compose_driver, hpc_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
+from expcore_onedata.ingesthealth import baseline_health
+from expcore_onedata.linkcheck import LinkReport, check_links
+from expcore_onedata.linkrecord import LINK_RECORD_NOTE, fact, record_path
+from expcore_onedata.linksettings import LinkCheckSettings
 from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
 from expcore_onedata.tls import WARNING
 from expcore_onedata.tokencheck import TokenRefused
@@ -131,17 +170,28 @@ def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = 
 
 
 def _fault_gate(
-    config: PlatformConfig, client: OnezoneClient, driver: FaultDriver | None, inner: HealthCheck
+    settings: FaultSettings | None,
+    config: PlatformConfig,
+    client: OnezoneClient,
+    driver: FaultDriver | None,
+    inner: HealthCheck,
+    links: Callable[[], LinkReport | None],
+    relink: Callable[[], None],
 ) -> FaultGate | None:
-    """The fault gate around `inner` when platform.toml has a `[faults]` table, None when it has none; a table that is
-    not valid raises ConfigError here, so a platform with an injector never runs without the gate. The Compose driver
-    it recovers through finds a restored provider serving by reading through the check's own client."""
-    settings = fault_settings_of(config)
+    """The fault gate around `inner` for a platform.toml's `[faults]` table (`settings`: `fault_settings_of`, which
+    raises ConfigError for a table that is not valid, so a platform with an injector never runs without the gate), None
+    when it has none. The Compose driver it recovers through finds a restored provider serving by reading through the
+    check's own client. `links` takes the link report the check made in the calling thread, `relink` makes its next call
+    check the links again, and the providers' services are those of `[faults.services]`, by label, so the gate heals the
+    stuck pairs its own link check finds (`fault_gate_heal`, when `[faults] heal` is declared)."""
     if settings is None:
         return None
-    if driver is None:
+    if driver is None and settings.backend == "hpc":  # its requests go through the federation's fault relay
+        driver = hpc_driver(settings, probe=provider_serves(config, settings, client))
+    elif driver is None:
         driver = compose_driver(settings, probe=provider_serves(config, settings, client))
-    return FaultGate(settings, driver, inner)
+    labels = {config.provider_label(name): service for name, service in settings.services.items()}
+    return FaultGate(settings, driver, inner, labels=labels, links=links, relink=relink)
 
 
 class PlatformHealth:
@@ -156,16 +206,58 @@ class PlatformHealth:
         *,
         clock: Callable[[], float] = time.time,
         fault_driver: FaultDriver | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        links: bool = True,
+        ingest_journals: Iterable[Path | str] = (),
     ) -> None:
         if config.principals.service is None:
             raise ConfigError(f"{config.file}: [principals]: key 'service' is required for the health check")
         self._config, self._client, self._issuer, self._clock = config, client, issuer, clock
+        self._monotonic, self._sleep = monotonic, sleep  # the link check's waits (a test's Ticker)
         self._service = config.principals.service
         self._token: MintedToken | None = None
         self._lock = threading.Lock()
         self._content_type: ContentTypeVerdict | None = None
-        self._gate = PreCampaignHealth(self._space, self._measure)
-        self._faults = _fault_gate(config, client, fault_driver, self._gate)  # outermost: it holds the federation
+        self._links: LinkReport | None = None
+        self._links_at = 0.0  # when the last link check ended, on `monotonic`
+        self._links_passed = False  # whether any link check of this campaign passed
+        self._links_lock = threading.Lock()
+        self._expiries = 0  # how many times the fault gate expired the last link report (after a heal)
+        self._fresh_for = 0  # the expiries the last link report postdates: older than `_expiries`, it is no answer
+        self._made = threading.local()  # the link report each thread's call made, which only that thread takes
+        self._with_links = links
+        settings = fault_settings_of(config)  # a table that is not valid raises ConfigError here
+        # the federation's record (O35): in its root, which `[faults] journal` names; a platform with no `[faults]`
+        # declares no root, so its checks write none
+        self._record = None if settings is None else record_path(settings.journal)
+        self._ingest_journals = tuple(Path(journal) for journal in ingest_journals)  # read at every call (O44)
+        # The link check is not a kept pre-campaign check: a stuck link is remedied while the campaign waits, and the
+        # gate's re-checks must see it pass (O35). It runs in `_regular`, after the space, at the first call and later.
+        self._gate = PreCampaignHealth(self._regular, self._measure)
+        # outermost: it holds the federation, and heals the stuck pairs the link check finds (`fault_gate_heal`)
+        self._faults = _fault_gate(
+            settings, config, client, fault_driver, self._gate, self._take_links, self._expire_links
+        )
+
+    @property
+    def gate_heal(self) -> dict | None:
+        """The record of the latest heal of stuck pairs the fault gate ran (`fault_gate_heal`), None before one or
+        without `[faults]`."""
+        return None if self._faults is None else self._faults.last_heal
+
+    def max_deferral_s(self) -> DeferralBound | None:
+        """The longest this check may stay deferred, which the core holds the campaign's `max_defer_s` to at its start
+        (`healthgate.deferral_bound`): the fault gate's (`FaultGate.max_deferral_s`), None without `[faults]`. A study
+        that wraps this check in its own passes the method on: the platform's run admission declares the same bound
+        (`admission.RunAdmit.declared_deferral_s`), and a wrapper that leaves it out is refused at the campaign's start
+        (`SchedulerConfig.check_declared_deferral`)."""
+        return None if self._faults is None else self._faults.max_deferral_s()
+
+    def wait_for_gate_heal(self, timeout_s: float | None = None) -> bool:
+        """Wait, at most `timeout_s`, for a heal the fault gate runs in the background to end; whether none runs now
+        (`FaultGate.wait_for_heal`; True without `[faults]`)."""
+        return True if self._faults is None else self._faults.wait_for_heal(timeout_s)
 
     @property
     def content_type(self) -> ContentTypeVerdict | None:
@@ -173,9 +265,79 @@ class PlatformHealth:
         was measured and is wrong from one that could not be measured."""
         return self._content_type
 
+    @property
+    def links(self) -> LinkReport | None:
+        """What the last link check found (None before the first, or while the content type or the space refuses):
+        every pair's verdict, seconds and bytes, and the transfers it made (`LinkReport.to_json()`)."""
+        return self._links
+
+    @property
+    def link_record(self) -> dict[str, str] | None:
+        """That the last link check's record was not written, as the optional fact `link_record: "not_written"` with
+        `link_record_reason` (`linkrecord.fact`); None when it was written, and before the first check."""
+        last = self._links
+        return None if last is None or last.not_written is None else fact(last.not_written)
+
     def _measure(self) -> Health:
         self._content_type = measure_content_type(self._config, self._client)
         return self._content_type.health
+
+    def _check_links(self) -> None:
+        def check() -> LinkReport:
+            return check_links(self._config, self._client, clock=self._monotonic, sleep=self._sleep, now=self._clock)
+
+        # with `[faults]`, the routine check writes the federation's record as the restore's and the heal's do (O35)
+        self._links = check() if self._record is None else recorded(self._record, check)
+        self._links_at = self._monotonic()
+        self._links_passed = self._links_passed or self._links.ok
+        self._made.report = self._links  # this thread's own: another thread's call never takes it
+        if self._links.not_written is not None:  # the run whose check this was learns its record was not written
+            prerun.note(LINK_RECORD_NOTE, fact(self._links.not_written))
+
+    def _take_links(self) -> LinkReport | None:
+        """The link report this thread's calls made since it last took one, None when they made none (for the fault
+        gate: only a report its own call made is one it acts on)."""
+        report = getattr(self._made, "report", None)
+        self._made.report = None
+        return report
+
+    def _expire_links(self) -> None:
+        """Make the next call check the links again, whatever the last verdict and its age (the fault gate, after a
+        heal: a pass another call made before the heal is no pass of the healed links). Until a check made after it
+        has answered, the last report is no answer for any call (`_regular`)."""
+        with self._lock:
+            self._expiries += 1
+
+    def _regular(self) -> Health:
+        """Every call once the content type passed: the space, then the links (O35), at the first call and again
+        whenever the last check is older than `[link_check] every_s` or failed, so a remedied link reopens the gate at
+        its next re-check. The first check is waited for by every caller; a later one under way in another thread is
+        not, and its caller answers with the last verdict."""
+        verdict = self._space()
+        if not verdict.ok or not self._with_links:
+            return verdict
+        settings = self._config.link_check
+        every_s = settings.every_s if settings is not None else LinkCheckSettings.every_s
+        if self._links_lock.acquire(blocking=self._links is None):
+            try:
+                last, asked = self._links, self._expiries
+                stale = asked > self._fresh_for or self._monotonic() - self._links_at >= every_s
+                if last is None or not last.ok or stale:
+                    self._check_links()
+                    self._fresh_for = max(self._fresh_for, asked)  # only once a check made after the expiry answered
+            finally:
+                self._links_lock.release()
+        elif self._expiries > self._fresh_for:  # another call checks afresh after a heal: the last report is no answer
+            detail = "the link check is being made afresh after a heal, so no run is admitted until it answers"
+            return Health(False, detail, deferred=True, charge=False)
+        report = self._links
+        if report is None:  # pragma: no cover - the first check is waited for, so a report is there
+            return Health(False, "the link check has not answered yet, so no run is admitted")
+        if report.ok:
+            return verdict
+        if self._links_passed:
+            return Health(False, f"a provider link stopped transferring during the campaign: {report.detail}")
+        return Health(False, f"no run is admitted until every provider link transfers: {report.detail}")
 
     def _current_token(self) -> MintedToken:
         """Return the cached token, minting a new one when none is left or it is about to expire."""
@@ -187,13 +349,15 @@ class PlatformHealth:
             return token
 
     def __call__(self) -> Health:
-        """Return the platform's health: with `[faults]`, the fault gate holding the federation around the rest; the
-        content type kept from the first call; then the space. Never raise.
+        """Return the platform's health: the ingests' baselines; with `[faults]`, the fault gate holding the federation
+        around the rest; the content type kept from the first call; then the space. Never raise.
 
         While `[tls] insecure_tls` is on, every reading, healthy, failed or deferred, ends with a warning that no client
         of the federation checks its certificate (`tls.WARNING`); the verdict, a deferral included, is unchanged."""
         try:
-            verdict = self._faults() if self._faults is not None else self._gate()
+            verdict = baseline_health(self._ingest_journals)  # first, and asking the federation nothing
+            if verdict.ok:
+                verdict = self._faults() if self._faults is not None else self._gate()
         except Exception as error:
             verdict = Health(False, f"health check raised {type(error).__name__}")
         return self._warned(verdict)

@@ -67,7 +67,7 @@ def test_o33_with_no_requirement_and_no_qos_rights_the_settle_and_the_quiet_chec
     assert record["stages"]["qos_settle"]["polls"] == 0
     quiet = record["stages"]["quiet"]
     assert (quiet["ran"], quiet["why"], quiet["waited_s"]) == (False, None, 0.0)
-    assert WAIT_S not in ticker.slept
+    assert ticker.slept.count(WAIT_S) == 1  # the occupancy stage's wait for the eviction (O46), and no other
 
 
 def test_o33_a_run_with_qos_rights_runs_the_quiet_check_with_no_requirement_left(scanned, fake, ticker):
@@ -85,7 +85,7 @@ def test_o33_a_run_with_qos_rights_runs_the_quiet_check_with_no_requirement_left
     assert quiet["waited_s"] == WAIT_S
     assert quiet["seconds"] >= WAIT_S
     assert quiet["physical_bytes"]["providers[1]"] == 0
-    assert WAIT_S in ticker.slept
+    assert ticker.slept.count(WAIT_S) == 2  # the occupancy stage's (O46), then the quiet stage's
 
 
 def test_o33_a_caller_that_does_not_say_gets_the_quiet_check_and_the_record_says_the_default(scanned, fake, ticker):
@@ -126,7 +126,7 @@ def test_o33_a_requirement_added_and_removed_by_the_agent_fails_the_reset_when_i
         SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, qos_rights=True)
     assert caught.value.record["stages"]["qos"]["removed"] == 0
     assert list(caught.value.record["stages"]) == list(STAGES[:-1])
-    assert WAIT_S not in ticker.slept  # failed at T
+    assert ticker.slept.count(WAIT_S) == 1  # the occupancy stage's (O46): the quiet stage failed at T, unwaited
 
 
 def test_o33_a_late_replication_of_a_file_beta_did_not_hold_is_caught_by_the_occupancy(
@@ -147,15 +147,18 @@ def test_o33_a_late_replication_of_a_file_beta_did_not_hold_is_caught_by_the_occ
 def test_o33_a_landing_after_t_is_not_certified_by_the_quiet_stage(
     client, config, platform_file, ticker, tmp_path, fake
 ):
-    """O33: the limit the stage states: it proves nothing about a landing after T. Bytes that land as the wait ends
-    show in the occupancy 15 s later, which nothing reads, so the stage passes and beta holds them afterwards. A
-    replication still running at T can do this, whichever scan found its requirement."""
+    """O33: the limit the stage states: it proves nothing about a landing after its last reading. Bytes that land
+    once the stage has read the files' block maps after its wait (O46) are read by nothing, so the stage passes and
+    beta holds them afterwards. A replication still running then can do this, whichever scan found its requirement."""
     file_id = fake.add_file("other/late.bin", DATA)
+    waits: list[float] = []
 
     def sleep(seconds):
         ticker.sleep(seconds)
-        if seconds == WAIT_S:  # the replication lands as the wait ends, after T
+        if len(waits) == 2 and not fake.blocks.get((file_id, BETA_ID)):  # the next pause, after the quiet's reading
             fake.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
+        if seconds == WAIT_S:
+            waits.append(seconds)  # the occupancy stage's wait (O46), then the quiet stage's
 
     provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=sleep)
     record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, qos_rights=True)
@@ -170,20 +173,28 @@ def test_o33_a_landing_after_t_is_not_certified_by_the_quiet_stage(
 def test_o33_the_block_maps_are_read_at_t_and_the_occupancy_at_t_plus_the_quiet_wait(
     scanned, fake, ticker, monkeypatch
 ):
-    """O33: the occupancy is read exactly `quiet_wait_s` after the last block map of the stage, so that it certifies
-    the instant the maps describe."""
-    seen, original = [], fake._distribution
+    """O33: the occupancy, its files' block maps and the counter, is read exactly `quiet_wait_s` after the last block
+    map the stage reads at T, so that it certifies the instant the maps describe."""
+    seen, original, at_t = [], fake._distribution, []
+    pairs = resetqos.read_pairs
 
     def timed(node):
         seen.append((node.file_id, ticker.now))
         return original(node)
 
+    def read_at_t(p, keys, reads):
+        found = pairs(p, keys, reads)
+        at_t.append(ticker.now)
+        return found
+
     fake._distribution = timed
+    monkeypatch.setattr(resetqos, "read_pairs", read_at_t)
     SpaceReset(scanned, now=ticker.clock).run({"beta": ["study"]}, qos_rights=True)
     files = {fake.id_of(path) for path in FILES}
     last_map = max(when for file_id, when in seen if file_id in files)
     last_root = max(when for file_id, when in seen if file_id == ROOT_ID)
-    assert last_root - last_map == WAIT_S
+    assert last_root - at_t[-1] == WAIT_S
+    assert last_map == last_root  # the occupancy's own reading of every file, at the counter's instant (O46)
 
 
 def test_o33_a_file_a_removed_requirement_applied_to_is_held_to_what_the_settle_saw(
@@ -253,17 +264,17 @@ def test_o33_a_deeper_affected_file_makes_the_quiet_wait_longer(scanned, fake, t
 def test_o33_on_a_large_space_the_quiet_stage_reads_only_the_maps_of_the_evicted_files(
     scanned, fake, ticker, monkeypatch
 ):
-    """O33: the quiet stage is bounded by the eviction plan. In a space of 1,500 more files that beta does not hold,
-    the plan evicts the six files of `study` from beta; the stage reads those six pairs' maps once, at T, and no file
-    outside the plan has a map read anywhere in the reset, where a read of every file of the space on beta before the
-    eviction (1,506 maps) was made until the plan bounded it."""
+    """O33: the quiet stage's reading at T is bounded by the eviction plan. In a space of 1,500 more files that beta
+    does not hold, the plan evicts the six files of `study` from beta; the stage reads those six pairs' maps once, at
+    T. The occupancy, the occupancy stage's and the quiet stage's after its wait, reads every regular file's map at
+    beta (O46): the counter is no verdict."""
     for i in range(1500):
         fake.add_file(f"bulk/f-{i:04d}.bin", b"x")
     read, original = [], resetqos.read_pairs
 
-    def counted(p, pairs):
+    def counted(p, pairs, reads):
         before = len(calls(fake, "/distribution"))
-        found = original(p, pairs)
+        found = original(p, pairs, reads)
         read.append(len(calls(fake, "/distribution")) - before)
         return found
 
@@ -272,8 +283,7 @@ def test_o33_on_a_large_space_the_quiet_stage_reads_only_the_maps_of_the_evicted
     assert read == [len(FILES)]  # each evicted file on beta, at T
     assert (quiet["files"], quiet["held_files"], quiet["held_source"]) == (len(FILES), len(FILES), "eviction plan")
     assert quiet["block_maps"] == len(FILES)
-    mapped = {c[2].split("/")[2] for c in calls(fake, "/distribution")}
-    assert mapped == {fake.id_of(path) for path in FILES} | {ROOT_ID}  # the root's is the occupancy's, not a file's
+    assert quiet["files_read"] == len(FILES) + 1500
 
 
 def test_o33_a_plan_of_file_paths_bounds_the_quiet_stage_to_those_files(scanned, fake, ticker, monkeypatch):
@@ -281,9 +291,9 @@ def test_o33_a_plan_of_file_paths_bounds_the_quiet_stage_to_those_files(scanned,
     beta alone, once, and beta keeps the four it was allowed."""
     read, original = [], resetqos.read_pairs
 
-    def counted(p, pairs):
+    def counted(p, pairs, reads):
         read.append(sorted(pairs))
-        return original(p, pairs)
+        return original(p, pairs, reads)
 
     monkeypatch.setattr(resetqos, "read_pairs", counted)
     plan = {"beta": FILES[:2]}

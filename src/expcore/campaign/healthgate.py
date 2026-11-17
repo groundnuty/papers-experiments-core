@@ -21,6 +21,11 @@ it opens, so a restart in the outage restores it (`restarts` counts those) and t
      itself, the passing one included, "restarts": restarts survived while open, "last_check_utc", "first_detail",
      "last_detail"}
 
+and, when a failed answer of the outage led with a reason only an operator can end (`deferral.operator_reason`),
+`"operator_reason"`: the latest such reason, kept apart because the passing check that opens the gate overwrites
+`last_detail` and an ordinary failure can be followed by one (a heal the dispatcher's own check began failed). The
+export's `operator_holds` reads it; the status's alarms and the hold the run says read the open outage's latest detail.
+
 **A gate state that cannot be read at a restart opens closed**: whether the platform is up is then unknown, and the
 first passing check ends it. Nothing is charged for a restart. A restored outage that was blocking does not block
 until the restored gate's first check has answered (bounded by its timeout), so a platform that is healthy again
@@ -44,23 +49,56 @@ status; a pass, before or after a run, ends it. A pre-run check deferred longer 
 does, charging the run that found it, and the outage is `blocking`, a hold that does not end by itself, so a campaign
 that exits when blocked stops instead of waiting on a holder that may never let go. A gate already closed is checked
 by the dispatcher alone, and its deferred checks count the same way: past the bound its outage becomes blocking too.
+A platform whose own waits are bounded declares the longest (`max_deferral_s`, a `DeferralBound`), so a wait it ends
+by itself (a repair it runs) is never cut off by that bound: a campaign whose `max_defer_s` is shorter is refused at
+its start, before its store is opened (`deferral_bound`, `SchedulerConfig.check_deferral_bound`). The bound is the
+platform's own seconds and the core's waits its wait includes: between two checks (`recheck_s`, `poll_interval_s`)
+and a check's own time (`health_timeout_s`), which only the core's settings give, each named in the refusal. **The
+platform declares it three times**, so a study's own check around the platform's, which hides the method, cannot hold
+the campaign to nothing: its run admission may also declare it (`declared_deferral_s`, the same `DeferralBound`, read
+from the platform's settings), and so may its module, which the core reads itself from the platform's own configuration
+(`declared_deferral_from_config`, `PlatformDeferral`, `expcore.study.platform_deferral`), where a study that wraps the
+admission as well hides nothing. A health check that exposes no `max_deferral_s`, or a smaller bound than any declared
+one, refuses the campaign at its start (`SchedulerConfig.check_declared_deferral`).
+
+**A failure an earlier attempt left charges no one.** A platform answers `Health(False, detail, charge=False)` for a
+failure it knows another attempt left behind (a progressive ingest's baseline that a failed reset, or an attempt
+that ended without its reset, left not whole): the pre-run check that finds it closes the gate as any failure does, so
+every run is held until a check passes, but it holds its own run too (`hold`) instead of charging it the outage's one
+attempt, and the outage's record says `"charged": false`. The flag rides on a deferral as well: a deferral past its
+bound then closes the gate blocking without charging the run that found it. A post-run check that fails so sets the
+attempt aside as one an outage overlapped (`outage_discarded`, never charged), since the failure is not its own; a
+platform answers `charge=True` for a failure the judged attempt left itself.
 
 **Every check runs in its caller's context** (`contextvars`), so a post-run check, which runs inside the run's
 admission (`expcore.campaign.attempt`: a platform's hook that holds a resource from before the attempt until after
-its post-run check), can see that the run still holds it.
+its post-run check), can see that the run still holds it, and that it runs inside its attempt
+(`expcore.campaign.liveness`), which the pre-run check and the dispatcher's own check do not.
+
+**A check can be told the attempt it judges** (O82, `expcore.campaign.health_context`). Checks of several runs and
+phases are inside the one check at the same moment, so a check that decides whom a failure is charged to (a marker the
+attempt left) cannot tell its own post-run check from another attempt's pre-run check by where it is called from: the
+gate hands it a `CheckContext` (run key, attempt number, phase, and the attempt's id after its row exists) as the
+argument `context`, when its signature declares a parameter of that name, and calls every other check with no argument
+as always. The dispatcher's own check, which judges no attempt, receives None. The context is passed down each call,
+never kept on the gate.
 """
 
 import contextlib
 import contextvars
+import functools
 import json
+import math
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
-from expcore.campaign.deferral import Deferral, deferral_alarms, parse_deferral
+from expcore.campaign.deferral import Deferral, deferral_alarms, operator_reason, parse_deferral
+from expcore.campaign.health_context import POST_RUN, PRE_RUN, CheckContext, takes_context
 from expcore.campaign.store import Store
+from expcore.config.loading import ConfigError
 
 META = "health_outages"
 HOW_PASSED = "check_passed"  # the dispatcher's own health check passed: dispatch resumed by itself
@@ -70,20 +108,132 @@ UNREADABLE_DETAIL = "the stored outage record was unreadable"
 
 
 class Health(NamedTuple):
-    """One reading of the platform: whether it is healthy, in what words, and whether the reading was deferred (the
-    platform is held on purpose and could not be looked at now; never ok, see the module docstring)."""
+    """One reading of the platform: whether it is healthy, in what words, whether the reading was deferred (the
+    platform is held on purpose and could not be looked at now; never ok, see the module docstring), and whether a
+    pre-run check that fails on it charges the run that found it (False: an earlier attempt left the failure, so the
+    gate closes and charges no one)."""
 
     ok: bool
     detail: str
     deferred: bool = False
+    charge: bool = True
 
 
 class HealthCheck(Protocol):
-    """What the platform supplies: a quick look at whether runs can start. It may raise; that reads as unhealthy."""
+    """What the platform supplies: a quick look at whether runs can start. It may raise; that reads as unhealthy.
+
+    A check may also declare the longest it can stay deferred, with a method `max_deferral_s()` answering a
+    `DeferralBound` or None (`deferral_bound`); the protocol leaves it out, so a check without it is still one. A check
+    that wraps the platform's passes the method on: where the platform declares a deferral of its own, a check without
+    it, or with a smaller bound, is refused when the scheduler is built (`SchedulerConfig.check_declared_deferral`).
+
+    A check that decides whom a failure is charged to can be told the attempt it judges: a `ContextHealthCheck`
+    declares a parameter named `context` and receives a `CheckContext` (O82); one that declares none is called with no
+    argument, as it always was."""
 
     def __call__(self) -> Health:
         """Return the platform's health."""
         ...
+
+
+class ContextHealthCheck(Protocol):
+    """A health check that is told which attempt it judges: it declares a parameter named `context`
+    (`expcore.campaign.health_context`), and the gate calls it `check(context=...)` with the `CheckContext` of the
+    attempt (None when the check judges none: the dispatcher's own check, or a call that names no attempt). It is a
+    `HealthCheck` in every other way, `max_deferral_s` included."""
+
+    def __call__(self, *, context: CheckContext | None) -> Health:
+        """Return the platform's health, judging the attempt `context` names."""
+        ...
+
+
+class DeferralBound(NamedTuple):
+    """The longest a platform's check may stay deferred, from its first deferred answer to its last with no pass
+    between them, and in the platform's words what defers it that long and how to shorten it (`detail`): what a check's
+    optional `max_deferral_s()` answers. The core refuses a campaign whose `max_defer_s` is shorter at its start
+    (`SchedulerConfig.check_deferral_bound`), since past it the platform's own wait would block the campaign.
+
+    `seconds` is the platform's own time. A wait that only a later check can start (a repair that begins at a check)
+    also holds waits whose lengths are the core's settings, which the platform cannot know: `rechecks` counts the waits
+    between two of the core's checks (`recheck_s` and up to `poll_interval_s` each) and `checks` the checks' own time
+    (`health_timeout_s` each) the wait includes beyond `seconds`; the core adds them with its figures and names each.
+
+    `platform` names the platform module the bound comes from, as `[study] platforms` lists it (the Onedata layer's is
+    `expcore_onedata.sandbox.kinds`; empty when the platform does not say). The core reads a platform's declared
+    deferral from its configuration through the modules a study lists, so when a bound that a health check or a run
+    admission declares names a module the study does not list, the campaign is refused at its start (`Scheduler(
+    listed_platforms=...)`): listing the module is required whenever a platform with a deferral is used."""
+
+    seconds: float
+    detail: str
+    rechecks: int = 0
+    checks: int = 0
+    platform: str = ""
+
+
+DEFERRAL_HOOK = "max_deferral_s"
+DECLARED_HOOK = "declared_deferral_s"  # the platform's own declaration, on its run admission (`StudyPlugin.admission`)
+HEALTH_OWNER = "the platform's health check"
+ADMISSION_OWNER = "the platform's run admission"
+
+
+def exposes_deferral(check: Any) -> bool:
+    """Whether a health check has the optional `max_deferral_s`, whatever it answers."""
+    return getattr(check, DEFERRAL_HOOK, None) is not None
+
+
+def deferral_bound(check: Any, hook: str = DEFERRAL_HOOK, owner: str = HEALTH_OWNER) -> DeferralBound | None:
+    """The longest deferral a health check declares through its optional `max_deferral_s()` (or, with `hook` and
+    `owner`, what the platform's run admission declares through `declared_deferral_s()`); None for an object without
+    the hook, or one that declares none. Raise ConfigError for a hook that is not callable, or that answers anything
+    but None or a `DeferralBound` of a finite, non-negative number of seconds and a detail."""
+    method = getattr(check, hook, None)
+    if method is None:
+        return None
+    if not callable(method):
+        raise ConfigError(f"{owner} has a {hook} that is not a method")
+    return checked_bound(method(), hook, owner)
+
+
+class PlatformDeferral(NamedTuple):
+    """What one platform of `[study] platforms` declares of its own longest deferral, read by the core from the
+    platform's configuration through the platform's module (`expcore.study.platform_deferral`, with no object of the
+    study's plugin between): the module's name and its `DeferralBound`, None for a platform whose configuration declares
+    none. The scheduler holds the health check to each (`Scheduler(platform_deferrals=...)`,
+    `SchedulerConfig.check_declared_deferral`).
+
+    `loaded` names the platform modules whose loader the module's function ran to answer (`expcore.config.platform_loads`):
+    a module of the study's own that re-exports a platform's function loads that platform's configuration, so it speaks
+    for the platform even when it answers None, and what the study's build loaded of that platform is covered by listing
+    the study's module (`Scheduler(platform_loads=...)`)."""
+
+    platform: str
+    bound: DeferralBound | None
+    loaded: tuple[str, ...] = ()
+
+
+def checked_bound(answer: Any, hook: str, owner: str) -> DeferralBound | None:
+    """What `owner` answered to `hook`, validated at the boundary: None, or a `DeferralBound` of a finite, non-negative
+    number of seconds, a detail and non-negative whole counts of the core's own waits; ConfigError, naming `owner` and
+    `hook`, for anything else."""
+    if answer is None:
+        return None
+    seconds = answer.seconds if isinstance(answer, DeferralBound) else None
+    number = isinstance(seconds, int | float) and not isinstance(seconds, bool)
+    if (
+        not number
+        or not math.isfinite(seconds)
+        or seconds < 0
+        or not isinstance(answer.detail, str)
+        or not all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in answer[2:4])
+        or not isinstance(answer.platform, str)
+    ):
+        raise ConfigError(
+            f"{owner} answered {hook}() with {answer!r:.120}, not None or a "
+            "DeferralBound of a finite, non-negative number of seconds, a detail, non-negative whole counts of "
+            "the core's own waits and the platform's module name as text"
+        )
+    return answer
 
 
 def read_health(check: Callable[[], Any]) -> Health:
@@ -94,8 +244,13 @@ def read_health(check: Callable[[], Any]) -> Health:
         answer = check()
     except Exception as error:
         return Health(False, f"health check raised {type(error).__name__}")
-    if isinstance(answer, Health) and isinstance(answer.ok, bool) and isinstance(answer.deferred, bool):
-        return Health(answer.ok and not answer.deferred, str(answer.detail), answer.deferred)
+    if (
+        isinstance(answer, Health)
+        and isinstance(answer.ok, bool)
+        and isinstance(answer.deferred, bool)
+        and isinstance(answer.charge, bool)
+    ):
+        return Health(answer.ok and not answer.deferred, str(answer.detail), answer.deferred, answer.charge)
     if isinstance(answer, tuple | list) and len(answer) == 2 and isinstance(answer[0], bool):
         return Health(answer[0], str(answer[1]))
     return Health(False, f"health check answered {str(answer)[:80]!r}, not (ok, detail)")
@@ -152,19 +307,31 @@ def alarms(state: dict[str, Any], every_s: float) -> list[str]:
     if outage is None:
         return deferral_alarms(state.get("deferral"))
     last = outage.get("last_detail") or outage.get("first_detail") or "no detail"
+    charged = (
+        "no attempt was charged: an earlier attempt left it"
+        if outage.get("charged") is False
+        else "one attempt was charged, to the run that found it"
+    )
+    reason = operator_reason(last)
+    if reason is not None:  # only an operator ends it: the dispatcher's checks pass once what it left is mended
+        return [
+            f"HEALTH GATE CLOSED since {outage['start_utc']}: {reason}; no run starts; the dispatcher re-checks every "
+            f"{every_s:g} s, but a check passes only once an operator has mended it ({outage.get('checks', 0)} "
+            f"check(s) so far, last {outage.get('last_check_utc') or 'not yet'}: {str(last)[:160]}); {charged}"
+        ]
     return [
         f"HEALTH GATE CLOSED since {outage['start_utc']}: no run starts; the dispatcher re-checks every {every_s:g} s "
         f"and resumes by itself on the first pass ({outage.get('checks', 0)} check(s) so far, last "
-        f"{outage.get('last_check_utc') or 'not yet'}: {str(last)[:160]}); one attempt was charged, to the run that "
-        "found it"
+        f"{outage.get('last_check_utc') or 'not yet'}: {str(last)[:160]}); {charged}"
     ]
 
 
 @dataclass(frozen=True)
 class PreRun:
-    """What a pre-run check lets the run do: `go`, `hold` (stay pending, charge nothing), `defer` (the check was
-    deferred: stay pending, charge nothing, try again after `recheck_s`, the gate left open) or `found` (this run found a
-    new outage and is charged its one attempt)."""
+    """What a pre-run check lets the run do: `go`, `hold` (stay pending, charge nothing: the gate is closed, by a new
+    outage this run found included when its check charges no one), `defer` (the check was deferred: stay pending,
+    charge nothing, try again after `recheck_s`, the gate left open) or `found` (this run found a new outage and is
+    charged its one attempt)."""
 
     verdict: str
     detail: str
@@ -176,7 +343,7 @@ class HealthGate:
     def __init__(
         self,
         store: Store,
-        check: HealthCheck,
+        check: HealthCheck | ContextHealthCheck,
         clock: Callable[[], str],
         *,
         recheck_s: float = 30.0,
@@ -185,6 +352,7 @@ class HealthGate:
     ):
         if recheck_s <= 0 or timeout_s <= 0 or max_defer_s <= 0:
             raise ValueError("recheck_s, timeout_s and max_defer_s must be positive")
+        self._takes_context = takes_context(check)  # an ambiguous signature is refused here, not at the first call
         self.store, self.check, self.clock = store, check, clock
         self.recheck_s, self.timeout_s, self.max_defer_s = recheck_s, timeout_s, max_defer_s
         self.deferral = Deferral(store, clock)
@@ -213,6 +381,13 @@ class HealthGate:
         healthy again, and that answer must not be thrown away by a campaign that exits as blocked."""
         outage = self._open
         return outage is not None and bool(outage.get("blocking")) and not self._restored.is_set()
+
+    @property
+    def operator_reason(self) -> str | None:
+        """The reason the open outage's latest answer leads with when only an operator can end it
+        (`deferral.operator_reason`); None when the gate is open or it says none."""
+        outage = self._open
+        return None if outage is None else operator_reason(outage.get("last_detail") or outage.get("first_detail"))
 
     def load(self) -> None:
         """Restore the outage list at a start. A gate closed when the last process ended is closed again and checked at
@@ -250,9 +425,10 @@ class HealthGate:
                 "checked at once; no attempt is charged for the restart",
             )
 
-    def _close(self, run_key: str, detail: str, *, blocking: bool = False) -> bool:
-        """Close the gate for a failed check. True: this run found the outage and is its one attempt. A `blocking`
-        outage, a deferral past its bound, is a hold that does not end by itself."""
+    def _close(self, run_key: str, detail: str, *, blocking: bool = False, charge: bool = True) -> bool:
+        """Close the gate for a failed check. True: this run found the outage, and is its one attempt unless `charge`
+        is False (an earlier attempt left the failure). A `blocking` outage, a deferral past its bound, is a hold that
+        does not end by itself."""
         with self._lock:
             if self._open is not None:
                 return False
@@ -269,23 +445,36 @@ class HealthGate:
             }
             if blocking:
                 record["blocking"] = True
+            if not charge:
+                record["charged"] = False
+            reason = operator_reason(detail)
+            if reason is not None:
+                record["operator_reason"] = reason
             self._open = record
             self._outages.append(record)
             self.store.put_meta(META, dump(self._outages), now)
+            who = (
+                "this run is charged one attempt, no other is"
+                if charge
+                else "no run is charged, this one included: an earlier attempt left the failure"
+            )
             self.store.event(
                 now,
                 "health_gate_closed",
                 None,
                 f"{run_key}: the pre-run health check failed ({detail[:200]}): no run starts until the dispatcher's own "
-                f"check passes (every {self.recheck_s:g} s); this run is charged one attempt, no other is",
+                f"check passes (every {self.recheck_s:g} s); {who}",
             )
         self._wake.set()
         return True
 
     # --- the checks of a run ----------------------------------------------------------------------------------------
 
-    def _ask(self, stop: threading.Event | None) -> Health | None:
+    def _ask(self, stop: threading.Event | None, context: CheckContext | None = None) -> Health | None:
         """Run the check in a thread of its own and wait for its answer at most `timeout_s`.
+
+        A check that takes a `context` is called with this call's (None for a check that judges no attempt): it is
+        bound into the call here, never kept on the gate, which every worker's checks share.
 
         Return what it said; a check that does not answer in time reads as down and its late answer is thrown away.
         Return None when `stop` is set before it answers: the campaign is ending and nobody is waiting for it. A check
@@ -300,9 +489,11 @@ class HealthGate:
             box: dict[str, Any] = {"done": threading.Event(), "deadline": time.monotonic() + self.timeout_s}
             self._out.append(box)
 
+        call = functools.partial(self.check, context=context) if self._takes_context else self.check
+
         def go() -> None:
             try:
-                box["health"] = read_health(self.check)
+                box["health"] = read_health(call)
             finally:
                 box["done"].set()
 
@@ -315,7 +506,7 @@ class HealthGate:
                 return Health(False, f"the health check did not answer within {self.timeout_s:g} s: counted as down")
         return box["health"]
 
-    def _read_at_gate(self) -> tuple[Health, dict[str, Any] | None]:
+    def _read_at_gate(self, context: CheckContext | None) -> tuple[Health, dict[str, Any] | None]:
         """Run a post-run check and take the gate's state the instant it returns: the open outage's record or None.
 
         The check runs outside the lock, since it may take as long as its timeout. The gate is read with the answer in
@@ -323,20 +514,25 @@ class HealthGate:
         the timeout alone: the end of the campaign does not cut it short, because the result it judges is finished and
         must not be relabelled as infrastructure for want of an answer.
         """
-        health = self._ask(None)
+        health = self._ask(None, context)
         assert health is not None  # only an ending campaign gives no answer, and none is passed
         with self._lock:
             return health, self._open
 
-    def before_run(self, run_key: str) -> PreRun:
+    def before_run(self, run_key: str, *, attempt: int | None = None) -> PreRun:
         """Check before an attempt. A closed gate holds the run without a check; a passing check lets it go unless the
         gate closed while the check was out; a deferred check defers the run and leaves the gate as it is; a failing
-        check closes the gate and charges this run, or, if another run closed it first, holds this one."""
+        check closes the gate and charges this run, or holds it when the check charges no one (`Health.charge`) or
+        another run closed the gate first.
+
+        `attempt` is the number the try will have (`CheckContext.attempt`): a check that takes the context is given
+        `CheckContext(run_key, attempt, PRE_RUN)`, or None when no attempt is named."""
+        context = None if attempt is None else CheckContext(run_key, attempt, PRE_RUN)
         if self._open is not None:
             return PreRun(HOLD, "the gate is closed")
         if self._stop is not None and self._stop.is_set():
             return PreRun(HOLD, "the campaign is ending")
-        answer = self._ask(self._stop)
+        answer = self._ask(self._stop, context)
         if answer is None:
             return PreRun(HOLD, "the campaign is ending")  # nothing is charged for a shutdown
         with self._lock:
@@ -353,14 +549,24 @@ class HealthGate:
                 return PreRun(DEFER, health.detail)  # a wait, not a failure: nothing is closed or charged
             blocking = True  # a wait past its bound: the holder may never let go
             detail = f"{detail} (deferred for {age:.0f} s, past max_defer_s of {self.max_defer_s:g} s)"
-        if not self._close(run_key, detail, blocking=blocking):
+        if not self._close(run_key, detail, blocking=blocking, charge=health.charge):
             return PreRun(HOLD, "another run's failed check closed the gate first")
-        return PreRun(FOUND, detail)
+        return PreRun(FOUND, detail) if health.charge else PreRun(HOLD, detail)
 
-    def after_run(self) -> tuple[Health, dict[str, Any] | None]:
+    def after_run(
+        self, run_key: str | None = None, *, attempt: int | None = None, attempt_id: int | None = None
+    ) -> tuple[Health, dict[str, Any] | None]:
         """Check after an attempt: the health, and the outage record if the gate was closed when the check returned. A
-        check that passes ends the current deferral, as a pre-run pass does, so a later one counts from its own start."""
-        health, outage = self._read_at_gate()
+        check that passes ends the current deferral, as a pre-run pass does, so a later one counts from its own start.
+
+        The attempt judged is named by `run_key`, `attempt` and `attempt_id` (`CheckContext`), given together or not at
+        all: a check that takes the context is given `CheckContext(run_key, attempt, POST_RUN, attempt_id)`, or None
+        when none is named."""
+        given = (run_key is not None, attempt is not None, attempt_id is not None)
+        if any(given) and not all(given):
+            raise ValueError("after_run takes the run_key, the attempt and the attempt_id together, or none of them")
+        context = CheckContext(run_key, attempt, POST_RUN, attempt_id) if all(given) else None
+        health, outage = self._read_at_gate(context)
         if health.ok:
             self.deferral.end()
         return health, outage
@@ -386,6 +592,9 @@ class HealthGate:
             now = self.clock()
             record["checks"] = int(record.get("checks", 0)) + 1
             record["last_check_utc"], record["last_detail"] = now, health.detail[:200]
+            reason = None if health.ok else operator_reason(health.detail)
+            if reason is not None:  # kept apart: the pass that opens the gate overwrites `last_detail`
+                record["operator_reason"] = reason
             if health.ok:
                 record["end_utc"], record["how"] = now, HOW_PASSED
                 self._open = None

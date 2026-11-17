@@ -19,6 +19,7 @@ id = "..."                      # the id Onezone reports for the provider; repor
 name = "..."
 id = "..."
 prefixes = ["..."]              # a mutation may only name a space whose name starts with one of these (O09)
+import = { readonly = true }    # optional: the data provider holds the space on an imported storage (spaces.py, O41)
 
 [support]
 providers = ["<name>", ...]     # the declared supporting set; health fails on any difference (O04)
@@ -70,14 +71,22 @@ manifest = "path.json"          # the frozen manifest the client checks the serv
 Two more tables are accepted here and read by the modules that use them, each validated against this file's providers:
 `[placement]` (the data provider, the bounds of placement and the declared range map; `rangemap.load_placement`) and
 `[slots.<name>]` (the leased platform users, one per token plane; `users.load_slots`). `[faults]` (the sanction, journal
-and services of the fault injector; `faults.load_faults`) is read the same way.
+and services of the fault injector; `faults.load_faults`) is read the same way. `[link_check]` (the probe space of the
+pre-campaign link check, never a study space, and its bounds; `linksettings.load_link_check`, O35) is read when the
+file is loaded, into `link_check`, and kept out of the fingerprint: it says what is checked before a campaign, not what
+a run measures.
 
-**Several spaces** (`spaces.py`). The one-space form's single space is `spaces[0]`, labelled `space`, and its
-fingerprint is unchanged. With several spaces, `space` and `support` refuse (there is no one space to give), and each
-consumer names the space it acts on by its label: provisioning, placement, eviction and the probes are bound to one
-(`provision.Provisioner`), a token plane's caveats and privilege checks reach every space it is scoped to
-(`space_ids`), a mutation passes the gate when its target lies under any declared prefix (`prefixes`), and the spaces
-enter the campaign fingerprint, so a resume under another set is refused.
+**Loading is recorded for the study's build** (C11, O35). `load_platform` and `fault_settings.load_faults` record that
+they ran, with `PLATFORM_MODULE` and the file (`expcore.config.platform_loads`), while a study's build is open, and the
+scheduler refuses a study whose build loaded this platform without listing the module in `[study] platforms`, whatever
+its plugin wraps. The record is the module and the path only, and no value or fingerprint depends on it.
+
+**Several spaces** (`spaces.py`). The one-space form's single space is `spaces[0]`, labelled `space`, and it is in
+the fingerprint by its support, name and prefixes (`support`). With several spaces, `space` and `support` refuse
+(there is no one space to give), and each consumer names the space it acts on by its label: provisioning, placement,
+eviction and the probes are bound to one (`provision.Provisioner`), a token plane's caveats and privilege checks
+reach every space it is scoped to (`space_ids`), a mutation passes the gate when its target lies under any declared
+prefix (`prefixes`), and the spaces enter the campaign fingerprint, so a resume under another set is refused.
 """
 
 import hashlib
@@ -92,12 +101,15 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
+from expcore.config.platform_loads import record_platform_load
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
+from expcore_onedata.linksettings import LinkCheckSettings, load_link_check
 from expcore_onedata.rights import declares_qos, declares_write, rights_problem
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
 
+PLATFORM_MODULE = "expcore_onedata.sandbox.kinds"  # the module a study lists in `[study] platforms` for this platform
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 HOSTNAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
@@ -213,6 +225,12 @@ class PlatformConfig:
     sha256: str = ""  # of the file as loaded: a record names the configuration by this, never by a value in it
     tls: TlsSettings = field(default_factory=TlsSettings)  # every client's one certificate check (`[tls]`)
     spaces_table: bool = False  # the spaces came from [[spaces]], one entry or several, not from [space]/[support]
+    link_check: LinkCheckSettings | None = None  # the pre-campaign link check's probe space and bounds (O35)
+
+    @property
+    def probe_space(self) -> Space | None:
+        """The link check's probe space, which only a request bound to it reaches (`OnezoneClient.mutate`), or None."""
+        return None if self.link_check is None else self.link_check.space
 
     def space_named(self, label: str | None = None) -> StudySpace:
         """Return the space a label names, or, with none, the only one; refuse, naming no label, when there is none
@@ -262,36 +280,74 @@ class PlatformConfig:
         return ", ".join(self.provider_label(n) for n in sorted(set(names), key=order.index))
 
     def fingerprint(self) -> dict[str, Any]:
-        """The platform's half of the campaign fingerprint (`StudyPlugin.platform`): what a resume must not change.
+        """The platform's half of the campaign fingerprint (`StudyPlugin.platform`): what a resume must not change, and
+        what two shards must share to merge. It holds every declared setting that shapes a run, after its default and
+        in one canonical form, and nothing that is one federation's or one host's own (an address, an id, a port, a
+        name, a path) or a secret (O12): two renders of one template on two federations give one fingerprint, and a
+        changed setting that shapes a run gives another (`runsettings`, which says what is in and what is out).
 
-        It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12), and,
-        whenever the `[[spaces]]` form is used (one entry or several), each entry's SHA-256 in the file's order
-        (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
-        The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was.
+        It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value, and the
+        lifetime rule of the run's tokens (`tokens`). Whenever the `[[spaces]]` form is used (one entry or several), it
+        holds each entry's SHA-256 in the file's order (`StudySpace.digest`), so a resume under another set, order,
+        support, data provider or token planes is refused. An entry that declares its data (`data_manifest`) is there
+        by its declared identity and its data's content hash, without its Onezone id: a space is the same experimental
+        condition across federations when its declared identity and its data identity match (C06); one that does not is
+        there with its id, as it always was. The one-space form holds its support set and its local provider by label
+        and its prefixes by their SHA-256 (`support`), its data identity (`space_data`) when `[space]` declares
+        `data_manifest`, and `storage_import` with its `readonly` (and `shared`, when true: O59) when it declares an
+        imported storage (O41).
 
-        With a `[sandbox]`, it also holds every level of the data path with its kind and a REST level's listing mode
-        (O21), so a resume after a level changed its data path or its listing is refused. A declared
-        `[sandbox.served_bytes]` puts the caps of the tables of the bytes served there too (O22), since they decide what
-        a run's evidence can show; without the table the fingerprint keeps the shape it had before the caps could be
-        declared, so a campaign that ran under the defaults still resumes.
+        With a `[sandbox]`, it also holds every level of the data path with its kind, a REST level's listing mode and a
+        mount level's I/O mode (O21, O36), the caps of the tables of the bytes served when `[sandbox.served_bytes]` is
+        declared (O22), on the Apptainer backend that backend's pins (`sandbox_backend`, O56), and the sandbox's other
+        settings that shape a run (`sandbox`: the backend, the images by id, the limits, the mount, the trust paths,
+        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256). With a
+        `[toolserver]`, its pinned commit, its command line (federation-neutral, hashed), its start's bound and each
+        condition's allow-list, rights and manifest's SHA-256 (`toolserver`); with a `[placement]`, its data provider by
+        label, its range map by digest and the bounds a run's instruments read (`placement`); with `[faults]`, the
+        fault injector's sanction, targets and every bound of its waits and its heal (`faults`,
+        `fault_settings.faults_fingerprint`).
 
-        When the file has `[faults]`, it holds the fault injector's sanction and targets too
-        (`fault_settings.faults_fingerprint`), never a path, a name or a value (O12). A file without `[faults]` keeps
-        the fingerprint it had before the fault injector existed.
+        The fingerprint of a store recorded before these settings were in it differs: such a store is refused at its
+        resume, naming what changed, and a merge never joins it with a shard of this form (C06).
         """
-        from expcore_onedata.fault_settings import faults_fingerprint  # it reads this module's config: import when used
+        from expcore_onedata import runsettings  # it reads this module's settings: import when used
+        from expcore_onedata.fault_settings import faults_fingerprint
 
-        out: dict[str, Any] = {"tls": self.tls.record()}
+        out: dict[str, Any] = {"tls": self.tls.record(), "tokens": runsettings.tokens_record(self.tokens)}
         if self.spaces_table:
             out["spaces"] = [entry.digest() for entry in self.spaces]
+        else:  # the one-space form's
+            out["support"] = runsettings.support_record(self)
+            if self.spaces[0].imported is not None:
+                out["storage_import"] = self.spaces[0].imported.record()
+            if self.spaces[0].data is not None:  # its data identity (C06): two federations agree only on the same data
+                out["space_data"] = self.spaces[0].data
         if self.sandbox is not None:
             out["data_paths"] = self.sandbox.data_path_record()
             if self.sandbox.served_caps_declared:
                 out["served_bytes"] = self.sandbox.served_caps.record()
+            if self.sandbox.apptainer is not None:  # O56: a Docker and an Apptainer run are never one experiment
+                out["sandbox_backend"] = self.sandbox.apptainer.record()
+            out["sandbox"] = runsettings.sandbox_record(self.sandbox, runsettings.federation_roles(self))
+        if self.toolserver is not None:
+            roles = runsettings.federation_roles(self)
+            out["toolserver"] = runsettings.toolserver_record(self.toolserver, self.file, roles)
+        placement = runsettings.placement_record(self)
+        if placement is not None:
+            out["placement"] = placement
         faults = faults_fingerprint(self)
         if faults is not None:
             out["faults"] = faults
         return out
+
+    def legacy_fingerprint(self) -> dict[str, Any] | None:
+        """The platform's half of the fingerprint as a store started before its spaces declared their data recorded
+        it (`StudyPlugin.platform_legacy`): every `[[spaces]]` entry by its id-bearing digest (`legacy_digest`). None
+        when no entry declares its data, since then the two are one."""
+        if not any(entry.data is not None for entry in self.spaces) or not self.spaces_table:
+            return None
+        return {**self.fingerprint(), "spaces": [entry.legacy_digest() for entry in self.spaces]}
 
     def condition_label(self, name: str) -> str:
         """Name a declared condition for a message by its position in the file, `conditions[i]`, never by its name."""
@@ -515,8 +571,11 @@ def load_platform(
     With `require_secrets` (the default, for a run) the admin credential's source must exist and hold something, and
     each fixed principal must have a credential file that others cannot read, so a missing variable or file fails here
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
+
+    While a study's build is open it records that it ran, with `PLATFORM_MODULE` and the file (`platform_loads`).
     """
     file = Path(path).resolve()
+    record_platform_load(PLATFORM_MODULE, file)  # at the entry: a load that then refuses its file still ran
     try:  # the same errors load_toml gives, so a missing file is a configuration error, not a crash
         digest = hashlib.sha256(file.read_bytes()).hexdigest()
     except FileNotFoundError:
@@ -540,6 +599,7 @@ def load_platform(
             "placement",  # read by rangemap.load_placement
             "slots",  # read by users.load_slots
             "faults",  # read by faults.load_faults
+            "link_check",  # read by linksettings.load_link_check, below
         )
     )
     zone = root.section("zone")
@@ -575,4 +635,5 @@ def load_platform(
         else None,
         sha256=digest,
         tls=tls,
+        link_check=load_link_check(root, providers, spaces),
     )

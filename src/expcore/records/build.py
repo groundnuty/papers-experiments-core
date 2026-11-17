@@ -28,6 +28,7 @@ from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import LoopResult, TurnRecord
 from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
+from expcore.models import spend
 from expcore.models.adapters import ModelBackend, ModelTurn
 from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
@@ -43,6 +44,7 @@ from expcore.records.schema import (
     SCHEMAS,
     RecordError,
     SchemaVersion,
+    check_required_targets,
     fields_of,
     first_turn_rule,
     optional_in,
@@ -215,11 +217,22 @@ def tool_entry(spec: ToolSpec) -> dict[str, Any]:
     }
 
 
-def call_entry(call: Any) -> dict[str, Any]:
-    """Return a tool-call log entry as the record keeps it."""
+def call_entry(call: Any, schema_version: str = CURRENT, schemas: Sequence[SchemaVersion] = SCHEMAS) -> dict[str, Any]:
+    """Return a tool-call log entry as the record keeps it, as a record of `schema_version` keeps it.
+
+    `elapsed_s` comes after the fields of the first merge point and `exec_check` last; each is left out where there is
+    nothing to say, never written as a null: `elapsed_s` for a call that never started (L17), `exec_check` for a call
+    whose tool verified no exec (O55), and both for a version that predates them.
+    """
     entry = plain(dataclasses.asdict(call))
+    elapsed, checked = entry.pop("elapsed_s"), entry.pop("exec_check")
     entry["detail"] = stable_call_detail(entry["status"], entry["detail"])
     entry["rendering_verified"] = True  # until redaction changes what the cap or the error text is computed from
+    known = fields_of("tool_call", schema_version, schemas)
+    if elapsed is not None and "elapsed_s" in known:
+        entry["elapsed_s"] = elapsed
+    if checked is not None and "exec_check" in known:
+        entry["exec_check"] = checked
     return entry
 
 
@@ -393,6 +406,7 @@ def _build_record(
     secrets, secret_env = tuple(secrets), tuple(secret_env)
     kinds = treatment_list(treatment_kinds)
     targets = target_table(treatment_targets, kinds)
+    check_required_targets(kinds, targets)
     if targets and not target_rule(schema_version, schemas):
         raise RecordError(f"treatment_targets: {schema_version} predates declared targets")
     sys_prompt, user_prompt = PromptText.of(system), PromptText.of(user)
@@ -431,7 +445,7 @@ def _build_record(
         "core_version": core_version,
         "transcript": turns,
         "failed_request": failed,
-        "tool_calls": [call_entry(c) for c in result.tool_calls],
+        "tool_calls": [call_entry(c, schema_version, schemas) for c in result.tool_calls],
         "clock": [[label, value] for label, value in result.clock_readings],
         "outcome": outcome_entry(
             result.outcome,
@@ -582,6 +596,7 @@ async def _record_attempt(
         sleep=sleep,
         on_defect=defect_log,
     )
+    spend.after_loop()  # every request is closed: an exception from here on is not one during the loop (C05)
     unheld = None if reply_cap_unheld is None else await asyncio.to_thread(reply_cap_unheld)
     record = _build_record(
         result,

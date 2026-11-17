@@ -7,6 +7,7 @@ a copy of a finished shard, or runs a shard against another environment, and exp
 the reason and to leave nothing behind.
 """
 
+import contextlib
 import hashlib
 import json
 import re
@@ -31,9 +32,19 @@ from shard_support import (
     write_meta,
 )
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, table
+from tree_support import read_only, tree_of
 
-from expcore.campaign.export import export_run_state, export_text
+from expcore.campaign.export import (
+    EXPORT_FINGERPRINT,
+    ExportError,
+    export_run_state,
+    export_text,
+    stored_fingerprint_sha256,
+    verify_export_fingerprint,
+)
+from expcore.campaign.lock import DispatchLock
 from expcore.campaign.merge import SHARDS_DIR
+from expcore.campaign.scheduler import STATE_FILE
 from expcore.campaign.shard import (
     MERGE_FILE,
     MERGE_SCHEMA,
@@ -231,6 +242,31 @@ def test_c29_the_merged_export_tags_every_run_with_its_shard_and_lists_the_shard
     assert export["planned_runs"] == sum(shard["runs"] for shard in export["shards"])
 
 
+def test_c36_the_merged_export_carries_the_one_fingerprint_every_shard_records_and_merge_json_names(
+    merged, shard1, shard2
+):
+    """C36: the merged export's `campaign_fingerprint` is the fingerprint each shard's store holds, which is the one
+    merge.json hashes, and the export verifies against merge.json's hash and each shard snapshot's."""
+    export = read(merged, "export.json")
+    merge = json.loads((merged.root / "out" / MERGE_FILE).read_text(encoding="utf-8"))
+    entry = export[EXPORT_FINGERPRINT]
+    for shard in (shard1, shard2):
+        assert json.loads(meta_of(shard)["fingerprint"]) == entry["fingerprint"]
+    assert entry["sha256"] == merge["fingerprint"]
+    assert verify_export_fingerprint(export, merge["fingerprint"])
+    for index in (1, 2):
+        snapshot = merged.root / "out" / SHARDS_DIR / str(index) / SNAPSHOT_FILE
+        held = StoreSnapshot(snapshot.read_bytes(), load_study(merged.root).schema)
+        assert verify_export_fingerprint(export, stored_fingerprint_sha256(held))
+    assert list(export)[-3:] == [EXPORT_FINGERPRINT, "shard_retries_by_kind", "shards"]
+
+
+def test_c36_a_merged_batchs_export_is_refused_against_the_hash_of_another_campaign(merged):
+    """C36: an analysis that reads the merged export with another campaign's hash is refused."""
+    with pytest.raises(ExportError, match="another campaign"):
+        verify_export_fingerprint(read(merged, "export.json"), hashlib.sha256(b"another campaign").hexdigest())
+
+
 def test_c29_the_merged_export_carries_each_runs_wall_time_and_turn_latency_and_each_shards_set_asides(
     merged, shard1, shard2, tmp_path
 ):
@@ -314,6 +350,85 @@ def _report_differs_only_in_positions(merged: str, whole: str) -> bool:
         if a != b and not (a.startswith("| ") and a.rsplit(" | ", 1)[0] == b.rsplit(" | ", 1)[0]):
             return False
     return True
+
+
+def test_r16_a_merge_reads_read_only_shards_and_leaves_each_shards_out_byte_for_byte(
+    base, clean_environment, shard1, shard2
+):
+    """R16: shards fetched back from other hosts may arrive read-only. The merge reads each finished shard's store
+    from a copy in a directory of its own, so it merges them and leaves every shard's out/ as it found it: no -shm or
+    -wal is made beside a store, and no lock file."""
+    shards = [copy_campaign(shard, base, f"r16-{shard.root.name}") for shard in (shard1, shard2)]
+    for shard in shards:
+        for leftover in (shard.root / "out").glob(f"{STATE_FILE}-*"):  # what the shard's own check left
+            leftover.unlink()
+    before = [tree_of(shard.root / "out") for shard in shards]
+    with contextlib.ExitStack() as stack:
+        for shard in shards:
+            stack.enter_context(read_only(shard.root / "out"))
+            stack.enter_context(read_only(shard.runs))
+        code, errors = merge_into(clean_environment, Campaign(make_study(base, "r16-merge")), *shards)
+    assert code == 0, errors
+    assert [tree_of(shard.root / "out") for shard in shards] == before
+
+
+def test_r16_a_merge_refuses_a_shard_a_dispatcher_still_holds(base, clean_environment, shard1, shard2):
+    """R16: a shard whose store a dispatcher holds is still being written, so no copy of it is one state: refused,
+    naming the shard, before its store is read."""
+    held = copy_campaign(shard2, base, "r16-held")
+    target = Campaign(make_study(base, "r16-merge-held"))
+    with DispatchLock(held.root / "out"):
+        code, errors = merge_into(clean_environment, target, shard1, held)
+    assert code == 1, errors
+    assert "another dispatcher holds" in errors, errors
+    assert "a shard is merged when it has finished" in errors, errors
+    assert not (target.root / "out").exists()
+
+
+def test_r16_a_merge_refuses_a_shard_whose_lock_file_is_missing_or_unreadable(base, clean_environment, shard1, shard2):
+    """R16: without a lock file it can take, nothing keeps a dispatcher off a shard's store while it is copied, so
+    the shard is refused, naming the file and why, and nothing is written there; never an uncaught error."""
+    missing = copy_campaign(shard2, base, "r16-no-lock-shard")
+    (missing.root / "out" / "campaign.lock").unlink()
+    unreadable = copy_campaign(shard2, base, "r16-unreadable-lock-shard")
+    lock = unreadable.root / "out" / "campaign.lock"
+    cases = ((missing, "no dispatcher ever ran there"), (unreadable, "cannot be opened"))
+    before = [tree_of(shard.root / "out") for shard, _ in cases]
+    lock.chmod(0o000)
+    try:
+        for shard, fragment in cases:
+            target = Campaign(make_study(base, f"r16-merge-{shard.root.name}"))
+            code, errors = merge_into(clean_environment, target, shard1, shard)
+            assert code == 1, errors
+            assert fragment in errors, errors
+            assert str(shard.root / "out") in errors, errors
+            assert not (target.root / "out").exists()
+    finally:
+        lock.chmod(0o644)
+    assert [tree_of(shard.root / "out") for shard, _ in cases] == before
+
+
+def test_r16_check_analyze_and_regenerate_read_a_merged_batchs_sealed_snapshots_and_leave_it_as_it_was(
+    base, clean_environment, merged
+):
+    """R16: each shard's snapshot under OUT/shards/ is read as the bytes merge.json names, never opened in place:
+    analyze, report and regenerate leave every file of OUT byte for byte, and check rewrites its own check file and
+    nothing else."""
+    copy = copy_campaign(merged, base, "r16-merged")
+    out = copy.root / "out"
+    sealed = tree_of(out)
+    assert [name for name in sealed if name.startswith(f"{SHARDS_DIR}/")] == [
+        f"{SHARDS_DIR}/1/{SNAPSHOT}",
+        f"{SHARDS_DIR}/2/{SNAPSHOT}",
+    ]
+    assert cli(clean_environment, "analyze", str(copy.root))[0] == 0
+    assert cli(clean_environment, "report", str(copy.root))[0] == 0
+    assert regenerate(copy.root) == []
+    assert tree_of(out) == sealed
+    assert cli(clean_environment, "check", str(copy.runs))[0] == 0
+    checked = tree_of(out)
+    assert set(checked) == set(sealed)
+    assert [name for name in sealed if checked[name] != sealed[name]] in ([], ["runs/replay-check.json"])
 
 
 def test_c29_regenerate_derives_the_outputs_of_a_merged_batch_anew(merged):
@@ -575,6 +690,32 @@ def test_c29_a_snapshot_merge_json_does_not_list_is_refused_by_the_check(base, c
 # --- what a merge refuses -------------------------------------------------------------------------------------------
 
 
+def test_o63_a_merge_refuses_a_shard_marked_not_final_naming_it_and_the_reason(
+    base, clean_environment, whole, shard1, shard2
+):
+    """O63: a shard whose out/ holds NOT-FINAL.json (the HPC shard driver's post-run script did not pass) is refused,
+    naming the shard and the reason the file gives, whether the file is readable or not, and nothing is written."""
+    marked = copy_out(shard2, base / "o63-marked")
+    (marked / "NOT-FINAL.json").write_text(json.dumps({"final": False, "reason": "the post-run script exited with 3"}))
+    refused(
+        clean_environment,
+        whole,
+        base / "o63-refused" / "out",
+        shard1.root / "out",
+        marked,
+        fragments=("shard 2 (shard-2)", "marked not final", "the post-run script exited with 3"),
+    )
+    (marked / "NOT-FINAL.json").write_text("{")
+    refused(
+        clean_environment,
+        whole,
+        base / "o63-refused-2" / "out",
+        shard1.root / "out",
+        marked,
+        fragments=("shard 2 (shard-2)", "marked not final", "NOT-FINAL.json says so"),
+    )
+
+
 def test_c29_a_merge_needs_every_shard_exactly_once(base, clean_environment, whole, shard1, shard2):
     """C29: shards 1..N each exactly once: a missing index and a duplicated one are refused, naming the shard."""
     out = base / "refused-missing" / "out"
@@ -714,6 +855,72 @@ def test_c29_a_shard_whose_replay_check_fails_is_refused_naming_the_record(
             f"{victim.relative_to(other / 'runs').as_posix()} [roundtrip]",
         ),
     )
+
+
+def test_r04_a_shard_holding_a_file_that_is_neither_a_record_nor_declared_is_refused_naming_it(
+    base, clean_environment, whole, shard1, shard2
+):
+    """R04 and C29: a study's evidence left in a run directory of a shard (a `.json` file the merge once replayed as a
+    record, and a file of any other kind it once passed over) is no record: the merge refuses the shard, naming each
+    file as unexpected and saying how to declare it, and does not count it among the records that fail."""
+    other = copy_out(shard2, base / "stray")
+    attempt = next(p for p in sorted((other / "runs").rglob("*.json")) if RECORD.fullmatch(p.name)).parent
+    strays = [attempt / "sandbox.json", attempt / "sandbox.log"]
+    strays[0].write_text('{"backend": "apptainer"}', encoding="utf-8")
+    strays[1].write_text("what the sandbox saw", encoding="utf-8")
+    errors = refused(
+        clean_environment,
+        whole,
+        base / "refused-stray" / "out",
+        shard1.root / "out",
+        other,
+        fragments=(
+            "shard 2 (shard-2): 2 unexpected files in the batch",
+            *(path.relative_to(other / "runs").as_posix() for path in strays),
+            "[[study.side_files]]",
+        ),
+    )
+    assert "records fail the replay check" not in errors
+    assert "[load]" not in errors
+
+
+def test_r04_a_shard_holding_a_link_to_a_directory_is_refused_and_what_it_points_at_never_copied(
+    base, clean_environment, whole, shard1, shard2
+):
+    """R04, C29 and #304: the merge replays a private copy of each shard's runs/ (copy_runs), and that copy keeps a link
+    as a link: following it would copy a directory outside the shard into the copy, where the check would see an
+    ordinary directory and the link would go unseen. So a shard holding a link to a directory is refused, naming it,
+    and nothing it points at reaches the merged batch."""
+    other = copy_out(shard2, base / "linked")
+    outside = base / "outside-the-shard"
+    outside.mkdir()
+    (outside / "planted.json").write_text('{"not": "a record"}', encoding="utf-8")
+    attempt = next(p for p in sorted((other / "runs").rglob("*.json")) if RECORD.fullmatch(p.name)).parent
+    link = attempt / "evidence"
+    link.symlink_to(outside, target_is_directory=True)
+    target = base / "refused-link" / "out"
+    errors = refused(
+        clean_environment,
+        whole,
+        target,
+        shard1.root / "out",
+        other,
+        fragments=("shard 2 (shard-2):", "unexpected", link.relative_to(other / "runs").as_posix()),
+    )
+    assert "planted.json" not in errors
+    assert not target.exists() or not any(target.rglob("planted.json"))
+
+
+def test_r04_a_merged_batchs_own_files_are_neither_records_nor_unexpected(merged):
+    """R04 and C29: merge.json and the shards' snapshots lie beside the batch, not in it, and the batch holds the
+    records, their markers and the check alone: its check found nothing unexpected."""
+    out = merged.root / "out"
+    check = json.loads((out / "runs" / "replay-check.json").read_text(encoding="utf-8"))
+    assert check["failures"] == []
+    assert (out / MERGE_FILE).is_file()
+    assert (out / SHARDS_DIR).is_dir()
+    assert all(RECORD.fullmatch(Path(rel).name) for rel in check["replayed"])
+    assert {Path(rel).name for rel in check["hashed_only"]} == {"attempt-marker.json"}
 
 
 def test_c29_shards_run_against_different_environments_are_refused(

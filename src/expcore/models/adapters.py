@@ -33,6 +33,7 @@ from typing import Any, Protocol
 
 from expcore.config.models import ClientSettings, Limits, ModelSpec
 from expcore.errors import InfraError
+from expcore.models.request_bound import PromptBound
 from expcore.models.retry import Retrier, RetryPolicy, SupportsUniform
 from expcore.models.route import public_url, sdk_version, settings_sent
 from expcore.models.served import Served, requested_from_sent
@@ -184,17 +185,31 @@ class _SdkBackend:
         self.cfg = client_cfg or ClientSettings()
         self.base_url = base_url or spec.base_url
         injected = {"sleep": sleep, "rng": rng, "time_left": time_left}
+        # The bound on the prompt of the request in flight, which the retrier keeps in the entry of an abandoned one (B19).
+        self._bound = PromptBound(spec.context_tokens, self.output_limit)
         self.retrier = Retrier(
-            RetryPolicy.from_settings(self.cfg), **{k: v for k, v in injected.items() if v is not None}
+            RetryPolicy.from_settings(self.cfg),
+            in_flight=self._bound.in_flight,
+            **{k: v for k, v in injected.items() if v is not None},
         )
         self.usage = UsageTally()
         self.served = Served()
         self._sent: dict[str, Any] = {}  # the settings of the latest request, taken from the request itself
 
     def _remember_sent(self, request: dict[str, Any]) -> None:
-        """Keep the settings of the request about to go out, and tell the served-model check which ones they are."""
+        """Keep the settings of the request about to go out, tell the served-model check which ones they are, and bound
+        the prompt of the request, which is the one in flight until its reply comes (B19)."""
         self._sent = settings_sent(request)
         self.served.expect(requested_from_sent(self._sent))
+        self._bound.sent(request)
+
+    async def _send[T](self, send: Callable[[], Awaitable[T]]) -> tuple[T, tuple[dict[str, Any], ...]]:
+        """Send through the retrier; a request that ends with no reply is no longer the one in flight (B19)."""
+        try:
+            return await self.retrier.call(send)
+        except BaseException:
+            self._bound.gave_up()
+            raise
 
     @property
     def requests_sent(self) -> int:
@@ -288,6 +303,7 @@ class OpenAICompatAdapter(_SdkBackend):
 
     def begin(self, system: str, user: str, tools: list[dict]) -> None:
         """Start a conversation with the tools as chat-completion functions."""
+        self._bound.begin()
         self._messages = ([{"role": "system", "content": system}] if system else []) + [
             {"role": "user", "content": user}
         ]
@@ -324,11 +340,12 @@ class OpenAICompatAdapter(_SdkBackend):
         """Send the conversation and return the reply; usage and the served model are noted on arrival."""
         t0 = time.monotonic()
         kw = self._request()
-        resp, retries = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
+        resp, retries = await self._send(lambda: self._client.chat.completions.create(**kw))
         usage = getattr(
             resp, "usage", None
         )  # counted the moment the reply arrives: a reply is billed even if reading it fails
         in_tok, out_tok = token_count(usage, "prompt_tokens"), token_count(usage, "completion_tokens")
+        self._bound.replied(in_tok, out_tok)
         self.served.note(resp)
         self._count(in_tok, out_tok)
         usage_extra, usage_cut = extra_usage(usage, skip=OPENAI_COUNTED)
@@ -478,6 +495,7 @@ class AnthropicAdapter(_SdkBackend):
 
     def begin(self, system: str, user: str, tools: list[dict]) -> None:
         """Start a conversation with the tools as Messages API tools."""
+        self._bound.begin()
         self._system = system
         self._messages = [{"role": "user", "content": user}]
         self._tools = [
@@ -512,12 +530,13 @@ class AnthropicAdapter(_SdkBackend):
         """Send the conversation and return the reply; usage and the served model are noted on arrival."""
         t0 = time.monotonic()
         kw = self._request()
-        resp, retries = await self.retrier.call(lambda: self._client.messages.create(**kw))
+        resp, retries = await self._send(lambda: self._client.messages.create(**kw))
         ua = getattr(resp, "usage", None)  # counted the moment the reply arrives (see the OpenAI adapter)
         fresh = token_count(ua, "input_tokens")  # the API's input_tokens is only the uncached remainder
         created = token_count(ua, "cache_creation_input_tokens")
         read = token_count(ua, "cache_read_input_tokens")
         in_tok, out_tok = _anthropic_counts(ua)  # the prompt size the budget counts, cached parts included
+        self._bound.replied(in_tok, out_tok)
         self.served.note(resp)
         self._count(in_tok, out_tok)
         usage_extra, usage_cut = extra_usage(ua, skip=ANTHROPIC_COUNTED)

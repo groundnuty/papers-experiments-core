@@ -32,9 +32,10 @@ def test_o04_the_declared_provider_alone_is_healthy(tmp_path, fake):
 
 
 def test_o04_a_declared_multi_provider_support_set_passes(tmp_path, fake):
-    """O04: a federation that reports exactly its declared set of two providers is healthy."""
+    """O04: a federation that reports exactly its declared set of two providers is healthy. The space check alone: with
+    two providers the composed check runs the link check first (O35), and this fake has no data API to probe."""
     fake.add_provider("pr-beta", "beta.test")
-    assert health_for(tmp_path, fake, both_declared)().ok is True
+    assert health_for(tmp_path, fake, both_declared).space().ok is True
 
 
 def test_o04_an_extra_provider_fails_an_exclusive_declaration(tmp_path, fake):
@@ -57,8 +58,8 @@ def test_o04_an_undeclared_provider_fails_and_is_shown_by_its_reported_id(tmp_pa
 
 
 def test_o04_a_missing_declared_provider_fails(tmp_path, fake):
-    """O04: a declared provider the federation does not report is a failure."""
-    result = health_for(tmp_path, fake, both_declared)()
+    """O04: a declared provider the federation does not report is a failure (the space check alone, as above)."""
+    result = health_for(tmp_path, fake, both_declared).space()
     assert result.ok is False
     assert "missing providers[1]" in result.detail
     assert "beta" not in result.detail

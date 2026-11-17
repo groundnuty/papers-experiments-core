@@ -29,6 +29,9 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.pin import PinError
 from expcore_onedata.rights import WRITE_RIGHTS
+from expcore_onedata.sandbox import deadline
+from expcore_onedata.sandbox.cells import SETTLE_SLACK_S
+from expcore_onedata.sandbox.settings import KILL_GRACE_MAX_S
 from expcore_onedata.testing import ALPHA_ID, BASELINE, CEILING_S, MANAGE, NOW, TOOL_SERVER_ARGS, write_platform
 from expcore_onedata.testing import DATA_PATH_USER as DATA
 from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
@@ -297,7 +300,7 @@ def test_o05_o06_the_plane_is_checked_before_the_spawn_and_again_after_the_stop(
     """O05, O06: the launch reads the token's examination, the principal's two privilege lists and its Onezone admin
     privileges, as admin reads, then the token's scope and the clusters it acts in, before the server starts, and the
     same six at teardown, so a run that held reads the plane twice. A read-only condition's token has no data-access
-    caveat (O39), so its plane is read as a writing condition's is."""
+    caveat (O88), so its plane is read as a writing condition's is."""
     config, issuer, launcher = world
     token = read_token(issuer, config)
     before = len(fake.requests)
@@ -467,6 +470,37 @@ def test_o06_the_token_at_teardown_only_has_to_be_unexpired(three_conditions, tm
     assert caught.value.kind == "tool_plane_integrity"
 
 
+def test_o06_a_token_minted_for_the_runs_ceiling_lasts_its_start_up_its_whole_time_and_its_teardown(
+    three_conditions,
+):
+    """O06: the phases that use the tool-server token, on the issuer's clock. Minted for a 600 s ceiling, it lives
+    600 + 900 + 300 s. The server's start-time check still passes after the whole headroom of 300 s (the sandbox's
+    start-up between the mint and the server's start); the loop then runs to its ceiling, waits on infrastructure
+    included; and the stop and its check of the plane (which needs the token unexpired) pass at the last second of
+    the 900 s margin, which also holds a cell's deadline escalation at its longest grace and the wait for its outcome.
+    One second past the token's expiry the same check fails, so nothing later than that may need it."""
+    config, issuer, _ = three_conditions
+    ceiling = 600.0
+    now = [NOW]
+    ticking = TokenIssuer(issuer._client, config, clock=lambda: now[0])
+    token = ticking.mint(tool_server_spec(config.space.id, config.condition("read")), TOOLS, ceiling_s=ceiling)
+    settings = config.tokens
+    assert token.expires_at == int(NOW) + ceiling + settings.margin_s + settings.mint_headroom_s == int(NOW) + 1800
+    assert deadline.margin_s(KILL_GRACE_MAX_S) + SETTLE_SLACK_S < settings.margin_s  # the escalation fits the margin
+    loop_starts = NOW + settings.mint_headroom_s
+    launcher = ToolServerLauncher(config, ticking, events=lambda kind, detail: None)
+
+    def phases(teardown_at):
+        now[0] = loop_starts  # the sandbox has started: the server's check before its spawn
+        run_with(
+            launcher, RecordingContext(), "read", token, lambda: now.__setitem__(0, teardown_at), ceiling_s=ceiling
+        )
+
+    phases(loop_starts + ceiling + settings.margin_s - 1)  # the loop ran to its ceiling; teardown at the margin's end
+    with pytest.raises(InfraError, match="failed its check at teardown"):
+        phases(token.expires_at + 1)
+
+
 def test_o05_every_failure_of_the_launch_time_check_is_of_the_integrity_kind_and_spawns_nothing(
     world, fake, tmp_path, monkeypatch
 ):
@@ -583,7 +617,7 @@ BOUNDARY_IDS = ["joined an outside space", "became an admin", "joined a cluster"
 def test_o09_a_tool_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_starts_no_server(
     change, reason, condition, world, fake, tmp_path
 ):
-    """O09: a tool-server token, a read-only condition's (O39) as a writing one's, is bounded by its user alone, so the
+    """O09: a tool-server token, a read-only condition's (O88) as a writing one's, is bounded by its user alone, so the
     launch reads its scope, the user's admin privileges and the clusters the token acts in again: a user who became a
     member of a space outside the plane, another study's say, or of a provider's cluster, or an admin of Onezone,
     after the mint starts nothing, and the refusal names no space and no cluster."""
@@ -623,7 +657,7 @@ def test_o09_a_writing_plane_is_read_for_its_scope_admin_privileges_and_clusters
     """O09: a writing condition's launch adds three reads to the examination and the two privilege reads: the user's
     admin privileges, as an admin read, the token's scope, which Onezone answers to the token in the body and no
     header, and the clusters the token acts in, which the token reads itself, so it is the credential of that request
-    and the admin is not. A read-only condition's launch makes the same six (O39)."""
+    and the admin is not. A read-only condition's launch makes the same six (O88)."""
     config, issuer, launcher = world
     token = manage_token(issuer, config, fake)
     before = len(fake.requests)
@@ -646,7 +680,7 @@ WRITES = [*WRITE_RIGHTS, "space_write_data"]  # every write right a condition ca
 def test_o39_a_read_only_planes_user_who_gained_a_write_right_after_the_mint_starts_no_server(
     right, world, fake, tmp_path
 ):
-    """O39: a read-only condition's token has no data-access caveat, so its user's rights are what keep it from writing;
+    """O88: a read-only condition's token has no data-access caveat, so its user's rights are what keep it from writing;
     a user who gained any write right between the mint and the launch, if only through a group, starts nothing."""
     config, issuer, launcher = world
     token = read_token(issuer, config)
@@ -659,7 +693,7 @@ def test_o39_a_read_only_planes_user_who_gained_a_write_right_after_the_mint_sta
 
 @pytest.mark.parametrize("right", WRITES)
 def test_o39_a_read_only_planes_user_who_gained_a_write_right_during_the_run_is_set_aside(right, world, fake, events):
-    """O39: a write right granted to a read-only condition's user while its server ran is found at teardown: the run is
+    """O88: a write right granted to a read-only condition's user while its server ran is found at teardown: the run is
     set aside as infrastructure of the tool-plane kind, with the rights event, whatever the body did."""
     config, issuer, launcher = world
     token = read_token(issuer, config)

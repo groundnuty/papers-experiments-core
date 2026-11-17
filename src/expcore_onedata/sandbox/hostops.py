@@ -9,8 +9,23 @@ that reaches the host takes a `HostOps` as its first argument; none of them impo
 
 Secrets never travel in an argument list: `docker` takes an `env` mapping for them, and a failure is logged with the
 size and SHA-256 of the tool's own stderr, never its text and never the environment.
+
+Every command runs through `run_bounded`, which bounds it twice. In time (O42): a command past its limit is killed, and
+the wait for it to end after the kill is bounded too, since a process in an uninterruptible sleep (a read of a FUSE
+mount whose provider is gone) cannot die and `subprocess.run` waits for it for ever, holding the caller and with it
+a whole teardown. In memory (O43): with an `output_cap` the first bytes of each stream are kept and the rest is read,
+counted and dropped, so a command that writes without end is never blocked on a full pipe and never held whole;
+`Counted` says how many bytes it wrote and how many were kept.
+
+Two more facts serve a cell's completion check (O55, `completion.py`). With a `marker`, every line of a stream that
+starts with it is taken out as the stream is read, before it is counted and capped, and its payload is handed back
+(`marks.py`): the text is the command's own. And the input is written whole or the result says it was not
+(`input_error`): a command that stopped reading its program is never taken to have run it.
 """
 
+import codecs
+import contextlib
+import dataclasses
 import errno
 import hashlib
 import ipaddress
@@ -20,11 +35,14 @@ import os
 import platform
 import re
 import subprocess
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from expcore_onedata.sandbox import marks
 from expcore_onedata.sandbox.api import SandboxError
 
 log = logging.getLogger(__name__)
@@ -33,13 +51,45 @@ DOCKER_TIMEOUT_S = 120.0
 TIMED_OUT = 124  # the exit code GNU timeout uses, and what a bounded command that ran out of time reports
 
 
+KILL_WAIT_S = 10.0  # how long a command's end is waited for after its kill: one that does not die is given up on (O42)
+READER_JOIN_S = 5.0  # how long the readers of a command's output are waited for once it has ended or was given up on
+READ_BYTES = 1 << 16  # what one read of a command's output takes: the most held at once beside the kept part
+
+
+@dataclass(frozen=True)
+class Counted:
+    """What one output stream of a command held when a cap was asked for (O43): the bytes it wrote and the bytes kept of
+    them, always the first ones and a whole number of characters."""
+
+    produced: int
+    kept: int
+
+    @property
+    def cut(self) -> bool:
+        return self.produced > self.kept
+
+    def record(self) -> dict[str, int]:
+        return {"produced": self.produced, "kept": self.kept}
+
+
 @dataclass(frozen=True)
 class CmdResult:
-    """A finished command. A command that ran out of time has `returncode` 124 and says so on stderr."""
+    """A finished command. A command that ran out of time has `returncode` 124 and says so on stderr. With an output
+    cap, `stdout_count` and `stderr_count` say how much each stream wrote and how much of it is in the text (O43); they
+    are None when no cap was asked for.
+
+    With a marker, `stdout_marks` and `stderr_marks` are the payloads of the marker lines taken out of each stream, in
+    the order they came (O55); None when no marker was asked for. `input_error` says why the input was not written whole
+    and closed (how many of its bytes went in, and the error), None when it was or there was none."""
 
     returncode: int
     stdout: str = ""
     stderr: str = ""
+    stdout_count: Counted | None = None
+    stderr_count: Counted | None = None
+    stdout_marks: tuple[str, ...] | None = None
+    stderr_marks: tuple[str, ...] | None = None
+    input_error: str | None = None
 
 
 @runtime_checkable
@@ -53,8 +103,14 @@ class HostOps(Protocol):
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
         input: str | None = None,
+        output_cap: int | None = None,
+        marker: bytes | None = None,
     ) -> CmdResult:
-        """Run `docker <args>`. With `check`, a non-zero exit raises; `env` is added to the environment."""
+        """Run `docker <args>`. With `check`, a non-zero exit raises; `env` is added to the environment. With
+        `output_cap`, each of stdout and stderr keeps at most that many bytes (a whole number of characters) and the
+        result says how many each wrote (`CmdResult.stdout_count`, O43). With `marker`, the lines that start with it are
+        taken out of both streams and their payloads handed back (`CmdResult.stdout_marks`, O55); `input_error` says
+        when the input did not go in whole."""
         ...
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
@@ -130,11 +186,234 @@ def describe_stderr(text: str | bytes | None) -> str:
     return f"stderr {digest['bytes']} bytes, sha256 {digest['sha256']}"
 
 
-def _text(value: str | bytes | None) -> str:
-    """Text of a captured stream, which a timed-out process may leave as bytes or None."""
-    if value is None:
-        return ""
-    return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+def _check_cap(cap: object) -> int | None:
+    if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1):
+        raise ValueError("an output cap is a whole number of bytes, at least 1")
+    return cap
+
+
+def _stream_text(data: bytes, produced: int, cap: int | None) -> tuple[str, Counted | None]:
+    """The text of one captured stream: `data` is its first bytes, `produced` how many it wrote. Decoded as UTF-8 with
+    bad bytes replaced and line ends made universal (`\r\n` and `\r` are `\n`), as `subprocess` did in text mode; a cut
+    never ends inside a character, so the bytes kept are those of the characters the text holds."""
+    cut = cap is not None and produced > len(data)
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    text = decoder.decode(data, final=not cut)
+    kept = len(data) - len(decoder.getstate()[0]) if cut else len(data)
+    return text.replace("\r\n", "\n").replace("\r", "\n"), (None if cap is None else Counted(produced, kept))
+
+
+def encode_input(text: str) -> bytes:
+    """The bytes a command's text input is written as: UTF-8, a character that cannot be encoded replaced."""
+    return text.encode("utf-8", "replace")
+
+
+def _take_marks(result: CmdResult, marker: bytes) -> CmdResult:
+    """`result` with the marker lines taken out of each stream and their payloads said, as `run_bounded` does."""
+    texts, found = [], []
+    for text in (result.stdout, result.stderr):
+        payloads: list[bytes] = []
+        kept, _ = marks.take(text.encode("utf-8", "replace"), marker, payloads, final=True)
+        texts.append(kept.decode("utf-8", "replace"))
+        found.append(tuple(p.decode("utf-8", "replace") for p in payloads))
+    return dataclasses.replace(result, stdout=texts[0], stderr=texts[1], stdout_marks=found[0], stderr_marks=found[1])
+
+
+def apply_output_cap(result: CmdResult, cap: int | None, marker: bytes | None = None) -> CmdResult:
+    """`result` as `run_bounded` would have returned it under `cap` and `marker`: the marker lines taken out of each
+    stream first (O55), then each stream cut to its first `cap` bytes, whole characters, and counted. For a host that
+    does not run a process (the in-memory one of the tests); None leaves that part of the result as it is."""
+    cap = _check_cap(cap)
+    if marker is not None:
+        result = _take_marks(result, marker)
+    if cap is None:
+        return result
+    parts = []
+    for text in (result.stdout, result.stderr):
+        raw = text.encode("utf-8", "replace")
+        parts.append(_stream_text(raw[:cap], len(raw), cap))
+    (out, out_count), (err, err_count) = parts
+    return dataclasses.replace(result, stdout=out, stderr=err, stdout_count=out_count, stderr_count=err_count)
+
+
+class _Pipe(threading.Thread):
+    """Reads one stream of a command to its end, keeping its first `cap` bytes (all of them without a cap) and counting
+    the rest, so what is held is bounded whatever the command writes. `produced` rises before `kept` does, so a
+    reader of both, `kept` first, never sees more kept than produced. With a `marker`, the lines that start with it are
+    taken out before anything is counted, and their payloads are in `marks` (O55); bytes that may begin one are held
+    until the next read decides them, and a stream that ends holds nothing back."""
+
+    def __init__(self, stream: Any, cap: int | None, marker: bytes | None = None) -> None:
+        super().__init__(daemon=True, name="command-output")
+        self._stream, self._cap, self._marker = stream, cap, marker
+        self.kept = bytearray()
+        self.produced = 0
+        self.marks: list[bytes] = []
+        self._held = b""
+        self._abandoned = False
+        self._lock = threading.Lock()  # what was read is decided and counted whole, before or after an abandonment
+
+    def abandon(self) -> None:
+        """The runner has taken its result and stopped waiting for this stream (a process that outlived its command
+        holds it open): from now on what is read is dropped, so a writer that goes on never grows what is held (O43).
+        Bytes held back as the possible start of a marker line are output, kept and counted first (O55)."""
+        with self._lock:
+            self._release_held()
+            self._abandoned = True
+
+    def run(self) -> None:
+        try:
+            while chunk := self._stream.read1(READ_BYTES):
+                with self._lock:
+                    if self._marker is not None:
+                        chunk, self._held = marks.take(self._held + chunk, self._marker, self.marks, final=False)
+                    self._count(chunk)
+        except (OSError, ValueError):  # the stream was closed under it: what it read stands
+            pass
+        with self._lock:  # nothing more can complete a marker line: what is held is output
+            self._release_held()
+
+    def _release_held(self) -> None:
+        if self._marker is not None and self._held:
+            held, self._held = self._held, b""
+            self._count(marks.take(held, self._marker, self.marks, final=True)[0])
+
+    def _count(self, chunk: bytes) -> None:
+        self.produced += len(chunk)
+        room = len(chunk) if self._cap is None else self._cap - len(self.kept)
+        if room > 0 and not self._abandoned:
+            self.kept += chunk[:room]
+
+    def snapshot(self) -> tuple[bytes, int]:
+        data = bytes(self.kept)
+        return data, max(self.produced, len(data))
+
+
+class _Feed(threading.Thread):
+    """Writes a command's input from a thread of its own, so that output being read never waits for it, and keeps how
+    many bytes went in and what stopped it (O55): a command that ended or closed its stdin before reading all of it, or
+    a close that failed, is said, never passed over."""
+
+    def __init__(self, stream: Any, data: bytes) -> None:
+        super().__init__(daemon=True, name="command-input")
+        self._stream, self._data = stream, data
+        self.sent = 0
+        self.error: str | None = None
+
+    def run(self) -> None:
+        view = memoryview(self._data)
+        try:
+            fd = self._stream.fileno()
+            while self.sent < len(view):
+                self.sent += os.write(fd, view[self.sent :])
+        except (OSError, ValueError) as error:  # the command ended or closed its stdin before reading all of it
+            self.error = type(error).__name__
+        finally:
+            try:
+                self._stream.close()
+            except (OSError, ValueError) as error:
+                self.error = self.error or f"its close raised {type(error).__name__}"
+
+    def problem(self) -> str | None:
+        """Why the input did not go in whole and closed, or None when it did; asked once the command has ended."""
+        if self.is_alive():
+            return f"{self.sent} of {len(self._data)} bytes written, and the write had not ended"
+        if self.error is None and self.sent == len(self._data):
+            return None
+        return f"{self.sent} of {len(self._data)} bytes written ({self.error or 'cut short'})"
+
+
+def run_bounded(
+    argv: Sequence[str],
+    timeout_s: float,
+    *,
+    env: Mapping[str, str] | None = None,
+    input: str | None = None,
+    output_cap: int | None = None,
+    marker: bytes | None = None,
+    inherit_env: bool = True,
+) -> CmdResult:
+    """Run a command within `timeout_s` and return its output as text; never raise for what the command did.
+
+    A command past its time is killed, and its end is waited for at most `KILL_WAIT_S` more: one that does not die (a
+    process in uninterruptible sleep) is left behind, and the result is the timeout all the same (returncode 124, stderr
+    `timed out after Ns`, stdout what it had written; O42). The limit covers the end of the command's output as well as
+    the command: a process the command left running that holds the pipes open past it is a timeout, never a success with
+    a short output, as `subprocess.run` had it. A program that cannot be run is 127. With `output_cap`, each of stdout
+    and stderr keeps at most that many bytes and the rest is read and dropped, and `stdout_count` and `stderr_count` say
+    what was written and kept (O43). With `marker`, the lines of either stream that start with it are taken out before
+    the counting and the cap, and their payloads are `stdout_marks` and `stderr_marks`; `input_error` says when the
+    input did not go in whole and closed (O55). `env` is added to the environment; with `inherit_env` false it is the
+    whole environment and nothing of this process's own is carried over (an `apptainer` call: it reads `APPTAINER_*`
+    and `APPTAINERENV_*` from the environment it is given, so it is given only what the caller names, O56)."""
+    cap = _check_cap(output_cap)
+    merged = dict(env or {}) if not inherit_env else None if env is None else {**os.environ, **env}
+    try:
+        child = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=merged,
+        )
+    except OSError as error:
+        return CmdResult(127, "", f"{argv[0]} could not be run: {error.strerror or type(error).__name__}")
+    out, err = _Pipe(child.stdout, cap, marker), _Pipe(child.stderr, cap, marker)
+    readers = (out, err)
+    for reader in readers:
+        reader.start()
+    feed = None if input is None else _Feed(child.stdin, encode_input(input))
+    if feed is not None:
+        feed.start()
+    timed_out = False
+    clock = time.monotonic
+    until = clock() + timeout_s
+    try:
+        try:
+            child.wait(timeout=timeout_s)
+            for reader in readers:  # the command has ended: its output has, unless something it started holds the pipes
+                reader.join(max(until - clock(), 0))
+            timed_out = any(reader.is_alive() for reader in readers)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        if timed_out:
+            with contextlib.suppress(OSError):
+                child.kill()
+            try:
+                child.wait(timeout=KILL_WAIT_S)
+            except subprocess.TimeoutExpired:
+                log.error("a command did not end %g s after its kill: it is left, and its caller goes on", KILL_WAIT_S)
+    except BaseException:  # an interrupt: nothing is left running behind the caller
+        with contextlib.suppress(OSError):
+            child.kill()
+        raise
+    for reader in readers:
+        reader.join(READER_JOIN_S if timed_out else 0)
+    if feed is not None:  # the command has ended, so its stdin's read end is closed: the write ends now
+        feed.join(READER_JOIN_S)
+    for reader in readers:
+        if reader.is_alive():
+            reader.abandon()  # whatever it reads from now on is dropped, never kept
+    if not any(
+        reader.is_alive() for reader in readers
+    ):  # nothing reads them any more: closed, not left to the collector
+        for stream in (child.stdout, child.stderr):
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+    (out_data, out_n), (err_data, err_n) = out.snapshot(), err.snapshot()
+    stdout, out_count = _stream_text(out_data, out_n, cap)
+    stderr, err_count = _stream_text(err_data, err_n, cap)
+    found = {} if marker is None else {"stdout_marks": _decoded(out.marks), "stderr_marks": _decoded(err.marks)}
+    fed = None if feed is None else feed.problem()
+    if timed_out:
+        return CmdResult(
+            TIMED_OUT, stdout, f"timed out after {timeout_s:g}s", out_count, None, input_error=fed, **found
+        )
+    return CmdResult(child.returncode, stdout, stderr, out_count, err_count, input_error=fed, **found)
+
+
+def _decoded(payloads: Sequence[bytes]) -> tuple[str, ...]:
+    return tuple(p.decode("utf-8", "replace") for p in payloads)
 
 
 class DockerHost:
@@ -144,26 +423,17 @@ class DockerHost:
         self._sudo = tuple(sudo_command)
 
     def _run(
-        self, argv: Sequence[str], timeout_s: float, *, env: Mapping[str, str] | None = None, input: str | None = None
+        self,
+        argv: Sequence[str],
+        timeout_s: float,
+        *,
+        env: Mapping[str, str] | None = None,
+        input: str | None = None,
+        output_cap: int | None = None,
+        marker: bytes | None = None,
     ) -> CmdResult:
-        merged = None if env is None else {**os.environ, **env}
-        try:
-            done = subprocess.run(
-                list(argv),
-                input=input,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_s,
-                env=merged,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as expired:
-            return CmdResult(TIMED_OUT, _text(expired.stdout), f"timed out after {timeout_s:g}s")
-        except OSError as error:
-            return CmdResult(127, "", f"{argv[0]} could not be run: {error.strerror or type(error).__name__}")
-        return CmdResult(done.returncode, done.stdout, done.stderr)
+        """Every command of this host, bounded in time and, when asked, in the output kept (`run_bounded`)."""
+        return run_bounded(argv, timeout_s, env=env, input=input, output_cap=output_cap, marker=marker)
 
     def docker(
         self,
@@ -172,8 +442,17 @@ class DockerHost:
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
         input: str | None = None,
+        output_cap: int | None = None,
+        marker: bytes | None = None,
     ) -> CmdResult:
-        result = self._run(["docker", *args], DOCKER_TIMEOUT_S if timeout is None else timeout, env=env, input=input)
+        result = self._run(
+            ["docker", *args],
+            DOCKER_TIMEOUT_S if timeout is None else timeout,
+            env=env,
+            input=input,
+            output_cap=output_cap,
+            marker=marker,
+        )
         if check and result.returncode != 0:
             # the tool's own words may name an image, a container or a path from the configuration: neither the log
             # nor the exception (which reaches a record) carries them, only the subcommand, the exit code and the

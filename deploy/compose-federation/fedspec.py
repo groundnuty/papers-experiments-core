@@ -7,9 +7,17 @@ The layout is a TOML file. Without --layout it is `federation.toml` beside this 
 this directory always had: one Onezone and three Oneproviders. A space's owner is the provider its data is written
 through and kept on; its mirrors are other providers that support it and may hold replicas, which the per-run reset
 evicts. A space declared `baseline = false` is made, supported and given its members like any other, but up writes
-none of the core's baseline files into it and `reset --clean` leaves it empty. Every key is checked when the file is
-read, and a refusal names the file and the key. The two images stay pinned by the deployment itself (fedlayout.IMAGES):
-a layout cannot name another.
+none of the core's baseline files into it and `reset --clean` leaves it empty. `probe_space` names the space the link
+check writes its probes into (#221): one declared `agent_visible = false`, supported by every provider of a space the
+agent may reach, in a layout with a `platform_template`; `reset --replicas` leaves it alone, since each probe is held by
+the provider that wrote it, owner or not. A space with an `import` table is held by its owner on an imported POSIX
+storage (Onedata's storage import) whose directory is a dataset the layout does not hold: the table names the
+environment variable that gives its path, never the path, since a layout is public. An import may be `shared` with
+other federations (O59): it is then read-only and names the variable of its manifest. Every key is checked when the file
+is read, and a refusal names the file and the key. A space that is neither a baseline space nor an import may declare
+the manifest of the data its owner will hold once the study has ingested it (`data_manifest`, C06): read by
+`deploy/hpc-federation` only, as `[hpc]` is. The two images stay pinned by the deployment itself
+(fedlayout.IMAGES): a layout cannot name another.
 """
 
 import hashlib
@@ -37,6 +45,11 @@ DOMAIN_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 DOMAIN_NAME = re.compile(rf"(?:{DOMAIN_LABEL}\.)+test")  # under the reserved .test, so it resolves nowhere else
 SERVICE_NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?")  # a Compose service name and a domain label
 SPACE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
+IMPORT_ENV = re.compile(r"EXPCORE_FED_IMPORT_[A-Z0-9_]{1,48}")  # the variable holding an import's source directory
+STUDY_ARTIFACTS = "@study_artifacts@"  # the HPC driver's placeholder for the study's own directory (site.env)
+# A space's declared data manifest: an absolute path, or one under the study's artifacts, plain names only (it is
+# written into a quoted string of the rendered platform file).
+DATA_MANIFEST = re.compile(rf"(?:{STUDY_ARTIFACTS}|(?=/))(?:/[A-Za-z0-9_.-]+)+")
 USER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,62}")
 PRIVILEGE = re.compile(r"space_[a-z_]+")
 MEMORY = re.compile(r"([1-9][0-9]{0,5})([mg])")
@@ -49,13 +62,17 @@ TOP_KEYS = {
     "memory_limit",
     "support_bytes",
     "platform_template",
+    "probe_space",
     "zone",
     "providers",
     "spaces",
     "principals",
+    "hpc",  # read by deploy/hpc-federation (hpcsettings.py) only; kept here unread, and Compose ignores it
 }
 SERVICE_KEYS = {"port", "memory_limit"}
-SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible", "baseline"}
+SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible", "baseline", "import", "data_manifest"}
+IMPORT_KEYS = {"readonly", "source_env", "shared", "manifest_env", "direct_io"}
+IMPORT_REQUIRED = {"readonly", "source_env"}
 PRINCIPAL_KEYS = {"privileges", "spaces", "agent"}
 
 
@@ -87,6 +104,30 @@ class Service:
 
 
 @dataclass(frozen=True)
+class Import:
+    """How a space's owner holds it on an imported storage: whether the storage is read-only, and the name of the
+    environment variable that holds the absolute path of the host directory with the dataset.
+
+    Only the name is ever declared or recorded: a layout is a public file, and the path is the host's own. A read-only
+    import mounts the directory itself, so the platform never writes to it; a writable one mounts a copy of it that
+    up makes inside the root, which goes with the root.
+
+    `shared` (O59) says other federations import the same directory, so this one must not write to it: it is refused
+    unless `readonly`, and it needs a `manifest_env`, the variable that names the file listing the tree's paths, sizes
+    and hashes, which the verification compares the space with. `direct_io` says the agent's mount reads this storage
+    through the filesystem itself (`[sandbox.mount] io_mode = "direct"`), which the sandbox binds read-only, so it too
+    needs `readonly`. A direct mount reads the storage of the agent's own provider (`local` in the platform file): it is
+    meaningful only on a space that provider owns, which a layout, having no `local`, cannot check; the platform
+    template carries it, and the layout's test holds the two together."""
+
+    readonly: bool
+    source_env: str
+    shared: bool = False
+    manifest_env: str | None = None
+    direct_io: bool = False
+
+
+@dataclass(frozen=True)
 class Space:
     """A space, the provider that owns its data, the providers that mirror it, whether the agent may reach it, and
     whether up writes the core's baseline files into it.
@@ -94,7 +135,16 @@ class Space:
     A space with `agent_visible` false is for the day-0 checks alone: no user of the agent is a member of it, so no
     token the agent holds reaches it, whatever its caveats, and it is never the study space whose path the agent's
     data-path tokens name. A space with `baseline` false is made, supported and given its members like any other, but
-    up writes nothing into it and `reset --clean` leaves it empty: its content is whatever a study puts there."""
+    up writes nothing into it and `reset --clean` leaves it empty: its content is whatever a study puts there.
+
+    A space with `imported` is held by its owner alone on an imported storage, whose files the platform finds by a scan
+    of the directory; its mirrors keep their regular storage and fetch what the owner holds. Its baseline is always
+    off, since the core's baseline files would be written into the dataset.
+
+    A space with `data_manifest` declares the data the study will ingest into it: a path, absolute or under the
+    study's artifacts (`@study_artifacts@/...`), to a manifest in the core's import-manifest format
+    (`expcore_onedata.importmanifest`). It needs `baseline = false` (a baseline space's data is its baseline) and no
+    `import` (an import names its manifest by `manifest_env`). Only `deploy/hpc-federation` reads it."""
 
     name: str
     owner: str
@@ -102,6 +152,8 @@ class Space:
     support_bytes: int = DEFAULT_SUPPORT_BYTES
     agent_visible: bool = True
     baseline: bool = True
+    imported: Import | None = None
+    data_manifest: str | None = None  # the manifest of the data the study ingests into it, as declared (C06)
 
     @property
     def supporters(self) -> tuple[str, ...]:
@@ -135,6 +187,8 @@ class Spec:
     study_space: str
     principals: tuple[Principal, ...]
     platform_template: Path | None = None
+    probe_space: str | None = None  # the link check's probe space (#221): agent_visible = false, never reset per run
+    hpc: Mapping[str, Any] | None = None  # the [hpc] table as written: the HPC driver checks it, Compose never reads it
 
     @property
     def services(self) -> tuple[Service, ...]:
@@ -260,6 +314,81 @@ def load_spec(path: Path | None = None) -> Spec:
     return _spec(_Reader(path), data, path, hashlib.sha256(raw).hexdigest())
 
 
+def _import(read: _Reader, table: Mapping[str, Any], key: str, has_baseline: bool, earlier: list[Space]) -> Import:
+    """The `import` table of a space. Its space declares no baseline, which up would write into the dataset, and no two
+    writable imports name one variable, since each would then copy, and write into its copy of, one source. A read-only
+    import may share its source: nothing writes to it. A shared import (O59) is read-only, names the manifest it is
+    verified against, has a tree and a manifest of its own, and a direct mount of a storage needs it read-only."""
+    where = f"{key}.import"
+    if has_baseline:
+        raise read.fail(where, "a space with an import must declare baseline = false, or up writes its baseline files")
+    value = read.table(table["import"], where, IMPORT_KEYS, required=IMPORT_REQUIRED)
+    readonly = read.boolean(value["readonly"], f"{where}.readonly")
+    variable = read.string(
+        value["source_env"], f"{where}.source_env", IMPORT_ENV, "the name of an environment variable"
+    )
+    shared = read.boolean(value.get("shared", False), f"{where}.shared")
+    direct = read.boolean(value.get("direct_io", False), f"{where}.direct_io")
+    manifest = None
+    if "manifest_env" in value:
+        manifest = read.string(
+            value["manifest_env"], f"{where}.manifest_env", IMPORT_ENV, "the name of an environment variable"
+        )
+    if shared and not readonly:
+        raise read.fail(
+            f"{where}.readonly",
+            "must be true when shared is true: other federations import this directory too, and nothing of this one "
+            "may write to it",
+        )
+    if direct and not readonly:
+        raise read.fail(
+            f"{where}.direct_io",
+            "needs readonly = true: a direct mount reads the storage's directory itself, which the sandbox binds "
+            "read-only",
+        )
+    if shared and manifest is None:
+        raise read.fail(
+            f"{where}.manifest_env",
+            "is required when shared is true: the verification compares the space with a manifest of the tree",
+        )
+    others = [s for s in earlier if s.imported is not None]
+    writable = [s.name for s in others if not s.imported.readonly and s.imported.source_env == variable]
+    if writable and not readonly:
+        raise read.fail(f"{where}.source_env", f"is also the source of writable {writable[0]}, which would share it")
+    twice = [s.name for s in others if s.imported.shared and s.imported.source_env == variable]
+    if shared and twice:
+        raise read.fail(f"{where}.source_env", f"is also the source of shared {twice[0]}: each has a tree of its own")
+    if manifest is not None:
+        if manifest == variable:
+            raise read.fail(f"{where}.manifest_env", "is also the source_env of this import")
+        taken = [s.name for s in others if manifest in (s.imported.source_env, s.imported.manifest_env)]
+        if taken:
+            raise read.fail(f"{where}.manifest_env", f"is already a variable of {taken[0]}")
+    if any(s.imported.manifest_env == variable for s in others):
+        raise read.fail(f"{where}.source_env", "is already the manifest_env of another import")
+    return Import(readonly, variable, shared, manifest, direct)
+
+
+def _data_manifest(
+    read: _Reader, table: Mapping[str, Any], key: str, has_baseline: bool, imported: Import | None
+) -> str:
+    """The `data_manifest` of a space: its manifest as declared, for a space the study ingests into. Its data is not
+    the baseline's, so the space declares `baseline = false`, and not an import's, which names its manifest by
+    `manifest_env`: one identity has one declaration."""
+    where = f"{key}.data_manifest"
+    if has_baseline:
+        raise read.fail(where, "needs baseline = false: a baseline space holds what up writes, its own manifest")
+    if imported is not None:
+        raise read.fail(where, "may not be declared on an import, whose manifest is its import's manifest_env")
+    value = table["data_manifest"]
+    plain = isinstance(value, str) and DATA_MANIFEST.fullmatch(value) and not {"..", "."} & set(value.split("/"))
+    if not plain:
+        raise read.fail(
+            where, f"must be an absolute path, or one under {STUDY_ARTIFACTS}, of plain names (letters, digits, _ . -)"
+        )
+    return value
+
+
 def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
     top = read.table(data, "", TOP_KEYS, required={"project", "domain", "study_space", "zone", "providers", "spaces"})
     project = read.string(top["project"], "project", PROJECT_NAME, "a Compose project name")
@@ -301,7 +430,9 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         size = read.integer(table.get("support_bytes", support), f"{key}.support_bytes", 1 << 20, 1 << 50)
         visible = read.boolean(table.get("agent_visible", True), f"{key}.agent_visible")
         has_baseline = read.boolean(table.get("baseline", True), f"{key}.baseline")
-        spaces.append(Space(name, owner, mirrors, size, visible, has_baseline))
+        imported = _import(read, table, key, has_baseline, spaces) if "import" in table else None
+        manifest = _data_manifest(read, table, key, has_baseline, imported) if "data_manifest" in table else None
+        spaces.append(Space(name, owner, mirrors, size, visible, has_baseline, imported, manifest))
     space_names = {space.name for space in spaces}
     study = read.name(top["study_space"], "study_space", space_names, "space")
     hidden = {space.name for space in spaces if not space.agent_visible}
@@ -333,6 +464,7 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         principals.append(Principal(name, tuple(rights), member_of, agent))
 
     template = checked_template(read, path, top["platform_template"]) if "platform_template" in top else None
+    probe = checked_probe_space(read, top, spaces, template) if "probe_space" in top else None
     return Spec(
         source=path.name,
         digest=digest,
@@ -344,4 +476,39 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         study_space=study,
         principals=tuple(principals),
         platform_template=template,
+        probe_space=probe,
+        hpc=_hpc_table(read, top),
     )
+
+
+def _hpc_table(read: _Reader, top: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The `[hpc]` table, kept as written: `deploy/hpc-federation/hpcsettings.py` checks its keys and values."""
+    if "hpc" not in top:
+        return None
+    if not isinstance(top["hpc"], Mapping):
+        raise read.fail("hpc", "must be a table")
+    return top["hpc"]
+
+
+def checked_probe_space(read: _Reader, top: Mapping[str, Any], spaces: list[Space], template: Path | None) -> str:
+    """The link check's probe space (#221): a declared space no agent may reach, supported by every provider that
+    supports a space the agent may reach (each a possible local provider or source), in a layout whose platform template
+    up runs the check through. Each refusal names the key, and the space or the provider."""
+    name = read.name(top["probe_space"], "probe_space", {s.name for s in spaces}, "space")
+    probe = next(s for s in spaces if s.name == name)
+    if probe.agent_visible:
+        raise read.fail(
+            f"spaces.{name}.agent_visible",
+            "must be false for the probe space: its probe files must be where no agent can see them",
+        )
+    for space in (s for s in spaces if s.agent_visible):
+        for provider in space.supporters:
+            if provider not in probe.supporters:
+                raise read.fail(
+                    "probe_space",
+                    f"{name} is not supported by {provider}, which supports {space.name}, so a pair of {provider} "
+                    "cannot be tested: the probe space must be supported by it",
+                )
+    if template is None:
+        raise read.fail("probe_space", "needs a platform_template: up runs the link check through its platform.toml")
+    return name

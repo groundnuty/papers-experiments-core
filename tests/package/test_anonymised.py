@@ -1,9 +1,10 @@
 """An anonymised package holds no commit id and no source URL, of the study or of the core, and still passes its check.
 
-The campaign runs once per module with the core's source reported as a version-control install, so its URL and commit
-reach every place an environment is recorded; a real one in these tests is editable and has neither.
+The campaign runs once per module with the core at an invented commit and git tree, which reach every place an
+environment is recorded, and installed, as the core reports it, from an invented repository URL at that commit.
 """
 
+import hashlib
 import io
 import json
 import sqlite3
@@ -17,10 +18,14 @@ import pytest
 from package_support import stand_in_vendor, wheel_of
 from study_support import HEAD, Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
+from expcore.campaign.export import EXPORT_FINGERPRINT, export_text, read_export
+from expcore.campaign.manifest import fingerprint_sha256
 from expcore.package import build as package_build
+from expcore.package import withhold
 from expcore.package.build import PACKAGE_FILE, build_package, verify_package
 from expcore.package.spec import PackageError
 from expcore.package.wheels import Wheel
+from expcore.provenance import core_identity
 from expcore.provenance import environment as environment_module
 from expcore.provenance.codestamp import STAMP
 from expcore.provenance.environment import CORE_DISTRIBUTION
@@ -30,21 +35,25 @@ from expcore.study.pipeline import OUTPUT_FILES
 NAME = "tiny-study-package"
 AUTHOR = "Quillon Varek"  # invented
 CORE_COMMIT = "b1" * 20  # invented
+CORE_TREE = "7a" * 20  # invented
 CORE_URL = "https://code.example.org/qvarek/tiny-core"  # invented
-SOURCE = {"kind": "vcs", "vcs": "git", "url": CORE_URL, "commit": CORE_COMMIT}
+SOURCE = {"kind": "vcs", "vcs": "git", "url": CORE_URL, "commit": CORE_COMMIT}  # where the core was installed from
+IDENTITY = core_identity.CoreIdentity(CORE_COMMIT, CORE_TREE, False, "f" * 64, "build")  # what the environment names
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
 
 @pytest.fixture(scope="module", autouse=True)
 def core_from_a_repository():
-    """The core reports a version-control source; every build vendors stand-in wheels."""
+    """The core is at an invented commit, installed from a version-control source; every build vendors stand-in
+    wheels."""
     real = environment_module.source_of
 
     def source_of(dist):
         return dict(SOURCE) if dist.metadata["Name"] == CORE_DISTRIBUTION else real(dist)
 
     with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(core_identity, "current", lambda: IDENTITY)
         patch.setattr(environment_module, "source_of", source_of)
         patch.setattr(package_build, "vendor_wheels", stand_in_vendor)
         yield
@@ -92,13 +101,47 @@ def record_files(root: Path) -> list[Path]:
     return [p for p in (root / "out" / "runs").rglob("*.json") if "." in p.stem and p.stem.split(".")[-1].isdigit()]
 
 
+def without_sources(export: bytes) -> bytes:
+    """An export as it reads once its campaign fingerprint has no source in its environment: the fingerprint and, with
+    it, the hash (C36). Written here from the form of the export, not with the code that builds the package."""
+    data = json.loads(export)
+    entry = data[EXPORT_FINGERPRINT]
+    del entry["fingerprint"]["environment"]["sources"]
+    entry["sha256"] = fingerprint_sha256(entry["fingerprint"])
+    return export_text(data).encode("utf-8")
+
+
+def test_c36_the_anonymised_export_holds_the_fingerprint_of_the_anonymised_snapshot_and_no_source(
+    campaign, built, tmp_path
+):
+    """C36: the author's export names the core's identity in its fingerprint, as the author's snapshot does; the
+    package's export holds the fingerprint its own snapshot holds, without any source, and the hash of that, so it
+    verifies against the snapshot it ships."""
+    author = json.loads((campaign.root / "out" / "export.json").read_text(encoding="utf-8"))
+    assert author[EXPORT_FINGERPRINT]["fingerprint"]["environment"]["sources"][CORE_DISTRIBUTION] == IDENTITY.entry()
+    root = unpack(built, tmp_path)
+    export = read_export(root / "out" / "export.json")
+    snapshot = sqlite3.connect(root / "out" / "runs" / "campaign-snapshot.sqlite")
+    try:
+        text = snapshot.execute("SELECT value FROM meta WHERE key = 'fingerprint'").fetchone()[0]
+    finally:
+        snapshot.close()
+    assert export[EXPORT_FINGERPRINT] == {
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "fingerprint": json.loads(text),
+    }
+    assert "sources" not in export[EXPORT_FINGERPRINT]["fingerprint"]["environment"]
+    assert export[EXPORT_FINGERPRINT]["sha256"] != author[EXPORT_FINGERPRINT]["sha256"]
+
+
 def test_k11_no_commit_id_or_source_url_of_the_study_or_the_core_is_anywhere_in_the_package(built, tmp_path):
-    """K11: the study's commit and the core's commit and URL, recorded by the campaign in the fingerprint and the
-    check, appear in no file of the package, the database and the wheels included."""
+    """K11: the study's commit, the core's commit and git tree, recorded by the campaign in the fingerprint and the
+    check, and the URL the core was installed from appear in no file of the package, the database and the wheels
+    included."""
     files = every_byte(unpack(built, tmp_path))
     assert any(name.endswith(".sqlite") for name in files)
     for name, data in files.items():
-        for hidden in (HEAD[:12], CORE_COMMIT[:12], "code.example.org", "qvarek"):
+        for hidden in (HEAD[:12], CORE_COMMIT[:12], CORE_TREE[:12], "code.example.org", "qvarek"):
             assert hidden.encode() not in data, f"{name} holds {hidden}"
 
 
@@ -128,7 +171,10 @@ def test_k11_the_anonymised_package_passes_its_own_check_byte_for_byte(campaign,
     assert json.loads((root / STAMP).read_text(encoding="utf-8"))["head"] == pseudo
     for name in OUTPUT_FILES:
         original = (campaign.root / "out" / name).read_bytes()
-        assert (root / "out" / name).read_bytes() == original.replace(HEAD.encode(), pseudo.encode())
+        expected = original.replace(HEAD.encode(), pseudo.encode())
+        if name == "export.json":  # the author's, with the fingerprint the anonymised snapshot holds (C36)
+            expected = without_sources(expected)
+        assert (root / "out" / name).read_bytes() == expected
     done = subprocess.run(
         ["make", "-C", str(root), "-f", "Makefile", "check-installed", f"PYTHON={sys.executable}"],
         capture_output=True,
@@ -161,11 +207,11 @@ def test_k06_two_anonymised_builds_of_one_tree_are_byte_identical(campaign, hash
     assert again.read_bytes() == built.read_bytes()
 
 
-def test_k11_a_plain_package_says_where_the_core_came_from(campaign, hashes, tmp_path):
-    """K11: without an anonymisation list, PACKAGE.json and the check keep the core's URL and commit (#45)."""
+def test_k11_a_plain_package_says_which_core_it_ran(campaign, hashes, tmp_path):
+    """K11: without an anonymisation list, PACKAGE.json and the check keep the core's commit and git tree (#45, C06)."""
     root = unpack(build_package(campaign.root, tmp_path / "dist", hashes=hashes), tmp_path / "unpacked")
     package = json.loads((root / PACKAGE_FILE).read_text(encoding="utf-8"))
-    assert package["environment"]["sources"][CORE_DISTRIBUTION] == SOURCE
+    assert package["environment"]["sources"][CORE_DISTRIBUTION] == IDENTITY.entry()
     assert package["code"]["commit"] == HEAD
     assert package["code_identity"] == "commit and tree hash"
     assert verify_package(root) == []
@@ -239,6 +285,51 @@ def test_k11_the_core_wheel_is_searched_for_the_identity_too(campaign, hashes, a
     root = copy_campaign(campaign, tmp_path, "copy").root
     with pytest.raises(PackageError, match=r"papers_experiments_core-.*whl.*a source URL"):
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation, vendor=naming_the_url)
+
+
+def carrying_its_build_identity(distributions, supplied=None):
+    """Stand-in wheels whose core carries the build identity a real core's wheel does, at its commit and tree."""
+    identity = {"commit": CORE_COMMIT, "dirty": False, "format": core_identity.BUILD_FORMAT, "tree": CORE_TREE}
+    out = []
+    for wheel in stand_in_vendor(distributions):
+        if wheel.name == CORE_DISTRIBUTION:
+            member = {
+                f"expcore/{core_identity.BUILD_FILE}": json.dumps({**identity, "python_sha256": "f" * 64}).encode()
+            }
+            with zipfile.ZipFile(io.BytesIO(wheel.data)) as archive:
+                member |= {name: archive.read(name) for name in archive.namelist() if ".dist-info/" not in name}
+            filename, data = wheel_of(wheel.name, wheel.version, member)
+            wheel = Wheel(wheel.name, wheel.version, filename, data, wheel.from_index)
+        out.append(wheel)
+    return out
+
+
+def core_wheel_member(package: Path, member: str) -> bytes:
+    [core] = (package / "wheels").glob("papers_experiments_core-*.whl")
+    with zipfile.ZipFile(core) as archive:
+        return archive.read(member)
+
+
+def test_k11_the_core_wheels_build_identity_is_withheld_and_a_plain_package_keeps_it(
+    campaign, hashes, anonymisation, tmp_path
+):
+    """K11: the core's wheel carries its build identity, its commit and git tree; an anonymised build replaces that
+    member with a neutral one and the build passes, its check too, with neither id anywhere; a plain build ships it as
+    it is."""
+    member = f"expcore/{core_identity.BUILD_FILE}"
+    root = copy_campaign(campaign, tmp_path, "copy").root
+    built = build_package(
+        root, tmp_path / "anonymous", hashes=hashes, anonymise=anonymisation, vendor=carrying_its_build_identity
+    )
+    package = unpack(built, tmp_path / "unpacked-anonymous")
+    assert core_wheel_member(package, member) == withhold.NEUTRAL_IDENTITY
+    for name, data in every_byte(package).items():
+        for hidden in (CORE_COMMIT[:12], CORE_TREE[:12]):
+            assert hidden.encode() not in data, f"{name} holds {hidden}"
+    assert verify_package(package) == []
+    plain = build_package(root, tmp_path / "plain", hashes=hashes, vendor=carrying_its_build_identity)
+    shipped = json.loads(core_wheel_member(unpack(plain, tmp_path / "unpacked-plain"), member))
+    assert (shipped["commit"], shipped["tree"]) == (CORE_COMMIT, CORE_TREE)
 
 
 def test_k11_a_core_installed_from_an_index_with_a_listed_authors_name_is_refused(
@@ -382,7 +473,19 @@ def test_k11_a_record_changed_after_the_check_refuses_the_anonymised_build_namin
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
     record.write_bytes((campaign.root / rel).read_bytes())
     (record.parent / "extra.json").write_text("{}", encoding="utf-8")
-    with pytest.raises(PackageError, match=r"extra\.json is not what the replay check hashed"):
+    with pytest.raises(PackageError, match=r"extra\.json is not what the replay check hashed: an unexpected file"):
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
+
+
+def test_k11_r04_a_file_of_any_kind_added_to_the_batch_after_the_check_refuses_the_anonymised_build(
+    campaign, hashes, anonymisation, tmp_path
+):
+    """R04 and K11: a file in out/runs that is neither a record nor one the check hashed is refused whatever its
+    suffix, before anything is rewritten, so the package never carries a file the check did not vouch for."""
+    root = copy_campaign(campaign, tmp_path, "copy").root
+    record = sorted(record_files(root))[0]
+    (record.parent / "sandbox.log").write_text("what the sandbox saw", encoding="utf-8")
+    with pytest.raises(PackageError, match=r"sandbox\.log is not what the replay check hashed: an unexpected file"):
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
 
 

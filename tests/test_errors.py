@@ -26,6 +26,8 @@ def _isolated_registry(monkeypatch):
     """Every test starts with only the core's kinds and leaves no platform or study kind behind."""
     monkeypatch.setattr(errors, "_platform_kinds", {})
     monkeypatch.setattr(errors, "_platform_untreatable", {})
+    monkeypatch.setattr(errors, "_platform_uncharged", {})
+    monkeypatch.setattr(errors, "_platform_targeted", {})
     monkeypatch.setattr(errors, "_study_kinds", {})
 
 
@@ -143,6 +145,62 @@ def test_o05_a_registered_kind_cannot_be_made_treatable_or_untreatable_by_regist
         register_infra_kind("provider_down", "stronger", treatable=False)
     assert is_treatable("provider_tampered") is False
     assert is_treatable("provider_down") is True
+
+
+def test_c33_a_platform_kind_registered_as_costing_no_attempt_is_a_hold_that_is_never_treatable():
+    """C33: a platform's hold (`charged=False`), a start held back with nothing sent, is listed by `uncharged_kinds`,
+    must be untreatable, and cannot be made charged by registering it again, nor a charged kind made a hold; the same
+    answer again is harmless, and a refused registration adds nothing."""
+    assert errors.uncharged_kinds() == frozenset()
+    register_infra_kind("baseline_held", "a start held back, nothing sent", treatable=False, charged=False)
+    register_infra_kind("baseline_held", "again", treatable=False, charged=False)
+    assert errors.uncharged_kinds() == frozenset({"baseline_held"})
+    assert is_treatable("baseline_held") is False
+    with pytest.raises(ValueError, match="must be registered treatable=False"):
+        register_infra_kind("free_fault", "a fault a condition could declare", charged=False)
+    with pytest.raises(ValueError, match="already registered as costing no attempt"):
+        register_infra_kind("baseline_held", "charged now", treatable=False)
+    register_infra_kind("provider_tampered", "a provider whose state was changed", treatable=False)
+    with pytest.raises(ValueError, match="already registered as charged"):
+        register_infra_kind("provider_tampered", "free now", treatable=False, charged=False)
+    assert errors.uncharged_kinds() == frozenset({"baseline_held"})
+    assert "free_fault" not in infra_kinds()
+
+
+def test_c34_a_platform_kind_registered_as_requiring_a_target_is_listed_and_is_never_made_targetless():
+    """C34: a platform's kind that is a fault on one target (`requires_target=True`) is listed by `targeted_kinds`; a
+    condition that declares it as its treatment must name the target. It cannot be made targetless, or a plain kind
+    targeted, by registering it again, and a kind that is never a treatment names no target to require."""
+    assert errors.targeted_kinds() == errors.TARGETED_NAMES == frozenset({"provider_outage"})
+    register_infra_kind("provider_down", "a provider that is down", requires_target=True)
+    register_infra_kind("provider_down", "again", requires_target=True)
+    register_infra_kind("relay_flap", "the relay restarted")
+    assert errors.targeted_kinds() == frozenset({"provider_down", "provider_outage"})
+    assert is_treatable("provider_down") is True
+    with pytest.raises(ValueError, match="already registered as requiring a target"):
+        register_infra_kind("provider_down", "targetless now")
+    with pytest.raises(ValueError, match="already registered as not requiring a target"):
+        register_infra_kind("relay_flap", "targeted now", requires_target=True)
+    with pytest.raises(ValueError, match="never a treatment, so it names no target"):
+        register_infra_kind(
+            "provider_tampered", "a provider whose state was changed", treatable=False, requires_target=True
+        )
+    assert errors.targeted_kinds() == frozenset({"provider_down", "provider_outage"})
+    assert "provider_tampered" not in infra_kinds()
+
+
+def test_c34_the_provider_outage_is_held_to_a_target_whoever_registers_or_declares_it():
+    """C34: the core holds the name `provider_outage` to a declared target, so a process that never imported the
+    platform that registers it, with a study declaring a kind of that name of its own in `[study.kinds]`, cannot score
+    an outage by its plain name; a platform cannot register the name without the requirement either."""
+    with pytest.raises(ValueError, match="must be registered requires_target=True"):
+        register_infra_kind("provider_outage", "a platform's outage, targetless")
+    assert "provider_outage" not in infra_kinds()
+    with errors.study_kinds({"provider_outage": errors.StudyKind("a study's own outage")}):
+        assert "provider_outage" in infra_kinds()
+        assert "provider_outage" in errors.targeted_kinds()
+    register_infra_kind("provider_outage", "the platform's outage", requires_target=True)
+    assert errors.targeted_kinds() == frozenset({"provider_outage"})
 
 
 def test_c02_a_study_s_own_kinds_hold_only_for_its_scope_however_the_scope_ends():

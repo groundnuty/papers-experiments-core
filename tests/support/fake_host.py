@@ -10,8 +10,17 @@ freezes a container: its cgroup says `frozen 1` until `unpause`, and nothing can
 and addresses are invented. The fake knows only the docker
 commands the package uses; anything else fails loudly, so a new command shows up as a test failure and not as a silent
 pass.
+
+A cell runs under the completion bootstrap (`completion.py`, O55), and the fake plays its part: it checks the program it
+was given against the size and hash the argv names, hands the test's `exec_handler` the program as the cell's stdin,
+and adds the completion record to both streams of what the handler returns, with its exit status, as the bootstrap
+would after the program's exit. `exec_delivers` stands for a stdin that loses bytes on the way (the bootstrap then
+records a source that is not whole, and runs nothing); `exec_input_error` for a write of the program that `docker exec`
+cut short; a handler that returns `Unrecorded` stands for an exec whose record never came (the stream ended first, or
+docker reported an exit it never saw).
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -23,9 +32,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fake_elf import elf
+
+from expcore_onedata.sandbox import completion
 from expcore_onedata.sandbox.api import SandboxError
-from expcore_onedata.sandbox.hostops import CmdResult
+from expcore_onedata.sandbox.containers import ONECLIENT_BIN
+from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_input
 from expcore_onedata.sandbox.inputs import PROBE_MARK
+from expcore_onedata.sandbox.oneclient_build import SLICE, SLICE_NAME
 
 VALUED = {
     "--name", "--network", "--label", "-l", "--user", "-u", "--cpus", "--memory", "--memory-swap", "--pids-limit",
@@ -36,6 +50,29 @@ REPEATED = {"--label", "-l", "-v", "--volume", "--mount", "-e", "--env", "--add-
 BOOT_ID = "0f0f0f0f-1111-2222-3333-444455556666"
 CERTIFI_BUNDLE = "/usr/lib/python3/site-packages/certifi/cacert.pem"  # where the fake agent image keeps certifi's
 PID_NS = "pid:[4026531836]"
+ONECLIENT_CONFIG_PATH = "/etc/invented/oneclient.conf"  # where the fake oneclient image keeps the file its help names
+ONECLIENT_CONFIG_SHA256 = hashlib.sha256(b"an invented oneclient configuration file\n").hexdigest()
+ONECLIENT_VERSION_TEXT = "Oneclient: 25.0\nFUSE library: 3.2\n"  # what the fake oneclient image's `--version` prints
+ONECLIENT_BUILD_ID = "ab" * 20  # the GNU build id of the fake oneclient image's binary
+
+
+class Unrecorded(CmdResult):
+    """What `docker exec` returned for a cell, as it is: no completion record is added (O55)."""
+
+
+def bootstrap_of(argv: Sequence[str]) -> tuple[str, int, str, str] | None:
+    """The nonce, size, hash and interpreter of a cell's bootstrap argv (`completion.Completion.argv`), or None."""
+    if completion.BOOTSTRAP not in argv:
+        return None
+    at = list(argv).index(completion.BOOTSTRAP)
+    nonce, size, digest, python = argv[at + 1 : at + 5]
+    return nonce, int(size), digest, python
+
+
+def recorded(result: CmdResult, nonce: str, record: dict[str, Any]) -> CmdResult:
+    """`result` with the completion record the bootstrap writes on both streams after the program's exit."""
+    line = completion.record_line(nonce, record)
+    return CmdResult(result.returncode, result.stdout + line, result.stderr + line, input_error=result.input_error)
 
 
 @dataclass
@@ -69,6 +106,19 @@ def _mounts_json(c: FakeContainer) -> list[dict[str, str]]:
     for spec in c.options.get("-v", []):
         parts = spec.split(":")
         out.append({"Source": parts[0], "Destination": parts[1] if len(parts) > 1 else ""})
+    return out
+
+
+def bound_files(options: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Each bind of `docker run`'s options, `-v` or `--mount type=bind`, as (host path, path in the container)."""
+    out = []
+    for spec in options.get("-v", []):
+        source, destination, *_ = spec.split(":")
+        out.append((source, destination))
+    for spec in options.get("--mount", []):
+        fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
+        if fields.get("type") == "bind":
+            out.append((fields["src"], fields["dst"]))
     return out
 
 
@@ -160,6 +210,8 @@ class FakeHost:
         self.next_pid = 5000
         self.sudo_commands: list[list[str]] = []
         self.exec_handler: Callable[[FakeContainer, list[str], str | None], CmdResult] = self._default_exec
+        self.exec_delivers: Callable[[bytes], bytes] | None = None  # what of a cell's program reaches the container
+        self.exec_input_error: str | None = None  # a write of a cell's program that docker exec cut short
         self.journal = ""
         self.run_handlers: dict[str, Callable[[list[str]], CmdResult]] = {}
         self.fail_remove: set[str] = set()
@@ -171,6 +223,13 @@ class FakeHost:
         self.one_shots: list[FakeContainer] = []  # the `--rm` containers that were run, as they were labelled
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
+        # what a oneclient container answers the sandbox's two reads of its binary (`oneclient_build`, O65): its
+        # `--version`, and the file at ONECLIENT_BIN (bytes, or the whole result the read gets); the test's
+        # `exec_handler` never sees either
+        self.oneclient_version = CmdResult(0, ONECLIENT_VERSION_TEXT)
+        self.oneclient_binary: bytes | CmdResult = elf(
+            interp="/opt/invented/lib/ld.so", needed=("libc.so.6",), build_id=bytes.fromhex(ONECLIENT_BUILD_ID)
+        )
         self.pause_without_freezing = False  # a `docker pause` that answers 0 but leaves the cgroup unfrozen
         self.signal_handlers: dict[str, Callable[[FakeContainer], None]] = {}  # a signal the process handles and lives
         self.base_bundle = "BASE BUNDLE\n"
@@ -336,7 +395,16 @@ class FakeHost:
                 shutil.rmtree(argv[-1], ignore_errors=True)
                 return CmdResult(0)
             case "rm" if "-f" in argv:  # one file; a missing one is not an error, as with the real command
-                Path(argv[-1]).unlink(missing_ok=True)
+                try:
+                    Path(argv[-1]).unlink(missing_ok=True)
+                except OSError:  # a directory: `rm -f` without `-r` refuses it, and says so
+                    return CmdResult(1, "", f"cannot remove '{argv[-1]}': Is a directory")
+                return CmdResult(0)
+            case "rmdir":  # what `rmdir` does: an empty directory only
+                try:
+                    Path(argv[-1]).rmdir()
+                except OSError as e:
+                    return CmdResult(1, "", f"failed to remove '{argv[-1]}': {e.strerror}")
                 return CmdResult(0)
             case "mkdir":
                 Path(argv[-1]).mkdir(parents=True, exist_ok=True)
@@ -372,10 +440,13 @@ class FakeHost:
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
         input: str | None = None,
+        output_cap: int | None = None,
+        marker: bytes | None = None,
     ) -> CmdResult:
         with self.lock:
             self.calls.append(("docker", args[0], args[1:] if args[0] not in ("exec", "run") else ()))
-            result = self._docker(list(args), env, input)
+            # a result is cut as the real host's runner cuts it, so a test sees what a cell's caller would
+            result = apply_output_cap(self._docker(list(args), env, input), output_cap, marker)
         if check and result.returncode != 0:
             raise SandboxError(f"docker {args[0]} failed ({result.returncode}): {result.stderr.strip()[-300:]}")
         return result
@@ -419,6 +490,11 @@ class FakeHost:
             return CmdResult(125, "", "cannot start the container")
         if name in self.containers:
             return CmdResult(125, "", f"Conflict. The container name {name} is already in use")
+        for spec in options.get("--mount", []):  # unlike `-v`, which makes a directory of it, `--mount` refuses
+            fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
+            if fields.get("type") == "bind" and not os.path.lexists(fields.get("src", "")):
+                # docker's own words name the path; the real `HostOps.docker` digests them, so the fake's carry none
+                return CmdResult(125, "", 'invalid mount config for type "bind": bind source path does not exist')
         labels = dict(item.split("=", 1) for item in options.get("--label", []))
         self.next_pid += 1
         container = FakeContainer(
@@ -442,13 +518,14 @@ class FakeHost:
         self.add_cgroup(container, procs, events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
         container.options["_env"] = dict(env or {})
         container.options["_files"] = {  # what each file bound in held when the container started, by destination
-            spec.split(":")[1]: Path(spec.split(":")[0]).read_text(encoding="utf-8")
-            for spec in options.get("-v", [])
-            if Path(spec.split(":")[0]).is_file()
+            destination: Path(source).read_text(encoding="utf-8")
+            for source, destination in bound_files(options)
+            if Path(source).is_file()
         }
         return CmdResult(0, container.id + "\n")
 
     def _mount_oneclient(self, container: FakeContainer) -> None:
+        container.logs = f"expcore-oneclient-config sha256={ONECLIENT_CONFIG_SHA256} path={ONECLIENT_CONFIG_PATH}\n"
         for spec in container.options.get("--mount", []):
             fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
             if fields.get("dst") == "/mnt/oneclient":
@@ -463,7 +540,47 @@ class FakeHost:
             return CmdResult(126, "", f"Error response from daemon: container {args[i]} is not running")
         if container.paused:
             return CmdResult(126, "", f"Error response from daemon: container {args[i]} is paused")
-        return self.exec_handler(container, args[i + 1 :], stdin)
+        if container.image in self.oneclient_images and (read := self._oneclient_read(args[i + 1 :])) is not None:
+            return read
+        boot = bootstrap_of(args[i + 1 :])
+        if boot is None:
+            return self.exec_handler(container, args[i + 1 :], stdin)
+        return self._run_cell(container, args[i + 1 :], stdin or "", *boot)
+
+    def _oneclient_read(self, argv: list[str]) -> CmdResult | None:
+        """The answer to one of the sandbox's reads of its sidecar's oneclient, as `od -An -v -tx1` of the window prints
+        it (a missing file prints nothing); None for any other command."""
+        if argv == [ONECLIENT_BIN, "--version"]:
+            return self.oneclient_version
+        if len(argv) != 7 or argv[:4] != ["sh", "-c", SLICE, SLICE_NAME] or argv[6] != ONECLIENT_BIN:
+            return None
+        if isinstance(self.oneclient_binary, CmdResult):
+            return self.oneclient_binary
+        offset, size = int(argv[4]), int(argv[5])
+        window = self.oneclient_binary[offset : offset + size]
+        return CmdResult(
+            0, "".join(" " + " ".join(f"{b:02x}" for b in window[n : n + 16]) + "\n" for n in range(0, len(window), 16))
+        )
+
+    def _run_cell(self, container: FakeContainer, argv: list[str], stdin: str, nonce: str, size: int, digest: str,
+                  python: str) -> CmdResult:  # fmt: skip
+        """A cell under the completion bootstrap (O55): the program checked whole, run by the handler, and recorded."""
+        sent = encode_input(stdin)
+        got = self.exec_delivers(sent) if self.exec_delivers is not None else sent
+        whole = len(got) == size and hashlib.sha256(got).hexdigest() == digest
+        if not whole:  # the bootstrap runs nothing and says what arrived
+            record = {"source_bytes": len(got), "source_whole": False, "exit_status": None}
+            result = recorded(CmdResult(completion.NOT_RUN_EXIT), nonce, record)
+        else:
+            ran = self.exec_handler(container, argv, got.decode("utf-8", "replace"))
+            if isinstance(ran, Unrecorded):
+                result = CmdResult(ran.returncode, ran.stdout, ran.stderr, input_error=ran.input_error)
+            else:
+                status = 128 - ran.returncode if ran.returncode < 0 else ran.returncode
+                result = recorded(ran, nonce, {"source_bytes": size, "source_whole": True, "exit_status": status})
+        if self.exec_input_error is not None:
+            result = CmdResult(result.returncode, result.stdout, result.stderr, input_error=self.exec_input_error)
+        return result
 
     def _cgroup_events(self, container: FakeContainer, frozen: bool) -> None:
         self.files[f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope/cgroup.events"] = (

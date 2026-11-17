@@ -60,6 +60,11 @@ class ToolCallRecord:
     waits_left_open: int = 0  # waits on infrastructure the call left open; the loop closed them when it ended (L04)
     terminal: bool = False  # the tool is a terminal one: a successful call ended the attempt (L09)
     infra_wait_by_kind: dict[str, float] = field(default_factory=dict)  # seconds the call waited, by kind (L04)
+    # wall seconds from the reading before the call to the one that ended it, waits on infrastructure inside it
+    # included, so `ended_s - started_s`; None when the call never started (L17)
+    elapsed_s: float | None = None
+    # what a code tool verified of the exec that ran the call's program, as it said (O55); None when it said nothing
+    exec_check: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         """Refuse a status outside the closed list."""

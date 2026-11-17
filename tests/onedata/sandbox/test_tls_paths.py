@@ -245,13 +245,15 @@ def test_o05_oneclient_is_given_the_tls_setting_and_the_bundle_read_only(tmp_pat
     settings = command[command.index(C.SIDECAR_SHELL_NAME) + 1 : binary]  # what `env` sets and unsets for oneclient
     copy = the_run_copy(sbx, mounts[C.SIDECAR_CA_PATH][0]) if C.SIDECAR_CA_PATH in mounts else None
     sbx.stop()
-    assert settings[:2] == ["-u", "ONECLIENT_INSECURE"]  # the image's own skip-verification flag is always removed
+    # the image's own skip-verification flag is always removed, and with it the two variables that could set another
+    # option (O36); what `env` then sets is the platform's `[tls]` alone
+    assert settings[:6] == ["-u", "ONECLIENT_INSECURE", "-u", "ONECLIENT_OVERRIDE", "-u", "ONECLIENT_CONFIG"]
     if tls and "ca_file" in tls:
-        assert settings[2:] == [f"SSL_CERT_FILE={C.SIDECAR_CA_PATH}"]
+        assert settings[6:] == [f"SSL_CERT_FILE={C.SIDECAR_CA_PATH}"]
         assert mounts[C.SIDECAR_CA_PATH][1] == "ro"
         assert copy == bundle
     else:
-        assert settings[2:] == []
+        assert settings[6:] == []
         assert C.SIDECAR_CA_PATH not in mounts
     assert ("--insecure" in command) is (label == "insecure_tls")
     assert str((tmp_path / CA_NAME).resolve()) not in json.dumps(sidecar.options, default=str) + " ".join(command)

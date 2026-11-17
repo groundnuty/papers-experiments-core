@@ -632,6 +632,53 @@ def test_during_a_delete_that_is_under_way_the_provider_it_went_to_answers_lenie
     assert read(fake, BETA_ID, file_id, "size").json() == GONE_25_0
 
 
+def test_a_tombstone_counts_from_the_time_the_delete_was_due_to_land_not_from_the_read_that_settled_it():
+    """#201: a delete due at 1005 (delay 5 s) and a tombstone of 10 s expire at 1015 whether or not anything read in
+    between; the clock moving straight to 1016 must not start the tombstone at 1016."""
+    fake, ticker = delayed()  # delays 5 s; the delete below is answered at 1000
+    fake.tombstone_s = 10.0
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    ticker.sleep(16.0)  # no read since: the delete lands lazily, at the first one
+    assert read(fake, BETA_ID, file_id, "size").json() == GONE_25_0
+    assert read(fake, ALPHA_ID, file_id, "parent_id").json() == GONE_25_0
+
+
+def test_a_tombstone_of_a_delete_that_landed_lazily_answers_exactly_until_its_time_is_up():
+    fake, ticker = delayed()
+    fake.tombstone_s = 10.0
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    ticker.sleep(14.5)  # 1014.5, the delete due at 1005 landed unread: the tombstone is up at 1015
+    assert read(fake, BETA_ID, file_id, "size").json() == {"size": len(DATA)}
+    ticker.sleep(0.5)
+    assert read(fake, BETA_ID, file_id, "size").json() == GONE_25_0
+
+
+def test_the_tombstones_of_what_was_under_a_directory_whose_delete_landed_lazily_count_from_its_due_time_too():
+    fake, ticker = delayed()
+    fake.tombstone_s = 10.0
+    directory = make(fake, ALPHA_ID, ROOT_ID, "d", "DIR")
+    inside = make(fake, ALPHA_ID, directory, "a.bin", "REG")
+    delete(fake, ALPHA_ID, directory)
+    ticker.sleep(16.0)
+    assert read(fake, BETA_ID, directory, "size").json() == GONE_25_0
+    assert read(fake, BETA_ID, inside, "size").json() == GONE_25_0
+
+
+def test_a_delete_landed_before_its_time_by_land_deletes_starts_its_tombstone_when_it_landed():
+    fake, ticker = delayed()
+    fake.tombstone_s = 10.0
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)  # due at 1005
+    ticker.sleep(1.0)
+    fake.land_deletes()  # landed at 1001, four seconds early: the tombstone is up at 1011, not at 1015
+    ticker.sleep(9.5)
+    assert read(fake, BETA_ID, file_id, "size").json() == {"size": len(DATA)}
+    ticker.sleep(0.5)
+    assert read(fake, BETA_ID, file_id, "size").json() == GONE_25_0
+
+
 @pytest.mark.parametrize("attributes", [("size",), ("parent_id",), ("file_id",)])
 def test_the_legacy_shape_keeps_no_tombstone(attributes):
     fake = make_federation(clock=Ticker().clock, error_shape=ERRORS_LEGACY)

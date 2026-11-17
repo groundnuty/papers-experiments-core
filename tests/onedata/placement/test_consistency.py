@@ -4,6 +4,7 @@ import asyncio
 
 import httpx
 import pytest
+from transfer_shapes import FIRST_FINAL, POLLS
 
 from expcore_onedata import consistency
 from expcore_onedata.client import OnezoneClient, PlatformError
@@ -93,6 +94,28 @@ def test_a_transfer_record_without_a_known_state_field_has_the_state_unknown():
     assert consistency.transfer_state({"bytesReplicated": 5}) == "unknown"
     assert "unknown" not in consistency.ENDED_STATES
     assert consistency.transfer_state({"replicationStatus": "completed"}) == "completed"
+
+
+@pytest.mark.parametrize("kind", list(POLLS))
+def test_o32_a_wait_for_a_transfers_end_stops_at_its_first_final_answer(config, kind):
+    """O32: `wait_transfers` polls a job until its record says it ended. With each kind's answers in turn (the live
+    replication's enqueued and ended answers, and an eviction's and a migration's derived from op-worker), it stops at
+    the first that does, never at an earlier one, and counts the job by its final state; a live ended replication read
+    conflicting before, so a wait on it ran to its bound."""
+    asked: list[str] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.path)
+        return httpx.Response(200, json=POLLS[kind][min(len(asked), len(POLLS[kind])) - 1])
+
+    client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(answer)))
+    ticker = Ticker()
+    report = consistency.wait_transfers(
+        client, "beta", ["tid-1"], timeout_s=600.0, poll_s=1.0, clock=ticker.clock, sleep=ticker.sleep
+    )
+    assert report.timed_out == ()
+    assert len(asked) == FIRST_FINAL[kind] + 1
+    assert report.states() == {"completed": 1}
 
 
 def test_o12_a_space_root_answer_without_a_file_id_names_the_provider_by_position_not_by_name(config):

@@ -21,6 +21,7 @@ from mount_live import (
     read_cell,
     reader_cell,
     reads_cell,
+    spaces_cell,
     unwritten_cell,
 )
 
@@ -265,3 +266,57 @@ def test_o11_an_entry_the_provider_answers_400_enoent_for_is_gone_as_onedata_25_
     space.created = [("near", "file-1"), ("near", "file-2"), ("near", "file-3")]
     failed = space.remove_all(window_s=3, poll_s=1, sleep=lambda s: None, clock=iter(range(100)).__next__)
     assert failed == ["entry 2: not shown gone (its last delete answered 204)"]
+
+
+def space_files(tmp_path, names=("one", "two", "three")):
+    """One file per invented space directory, with the (path, size, SHA-256) the cell is given for each."""
+    out = {}
+    for name in names:
+        (tmp_path / name).mkdir()
+        data = pattern(f"space-{name}", 100_003)
+        (tmp_path / name / "small.bin").write_bytes(data)
+        out[name] = (str(tmp_path / name / "small.bin"), len(data), hashlib.sha256(data).hexdigest())
+    return out
+
+
+def test_o36_the_spaces_cell_reads_one_file_of_each_space_and_reports_whether_its_bytes_are_the_files(tmp_path):
+    """O36: every file is read whole by a child process of its own within the deadline; each is `read` when its size
+    and SHA-256 are the file's, with its seconds, and no byte of it is printed."""
+    files = space_files(tmp_path)
+    code = spaces_cell(files, 30, wait_s=0)
+    done = subprocess.run([sys.executable, "-"], input=code.encode(), capture_output=True, timeout=60, check=False)
+    found = json.loads(done.stdout)
+    assert set(found) == set(files)
+    for label, (_, size, _) in files.items():
+        assert found[label]["outcome"] == "read", label
+        assert found[label]["matches"] is True
+        assert found[label]["bytes"] == size
+        assert found[label]["seconds"] < 30
+        assert pattern(f"space-{label}", 4096) not in done.stdout
+
+
+def test_o36_a_file_whose_bytes_differ_or_that_is_missing_is_never_reported_as_read(tmp_path):
+    """O36: a file that reads but is not the file written is `mismatch`, and one that never reaches the mount is an
+    `error` named ENOENT after the wait, never `read`."""
+    files = space_files(tmp_path, ("changed", "missing"))
+    (tmp_path / "changed" / "small.bin").write_bytes(pattern("another", 100_003))
+    (tmp_path / "missing" / "small.bin").unlink()
+    found = run(spaces_cell(files, 30, wait_s=0))
+    assert found["changed"]["outcome"] == "mismatch"
+    assert found["changed"]["matches"] is False
+    assert found["missing"]["outcome"] == "error"
+    assert found["missing"]["stat_error"] == "ENOENT"
+
+
+def test_o36_a_read_that_never_returns_is_blocked_at_its_deadline_and_the_other_spaces_are_still_tried(tmp_path):
+    """O36: the failure the check exists for, a first read of a space that hangs, is `blocked` after its deadline and
+    its reader is killed; the files of the other spaces are read as before, so one hang never hides the rest."""
+    files = space_files(tmp_path, ("before", "after"))
+    (tmp_path / "hung").mkdir()
+    os.mkfifo(tmp_path / "hung" / "small.bin")
+    hung = (str(tmp_path / "hung" / "small.bin"), 5, "0" * 64)
+    found = run(spaces_cell({"before": files["before"], "hung": hung, "after": files["after"]}, 1, wait_s=0))
+    assert found["hung"]["outcome"] == "blocked"
+    assert found["hung"]["killed"] is True
+    assert found["hung"]["seconds"] >= 1
+    assert found["before"]["outcome"] == found["after"]["outcome"] == "read"

@@ -121,8 +121,10 @@ def test_o24_a_harness_step_runs_as_the_agent_and_is_recorded_apart_from_the_age
             "status": "ran",
             "exit_code": 3,
             "timed_out": False,
+            "bound": None,
             "gate_refusals": ["redirect"],
             "earlyoom_kills": [],
+            "exec_check": {"source_whole": True, "exit_status": 3, "nonce_matched": True},
         }
     ]
     cell = sbx.exec("print(1)", 30)

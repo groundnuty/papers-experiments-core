@@ -16,11 +16,12 @@ def mutating(fake):
 
 
 def test_o01_a_replication_reported_completed_with_zero_blocks_is_not_placed(provisioner, seeded):
-    """O01: a job that ends as completed while the block map shows nothing is refused, not believed."""
+    """O01: a job that ends as completed while the block map shows nothing is refused, not believed, and so is the one
+    scheduled again after it, the settle bound leaving room for one more try."""
     seeded.transfers_place_blocks = False
     with pytest.raises(NotPlaced) as raised:
         provisioner.replicate(PATH, "beta")
-    assert [t.ended for t in seeded.transfers.values()] == [True]  # the fake did report the job as ended
+    assert [t.ended for t in seeded.transfers.values()] == [True, True]  # the fake did report each job as ended
     assert raised.value.report.bytes_short == len(DATA)
     assert seeded.held(PATH, BETA_ID) == []
 

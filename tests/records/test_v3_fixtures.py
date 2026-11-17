@@ -326,3 +326,101 @@ def test_c27_the_fifth_fixture_pins_whether_the_attempt_was_held_to_the_reservat
         assert "reserved_capped" not in held.totals
         assert "reply_cap_unheld" not in held.totals
         assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
+
+
+def test_l17_the_sixth_fixture_pins_a_declared_tool_server_call_bound_and_each_started_call_elapsed_time():
+    """L17 and R03: the sixth merge point added `agent_config.tool_server_call_bound_s`, which a study that declares no
+    bound leaves out, with the names of the tools it reached beside it (`tool_server_tools`), and the optional
+    `elapsed_s` of a tool call that started. Its fixture, written by the code of that merge on the record tests' fake
+    clock, declares a bound of 60 s over two tools: a code-like `echo`, which the bound does not reach, and a tool
+    server's `search`. It holds a call that took 10 s, a call to the tool server that outlasted the bound and failed
+    as `knowledge` infrastructure, and a call answered as skipped, which has no elapsed time. It validates and replays
+    to its own bytes (the parametrized tests above); the five fixtures before it hold none of these, and a record
+    without them gains nothing. (The bound was first merged as `tool_call_bound_s`, capping every call, and renamed
+    before any release.)"""
+    sixth = [p for p in FIXTURES if p.name.startswith("06-")]
+    assert [p.name for p in sixth] == ["06-tool-call-bound.json"]
+    record = load_record(sixth[0])
+    assert record.agent_config["tool_server_call_bound_s"] == 60.0
+    assert list(record.agent_config)[-3:] == ["tool_server_call_bound_s", "terminal_tools", "tool_server_tools"]
+    assert record.agent_config["tool_server_tools"] == ["search"]  # the bound did not reach `echo`
+    assert "tool_call_bound_s" not in record.agent_config
+    assert [(c["status"], c.get("elapsed_s")) for c in record.tool_calls] == [
+        ("ok", 10.0),
+        ("failed", 60.0),
+        ("skipped", None),
+    ]
+    assert "elapsed_s" not in record.tool_calls[2]
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "knowledge")
+    assert "within 60 s" in record.outcome["detail"]
+    assert replay_record(record).dumps().encode("utf-8") == sixth[0].read_bytes()
+    for earlier in FIXTURES[:5]:
+        held = load_record(earlier)
+        assert "tool_server_call_bound_s" not in held.agent_config
+        assert "tool_server_tools" not in held.agent_config
+        assert all("elapsed_s" not in call for call in held.tool_calls)
+        assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
+
+
+def test_o55_the_seventh_fixture_pins_each_code_cells_exec_check_and_a_call_without_one():
+    """O55 and R03: the seventh merge point added the optional `exec_check` of a tool call, what a code tool verified of
+    the exec that ran the call's program. Its fixture, written by the code of that merge on the record tests' fake
+    clock, holds a code tool's three calls, a verified success that printed nothing, a verified failure with its exit
+    status and a cell its time limit ended, with no completion record (nothing known, no nonce matched), and a call of
+    another tool, which has none. It validates and replays to its own bytes (the parametrized tests above); the six
+    fixtures before it hold none, and a record without it gains nothing."""
+    seventh = [p for p in FIXTURES if p.name.startswith("07-")]
+    assert [p.name for p in seventh] == ["07-exec-check.json"]
+    record = load_record(seventh[0])
+    assert [(c["name"], c["status"], c.get("exec_check")) for c in record.tool_calls] == [
+        ("python", "ok", {"source_whole": True, "exit_status": 0, "nonce_matched": True}),
+        ("python", "error", {"source_whole": True, "exit_status": 1, "nonce_matched": True}),
+        ("python", "error", {"source_whole": None, "exit_status": None, "nonce_matched": False}),
+        ("echo", "ok", None),
+    ]
+    assert "exec_check" not in record.tool_calls[3]
+    assert list(record.tool_calls[0])[-2:] == ["elapsed_s", "exec_check"]
+    assert replay_record(record).dumps().encode("utf-8") == seventh[0].read_bytes()
+    for earlier in FIXTURES[:6]:
+        held = load_record(earlier)
+        assert all("exec_check" not in call for call in held.tool_calls)
+        assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
+
+
+def test_o60_the_eighth_fixture_pins_a_mount_guard_snapshot_and_the_seven_before_it_hold_none():
+    """O60 and R03: the eighth merge point added the `mount_guard` instrument of a mount run on an HPC node, an entry
+    of `instruments` (an object under a lower-case namespace, as every instrument's), so no field of the schema
+    changes. Its fixture, written by the code of that merge, is the seventh's record with the snapshot of a clean run's
+    watcher log put in by the record's own API: it validates and replays to its own bytes (the parametrized tests
+    above), the record's redaction leaves its counts as they are (none is under a key it takes for a secret's), and
+    the judge reads it as clean. The seven fixtures before it hold none."""
+    from expcore.mountguard import NAMESPACE, judge
+
+    eighth = [p for p in FIXTURES if p.name.startswith("08-")]
+    assert [p.name for p in eighth] == ["08-mount-guard.json"]
+    record = load_record(eighth[0])
+    snapshot = record.instruments[NAMESPACE]
+    assert snapshot["accesses"] == {"token_file": 0, "token_dir": 0}
+    assert judge(record, "cond").verdict == "clean"
+    assert record.redacted_paths == load_record(FIXTURES[6]).redacted_paths
+    assert replay_record(record).dumps().encode("utf-8") == eighth[0].read_bytes()
+    for earlier in FIXTURES[:7]:
+        assert NAMESPACE not in load_record(earlier).instruments
+
+
+def test_o56_the_ninth_fixture_pins_a_process_visibility_snapshot_and_the_eight_before_it_hold_none():
+    """O56 and R03: the ninth merge point added the `process_visibility` instrument of a run on an HPC node, another
+    entry of `instruments`, so no field of the schema changes. Its fixture is the eighth's record with a clean run's
+    snapshot put in by the record's own API: it validates and replays to its own bytes (the parametrized tests above),
+    the redaction leaves it as it is, and the judge reads it as clean. The eight fixtures before it hold none."""
+    from expcore.visibility import NAMESPACE, judge
+
+    ninth = [p for p in FIXTURES if p.name.startswith("09-")]
+    assert [p.name for p in ninth] == ["09-process-visibility.json"]
+    record = load_record(ninth[0])
+    assert record.instruments[NAMESPACE]["memory"] == "within"
+    assert judge(record, "cond").verdict == "clean"
+    assert record.redacted_paths == load_record(FIXTURES[7]).redacted_paths
+    assert replay_record(record).dumps().encode("utf-8") == ninth[0].read_bytes()
+    for earlier in FIXTURES[:8]:
+        assert NAMESPACE not in load_record(earlier).instruments

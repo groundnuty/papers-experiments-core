@@ -22,7 +22,8 @@ hash of the same code, which a reader can recompute, and drops every source:
 
 The mapping from pseudo-commit back to commit is the local campaign itself, which never leaves the author's machine.
 The core's own identity follows the same rule: the only trace of it in a record is `core_version`, a plain version;
-its commit and URL live in the environment's `sources`, which are dropped. A version with a local label (`1.2+g1a2b3c`)
+its commit, git tree and URL live in the environment's `sources`, which are dropped, and in its wheel's build
+identity, which is withheld (`withhold`). A version with a local label (`1.2+g1a2b3c`)
 can spell a commit, so an anonymised build refuses one.
 
 What an anonymised package still shows: the core's distribution name and its code, which the reader must run. So its
@@ -48,6 +49,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from expcore.campaign.export import EXPORT_FINGERPRINT, export_text, fingerprint_entry
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, ShardFacts, facts_of_bytes, merge_document, merge_text, read_merge
 from expcore.campaign.merged import snapshot_rel
@@ -56,13 +58,14 @@ from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.package.spec import PackageError
 from expcore.package.views import streams, views
+from expcore.provenance import environment
 from expcore.provenance.codestamp import STAMP, CodeScope, covered_files, is_sha, write_stamp
-from expcore.provenance.environment import without_sources
+from expcore.provenance.environment import CORE_DISTRIBUTION, EnvironmentUnknown, without_sources
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.redact import Redactor
-from expcore.records.record import RunRecord, decode
-from expcore.replay.check import CHECK_FILE, inputs_sha256, recorded_side_files, verify_batch, write_check
-from expcore.study.pipeline import OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
+from expcore.records.record import RunRecord, decode, is_record_name
+from expcore.replay.check import CHECK_FILE, UNEXPECTED, inputs_sha256, recorded_side_files, verify_batch, write_check
+from expcore.study.pipeline import EXPORT_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
 
 PREFIX_DIGITS = 12
 SHORTEST_ID = 7  # a commit written short, as provenance headers write the ones they merge from
@@ -99,26 +102,34 @@ def stamp_bytes(
 def verify_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -> None:
     """Refuse a batch whose files are not exactly the inputs the replay check hashed, naming the first that differs.
 
-    An input is what the check counts as one: a `.json` file other than the check, or a file its hashed-only patterns
-    name, never a name starting with a dot.
+    An input is what the check counts as one (`replay.check.batch_files`): a file its hashed-only patterns name, or a
+    file named as a run record, never the check or a name starting with a dot. Any other file of the batch is one the
+    check fails as unexpected (R04), so it is refused here too, whatever its suffix: a package carries no file of the
+    batch that the check did not vouch for.
     """
     recorded = check.get("inputs")
     if not isinstance(recorded, dict) or check.get("inputs_sha256") != inputs_sha256(recorded):
         raise PackageError(f"{BATCH}/{CHECK_FILE}: its list of inputs was altered; run `python -m expcore check` again")
     patterns = check.get("hashed_only_patterns") or ()
-    current = {}
+    current, unexpected = {}, []
     for path, data in files.items():
         rel = path[len(BATCH) + 1 :] if path.startswith(f"{BATCH}/") else None
         if rel is None or rel == CHECK_FILE or Path(rel).name.startswith("."):
             continue
-        if rel.endswith(".json") or any(fnmatch.fnmatchcase(rel, pattern) for pattern in patterns):
+        if any(fnmatch.fnmatchcase(rel, pattern) for pattern in patterns) or is_record_name(Path(rel).name):
             current[rel] = hashlib.sha256(data).hexdigest()
+        else:
+            unexpected.append(rel)
     for rel in sorted(set(current) | set(recorded)):
         if current.get(rel) != recorded.get(rel):
             state = "is not" if rel not in recorded else "is missing" if rel not in current else "differs from"
             raise PackageError(
                 f"{BATCH}/{rel} {state} what the replay check hashed; run `python -m expcore check` again"
             )
+    if unexpected:
+        raise PackageError(
+            f"{BATCH}/{min(unexpected)} is not what the replay check hashed: an unexpected file, {UNEXPECTED}"
+        )
 
 
 def verify_merged_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -> None:
@@ -250,9 +261,26 @@ def _anonymised_check(
     return (batch / CHECK_FILE).read_bytes()
 
 
+def _export_without_sources(text: bytes) -> bytes:
+    """The author's export as it reads once the snapshot's fingerprint has lost the environment's sources (C36): the
+    export holds the fingerprint, which the anonymised snapshot holds without them, and the hash of it that changes with
+    them. An export without the key (from before it, or of a store that records none) is as it is."""
+    data = json.loads(text)
+    if EXPORT_FINGERPRINT not in data:
+        return text
+    fingerprint = dict(data[EXPORT_FINGERPRINT]["fingerprint"])
+    if "environment" in fingerprint:
+        fingerprint["environment"] = without_sources(fingerprint["environment"])
+    # the rewritten snapshot stores the fingerprint with sorted keys and an export reads it back in that order
+    fingerprint = json.loads(json.dumps(fingerprint, sort_keys=True, allow_nan=False))
+    data[EXPORT_FINGERPRINT] = fingerprint_entry(fingerprint)
+    return export_text(data).encode("utf-8")
+
+
 def _outputs(files: dict[str, bytes], commit: str, pseudo: str, stage: Path, swaps: Mapping[str, str]) -> None:
     """Derive the outputs from the rewritten batch; refuse any that is not the author's with the commit replaced,
-    and each old snapshot hash of `swaps` (a merged batch's export lists them) with its new one."""
+    each old snapshot hash of `swaps` (a merged batch's export lists them) with its new one and, in the export, the
+    campaign fingerprint without the environment's sources, with its hash."""
     lay_out(stage, files)
     try:
         made = output_bytes(analyse_study(stage, stamped=True))
@@ -263,6 +291,8 @@ def _outputs(files: dict[str, bytes], commit: str, pseudo: str, stage: Path, swa
         expected = files[path].replace(commit.encode(), pseudo.encode())
         for old, new in swaps.items():
             expected = expected.replace(old.encode(), new.encode())
+        if name == EXPORT_FILE:
+            expected = _export_without_sources(expected)
         if expected != made[name]:
             raise PackageError(f"{path}: differs from what the records give")
         files[path] = made[name]
@@ -343,13 +373,27 @@ def _url_forms(url: str) -> set[str]:
 def hidden_identity(
     root: Path, code: Mapping[str, Any], env: Mapping[str, Any], records: Collection[str]
 ) -> tuple[frozenset[str], frozenset[str]]:
-    """What an anonymised package may not hold: commit prefixes, and URLs in the forms `find_identity` looks for."""
-    sources = env.get("sources", {})
+    """What an anonymised package may not hold: commit prefixes, and URLs in the forms `find_identity` looks for.
+
+    The environment's sources name the core by its commit and git tree, not by where it was installed from; that
+    source (a repository URL and its commit, `environment.source_of`) names its authors as much, so it is looked for
+    too, read from the installed core."""
+    sources = [*env.get("sources", {}).values(), _core_install_source()]
     commits = {*records, *study_commits(root), code["commit"]}
-    commits |= {s["commit"] for s in sources.values() if is_sha(s.get("commit"))}
-    urls = {s["url"] for s in sources.values() if isinstance(s.get("url"), str)} | study_remotes(root)
+    commits |= {s["commit"] for s in sources if is_sha(s.get("commit"))}
+    commits |= {s["tree"] for s in sources if is_sha(s.get("tree"))}  # the core's git tree, a lookup key too
+    urls = {s["url"] for s in sources if isinstance(s.get("url"), str)} | study_remotes(root)
     forms = frozenset(form for url in urls for form in _url_forms(url))
     return frozenset(commit[:PREFIX_DIGITS] for commit in commits), forms
+
+
+def _core_install_source() -> Mapping[str, Any]:
+    """Where the installed core came from, by its direct URL; empty when it came from an index or cannot be read."""
+    dist = environment.installed().get(CORE_DISTRIBUTION)
+    try:
+        return (environment.source_of(dist) if dist is not None else None) or {}
+    except EnvironmentUnknown:  # an editable core whose checkout cannot be found names no URL to look for
+        return {}
 
 
 def commit_lines(text: str, prefixes: frozenset[str]) -> set[int]:

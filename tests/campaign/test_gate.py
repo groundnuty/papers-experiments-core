@@ -1,7 +1,9 @@
 """The budget gate: budgets are enforced, unknown cost holds like over-budget, and a release counts once (C12, C13)."""
 
 import json
+import logging
 import os
+import re
 
 import pytest
 from campaign_support import LATER, NOW, finished, planned_store, run_one
@@ -9,6 +11,8 @@ from campaign_support import LATER, NOW, finished, planned_store, run_one
 from expcore.campaign.gate import ALL, HOLDS_KEY, RELEASED_KEY, Budget, BudgetGate
 from expcore.campaign.recovery import recover
 from expcore.campaign.release import epoch_of
+from expcore.campaign.snapshot import take_snapshot
+from expcore.campaign.store import Store
 from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import Price
 
@@ -107,74 +111,150 @@ def test_c12_a_ceiling_for_one_model_holds_that_model_only(tmp_path):
     assert "model m1" in state.reason("m1")
 
 
+def serial_of_hold(store, scope=ALL):
+    return json.loads(store.get_meta(HOLDS_KEY))[scope]["serial"]
+
+
+def released_gate(store, path, **budget):
+    return gate_for(store, **{"max_usd": 20.0, "release_step_usd": 15.0, "release_file": path, **budget})
+
+
 def test_c13_a_stale_or_reused_release_does_not_resume_dispatch(tmp_path):
-    """C13: a release written before the stop is ignored and stays; one written after lifts it once and is used up."""
+    """C13: a bare scope written long before the stop is refused and stays; the line the hold names lifts it once and
+    is used up, so the same file lifts nothing again."""
     store, _, _ = planned_store(tmp_path)
     path = tmp_path / "release"
     path.write_text(f"{ALL}\n", encoding="utf-8")
     os.utime(path, (epoch_of(NOW) - 1000, epoch_of(NOW) - 1000))  # written long before the stop
-    gate = gate_for(store, max_usd=20.0, release_step_usd=15.0, release_file=path)
-    assert gate.assess([], NOW).reason("m1") is not None  # the stop begins here
+    gate = released_gate(store, path)
+    reason = gate.assess([], NOW).reason("m1")  # the stop begins here
+    serial = serial_of_hold(store)
+    assert reason.endswith(f"(stop {serial}; to end it, write the line 'ALL {serial}' in the budget's release file)")
     assert gate.assess([], LATER).reason("m1") is not None  # the stale file did not lift it
-    assert path.exists()
-    os.utime(path, (epoch_of(LATER) + 5, epoch_of(LATER) + 5))  # now written after the stop
-    state = gate.assess([], LATER)
-    assert state.reason("m1") is None  # the ceiling is now 20 + 15 = 35, and a run is expected to cost 30
+    assert path.read_text(encoding="utf-8") == "ALL\n"
+    line = re.search(r"write the line '([^']+)'", reason).group(1)
+    path.write_text(f"{line}\n", encoding="utf-8")
+    os.utime(path, (epoch_of(NOW) - 1000, epoch_of(NOW) - 1000))  # its time, behind the stop's, changes nothing
+    assert gate.assess([], LATER).reason("m1") is None  # the ceiling is now 20 + 15 = 35, and a run expects 30
     assert not path.exists()
+    assert json.loads(store.get_meta(RELEASED_KEY)) == {ALL: 15.0}
 
 
 def test_c13_a_release_raises_the_ceiling_by_its_step_and_a_later_stop_needs_a_new_release(tmp_path):
-    """C13: a release lets the campaign go on by a stated amount and no more; the file is used up."""
+    """C13: a release lets the campaign go on by a stated amount and no more; a later stop has a serial of its own,
+    which the earlier stop's line does not name."""
     store, _, _ = planned_store(tmp_path)
     path = tmp_path / "release"
-    gate = gate_for(store, max_usd=20.0, release_step_usd=15.0, release_file=path)
+    gate = released_gate(store, path)
     assert gate.assess([], NOW).reason("m1") is not None
-    path.write_text(f"{ALL}\n", encoding="utf-8")
-    os.utime(path, (epoch_of(NOW) + 5, epoch_of(NOW) + 5))
+    first = serial_of_hold(store)
+    path.write_text(f"ALL {first}\n", encoding="utf-8")
     assert gate.assess([], LATER).reason("m1") is None  # the ceiling is 35 and the run expects 30
     assert not path.exists()
-    assert json.loads(store.get_meta(RELEASED_KEY)) == {ALL: 15.0}
     assert json.loads(store.get_meta(HOLDS_KEY)) == {}
     assert gate.assess(["m1"], LATER).reason("m1") is not None  # one in flight more is over 35 again: a new stop
+    second = serial_of_hold(store)
+    assert int(second.split(".")[0]) == int(first.split(".")[0]) + 1
+    path.write_text(f"ALL {first}\n", encoding="utf-8")
+    assert gate.assess(["m1"], LATER).reason("m1") is not None
+    assert json.loads(store.get_meta(RELEASED_KEY)) == {ALL: 15.0}
     kinds = [e["kind"] for e in store.q("SELECT kind FROM events ORDER BY id")]
-    assert kinds == ["budget_hold", "budget_released", "budget_hold"]
+    assert kinds == ["budget_hold", "budget_released", "budget_hold", "budget_release_refused"]
+    details = [e["detail"] for e in store.q("SELECT detail FROM events WHERE kind='budget_hold' ORDER BY id")]
+    assert [f"(stop {first})" in details[0], f"(stop {second})" in details[1]] == [True, True]
 
 
-def test_c13_a_release_written_earlier_in_the_second_than_the_budget_stop_does_not_end_it(tmp_path):
-    """C13: the budget stop is dated at full precision: .200 of the second is older than a stop at .800 of it."""
+@pytest.mark.parametrize("offset", [-3600.0, -0.0015, 0.0, 1.0], ids=["behind", "a-tick-behind", "same-tick", "ahead"])
+def test_c13_the_budget_holds_own_line_lifts_it_whatever_time_the_file_carries(tmp_path, offset):
+    """C13: a coarse clock, a server behind or ahead, or the stop's own tick: the file's time changes nothing."""
     store, _, _ = planned_store(tmp_path)
     path = tmp_path / "release"
-    gate = gate_for(store, max_usd=20.0, release_step_usd=15.0, release_file=path)
+    gate = released_gate(store, path)
     assert gate.assess([], NOW, exact="2026-01-01T00:00:00.800000Z").reason("m1") is not None
-    assert json.loads(store.get_meta(HOLDS_KEY))[ALL]["since_epoch"] == pytest.approx(epoch_of(NOW) + 0.8)
-    path.write_text(f"{ALL}\n", encoding="utf-8")
-    os.utime(path, (epoch_of(NOW) + 0.2, epoch_of(NOW) + 0.2))
-    assert gate.assess([], LATER).reason("m1") is not None  # not newer than the stop, though in the same second
-    assert path.exists()
-    os.utime(path, (epoch_of(NOW) + 0.9, epoch_of(NOW) + 0.9))
+    since = json.loads(store.get_meta(HOLDS_KEY))[ALL]["since_epoch"]
+    assert since == pytest.approx(epoch_of(NOW) + 0.8)  # kept at full precision, for display
+    path.write_text(f"ALL {serial_of_hold(store)}\n", encoding="utf-8")
+    os.utime(path, (since + offset, since + offset))
     assert gate.assess([], LATER).reason("m1") is None
     assert not path.exists()
 
 
-def test_c13_a_stop_recorded_without_its_full_precision_is_read_from_its_whole_second(tmp_path):
-    """C13: a record from before the precise time was kept still has its stop, at the second it names."""
+@pytest.mark.parametrize("ahead", [0.0, 1.0, 3600.0])
+def test_c13_a_file_written_before_the_budget_stop_lifts_nothing_even_stamped_after_it(tmp_path, ahead):
+    """C13: a bare scope written before the stop by a writer whose clock is ahead raises no ceiling."""
+    store, _, _ = planned_store(tmp_path)
+    path = tmp_path / "release"
+    path.write_text(f"{ALL}\n", encoding="utf-8")
+    gate = released_gate(store, path)
+    gate.assess([], NOW, exact="2026-01-01T00:00:00.800000Z")
+    stamp = json.loads(store.get_meta(HOLDS_KEY))[ALL]["since_epoch"] + ahead
+    os.utime(path, (stamp, stamp))
+    assert gate.assess([], LATER).reason("m1") is not None
+    assert path.exists()
+    assert store.get_meta(RELEASED_KEY) is None
+
+
+def test_c13_a_hold_recorded_before_serials_is_given_one_and_a_bare_scope_is_refused_naming_it(tmp_path, caplog):
+    """C13: a store from before serials: the hold in force is given a serial at the next assessment, kept across a
+    restart; the bare scope, the old form, is refused with the line to write, which then lifts it once."""
     store, _, _ = planned_store(tmp_path)
     store.put_meta(HOLDS_KEY, json.dumps({ALL: {"since_utc": NOW, "reason": "over"}}), NOW)
     path = tmp_path / "release"
-    gate = gate_for(store, max_usd=20.0, release_step_usd=15.0, release_file=path)
     path.write_text(f"{ALL}\n", encoding="utf-8")
-    os.utime(path, (epoch_of(NOW) + 5, epoch_of(NOW) + 5))
+    with caplog.at_level(logging.WARNING, logger="expcore.campaign.release"):
+        reason = released_gate(store, path).assess([], LATER).reason("m1")
+    serial = serial_of_hold(store)
+    assert f"write the line 'ALL {serial}'" in reason
+    [numbered] = store.q("SELECT detail FROM events WHERE kind='budget_hold_numbered'")
+    assert numbered["detail"] == f"ALL: the hold, recorded without a serial, is stop {serial}"
+    [warned] = [r.getMessage() for r in caplog.records]
+    assert "'<name> <serial>'" in warned
+    assert f"the line 'ALL {serial}' ends it" in warned
+    restarted = released_gate(store, path)
+    assert restarted.assess([], LATER).reason("m1") is not None
+    assert serial_of_hold(store) == serial  # numbered once, never again
+    path.write_text(f"ALL {serial}\n", encoding="utf-8")
+    assert restarted.assess([], LATER).reason("m1") is None
+    assert json.loads(store.get_meta(RELEASED_KEY)) == {ALL: 15.0}
+
+
+def test_c13_a_budget_hold_lost_in_a_restore_gives_its_line_to_no_later_hold(tmp_path):
+    """C13: a store copied back from a snapshot taken before a hold gives the next hold the same count, and another
+    random part: the lost hold's exact line, still in the file, raises no ceiling; the new hold's own line does."""
+    store, schema, _ = planned_store(tmp_path)
+    live = tmp_path / "campaign.db"
+    take_snapshot(live, tmp_path / "snapshot.db", in_place=True)
+    path = tmp_path / "release"
+    released_gate(store, path).assess([], NOW)
+    lost = serial_of_hold(store)
+    path.write_text(f"ALL {lost}\n", encoding="utf-8")  # written for the hold the restore will lose
+    store.close()
+    for leftover in tmp_path.glob("campaign.db*"):
+        leftover.unlink()
+    (tmp_path / "snapshot.db").rename(live)
+    store = Store(live, schema)
+    gate = released_gate(store, path)
+    assert gate.assess([], LATER).reason("m1") is not None
+    new = serial_of_hold(store)
+    assert new.split(".")[0] == lost.split(".")[0]
+    assert new != lost
+    assert gate.assess([], LATER).reason("m1") is not None  # the lost hold's line ends nothing
+    assert store.get_meta(RELEASED_KEY) is None
+    [refused] = store.q("SELECT detail FROM events WHERE kind='budget_release_refused'")
+    assert f"the release line 'ALL {lost}' ends nothing" in refused["detail"]
+    with path.open("a", encoding="utf-8") as file:
+        file.write(f"ALL {new}\n")
     assert gate.assess([], LATER).reason("m1") is None
+    assert path.read_text(encoding="utf-8").splitlines() == [f"ALL {lost}"]
 
 
 def test_c13_a_release_names_what_it_ends_and_leaves_other_stops(tmp_path):
-    """C13: a model's name ends that model's ceiling; the total's stop is not ended by it."""
+    """C13: a model's line ends that model's ceiling; the total's stop is not ended by it."""
     store, _, _ = planned_store(tmp_path)
     path = tmp_path / "release"
-    gate = gate_for(store, max_usd=20.0, per_model_usd={"m1": 20.0}, release_step_usd=15.0, release_file=path)
+    gate = released_gate(store, path, per_model_usd={"m1": 20.0})
     assert "model m1" in gate.assess([], NOW).reason("m1")
-    path.write_text("m1\n", encoding="utf-8")
-    os.utime(path, (epoch_of(NOW) + 5, epoch_of(NOW) + 5))
+    path.write_text(f"m1 {serial_of_hold(store, 'm1')}\n", encoding="utf-8")
     state = gate.assess([], LATER)
     assert "the campaign" in state.reason("m1")  # the total is still over its 20
     assert "model m1" not in state.reason("m1")
@@ -185,12 +265,21 @@ def test_c13_the_stops_and_the_releases_survive_a_restart(tmp_path):
     """C13: they are kept in the store, so a new gate over the same store sees what the old one recorded."""
     store, _, _ = planned_store(tmp_path)
     path = tmp_path / "release"
-    gate_for(store, max_usd=20.0, release_step_usd=15.0, release_file=path).assess([], NOW)
-    path.write_text(f"{ALL}\n", encoding="utf-8")
-    os.utime(path, (epoch_of(NOW) + 5, epoch_of(NOW) + 5))
-    restarted = gate_for(store, max_usd=20.0, release_step_usd=15.0, release_file=path)
+    released_gate(store, path).assess([], NOW)
+    path.write_text(f"ALL {serial_of_hold(store)}\n", encoding="utf-8")
+    restarted = released_gate(store, path)
     assert restarted.assess([], LATER).reason("m1") is None
     assert json.loads(store.get_meta(RELEASED_KEY)) == {ALL: 15.0}
+
+
+def test_c13_a_budget_hold_without_a_release_file_names_its_stop_and_a_top_up_refusal_names_none(tmp_path):
+    """C13: without a release file the hold names its serial and no line; a top-up's refusal, which a run record
+    keeps and replays, carries no serial."""
+    store, _, _ = planned_store(tmp_path)
+    gate = gate_for(store, max_usd=20.0)
+    reason = gate.assess([], NOW).reason("m1")
+    assert reason.endswith(f"(stop {serial_of_hold(store)})")
+    assert "stop" not in gate.refusal("m1", [], 25.0)
 
 
 @pytest.mark.parametrize(

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.loop.outcomes import SET_ASIDE_OUTCOMES
+from expcore.records.injections import restore_refusal
 from expcore.records.redact import Redactor
 from expcore.records.schema import (
     CURRENT,
@@ -43,6 +44,8 @@ from expcore.records.schema import (
 from expcore.records.seal import mark_unverified, seal
 
 _LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")  # in a str only unpaired (a valid pair decodes to one character)
+# Every name `record_filename` has given, in every version of the core: the one form it has ever had.
+_RECORD_NAME = re.compile(r"[0-9a-f]{64}\.\d+\.json")
 
 
 def record_filename(run_key: str, attempt: int) -> str:
@@ -50,6 +53,15 @@ def record_filename(run_key: str, attempt: int) -> str:
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise RecordError(f"the attempt is a non-negative integer, not {attempt!r}")
     return f"{hashlib.sha256(run_key.encode('utf-8')).hexdigest()}.{attempt}.json"
+
+
+def is_record_name(name: str) -> bool:
+    """Tell whether a file name is one a run record is written under (`record_filename`).
+
+    This is how every reader of a batch tells a record from the other files beside it (R04): by its name, never by its
+    suffix or its content, so a study's own `.json` file in a run's directory is never read as a record.
+    """
+    return _RECORD_NAME.fullmatch(name) is not None
 
 
 @dataclass(frozen=True)
@@ -93,9 +105,11 @@ class RunRecord:
 
         An infrastructure outcome of a kind the attempt's condition declares as its treatment is a scored final
         attempt, so it is not set aside: the record carries the declared kinds and the flag, and the store agrees. An
-        attempt an instrument refused after the run is set aside whatever its outcome was (C31).
+        attempt an instrument refused after the run is set aside whatever its outcome was (C31), and so is one whose
+        fault injector's reading says its restore was not verified (O11): the record carries the failure itself, so no
+        re-scoring takes such a record, whether or not it holds a refusal of its own.
         """
-        if self.instrument_refusal is not None:
+        if self.instrument_refusal is not None or restore_refusal(self.instruments) is not None:
             return True
         return self.outcome["name"] in SET_ASIDE_OUTCOMES and not self.outcome["treatment"]
 

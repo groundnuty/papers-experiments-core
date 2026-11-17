@@ -28,18 +28,20 @@ of its reads.
 """
 
 import asyncio
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
 from expcore_onedata.client import OnezoneClient, PlatformError, answered_absent
 from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
+from expcore_onedata.transferrecord import state_of
 
 # The states in which a transfer has ended: the earlier study's working code stopped polling at these four.
 ENDED_STATES = ("completed", "failed", "cancelled", "skipped")
-STATE_FIELDS = ("transferStatus", "replicationStatus", "evictionStatus")
 # A file or a transfer that is not there (yet) is told by `client.answered_absent`, the one rule for it: a 404, or
 # exactly Onedata 25.0's 400 posix enoent. Any other answer, another 400 among them, is never "not there yet".
 
@@ -138,6 +140,35 @@ def bounded_map[K, V](call: Callable[[K], V], keys: Sequence[K], workers: int) -
     return [future.result() for future in futures]
 
 
+class WaitLog:
+    """The waits an operation took, by why each was taken: how many, and their seconds, for its record. `sleeper`
+    wraps a sleep so that each wait through it is logged under its reason; several threads may log at once."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._waits: dict[str, list[float]] = {}  # reason -> [count, seconds]
+
+    def add(self, why: str, seconds: float) -> None:
+        with self._lock:
+            entry = self._waits.setdefault(why, [0, 0.0])
+            entry[0] += 1
+            entry[1] += seconds
+
+    def sleeper(self, why: str, sleep: Callable[[float], None]) -> Callable[[float], None]:
+        """`sleep`, logging each wait under `why` before it is taken."""
+
+        def logged(seconds: float) -> None:
+            self.add(why, seconds)
+            sleep(seconds)
+
+        return logged
+
+    def facts(self) -> dict[str, dict[str, float | int]]:
+        """Each reason's `count` and `seconds`, in the order the reasons were first logged."""
+        with self._lock:
+            return {why: {"count": int(n), "seconds": round(s, 3)} for why, (n, s) in self._waits.items()}
+
+
 @dataclass(frozen=True)
 class EachConvergence:
     """How a convergence over many items went: whether every item settled, the items that did not, the last value
@@ -199,13 +230,17 @@ def converge_each[K, T](
 
 
 def transfer_state(record: Any) -> str:
-    """Return the state a transfer record reports, or "unknown" when it names none of the known fields."""
-    if isinstance(record, dict):
-        for name in STATE_FIELDS:
-            state = record.get(name)
-            if isinstance(state, str) and state:
-                return state
-    return "unknown"
+    """Return the state a transfer record reports, read as the transfer log reads it (`transferrecord.state_of`, O32),
+    or "unknown" when it names none of the known fields.
+
+    A job's state is that of the half it does, so a replication that ended reads `completed` beside its
+    `evictionStatus: skipped`, and an eviction beside its `replicationStatus: skipped`. A record whose status fields
+    contradict each other reads `conflicting`, which is not an ended state, so a wait on it runs to its bound and says
+    so, never taking it for done. The first field present used to win: on 25.0's records that is `transferStatus`,
+    op-worker's own summary of the halves, which ends exactly when they do; on a record without it, an eviction's
+    `replicationStatus: skipped` read as ended while the eviction was still active."""
+    state = state_of(record)
+    return state if isinstance(state, str) and state else "unknown"
 
 
 @dataclass(frozen=True)
@@ -325,6 +360,7 @@ def wait_visible(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     retry: ReadRetry = ONE_ATTEMPT,
+    slot: Callable[[], AbstractContextManager[Any]] = nullcontext,
 ) -> float:
     """Wait until a provider sees a file written through another, at its size; return the seconds it took.
 
@@ -335,19 +371,22 @@ def wait_visible(
     (`VISIBLE_ATTRIBUTES`). "Not visible yet" is `answered_absent` (a 404, or 25.0's 400 posix enoent), and a size other
     than `size` is a file the provider has not caught up with; both are asked again every `poll_s`. Any other failure,
     another 400 included, propagates at once (fail closed). Past `timeout_s` it raises `NotVisible`, naming the provider
-    by its position in platform.toml. A consistency wait (O07), never a probe's read (O08).
+    by its position in platform.toml. A consistency wait (O07), never a probe's read (O08). Each read is made inside
+    `slot()` (a reset's per-provider bound, `Provisioner.reading_slot`; none by default), its retries included and the
+    wait's pauses outside it.
     """
     guard()
     began = clock()
     while True:
         try:
-            answer = client.get(
-                f"/data/{file_id}",
-                provider=provider,
-                params={"attribute": list(VISIBLE_ATTRIBUTES)},
-                retry=retry,
-                deadline_s=timeout_s - (clock() - began),
-            )
+            with slot():
+                answer = client.get(
+                    f"/data/{file_id}",
+                    provider=provider,
+                    params={"attribute": list(VISIBLE_ATTRIBUTES)},
+                    retry=retry,
+                    deadline_s=timeout_s - (clock() - began),
+                )
             if isinstance(answer, dict) and answer.get("size") == size:
                 return round(clock() - began, 3)
         except PlatformError as error:

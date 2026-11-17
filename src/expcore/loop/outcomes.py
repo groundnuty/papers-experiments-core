@@ -15,7 +15,8 @@ The vocabulary is closed so a typo never reaches a record and the analysis can e
   unchanged (C02), and the target the failure names, if any (a position label such as `providers[1]`). The attempt
   is set aside and re-run, never scored, unless its condition declares the kind as its treatment, the kind can be one,
   the model completed at least one turn and, where the declaration names a target, the failure is of that target and
-  the run's fault injector held it down (`Outcome.is_treatment`).
+  the run's fault injector held it down (`Outcome.is_treatment`). A kind that is a fault on one target
+  (`expcore.errors.targeted_kinds`) is never treatment without its declared target.
 - `harness_defect`: a crash in harness or tool code on valid input (L08); carries a line-free stack hash. Set aside
   and re-run after the fix, never scored as the agent's failure.
 """
@@ -27,7 +28,7 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from expcore.errors import check_target, infra_kinds, is_treatable
+from expcore.errors import check_target, infra_kinds, is_treatable, targeted_kinds
 
 OUTCOMES = (
     "finished",
@@ -120,9 +121,13 @@ class Outcome:
           of it in this attempt (`injected`, from `expcore.records.injections.injected_targets`). Another target's
           failure, a failure that names none, and a target the injector did not take down are set aside.
 
-        A kind declared without a target is decided by the first two alone, whatever target the failure names. Records
-        of the first version, and markers written before the first-turn rule, were made without it
-        (`first_turn_rule=False`): for them the declared kind alone decides. Versions before 3 declare no target.
+        A kind declared without a target is decided by the first two alone, whatever target the failure names, unless
+        it is a kind that requires one (`expcore.errors.targeted_kinds`, such as a provider outage). Such a kind is
+        treatment only under its declared target, by the whole of the target clause, whatever `target_rule` says: with
+        no declared target it is never treatment, because the target is what says which failure is the manipulation and
+        the plain name would score any target's failure as the condition's. Records of the first version, and markers
+        written before the first-turn rule, were made without it (`first_turn_rule=False`): for them the declared kind
+        alone decides. Versions before 3 declare no target, and no kind that requires one exists in them.
         """
         if not (
             self.name == "infrastructure"
@@ -131,7 +136,10 @@ class Outcome:
             and is_treatable(self.infra_kind)
         ):
             return False
-        target = (treatment_targets or {}).get(self.infra_kind) if target_rule else None
+        declared = (treatment_targets or {}).get(self.infra_kind)
+        if self.infra_kind in targeted_kinds():  # the target is the whole of the manipulation: no rule of a version
+            return declared is not None and self.infra_target == declared and declared in injected  # waives it
+        target = declared if target_rule else None
         return target is None or (self.infra_target == target and target in injected)
 
 

@@ -32,35 +32,52 @@ import datetime as dt
 import json
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign import reply_cap
+from expcore.campaign import liveness, reply_cap
 from expcore.campaign.attempt import AttemptRunner, Parts, RunAdmission
 from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
+from expcore.campaign.export import stored_fingerprint_sha256
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.harness_stop import HarnessStops
-from expcore.campaign.healthgate import HealthCheck, HealthGate
+from expcore.campaign.health_required import refuse_without_health_check
+from expcore.campaign.healthgate import (
+    ADMISSION_OWNER,
+    DECLARED_HOOK,
+    HEALTH_OWNER,
+    ContextHealthCheck,
+    DeferralBound,
+    HealthCheck,
+    HealthGate,
+    PlatformDeferral,
+    deferral_bound,
+    exposes_deferral,
+    takes_context,
+)
 from expcore.campaign.holds import ALL, Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.lock import CampaignLocked, DispatchLock
-from expcore.campaign.manifest import Manifest
+from expcore.campaign.lost_spend import Pricing, open_journal
+from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.probe_spend import MeteredProbes
 from expcore.campaign.recovery import Recovery
 from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.shard import META_SHARD
 from expcore.campaign.shard_run import ShardStart
 from expcore.campaign.store import Store, column_for
 from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
-from expcore.config.loading import Section
+from expcore.config.loading import ConfigError, Section
 from expcore.config.models import ModelTable
+from expcore.config.platform_loads import PlatformLoad, check_loads_listed
 from expcore.loop.config import AgentConfig
 from expcore.models.admission import admit_reading, max_tokens_ignored, reply_cap_unshown
 
@@ -77,6 +94,12 @@ def utc_now() -> dt.datetime:
 def iso(moment: dt.datetime) -> str:
     """Return a time the way the store writes timestamps: ISO 8601 UTC, whole seconds, Z suffix."""
     return moment.astimezone(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _attempt_state(store: Store, attempt_id: int) -> str | None:
+    """The state of an attempt's row in the store, or None when there is none (`liveness.register`)."""
+    rows = store.q("SELECT state FROM attempts WHERE id=?", (attempt_id,))
+    return rows[0]["state"] if rows else None
 
 
 @dataclass(frozen=True)
@@ -108,7 +131,7 @@ class Scheduler:
         models: ModelTable,
         endpoints: Mapping[str, Endpoint],
         settings: SchedulerConfig | None = None,
-        health: HealthCheck | None = None,
+        health: HealthCheck | ContextHealthCheck | None = None,
         leases: LeasePool | None = None,
         lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None,
         admission: RunAdmission | None = None,
@@ -119,9 +142,18 @@ class Scheduler:
         crash_hook: Callable[[str, str], None] = lambda point, run_key: None,
         on_hold: Callable[[str], None] | None = None,
         shard: ShardStart | None = None,
+        reset_settings: Mapping[str, Any] | None = None,
+        spend_journal: Path | None = None,
+        platform_deferrals: Sequence[PlatformDeferral] = (),
+        listed_platforms: Collection[str] | None = None,
+        platform_loads: Collection[PlatformLoad] = (),
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
         self.shard = shard  # a shard's start: `manifest` is then its part of the plan, `settings` its shares (#154)
+        # this start's spend journal, new (O62): every other journal beside it is counted against the store at the open
+        self.spend_journal = None if spend_journal is None else Path(spend_journal)
+        self.lost_counted: dict[str, Any] | None = None  # what the open counted of them (`lost_spend.reconcile`)
+        self.reset_settings = reset_settings  # the platform's settings in no fingerprint, recorded and compared (C35)
         self.on_hold = on_hold  # takes one line per hold that begins, changes or ends; never one per pass
         self.executor, self.agent_config, self.models = executor, agent_config, models
         self.endpoints, self.settings = dict(endpoints), settings or SchedulerConfig()
@@ -141,13 +173,38 @@ class Scheduler:
             else ()
         )
         self.settings.check_kinds(schema)
+        # what the admission and the health check declare, read once and before the lock or the store; the admission's is
+        # read only when something asks for it (a study's list of platforms, or a health check to hold to it)
+        if health is not None:  # a signature the gate could never call is refused here, not at the first check (O82)
+            takes_context(health)
+        asked = health is not None or listed_platforms is not None
+        declared = deferral_bound(admission, DECLARED_HOOK, ADMISSION_OWNER) if asked else None
+        reported = deferral_bound(health) if health is not None else None
+        if listed_platforms is not None:  # the study's own list: a platform used with a deferral must be listed (C11)
+            # a listed module speaks for the platforms its answers name (one of the study's own may re-export a platform's
+            # function, so its bounds name the platform's module and not its own)
+            listed = frozenset(listed_platforms)
+            speaks = {
+                p.bound.platform for p in platform_deferrals if p.platform in listed and p.bound and p.bound.platform
+            }
+            # a listed module that ran a platform's loader to answer speaks for that platform too, even when it answers
+            # None (a heal that is off), which names no module
+            speaks |= {module for p in platform_deferrals if p.platform in listed for module in p.loaded}
+            self._check_listed(declared, reported, listed | speaks)
+            # what the study's build loaded through the core's own loaders: the plugin may hide what its objects
+            # declare, but not that the platform's loader ran (`platform_loads`, C11)
+            check_loads_listed(platform_loads, listed | speaks)
+        if health is not None:  # the platform's own wait must fit under max_defer_s
+            self._check_deferral(health, declared, reported, tuple(platform_deferrals))
         exclusive = [name for name, value in schema.exclusive.items() if value]
         if exclusive and admission is None:  # nothing would hold the platform exclusively: refuse, never pretend
             raise Section({}, schema.file, f"[conditions.{exclusive[0]}]").fail(
                 EXCLUSIVE_KEY,
                 "declares an exclusive run, but the platform gives the campaign no run admission to hold exclusively",
             )
+        refuse_without_health_check(admission, health)  # an admission that reads the pre-run check's note: never blind
         self.store: Store | None = None
+        self._campaign: str | None = None  # the store's key for the attempts' liveness (`liveness.register`)
         self.recovery: Recovery | None = None
         self.not_admitted: dict[str, str] = {}
         self.stop = threading.Event()
@@ -163,6 +220,45 @@ class Scheduler:
         self._workers: list[threading.Thread] = []
         self._run_thread: threading.Thread | None = None  # the thread inside `run`, while there is one
         self._fatal: BaseException | None = None
+
+    @staticmethod
+    def _check_listed(declared: DeferralBound | None, reported: DeferralBound | None, listed: Collection[str]) -> None:
+        """Refuse a campaign whose admission or health check declares a deferral that names a platform module the study
+        does not list in `[study] platforms` (`DeferralBound.platform`; a bound that waits for nothing declares no deferral): the core reads a platform's declaration from its
+        configuration only through the modules the study lists, so an unlisted platform's would go unchecked, and a
+        study that wraps its objects would hide it."""
+        for owner, bound in ((ADMISSION_OWNER, declared), (HEALTH_OWNER, reported)):
+            waits = bound is not None and (bound.seconds > 0 or bound.rechecks > 0 or bound.checks > 0)
+            if bound is not None and waits and bound.platform and bound.platform not in listed:
+                raise ConfigError(
+                    f"{owner} declares a deferral of {bound.seconds:g} s that comes from the platform module "
+                    f"{bound.platform!r}, which [study] platforms does not list: list it, so the core reads the "
+                    "platform's own configuration for its declared deferral and holds the health check and max_defer_s "
+                    "to it, whatever the study's plugin wraps"
+                )
+
+    def _check_deferral(
+        self,
+        health: HealthCheck,
+        declared: DeferralBound | None,
+        reported: DeferralBound | None,
+        platforms: Sequence[PlatformDeferral],
+    ) -> None:
+        """Refuse a campaign the platform's own deferral outlasts: first one whose health check does not carry what each
+        platform of the study declares from its own configuration (`platforms`, read through the registry with no object
+        of the study's plugin between), then what the platform's admission declares (a wrapper that hid `max_deferral_s`
+        is seen either way), then a `max_defer_s` shorter than what the check declares
+        (`SchedulerConfig.check_declared_deferral`, `check_deferral_bound`)."""
+        exposed = exposes_deferral(health)
+        for platform in platforms:  # the registry's: no wrapper of the study's can hide it
+            self.settings.check_declared_deferral(
+                platform.bound,
+                reported,
+                exposed=exposed,
+                source=f"the platform {platform.platform!r} (its configuration, read through [study] platforms)",
+            )
+        self.settings.check_declared_deferral(declared, reported, exposed=exposed)
+        self.settings.check_deferral_bound(reported)
 
     # --- lifecycle ------------------------------------------------------------------------------------------------
 
@@ -200,8 +296,14 @@ class Scheduler:
             max_attempts=cfg.max_attempts,
             allow_growth=cfg.allow_growth,
             shard=self.shard,
+            reset_settings=self.reset_settings,
         )
         store = self.store
+        if self.spend_journal is not None:  # before the probes, the first spend this start can make (O62)
+            label = None if self.shard is None else self.shard.pinned()[META_SHARD]  # the whole spec, not its label
+            campaign = stored_fingerprint_sha256(store) or fingerprint_sha256(self.fingerprint)
+            pricing = Pricing({m: self.models.resolve(m) for m in self.plan_models}, self.agent_config.limits)
+            self.lost_counted = open_journal(store, self.spend_journal, campaign, label, self.stamp(), pricing)
         self.holds = HoldRegistry(store, self.stamp, None if self.on_hold is None else self._announce)
         self.units = UnitHealth(
             store,
@@ -240,6 +342,7 @@ class Scheduler:
             )
             self.gate.load()
         self._sweep_leases()
+        self._campaign = liveness.register(lambda attempt_id: _attempt_state(store, attempt_id))
         self.runner = AttemptRunner(
             Parts(
                 store=store,
@@ -268,6 +371,7 @@ class Scheduler:
                 ledger=self.ledger,
                 reserved_capped=self._admitted_capped,
                 reply_cap_unheld=self._reply_cap_unheld,
+                campaign=self._campaign,
             )
         )
 
@@ -384,9 +488,15 @@ class Scheduler:
         gate = getattr(self, "gate", None)
         if gate is not None:
             gate.join()
+        if self._campaign is not None:  # before the store closes: its attempts read as ended from here
+            liveness.unregister(self._campaign)
+            self._campaign = None
         if self.store is not None:
+            journal = self.store.spend_journal
             self.store.close()
             self.store = None
+            if journal is not None:
+                journal.close()
         self._lock.release()
 
     def _wait_for_workers(self) -> None:
@@ -446,7 +556,7 @@ class Scheduler:
         with self._cv:
             others = [m for k, (m, _) in self._inflight.items() if k != key]
             live = frozenset(self._inflight)
-        stopped, stopped_all = self.stops.stopped()
+        stopped, stopped_all = self.stops.hold_reasons()
         budget = self._assessed(others, self.stamp(), live)
         hold = (
             self._all_hold(stopped_all)
@@ -472,21 +582,24 @@ class Scheduler:
         assert self.store
         return reply_cap.is_unheld(reply_cap.unheld(self.store), model)
 
-    def _all_hold(self, stopped_all: bool) -> Hold | None:
-        """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
-        if stopped_all:
-            return Hold("harness_errors", "dispatch of every model is stopped by harness errors", temporary=False)
+    def _all_hold(self, stopped_all: str | None) -> Hold | None:
+        """The hold that applies to every run, if any: a stop on all dispatch (its sentence), or a closed health gate."""
+        if stopped_all is not None:
+            return Hold("harness_errors", stopped_all, temporary=False)
+        reason = None if self.gate is None else self.gate.operator_reason  # what only an operator can end, said first
+        said = "" if reason is None else f": {reason}"
         if self.gate is not None and self.gate.blocking:  # a deferral past its bound: it may never end by itself
-            why = "the health gate is closed: the platform's check stayed deferred past max_defer_s"
+            why = f"the health gate is closed: the platform's check stayed deferred past max_defer_s{said}"
             return Hold("health_gate", why, temporary=False)
         if self.gate is not None and self.gate.closed:
-            return Hold("health_gate", "the health gate is closed: no run starts until a check passes", temporary=True)
+            why = f"the health gate is closed: no run starts until a check passes{said}"
+            return Hold("health_gate", why, temporary=True)
         return None
 
-    def _model_hold(self, model: str, stopped: frozenset[str], budget: Any) -> Hold | None:
-        """The hold that applies to one model's runs, if any."""
+    def _model_hold(self, model: str, stopped: Mapping[str, str], budget: Any) -> Hold | None:
+        """The hold that applies to one model's runs, if any; `stopped` holds the sentence of each model's stop."""
         if model in stopped:
-            return Hold("harness_errors", f"dispatch of {model} is stopped by harness errors", temporary=False)
+            return Hold("harness_errors", stopped[model], temporary=False)
         if model in self.not_admitted:
             return Hold("not_admitted", self.not_admitted[model], temporary=False)
         reason = None if budget is None else budget.reason(model)
@@ -528,7 +641,7 @@ class Scheduler:
         self.stops.take_releases(now)
         if self.leases is not None:
             self.leases.settle_quarantines()
-        stopped, stopped_all = self.stops.stopped()
+        stopped, stopped_all = self.stops.hold_reasons()
         budget = self._assessed([m for m, _ in self._inflight.values()], now, frozenset(self._inflight))
         in_use = self._in_use()
         held_in_unit = self._live_per_unit()

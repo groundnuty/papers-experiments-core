@@ -22,7 +22,7 @@ by an id or a name (O12).
 import errno as errnos
 import hashlib
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,6 +30,7 @@ from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.provision import LISTING_ATTRIBUTES, LISTING_LIMIT, Provisioner, listing_entry, next_page_token
 from expcore_onedata.readretry import ONE_ATTEMPT
+from expcore_onedata.streamed import ReadOutcome
 
 BLOCKED_FRACTION = 0.9  # an unanswered call that took this much of its bound was blocked, not refused
 ROLES = ("target", "mirror", "local")
@@ -102,6 +103,18 @@ def unanswered(seconds: float, bound_s: float) -> str:
     return "blocked" if seconds >= BLOCKED_FRACTION * bound_s else "no answer"
 
 
+def answers_facts(outcomes: Iterable[ReadOutcome]) -> dict[str, Any]:
+    """What the platform answered to a read's ranges: how many answers it gave by status (a ranged read is answered 206,
+    a range at a time), and the bytes of their bodies. A read that was given no answer has no statuses and no bytes
+    (O37)."""
+    statuses: dict[str, int] = {}
+    total = 0
+    for outcome in outcomes:
+        statuses[str(outcome.status)] = statuses.get(str(outcome.status), 0) + 1
+        total += outcome.body_bytes
+    return {"statuses": statuses, "body_bytes": total}
+
+
 def failure_facts(error: BaseException, seconds: float, bound_s: float) -> dict[str, Any]:
     """What a failed call shows: the answer's status, error id and errno, or the mount's errno, and its outcome."""
     facts: dict[str, Any] = {}
@@ -151,8 +164,10 @@ class Cells:
 
     # -- reads of a file ------------------------------------------------------------------------------------------
     def read(self, file: ScratchFile, provider: str | None = None) -> dict[str, Any]:
-        """Read a whole file through the REST data path of a provider (the local one by default), streamed, hashed."""
+        """Read a whole file through the REST data path of a provider (the local one by default), streamed, hashed. The
+        facts hold `answers`: what the platform answered to each range it accepted, by status, and their bytes (O37)."""
         received = 0
+        answered: list[ReadOutcome] = []
 
         def sink(piece: bytes) -> None:
             nonlocal received
@@ -170,9 +185,15 @@ class Cells:
                 clock=self._clock,
                 space=self._entry.space,
                 gate_retry=ONE_ATTEMPT,  # a measurement: a stalled gate read is the cell's recorded outcome (O29)
+                answers=answered.append,
             )
         )
-        facts = {**self._base(seconds), "bytes": received, "expected_bytes": len(file.data)}
+        facts = {
+            **self._base(seconds),
+            "bytes": received,
+            "expected_bytes": len(file.data),
+            "answers": answers_facts(answered),
+        }
         return self._read_outcome(facts, file, error, digest.sha256 if error is None else None, received)
 
     def _read_outcome(

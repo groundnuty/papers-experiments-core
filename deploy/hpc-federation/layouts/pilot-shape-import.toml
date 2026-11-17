@@ -1,0 +1,106 @@
+# The pilot's shape on HPC batch nodes with its four data spaces imported, not ingested (O59, DESIGN.md section 8): the
+# same zone, five providers, four data spaces each owned by one provider and mirrored by aspen, and the link check's probe
+# space as layouts/pilot-shape.toml, every name invented. Each data space is held by its owner on a directory of the
+# cluster's shared filesystem that other federations read too, read-only in every one of them. layouts/pilot-shape.toml
+# stays the ingest-based layout: the ingest path is the primary one until a live slot shows the two equivalent.
+#
+#   set -a; . deploy/hpc-federation/site.env; set +a        # site.env sets the eight EXPCORE_FED_IMPORT_ variables below
+#   uv run python -I -B deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape-import.toml \
+#     --root <a directory on a filesystem the login node and the nodes see> up
+#
+# The layout holds no path: each import names the two variables of site.env that hold its tree's directory and its
+# manifest's file (site.env.example), and `up` reads them on the login node. `[hpc] core` stays "login": a core step runs
+# on a node whose environment is an allowlist that carries neither variable, and the preflight refuses it.
+#
+# What `shared = true` asks of the federation: the tree is imported read-only (`readonly = true` is required beside it),
+# only its owner's service mounts it, read-only, and the owner's imported storage is read-only on the panel; the platform
+# template repeats `import = { readonly = true, shared = true }` on each data space, so the core refuses anything else,
+# and `fedimport.verify_imports` shows after up that each space holds exactly its manifest. The mirrors keep node-local
+# storage and fetch what the owner holds. To start again: down, then up.
+#
+# No data space declares `direct_io`: a direct mount reads the storage of the agent's own provider (`local` in the
+# platform file, aspen here), and aspen owns none of the four. An import declares baseline = false, so the study's own
+# files go in a fifth, ordinary space (alpha-work) on aspen's node-local storage. The platform template does not list it
+# in its [[spaces]], so the link check still covers the pilot's ten ordered pairs.
+#
+# The ports and memory limits are the Compose federation's and unused here, as in layouts/pilot-shape.toml.
+
+project = "expcore-hpc-pilot-import"
+domain = "expcore-hpc-pilot-import.test"
+study_space = "alpha-work"
+memory_limit = "6g"
+platform_template = "pilot-shape-import.platform.toml.template"
+probe_space = "link-probes"
+
+[hpc]
+time = "02:00:00"                        # the held job's --time: bring it down well before
+stop_seconds = 600                       # a service's graceful stop bound; settle_timeout_s is derived from it
+core = "login"                           # the import check needs the login node's environment (DESIGN.md section 8)
+zone = { cpus = 4, memory = "8g" }       # live peaks: about 4.0 GB of RSS and the 1.9 GB rootfs on tmpfs
+provider = { cpus = 4, memory = "10g" }  # about 4.8 GB of RSS, the 2.5 GB rootfs and the posix storage on tmpfs
+control = { cpus = 1, memory = "1g" }    # every node's reserve for control steps (a token's delivery peaked at 180 MB)
+
+[zone]
+port = 29743
+
+[providers.aspen]                        # the agent's local provider: it supports every data space
+port = 29744
+
+[providers.larch]
+port = 29745
+
+[providers.rowan]
+port = 29746
+
+[providers.alder]
+port = 29747
+
+[providers.hazel]
+port = 29748
+
+[spaces.alpha-space]                     # imported by larch, mirrored by aspen and rowan
+owner = "larch"
+mirrors = ["aspen", "rowan"]
+baseline = false
+import = { readonly = true, shared = true, source_env = "EXPCORE_FED_IMPORT_ALPHA", manifest_env = "EXPCORE_FED_IMPORT_ALPHA_MANIFEST" }
+
+[spaces.beta-space]
+owner = "rowan"
+mirrors = ["aspen"]
+baseline = false
+import = { readonly = true, shared = true, source_env = "EXPCORE_FED_IMPORT_BETA", manifest_env = "EXPCORE_FED_IMPORT_BETA_MANIFEST" }
+
+[spaces.gamma-space]
+owner = "alder"
+mirrors = ["aspen"]
+baseline = false
+import = { readonly = true, shared = true, source_env = "EXPCORE_FED_IMPORT_GAMMA", manifest_env = "EXPCORE_FED_IMPORT_GAMMA_MANIFEST" }
+
+[spaces.delta-space]                     # stands for the pilot's largest space, 15,340 files
+owner = "hazel"
+mirrors = ["aspen"]
+baseline = false
+import = { readonly = true, shared = true, source_env = "EXPCORE_FED_IMPORT_DELTA", manifest_env = "EXPCORE_FED_IMPORT_DELTA_MANIFEST" }
+
+[spaces.alpha-work]                      # the study's own files: an ordinary space on node-local storage
+owner = "aspen"
+mirrors = ["larch"]
+
+[spaces.link-probes]                     # the link check's probes: no agent user is a member, up writes nothing
+owner = "aspen"
+mirrors = ["larch", "rowan", "alder", "hazel"]
+agent_visible = false
+baseline = false
+support_bytes = 1073741824
+
+[principals.alpha-reader]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space", "alpha-work"]
+
+[principals.alpha-tools]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space", "alpha-work"]
+
+[principals.alpha-health]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space", "alpha-work"]

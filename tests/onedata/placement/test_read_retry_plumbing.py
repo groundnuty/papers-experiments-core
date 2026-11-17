@@ -473,14 +473,16 @@ def test_o29_a_reset_that_retried_nothing_says_zero(provisioner, seeded, flaky, 
 
 
 def test_o29_a_failed_reset_still_says_how_many_reads_it_retried(provisioner, seeded, flaky, ticker):
-    """O29: a listing that times out on all three attempts fails the reset at its stage; the record of the failure holds
-    the two retries it made, since a failed reset's evidence is the one that is read."""
+    """O29: a transfer listing that times out on all four of its stage's attempts (the reset's own transfer reads go
+    under a reading's policy, O46) fails the reset at its stage; the record of the failure holds the three retries it
+    made, since a failed reset's evidence is the one that is read, and the stage's tally says so too."""
     flaky.hang(TRANSFERS, times=None)
     with pytest.raises(ResetFailed) as caught:
         SpaceReset(provisioner, now=ticker.clock).run()
     assert caught.value.stage == "transfers"
-    assert caught.value.record["reads_retried"] == 2
-    assert len(flaky.timed_out) == 3
+    assert caught.value.record["reads_retried"] == 3
+    assert caught.value.record["stages"]["transfers"]["transfer_read_retry"]["errors"] == {"ReadTimeout": 4}
+    assert len(flaky.timed_out) == 4
 
 
 def test_o29_the_count_of_a_second_reset_is_its_own(provisioner, seeded, flaky, ticker):

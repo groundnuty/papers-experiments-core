@@ -6,7 +6,20 @@ import math
 import pytest
 
 from expcore.report import render_report, summary_lines
-from expcore.stats.analysis import CONCLUSIONS, AnalysisResult, ContrastResult, HolmDecision
+from expcore.stats.analysis import (
+    CONCLUSIONS,
+    AnalysisResult,
+    ContrastResult,
+    EquivalenceFamily,
+    HolmDecision,
+    HolmFamily,
+    HolmStep,
+)
+from expcore.stats.armruns import LOST_CAUSES, ArmRuns
+from expcore.stats.estimators import ModelEstimate
+from expcore.stats.onearm import DescriptiveResult
+from expcore.stats.ratio import RatioForm
+from expcore.stats.smallest import SmallestEffect
 
 CODE = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
 MANIFEST = {"preregistration_sha256": "e" * 64, "factor_schema_sha256": "f" * 64}
@@ -296,6 +309,75 @@ def test_set_aside_and_treatment_counts_are_listed_per_condition_and_kind():
     assert "| cond-a | endpoint | no | 3 | 0 | 0 |" in report
     assert "| cond-b | knowledge | yes | 1 | 2 | 0 |" in report
     assert "| cond-a | none |" not in report  # a condition with a row of its own needs no row of zeros
+
+
+SETTINGS_HEADING = "### Platform settings outside the fingerprint"
+SCAN = {"at": "2026-03-01T11:00:00Z", "key": "placement.qos_scan", "old": "listing", "new": "summaries"}
+
+
+def settings_export(changes=(), unknown=()):
+    return export(reset_settings={"changes": list(changes), "unknown_before": list(unknown)})
+
+
+def settings_section(report: str) -> str:
+    """The text of the settings section: from its heading to the next one."""
+    return report.split(SETTINGS_HEADING, 1)[1].split("\n### ", 1)[0]
+
+
+def test_c35_a_changed_platform_setting_is_in_the_infrastructure_notes_with_both_values_and_when():
+    """C35: each start that found a setting changed is a row with the key, the value before and the value after, as the
+    store holds them; a setting that was not reported on one side reads `absent`, never None or empty; the section is
+    among the infrastructure notes, before the budget holds."""
+    changes = [SCAN, {"at": "2026-03-02T09:00:00Z", "key": "placement.concurrency", "old": 16}]
+    report = render(analysis(contrast("primary", "difference")), settings_export(changes))
+    assert (
+        report.index("### Infrastructure failures") < report.index(SETTINGS_HEADING) < report.index("### Budget holds")
+    )
+    rows = table_of(report, SETTINGS_HEADING)
+    assert rows["Recorded"] == ["Recorded", "Key", "Before", "After"]
+    assert rows["2026-03-01T11:00:00Z"] == ["2026-03-01T11:00:00Z", "placement.qos_scan", '"listing"', '"summaries"']
+    assert rows["2026-03-02T09:00:00Z"] == ["2026-03-02T09:00:00Z", "placement.concurrency", "16", "absent"]
+    assert "No change" not in settings_section(report)
+
+
+def test_c35_a_store_whose_earlier_settings_are_unknown_says_so_and_names_the_start_that_recorded_them():
+    """C35: the start of a store made before the settings were recorded says that the runs before it ran under
+    settings that are unknown, and never that nothing changed."""
+    report = render(
+        analysis(contrast("primary", "difference")), settings_export(unknown=[{"at": "2026-03-05T08:00:00Z"}])
+    )
+    section = settings_section(report)
+    assert "2026-03-05T08:00:00Z" in section
+    assert "unknown" in section
+    assert "No change" not in section
+
+
+def test_c35_settings_that_never_changed_are_reported_as_such_in_one_line_and_never_as_a_table():
+    """C35: the key is present when the store recorded settings, and says that no start found them changed."""
+    section = settings_section(render(analysis(contrast("primary", "difference")), settings_export()))
+    assert "No change in them was recorded at any start." in section
+    assert "|" not in section
+
+
+def test_c35_the_changes_of_a_merged_batch_name_their_shard():
+    """C35: the joined export's changes and unknown starts carry the shard that saw them, and the table has a shard
+    column only then."""
+    data = settings_export([{**SCAN, "shard": 2}], [{"at": "2026-03-05T08:00:00Z", "shard": 1}])
+    report = render(analysis(contrast("primary", "difference")), data)
+    rows = table_of(report, SETTINGS_HEADING)
+    assert rows["Shard"] == ["Shard", "Recorded", "Key", "Before", "After"]
+    assert rows["2"] == ["2", "2026-03-01T11:00:00Z", "placement.qos_scan", '"listing"', '"summaries"']
+    assert "shard 1" in settings_section(report)
+
+
+def test_c35_an_export_without_the_key_gives_the_report_it_always_gave():
+    """C35: a campaign whose platform supplies no settings has no section, and nothing else in its report moves."""
+    result = analysis(contrast("primary", "difference"))
+    plain = render(result)
+    assert SETTINGS_HEADING not in plain
+    with_section = render(result, settings_export([SCAN]))
+    before, rest = with_section.split(SETTINGS_HEADING)
+    assert before + "### Budget holds" + rest.split("### Budget holds", 1)[1] == plain
 
 
 def test_c23_each_condition_shows_its_planned_runs_how_each_ended_and_its_attempts_set_aside():
@@ -683,3 +765,811 @@ def test_c26_a_campaign_without_a_budget_hold_has_a_row_of_zeros_for_every_condi
     holds = render(analysis(contrast("primary", "difference")), data).split("### Budget holds by condition", 1)[1]
     for name in ("cond-a", "cond-b", "cond-c"):
         assert f"| {name} | model-a | 0 |" in holds
+
+
+# --- a ratio contrast in the report -----------------------------------------------------------------------------------
+
+NO_CELL_LOST = {"no_pair": 0, "zero_denominator": 0, "zero_numerator": 0}
+RATIO_MISSING = {
+    **NO_PAIR,
+    "exhausted": 0,
+    "unpaired_or_left_out": 0,
+    "numerator_none_at_zero": 1,
+    "zero_denominator": 3,
+    "zero_numerator": 0,
+}
+
+
+EXCLUDE = RatioForm("spend", "wins", "exclude")
+
+
+def ratio_contrast(name="spend-per-win", form=EXCLUDE, conclusion="difference", **changes) -> ContrastResult:
+    """A ratio contrast's result: its estimate ln 2 with the interval [ln 1.5, ln 3], and the pairs its rule took."""
+    numbers = {"estimate": math.log(2.0), "ci_low": math.log(1.5), "ci_high": math.log(3.0), "n_pairs": 20}
+    units = {"estimation_unit": ("group",), "independent_unit": "group", "n_cells": 12, "cells_lost": NO_CELL_LOST}
+    base = {"outcome": form.label, "estimator": "ratio", "ratio": form, "pairs_missing": RATIO_MISSING, **numbers}
+    base |= units
+    return contrast(name, conclusion, **{**base, **changes})
+
+
+def test_s13_a_ratio_contrasts_row_names_its_outcome_on_the_log_scale():
+    """S13: the estimate and its interval are natural-log ratios, and the outcome cell says so."""
+    cells = row(render(analysis(ratio_contrast())), "spend-per-win")
+    assert cells[2:5] == ["ln(spend/wins)", "0.6931", "[0.4055, 1.099]"]
+
+
+def test_s13_the_ratio_contrasts_table_gives_the_rule_and_the_ratio_itself():
+    """S13: each ratio contrast's two outcomes, its declared zero rule, and exp of the estimate and of its interval."""
+    continuity = ratio_contrast("spend-per-win-c", RatioForm("spend", "wins", "continuity", 0.5))
+    report = render(analysis(ratio_contrast(), continuity))
+    table = table_of(report, "## Ratio contrasts")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Numerator",
+        "Denominator",
+        "Estimation unit",
+        "Independent unit",
+        "Cells",
+        "Zero total",
+        "Ratio (A / B)",
+        "Ratio interval",
+    ]
+    assert table["spend-per-win"][1:] == ["spend", "wins", "group", "group", "12", "exclude", "2", "[1.5, 3]"]
+    assert table["spend-per-win-c"][6] == "continuity correction 0.5"
+    assert "the cell is excluded from the contrast" in report.split("## Ratio contrasts")[1]
+
+
+def test_s13_the_terminal_summary_says_a_ratio_contrasts_estimate_is_a_log_ratio():
+    """S13: a log ratio printed bare could be read as a difference of ratios."""
+    line = next(line for line in summary_lines(analysis(ratio_contrast())) if line.startswith("spend-per-win:"))
+    assert line.startswith("spend-per-win: estimate 0.6931 (ln ratio), p ")
+    assert summary_lines(analysis(contrast("plain", "difference")))[0].startswith("plain: estimate 0.25, p ")
+
+
+def test_s13_the_pairs_table_shows_the_ratio_causes_when_a_ratio_contrast_is_in_it():
+    """S13: the ratio contrast's counts under its three causes; a difference contrast beside it has none of them."""
+    report = render(analysis(ratio_contrast(), contrast("plain", "difference")))
+    table = table_of(report, "### Pairs of the family's contrasts")
+    assert table["Contrast"][-3:] == ["Numerator None at denominator 0", "Zero denominator", "Zero numerator"]
+    assert table["spend-per-win"][-3:] == ["1", "3", "0"]
+    assert table["plain"][-3:] == ["-", "-", "-"]
+    assert "*Zero denominator*" in report.split("## Missing pairs by cause")[1]
+
+
+def test_s13_a_report_with_no_ratio_contrast_has_none_of_its_columns_notes_or_sections():
+    """S13, C29: a study without a ratio contrast gets the report it got before ratio contrasts existed."""
+    report = render(analysis(contrast("plain", "difference")))
+    assert not [word for word in ("Ratio", "Zero denominator", "Numerator None", "ln(") if word in report]
+    assert table_of(report, "### Pairs of the family's contrasts")["Contrast"][-1] == "Outcome None (other)"
+
+
+def test_s13_an_untestable_ratio_contrast_names_the_rule_that_took_its_pairs():
+    """S13, S11: every cell excluded is untestable, and the row says the zero rule took the pairs."""
+    nothing = {"estimate": math.nan, "p_value": math.nan, "ci_low": math.nan, "ci_high": math.nan, "n_clusters": 0}
+    dry = ratio_contrast(conclusion="untestable", n_pairs=0, **nothing)
+    report = render(analysis(dry))
+    assert row(report, "spend-per-win")[11] == "0 (missing: numerator None at denominator 0 1, zero denominator 3)"
+    assert table_of(report, "## Ratio contrasts")["spend-per-win"][7:] == ["n/a", "[n/a, n/a]"]
+
+
+BY_MODEL = (
+    ModelEstimate("model-a", math.log(4.0), math.log(2.0), math.log(8.0), 0),
+    ModelEstimate("model-b", math.log(1.25), math.log(0.8), math.log(2.0), 3),
+)
+
+
+def by_model_contrast(name="spend-per-win") -> ContrastResult:
+    """A ratio contrast estimated per (model, group) cell and tested over groups, with each model's estimate from the
+    same draws of the groups; one cell lost to a zero denominator."""
+    lost = {**NO_CELL_LOST, "zero_denominator": 1}
+    return ratio_contrast(name, estimation_unit=("model", "group"), per_model=BY_MODEL, n_cells=23, cells_lost=lost)
+
+
+def test_s13_the_ratio_contrasts_table_names_each_contrasts_estimation_and_independent_units():
+    """S13: the estimation unit decides the estimand and the independent unit what Clusters, the test and the
+    resampling count, so the report names both, with the cells used and lost."""
+    report = render(analysis(by_model_contrast(), ratio_contrast("pooled-per-win")))
+    table = table_of(report, "## Ratio contrasts")
+    assert table["spend-per-win"][3:6] == ["model, group", "group", "23 (lost: zero denominator 1)"]
+    assert table["pooled-per-win"][3:6] == ["group", "group", "12"]
+    notes = report.split("## Ratio contrasts")[1]
+    assert "never counted as independent" in notes
+    assert "each model weighing the same" in notes
+
+
+def test_s13_a_ratio_contrast_by_model_shows_each_models_ratio_as_an_exploratory_breakdown():
+    """S13: each model's log ratio, its ratio and its interval, under a heading that says it is no test."""
+    report = render(analysis(by_model_contrast()))
+    table = table_of(report, "### Ratio contrasts by model (exploratory)")
+    assert table["Contrast"] == ["Contrast", "Model", "Estimate", "Ratio (A / B)", "Ratio interval"]
+    lines = report.split("### Ratio contrasts by model (exploratory)")[1].splitlines()
+    first, second = ([cell.strip() for cell in line.strip("|").split(" | ")] for line in lines if "| spend" in line)
+    assert first == ["spend-per-win", "model-a", "1.386", "4", "[2, 8]"]
+    assert second[1:3] == ["model-b", "0.2231"]
+    assert "no test of its own" in report.split("### Ratio contrasts by model (exploratory)")[1]
+
+
+def test_s13_a_report_whose_ratio_contrasts_pool_the_models_has_no_breakdown_by_model():
+    """S13: a pooled key has no estimate by model, so the report has no section for one."""
+    report = render(analysis(ratio_contrast()))
+    assert "## Ratio contrasts" in report
+    assert "### Ratio contrasts by model" not in report
+
+
+ADVERSE = RatioForm(None, "wins", "exclude", numerator_a="spend_high", numerator_b="spend_low")
+
+
+def test_s13_a_contrast_whose_arms_read_different_columns_names_each_arms_column_in_the_ratio_table():
+    """S13: the Numerator cell names arm A's column and arm B's, each with its arm, and the shared denominator stays
+    one name; the outcome cell names both arms' ratios."""
+    report = render(analysis(ratio_contrast("adverse-per-win", ADVERSE), ratio_contrast()))
+    table = table_of(report, "## Ratio contrasts")
+    assert table["adverse-per-win"][1:3] == ["cond-a: spend_high; cond-b: spend_low", "wins"]
+    assert table["spend-per-win"][1:3] == ["spend", "wins"]
+    assert row(report, "adverse-per-win")[2] == "ln(spend_high/wins vs spend_low/wins)"
+    assert "reads its own columns" in report.split("## Ratio contrasts")[1]
+
+
+def test_s13_a_report_whose_ratio_contrasts_share_their_columns_has_no_note_on_arm_columns():
+    """S13: the note on per-arm columns comes only with a contrast that has them, so earlier reports are unchanged."""
+    assert "reads its own columns" not in render(analysis(ratio_contrast(), by_model_contrast("by-model")))
+
+
+# --- an equivalence family (S15) --------------------------------------------------------------------------------------
+
+
+def member(name, equivalent, tost, holm, level, interval):
+    """A member of the equivalence family as the analysis gives one."""
+    return contrast(
+        name,
+        "equivalent" if equivalent else "not_detected",
+        p_value=0.4,
+        significant=False,
+        equivalence_margin=0.2,
+        equivalence_interval=(-0.05, 0.06),
+        in_equivalence_family=True,
+        tost_p=tost,
+        tost_p_holm=holm,
+        equivalence_level=level,
+        equivalence_interval_adjusted=interval,
+    )
+
+
+def equivalence_analysis():
+    """Two members: one equivalent at the first step, one not, though its raw TOST p is below alpha."""
+    results = (
+        member("same-a", True, 0.002, 0.004, 0.95, (-0.08, 0.09)),
+        member("same-b", False, 0.04, 0.04, 0.9, (-0.1, 0.12)),
+    )
+    holm = tuple(HolmDecision(r.name, 0.4, 0.4, 0.05, False) for r in results)
+    eq = (HolmDecision("same-a", 0.002, 0.004, 0.025, True), HolmDecision("same-b", 0.04, 0.04, 0.05, True))
+    return AnalysisResult(results, holm, 0.05, dict(MANIFEST), equivalence_holm=eq)
+
+
+def test_s15_the_equivalence_family_has_a_table_with_each_members_tost_p_its_holm_p_and_its_adjusted_interval():
+    """S15: the decision a member's `equivalent` rests on, beside the interval at the level Holm compared it with."""
+    report = render(equivalence_analysis())
+    table = table_of(report, "### Equivalence family (Holm over two one-sided tests)")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Margin",
+        "TOST p",
+        "Holm TOST p",
+        "Interval level",
+        "Adjusted interval",
+        "Equivalent",
+    ]
+    assert table["same-a"][1:] == ["0.2", "0.0020", "0.0040", "95%", "[-0.08, 0.09]", "yes"]
+    assert table["same-b"][1:] == ["0.2", "0.0400", "0.0400", "90%", "[-0.1, 0.12]", "no"]
+    assert "not the 90% equivalence interval" in report.split("### Equivalence family", 1)[1]
+
+
+def test_s15_a_report_without_an_equivalence_family_has_no_such_section():
+    """S15: nothing declared, nothing shown."""
+    assert "Equivalence family" not in render(analysis(contrast("primary", "difference")))
+
+
+def test_s15_the_terminal_summary_gives_a_members_holm_tost_p():
+    """S15: the basis of `equivalent` for a member is never printed apart from it."""
+    lines = summary_lines(equivalence_analysis())
+    assert lines[0] == "same-a: estimate 0.25, p 0.4000, Holm p 0.4000, equivalent, Holm TOST p 0.0040"
+    assert summary_lines(analysis(contrast("primary", "difference")))[0].endswith(", difference")
+
+
+# --- each arm's runs, and the one-arm estimates -----------------------------------------------------------------------
+
+
+def arm(name, planned, measured, **lost):
+    """One arm's planned runs; the causes not given are 0, and the finished runs are the measured and the None ones."""
+    causes = {cause: lost.get(cause, 0) for cause in LOST_CAUSES}
+    finished = measured + causes["treatment_outcome_none"] + causes["outcome_none"]
+    return ArmRuns(name, planned, finished, measured, causes)
+
+
+def test_s14_each_contrast_shows_each_arms_finish_rate_and_its_runs_lost_by_cause():
+    """S14: beside the outcome defined over finished runs, how many of each arm's planned runs finished, and why the
+    others are missing, so a loss in one arm is not hidden in a count of pairs."""
+    runs = (arm("cond-a", 10, 6, outcome_none=1, exhausted=3), arm("cond-b", 10, 10))
+    report = render(analysis(contrast("primary", "difference", arm_runs=runs)))
+    table = table_of(report, "### Runs of each arm")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Arm",
+        "Planned",
+        "Finished",
+        "Finish rate",
+        "Measured",
+        "Treatment outcome None",
+        "Outcome None",
+        "Exhausted",
+        "Unfinished",
+        "Left out",
+    ]
+    section = report.split("### Runs of each arm", 1)[1].splitlines()
+    first, second = (line for line in section if line.startswith("| primary | cond-"))
+    assert first == "| primary | cond-a | 10 | 7 | 70% | 6 | 0 | 1 | 3 | 0 | 0 |"
+    assert second == "| primary | cond-b | 10 | 10 | 100% | 10 | 0 | 0 | 0 | 0 | 0 |"
+
+
+def test_s14_an_arm_with_no_planned_run_has_a_finish_rate_of_n_a():
+    """S14: 0 of 0 is not 0%."""
+    report = render(analysis(contrast("primary", "difference", arm_runs=(arm("cond-a", 0, 0), arm("cond-b", 0, 0)))))
+    assert "| primary | cond-a | 0 | 0 | n/a | 0 |" in report
+
+
+def described(name="waited-in-a", kind="rate", **changes):
+    """A one-arm estimate as the analysis gives one."""
+    base = {
+        "name": name,
+        "kind": kind,
+        "outcome": "waited",
+        "conditions": ("cond-a",),
+        "cluster": "group",
+        "estimate": 0.25,
+        "ci_low": 0.1,
+        "ci_high": 0.4,
+        "n_clusters": 12,
+        "n_runs": 40,
+        "n_undefined_replicates": 0,
+        "runs": arm("cond-a", 44, 40, outcome_none=1, unfinished=3),
+        "per_model": (),
+    }
+    return DescriptiveResult(**{**base, **changes})
+
+
+def test_s14_the_one_arm_estimates_have_a_section_of_their_own_that_says_they_are_descriptive():
+    """S14: each with its arm, estimate, interval, clusters, runs used, finish rate and undefined replicates; no p-value
+    and no conclusion, and the section says nothing adjusts or tests them."""
+    ratio = described(
+        "queries-per-placement",
+        "ratio_of_totals",
+        outcome="queries/placements",
+        conditions=("cond-a", "cond-b"),
+        n_undefined_replicates=7,
+    )
+    result = dataclasses.replace(analysis(contrast("primary", "difference")), descriptives=(described(), ratio))
+    report = render(result, interval_level=0.95)
+    section = report.split("## One-arm estimates (descriptive)", 1)[1]
+    table = table_of(report, "## One-arm estimates (descriptive)")
+    assert table["Estimate"] == [
+        "Estimate",
+        "Kind",
+        "Arm",
+        "Outcome",
+        "Value",
+        "95% interval",
+        "Clusters",
+        "Runs used",
+        "Finish rate",
+        "Undefined replicates",
+    ]
+    assert table["waited-in-a"][1:] == ["rate", "cond-a", "waited", "0.25", "[0.1, 0.4]", "12", "40", "93.18%", "0"]
+    assert table["queries-per-placement"][2] == "cond-a + cond-b"
+    assert table["queries-per-placement"][-1] == "7"
+    assert "no test" in section
+    assert "Holm" in section
+
+
+def test_s14_a_report_without_one_arm_estimates_has_no_such_section():
+    """S14: nothing declared, nothing shown."""
+    assert "One-arm estimates" not in render(analysis(contrast("primary", "difference")))
+
+
+def test_s14_the_terminal_summary_gives_each_one_arm_estimate_as_descriptive():
+    """S14: an estimate with no test is never printed as a contrast is."""
+    result = dataclasses.replace(analysis(contrast("primary", "difference")), descriptives=(described(),))
+    assert summary_lines(result)[-1] == "waited-in-a (descriptive, rate of waited in cond-a): 0.25 [0.1, 0.4]"
+
+
+# --- a smallest effect of interest (S16) -----------------------------------------------------------------------------
+
+
+def smallest(form="difference", declared=0.1, direction="higher", decision="meets", **changes) -> SmallestEffect:
+    """A contrast's judged smallest effect; a ratio's threshold is the natural log of its declared ratio."""
+    threshold = abs(math.log(declared)) if form == "ratio" else declared
+    base = {"interval": "includes", "detectable": True, "minimum_detectable_ratio": None}
+    return SmallestEffect(form, declared, threshold, direction, decision, **{**base, **changes})
+
+
+SMALLEST = "## Smallest effects of interest"
+
+
+def test_s16_each_declaring_contrast_has_a_row_with_its_estimate_and_interval_against_its_smallest_effect():
+    """S16: the threshold as declared, the direction, the signed estimate and interval, the decision, where the
+    interval lies against it, the minimum detectable effect and whether the design detects the smallest effect."""
+    declared = contrast("primary", "difference", minimum_detectable_effect=0.2, smallest_effect=smallest())
+    report = render(analysis(declared, contrast("other", "difference")), interval_level=0.95)
+    table = table_of(report, SMALLEST)
+    assert table["Contrast"] == [
+        "Contrast",
+        "Smallest effect",
+        "Direction",
+        "Estimate",
+        "95% interval",
+        "Decision",
+        "Interval against it",
+        "Min. detectable effect",
+        "Detects it",
+    ]
+    assert table["primary"][1:] == ["0.1", "higher", "+0.25", "[0.1, 0.4]", "meets", "includes it", "0.2", "yes"]
+    assert "other" not in table  # it declares none
+
+
+@pytest.mark.parametrize(
+    ("relation", "cell"),
+    [("beyond", "excludes it: beyond it"), ("short_of", "excludes it: short of it"), (None, "n/a")],
+)
+def test_s16_the_interval_excludes_the_smallest_effect_beyond_or_short_of_it_or_includes_it(relation, cell):
+    """S16: the relation in words, and n/a for an undefined interval."""
+    declared = contrast("primary", "difference", smallest_effect=smallest(interval=relation))
+    assert table_of(render(analysis(declared)), SMALLEST)["primary"][6] == cell
+
+
+def test_s16_a_ratio_contrasts_smallest_ratio_is_shown_as_declared_with_its_log_beside_every_number_as_a_ratio():
+    """S16: the ratio 2 is compared as ln 2 = 0.6931, the scale of the estimate, the interval and the MDE."""
+    rule = smallest("ratio", 2.0, minimum_detectable_ratio=math.exp(0.5))
+    judged = ratio_contrast(minimum_detectable_effect=0.5, smallest_effect=rule)
+    cells = table_of(render(analysis(judged)), SMALLEST)["spend-per-win"]
+    assert cells[1:4] == ["ratio 2 (ln 0.6931)", "higher", "+0.6931 (ratio 2)"]
+    assert cells[4] == "[0.4055, 1.099] (ratio [1.5, 3])"
+    assert cells[7:] == ["0.5 (ratio 1.649)", "yes"]
+
+
+def test_s16_a_rule_with_no_direction_reads_meets_either_direction_and_the_estimates_sign_is_written():
+    """S16 (the issue): never a bare "meets" for a two-sided rule; the sign says which way the difference went."""
+    rule = smallest(direction="either", decision="meets_either_direction")
+    judged = contrast("primary", "difference", estimate=-0.25, smallest_effect=rule)
+    cells = table_of(render(analysis(judged)), SMALLEST)["primary"]
+    assert cells[2:4] == ["either", "-0.25"]
+    assert cells[5] == "meets (either direction)"
+
+
+def test_s16_an_exploratory_contrasts_decision_is_labelled_exploratory():
+    """S16: as its conclusion is, so an exploratory "meets" never reads as confirmatory."""
+    judged = contrast("side", "difference", in_family=False, exploratory=True, smallest_effect=smallest())
+    assert table_of(render(analysis(judged)), SMALLEST)["side"][5] == "meets (exploratory)"
+
+
+@pytest.mark.parametrize(
+    ("mde", "detects", "cells"),
+    [(None, None, ["-", "-"]), (math.nan, None, ["n/a", "n/a"]), (0.3, False, ["0.3", "no"])],
+)
+def test_s16_whether_the_design_detects_it_is_no_only_when_known_and_unknown_otherwise(mde, detects, cells):
+    """S16: `-` without power settings, n/a where the figure cannot be found, `no` only for a larger figure."""
+    rule = smallest(detectable=detects)
+    judged = contrast("primary", "difference", minimum_detectable_effect=mde, smallest_effect=rule)
+    assert table_of(render(analysis(judged)), SMALLEST)["primary"][7:] == cells
+
+
+def test_s16_the_notes_say_a_margin_and_a_smallest_effect_are_two_declarations():
+    """S16: a contrast may declare both; the report says how they differ and derives neither from the other."""
+    judged = contrast("primary", "difference", equivalence_margin=0.05, smallest_effect=smallest())
+    section = render(analysis(judged)).split(SMALLEST)[1]
+    assert "two declarations" in section
+    assert "opposite_direction" in section  # every decision word is explained
+
+
+def test_s16_the_terminal_summary_gives_the_decision_beside_the_signed_estimate():
+    """S16 (the issue): the sign of the estimate is always shown beside the verdict."""
+    rule = smallest(decision="opposite_direction")
+    line = summary_lines(analysis(contrast("primary", "difference", estimate=-0.25, smallest_effect=rule)))[0]
+    assert line.endswith("; smallest effect 0.1 (higher): opposite_direction, estimate -0.25")
+
+
+def test_s16_a_report_with_no_smallest_effect_has_no_section_and_no_summary_text_of_one():
+    """S16: nothing declared, nothing shown, with a family or without one."""
+    plain = analysis(contrast("primary", "difference", minimum_detectable_effect=0.2), ratio_contrast())
+    for report in (render(plain), render(exploratory_only("first", "second"))):
+        assert SMALLEST not in report
+        assert "Detects it" not in report
+        assert "opposite_direction" not in report
+    assert all("smallest" not in line for line in summary_lines(plain))
+
+
+def test_s16_an_exploratory_only_report_shows_its_smallest_effects_too():
+    """S16: a pilot may declare one to see whether its design could detect it."""
+    pilot = exploratory_only("first")
+    judged = dataclasses.replace(pilot.contrasts[0], smallest_effect=smallest(decision="not_significant"))
+    report = render(dataclasses.replace(pilot, contrasts=(judged,)))
+    assert table_of(report, SMALLEST)["first"][5] == "not_significant (exploratory)"
+
+
+# --- several named Holm families (S17) --------------------------------------------------------------------------------
+
+# The steps of case B of tests/stats/test_holm_families.py, worked by hand at alpha = 0.05: phase1 rejects 0.008 at
+# 0.05/3 and stops at 0.030 against 0.05/2; phase2 rejects 0.020 at 0.05/2 and 0.045 at 0.05/1.
+FAMILY_STEPS = {
+    "phase1": (
+        HolmStep(1, "h1a", 0.008, 0.024, 0.05 / 3, True),
+        HolmStep(2, "h1b", 0.030, 0.060, 0.05 / 2, False),
+        HolmStep(3, "h1c", 0.040, 0.060, 0.05 / 1, False),
+    ),
+    "phase2": (
+        HolmStep(1, "h2a", 0.020, 0.040, 0.05 / 2, True),
+        HolmStep(2, "h2b", 0.045, 0.045, 0.05 / 1, True),
+    ),
+}
+
+
+def named_families(steps):
+    """The families of these steps, each with its members in step order."""
+    return tuple(HolmFamily(name, tuple(s.name for s in family), family) for name, family in steps.items())
+
+
+def families_analysis(*, equivalence=()):
+    """A result with the two named families above and one exploratory contrast; `equivalence` replaces members."""
+    replaced = {r.name: r for r in equivalence}
+    results, holm, families = [], [], []
+    for name, family in FAMILY_STEPS.items():
+        for s in family:
+            word = "difference" if s.reject else "not_detected"
+            results.append(replaced.get(s.name) or contrast(s.name, word, p_value=s.p_value, significant=s.reject))
+            holm.append(HolmDecision(s.name, s.p_value, s.p_holm, s.level, s.reject))
+        members = tuple(s.name for s in family)
+        eq = tuple(EQUIVALENCE[m] for m in members if m in replaced)  # each claim alone in its family: at alpha
+        families.append(HolmFamily(name, members, family, eq))
+    results.append(contrast("side", "difference", in_family=False, exploratory=True))
+    equivalence_holm = tuple(EQUIVALENCE[r.name] for r in equivalence)
+    return AnalysisResult(
+        tuple(results),
+        tuple(holm),
+        0.05,
+        dict(MANIFEST),
+        equivalence_holm=equivalence_holm,
+        holm_families=tuple(families),
+    )
+
+
+EQUIVALENCE = {  # the TOST decisions of h1a and h2a, each the only equivalence claim of its family
+    "h1a": HolmDecision("h1a", 0.002, 0.002, 0.05, True),
+    "h2a": HolmDecision("h2a", 0.01, 0.01, 0.05, True),
+}
+
+
+def equivalence_members():
+    """h1a and h2a as equivalence claims, each judged at alpha / 1 within its own family: a 90% adjusted interval."""
+    return (
+        member("h1a", True, 0.002, 0.002, 0.9, (-0.08, 0.09)),
+        member("h2a", True, 0.01, 0.01, 0.9, (-0.1, 0.12)),
+    )
+
+
+def test_s17_each_named_family_has_a_table_of_its_own_members_with_their_holm_p_within_it():
+    """S17: the report groups the confirmatory contrasts by family, each table holding its family's members only."""
+    report = render(families_analysis())
+    assert "## Preregistered contrasts (2 Holm families, each adjusted on its own at alpha = 0.05)" in report
+    phase1 = table_of(report, "### Holm family phase1 (3 contrasts)")
+    phase2 = table_of(report, "### Holm family phase2 (2 contrasts)")
+    assert set(phase1) - {"Contrast"} == {"h1a", "h1b", "h1c"}
+    assert set(phase2) - {"Contrast"} == {"h2a", "h2b"}
+    assert phase1["h1b"][7:10] == ["0.0300", "0.0600", "not_detected"]
+    assert phase2["h2b"][7:10] == ["0.0450", "0.0450", "difference"]
+    assert "Holm family of" not in report
+
+
+def test_s17_each_family_shows_its_holm_steps_with_the_level_of_each_step_and_its_verdict():
+    """S17: alpha/3, alpha/2, alpha/1 for the family of three and alpha/2, alpha/1 for the family of two, each step's
+    raw and adjusted p-value, and where the step-down stopped."""
+    report = render(families_analysis())
+    phase1 = table_of(report, "Holm steps of phase1")
+    assert phase1["Step"] == ["Step", "Contrast", "p", "Level", "Holm p", "Rejected"]
+    assert phase1["1"][1:] == ["h1a", "0.0080", "0.01667 (alpha/3)", "0.0240", "yes"]
+    assert phase1["2"][1:] == ["h1b", "0.0300", "0.025 (alpha/2)", "0.0600", "no"]
+    assert phase1["3"][1:] == ["h1c", "0.0400", "0.05 (alpha/1)", "0.0600", "no"]
+    phase2 = table_of(report, "Holm steps of phase2")
+    assert phase2["1"][1:] == ["h2a", "0.0200", "0.025 (alpha/2)", "0.0400", "yes"]
+    assert phase2["2"][1:] == ["h2b", "0.0450", "0.05 (alpha/1)", "0.0450", "yes"]
+    assert "Each Holm family is adjusted on its own" in report
+
+
+def test_s17_the_exploratory_contrasts_are_outside_every_family():
+    """S17: the contrast in no family is apart, labelled exploratory, under a heading that names every family."""
+    report = render(families_analysis())
+    assert set(table_of(report, "## Exploratory contrasts (outside every Holm family)")) - {"Contrast"} == {"side"}
+    assert row(report, "side")[8:10] == ["exploratory", "difference (exploratory)"]
+
+
+def test_s17_the_terminal_summary_names_each_members_family():
+    """S17: a member's adjusted p is its own family's, and the line says which family that is."""
+    lines = {line.split(":")[0]: line for line in summary_lines(families_analysis())}
+    assert lines["h1b"] == "h1b: estimate 0.25, p 0.0300, Holm p 0.0600 (family phase1), not_detected"
+    assert lines["side"].endswith("Holm p exploratory, difference (exploratory)")
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        {"phase1": FAMILY_STEPS["phase1"], "phase2": FAMILY_STEPS["phase2"][:1]},  # h2b in no family's steps
+        {"phase1": FAMILY_STEPS["phase1"], "phase2": FAMILY_STEPS["phase1"][:1] + FAMILY_STEPS["phase2"]},  # h1a twice
+    ],
+    ids=["missing", "twice"],
+)
+def test_s17_a_result_whose_families_disagree_with_its_holm_decisions_is_refused(steps):
+    """S17: a member must be in exactly one family, with that family's step as its Holm decision; anything else
+    would show a member adjusted in the wrong family, so the report refuses it, and so does the summary."""
+    bad = dataclasses.replace(families_analysis(), holm_families=named_families(steps))
+    with pytest.raises(ValueError, match="Holm famil"):
+        render(bad)
+    with pytest.raises(ValueError, match="Holm famil"):
+        summary_lines(bad)
+
+
+def test_s17_a_step_whose_numbers_are_not_its_members_holm_decision_is_refused():
+    """S17: the steps and the flat decisions are one computation; a step that disagrees with its member's decision
+    (the level of another family, say) is refused."""
+    moved = dataclasses.replace(FAMILY_STEPS["phase2"][0], level=0.05 / 5)
+    steps = {"phase1": FAMILY_STEPS["phase1"], "phase2": (moved, FAMILY_STEPS["phase2"][1])}
+    bad = dataclasses.replace(families_analysis(), holm_families=named_families(steps))
+    with pytest.raises(ValueError, match="'h2a'"):
+        render(bad)
+
+
+def test_s17_a_member_with_two_holm_decisions_is_refused():
+    """S17: a second, contradicting decision for a member would give a reader of analysis.json two verdicts, one
+    of which no family made; the report refuses it."""
+    good = families_analysis()
+    other = HolmDecision("h1a", 0.008, 0.9, 0.05 / 3, False)
+    with pytest.raises(ValueError, match="'h1a' has 2 Holm decisions"):
+        render(dataclasses.replace(good, holm=(other, *good.holm)))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda f: {"phase1": (EQUIVALENCE["h1a"], EQUIVALENCE["h2a"]), "phase2": ()},  # h2a's claim in phase1
+        lambda f: {"phase1": (dataclasses.replace(EQUIVALENCE["h1a"], reject=False),), "phase2": f["phase2"]},
+        lambda f: {"phase1": (), "phase2": f["phase2"]},  # h1a's claim in no family
+    ],
+    ids=["another-familys-claim", "another-verdict", "missing"],
+)
+def test_s17_a_familys_equivalence_decisions_must_be_its_own_members_claims_as_decided(change):
+    """S17, S15: each family holds the equivalence decisions of its own members, exactly as `equivalence_holm` gives
+    them; a claim filed under another family, with another verdict, or under none is refused."""
+    good = families_analysis(equivalence=equivalence_members())
+    current = {f.name: f.equivalence for f in good.holm_families}
+    moved = change(current)
+    families = tuple(dataclasses.replace(f, equivalence=moved[f.name]) for f in good.holm_families)
+    with pytest.raises(ValueError, match="equivalence"):
+        render(dataclasses.replace(good, holm_families=families))
+
+
+def test_s17_the_equivalence_table_names_each_members_holm_family():
+    """S17, S15: each equivalence claim is adjusted within its own Holm family, and its row says which."""
+    report = render(families_analysis(equivalence=equivalence_members()))
+    table = table_of(report, "### Equivalence family (Holm over two one-sided tests, within each Holm family)")
+    assert table["Contrast"][:2] == ["Contrast", "Holm family"]
+    assert table["h1a"][1] == "phase1"
+    assert table["h2a"][1] == "phase2"
+    assert "other claims of its own Holm family only" in report
+
+
+def test_s17_a_single_family_report_has_no_family_steps_or_family_column():
+    """S17: one flat family's report is the text it was before named families: no steps, no family column."""
+    report = render(equivalence_analysis())
+    assert "Holm steps of" not in report
+    assert "Holm family |" not in report
+    assert "### Equivalence family (Holm over two one-sided tests)\n" in report
+
+
+# --- declared equivalence families (S18) ------------------------------------------------------------------------------
+
+# One declared equivalence family of three claims across both Holm families above, worked by hand at alpha = 0.05:
+# TOST p 0.004 (h1a) <= 0.05/3 = 0.01667, adjusted 3 x 0.004 = 0.012; 0.020 (h2a) <= 0.05/2, adjusted max(0.012,
+# 2 x 0.020) = 0.040; 0.30 (h1b) > 0.05, adjusted max(0.040, 0.30) = 0.30.
+DECLARED_STEPS = (
+    HolmStep(1, "h1a", 0.004, 0.012, 0.05 / 3, True),
+    HolmStep(2, "h2a", 0.020, 0.040, 0.05 / 2, True),
+    HolmStep(3, "h1b", 0.30, 0.30, 0.05 / 1, False),
+)
+
+
+def declared(result, steps=DECLARED_STEPS, name="h1"):
+    """`result` with h1a, h2a and h1b as the claims of one declared equivalence family of these steps, each claim's
+    numbers its step's, and no Holm family holding an equivalence decision."""
+    by_step = {s.name: s for s in steps}
+    claims = tuple(
+        dataclasses.replace(r, **claim_fields(by_step[r.name])) if r.name in by_step else r for r in result.contrasts
+    )
+    decisions = tuple(HolmDecision(s.name, s.p_value, s.p_holm, s.level, s.reject) for s in steps)
+    family = EquivalenceFamily(name, tuple(s.name for s in steps), steps)
+    return dataclasses.replace(result, contrasts=claims, equivalence_holm=decisions, equivalence_families=(family,))
+
+
+def claim_fields(step):
+    """What the analysis gives a claim of an equivalence family from its step."""
+    return {
+        "p_value": 0.4,
+        "significant": False,
+        "conclusion": "equivalent" if step.reject else "not_detected",
+        "equivalence_margin": 0.2,
+        "equivalence_interval": (-0.05, 0.06),
+        "equivalent": step.reject,
+        "in_equivalence_family": True,
+        "tost_p": step.p_value,
+        "tost_p_holm": step.p_holm,
+        "equivalence_level": 1 - 2 * step.level,
+        "equivalence_interval_adjusted": (-0.08, 0.09),
+    }
+
+
+DECLARED_HEADING = "### Equivalence families (Holm over two one-sided tests, within each declared equivalence family)"
+
+
+def test_s18_the_report_gives_each_declared_equivalence_family_its_claims_and_its_tost_steps():
+    """S18: each claim's equivalence family beside the Holm family of its significance test, its raw and adjusted
+    TOST p and its verdict, then the family's steps at alpha/3, alpha/2, alpha/1 over its own three claims."""
+    report = render(declared(families_analysis()))
+    table = table_of(report, DECLARED_HEADING)
+    assert table["Contrast"] == [
+        "Contrast",
+        "Equivalence family",
+        "Holm family",
+        "Margin",
+        "TOST p",
+        "Holm TOST p",
+        "Interval level",
+        "Adjusted interval",
+        "Equivalent",
+    ]
+    assert table["h1a"][1:] == ["h1", "phase1", "0.2", "0.0040", "0.0120", "96.66666667%", "[-0.08, 0.09]", "yes"]
+    assert table["h2a"][1:3] == ["h1", "phase2"]
+    assert table["h1b"][1:] == ["h1", "phase1", "0.2", "0.3000", "0.3000", "90%", "[-0.08, 0.09]", "no"]
+    steps = table_of(report, "TOST steps of equivalence family h1")
+    assert steps["Step"] == ["Step", "Contrast", "TOST p", "Level", "Holm TOST p", "Equivalent"]
+    assert steps["1"][1:] == ["h1a", "0.0040", "0.01667 (alpha/3)", "0.0120", "yes"]
+    assert steps["2"][1:] == ["h2a", "0.0200", "0.025 (alpha/2)", "0.0400", "yes"]
+    assert steps["3"][1:] == ["h1b", "0.3000", "0.05 (alpha/1)", "0.3000", "no"]
+    assert "each Holm-adjusted over its own claims alone" in report
+    assert "within each Holm family" not in report
+
+
+def test_s18_under_one_flat_holm_family_the_equivalence_table_has_no_holm_family_column():
+    """S18: declared equivalence families need no named Holm family; the table then names the equivalence family
+    only."""
+    flat = analysis(contrast("h1a", "difference"), contrast("h2a", "difference"), contrast("h1b", "difference"))
+    table = table_of(render(declared(flat)), DECLARED_HEADING)
+    assert table["Contrast"][:3] == ["Contrast", "Equivalence family", "Margin"]
+    assert table["h2a"][1:3] == ["h1", "0.2"]
+
+
+def test_s18_the_terminal_summary_names_each_claims_equivalence_family():
+    """S18: a claim's Holm TOST p is its own equivalence family's, and the line says which family that is."""
+    lines = {line.split(":")[0]: line for line in summary_lines(declared(families_analysis()))}
+    assert lines["h1a"] == (
+        "h1a: estimate 0.25, p 0.4000, Holm p 0.0240 (family phase1), equivalent, Holm TOST p 0.0120 "
+        "(equivalence family h1)"
+    )
+    assert lines["h1c"].endswith(", not_detected")
+
+
+NOT_ITS_DECISION = "'h1b': its step in equivalence family 'h1' is not its decision in equivalence_holm"
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda r: dataclasses.replace(r, equivalence_holm=r.equivalence_holm[:2]), NOT_ITS_DECISION),
+        (
+            lambda r: dataclasses.replace(
+                r, equivalence_families=(*r.equivalence_families, EquivalenceFamily("h2", ("h1b",), DECLARED_STEPS[2:]))
+            ),
+            "'h1b' is in two equivalence families, 'h1' and 'h2'",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                equivalence_families=(
+                    EquivalenceFamily(
+                        "h1",
+                        ("h1a", "h2a", "h1b"),
+                        (*DECLARED_STEPS[:2], dataclasses.replace(DECLARED_STEPS[2], level=0.05 / 11)),
+                    ),
+                ),
+            ),
+            NOT_ITS_DECISION,
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                holm_families=(
+                    dataclasses.replace(r.holm_families[0], equivalence=r.equivalence_holm[:1]),
+                    *r.holm_families[1:],
+                ),
+            ),
+            "Holm family 'phase1' holds equivalence decisions",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                contrasts=tuple(
+                    dataclasses.replace(c, in_equivalence_family=False) if c.name == "h1b" else c for c in r.contrasts
+                ),
+            ),
+            "'h1b' is in equivalence family 'h1' but is not an equivalence claim",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r, equivalence_families=(EquivalenceFamily("h1", ("h1a", "h2a"), DECLARED_STEPS[:2]),)
+            ),
+            "'h1b' is an equivalence claim that no equivalence family holds",
+        ),
+    ],
+    ids=["no-decision", "claim-in-two", "another-level", "holm-family-holds-one", "unflagged", "claim-in-none"],
+)
+def test_s18_a_result_whose_equivalence_families_disagree_with_its_decisions_is_refused(change, message):
+    """S18: each claim is in exactly one declared equivalence family, with that family's step as its decision (at
+    its own family's level, never another's), no Holm family holds one, and every family member is a claim; anything
+    else would show a claim adjusted in another family than its own, so the report refuses it, and so does the
+    summary."""
+    bad = change(declared(families_analysis()))
+    with pytest.raises(ValueError, match=message):
+        render(bad)
+    with pytest.raises(ValueError, match=message):
+        summary_lines(bad)
+
+
+# Three claims each adjusted alone (at alpha / 1: adjusted p = raw p, 0.03 and 0.04 rejected), filed as one family of
+# three. Holm over the three gives levels 0.01667, 0.025, 0.05 and adjusted p 3 x 0.03 = 0.09, max(0.09, 2 x 0.04) =
+# 0.09, 0.30: none rejected, so a report showing these steps would show two claims equivalent that are not.
+ALONE_STEPS = (
+    HolmStep(1, "h1a", 0.03, 0.03, 0.05, True),
+    HolmStep(2, "h2a", 0.04, 0.04, 0.05, True),
+    HolmStep(3, "h1b", 0.30, 0.30, 0.05, False),
+)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda r: declared(families_analysis(), steps=ALONE_STEPS), "'h1a': its step in equivalence family 'h1' is"),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                contrasts=tuple(
+                    dataclasses.replace(c, equivalent=False, conclusion="not_detected") if c.name == "h2a" else c
+                    for c in r.contrasts
+                ),
+            ),
+            "'h2a': its TOST p, Holm TOST p, verdict or interval level is not its step's in equivalence family 'h1'",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                contrasts=tuple(
+                    dataclasses.replace(c, equivalence_level=0.9) if c.name == "h1a" else c for c in r.contrasts
+                ),
+            ),
+            "'h1a': its TOST p, Holm TOST p, verdict or interval level is not its step's",
+        ),
+    ],
+    ids=["adjusted-alone-shown-as-a-family-of-three", "claim-verdict", "claim-level"],
+)
+def test_s18_a_family_whose_steps_are_not_holm_over_its_own_claims_is_refused(change, message):
+    """S18: each family's steps are recomputed from its own claims' raw TOST p-values at alpha, and each claim's
+    numbers must be its step's; decisions made at another family size, or a claim showing another verdict or level,
+    are refused by the report and the summary."""
+    bad = change(declared(families_analysis()))
+    with pytest.raises(ValueError, match=message):
+        render(bad)
+    with pytest.raises(ValueError, match=message):
+        summary_lines(bad)

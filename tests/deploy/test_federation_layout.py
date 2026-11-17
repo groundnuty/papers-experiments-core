@@ -27,7 +27,11 @@ def test_the_default_layout_is_the_deployment_this_directory_always_had(fed):
     assert [(s.name, s.supporters, s.support_bytes) for s in spec.spaces] == [
         ("alpha-space", ("pine", "birch", "cedar"), 10 << 30),
         ("beta-space", ("birch", "cedar"), 10 << 30),
+        ("link-probes", ("pine", "birch", "cedar"), 10 << 30),  # the link check's probe space (#221)
     ]
+    assert spec.probe_space == "link-probes"
+    assert not spec.space("link-probes").agent_visible
+    assert not spec.space("link-probes").baseline
     assert (spec.study_space, spec.holder) == ("alpha-space", "pine")
     assert [(p.name, p.privileges, p.spaces) for p in spec.principals] == [
         (user, ("space_view", "space_read_data"), ("alpha-space",))
@@ -40,7 +44,9 @@ def test_the_default_layout_is_the_deployment_this_directory_always_had(fed):
 def test_the_example_has_five_providers_four_spaces_and_one_provider_mirroring_a_second_owners_space(fed):
     spec = fed.spec.load_spec(EXAMPLE)
     assert len(spec.providers) == 5
-    assert len(spec.spaces) == 4
+    assert len([s for s in spec.spaces if s.agent_visible]) == 4
+    assert spec.probe_space == "link-probes"  # the fifth, the link check's (#221), on every provider
+    assert len(spec.space("link-probes").supporters) == 5
     owners = {s.name: s.owner for s in spec.spaces}
     mirroring_owners = {m for s in spec.spaces for m in s.mirrors if m in owners.values() and m != s.owner}
     assert mirroring_owners, "a provider that owns a space also mirrors another owner's space"

@@ -22,6 +22,14 @@ Two optional keys of `[study]` widen the infrastructure kinds a condition may de
     [study.kinds]                         # the study's own kinds; treatable is true unless it says false
     relay_flap = { description = "the relay restarted under the run", treatable = true }
 
+A platform module may also tell the core, when a campaign starts, the longest its health check may stay deferred, read
+from the platform's own configuration (`study.platform_deferral`, C11). The configuration is the file `[study]
+platform_config` names, a file of the study directory; without the key it is the `platform.toml` beside study.toml,
+and a study with neither points at none:
+
+    [study]
+    platform_config = "platform.toml"     # optional: the platform's own settings, a file of the study directory
+
 A module that cannot be imported is refused, as is a study kind that is a core kind or a platform's. A platform's kinds
 are the process's once imported. A study's own last only while it is loaded and while the pipeline works on it
 (`errors.study_kinds(study.kinds)`), so a study's kinds do not outlast it. Neither key is part of the factor schema;
@@ -54,7 +62,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.config import CampaignConfig, load_campaign
-from expcore.campaign.factors import FactorSchema, load_factor_schema
+from expcore.campaign.factors import FactorSchema, PlanError, load_factor_schema
 from expcore.campaign.manifest import Manifest, build_manifest
 from expcore.campaign.markers import MARKER_NAME
 from expcore.campaign.shard import ShardError
@@ -78,6 +86,7 @@ PREREG_FILE = "preregistration.toml"
 OUT_DIR = "out"  # everything a study produces goes below it (`study.pipeline`)
 CONFIG_FILES = (STUDY_FILE, MODELS_FILE, CAMPAIGN_FILE, PREREG_FILE)
 PLATFORMS_KEY, KINDS_KEY, SIDE_FILES_KEY = "platforms", "kinds", "side_files"
+PLATFORM_CONFIG_KEY, PLATFORM_FILE = "platform_config", "platform.toml"
 KIND_KEYS = ("description", "treatable")
 SIDE_FILE_KEYS = ("pattern", "hash_field")
 _FIELD = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*")
@@ -109,6 +118,10 @@ class StudyConfig:
     kinds: Mapping[str, StudyKind] = field(default_factory=dict)  # `[study.kinds]`, for `errors.study_kinds`
     requires: tuple[str, ...] = ()  # distributions beyond the core: part of the campaign's environment
     side_files: tuple[SideFile, ...] = ()  # `[[study.side_files]]`: what the check, analysis and package verify
+    platforms: tuple[
+        str, ...
+    ] = ()  # `[study] platforms`: the modules the core asks for the platform's declared deferral
+    platform_config: Path | None = None  # `[study] platform_config`, or the platform.toml beside study.toml; resolved
 
     @property
     def manifest(self) -> Manifest:
@@ -154,7 +167,9 @@ def _tasks(top: Section, file: Path) -> dict[str, Task]:
 
 def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope, tuple[str, ...]]:
     section = Section(top.section("study").data, top.file, "[study]")
-    section.reject_unknown(["name", "plugin", "code", PLATFORMS_KEY, KINDS_KEY, "requires", SIDE_FILES_KEY])
+    section.reject_unknown(
+        ["name", "plugin", "code", PLATFORMS_KEY, PLATFORM_CONFIG_KEY, KINDS_KEY, "requires", SIDE_FILES_KEY]
+    )
     name, plugin = section.string("name"), section.string("plugin")
     plugin_file = (root / plugin).resolve()
     if not plugin_file.is_file() or root.resolve() not in plugin_file.parents:
@@ -178,6 +193,33 @@ def _study_table(top: Section, root: Path) -> tuple[str, Path, CodeScope, tuple[
 
 def _platforms(top: Section) -> tuple[str, ...]:
     return Section(top.section("study").data, top.file, "[study]").strings(PLATFORMS_KEY)
+
+
+def _platform_config(top: Section, root: Path) -> Path | None:
+    """The platform's own configuration, resolved: the file `[study] platform_config` names (a path inside the study
+    directory, as the plugin is), or without the key the `platform.toml` beside study.toml when there is one, else None.
+    The core never reads it: it hands the path to each platform module that declares its deferral from it, and that
+    file's being there is checked only then (`platform_deferral`), since a replication package ships the study without
+    its platform.toml and still loads it. A named path must lie inside the study directory (links followed); the default
+    is returned as it resolves and refused only where a platform would read it, since nothing read it before."""
+    section = Section(top.section("study").data, top.file, "[study]")
+    named = section.optional_string(PLATFORM_CONFIG_KEY)
+    if named is None:  # the default is never refused here: nothing read it before, so a study that links a shared
+        default = root / PLATFORM_FILE  # platform.toml in loads as ever, and is refused only where a platform reads it
+        return default.resolve() if default.is_file() else None
+    file = (root / named).resolve()  # a link is followed: where it leads is what the platform would read
+    if not inside_study(file, root):
+        raise section.fail(
+            PLATFORM_CONFIG_KEY,
+            f"must name a file inside the study directory; {named!r} is not one (a link that leaves the directory "
+            "is not inside it)",
+        )
+    return file
+
+
+def inside_study(file: Path, root: Path) -> bool:
+    """Whether `file`, with its links followed, lies inside the study directory `root`."""
+    return root.resolve() in file.resolve().parents
 
 
 def import_platforms(study_file: Path, modules: Sequence[str]) -> None:
@@ -328,24 +370,97 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
         models = load_models(root / MODELS_FILE)
         campaign = load_campaign(root / CAMPAIGN_FILE)
         _check_scheduler_kinds(campaign)
-        unknown = [m for m in campaign.models if m not in models]
-        if unknown:
-            raise ConfigError(
-                f"{campaign.source}: key 'models' names {unknown[0]!r}{close_match(unknown[0], models)}, which "
-                f"{MODELS_FILE} does not define; it defines: {', '.join(models)}"
-            )
+        _check_models(campaign, models)
         loaded = prereg.load(root / PREREG_FILE, schema)
         _check_clusters(name, tasks, loaded)
     hashes = {file: hashlib.sha256(_hashed_bytes(root, file)).hexdigest() for file in CONFIG_FILES}
     study = StudyConfig(
-        root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds, requires, side_files
+        root,
+        name,
+        schema,
+        tasks,
+        models,
+        campaign,
+        loaded,
+        plugin_file,
+        scope,
+        hashes,
+        kinds,
+        requires,
+        side_files,
+        _platforms(top),
+        _platform_config(top, root),
     )
+    _check_shard_budgets(study)
+    return study
+
+
+def check_study(study: StudyConfig) -> None:
+    """Check a study that was built in code as `load_study` checks one it read; raise ConfigError naming the key.
+
+    A study that cuts a loaded one to a smoke or a selection (`dataclasses.replace` of its campaign, its tasks) hands
+    the pipeline a `StudyConfig` no loader has seen. This holds it to what the loader holds a study to, in the scope
+    of the study's own kinds (`errors.study_kinds`), and touches nothing on disk:
+
+    - each kind in `kinds` is one a study may declare (a core kind, a platform's or a malformed name is refused);
+    - the factor schema is built again from its parts (`FactorSchema.rebuilt`), so every rule of its constructor
+      holds against the vocabulary of that scope, a treatment kind that is a fault on one target still names its
+      target (C34), a kind unknown to the config is refused, and so is a schema whose conditions were edited after it
+      was built, whose lookup of a run's condition and digest then no longer match them;
+    - the `[scheduler]` health and identity kinds are known, every model of the campaign is in the model table, each
+      contrast's cluster is an attribute of every task, a campaign that shards by model and has a budget shares it;
+    - the plan expands: no list is empty or repeats, a seed is an integer, and a task a condition names is a task of
+      the plan, so a cut of the tasks that leaves a condition naming one it dropped is refused here and not at the
+      first run (every refusal is a ConfigError, the plan's own named for campaign.toml).
+
+    Not repeated: importing `[study] platforms`, which `load_study` does for the process, since a config names a
+    platform's kind only in a process that has imported the platform; and the preregistration against the schema,
+    which the analysis checks when it loads the study from its files, since a cut of the plan is a cut of the
+    campaign, not of the analysis it was preregistered with.
+    """
+    declared = Section({}, study.root / STUDY_FILE, f"[study.{KINDS_KEY}]")
+    for kind, entry in study.kinds.items():
+        try:
+            check_study_kind(kind, entry.description)
+        except ValueError as error:
+            raise declared.fail(kind, f"cannot be declared: {error}") from None
+    with study_kinds(study.kinds):
+        study.schema.rebuilt()
+        _check_scheduler_kinds(study.campaign)
+        _check_models(study.campaign, study.models)
+        _check_clusters(study.name, study.tasks, study.prereg)
+        _check_plan(study)
+    _check_shard_budgets(study)
+
+
+def _check_plan(study: StudyConfig) -> None:
+    """Refuse a plan that does not expand: an empty or repeated task, model or seed, a non-integer seed, a condition
+    that names a task the plan lacks. The plan's own refusals are ConfigErrors naming the condition; the rest are
+    its PlanErrors, which are named for the campaign's file here, so a caller has one kind of error to expect."""
+    try:
+        study.schema.expand(study.tasks, study.campaign.models, study.campaign.seeds)
+    except PlanError as error:
+        raise ConfigError(f"{study.campaign.source}: the plan does not expand: {error}") from None
+
+
+def _check_models(campaign: CampaignConfig, models: ModelTable) -> None:
+    """Refuse a campaign that names a model the model table does not define, naming both files."""
+    unknown = [m for m in campaign.models if m not in models]
+    if unknown:
+        raise ConfigError(
+            f"{campaign.source}: key 'models' names {unknown[0]!r}{close_match(unknown[0], models)}, which "
+            f"{MODELS_FILE} does not define; it defines: {', '.join(models)}"
+        )
+
+
+def _check_shard_budgets(study: StudyConfig) -> None:
+    """Refuse a campaign that shards by model and has a budget its shards cannot share."""
+    campaign = study.campaign
     if campaign.shards is not None and campaign.scheduler.budget is not None:
         try:
             shard_budgets_of(study)
         except ShardError as error:
             raise ConfigError(f"{campaign.source}: [shards] per_model with [budget]: {error}") from None
-    return study
 
 
 def shard_budgets_of(study: StudyConfig) -> dict[int, dict[str, Any]]:

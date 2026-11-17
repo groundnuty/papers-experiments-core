@@ -83,7 +83,7 @@ from expcore_onedata.provision import Provisioner, resolve_provider_ids  # noqa:
 from expcore_onedata.rangemap import load_placement  # noqa: E402
 from expcore_onedata.sandbox import hostops, teardown  # noqa: E402
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec  # noqa: E402
-from expcore_onedata.sandbox.containers import ONECLIENT_BIN, effective_log_dir, sidecar_command  # noqa: E402
+from expcore_onedata.sandbox.containers import ONECLIENT_BIN, SIDECAR_LOG_DIR  # noqa: E402
 from expcore_onedata.sandbox.hostops import DockerHost  # noqa: E402
 from expcore_onedata.sandbox.provider import SandboxProbe  # noqa: E402
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, TOKEN_FILE, DockerSandbox  # noqa: E402
@@ -204,7 +204,7 @@ def launch_facts(host: DockerHost, sandbox: DockerSandbox, network: str, secret:
             ),
         }
     meta = sandbox.metadata()
-    out["mount"] = {k: meta["mount"].get(k) for k in ("network", "io_mode", "wait_s")}
+    out["mount"] = {k: meta["mount"].get(k) for k in ("network", "io_mode", "wait_s", "oneclient_build")}
     out["read_only_verified"] = meta["read_only_verified"]
     out["tls_mode"] = meta["tls"]["mode"]
     return out
@@ -312,7 +312,7 @@ def sidecar_accounting(host: DockerHost, sandbox: DockerSandbox, spec: SandboxSp
         "candidate_options": candidate_options(help_text),
         "oneclient_args": list(sandbox.s.mount.extra_args),
     }
-    log_dir = effective_log_dir(sidecar_command(spec.provider.host, sandbox.s))
+    log_dir = SIDECAR_LOG_DIR
     listed = host.docker("exec", sidecar, "find", log_dir, "-type", "f", "-printf", "%s %p\\n", check=False, timeout=60)
     found = [(int(size), path) for size, _, path in (line.partition(" ") for line in listed.stdout.splitlines())]
     out["log_files"] = [{"name": os.path.relpath(path, log_dir), "bytes": size} for size, path in found]
@@ -619,6 +619,17 @@ def test_o03_the_sidecar_alone_is_on_the_federation_network_and_mounted_with_the
     assert launch["mount"]["network"] == "federation"
     assert launch["mount"]["wait_s"] is not None
     assert launch["tls_mode"] == "ca_file"
+
+
+def test_o65_the_run_records_the_oneclient_the_sidecar_ran(attempt):
+    """O65: the sandbox's record names the oneclient that served the run, read by `docker exec` in the running sidecar:
+    its own version words, the GNU build id of its binary and the id of its image (the Apptainer backend's host mount
+    records the same keys, with the bundle's pin where this has the image)."""
+    build = attempt["launch"]["mount"]["oneclient_build"]
+    assert set(build) <= {"version", "fuse", "build_id", "image"}
+    assert re.fullmatch(r"[0-9A-Za-z.+~_-]{1,64}", build["version"] or "")
+    assert re.fullmatch(r"([0-9a-f]{2}){8,}", build["build_id"] or "")
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", build["image"])
 
 
 def test_o05_docker_inspect_of_the_running_sidecar_and_agent_shows_no_token(attempt):

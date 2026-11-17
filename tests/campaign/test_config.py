@@ -72,6 +72,76 @@ def test_the_caps_are_plain_data_for_the_fingerprint(tmp_path):
     assert caps["agent"]["limits"]["max_tool_rounds"] == 4
 
 
+def with_agent_lines(lines):
+    """VALID with extra lines in `[agent]`, after the time cap."""
+    return VALID.replace("time_cap_s = 30\n", f"time_cap_s = 30\n{lines}\n")
+
+
+def test_o06_without_a_ceiling_a_runs_whole_time_is_three_times_its_cap_as_before(tmp_path):
+    """O06: `[agent]` that names no ceiling falls back to the default factor, so the caps and the fingerprint are
+    what they were, and a run's tokens are minted for that ceiling."""
+    agent = load(tmp_path).agent
+    assert (agent.ceiling_s, agent.ceiling_factor) == (90.0, 3.0)
+
+
+@pytest.mark.parametrize(
+    ("line", "ceiling", "factor"), [("ceiling_s = 45", 45.0, None), ("ceiling_factor = 1.5", 45.0, 1.5)]
+)
+def test_o06_agent_may_bound_a_runs_whole_time_near_its_cap(tmp_path, line, ceiling, factor):
+    """O06: `[agent] ceiling_s` or `ceiling_factor` sets the ceiling on a run's whole time, waits included, which a
+    platform mints the run's tokens for; a ceiling near the cap is what lets a slot go soon after its run."""
+    campaign = load(tmp_path, with_agent_lines(line))
+    assert (campaign.agent.ceiling_s, campaign.agent.ceiling_factor) == (ceiling, factor)
+    assert campaign.caps()["agent"]["ceiling_s"] == ceiling  # in the fingerprint: a resume cannot change it
+
+
+def test_o06_a_ceiling_is_part_of_the_caps_so_another_one_is_another_experiment(tmp_path):
+    """O06 with C06: the caps the fingerprint is made of hold the ceiling, so two files that differ only in it have
+    different caps, and the same ceiling written as a factor and as seconds differs too, for each records what it
+    was given."""
+    caps = {
+        name: load(tmp_path, text).caps()
+        for name, text in {
+            "default": VALID,
+            "seconds": with_agent_lines("ceiling_s = 45"),
+            "more_seconds": with_agent_lines("ceiling_s = 60"),
+            "factor": with_agent_lines("ceiling_factor = 1.5"),
+            "default_factor": with_agent_lines("ceiling_factor = 3"),
+        }.items()
+    }
+    assert caps["default"] == caps["default_factor"]  # three times the cap, spelt out: the fingerprint it had
+    assert len({repr(c) for c in caps.values()}) == 4
+    assert caps["seconds"]["agent"]["ceiling_s"] == caps["factor"]["agent"]["ceiling_s"] == 45.0
+
+
+@pytest.mark.parametrize(
+    ("lines", "fragments"),
+    [
+        ("ceiling_s = 29", ("[agent]", "ceiling_s must be finite and not below time_cap_s")),
+        ("ceiling_s = inf", ("[agent]", "ceiling_s must be finite and not below time_cap_s")),
+        ("ceiling_factor = 0.5", ("[agent]", "ceiling_factor must be a finite number, at least 1")),
+        ("ceiling_factor = nan", ("[agent]", "ceiling_factor must be a finite number, at least 1")),
+        # a finite factor whose product with the cap is not finite (Codex, 13 Nov)
+        ("ceiling_factor = 1e308", ("[agent]", "the ceiling the factor gives must be finite")),
+        ('ceiling_s = "long"', ("[agent]", "ceiling_s", "must be a float")),
+        ("ceiling_factor = true", ("[agent]", "ceiling_factor", "must be a float")),
+    ],
+)
+def test_o06_a_ceiling_that_cannot_bound_the_run_is_refused_at_load(tmp_path, lines, fragments):
+    """O06: a ceiling below the cap, a factor below 1, one that is not finite or one that is not a number is refused
+    when the file is loaded, naming the table, so no run is minted tokens for a ceiling its loop cannot keep."""
+    refused(tmp_path, with_agent_lines(lines), *fragments)
+
+
+@pytest.mark.parametrize("lines", ["ceiling_s = 60\nceiling_factor = 3", "ceiling_s = 90\nceiling_factor = 3"])
+def test_o06_a_ceiling_in_seconds_and_a_factor_together_are_refused_even_when_they_agree(tmp_path, lines):
+    """O06: `ceiling_s` and `ceiling_factor` are two ways to say one thing, and a file gives at most one. A pair that
+    agrees (3 times 30 s is 90 s) is refused as a pair that disagrees is, so no reader has to work out which is
+    meant, and the record's `ceiling_factor` is never one the study did not write."""
+    message = refused(tmp_path, with_agent_lines(lines), "[agent]", "ceiling_s", "ceiling_factor", "give one")
+    assert "campaign.toml" in message
+
+
 def test_a_misspelt_key_is_refused_naming_it(tmp_path):
     refused(tmp_path, VALID.replace("seeds =", "seed ="), "'seed'", "not a known key")
     refused(tmp_path, VALID.replace("workers", "worker"), "[scheduler]", "'worker'")
@@ -151,3 +221,51 @@ def test_a_missing_file_and_bad_toml_name_the_file(tmp_path):
     with pytest.raises(ConfigError, match="file not found"):
         load_campaign(tmp_path / "campaign.toml")
     refused(tmp_path, "order_seed = ", "not valid TOML")
+
+
+def test_l17_tool_server_call_bound_s_is_optional_and_enters_the_caps_only_when_declared(tmp_path):
+    """L17: `[agent] tool_server_call_bound_s` is read as seconds (an integer may stand for a float). Undeclared, the
+    loop's caps in the fingerprint are what they were before the key existed; declared, they differ, so a store started
+    without it cannot be resumed with it."""
+    plain = load(tmp_path)
+    assert plain.agent.tool_server_call_bound_s is None
+    assert "tool_server_call_bound_s" not in plain.caps()["agent"]
+    declared = load(
+        tmp_path, VALID.replace("max_output_tokens = 256", "max_output_tokens = 256\ntool_server_call_bound_s = 300")
+    )
+    assert declared.agent.tool_server_call_bound_s == 300.0
+    assert declared.caps()["agent"]["tool_server_call_bound_s"] == 300.0
+    assert declared.caps() != plain.caps()
+
+
+@pytest.mark.parametrize(
+    ("value", "fragments"),
+    [
+        ("0", ("[agent]", "tool_server_call_bound_s", "positive")),
+        ("-5", ("[agent]", "tool_server_call_bound_s", "positive")),
+        ("inf", ("[agent]", "tool_server_call_bound_s", "finite")),
+        ("nan", ("[agent]", "tool_server_call_bound_s", "finite")),
+        ('"300"', ("[agent]", "tool_server_call_bound_s", "must be a float")),
+        ("true", ("[agent]", "tool_server_call_bound_s", "must be a float")),
+    ],
+)
+def test_l17_a_tool_call_bound_that_cannot_work_is_refused_naming_the_table_and_the_key(tmp_path, value, fragments):
+    """L17: refused at load, naming the file, the table and the key."""
+    text = VALID.replace("max_output_tokens = 256", f"max_output_tokens = 256\ntool_server_call_bound_s = {value}")
+    refused(tmp_path, text, *fragments)
+
+
+def test_l17_the_old_name_of_the_bound_is_refused_naming_the_new_key_and_why(tmp_path):
+    """L17: `[agent] tool_call_bound_s` capped every tool call, the code tool's included, which was not what it was
+    for. It was renamed `tool_server_call_bound_s` so that its name says its scope, and the old key is refused at load
+    with the new name and the reason, not read under the new meaning and not left to the generic message of an unknown
+    key."""
+    text = VALID.replace("max_output_tokens = 256", "max_output_tokens = 256\ntool_call_bound_s = 300")
+    message = refused(tmp_path, text, "[agent]", "tool_call_bound_s", "tool_server_call_bound_s", "tool server")
+    assert "is not a known key" not in message
+
+
+def test_l17_the_old_name_is_refused_even_beside_the_new_one(tmp_path):
+    """L17: a file that declares both is refused too: the old key is never quietly dropped."""
+    both = "max_output_tokens = 256\ntool_call_bound_s = 300\ntool_server_call_bound_s = 300"
+    refused(tmp_path, VALID.replace("max_output_tokens = 256", both), "tool_call_bound_s", "tool_server_call_bound_s")

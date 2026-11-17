@@ -143,6 +143,61 @@ def minimum_detectable_effect(
     return high
 
 
+TostPValues = Callable[[np.ndarray, float], np.ndarray]  # (studies x clusters), margin -> TOST p per study
+
+
+def tost_t_p_values(samples: np.ndarray, margin: float) -> np.ndarray:
+    """Two one-sided t-tests (Schuirmann) of every row's mean against plus or minus `margin`, written again here from
+    scipy's t distribution (S09): the larger of the one-sided p-values, on n - 1 degrees of freedom; NaN with fewer
+    than two clusters or no spread. It is the rule the core's estimator registers, so the default."""
+    x = np.asarray(samples, dtype=float)
+    if x.ndim != 2:
+        raise ValueError("samples must be a (studies x clusters) array")
+    n = x.shape[1]
+    if n < 2:
+        return np.full(x.shape[0], math.nan)
+    sd = x.std(axis=1, ddof=1)
+    # Equal values have no spread whatever their float SD, and an SD that underflows to 0 is none to divide by.
+    spread = (x.max(axis=1) > x.min(axis=1)) & (sd > 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        se = np.where(spread, sd / math.sqrt(n), math.nan)
+        lower = stats.t.sf((x.mean(axis=1) + margin) / se, n - 1)
+        upper = stats.t.cdf((x.mean(axis=1) - margin) / se, n - 1)
+    return np.maximum(lower, upper)
+
+
+def equivalence_feasibility(
+    sd: float,
+    n: int,
+    margin: float,
+    alpha: float,
+    n_sim: int,
+    rng: np.random.Generator,
+    deltas: Sequence[float],
+    p_values: TostPValues | None = None,
+) -> list[float]:
+    """The probability of concluding "equivalent" within plus or minus `margin`, for each true difference (S15).
+
+    Each simulated study draws n cluster differences from N(delta, sd^2), one set of standard normal draws shared by
+    every delta, and concludes equivalent when its TOST p-value is at most alpha (see `rejects`, S06); an undefined p
+    (one cluster, no spread) never does. `p_values` is the test the studies are judged by, the contrast's estimator's
+    own (`Tost.p_values`), as the minimum detectable effect is; by default the two one-sided t-tests above. Pass alpha
+    divided by the equivalence family's size for its first, hardest Holm step. The chance at delta = 0 is the power to
+    show equivalence; at delta = margin it is the rule's error rate, at most about alpha.
+    """
+    if not (math.isfinite(sd) and sd > 0):
+        raise ValueError(f"sd must be a positive number, got {sd}")
+    if min(n, n_sim) < 1:
+        raise ValueError(f"n and n_sim must be at least 1, got {n} and {n_sim}")
+    if not (math.isfinite(margin) and margin > 0):
+        raise ValueError(f"margin must be a positive finite number, got {margin}")
+    if not 0.0 < alpha < 0.5:
+        raise ValueError(f"alpha must be strictly between 0 and 0.5, got {alpha}")
+    test = p_values if p_values is not None else tost_t_p_values
+    noise = rng.standard_normal((n_sim, n))
+    return [float(rejects(np.asarray(test(delta + sd * noise, margin), dtype=float), alpha).mean()) for delta in deltas]
+
+
 def pilot_cluster_sd(differences: Sequence[float]) -> float:
     """Between-cluster SD of the paired differences of a pilot; NaN with fewer than two defined clusters."""
     values = np.asarray(differences, dtype=float)

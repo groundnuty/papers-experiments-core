@@ -1,8 +1,11 @@
 """O34: a cell's deadline through the agent loop, as a study runs it. The loop gives each cell the agent's remaining
-time as its cap, so the cell's deadline falls with the agent's own; the loop's watch then cuts the call and cancels its
-wait for it while the deadline's escalation is still under way, which alone would make the attempt the agent's
-`time_cap`. A cell a process of which outlived its kill must still end the run as `cell_unkillable`: `launch` settles
-the deadline of a cell still running, and decides from it before anything else, on every way out of its body."""
+time as its cap, so the cell's deadline falls with the agent's own, at the same moment of the real clock: either the
+loop's watch cuts the call and cancels its wait for it while the deadline's escalation is still under way, which alone
+would make the attempt the agent's `time_cap`, or the escalation decides first and the code tool raises the cell's
+`cell_unkillable` to the loop. A cell a process of which outlived its kill must end the run as `cell_unkillable` either
+way: `launch` settles the deadline of a cell still running, and decides from it before anything else, on every way out
+of its body. Which of the two comes first is a race of a few milliseconds (#226), so each test holds one order with
+events and the fake docker, never the real clock."""
 
 import asyncio
 import contextlib
@@ -21,6 +24,7 @@ from expcore.config.models import Limits
 from expcore.errors import InfraError
 from expcore.loop.agent_loop import run_agent
 from expcore.loop.config import AgentConfig
+from expcore.loop.timer import real_time_cleanup_waiter
 from expcore.loop.toolbox import ToolBox
 from expcore_onedata.sandbox import cells as cells_module
 from expcore_onedata.sandbox import deadline
@@ -34,6 +38,7 @@ from expcore_onedata.users import GROUP, TokenJournal
 CAP_S = 2.0  # the agent's time cap, and so the cap of its one cell
 CEILING_S = 600.0
 CODE = "open('/data/only-on-the-stopped-provider.bin').read()"  # a read that waits in the kernel on the mount
+LATE_S = 30.0  # how late the loop's watch wakes when the cell's deadline is to decide first: far past its escalation
 
 
 class Context:
@@ -79,10 +84,11 @@ def platform(config, issuer, fake, slots, tmp_path):
     return SimpleNamespace(platform=built, host=host, pool=pool)
 
 
-def wedge_the_cell(sandbox, host) -> threading.Event:
+def wedge_the_cell(sandbox, host, *, cut: threading.Event | None = None) -> threading.Event:
     """The cell's python waits in the kernel and ignores its kill until the sidecar aborts the mount; the fake docker
     returns the cell once its deadline has fired, as the real one returns once its processes end or its container goes.
-    The event is set when the deadline fires."""
+    The event is set when the deadline fires. With `cut`, the fake docker returns only once that is set too: the
+    escalation's commands wait on the fake docker, so nothing of the deadline is decided before it."""
     pids = cell_processes(SimpleNamespace(host=host), sandbox, wedged=True)
     firing, cells = threading.Event(), sandbox._cells
     kill = cells._kill_at_the_cap
@@ -94,6 +100,7 @@ def wedge_the_cell(sandbox, host) -> threading.Event:
     def runs_until_its_cap(container, argv, stdin):
         if stdin == CODE:
             assert firing.wait(30), "the cell's deadline never fired"
+            assert cut is None or cut.wait(30), "the agent loop never cut the call"
             return CmdResult(137, "", "")
         if container.name == sandbox.names.sidecar:  # the abort: the read fails with an errno, the pending kill takes
             host.unkillable.discard(pids["python"])
@@ -104,24 +111,70 @@ def wedge_the_cell(sandbox, host) -> threading.Event:
     return firing
 
 
-def run_the_agent(sandbox) -> object:
-    """The agent loop over the sandbox's code tool, on the real clock, with one call that runs the cell."""
+def run_the_agent(sandbox, *, cut: threading.Event | None = None, late_s: float = 0.0) -> object:
+    """The agent loop over the sandbox's code tool, on the real clock, with one call that runs the cell. `cut` is set
+    once the loop has cut a call and cancelled it (its cleanup waiter is called only then); with `late_s` its watch
+    wakes that much late, as an event loop held up on a loaded host, so it cuts nothing a cell ends before then."""
     limits = Limits(
         max_tool_rounds=5, time_cap_s=CAP_S, token_budget=100_000, output_cap_chars=8000, max_output_tokens=4096
     )
     config = AgentConfig(limits)
     box = ToolBox([CodeExecutionProvider(sandbox)], cap_chars=limits.output_cap_chars)
     backend = ScriptedBackend([turn(call("call-1", "python", {"code": CODE}))])
-    return run_agent(backend, box, "system", "task", config)
+
+    async def the_loop_has_cut(tasks, deadline_s):
+        if cut is not None:
+            cut.set()
+        return await real_time_cleanup_waiter(tasks, deadline_s)
+
+    async def wakes_late(seconds):
+        await asyncio.sleep(seconds + late_s)
+
+    timer = config.timer(cleanup_waiter=the_loop_has_cut)
+    return run_agent(backend, box, "system", "task", config, timer=timer, sleep=wakes_late)
+
+
+def assert_ended_as_cell_unkillable(ended, sandbox) -> None:
+    """`launch` raised `cell_unkillable`, the sandbox is stopped with its disks kept, and the deadline that ended the
+    run aborted the mount, which released the wedged read."""
+    assert ended.value.kind == "cell_unkillable"
+    assert sandbox.stopped is True
+    record = sandbox._cells.ended
+    assert record["outcome"] == "mount_aborted"
+    assert [s["step"] for s in record["steps"]] == ["kill", "survived", "abort", "ended"]
+    assert sandbox.metadata()["evidence_kept"]["relocated"] is True  # launch's stop keeps a set-aside run's disks
 
 
 def test_o34_a_cell_that_outlives_its_kill_in_the_agent_loop_ends_the_run_as_cell_unkillable(platform):
     """O34: through `launch`, the agent loop and the code tool: the agent's one cell reads through the mount and its
-    python ignores the kill at the cap until the mount is aborted. The loop sees only its own cap passing
-    (`time_cap`); the attempt still ends `cell_unkillable`, raised by `launch`, not the agent's time cap, and the
-    sandbox is stopped."""
+    python ignores the kill at the cap until the mount is aborted. The loop cuts the call at its cap before the
+    deadline decides (the fake docker returns the cell, and so lets the escalation's commands run, only once the
+    deadline has fired and the loop has cut), so the loop sees only its own cap passing (`time_cap`); the attempt still
+    ends `cell_unkillable`, raised by `launch`, not the agent's time cap, and the sandbox is stopped."""
     lease = platform.pool.acquire(GROUP, run_key="run-1")
-    outcomes, kept = [], []
+    outcomes, kept, cut = [], [], threading.Event()
+
+    async def go():
+        async with platform.platform.launch(
+            Context(), run_key="run-1", level="mounted", ceiling_s=CEILING_S, lease=lease
+        ) as sandbox:
+            kept.append(sandbox)
+            wedge_the_cell(sandbox, platform.host, cut=cut)
+            outcomes.append((await run_the_agent(sandbox, cut=cut)).outcome)
+
+    with pytest.raises(InfraError) as ended:
+        asyncio.run(go())
+    assert [o.name for o in outcomes] == ["time_cap"]  # the loop alone would have scored the agent's time cap
+    assert_ended_as_cell_unkillable(ended, kept[0])
+
+
+def test_o34_a_cell_whose_deadline_decides_before_the_loop_cuts_ends_the_run_as_cell_unkillable(platform):
+    """O34: the other order of the same race (#226): the loop's watch wakes late, so the cell's own timer fires at its
+    cap, the escalation aborts the mount, and the code tool raises the cell's `cell_unkillable` to the loop before the
+    loop cuts the call. The loop's outcome is then that infrastructure kind, never `time_cap`, and `launch` ends the run
+    as `cell_unkillable` from the same deadline, with the sandbox stopped."""
+    lease = platform.pool.acquire(GROUP, run_key="run-1")
+    outcomes, kept, cut = [], [], threading.Event()
 
     async def go():
         async with platform.platform.launch(
@@ -129,18 +182,13 @@ def test_o34_a_cell_that_outlives_its_kill_in_the_agent_loop_ends_the_run_as_cel
         ) as sandbox:
             kept.append(sandbox)
             wedge_the_cell(sandbox, platform.host)
-            outcomes.append((await run_the_agent(sandbox)).outcome)
+            outcomes.append((await run_the_agent(sandbox, cut=cut, late_s=LATE_S)).outcome)
 
     with pytest.raises(InfraError) as ended:
         asyncio.run(go())
-    assert [o.name for o in outcomes] == ["time_cap"]  # the loop alone would have scored the agent's time cap
-    assert ended.value.kind == "cell_unkillable"
-    sandbox = kept[0]
-    assert sandbox.stopped is True
-    record = sandbox._cells.ended
-    assert record["outcome"] == "mount_aborted"
-    assert [s["step"] for s in record["steps"]] == ["kill", "survived", "abort", "ended"]
-    assert sandbox.metadata()["evidence_kept"]["relocated"] is True  # launch's stop keeps a set-aside run's disks
+    assert [(o.name, o.infra_kind) for o in outcomes] == [("infrastructure", "cell_unkillable")]
+    assert not cut.is_set()  # the loop never cut the call: the cell's own deadline decided it
+    assert_ended_as_cell_unkillable(ended, kept[0])
 
 
 def test_o34_collect_settles_a_cell_still_running_before_it_decides(world, mounted):

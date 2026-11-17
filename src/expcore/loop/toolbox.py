@@ -12,7 +12,7 @@ caller, next to a flag saying whether the cap cut what the model saw.
 import copy
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,13 +20,14 @@ from expcore.loop.arguments import argument_problems
 from expcore.loop.capping import cap_error, cap_text, describe_cap, render_error
 from expcore.loop.records import ToolCallRecord
 from expcore.models.adapters import ToolCall, ToolResult
-from expcore.plugin import NO_WAITS, CallContext, ToolProvider, ToolSpec
+from expcore.plugin import NO_WAITS, CallContext, ToolOutput, ToolProvider, ToolSpec
 
 SKIPPED_CLASS = "skipped"
 SKIP_REASONS = {
     "ended": "not executed: the attempt ended at an earlier call in this turn",
     "time": "not executed: the run's time was used up before this call started",
     "cut": "not completed: the run's time was used up while this call was running",
+    "bound": "not completed: this call outlasted the bound declared for one tool server call, and the attempt ended",
     "failed": "not completed: this call failed and the attempt ended",
     "cap": "not executed: the attempt ended on a cap before any call of this reply ran",
 }
@@ -45,6 +46,7 @@ class ToolRun:
     error_class: str | None
     ends_attempt: bool  # a successful call of a terminal tool
     source_truncated: bool | None = None  # the data source's own limit was hit, as the provider says (L07)
+    exec_check: dict[str, Any] | None = None  # what a code tool verified of its exec, as the provider says (O55)
 
     def record(
         self,
@@ -54,6 +56,7 @@ class ToolRun:
         round_no: int,
         started_s: float | None,
         ended_s: float | None,
+        elapsed_s: float | None = None,
         status: str | None = None,
         detail: str = "",
         waited_s: float = 0.0,
@@ -81,18 +84,42 @@ class ToolRun:
             infra_wait_s=waited_s,
             started_s=started_s,
             ended_s=ended_s,
+            elapsed_s=elapsed_s,
             detail=detail,
             source_truncated=self.source_truncated,
+            exec_check=self.exec_check,
             waits_left_open=waits_left_open,
             terminal=terminal,
             infra_wait_by_kind=dict(waited_by_kind or {}),
         )
 
 
-class ToolBox:
-    """The tools one run exposes, from any number of providers, and the cap that applies to all of them."""
+def _checked(output: ToolOutput) -> dict[str, Any] | None:
+    """The provider's exec check as the record keeps it: a plain copy, or None when it gave none (O55)."""
+    return None if output.exec_check is None else dict(output.exec_check)
 
-    def __init__(self, providers: Sequence[ToolProvider], *, cap_chars: int):
+
+def serves_a_tool_server(provider: ToolProvider) -> bool:
+    """Tell whether a provider's tools are a tool server's, which is what the declared per-call bound is for (L17).
+
+    A provider says so with a true `tool_server` attribute (`McpToolProvider` does); one that has none, or any other
+    value, serves in-process tools, which the bound never reaches: the code tool is one. Read in the way a provider's
+    optional `abandoned_threads` is, so that a test double needs no inheritance.
+    """
+    return getattr(provider, "tool_server", False) is True
+
+
+class ToolBox:
+    """The tools one run exposes, from any number of providers, and the cap that applies to all of them.
+
+    `tool_servers` names the tools that are a tool server's, for a box that is not told by its providers: a replay,
+    whose one provider serves every recorded call, is given the names the record holds. By default they are the tools
+    of the providers that say they serve a tool server (`serves_a_tool_server`).
+    """
+
+    def __init__(
+        self, providers: Sequence[ToolProvider], *, cap_chars: int, tool_servers: Collection[str] | None = None
+    ):
         if cap_chars <= 0:
             raise ValueError(f"the output cap must be a positive number of characters, got {cap_chars!r}")
         self.cap_chars = cap_chars
@@ -104,6 +131,12 @@ class ToolBox:
                     raise ValueError(f"two providers offer a tool named {spec.name!r}")
                 self._providers[spec.name] = provider
                 self._specs[spec.name] = spec
+        served = (
+            {name for name, provider in self._providers.items() if serves_a_tool_server(provider)}
+            if tool_servers is None
+            else set(tool_servers) & self._specs.keys()
+        )
+        self._tool_servers = frozenset(served)
         self._definitions = [self._definition(self._specs[name]) for name in sorted(self._specs)]
         # What the model is told is the definitions; the hash also covers which tools end the attempt, which the
         # model is not told, because a tool that is terminal changes what a run does (L06, L09).
@@ -121,6 +154,15 @@ class ToolBox:
     def terminal_names(self) -> list[str]:
         """The names of the terminal tools, sorted: a successful call to one ends the attempt."""
         return [name for name in sorted(self._specs) if self._specs[name].terminal]
+
+    @property
+    def tool_server_names(self) -> list[str]:
+        """The names of the tools that are a tool server's, sorted: the only tools the declared bound reaches (L17)."""
+        return sorted(self._tool_servers)
+
+    def is_tool_server(self, name: str) -> bool:
+        """Tell whether the named tool is a tool server's; False for a name that is not a tool."""
+        return name in self._tool_servers
 
     def abandoned_threads(self) -> int:
         """How many threads that calls were cancelled out of may still be running, from the providers that say (L15)."""
@@ -158,8 +200,9 @@ class ToolBox:
         return self._error_run(call, "malformed", "MalformedArguments", message)
 
     async def run(self, call: ToolCall, *, timeout_s: float, ctx: CallContext = NO_WAITS) -> ToolRun:
-        """Run one call and return its outcome. `timeout_s` is the run's remaining time, passed on unchanged (L05), and
-        `ctx` is the call context through which the provider marks its waits on infrastructure (L04).
+        """Run one call and return its outcome. `timeout_s` is passed on unchanged: the run's remaining time (L05), or,
+        for a call to a tool server under a declared bound, the bound when that is shorter (L17). `ctx` is the call
+        context through which the provider marks its waits on infrastructure (L04).
 
         The provider is handed a deep copy of the arguments; the call keeps the original for the record. An exception
         from the provider is not caught: `InfraError` and defects reach the loop, which decides.
@@ -191,6 +234,7 @@ class ToolBox:
                 error_class,
                 False,
                 output.source_truncated,
+                _checked(output),
             )
         text, truncated = cap_text(output.text, self.cap_chars)
         return ToolRun(
@@ -202,4 +246,5 @@ class ToolBox:
             None,
             spec.terminal,
             output.source_truncated,
+            _checked(output),
         )

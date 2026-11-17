@@ -26,7 +26,7 @@ from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.loop.config import AgentConfig, config_sha256_of
-from expcore.loop.endings import cannot_start, cut_ending, time_ending
+from expcore.loop.endings import cannot_start, cut_ending, hung_past_the_bound, time_ending
 from expcore.loop.leaks import leaked_tool
 from expcore.loop.outcomes import HarnessDefect, Outcome, harness_defect_of
 from expcore.loop.records import LoopResult, ToolCallRecord, TurnRecord
@@ -299,14 +299,23 @@ class _Run:
             return self._skip(index, call, "time"), stop
         waited0 = (self.timer.infra_wait_s, self.timer.infra_wait_by_kind)
         try:
-            # The provider is told the agent's time left and marks its waits on infrastructure through the context; the
-            # loop cuts the call if the agent's time, which leaves those waits out, or the ceiling is used up (L04, L05).
+            # The provider is told the agent's time left, or, for a call to a tool server under a declared bound, the
+            # shorter of the two, and marks its waits on infrastructure through the context; the loop cuts the call if
+            # the agent's time, which leaves those waits out, or the ceiling is used up (L04, L05). A tool server that
+            # runs out of a bound shorter than the time left fails the call as infrastructure (L17); the watch judges
+            # an expiry at the time left (L16). A code cell, or any tool that is no tool server's, is never bounded by
+            # the declared bound nor judged by it: its time is the agent's.
             ctx = WaitContext(self.timer)
-            run = await self.watcher.run(self.toolbox.run(call, timeout_s=tick.remaining_s, ctx=ctx), tick)
+            run = await self.watcher.run(self.toolbox.run(call, timeout_s=self._call_bound(tick, call), ctx=ctx), tick)
         except Cut as cut:
-            cut_run = self.toolbox.skipped(call, "cut")
-            self._log(index, call, cut_run, self.rounds, tick, cut.tick, status="cut", waited=self._waited(waited0))
-            return cut_run, cut_ending(f"tool {call.name!r}", cut.tick, self.config)
+            tool_server = self.toolbox.is_tool_server(call.name)
+            hung = hung_past_the_bound(call.name, tick, cut.tick, self.config, tool_server=tool_server)  # (L17)
+            ending = hung if hung is not None else cut_ending(f"tool {call.name!r}", cut.tick, self.config)
+            cut_run = self.toolbox.skipped(call, "cut" if hung is None else "bound")
+            detail = "" if hung is None else hung.detail
+            waited = self._waited(waited0)
+            self._log(index, call, cut_run, self.rounds, tick, cut.tick, status="cut", detail=detail, waited=waited)
+            return cut_run, ending
         except InfraError as exc:
             return self._failed(index, call, tick, f"infrastructure: {exc.kind}", waited0), Outcome(
                 "infrastructure", exc.detail, infra_kind=exc.kind, infra_target=exc.target
@@ -325,6 +334,16 @@ class _Run:
                 return run, Outcome(over.name, detail, infra_kind=over.infra_kind)
             return run, Outcome("finished", f"a call to the terminal tool {call.name!r} succeeded")
         return run, None
+
+    def _call_bound(self, tick: Tick, call: ToolCall) -> float:
+        """The `timeout_s` a call is handed: the agent's time left (L05), or, for a call to a tool server, the declared
+        per-call bound when that is shorter (L17). The call is cut at the time left whatever the provider does; the
+        bound is the tool server's to keep. Any other tool, the code tool above all, gets the time left whatever is
+        declared, so what the model is told about a cell that ran long does not depend on the key."""
+        declared = self.config.tool_server_call_bound_s
+        if declared is None or not self.toolbox.is_tool_server(call.name):
+            return tick.remaining_s
+        return min(declared, tick.remaining_s)
 
     def _waited(self, before: tuple[float, dict[str, float]]) -> tuple[float, dict[str, float]]:
         """The time the call just made spent waiting on infrastructure, in all and by kind: the timer's totals now, less
@@ -385,6 +404,7 @@ class _Run:
                 round_no=round_no,
                 started_s=self.timer.since_start(started.now) if started else None,
                 ended_s=self.timer.since_start(ended.now) if ended else None,
+                elapsed_s=ended.now - started.now if started and ended else None,
                 status=status,
                 detail=detail,
                 waited_s=waited[0],
@@ -414,8 +434,11 @@ class _Run:
         end = self.timer.check("end") if self.timer.started else None
         info = self.backend.info()
         usage = info.get("usage_seen") or {}
-        # The terminal tools change what the run does, so they are part of the configuration the record keeps and hashes.
+        # The terminal tools change what the run does, so they are part of the configuration the record keeps and hashes;
+        # so are the tool servers' tools when a per-call bound is declared, since the bound reaches those and no others.
         record = {**self.config.as_dict(), "terminal_tools": self.toolbox.terminal_names}
+        if self.config.tool_server_call_bound_s is not None:  # which tools the bound reached, so a replay judges alike
+            record["tool_server_tools"] = self.toolbox.tool_server_names
         # A billed reply that became no turn is judged by the record, by the rule of its version (`reply_count_rule`).
         incomplete = self.usage_incomplete or bool(info.get("abandoned_request")) or bool(usage.get("missing"))
         return LoopResult(
