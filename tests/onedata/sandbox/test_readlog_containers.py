@@ -76,7 +76,9 @@ def test_the_collector_has_no_network_a_read_only_root_and_no_capability(s, name
     assert ("--security-opt", "no-new-privileges") in pairs(args)
     assert "--cap-add" not in args
     assert "--privileged" not in args
-    assert "--add-host" not in args and "-p" not in args and "--publish" not in args
+    assert "--add-host" not in args
+    assert "-p" not in args
+    assert "--publish" not in args
 
 
 def test_the_collector_runs_as_the_drivers_uid_and_gid(s, names):
@@ -90,7 +92,8 @@ def test_the_collector_is_labelled_like_every_container_of_the_sandbox_so_the_re
 
 def test_the_collector_is_started_by_the_pinned_image_id_of_the_gates_image(s, names):
     args = collector(s, names)
-    assert s.gate.id in args and s.gate.name not in args
+    assert s.gate.id in args
+    assert s.gate.name not in args
     assert args.index(s.gate.id) > max(i for i, a in enumerate(args) if a.startswith("--"))  # after every option
 
 
@@ -102,7 +105,7 @@ def test_the_collector_has_bounds_of_its_own_so_the_agent_cannot_make_it_eat_the
 
 
 def test_the_collector_command_is_the_cores_command_line_with_the_expected_peer_the_declared_agent_uid(s, names):
-    """`python3 -I collector.py <socket dir> <log file> <nonce> <expected peer uid>`, the paths those in the container."""
+    """`python3 -I collector.py <socket dir> <log file> <nonce> <expected peer uid>`, with the container's paths."""
     args = collector(s, names)
     assert ("--entrypoint", "python") in pairs(args)
     command = args[args.index(s.gate.id) + 1 :]
@@ -125,23 +128,30 @@ def test_the_expected_peer_uid_is_the_agents_not_the_drivers(s, names):
 def test_the_collectors_binds_are_its_program_read_only_and_its_two_directories(s, names):
     bound = by_destination(collector(s, names))
     assert set(bound) == {C.READLOG_PROGRAM_DIR, C.READLOG_SOCKET_DIR, C.READLOG_LOG_DIR}
-    assert bound[C.READLOG_PROGRAM_DIR]["src"] == str(DIRS.program) and "readonly" in bound[C.READLOG_PROGRAM_DIR]
-    assert bound[C.READLOG_SOCKET_DIR]["src"] == str(DIRS.sockets) and "readonly" not in bound[C.READLOG_SOCKET_DIR]
-    assert bound[C.READLOG_LOG_DIR]["src"] == str(DIRS.log) and "readonly" not in bound[C.READLOG_LOG_DIR]
+    assert bound[C.READLOG_PROGRAM_DIR]["src"] == str(DIRS.program)
+    assert "readonly" in bound[C.READLOG_PROGRAM_DIR]
+    assert bound[C.READLOG_SOCKET_DIR]["src"] == str(DIRS.sockets)
+    assert "readonly" not in bound[C.READLOG_SOCKET_DIR]
+    assert bound[C.READLOG_LOG_DIR]["src"] == str(DIRS.log)
+    assert "readonly" not in bound[C.READLOG_LOG_DIR]
     assert all(fields["type"] == "bind" for fields in bound.values())  # `--mount`, which refuses a missing source
 
 
 def test_no_secret_reaches_the_collector_not_the_token_the_tls_keys_or_the_environment(s, names):
     args = collector(s, names)
-    assert "-e" not in args and "--env" not in args and "-v" not in args
+    assert "-e" not in args
+    assert "--env" not in args
+    assert "-v" not in args
     assert not any(word in " ".join(args) for word in ("token", "tls", "gate.json", "federation"))
 
 
 def test_the_agent_gets_the_socket_directory_and_the_client_read_only_at_the_fixed_targets(s, names):
     args, _ = agent(s, names, DataPathMode.NONE, readlog=DIRS)
     bound = by_destination(args)
-    assert bound[paths.SOCKET_DIR]["src"] == str(DIRS.sockets) and "readonly" in bound[paths.SOCKET_DIR]
-    assert bound[paths.CLIENT_DIR]["src"] == str(DIRS.client) and "readonly" in bound[paths.CLIENT_DIR]
+    assert bound[paths.SOCKET_DIR]["src"] == str(DIRS.sockets)
+    assert "readonly" in bound[paths.SOCKET_DIR]
+    assert bound[paths.CLIENT_DIR]["src"] == str(DIRS.client)
+    assert "readonly" in bound[paths.CLIENT_DIR]
     assert bound[paths.SOCKET_DIR]["type"] == bound[paths.CLIENT_DIR]["type"] == "bind"
 
 
@@ -154,15 +164,18 @@ def test_the_agent_never_gets_the_log_the_program_or_the_collectors_containers_p
     }[mode]
     args, env = agent(s, names, mode, readlog=DIRS, **extra)
     text = " ".join(args)
-    assert str(DIRS.log) not in text and str(DIRS.program) not in text
-    assert C.READLOG_LOG_DIR not in text and C.READLOG_PROGRAM_DIR not in text
+    assert str(DIRS.log) not in text
+    assert str(DIRS.program) not in text
+    assert C.READLOG_LOG_DIR not in text
+    assert C.READLOG_PROGRAM_DIR not in text
     assert {fields["dst"] for fields in map(mount_fields, mounts(args))} >= {paths.SOCKET_DIR, paths.CLIENT_DIR}
     assert not any("readlog" in name.lower() for name in env)  # no environment variable: the target is fixed
 
 
 def test_an_agent_without_the_channel_has_neither_bind(s, names):
     args, _ = agent(s, names, DataPathMode.NONE)
-    assert paths.SOCKET_DIR not in " ".join(args) and paths.CLIENT_DIR not in " ".join(args)
+    assert paths.SOCKET_DIR not in " ".join(args)
+    assert paths.CLIENT_DIR not in " ".join(args)
 
 
 @pytest.mark.parametrize("target", [paths.SOCKET_DIR, paths.CLIENT_DIR, f"{paths.SOCKET_DIR}/x", paths.SOCKET])

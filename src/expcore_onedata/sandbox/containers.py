@@ -17,6 +17,13 @@ type=bind,...,readonly`, never `-v SOURCE:PATH:ro` (`bind`). With `-v`, a source
 daemon as a directory owned by root, and a `docker cp` from a running container re-mounts its binds: after the host's
 copy of a token was removed, that left an empty directory at the token's path, which the teardown could not remove
 (O05). `--mount` refuses a missing source instead.
+
+The read-log channel (`expcore_onedata.readlog`) adds a fourth container, the collector (`collector_run_args`), a
+sibling of the gate's: no network, a read-only root, every capability dropped, the driver's uid, the gate's image by
+id. It receives a Unix datagram socket's records from the agent's code and writes them to a log the agent never sees:
+the agent's container gets the collector's socket directory and the client module, both read-only, at the fixed
+targets of `readlog.paths`, and neither the log's directory nor the collector's program (`agent_run_args`). Linux
+only.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore_onedata.readlog import paths as readlog_paths
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint
 from expcore_onedata.sandbox.cellhost import CELL_HOSTNAME
 from expcore_onedata.sandbox.oneclient_args import (
@@ -108,6 +116,17 @@ CERTIFI_PROBE = (
 CERTIFI_NONE = "none"
 CERTIFI_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,4095}")  # an absolute path a bind can be mounted over
 MOUNT_FIELD_UNSAFE = re.compile(r'[,"\r\n]')  # in a `--mount` value a comma starts the next field and a quote opens one
+# The read-log collector's container. Its program is bound read-only, its socket directory and its log directory
+# read-write, each a directory of its own so that nothing but the socket reaches the agent (`agent_run_args`).
+READLOG_SUFFIX = "-readlog"  # the collector's name: the agent's, then this
+READLOG_PROGRAM_DIR = "/opt/readlog"  # the run's pinned copy of the collector program, read-only
+READLOG_PROGRAM_NAME = "collector.py"
+READLOG_SOCKET_DIR = "/run/readlog"  # the collector binds `sock` here; the agent has the same directory at another path
+READLOG_LOG_DIR = "/var/readlog"  # the collector's log, which no other container binds
+READLOG_LOG_NAME = "readlog.jsonl"
+READLOG_READY = "readlog collector ready"  # the line the collector prints once it is listening
+READLOG_PIDS = 64  # the collector is one process: a bound of its own, whatever the agent sends
+READLOG_MEMORY_BYTES = 256 * 1024 * 1024
 
 
 def certifi_probe_args(s: SandboxSettings, name: str, labels: Sequence[str], image_id: str) -> list[str]:
@@ -155,6 +174,11 @@ class Names:
     def make(cls, prefix: str, sid: str) -> Names:
         agent = f"{prefix}-{sid}"
         return cls(sid, agent, agent + "-net", agent + "-gate", agent + SIDECAR_SUFFIX)
+
+    @property
+    def readlog(self) -> str:
+        """The read-log collector's container, when the run has the channel."""
+        return self.agent + READLOG_SUFFIX
 
 
 def _checked_mount(settings: SandboxSettings) -> MountSettings:
@@ -409,6 +433,56 @@ def gate_run_args(
     ]
 
 
+@dataclass(frozen=True)
+class ReadLogDirs:
+    """The four host directories of one run's read-log channel, each its own so that a bind carries nothing else.
+
+    `program` holds the run's pinned copy of the collector, `sockets` the collector's socket (the agent's container
+    gets it read-only), `log` the collector's log (no container but the collector's gets it), `client` the pinned copy
+    of the client module (the agent's container gets it read-only)."""
+
+    program: Path
+    sockets: Path
+    log: Path
+    client: Path
+
+
+def collector_run_args(
+    s: SandboxSettings,
+    names: Names,
+    labels: Sequence[str],
+    dirs: ReadLogDirs,
+    image_id: str,
+    *,
+    uid: int,
+    gid: int,
+    nonce: str,
+) -> list[str]:
+    """`docker run` for the read-log collector: the gate's sibling, with no network, a read-only root, every capability
+    dropped, no new privilege and the DRIVER's uid and gid, so that the harness reads and removes what it writes.
+
+    It runs the pinned `collector.py` (`readlog.collector`) as `python -I collector.py <socket dir> <log file> <nonce>
+    <expected peer uid>`, with the run's nonce and the declared agent uid, the only uid a record may come from: the
+    reader makes a log with a record from another uid unknown. Its program is bound read-only, its socket directory and
+    its log directory read-write; the agent's container gets the first of those two read-only and never the second
+    (`agent_run_args`). The image is the gate's (the same interpreter), by its pinned id, and the bounds are the
+    collector's own (`READLOG_PIDS`, `READLOG_MEMORY_BYTES`). No secret reaches it, and it has no environment."""
+    memory = str(READLOG_MEMORY_BYTES)
+    return [
+        *("run", "-d", "--name", names.readlog, "--network", "none", *labels),
+        *("--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--user", f"{uid}:{gid}"),
+        *("--pids-limit", str(READLOG_PIDS), "--memory", memory, "--memory-swap", memory),
+        *bind(dirs.program, READLOG_PROGRAM_DIR),
+        *bind(dirs.sockets, READLOG_SOCKET_DIR, readonly=False),
+        *bind(dirs.log, READLOG_LOG_DIR, readonly=False),
+        *("--entrypoint", "python", image_id, "-I", f"{READLOG_PROGRAM_DIR}/{READLOG_PROGRAM_NAME}"),
+        READLOG_SOCKET_DIR,
+        f"{READLOG_LOG_DIR}/{READLOG_LOG_NAME}",
+        nonce,
+        str(s.agent_uid),
+    ]
+
+
 def sidecar_run_args(
     s: SandboxSettings,
     names: Names,
@@ -469,6 +543,7 @@ def agent_run_args(
     trust_bundles: Mapping[str, Path],
     zone_host: str | None,
     inputs: Sequence[tuple[Path, str]] = (),
+    readlog: ReadLogDirs | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """`docker run` for the agent and the environment names it takes: read-only root, no capability, no new privilege.
 
@@ -479,6 +554,11 @@ def agent_run_args(
     path it has neither. Each read-only input, the run's own copy and the path the agent sees it at, is bound in with
     `readonly` too, in every data path (O20). Its host name is the declared one (`cellhost`, O73), as every Apptainer
     cell's, so `hostname` reads the same string on both backends and not the engine's container id.
+
+    With the read-log channel (`readlog`) it gets the collector's socket directory at `readlog.paths.SOCKET_DIR` and the
+    client module's directory at `readlog.paths.CLIENT_DIR`, both `readonly`: a datagram socket takes a send on a
+    read-only bind, and nothing else of the collector reaches it, neither its log nor its program, and no environment
+    variable names either (the targets are fixed).
     """
     lim, uid = s.limits, s.agent_uid
     args = [
@@ -506,6 +586,8 @@ def agent_run_args(
         if share is None or s.mount is None:
             raise ValueError("a mount data path needs the shared mount point and [sandbox.mount]")
         args += ["--mount", f"type=bind,src={share},dst={s.mount.path},readonly,bind-propagation=rslave"]
+    if readlog is not None:
+        args += [*bind(readlog.sockets, readlog_paths.SOCKET_DIR), *bind(readlog.client, readlog_paths.CLIENT_DIR)]
     for copy, target in inputs:
         args += ["--mount", f"type=bind,src={copy},dst={target},readonly"]
     # settings and the placeholder, never a credential; their values travel in the docker client's environment
