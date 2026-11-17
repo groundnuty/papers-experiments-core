@@ -850,7 +850,7 @@ def _analyse_loaded(
                 "the replay check ran under another environment than the campaign's:\n  " + "\n  ".join(changed)
             )
     # the data path of each level of `data_path`, as every snapshot's campaign fingerprint records it; none when the
-    # snapshots disagree, so a run the guard might not apply to is then left unknown (O72)
+    # snapshots disagree, so a run the guard might not apply to is then left unknown (O75)
     data_paths = recorded_paths[0] if recorded_paths and all(p == recorded_paths[0] for p in recorded_paths) else None
     plugin = load_plugin(StudyContext(study, code))
     try:
@@ -1035,7 +1035,7 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
 
 
 def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
-    """What `analysis.json` holds of a batch checked by two or more guards (O60, O73): the guards that checked it, the
+    """What `analysis.json` holds of a batch checked by two or more guards (O60, O76): the guards that checked it, the
     runs any leaves out, overall and per condition, each run as each guard found it (None for a guard that did not
     check the batch), and the rerun without the left-out runs, or why there is none."""
     sensitivity = guards.sensitivity

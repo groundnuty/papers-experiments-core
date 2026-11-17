@@ -155,8 +155,8 @@ def mixed(**changes) -> MountGuardAnalysis:
     return dataclasses.replace(MountGuardAnalysis(runs, again), **changes)
 
 
-def test_o72_the_runs_with_no_mount_are_counted_and_shown_as_not_applicable_and_never_as_clean():
-    """O72: the report counts them apart, lists none of them as not clean, and the rerun keeps them."""
+def test_o75_the_runs_with_no_mount_are_counted_and_shown_as_not_applicable_and_never_as_clean():
+    """O75: the report counts them apart, lists none of them as not clean, and the rerun keeps them."""
     report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=mixed())
     assert "1 of 4 analysed run(s) not clean: 1 flagged for an access" in report
     assert (
@@ -351,7 +351,7 @@ def test_s17_a_flat_family_rerun_keeps_its_analysis_json_keys_in_both_guards():
     assert list(_guards_summary(combined())["sensitivity"]) == ["left_out", "contrasts", "holm"]
 
 
-# --- the combined section of three guards, and of egress with the visibility check (O73) --------------------------
+# --- the combined section of three guards, and of egress with the visibility check (O76) --------------------------
 
 ALL_HEADING = "## Egress, mount isolation and process visibility together (detected, not prevented)"
 ANY_SENSITIVITY = "#### Preregistered contrasts without the runs any guard leaves out"
@@ -373,8 +373,8 @@ def combined_all(**changes):
     return dataclasses.replace(GuardsAnalysis(runs, again), **changes)
 
 
-def test_o73_the_section_of_three_guards_is_named_for_all_of_them_and_counts_each_alone_and_several():
-    """O73: process visibility joins the combined section; a run not applicable to the mount guard is not left out."""
+def test_o76_the_section_of_three_guards_is_named_for_all_of_them_and_counts_each_alone_and_several():
+    """O76: process visibility joins the combined section; a run not applicable to the mount guard is not left out."""
     report = render(analysis(contrast("a-vs-b", "difference")), guards=combined_all())
     assert ALL_HEADING in report
     assert (
@@ -393,8 +393,8 @@ def test_o73_the_section_of_three_guards_is_named_for_all_of_them_and_counts_eac
     assert table_of(report, ANY_SENSITIVITY)["a-vs-b"][3] == "0.15"
 
 
-def test_o73_egress_with_the_visibility_check_alone_reads_as_a_pair_of_guards():
-    """O73: two guards other than the first pair are named, and `both` means both of them."""
+def test_o76_egress_with_the_visibility_check_alone_reads_as_a_pair_of_guards():
+    """O76: two guards other than the first pair are named, and `both` means both of them."""
     from expcore.guards import GuardedRun, GuardsAnalysis
 
     runs = (
@@ -413,7 +413,7 @@ def test_o73_egress_with_the_visibility_check_alone_reads_as_a_pair_of_guards():
     assert rows["k1"][3:] == ["flagged", "flagged", "both"]
 
 
-def test_o73_the_terminal_summary_of_three_guards_says_all_guards():
+def test_o76_the_terminal_summary_of_three_guards_says_all_guards():
     lines = summary_lines(analysis(contrast("a-vs-b", "difference")), None, None, combined_all())
     assert (
         "all guards: 3 of 5 analysed run(s) left out (0 by egress alone, 1 by the mount guard alone, 1 by the "
@@ -428,7 +428,7 @@ def test_o73_the_terminal_summary_of_three_guards_says_all_guards():
     assert quiet[-1] == "all-guards sensitivity: every run clean to all, the same as the analysis above"
 
 
-def test_o73_analysis_json_names_the_guards_that_checked_the_batch_and_each_runs_visibility_state():
+def test_o76_analysis_json_names_the_guards_that_checked_the_batch_and_each_runs_visibility_state():
     both = _guards_summary(combined_all())
     assert both["guards"] == ["egress", "mount", "visibility"]
     by_key = {run["run_key"]: run for run in both["runs"]}
@@ -442,8 +442,8 @@ def test_o73_analysis_json_names_the_guards_that_checked_the_batch_and_each_runs
     assert legacy["runs"][0]["visibility"] is None
 
 
-def test_o73_a_batch_whose_runs_are_clean_or_not_applicable_never_says_every_run_is_clean_to_the_guards():
-    """O73: a run the mount guard does not apply to is kept, and the combined text does not call it clean to it."""
+def test_o76_a_batch_whose_runs_are_clean_or_not_applicable_never_says_every_run_is_clean_to_the_guards():
+    """O76: a run the mount guard does not apply to is kept, and the combined text does not call it clean to it."""
     from expcore.guards import GuardedRun, GuardsAnalysis
 
     runs = (GuardedRun("k1", 1, "cond-a", "clean", "clean"), GuardedRun("k2", 1, "cond-a", "clean", "not_applicable"))

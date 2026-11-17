@@ -159,7 +159,7 @@ def no_mount(kind: str = "rest") -> dict:
 
 @pytest.mark.parametrize("kind", ["rest", "none"])
 def test_a_run_whose_record_says_it_had_no_mount_is_not_applicable_and_stays_in_the_rerun(kind):
-    """O72: the sandbox's own statement that the run's data path has no mount; no flag, kept."""
+    """O75: the sandbox's own statement that the run's data path has no mount; no flag, kept."""
     run = judge(record(instruments={NAMESPACE: no_mount(kind)}), "rest-arm")
     assert run.verdict == NOT_APPLICABLE
     assert run.not_applicable == kind
@@ -192,7 +192,7 @@ def test_the_statement_is_what_the_instrument_for_a_run_without_a_mount_records(
     ],
 )
 def test_a_statement_that_is_not_exactly_the_one_this_code_reads_is_unknown_never_not_applicable(data):
-    """O72: only the exact statement makes a run not applicable; any other shape is unknown and left out."""
+    """O75: only the exact statement makes a run not applicable; any other shape is unknown and left out."""
     run = judge(record(instruments={NAMESPACE: data}), "rest-arm")
     assert run.verdict == UNKNOWN_VERDICT
     assert run.not_applicable is None
@@ -200,6 +200,6 @@ def test_a_statement_that_is_not_exactly_the_one_this_code_reads_is_unknown_neve
 
 
 def test_no_snapshot_is_never_not_applicable_even_where_the_run_may_have_had_no_mount():
-    """O72: the absence of a snapshot is `not_recorded`: a mount run whose guard was not listed reads the same."""
+    """O75: the absence of a snapshot is `not_recorded`: a mount run whose guard was not listed reads the same."""
     run = judge(record(), "rest-arm")
     assert (run.verdict, run.not_applicable, run.unknown) == (UNKNOWN_VERDICT, None, (guard_flags.NOT_RECORDED,))

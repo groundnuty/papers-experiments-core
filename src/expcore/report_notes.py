@@ -398,7 +398,7 @@ GUARDS_SENSITIVITY_NOTES = [
 
 def any_guard_notes(names: str) -> list[str]:
     """The notes of the combined section of a batch checked by guards other than egress and the mount guard alone:
-    `names` lists the guards that checked it (O73)."""
+    `names` lists the guards that checked it (O76)."""
     return [
         f"This batch was checked by {names}, and each section above reruns the analysis without its own runs. This one",
         "reruns it without every run any of them leaves out: flagged or unknown to any, so a run unknown to one guard",

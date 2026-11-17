@@ -844,7 +844,7 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> list[str]:
 
 
 def _guards_summary(guards: GuardsAnalysis) -> list[str]:
-    """The terminal's lines of the guards together (O60, O73): the runs any leaves out, then each confirmatory contrast
+    """The terminal's lines of the guards together (O60, O76): the runs any leaves out, then each confirmatory contrast
     without them."""
     return guards_summary_lines(guards, _rerun_lines)
 
@@ -985,7 +985,7 @@ def render_report(
     report says n/a without them), `interval_level` the level of the contrasts' intervals when the preregistration
     states one, `egress` the egress verdicts and the sensitivity analysis of a batch checked for egress (no section
     without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60),
-    `guards` the rerun without the runs any guard leaves out (a batch checked by two or more, O60, O73), `visibility`
+    `guards` the rerun without the runs any guard leaves out (a batch checked by two or more, O60, O76), `visibility`
     the process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
     it, O56). A partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`).
     What each number counts is stated in the report beside it. The text ends with a newline.

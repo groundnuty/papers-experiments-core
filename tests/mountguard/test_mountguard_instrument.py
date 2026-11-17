@@ -36,7 +36,7 @@ def test_a_mount_run_gets_the_guard_over_its_watcher_log():
 
 @pytest.mark.parametrize("kind", ["rest", "none"])
 def test_a_run_whose_data_path_has_no_mount_gets_the_statement_that_the_guard_does_not_apply(kind):
-    """O72: the sandbox's data path decides; the statement names it."""
+    """O75: the sandbox's data path decides; the statement names it."""
     instrument = mount_guard_for(Box(kind))
     assert isinstance(instrument, NoMount)
     assert instrument.namespace == NAMESPACE
@@ -44,13 +44,13 @@ def test_a_run_whose_data_path_has_no_mount_gets_the_statement_that_the_guard_do
 
 
 def test_a_mount_run_without_a_watcher_nonce_is_refused_never_recorded_as_not_applicable():
-    """O72: the helper's lack of a watcher says nothing about the run's data path: a mount run it stays."""
+    """O75: the helper's lack of a watcher says nothing about the run's data path: a mount run it stays."""
     with pytest.raises(ValueError, match="nonce"):
         mount_guard_for(Box("mount", None))
 
 
 def test_a_mount_run_whose_watcher_log_is_missing_is_unknown_never_not_applicable():
-    """O72: a mount run with no log is unknown and left out, whatever else is missing."""
+    """O75: a mount run with no log is unknown and left out, whatever else is missing."""
     box = Box("mount", NONCE, None)
     verdict = judge(SimpleNamespace(run_key="k", attempt=1, instruments={NAMESPACE: snapshot_of(box)}), "c")
     assert verdict.verdict == "unknown"

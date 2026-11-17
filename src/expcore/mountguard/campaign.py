@@ -1,5 +1,5 @@
 # Provenance: new
-"""The data path of each level of a study's `data_path` factor, as the campaign's own fingerprint records it (O72).
+"""The data path of each level of a study's `data_path` factor, as the campaign's own fingerprint records it (O75).
 
 A run of a campaign that mixes data paths carries the study's word for its path (`factors["data_path"]`, a level such
 as `rest-arm`), and only the platform's file maps the word to a kind: `mount`, `rest` or `none`. The platform puts the

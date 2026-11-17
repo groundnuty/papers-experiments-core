@@ -1,6 +1,6 @@
 # Provenance: new
 """The `## Egress and mount isolation together` section of the report of a batch checked by two or more guards (#179,
-O60, O73): the runs any guard leaves out, and the analysis again without them, beside each guard's own section and
+O60, O76): the runs any guard leaves out, and the analysis again without them, beside each guard's own section and
 rerun.
 
 A batch gets the section only when its records carry two or more of the `egress`, `mount_guard` and
@@ -122,7 +122,7 @@ def guards_lines(
 
 
 def summary_lines(guards: GuardsAnalysis, rerun: Callable[[Any, str], list[str]]) -> list[str]:
-    """The terminal's lines of the guards together (O60, O73): the runs any leaves out, overall and per condition, then
+    """The terminal's lines of the guards together (O60, O76): the runs any leaves out, overall and per condition, then
     each confirmatory contrast without them. `rerun` renders a sensitivity result's lines under a prefix."""
     n, label = guards.counts(), f"{every(guards)} guards"
     lines = [f"{label}: {n['left_out']} of {n['analysed']} analysed run(s) left out ({by_alone(guards, n)})"]

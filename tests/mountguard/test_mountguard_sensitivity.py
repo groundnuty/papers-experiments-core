@@ -162,7 +162,7 @@ def mixed_instruments(i: int) -> dict:
 
 
 def test_a_rest_run_is_not_applicable_and_stays_in_the_mount_guards_rerun(prereg):
-    """O72: the REST runs had no mount exposure, so the rerun leaves out only the mount runs that are not clean."""
+    """O75: the REST runs had no mount exposure, so the rerun leaves out only the mount runs that are not clean."""
     rows = rows_of_pairs(8)  # 16 runs: pairs 0-1 are mount runs, pairs 2-7 REST runs
     done = mount_guard_analysis(runs_for(rows, mixed_instruments), rows, [], prereg)
     counts = done.counts()
@@ -177,7 +177,7 @@ def test_a_rest_run_is_not_applicable_and_stays_in_the_mount_guards_rerun(prereg
 
 
 def test_a_mount_run_without_its_snapshot_is_still_unknown_and_excluded_beside_not_applicable_runs(prereg):
-    """O72: not applicable is the run's own statement: the absence of a snapshot does not make a mount run one."""
+    """O75: not applicable is the run's own statement: the absence of a snapshot does not make a mount run one."""
     rows = rows_of_pairs(4)
     done = mount_guard_analysis(runs_for(rows, lambda i: {} if i == 0 else rest()), rows, [], prereg)
     assert [(run.run_key, run.verdict, run.unknown) for run in done.left_out] == [
@@ -187,7 +187,7 @@ def test_a_mount_run_without_its_snapshot_is_still_unknown_and_excluded_beside_n
 
 
 def test_a_batch_of_not_applicable_runs_alone_is_checked_and_has_no_second_analysis(prereg):
-    """O72: every run had no mount: the guard says so, nothing is left out, and a rerun would be the primary one."""
+    """O75: every run had no mount: the guard says so, nothing is left out, and a rerun would be the primary one."""
     rows = rows_of_pairs(3)
     done = mount_guard_analysis(runs_for(rows, lambda i: rest()), rows, [], prereg)
     assert done is not None
@@ -224,8 +224,8 @@ def arm_runs(rows, flagged=(0, 1, 2, 3)) -> list:
     return runs
 
 
-def test_o72_without_the_campaigns_data_paths_every_rest_run_with_no_snapshot_is_unknown_and_left_out(prereg):
-    """O72: the shape that went wrong: 48 REST runs with no snapshot and 4 flagged mount runs of 96 leave 52 out."""
+def test_o75_without_the_campaigns_data_paths_every_rest_run_with_no_snapshot_is_unknown_and_left_out(prereg):
+    """O75: the shape that went wrong: 48 REST runs with no snapshot and 4 flagged mount runs of 96 leave 52 out."""
     rows = arm_rows()
     done = mount_guard_analysis(arm_runs(rows), rows, [], prereg)
     counts = done.counts()
@@ -233,8 +233,8 @@ def test_o72_without_the_campaigns_data_paths_every_rest_run_with_no_snapshot_is
     assert counts["not_applicable"] == 0
 
 
-def test_o72_a_rest_arm_with_no_snapshot_is_not_applicable_by_the_campaigns_recorded_data_path(prereg):
-    """O72: the campaign fingerprint's `data_paths` says the level `api` is a REST data path, so a run of it with no
+def test_o75_a_rest_arm_with_no_snapshot_is_not_applicable_by_the_campaigns_recorded_data_path(prereg):
+    """O75: the campaign fingerprint's `data_paths` says the level `api` is a REST data path, so a run of it with no
     snapshot had no mount: not applicable, kept in the rerun; only the 4 flagged mount runs are left out."""
     rows = arm_rows()
     done = mount_guard_analysis(arm_runs(rows), rows, [], prereg, DATA_PATHS)
@@ -248,8 +248,8 @@ def test_o72_a_rest_arm_with_no_snapshot_is_not_applicable_by_the_campaigns_reco
     assert sum(a.lost[LEFT_OUT_AS] for a in again.arm_runs) == 4
 
 
-def test_o72_a_mount_run_with_no_snapshot_is_unknown_whatever_the_campaign_records(prereg):
-    """O72: the level `mount` is a mount data path, so the run's missing snapshot is not a statement of anything."""
+def test_o75_a_mount_run_with_no_snapshot_is_unknown_whatever_the_campaign_records(prereg):
+    """O75: the level `mount` is a mount data path, so the run's missing snapshot is not a statement of anything."""
     rows = arm_rows(4)
     runs = [(record(run_key=row.run_key, factors=row.factors), row.condition) for row in rows]
     runs[1] = (runs[1][0].__class__(**{**vars(runs[1][0]), "instruments": clean()}), runs[1][1])  # one run carries it
@@ -269,18 +269,18 @@ def test_o72_a_mount_run_with_no_snapshot_is_unknown_whatever_the_campaign_recor
         {"data_path": None},
     ],
 )
-def test_o72_a_run_whose_level_the_campaign_does_not_map_to_a_data_path_stays_unknown(factors):
+def test_o75_a_run_whose_level_the_campaign_does_not_map_to_a_data_path_stays_unknown(factors):
     done = judge(record(factors=factors), "c", DATA_PATHS)
     assert (done.verdict, done.not_applicable) == ("unknown", None)
 
 
 @pytest.mark.parametrize("paths", [None, {}, {"api": "mount"}, {"api": "api"}, {"api": ""}, {"api": None}])
-def test_o72_a_campaign_that_records_no_rest_or_none_data_path_for_the_level_gives_no_exemption(paths):
+def test_o75_a_campaign_that_records_no_rest_or_none_data_path_for_the_level_gives_no_exemption(paths):
     done = judge(record(factors={"data_path": "api"}), "c", paths)
     assert (done.verdict, done.not_applicable) == ("unknown", None)
 
 
-def test_o72_a_statement_that_contradicts_the_campaigns_data_path_is_unknown():
+def test_o75_a_statement_that_contradicts_the_campaigns_data_path_is_unknown():
     """The record says no mount where the campaign says the level is a mount, or names another data path than it."""
     as_mount = judge(record(instruments={NAMESPACE: NoMount("rest").finish()}, factors={"data_path": "mount"}), "c",
                      DATA_PATHS)  # fmt: skip
@@ -295,7 +295,7 @@ def test_o72_a_statement_that_contradicts_the_campaigns_data_path_is_unknown():
     assert (agrees.verdict, agrees.not_applicable, agrees.data_path_from) == ("not_applicable", "rest", "record")
 
 
-def test_o72_a_real_snapshot_is_judged_as_it_is_whatever_the_campaign_says_of_the_level():
+def test_o75_a_real_snapshot_is_judged_as_it_is_whatever_the_campaign_says_of_the_level():
     done = judge(record(instruments=clean(), factors={"data_path": "api"}), "c", DATA_PATHS)
     assert (done.verdict, done.not_applicable) == ("clean", None)
     flagged = judge(record(instruments=touched(), factors={"data_path": "api"}), "c", DATA_PATHS)

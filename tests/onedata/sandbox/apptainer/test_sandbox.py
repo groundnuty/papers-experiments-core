@@ -303,8 +303,8 @@ def test_this_core_s_gate_has_the_peer_uid_check_so_the_apptainer_gate_asks_for_
 
 
 @pytest.mark.parametrize(("level", "kind"), [("via-gate", "rest"), ("isolated", "none")])
-def test_o72_a_run_without_a_mount_has_the_statement_that_the_mount_guard_does_not_apply(node, settings, level, kind):
-    """O72: the sandbox's own data path, not a missing watcher, makes the guard not apply; the instrument built from the
+def test_o75_a_run_without_a_mount_has_the_statement_that_the_mount_guard_does_not_apply(node, settings, level, kind):
+    """O75: the sandbox's own data path, not a missing watcher, makes the guard not apply; the instrument built from the
     sandbox records it, and the core judges it `not_applicable`."""
     from types import SimpleNamespace
 
