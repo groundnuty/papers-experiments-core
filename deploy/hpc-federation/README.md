@@ -727,6 +727,18 @@ your host and does not check that you did.
 > remedy. Before, a shard on a `git archive` reached its node, started, and stopped there with "the core's commit is
 > unknown".
 
+**One campaign fingerprint before any line (O63).** A campaign's fingerprint holds the platform settings that shape a
+run, which each federation's `platform.toml` renders: the faults sanction and targets, the placement bounds, the data
+identity, the sandbox's pins. Shards on federations that render different ones pin different fingerprints, and the core's
+`merge` refuses them only after the shards have run. `shards.py plan` and `lines` therefore take each shard's campaign
+fingerprint first, as `resume-line` does (the manifest's Python, `-I -B`, on a private copy of the study with that
+federation's `platform.toml` beside it, as the step places it; `shardresume.check_one_campaign`), and print nothing
+unless they are all one. A refusal names each shard that differs from the largest group of equal shards by its label and
+the first differing top-level key of the fingerprint (`platform` for a setting of the platform file, the usual one),
+never a host, a path or a value, so the fix is to compare those federations' files; a federation whose `platform.toml`
+cannot be read, or whose fingerprint cannot be taken, is refused by its label too, with the program's status and none
+of its output. It costs one start of the manifest's Python per shard.
+
 **What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the
 step makes its `work_root` (0700) before the dispatcher and refuses one that is a link, another user's, open to others
 or not under `--tmpfs`. It copies the federation's `platform.toml` beside the study's `study.toml` in its copy, where
@@ -953,7 +965,11 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   their shards would never merge. It names each federation and the differing keys. **A federation whose layout has an
   ingested space** (the pilot's `delta-space`) is planned only once its data is verified: run `hpcfed.py --layout L
   --root <fleet>/fed-k/root verify-data` on each, after the study's ingest and before `plan` (the fleet has no verb
-  for it); until then `plan` refuses it, naming the space. It also refuses a manifest whose `python` imports a core that names no code (unknown or stale: the note above), before anything is recorded.
+  for it); until then `plan` refuses it, naming the space. **The study's own fingerprint is checked too (O63):** the
+  platform fingerprint above is the platform's half, and a study's plugin may fingerprint a setting that half leaves
+  out, so `plan` also takes the campaign fingerprint beside each assigned shard's `platform.toml`, as `shards.py plan`
+  does, and refuses before it assigns or writes anything unless they are all one.
+  It also refuses a manifest whose `python` imports a core that names no code (unknown or stale: the note above), before anything is recorded.
 - **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never
   starts in the directory you ran it from), its client recorded and its output in `<fleet>/logs/`, after checking the
   federation again, that `shards.toml` is the one the record gives, that the manifest's `python` still imports a core

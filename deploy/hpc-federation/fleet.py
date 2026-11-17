@@ -340,6 +340,7 @@ class Fleet:
             plan = fleetplan.load(draft)
             holding = {**{s["label"]: s["member"] for s in record["shards"] if s["member"]}, **new}
             lines = {label: fleetplan.line_of(plan, label, False) for label in sorted(holding)}
+            fleetplan.check_campaign(plan, sorted(holding))  # one campaign fingerprint, before anything is assigned
             fleetplan.require_core(plan)  # last: it runs the manifest's interpreter; nothing is recorded before it
 
             def apply(current: Dict[str, Any]) -> None:

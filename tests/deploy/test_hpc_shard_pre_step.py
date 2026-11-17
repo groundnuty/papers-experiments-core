@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
+from fingerprint_support import standin_python
 
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
 SPEC = {"index": 1, "count": 2, "label": "fed-a"}
@@ -433,7 +434,7 @@ def test_o63_archive_left_archives_a_kept_out_without_the_guard_and_carries_its_
 def manifest(tmp_path: Path, extra: str = "", guard: str | None = "raise SystemExit(0)\n") -> Path:
     """A shard plan of two federations; `extra` (top-level keys) goes before the `[[shards]]`."""
     make_study(tmp_path, guard)
-    lines = [f'study = "{tmp_path / "study"}"', f'python = "{tmp_path / "venv" / "python"}"',
+    lines = [f'study = "{tmp_path / "study"}"', f'python = "{standin_python(tmp_path / "venv")}"',
              f'core_src = "{tmp_path / "core" / "src"}"', f'results = "{tmp_path / "results"}"',
              f'tmpfs = "{tmp_path / "tmpfs"}"', 'step_path = "/usr/bin:/bin"', "cpus = 6",
              'memory = "18g"']  # fmt: skip

@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fingerprint_support import standin_python
 from hpc_fed_support import LAYOUT, PILOT_TEMPLATE, SITE, agent_site, data_stand_in, hpc_on_path, services_only
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
@@ -841,7 +842,7 @@ def manifest(tmp_path: Path, extra: str = "", expected: dict | str | None = None
     """A shard plan of two federations; `extra` (top-level keys) goes before the `[[shards]]`; `expected` is the study's
     expected record, when there is one."""
     make_study(tmp_path, expected)
-    lines = [f'study = "{tmp_path / "study"}"', f'python = "{tmp_path / "venv" / "python"}"',
+    lines = [f'study = "{tmp_path / "study"}"', f'python = "{standin_python(tmp_path / "venv")}"',
              f'core_src = "{tmp_path / "core" / "src"}"', f'results = "{tmp_path / "results"}"',
              f'tmpfs = "{tmp_path / "tmpfs"}"', 'step_path = "/usr/bin:/bin"', "cpus = 6",
              'memory = "18g"']  # fmt: skip

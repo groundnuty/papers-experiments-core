@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from fingerprint_support import standin_python
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in, make_ca
 
@@ -192,8 +193,10 @@ class Bench:
     def settings(self) -> Path:
         """The shard settings an operator gives plan: shards.py's keys, no [[shards]]."""
         path = self.base / "shard-settings.toml"
+        (self.base / "study").mkdir(exist_ok=True)  # the campaign fingerprint is taken on a copy of it (O63)
+        python = standin_python(self.base / "venv", real_platform=True)
         lines = [f'{key} = "{self.base / key}"' for key in ("study", "results")]
-        lines += ['python = "/usr/bin/python3"', f'core_src = "{self.base / "src"}"', f'tmpfs = "{self.node_tmp}"']
+        lines += [f'python = "{python}"', f'core_src = "{self.base / "src"}"', f'tmpfs = "{self.node_tmp}"']
         lines += ['step_path = "/usr/bin:/bin"', "cpus = 2", 'memory = "4g"']
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
