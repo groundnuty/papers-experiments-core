@@ -155,6 +155,19 @@ def pin_values(directory: Path) -> dict:
     return hpcpins.values(hpcsettings.site_from_environment(site))
 
 
+def write_address_map(layout: Any) -> None:
+    """The map `up` leaves in the root of a layout of declared names (`service_client` refuses a root without one):
+    each service's declared name at an invented address of its own, with a node name of its own."""
+    from expcore_onedata.addresses import AddressMap
+
+    layout.secrets.mkdir(parents=True, exist_ok=True)
+    hosts = {
+        service.host: {"address": f"10.0.0.{n + 1}", "nodes": [f"node{n + 1:02d}.cluster.example.org"]}
+        for n, service in enumerate(layout.spec.services)
+    }
+    AddressMap.from_document({"format": "expcore-address-map/1", "hosts": hosts}).write(layout.address_map)
+
+
 # Options Slurm passes from one component of a heterogeneous job to the next (heterogeneous_jobs.html, those sbatch
 # takes that the driver uses); every other option of a later component falls back to Slurm's default.
 PROPAGATED = ("--job-name", "--account", "--time", "--mem", "--no-requeue", "--export", "--output", "--chdir")

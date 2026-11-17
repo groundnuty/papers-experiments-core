@@ -9,7 +9,7 @@ import tomllib
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import data_stand_in, hpc_on_path, manifest_values, pin_values
+from hpc_fed_support import data_stand_in, hpc_on_path, manifest_values, pin_values, write_address_map
 from hpc_import_support import (
     IMPORT_LAYOUT,
     IMPORT_TEMPLATE,
@@ -170,7 +170,9 @@ def core_root(hpc, tmp_path, make_ca, layout_file):
         (root / name).write_text(value, encoding="utf-8")
         os.chmod(root / name, 0o600)
     hosts = {s.name: f"{s.name}.cluster.example.org" for s in spec.services}
-    return root, fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
+    layout = fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
+    write_address_map(layout)  # `up` leaves one in a root of declared names
+    return root, layout
 
 
 def boot_of(layout, storages=None):
@@ -188,7 +190,7 @@ def boot_of(layout, storages=None):
 def run_core(hpc, layout, environ, events, storages=None, **replaced):
     options = {
         "environ": environ,
-        "rest": lambda ca: SimpleNamespace(close=lambda: None),
+        "rest": lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
         "bootstrap": lambda rest, lay, owner: boot_of(lay, storages),
         "steps": lambda boot: events.append("steps"),
         "content": lambda boot: SimpleNamespace(reset=lambda timeout: None),
