@@ -21,8 +21,10 @@ Run on the login node with the site's values exported (`set -a; . site.env; set 
   `<fleet>/logs/<label>.<up|down>.log`.
 - add: K fresh federations into the fleet, by the same rules, the maximum counting every one that may hold a job.
 - plan: each shard on a federation (`fleetplan`), written to `<fleet>/shards.toml`, and each one's srun line printed
-  as `shards.py plan` prints it.
-- step: each assigned shard's line launched detached on the login node, its client recorded.
+  as `shards.py plan` prints it; refused, with nothing recorded, when the manifest's python imports a core that names
+  no code (C06: unknown or stale), as `shards.py plan` refuses it.
+- step: each assigned shard's line launched detached on the login node, its client recorded; the same core check
+  first, when there is a line to launch.
 - status: what the record and each root's state file say; nothing is run.
 - down: every federation this fleet made, or one, taken down by `hpcfed.py down` and verified gone; a root or state
   that is not the one this fleet's up made is refused and left untouched, and nothing else is ever looked for.
@@ -338,6 +340,7 @@ class Fleet:
             plan = fleetplan.load(draft)
             holding = {**{s["label"]: s["member"] for s in record["shards"] if s["member"]}, **new}
             lines = {label: fleetplan.line_of(plan, label, False) for label in sorted(holding)}
+            fleetplan.require_core(plan)  # last: it runs the manifest's interpreter; nothing is recorded before it
 
             def apply(current: Dict[str, Any]) -> None:
                 current["template"] = settings

@@ -59,6 +59,9 @@ def shards():
     sys.modules["hpc_shards_verify"] = module  # its dataclasses look their module up by name
     try:
         spec.loader.exec_module(module)
+        # these manifests name an interpreter that does not exist; the core it imports is asked in
+        # test_hpc_shards_core_identity.py (C06), with real interpreters
+        module.identify_core = lambda plan: {"known": True, "stale": False, "why": None}
         yield module
     finally:
         sys.modules.pop("hpc_shards_verify", None)

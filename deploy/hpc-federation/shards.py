@@ -136,6 +136,14 @@ it to the node's tmpfs and runs it there, since the campaign's store (SQLite, an
 a network filesystem; it checks first that the interpreter imports the core it was given (`--core-src`), relays SIGTERM
 to the dispatcher, and ends with the dispatcher's exit status.
 
+**The core must name its code (C06).** `expcore run` refuses to start on a core whose commit is unknown (a copy without
+`.git` and without a build identity: what `git archive` leaves) or whose installed source differs from its build's
+(stale), so a shard on one would reach its node, start and stop there. `plan` and `lines` ask the manifest's `python`
+which core it imports (a process of its own, `-I`, under the step's PATH and no home), and `step` reads the identity of
+its own interpreter, which the dispatcher is, before anything is made; each refuses an unknown or stale core, saying to
+use a git checkout of the core or a wheel built with its build identity (`hatch build` writes
+`expcore/_build_identity.json`). A dirty core is not asked here: the run refuses it with its own message.
+
 **How a shard comes back.** Once the dispatcher has exited (its lock released), `step` writes the copy's `out/` whole,
 `campaign.lock` included, to `<results>/<label>.out.tar` with a manifest beside it (`<label>.out.json`: its SHA-256,
 bytes, files, the shard's spec and the dispatcher's exit status), each written whole and renamed into place, and removes
@@ -247,6 +255,17 @@ PLACEMENTS = ("het", "separate")  # the sandbox record's placements: a het compo
 LOCK_NAME = "campaign.lock"  # expcore.campaign.lock.LOCK_NAME: the merge refuses a shard without it
 ALLOWLIST = ("PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT")
 CORE_MISMATCH = 97  # the step's interpreter imports another core than the one it was given
+CORE_REMEDY = (  # what an operator does about a core that names no code (`expcore run` refuses to start on one)
+    "use a git checkout of the core, or a wheel built with its build identity "
+    "(hatch build writes expcore/_build_identity.json)"
+)
+CORE_PROBE_S = 120  # how long the manifest's interpreter has to say which core it imports
+# What the manifest's interpreter runs for `plan` and `lines`: `this_core`, in a process of its own.
+CORE_PROBE = """import json
+from expcore.provenance import core_identity
+found = core_identity.current()
+print(json.dumps({"known": found.known, "stale": found.stale, "why": found.why}))
+"""
 ARCHIVE_FAILED = 75  # the dispatcher ended but its out/ could not be archived: kept on the node's tmpfs
 PRE_STEP_REFUSED = 73  # a script the study declared refused the step, or could not be run as declared, or the
 # federation's render identity is not the expected one (or could not be compared with it): nothing made
@@ -1047,6 +1066,52 @@ def imports_core_from(core_src: Path, find: Callable[[], str] | None = None) -> 
         return Path(find()).resolve().is_relative_to(core_src.resolve())
     except (OSError, ValueError):
         return False
+
+
+def this_core() -> dict[str, Any]:
+    """The core this interpreter imports, as `CORE_PROBE` reports it: whether its commit is known, whether an installed
+    core is stale (its source differs from its build's), and why (`expcore.provenance.core_identity`)."""
+    from expcore.provenance import core_identity
+
+    found = core_identity.current()
+    return {"known": found.known, "stale": found.stale, "why": found.why}
+
+
+def core_refusal(report: Mapping[str, Any]) -> str | None:
+    """Why `expcore run` would refuse to start on the core a report describes, else None: its commit is unknown (a copy
+    without `.git` and without a build identity, which is what `git archive` leaves) or its install is stale
+    (`provenance.core_check.require_core`). Dirt is not asked here: the run's own message names it."""
+    if not report["known"]:
+        state = "unknown"
+    elif report["stale"]:
+        state = "stale"
+    else:
+        return None
+    return f"the core is {state} ({report.get('why')}), and `expcore run` refuses to start on it: {CORE_REMEDY}"
+
+
+def identify_core(plan: Plan) -> dict[str, Any]:
+    """What the manifest's interpreter says of the core it imports: `CORE_PROBE` run as the step runs, `-I -B`, under
+    the step's PATH and the no-home environment (a checkout's identity is read with git, so a login node's own PATH and
+    git configuration must not decide it). A refusal, naming why, when it cannot say."""
+    env = {"PATH": plan.step_path, "LC_ALL": "C", **home_env(NO_HOME)}
+    cannot = "the manifest's python could not report the core's identity"
+    try:
+        done = subprocess.run([plan.python, "-I", "-B", "-c", CORE_PROBE], capture_output=True, text=True,
+                              errors="replace", env=env, timeout=CORE_PROBE_S, check=False)  # fmt: skip
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ShardsError(f"{cannot} ({type(error).__name__})") from None
+    if done.returncode != 0:
+        last = (done.stderr.strip().splitlines() or ["no message"])[-1][:200]
+        raise ShardsError(f"{cannot} (exit {done.returncode}: {last})")
+    try:
+        report = json.loads(done.stdout.strip().splitlines()[-1])
+        ok = isinstance(report["known"], bool) and isinstance(report["stale"], bool)
+    except (IndexError, KeyError, TypeError, ValueError):
+        ok = False
+    if not ok:
+        raise ShardsError(f"{cannot} (it printed something else)")
+    return report
 
 
 # The dispatcher's first words, in its own process. It asks the kernel to kill it when its step dies
@@ -2066,6 +2131,9 @@ def step(
     if not core_found(args.core_src):
         print("shards: ERROR: this interpreter does not import the core from --core-src", file=sys.stderr)
         return CORE_MISMATCH
+    refusal = core_refusal(this_core())  # the dispatcher is this interpreter's: it would stop at its start on this core
+    if refusal:
+        raise ShardsError(refusal)
     from expcore.campaign import out_snapshot
 
     if args.tmpfs.is_symlink() or not args.tmpfs.is_dir():
@@ -2293,9 +2361,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         plan = pinned(plan)  # each declared script read and hashed before any line is printed
         script = Path(__file__).resolve()
+        built = []
         for shard in plan.shards:
-            fed = federation(shard)
-            line = step_argv(plan, shard, fed, script)
+            line = step_argv(plan, shard, federation(shard), script)
             record = {"shard": shard.label, "argv": line}
             if plan.pre_step is not None:
                 record["pre_step"] = {"path": plan.pre_step, "sha256": plan.pre_step_sha256,
@@ -2306,6 +2374,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if plan.expect_render_identity is not None:
                 record["expect_render_identity"] = {"path": plan.expect_render_identity,
                                                     "sha256": plan.expect_render_identity_sha256}  # fmt: skip
+            built.append((line, record))
+        refusal = core_refusal(identify_core(plan))  # last: it runs the manifest's interpreter, as the step will
+        if refusal:
+            raise ShardsError(refusal)
+        for line, record in built:
             print(json.dumps(record) if args.command == "plan" else shlex.join(line))
         return 0
     except ShardsError as error:

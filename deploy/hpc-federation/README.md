@@ -675,14 +675,26 @@ name is a warning. It checks the archives, which are what the merge needs; the `
 shard's journals and snapshots in `<results>` come along in the same pull and are evidence too, but are not checked.
 **Do not run `down` until it exits 0**: `down` cannot see your host and does not check that you did.
 
-> **A bare copy of the core without `.git` is refused as `core_src`.** The core names itself by its commit in every
-> campaign's environment (`provenance.core_identity`), read from the git work tree its `src/` lies in, or from the build
-> record of a wheel made from one. A copy of the core's files without `.git` (a tarball, an `rsync` that leaves `.git`
-> out, a `git archive`) has no commit to name: its identity is unknown, and `expcore run`, `check`, `merge` and `analyze`
-> refuse to start on a core whose commit is unknown, with or without the allow-dirty option, so every shard step on it
-> stops at its start with "the core's commit is unknown". Point `core_src` at the `src/` of a `git clone` (or install a
-> wheel built from one into the interpreter's environment), and commit what you run: a checkout with uncommitted changes
-> is refused too unless the command allows dirt, and a campaign run so records the core dirty.
+> **The core on the shared filesystem is a git checkout, or a wheel built with its build identity (C06).** The core
+> names itself by its commit in every campaign's environment (`provenance.core_identity`), read from the git work tree
+> its `src/` lies in, or from `expcore/_build_identity.json`, which the build (`hatch_build.py`, under `uv build` or
+> `hatch build`) writes into a wheel from the checkout it builds from. A copy of the core's files with neither (a
+> `git archive`, a tarball, an `rsync` that leaves `.git` out) has no commit to name: its identity is unknown, and
+> `expcore run`, `check`, `merge` and `analyze` refuse to start on it, with or without the allow-dirty option. Set the
+> core up one of two ways:
+>
+> - **A checkout:** `git clone` the core's repository to a directory the nodes see, check out the commit to pin, make
+>   the interpreter's environment from it (`uv sync`, or `uv venv` and `uv pip install --editable .`), and give
+>   `core_src` as the checkout's `src/`. Commit what you run: a checkout with uncommitted changes is refused too unless
+>   the command allows dirt, and a campaign run so records the core dirty.
+> - **A wheel:** build it from a checkout of that commit (`uv build --wheel`), install it into the interpreter's
+>   environment (`uv pip install --python <venv>/bin/python <wheel>`), and give `core_src` as that environment's
+>   `site-packages` directory.
+>
+> `shards.py plan` and `lines` ask the manifest's `python` which core it imports, and `step` reads its own, before
+> anything is made: an unknown or stale core (an installed one edited since its build) is refused there, naming this
+> remedy. Before, a shard on a `git archive` reached its node, started, and stopped there with "the core's commit is
+> unknown".
 
 **What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the
 step makes its `work_root` (0700) before the dispatcher and refuses one that is a link, another user's, open to others
@@ -910,11 +922,12 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   their shards would never merge. It names each federation and the differing keys. **A federation whose layout has an
   ingested space** (the pilot's `delta-space`) is planned only once its data is verified: run `hpcfed.py --layout L
   --root <fleet>/fed-k/root verify-data` on each, after the study's ingest and before `plan` (the fleet has no verb
-  for it); until then `plan` refuses it, naming the space.
+  for it); until then `plan` refuses it, naming the space. It also refuses a manifest whose `python` imports a core that names no code (unknown or stale: the note above), before anything is recorded.
 - **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never
   starts in the directory you ran it from), its client recorded and its output in `<fleet>/logs/`, after checking the
-  federation again, that `shards.toml` is the one the record gives, and that Slurm still holds the job the line lands
-  in, running, under the name its federation's `up` gave it (Slurm reuses ids). A shard is not launched again while its
+  federation again, that `shards.toml` is the one the record gives, that the manifest's `python` still imports a core
+  that names its code, and that Slurm still holds the job the line lands in, running, under the name its federation's
+  `up` gave it (Slurm reuses ids). A shard is not launched again while its
   client runs; one whose step ended is relaunched only with `--shard L --resume`. A shard refused exits 1. A site that
   needs `HPC_STEP_NETWORK` gives it to each federation's own steps (`hpcfed`); a shard's step, on the agent's own job of
   one component, carries none.
