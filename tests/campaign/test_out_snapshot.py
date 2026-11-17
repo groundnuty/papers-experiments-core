@@ -1,18 +1,22 @@
 """Snapshots of a live campaign's out/, verified and swapped in by rename, and their restore (O62)."""
 
 import json
+import os
 import sqlite3
+import stat
 
 import pytest
 from campaign_support import NOW, finished, make_manifest, make_schema
 from scheduler_support import build
 
 from expcore.campaign import out_snapshot
+from expcore.campaign.defect_log import write_note
 from expcore.campaign.markers import MARKER_NAME, read_marker, write_marker
 from expcore.campaign.out_snapshot import OutSnapshotError, restore, snapshots, take
 from expcore.campaign.recovery import recover
 from expcore.campaign.snapshot import take_snapshot
 from expcore.campaign.store import Store
+from expcore.records.redact import Redactor
 
 FACTS = {"shard": {"index": 1, "count": 2, "label": "fed-a"}, "base": None}
 
@@ -110,6 +114,29 @@ def test_o62_the_lease_notes_the_logs_and_the_lock_come_back_and_the_live_store_
     restore(made, new)
     assert (new / "leases" / "slot-1.lock").read_text() == '{"holder": 4321, "unit": "unit-m1"}'
     assert (new / "campaign.lock").is_file()
+
+
+def test_l08_the_local_log_stays_private_in_a_snapshot_and_in_its_restore_whatever_the_umask(live, tmp_path):
+    """L08: the campaign's local log holds the text of a withheld start diagnostic, and a snapshot is pulled to the
+    operator's host with the shard's results: `logs/` is 0700 and the log 0600 in the snapshot and in the out/ it is
+    restored to, as the core's own writer made them and under a umask that would make them readable by others."""
+    out, _store = live
+    previous = os.umask(0o022)
+    try:
+        write_note(
+            out, title="k attempt 1: a withheld diagnostic", stamp="T", text="a note\n", redactor=lambda: Redactor([])
+        )
+        made = snap(out, tmp_path / "snaps", tmp_path)
+        restored = tmp_path / "new" / "out"
+        restore(made, restored)
+    finally:
+        os.umask(previous)
+    for root in (made, restored):
+        logs = root / "logs"
+        assert (logs / "harness-errors.log").read_text(encoding="utf-8").endswith("a note\n"), root
+        assert stat.S_IMODE(logs.stat().st_mode) == 0o700, (root.name, oct(stat.S_IMODE(logs.stat().st_mode)))
+        mode = stat.S_IMODE((logs / "harness-errors.log").stat().st_mode)
+        assert mode == 0o600, (root.name, oct(mode))
 
 
 def test_o62_the_store_is_copied_first_so_a_run_that_ends_between_the_copies_is_recovered(live, tmp_path):

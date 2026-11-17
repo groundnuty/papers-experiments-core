@@ -11,7 +11,7 @@ from loop_support import FakeProvider
 from record_support import CODE
 from scheduler_support import FakeExecutor, attempts_of, build, key_of
 
-from expcore.campaign.defect_log import HARNESS_LOG, Chained, log_path, write_defect
+from expcore.campaign.defect_log import HARNESS_LOG, Chained, DefectLog, log_path, write_defect
 from expcore.campaign.executor import record_run
 from expcore.config.loading import ConfigError
 from expcore.loop.outcomes import harness_defect_of
@@ -82,6 +82,30 @@ def test_l08_the_log_is_ignored_by_git_whatever_the_studys_own_gitignore_says(tm
         text=True,
     )
     assert status.stdout == ""
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_c40_a_withheld_diagnostics_note_is_never_staged_by_git_in_a_study_repository(tmp_path):
+    """C40: the note a withheld diagnostic leaves in `out/logs/harness-errors.log` is local evidence, never committed.
+    The core writes the ignore file that keeps it out (`out/logs/.gitignore`), so the assertion is on that file as a
+    study repository meets it: its own ignore file does not mention `out/`, everything is added as a person would
+    (`git add -A`), and neither the log nor the ignore file is staged or left untracked."""
+    note = "the instrument saw a space named by the executor's own secret\n"
+    (tmp_path / "study.toml").write_text("name = 'a-study'\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
+    log = DefectLog(tmp_path / "out", "run-key", 1, lambda: "T", lambda: Redactor([]))
+    assert log.keep_private("a diagnostic withheld", note) is True
+    assert note in log_path(tmp_path / "out").read_text(encoding="utf-8")
+    git = ["git", "-C", str(tmp_path)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    staged = subprocess.run([*git, "ls-files"], check=True, capture_output=True, text=True).stdout.split()
+    assert staged == [".gitignore", "study.toml"]  # the control: what a study keeps is staged, nothing of out/logs is
+    status = subprocess.run(
+        [*git, "status", "--porcelain", "--untracked-files=all"], check=True, capture_output=True, text=True
+    ).stdout
+    assert "out/" not in status
+    assert subprocess.run([*git, "check-ignore", "-q", "out/logs/harness-errors.log"], check=False).returncode == 0
 
 
 def test_l08_a_traceback_that_cannot_be_redacted_is_withheld_with_the_reason(tmp_path):
