@@ -8,6 +8,7 @@ record can be compared with the check that made it. The probe's own behaviour, o
 is in `tests/onedata/placement/test_link_record.py`.
 """
 
+import contextlib
 import json
 import threading
 
@@ -17,6 +18,7 @@ from gate_support import EVERY, Federation, gate_of
 from heal_support import RESTORED, STORES, HealServices, four_providers, stale
 
 from expcore_onedata import fault_serves
+from expcore_onedata.admission import FederationLock
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_epoch import LinkEpoch
 from expcore_onedata.fault_serves import ServingProbe
@@ -236,6 +238,133 @@ def test_o35_a_restores_heal_ends_with_the_passing_rechecks_record(tmp_path, mon
     assert wired.on_disk[-1] is False
     assert wired.text() == record_text(wired.reports[-1])
     assert json.loads(wired.text())["window"]["end_epoch_s"] == services.checked_at[-1]
+
+
+# --- a record that was not written is said in the run's facts ---------------------------------------------------------
+
+
+def no_lock(monkeypatch) -> None:
+    """The record's lock is never taken (the `up` note's case on a root whose `flock` the filesystem refuses)."""
+
+    @contextlib.contextmanager
+    def unlocked(path):
+        yield False
+
+    monkeypatch.setattr(fault_serves, "recording", unlocked)
+
+
+def refused_writes(monkeypatch) -> None:
+    """The lock is taken and the write is refused (a read-only root, a full disk)."""
+
+    def refused(report, path):
+        raise PermissionError(13, "read-only file system")
+
+    monkeypatch.setattr(fault_serves, "write_record", refused)
+
+
+def said(reading) -> dict:
+    """The two optional facts of a reading, those it holds."""
+    return {key: reading[key] for key in ("link_record", "link_record_reason") if key in reading}
+
+
+def mentioning(snapshot) -> list:
+    """Every place of the snapshot that holds the fact: its top level and each step."""
+    return [place for place in (snapshot, *snapshot["steps"]) if "link_record" in place]
+
+
+NOT_TAKEN = {"link_record": "not_written", "link_record_reason": "lock_not_taken"}
+NOT_WRITTEN = {"link_record": "not_written", "link_record_reason": "write_failed"}
+
+
+def test_o35_a_restore_whose_check_wrote_its_record_says_nothing_of_it(tmp_path, monkeypatch):
+    """O35: the optional fact is absent, never null, from the snapshot and from each of its steps, when the record was
+    written as it always was."""
+    services = WiredRestore()
+    services.stuck = set()
+    injector, _ = wire_restore(tmp_path, monkeypatch, services)
+    injector.start(RUN)
+    assert injector.clear() is True
+    snapshot = injector.snapshot()
+    assert mentioning(snapshot) == []
+    assert "link_record_reason" not in json.dumps(snapshot)
+
+
+def test_o35_a_restore_whose_check_could_not_take_the_lock_says_so_in_the_snapshot(tmp_path, monkeypatch):
+    """O35: the log line is not the run's record. The restore's check made without the record's lock writes nothing, and
+    the snapshot the run's record keeps says `link_record: "not_written"` with `lock_not_taken`, at its top level and
+    as a step of its own; the restore is verified all the same, since the record is advisory."""
+    services = WiredRestore()
+    services.stuck = set()
+    injector, wired = wire_restore(tmp_path, monkeypatch, services)
+    no_lock(monkeypatch)
+    injector.start(RUN)
+    assert injector.clear() is True
+    snapshot = injector.snapshot()
+    assert snapshot["restore_verified"] is True
+    assert said(snapshot) == NOT_TAKEN
+    (step,) = [step for step in snapshot["steps"] if step["step"] == "link_record"]
+    assert (step["ok"], said(step)) == (False, NOT_TAKEN)
+    assert wired.record_ok() is None  # nothing was written
+
+
+def test_o35_a_restore_whose_record_could_not_be_written_says_write_failed_in_the_snapshot(tmp_path, monkeypatch):
+    """O35: the other reason, a write the directory refused, is its own word, and holds no path or error text."""
+    services = WiredRestore()
+    services.stuck = set()
+    injector, _ = wire_restore(tmp_path, monkeypatch, services)
+    refused_writes(monkeypatch)
+    injector.start(RUN)
+    assert injector.clear() is True
+    snapshot = injector.snapshot()
+    assert said(snapshot) == NOT_WRITTEN
+    assert str(tmp_path) not in json.dumps(snapshot)
+
+
+def test_o35_a_heal_whose_reads_could_not_take_the_lock_says_so_in_its_matrices_and_the_snapshot(tmp_path, monkeypatch):
+    """O35: a restore that heals reads the pairs again and again; each read made without the lock says so in its matrix
+    (the heal's `first`, `before` and `after`), and the snapshot says it once, at the top, for the run."""
+    services = WiredRestore()
+    services.stuck = stale().stuck
+    services.wedge_s = 20.0
+    injector, _ = wire_restore(tmp_path, monkeypatch, services, heal="all_links")
+    no_lock(monkeypatch)
+    injector.start(RUN)
+    assert injector.clear() is True
+    snapshot = injector.snapshot()
+    assert said(snapshot) == NOT_TAKEN
+    (heal,) = [step for step in snapshot["steps"] if step["step"] == "heal"]
+    assert [said(heal[key]) for key in ("first", "before", "after")] == [NOT_TAKEN] * 3
+
+
+def test_o35_a_recovery_that_settles_an_earlier_runs_injection_says_it_in_its_recovered_step(tmp_path, monkeypatch):
+    """O35: the start's recovery of an injection an earlier run left open (`recovered`) carries the fact in its own
+    step, as it carries the gate's and the heal's records, and the snapshot says it too."""
+    services = WiredRestore()
+    services.stuck = set()
+    first, wired = wire_restore(tmp_path, monkeypatch, services)
+    first.start(RUN)
+    first._unlock()  # the run's process ends: the kernel drops its lock on the target, and its admission
+    first._release_admission()
+    no_lock(monkeypatch)
+    following = injector_for(wired.settings.file, services, target=RESTORED, clock=services.clock)
+    with FederationLock(wired.settings).held(exclusive=True, timeout_s=5):
+        following.start({"run_key": "the-next-run", "attempt": 1})
+        (recovered,) = [step for step in following.snapshot()["steps"] if step["step"] == "recovered"]
+        assert following.clear() is True
+    assert recovered["ok"] is True
+    assert said(recovered) == NOT_TAKEN
+    assert said(following.snapshot()) == NOT_TAKEN
+
+
+def test_o35_the_fault_gates_heal_says_it_in_its_record_when_its_reads_were_not_written(tmp_path, monkeypatch):
+    """O35: the gate's heal has no run and no snapshot; its record (`PlatformHealth.gate_heal`, the `ended` line) holds
+    the pairs it read, and a read whose record was not written says so there."""
+    gate, federation, _, _ = wire_gate(tmp_path, monkeypatch, heal="all_links")
+    no_lock(monkeypatch)
+    reading = healed(gate, federation)
+    assert reading.ok is True, reading.detail
+    assert gate.last_heal["outcome"] == "healed"
+    assert said(gate.last_heal["after"]) == NOT_TAKEN
 
 
 # --- checks that overlap ---------------------------------------------------------------------------------------------
