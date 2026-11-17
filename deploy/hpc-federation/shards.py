@@ -933,9 +933,9 @@ def core_refusal(report: Mapping[str, Any]) -> str | None:
 
 
 def identify_core(plan: Plan) -> dict[str, Any]:
-    """What the manifest's interpreter says of the core it imports: `CORE_PROBE` run as the step runs, `-I -B`, under the
-    step's PATH and the no-home environment (a checkout's identity is read with git, so a login node's own PATH and git
-    configuration must not decide it). A refusal, naming why, when it cannot say."""
+    """What the manifest's interpreter says of the core it imports: `CORE_PROBE` run as the step runs, `-I -B`, under
+    the step's PATH and the no-home environment (a checkout's identity is read with git, so a login node's own PATH and
+    git configuration must not decide it). A refusal, naming why, when it cannot say."""
     env = {"PATH": plan.step_path, "LC_ALL": "C", **home_env(NO_HOME)}
     cannot = "the manifest's python could not report the core's identity"
     try:
