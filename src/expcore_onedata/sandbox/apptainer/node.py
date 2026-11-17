@@ -219,10 +219,19 @@ def _read(path: Path) -> str:
 
 
 def _start_of(pid: int) -> str | None:
-    """The start time of `pid` from `/proc`, or None when its directory is not there or not whole."""
+    """The start time of `pid` from `/proc`, or None when its directory is not there, not whole or cannot be read."""
+    try:
+        return _live_start(pid)
+    except OSError:
+        return None
+
+
+def _live_start(pid: int) -> str | None:
+    """The start time of `pid`, or None when the process is gone (no entry, the kernel's ESRCH, or an entry that is not
+    whole); an `OSError` when its `stat` is there and cannot be read: a live process that is unreadable is not gone."""
     try:
         parsed = P.parse_stat(_read(PROC / str(pid) / "stat"))
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     return None if parsed is None else parsed[3]
 
@@ -491,7 +500,11 @@ class LocalNode:
             return None
 
     def hidden_children(self, pid: int, start: str) -> list[int] | None:
-        if _start_of(pid) != start:  # gone, hidden itself (its parent's children name it), or another process now
+        try:
+            here = _live_start(pid)
+        except OSError:
+            return None  # there, and unreadable: never taken for gone
+        if here != start:  # gone, hidden itself (its parent's children name it), or another process now
             return []
         return P.hidden_children(lambda: _children(pid), _shown_ours, _exists)
 
@@ -502,7 +515,11 @@ class LocalNode:
             return None
 
     def task_affinity(self, pid: int, start: str) -> frozenset[int] | None:
-        if _start_of(pid) != start:  # gone, hidden, or another process now
+        try:
+            here = _live_start(pid)
+        except OSError:
+            return None  # there, and unreadable: never taken for gone
+        if here != start:  # gone, hidden, or another process now
             return frozenset()
         tasks = PROC / str(pid) / "task"
         try:
