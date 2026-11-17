@@ -202,7 +202,9 @@ class Driver(Down):
         text = template.read_text(encoding="utf-8") if template is not None else None
         declared = [space.data_manifest for space in self.spec.spaces if space.data_manifest]
         hpcpins.check(site, text, declared)
-        hpcplacement.check_template(text)  # a template declares [placement] holder (O79), which the core has no default for
+        hpcplacement.check_template(
+            text
+        )  # a template declares [placement] holder (O79), which the core has no default for
         # every declared manifest loads now, so a mistake in one fails before a job is held
         hpcdata.ingested_manifests(self.layout, hpcdata.study_values(site.study_artifacts))
         self.check_scratch(site)
