@@ -20,6 +20,7 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
 POST = "guards/post_run.py"
 PASS = "raise SystemExit(0)\n"
+NO_BYTECODE_VAR = "PYTHONDONTWRITEBYTECODE"  # the step sets it for every child of its dispatcher (B1)
 HOME_NAMES = {"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPTAINER_CONFIGDIR",
               "APPTAINER_CACHEDIR", "UV_CACHE_DIR", "PIP_CACHE_DIR", "PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL",
               "GIT_CONFIG_NOSYSTEM", "TMPDIR"}  # fmt: skip
@@ -169,7 +170,11 @@ def test_o63_the_script_runs_after_the_dispatcher_before_the_archive_isolated_in
     assert Path(found["argv"][2]).resolve() == cwd / "out"
     assert "campaign.lock" in found["out"]
     assert found["archived"] is False
-    assert set(found["env"]) == {"PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT"} | HOME_NAMES
+    assert (
+        set(found["env"])
+        == {"PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT", NO_BYTECODE_VAR} | HOME_NAMES
+    )
+    assert found["env"][NO_BYTECODE_VAR] == "1"  # what a Python of the script's own, started without -I, honours (B1)
     assert Path(found["env"]["HOME"]).parent == cwd.parent  # the step's own directory, never the account's
     assert found["env"]["TMPDIR"] == str(cwd.parent / "tmp")
     assert (found["record"]["phase"], found["record"]["exit_status"]) == ("archiving", 0)
@@ -536,7 +541,8 @@ def manifest_file(tmp_path: Path, extra: str = "", post: str | None = PASS, guar
         root = tmp_path / "fed" / name
         root.mkdir(parents=True, exist_ok=True)
         state = {"format": "expcore-hpc-federation/1", "allocation": {"job": str(100 + n), "name": f"hpcop-x-{n}"},
-                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked"}  # fmt: skip
+                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked",
+                 "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         (root / "platform.toml").write_text('[space]\nname = "s"\ndata_manifest = "m.json"\n')
     if extra:

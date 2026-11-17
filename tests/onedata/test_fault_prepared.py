@@ -110,11 +110,14 @@ class CountingClock(FakeClock):
 
 
 def normalised(lines):
-    """Journal lines with each injection's id replaced by its order of first appearance, and without the holder (the
-    pid and boot id of the process that journalled it)."""
+    """Journal lines with each injection's id replaced by its order of first appearance, and without the holder and
+    the owner (the pid and boot id of the process that journalled it, which the owner names too, O80)."""
     ids: dict[str, int] = {}
     return [
-        {**{key: value for key, value in line.items() if key != "holder"}, "id": ids.setdefault(line["id"], len(ids))}
+        {
+            **{key: value for key, value in line.items() if key not in ("holder", "owner")},
+            "id": ids.setdefault(line["id"], len(ids)),
+        }
         for line in lines
     ]
 

@@ -1,21 +1,26 @@
 """shards.py: one shard of a campaign per HPC federation (#154, milestone M5), from launch to merge.
 
-    uv run python deploy/hpc-federation/shards.py plan    --manifest shards.toml
-    uv run python deploy/hpc-federation/shards.py lines   --manifest shards.toml
-    <python> -I deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
-        --results DIR --core-src DIR                    # inside the step on the sandbox node; `lines` writes it
-    uv run python deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
-    <python> -I deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
+    <python> -I -B deploy/hpc-federation/shards.py plan    --manifest shards.toml
+    <python> -I -B deploy/hpc-federation/shards.py lines   --manifest shards.toml
+    <python> -I -B deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
+        --results DIR --core-src DIR --job J --step-name S  # inside the step on the sandbox node; `lines` writes it
+    <python> -I -B deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
+    <python> -I -B deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
     # a step's line may end in: --pre-step REL --pre-step-sha256 HEX --pre-step-timeout S  (`lines` writes them)
-    <node python> -I deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
+    #   and: --expect-render-identity REL --expect-render-identity-sha256 HEX  (the render the plan expects)
+    <python> -I -B deploy/hpc-federation/shards.py resume-line --manifest M --label L --job J --node N
+    <core python> -I -B deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
+
+Every Python here runs with `-I -B` (B1, live slot 5: a node step's imports wrote bytecode into the core's interpreter
+under the account's shared home; `-I` ignores PYTHONDONTWRITEBYTECODE, so only the flag stops it).
 
 **Where the dispatcher runs.** One shard runs per federation, as one job step on that federation's sandbox node: the
 Apptainer sandbox's data gate listens on that node's loopback and its cells are that node's `apptainer exec`s, so the
 dispatcher (`python -m expcore run STUDY --shard i/N --shard-label L`) must run there, never on the login node. A step
 is launched from the login node alone (srun cannot start one on a compute node), as the federation's own services are
-(`DESIGN.md`): `lines` prints each shard's `srun --jobid=<job> [--het-group=<g>] --exact ... /usr/bin/env -i
-<allowlist> <python> -I shards.py step ...`, to run detached (`setsid nohup ... &`). The job and the component are the
-state file's `sandbox` record's: a component of the federation's heterogeneous job (`het`) or a job of its own
+(`DESIGN.md`): `lines` prints each shard's `srun --jobid=<job> [--het-group=<g>] --exact ... --chdir=/ /usr/bin/env
+-i <allowlist> <python> -I -B shards.py step ...`, to run detached (`setsid nohup ... &`). The job and the component are
+the state file's `sandbox` record's: a component of the federation's heterogeneous job (`het`) or a job of its own
 (`separate`). Nothing here runs srun.
 
 **How it reaches its federation.** The step's environment is an allowlist: `PATH`, `LC_ALL`, and the federation's
@@ -38,6 +43,12 @@ its federation's `platform.toml` declares it (`data_manifest`, which `up` render
 space's Onezone id, which every federation's `up` makes anew, and the shards never merge. So `plan` and `lines` refuse
 a manifest of more than one federation whose platform files leave a space's data undeclared, naming each shard and
 space, before anything runs.
+
+**The study's own data is verified before a shard is planned (O57).** A space whose data comes from the study's ingest,
+after `up`, is checked by `hpcfed.py verify-data` (every file's path, size and SHA-256 read back through its owner and
+compared with the manifest it declares), which records a marker in the federation's state file. `plan` and `lines`
+refuse a federation whose ingested spaces have no marker, or whose marker is for another manifest than the one `up`
+recorded or the platform file names now, naming the shard and the spaces; so does a state with no record of them.
 
 **The study's own refusals: a pre-step guard.** A study that refuses a campaign it must not run (one worker, each
 model's cap exactly 1, a federation of its own) can have every step assert that again at its start, before anything is
@@ -80,6 +91,30 @@ true (a line that dropped the words); the core's `merge` refuses an `out/` holdi
 from such an archive as from any and decides afresh; `--archive-left` archives a kept `out/` as final only when the
 step's record says its script passed.
 
+**Which render a shard runs against: the render identity (O74).** `hpcfed.py up` writes `render-identity.json` in the
+federation's root (`hpcidentity.py`): mode 0600, canonical JSON, nothing but SHA-256s and a version: the template as it
+was read before it was rendered, the rendered platform's fingerprint, each pin the platform holds (the agent's SIF,
+the egress shim, the egress collector, oneclient's bundle), and, when the site declares `HPC_STUDY_ARTIFACTS`, the
+digest of that directory's tree (`study_artifacts_tree_sha256`; no path of the directory). A manifest that declares
+`expect_render_identity`, a path
+of the study (`render-identity.expected.json` at its root, say: a federation's record copied there), makes every line
+carry `--expect-render-identity REL --expect-render-identity-sha256 HEX` (`plan` and `lines` read the file by the
+guard's path rules, refuse one that is not a well-formed record, and record its hash; with none declared the line and
+the plan are what they were). `step` compares first, before the pre-step guard and before anything else is made: it
+reads the expected file below the held study root, shows it is the file the plan hashed, reads the federation's own
+record once from `$EXPCORE_FED_ROOT` (below that root, no link followed, a root of this user's that no group or other
+can write to), and refuses with `PRE_STEP_REFUSED` (73), naming the keys that differ and never a value, when they are
+not equal key by key, when either is not well formed, or when the federation has no record, an unreadable one, or no
+root named. Whether or not one is expected, a step that has the federation's record writes it, as validated (its
+canonical text: the bytes `up` wrote), into its `out/study-state/render-identity.<step id>.json` at its start, once a
+resume has restored `out/` and before the dispatcher starts, a file of this step's own (UTC time and four random
+bytes), so a snapshot, a step killed mid-shard, the archive and a post-run script all carry it, and a resumed shard
+keeps the identity each of its steps ran under; a step that cannot write it does not start. A federation whose `up`
+wrote none (before O74, or a layout with no platform template) and a plan with no expectation run as they did, and
+write none. A dispatcher that leaves nothing but the record leaves no `out/` to archive. The record
+is what `up` wrote: a `platform.toml` edited by hand afterwards is not seen, and a line edited to drop the two words
+runs unchecked.
+
 **The node's tmpfs is the node's, not the job's.** Each step's directory there (`expcore-shard-<label>.<random>`)
 records its step (`step.json`: its pid and start time, its shard, its federation's root, its results directory, the
 archive it started from, and its phase): `running` while its dispatcher runs, `archiving` from the moment it ends
@@ -114,12 +149,21 @@ its tmpfs directory; an archive that cannot be written leaves that directory in 
 the only whole `out/`. A start of a shard that has results is refused unless it is `--resume`, which unpacks that
 archive into its copy first, so a repeated launch line never replaces a finished shard. `collect` verifies a private
 copy of every shard's archive against its manifest and the manifest against the plan, unpacks that copy into
-`<into>/<label>/out`, read-only, and prints (or with `--run` runs) `python -m expcore merge`. A shard whose archive has
-no `campaign.lock`, does not verify, or is missing is refused, naming its label: the merge would refuse it too.
+`<into>/<label>/out`, read-only, and prints (or with `--run` runs, in `<into>`, a 0700 directory of ours) `<python> -I
+-B -m expcore merge`. A shard whose archive has no `campaign.lock`, does not verify, or is missing is refused, naming
+its label: the merge would refuse it too.
 
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
 own, and `EXPCORE_FED_ROOT` is how it finds that root. Outage runs on HPC depend on that relay.
+
+**What a step killed outright leaves, and a resume on another node (W1, W2, live slot 5).** Its sandbox's run, a
+dead FUSE mount in it: the next step on the node reaps the work root before it uses it (`reap_work_root`, the core's
+Apptainer reaper), and `sweep`, on every node a shard step of the federation ran on, reaps it too and removes the work
+root once empty. The shard's running mark on the shared results directory (`claim_running`) is what stops two steps
+of one shard on two nodes. `resume-line` (`shardresume.py`, login node only) prints a resume's line for a held job of
+the operator's on another node, after its checks, and records the job and the node in the federation's state, so
+`down` sweeps that node too.
 
 **Snapshots, and a step killed outright (O62).** The step's `out/` is on the node's tmpfs, so a step killed outright
 (walltime, a node's end, an OOM in the step's cgroup) would lose all of it. While the dispatcher runs, `step`
@@ -152,6 +196,7 @@ The manifest (`shards.toml`, operator-local, never committed, since it names the
     pre_step_timeout_s = 60           # optional, with pre_step: its bound in seconds (above 0, at most 600)
     post_run = "guards/post_run.py"   # optional: a script of the study that each step runs after its dispatcher exits 0
     post_run_timeout_s = 300          # optional, with post_run: its bound in seconds (above 0, at most 1800)
+    expect_render_identity = "render-identity.expected.json"  # optional: the render a federation must have (see above)
     [[shards]]                        # in order: shard i is the i-th entry
     label = "fed-a"                   # the shard's label (no host name: it travels with the export)
     root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml
@@ -206,7 +251,8 @@ found = core_identity.current()
 print(json.dumps({"known": found.known, "stale": found.stale, "why": found.why}))
 """
 ARCHIVE_FAILED = 75  # the dispatcher ended but its out/ could not be archived: kept on the node's tmpfs
-PRE_STEP_REFUSED = 73  # a script the study declared refused the step, or could not be run as declared: nothing made
+PRE_STEP_REFUSED = 73  # a script the study declared refused the step, or could not be run as declared, or the
+# federation's render identity is not the expected one (or could not be compared with it): nothing made
 POST_RUN_FAILED = 74  # the dispatcher exited 0 and the study's post-run script did not: archived, marked not final
 PRE_STEP_TIMEOUT_S = 60.0  # a guard's bound when the manifest names none
 PRE_STEP_MAX_S = 600.0  # the longest bound a manifest may give a guard
@@ -232,6 +278,28 @@ OWNER_POST = ".step.post.json"  # the same with the post-run script's record, wr
 RUNNING, ARCHIVING = "running", "archiving"  # the step's phase: its dispatcher runs; it ended and out/ is whole
 ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not be archived, so it is kept
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
+RUNNING_MARK, RUNNING_FORMAT = "running.json", "expcore-hpc-shard-running/1"  # <results>/<label>/: a step runs it
+# The federation's render identity (O74): the record `hpcfed.py up` writes in its root (hpcidentity.py: hashes and a
+# version, no address, id, path or secret). This file runs alone on a node, so it keeps its own copy of the names; a
+# test compares them with hpcidentity's.
+RENDER_IDENTITY = "render-identity.json"
+RENDER_IDENTITY_VERSION = "expcore-render-identity/1"
+RENDER_IDENTITY_PINS = (
+    "sandbox_sif_sha256",
+    "egress_shim_sha256",
+    "egress_collector_sha256",
+    "oneclient_bundle_sha256",
+)
+RENDER_IDENTITY_ARTIFACTS = "study_artifacts_tree_sha256"  # in the record only when the site declares the directory
+RENDER_IDENTITY_KEYS = (
+    "version",
+    "template_sha256",
+    "platform_fingerprint_sha256",
+    *RENDER_IDENTITY_PINS,
+    RENDER_IDENTITY_ARTIFACTS,
+)
+STUDY_STATE = "study-state"  # in a step's out/: what the step records of the federation it ran against
+SHA256_TEXT = re.compile(r"[0-9a-f]{64}")
 
 
 # The step's HOME, and every directory a tool writes under one, until it has made its directory on the tmpfs: a path
@@ -291,6 +359,8 @@ class Plan:
     post_run: str | None = None  # the study's post-run script: a path relative to its root
     post_run_sha256: str | None = None  # its SHA-256, recorded by `pinned`
     post_run_timeout_s: float = POST_RUN_TIMEOUT_S
+    expect_render_identity: str | None = None  # the render identity the plan expects: a path relative to the study
+    expect_render_identity_sha256: str | None = None  # its SHA-256, recorded by `pinned`
 
 
 # ------------------------------------------------------------------------------------------------ the manifest
@@ -311,7 +381,8 @@ def load_plan(path: Path) -> Plan:
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
     keys = {"study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory", "shards"}
-    optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s", "post_run", "post_run_timeout_s"}
+    optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s", "post_run", "post_run_timeout_s",
+                "expect_render_identity"}  # fmt: skip
     if not keys <= set(data) <= keys | optional:
         raise ShardsError(
             f"the manifest's keys must be: {', '.join(sorted(keys))}, and perhaps {', '.join(sorted(optional))}"
@@ -328,7 +399,9 @@ def load_plan(path: Path) -> Plan:
         bounds[key] = data.get(f"{key}_timeout_s", default)
         if problem := bound_problem(bounds[key], maximum):
             raise ShardsError(f"{key}_timeout_s {problem}")
-    for key in ("study", "core_src", "results", "tmpfs"):
+    if "expect_render_identity" in data and (problem := guard_path_problem(data["expect_render_identity"])):
+        raise ShardsError(f"expect_render_identity {problem}")
+    for key in sorted({"study", "python", "core_src", "results", "tmpfs"}):  # a step starts in / (`--chdir=/`)
         if not isinstance(data[key], str) or not data[key].startswith("/"):
             raise ShardsError(f"{key} must be an absolute path")
     if not isinstance(data["cpus"], int) or isinstance(data["cpus"], bool) or data["cpus"] < 1:
@@ -352,7 +425,7 @@ def load_plan(path: Path) -> Plan:
     return Plan(Path(data["study"]), str(data["python"]), Path(data["core_src"]), Path(data["results"]),
                 Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
                 float(every), data.get("pre_step"), None, float(bounds["pre_step"]), data.get("post_run"), None,
-                float(bounds["post_run"]))  # fmt: skip
+                float(bounds["post_run"]), data.get("expect_render_identity"))  # fmt: skip
 
 
 def federation(shard: Shard) -> dict[str, Any]:
@@ -376,6 +449,7 @@ def federation(shard: Shard) -> dict[str, Any]:
         raise ShardsError(f"shard {shard.label}: its federation has no held job on record")
     if state.get("phase") != LINKED:  # an up that failed (its data check, its link check) left a federation not ready
         raise ShardsError(f"shard {shard.label}: its federation's up has not finished (phase {state.get('phase')})")
+    check_ingested(shard, state)
     record = state.get("sandbox")
     placement, group = "allocation", None
     if record is not None:
@@ -399,7 +473,64 @@ def federation(shard: Shard) -> dict[str, Any]:
         raise ShardsError(f"shard {shard.label}: no sandbox node: the state file names none and the manifest neither")
     if shard.node and node != shard.node:
         raise ShardsError(f"shard {shard.label}: the manifest's sandbox_node is not the one its state file names")
-    return {"job": job, "name": name, "node": node, "placement": placement, "het_group": group}
+    listed = (record.get("component_job") or job) if placement == "het" else job  # `squeue -s`'s id for its steps
+    return {"job": job, "name": name, "node": node, "placement": placement, "het_group": group, "listed": listed}
+
+
+def platform_data(root: Path) -> dict[str, str | None]:
+    """For each space of the federation's `platform.toml` that declares its data (`data_manifest`), the content hash of
+    the manifest it names, as the dispatcher's fingerprint will take it (`Manifest.digest()`), None for a file that
+    cannot be read or is no manifest. A relative path is the root's, where the file lies."""
+    from expcore.config.loading import ConfigError
+    from expcore_onedata.importmanifest import load_manifest
+
+    data = tomllib.loads((root / PLATFORM).read_text(encoding="utf-8"))
+    entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
+    found: dict[str, str | None] = {}
+    for entry in entries:
+        if not (isinstance(entry, Mapping) and isinstance(entry.get("name"), str) and entry.get("data_manifest")):
+            continue
+        try:
+            found[entry["name"]] = load_manifest(root / str(entry["data_manifest"])).digest()
+        except (ConfigError, OSError, ValueError):
+            found[entry["name"]] = None
+    return found
+
+
+def check_ingested(shard: Shard, state: Mapping[str, Any]) -> None:
+    """Refuse a federation whose ingested spaces (those the study fills after `up`, which its state records) have no
+    verified marker (O57): data nothing has shown to be the declared data is data a shard would spend on under a
+    fingerprint that says otherwise. A marker is `hpcfed.py verify-data`'s pass, bound to the digest of the manifest it
+    compared with; it counts only while that is the manifest `up` recorded and the one the platform file names now (a
+    manifest edited after the verification changes the fingerprint and leaves the pass for another experiment). A state
+    with no record at all, from an `up` that predates it, cannot be shown verified."""
+    data = state.get("data")
+    ingested = data.get("ingested") if isinstance(data, Mapping) else None
+    if not isinstance(ingested, Mapping):
+        raise ShardsError(
+            f"shard {shard.label}: its federation's state has no record of its ingested spaces (its up predates it): "
+            "down, then up again"
+        )
+    if not ingested:
+        return
+    try:
+        declared = platform_data(shard.root)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        raise ShardsError(f"shard {shard.label}: its federation's {PLATFORM} could not be read") from None
+    unverified = []
+    for space, record in ingested.items():
+        record = record if isinstance(record, Mapping) else {}
+        verified = record.get("verified")
+        marker = verified.get("manifest") if isinstance(verified, Mapping) else None
+        recorded = record.get("manifest")
+        if not (isinstance(marker, str) and marker == recorded and declared.get(space, recorded) == recorded):
+            unverified.append(str(space))
+    if unverified:
+        spaces = ", ".join(sorted(unverified))
+        raise ShardsError(
+            f"shard {shard.label}: its federation's ingested space(s) have no verified data: {spaces} "
+            "(run `hpcfed.py verify-data` once the ingest is done)"
+        )
 
 
 def undeclared_data(plan: Plan) -> list[str]:
@@ -431,16 +562,27 @@ def _job_id(job: Any) -> bool:
     return isinstance(job, str) and job.isdigit()
 
 
-def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) -> list[str]:
-    """The login node's `srun` of one shard's step (the module's docstring): `--exact`, never `--overlap`; `--chdir=/`,
-    so the step never starts in the directory srun was run from, which may be a shared one; an environment of the
-    allowlist alone, set on the node by `env -i`, with no secret in it."""
+def step_name(fed: Mapping[str, Any], shard: Shard) -> str:
+    """The name of every step of the shard, wherever it runs (`lines`, `resume-line`): the one name a search of every
+    step of this user's finds it by."""
+    return f"{fed['name']}-shard-{shard.index}"
+
+
+def step_argv(
+    plan: Plan, shard: Shard, fed: Mapping[str, Any], script: Path, *, resume: bool = False, over: str | None = None
+) -> list[str]:
+    """The login node's `srun` of one shard's step (the module's docstring): `--exact`, never `--overlap`, in `/` on
+    the node (`--chdir=/`); an environment of the allowlist alone, set on the node by `env -i`, with no secret in it.
+    The step is told the id its step is listed under and its name, which its running mark records (`claim_running`);
+    `resume` and `over` are `resume-line`'s."""
     env = [f"PATH={plan.step_path}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={shard.root.parent}",
            f"EXPCORE_FED_ROOT={shard.root}", *(f"{k}={v}" for k, v in home_env(NO_HOME).items())]  # fmt: skip
-    step = [plan.python, "-I", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
+    step = [plan.python, "-I", "-B", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
             "--results", str(plan.results), "--core-src", str(plan.core_src),
-            "--snapshot-every", f"{plan.snapshot_every_s:g}"]  # fmt: skip
+            "--snapshot-every", f"{plan.snapshot_every_s:g}",
+            "--job", str(fed.get("listed") or fed["job"]), "--step-name", step_name(fed, shard),
+            *(["--resume"] if resume else []), *(["--over", over] if over else [])]  # fmt: skip
     if plan.pre_step is not None:  # the study's guard rides on the line: `step` runs it first (`run_pre_step`)
         if plan.pre_step_sha256 is None:
             raise ShardsError(
@@ -453,10 +595,16 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
             raise ShardsError("the post-run script is not pinned: no line is made from a plan that has not hashed it")
         step += ["--post-run", plan.post_run, "--post-run-sha256", plan.post_run_sha256,
                  "--post-run-timeout", f"{plan.post_run_timeout_s:g}"]  # fmt: skip
+    if plan.expect_render_identity is not None:  # and the record the federation's render must be: `step` compares first
+        if plan.expect_render_identity_sha256 is None:
+            raise ShardsError("the expected render identity is not pinned: no line is made from a plan that has not "
+                              "hashed it")  # fmt: skip
+        step += ["--expect-render-identity", plan.expect_render_identity, "--expect-render-identity-sha256",
+                 plan.expect_render_identity_sha256]  # fmt: skip
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
-        f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH", "--chdir=/",
+        f"--mem={plan.memory}", "-J", step_name(fed, shard), "--export=PATH", "--chdir=/",
         "/usr/bin/env", "-i", *env, *step,
     ]  # fmt: skip
 
@@ -513,7 +661,11 @@ def read_below(root_fd: int, path: str, name: str) -> bytes:
 
 def read_in_study(study: Path, key: str, path: str) -> bytes:
     """The bytes of the study's declared script `path` (`key` says which), read below the study's root."""
-    name = f"{HOOKS[key][0]} {path}"
+    return read_study_file(study, f"{HOOKS[key][0]} {path}", path)
+
+
+def read_study_file(study: Path, name: str, path: str) -> bytes:
+    """The bytes of the file `path` of the study (`name` says what it is in a message), read below the study's root."""
     try:
         fd = os.open(study, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError:
@@ -525,14 +677,20 @@ def read_in_study(study: Path, key: str, path: str) -> bytes:
 
 
 def pinned(plan: Plan) -> Plan:
-    """The plan with the SHA-256 of each declared script (its pre-step guard, its post-run script) recorded, from the
-    study as it is now: `plan` and `lines` call it, so that a script that leaves the study, is a link or is missing
-    refuses them before a line is printed. The same plan when none is declared."""
+    """The plan with the SHA-256 of each declared script (its pre-step guard, its post-run script) and of the expected
+    render identity recorded, from the study as it is now: `plan` and `lines` call it, so that a file that leaves the
+    study, is a link or is missing, or an expected record that is not well formed, refuses them before a line is
+    printed. The same plan when none is declared."""
     found = {}
     for key in HOOKS:
         path = getattr(plan, key)
         if path is not None:
             found[f"{key}_sha256"] = hashlib.sha256(read_in_study(plan.study, key, path)).hexdigest()
+    if plan.expect_render_identity is not None:
+        name = expected_identity_name(plan.expect_render_identity)
+        raw = read_study_file(plan.study, name, plan.expect_render_identity)
+        parse_render_identity(raw, name)
+        found["expect_render_identity_sha256"] = hashlib.sha256(raw).hexdigest()
     return replace(plan, **found)
 
 
@@ -687,9 +845,14 @@ def collect(plan: Plan, into: Path) -> list[Path]:
         raise ShardsError("the directory to collect into must be new or empty")
     wanted = None
     if plan.post_run is not None:  # the script the plan declares, as the study holds it now
-        wanted = pinned(replace(plan, pre_step=None)).post_run_sha256
+        wanted = pinned(replace(plan, pre_step=None, expect_render_identity=None)).post_run_sha256
     created = not into.exists()
-    into.mkdir(parents=True, exist_ok=True)
+    into.mkdir(mode=0o700, parents=True, exist_ok=True)
+    seen = into.lstat()  # the merge runs in it (`--run`): a private directory of ours, never one others may enter
+    if not stat.S_ISDIR(seen.st_mode) or seen.st_uid != os.getuid() or seen.st_mode & 0o077:
+        if created:
+            into.rmdir()
+        raise ShardsError("the directory to collect into must be a private directory of this user (0700)")
     try:
         found = []
         for shard in plan.shards:
@@ -716,8 +879,9 @@ def collect(plan: Plan, into: Path) -> list[Path]:
 
 
 def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
-    """`python -I -m expcore merge`: isolated, so no module of the directory it is run from is imported."""
-    return [plan.python, "-I", "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
+    """`python -I -B -m expcore merge`: isolated, no bytecode written: no module of the directory it is run from is
+    imported."""
+    return [plan.python, "-I", "-B", "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
 
 
 # ------------------------------------------------------------------------------------------------ the step
@@ -807,9 +971,9 @@ if not tied or os.getppid() != int(sys.argv[1]):
     sys.stderr.write("shards: ERROR: the dispatcher could not be tied to its step, so it does not start\\n")
     os._exit(71)
 argv = sys.argv[2:]
-if argv[1:4] != ["-I", "-m", "expcore"]:
+if argv[1:5] != ["-I", "-B", "-m", "expcore"]:
     os.execv(argv[0], argv)
-sys.argv = ["expcore", *argv[4:]]
+sys.argv = ["expcore", *argv[5:]]
 try:  # its SystemExit, its message and its exit status pass as `python -m expcore`'s own
     runpy.run_module("expcore", run_name="__main__", alter_sys=True)
 finally:
@@ -824,7 +988,7 @@ NOT_TIED = 71  # the dispatcher could not be tied to its step: it never started
 def run_dispatcher(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int:
     """Run the dispatcher, relaying SIGTERM and SIGINT to it, and return its exit status (128 + N for a signal N). It
     dies with this step, and records its own end in the step's record (`DISPATCHER`); `cwd` is the step's directory."""
-    words = [sys.executable, "-I", "-c", DISPATCHER, str(os.getpid()), *argv]
+    words = [sys.executable, "-I", "-B", "-c", DISPATCHER, str(os.getpid()), *argv]
     child = subprocess.Popen(words, env=dict(env), cwd=cwd, stdin=subprocess.DEVNULL)
 
     def relay(signum: int, _frame: Any) -> None:
@@ -840,9 +1004,9 @@ class Snapshots:
     """When a running shard's `out/` is snapshotted (O62; `snapshot` is what a snapshot is).
 
     `take(out)` is called from a thread of its own while the dispatcher runs: every `every_s` seconds, and, given
-    `progress` (a reading that changes when a run ends, None while there is none), within `poll_s` of a change, one
-    snapshot at a time; and once after the dispatcher has exited, before the archive. One that raises is reported
-    and never ends the run: the last good snapshot stands."""
+    `progress` (a count that changes when a run ends, None while there is no reading, which counts as 0), within
+    `poll_s` of a change, one snapshot at a time; and once after the dispatcher has exited, before the archive. One
+    that raises is reported and never ends the run: the last good snapshot stands."""
 
     def __init__(
         self,
@@ -875,7 +1039,9 @@ class Snapshots:
             last, seen = self.clock(), self._seen()
             while not self._stop.wait(self.poll_s):
                 now = self._seen()
-                ended = now is not None and now != seen
+                # no reading yet (None: out/ has no runs/ until its first attempt begins) is a count of 0, so that
+                # attempt's beginning is no run's end: the first snapshot comes at the first run's end, or the clock's
+                ended = now is not None and now != (0 if seen is None else seen)
                 if (ended or self.clock() - last >= self.every_s) and out.is_dir():
                     self._once(out)
                     last, seen = self.clock(), now if now is not None else seen
@@ -948,6 +1114,32 @@ def archive_named(results: Path, label: str) -> str | None:
     return named if isinstance(named, str) else "unreadable"
 
 
+def restore_newest(results: Path, label: str, spec: Mapping[str, Any], base: str | None, out: Path) -> Path | None:
+    """Restore into `out` the newest snapshot of the shard that verifies (`out_snapshot.restore`: every file against
+    its hash, the store's integrity, every ended attempt's marker) and return it; None when there is none, or when the
+    archive is newer (a snapshot that does not name `base`, the archive's SHA-256, was taken before it). A snapshot of
+    another shard is `ShardsError`. `resume_into` restores what this picks, and `resume-line` checks the same pick."""
+    from expcore.campaign import out_snapshot
+
+    for snapshot in out_snapshot.snapshots(results / label / SNAPSHOTS):
+        try:
+            facts = out_snapshot.manifest_of(snapshot)["facts"]
+        except out_snapshot.OutSnapshotError as error:
+            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
+            continue
+        if facts.get("shard") != dict(spec):
+            raise ShardsError(f"shard {label}: snapshot {snapshot.name} is of shard {facts.get('shard')}")
+        if base is not None and facts.get("base") != base:
+            return None  # taken before the archive: the archive is newer than it and every older one
+        try:
+            out_snapshot.restore(snapshot, out)
+        except out_snapshot.OutSnapshotError as error:
+            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
+            continue
+        return snapshot
+    return None
+
+
 def resume_into(args: argparse.Namespace, spec: Mapping[str, Any], base: str | None, work: Path, out: Path) -> None:
     """Put the shard's latest `out/` at `out`: the newest snapshot that verifies, unless the archive is newer (a
     snapshot that does not name it was taken before it), else the archive, else nothing (a fresh start, only when the
@@ -958,21 +1150,8 @@ def resume_into(args: argparse.Namespace, spec: Mapping[str, Any], base: str | N
     from expcore.campaign.snapshot import rebase_run_dirs
 
     found = out_snapshot.snapshots(args.results / args.label / SNAPSHOTS)
-    for snapshot in found:
-        try:
-            facts = out_snapshot.manifest_of(snapshot)["facts"]
-        except out_snapshot.OutSnapshotError as error:
-            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
-            continue
-        if facts.get("shard") != dict(spec):
-            raise ShardsError(f"shard {args.label}: snapshot {snapshot.name} is of shard {facts.get('shard')}")
-        if base is not None and facts.get("base") != base:
-            break  # taken before the archive: the archive is newer than it and every older one
-        try:
-            out_snapshot.restore(snapshot, out)
-        except out_snapshot.OutSnapshotError as error:
-            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
-            continue
+    snapshot = restore_newest(args.results, args.label, spec, base, out)
+    if snapshot is not None:
         print(f"shards: shard {args.label} resumes from snapshot {snapshot.name}", file=sys.stderr)
         return
     if found and not (args.results / f"{args.label}.out.tar").exists():
@@ -1035,6 +1214,57 @@ def make_work_root(path: Path, tmpfs: Path) -> None:
         raise ShardsError("[sandbox] work_root is not this user's")
     if stat.S_IMODE(info.st_mode) & 0o077:
         raise ShardsError("[sandbox] work_root gives others access: it must be 0700")
+
+
+def _private_work_root(path: Path) -> None:
+    """The work root is a directory of this user's, not a link, with no access for others: anything else is never
+    reaped or removed (a link would take the reaper out of it). `ShardsError` names what is wrong, never the path."""
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ShardsError("[sandbox] work_root is a link or not a directory")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ShardsError("[sandbox] work_root is not this user's alone (0700)")
+
+
+def reap_work_root(work_root: Path, node: Any = None) -> dict[str, int]:
+    """The Apptainer run reaper (`expcore_onedata.sandbox.apptainer.runs.reap`) over the sandbox's work root on this
+    node (W2, live slot 5): a run whose driver is shown gone, as a step killed outright leaves it, has its token files
+    removed, its helpers and every process carrying its tag ended, each mount in its directory unmounted (`fusermount3
+    -u`, then `-uz` for a dead FUSE mount, "Transport endpoint is not connected"), shown gone by the mount table, then
+    its directory and its record removed. A run whose driver lives, or cannot be told gone, is never touched. The
+    reaper's counts; `ShardsError` when a dead run's leftovers could not all be removed, or its records could not be
+    read: never "nothing to reap". It needs the core (`node`: the node it acts on, `LocalNode` by default)."""
+    if not os.path.lexists(work_root):
+        return {"runs": 0, "processes": 0, "left": 0}
+    _private_work_root(work_root)
+    from expcore_onedata.sandbox.apptainer import runs
+
+    if node is None:
+        from expcore_onedata.sandbox.apptainer.node import LocalNode
+
+        node = LocalNode()
+    found = runs.reap(node, work_root, own="")
+    if found.get("error") or found.get("left"):
+        raise ShardsError(
+            f"the sandbox's work root on this node holds a killed run's leftovers that could not all be removed "
+            f"({found.get('error') or str(found.get('left')) + ' run(s) left'})"
+        )
+    return found
+
+
+def remove_empty_work_root(work_root: Path) -> bool:
+    """The work root removed once nothing is left in it but an empty run-record directory (W1: the step makes it and
+    nothing else removes it, so every node a shard step ran on kept one): `rmdir` alone, never a removal of anything
+    in it. False when anything is left (a run of a live driver, say) or it is not there."""
+    from_runs = work_root / "_runs"  # expcore_onedata.sandbox.apptainer.runs.RUNS
+    try:
+        _private_work_root(work_root)
+        if os.path.lexists(from_runs):
+            os.rmdir(from_runs)
+        os.rmdir(work_root)
+    except (OSError, ShardsError):
+        return False
+    return True
 
 
 def _start_of(pid: int) -> str | None:
@@ -1193,11 +1423,17 @@ def archive_left(args: argparse.Namespace) -> int:
     return 0
 
 
-def sweep(tmpfs: Path, root: str) -> int:
-    """On the agent's node, at the federation's down: remove every step's directory of this federation (its owner
-    record names `root`) whose step was killed while its dispatcher ran and is shown gone; name each one kept (an out/
-    not archived, a step still running). Stdlib alone: it runs under the node's own Python."""
-    removed, kept = 0, []
+def sweep(tmpfs: Path, root: str, node: Any = None, live_fails: bool = False) -> int:
+    """On a node a shard step of this federation ran on, at the federation's down: remove every step's directory of
+    this federation (its owner record names `root`) whose step was killed while its dispatcher ran and is shown gone;
+    name each one kept (an out/ not archived, a step still running). Then the sandbox's work root that the federation's
+    `platform.toml` names: its killed runs reaped (`reap_work_root`, W2), and the root itself removed once empty (W1),
+    unless a step directory of ours on this node is kept (its step may still use it). Exit 1 when the work root could
+    not be reaped (its leftovers, or a Python that cannot import the core's reaper: down's `HPC_CORE_PYTHON`), so down
+    never takes a work root it could not reap for a clean one. With `live_fails` (down's sweep of a node in a job it
+    does not cancel, once it cancelled this federation's shard steps there), a step of this federation that still runs
+    there, or cannot be shown gone, is exit 3: down never takes it for clean."""
+    removed, kept, live = 0, [], 0
     for left in leftovers(tmpfs):
         if left.owner is None or left.owner.get("root") != root:
             continue  # not this federation's, or not to be told
@@ -1205,10 +1441,36 @@ def sweep(tmpfs: Path, root: str) -> int:
             kept.append(f"{left.path.name} (its out/ was not archived: `shards.py step --archive-left`)")
         elif not left.removable:
             kept.append(f"{left.path.name} (its step still runs, or cannot be shown gone)")
+            live += 1
         else:
             remove_tree(left.path)
             removed += 1
-    print(f"shards: sweep: {removed} step directory(ies) removed; kept: {'; '.join(kept) or 'none'}")
+    if live_fails and live:
+        print(f"shards: sweep: ERROR: {live} step(s) of this federation still run here, or cannot be shown gone; "
+              f"kept: {'; '.join(kept)}")  # fmt: skip
+        return 3
+    try:
+        work_root = sandbox_work_root(root)
+        reaped = reap_work_root(work_root, node) if work_root is not None else {"runs": 0}
+    except ImportError:
+        print("shards: sweep: ERROR: this Python cannot import the core's reaper, so the sandbox's work root here is "
+              "not reaped (down runs the sweep with HPC_CORE_PYTHON)")  # fmt: skip
+        return 1
+    except (ShardsError, OSError) as error:
+        print(f"shards: sweep: ERROR: the sandbox's work root here could not be reaped ({error})")
+        return 1
+    busy = bool(leftovers(tmpfs))  # a step directory still here: its step may yet use the work root
+    root_gone = work_root is not None and not busy and remove_empty_work_root(work_root)
+    if work_root is None:
+        state = "none declared"
+    elif root_gone:
+        state = "removed"
+    elif not os.path.lexists(work_root):
+        state = "none here"
+    else:
+        state = "kept (a live run, or a step directory on this node, may use it)"
+    print(f"shards: sweep: {removed} step directory(ies) removed; kept: {'; '.join(kept) or 'none'}; "
+          f"killed sandbox run(s) reaped: {reaped['runs']}; the sandbox's work root: {state}")  # fmt: skip
     return 0
 
 
@@ -1236,6 +1498,87 @@ def _ended(work: Path, status: int) -> bool:
     except OSError:
         pass  # the record without the status stands, whole
     return True
+
+
+def _mark_path(args: argparse.Namespace) -> Path:
+    return args.results / args.label / RUNNING_MARK
+
+
+def taking_over(found: Mapping[str, Any] | None, args: argparse.Namespace, spec: Mapping[str, Any]) -> bool:
+    """Whether a `--resume` may take over the running mark an earlier step of the shard left: only when its step is
+    shown gone, by `resume-line` on the login node (it found no step of the shard listed anywhere and passed this
+    mark's nonce as `--over`), or here, the mark naming this very node and a process of it that has ended. Anything
+    else (another node with no `--over`, a mark that cannot be read, of another shard) may be a step that still runs:
+    never taken over."""
+    if found is None or found.get("format") != RUNNING_FORMAT or found.get("shard") != dict(spec):
+        return False
+    if not isinstance(found.get("nonce"), str) or not re.fullmatch(r"[0-9a-f]{32}", found["nonce"]):
+        return False  # it names its claim's file: never anything but a nonce of ours
+    over = getattr(args, "over", None)
+    if over:
+        return found.get("nonce") == over
+    return found.get("node") == os.uname().nodename and alive(found.get("pid"), found.get("start")) is False
+
+
+def claim_running(args: argparse.Namespace, spec: Mapping[str, Any]) -> dict[str, Any]:
+    """The shard's running mark, `<results>/<label>/running.json`, taken for this step before anything else (O62):
+    which node, process, job and step run the shard, and a nonce. A step's directory on one node's tmpfs cannot be
+    seen from another (`clear_leftovers`), so this mark on the shared results directory is what stops two steps of
+    one shard on two nodes. It is removed when the step ends by itself (`release_running`): a step killed outright
+    leaves it. The mark is never absent while a step holds it, so it is made whole in a draft of this step's and put
+    in place by an exclusive link (a start: refused when one is there) or, for a `--resume` that may take one over
+    (`taking_over`), by a rename over it once this step made the one claim of that mark, `.running.json.<its
+    nonce>.taken`, exclusively: of any number of steps taking one mark over, one alone makes the claim, and the claim
+    is never removed, so a later step can never claim that mark again. `ShardsError` on any refusal; nothing of the
+    shard is touched then."""
+    path = _mark_path(args)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mark = {"format": RUNNING_FORMAT, "shard": dict(spec), "nonce": secrets.token_hex(16),
+            "node": os.uname().nodename, "pid": os.getpid(), "start": _start_of(os.getpid()),
+            "job": getattr(args, "job", None), "step": getattr(args, "step_name", None),
+            "root": os.environ.get("EXPCORE_FED_ROOT"), "started": _stamp()}  # fmt: skip
+    draft = path.with_name(f".{RUNNING_MARK}.{mark['nonce']}.draft")
+    descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(mark, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        if not os.path.lexists(path):
+            try:
+                os.link(draft, path)  # exclusive, and whole: a reader never sees a part of it
+            except FileExistsError:
+                raise ShardsError(f"shard {args.label}: another step of it started meanwhile") from None
+            return mark
+        found = _record(path)
+        if not args.resume:
+            raise ShardsError(f"shard {args.label}: a step of it runs, or was killed outright (its running mark is "
+                              "there): --resume continues it")  # fmt: skip
+        if not taking_over(found, args, spec):
+            raise ShardsError(f"shard {args.label}: a step of it may still run on another node (its running mark "
+                              "names it); `shards.py resume-line` shows it gone and continues it")  # fmt: skip
+        claim = path.with_name(f".{RUNNING_MARK}.{found['nonce']}.taken")
+        try:
+            os.close(os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        except FileExistsError:
+            raise ShardsError(
+                f"shard {args.label}: another step took its running mark over first (if no step of the shard runs "
+                f"anywhere, a takeover was killed between its claim and its mark: remove {claim.name} by hand)"
+            ) from None
+        if _record(path) != found:  # only the claim's maker replaces that mark: never another step's, kept
+            raise ShardsError(f"shard {args.label}: its running mark changed while it was taken over")
+        os.replace(draft, path)
+        return mark
+    finally:
+        draft.unlink(missing_ok=True)
+
+
+def release_running(args: argparse.Namespace, mark: Mapping[str, Any]) -> None:
+    """Remove the shard's running mark at the step's own end, only while it is still this step's (its nonce)."""
+    path = _mark_path(args)
+    found = _record(path)
+    if found is not None and found.get("nonce") == mark["nonce"]:
+        path.unlink(missing_ok=True)
 
 
 class StepRefused(Exception):
@@ -1434,20 +1777,192 @@ def note_post_run(work: Path, post: Mapping[str, Any]) -> None:
               file=sys.stderr)  # fmt: skip
 
 
+# ------------------------------------------------------------------------------------------------ the render identity
+def expected_identity_name(path: str) -> str:
+    return f"the expected render identity {path}"
+
+
+def identity_problem(record: Any) -> str | None:
+    """Why `record` is not a render identity (hpcidentity.py), or None: a JSON object with the version, the template's
+    and the platform fingerprint's hashes, perhaps some of the pins' hashes and the study's artifacts digest, and
+    nothing else. It says what kind of thing is wrong and never what the record holds."""
+    if not isinstance(record, dict):
+        return "it is not a JSON object"
+    if not {"version", "template_sha256", "platform_fingerprint_sha256"} <= set(record):
+        return "an entry it must hold is missing"
+    if not set(record) <= set(RENDER_IDENTITY_KEYS):
+        return "it holds an entry that is not declared"
+    for key, value in record.items():
+        if key == "version":
+            if not isinstance(value, str) or not re.fullmatch(r"expcore-render-identity/[0-9]{1,6}", value):
+                return "its version is not one"
+        elif not isinstance(value, str) or not SHA256_TEXT.fullmatch(value):
+            return "an entry is no SHA-256"
+    return None
+
+
+def no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """`json.loads`'s `object_pairs_hook`: a key given twice is refused, since the last would be all a check saw."""
+    keys = [key for key, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("a key is given twice")
+    return dict(pairs)
+
+
+def canonical_render_identity(record: Mapping[str, str]) -> bytes:
+    """A render identity's canonical text, as hpcidentity.py writes it: sorted keys, no spaces, one newline."""
+    return (json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+
+def parse_render_identity(raw: bytes, name: str) -> dict[str, str]:
+    """The render identity `raw` holds, `ShardsError` naming `name` if it is not one: JSON with no key given twice, an
+    object of exactly the declared keys' kinds (`identity_problem`). The error says nothing of the content."""
+    try:
+        record = json.loads(raw, object_pairs_hook=no_duplicate_keys)
+    except (ValueError, RecursionError):
+        raise ShardsError(f"{name} is not a well-formed render identity: it is not JSON") from None
+    if problem := identity_problem(record):
+        raise ShardsError(f"{name} is not a well-formed render identity: {problem}")
+    return record
+
+
+def read_federation_identity(root: str) -> bytes | None:
+    """The bytes of the render identity `up` wrote in the federation's root `root`: None when the root holds none, and
+    `ShardsError` when it cannot be taken: a root that cannot be opened, is not this user's or can be written by its
+    group or others, or a record that is a link, not a regular file, over the size a record can be, or unreadable.
+    It is read below the held root, no link followed, once."""
+    name = f"the federation's render identity record ({RENDER_IDENTITY})"
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        raise ShardsError(f"{name} cannot be read: the federation's root cannot be opened") from None
+    try:
+        info = os.fstat(root_fd)
+        if info.st_uid != os.getuid():
+            raise ShardsError(f"{name} cannot be trusted: the federation's root is not this user's")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise ShardsError(f"{name} cannot be trusted: the federation's root can be written by its group or others")
+        try:
+            os.lstat(RENDER_IDENTITY, dir_fd=root_fd)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise ShardsError(f"{name} cannot be read") from None
+        return read_below(root_fd, RENDER_IDENTITY, name)
+    finally:
+        os.close(root_fd)
+
+
+def check_render_identity(args: argparse.Namespace) -> bytes | None:
+    """The step's first act, before its pre-step guard and everything else: the canonical text of the federation's own
+    render identity (`EXPCORE_FED_ROOT`'s record, as validated: the bytes `up` wrote, whatever else the file held is
+    never copied), for the step to put into its out/ (`note_render_identity`); None when the federation has none or its
+    record cannot be taken, which is said on stderr and nothing more, as a federation `up` rendered before the record
+    existed is run as it was.
+
+    When the line gives the expected record (`--expect-render-identity REL --expect-render-identity-sha256 HEX`): the
+    file is read below the study's root, shown to be the bytes the plan hashed and a well-formed record; the
+    federation's record must exist, be well formed and be the expected one, key by key. `StepRefused` otherwise,
+    naming the keys that differ (never a value, a path or a hash) or what could not be read."""
+    path, wanted = (getattr(args, f"expect_render_identity{s}", None) for s in ("", "_sha256"))
+    root = os.environ.get("EXPCORE_FED_ROOT")
+    if path is None:
+        if wanted is not None:
+            raise StepRefused(
+                "--expect-render-identity-sha256 belongs to an --expect-render-identity, which is not given"
+            )
+        if not root:
+            return None
+        try:
+            raw = read_federation_identity(root)
+            if raw is None:
+                return None
+            return canonical_render_identity(
+                parse_render_identity(raw, f"the federation's render identity record ({RENDER_IDENTITY})")
+            )
+        except ShardsError as error:
+            print(f"shards: the federation's render identity is not archived: {error}", file=sys.stderr)
+            return None
+    name = expected_identity_name(path)
+    if problem := guard_path_problem(path):
+        raise StepRefused(f"{name} {problem}")
+    if not isinstance(wanted, str) or not SHA256_TEXT.fullmatch(wanted):
+        raise StepRefused(f"{name} has no SHA-256 from the plan: --expect-render-identity-sha256 is 64 hex digits")
+    try:
+        study_fd = os.open(os.path.abspath(args.study), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        raise StepRefused(f"the study's root cannot be opened, so {name} cannot be read") from None
+    try:
+        raw = read_below(study_fd, path, name)
+    except ShardsError as error:
+        raise StepRefused(str(error)) from None
+    finally:
+        os.close(study_fd)
+    if hashlib.sha256(raw).hexdigest() != wanted:
+        raise StepRefused(f"{name} is not the file the plan hashed")
+    try:
+        expected = parse_render_identity(raw, name)
+        if not root:
+            raise ShardsError(
+                f"EXPCORE_FED_ROOT names no federation, so its render identity cannot be compared with {name}"
+            )
+        held = read_federation_identity(root)
+        if held is None:
+            raise ShardsError(
+                f"the federation has no render identity record ({RENDER_IDENTITY}) in its root to compare with {name}: "
+                "its up wrote none"
+            )
+        actual = parse_render_identity(held, f"the federation's render identity record ({RENDER_IDENTITY})")
+    except ShardsError as error:
+        raise StepRefused(str(error)) from None
+    if differing := [key for key in RENDER_IDENTITY_KEYS if expected.get(key) != actual.get(key)]:
+        raise StepRefused(
+            f"the federation's render identity is not the expected one ({path}): it differs in {', '.join(differing)}"
+        )
+    return canonical_render_identity(actual)
+
+
+def note_render_identity(out: Path, record: bytes, step_id: str) -> None:
+    """Put the federation's render identity, the text `check_render_identity` gave, into the step's out/ as
+    `study-state/render-identity.<step_id>.json` (mode 0600, made new, no link followed): a file of this step's own, so
+    a resumed shard keeps the identity each of its steps ran under. `out` need not exist yet. `ShardsError` when it
+    cannot be written: a step that cannot carry the proof of its render does not start."""
+    try:
+        folder = out / STUDY_STATE
+        folder.mkdir(parents=True, exist_ok=True)
+        if folder.is_symlink() or not folder.is_dir():
+            raise OSError(errno.ENOTDIR, "not a directory")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        descriptor = os.open(folder / f"render-identity.{step_id}.json", flags, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(record)
+    except OSError as error:
+        raise ShardsError(
+            f"the federation's render identity could not be written into out/{STUDY_STATE}/ ({type(error).__name__}): "
+            "a step that cannot carry it does not start"
+        ) from None
+
+
 def step(
     args: argparse.Namespace,
     *,
     runner: Callable[[Sequence[str], Mapping[str, str], Path], int] = run_dispatcher,
     core_found: Callable[[Path], bool] = imports_core_from,
     snapshots: Snapshots | None = None,
+    node: Any = None,
 ) -> int:
     """One shard on its node (the module's docstring): copy, restore, run, archive, clean up; the dispatcher's exit
     status. `snapshots` says when `out/` is snapshotted; by default every `--snapshot-every` seconds and at each run's
-    end, into `<results>/<label>/snapshots/`. Its first act is the study's pre-step guard, when its line declares one
-    (`start_hooks`): nothing is made, removed or read before it, and `PRE_STEP_REFUSED` ends a step it refuses. A
-    declared post-run script runs after the dispatcher exits 0 and before the archive (`run_post_run`): a step whose
-    script does not pass archives its results marked not final and ends with `POST_RUN_FAILED`."""
+    end, into `<results>/<label>/snapshots/`. `node` is what the reaper of the sandbox's work root acts on (the
+    Apptainer backend's `NodeOps`; `LocalNode` by default). Its first acts are the check of the federation's render
+    identity against the one the line expects (`check_render_identity`) and then the study's pre-step guard, when its
+    line declares one (`start_hooks`): nothing is made, removed or read before them, and `PRE_STEP_REFUSED` ends a step
+    they refuse. The federation's render identity is written into `out/study-state/` before the dispatcher starts,
+    after a resume has restored its `out/`, in a file of this step's own (`note_render_identity`). A declared post-run
+    script runs after the dispatcher exits 0 and before the archive (`run_post_run`): a step whose script does not
+    pass archives its results marked not final and ends with `POST_RUN_FAILED`."""
     try:
+        identity = check_render_identity(args)  # the federation's render is the plan's, before the study's own guard
         guard, post_hook = start_hooks(args)
     except StepRefused as error:
         print(f"shards: ERROR: {error}; the step is refused, with nothing made", file=sys.stderr)
@@ -1481,9 +1996,31 @@ def step(
         return 2
     if args.resume:  # an earlier step killed outright left its directory here: removed, or the resume refused
         clear_leftovers(args.tmpfs, spec, os.environ.get("EXPCORE_FED_ROOT"), args.results)
-    work_root = sandbox_work_root(os.environ.get("EXPCORE_FED_ROOT"))
-    if work_root is not None:  # the Apptainer sandbox's, which it refuses to start without
-        make_work_root(work_root, args.tmpfs)
+    mark = claim_running(args, spec)  # no other step of the shard runs anywhere from here until this one ends
+    try:
+        return _run_step(args, spec, runner, snapshots, node, identity, guard, post_hook)
+    finally:
+        release_running(args, mark)
+
+
+def _run_step(
+    args: argparse.Namespace,
+    spec: Mapping[str, Any],
+    runner: Callable[[Sequence[str], Mapping[str, str], Path], int],
+    snapshots: Snapshots | None,
+    node: Any,
+    identity: bytes | None,
+    guard: Mapping[str, Any] | None,
+    post_hook: Hook | None,
+) -> int:
+    """`step` once its checks passed and it holds the shard's running mark: its directory on the tmpfs first (so a
+    sweep finds a step of ours here before its work root is used), the sandbox's work root made and its killed runs
+    reaped, then copy, restore, run, archive, clean up. `identity`, `guard` and `post_hook` are what the step's first
+    acts found (the federation's render identity as validated, the pre-step guard that passed, the post-run script
+    declared)."""
+    from expcore.campaign import out_snapshot
+
+    snapdir = args.results / args.label / SNAPSHOTS
     base = archive_named(args.results, args.label)  # the archive this step starts from: its snapshots name it
     work = Path(tempfile.mkdtemp(prefix=f"{WORK_PREFIX}{args.label}.", dir=args.tmpfs))
     keep = False
@@ -1496,6 +2033,13 @@ def step(
                                   "final": False}} if post_hook is not None else {})}  # fmt: skip
         (work / OWNER).write_text(json.dumps(owner, sort_keys=True) + "\n", encoding="utf-8")
         (work / OWNER_ENDING).write_text(json.dumps({**owner, "phase": ARCHIVING}, sort_keys=True) + "\n", "utf-8")
+        work_root = sandbox_work_root(os.environ.get("EXPCORE_FED_ROOT"))
+        if work_root is not None:  # the Apptainer sandbox's, which it refuses to start without
+            make_work_root(work_root, args.tmpfs)
+            reaped = reap_work_root(work_root, node)  # W2: what a step killed here left, before any use
+            if reaped["runs"]:
+                print(f"shards: shard {args.label}: {reaped['runs']} killed sandbox run(s) on this node reaped "
+                      "(mounts, directories, records)", file=sys.stderr)  # fmt: skip
         copy = work / "study"
         shutil.copytree(args.study, copy, symlinks=True)
         platform = Path(os.environ.get("EXPCORE_FED_ROOT") or "/nonexistent") / PLATFORM
@@ -1507,14 +2051,17 @@ def step(
             (copy / "out" / NOT_FINAL).unlink(
                 missing_ok=True
             )  # an archive not final is resumed; this step decides afresh
+        if identity is not None:  # the proof of the render is in out/ from the start: in every snapshot, and a kill's
+            note_render_identity(copy / "out", identity, f"{_stamp()}-{secrets.token_hex(4)}")
         for name in ("home", "tmp", *(f"home/{sub}" for sub in HOME_DIRS)):
             (work / name).mkdir(mode=0o700)
         env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
         env |= {**home_env(str(work / "home")), "TMPDIR": str(work / "tmp")}  # never the account's ~
+        env["PYTHONDONTWRITEBYTECODE"] = "1"  # B1: for a Python the dispatcher's children start without -I -B
         journals = args.results / args.label / JOURNALS
         journals.mkdir(parents=True, exist_ok=True)
         journal = journals / f"{_stamp()}-{os.getpid()}-{secrets.token_hex(4)}.jsonl"
-        argv = [sys.executable, "-I", "-m", "expcore", "run", str(copy), "--spend-journal", str(journal),
+        argv = [sys.executable, "-I", "-B", "-m", "expcore", "run", str(copy), "--spend-journal", str(journal),
                 "--shard", f"{args.index}/{args.count}", "--shard-label", args.label]  # fmt: skip
         out = copy / "out"
         live = threading.Event()
@@ -1534,7 +2081,7 @@ def step(
             live.clear()  # the dispatcher has exited: the last snapshot reads a private copy of the store
             snapshots.stop(out)
         settle_quietly(out)
-        if not out.is_dir():
+        if not out.is_dir() or {entry.name for entry in out.iterdir()} <= {STUDY_STATE}:  # the record alone is none
             print(f"shards: shard {args.label} left no out/ to archive (exit status {status})", file=sys.stderr)
             return status
         post = None
@@ -1570,6 +2117,20 @@ def step(
 
 
 # ------------------------------------------------------------------------------------------------ the command line
+def _sibling(name: str) -> Any:
+    """A module beside this file, by its path, without putting this directory on `sys.path` (`-I` leaves it off)."""
+    import importlib.util
+
+    loaded = sys.modules.get(f"hpc_{name}")
+    if loaded is not None:
+        return loaded
+    spec = importlib.util.spec_from_file_location(f"hpc_{name}", Path(__file__).resolve().parent / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # its dataclasses look their module up by name
+    spec.loader.exec_module(module)
+    return module
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="shards.py", description="One campaign shard per HPC federation.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1588,26 +2149,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--resume", action="store_true")
     one.add_argument("--archive-left", dest="archive_left", action="store_true")
     one.add_argument("--snapshot-every", dest="snapshot_every", type=float, default=SNAPSHOT_EVERY_S)
+    one.add_argument("--job", help="the id squeue -s lists this step under (its running mark records it)")
+    one.add_argument("--step-name", dest="step_name", help="this step's name (its running mark records it)")
+    one.add_argument("--over", help="the nonce of the running mark resume-line showed the step of gone")
     one.add_argument("--pre-step", dest="pre_step", default=None)  # the study's guard: `lines` writes all three
     one.add_argument("--pre-step-sha256", dest="pre_step_sha256", default=None)
     one.add_argument("--pre-step-timeout", dest="pre_step_timeout", type=float, default=None)
     one.add_argument("--post-run", dest="post_run", default=None)  # the study's post-run script: all three
     one.add_argument("--post-run-sha256", dest="post_run_sha256", default=None)
     one.add_argument("--post-run-timeout", dest="post_run_timeout", type=float, default=None)
+    one.add_argument("--expect-render-identity", dest="expect_render_identity", default=None)  # with its hash: both
+    one.add_argument("--expect-render-identity-sha256", dest="expect_render_identity_sha256", default=None)
     left = sub.add_parser("sweep")
     left.add_argument("--tmpfs", type=Path, required=True)
     left.add_argument("--root", required=True)
+    left.add_argument("--live-fails", dest="live_fails", action="store_true")
+    again = sub.add_parser("resume-line")
+    again.add_argument("--manifest", type=Path, required=True)
+    again.add_argument("--label", required=True)
+    again.add_argument("--job", required=True)
+    again.add_argument("--node", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "sweep":
-            return sweep(args.tmpfs, args.root)
+            return sweep(args.tmpfs, args.root, live_fails=args.live_fails)
+        if args.command == "resume-line":
+            line = _sibling("shardresume").resume_line(sys.modules[__name__], args.manifest, args.label, args.job,
+                                                       args.node, script=Path(__file__).resolve())  # fmt: skip
+            print(shlex.join(line))
+            return 0
         if args.command == "step":
             return archive_left(args) if args.archive_left else step(args)
         plan = load_plan(args.manifest)
         if args.command == "collect":
             line = merge_argv(plan, collect(plan, args.into))
             print(shlex.join(line))
-            return subprocess.run(line, check=False).returncode if args.run else 0
+            return subprocess.run(line, check=False, cwd=args.into).returncode if args.run else 0
         missing = undeclared_data(plan)
         if missing:
             raise ShardsError(
@@ -1626,6 +2203,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if plan.post_run is not None:
                 record["post_run"] = {"path": plan.post_run, "sha256": plan.post_run_sha256,
                                       "timeout_s": plan.post_run_timeout_s}  # fmt: skip
+            if plan.expect_render_identity is not None:
+                record["expect_render_identity"] = {"path": plan.expect_render_identity,
+                                                    "sha256": plan.expect_render_identity_sha256}  # fmt: skip
             built.append((line, record))
         refusal = core_refusal(identify_core(plan))  # last: it runs the manifest's interpreter, as the step will
         if refusal:

@@ -130,6 +130,12 @@ class Bench:
             content=lambda b: SimpleNamespace(reset=lambda timeout: None),
             data=self.data.get(label) or data_stand_in(),
         )
+        made.verify = functools.partial(  # `verify-data`: each ingested space read back as the same stand-in holds it
+            self.deploy.hpc.boot.verify_ingested,
+            rest=lambda ca: SimpleNamespace(close=lambda: None),
+            bootstrap=BootStandIn(label),
+            data=self.data.get(label) or data_stand_in(),
+        )
         return made
 
     def make_driver(
@@ -149,7 +155,18 @@ class Bench:
             code = self.deploy.hpc.cli.main(["--layout", str(layout), "--root", str(root), command], self.environ,
                                             runner=self.fake(label))  # fmt: skip
         log.write_text(printed.getvalue(), encoding="utf-8")
+        if code == 0 and command == "up":
+            self.verify_data(label, layout, root)
         return code, printed.getvalue()
+
+    def verify_data(self, label: str, layout: Path, root: Path) -> None:
+        """What an operator runs on each federation once the study's ingest is done, before `plan` (O57): the layout's
+        one ingested space holds nothing, as its manifest (the empty one) declares: the stand-in shows it verified."""
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
+            code = self.deploy.hpc.cli.main(["--layout", str(layout), "--root", str(root), "verify-data"], self.environ,
+                                            runner=self.fake(label))  # fmt: skip
+        assert code == 0, printed.getvalue()
 
     def hooks(self, **given: Any) -> Any:
         fleet = self.deploy.fleet

@@ -441,7 +441,8 @@ def manifest(tmp_path: Path, extra: str = "", guard: str | None = "raise SystemE
         root = tmp_path / "fed" / name
         root.mkdir(parents=True, exist_ok=True)
         state = {"format": "expcore-hpc-federation/1", "allocation": {"job": str(100 + n), "name": f"hpcop-x-{n}"},
-                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked"}  # fmt: skip
+                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked",
+                 "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         (root / "platform.toml").write_text('[space]\nname = "s"\ndata_manifest = "m.json"\n')
     if extra:
@@ -506,10 +507,10 @@ def test_o63_a_line_with_no_guard_is_byte_for_byte_the_line_it_was(shards, tmp_p
         "-J", "hpcop-x-1-shard-1", "--export=PATH", "--chdir=/", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LC_ALL=C",
         f"EXPCORE_FED_ROOT_PARENT={tmp_path / 'fed'}", f"EXPCORE_FED_ROOT={tmp_path / 'fed' / 'a'}", *homeless,
         "PYTHONNOUSERSITE=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
-        str(tmp_path / "venv" / "python"), "-I", str(SCRIPT), "step", "--study", str(tmp_path / "study"),
+        str(tmp_path / "venv" / "python"), "-I", "-B", str(SCRIPT), "step", "--study", str(tmp_path / "study"),
         "--index", "1", "--count", "2", "--label", "fed-a", "--tmpfs", str(tmp_path / "tmpfs"),
         "--results", str(tmp_path / "results"), "--core-src", str(tmp_path / "core" / "src"),
-        "--snapshot-every", "900",
+        "--snapshot-every", "900", "--job", "101", "--step-name", "hpcop-x-1-shard-1",
     ]  # fmt: skip
 
 

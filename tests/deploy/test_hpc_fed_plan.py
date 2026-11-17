@@ -107,6 +107,17 @@ def test_the_site_comes_from_the_environment_and_a_missing_value_is_named(hpc):
         hpc.settings.site_from_environment({**environ, "HPC_NODE_TMP": "tmp"})
 
 
+@pytest.mark.parametrize("python", ["venv/bin/python", "./python3.11", "bin/python3"])
+def test_o57_a_node_python_that_is_a_relative_path_is_refused(hpc, python):
+    """O57: every step starts in `/` (`--chdir=/`), so a relative HPCOP_PY would name another interpreter than the
+    one meant: it must be a command name, found on the step's PATH, or an absolute path."""
+    environ = {"HPC_ACCOUNT": "a", "HPC_PARTITION": "p", "SH": "/site/images", "L": "/site/logs"}
+    assert hpc.settings.site_from_environment({**environ, "HPCOP_PY": "python3.11"}).node_python == "python3.11"
+    assert hpc.settings.site_from_environment({**environ, "HPCOP_PY": "/opt/py/bin/python3"}).node_python
+    with pytest.raises(hpc.settings.SettingsError, match="HPCOP_PY: must be a command name or an absolute path"):
+        hpc.settings.site_from_environment({**environ, "HPCOP_PY": python})
+
+
 SITE_ENVIRON = {
     "HPC_ACCOUNT": "test-account",
     "HPC_PARTITION": "test-partition",
@@ -161,13 +172,13 @@ def test_a_step_network_in_the_state_that_is_not_a_string_is_refused_naming_the_
 
 def test_a_step_names_a_network_option_only_when_it_has_one(hpc):
     """O57: without one the step's whole srun line is what it was before the setting existed (an empty value is none);
-    with one, that line plus `--network=<value>` after `--export=PATH`, so the prefix every test and tool slices
+    with one, that line plus `--network=<value>` after `--chdir=/`, so the prefix every test and tool slices
     (`--jobid`, `--het-group`, `--exact`) does not move; a value an argv must not carry is refused."""
     env = hpc.slurm.allowlist("/usr/bin:/bin", "/tmp")
     plain = hpc.slurm.Step("4242", "node01", "hpcop-x-zone-facts", 1, 1024, env, ("python3.11", "x.py"), het_group=0)
     wanted = ["srun", "--jobid=4242", "--het-group=0", "--exact", "-N1", "-n1", "-w", "node01", "-c", "1",
-              "--mem=1024M", "-J", "hpcop-x-zone-facts", "--export=PATH", "/usr/bin/env", "-i", *env, "python3.11",
-              "x.py"]  # fmt: skip
+              "--mem=1024M", "-J", "hpcop-x-zone-facts", "--export=PATH", "--chdir=/", "/usr/bin/env", "-i", *env,
+              "python3.11", "x.py"]  # fmt: skip
     assert plain.argv() == wanted
     assert replace(plain, network="").argv() == wanted
     command = wanted.index("/usr/bin/env")

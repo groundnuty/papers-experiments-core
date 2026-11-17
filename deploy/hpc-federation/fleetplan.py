@@ -30,7 +30,16 @@ import tomllib
 from fleetrecord import FleetError, identity, member_of, root_of
 
 MANIFEST = "shards.toml"  # in the fleet's directory: what `shards.py collect --manifest` reads at the end
-SETTINGS = ("study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory")  # shards.py's keys
+SETTINGS = {
+    "study",
+    "python",
+    "core_src",
+    "results",
+    "tmpfs",
+    "step_path",
+    "cpus",
+    "memory",
+}  # shards.py's keys: no argv
 OPTIONAL = ("snapshot_every_s",)
 SCRIPT = Path(__file__).resolve().parent / "shards.py"
 
@@ -43,7 +52,8 @@ def read_settings(path: Path) -> Dict[str, Any]:
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise FleetError(f"the shard settings could not be read ({type(error).__name__})") from None
     if not set(SETTINGS) <= set(data) <= set(SETTINGS) | set(OPTIONAL):
-        raise FleetError(f"the shard settings take exactly: {', '.join(SETTINGS)}, and perhaps snapshot_every_s; "
+        keys = ", ".join(sorted(SETTINGS))
+        raise FleetError(f"the shard settings take exactly: {keys}, and perhaps snapshot_every_s; "
                          "no [[shards]] (the fleet writes them)")  # fmt: skip
     for key, value in data.items():
         if isinstance(value, bool) or not isinstance(value, (str, int, float)):
