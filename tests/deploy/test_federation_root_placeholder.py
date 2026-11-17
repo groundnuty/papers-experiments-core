@@ -50,6 +50,9 @@ session_drain_s = 0
 [faults.services]
 oak = "oak"
 elm = "elm"
+
+[tokens]
+margin_s = 900
 """
 
 
