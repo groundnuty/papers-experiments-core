@@ -69,7 +69,7 @@ def rendered_slots(tmp_path: Path, rights) -> dict:
     """The `[slots]` table the renderer writes for that layout, as the platform layer reads it: the renderer's own entry
     point (`additions`, the one both platforms call), over the ids the sandbox tests' users have."""
     source = tmp_path / "layout" / "layout.toml"
-    source.parent.mkdir()
+    source.parent.mkdir(parents=True)
     source.write_text(layout_text(rights), encoding="utf-8")
     spec = MODULES["spec"].load_spec(source)
     layout = MODULES["layout"].Layout(tmp_path / "root", spec=spec)
