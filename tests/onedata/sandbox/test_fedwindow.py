@@ -380,8 +380,8 @@ async def run_in_loop(platform, settings, body):
 
 def test_o86_a_launch_that_closes_before_the_restore_never_reads_stable(config, issuer, slots, tmp_path):
     """O86: an executor whose `running` encloses the launch has taken the target down before the read, and closes the
-    launch before the restore: that window is not the run's, and it is never `stable`: the service is not running
-    at its end, which the window says."""
+    launch before the restore: that window is not the run's outage. It is never `stable`: the service is not running
+    at its end, and the injection that holds it down began before the window, so the window reports a finding."""
     federation = Federation(config)
     platform, host = build(config, issuer, slots, tmp_path, federation.watch)
     injector = federation.injector()
@@ -393,8 +393,9 @@ def test_o86_a_launch_that_closes_before_the_restore_never_reads_stable(config, 
 
     asyncio.run(go())
     window = window_of(seen[0])
-    assert window["verdict"] != "stable"
+    assert window["verdict"] == "finding"
     assert window["services"]["providers[1]"]["end"] == "not_running"
+    assert any("not running at the window's end" in text for text in window["findings"])
     assert not host.containers
 
 

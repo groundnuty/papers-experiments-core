@@ -493,6 +493,15 @@ The three have the same names and shapes on Docker and on an HPC node (`docs/int
 
 `infra_container_check()` and `sidecar_errors()` still work, and warn: rename them. A `docker exec` of your own into the sidecar, or `sandbox.host` and `sandbox.names`, work on Docker alone; `mount_log()` replaces them.
 
+### The federation's window on every run
+
+Build the platform with the federation watch, once, and every run's launch reads the federation for you (O86):
+
+    watch = watch_for(config, fault_settings_of(config), client, zone="<the zone's service>", hpc_command=None)
+    platform = SandboxPlatform(config, issuer, host, ..., federation_watch=watch)
+
+`launch` reads the services before the run's sandbox exists, which is before any injection your body makes, and again once your body has ended, before the stop. Run the injector's `running` inside the launch (the order `faults.py` documents): its restore is then before the second read, and the run's own outage is in its window and explained by its own journal lines. After the launch has ended, read `sandbox.metadata()["infrastructure_facts"]["federation_window"]`: the verdict (`stable`, `restarted`, `finding` or `unknown`), each service's status and restarts (`outage`, `heal` or `finding`), the findings and the unknowns, by label (`zone`, `providers[i]`). `sandbox.collect()` writes `metadata.json` before the restore, so that file holds no window. A federation that cannot be read is `unknown` with the reason and never fails the run: your post-check decides what a verdict means (nothing but `stable` is a pass, and an S3-shaped run's `restarted` is its own outage). A platform built without `federation_watch` reads nothing, and its runs are as they were (`docs/interfaces.md`, "The platform layer's read of the federation's own services").
+
 ### What the code tool tells the agent of its output
 
 A model reads these strings, and a study freezes them, so they are given exactly. The Onedata layer's code tool keeps the first 1 MiB (1,048,576 bytes, cut at a whole character) of each of a cell's stdout and stderr and drops the rest. When it cut a stream, the text the tool returns ends with a line after a newline, `[output cut by the sandbox: the first K of the P bytes of stdout were kept]`, where P is what the cell wrote and K what was kept, both plain digits; when both streams were cut, the line has the clause for stdout, then `; `, then the same clause with `stderr`. The call's `source_truncated` is then `True`, and the run's record keeps the same numbers (`output_cut` on the cell, `cell_output_cuts` in the sandbox's metadata). A cell that prints 3 MiB gives a text of 1 MiB of its output followed by `[output cut by the sandbox: the first 1048576 of the 3145728 bytes of stdout were kept]`.

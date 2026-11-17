@@ -1239,6 +1239,8 @@ provider_storage = "tmpfs"          # optional (O57): where the federation's pro
 
 - **The providers' storage kind** (O57; `provider_storage`). Where a provider stores its data shapes a run's I/O timing, so `[sandbox.apptainer] provider_storage` declares it, `"tmpfs"` or `"shared_filesystem"` (any other word is refused at load, naming the key). The HPC driver renders it from `site.env` (`HPC_STORAGE_ROOT` set: `shared_filesystem`), the word and never the root's path. Declared, it is in `PlatformConfig.fingerprint()` (`sandbox_backend`), so shards on the two kinds never merge and a campaign never resumes from one onto the other, in each run's `metadata()["backend"]` and as `metadata()["infrastructure_facts"]["provider_storage"]`. A platform that declares none (the Docker backend, so a Compose federation, or an Apptainer platform written before the key) has no such key anywhere and keeps its fingerprint.
 
+- **The federation's window** (O86; `federation_window`), only for a platform built with a federation watch (`SandboxPlatform(..., federation_watch=)`), recorded once the run's body has ended: the verdict, each service's status and restarts, the findings and the unknowns. It sits beside the keys above, not among `facts`, and a Docker run holds it in an `infrastructure_facts` of its own. See "The platform layer's read of the federation's own services".
+
 ## The platform layer's read of the federation's own services
 
 `expcore_onedata.fedwatch` (O86). A study's post-check asks of a run's or a batch's window: did the federation's services, the zone and each provider, run and answer throughout, and was a restart the injector's doing? One watch, the same on Compose and on HPC; every call only reads (`docker compose ps` and `docker inspect`; `squeue -s` and `sacct`; `GET /configuration`; the journal's file, opened read-only and without its lock).
@@ -1274,6 +1276,28 @@ result = watch.window(start)  # now: the window since start
 **A restart** is an end reading whose container id or step id differs from the start's, whose start differs, or whose counter rose (`RestartCount`; the state's `launch`). On HPC the step is read by its exact id (`hpcslurm.Slurm.step_observed`), never the state file's word for it. It is explained only by the injector's journal (`fault_journal`), whose lines carry no time: the journal is append-only, so the window is the lines after the start reading's count. An injection of the service (its `service`, as `[faults.services]` names it) explains a restart when its stop was asked for (`stopping`, `injected` or `stop_unknown`), it did not end `never_down`, and either the stop was asked inside the window or the service was down at the start and the injection has a line in the window (its restore is the restart). The label is `heal` for an injection whose line carries `heal` (a heal's container restart), `outage` for any other. On HPC the count is checked as well: `launch` says how many starts there were, each restart of a running service owes a stop the state records (`stops`) after the start reading, and an injection explains one launch; a step squeue lists that the state does not name is a restart the driver did not make. A restart nothing explains is `finding`, and so are: a `RestartCount` that rose (Docker's restart policy, never the injector's stop and start), a journal that is not declared, cannot be read, or is shorter than at the start, a service not running at the end that no open injection holds, and a container whose health check does not report healthy.
 
 On Compose only a change is seen, so a service restarted twice in a window reads as one restart (the reason says "at least"), and the window's injections must still account for it. The relay keeps no durable request log, so the HPC cross-check uses the state's `stops` and `launch`, which the verbs write, instead of the relay's files.
+
+**Every run carries its own window.** A platform built with the watch, `SandboxPlatform(..., federation_watch=watch_for(...))` (built once for the platform: the platform's client, its configuration and the zone's service; optional, and a platform given none is unchanged), reads it for each run in `launch`, with nothing for the study's executor to call:
+
+- `read()` after `launch`'s refusals (no admission, an undeclared input) and before the run's tokens are minted or its sandbox exists, so before any injection the run's body makes: the run's own outage is then in its window, explained by its own journal lines.
+- `window(start)` once the body has ended and before the sandbox's stop, so after the restore of a fault injector whose `running` is inside the launch (the documented order, `faults.py`: the restore at `running`'s exit, while the run's sandbox and tool server still run).
+- Each is inside a `sandbox_lifecycle` wait (infrastructure time, never the agent's), off the event loop. A platform with no watch enters the two waits it always did.
+
+The window is in the sandbox's metadata, `metadata()["infrastructure_facts"]["federation_window"]`, on both sandbox backends (a Docker run has an `infrastructure_facts` only when it holds this one). **Read `metadata()` once the launch has ended**: `collect()` writes `metadata.json` before the injector's restore, so that file holds no window, as it holds no `teardown`. The shape, plain JSON and the same on Compose and on HPC, keyed by label and holding no service, container, step, node, address, path or secret:
+
+```json
+{"version": 1, "verdict": "restarted", "backend": "compose",
+ "window": {"start": "2026-11-17T04:00:00Z", "end": "2026-11-17T04:09:12Z"},
+ "services": {"zone": {"status": "stable", "start": "running", "end": "running", "restarts": []},
+              "providers[1]": {"status": "restarted", "start": "running", "end": "running",
+                              "restarts": [{"label": "outage", "explained": true, "reason": "1 restart(s); the journal holds 1 injection(s) of the service in the window"}]}},
+ "findings": [], "unknown": [],
+ "journal": {"declared": true, "lines_start": 3, "lines_end": 7, "read": true}}
+```
+
+`verdict` is the watch's (`finding`, `unknown`, `restarted` or `stable`), and `restarts[].label` is `outage`, `heal` or `finding`. A read that cannot be made is recorded, never raised: the verdict is `unknown` and `unknown` holds the reason, with the exception's type and never its message (`the window's start could not be read (RuntimeError)`), and a window whose start was not read is never `stable`. A run cancelled during its body records `unknown` too ("the run was cancelled before its window was read"; no read is awaited under a cancellation) and is still stopped. The run goes on in every case, and the body's own error stands over a window that failed: the study's post-check decides what a verdict means for the run.
+
+**The window is the run's only in the documented order.** An executor whose `running` encloses the launch takes its target down before the read and restores after the window. Its window opens with the target already down and closes before the restore, so it is never `stable`: the service is `not_running` at its end, and the injection that holds it down began before the window, so the watch reports a finding ("not running at the window's end, and no open injection of it holds it down"), and the window is not the run's outage. Run the injector's `running` inside the launch.
 
 ## The platform layer's files in and out
 
