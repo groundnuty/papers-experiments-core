@@ -143,11 +143,10 @@ def test_o87_an_apptainer_platform_with_spaces_takes_the_check_provider_of_the_f
     """O87: the Apptainer backend's `[sandbox]` with `[[spaces]]` is checked through `load_platform`: a provider of the
     first space is read through and in the fingerprint by position; one that supports another space alone is refused,
     naming the key."""
-    anchor = "kill_grace_s = 5"
+    anchor = 'content_check_file = "dir/check-apptainer.bin"'  # the template carries the check file (O69)
 
     def with_provider(name):
-        text = anchor + f'\ncontent_check_file = "dir/check.bin"\ncontent_check_provider = "{name}"'
-        return edited(APPTAINER, [platform(anchor, text)])
+        return edited(APPTAINER, [platform(anchor, anchor + f'\ncontent_check_provider = "{name}"')])
 
     loaded = load(with_provider("larch"), tmp_path / "ok", cas[0])
     assert loaded.content_check_reader.name == "larch"
