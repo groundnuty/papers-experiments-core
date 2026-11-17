@@ -15,7 +15,8 @@ The template's `[sandbox.apptainer]` also declares where the federation's provid
 filesystem when the site has a scratch root, `HPC_STORAGE_ROOT`, else the nodes' tmpfs, never the root's path), and
 `check` refuses a template that declares the sandbox without it, or with it only in a comment, since it would give a
 scratch federation the fingerprint a tmpfs one has: where a provider stores its data shapes a run's I/O timing, so
-shards on the two can never merge. The renderer reads the file it writes back (`hpcboot.check_provider_storage`).
+shards on the two can never merge. It reads the template as TOML, so a comment, another table or a hard-coded other word
+declares nothing; the renderer reads the file it writes back for the same (`hpcboot.check_provider_storage`).
 """
 
 import hashlib
@@ -23,16 +24,12 @@ import re
 from pathlib import Path
 from typing import Dict, Optional
 
+import tomllib
 from hpcsettings import Site
 
 TMPFS, SHARED_FILESYSTEM = "tmpfs", "shared_filesystem"  # the platform layer's PROVIDER_STORAGE_KINDS, in this order
 STORAGE_KIND = "hpc_provider_storage"  # the placeholder of `[sandbox.apptainer] provider_storage` (O57)
-# The template's declaration of the Apptainer sandbox (its table's header, with or without a subtable, or a dotted key)
-# and of the providers' storage kind (a key at the start of a line: a comment never declares it).
-APPTAINER_DECLARED = re.compile(
-    r"^[ \t]*(?:\[[ \t]*sandbox[ \t]*\.[ \t]*apptainer[ \t]*[\].]|sandbox[ \t]*\.[ \t]*apptainer[ \t]*\.)", re.M
-)
-KIND_DECLARED = re.compile(r'^[ \t]*provider_storage[ \t]*=[ \t]*"([^"\n]*)"[ \t]*(?:#.*)?$', re.M)
+ANY_PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a name of `fedfacts.placeholders` may hold dots and dashes
 COLLECTOR = Path(__file__).resolve().parent / "bundle" / "egress-collector.py"
 CHUNK = 1 << 20
 # Each placeholder a template may name, the site variable that fills it and the Site field that holds it. A name holds
@@ -76,20 +73,43 @@ def provider_storage(site: Site) -> str:
     return SHARED_FILESYSTEM if site.storage_root else TMPFS
 
 
-def check_storage_kind(site: Site, template: str) -> None:
-    """Refuse a template that declares the Apptainer sandbox and does not declare the providers' storage kind as the
-    site has it (O57): the placeholder `@hpc_provider_storage@`, or that kind's own word. A key in a comment declares
-    nothing, and literal pins do not excuse the key. The renderer reads the file it writes back for the same
-    (`hpcboot.check_provider_storage`): this is the refusal before anything is submitted."""
-    if APPTAINER_DECLARED.search(template) is None:
+def check_declared_kind(document: str, kind: Optional[str]) -> None:
+    """Refuse a platform file, rendered or a template filled in, whose `[sandbox.apptainer]` does not declare
+    `provider_storage` as `kind` (O57): the key is in the campaign fingerprint, so a file that leaves it out, names it
+    in a comment or another table, or hard-codes another word would let shards on tmpfs and on scratch merge. It reads
+    the document as TOML, so every spelling of a declaration counts (a literal string, a dotted key, an inline table)
+    and none that is not one. A document with no Apptainer sandbox has no run to fingerprint and is not asked. Names
+    the key, never a path."""
+    table = tomllib.loads(document).get("sandbox", {}).get("apptainer")
+    if table is None:
         return
-    declared = KIND_DECLARED.findall(template)
-    if not any(value in (f"@{STORAGE_KIND}@", provider_storage(site)) for value in declared):
+    if kind is None or table.get("provider_storage") != kind:
         raise RuntimeError(
-            "the platform template declares the agent's sandbox without the providers' storage kind as this site has "
-            f'it: add provider_storage = "@{STORAGE_KIND}@" to its [sandbox.apptainer] (a federation on scratch and '
-            "one on tmpfs would otherwise share a campaign fingerprint)"
+            "the platform file's [sandbox.apptainer] must declare provider_storage as the site has it "
+            f'("{kind}"): add provider_storage = "@{STORAGE_KIND}@" to the template (a federation on scratch and one '
+            "on tmpfs are two experiments)"
         )
+
+
+def filled_in(template: str, kind: str) -> str:
+    """A template with its storage placeholder as the site's kind and every other placeholder as `0`, which a TOML
+    value of the renderer's templates takes as it is (an integer where the placeholder stands bare, a character in a
+    string where it stands in one): the template as a document, for `check_declared_kind`."""
+    word = f"@{STORAGE_KIND}@"
+    return ANY_PLACEHOLDER.sub(lambda found: kind if found.group(0) == word else "0", template)
+
+
+def check_storage_kind(site: Site, template: str) -> None:
+    """The refusal before anything is submitted (O57): the template, read as TOML with its placeholders filled in
+    (`filled_in`), declares the providers' storage kind as the site has it, or declares no Apptainer sandbox. A template
+    that is no TOML once filled in (a placeholder in a key, say) is left to the renderer, which reads the file it writes
+    back for the same (`hpcboot.check_provider_storage`) before it writes it."""
+    kind = provider_storage(site)
+    try:
+        tomllib.loads(filled_in(template, kind))
+    except tomllib.TOMLDecodeError:
+        return
+    check_declared_kind(filled_in(template, kind), kind)
 
 
 def check(site: Site, template: Optional[str]) -> None:

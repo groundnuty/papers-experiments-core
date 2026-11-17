@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
 import hpcimport
+import hpcpins
 import tomllib
 from fedboot import Bootstrap
 from fedcontent import Content
@@ -221,18 +222,9 @@ def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int,
 
 def check_provider_storage(rendered: str, values: Mapping[str, str]) -> None:
     """Refuse a rendered file whose `[sandbox.apptainer]` does not declare the providers' storage kind the site has
-    (`values["hpc_provider_storage"]`, O57): the kind is in the campaign fingerprint, so a file that leaves it out, or
-    hard-codes another, would let shards on tmpfs and on scratch merge. A file with no Apptainer sandbox has no run to
-    fingerprint and is not asked. Names the key and the two kinds, never a path."""
-    table = tomllib.loads(rendered).get("sandbox", {}).get("apptainer")
-    if table is None:
-        return
-    wanted = values.get(PROVIDER_STORAGE)
-    if wanted is None or table.get("provider_storage") != wanted:
-        raise RuntimeError(
-            "the platform file's [sandbox.apptainer] must declare provider_storage as the site has it "
-            f'("{wanted}"): a federation on scratch and one on tmpfs are two experiments'
-        )
+    (`values["hpc_provider_storage"]`, O57; `hpcpins.check_declared_kind`): the kind is in the campaign fingerprint, so
+    a file that leaves it out, or hard-codes another, would let shards on tmpfs and on scratch merge."""
+    hpcpins.check_declared_kind(rendered, values.get(PROVIDER_STORAGE))
 
 
 def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, str]) -> str:

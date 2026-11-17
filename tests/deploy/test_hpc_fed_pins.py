@@ -366,8 +366,9 @@ LITERAL_SANDBOX = f'[sandbox.apptainer]\nimage = "/invented/agent.sif"\nimage_sh
         LITERAL_SANDBOX + 'provider_storage = "shared_filesystem"\n',  # not this site's
         "[sandbox.apptainer.gate_options]\nkey = 1\n",  # a subtable declares the table
         'sandbox.apptainer.image = "/invented/agent.sif"\n',  # a dotted key too
+        LITERAL_SANDBOX + '[metadata]\nprovider_storage = "tmpfs"\n',  # the key of another table declares nothing
     ],
-    ids=["literal-pins", "comment-only", "unknown-word", "other-kind", "subtable", "dotted-key"],
+    ids=["literal-pins", "comment-only", "unknown-word", "other-kind", "subtable", "dotted-key", "another-table"],
 )
 def test_o57_the_preflight_reads_the_template_s_declaration_not_its_placeholders(pins, hpc, template):
     """O57: `check` looks for the declaration itself: a template of literal pins is refused like one of placeholders."""
@@ -382,8 +383,11 @@ def test_o57_the_preflight_reads_the_template_s_declaration_not_its_placeholders
         LITERAL_SANDBOX + 'provider_storage = "tmpfs"  # this site\'s own\n',
         LITERAL_SANDBOX + 'provider_storage = "@hpc_provider_storage@"\n',
         'zone = { name = "zone" }\n# [sandbox.apptainer] is in a comment here\n',  # no sandbox declared
+        LITERAL_SANDBOX + "provider_storage = 'tmpfs'\n",  # a literal string is TOML's too
+        'sandbox.apptainer.image = "x"\nsandbox.apptainer.provider_storage = "tmpfs"\n',  # dotted keys at the root
+        'sandbox = { apptainer = { image = "x", provider_storage = "tmpfs" } }\n',  # inline tables
     ],
-    ids=["its-own-word", "placeholder", "no-sandbox"],
+    ids=["its-own-word", "placeholder", "no-sandbox", "literal-string", "dotted-keys", "inline-tables"],
 )
 def test_o57_the_preflight_accepts_the_site_s_own_kind_and_a_template_with_no_sandbox(pins, hpc, template):
     """O57: the placeholder and the site's own word declare the kind; a template that declares no Apptainer sandbox is
@@ -412,3 +416,21 @@ def test_o57_a_rendered_file_that_declares_another_kind_than_the_site_s_is_refus
     with pytest.raises(RuntimeError, match="provider_storage"):
         render(hpc, pins, tmp_path / "root", site, ca)
     assert not (tmp_path / "root" / "platform.toml").exists()  # nothing a campaign could read was left behind
+
+
+def test_o57_a_template_that_is_no_toml_once_filled_in_is_left_to_the_renderer(pins, hpc):
+    """O57: the preflight cannot read a template whose placeholder stands where no value does (`key = @x@ @y@`): it
+    raises nothing, and the renderer's read-back of the file it writes is the check that stands."""
+    pins.check(hpc.settings.site_from_environment(PLAIN_SITE), "[sandbox.apptainer]\nkey = @x@ @y@\n")
+
+
+@pytest.mark.parametrize("kind", ["tmpfs", "shared_filesystem"])
+def test_o57_every_shipped_template_is_toml_once_filled_in_and_the_pilot_s_declares_the_kind(pins, kind):
+    """O57: the preflight really reads the templates this repository ships (none is silently skipped as no TOML), and
+    the pilot's, filled in for a site, declares that site's kind in `[sandbox.apptainer]`."""
+    import tomllib
+
+    for template in sorted(PILOT_TEMPLATE.parent.glob("*.platform.toml.template")):
+        document = tomllib.loads(pins.filled_in(template.read_text(encoding="utf-8"), kind))
+        declared = document.get("sandbox", {}).get("apptainer", {}).get("provider_storage")
+        assert declared == (kind if template == PILOT_TEMPLATE else None), template.name
