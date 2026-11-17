@@ -14,22 +14,22 @@ for n in 1 2 3; do PW[n]=$(wlog "$(svc_log "P$n")"); done
 ev roundtrip
 cd /
 t0=$(date +%s)
-PREP=$(st Z -c1 --mem=500M python3.11 -I "$RUN/fed_zone.py" --workdir "$ZW" --evidence "$E/roundtrip" prepare-n "$SPACE_NAME" 3 \
+PREP=$(st Z -c1 --mem=500M python3.11 -I -B "$RUN/fed_zone.py" --workdir "$ZW" --evidence "$E/roundtrip" prepare-n "$SPACE_NAME" 3 \
   < /dev/null 2> "$L/rt-prepare.err")
 rc=$?
 rec kv "$E/roundtrip/prepare.json" "rc=int:$rc" "stdout_bytes=int:${#PREP}"
 say "prepare: exit status $rc; $(grep -v -i token "$L/rt-prepare.err" | tr '\n' ' ' | cut -c1-200)"
 [[ $rc == 0 && -n $PREP ]] || exit 1
 for n in 1 2 3; do
-  printf '%s\n' "$PREP" | python3 -I "$RUN/pick.py" support "$((n - 1))" \
-    | st "P$n" -c1 --mem=500M python3.11 -I "$RUN/fed_provider.py" --workdir "${PW[n]}" --bundle "$B" --evidence "$E/roundtrip" support \
+  printf '%s\n' "$PREP" | python3 -I -B "$RUN/pick.py" support "$((n - 1))" \
+    | st "P$n" -c1 --mem=500M python3.11 -I -B "$RUN/fed_provider.py" --workdir "${PW[n]}" --bundle "$B" --evidence "$E/roundtrip" support \
       > "$E/roundtrip/support-P$n.out.json" 2> "$L/rt-support-$n.err"
   pipe=("${PIPESTATUS[@]}")
   rec rc "$E/roundtrip/support-P$n.rc.json" support "${pipe[2]}"
   say "P$n support: exit status ${pipe[2]} at $(date -u +%T)"
 done
-printf '%s\n' "$PREP" | python3 -I "$RUN/pick.py" access \
-  | st P1 -c1 --mem=500M python3.11 -I "$RUN/fed_provider.py" --workdir "${PW[1]}" --evidence "$E/roundtrip" write \
+printf '%s\n' "$PREP" | python3 -I -B "$RUN/pick.py" access \
+  | st P1 -c1 --mem=500M python3.11 -I -B "$RUN/fed_provider.py" --workdir "${PW[1]}" --evidence "$E/roundtrip" write \
     > "$E/roundtrip/write.out.json" 2> "$L/rt-write.err"
 pipe=("${PIPESTATUS[@]}")
 rec rc "$E/roundtrip/write.rc.json" write "${pipe[2]}"
@@ -37,8 +37,8 @@ say "write on P1: exit status ${pipe[2]}"
 FID=$(rec field "$E/roundtrip/write.out.json" file_id) && SHA=$(rec field "$E/roundtrip/write.out.json" sha256) \
   || { say "no usable write evidence"; exit 1; }
 for n in 2 3; do
-  printf '%s\n' "$PREP" | python3 -I "$RUN/pick.py" access \
-    | st "P$n" -c1 --mem=500M python3.11 -I "$RUN/fed_provider.py" --workdir "${PW[n]}" --evidence "$E/roundtrip" read "$FID" "$SHA" \
+  printf '%s\n' "$PREP" | python3 -I -B "$RUN/pick.py" access \
+    | st "P$n" -c1 --mem=500M python3.11 -I -B "$RUN/fed_provider.py" --workdir "${PW[n]}" --evidence "$E/roundtrip" read "$FID" "$SHA" \
       > "$E/roundtrip/read-P$n.out.json" 2> "$L/rt-read-$n.err"
   pipe=("${PIPESTATUS[@]}")
   rec rc "$E/roundtrip/read-P$n.rc.json" read "${pipe[2]}"
@@ -46,5 +46,5 @@ for n in 2 3; do
 done
 say "round trip done in $(($(date +%s) - t0)) s"
 say "=== agent cell on S at $(date -u +%T)"
-printf '%s\n' "$PREP" | python3 -I "$RUN/pick.py" gate | cell_step
+printf '%s\n' "$PREP" | python3 -I -B "$RUN/pick.py" gate | cell_step
 PREP=''

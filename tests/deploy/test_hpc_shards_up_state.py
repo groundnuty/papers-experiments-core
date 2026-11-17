@@ -18,6 +18,9 @@ AGENT = 'sandbox = { cpus = 8, memory = "17g" }'
 @pytest.fixture(scope="module")
 def hpc():
     with hpc_on_path() as modules:
+        import hpcdata
+
+        modules.data = hpcdata
         yield modules
 
 
@@ -53,10 +56,18 @@ def up_federation(hpc, tmp_path: Path, placement: str) -> tuple[Path, FakeSlurm]
     driver = hpc.cli.make_driver(layouts / LAYOUT.name, str(root), runner=fake)
     driver.sleep = driver.slurm.sleep = lambda s: None
     driver.poll_s = driver.slurm.poll_s = 0.0
-    driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
+
+    def core(layout, owner, values, environ=None):
+        (root / "platform.toml").write_text("", encoding="utf-8")  # the file the real phase renders (plan reads it)
+        return "core: the link check passed"
+
+    driver.core = core
     driver.relay_available = lambda: False
     site = {**SITE, **agent_site(tmp_path / "agent"), "SH": str(images), "L": str(logs)}
     driver.up(hpc.settings.site_from_environment(site))
+    # the layout's one ingested space (delta-space) holds nothing, as its manifest (the empty one) declares: verified
+    driver.verify = lambda layout, owner, manifests: hpc.data.verify(manifests, lambda space: ({}, set()))
+    driver.verify_data()
     return root, fake
 
 
