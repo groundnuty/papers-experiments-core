@@ -68,12 +68,16 @@ a port per federation would patch the shim, the guard and the images, for a plac
 answer. Asking the site for whole nodes (`--exclusive`) was the other option: it would change the held job's shape and
 what it bills (above), which this problem does not need.
 
-- **Which jobs.** Every live job of the account (`squeue --me`, read-only, ids, names, states and node lists) whose
+- **Which jobs.** Every live job of the account (`squeue --me -t <every state a job holds a node in>`, read-only, ids,
+  names, states and node lists; the states are named because squeue's default lists pending, running and completing
+  alone, which would miss a suspended job, and the call runs with no `SQUEUE_*` variable and none of Slurm's
+  output-format variables in its environment, so a login shell's own cannot hide a job) whose
   name starts with `hpcop-` (`hpcexclude.JOB_PREFIX`, the one prefix `up` names its jobs by, and the bundle's batch
   scripts carry): the held job, the agent's own job (`-sandbox`), the older scripts' `hpcop-zone` and `hpcop-provider`. A
   job is read whole, a heterogeneous job's components together, so another federation's agent's node is one of its nodes:
-  the agent's sandbox never runs on a node that hosts an Onedata service. A pending job holds none, a completing one still
-  does.
+  the agent's sandbox never runs on a node that hosts an Onedata service. A pending job holds none unless
+  it names its nodes (a list that cannot be expanded refuses, naming the job's own name, as one of any other state
+  does), a completing one still does.
 - **Before the submit** (section 5, step 2): the nodes of those jobs go to every component of every held job `up`
   submits as `--exclude`, named on every component so that nothing depends on Slurm passing it on, and only when there
   are some, so
