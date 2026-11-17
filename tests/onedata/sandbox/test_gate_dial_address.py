@@ -17,7 +17,7 @@ from tls_peer import TlsPeer
 from expcore_onedata.sandbox import gate
 from expcore_onedata.sandbox.hostops import DockerHost
 
-SERVED = "alpha.layout.test"  # the declared name: the URL's host, the name the gate serves and its certificate holds
+SERVED = "depot.layout.test"  # the declared name: the URL's host, the name the gate serves and its certificate holds
 DIAL = "127.0.0.1"  # the mapped address: where the node is, never its client's to see
 FILE = "/api/v3/oneprovider/data/f1/content"
 
@@ -114,7 +114,7 @@ def test_o70_the_certificate_is_still_checked_against_the_declared_name(tmp_path
     [
         ("connect to 192.0.2.10:8443 failed", f"connect to {SERVED}:443 failed"),
         ("no route to [192.0.2.10]:8443 or 192.0.2.10", f"no route to {SERVED}:443 or {SERVED}"),
-        ("not valid for 'alpha.layout.test'.", "not valid for 'alpha.layout.test'."),
+        ("not valid for 'depot.layout.test'.", "not valid for 'depot.layout.test'."),
     ],
 )
 def test_o70_the_dialled_address_is_named_by_the_served_name_in_a_failure(text, expected):
