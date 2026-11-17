@@ -162,12 +162,22 @@ def differences(tree: Tree, manifest: Manifest) -> str:
 def check_rendered(layout: Layout, manifests: Mapping[str, Path]) -> None:
     """Refuse a rendered platform.toml whose entry for a space names another `data_manifest` than the one `up` rendered
     for it (`manifests`): a template that writes a path of its own would leave the data the campaign's fingerprint holds
-    unchecked, since only the manifests `up` renders are read back or verified. RuntimeError naming the space."""
+    unchecked, since only the manifests `up` renders are read back or verified. Nor may an entry declare one for a space
+    that is neither a baseline space nor an import unless the template names that space's `@data_manifest.<space>@`
+    (an ingested space): written as a path to the root's own file, it would pass the first rule and fingerprint the
+    empty baseline of a space the study fills. RuntimeError naming the space."""
     data = tomllib.loads(layout.platform.read_text(encoding="utf-8"))
     entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
+    waiting = ingested(layout)
     for entry in entries:
         if not (isinstance(entry, Mapping) and entry.get("data_manifest") and entry.get("name") in manifests):
             continue
+        space = layout.spec.space(entry["name"])
+        if not space.baseline and space.imported is None and space.name not in waiting:
+            raise RuntimeError(
+                f"{space.name}: its platform entry declares a data_manifest the template does not take from "
+                "@data_manifest.<space>@: the space's data would go unverified"
+            )
         named = os.path.normpath(os.path.join(layout.root, str(entry["data_manifest"])))
         if named != os.path.normpath(str(manifests[entry["name"]])):
             raise RuntimeError(

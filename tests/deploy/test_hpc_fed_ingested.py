@@ -291,6 +291,26 @@ def test_c06_a_template_that_writes_a_data_manifest_path_of_its_own_is_refused_s
     assert not (fed.root / "link-check.json").exists()
 
 
+def test_c06_a_template_that_points_a_non_baseline_space_at_the_roots_own_manifest_is_refused_too(hpc, tmp_path, ca):
+    """C06: written as `@hpc_root@/data-manifests/<space>.json`, the path is the one up would render for the space's
+    empty baseline, which the first rule accepts: a space the study fills would fingerprint empty and never be
+    verified. `up` refuses it, naming the space."""
+    layout = study_layout(tmp_path / "layout", declared=None)
+    template = layout.parent / "pilot-shape.platform.toml.template"
+    text = template.read_text(encoding="utf-8")
+    template.write_text(
+        text.replace("@data_manifest.delta-space@", "@hpc_root@/data-manifests/delta-space.json"), encoding="utf-8"
+    )
+    fed = driver_over(hpc, tmp_path, layout, "fed-a", ca)
+    real_core(hpc, fed, data_stand_in())
+    env = site_env(tmp_path, None)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(hpc.fedlinks, "check_links", link_check_stand_in([]))
+        with pytest.raises(RuntimeError, match=r"^delta-space: its platform entry declares a data_manifest"):
+            fed.driver.up(hpc.settings.site_from_environment(env))
+    assert not (fed.root / "link-check.json").exists()
+
+
 def test_c06_a_baseline_space_keeps_its_check_at_up(hpc, tmp_path, ca):
     """C06: a baseline space differing from its manifest still fails `up`, naming the space and never a path."""
     fed = driver_over(hpc, tmp_path, study_layout(tmp_path / "layout"), "fed-a", ca)

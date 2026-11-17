@@ -464,7 +464,8 @@ written into a quoted TOML string). `up` loads each declared manifest in the pre
 is held, naming the space and never the path. **The directory must be on a filesystem both the login node and the
 agent's node see**: `up`, `verify-data` and `plan` read the manifest on the login node, and the dispatcher's fingerprint
 reads it on the agent's node. `up` also refuses a rendered `platform.toml` whose entry for a space names another
-`data_manifest` than the one it rendered (a template that hard-codes a path of its own): only a manifest `up` renders
+`data_manifest` than the one it rendered (a template that hard-codes a path of its own), or declares one for a space the
+study fills without taking it from `@data_manifest.<space>@` (even the root's own file): only a manifest `up` renders
 is read back or verified.
 
 **`verify-data`** (`Driver.verify_data`, `hpcboot.verify_ingested`): refused unless the state's phase is `linked`, the
