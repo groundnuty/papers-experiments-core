@@ -251,14 +251,18 @@ class LinkHeal:
         self._hold(self._settle_s)
         return result
 
+    def _link_timing(self) -> dict[str, Any]:
+        """Where the link restart just sent spent its time (O58), as the driver kept it from the relay's answer: the
+        `timing` key for the action's record, or nothing when the driver kept none. Read right after `_sent`, before
+        another request replaces it, by every record of a link restart."""
+        timing = (getattr(self._driver, "last_timing", None) or {}).get("restart_link")
+        return {"timing": dict(timing)} if isinstance(timing, Mapping) else {}
+
     def _restart_link(self, label: str, service: str) -> str:
         """One link restart of the all-links sequence, recorded by its result word."""
         start = self._utc()
         result = self._sent(label, service)
-        timing = (getattr(self._driver, "last_timing", None) or {}).get("restart_link")  # where its time went (O58)
-        self._record(
-            label, "restart_link", result, start, **({"timing": dict(timing)} if isinstance(timing, Mapping) else {})
-        )
+        self._record(label, "restart_link", result, start, **self._link_timing())
         return result
 
     def _no_transfers(self, phase: str, *, wait: bool = True) -> bool:
@@ -312,6 +316,7 @@ class LinkHeal:
         start, extra = self._utc(), {}
         if action == "restart_link":
             result = self._sent(label, service)
+            extra = self._link_timing()  # in every record of this action below, whatever follows the restart
         else:  # its waits end by what its reserve leaves after the margin and the settle: never past the bound
             budget = max(0.0, self._left() - self._margin_s - self._settle_s)
             self._hold(self._container_cost)  # held before the stop: an interrupted restart still leaves no read early

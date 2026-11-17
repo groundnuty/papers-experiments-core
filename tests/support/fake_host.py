@@ -37,6 +37,8 @@ from fake_elf import elf
 
 from expcore_onedata.sandbox import completion
 from expcore_onedata.sandbox.api import SandboxError
+from expcore_onedata.sandbox.cellresolv import PROBE as RESOLV_PROBE
+from expcore_onedata.sandbox.cellresolv import RESOLV_CONF
 from expcore_onedata.sandbox.containers import ONECLIENT_BIN
 from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_input
 from expcore_onedata.sandbox.inputs import PROBE_MARK
@@ -55,6 +57,8 @@ ONECLIENT_CONFIG_PATH = "/etc/invented/oneclient.conf"  # where the fake oneclie
 ONECLIENT_CONFIG_SHA256 = hashlib.sha256(b"an invented oneclient configuration file\n").hexdigest()
 ONECLIENT_VERSION_TEXT = "Oneclient: 25.0\nFUSE library: 3.2\n"  # what the fake oneclient image's `--version` prints
 ONECLIENT_BUILD_ID = "ab" * 20  # the GNU build id of the fake oneclient image's binary
+# the /etc/resolv.conf the engine makes for a container on a user-defined network, with the host's `search` line copied
+ENGINE_RESOLV = "search host-search.invented.test\nnameserver 127.0.0.11\noptions ndots:0\n"
 
 
 class Unrecorded(CmdResult):
@@ -105,6 +109,14 @@ class FakeContainer:
     def hostname(self) -> str:
         """What `hostname` prints in the container: `--hostname`, else the engine's own choice, its short id."""
         return self.options.get("--hostname") or self.id[:12]
+
+    def file(self, path: str) -> str | None:
+        """What a cell of the container reads at `path`: the text of a file bound there when the container started, and
+        for `/etc/resolv.conf` with no bind the engine's own (`ENGINE_RESOLV`); None for any other path."""
+        bound = self.options.get("_files", {})
+        if path in bound:
+            return bound[path]
+        return ENGINE_RESOLV if path == RESOLV_CONF else None
 
 
 def _mounts_json(c: FakeContainer) -> list[dict[str, str]]:
@@ -246,6 +258,8 @@ class FakeHost:
             interp="/opt/invented/lib/ld.so", needed=("libc.so.6",), build_id=bytes.fromhex(ONECLIENT_BUILD_ID)
         )
         self.pause_without_freezing = False  # a `docker pause` that answers 0 but leaves the cgroup unfrozen
+        # an engine that writes its own /etc/resolv.conf whatever a bind names, so a cell reads `ENGINE_RESOLV`
+        self.engine_resolv_wins = False
         self.signal_handlers: dict[str, Callable[[FakeContainer], None]] = {}  # a signal the process handles and lives
         self.base_bundle = "BASE BUNDLE\n"
         # what the agent image's interpreter answers the sandbox's question of where its certifi bundle is
@@ -253,10 +267,25 @@ class FakeHost:
         self.add_process(__import__("os").getpid(), start=777)
 
     @staticmethod
+    def reading_resolv(handler: Callable[[FakeContainer, list[str], str | None], CmdResult]):
+        """`handler` for every program but the start's read of /etc/resolv.conf (O56), which the fake answers from what
+        the container holds, as `_default_exec` does: for a test whose handler answers the other start probes alone."""
+
+        def answering(container: FakeContainer, argv: list[str], stdin: str | None) -> CmdResult:
+            if stdin == RESOLV_PROBE:
+                return FakeHost._default_exec(container, argv, stdin)
+            return handler(container, argv, stdin)
+
+        return answering
+
+    @staticmethod
     def _default_exec(container: FakeContainer, argv: list[str], stdin: str | None) -> CmdResult:
         """The agent's code does nothing, and the read-only probes are refused as a read-only filesystem refuses them:
         the root's and the mount's write, and every change to a read-only input, which the agent can still read and
         run."""
+        if stdin == RESOLV_PROBE:  # a cell reads its /etc/resolv.conf back and says the hash of the bytes
+            seen = (container.file(RESOLV_CONF) or "").encode()
+            return CmdResult(0, f"resolv {hashlib.sha256(seen).hexdigest()}\n")
         if stdin and PROBE_MARK in stdin:
             refused = dict.fromkeys(("write", "beside", "mkdir", "rename", "chmod", "delete"), 30)
             return CmdResult(0, json.dumps({"read": "done", "run": True, **refused, "work": "done"}) + "\n")
@@ -590,6 +619,8 @@ class FakeHost:
             for source, destination in bound_files(options)
             if Path(source).is_file()
         }
+        if self.engine_resolv_wins:
+            container.options["_files"].pop(RESOLV_CONF, None)
         return CmdResult(0, container.id + "\n")
 
     def _mount_oneclient(self, container: FakeContainer) -> None:
