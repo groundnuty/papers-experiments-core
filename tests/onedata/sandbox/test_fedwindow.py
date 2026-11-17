@@ -981,16 +981,16 @@ def test_o86_in_the_pilots_order_an_hpc_target_stopped_just_before_the_start_rea
     assert window["findings"] == []
     others = [window["services"][label] for label in ("zone", "providers[0]")]
     assert [seen["status"] for seen in others] == ["stable", "stable"]
-    assert [seen["accounting_wait_s"] for seen in others] == [{"start": 0.0, "end": 0.0}] * 2
+    assert [seen["accounting_wait_s_used"] for seen in others] == [{"start": 0.0, "end": 0.0}] * 2
     if verdict == "held":
         assert window["unknown"] == []
         assert (target["start"], target["end"], target["restarts"]) == ("not_running", "not_running", [])
-        assert target["accounting_wait_s"] == {"start": 6.0, "end": 0.0}
+        assert target["accounting_wait_s_used"] == {"start": 6.0, "end": 0.0}
         assert target["held"]["injections"] == 1
         assert window["restore"]["field"] == "restore_verified"
     else:
         assert any("accounting_lag" in text for text in window["unknown"])
         assert (target["start"], target["end"], target["held"]) == ("unknown", "unknown", None)
-        assert target["accounting_wait_s"] == {"start": 0.0, "end": 0.0}
+        assert target["accounting_wait_s_used"] == {"start": 0.0, "end": 0.0}
     assert restore["ok"] is True  # the restore is the injector's own, whatever the window could read
     assert not host.containers
