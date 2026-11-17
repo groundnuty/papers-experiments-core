@@ -61,6 +61,7 @@ from fedlayout import Layout, import_storage_name
 from fedlinks import check_after_up
 from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
+from fedtools import check_rendered, require_study_artifacts
 
 from expcore_onedata.addresses import AddressMap
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
@@ -188,6 +189,7 @@ def bring_up(boot: Bootstrap) -> None:
     for space in boot.spec.spaces:
         if boot.spec.members(space.name):
             boot.ensure_members(space.name)
+    boot.audit_slot_users()  # an existing slot user is verified and recorded matched, never changed (O83)
     boot.wait_import(IMPORT_TIMEOUT_S)  # each import's one scan complete (no-op with no import)
 
 
@@ -318,8 +320,12 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
         ).is_file():  # the launcher `up` copied into the root, for a Python server
             values["hpc_resolver"] = str(layout.toolshim / hpcnames.LAUNCHER)
     text = template.read_text(encoding="utf-8")
+    require_study_artifacts(text, values.get("study_artifacts"))
     write_platform(layout.platform, text, facts, values)
     hpcidentity.write(layout.root, hpcidentity.build(text, values, layout.platform))
+    check_rendered(
+        layout, facts
+    )  # O83: the slots the file declares, against the layout's principals; as a campaign loads it
     return f"facts.json and platform.toml written; {hpcidentity.FILE} written"
 
 

@@ -228,7 +228,10 @@ def launch_argv(command: str, args: Sequence[str], launcher: Path, map_file: Pat
     that interpreter would have been given it. The server must be a Python started by `-m <module>` or by a script,
     since only then can the launcher run it; anything else is an AddressMapError naming what to change."""
     if not _PYTHON.fullmatch(Path(command).name):
-        raise AddressMapError("[toolserver] command must be a Python interpreter: the resolver starts the server by it")
+        raise AddressMapError(
+            "[toolserver] command must be a Python interpreter; use <venv>/bin/python with args "
+            "['-m', '<module>', ...]: the resolver starts the server by it"
+        )
     if not args or (args[0].startswith("-") and args[0] != "-m"):
         raise AddressMapError("[toolserver] args must start with -m <module> or a script: the resolver runs the server")
     if args[0] == "-m" and (len(args) < 2 or not args[1] or args[1].startswith("-")):

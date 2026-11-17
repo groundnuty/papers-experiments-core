@@ -50,7 +50,9 @@ PLACEHOLDERS = {
     "study_artifacts": ("HPC_STUDY_ARTIFACTS", "study_artifacts"),
 }
 WHY = {  # what names a placeholder, where the default (the template's [sandbox]) is not it
-    "study_artifacts": "a platform template or a space's data_manifest names @study_artifacts@ (site.env)",
+    "study_artifacts": (
+        "a platform template or a space's data_manifest names @study_artifacts@, the study's own files (site.env)"
+    ),
 }
 FILES = {  # file -> its pin
     "hpc_agent_sif": "hpc_agent_sif_sha",
