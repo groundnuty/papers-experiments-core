@@ -11,7 +11,7 @@ the store's id of the attempt), and the verdicts (`FaultGate`, `SettledInjection
 - an entry owned by **the attempt this context runs** is charged to it, exactly as before: a run's own post-run check
   of its own failed restore is never spared;
 - every entry owned by **another attempt**, and the check judging none (a pre-run check, the dispatcher's own), holds
-  uncharged, and its detail says so (`LEFT_BY_ANOTHER`);
+  uncharged, and its detail says so (`LEFT_BY_ANOTHER`: short, since the gate keeps 200 characters of a detail);
 - an entry that **names no attempt**, because it records no owner (written before owners were recorded, or one that
   cannot be read) or only a process (a heal's container restart, or a tool's injection outside any attempt), is
   charged as before and its detail says so (`NO_ATTEMPT`): an owner is never guessed.
@@ -27,7 +27,7 @@ from typing import Any
 from expcore.campaign import liveness
 
 LEFT_BY_ANOTHER = "left by another attempt, so no run is charged for it"
-NO_ATTEMPT = "its journal line records no attempt as its owner, so a run that finds it is charged as before"
+NO_ATTEMPT = "it records no attempt as its owner: charged as before"  # short: the gate keeps 200 characters of a detail
 
 
 def _attempt_of(owner: Any) -> tuple[Any, Any, Any] | None:
