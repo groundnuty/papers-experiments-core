@@ -105,6 +105,7 @@ from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch, Rais
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals, failed_heal_reason
 from expcore_onedata.fault_journal import HeldLock, holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
+from expcore_onedata.fault_owner import charge_of, with_note
 from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling, failure
 from expcore_onedata.fault_relay import RELAY_NOTE, beat
 from expcore_onedata.fault_settings import (
@@ -160,7 +161,8 @@ def _held_for(record: Mapping[str, Any]) -> float | None:
 def _unsettled(entries: list[dict[str, Any]]) -> Health:
     """The failure of a journal with open injections: a failed restore by its target's label and how it failed. A
     journal whose only open injections are heals' container restarts that a recovery brought back and that settle before
-    their gate and pairs are read (`settling`) is a wait that charges no run, never a pass."""
+    their gate and pairs are read (`settling`) is a wait that charges no run, never a pass. Otherwise the failure
+    charges the attempt that made the injection and no other (`fault_owner.charge_of`, O80)."""
     if entries and all(entry.get("clear_failed") == "settling" for entry in entries):
         settling = ", ".join(sorted({entry["target"] for entry in entries}))
         detail = (
@@ -171,9 +173,13 @@ def _unsettled(entries: list[dict[str, Any]]) -> Health:
     failed = sorted({(entry["target"], entry["clear_failed"]) for entry in entries if "clear_failed" in entry})
     if failed:
         hows = ", ".join(f"{target} ({how if _WORD.fullmatch(how) else 'failed'})" for target, how in failed)
-        return Health(False, f"the restore of {hows} failed: the federation is not in its baseline state")
+        detail = f"the restore of {hows} failed: the federation is not in its baseline state"
+        charge, note = charge_of(entry for entry in entries if "clear_failed" in entry)
+        return Health(False, with_note(detail, note), charge=charge)  # only its injecting attempt is charged (O80)
     targets = ", ".join(sorted({entry["target"] for entry in entries}))
-    return Health(False, f"an injection of {targets} is unsettled: the federation is not in its baseline state")
+    detail = f"an injection of {targets} is unsettled: the federation is not in its baseline state"
+    charge, note = charge_of(entries)
+    return Health(False, with_note(detail, note), charge=charge)
 
 
 class FaultGate:

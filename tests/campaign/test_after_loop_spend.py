@@ -108,9 +108,11 @@ def test_c05_the_measured_dollars_of_an_attempt_raised_after_its_loop_count_in_t
         assert {row["spend_basis"] for row in rows} == {MEASURED}
         state = BudgetGate(store, {"m1": TABLE.resolve("m1")}, Budget(max_usd=50.0), limits).assess([], LATER)
         assert state.spent_usd == pytest.approx(len(rows) * MEASURED_USD)  # not len(rows) * the bound
-        [cell] = [c for c in export_run_state(store)["discarded_usage"] if c["state"] == "infra_fail"]
-        assert (cell["attempts"], cell["usage_incomplete_attempts"]) == (len(rows), 0)
-        assert (cell["input_tokens"], cell["output_tokens"]) == (len(rows) * 9_000, len(rows) * 110)
+        cells = [c for c in export_run_state(store)["discarded_usage"] if c["state"] == "infra_fail"]
+        assert sum(c["attempts"] for c in cells) == len(rows)
+        assert sum(c["usage_incomplete_attempts"] for c in cells) == 0
+        assert sum(c["input_tokens"] for c in cells) == len(rows) * 9_000
+        assert sum(c["output_tokens"] for c in cells) == len(rows) * 110
 
 
 @pytest.mark.parametrize(
