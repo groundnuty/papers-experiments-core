@@ -130,8 +130,7 @@ def other_document(text: str) -> dict:
 def implied(written: Path, into: Path) -> Path:
     """The same file with its `[placement]` as the template declared it (the holder alone), the rest implied: a copy of
     `written` beside it in the root, so the files it names are read from where they are."""
-    pattern = r"(?m)^placement = \{.*\}$"
-    text = re.sub(pattern, DECLARED, written.read_text(encoding="utf-8"))
+    text = re.sub(r"(?m)^placement = \{[^}]*\}", DECLARED, written.read_text(encoding="utf-8"))
     into.write_text(text, encoding="utf-8")
     assert tomllib.loads(text)["placement"] == {"holder": "aspen"}
     return into
@@ -266,7 +265,11 @@ def test_o79_a_template_that_declares_its_placement_as_a_table_gets_the_same_ren
     inline, _ = render(hpc, tmp_path / "inline", TEMPLATE, ca)
     as_table = TEMPLATE.replace(DECLARED, "") + '\n[placement]\nholder = "aspen"\n'
     table, _ = render(hpc, tmp_path / "table", as_table, ca)
-    assert tomllib.loads(table.read_text(encoding="utf-8")) == tomllib.loads(inline.read_text(encoding="utf-8"))
+
+    def read(path: Path) -> dict:  # each render names the files of its own root
+        return tomllib.loads(path.read_text(encoding="utf-8").replace(str(path.parent), "ROOT"))
+
+    assert read(table) == read(inline)
 
 
 # -- what a template may declare, and what completing does to it -------------------------------------------------------
