@@ -73,7 +73,7 @@ def watch(
              still_listed=[])  # fmt: skip
         return 1
     slurm = launcher.slurm
-    handled: Dict[str, bool] = {}  # a late step's id: whether its cancel worked
+    handled: Dict[str, bool] = {}  # a late step's id: whether it is settled (cancelled, or refused as another job's)
     late = read = unread = 0
     still: List[str] = []
     outcome: Optional[str] = None
@@ -94,7 +94,7 @@ def watch(
             unread += 1
         try:
             gone = slurm.gone(job)
-        except (SlurmError, OSError):  # not known to be gone (nor known to be there): the window runs on
+        except (SlurmError, OSError, TypeError):  # not known to be gone (nor to be there): the window runs on
             gone = False
         for name, ids in found.items():
             for step_id in ids:
@@ -102,12 +102,14 @@ def watch(
                     continue
                 try:
                     launcher.cancel(step_id)
-                    cancelled, error = True, None
-                except Exception as failure:  # refused (another job's id) or failed: said, tried again at the next look
-                    cancelled, error = False, type(failure).__name__
+                    cancelled, error, settled = True, None, True
+                except StateError as refusal:  # another job's id: never cancelled, and said once, not at every look
+                    cancelled, error, settled = False, type(refusal).__name__, True
+                except Exception as failure:  # a cancel that failed: said, tried again at the next look
+                    cancelled, error, settled = False, type(failure).__name__, False
                 if step_id not in handled:
                     late += 1
-                handled[step_id] = cancelled
+                handled[step_id] = settled
                 emit("late_step", step=name, id=step_id, cancelled=cancelled, error=error)
         still = sorted(found)
         if gone:

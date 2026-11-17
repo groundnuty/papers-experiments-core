@@ -1102,6 +1102,9 @@ class FaultInjector:
         waited = self._recovery.restore_record.get("domain_wait_s") if ready_after_s is not None else None
         if waited is not None:  # only a driver that reported it: never a 0 nobody measured (O58)
             timed["domain_wait_s"] = waited
+        start_timing = self._recovery.restore_record.get("start_timing")  # where the start's time went, served or not
+        if start_timing is not None:
+            timed["start_timing"] = start_timing
         self._injection = {**injection, "cleared": done, "verified": verified, **timed}
         self._record_links(self._recovery.restore_record)
         self._step("cleared", done, how=how)
@@ -1112,6 +1115,7 @@ class FaultInjector:
             identity_after_sha256=after,
             ready_after_s=ready_after_s,
             **({} if waited is None else {"domain_wait_s": waited}),
+            **({} if start_timing is None else {"start_timing": start_timing}),
         )
         if done:
             self._drain(admission, own, how, began)  # before the federation goes back to the other runs

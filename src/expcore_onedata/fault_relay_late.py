@@ -43,12 +43,30 @@ JOURNAL = "late-steps.jsonl"
 WATCH_COMMAND = "late-steps"  # a command of `hpcfed.py` the relay alone starts; never a verb a request can name
 LATE_WINDOW_S = 400.0  # twice the site's controller message timeout (about 200 s), counted from the verb's bound
 LATE_POLL_S = 5.0  # between two looks at the job's steps
+# hpcfed ends one of its own `srun` clients only after the step's own bound has passed (`Slurm._finish`: the read-only
+# check's 30 s is the shortest), and the controller may still hold that step: so a verb that ran this long, whatever its
+# exit status, may have left a step pending, and is watched as a verb that timed out (a test keeps this below those
+# bounds, `hpcfed_control.*_TIMEOUT_S` and the stop's margin).
+LATE_ELAPSED_S = 25.0
+# The words of the control steps each verb launches (`hpcfed_control.CONTROL_WORDS`, which a test holds equal): a step
+# is named `<allocation>-<service>-<word>-<tag>`. A start's service step (`...-run-<n>`) is no control step.
+CONTROL_WORDS: dict[str, tuple[str, ...]] = {
+    "status": ("status", "mounts"),
+    "stop": ("stop",),
+    "start": ("status",),
+    "exec": ("exec",),
+}
 _RELAY_DIR = "fault-relay"  # `fault_relay.RELAY_DIR`; a test holds the two together
 
 
 def step_tag(nonce: str, key: str) -> str:
     """The tag of one request's steps: 12 hex digits of a hash of the relay's nonce and the request's id."""
     return hashlib.sha256(f"{nonce}:{key}".encode()).hexdigest()[:12]
+
+
+def step_name(prefix: str, service: str, word: str, tag: str) -> str:
+    """The name hpcfed gives a control step it launches for a verb with the relay's tag."""
+    return f"{prefix}-{service}-{word}-{tag}"
 
 
 def journal_path(root: Path) -> Path:

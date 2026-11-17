@@ -180,9 +180,9 @@ def test_o58_a_step_listed_under_another_job_is_never_cancelled_even_when_it_has
     _, lines, _ = run_watch(hpc, tmp_path, cluster)
     assert "9999" not in cluster.asked
     assert cluster.cancelled == []
-    (late,) = {line["id"]: line for line in events(lines, "late_step")}.values()
+    (late,) = events(lines, "late_step")  # said once, not at every look
     assert late["cancelled"] is False
-    assert late["error"]
+    assert late["error"] == "StateError"
 
 
 @pytest.mark.parametrize("verb", sorted(WORDS))
@@ -307,6 +307,42 @@ def test_o58_a_listing_that_fails_after_the_step_was_found_keeps_what_was_found(
     _, lines, _ = run_watch(hpc, tmp_path, cluster, store=Store(sandbox), window_s=5.0)
     assert cluster.cancelled == [f"{JOB}.7"]
     assert events(lines, "late_step")[0]["cancelled"] is True
+
+
+def test_o58_a_job_check_that_raises_something_unforeseen_does_not_kill_the_watch(hpc, tmp_path):
+    """O58: the check that the job exists fails with a type the watch did not name (a state with no job gives None): the
+    window still runs and closes with its record."""
+    cluster = Cluster(hpc.slurm)
+
+    def broken(job):
+        raise TypeError("no job")
+
+    cluster.gone = broken
+    status, lines, _ = run_watch(hpc, tmp_path, cluster, window_s=10.0)
+    assert status == 0
+    assert events(lines, "watch_closed")[-1]["outcome"] == "none_seen"
+
+
+def test_o58_the_relays_tables_and_threshold_hold_to_hpcfeds_own(hpc):
+    """O58: the words the relay looks for are the words hpcfed's verbs name their steps by, and the elapsed time at
+    which the relay watches a verb is below every bound hpcfed ends a control step at (it kills an srun only after its
+    step's own bound, so a verb quicker than that cannot have left one pending that the group kill missed)."""
+    import inspect
+    import re
+
+    from expcore_onedata.fault_relay_late import CONTROL_WORDS, LATE_ELAPSED_S
+
+    assert hpc.control.CONTROL_WORDS == CONTROL_WORDS
+    bounds = re.findall(r"timeout_s=([^,\n)]+)", inspect.getsource(hpc.control))
+    known = {
+        "STATUS_TIMEOUT_S": hpc.control.STATUS_TIMEOUT_S,
+        "MOUNT_CHECK_TIMEOUT_S": hpc.control.MOUNT_CHECK_TIMEOUT_S,
+        "EXEC_TIMEOUT_S": hpc.control.EXEC_TIMEOUT_S,
+        "stop_seconds + STOP_MARGIN_S": 1 + hpc.control.STOP_MARGIN_S,  # a stop's bound, `stop_seconds` at least 1
+    }
+    control_bounds = [bound.strip() for bound in bounds if bound.strip() not in ("timeout_s", "timeout")]
+    assert set(control_bounds) <= set(known), "a control step has a bound the relay's threshold does not know"
+    assert min(known.values()) >= LATE_ELAPSED_S
 
 
 def test_o58_the_watch_ends_early_once_the_held_job_is_gone(hpc, tmp_path):

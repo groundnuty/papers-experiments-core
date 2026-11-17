@@ -353,6 +353,7 @@ class Recovery(LinkSettling):
             how = "never_down"  # the stop never took effect
         else:
             restored, after, reason = self._restore(entry["service"], before)
+            self._note_start_timing(links)
             if restored:
                 how = "restored"
             elif reason == "identity_unchanged" and not injected:
@@ -378,6 +379,15 @@ class Recovery(LinkSettling):
         if clear:
             self.journal.append({"event": "cleared", "id": entry["id"], "how": how})
         return Settled(True, how, after, ready_after_s)
+
+    def _note_start_timing(self, links: bool) -> None:
+        """Where the target's start spent its time, as the driver kept it from the relay (`HpcDriver.last_timing`), into
+        `restore_record` for the injector's snapshot (O58): the controller's stall is the site's, and a restore that
+        failed has it too. A driver that keeps none (Compose) records nothing, and a reader's container restart inside
+        a heal (`links` false) never replaces the target's."""
+        timing = (getattr(self._driver, "last_timing", None) or {}).get("start")
+        if links and isinstance(timing, Mapping):
+            self.restore_record["start_timing"] = dict(timing)
 
     def _note_domain_wait(self, links: bool) -> None:
         """Once the restored service serves: the seconds its start waited for the provider's domain, as the driver kept

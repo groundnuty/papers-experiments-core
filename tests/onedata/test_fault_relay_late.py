@@ -26,6 +26,7 @@ from expcore_onedata.fault_hpc import Request
 from expcore_onedata.fault_relay import Relay, RelayClient, beat, clean_environment, relay_dir
 from expcore_onedata.fault_relay_late import (
     JOURNAL,
+    LATE_ELAPSED_S,
     LATE_POLL_S,
     LATE_WINDOW_S,
     journal_path,
@@ -77,12 +78,12 @@ def lines_of(root):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
 
 
-def setup(tmp_path, behaviour=None, fail=False):
+def setup(tmp_path, behaviour=None, fail=False, **options):
     root = tmp_path / "root"
     root.mkdir(mode=0o700)
     write_state(root, tuple(SERVICES.values()))
     verbs, watchers = Verbs(behaviour), Watchers(root, fail)
-    relay = Relay(root, PREFIX, runner=verbs, environ=ENVIRONMENT, watcher=watchers)
+    relay = Relay(root, PREFIX, runner=verbs, environ=ENVIRONMENT, watcher=watchers, **options)
     return root, relay, verbs, watchers
 
 
@@ -174,6 +175,60 @@ def test_o58_a_verb_that_fails_after_it_may_have_run_opens_a_watch_too(tmp_path)
     with relay.holding():
         ask(root, relay, Request("status", SERVICE))
     assert len(watchers.started) == 1
+
+
+def test_o58_a_timed_out_start_journals_its_tag_and_the_window_so_a_late_service_start_is_attributable(tmp_path):
+    """O58: a start that timed out has the same watch as any verb: its `watch_opened` line holds the tag its status step
+    was named by and the window, so that a service step that comes up late (a start, which the watch never cancels by
+    name: it is the start arriving) can be put to the request afterwards."""
+    root, relay, verbs, watchers = setup(tmp_path, hangs)
+    with relay.holding():
+        end = ask(root, relay, Request("start", SERVICE), timeout_s=3)
+    assert isinstance(end, subprocess.TimeoutExpired)
+    (opened,) = lines_of(root)
+    assert (opened["event"], opened["verb"], opened["service"], opened["why"]) == (
+        "watch_opened",
+        "start",
+        SERVICE,
+        "timed_out",
+    )
+    assert opened["window_s"] == LATE_WINDOW_S
+    assert opened["tag"] == verbs.calls[0][0][len(PREFIX) + 1]
+    assert watchers.started[0]["argv"][len(PREFIX) + 2] == "late-steps"
+
+
+def clocked(seconds):
+    """A verb that takes `seconds` on the relay's clock, and the clock."""
+    clock = FakeClock()
+
+    def verb(argv):
+        clock.sleep(seconds)
+        return CommandResult(0, '{"running": true}\n')
+
+    return verb, clock
+
+
+def test_o58_a_verb_that_ran_as_long_as_hpcfeds_shortest_bound_is_watched_whatever_its_exit(tmp_path):
+    """O58: hpcfed ends one of its own srun clients only after its step's own bound (30 s at the least) and the
+    controller may still hold that step: a verb that ran that long (here a status that took the threshold, and exited
+    0) is watched as a verb that timed out, and its answer is its own."""
+    verb, clock = clocked(LATE_ELAPSED_S)
+    root, relay, _, watchers = setup(tmp_path, verb, clock=clock)
+    with relay.holding():
+        done = ask(root, relay, Request("status", SERVICE))
+    assert done == CommandResult(0, '{"running": true}\n')
+    (started,) = watchers.started
+    assert started["journal"][0]["why"] == "own_bound"
+
+
+def test_o58_a_verb_quicker_than_that_opens_no_watch(tmp_path):
+    """O58: the ordinary verb (a second or two) is not watched."""
+    verb, clock = clocked(LATE_ELAPSED_S - 1.0)
+    root, relay, _, watchers = setup(tmp_path, verb, clock=clock)
+    with relay.holding():
+        ask(root, relay, Request("status", SERVICE))
+    assert watchers.started == []
+    assert lines_of(root) == []
 
 
 def test_o58_a_verb_that_ends_within_its_bound_opens_no_watch_and_is_answered_as_before(tmp_path):

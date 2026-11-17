@@ -47,7 +47,14 @@ never retried. A relay that is not answering (no heartbeat, or one older than `R
 its own, and at its bound the whole group is ended (`fault_relay_group`), so no `srun` client survives it to create
 the step after the relay has answered. The relay also stamps each verb's steps with a tag of its own, and after a
 timed-out verb starts a watch that cancels, by exact id and in the federation's own job alone, any step of that verb's
-exact names that is made late, and journals it (`fault_relay_late`). The answer stays `timed_out`.
+exact names that is made late, and journals it (`fault_relay_late`). The answer stays `timed_out`. A verb that ran at
+least `LATE_ELAPSED_S` is watched too: hpcfed ends its own `srun` only after its own bound, and the controller may
+still hold that step.
+
+**Where the time went.** After each verb the relay reads the accounting once (`fault_relay_timing`) and puts in the
+answer's `timing` the time from the verb's issue to each of its steps' accounted Start, and from the answer to each End,
+so that a controller stall is the site's in the record; a figure it cannot give is unknown with the reason, and it never
+fails or delays a verb past the client's wait.
 
 **Liveness.** The relay writes `heartbeat.json` every `BEAT_S` (its nonce, the federation, a count and the wall clock),
 removes it when it stops, and holds `relay.lock` while it runs, so a second relay for the same root refuses to start.
@@ -79,6 +86,7 @@ from expcore_onedata.compose import CommandResult, DriverError
 from expcore_onedata.fault_hpc import EXEC_COMMANDS, VERBS, Request, VerbCommand
 from expcore_onedata.fault_relay_group import GRACE_S, run_in_group
 from expcore_onedata.fault_relay_late import (
+    LATE_ELAPSED_S,
     LATE_POLL_S,
     LATE_WINDOW_S,
     journal_path,
@@ -87,6 +95,7 @@ from expcore_onedata.fault_relay_late import (
     step_tag,
     watch_argv,
 )
+from expcore_onedata.fault_relay_timing import SACCT_TIMEOUT_S, Sacct, is_timing, read_timing, step_names
 
 FORMAT = "expcore-fault-relay/1"
 RELAY_DIR = "fault-relay"
@@ -272,6 +281,13 @@ class RelayClient:
         raise RelayDown("the fault relay took no request in time: withdrawn, nothing ran")
 
 
+class RelayTimeout(subprocess.TimeoutExpired):
+    """A command the relay ran and answered `timed_out`: its outcome unknown. `timing` is where its time went, when the
+    relay read it (`fault_relay_timing`), else None."""
+
+    timing: Mapping[str, Any] | None = None
+
+
 def _answered(answer: Mapping[str, Any], key: str, nonce: str, timeout_s: float) -> CommandResult:
     """An answer as a command's end; raise DriverError for a refusal (nothing ran) and `subprocess.TimeoutExpired` for
     a command the relay ran past its bound (its outcome unknown). An answer not for this request is no answer."""
@@ -281,12 +297,15 @@ def _answered(answer: Mapping[str, Any], key: str, nonce: str, timeout_s: float)
     if refused is not None:
         word = refused if isinstance(refused, str) and re.fullmatch(r"[a-z_]{1,40}", refused) else "refused"
         raise DriverError(f"the fault relay refused the request ({word}): nothing ran")
+    timing = answer.get("timing") if is_timing(answer.get("timing")) else None  # a file of the relay's: checked
     if answer.get("timed_out") is True:
-        raise subprocess.TimeoutExpired(["fault-relay"], timeout_s)
+        error = RelayTimeout(["fault-relay"], timeout_s)
+        error.timing = timing
+        raise error
     code, out, err = answer.get("returncode"), answer.get("stdout"), answer.get("stderr")
     if isinstance(code, bool) or not isinstance(code, int) or not isinstance(out, str) or not isinstance(err, str):
         raise subprocess.TimeoutExpired(["fault-relay"], timeout_s)
-    return CommandResult(code, out, err)
+    return CommandResult(code, out, err, timing)
 
 
 def _issued(paths: Iterator[Path]) -> list[Path]:
@@ -338,6 +357,7 @@ class Relay:
         watcher: Callable[[Sequence[str], Mapping[str, str]], Any] | None = None,
         late_window_s: float = LATE_WINDOW_S,
         late_poll_s: float = LATE_POLL_S,
+        sacct: Sacct | None = None,
     ) -> None:
         environ = dict(os.environ if environ is None else environ)
         named = sorted(name for name in environ if SECRET_NAME.search(name))
@@ -351,6 +371,7 @@ class Relay:
         self._env = clean_environment(environ)  # what the verbs, and the watch, are run with
         self._watcher = watcher or spawn_watch  # (argv, env) -> a process handle with `poll()`
         self._late_window_s, self._late_poll_s = late_window_s, late_poll_s
+        self._sacct: Sacct = sacct or self._run_sacct  # (argv, bound) -> the accounting call's end
         self._watches: list[tuple[str, Any]] = []  # each watch started: its request id and handle, until it ends
         self._beats = 0
         self._taken: set[str] = set()  # every request id this relay has claimed: one never runs twice
@@ -457,19 +478,75 @@ class Relay:
         bound = min(float(record["bound_s"]), left)
         assert key is not None  # `_refusal` holds it
         tag, self._left_behind = step_tag(self.nonce, key), False
+        launched = self._launch_of(request.service) if request.verb == "start" else None
+        issued, began, why = self._wall(), self._clock(), None
         try:
             done = self._verbs(request, timeout_s=bound, step_tag=tag)
+            answer: dict[str, Any] = {
+                "returncode": done.returncode,
+                "stdout": done.stdout[:OUTPUT_CAP],
+                "stderr": done.stderr[:OUTPUT_CAP],
+            }
         except subprocess.TimeoutExpired:
-            self._watch(request, key, tag, "timed_out")  # before the answer: the guard is in place when it is read
-            return {"timed_out": True}
+            why, answer = "timed_out", {"timed_out": True}
         except OSError:  # the verb's process could not be started
             return {"refused": "not_run"}
         except Exception:  # anything else once the verb may have run: its outcome is unknown, never "not run"
-            self._watch(request, key, tag, "unknown")
-            return {"timed_out": True}
-        if self._left_behind:  # it ended with an srun still in its group, now ended: its steps may yet be made
-            self._watch(request, key, tag, "left_behind")
-        return {"returncode": done.returncode, "stdout": done.stdout[:OUTPUT_CAP], "stderr": done.stderr[:OUTPUT_CAP]}
+            why, answer = "unknown", {"timed_out": True}
+        answered, elapsed = self._wall(), self._clock() - began
+        if why is None and self._left_behind:  # it ended with an srun still in its group, now ended
+            why = "left_behind"
+        if why is None and elapsed >= LATE_ELAPSED_S:  # hpcfed may have ended an srun whose step the controller holds
+            why = "own_bound"
+        if why is not None:
+            self._watch(request, key, tag, why)  # before the answer: the guard is in place when it is read
+        timing = self._timing(record, request, tag, issued, answered, launched)
+        return answer if timing is None else {**answer, "timing": timing}
+
+    def _state(self) -> dict[str, Any]:
+        return _read(self.root / STATE_FILE) or {}
+
+    def _launch_of(self, service: str) -> tuple[Any, str] | None:
+        """The service's launch count and the name of the service step the state records for it, or None."""
+        entry = (self._state().get("services") or {}).get(service)
+        step = entry.get("step") if isinstance(entry, dict) else None
+        name = step.get("name") if isinstance(step, dict) else None
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", name):
+            return None
+        return entry.get("launch"), name
+
+    def _run_sacct(self, argv: Sequence[str], bound_s: float) -> CommandResult:
+        return run_in_group(argv, env=self._env, timeout_s=bound_s, grace_s=1.0)
+
+    def _timing(
+        self,
+        record: dict[str, Any],
+        request: Request,
+        tag: str,
+        issued: float,
+        answered: float,
+        launched: tuple[Any, str] | None,
+    ) -> dict[str, Any] | None:
+        """The answer's `timing` (`fault_relay_timing`): one accounting call, within what is left of the client's wait.
+        Never raises: a timing that could not be made is None, and the answer is the verb's own."""
+        try:
+            state = self._state()
+            allocation = state.get("allocation") if isinstance(state.get("allocation"), dict) else {}
+            prefix, job = federation_of(self.root), allocation.get("job")
+            now = self._launch_of(request.service) if request.verb == "start" else None
+            service_step = now[1] if now is not None and launched is not None and now[0] != launched[0] else None
+            names = step_names(prefix or "", request.service, request.verb, tag, service_step)
+            budget = min(SACCT_TIMEOUT_S, float(record["deadline"]) - self._wall() - POLL_S)
+            return read_timing(
+                self._sacct,
+                job=job if isinstance(job, str) else None,
+                names=names if prefix else [],
+                issued=issued,
+                answered=answered,
+                budget_s=budget,
+            )
+        except Exception:  # a timing never fails a verb
+            return None
 
     def _note_stragglers(self) -> None:
         self._left_behind = True
@@ -531,25 +608,51 @@ class Relay:
             beater.join(timeout=BEAT_S + 1)
 
 
+def _serve_options(words: Sequence[str]) -> dict[str, float] | None:
+    """The optional `--late-window-s N` and `--late-poll-s N` of `serve` (tests and slots that shorten the watch), as
+    `Relay`'s keywords; None for anything else, so a typo is a usage error and never a default silently."""
+    names = {"--late-window-s": "late_window_s", "--late-poll-s": "late_poll_s"}
+    found: dict[str, float] = {}
+    if len(words) % 2:
+        return None
+    for flag, value in zip(words[::2], words[1::2], strict=True):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        if flag not in names or names[flag] in found or not math.isfinite(number) or not 0 < number <= 3600:
+            return None
+        found[names[flag]] = number
+    return found
+
+
 def main(argv: Sequence[str]) -> int:
-    """`serve --root R -- <prefix...>`: run the relay; `alive --root R`: exit 0 when a live relay beats (its record on
-    stdout), 1 otherwise; `stop --root R`: SIGTERM to the relay that beats, then wait for its heartbeat to go."""
+    """`serve --root R [--late-window-s N] [--late-poll-s N] -- <prefix...>`: run the relay; `alive --root R`: exit 0
+    when a live relay beats (its record on stdout), 1 otherwise; `stop --root R`: SIGTERM to the relay that beats,
+    then wait for its heartbeat to go."""
     args = list(argv)
     if len(args) >= 3 and args[1] == "--root":
         verb, root = args[0], Path(args[2])
-        if verb == "serve" and len(args) > 4 and args[3] == "--":
-            relay = Relay(root, args[4:])
-            for signum in (signal.SIGTERM, signal.SIGINT):
-                signal.signal(signum, lambda *_: relay.stop())
-            relay.serve()
-            return 0
+        if verb == "serve" and "--" in args[3:] and len(args) > args.index("--", 3) + 1:
+            cut = args.index("--", 3)
+            options = _serve_options(args[3:cut])
+            if options is not None:
+                relay = Relay(root, args[cut + 1 :], **options)
+                for signum in (signal.SIGTERM, signal.SIGINT):
+                    signal.signal(signum, lambda *_: relay.stop())
+                relay.serve()
+                return 0
         if verb == "alive" and len(args) == 3:
             live = beat(root)
             print(json.dumps({"alive": live is not None, "nonce": None if live is None else live["nonce"]}))
             return 0 if live is not None else 1
         if verb == "stop" and len(args) == 3:
             return _stop(root)
-    print("usage: fault_relay serve --root R -- <prefix...> | alive --root R | stop --root R", file=sys.stderr)
+    print(
+        "usage: fault_relay serve --root R [--late-window-s N] [--late-poll-s N] -- <prefix...> | alive --root R | "
+        "stop --root R",
+        file=sys.stderr,
+    )
     return 2
 
 
