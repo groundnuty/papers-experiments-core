@@ -5,9 +5,10 @@
   was asked for. A heterogeneous job (`sbatch <component 0> : <component 1>`, the agent's node as component 1) is read
   back component by component: one record each, by `HetJobOffset`; squeue lists it as `<leader>+<k>`, and a cancel of
   its leader's id ends every component.
-- **Every step** is `srun --jobid --exact` with a name, its cores and memory, and `/usr/bin/env -i` with an explicit
-  allowlist in front of its command, so neither the login environment nor a site prolog decides what it sees. No step
-  uses `--overlap`.
+- **Every step** is `srun --jobid --exact` with a name, its cores and memory, `--chdir=/`, and `/usr/bin/env -i` with
+  an explicit allowlist in front of its command, so neither the login environment nor a site prolog decides what it
+  sees, and it never starts in the login node's working directory (or, where that does not exist on the node, in the
+  node's shared /tmp, where slurmstepd falls back). No step uses `--overlap`.
 - **A control step's srun client** that outlives its bound is ended only once its step has been gone from `squeue -s`
   for three polls in a row (a finished step's client can hang on the login node); a step still listed at the bound is
   cancelled by its own id.
@@ -37,6 +38,15 @@ JOB_LISTED = re.compile(r"([0-9]{1,12})(?:\+[0-9]{1,6})?")  # squeue's %i: a job
 STEP_LINE = re.compile(r"([0-9]{1,12}(?:\+[0-9]{1,6})?\.(?:[0-9]{1,9}|batch|extern))\s+(\S+)")
 STEP_ID = re.compile(r"[0-9]{1,12}(?:\+[0-9]{1,6})?\.[0-9]{1,9}")
 OFFSET = re.compile(r"[0-9]{1,6}")
+# A value of srun's --network (HPC_STEP_NETWORK): letters, digits and `_ . , = : + -`, led by a letter or digit, so no
+# shell character, space or option of its own reaches the argv. It names no plugin's words: other sites take others.
+NETWORK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.,=:+-]{0,127}")
+
+
+def valid_network(value: object) -> bool:
+    """Whether a step's network option can be used: the empty string (no option), or a string `NETWORK` matches. Any
+    other type is no option: a state record is data, and a false or a null must not read as none."""
+    return isinstance(value, str) and (value == "" or NETWORK.fullmatch(value) is not None)
 
 
 class SlurmError(RuntimeError):
@@ -154,13 +164,15 @@ class Runner:
         left.stdout.close()  # the right-hand side holds the only reading end
         return Process(left, None), Process(right, None)
 
-    def spawn(self, argv: Sequence[str], client_log: str) -> Client:
-        """Start a command in its own session, detached from this one, its output into a 0600 file."""
+    def spawn(self, argv: Sequence[str], client_log: str, cwd: Optional[str] = None) -> Client:
+        """Start a command in its own session, detached from this one, its output into a 0600 file; in `cwd` when
+        given (the fault relay's: the federation's root), else in this process's working directory."""
         descriptor = os.open(client_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         try:
             popen = subprocess.Popen(
-                list(argv), stdin=subprocess.DEVNULL, stdout=descriptor, stderr=descriptor, start_new_session=True
-            )
+                list(argv), stdin=subprocess.DEVNULL, stdout=descriptor, stderr=descriptor, start_new_session=True,
+                cwd=cwd,
+            )  # fmt: skip
         finally:
             os.close(descriptor)
         start = proc_start(popen.pid)
@@ -253,7 +265,9 @@ class Step:
     """One job step: where it runs, its size, its name, and its command behind the environment allowlist. A step of a
     heterogeneous job names its component (`het_group`, srun's `--het-group`), 0 included: on the site's Slurm a step
     of one with no `--het-group` is refused. A step of a further component also carries that component's own job id
-    (`component`), by which squeue -s and sacct list its steps. A job of one component takes no `het_group`."""
+    (`component`), by which squeue -s and sacct list its steps. A job of one component takes no `het_group`. A step
+    names `--network=<value>` (`network`, the site's `HPC_STEP_NETWORK`) only when it has a value: with none, its argv
+    is what it was before the setting existed."""
 
     job: str
     node: str
@@ -265,6 +279,7 @@ class Step:
     output: Optional[str] = None
     het_group: Optional[int] = None
     component: Optional[str] = None
+    network: str = ""
 
     @property
     def listed_as(self) -> str:
@@ -274,6 +289,9 @@ class Step:
     def argv(self) -> List[str]:
         out = [f"--output={self.output}"] if self.output else []
         group = [] if self.het_group is None else [f"--het-group={self.het_group}"]
+        if not valid_network(self.network):
+            raise SlurmError("HPC_STEP_NETWORK: the step's network option is not one an srun argv may carry")
+        network = [f"--network={self.network}"] if self.network else []
         return [
             "srun",
             f"--jobid={self.job}",
@@ -289,6 +307,8 @@ class Step:
             "-J",
             self.name,
             "--export=PATH",
+            "--chdir=/",  # never the login node's directory, or the node's shared /tmp where that does not exist
+            *network,
             *out,
             ENV,
             "-i",

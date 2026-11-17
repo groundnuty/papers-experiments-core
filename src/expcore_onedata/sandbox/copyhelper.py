@@ -1,5 +1,5 @@
 # Provenance: new
-"""The root half of a copy out of the sandbox: a standalone script, run as `sudo PYTHON -I -c SOURCE OP` (O19).
+"""The root half of a copy out of the sandbox: a standalone script, run as `sudo PYTHON -I -B -c SOURCE OP` (O19).
 
 `copyout.py` passes this file's source to the interpreter it runs under, so the script imports nothing but the standard
 library and nothing of the package. Its request comes on stdin as JSON; it never takes a path of the agent's tree as

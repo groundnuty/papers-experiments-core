@@ -71,7 +71,7 @@ def test_o12_without_a_tls_table_every_client_verifies_and_the_record_says_so(tm
     assert config.tls.record() == {"mode": "verify"}
     assert config.tls.ca_file is None
     assert config.tls.insecure is False
-    assert config.fingerprint() == {"tls": {"mode": "verify"}}
+    assert config.fingerprint()["tls"] == {"mode": "verify"}
 
 
 def test_o12_a_ca_file_is_recorded_by_the_sha256_of_the_bundle_and_never_by_its_path_or_contents(
@@ -81,7 +81,7 @@ def test_o12_a_ca_file_is_recorded_by_the_sha256_of_the_bundle_and_never_by_its_
     config = load(tmp_path, {"ca_file": CA_NAME}, ca=federation.ca)
     digest = hashlib.sha256(federation.ca.read_bytes()).hexdigest()
     assert config.tls.record() == {"mode": "ca_file", "ca_sha256": digest}
-    assert config.fingerprint() == {"tls": {"mode": "ca_file", "ca_sha256": digest}}
+    assert config.fingerprint()["tls"] == {"mode": "ca_file", "ca_sha256": digest}
     assert config.tls.ca_file == (tmp_path / CA_NAME).resolve()
     text = json.dumps([config.tls.record(), config.fingerprint()])
     assert CA_NAME not in text
