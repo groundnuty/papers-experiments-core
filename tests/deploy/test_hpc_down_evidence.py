@@ -1,8 +1,9 @@
 """O63: `hpcfed.py down` does not remove a federation's root while evidence a campaign left in it is uncollected. A root
 that has shard results recorded against it (a step ran: `shards.py step` leaves `shard-steps/<label>.json` there) and
 no collected-evidence marker (`shards.py collect` writes one, naming the root archive's hash) is refused before
-anything is stopped, unless `--discard-evidence` is given, which down's output records. A root where no step ever ran
-goes as before. Against the fake Slurm of hpc_fed_support; nothing reaches a cluster."""
+anything is stopped, unless `--discard-evidence` is given, which down's output records. A root that holds no
+evidence a run left (no step record either) goes as before; a root with evidence and no step record is
+`test_hpc_down_evidence_present.py`'s. Against the fake Slurm of hpc_fed_support; nothing reaches a cluster."""
 
 import json
 import os

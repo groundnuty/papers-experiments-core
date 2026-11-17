@@ -169,12 +169,13 @@ def test_a_lock_held_inside_the_root_is_what_failed_live_and_a_second_down_finis
 
 
 def test_a_file_another_process_holds_in_the_root_is_waited_for_and_the_root_goes(hpc, tmp_path, site):
-    """O57: a file of the root held open elsewhere while down removes it (a reader of the journal, say) becomes a
-    silly file; the removal waits for its holder to close it, then removes its directory and the root."""
+    """O57: a file of the root held open elsewhere while down removes it (a lock file of the journal, say: one with
+    nothing in it, which is no evidence a run left, O63) becomes a silly file; the removal waits for its holder to close
+    it, then removes its directory and the root."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
-    journal = rig.driver.layout.journal / "held.jsonl"
-    journal.write_text("{}\n", encoding="utf-8")
+    journal = rig.driver.layout.journal / "held.lock"
+    journal.write_text("", encoding="utf-8")
     handle = Held(journal)
     rig.nfs.on_sleep = lambda count: handle.close() if count == 3 else None
     try:
@@ -183,6 +184,44 @@ def test_a_file_another_process_holds_in_the_root_is_waited_for_and_the_root_goe
         handle.close()
     assert not rig.root.exists()
     assert rig.nfs.sleeps == 3
+
+
+def test_a_second_down_over_a_collected_root_whose_held_journal_became_a_silly_file_waits_and_finishes(
+    hpc, tmp_path, site
+):
+    """O63, O57: a collected root's `down` passes the evidence gate and removes the root, but a process of another host
+    holds a journal file with lines in it open: it becomes a silly file, the removal waits its bound and says to run
+    down again, with the marker kept, the state and the evidence marker gone. The second `down`, the file still held,
+    is not refused as evidence nobody collected (the file is already removed): it waits again for the holder, and a
+    third, once the holder has closed, finishes the removal."""
+    import hpcevidence
+
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    (rig.root / "facts.json").write_text("{}")
+    journal = rig.driver.layout.journal / "injections.jsonl"
+    journal.write_text('{"event": "injecting"}\n', encoding="utf-8")
+    held = hpcevidence.archive_root(rig.root, "shard-1")
+    hpcevidence.write_marker(rig.root, "shard-1", held.sha256, held.steps_sha256, files=held.hashes)
+    handle = Held(journal)
+    try:
+        with pytest.raises(RuntimeError, match=r"1 NFS silly-rename file\(s\)"):
+            rig.driver.down()
+        assert rig.fake.cancelled == ["4242"]
+        assert rig.driver.layout.owned
+        assert not (rig.root / "hpc-federation.json").exists()
+        assert not (rig.root / "evidence-collected.json").exists()
+        left = [p.name for p in (rig.root / "fault-journal").iterdir()]
+        assert len(left) == 1
+        assert left[0].startswith(".nfs")
+        with pytest.raises(RuntimeError, match=r"1 NFS silly-rename file\(s\)") as again:
+            rig.driver.down()
+        assert "evidence" not in str(again.value)
+        assert rig.fake.cancelled == ["4242"]  # no second job to cancel: the first was ended and the state is gone
+    finally:
+        handle.close()
+    assert "no job of up's is left to cancel; the root removed" in rig.driver.down()
+    assert not rig.root.exists()
 
 
 def test_down_over_an_unmarked_root_of_nothing_but_silly_files_finishes_its_removal(hpc, tmp_path, site):

@@ -77,7 +77,7 @@ MKFS_ONE_PROGRAM = "must be exactly one program word (a name or an absolute path
 PROVIDER_STORAGE_KINDS = ("tmpfs", "shared_filesystem")  # where the providers keep their data (O57)
 CELL_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,1023}")
 # the targets the sandbox binds itself, and those under which it binds: an extra bind may be none of them
-OWN_TARGETS = ("/work", "/tmp", "/dev/shm", "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
+OWN_TARGETS = ("/work", "/tmp", "/dev/shm", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/etc/nsswitch.conf",
                "/etc/ld.so.preload", "/etc/sandbox", "/etc/expcore", "/hpcop-egress", "/hpcop-shim",
                "/expcore-preload")  # fmt: skip
 MARGIN_BOUNDS = (1 << 20, 64 << 30)  # hidden_memory_margin_bytes, in bytes

@@ -4,7 +4,9 @@ It implements `NodeOps` (expcore_onedata.sandbox.apptainer.node). Every `apptain
 its environment, its image and its command, and kept in `execs`, so a test reads exactly what a cell was given. A cell
 runs under the completion bootstrap (O55) as on the fake docker host (`fake_host`): the program is checked against the
 size and hash its argv names, handed to `cell_handler`, and the record added to both streams; `exec_delivers` stands
-for a stdin that loses bytes and a handler that returns `Unrecorded` for an exec whose record never came.
+for a stdin that loses bytes and a handler that returns `Unrecorded` for an exec whose record never came. An exec with
+no `--uts --hostname <name>` after `--pwd` fails to parse, as every exec path of the backend must carry them; what a
+cell reads as its host name (`Cell.hostname`, `Exec.hostname`) is that name.
 
 While a cell runs, its processes are in the process table in a PID namespace of their own, carrying the run's tag in
 their environment and the nonce in their command line, as `apptainer exec --containall` would make them; the cell waits
@@ -52,6 +54,7 @@ from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import workdisk
 from expcore_onedata.sandbox.apptainer.node import LocalNode, Spawned
 from expcore_onedata.sandbox.apptainer.procs import Proc
+from expcore_onedata.sandbox.cellhost import OwnNames
 from expcore_onedata.sandbox.containers import CERTIFI_PROBE
 from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap, encode_input, run_bounded
 from expcore_onedata.sandbox.sandbox import READ_ONLY_PROBE
@@ -62,6 +65,8 @@ CERTIFI = "/usr/lib/invented/certifi/cacert.pem"
 IMAGE_BUNDLE = "-----BEGIN CERTIFICATE-----\ninvented image bundle\n-----END CERTIFICATE-----\n"
 CANARY_MARK = "canary open"
 READINGS = {"os": {"id": "invented", "version_id": "9.9"}, "glibc": "glibc 2.99", "kernel": "9.99.0-invented"}
+OWN_HOST = "cn-invented-n01"  # the invented agent node's own host name, and its fully qualified form: a site's, private
+OWN_FQDN = "cn-invented-n01.cluster.example.invalid"
 
 
 @dataclass
@@ -112,6 +117,7 @@ class Exec:
     nofile: int | None = None  # the `prlimit --nofile=N:N` in front of a cell's `apptainer` (O70)
     cpus: list[int] | None = None  # the `taskset -c` in front of it
     images: dict[str, str] = field(default_factory=dict)  # target -> image-src, for a bind of an image's directory
+    hostname: str | None = None  # the name `--uts --hostname` set in the exec's UTS namespace
 
 
 @dataclass
@@ -165,6 +171,11 @@ class Cell:
             return errno.ENOSPC
         (self.work_dir() / rel).write_bytes(b"\0" * size)
         return 0
+
+    def hostname(self) -> str:
+        """What `hostname` and `uname -n` print in the cell: the name set in its UTS namespace."""
+        assert self.exec.hostname is not None
+        return self.exec.hostname
 
 
 @dataclass
@@ -251,6 +262,9 @@ class FakeNode:
         self.copy_helper_result: CmdResult | None = None  # what every copy exec of a work disk returns, if not its own
         self.boot: str | None = "00000000-0000-4000-8000-000000000001"  # this boot of the node (`boot_id`)
         self.mkfs_superblock = True  # whether the fake's mkfs writes an ext superblock into the image
+        self.own_hosts: tuple[str, ...] | Exception = (OWN_HOST, OWN_FQDN)  # what `own_names` answers (O73)
+        self.own_unread: tuple[str, ...] = ()  # the reasons a form of them could not be read
+        self.own_asked = 0  # how many times `own_names` was called
         self.readings: Any = READINGS  # what `node_readings` answers (O87); a test sets another, or `readings_error`
         self.readings_error: Exception | None = None
         self.tool_server_host: Any = None  # the tool server's host's readings; None: the node's own host
@@ -373,6 +387,12 @@ class FakeNode:
 
     def boot_id(self) -> str | None:
         return self.boot
+
+    def own_names(self) -> OwnNames:
+        self.own_asked += 1
+        if isinstance(self.own_hosts, Exception):
+            raise self.own_hosts
+        return OwnNames(self.own_hosts, self.own_unread)
 
     def node_readings(self) -> dict[str, Any]:
         if self.readings_error is not None:
@@ -653,6 +673,9 @@ def parse_exec(argv: list[str], stdin: str | None) -> Exec:
     expected = ["--containall", "--cleanenv", "--no-home", "--no-mount", AV.NO_MOUNT, "--pwd", "/work"]
     assert rest[: len(expected)] == expected, f"the exec's flags: {rest[: len(expected)]}"
     rest = rest[len(expected) :]
+    assert rest[:2] == ["--uts", "--hostname"], f"the exec's UTS flags: {rest[:3]}"
+    assert len(rest) > 2, f"the exec's UTS flags: {rest[:3]}"
+    hostname, rest = rest[2], rest[3:]
     binds: dict[str, tuple[str, bool]] = {}
     images: dict[str, str] = {}
     env: dict[str, str] = {}
@@ -670,7 +693,10 @@ def parse_exec(argv: list[str], stdin: str | None) -> Exec:
         else:
             name, _, text = value.partition("=")
             env[name] = text
-    return Exec(argv, flags, binds, env, rest[0], rest[1:], stdin, nofile, cpus, images)
+    return Exec(argv, flags, binds, env, rest[0], rest[1:], stdin, nofile, cpus, images, hostname=hostname)
 
 
-__all__ = ["CANARY_MARK", "CGROUP", "Cell", "Exec", "FakeImage", "FakeNode", "FakeProc", "Unrecorded", "parse_exec"]
+__all__ = [
+    "CANARY_MARK", "CGROUP", "OWN_FQDN", "OWN_HOST", "Cell", "Exec", "FakeImage", "FakeNode", "FakeProc",
+    "Unrecorded", "parse_exec",
+]  # fmt: skip
