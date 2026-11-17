@@ -28,8 +28,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import MutableMapping
-from typing import Any
+
+from expcore_onedata.sandbox.infrafacts import CELL_RESOLV, InfrastructureFacts
 
 RESOLV_CONF = "/etc/resolv.conf"
 # No name server (`apptainer/facts.py`, `dns_none`). A resolv.conf that names none does not alone leave the C library
@@ -57,9 +57,10 @@ def judge(exit_code: int, stdout: str) -> tuple[str | None, str | None]:
     return found.group(1), None
 
 
-def note(meta: MutableMapping[str, Any], digest: str) -> None:
-    """Put the hash a cell read in `meta`'s `infrastructure_facts`, beside what that holds."""
-    meta.setdefault("infrastructure_facts", {})[FACT] = digest
+def note(facts: InfrastructureFacts, digest: str) -> None:
+    """Put the hash a cell read in the run's infrastructure facts, beside what they hold, through the run's one writer
+    (`infrafacts`, O89): the key is `CELL_RESOLV`'s, so no other writer may take it."""
+    facts.write(CELL_RESOLV, {FACT: digest})
 
 
 __all__ = ["FACT", "PROBE", "REFUSAL", "RESOLV_CONF", "RESOLV_SHA256", "RESOLV_TEXT", "judge", "note"]

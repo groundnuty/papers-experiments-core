@@ -43,12 +43,14 @@ WORK_DISK = "work_disk"  # `apptainer.facts.record`: the departures, the work di
 NODE = "node"  # the readings of the node (O87) and of the tool server's host
 WINDOW = "federation_window"  # the federation's window (O86), which the platform records from the run's preparation on
 METADATA = "metadata"  # the readings made when `metadata()` is read
+CELL_RESOLV = "cell_resolv"  # `cellresolv.note`: the hash of the resolv.conf a cell read back at the start (O56)
 
 OWNED: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         WORK_DISK: frozenset({"backend", "facts", "dns", "provider_storage"}),
         NODE: frozenset({"node", "tool_server_host"}),
         WINDOW: frozenset({"federation_window"}),
+        CELL_RESOLV: frozenset({"resolv_conf_sha256"}),  # `cellresolv.FACT`; a test holds the two equal
         METADATA: frozenset(
             {
                 "run_ended",
@@ -128,6 +130,7 @@ def refuse_replacement(fields: Mapping[str, Any]) -> None:
 
 
 __all__ = [
+    "CELL_RESOLV",
     "METADATA",
     "NODE",
     "OWNED",

@@ -792,8 +792,7 @@ class DockerSandbox:
         if problem is not None:
             log.error("resolv.conf probe: %s (%s)", problem, describe_stderr(r.stderr))
             raise SandboxError(problem)
-        with self._meta_lock:  # `metadata()` may be reading it from another thread
-            cellresolv.note(self._meta, digest)
+        cellresolv.note(self._facts, digest)  # `metadata()` may be reading it from another thread: the writer's lock
 
     def _verify_direct_io(self) -> None:
         """Show that the direct mount reads the local provider's storage itself, or refuse to hand the sandbox out (O40,

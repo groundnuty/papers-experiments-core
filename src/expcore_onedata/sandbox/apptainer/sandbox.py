@@ -652,8 +652,7 @@ class ApptainerSandbox:
         if problem is not None:
             log.error("resolv.conf probe: %s (%s)", problem, describe_stderr(r.stderr))
             raise SandboxError(problem)
-        with self._meta_lock:
-            cellresolv.note(self._meta, digest)
+        cellresolv.note(self._facts, digest)  # O89: the run's one writer, under the metadata's lock
 
     def _verify_work_disk(self) -> None:
         """O71: the work disk proved before the agent's first cell, or the start fails. The first start of this driver
