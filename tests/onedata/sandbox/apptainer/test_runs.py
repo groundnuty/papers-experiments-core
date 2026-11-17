@@ -4,11 +4,11 @@ and proved gone by the lease's probe; a start that fails leaves nothing, the tok
 import json
 
 import pytest
-from apptainer_support import make_settings, make_spec, start
+from apptainer_support import EGRESS_SOCKET, make_settings, make_spec, settings_with_socket_bytes, start
 from fake_node import FakeNode
 
-from expcore_onedata.sandbox.api import SandboxError
-from expcore_onedata.sandbox.apptainer import runs, workdisk
+from expcore_onedata.sandbox.api import SandboxError, StartRefused
+from expcore_onedata.sandbox.apptainer import runs, sockets, workdisk
 from expcore_onedata.sandbox.apptainer.node import Spawned
 
 
@@ -131,6 +131,61 @@ def test_a_gate_whose_port_was_taken_is_started_again_on_another(node, settings)
         assert not (box.dir / "gate-secret" / "gate-token").exists()
     finally:
         box.stop()
+
+
+def test_a_run_id_is_never_longer_than_the_bound_the_load_counts(node, short_tmp):
+    """O56: the platform's load bounds the work root with a run id of `sockets.RUN_ID_MAX_BYTES` (57); the id of a run
+    with a key far over the cap is exactly that long, never longer."""
+    box = start(node, make_settings(short_tmp), make_spec(lease_key="k" * 200))
+    try:
+        assert len(box.sid) == sockets.RUN_ID_MAX_BYTES == 57
+    finally:
+        box.stop()
+
+
+def _nothing_left(settings) -> bool:
+    return not [p for p in settings.work_root.iterdir() if p.name != runs.RUNS] and not list(
+        (settings.work_root / runs.RUNS).iterdir()
+    )
+
+
+def test_a_collector_that_ends_before_it_is_ready_fails_the_start_and_leaves_nothing(node, short_tmp):
+    """O56: with a work root whose socket path fits, an egress collector that ends unready fails the start with the
+    helper's own message, and the directory, the record and the helpers are gone."""
+    node.collector_ends_unready = True
+    settings = make_settings(short_tmp)
+    with pytest.raises(SandboxError, match="collector ended before it was ready"):
+        start(node, settings)
+    assert not [p for p in node.procs.values() if p.alive and p.role != "driver"]
+    assert _nothing_left(settings)
+
+
+@pytest.mark.parametrize("size", [108, 200])
+def test_a_collector_that_ends_unready_over_a_unix_socket_s_limit_says_the_path_is_too_long(node, short_tmp, size):
+    """O56: the egress collector binds `<work_root>/<run id>/egress-sock/sock`; a Unix socket's address holds 107 bytes
+    of path, so a longer one cannot be bound and the collector ends unready. The start fails saying the path's length
+    and the limit (never the path), as the read-log collector's refusal does, and leaves nothing. It is a plain
+    `SandboxError`: a directory and a helper existed by then, so it is no `StartRefused`."""
+    node.collector_ends_unready = True
+    settings = settings_with_socket_bytes(short_tmp, size, socket=EGRESS_SOCKET)
+    with pytest.raises(SandboxError) as failed:
+        start(node, settings)
+    assert not isinstance(failed.value, StartRefused)
+    assert str(failed.value) == (
+        f"the egress socket path is {size} bytes, over the 107-byte limit of a Unix socket: "
+        "use a shorter [sandbox] work_root"
+    )
+    assert str(short_tmp) not in str(failed.value)
+    assert not [p for p in node.procs.values() if p.alive and p.role != "driver"]
+    assert _nothing_left(settings)
+
+
+def test_a_collector_that_ends_unready_on_a_path_of_exactly_the_limit_is_not_blamed_on_it(node, short_tmp):
+    """O56: the limit is 107 bytes inclusive: a collector that ends unready on a path of exactly that many ended for
+    another reason, and the helper's own message stands."""
+    node.collector_ends_unready = True
+    with pytest.raises(SandboxError, match="collector ended before it was ready"):
+        start(node, settings_with_socket_bytes(short_tmp, 107, socket=EGRESS_SOCKET))
 
 
 def test_remove_tree_removes_read_only_directories_and_never_follows_a_link(tmp_path):

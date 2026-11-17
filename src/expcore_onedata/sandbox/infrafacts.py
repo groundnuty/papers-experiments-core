@@ -47,6 +47,7 @@ METADATA = "metadata"  # the readings made when `metadata()` is read
 GATE = "gate"  # the gate's configuration as it was written (O85): the sandbox records what the file holds
 CELL_RESOLV = "cell_resolv"  # `cellresolv.note`: the hash of the resolv.conf a cell read back at the start (O56)
 HEALTH = "health"  # the platform check's structured reading of the run's post-run state (O90, `healthreading.FACT`)
+READLOG = "readlog"  # the read-log channel's fact (`readlog.facts`): the collector, the client, where, the peer uid
 
 OWNED: Mapping[str, frozenset[str]] = MappingProxyType(
     {
@@ -69,6 +70,7 @@ OWNED: Mapping[str, frozenset[str]] = MappingProxyType(
                 "own_node_scan",  # the facts of the agent node's names in the gate's scan (O73)
             }
         ),
+        READLOG: frozenset({"read_log"}),  # `readlog.paths.FACT_KEY` (O91); a test holds the two equal
     }
 )
 _DECLARED: Mapping[str, str] = MappingProxyType({key: owner for owner, keys in OWNED.items() for key in keys})
@@ -146,6 +148,7 @@ __all__ = [
     "METADATA",
     "NODE",
     "OWNED",
+    "READLOG",
     "WINDOW",
     "WORK_DISK",
     "FactsConflict",

@@ -2,20 +2,22 @@
 """Every guard together: the preregistered analysis again without every run that any guard leaves out (#179, O60, O76).
 It is the rerun a reader asks for of a batch checked by two or more guards, beside each guard's own.
 
-`guards_analysis(rows, absent, prereg, egress, mount, visibility=None)` takes the analysis rows in the export's order,
-the absent runs, the preregistration, and the guards' analyses (`expcore.egress.sensitivity.egress_analysis`,
-`expcore.mountguard.sensitivity.mount_guard_analysis`, `expcore.visibility.sensitivity.visibility_analysis`), whose
-verdicts are in that same order; a guard that did not check the batch is None. It returns None unless at least two
+`guards_analysis(rows, absent, prereg, egress, mount, visibility=None, read_log=None)` takes the analysis rows in the
+export's order, the absent runs, the preregistration, and the guards' analyses
+(`expcore.egress.sensitivity.egress_analysis`, `expcore.mountguard.sensitivity.mount_guard_analysis`,
+`expcore.visibility.sensitivity.visibility_analysis`, `expcore.readlog.sensitivity.read_log_analysis`), whose verdicts
+are in that same order; a guard that did not check the batch is None. It returns None unless at least two
 guards checked the batch: with one alone, its own rerun is the combined one.
 
 Each run is described by what each guard that checked the batch found: `clean`, `flagged` or `unknown` (for egress, a
 run flagged for an unknown log alone is `unknown`; one with an outside connection or a static-scan hit is `flagged`),
-and, for the mount guard, `not_applicable` (a run with no mount, such as a REST run). A run is left out when any guard
-leaves it out: flagged or unknown to any, so a run unknown to one guard and clean to the others is left out. **A guard
-that does not apply to a run leaves it out for nothing**: only `clean` and `not_applicable` keep a run, so a state this
-code does not know leaves it out. `left_by` names the guards that leave a run out, in the order egress, mount,
-visibility; `by` says it in one word: the guard's name, `both` when the batch was checked by two guards and both leave
-the run out, else the names joined by `+`. The rerun is `stats.analysis.analyse` over the other rows, with each
+for the mount guard, `not_applicable` (a run with no mount, such as a REST run), and for the read-log scan `flagged`
+(its code names the channel or a way to it) or `clean`, never unknown. A run is left out when any guard leaves it out:
+flagged or unknown to any, so a run unknown to one guard and clean to the others is left out. **A guard that does not
+apply to a run leaves it out for nothing**: only `clean` and `not_applicable` keep a run, so a state this code does not
+know leaves it out. `left_by` names the guards that leave a run out, in the order egress, mount, visibility, read log;
+`by` says it in one word: the guard's name, `both` when the batch was checked by two guards and both leave the run
+out, else the names joined by `+`. The rerun is `stats.analysis.analyse` over the other rows, with each
 left-out run passed as an absent run of reason `excluded`, as each guard's own rerun is; a rerun the kernel refuses
 keeps the primary analysis and records why. With no run left out there is no second analysis.
 """
@@ -28,13 +30,14 @@ from typing import Any
 from expcore.egress.flags import LOG_UNKNOWN
 from expcore.egress.sensitivity import EgressAnalysis
 from expcore.mountguard.sensitivity import MountGuardAnalysis
+from expcore.readlog.sensitivity import ReadLogAnalysis
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
 from expcore.visibility.sensitivity import VisibilityAnalysis
 
 LEFT_OUT_AS = "excluded"  # the reason a left-out run is passed to the rerun with, as each guard's own rerun does
-EGRESS, MOUNT, VISIBILITY = "egress", "mount", "visibility"
-GUARDS = (EGRESS, MOUNT, VISIBILITY)  # the order guards are named in
+EGRESS, MOUNT, VISIBILITY, READ_LOG = "egress", "mount", "visibility", "read_log"
+GUARDS = (EGRESS, MOUNT, VISIBILITY, READ_LOG)  # the order guards are named in
 BOTH, SEVERAL = "both", "several"  # `both`: both guards of a two-guard batch; `several`: two or more of three
 CLEAN, FLAGGED, UNKNOWN, NOT_APPLICABLE = "clean", "flagged", "unknown", "not_applicable"
 KEPT = (CLEAN, NOT_APPLICABLE)  # what a guard may say of a run it leaves in: any other state leaves the run out
@@ -51,11 +54,12 @@ class GuardedRun:
     egress: str | None
     mount: str | None
     visibility: str | None = None
+    read_log: str | None = None
 
     @property
     def states(self) -> dict[str, str]:
-        """What each guard that checked the batch found, by guard, in the order egress, mount, visibility."""
-        found = {EGRESS: self.egress, MOUNT: self.mount, VISIBILITY: self.visibility}
+        """What each guard that checked the batch found, by guard, in the order egress, mount, visibility, read log."""
+        found = {EGRESS: self.egress, MOUNT: self.mount, VISIBILITY: self.visibility, READ_LOG: self.read_log}
         return {guard: state for guard, state in found.items() if state is not None}
 
     @property
@@ -65,8 +69,8 @@ class GuardedRun:
 
     @property
     def by(self) -> str | None:
-        """Which guards leave the run out: `egress`, `mount` or `visibility`; `both` for both guards of a batch two
-        guards checked; the names joined by `+` for several of three; None for a run no guard leaves out."""
+        """Which guards leave the run out: `egress`, `mount`, `visibility` or `read_log`; `both` for both guards of a
+        batch two guards checked; the names joined by `+` for several; None for a run no guard leaves out."""
         left = self.left_by
         if not left:
             return None
@@ -96,7 +100,8 @@ class GuardsAnalysis:
 
     @property
     def guards(self) -> tuple[str, ...]:
-        """The guards that checked the batch, in the order egress, mount, visibility (egress and mount for no run)."""
+        """The guards that checked the batch, in the order egress, mount, visibility, read log (egress and mount for
+        no run)."""
         return tuple(g for g in GUARDS if any(g in run.states for run in self.runs)) or LEGACY
 
     @property
@@ -131,7 +136,10 @@ class GuardsAnalysis:
 
 
 def _states(
-    egress: EgressAnalysis | None, mount: MountGuardAnalysis | None, visibility: VisibilityAnalysis | None
+    egress: EgressAnalysis | None,
+    mount: MountGuardAnalysis | None,
+    visibility: VisibilityAnalysis | None,
+    read_log: ReadLogAnalysis | None = None,
 ) -> dict[str, list[str]]:
     """Each guard that checked the batch's verdict of each run, in the rows' order."""
     found: dict[str, list[str]] = {}
@@ -141,6 +149,8 @@ def _states(
         found[MOUNT] = [run.verdict for run in mount.runs]
     if visibility is not None:
         found[VISIBILITY] = [run.verdict for run in visibility.runs]
+    if read_log is not None:
+        found[READ_LOG] = [run.verdict for run in read_log.runs]
     return found
 
 
@@ -151,16 +161,17 @@ def guards_analysis(
     egress: EgressAnalysis | None,
     mount: MountGuardAnalysis | None,
     visibility: VisibilityAnalysis | None = None,
+    read_log: ReadLogAnalysis | None = None,
 ) -> GuardsAnalysis | None:
     """The runs as each guard found them and the rerun without those any guard leaves out; None unless two or more
     guards checked the batch."""
-    analyses = [found for found in (egress, mount, visibility) if found is not None]
+    analyses = [found for found in (egress, mount, visibility, read_log) if found is not None]
     if len(analyses) < 2:
         return None
     keys = [row.run_key for row in rows]
     if any([run.run_key for run in found.runs] != keys for found in analyses):
         raise ValueError("the guards' verdicts are not of the same runs as the analysis rows, in their order")
-    states = _states(egress, mount, visibility)
+    states = _states(egress, mount, visibility, read_log)
     runs = tuple(
         GuardedRun(
             first.run_key,

@@ -97,6 +97,8 @@ from expcore.accounting import condition_accounting
 from expcore.egress.sensitivity import EgressAnalysis
 from expcore.guards import GuardsAnalysis
 from expcore.mountguard.sensitivity import MountGuardAnalysis
+from expcore.readlog.scan import KINDS
+from expcore.readlog.sensitivity import ReadLogAnalysis
 from expcore.report_diagnostics import section as start_failures
 from expcore.report_egress import egress_lines
 from expcore.report_families import (
@@ -140,6 +142,8 @@ from expcore.report_notes import (
     equivalence_header,
     percent,
 )
+from expcore.report_readlog import LEFT_OUT as TOUCHED_THE_CHANNEL
+from expcore.report_readlog import read_log_lines
 from expcore.report_shards import shard_lines
 from expcore.report_smallest import section as smallest_section
 from expcore.report_smallest import summary_suffix
@@ -881,12 +885,26 @@ def _visibility_summary(seen: VisibilityAnalysis) -> list[str]:
     return lines + _rerun_lines(seen.sensitivity, "visibility sensitivity")
 
 
+def _read_log_summary(scanned: ReadLogAnalysis) -> list[str]:
+    """The terminal's read-log lines (S20): the runs whose code touched the channel by kind, then each confirmatory
+    contrast without them."""
+    n = scanned.counts()
+    kinds = ", ".join(f"{n[kind]} {kind}" for kind in KINDS if n[kind])
+    lines = [f"read log: {n['flagged']} of {n['analysed']} analysed run(s) flagged" + (f" ({kinds})" if kinds else "")]
+    if scanned.refused is not None:
+        return [*lines, f"read-log sensitivity: not computed ({scanned.refused})"]
+    if scanned.sensitivity is None:
+        return [*lines, "read-log sensitivity: no run flagged, the same as the analysis above"]
+    return lines + _rerun_lines(scanned.sensitivity, "read-log sensitivity")
+
+
 def summary_lines(
     result: AnalysisResult,
     egress: EgressAnalysis | None = None,
     mount_guard: MountGuardAnalysis | None = None,
     guards: GuardsAnalysis | None = None,
     visibility: VisibilityAnalysis | None = None,
+    read_log: ReadLogAnalysis | None = None,
 ) -> list[str]:
     """One line per contrast for a terminal: the estimate, the raw p-value, the Holm-adjusted one (or the word
     exploratory) and the conclusion word, which is labelled exploratory too outside the family. A conclusion is never
@@ -918,6 +936,7 @@ def summary_lines(
     lines += _egress_summary(egress) if egress is not None else []
     lines += _mount_guard_summary(mount_guard) if mount_guard is not None else []
     lines += _visibility_summary(visibility) if visibility is not None else []
+    lines += _read_log_summary(read_log) if read_log is not None else []
     return lines + (_guards_summary(guards) if guards is not None else [])
 
 
@@ -1006,6 +1025,7 @@ def render_report(
     guards: GuardsAnalysis | None = None,
     visibility: VisibilityAnalysis | None = None,
     model_usage: Mapping[str, Any] | None = None,
+    read_log: ReadLogAnalysis | None = None,
 ) -> str:
     """Render the report as Markdown.
 
@@ -1017,8 +1037,9 @@ def render_report(
     `guards` the rerun without the runs any guard leaves out (a batch checked by two or more, O60, O76), `visibility`
     the process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
     it, O56), `model_usage` what each model spent and what served and retried its requests (`campaign.model_usage`: no
-    section and no provenance line without it, C39). A partial analysis is described by the export (`partial`,
-    `running_attempts`, `excluded_attempts`).
+    section and no provenance line without it, C39), `read_log` the read-log scan's verdicts and rerun of a batch whose
+    records carry the `read_log` instrument (no section without it, S20). A partial analysis is described by the export
+    (`partial`, `running_attempts`, `excluded_attempts`).
     What each number counts is stated in the report beside it. The text ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
@@ -1056,6 +1077,7 @@ def render_report(
     guarded = mount_guard_lines(mount_guard, _table, lambda r: _sensitivity(r, interval_level, NOT_CLEAN))  # O60
     both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, left_out_label(guards)))  # O60
     seen = visibility_lines(visibility, _table, lambda r: _sensitivity(r, interval_level, HID_OR_UNKNOWN))  # O56
+    scanned = read_log_lines(read_log, _table, lambda r: _sensitivity(r, interval_level, TOUCHED_THE_CHANNEL))  # S20
     sections = (
         _contrasts(result, interval_level)
         + _conditions(export)
@@ -1064,6 +1086,7 @@ def render_report(
         + checked
         + guarded
         + seen
+        + scanned
         + both
         + _deployments(export)
         + _left_out(left_out)

@@ -235,6 +235,19 @@ def test_c06_the_egress_and_mount_pins_stay_in_the_fingerprint(tmp_path, cas):
     assert docker["data_paths"]["mounted"] == {"kind": "mount", "io_mode": "proxy"}
 
 
+def test_o91_a_platform_that_declares_no_read_log_pin_keeps_the_fingerprint_it_had(tmp_path, cas):
+    """O91: the read-log collector's pin is in the backend's record only when it is declared (another collector is
+    another experiment), so a platform without the channel has no key of it and fingerprints as before the key
+    existed; one that declares it differs in that key alone."""
+    key = "sandbox.apptainer.readlog_collector_sha256"
+    base = load(APPTAINER, tmp_path / "root", cas[0]).fingerprint()
+    pinned = load(edited(APPTAINER, IN[key][1]), tmp_path / "root", cas[0]).fingerprint()
+    assert "readlog_collector_sha256" not in base["sandbox_backend"]
+    assert pinned["sandbox_backend"]["readlog_collector_sha256"] == SHA["gate"]
+    del pinned["sandbox_backend"]["readlog_collector_sha256"]
+    assert pinned == base
+
+
 def test_c06_a_store_recorded_before_the_settings_were_in_the_fingerprint_is_refused_naming_them(tmp_path, cas):
     """C06: the fingerprint's earlier form (TLS, spaces, data paths, served caps, Apptainer pins and the fault
     injector's sanction and targets) is not this one: a store that recorded it is refused at its resume, each new

@@ -110,6 +110,34 @@ run's outbound connections are logged and reported, and the analysis is run agai
 `tests/egress_probe.c`, which connects to a loopback listener and, non-blocking, to 192.0.2.1 (TEST-NET-1, never
 routed), so no test sends outside traffic. It needs Unix sockets, which some sandboxes forbid; it skips there.
 
+## The agent's read log (the Apptainer backend's read-log channel)
+
+A study's canonical scripts run in the agent's cell and log every read they make, so that its omission scoring rests on a
+log the agent can neither read nor rewrite (`docs/interfaces.md`, "The read-log channel"). On the Apptainer backend the
+platform declares `[sandbox.apptainer] readlog_collector_sha256`, the SHA-256 of the core's own `readlog/collector.py`
+(`python3 -c "import hashlib,expcore_onedata.readlog.files as f; print(hashlib.sha256(f.collector_file().read_bytes()).hexdigest())"`
+prints it); without it a run has no channel, and the shipped layouts' templates do not name it yet, so a study that needs
+it declares it in its own platform file.
+
+- **The collector** is a second helper of the driver's uid beside the egress collector, started before any cell: it binds
+  `sock` in an empty 0700 directory (`readlog-sock/` of the run's directory) and writes its log in `readlog/`, which no
+  cell sees. Every cell binds `readlog-sock/` read-only at `/expcore-readlog` and the client module's directory read-only
+  at `/expcore-readlog-client`; a Unix datagram socket takes `sendto` on a read-only bind, as the egress shim's does.
+  The socket's path, `<work_root>/<run id>/readlog-sock/sock`, must fit a Unix socket's 107 bytes (a run id is at most
+  57 bytes), so with the pin `[sandbox] work_root` may hold at most 31 bytes: the platform refuses a longer one when it
+  loads, saying its length and the limit, so a plan or any other load fails at once (`/tmp/expcore-agent`, the site
+  file's example, is 18 bytes). A run's start refuses a socket path over the limit again, and the egress collector's
+  (`egress-sock/sock`, a byte shorter) is said at a run's start only, never at load.
+- **The canary:** before the agent runs, a cell sends the canary through the real client; it is the log's first
+  record, and a start whose cell cannot send it fails.
+- **The collection** stops the collector on SIGTERM (it drains what is queued and writes its end line), reads the log
+  once, copies it as `read-log.jsonl` and scans it for the token like every file of evidence.
+- **What the cell can and cannot do:** the cell runs with `--containall`, so it cannot see or signal the collector and
+  never sees the log. Under one uid it can still send forged datagrams to the socket: they add lines and never remove
+  one. A collector that dies mid-run (killed, or out of its log's cap) leaves a log without its end line, which reads as
+  UNKNOWN reads, never as fewer reads, and its death is infrastructure. Whether a user namespace made inside a cell can
+  over-mount the bound directory on a node is not known: the live slot proves it.
+
 ## The agent's gate on a shared loopback
 
 The data gate has no network of its own on these nodes either: it listens on the loopback every user of the node

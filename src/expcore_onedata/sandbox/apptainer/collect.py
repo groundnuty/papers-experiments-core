@@ -10,7 +10,8 @@ more than the work disk holds; what the agent made so is refused for the scorers
 `InfraError` of kind `output_collection`), out of the run's ext3 image by the copy helper in execs of it with
 `work_disk = "image"`, every refusal the same (`workdisk.collect`, O71); the read-only inputs are hashed again; the gate
 is stopped (SIGTERM, so it writes its close lines) and the bytes it served counted once (O22), its log copied; the
-collector is stopped (it writes its end line) and its log read once, kept for the egress instrument and copied. Every
+collector is stopped (it writes its end line) and its log read once, kept for the egress instrument and copied, and the
+read-log collector's the same when the platform has the channel (O91, `readlogrun`). Every
 file of evidence the collection writes is scanned for the data-path token: one that holds it is removed and the
 collection fails, since a secret is never evidence (O05). A mount run's guard closes its window here and its log is
 copied too (O60, `hostmount`).
@@ -28,7 +29,7 @@ from expcore_onedata.fault_drain import GATE
 from expcore_onedata.sandbox import copyout, gatelog, inputs, kinds
 from expcore_onedata.sandbox.api import DataPathMode, SandboxError
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import helpers, runs, workdisk
+from expcore_onedata.sandbox.apptainer import helpers, readlogrun, runs, workdisk
 from expcore_onedata.sandbox.hostops import describe_error
 from expcore_onedata.sandbox.sandbox import TEARDOWN_TROUBLE
 
@@ -48,6 +49,7 @@ class Collection:
     def __init__(self, box: ApptainerSandbox) -> None:
         self.box = box
         self.egress_bytes: bytes | None = None
+        self.readlog_bytes: bytes | None = None  # O91: the read-log collector's log once read; None until then
 
     def run(self, dest: Path, outputs: Sequence[str]) -> dict[str, Any]:
         box = self.box
@@ -72,6 +74,9 @@ class Collection:
             result["gate_log"] = GATE_COPY
         written.append(self._egress(dest))
         result["egress_log"] = EGRESS_COPY if self.egress_bytes is not None else None
+        if box._readlog.enabled:  # a platform without the channel has no key of it (O91)
+            written.append(self._readlog(dest))
+            result["read_log"] = readlogrun.COPY if self.readlog_bytes is not None else None
         if box.spec.mode is DataPathMode.MOUNT:
             written.append(self._mount_watch(dest))
             result["mount_watch_log"] = MOUNT_WATCH_COPY if written[-1] is not None else None
@@ -218,6 +223,18 @@ class Collection:
         target.write_bytes(self.egress_bytes)
         return target
 
+    def _readlog(self, dest: Path) -> Path | None:
+        """Stop the read-log collector so it drains and writes its end line, read its log once and copy it (O91). A log
+        that cannot be read is None, which the instrument reads as unknown, never as a run that read nothing."""
+        channel = self.box._readlog
+        channel.stop()
+        self.readlog_bytes = channel.read()
+        if self.readlog_bytes is None:
+            return None
+        target = dest / readlogrun.COPY
+        target.write_bytes(self.readlog_bytes)
+        return target
+
     def _mount_watch(self, dest: Path) -> Path | None:
         """Close the mount guard's window, now that every process of the run is shown gone, and copy its log (O60): the
         guard's verdict is then in the metadata this collection writes. A helper without a guard has none."""
@@ -238,6 +255,8 @@ class Collection:
             path.unlink()
             if path.name == EGRESS_COPY:
                 self.egress_bytes = None
+            elif path.name == readlogrun.COPY:  # the log is never handed on as the instrument's source (O05)
+                self.readlog_bytes = None
         if held:
             raise kinds.collection_error("the run's evidence", f"{len(held)} file(s) held the data-path token")
 

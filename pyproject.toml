@@ -77,8 +77,9 @@ src = ["src", "tests"]
 # Template tooling under .claude/ is not this project's code.
 extend-exclude = [".claude"]
 # The HPC bundle's Python runs inside the Onedata images (Python 3.8) and on the batch nodes, not under the
-# distribution's interpreter: the linter must not rewrite it into syntax those cannot parse.
-per-file-target-version = { "deploy/hpc-federation/**" = "py38" }
+# distribution's interpreter: the linter must not rewrite it into syntax those cannot parse. The same holds for the two
+# single files of the read-log channel (the collector the harness runs, the client a cell imports), which run alone.
+per-file-target-version = { "deploy/hpc-federation/**" = "py38", "src/expcore_onedata/readlog/client.py" = "py38", "src/expcore_onedata/readlog/collector.py" = "py38" }
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]

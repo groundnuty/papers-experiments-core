@@ -2,7 +2,8 @@
 """The state of a run's other infrastructure on an HPC node, in the shape of Docker's `infra_check` (O17, O56).
 
 Docker's check compares each of the run's other containers with its state when it came up. On a node the run's other
-infrastructure is processes of the driver's, read by role: the egress collector (`collector`), the gate of a REST run
+infrastructure is processes of the driver's, read by role: the egress collector (`collector`), the read-log collector of
+a platform that pins one (`readlog`, O91), the gate of a REST run
 (`gate`), and for a mount run the helper's oneclient with its FUSE mount (`mount`) and the mount guard's watcher
 (`mount_watch`, `hostmount`). For each, `start` is its process (pid and start time) and `end` its state now:
 
@@ -42,7 +43,7 @@ from expcore_onedata.sandbox.apptainer.node import NodeOps, Spawned
 if TYPE_CHECKING:
     from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
 
-HELPERS = ("collector", "gate")  # the sandbox's own helpers, in the order they are listed
+HELPERS = ("collector", "readlog", "gate")  # the sandbox's own helpers, in the order they are listed (`readlog`: O91)
 BASIS = (
     "a process of the driver's on the node: no per-process limit, OOM counter or kernel line names how it ended, so "
     "nothing attributes it"
