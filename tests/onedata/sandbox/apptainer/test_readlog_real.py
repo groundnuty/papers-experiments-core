@@ -13,21 +13,31 @@ import os
 import shutil
 import signal
 import stat
-import tempfile
 import time
-from pathlib import Path
 
 import pytest
-from apptainer_support import make_settings
+from apptainer_support import (
+    make_settings,
+    make_spec,
+    settings_with_socket_bytes,
+    settings_with_work_root_bytes,
+    short_dir,
+)
 from apptainer_support import start as start_with
 from fake_node import FakeNode
 
 from expcore_onedata.readlog import files, paths
 from expcore_onedata.readlog.instrument import ReadLog
+from expcore_onedata.sandbox.apptainer.sockets import (
+    READLOG_SOCK_DIR,
+    RUN_ID_MAX_BYTES,
+    work_root_max_bytes,
+    work_root_problem,
+)
 from expcore_onedata.sandbox.hostops import CmdResult
 
 SHA = "ab" * 32
-SOCKET_PATH_LIMIT = 100  # AF_UNIX's sun_path holds 108 bytes
+UNIX_SOCKET_PATH_BYTES = 107  # AF_UNIX's sun_path holds 108 bytes, the last one a NUL
 
 
 @pytest.fixture
@@ -38,18 +48,17 @@ def node() -> FakeNode:
 
 
 @pytest.fixture
-def settings():
-    """A short work root: the collector's socket path must fit a Unix socket's address, which a pytest path may not."""
-    short = Path(tempfile.mkdtemp(prefix="rl"))
-    yield make_settings(short, readlog_collector_sha256=files.sha256_of(files.collector_file()))
-    shutil.rmtree(short, ignore_errors=True)
+def settings(short_tmp):
+    """A short work root: the collector's socket path must fit a Unix socket's address, which a pytest path may not (on
+    a batch node pytest's own paths are well over it, and the start refuses a path that does not fit)."""
+    return make_settings(short_tmp, readlog_collector_sha256=files.sha256_of(files.collector_file()))
 
 
-def start(node, settings):
+def start(node, settings, spec=None):
     """A start on the real clock: the helpers' waits (`helpers.stop` gives a collector a few seconds to drain and write
     its end line) are in real time here, since the collector is a real process; the default's clock moves only when the
     sandbox sleeps, so a stop would give up at once and kill the collector before its end line."""
-    return start_with(node, settings, sleep=time.sleep, clock=time.monotonic)
+    return start_with(node, settings, spec, sleep=time.sleep, clock=time.monotonic)
 
 
 def instrument(box) -> ReadLog:
@@ -77,7 +86,7 @@ def test_o91_a_client_in_a_cell_sends_and_the_record_appears_with_the_expected_p
     sender's uid as the kernel attests it: the driver's own, which the collector was told to expect."""
     box = start(node, settings)
     try:
-        assert len(str(box.dir / "readlog-sock" / paths.SOCKET_NAME)) < SOCKET_PATH_LIMIT
+        assert len(str(box.dir / "readlog-sock" / paths.SOCKET_NAME)) <= UNIX_SOCKET_PATH_BYTES
         node.cell_handler = sends("file-7", range=[0, 10], bytes=10, sha256=SHA)
         box.exec("print('x')", 30)
         box.collect(tmp_path / "out")
@@ -206,6 +215,43 @@ def test_o91_a_real_collector_terminated_before_the_collection_gives_an_unknown_
         assert "log_missing" in snapshot["unknown"]
     finally:
         box.stop()
+
+
+def test_o91_a_socket_path_of_exactly_the_limit_binds_with_the_real_collector(node, short_tmp):
+    """O91: the start's refusal of a long socket path (`test_readlog.py`) is placed where the kernel's own limit is: the
+    real collector binds a path of exactly 107 bytes, and the start, canary included, completes."""
+    long = settings_with_socket_bytes(
+        short_tmp, UNIX_SOCKET_PATH_BYTES, readlog_collector_sha256=files.sha256_of(files.collector_file())
+    )
+    box = start(node, long)
+    try:
+        assert len(os.fsencode(box.dir / "readlog-sock" / paths.SOCKET_NAME)) == UNIX_SOCKET_PATH_BYTES
+        assert stat.S_ISSOCK(os.lstat(box.dir / "readlog-sock" / paths.SOCKET_NAME).st_mode)
+    finally:
+        box.stop()
+
+
+def test_o91_the_longest_work_root_the_load_allows_binds_with_the_real_collector_at_the_longest_run_id(node):
+    """O91: the load's bound (`work_root_problem`) is the work root that, with a run id of its longest (a 200-character
+    lease key cut to 48, "-" and 8 hex digits: 57 bytes), leaves the read-log socket path at exactly 107 bytes, and the
+    real collector binds it: the bound refuses what cannot bind and nothing that can."""
+    longest = work_root_max_bytes(READLOG_SOCK_DIR)
+    assert work_root_problem(longest) is None
+    assert work_root_problem(longest + 1) is not None
+    base = short_dir(limit=longest - len("/root") - 2)  # leaves one byte at least for the name that makes up the rest
+    try:
+        pin = files.sha256_of(files.collector_file())
+        box = start(node, settings_with_work_root_bytes(base, longest, readlog_collector_sha256=pin),
+                    make_spec(lease_key="k" * 200))  # fmt: skip
+        try:
+            assert len(box.sid) == RUN_ID_MAX_BYTES
+            socket = box.dir / READLOG_SOCK_DIR / paths.SOCKET_NAME
+            assert len(os.fsencode(socket)) == UNIX_SOCKET_PATH_BYTES
+            assert stat.S_ISSOCK(os.lstat(socket).st_mode)
+        finally:
+            box.stop()
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def test_o91_the_teardown_stops_the_real_collector_and_removes_the_socket_and_the_log(node, settings):

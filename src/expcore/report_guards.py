@@ -3,24 +3,28 @@
 O60, O76): the runs any guard leaves out, and the analysis again without them, beside each guard's own section and
 rerun.
 
-A batch gets the section only when its records carry two or more of the `egress`, `mount_guard` and
-`process_visibility` instruments (`expcore.guards`); with one guard alone, that guard's rerun is the combined one, and
-the report is the text it was. The section is named for the guards that checked the batch (`Egress and mount isolation
-together`, as it always was for those two; `Egress, mount isolation and process visibility together` for all three) and
-shows the runs left out per condition, by which guard left each out; one row per left-out run with what each guard
-found; and the rerun in the tables the primary analysis uses (rendered by the caller), or why there is none.
+A batch gets the section only when its records carry two or more of the `egress`, `mount_guard`,
+`process_visibility` and `read_log` instruments (`expcore.guards`); with one guard alone, that guard's rerun is the
+combined one, and the report is the text it was. The section is named for the guards that checked the batch (`Egress
+and mount isolation together`, as it always was for those two; `Egress, mount isolation and process visibility
+together` for all three) and shows the runs left out per condition, by which guard left each out; one row per left-out
+run with what each guard found; and the rerun in the tables the primary analysis uses (rendered by the caller), or why
+there is none.
 """
 
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from expcore.guards import EGRESS, MOUNT, NOT_APPLICABLE, VISIBILITY, GuardedRun, GuardsAnalysis
+from expcore.guards import EGRESS, MOUNT, NOT_APPLICABLE, READ_LOG, VISIBILITY, GuardedRun, GuardsAnalysis
 from expcore.report_notes import GUARDS_NOTES, GUARDS_SENSITIVITY_NOTES, any_guard_notes, any_guard_sensitivity_notes
 
-TITLES = {EGRESS: "egress", MOUNT: "mount isolation", VISIBILITY: "process visibility"}  # the section's title
-ALONE = {EGRESS: "egress", MOUNT: "the mount guard", VISIBILITY: "the process visibility check"}  # "by X alone"
-COLUMNS = {EGRESS: "Egress", MOUNT: "Mount guard", VISIBILITY: "Process visibility"}  # a guard's column of a row
-BY_NAMES = {EGRESS: "egress", MOUNT: "mount guard", VISIBILITY: "process visibility", "both": "both"}
+TITLES = {EGRESS: "egress", MOUNT: "mount isolation", VISIBILITY: "process visibility", READ_LOG: "read log"}  # a title
+ALONE = {EGRESS: "egress", MOUNT: "the mount guard", VISIBILITY: "the process visibility check",
+         READ_LOG: "the read-log scan"}  # "by X alone"  # fmt: skip
+COLUMNS = {EGRESS: "Egress", MOUNT: "Mount guard", VISIBILITY: "Process visibility",
+           READ_LOG: "Read log"}  # a guard's column of a row  # fmt: skip
+BY_NAMES = {EGRESS: "egress", MOUNT: "mount guard", VISIBILITY: "process visibility", READ_LOG: "read log",
+            "both": "both"}  # fmt: skip
 
 
 def _list(names: Sequence[str], last: str = "and") -> str:
@@ -99,7 +103,7 @@ def guards_lines(
         return []
     n = guards.counts()
     names = _list([TITLES[g] for g in guards.guards])
-    notes = GUARDS_NOTES if guards.legacy else any_guard_notes(names)
+    notes = GUARDS_NOTES if guards.legacy else any_guard_notes(names, READ_LOG in guards.guards)
     rerun = GUARDS_SENSITIVITY_NOTES if guards.legacy else any_guard_sensitivity_notes(either(guards))
     lines = [title(guards), "", *notes, ""]
     lines.append(

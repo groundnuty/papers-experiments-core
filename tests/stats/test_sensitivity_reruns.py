@@ -6,7 +6,7 @@ import pytest
 from expcore.campaign.factors import FactorSchema
 from expcore.config.loading import ConfigError
 from expcore.stats.prereg import load as load_checked
-from expcore.stats.reruns import ANY_GUARD, EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, RERUNS, difference
+from expcore.stats.reruns import ANY_GUARD, EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, RERUNS, difference
 
 SCHEMA = FactorSchema({"arm": ["a", "b"]}, ["task", "arm", "model", "seed"], {f"cond-{a}": {"arm": a} for a in "ab"})
 BASE = """\
@@ -23,7 +23,7 @@ outcome = "score"
 estimator = "wilcoxon_cluster_bootstrap"
 cluster = "group"
 """
-ALL = '[sensitivity]\nreruns = ["egress", "mount_guard", "process_visibility", "any_guard"]\n'
+ALL = '[sensitivity]\nreruns = ["egress", "mount_guard", "process_visibility", "read_log", "any_guard"]\n'
 
 
 def write(tmp_path, text=BASE):
@@ -36,9 +36,10 @@ def load(path):
     return load_checked(path, SCHEMA)
 
 
-def test_s19_the_four_reruns_are_named_as_the_core_runs_them():
-    assert RERUNS == ("egress", "mount_guard", "process_visibility", "any_guard")
-    assert (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, ANY_GUARD) == RERUNS
+def test_s19_the_reruns_are_named_as_the_core_runs_them():
+    """S19, S20: the four guards' reruns and the one of every guard together, in this order."""
+    assert RERUNS == ("egress", "mount_guard", "process_visibility", "read_log", "any_guard")
+    assert (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, ANY_GUARD) == RERUNS
 
 
 def test_s19_a_preregistration_declares_the_reruns_it_expects_in_the_order_it_gives(tmp_path):
@@ -59,7 +60,7 @@ def test_s19_a_preregistration_that_declares_nothing_has_none_declared(tmp_path)
     ("text", "fragment"),
     [
         ('[sensitivity]\nreruns = ["egres"]\n', "did you mean 'egress'"),
-        ('[sensitivity]\nreruns = ["both"]\n', "egress, mount_guard, process_visibility, any_guard"),
+        ('[sensitivity]\nreruns = ["both"]\n', "egress, mount_guard, process_visibility, read_log, any_guard"),
         ('[sensitivity]\nreruns = ["egress", "egress"]\n', "twice"),
         ('[sensitivity]\nreruns = "egress"\n', "array"),
         ("[sensitivity]\nreruns = [1]\n", "array"),
@@ -150,7 +151,8 @@ def test_s19_a_guard_that_checked_the_batch_ran_its_rerun_whether_or_not_it_left
     assert clean.sensitivity is None
     assert ran_reruns(clean, None, None, None) == ("egress",)
     assert ran_reruns(None, None, None, None) == ()
-    assert ran_reruns(clean, clean, clean, clean) == RERUNS
+    assert ran_reruns(clean, clean, clean, clean, clean) == RERUNS
+    assert ran_reruns(clean, clean, clean, clean) == ("egress", "mount_guard", "process_visibility", "any_guard")
     assert ran_reruns(None, clean, None, clean) == ("mount_guard", "any_guard")
 
 
@@ -165,3 +167,35 @@ def test_s19_the_refusal_for_an_absent_table_names_the_table_to_add():
     )
     assert difference((), ("egress", "any_guard")) is not None  # what an absent table is checked as
     assert difference((), ()) is None  # nothing guarded, nothing to declare
+
+
+def test_s20_the_read_log_rerun_is_run_when_its_analysis_exists_and_ordered_before_any_guard():
+    """S20: the read-log scan's analysis exists when a record carries the `read_log` instrument, whether or not a run
+    was flagged; its rerun is named `read_log`, between the process-visibility check's and the combined one."""
+    from expcore.egress.sensitivity import EgressAnalysis
+    from expcore.readlog.sensitivity import ReadLogAnalysis
+    from expcore.stats.reruns import ran_reruns
+
+    clean = ReadLogAnalysis((), None)
+    assert ran_reruns(None, None, None, None, clean) == ("read_log",)
+    assert ran_reruns(EgressAnalysis((), None), None, None, clean, clean) == ("egress", "read_log", "any_guard")
+    assert ran_reruns(None, None, None, None) == ()
+
+
+def test_s20_a_declared_read_log_rerun_that_cannot_run_is_named_with_why():
+    said = difference(("read_log",), ("egress",))
+    assert "declared but not run: read_log (no analysed record carries the read_log instrument)" in said
+    assert "run but not declared: egress" in said
+
+
+def test_s20_any_guard_names_the_read_log_scan_among_the_guards_that_checked_the_batch():
+    assert difference(("egress", "read_log", "any_guard"), ("egress", "read_log", "any_guard")) is None
+    said = difference(("any_guard",), ("read_log",))
+    assert "only read_log did" in said
+
+
+def test_s20_a_preregistration_declares_the_read_log_rerun(tmp_path):
+    prereg = load(write(tmp_path, BASE + '\n[sensitivity]\nreruns = ["read_log", "any_guard"]\n'))
+    assert prereg.sensitivity_reruns == ("read_log", "any_guard")
+    with pytest.raises(ConfigError, match="did you mean 'read_log'"):
+        load(write(tmp_path, BASE + '\n[sensitivity]\nreruns = ["read_lo"]\n'))

@@ -21,6 +21,7 @@ from pathlib import Path
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer.argv import bindable
 from expcore_onedata.sandbox.apptainer.settings import Pinned
+from expcore_onedata.sandbox.apptainer.sockets import socket_path_problem
 
 CHUNK = 1 << 20
 TOOL_SERVER_DIR = "toolserver"  # in the run's directory, 0700, while the run's tool server runs: its HOME (O56)
@@ -77,6 +78,14 @@ def check_work_root(path: Path, uid: int) -> None:
         )
 
 
+def check_socket_path(path: Path, what: str) -> None:
+    """Before anything exists: `StartRefused` when the collector's socket path does not fit a Unix socket's address
+    (`sockets.socket_path_problem`: a long `[sandbox] work_root` is the cause, since the path is under it)."""
+    problem = socket_path_problem(path, what)
+    if problem is not None:
+        raise StartRefused(problem)
+
+
 def copy_pinned(pin: Pinned, target: Path, what: str, *, mode: int = 0o444) -> None:
     """Copy a pinned file to a new file of the run's, and show the copy has the pinned SHA-256; `SandboxError` naming
     `what` otherwise (the copy is removed)."""
@@ -103,4 +112,4 @@ def write_text(path: Path, text: str, *, mode: int = 0o444) -> None:
     path.chmod(mode)
 
 
-__all__ = ["check_work_root", "copy_pinned", "identity", "pin_image", "sha256_of", "write_text"]
+__all__ = ["check_socket_path", "check_work_root", "copy_pinned", "identity", "pin_image", "sha256_of", "write_text"]

@@ -308,7 +308,12 @@ def _analyze(args: argparse.Namespace) -> int:
     for path in write_analysis(analysis):
         print(f"wrote {path}")
     lines = summary_lines(
-        analysis.result, analysis.egress, analysis.mount_guard, analysis.guards, visibility=analysis.visibility
+        analysis.result,
+        analysis.egress,
+        analysis.mount_guard,
+        analysis.guards,
+        visibility=analysis.visibility,
+        read_log=analysis.read_log,
     )
     print("\n".join(lines))
     return EXIT_OK

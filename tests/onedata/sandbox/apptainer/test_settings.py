@@ -1,12 +1,15 @@
 """O56: `[sandbox] backend = "apptainer"` and `[sandbox.apptainer]`: every file pinned, the Docker backend's tables
 refused, the hooks' entries checked, and a message that names the key, never a value or a path."""
 
+from pathlib import Path
+
 import pytest
 from sandbox_support import add_sandbox
 
 from expcore.config.loading import ConfigError, Section
 from expcore_onedata.readlog import paths
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.sandbox.apptainer import sockets
 from expcore_onedata.sandbox.settings import FederationNetwork, load_sandbox
 
 SHA = "a" * 64
@@ -60,6 +63,56 @@ def test_the_docker_backend_s_tables_and_keys_are_refused(tmp_path, table):
     document[table] = {} if table in ("images", "network") else 1000
     with pytest.raises(ConfigError, match="Docker backend alone"):
         _load(tmp_path, document)
+
+
+# -- the work root and the read-log collector's socket: a Unix socket's path is at most 107 bytes (O91) ----------------
+# The read-log socket is `<work_root>/<run id>/readlog-sock/sock`, the run id at most 57 bytes (a 48-character key, "-"
+# and 8 hex digits), so with the read-log pin the work root may hold at most 31 bytes. Without the pin the load bounds
+# nothing: every platform has the egress collector, whose too-long path is said at a run's start (`test_runs.py`).
+PIN = {"readlog_collector_sha256": "e" * 64}
+
+
+def _rooted(size: int, **apptainer_changes):
+    """The document with a work root of `size` bytes: an absolute path, so the platform file's directory is no part."""
+    document = _document(**apptainer_changes)
+    document["work_root"] = "/" + "w" * (size - 1)
+    return document
+
+
+@pytest.mark.parametrize("size", [32, 200])
+def test_o91_a_work_root_too_long_for_the_read_log_socket_is_refused_at_load(tmp_path, size):
+    """O91: with the read-log pin the platform names the length and the longest work root, never a path, when it
+    loads, so a plan or any other load fails at once and not at a run's first start."""
+    with pytest.raises(ConfigError) as refused:
+        _load(tmp_path, _rooted(size, **PIN))
+    message = str(refused.value)
+    assert f"key 'work_root' is {size} bytes, over the 31 a run's read-log collector socket allows" in message
+    assert "<run id of at most 57 bytes>/readlog-sock/sock must fit a Unix socket's 107 bytes" in message
+    assert "w" * 20 not in message
+
+
+@pytest.mark.parametrize("size", [31, 18])
+def test_o91_a_work_root_that_leaves_room_for_the_read_log_socket_loads(tmp_path, size):
+    """O91: the bound is inclusive (31 bytes), and a work root of the real form (about 20 characters, as the HPC
+    layouts' `/tmp/...` directory) loads."""
+    assert len(str(_load(tmp_path, _rooted(size, **PIN)).work_root)) == size
+
+
+@pytest.mark.parametrize("size", [32, 200])
+def test_o91_a_platform_that_declares_no_read_log_pin_loads_with_any_work_root(tmp_path, size):
+    """O91: the bound is the read-log channel's alone: a platform without the pin (every platform written before it, and
+    the egress collector everywhere, whose too-long path is said at a run's start) loads whatever its work root."""
+    assert len(str(_load(tmp_path, _rooted(size)).work_root)) == size
+
+
+def test_o91_the_bound_is_made_of_the_names_the_collectors_bind():
+    """O91, O56: the load's bound counts the socket file's name and the directory names the backend makes; the
+    read-log collector and the egress collector's file name the same socket file, so the bound cannot drift."""
+    assert sockets.SOCKET_NAME == paths.SOCKET_NAME == "sock"
+    collector = Path(__file__).resolve().parents[4] / "deploy" / "hpc-federation" / "bundle" / "egress-collector.py"
+    assert f'os.path.join(sock_dir, "{sockets.SOCKET_NAME}")' in collector.read_text(encoding="utf-8")
+    assert (sockets.READLOG_SOCK_DIR, sockets.EGRESS_SOCK_DIR) == ("readlog-sock", "egress-sock")
+    assert sockets.work_root_max_bytes(sockets.READLOG_SOCK_DIR) == 31
 
 
 # -- [sandbox.federation] on this backend: the names the gate serves the agent (O69) -----------------------------------
@@ -169,7 +222,9 @@ def test_o91_the_read_log_collector_is_pinned_and_recorded_only_when_declared(tm
     plain = _load(tmp_path, _document())
     assert plain.apptainer.readlog_collector_sha256 is None
     assert "readlog_collector_sha256" not in plain.apptainer.record()
-    declared = _load(tmp_path, _document(readlog_collector_sha256="e" * 64))
+    document = _document(readlog_collector_sha256="e" * 64)
+    document["work_root"] = "/tmp/node-tmp"  # short and absolute: with the pin the load bounds the work root (below)
+    declared = _load(tmp_path, document)
     assert declared.apptainer.readlog_collector_sha256 == "e" * 64
     assert declared.apptainer.record() == {**plain.apptainer.record(), "readlog_collector_sha256": "e" * 64}
 
