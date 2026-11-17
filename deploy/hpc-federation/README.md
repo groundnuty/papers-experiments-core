@@ -225,7 +225,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `B` | the bundle on a filesystem the nodes see (`<shared_root>/hpc-federation/bundle`), `chmod -R go-w` |
 | `SH` | a 0700 directory for the two rootfs tarballs, each with its `.provenance` (SHA-256): single files only (`<scratch_root>/hpcop-images`) |
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
-| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's clone and venv, its manifests), an absolute path with no `..`, on a filesystem the login node sees (`<shared_root>/studies/<study>/artifacts`). `up` digests its tree into the render identity (O74, below); the path is never in the record |
+| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's clone and venv, its manifests), an absolute path with no `..`, on a filesystem the login node sees (`<shared_root>/studies/<study>/artifacts`). `up` digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository. The optional keys of the driver, the agent's sandbox and the study's artifacts are in `site.env.example`; the four of the next
@@ -447,10 +447,20 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   `a/b`) and none for the directory itself: `F NUL path NUL size NUL sha256 NUL` for a regular file, `D NUL path NUL`
   for a directory, `L NUL path NUL target NUL` for a symbolic link (paths are raw bytes, `/`-separated). The venv is in
   it. Mode, owner, time and the directory's own path are not, so a copy of the tree at another path has the same digest
-  and no path is in the record. **A link is recorded by its target string and never followed:** a venv's `bin/python`
-  is a link to an interpreter outside the tree, so a rule that refused links would refuse the venv the digest is for;
-  what a link points at is not hashed, so a tree that must hold its interpreter holds a copy of it (a venv made with
-  `--copies`). A **special file** (a FIFO, a socket, a device) is refused, and so is a directory that does not exist,
+  and no path is in the record. **A link is recorded by its target string and never followed, and the directory is
+  self-contained:** what a link points at is not hashed, so it must be in the tree, where its own entry pins it. The
+  study's interpreter is installed in the directory and its venv built on it (the venv's `bin/python3` links into the
+  tree, `lib64` to `lib`), and `up` refuses a link whose resolved target leaves the directory, naming
+  `HPC_STUDY_ARTIFACTS` and the link's path relative to the directory, never its target. A link is resolved as the
+  kernel resolves it, against the tree's own entries alone (nothing outside is opened, so a target that does not exist,
+  or a FIFO, is refused all the same): a relative target is read from the link's own directory; an absolute one must
+  begin, component by component (`/p/artifacts2` is not inside `/p/artifacts`), with the directory's real path or the
+  path `HPC_STUDY_ARTIFACTS` gives; `..` goes up one directory and one at the root is an escape; a link met on the way
+  (a link to a parent, a chain) is followed, never collapsed as text; and a path may pass through at most 40 links (the
+  link itself the first: Linux's own limit), so a loop is refused. A link that dangles inside the tree is allowed and
+  recorded like any other (a file that appears where it points changes the tree, so it changes the digest). The
+  canonical form is the one above, and a tree whose links stay inside has the digest it had before this check. A
+  **special file** (a FIFO, a socket, a device) is refused, and so is a directory that does not exist,
   is a file or is itself a link. Every refusal fails `up` before the root is made, naming `HPC_STUDY_ARTIFACTS` and a
   path relative to the directory (escaped), never an absolute one. The tree is opened below one held descriptor with
   no link followed and is never written, so a read-only tree reads as any other, and a file that changes while it is
