@@ -86,6 +86,29 @@ HOSTILE = {
     # and `out/s/leak` is written through it beside out/: every name and target is inside out/ taken by itself
     "through-a-link": [OUT, ("out/d", SYMLINK, "."), ("out/d/s", SYMLINK, ".."), ("out/s/leak", FILE, None)],
     "through-a-directory-link": [OUT, ("out/d", SYMLINK, "."), ("out/d/file", FILE, None)],
+    # A hard link whose target is a link of the archive: extraction makes `out/h` the symbolic link `../x` (CPython
+    # 3.12 and 3.13) and the file that follows is written through it, to `x` beside out/. The target `out/a/s` is in
+    # out/ and no ancestor of it is a link, so only the target's being a link itself shows it.
+    "hardlink-to-a-symlink": [
+        OUT,
+        ("out/a", DIR, None),
+        ("out/x", FILE, None),
+        ("out/a/s", SYMLINK, "../x"),
+        ("out/h", HARDLINK, "out/a/s"),
+        ("out/h", FILE, None),
+    ],
+    "hardlink-to-a-symlink-listed-later": [  # the order of the members changes nothing
+        OUT,
+        ("out/x", FILE, None),
+        ("out/h", HARDLINK, "out/s"),
+        ("out/s", SYMLINK, "x"),
+    ],
+    "hardlink-to-a-hardlink": [
+        OUT,
+        ("out/file", FILE, None),
+        ("out/h1", HARDLINK, "out/file"),
+        ("out/h2", HARDLINK, "out/h1"),
+    ],
     # `tarfile` keeps the trailing `/` of a link's name and drops it when it makes the link: the link is at out/d
     "symlink-named-with-a-slash": [OUT, ("out/d/", SYMLINK, "..")],
     "symlink-named-out": [("out/", SYMLINK, "x")],

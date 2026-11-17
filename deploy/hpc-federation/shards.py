@@ -1156,7 +1156,10 @@ def archive_problem(members: Sequence[tarfile.TarInfo]) -> str | None:
     None. `tarfile`'s data filter judges a member against the directory unpacked into, so it lets `out/../x` and a link
     to `../x` land beside `out/`; here `out/` is the boundary. A member's name has no `..` and is `out` (a directory)
     or under `out/`, a link stays in `out/` (`_link_stays_in_out`), and no member's path (a hard link's target too)
-    passes through a link of the archive, in whatever order, so that every link sits in a real directory."""
+    passes through a link of the archive, in whatever order, so that every link sits in a real directory. A hard link's
+    target is no link of the archive either, a symbolic link or another hard link: extraction would make the hard link
+    a symbolic link (CPython 3.12 and 3.13) and a member written under its name goes through it, beside `out/`. A
+    hard link made by `tarfile` or GNU tar names the first member of its file, which is a regular file."""
     if not members:
         return "holds something besides out/"
     links = {posixpath.normpath(m.name) for m in members if m.issym() or m.islnk()}
@@ -1175,6 +1178,8 @@ def archive_problem(members: Sequence[tarfile.TarInfo]) -> str | None:
         if (member.issym() or member.islnk()) and not _link_stays_in_out(member):
             return "has a link that leaves out/"
         if through_a_link(member.name) or (member.islnk() and through_a_link(member.linkname)):
+            return "has a member written through a link"
+        if member.islnk() and posixpath.normpath(member.linkname) in links:
             return "has a member written through a link"
     return None
 
