@@ -5,6 +5,8 @@ phase ends and holds nothing; and `down` refuses a root that holds evidence a ru
 (`hpcevidence.present_evidence`) and no current marker. Against the fake Slurm of hpc_fed_support; nothing reaches a
 cluster."""
 
+import json
+
 import pytest
 from down_rig_support import Rig, make_site
 from hpc_fed_support import hpc_on_path
@@ -45,14 +47,16 @@ def _day0_root(rig):
 
 @pytest.mark.parametrize("content", [b"", b"a line in the lock file\n"], ids=["empty", "with a line"])
 def test_o63_the_core_phase_lock_is_no_evidence_held_or_left_and_whatever_it_holds(hpc, tmp_path, site, content):
-    """O63: with the lock held by a core phase, and with the file left behind holding nothing or a line, a root after
-    `up` alone has no evidence present and nothing uncollected: the file is in none of the sets of `hpcevidence`."""
+    """O63: with the lock held by a core phase and holding nothing or a line, and with the file left behind holding the
+    same, a root after `up` alone has no evidence present and nothing uncollected: the file is in none of the sets of
+    `hpcevidence`, so what it holds does not matter (a line in it would count, were it a file of the run's)."""
     rig = Rig(hpc, tmp_path, site)
     leave_what_up_leaves(rig.root)
     with rig.driver.store.core_phase("this test's core phase"):
+        (rig.root / LOCK).write_bytes(content)
         assert hpc.evidence.present_evidence(rig.root) == ()
         assert hpc.evidence.uncollected(rig.root) is None
-    (rig.root / LOCK).write_bytes(content)
+    assert (rig.root / LOCK).read_bytes() == content
     assert hpc.evidence.present_evidence(rig.root) == ()
     assert hpc.evidence.uncollected(rig.root) is None
 
@@ -84,12 +88,18 @@ def test_o63_a_root_after_a_core_rerun_alone_goes_down_unrefused(hpc, tmp_path, 
     assert not rig.root.exists()
 
 
-def test_o63_a_day0_root_with_the_core_phase_lock_is_refused_for_its_journal_alone(hpc, tmp_path, site):
+@pytest.mark.parametrize("lock_first", [True, False], ids=["lock first", "evidence first"])
+def test_o63_a_day0_root_with_the_core_phase_lock_is_refused_for_its_journal_alone(hpc, tmp_path, site, lock_first):
     """O63: the refusal names the fault journal and nothing of the lock, whatever order the evidence and the lock came
     in; nothing is cancelled or stopped, and the root stays."""
     rig = Rig(hpc, tmp_path, site)
-    _day0_root(rig)
-    _rerun(rig)
+    if lock_first:
+        _rerun(rig)
+        _day0_root(rig)
+    else:
+        _day0_root(rig)
+        _rerun(rig)
+    assert (rig.root / LOCK).is_file()
     assert hpc.evidence.present_evidence(rig.root) == ("the fault journal",)
     with pytest.raises(RuntimeError) as refused:
         rig.driver.down()
@@ -102,13 +112,17 @@ def test_o63_a_day0_root_with_the_core_phase_lock_is_refused_for_its_journal_alo
 
 
 def test_o63_a_core_rerun_after_the_collect_does_not_make_the_collected_evidence_stale(hpc, tmp_path, site):
-    """O63: a root collected and marked, whose core phase is then rerun (the lock file is made or taken again), is still
-    collected: no strict file changed, so down goes on, naming no change since the collect."""
+    """O63: a root collected and marked with no lock in it (the rig's `up` made one, which is removed first), whose core
+    phase is then rerun and so makes the lock file, is still collected: the marker names no lock, no file the marker
+    holds changed, so the new file is no change since the collect and down goes on."""
     rig = Rig(hpc, tmp_path, site)
     _day0_root(rig)
+    (rig.root / LOCK).unlink()
     rig.collected()
+    assert LOCK not in json.loads((rig.root / "evidence-collected.json").read_text(encoding="utf-8"))["files"]
     assert hpc.evidence.uncollected(rig.root) is None
     _rerun(rig)
+    assert (rig.root / LOCK).is_file()
     assert hpc.evidence.uncollected(rig.root) is None
     printed = rig.driver.down()
     assert printed.startswith("down: the held job 4242 is gone, and so is the root")
