@@ -19,7 +19,8 @@ It must never be a node's name. The gate counts the node names the answers it re
 the cell's own host name would be one of them; a federation with a node of that name, or whose fully qualified name
 starts with it, is refused at the start (`is_node_name`). The scan holds the agent node's own host name instead, in its
 fully qualified and one-label forms, as the node reports them (`scan_names`): a leak of the one name the cell no longer
-shows is still counted, and the declared name, which is the allowed one, never is.
+shows is still counted, and the declared name, which is the allowed one, never is. A node whose own name is the
+declared one is refused too (`REFUSAL_OWN`): its cell would show a real name that nothing counts.
 """
 
 from __future__ import annotations
@@ -38,12 +39,18 @@ REFUSAL = (
     "the cells' fixed host name is also the name of a node of the federation: a node's own name may not be the neutral "
     "one the agent reads (O73)"
 )
+REFUSAL_OWN = (
+    "the cells' fixed host name is also the host name of the agent node: a node's own name may not be the neutral one "
+    "the agent reads (O73)"
+)
 
 
 @dataclass(frozen=True)
 class OwnNames:
     """What a node says of its own names: the names it could read (its host name, its fully qualified name) and the
-    reasons, never a name, that a form could not be read (`host_name_failed`, `fqdn_failed`, `fqdn_timeout`)."""
+    reasons, never a name, that a form could not be read (`host_name_failed`, `fqdn_failed`, `fqdn_timeout`, and
+    `fqdn_unqualified` when the resolver gave no name with a domain: the scan then holds the one-label form alone, which
+    never matches that name followed by its domain)."""
 
     names: tuple[str, ...] = ()
     unread: tuple[str, ...] = ()
@@ -55,9 +62,22 @@ def valid(name: str) -> bool:
 
 
 def is_node_name(node_names: Iterable[str], name: str = CELL_HOSTNAME) -> bool:
-    """Whether one of the federation's real node names or addresses is `name`, or has it as its first label (a fully
-    qualified name), in any case: the clash the start refuses."""
-    return any(n.lower().split(".", 1)[0] == name for n in node_names)
+    """Whether one of a node's names (the federation's real node names or addresses, or the agent node's own) is `name`,
+    or has it as its first label (a fully qualified name), in any case and whatever blanks surround it: the clash the
+    start refuses."""
+    return any(n.strip().lower().rstrip(".").split(".", 1)[0] == name.lower() for n in node_names)
+
+
+def qualified(name: str) -> bool:
+    """Whether `name` is a fully qualified one: a name with a domain, and no address (an address holds dots too)."""
+    name = name.strip().rstrip(".")
+    if "." not in name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return True
+    return False
 
 
 def scan_names(node_names: Iterable[str], own: Iterable[str], declared: Iterable[str] = ()) -> tuple[str, ...]:
@@ -82,13 +102,7 @@ def scan_names(node_names: Iterable[str], own: Iterable[str], declared: Iterable
 
 def _first_label(name: str) -> tuple[str, ...]:
     """The first label of a fully qualified name; nothing for a name of one label or an address."""
-    if "." not in name:
-        return ()
-    try:
-        ipaddress.ip_address(name)
-    except ValueError:
-        return (name.split(".", 1)[0],)
-    return ()
+    return (name.split(".", 1)[0],) if qualified(name) else ()
 
 
 def note(meta: MutableMapping[str, Any], name: str = CELL_HOSTNAME) -> None:
@@ -97,5 +111,6 @@ def note(meta: MutableMapping[str, Any], name: str = CELL_HOSTNAME) -> None:
 
 
 __all__ = [
-    "CELL_HOSTNAME", "FACT", "LOCAL_NAMES", "REFUSAL", "OwnNames", "is_node_name", "note", "scan_names", "valid",
+    "CELL_HOSTNAME", "FACT", "LOCAL_NAMES", "REFUSAL", "REFUSAL_OWN", "OwnNames", "is_node_name", "note", "qualified",
+    "scan_names", "valid",
 ]  # fmt: skip

@@ -77,6 +77,7 @@ from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelp
 from expcore_onedata.sandbox.apptainer.node import NodeOps
 from expcore_onedata.sandbox.apptainer.teardown import Teardown
 from expcore_onedata.sandbox.apptainer.watch import Watch, spaces_of
+from expcore_onedata.sandbox.cellhost import OwnNames
 from expcore_onedata.sandbox.cells import OUTPUT_CAP_BYTES
 from expcore_onedata.sandbox.completion import ExecIncomplete
 from expcore_onedata.sandbox.containers import (
@@ -116,6 +117,7 @@ class ApptainerSandbox:
     """The `Sandbox` of the platform layer on an HPC batch node. Build it with `start`; stop it with `stop`."""
 
     _own_scan: dict[str, Any] | None = None  # the facts of the agent node's names in the gate's scan (O73)
+    _own: OwnNames = OwnNames()  # what the agent node says of its own names, asked once at the start's checks (O73)
 
     def __init__(
         self,
@@ -255,6 +257,12 @@ class ApptainerSandbox:
             raise StartRefused("the listing mode must be paged or complete, and complete is for a REST data path only")
         if cellhost.is_node_name(sp.node_names):  # O73: the neutral host name is never a node's
             raise StartRefused(cellhost.REFUSAL)
+        if (
+            sp.node_names
+        ):  # O73: asked once, here, before anything exists: a bounded lookup; the gate's list is made of it
+            self._own = self.node.own_names()
+            if cellhost.is_node_name(self._own.names):  # the agent node's own name is never the neutral one either
+                raise StartRefused(cellhost.REFUSAL_OWN)
         if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
             try:
                 self._ca_bytes = s.tls.bundle()
@@ -370,7 +378,7 @@ class ApptainerSandbox:
         how many forms were added and why any could not be read (`own_node_scan`), never a name."""
         if not self.spec.node_names:
             return ()
-        own = self.node.own_names()
+        own = self._own
         scanned = cellhost.scan_names(self.spec.node_names, own.names, declared=served)
         self._own_scan = {"version": 1, "forms": len(scanned) - len(self.spec.node_names), "unread": list(own.unread)}
         return scanned

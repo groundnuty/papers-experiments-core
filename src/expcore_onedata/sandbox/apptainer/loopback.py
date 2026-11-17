@@ -10,8 +10,9 @@ from __future__ import annotations
 import contextlib
 import socket
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
+from expcore_onedata.sandbox import cellhost
 from expcore_onedata.sandbox.cellhost import OwnNames
 
 LOOPBACK = "127.0.0.1"
@@ -25,45 +26,57 @@ def free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _bounded(lookup: Callable[[], str], timeout_s: float) -> tuple[str | None, str | None]:
+def _bounded[T](lookup: Callable[[], T], timeout_s: float) -> tuple[T | None, str | None]:
     """`(answer, None)` of `lookup`, run in a thread of its own that is not waited for past `timeout_s`; `(None,
     "fqdn_timeout")` when it did not answer in time (the thread is left to end by itself: it is a daemon's), and `(None,
     "fqdn_failed")` when it raised. A resolver that hangs thus costs a start the bound and no more."""
-    box: dict[str, str] = {}
+    box: dict[str, T] = {}
 
     def run() -> None:
-        try:
-            box["name"] = lookup()
-        except Exception:  # whatever it was, the reason recorded is `fqdn_failed`, never the exception's text
-            box["failed"] = "yes"
+        with contextlib.suppress(Exception):  # whatever it raised, the reason recorded is `fqdn_failed`, never its text
+            box["answer"] = lookup()
 
     thread = threading.Thread(target=run, name="own-fqdn-lookup", daemon=True)
     thread.start()
     thread.join(timeout_s)
     if thread.is_alive():
         return None, "fqdn_timeout"
-    return (box["name"], None) if "name" in box else (None, "fqdn_failed")
+    return (box["answer"], None) if "answer" in box else (None, "fqdn_failed")
 
 
 def own_names(timeout_s: float | None = None) -> OwnNames:
-    """The node's own host name and its fully qualified form, as the system says them (`gethostname`, `getfqdn`). The
-    second is a resolver lookup, bounded (`FQDN_TIMEOUT_S`): on a timeout or a failure the host name stands alone, and
-    the reason, never a name, is in `unread`. For the gate's scan (`cellhost.scan_names`), never recorded: a site's
-    name."""
+    """The node's own names as the system says them: its host name (`gethostname`) and the names its resolver gives that
+    host name (`gethostbyaddr`: the primary name and every alias), each once in any case. The lookup is bounded
+    (`FQDN_TIMEOUT_S`): on a timeout or a failure the host name stands alone, and the reason, never a name, is in
+    `unread`. When no name read holds a domain the reason is `fqdn_unqualified` too: the scan then holds a one-label
+    name, which never matches that name followed by its domain, and the record says so. (`getfqdn` was not used: it
+    returns the first name with a dot, or else the bare host name without an error, so a node of several dotted names
+    had one scanned and one with none looked read.) For the gate's scan (`cellhost.scan_names`), never recorded: a
+    site's name."""
     bound = FQDN_TIMEOUT_S if timeout_s is None else timeout_s
     names: list[str] = []
     unread: list[str] = []
+
+    def add(found: Iterable[str]) -> None:  # the names as said, in order, none blank and none twice in any case
+        for name in found:
+            if name and name.lower() not in map(str.lower, names):
+                names.append(name)
+
     try:
         host = socket.gethostname()
     except OSError:
-        unread.append("host_name_failed")
-    else:
-        names += [host] if host else []
-    full, why = _bounded(socket.getfqdn, bound)
+        host = ""
+    if not host:
+        return OwnNames((), ("host_name_failed", "fqdn_failed"))
+    add([host])
+    answer, why = _bounded(lambda: socket.gethostbyaddr(host), bound)
     if why is not None:
         unread.append(why)
-    elif full:
-        names.append(full)
+    elif answer is not None:
+        primary, aliases, _addresses = answer
+        add([primary, *aliases])
+    if not why and not any(cellhost.qualified(n) for n in names):
+        unread.append("fqdn_unqualified")
     return OwnNames(tuple(names), tuple(unread))
 
 
