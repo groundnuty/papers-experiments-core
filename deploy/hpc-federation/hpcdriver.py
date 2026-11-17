@@ -903,17 +903,24 @@ class Driver(Down):
     def relink_refusal(self, state: Mapping[str, Any]) -> Optional[str]:
         """Why a rerun on a `linked` federation cannot say `linked` again, whatever its own checks find, or None. The
         rerun never reads an ingested space, and `shards.py plan` takes the markers `verify-data` left as read. So a
-        rerun that found no facts file (the core's phase then resets every space's content, an ingested one's too), or
-        one over a layout whose ingested spaces or manifests are not what `up` recorded, does not vouch for them."""
+        rerun that found no facts file (the core's phase then resets every space's content, an ingested one's too), one
+        over another layout than the one `up` recorded (it renders the platform file from the layout it is given, and
+        a layout with no platform template runs no link check), or one whose ingested spaces or manifests are not what
+        `up` recorded, does not vouch for them. Whatever goes wrong while comparing is a refusal too, in fixed words:
+        the rerun still runs, and no error here names a path or ends in a traceback."""
         if not self.layout.facts.exists():
             return "its facts file was missing, so the core's phase reset every space's content"
+        if self.spec.digest != (state.get("layout") or {}).get("digest"):
+            return "its layout is not the one up recorded"
         recorded = (state.get("data") or {}).get("ingested")
         if recorded is None:
             return "its state holds no record of the ingested spaces (its up predates it)"
         try:
             self.recorded_manifests(state, recorded)
-        except RuntimeError as error:
+        except RuntimeError as error:  # the comparison's own words: they name a space and never a path
             return str(error)
+        except (OSError, ValueError, KeyError, TypeError):
+            return "its ingested spaces could not be compared with the layout"
         return None
 
     def core_here(self) -> str:
@@ -924,9 +931,10 @@ class Driver(Down):
         On a federation that is `linked` (`hpcfed.py core` run again on a finished root) the phase is `bootstrapped`
         from before the core's phase runs, and `linked` again only if it returns, which it does only when its link
         check passed: `up`'s own condition for `linked`, and `relink_refusal` finds nothing against it. A rerun that
-        fails, or dies, leaves `bootstrapped`, which `shards.py plan` refuses, and no `linked` it did not earn. On any
-        other state the phase ends `bootstrapped` and only `up` says `linked`. Either way a phase another command
-        wrote meanwhile (a `down`'s `stopping`) is never overwritten."""
+        starts and fails, or dies, leaves `bootstrapped`, which `shards.py plan` refuses, and no `linked` it did not
+        earn; one refused before it starts (no owner, a mount not proved read-only) changes nothing, the phase
+        included. On any other state the phase ends `bootstrapped` and only `up` says `linked`. Either way a phase
+        another command wrote meanwhile (a `down`'s `stopping`) is never overwritten."""
         with self.store.core_phase():
             return self.core_phase_locked()
 
