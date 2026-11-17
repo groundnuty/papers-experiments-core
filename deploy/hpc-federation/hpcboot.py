@@ -29,6 +29,11 @@ real addresses (DESIGN.md, sections 5 and 6).
   the template, of the rendered platform's fingerprint and of each pin it holds, and the digest of the study's artifacts
   tree when the site declares one (`up` took it in its preflight and the state file carries it here), as
   `render-identity.json` in the root, which a shard's step compares with the one its plan expects.
+- **`[placement]`** is always in the rendered file, complete (`hpcplacement.complete`, O79): the platform layer requires
+  it (`rangemap.load_placement`) and a reader that finds none patches in a default of its own, which is how a setting
+  drifts unseen. The template declares `holder`, the one setting the core has no default for (`up` refuses one that
+  does not, before anything is submitted); the render writes every other setting at the core's default, read from
+  `PlacementSettings`' fields, beside what the template declared.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -44,6 +49,7 @@ import hpcdata
 import hpcidentity
 import hpcimport
 import hpcpins
+import hpcplacement
 import tomllib
 from fedboot import Bootstrap
 from fedcontent import Content
@@ -237,16 +243,18 @@ def check_provider_storage(rendered: str, values: Mapping[str, str]) -> None:
 
 def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, str]) -> str:
     """Write the platform file: the Compose placeholders from the facts, the HPC ones, and the token margin last, the
-    least the platform layer accepts for the rest of the file. Returns the text written. The kind of storage the
-    providers have is checked in the first render, before anything is written (`check_provider_storage`)."""
+    least the platform layer accepts for the rest of the file, and `[placement]` complete (`hpcplacement.complete`) in
+    both. Returns the text written. The kind of storage the providers have is checked in the first render, before
+    anything is written (`check_provider_storage`)."""
     filled = {**placeholders(facts), **values, "hpc_token_margin_s": str(PROVISIONAL_MARGIN_S)}
     text = render(template, filled)
     check_provider_storage(text, values)
+    text = hpcplacement.complete(text)
     write_private(path, text)
     if "@hpc_token_margin_s@" not in template:
         return text
     filled["hpc_token_margin_s"] = str(least_margin_s(path, text, float(values["hpc_settle_timeout_s"])))
-    text = render(template, filled)
+    text = hpcplacement.complete(render(template, filled))
     write_private(path, text)
     return text
 
