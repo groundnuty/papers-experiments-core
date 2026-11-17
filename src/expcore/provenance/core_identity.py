@@ -42,6 +42,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from expcore.provenance.gitobjects import git_env
+
 CORE_PROJECT = "papers-experiments-core"
 BUILD_FILE = "_build_identity.json"
 BUILD_FORMAT = "expcore-core-identity/1"
@@ -107,7 +109,9 @@ def is_sha(value: object) -> bool:
 def _git(root: Path, *args: str, raw: bool = False) -> str | None:
     """Run git in `root`; None when git cannot run or fails. Stripped unless `raw` (NUL-separated listings)."""
     try:
-        done = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=60)
+        done = subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=60, env=git_env()
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:

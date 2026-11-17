@@ -12,6 +12,24 @@ class GitError(RuntimeError):
     """A git command failed or was given an unusable revision."""
 
 
+def git_env(*, isolate_config: bool = False) -> dict[str, str]:
+    """The environment for a git command that only reads a clone: the process's own, plus `GIT_OPTIONAL_LOCKS=0` (O80).
+
+    `git status` refreshes `.git/index` as a side effect, on a fresh copy's first run and again after a tracked file's
+    mtime changes; with the flag it completes the same operation, with the same answer, without taking the lock that
+    write needs. A check that writes the clone it checks changes every digest of a directory that includes `.git`.
+    The flag does not stop every verb: `git diff` still refreshes the index, so no launch or check may read with it.
+
+    With `isolate_config` the user's global and the system configuration are read as empty, so the answer does not
+    depend on them (`core.fsmonitor` in the global file runs a program; `diff.ignoreSubmodules` hides a change). A clone
+    that relied on a global `safe.directory` is then refused, which is the safe side of a check that decides a launch.
+    """
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    if isolate_config:
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    return env
+
+
 def blob_id(data: bytes) -> str:
     """Return the git blob id (SHA-1 of 'blob <length>' NUL content) of the given bytes."""
     return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
@@ -19,7 +37,7 @@ def blob_id(data: bytes) -> str:
 
 def run_git(repo: Path, *args: str) -> bytes:
     """Run git in the repository and return stdout; raise GitError with git's message on failure."""
-    result = subprocess.run(["git", *args], cwd=repo, capture_output=True, check=False)
+    result = subprocess.run(["git", *args], cwd=repo, capture_output=True, check=False, env=git_env())
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", "replace").strip()
         raise GitError(f"git {args[0]} failed in {repo}: {detail}")
