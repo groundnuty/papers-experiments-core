@@ -5,7 +5,8 @@
 
 The allow-list comes from ONEDATA_MCP_TOOLS, as the real server reads it. When FAKE_MCP_RECORD names a file, the
 server writes the Onedata settings it received there as JSON, so a test can see what the launcher passed it, with the
-SHA-256 and the mode of the file SSL_CERT_FILE names. The values are test values.
+SHA-256 and the mode of the file SSL_CERT_FILE names. When FAKE_MCP_RECORD_ENVIRON names a file, it writes its whole
+environment and its working directory there, so a test sees everything it inherited. The values are test values.
 
 When FAKE_MCP_TLS_PROBE names HTTPS URLs (separated by commas), the server first opens each with an httpx client that
 verifies unless ONEDATA_ALLOW_INSECURE_TLS is "true" and otherwise takes its CA bundle from the environment as httpx
@@ -72,6 +73,10 @@ def main() -> None:
     if record:
         with open(record, "w", encoding="utf-8") as out:
             json.dump(seen, out)
+    whole = os.environ.get("FAKE_MCP_RECORD_ENVIRON")
+    if whole:  # every variable and the working directory, so a test sees what the server inherited
+        with open(whole, "w", encoding="utf-8") as out:
+            json.dump({"environ": dict(os.environ), "cwd": os.getcwd()}, out)
     tools = [t for t in os.environ.get("ONEDATA_MCP_TOOLS", "").split(",") if t]
     if "--hang" in sys.argv:
         import time

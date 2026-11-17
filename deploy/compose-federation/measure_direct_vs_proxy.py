@@ -307,7 +307,7 @@ def run_pass(ctx: dict, entry: dict, fixtures: list[dict], log: Log) -> dict[str
         log("started", **{"pass": label}, round=entry["round"], seconds=round(time.monotonic() - began, 1),
             io_mode=mount["io_mode"], options=mount["options"], direct=mount.get("direct"))  # fmt: skip
         results = {f"{f['mode']}-{f['id']}": replay_one(ctx, sandbox, f, label, log) for f in fixtures}
-        errors = sandbox.sidecar_errors() or {}
+        errors = sandbox.mount_errors() or {}
         log("sidecar", **{"pass": label}, round=entry["round"], total=errors.get("total"),
             by_kind=errors.get("by_kind"), signatures=errors.get("signatures"))  # fmt: skip
         if entry["mode"] == "direct":  # a read refused for permissions went through the provider: not a direct pass

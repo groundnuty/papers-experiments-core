@@ -205,3 +205,32 @@ def test_the_watcher_as_its_own_process_writes_a_log_the_core_reads(run, tmp_pat
     assert reading.accesses["token_dir"] >= 1
     assert guard_log.MOUNT_UNSEEN in reading.isolation_problems
     assert verdict_of(snapshot(reading)) == "flagged"
+
+
+def test_o60_the_drivers_read_of_oneclients_log_in_the_window_flags_nothing(tmp_path, run):
+    """O60: a study reads oneclient's log during the run (`mount_log()`, before the agent's first turn, say): that read
+    is the driver's, of the log directory, which is protected from every cell but which the watcher does not watch
+    (it watches the token file and its directory alone). So it is no `token_access`, no `process_access` and leaves the
+    isolation proven: the run reads clean, with no access counted."""
+    log_dir = tmp_path / "oneclient-log"
+    log_dir.mkdir(mode=0o700)
+    (log_dir / "oneclient.INFO").write_text("I1116 10:00:00.000000 1 logging.cc:80] Forced proxy IO: 1\n")
+    run.protect = [*run.protect, str(log_dir)]  # as the host mount protects it (`hostmount.Layout.protected`)
+    proc = FakeProc().add(host_process(99))
+    w = watcher(run, proc)
+    os.unlink(run.token)
+    w.tick()
+    assert w.armed
+    proc.add(cell(500))
+    w.tick()
+    for _ in range(3):  # the driver reads it, listing the directory first, during the window
+        assert "Forced proxy IO" in (log_dir / "oneclient.INFO").read_text()
+        os.listdir(log_dir)
+        w.tick()
+    del proc.procs[500]
+    reading = read_log(finish(w, run), NONCE)
+    assert reading.problems == ()
+    assert reading.isolation_problems == ()
+    assert reading.accesses == {"token_file": 0, "token_dir": 0}
+    assert reading.traced == 0
+    assert verdict_of(snapshot(reading)) == "clean"
