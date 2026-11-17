@@ -791,9 +791,13 @@ class ApptainerSandbox:
         if self._mount is not None:
             meta["mount"] = self._mount.metadata()
         meta["served_bytes"] = self.served_bytes()
-        counted = meta.pop("rest_node_name_hits", None)
+        counted, timed = meta.pop("rest_node_name_hits", None), meta.pop("rest_request_durations", None)
         if self.spec.node_names and self.spec.mode is DataPathMode.REST:  # O73: scanned, so never silently absent
             meta["infrastructure_facts"]["rest_node_name_hits"] = counted or gatelog.node_name_hits_unknown(
+                gatelog.GATE_NOT_COLLECTED
+            )
+        if self.spec.mode is DataPathMode.REST:  # O73: every gate's requests are timed, so never silently absent
+            meta["infrastructure_facts"]["rest_request_durations"] = timed or gatelog.request_durations_unknown(
                 gatelog.GATE_NOT_COLLECTED
             )
         return meta

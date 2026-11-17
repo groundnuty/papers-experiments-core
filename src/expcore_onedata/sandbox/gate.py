@@ -105,6 +105,7 @@ import io
 import ipaddress
 import itertools
 import json
+import math
 import os
 import re
 import select
@@ -185,6 +186,13 @@ CLIENT_WRITE_TIMEOUT_S = 60
 
 
 _ECHOED = ("request_line", "reason", "path", "query")  # the log's fields that hold what the client wrote
+
+_clock = time.monotonic  # the clock of the timing on a request's line (O73); a test's own clock replaces it
+
+
+def _ms(seconds: float) -> int:
+    """Whole milliseconds, rounded up, so that "took more than N s" is true of the line exactly when it was of the request."""
+    return max(0, math.ceil(seconds * 1000))
 
 
 def _log(rec: dict) -> None:
@@ -311,6 +319,21 @@ def _upstream_conn(h: dict) -> http.client.HTTPConnection:
     return conn
 
 
+def _note_wait(rec: dict, kind: str, began: float, seen: dict) -> None:
+    """One upstream attempt's wait for an answer is on the request's line when it is the longest so far (O73): how long
+    (`upstream_wait_ms`) from `began` to the attempt's first answer byte (`seen["first"]`), or to now when none came, on
+    which kind of connection (`upstream_wait_conn`), and what ended it (`upstream_wait_end`: `first_byte` or `failure`).
+    `upstream_conn` stays the connection of the last attempt, so a kept connection that hung and was dropped, and the
+    retry on a new one that answered, leave the long wait on `reused` and the answer on `new`. A complete listing's
+    pages are one request: the longest wait of any of them. Integers and fixed words, never a byte of any exchange."""
+    first = seen.get("first")
+    waited = _ms((_clock() if first is None else first) - began)
+    if waited > rec.get("upstream_wait_ms", -1):
+        rec["upstream_wait_ms"] = waited
+        rec["upstream_wait_conn"] = kind
+        rec["upstream_wait_end"] = "failure" if first is None else "first_byte"
+
+
 def _went_stale(conn: http.client.HTTPConnection) -> bool:
     """A kept connection with nothing owed to us: readable now means the peer closed it (FIN, RST or close_notify)."""
     if conn.sock is None:
@@ -334,6 +357,8 @@ class _CountingRaw(io.RawIOBase):
     def readinto(self, b) -> int:
         n = self._raw.readinto(b)
         self._seen["bytes"] += n or 0
+        if n and "first" not in self._seen:
+            self._seen["first"] = _clock()  # when the first byte of this attempt's answer arrived (O73)
         return n
 
     def close(self) -> None:
@@ -740,6 +765,7 @@ class Handler(BaseHTTPRequestHandler):
         self.rfile = io.BufferedReader(self._probe, io.DEFAULT_BUFFER_SIZE)  # the size `makefile` gives it
         self._pool: dict[tuple, http.client.HTTPConnection] = {}  # this client connection's upstream connections
         self._served = 0  # requests so far on this client connection
+        self._began: float | None = None  # when the request being answered was read (O73): `_clock`'s reading
         self._response_started = False
         with _LIVE_LOCK:  # last: a handler whose setup failed was never live
             _LIVE[self._conn] = self
@@ -756,6 +782,7 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(IDLE_TIMEOUT_S)  # only while waiting for a request: `_handle` lifts it
         self.raw_requestline = b""  # set by the parser once a request line has arrived
         self._head_folded = False  # set by `parse_request` once the request's header block is read
+        self._began = None  # a request's own, set by `_handle`: a keep-alive wait before the head is no request's time
         self._w.reset()
         self._timed_out = False
         after = self._served
@@ -812,7 +839,10 @@ class Handler(BaseHTTPRequestHandler):
         if self._close_logged:
             return
         after = self._last_logged
-        self._conn_close("teardown", after, in_request=self._served > after)
+        waiting = self._served > after
+        # the request that never got its line says how long it had been waiting, so the stall is not lost (O73)
+        age = {"request_age_ms": _ms(_clock() - self._began)} if waiting and self._began is not None else {}
+        self._conn_close("teardown", after, in_request=waiting, **age)
 
     def _peer_gone(self) -> bool:
         """After a response and before the next request: has the client gone? If so the line `conn_close` is logged and True is returned (the connection ends here).
@@ -897,6 +927,9 @@ class Handler(BaseHTTPRequestHandler):
         headers is the body not sent at all."""
         w = self._w
         rec.setdefault("conn", self._conn)
+        # a request relayed upstream says how long it took, to the last byte relayed or the failure (O73)
+        if "upstream_conn" in rec and self._began is not None:
+            rec["duration_ms"] = _ms(_clock() - self._began)
         body = 0 if w.mark is None else w.n - w.mark
         rec["body_bytes"] = body
         if w.failed:
@@ -1012,13 +1045,16 @@ class Handler(BaseHTTPRequestHandler):
             conn = None
         for attempt in (1, 2):
             seen = {"bytes": 0}
-            rec["upstream_conn"] = "reused" if conn is not None else "new"
+            kind = "reused" if conn is not None else "new"
+            rec["upstream_conn"] = kind
             phase = "connect"
+            began = _clock()  # a connect that fails is waited on from here
             try:
                 if conn is None:
                     conn = self._pool[key] = _upstream_conn(hcfg)
                 phase = "exchange"
                 conn.response_class = lambda sock, *a, seen=seen, **kw: _CountingResponse(sock, *a, seen=seen, **kw)
+                began = _clock()  # the wait for an answer begins as the request goes: the connect is over
                 conn.request(method, target, body=body, headers=headers)
                 return _checked(conn.getresponse(), seen)
             except _Framing as e:
@@ -1031,6 +1067,8 @@ class Handler(BaseHTTPRequestHandler):
                 rec["upstream_retries"] = rec.get("upstream_retries", 0) + 1
                 rec["upstream_retry_cause"] = repr(e)[:200]
                 conn = None
+            finally:
+                _note_wait(rec, kind, began, seen)
         raise AssertionError("unreachable")
 
     def _settle(self, hcfg: dict, resp) -> None:
@@ -1052,6 +1090,7 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(BODY_TIMEOUT_S)  # the head has arrived; the body gets a bounded time
         if not self._begin_request():
             return
+        self._began = _clock()
         self._response_started = False
         host = (self.headers.get("Host") or "").split(":")[0].lower()
         hcfg = CFG["hosts"].get(host)

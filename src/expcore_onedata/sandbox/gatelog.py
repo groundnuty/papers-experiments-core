@@ -70,6 +70,15 @@ and tables only the answers after that line, and counts those before it, or name
 the loop started (`confirmed`), or one the log does not show once and before its teardown mark, leaves every count
 unknown (`run_start_unconfirmed`), never "everything after"; a mark in the log of a run that set none, or one that does
 not name its requests, is a malformed log. Without a mark every answer is the run's, and `before_run_start` is None.
+
+**How long the requests took (O73, `request_durations`).** The line of a request the gate relayed to an upstream carries
+`duration_ms` (from the gate's reading of the request to the last byte of its answer relayed, or to the failure) and, of
+the upstream attempt that waited longest for an answer, `upstream_wait_ms` (from just before the attempt's request went
+to its first answer byte, or to its failure when none came), `upstream_wait_conn` (`new` or `reused`) and
+`upstream_wait_end` (`first_byte` or `failure`), beside `upstream_conn`, the connection of the last attempt. A kept
+connection that hangs and is dropped is retried on a new one, so the request ends on `new` and its wait was on `reused`:
+the summary counts it under the connection it waited on. A request whose answer has not ended when the gate stops writes
+no line; its connection's teardown line says how old it was (`request_age_ms`), and the summary is unknown.
 """
 
 import dataclasses
@@ -406,15 +415,12 @@ def node_name_hits_unknown(*reasons: str) -> dict[str, Any]:
     return {"version": NODE_NAME_HITS_VERSION, "rest_answers": None, "unknown": sorted(reasons)}
 
 
-def node_name_hits(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The node names and addresses the gate counted in the answers it relayed (O73), from its log once it was stopped:
-    one channel, `rest_answers` (what the platform answered, and what the gate itself answered), the sum of the request
-    lines' `node_name_hits`. The data a file's content holds is no answer and is not scanned. Never a body, a matched
-    name or its context: the lines hold an integer. As for the bytes served, the count is shown or unknown, never a
-    partial sum taken for the whole: a log that could not be read, a gate not shown stopped, a failed write, a line
-    that is no count, an answer in flight at the stop or no `teardown_complete` line make it `None` with the reasons."""
+def _whole_log(lines: list[str] | None, stop: Mapping[str, Any] | None) -> tuple[list[dict[str, Any]], set[str]]:
+    """The records of a gate's log that a count summed over the whole log reads, and why the log may not be whole (O73).
+    The reasons are `_stop_reasons`, a log that could not be read, a line that is no record, an answer in flight at the
+    stop (`conn_close` with `in_request`) and no `teardown_complete` line; a count is shown only when there are none."""
     reasons = _stop_reasons(stop) | (set() if lines is not None else {UNREADABLE})
-    total, confirmed = 0, False
+    records, confirmed = [], False
     for text in lines or ():
         if not text.strip():
             continue
@@ -429,17 +435,113 @@ def node_name_hits(lines: list[str] | None, stop: Mapping[str, Any] | None) -> d
         if record.get("event") == "conn_close" and record.get("in_request") is True:
             reasons.add(REQUEST_IN_FLIGHT)
         confirmed = confirmed or record.get("event") == TEARDOWN_COMPLETE
+        records.append(record)
+    if lines is not None and not confirmed:
+        reasons.add(GATE_TEARDOWN_UNCONFIRMED)
+    return records, reasons
+
+
+def node_name_hits(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The node names and addresses the gate counted in the answers it relayed (O73), from its log once it was stopped:
+    one channel, `rest_answers` (what the platform answered, and what the gate itself answered), the sum of the request
+    lines' `node_name_hits`. The data a file's content holds is no answer and is not scanned. Never a body, a matched
+    name or its context: the lines hold an integer. As for the bytes served, the count is shown or unknown, never a
+    partial sum taken for the whole: a log that could not be read, a gate not shown stopped, a failed write, a line
+    that is no count, an answer in flight at the stop or no `teardown_complete` line make it `None` with the reasons."""
+    records, reasons = _whole_log(lines, stop)
+    total = 0
+    for record in records:
         if "node_name_hits" in record:
             hits = record["node_name_hits"]
             if isinstance(hits, bool) or not isinstance(hits, int) or hits < 0:
                 reasons.add(GATE_LOG_MALFORMED)
             else:
                 total += hits
-    if lines is not None and not confirmed:
-        reasons.add(GATE_TEARDOWN_UNCONFIRMED)
     if reasons:
         return node_name_hits_unknown(*reasons)
     return {"version": NODE_NAME_HITS_VERSION, "rest_answers": total, "unknown": []}
+
+
+REQUEST_DURATIONS_VERSION = 1
+DURATION_BANDS_S = (10, 30, 60)  # a request is "over" a band when it took strictly more than it
+UPSTREAM_CONNS = ("new", "reused")  # the kinds of upstream connection the gate logs (`upstream_conn`)
+
+
+def _no_band() -> dict[str, int]:
+    return {"requests": 0, **{f"over_{band}s": 0 for band in DURATION_BANDS_S}}
+
+
+def request_durations_unknown(*reasons: str) -> dict[str, Any]:
+    """A summary of request durations that cannot be shown: every count is None, with the reasons."""
+    return {
+        "version": REQUEST_DURATIONS_VERSION,
+        "requests": None,
+        "by_connection": None,
+        "max_duration_ms": None,
+        "unknown": sorted(reasons),
+    }
+
+
+def _timing_of(record: Mapping[str, Any]) -> tuple[str, int] | None:
+    """The kind of connection a relayed request waited longest on and its duration in ms; None for a line that is no
+    relayed request's; ValueError for one whose timing is no figure the gate writes. A relayed request is a line that
+    names an upstream connection (`upstream_conn`): it then has all of `duration_ms`, `upstream_wait_conn` and
+    `upstream_wait_ms`, whole numbers and the two kinds, and a line with one of them and not the others is malformed."""
+    named = [k for k in ("upstream_conn", "duration_ms", "upstream_wait_conn", "upstream_wait_ms") if k in record]
+    if not named:
+        return None
+    if (
+        len(named) != 4
+        or record["upstream_conn"] not in UPSTREAM_CONNS
+        or record["upstream_wait_conn"] not in UPSTREAM_CONNS
+    ):
+        raise ValueError("a relayed request's line without its whole timing")
+    for key in ("duration_ms", "upstream_wait_ms"):
+        value = record[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{key} is no duration")
+    return record["upstream_wait_conn"], record["duration_ms"]
+
+
+def request_durations(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str, Any]:
+    """How long the requests the gate relayed took (O73), from its log once it was stopped: `requests` of them, and by
+    the connection each waited longest on (`new` or `reused`: for a request retried after a kept connection was dropped
+    it is the kept one, `upstream_wait_conn`, not the one the answer came on) how many took over 10, 30 and 60 s
+    (`over_10s`, each strictly more, so the bands nest), and the longest, `max_duration_ms` (None when none was
+    relayed). Only a request that reached an upstream is counted: the gate's own refusals and the parser's errors have
+    no timing, nor a connection's events. Every request the log holds is counted, those before the run's start mark
+    included (the harness's own check of the data path). Never a body, a header or a name: the lines hold whole numbers
+    and two words. As for the bytes served, the summary is shown or unknown, never a partial sum taken for the whole: a
+    log that could not be read, a gate not shown stopped, a failed write, a line whose timing is no figure, an answer
+    in flight at the stop (its age is on its connection's teardown line, `request_age_ms`, and is not summed) or no
+    `teardown_complete` line make every count `None` with the reasons."""
+    records, reasons = _whole_log(lines, stop)
+    by_connection = {kind: _no_band() for kind in UPSTREAM_CONNS}
+    longest: int | None = None
+    for record in records:
+        try:
+            timing = _timing_of(record)
+        except ValueError:
+            reasons.add(GATE_LOG_MALFORMED)
+            continue
+        if timing is None:
+            continue
+        kind, milliseconds = timing
+        counts = by_connection[kind]
+        counts["requests"] += 1
+        for band in DURATION_BANDS_S:
+            counts[f"over_{band}s"] += milliseconds > band * 1000
+        longest = milliseconds if longest is None else max(longest, milliseconds)
+    if reasons:
+        return request_durations_unknown(*reasons)
+    requests = sum(counts["requests"] for counts in by_connection.values())
+    return {
+        "version": REQUEST_DURATIONS_VERSION,
+        "requests": requests,
+        "by_connection": by_connection,
+        "max_duration_ms": longest,
+        "unknown": [],
+    }
 
 
 def served(
