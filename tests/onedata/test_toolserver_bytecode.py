@@ -134,6 +134,8 @@ def test_o84_pass_env_refuses_the_bytecode_setting_whether_the_driver_holds_it_o
     naming it, whether or not the driver's environment holds it (a driver that runs Python with `-B` may); nothing is
     started and the manifest is not written."""
     config = platform(tmp_path, "compose", SOMEWHERE)
+    manifest = config.condition("read").manifest
+    before = manifest.read_bytes()
     if held:
         monkeypatch.setenv(BYTECODE, "1")
     else:
@@ -143,7 +145,7 @@ def test_o84_pass_env_refuses_the_bytecode_setting_whether_the_driver_holds_it_o
         error = capsys.readouterr().err
         assert BYTECODE in error
         assert "the launch sets" in error
-    assert not config.condition("read").manifest.exists()
+    assert manifest.read_bytes() == before
 
 
 @pytest.mark.parametrize("kind", PLATFORMS)
