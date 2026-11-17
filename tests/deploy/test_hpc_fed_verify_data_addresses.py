@@ -101,26 +101,26 @@ def test_o73_verify_data_reaches_the_owner_through_the_address_map_and_records_i
     assert ingested_state(fed)["delta-space"]["verified"]["manifest"] == ONE.digest()
 
 
-def test_o73_verify_data_with_no_map_in_the_root_cannot_reach_the_owner_and_leaves_no_marker(
+def test_o73_verify_data_with_no_map_in_the_root_is_refused_dials_nothing_and_leaves_no_marker(
     hpc, tmp_path, ca, monkeypatch
 ):
-    """O73: the client is the core phase's: with no map in the root the declared name is dialled as it is, which
-    resolves nowhere, so the read fails naming no address and the space has no marker."""
+    """O73: the client is `service_client`'s: with no map in the root the declared name would be dialled as it is, which
+    resolves nowhere, so `verify-data` is refused naming the map before any call, and the space has no marker."""
     fed, layout, names = federation(hpc, tmp_path, ca)
     amap = AddressMap.load(layout.address_map)
     addresses = {amap.address_of(name) for name in names.values()}
     layout.address_map.unlink()
     dialled = only_addresses_resolve(monkeypatch, addresses)
-    with pytest.raises(hpc.boot.RestError, match=r"no answer \(ConnectError\)") as raised:
+    with pytest.raises(AddressMapError, match=r"secrets/address-map\.json is missing") as raised:
         fed.driver.verify_data()
-    assert not addresses & set(dialled)
+    assert dialled == []
     assert not any(address in str(raised.value) for address in addresses)
     assert ingested_state(fed)["delta-space"]["verified"] is None
 
 
 def test_o73_verify_ingested_passes_the_clients_factory_the_map_the_core_phase_loads(hpc, tmp_path, ca):
     """O73: the factory is given the root's map as `addresses`, as `core_phase`'s is, and a map the root holds but
-    cannot be read is refused before any client is made."""
+    cannot be read is refused (naming the file) before any client is made."""
     _, layout, _ = federation(hpc, tmp_path, ca)
     given: list[dict] = []
 
@@ -138,6 +138,6 @@ def test_o73_verify_ingested_passes_the_clients_factory_the_map_the_core_phase_l
     assert [list(kwargs) for kwargs in given] == [["addresses"]]
     assert given[0]["addresses"].to_document() == AddressMap.load(layout.address_map).to_document()
     layout.address_map.write_text("not a map", encoding="utf-8")
-    with pytest.raises(AddressMapError):
+    with pytest.raises(AddressMapError, match=r"secrets/address-map\.json cannot be used"):
         verify(layout, (5001, 5001), {"delta-space": ONE})
     assert len(given) == 1

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
 
-from expcore_onedata.addresses import AddressMap
+from expcore_onedata.addresses import AddressMap, AddressMapError
 from expcore_onedata.config import load_platform
 
 PROVIDERS = ["aspen", "larch", "rowan", "alder", "hazel"]
@@ -260,15 +260,17 @@ def _run(hpc, phase, *, with_map, **more):
 
 
 def test_o73_the_core_s_rest_client_is_given_the_map_when_the_root_holds_one(hpc, phase):
-    """O73: the bootstrap's client dials each declared name at its address; a root without a map (a Compose one) builds
-    its client as it always has."""
+    """O73: the bootstrap's client dials each declared name at its address; a root that holds no map is refused, naming
+    it, before any client is made (`service_client`: with every service at a name that resolves nowhere, a client
+    with none would reach no service)."""
     built, _ = _run(hpc, phase, with_map=True)
     (kwargs,) = built
     assert isinstance(kwargs["addresses"], AddressMap)
     assert kwargs["addresses"].address_of(ZONE_NAME) == ADDRESS["zone"]
     phase.layout.address_map.unlink()
-    built, _ = _run(hpc, phase, with_map=False)
-    assert built == [{}]
+    with pytest.raises(AddressMapError, match=r"secrets/address-map\.json is missing"):
+        _run(hpc, phase, with_map=False)
+    assert len(built) == 1
 
 
 def test_o73_the_platform_file_names_the_map_and_loads_with_declared_urls(hpc, phase, monkeypatch):
