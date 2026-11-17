@@ -68,6 +68,7 @@ from fedlayout import Layout, import_storage_name
 from fedlinks import check_after_up
 from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
+from fedsupport import check_rendered_support
 from fedtools import check_rendered, require_study_artifacts
 from hpcsettings import DEFAULT_STEP_LAUNCH_WAIT_S, VERB_WORK_S
 
@@ -186,7 +187,8 @@ class HpcBootstrap(Bootstrap):
 
 def bring_up(boot: Bootstrap) -> None:
     """The bootstrap after the services are up: the admin's token, the users, the providers online, the spaces, the
-    owners' imported storages, their support, their members, and the scan of each imported space."""
+    owners' imported storages, their support and the support sets read back against the declaration (O35), their
+    members, and the scan of each imported space."""
     boot.wait_zone(ZONE_TIMEOUT_S)
     boot.ensure_admin_token()
     boot.ensure_users()
@@ -194,6 +196,7 @@ def bring_up(boot: Bootstrap) -> None:
     boot.ensure_spaces()
     boot.ensure_import_storages()  # an owner's imported storage, before any support names it (no-op with no import)
     boot.ensure_support(SUPPORT_TIMEOUT_S)
+    boot.verify_support()  # each space's providers as the zone lists them, against the layout's declaration (O35)
     for space in boot.spec.spaces:
         if boot.spec.members(space.name):
             boot.ensure_members(space.name)
@@ -344,6 +347,7 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
     check_rendered(
         layout, facts
     )  # O83: the slots the file declares, against the layout's principals; as a campaign loads it
+    check_rendered_support(layout, facts)  # the file's own support sets, against the zone's (O35)
     return f"facts.json and platform.toml written; {hpcidentity.FILE} written"
 
 

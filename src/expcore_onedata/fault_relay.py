@@ -95,7 +95,15 @@ from expcore_onedata.fault_relay_late import (
     step_tag,
     watch_argv,
 )
-from expcore_onedata.fault_relay_timing import SACCT_TIMEOUT_S, Sacct, is_timing, read_timing, step_names
+from expcore_onedata.fault_relay_timing import (
+    SACCT_TIMEOUT_S,
+    Launch,
+    Sacct,
+    is_timing,
+    own_service_step,
+    read_timing,
+    step_names,
+)
 
 FORMAT = "expcore-fault-relay/1"
 RELAY_DIR = "fault-relay"
@@ -507,14 +515,15 @@ class Relay:
     def _state(self) -> dict[str, Any]:
         return _read(self.root / STATE_FILE) or {}
 
-    def _launch_of(self, service: str) -> tuple[Any, str] | None:
-        """The service's launch count and the name of the service step the state records for it, or None."""
+    def _launch_of(self, service: str) -> Launch | None:
+        """The service's latest launch as the state records it: its count, the name of its service step, the service's
+        state and whether the step's id is recorded; None when the state names no step."""
         entry = (self._state().get("services") or {}).get(service)
         step = entry.get("step") if isinstance(entry, dict) else None
         name = step.get("name") if isinstance(step, dict) else None
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", name):
             return None
-        return entry.get("launch"), name
+        return Launch(entry.get("launch"), name, entry.get("state"), step.get("id") not in (None, ""))
 
     def _run_sacct(self, argv: Sequence[str], bound_s: float) -> CommandResult:
         return run_in_group(argv, env=self._env, timeout_s=bound_s, grace_s=SACCT_GRACE_S)
@@ -526,7 +535,7 @@ class Relay:
         tag: str,
         issued: float,
         answered: float,
-        launched: tuple[Any, str] | None,
+        launched: Launch | None,
     ) -> dict[str, Any] | None:
         """The answer's `timing` (`fault_relay_timing`): one accounting call, within what is left of the client's wait.
         Never raises: a timing that could not be made is None, and the answer is the verb's own."""
@@ -535,7 +544,7 @@ class Relay:
             allocation = state.get("allocation") if isinstance(state.get("allocation"), dict) else {}
             prefix, job = federation_of(self.root), allocation.get("job")
             now = self._launch_of(request.service) if request.verb == "start" else None
-            service_step = now[1] if now is not None and launched is not None and now[0] != launched[0] else None
+            service_step = own_service_step(launched, now)  # launched by this start, or taken over by it
             names = step_names(prefix or "", request.service, request.verb, tag, service_step)
             budget = min(SACCT_TIMEOUT_S, float(record["deadline"]) - self._wall() - POLL_S - SACCT_GRACE_S)
             return read_timing(

@@ -71,6 +71,11 @@ direct_check_file = "space/f"   # "direct" only, and required with it: a space's
 [sandbox.served_bytes]          # optional: how much a run's tables of the bytes served list (gatelog.Caps, O22)
 max_files = 1000                # files, the first read; max_directories = 1000; max_ranges_per_file = 64
 
+[sandbox.gate]                  # optional, with a rest level (a gate runs for no other): the data gate's own settings
+upstream_read_timeout_s = 14400 # optional, 1 to 86400: how long the gate waits for the upstream's next byte before it
+                                # gives the read up (a 502 of origin `gate`), the same on both backends (O85); the
+                                # default is the gate's constant, 4 h, the official client's own read timeout
+
 [sandbox.federation]            # optional, with a mount or rest level: the federation on a docker network of its own
 network = "fed_net"             # an existing network of the federation's deployment (a Compose project's); the
                                 # oneclient sidecar and the data gate start on it instead of docker's default bridge;
@@ -129,6 +134,18 @@ campaign fingerprint by its SHA-256 (`runsettings.sandbox_record`), and a study 
 refuses the default names another. A value equal to the run's
 token refuses the start.
 
+`upstream_read_timeout_s` (O85) is how long the data gate waits for the upstream to send the next byte of an answer
+before it gives the read up, which the agent sees as a 502 `badGateway` and the gate's line records with
+`error_origin` `gate`. It decides when an agent's REST read fails while the platform hangs, so it is declared, never a
+constant the agent cannot see: at the default, 14,400 s, the gate never gives up before the official client's own read
+timeout (4 h), so a hung read can last that long unless the run's own limits end it first; a shorter value makes the
+gate the one that ends it, after that long, and a value above 14,400 s changes nothing an agent sees (the client gives
+up first). The value is written into the gate's configuration on both backends (`gate.json` on Docker,
+`gaterun.config` on Apptainer, where `gate_options` may not set it), each REST run records it
+(`infrastructure_facts.gate_upstream_read_timeout_s`), and the campaign fingerprint holds it when it is not the
+default (`runsettings.sandbox_record`), so a resume or a merge under another value is refused and a platform that
+declares nothing is as it was. It is refused without a rest level, where no gate runs.
+
 The certificate check of the data gate's upstream and of oneclient is not declared here either: it is the platform's one
 `[tls]` setting (`tls.py`), which `load_platform` hands to `load_sandbox` and which every client of the federation
 takes. A `tls` key in `[sandbox.mount]`, oneclient's own setting in earlier versions, is refused with a pointer to it.
@@ -151,7 +168,7 @@ from expcore_onedata.sandbox import checkprovider as CP
 from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.apptainer.settings import SHA256, ApptainerSettings, load_apptainer
 from expcore_onedata.sandbox.gatelog import DEFAULT_CAPS, Caps
-from expcore_onedata.sandbox.gatepolicy import LISTINGS, PAGED
+from expcore_onedata.sandbox.gatepolicy import LISTINGS, PAGED, UPSTREAM_READ_TIMEOUT_BOUNDS_S, UPSTREAM_READ_TIMEOUT_S
 from expcore_onedata.sandbox.hostops import strict_networks
 from expcore_onedata.sandbox.oneclient_args import (
     IO_MODES,
@@ -284,6 +301,10 @@ class SandboxSettings:
     federation: FederationNetwork | None = None  # [sandbox.federation]: None puts the sidecar on the default bridge
     placeholder_token: str = PLACEHOLDER_TOKEN  # the REST agent's ONEDATA_TOKEN: no credential, the gate drops it (O23)
     kill_grace_s: float = KILL_GRACE_S  # a cell's processes' time to end after the kill at its deadline (O34)
+    # `[sandbox.gate] upstream_read_timeout_s` (O85): how long the REST data path's gate waits for the upstream's next
+    # byte; written into the gate's configuration on both backends and in the fingerprint when not the default. Not
+    # `gate`, which is the gate's image.
+    gate_upstream_read_timeout_s: float = float(UPSTREAM_READ_TIMEOUT_S)
     backend: str = "docker"  # `[sandbox] backend`: docker, or apptainer with `apptainer` (O56)
     apptainer: ApptainerSettings | None = None  # `[sandbox.apptainer]`, exactly when the backend is apptainer
     # `[sandbox] readlog_collector_sha256` (O91): the read-log collector the core must hold, by its SHA-256. Declared,
@@ -608,6 +629,25 @@ def _readlog_pin(section: Section) -> str | None:
     return value
 
 
+def _gate_read_timeout(section: Section, *, rest: bool) -> float:
+    """Read the optional `[sandbox.gate]` (O85): the gate's upstream read timeout in seconds, from 1 to 86,400, the
+    gate's own constant when the table or the key is absent. Refused without a rest level, which is the only data path
+    a gate serves: a setting nothing reads is never silently accepted."""
+    if "gate" not in section.data:
+        return float(UPSTREAM_READ_TIMEOUT_S)
+    table = section.section("gate")
+    table.reject_unknown(("upstream_read_timeout_s",))
+    if not rest and "upstream_read_timeout_s" in table.data:
+        raise table.fail(
+            "upstream_read_timeout_s", "is read by the REST data path's gate alone, and no data path is rest"
+        )
+    low, high = UPSTREAM_READ_TIMEOUT_BOUNDS_S
+    seconds = float(_number(table, "upstream_read_timeout_s", minimum=low, default=UPSTREAM_READ_TIMEOUT_S))
+    if seconds > high:
+        raise table.fail("upstream_read_timeout_s", f"must be at most {high} seconds")
+    return seconds
+
+
 def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
     """Read an optional list of command words (a path or an option), with no space or control character."""
     words = section.strings(key) if key in section.data else default
@@ -681,6 +721,7 @@ def _apptainer_sandbox(
         federation=federation,
         placeholder_token=_placeholder(section),
         kill_grace_s=_kill_grace(section),
+        gate_upstream_read_timeout_s=_gate_read_timeout(section, rest=DataPathMode.REST in data_paths.values()),
         backend="apptainer",
         apptainer=app,
     )
@@ -722,7 +763,7 @@ def load_sandbox(
             "a toolserver user, so one lease key gives a run both planes' users (C19)",
         )
     section.reject_unknown(
-        (*keys, "images", "network", "limits", "mount", "data_paths", "served_bytes", "federation", "apptainer")
+        (*keys, "images", "network", "limits", "mount", "data_paths", "served_bytes", "federation", "apptainer", "gate")
     )
     backend = section.optional_string("backend") or "docker"
     if backend not in BACKENDS:
@@ -789,6 +830,7 @@ def load_sandbox(
         placeholder_token=_placeholder(section),
         kill_grace_s=_kill_grace(section),
         readlog_collector_sha256=_readlog_pin(section),
+        gate_upstream_read_timeout_s=_gate_read_timeout(section, rest=DataPathMode.REST in data_paths.values()),
     )
 
 

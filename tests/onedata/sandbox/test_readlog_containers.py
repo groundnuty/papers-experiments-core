@@ -44,7 +44,8 @@ def mounts(args):
 
 def agent(s, names, mode, **kw):
     defaults = {
-        "image_id": s.agent.id, "mode": mode, "work": Path("/w/work"), "share": None, "gate_ip": None,
+        "image_id": s.agent.id, "mode": mode, "work": Path("/w/work"), "resolv": Path("/w/resolv.conf"),
+        "share": None, "gate_ip": None,
         "gate_hosts": [], "ca": None, "trust_bundles": {}, "zone_host": None,
     }  # fmt: skip
     return C.agent_run_args(s, names, LABELS, **(defaults | kw))

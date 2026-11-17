@@ -148,12 +148,16 @@ def sandbox_record(sandbox: SandboxSettings, roles: list[tuple[str, str]]) -> di
     the mount's path in the agent, its I/O mode and oneclient's extra arguments (by the SHA-256 of their federation-
     neutral form, `neutral_words`: a `--space-id` is its space's role, never its id); the paths in the
     agent's image that trust the run's CA; the agent's user and interpreter; the kill's grace at a cell's deadline; and
-    the agent's placeholder token by its SHA-256. Not here: the work root, the name prefix, the label namespace, the
-    privilege command and earlyoom's name for the driver (the host's own), the network pools and `[sandbox.federation]`
-    (the host's and the federation's addresses and names), the mount's storages and check file (the federation's
-    storage ids and the host's paths), and `content_check_file`, read once before a campaign. The provider that file is
-    read through is in, when it is not the local one, beside this record (`check_provider_record`, O87)."""
-    from expcore_onedata.sandbox.settings import Limits  # it imports the sandbox's modules: import when used
+    the agent's placeholder token by its SHA-256; and the gate's upstream read timeout (`gate`, O85), only when it is
+    not the default, as the provider the content check reads through is: a platform that does not declare it, or
+    declares the default, is the fingerprint it was before the key. Not here: the work root, the name prefix, the label
+    namespace, the privilege command and earlyoom's name for the driver (the host's own), the network pools and
+    `[sandbox.federation]` (the host's and the federation's addresses and names), the mount's storages and check file
+    (the federation's storage ids and the host's paths), and `content_check_file`, read once before a campaign. The
+    provider that file is read through is in, when it is not the local one, beside this record
+    (`check_provider_record`, O87)."""
+    from expcore_onedata.sandbox.gatepolicy import UPSTREAM_READ_TIMEOUT_S  # the sandbox's modules: import when used
+    from expcore_onedata.sandbox.settings import Limits
 
     mount = sandbox.mount
     images = {  # the Apptainer backend's one image is its SIF, pinned in `sandbox_backend` (O56)
@@ -163,7 +167,7 @@ def sandbox_record(sandbox: SandboxSettings, roles: list[tuple[str, str]]) -> di
             "oneclient": None if sandbox.oneclient is None else sandbox.oneclient.id,
         }
     }
-    return {
+    out = {
         "backend": sandbox.backend,
         **(images if sandbox.apptainer is None else {}),
         "limits": {
@@ -187,6 +191,9 @@ def sandbox_record(sandbox: SandboxSettings, roles: list[tuple[str, str]]) -> di
         # another collector is another experiment; a platform without the channel keeps the record it had (O91)
         **({"readlog_collector_sha256": sandbox.readlog_collector_sha256} if sandbox.readlog_collector_sha256 else {}),
     }
+    if float(sandbox.gate_upstream_read_timeout_s) != float(UPSTREAM_READ_TIMEOUT_S):  # O85: as before when not set
+        out["gate"] = {"upstream_read_timeout_s": float(sandbox.gate_upstream_read_timeout_s)}
+    return out
 
 
 def toolserver_record(server: ToolServer, file: Any, roles: list[tuple[str, str]]) -> dict[str, Any]:

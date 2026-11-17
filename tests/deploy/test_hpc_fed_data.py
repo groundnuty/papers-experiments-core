@@ -306,8 +306,8 @@ def shards():
 
 
 def manifest(tmp_path, platforms, *, phase="linked", same_root=False) -> Path:
-    """A shard manifest of two shards on two federations (or one), each root holding a finished state and the given
-    platform.toml text."""
+    """A shard manifest of two shards on two federations (`same_root`: both on the first, which a manifest refuses),
+    each root holding a finished state and the given platform.toml text."""
     roots = [tmp_path / "fed" / ("a" if same_root else name) for name in ("a", "b")]
     for root, text in zip(roots, platforms, strict=True):
         root.mkdir(parents=True, exist_ok=True)
@@ -355,9 +355,13 @@ def test_o63_plan_takes_several_federations_that_declare_every_spaces_data(shard
     assert len(capsys.readouterr().out.splitlines()) == 2
 
 
-def test_o63_plan_on_one_federation_needs_no_declared_data(shards, tmp_path, capsys):
-    """O63: on one federation every shard holds the same ids, so nothing is asked of it: as before."""
-    assert shards.main(["plan", "--manifest", str(manifest(tmp_path, (ONE_SPACE, ONE_SPACE), same_root=True))]) == 0
+def test_o63_plan_refuses_two_shards_on_one_federation_before_it_asks_for_declared_data(shards, tmp_path, capsys):
+    """O63: a federation's root is one shard's own (one shard per federation): a manifest of one federation, which
+    asked nothing of its data because every shard held the same ids, is refused at load, naming both labels."""
+    assert shards.main(["plan", "--manifest", str(manifest(tmp_path, (ONE_SPACE, ONE_SPACE), same_root=True))]) == 2
+    err = capsys.readouterr().err
+    assert "shards fed-a and fed-b have one federation root between them" in err
+    assert "undeclared" not in err
 
 
 def test_o63_plan_refuses_a_federation_whose_up_did_not_finish(shards, tmp_path, capsys):

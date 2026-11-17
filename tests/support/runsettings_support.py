@@ -118,6 +118,9 @@ shm_bytes = 1073741824
 work_disk_bytes = 4294967296
 gate_memory_bytes = 1073741824
 
+[sandbox.gate]
+upstream_read_timeout_s = 3600
+
 [sandbox.mount]
 path = "/data"
 io_mode = "proxy"
@@ -269,6 +272,9 @@ nofile = 4096
 tmp_bytes = 1073741824
 shm_bytes = 1073741824
 work_disk_bytes = 4294967296
+
+[sandbox.gate]
+upstream_read_timeout_s = 7200
 
 [sandbox.data_paths]
 mounted = "mount"
@@ -465,6 +471,8 @@ IN = {
                                                               "work_disk_bytes = 4294967297")),
     "sandbox.limits.gate_memory_bytes": edit("docker", platform("gate_memory_bytes = 1073741824",
                                                                 "gate_memory_bytes = 1073741825")),
+    "sandbox.gate.upstream_read_timeout_s": edit("docker", platform("upstream_read_timeout_s = 3600",
+                                                                    "upstream_read_timeout_s = 3601")),
     "sandbox.mount.path": edit("docker", platform('path = "/data"', 'path = "/space"')),
     "sandbox.mount.io_mode": edit("docker", platform('io_mode = "proxy"', 'io_mode = "direct"\n'
                                                      'direct_check_file = "alpha-space/f"\n'
@@ -557,6 +565,8 @@ IN_REASONS = {
     "tokens": "a run's token lifetime: a token that expires fails the run's last check of its tool plane (O06)",
     "toolserver": "the tool server's code (commit), command line (federation-neutral), start bound and conditions",
     "sandbox": "what the agent runs in and is held to: images by id, limits, mount, interpreter, user, grace, pins",
+    "sandbox.gate": "when the gate gives up a hung upstream read, which ends an agent's REST read in an outage, only "
+    "when it is not the default (O85)",
     "sandbox.data_paths": "each level's data path, listing and I/O mode (O21, O36)",
     "sandbox.served_bytes": "the caps of a run's tables of the bytes served, which bound its evidence (O22)",
     "sandbox.apptainer": "the Apptainer backend's pins and watch (image, egress shim and collector, memory guard: O56) "

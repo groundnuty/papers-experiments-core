@@ -38,6 +38,7 @@ from typing import Any
 from expcore_onedata.readlog import paths as readlog_paths
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint
 from expcore_onedata.sandbox.cellhost import CELL_HOSTNAME
+from expcore_onedata.sandbox.cellresolv import RESOLV_CONF
 from expcore_onedata.sandbox.oneclient_args import (
     CONFIG_NULL,
     CONFIG_OPTION,
@@ -536,6 +537,7 @@ def agent_run_args(
     image_id: str,
     mode: DataPathMode,
     work: Path,
+    resolv: Path,
     share: Path | None,
     gate_ip: str | None,
     gate_hosts: Sequence[str],
@@ -555,6 +557,11 @@ def agent_run_args(
     `readonly` too, in every data path (O20). Its host name is the declared one (`cellhost`, O73), as every Apptainer
     cell's, so `hostname` reads the same string on both backends and not the engine's container id.
 
+    `resolv` is the run's own copy of the neutral `/etc/resolv.conf` (`cellresolv`, O56), bound read-only over the
+    engine's own file in every data path, so the agent reads no name server, search or domain line, the same file as an
+    Apptainer cell's. It is one `--mount` and changes nothing else of the container: the names the agent resolves are
+    `--add-host`'s, and nothing of it resolves through the engine's embedded resolver.
+
     With the read-log channel (`readlog`) it gets the collector's socket directory at `readlog.paths.SOCKET_DIR` and the
     client module's directory at `readlog.paths.CLIENT_DIR`, both `readonly`: a datagram socket takes a send on a
     read-only bind, and nothing else of the collector reaches it, neither its log nor its program, and no environment
@@ -570,6 +577,7 @@ def agent_run_args(
         *("--pids-limit", str(lim.pids), "--ulimit", f"nofile={lim.nofile}:{lim.nofile}"),
         *("--tmpfs", f"/tmp:size={lim.tmp_bytes},mode=1777", "--shm-size", str(lim.shm_bytes)),
         *("-v", f"{work}:/work"),
+        *bind(resolv, RESOLV_CONF),
     ]
     env: dict[str, str] = {}
     if mode is DataPathMode.REST:
