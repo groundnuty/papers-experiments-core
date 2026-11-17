@@ -32,14 +32,16 @@ or may have happened, never that nothing happened; `no_node` and `not_run` mean 
 could not run. nodetool prints the node's name in its failure line, so its output is never kept, only the word.
 """
 
+import json
 import re
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from expcore_onedata.client import PlatformError
+from expcore_onedata.sandbox.infradeath import parse_inspect
 
 if TYPE_CHECKING:  # the heal's module imports this one
     from expcore_onedata.fault_matrix import LinkMatrix
@@ -160,6 +162,43 @@ class ComposeDriver:
         if health and not HEALTH_STATUS.fullmatch(health):
             raise DriverError("the container's inspection could not be read")
         return Observation(parts[2] == "true", f"{parts[0]}@{parts[1]}", health or None)
+
+    def inspect_state(self, service: str) -> dict[str, Any] | None:
+        """Read-only: the service's one container as `docker inspect` states it, for a reading of the federation over a
+        window (`expcore_onedata.fedwatch`): `infradeath.parse_inspect`'s fields (id, status, running, restarting,
+        paused, exit code, `RestartCount`, `StartedAt`, `FinishedAt`) and `health` (its health check's status, None
+        without one). None when the service has no container. `observe` and its identity are left as they are: the
+        journal's digests and every recovery read them. Raises DriverError when a command fails or its answer cannot be
+        read, and when the service has more than one container."""
+        listed = self._run([*self._compose, "ps", "--all", "--quiet", service], "list the service's containers")
+        containers = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+        if not containers:
+            return None
+        if len(containers) > 1:
+            raise DriverError(f"the service has {len(containers)} containers, so its state is ambiguous")
+        shown = self._run([*self._docker, "inspect", containers[0]], "inspect the container")
+        state = parse_inspect(shown.stdout)
+        if state is None:
+            raise DriverError("the container's inspection could not be read")
+        document = json.loads(shown.stdout)[0]
+        running = document["State"]
+        # `parse_inspect` supplies a default for a field Docker did not give; a reading of restarts has none to give
+        complete = (
+            isinstance(document.get("RestartCount"), int)
+            and not isinstance(document.get("RestartCount"), bool)
+            and isinstance(running.get("Running"), bool)
+            and isinstance(running.get("StartedAt"), str)
+            and bool(running["StartedAt"])
+            and isinstance(running.get("FinishedAt"), str)
+            and isinstance(running.get("ExitCode"), int)
+        )
+        if not complete:
+            raise DriverError("the container's inspection lacks a field a restart is read from")
+        health = running.get("Health")
+        status = health.get("Status") if isinstance(health, dict) else None
+        if status is not None and not (isinstance(status, str) and HEALTH_STATUS.fullmatch(status)):
+            raise DriverError("the container's inspection could not be read")
+        return {**state, "health": None if status in (None, "none") else status}
 
     def serves(self, service: str) -> bool:
         """Whether the service serves now: its container runs, its health check (when it has one) reports healthy, and
