@@ -182,7 +182,8 @@ use a git checkout of the core or a wheel built with its build identity (`hatch 
 
 **How a shard comes back.** Once the dispatcher has exited (its lock released), `step` writes the copy's `out/` whole,
 `campaign.lock` included, to `<results>/<label>.out.tar` with a manifest beside it (`<label>.out.json`: its SHA-256,
-bytes, files, the shard's spec and the dispatcher's exit status), each written whole and renamed into place, and removes
+bytes, files, the shard's spec and the dispatcher's exit status), each written whole and renamed into place, both mode
+0600 whatever the umask (the archive holds `out/logs`; a results directory the step creates is 0700), and removes
 its tmpfs directory; an archive that cannot be written leaves that directory in place, marked (exit 75), since it holds
 the only whole `out/`. A start of a shard that has results is refused unless it is `--resume`, which unpacks that
 archive into its copy first, so a repeated launch line never replaces a finished shard. `collect` verifies a private
@@ -718,7 +719,7 @@ def record_pass_env_origin(results: Path, spec: Mapping[str, Any], passed: Mappi
             "refused"
         )
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _private_dirs(path.parent)
         with os.fdopen(os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as handle:
             handle.write(payload)
             handle.flush()
@@ -1168,6 +1169,16 @@ def _write_whole(path: Path, write: Callable[[Path], None]) -> None:
     os.replace(draft, path)
 
 
+def _private_dirs(directory: Path) -> None:
+    """`directory` and each parent of it that is not there yet, made mode 0700 whatever the umask: `mkdir(mode=,
+    parents=True)` gives a parent the umask's mode, so each missing one is made on its own. A directory that exists is
+    left as it was found, since the operator may share it; the files a step writes into it are private themselves.
+    Steps of other shards race to make the same directory: one that appears meanwhile is theirs, made the same way."""
+    for missing in reversed([path for path in (directory, *directory.parents) if not path.exists()]):
+        with contextlib.suppress(FileExistsError):
+            missing.mkdir(mode=0o700)
+
+
 def not_final_mark(reason: str) -> bytes:
     """The bytes of `NOT-FINAL.json`, which the core's merge refuses (`expcore.campaign.shard.NOT_FINAL_FILE`)."""
     return (json.dumps({"format": NOT_FINAL_FORMAT, "final": False, "reason": reason}, sort_keys=True) + "\n").encode()
@@ -1187,6 +1198,7 @@ def archive(
     when there is one; with a post-run record it also says `final`, whether that script passed. `pass_env` is the
     name and value of each variable the step passed to its dispatcher (`check_pass_env`), in it when there is one."""
     label = str(spec["label"])
+    _private_dirs(results)
     tar_path = results / f"{label}.out.tar"
     files = sum(1 for p in out.rglob("*") if p.is_file() and not p.is_symlink())
 
@@ -1194,7 +1206,12 @@ def archive(
     mark = None if final else not_final_mark(str(post_run.get("reason") or "the post-run script did not pass"))
 
     def write_tar(draft: Path) -> None:
-        with tarfile.open(draft, "w", format=tarfile.PAX_FORMAT) as tar:
+        # the draft is made 0600 and the rename keeps it so: the archive carries `out/logs`, the text of a start
+        # diagnostic withheld from every record, to the operator, who pulls it with `rsync -a`, which keeps modes
+        descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as handle, tarfile.open(
+            fileobj=handle, mode="w", format=tarfile.PAX_FORMAT
+        ) as tar:
             # a shard not final carries the mark in its archive, written here from memory so that no full tmpfs can
             # leave it out; a file of that name in out/ is replaced by it, and in a final shard's it is left, for
             # `collect` and the merge to refuse
@@ -1221,7 +1238,7 @@ def archive(
         **({"post_run": dict(post_run), "final": post_run.get("final") is True} if post_run is not None else {}),
         **({"pass_env": dict(pass_env)} if pass_env else {}),
     }
-    _write_whole(results / f"{label}.out.json", lambda d: d.write_text(json.dumps(manifest, sort_keys=True) + "\n"))
+    _write_whole(results / f"{label}.out.json", _private_bytes((json.dumps(manifest, sort_keys=True) + "\n").encode()))
     return manifest
 
 
@@ -1322,7 +1339,28 @@ def unpack(tar_path: Path, into: Path, *, label: str | None = None) -> Path:
             raise ShardsError(f"shard {label}: its archive {problem}" if label else f"an archive {problem}")
         into.mkdir(parents=True)
         tar.extractall(into, filter="data")
+    _private_logs(into / "out")
     return into / "out"
+
+
+LOCAL_LOGS = "logs"  # the campaign's local logs under out/ (`expcore.campaign.defect_log.LOG_DIR`)
+
+
+def _private_logs(out: Path) -> None:
+    """`out/logs/` made the operator's alone, whatever the archive recorded and whatever the umask is: the directory
+    0700 and each file in it 0600. The local log holds the text of a start diagnostic that the core withheld from every
+    record, and the archive carries it here as private evidence; `tarfile`'s data filter keeps a file's recorded mode
+    (a node's loose umask included) and gives a directory the umask's, so neither is left to it. A link is never
+    followed or changed."""
+    logs = out / LOCAL_LOGS
+    if logs.is_symlink() or not logs.is_dir():
+        return
+    for base, _dirs, files in os.walk(logs):
+        os.chmod(base, 0o700)
+        for name in files:
+            path = Path(base, name)
+            if not path.is_symlink():
+                os.chmod(path, 0o600)
 
 
 def _read_only(root: Path) -> None:
@@ -2913,7 +2951,7 @@ def claim_running(args: argparse.Namespace, spec: Mapping[str, Any]) -> dict[str
     is never removed, so a later step can never claim that mark again. `ShardsError` on any refusal; nothing of the
     shard is touched then."""
     path = _mark_path(args)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _private_dirs(path.parent)
     mark = {"format": RUNNING_FORMAT, "shard": dict(spec), "nonce": secrets.token_hex(16),
             "node": os.uname().nodename, "pid": os.getpid(), "start": _start_of(os.getpid()),
             "job": getattr(args, "job", None), "step": getattr(args, "step_name", None),
@@ -3523,7 +3561,7 @@ def _run_step(
         env |= {**home_env(str(work / "home")), "TMPDIR": str(work / "tmp")}  # never the account's ~
         env["PYTHONDONTWRITEBYTECODE"] = "1"  # B1: for a Python the dispatcher's children start without -I -B
         journals = args.results / args.label / JOURNALS
-        journals.mkdir(parents=True, exist_ok=True)
+        _private_dirs(journals)
         journal = journals / f"{_stamp()}-{os.getpid()}-{secrets.token_hex(4)}.jsonl"
         argv = [sys.executable, "-I", "-B", "-m", "expcore", "run", str(copy), "--spend-journal", str(journal),
                 "--shard", f"{args.index}/{args.count}", "--shard-label", args.label]  # fmt: skip

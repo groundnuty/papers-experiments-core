@@ -2,7 +2,9 @@
 
 import collections
 import json
+import os
 import shutil
+import stat
 import subprocess
 
 import pytest
@@ -11,7 +13,7 @@ from loop_support import FakeProvider
 from record_support import CODE
 from scheduler_support import FakeExecutor, attempts_of, build, key_of
 
-from expcore.campaign.defect_log import HARNESS_LOG, Chained, log_path, write_defect
+from expcore.campaign.defect_log import HARNESS_LOG, Chained, DefectLog, log_path, write_defect, write_note
 from expcore.campaign.executor import record_run
 from expcore.config.loading import ConfigError
 from expcore.loop.outcomes import harness_defect_of
@@ -82,6 +84,30 @@ def test_l08_the_log_is_ignored_by_git_whatever_the_studys_own_gitignore_says(tm
         text=True,
     )
     assert status.stdout == ""
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_c40_a_withheld_diagnostics_note_is_never_staged_by_git_in_a_study_repository(tmp_path):
+    """C40: the note a withheld diagnostic leaves in `out/logs/harness-errors.log` is local evidence, never committed.
+    The core writes the ignore file that keeps it out (`out/logs/.gitignore`), so the assertion is on that file as a
+    study repository meets it: its own ignore file does not mention `out/`, everything is added as a person would
+    (`git add -A`), and neither the log nor the ignore file is staged or left untracked."""
+    note = "the instrument saw a space named by the executor's own secret\n"
+    (tmp_path / "study.toml").write_text("name = 'a-study'\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
+    log = DefectLog(tmp_path / "out", "run-key", 1, lambda: "T", lambda: Redactor([]))
+    assert log.keep_private("a diagnostic withheld", note) is True
+    assert note in log_path(tmp_path / "out").read_text(encoding="utf-8")
+    git = ["git", "-C", str(tmp_path)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    staged = subprocess.run([*git, "ls-files"], check=True, capture_output=True, text=True).stdout.split()
+    assert staged == [".gitignore", "study.toml"]  # the control: what a study keeps is staged, nothing of out/logs is
+    status = subprocess.run(
+        [*git, "status", "--porcelain", "--untracked-files=all"], check=True, capture_output=True, text=True
+    ).stdout
+    assert "out/" not in status
+    assert subprocess.run([*git, "check-ignore", "-q", "out/logs/harness-errors.log"], check=False).returncode == 0
 
 
 def test_l08_a_traceback_that_cannot_be_redacted_is_withheld_with_the_reason(tmp_path):
@@ -346,3 +372,41 @@ def test_c40_the_one_pass_chain_never_redacts_less_than_the_redactors_one_after_
         "cut": "[redacted]\n[output truncated: 10 of 62 characters dropped by the harness cap]"
     }
     assert chain.structure({"leaf": leaf})[0] == {"leaf": '{"token": "[redacted]", "seen": "[redacted]"}'}
+
+
+def _written_under(umask, root):
+    previous = os.umask(umask)
+    try:
+        write_note(
+            root,
+            title="k attempt 1: a diagnostic withheld",
+            stamp="T",
+            text="the text of the note\n",
+            redactor=lambda: Redactor([]),
+        )
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.parametrize("umask", [0o022, 0o002, 0o000], ids=["022", "002", "000"])
+def test_l08_a_new_local_log_and_its_directory_are_private_whatever_the_umask(tmp_path, umask):
+    """L08: the log holds the text of a start diagnostic that the core withheld from every record, so the live file is
+    the operator's alone from the moment it is made (not only the copies a snapshot or an archive carries): the
+    directory 0700 and the log 0600, whatever the process's umask."""
+    _written_under(umask, tmp_path)
+    assert stat.S_IMODE((tmp_path / "logs").stat().st_mode) == 0o700
+    assert stat.S_IMODE(log_path(tmp_path).stat().st_mode) == 0o600
+    assert "the text of the note" in log_path(tmp_path).read_text(encoding="utf-8")
+
+
+def test_l08_a_log_directory_that_was_there_is_left_as_found_and_an_entry_is_appended_privately(tmp_path):
+    """L08: a `logs/` the study made (it may keep other files there) keeps its mode, and what is appended to a log
+    already in it keeps the entries before it; a log this made new is 0600 all the same."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    os.chmod(logs, 0o755)
+    _written_under(0o022, tmp_path)
+    assert stat.S_IMODE(logs.stat().st_mode) == 0o755
+    assert stat.S_IMODE(log_path(tmp_path).stat().st_mode) == 0o600
+    _written_under(0o022, tmp_path)
+    assert log_path(tmp_path).read_text(encoding="utf-8").count("the text of the note") == 2

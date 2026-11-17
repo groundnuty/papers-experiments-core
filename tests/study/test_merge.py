@@ -34,6 +34,7 @@ from shard_support import (
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, table
 from tree_support import read_only, tree_of
 
+from expcore.campaign.defect_log import HARNESS_LOG, log_path
 from expcore.campaign.export import (
     EXPORT_FINGERPRINT,
     ExportError,
@@ -63,6 +64,7 @@ from expcore.study.selection_start import pricing_of
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
 SNAPSHOT = "campaign-snapshot.sqlite"
+LOCAL_NOTE = b"sentinel-of-a-withheld-start-diagnostic-4c19"  # what a shard's local log holds, invented
 RECORD = re.compile(r"[0-9a-f]{64}\.\d+\.json")
 
 
@@ -343,6 +345,35 @@ def test_c39_a_merged_batch_adds_what_its_shards_spent_model_by_model(merged, sh
         len([e for e in read(merged, "export.json")["analysed_attempts"] if e["factors"]["model"] == m["model"]])
         for m in usage["models"]
     ]
+
+
+def holders(root: Path, needle: bytes) -> list[str]:
+    """The files under `root`, by relative name, whose bytes hold `needle`."""
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and needle in p.read_bytes())
+
+
+def test_l08_a_shards_local_log_is_never_carried_into_the_merged_batch(base, clean_environment, shard1, shard2):
+    """L08: the text a withheld start diagnostic leaves in a shard's `out/logs/harness-errors.log` stays on the host
+    that merges it. The merge reads a shard's store (by the online backup) and its `runs/`, so the merged batch holds
+    no `logs/`, no file of that name and no byte of what the log said; the control is that the shards did hold it and
+    that the same scan finds a run key, which the merged batch does hold."""
+    shard_outs = []
+    for number, shard in ((1, shard1), (2, shard2)):
+        out = copy_out(shard, base / f"logged-{number}")
+        log = log_path(out)
+        log.parent.mkdir()
+        log.write_bytes(LOCAL_NOTE + b"\n")
+        (log.parent / ".gitignore").write_text("*\n", encoding="utf-8")
+        assert holders(out, LOCAL_NOTE) == [HARNESS_LOG]
+        shard_outs.append(out.parent)
+    target = Campaign(make_study(base, "merged-with-logs"))
+    code, errors = merge_into(clean_environment, target, *shard_outs)
+    assert code == 0, errors
+    merged_out = target.root / "out"
+    run_key = keys_of_shard(shard1.root, 1)[0]
+    assert holders(merged_out, run_key.encode())  # the scan reads what the merge wrote
+    assert holders(merged_out, LOCAL_NOTE) == []
+    assert not [p for p in merged_out.rglob("*") if p.name in {"logs", "harness-errors.log"}]
 
 
 def test_c29_the_merged_batch_gives_the_scores_of_one_unsharded_driver(whole, merged):

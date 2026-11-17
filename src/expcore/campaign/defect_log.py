@@ -21,6 +21,7 @@ either.
 - Entries are appended under a lock, since the campaign's workers are threads.
 """
 
+import os
 import threading
 import traceback
 from collections.abc import Callable
@@ -111,9 +112,14 @@ def _append(root: Path, head: str, text: str) -> Path:
     """Append an entry to the campaign's local log; return the log's path."""
     path = log_path(root)
     with _lock:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # the log holds text that no record, marker or store does (a withheld diagnostic, a traceback): its directory
+        # is made 0700 and the file 0600, whatever the umask, from the moment they exist, so that no other user of the
+        # host reads the live file (a directory or a log already there is left as it is; not `umask`, which is the
+        # whole process's, the dispatcher's threads included)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _ensure_ignored(path.parent / ".gitignore")
-        with path.open("a", encoding="utf-8") as handle:
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(head + text + ("" if text.endswith("\n") else "\n"))
     return path
 
