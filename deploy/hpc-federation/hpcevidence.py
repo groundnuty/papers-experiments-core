@@ -24,7 +24,9 @@ left (`present_evidence`), by who writes it: `UP_FILES` and `UP_TREES` are what 
 check, the platform file, the facts, the render identity, the data manifests), present in every root `up` finished,
 and count for nothing; `RUN_FILES` and `RUN_TREES` are what a run, a step or the operator leaves, and each one with
 something in it counts: a file of the fault journal at any depth, a relay request, taken request, answer or
-`late-steps.jsonl`, a shard claim, the pilot's `day0-wiring.toml`, and any step record (`shard-steps/<label>.json`,
+`late-steps.jsonl`, a shard claim, the pilot's `day0-wiring.toml`, the study's `ingest-evidence.json` (what a study's
+`ingest run --out <root>/ingest-evidence.json` writes at the federation's root, and the study reads its id map from:
+the ingest's own evidence, which no later file of the root holds), and any step record (`shard-steps/<label>.json`,
 which `shards.py step` leaves in the root when a step of that shard starts: the shard's spec and how many steps of
 it started; no path, host or secret). An empty file does not (the injector's lock files, the claim's lock), nor does
 an NFS silly-rename file (a removed file still held open, which a `down` run again after a removal cut short finds),
@@ -41,7 +43,8 @@ reads the root's evidence again (`check_collected`) and compares it with the mar
 **Two sets, compared differently.** `STRICT_FILES` and the trees (`STRICT_TREES`) hold what a
 step, the study or `up` writes: the fault journal, the relay's journals (`late-steps.jsonl` and its request, taken and
 answer files), the shard claims, the step records, the data manifests, and the files `up` writes once (`platform.toml`,
-`facts.json`, `render-identity.json`) and the pilot's `day0-wiring.toml`. A change to any of them since the collect,
+`facts.json`, `render-identity.json`), the pilot's `day0-wiring.toml` and the study's `ingest-evidence.json` (written
+once by the study's ingest, and read by it afterwards). A change to any of them since the collect,
 a line appended to a journal included, makes the marker stale and `down` refuses. `SELF_REWRITTEN_FILES` holds the two
 files the running federation rewrites itself, which post-date every run once `collect` has run: the state
 (`hpc-federation.json`, rewritten by every state update, such as a resumed step's node or a data verification) and the
@@ -91,11 +94,13 @@ JOURNAL_KIND = "the fault journal"
 RELAY_KIND = "the relay's journals"
 CLAIM_KIND = "a shard claim"
 WIRING_KIND = "the day-0 wiring"
-KINDS = (STEPS_KIND, JOURNAL_KIND, RELAY_KIND, CLAIM_KIND, WIRING_KIND)  # the order `down` names them in
-RUN_FILES = {  # left by the pilot (the wiring a day-0 run reads) or by a step's pre-step guard (who held the root)
+INGEST_KIND = "the ingest's evidence"
+KINDS = (STEPS_KIND, JOURNAL_KIND, RELAY_KIND, CLAIM_KIND, WIRING_KIND, INGEST_KIND)  # the order `down` names them in
+RUN_FILES = {  # left by the pilot (the day-0 wiring), a step's pre-step guard (who held the root) or a study's ingest
     "day0-wiring.toml": WIRING_KIND,
     "shard-claim.json": CLAIM_KIND,
     "shard-claim.lock": CLAIM_KIND,
+    "ingest-evidence.json": INGEST_KIND,  # a study's `ingest run --out <root>/ingest-evidence.json` (its id map)
 }
 RUN_TREES = {  # the injector's journal, the relay's journals and the step records: written by a run, never by `up`
     "fault-journal": JOURNAL_KIND,
