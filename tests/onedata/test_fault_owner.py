@@ -10,10 +10,11 @@ import sys
 
 import pytest
 from campaign_support import planned_store
-from fault_support import OUTAGE_TARGET, SERVICES, FakeClock, FakeServices, injector_for, write_faults
+from fault_support import LOCAL_TARGET, OUTAGE_TARGET, SERVICES, FakeClock, FakeServices, injector_for, write_faults
 
 from expcore.campaign import liveness
 from expcore.campaign.healthgate import HOLD, META, HealthGate, parse
+from expcore.errors import InfraError
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate, _unsettled
 from expcore_onedata.fault_journal import JOURNAL, InjectionJournal, boot_id
@@ -289,3 +290,26 @@ def test_o80_the_judged_attempts_own_open_injection_is_charged_beside_anothers_f
         health = _unsettled(entries)
     assert health.charge is True
     assert health.detail.startswith(FAILED)
+
+
+def test_o80_a_failed_recovery_judges_every_open_entry_not_only_the_failing_targets(tmp_path, campaign):
+    """O80: the recovery fails on attempt 5's injection of one target, and the judged attempt 6 has its own injection
+    open on another: 6's own failure is never spared, and an entry that names no attempt keeps the charge."""
+    platform = write_faults(tmp_path, health_wait_s=0.2)
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    journal = InjectionJournal(settings.journal)
+    service = SERVICES["alpha"]
+    base = {"event": "injecting", "service": service, "identity_sha256": "0" * 64, "holder": {}}
+    journal.append({**base, "id": "a", "target": OUTAGE_TARGET, "owner": attempt(campaign, 5)})
+    journal.append({**base, "id": "b", "target": LOCAL_TARGET, "owner": attempt(campaign, 6)})
+    gate = FaultGate(settings, FakeServices())
+    error = InfraError("injector_failure", "an injection that an earlier run left open was not cleared", OUTAGE_TARGET)
+    with liveness.running(campaign, 6):
+        assert gate._left_open(error).charge is True
+    with liveness.running(campaign, 7):
+        other = gate._left_open(error)
+    assert other.charge is False
+    assert "left by another attempt" in other.detail
+    journal.append({**base, "id": "c", "target": LOCAL_TARGET, "service": SERVICES["alpha"]})  # records no owner
+    with liveness.running(campaign, 7):
+        assert gate._left_open(error).charge is True
