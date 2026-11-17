@@ -1,5 +1,9 @@
 """Fixtures for the platform layer: a fake federation, a loaded configuration, the client and the issuer."""
 
+import os
+from collections.abc import Callable
+from pathlib import Path
+
 import pytest
 from platform_support import leaked_values
 from record_support import no_secrets_in_the_environment
@@ -11,6 +15,7 @@ from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
 from expcore_onedata.config import PlatformConfig, load_platform
 from expcore_onedata.consistency import WaitTimeout
 from expcore_onedata.federation import FederationUnreadable, PinRefused
+from expcore_onedata.linkrecord import LOCK
 from expcore_onedata.pin import PinError
 from expcore_onedata.provision import NotPlaced, ProvisionError, Refused
 from expcore_onedata.testing import ADMIN_ENV, NOW, SPACE_NAME, FakeFederation, add_users, write_platform
@@ -97,3 +102,27 @@ def _no_message_holds_a_configured_value(monkeypatch, tmp_path):
     yield
     leaks = {text: found for text in messages if (found := leaked_values(text, tmp_path))}
     assert not leaks, f"a message of the platform layer holds configured values: {leaks}"
+
+
+@pytest.fixture
+def refuse_lock_writes(monkeypatch) -> Callable[[int], list[int]]:
+    """Make the link-check record's lock file one this process cannot open for writing, whatever its user is (a mode
+    change would not stop a root): `refuse(code)` makes every writing open of it fail with `code` (EACCES, EROFS,
+    EPERM) and returns the list of access modes (`os.O_RDONLY`, `os.O_RDWR`) the code tries, in order."""
+    real = os.open
+
+    def refuse(code: int) -> list[int]:
+        tried: list[int] = []
+
+        def opening(path, flags, *args, **kwargs):
+            if Path(os.fsdecode(path)).name == LOCK:
+                access = flags & os.O_ACCMODE
+                tried.append(access)
+                if access != os.O_RDONLY:
+                    raise OSError(code, os.strerror(code), str(path))
+            return real(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", opening)
+        return tried
+
+    return refuse

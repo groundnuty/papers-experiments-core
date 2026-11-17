@@ -179,8 +179,8 @@ def test_o56_a_second_namespace_of_the_run_s_own_never_widens_the_margin(node, t
     assert watch.end_cell()["kills"][0]["limit"] == MARGIN
 
 
-def test_o69_hidden_memory_another_run_s_cell_may_hold_ends_the_run_and_reads_unknown(node, tmp_path):
-    """O69, O56: with another run's cell charged to the same cgroup, the hidden memory cannot be told the cell's, so
+def test_o72_hidden_memory_another_run_s_cell_may_hold_ends_the_run_and_reads_unknown(node, tmp_path):
+    """O72, O56: with another run's cell charged to the same cgroup, the hidden memory cannot be told the cell's, so
     the cell cannot be isolated: the watch kills it and ends the run (`scope: run`, `attributed: false`, with its
     reason), once; the reading is `unknown` (`unattributed`), never `over`, and the run is not counted as hiding."""
     watch = _watch(node, tmp_path)

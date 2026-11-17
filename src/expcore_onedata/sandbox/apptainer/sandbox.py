@@ -21,7 +21,9 @@ Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded fir
   proves the watch sees a cell's processes, or the start fails;
 * REST: the core's gate on 127.0.0.1 (`gaterun.py`), with the token in its memory alone; the cell resolves the zone's
   and the provider's names to the loopback and trusts the run's CA; its `ONEDATA_TOKEN` is the placeholder (O23);
-* a mount: refused until the helper of hook (c) is given (`mounthook.py`);
+* a mount: oneclient on the node, outside every cell, by the helper of hook (c) (`mounthook.py`, `hostmount.py`); a
+  mount run is refused at its start without the helper, without `[sandbox.mount]`, and by the helper itself for a
+  direct mount (HPC mounts are proxy-only until the direct-I/O comparison passes);
 * no name server: every cell binds a `resolv.conf` that names none and an `nsswitch.conf` whose hosts are `files`, so
   the C library resolves the names of `/etc/hosts` alone: the federation's, as Docker's `--add-host` gives them
   (`facts.py`, `dns_none`);
@@ -59,7 +61,7 @@ from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs, workdisk
-from expcore_onedata.sandbox.apptainer.cells import AppCellRunner
+from expcore_onedata.sandbox.apptainer.cells import RUN_ENDED_FACT, AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
 from expcore_onedata.sandbox.apptainer.node import NodeOps
@@ -129,7 +131,9 @@ class ApptainerSandbox:
             "data_path": spec.mode.value,
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,
             "backend": self.app.record() if self.app is not None else {"backend": "apptainer"},
-            "infrastructure_facts": facts.record("image_unverified" if self.work_image else "directory"),
+            "infrastructure_facts": facts.record(
+                "image_unverified" if self.work_image else "directory", mount_refused=self._mount_refused()
+            ),
             "images": {},
             "tls": settings.tls.record(),
             "certifi": None,
@@ -205,6 +209,12 @@ class ApptainerSandbox:
                 log.error("cleanup after a failed start was incomplete: %s", describe_error(error))
             raise
 
+    def _mount_refused(self) -> bool:
+        """Whether a mount data path is refused here: no helper is given or the platform declares no `[sandbox.mount]`.
+        The run's facts list `mount_refused` exactly when this holds; the helper's own refusals (a direct mount, a run
+        without a token) come after it, at the helper's start."""
+        return self._mount_factory is None or self.s.mount is None
+
     def _validate(self) -> None:
         sp, s = self.spec, self.s
         if self.app is None:
@@ -213,7 +223,7 @@ class ApptainerSandbox:
             raise StartRefused("the run key must be 1 to 200 printable ASCII characters without spaces")
         if (sp.token is None) != (sp.mode is DataPathMode.NONE):
             raise StartRefused("a data path takes the data-path token, and no data path takes none")
-        if sp.mode is DataPathMode.MOUNT and (self._mount_factory is None or s.mount is None):
+        if sp.mode is DataPathMode.MOUNT and self._mount_refused():
             raise StartRefused(MOUNT_REFUSED)
         if sp.mode is not DataPathMode.NONE and sp.provider is None:
             raise StartRefused("a data path needs the agent's local provider")
@@ -533,7 +543,7 @@ class ApptainerSandbox:
             raise SandboxError("the run's /work is not a file system of its own of at most its size")
         with self._meta_lock:
             self._meta["work_disk"].update(enospc_verified=True, held_bytes=held, filesystem_bytes=total, remade=True)
-            self._meta["infrastructure_facts"] = facts.record("image")
+            self._meta["infrastructure_facts"] = facts.record("image", mount_refused=self._mount_refused())
 
     def _snapshot_inputs(self) -> list[tuple[Path, str]]:
         """Copy each read-only input into the run's directory, hash it, and take every write bit away (O20)."""
@@ -784,8 +794,11 @@ class ApptainerSandbox:
         """The facts of the run for its record. Never a secret: the token is in none of them."""
         with self._meta_lock:
             meta = json.loads(json.dumps(self._meta, default=str))
+            ended = None if self._cells is None else self._cells.ended
         if self._cells is not None:
             meta["cells"] = len(self._cells.cells)
+        if ended is not None and ended.get("scope") == "run":  # the watch ended the run: a fact of the run (O72)
+            meta["infrastructure_facts"]["run_ended"] = {key: ended.get(key) for key in RUN_ENDED_FACT}
         if self._watch is not None:
             meta["watch"] = self._watch.summary()
             meta["infrastructure_facts"]["memory"] = meta["watch"]["memory"]  # never `within` unless the check held

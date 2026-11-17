@@ -361,7 +361,7 @@ def test_o71_an_image_run_s_facts_close_work_and_keep_tmp_and_shm_declared(node,
 
 def test_o71_an_image_run_s_facts_say_unverified_until_the_probe_holds(node, settings):
     """O71: before the proof, the record never says /work is closed."""
-    keys = facts.record(work_disk="image_unverified")["facts"]
+    keys = facts.record(work_disk="image_unverified", mount_refused=True)["facts"]
     assert "work_disk_unverified" in keys
     assert not {"work_disk_image", "disk_watch"} & set(keys)
     box = ApptainerSandbox(node, settings, make_spec(), **options())
@@ -374,9 +374,12 @@ def test_o71_the_directory_mode_is_unchanged(node, tmp_path):
     settings = make_settings(tmp_path)
     assert settings.apptainer.work_disk == "directory"
     assert "work_disk" not in settings.apptainer.record()
-    assert facts.record() == facts.record(work_disk="directory")
-    assert "disk_watch" in facts.record()["facts"]
-    assert not {"disk_watch_tmp", "work_disk_image", "work_disk_unverified"} & set(facts.record()["facts"])
+    image_keys = {"disk_watch_tmp", "work_disk_image", "work_disk_unverified"}
+    for refused in (True, False):  # the keys every run had before the image existed, `mount_refused` as it was
+        before = sorted(k for k in facts.FACTS if k not in image_keys and (refused or k != "mount_refused"))
+        assert facts.record(mount_refused=refused)["facts"] == before
+        assert facts.record("directory", mount_refused=refused) == facts.record(mount_refused=refused)
+    assert "disk_watch" in facts.record(mount_refused=True)["facts"]
     box = start(node, settings, make_spec("isolated"))
     try:
         assert not node.mkfs_calls

@@ -7,7 +7,10 @@ one, and the locks are real, on the fixture's journal directory.
 """
 
 import dataclasses
+import fcntl
+import os
 import threading
+from pathlib import Path
 
 import pytest
 from fault_support import faults_table
@@ -22,6 +25,7 @@ from expcore_onedata.occupancy import Listing
 from expcore_onedata.provision import Provisioner, resolve_provider_ids
 from expcore_onedata.rangemap import load_placement
 from expcore_onedata.reset import SpaceReset
+from expcore_onedata.resetlock import FEDERATION_RESET
 from expcore_onedata.resetspaces import ResetPlan, SpacesReset
 from expcore_onedata.testing import BETA_ID, DATA, write_platform
 from expcore_onedata.tool_admission import shared_admission
@@ -218,6 +222,98 @@ def test_o51_a_reset_of_several_spaces_takes_one_exclusive_section_for_all(
         record = driver.run([ResetPlan(holdings.plan(), planned=holdings, qos_rights=True)])
     assert {path: distribution_reads(fake, path) - before[path] for path in UNTOUCHED} == dict.fromkeys(UNTOUCHED, 0)
     assert record["spaces"][0]["occupancy_reads"]["mode"] == "shortcut"
+
+
+FULL_REASON = "owner_ledger_fell_back"  # a study's reason for one full reset: a short code
+
+
+def a_reader_could_share(platform_file, config) -> bool:
+    """Whether a reader could take its share of the reset lock now, on a descriptor of the test's own."""
+    journal = load_faults(platform_file, config).journal
+    descriptor = os.open(Path(journal) / FEDERATION_RESET, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(descriptor)  # closing drops the share if it was taken
+    return True
+
+
+def test_o51_a_full_reason_gives_the_full_reads_inside_the_section_with_the_grant_held_throughout(
+    client, config, platform_file, ticker, tmp_path, fake, lock, monkeypatch
+):
+    """O51: a study asks for one full reset (`full_reason`) inside the exclusive section, the shortcut on: the
+    occupancy and quiet stages read every file, the record says full with the core's why (`requested`) and the study's
+    reason beside it, and the section's exclusive hold stays in force: no reader could take its share of the reset lock
+    while the occupancy stage read, and the grant still holds at the reset's end."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path)
+    shares: list[bool] = []
+    narrowed = resetshortcut.narrowed
+
+    def looked(reset, run):  # the occupancy stage's choice of reads, every round
+        shares.append(a_reader_could_share(platform_file, config))
+        return narrowed(reset, run)
+
+    monkeypatch.setattr(resetshortcut, "narrowed", looked)
+    reset = SpaceReset(p, now=ticker.clock)
+    with lock.held(exclusive=False, timeout_s=1.0), reset.exclusive() as grant:
+        holdings = reset.plan_scan()
+        before = {path: distribution_reads(fake, path) for path in FILES}
+        record = reset.run(holdings.plan(), planned=holdings, qos_rights=True, full_reason=FULL_REASON)
+        held_at_the_end = grant.held
+    assert {path: distribution_reads(fake, path) - before[path] for path in UNTOUCHED} == dict.fromkeys(UNTOUCHED, 2)
+    mode = record["occupancy_reads"]
+    assert (mode["mode"], mode["why"], mode["full_reason"]) == ("full", "requested", FULL_REASON)
+    assert (mode["grant"]["mode"], mode["grant"]["granted"], mode["grant"]["why"]) == ("exclusive", True, None)
+    assert shares  # the occupancy stage chose its reads
+    assert not any(shares)
+    assert held_at_the_end
+    assert a_reader_could_share(platform_file, config)  # the section over, a reader gets in again
+
+
+def test_o51_a_full_reason_keeps_the_cores_own_why_when_the_core_gives_the_full_reads_anyway(
+    client, config, platform_file, ticker, tmp_path, fake, lock
+):
+    """O51: with the shortcut off the reads are full by the core's own why (`off`): the study's reason is recorded
+    beside it, never in its place."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path, shortcut=False)
+    reset = SpaceReset(p, now=ticker.clock)
+    with lock.held(exclusive=False, timeout_s=1.0), reset.exclusive():
+        holdings = reset.plan_scan()
+        record = reset.run(holdings.plan(), planned=holdings, qos_rights=True, full_reason=FULL_REASON)
+    mode = record["occupancy_reads"]
+    assert (mode["mode"], mode["why"], mode["full_reason"]) == ("full", "off", FULL_REASON)
+
+
+@pytest.mark.parametrize("shortcut", [True, False], ids=["shortcut", "full"])
+def test_o51_without_a_full_reason_the_reads_are_recorded_as_before(
+    client, config, platform_file, ticker, tmp_path, fake, lock, shortcut
+):
+    """O51: a reset given no `full_reason` records its reads with the keys it always had, and `ResetPlan`'s default
+    gives the same record as `initial` called as before."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path, shortcut=shortcut)
+    with lock.held(exclusive=False, timeout_s=1.0):
+        record, _ = reset_with_leftover(fake, SpaceReset(p, now=ticker.clock), ticker)
+    keys = {"mode", "why", "grant", "reading"} | ({"reread"} if shortcut else set())
+    assert set(record["occupancy_reads"]) == keys
+    assert ResetPlan().full_reason is None
+    assert resetshortcut.initial(p.settings, None, None) == resetshortcut.initial(p.settings, None, None, None)
+
+
+@pytest.mark.parametrize("reason", ["", "the owner ledger fell back"], ids=["empty", "sentence"])
+def test_o51_a_full_reason_that_is_not_a_short_code_is_refused_before_anything_is_sent(
+    client, config, platform_file, ticker, tmp_path, fake, lock, reason
+):
+    """O51: a full reset's reason goes into the published record, so it is a short code (`resetshortcut
+    .checked_reason`, whose own tests hold every form): one that is not is refused before any stage, and nothing is
+    sent to the federation."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path)
+    reset = SpaceReset(p, now=ticker.clock)
+    calls = len(fake.provider_calls)
+    with pytest.raises(ValueError, match="full_reason is a short code"):
+        reset.run(full_reason=reason)
+    assert len(fake.provider_calls) == calls
 
 
 def test_o51_every_hard_link_and_every_file_the_reading_did_not_read_is_reread():

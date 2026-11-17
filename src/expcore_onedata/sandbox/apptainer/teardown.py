@@ -117,7 +117,7 @@ class Teardown:
         state = cells.quiesce("teardown")
         # stricter than the collection's `quiet`: a process in D may never leave the kernel (a dead mount), and no
         # container's removal follows here to show it gone, so only a zombie, which is dead, may be left
-        if state["killed"] is None or any(p["state"] != "Z" for p in state["left"]):
+        if state["killed"] is None or state["left_alive"]:  # every process left, not only the 16 recorded
             raise SandboxError("a process of the run's cells could not be shown gone")
 
     def _helper(self, role: str) -> Callable[[], None]:
