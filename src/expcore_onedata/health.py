@@ -65,7 +65,11 @@ check ran through (the root is the `[faults] journal`'s parent), by the same rul
 (`fault_serves.recorded`: the latest check's verdict, a check that raises or whose record cannot be written leaving no
 older record standing, one check at a time under the record's lock), so the record is the check's, not the one `up`
 wrote before an outage. Without `[faults]` no root is declared and nothing is written. The record is advisory: it
-never changes a verdict and takes no federation lock.
+never changes a verdict and takes no federation lock. A check whose record could not be written (its lock not taken, or
+the write refused) says so beyond a log line: `link_record` holds `{"link_record": "not_written", "link_record_reason":
+"lock_not_taken" | "write_failed"}` for the latest check (None when its record was written), and the try's note
+(`expcore.campaign.prerun`, key `linkrecord.LINK_RECORD_NOTE`) holds it for the run whose pre-run check it was, which an
+executor reads with `prerun.current()` to put it in the run's record. Neither exists when the record was written.
 
 **So is every preallocated ingest's baseline (O44, `ingesthealth.py`), when the study names the ingests' journals**
 (`ingest_journals`): before anything else, with no request to the federation, the check fails while a space's baseline
@@ -83,6 +87,7 @@ import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+from expcore.campaign import prerun
 from expcore.campaign.healthgate import DeferralBound, Health, HealthCheck
 from expcore.config.loading import ConfigError
 from expcore_onedata.admission import fault_settings_of
@@ -95,7 +100,7 @@ from expcore_onedata.fault_settings import FaultSettings, compose_driver, hpc_dr
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
 from expcore_onedata.ingesthealth import baseline_health
 from expcore_onedata.linkcheck import LinkReport, check_links
-from expcore_onedata.linkrecord import record_path
+from expcore_onedata.linkrecord import LINK_RECORD_NOTE, fact, record_path
 from expcore_onedata.linksettings import LinkCheckSettings
 from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
 from expcore_onedata.tls import WARNING
@@ -266,6 +271,13 @@ class PlatformHealth:
         every pair's verdict, seconds and bytes, and the transfers it made (`LinkReport.to_json()`)."""
         return self._links
 
+    @property
+    def link_record(self) -> dict[str, str] | None:
+        """That the last link check's record was not written, as the optional fact `link_record: "not_written"` with
+        `link_record_reason` (`linkrecord.fact`); None when it was written, and before the first check."""
+        last = self._links
+        return None if last is None or last.not_written is None else fact(last.not_written)
+
     def _measure(self) -> Health:
         self._content_type = measure_content_type(self._config, self._client)
         return self._content_type.health
@@ -279,6 +291,8 @@ class PlatformHealth:
         self._links_at = self._monotonic()
         self._links_passed = self._links_passed or self._links.ok
         self._made.report = self._links  # this thread's own: another thread's call never takes it
+        if self._links.not_written is not None:  # the run whose check this was learns its record was not written
+            prerun.note(LINK_RECORD_NOTE, fact(self._links.not_written))
 
     def _take_links(self) -> LinkReport | None:
         """The link report this thread's calls made since it last took one, None when they made none (for the fault
