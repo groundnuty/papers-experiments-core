@@ -159,12 +159,15 @@ def test_c05_a_raise_during_the_loop_keeps_its_bound_and_records_no_basis(tmp_pa
     assert (cost.usd, cost.bounded) == (pytest.approx(bound), True)
 
 
-def test_c05_an_executor_that_raises_before_any_request_keeps_its_bound_and_records_no_basis(tmp_path):
-    """C05: a raise before the loop sent nothing the log can show; the loop did not end, so nothing is measured."""
+def test_c05_an_executor_that_raises_before_any_request_is_charged_nothing_and_records_measured(tmp_path):
+    """C05: a raise before the loop sent nothing, and the log, complete, says so: the attempt costs 0 and records
+    `measured`. It was charged its bound until then, which two such failures could spend a model's budget on
+    (tests/campaign/test_unsent_spend.py has the rest of the rule: what keeps the bound)."""
     executor = FakeExecutor(default=("raise_infra", "sandbox"))
-    row, cost, bound = run_once(tmp_path / "out", executor)
-    assert (row["state"], row["usage_complete"], row["spend_basis"]) == ("infra_fail", 0, None)
-    assert (cost.usd, cost.bounded) == (pytest.approx(bound), True)
+    row, cost, _ = run_once(tmp_path / "out", executor)
+    assert (row["state"], row["usage_complete"], row["spend_basis"]) == ("infra_fail", 1, MEASURED)
+    assert (row["calls_sent"], row["input_tokens"], row["output_tokens"]) == (0, 0, 0)
+    assert (cost.usd, cost.bounded) == (0.0, False)
 
 
 def test_c05_without_a_budget_a_raise_after_the_loop_is_unchanged_since_no_call_log_is_kept(tmp_path):

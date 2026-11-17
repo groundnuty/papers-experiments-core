@@ -235,7 +235,7 @@ def sent_no_request(error: BaseException, backend: Any) -> bool:
     True for a first-turn refusal, which the hook raises before the loop's first request, unless the backend says it
     started one (`requests_sent`, an optional attribute of a backend: a request an executor sent before the hook ran
     may have been billed). A backend that keeps no count is taken at the refusal's word. Any other failure may have
-    sent requests, so its usage stays unknown.
+    sent requests, so its usage stays unknown here; the attempt's call log may still show none (`campaign.no_request`).
     """
     return isinstance(error, FirstTurnRefusal) and getattr(backend, "requests_sent", None) in (None, 0)
 
