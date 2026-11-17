@@ -87,7 +87,10 @@ Errors and retries, identical on every path: an upstream attempt that fails befo
 an answer arrives (connect, handshake, send, or the peer closing first) is retried once, on a new connection, before
 anything reaches the client; nothing is retried after an answer began, and a read timeout is never retried. Every
 failure is logged with its origin, `upstream` (the platform) or `gate` (the gate itself), and with what the client saw
-(`5xx` or `reset`), so a run can tell an error the gate made from one the platform made.
+(`5xx` or `reset`), so a run can tell an error the gate made from one the platform made. The 502 of a failed upstream
+call carries the failure's text, with the host the gate dialled (`addr`, and `addr:port`, as a certificate's name
+mismatch quotes them) named by the name it serves and port 443 (`_as_served`, O69): a gate whose names are not the
+hosts behind them never gives its client those hosts. The log's line keeps the text as it was.
 """
 
 from __future__ import annotations
@@ -100,6 +103,7 @@ import io
 import itertools
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -390,6 +394,24 @@ class _Upstream(Exception):
         super().__init__(repr(cause))
         self.cause = cause
         self.origin = origin_of(cause)
+
+
+SERVED_PORT = 443  # where a client of the gate dials every name it serves: the gate's own port, or the 443 mapped to it
+
+
+def _as_served(text: str, name: str, hcfg: dict) -> str:
+    """The text of a failure as the gate's answer gives it to its client: the host it dialled upstream (`addr`, and
+    `addr:port`), which a certificate's name mismatch quotes, named as the client knows it, by the name the gate
+    serves on 443 (O69). A gate whose name is the host it dials (Docker's) gives the text unchanged; the log's line
+    keeps the text as it was."""
+    addr = str(hcfg.get("addr") or "")
+    if not addr or addr.lower() == name.lower():
+        return text
+    port = hcfg.get("port", 443 if hcfg.get("tls", True) else 80)
+    with_port = (f"[{addr}]:{port}", f"{addr}:{port}")
+    dialled = re.compile("|".join(re.escape(form) for form in (*with_port, addr)), re.IGNORECASE)  # one pass
+    return dialled.sub(lambda m: f"{name}:{SERVED_PORT}" if m.group(0).lower() in {f.lower() for f in with_port}
+                       else name, text)  # fmt: skip
 
 
 _LOST = (
@@ -944,7 +966,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._abort_client()
                 return
             rec["client_saw"] = "5xx"
-            details = str(e)
+            details = _as_served(str(e), host, hcfg)  # the line's `error` keeps the host dialled; the answer, the name
             if gateboundary.holds_token(details.encode(errors="replace"), CFG.get("token")):  # an upstream's echo
                 details = gateboundary.CREDENTIAL_DETAILS
             with contextlib.suppress(OSError):
