@@ -182,7 +182,7 @@ Implementer must guarantee:
 - `info()` and `transcript()` never contain a credential; the base URL has none (R12).
 - A backend of a study's own that serves a model declaring `accepted_fingerprints` sets `ModelTurn.system_fingerprint` on each reply that reports one, and after `probe` gives the probe's served model id and fingerprint in `info()` (`served_model_ids`, `system_fingerprints`, each a list); without them no declared fingerprint is confirmed at admission.
 - An executor that needs more than the protocol (the example's executor scripts the stub with `use`) checks for that method, never for a class, so a backend that wraps or replaces the stub serves it too.
-- A backend may have a `requests_sent` count, the requests it has started, a resend after a failure included; the core's backends have it. The scheduler reads it only to tell an attempt that sent no request after an instrument's first-turn refusal ([below](#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check)): a backend of a study's own without it is taken at the refusal's word.
+- A backend may have a `requests_sent` count, the requests it has started, a resend after a failure included; the core's backends have it. The scheduler reads it to tell an attempt that sent no request: after an instrument's first-turn refusal ([below](#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check)) a backend of a study's own without it is taken at the refusal's word, and for any other failure at start (C05, `campaign/no_request.py`) a count of exactly 0 is what confirms that an empty call log means none, so a backend without it keeps its attempt's bound.
 
 ### Retries of a reply
 
