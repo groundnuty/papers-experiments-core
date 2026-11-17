@@ -11,7 +11,17 @@ import subprocess
 import sys
 
 import pytest
-from copy_back_support import JOURNALS, SCRIPT, make_plan, pull, pulled, verify, with_newer_snapshot
+from copy_back_support import (
+    JOURNALS,
+    SCRIPT,
+    archived,
+    make_plan,
+    plan_file,
+    pull,
+    pulled,
+    verify,
+    with_newer_snapshot,
+)
 
 
 @pytest.fixture(scope="module")
@@ -181,6 +191,26 @@ def test_verify_copy_warns_once_of_an_extra_file_under_a_nested_journals_directo
     seen = capsys.readouterr().err
     assert seen.count("WARNING") == 1
     assert "fed-a/journals/old/later.jsonl" in seen
+
+
+def test_verify_copy_warns_of_a_journal_added_to_a_shard_that_had_none_when_collected(shards, tmp_path, capsys):
+    """O63: the journals directories searched for extras are those of every shard with an archive in the manifest, not
+    only those that already held a listed journal: a shard collected with no journals, then stepped again, and pulled,
+    has a journal the manifest does not name, which is warned of (the spend it records is verified by nothing else)."""
+    plan = shards.load_plan(plan_file(tmp_path))
+    for shard in plan.shards:
+        archived(shards, tmp_path, shard.label, shard.index, journals=False)
+    shards.collect(plan, tmp_path / "merge")
+    manifest, local, given = pull(plan, tmp_path)
+    (local / "fed-a" / "journals").mkdir(parents=True)
+    (local / "fed-a" / "journals" / "20261117T000000Z-9-dddd0004.jsonl").write_text("{}\n")
+    (local / "fed-z" / "journals").mkdir(parents=True)  # a shard of another campaign: its files are not this pull's
+    (local / "fed-z" / "journals" / "other.jsonl").write_text("{}\n")
+    assert verify(shards, manifest, local, given) == 0
+    seen = capsys.readouterr().err
+    assert seen.count("WARNING") == 1
+    assert "fed-a/journals/20261117T000000Z-9-dddd0004.jsonl" in seen
+    assert "fed-z" not in seen
 
 
 def _rewrite(manifest, mutate):

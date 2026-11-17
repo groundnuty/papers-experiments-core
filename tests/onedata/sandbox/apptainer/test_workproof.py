@@ -249,3 +249,34 @@ def test_o71_a_kept_run_s_token_scan_never_reads_the_proof(node, settings):
     _started(node, settings)
     (kept,) = _proofs(settings)
     assert TOKEN.encode() not in kept.read_bytes()
+
+
+def _proof_file(tmp_path, text):
+    """A proof file as `load` takes one (the driver's, 0600, one link, within the size cap) holding `text`."""
+    root = tmp_path / "work"
+    (root / workproof.DIR).mkdir(parents=True, mode=0o700, exist_ok=True)
+    path = workproof.path_of(root, "k")
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+    return root, path
+
+
+def test_o71_a_proof_nested_past_the_parser_s_recursion_limit_is_unreadable_never_raised(tmp_path):
+    """O71: `load` never raises. 30,000 nested brackets (60,001 bytes, under the size cap) made `json.loads` raise
+    `RecursionError` on CPython 3.12 and 3.13: the start would have failed on a file a cell can never write."""
+    root, path = _proof_file(tmp_path, "[" * 30000 + "0" + "]" * 30000)
+    assert path.stat().st_size <= 1 << 16
+    assert workproof.load(root, "k", {}) == (None, "unreadable")
+
+
+@pytest.mark.parametrize("error", [RecursionError, MemoryError])
+def test_o71_a_proof_the_parser_cannot_hold_is_unreadable_never_raised(tmp_path, monkeypatch, error):
+    """O71: whatever interpreter runs it, a parser that gives up (recursion, memory) is a proof that is no proof."""
+    root, _ = _proof_file(tmp_path, "{}")
+
+    def give_up(*args, **kwargs):
+        raise error
+
+    with monkeypatch.context() as patched:
+        patched.setattr(workproof.json, "loads", give_up)
+        assert workproof.load(root, "k", {}) == (None, "unreadable")

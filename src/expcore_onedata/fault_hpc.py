@@ -424,10 +424,22 @@ _TIMING_REASON = re.compile(r"[A-Za-z0-9_]{1,60}")
 _TIMING_FIGURES = ("start_after_issue_s", "end_after_answer_s")
 
 
+def _finite(value: Any) -> float | None:
+    """`value` as a float when it is a number (never a bool) a float holds and that is finite, else None: a whole
+    number beyond a float's range (a corrupt or crafted record's) is no figure, as an infinity is, and never raises."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _seconds_figure(value: Any) -> float | None:
     """A finite number (it may be negative: a step ended before the answer), rounded to the millisecond, else None."""
-    ok = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
-    return round(float(value), 3) if ok else None
+    number = _finite(value)
+    return None if number is None else round(number, 3)
 
 
 def timing_evidence(timing: Any) -> dict[str, Any] | None:
@@ -474,8 +486,8 @@ def timing_evidence(timing: Any) -> dict[str, Any] | None:
 
 def _duration(value: Any) -> float | None:
     """A finite number of at least 0, rounded to the millisecond; None for anything else."""
-    numeric = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
-    return round(float(value), 3) if numeric and value >= 0 else None
+    number = _finite(value)
+    return round(number, 3) if number is not None and number >= 0 else None
 
 
 def status_domain_wait(stdout: str) -> float | None:

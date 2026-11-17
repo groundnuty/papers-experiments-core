@@ -173,6 +173,7 @@ class OrchardExecutor:
         exposure = factors["exposure"]
         user = self.template.render({"QUESTION": QUESTIONS[factors["task"]], "HINT": HINTS[exposure]}, study_run=True)
         session = self.platform.session()  # one per run: its log and its instrument are this run's
+        request.declare_secrets()  # no secret beyond the environment's: a failed start's diagnostic is then shown (C40)
         instruments = [session.instrument()]
         identity = {"run_key": request.run_key, "factors": dict(factors), "attempt": request.identity.attempt}
         await asyncio.to_thread(start_instruments, instruments, identity)

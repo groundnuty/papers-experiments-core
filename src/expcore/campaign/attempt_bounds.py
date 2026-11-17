@@ -81,8 +81,15 @@ LOST_STATE = "lost_in_kill"
 @dataclass(frozen=True)
 class AttemptCost:
     """The cost of one attempt in dollars: `None` when the model's price is unknown; `bounded` when it is the bound, or
-    holds one (a request in flight); `basis`, for an interrupted attempt with a call log or a lost one the journal never
-    saw end, how it was charged (`interrupted_spend.BASES`), else None."""
+    holds one (a request in flight, a top-up); `basis`, for an interrupted attempt with a call log or a lost one the
+    journal never saw end, how it was charged (`interrupted_spend.BASES`), else None.
+
+    `topup_usd` is the part of `usd` that is its top-ups (C26), and `charged_on` the basis the rest of it was charged
+    on, for every attempt that has one (C39): `measured` (its counts at the model's price, or a free model's known
+    zero), `measured_plus_inflight` (an interrupted attempt's replies and one request in flight at its bound) or
+    `bound`; None when `usd` is unknown, and for a charge that is top-ups alone (a running attempt's, a lost top-up or
+    probe send). It is what the gate charged, not what the row records: a row that records `measured` but is charged
+    its bound says `bound` here."""
 
     attempt_id: int
     run_key: str
@@ -91,6 +98,8 @@ class AttemptCost:
     usd: float | None
     bounded: bool
     basis: str | None = None
+    topup_usd: float = 0.0
+    charged_on: str | None = None
 
 
 def _check_limits(limits: Limits) -> None:
@@ -217,6 +226,12 @@ def measured_usd(spec: ModelSpec, row: Mapping[str, Any]) -> float | None:
     )
 
 
+def known_no_turn(row: Mapping[str, Any]) -> bool:
+    """Whether an attempt's usage is known to hold no turn (`_no_turn`): no count was reported because no reply was
+    answered, which costs 0 and is not an unreported count."""
+    return _no_turn(row)
+
+
 def _no_turn(row: Mapping[str, Any]) -> bool:
     """Tell whether an attempt is known to have had no request answered: its per-turn usage holds no turn, and its
     usage was judged with the check that a billed reply the backend could not read leaves it incomplete (C26). A row
@@ -289,18 +304,22 @@ def attempt_costs(
         if row["state"] == "running":
             if live is None or row["run_key"] in live:
                 if topped:
-                    costs.append(AttemptCost(row["id"], row["run_key"], row["model"], "running", topped, True))
+                    costs.append(
+                        AttemptCost(row["id"], row["run_key"], row["model"], "running", topped, True, topup_usd=topped)
+                    )
                 continue
             usd, bounded = _bound_cost(spec, limits, capped)  # no worker settles it: its usage is unknown
-            basis = None
+            basis, charged_on = None, None if usd is None else BOUND
         elif row["state"] == "interrupted" and row["spend_basis"] is not None:
             usd, bounded, basis = _interrupted_cost(spec, row, limits, capped)
+            charged_on = None if usd is None else basis
         else:
             (usd, bounded), basis = _base_cost(spec, row, limits, capped), None
+            charged_on = None if usd is None else (BOUND if bounded else MEASURED)
         costs.append(
             AttemptCost(
                 row["id"], row["run_key"], row["model"], row["state"],
-                None if usd is None else usd + topped, bounded or topped > 0, basis,
+                None if usd is None else usd + topped, bounded or topped > 0, basis, topped, charged_on,
             )
         )  # fmt: skip
     return costs

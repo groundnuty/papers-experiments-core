@@ -13,8 +13,9 @@ processes are found and killed, and what says it was killed.
 * **The processes** of the run are the watch's (`watch.Watch.members`): every process in a PID namespace of the
   run's. At the cap the harness's timer kills them through their pidfds (`deadline.enforce`), and one that outlives
   the kill past the grace orders the sandbox's stop (there is no mount to abort). After every exec, whatever of the
-  cell is left is killed and shown gone: a cell's processes end with it (`facts.py`, a departure from Docker, where a
-  detached worker lives on until the next cap or the collection). One that cannot be shown gone ends the run as
+  cell is left is killed and shown gone: a cell's processes end with it, as on Docker, whose runner sweeps what a cell
+  detached into a session of its own (`sandbox/cells.py`, `_sweep`, O72). Here the end of the cell's PID namespace
+  ends them anyway, and this runner's own `_sweep` shows it. One that cannot be shown gone ends the run as
   `survived_kill`.
 * **The cause** of a kill, one per cell, from the harness's own evidence only (O17): the watch's kill
   (`memory_limit`, `disk_limit`), an OOM kill the step's memory cgroup counted during the cell (`host_oom`, since that

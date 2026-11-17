@@ -1262,6 +1262,16 @@ The version, hash included, is what `scores.json`, `analysis.json` and the repor
 
 **Correcting a scorer after an HPC batch.** A scorer is found wrong after the batch is copied back, where `build` cannot run. Fix it and change its `version`, in the one function both builders call; a reference it is built from, corrected, is a correction of the scorer in the same way, and with its hash folded into the version, as above, the version changes by itself. The scorer is code, so the replay check is stale: run `check` again on the batch (it builds nothing, so it needs no federation). Then run `analyze my-study --rescore` and `report my-study --rescore`. Without the flag both refuse, naming the scorers. With it the analysis scores every record anew with the corrected scorer, and says so: `scores.json`, the `scorers` of `analysis.json` and the report's `Scorers` line hold the new version, as any re-score does (R13), and `analysis.json` (`rescore`) and one line of the report's Provenance hold the digest the campaign recorded and the digest of the scorers used. They cannot name the scorer that changed, because the campaign records one digest of all its scorers: keep the old version in your own notes or in git. The flag changes nothing when the scorers are the campaign's own, and nothing for a module without `build_analysis`. A store that records no digest is refused with the flag too. Then build the replication package as for any study, with no flag: the decision was recorded at `analyze`, so the package's build, its `make check` and `package-check` honour it, and an anonymised package does too. A differing scorer digest is accepted exactly when the `analysis.json` that ships holds a `rescore` entry equal to what the check works out now, the digests the store recorded and the digest of the scorers in the package's plugin; with no entry, with an entry for other scorers or another store, or with a store that records no digest, the build and the check refuse as `analyze` does, and they never re-ask. The package's outputs are still compared byte for byte with what the records give, so an entry on a batch that re-scored nothing fails as differing, and the package carries the `rescore` entry and the Provenance line, so a reader of it sees the re-score.
 
+### What each model cost
+
+`analysis.json` has `model_usage` and `report.md` a section "Model usage and spend" (and one line of the provenance, `- Spend: ...`) for every analysis, so a reader can tell what the campaign spent per model, the tokens, how many attempts were set aside, which model ids served it and how often its requests were retried (C39). Nothing in it is priced or counted again: it is the budget gate's own figure broken down, read from the snapshot of the store the check took, the verified records and your `models.toml`.
+
+- **Spend by model** gives each model's total, the part spent on the attempts the analysis uses and the part on the rest, and the total on each basis. **Cost per scored run is the first figure over the number of scored runs; the rest is the overhead beside it**, and it is not small when attempts were set aside, harness errors, interrupted or lost in a kill: those were never scored and were paid for all the same.
+- **The basis is the one the dollars were charged on.** *Measured*: the attempt's counts at the model's price, each request at its own tier. *Measured plus in flight*: an interrupted attempt's replies and one request sent and not answered, at the most one request can cost. *Bound*: the most its caps let it cost, because its usage is unknown (a count the endpoint did not report, a run killed before its log could be read, a model whose cost cannot be told from the totals). *Top-ups* and the *probes* of admission are charged apart. An attempt charged a measured zero (it failed before any request was sent, C05) has 0 tokens and 0 dollars, measured.
+- **`n/a` is not 0.** A model with no price has tokens and no dollars. If `models.toml` or the `[agent]` caps are not the ones the campaign ran under (compared with the campaign fingerprint), no dollar is shown for any model and the provenance line says why; a priced model with no `context_tokens` cannot be bounded, so a campaign made before that rule still analyses, reports and regenerates, with `n/a` where a bound was needed. A count the endpoint did not report is counted under Usage incomplete and is not added as 0.
+- **Served ids and retries come from the records** of the batch: each served model id and system fingerprint a model's turns carried, with the turns and records; `not reported` for a reply that named none (a stub's, say), never the id you asked for. Retries inside an attempt are the transient errors the backend retried before a reply, by kind, with the seconds waited; the attempts set aside as infrastructure are those of the export's `retries_by_kind`, added over the conditions.
+- **A batch merged from shards** adds its shards' figures, so its probes are the sum of its shards' (each shard's start probes its own models and pays for it); every other figure is what one driver of the whole campaign would show. The figures are the same on every machine: `regenerate` and a package's check derive the same bytes.
+
 ### How pairs become a contrast's input
 
 What a contrast estimates is decided by how its pairs are combined, in stages of plain means:
@@ -1392,6 +1402,56 @@ fingerprint = saved["campaign_fingerprint"]["fingerprint"]
 assert set(fingerprint["caps"]) and fingerprint["environment"]["distributions"]  # what the report may read from it
 snapshot.close()
 ```
+
+### Judging an outage run: was the outage the run's own?
+
+The platform's post-run check compares every space with its declared providers, and a provider Onezone still reports offline after the run's restore fails it, with a text that names the first failing space only (`spaces[1]: declared provider(s) reported offline: providers[1]`). A study with several spaces cannot tell from that text whether the one provider its run took down is all that is offline, or another provider is too. The check makes the answer beside the text (O90, `expcore_onedata.healthreading`): `PlatformHealth.reading` holds, for every declared space, whether it was read completely and which providers it reports offline, by label, and the targets the run's own attempt took down, from its own journal lines. `target_only(reading)` asks the question:
+
+- `True`: every space was read, and everything offline is a target of this run (nothing offline is `True` too);
+- `False`: a provider the run did not take down is offline in a space that was read;
+- `None`: the reading cannot say. A space was not read (the answer lacks it, its providers are not exactly its declared set, or only the tool server's token reaches it, so **a platform with such a space always answers `None`**), the call never reached the spaces, or something is offline and the journal could not be read. Treat it as the run's reading being unusable, never as `True`.
+
+The core's own judgment is unchanged: a failing post-run check sets an attempt that would have been scored aside as infrastructure of `[scheduler] health_kind`, and leaves a run that already ended as the condition's treatment scored, with an event. A study that wants a run whose only offline provider is its own target to stand as a clean run wraps the check; the reading is read in the thread the gate gave the check, so a wrapper has it as soon as the platform's check has answered:
+
+```python
+from expcore.campaign.health_context import POST_RUN, CheckContext
+from expcore.campaign.healthgate import Health
+from expcore_onedata.healthreading import target_only
+
+
+class OutageAwareHealth:
+    """The platform's check, but a post-run reading that shows only the run's own target offline is a pass."""
+
+    def __init__(self, platform_health):
+        self.platform_health = platform_health
+
+    def max_deferral_s(self):
+        return self.platform_health.max_deferral_s()  # the campaign holds its max_defer_s to the platform's bound
+
+    def __call__(self, context: CheckContext | None = None) -> Health:
+        verdict = self.platform_health()
+        reading = self.platform_health.reading
+        own_outage = (
+            context is not None
+            and context.phase == POST_RUN
+            and not verdict.ok
+            and not verdict.deferred
+            and reading is not None
+            and bool(reading.offline)
+            and target_only(reading) is True
+        )
+        if own_outage:
+            return Health(True, f"post-run: only the run's own target is reported offline: {sorted(reading.offline)}")
+        return verdict
+```
+
+What the wrapper keeps and what it gives up:
+
+- It relaxes a post-run check only: before a run, a target still reported offline means the federation is not back to its baseline, and the run waits as it does.
+- With `target_only` true, every space was read and passed the name and membership comparison, so what failed the call was the offline set alone; a failure of the fault gate, the baseline or the content type leaves the reading `UNREAD`, and `None` never relaxes anything.
+- While a provider is reported offline the platform's check stops at the space and **does not run its link check**; a wrapper that turns that call into a pass has skipped it for that call. The next run's pre-run check runs it.
+- The reading is made in both orders: after the restore (the injector's own order, the post-run check the scheduler makes) and inside the run's own open injection (an executor that reads health before it restores; its own entry is not an unsettled injection under its own admission, and the reading says the target is `held`). The scheduler's own post-run check never explains an own entry that is still open once the executor has returned: it is a leftover. Another attempt's open injection, an entry that names no attempt, a failed restore, a heal's restart and an entry whose injector is gone (an executor that returned without restoring) are never explained: the fault gate answers them and the reading is `UNREAD`. A run whose restore failed is set aside as `injector_failure` before any health judgment, whatever the wrapper does. Take the reading from the full chain, `healthreading.checked(platform_health)`, never from `platform_health.space()`, which skips the fault gate.
+- Record it, so that the merged batch carries it: the attempt's marker and a store event of kind `post_run_health` always keep the reading the post-run check noted, but the record is your executor's, written before that check, and it holds the reading only if your executor takes it. The sandbox's collected `metadata.json`, and the run facts in it, are not in a merged batch (a file in a run directory that is neither a record nor a declared side file makes the merge refuse the shard). The way that is: an instrument, whose snapshot is in `record.instruments`, which is replayed, hashed and packaged with the record. `healthreading.PostRunHealth(platform_health)` is one: list it AFTER your fault injector so that it finishes inside the injection, before the restore (instruments finish in the reverse of their list order), and judge from `target_only(reading_in_instruments(record.instruments))`. If your injector instead restores when its own session closes, before your executor runs `finish_instruments`, a bare `PostRunHealth` reads after the restore (the target is back, nothing is held, and the reading says nothing of the outage): call `take()` on it ONCE inside the injection, after the agent loop and before you collect and the session closes. It makes the one call then, and `finish` returns that snapshot unchanged. A second `take` raises; a `take` whose check raised is recorded by `finish` as a failed finish (unknown), never replaced by a fresh reading; with no `take` nothing changes. To make your own verdict inside the session, after `take` and before the instruments finish, read the read-only property `taken`: a deep copy of the kept snapshot (so changing it never changes what `finish` returns), without consuming it, and None before `take`, after `start` or `finish`, and when the take's check raised. Give each run its own instance, or let `start` clear the one an earlier run left. Run your injection inside the attempt's context, as the core's injector does, so that its journal entry names the attempt: an entry with no attempt as its owner is never explained and stays unsettled. Inside an injection the full check can run its link check against the provider you took down when Onezone still shows it online; that call fails and raises the federation's link epoch, and the reading it made first stays valid.
 
 ### Tools outside a campaign: hold the federation shared
 
@@ -1997,6 +2057,39 @@ else:
 A class that wraps an instrument passes both methods on, or it drops them without a word. The core finds `at_first_turn` and `check` by name on the object it is given, so a wrapper that forwards `start` and `finish` only hides the wrapped instrument's refusal, and the attempt is scored. `expcore.records.instruments.OPTIONAL_HOOKS` lists the names, and `missing_hooks(wrapper, wrapped)` returns the ones a wrapper lacks, so a test of your wrapper can assert `missing_hooks(wrapper, wrapped) == ()` ([the wrapper rule](interfaces.md#a-class-that-wraps-an-instrument)).
 
 [`interfaces.md`](interfaces.md#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check) says when each runs, what it may do and how a failure is classified.
+
+### An instrument whose start fails: say why
+
+If your instrument verifies something in `start` (a state inducer that checks the start state it induced) and it does not hold, raise an `InfraError` of a kind no condition declares as its treatment, as for any refusal, and give it what you checked and what you saw (C40):
+
+```python
+from expcore.errors import InfraError
+
+
+class StateInducer:
+    namespace = "state_inducer"
+
+    def start(self, identity):
+        seen = self.read_state()
+        if seen != self.wanted:
+            raise InfraError(
+                "sandbox",
+                "the start state was not reached",
+                diagnostic={"checked": "the replica count", "seen": seen, "wanted": self.wanted},
+            )
+```
+
+`start_instruments` names your instrument on the error it lets through, and the attempt that is set aside and run again keeps the snapshot `{"phase": "start", "instrument": ..., "diagnostic": ...}` on its row and in its marker, redacted as an instrument's snapshot is. **Your executor must call `request.declare_secrets(...)` first thing, before it starts any instrument, or the diagnostic is not shown.** Call it with the secrets your executor mints or reads from a file, if it has any, and with no argument if it has none beyond the environment's, the models' keys and the registry:
+
+```python
+async def __call__(self, request):
+    request.declare_secrets()  # no secret beyond the environment's: a failed start's diagnostic is shown
+    instruments = [StateInducer()]
+    await asyncio.to_thread(start_instruments, instruments, identity)
+    record = await record_run(request, providers, system, user, config, code=code)
+```
+
+`record_run` runs after the start, so a secret named only to `record_run(secrets=...)` is not known when the start fails, and the core never shows a diagnostic redacted against a partial list of the run's secrets. An executor that does not declare has the diagnostic of its failed start **withheld**: the row and the marker keep a stub that says so and why, `export.json` and the report show only that stub, never the text, and the report counts the attempt under "Withheld" with no instrument named. The text is written to the campaign's local log, `out/logs/harness-errors.log`, which no merge or package carries; a store, its snapshot and the markers are packaged, so the text is not kept there. Declaring says "this is every secret the run has": one you name to `record_run` afterwards, and the text of a log the HPC shard driver archives with the shard's `out/`, are not covered. The example studies declare, so their diagnostics show. `record_run` merges what you declared, so you need not pass it again. The export lists every shown attempt (`attempt_diagnostics`, with its run, condition, kind and whether it was charged) and the report counts them per condition, instrument and kind under "Instrument start failures", with a row of zeros for a condition that had none, so you can count induction failures per condition and read each one. Keep the diagnostic a plain JSON object of at most 16 KiB; one that is not, or whose redaction fails, is recorded as `{"ok": false, "error": ...}` and costs the attempt nothing. Nothing about the run record changes, since an attempt that raised from `start` has none. If your instrument is wrapped by another class, the wrapper needs nothing: the error is the instrument's own.
 
 ### Data that arrives during a run
 

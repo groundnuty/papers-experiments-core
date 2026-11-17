@@ -374,6 +374,16 @@ def isolated(argv) -> list:
     return list(argv)
 
 
+# What `squeue` lists with no `-t` (Slurm's `_filter_job`, read on master and on 23.02): a job whose base state is
+# pending, running or suspended, or that is staging out or completing, whatever flag it carries, so a running job with
+# a signal pending (SIGNALING), a stop sent (STOPPED), configuring or resizing is listed too. Its manual says only
+# "pending, running, and completing", which is less than it does. An explicit `-t` matches a base state by equality
+# with the whole state, flags included, so a list of base names hides those flagged jobs: the guard's read therefore
+# names no state.
+DEFAULT_STATES = {"PENDING", "RUNNING", "SUSPENDED", "STAGE_OUT", "COMPLETING", "CONFIGURING", "RESIZING", "STOPPED",
+                  "SIGNALING"}  # fmt: skip
+
+
 @dataclass
 class OtherJob:
     """A live job of the account that is none of one fake's own: another federation's held job, or a job of no
@@ -470,9 +480,9 @@ class FakeSlurm:
         self.calls.append(argv)
         tool = argv[0]
         if tool == "squeue" and "--me" in argv:  # the account's live jobs: ids, names, states and node lists only
-            assert argv == ["squeue", "--me", "-h", "-o", "%i %j %T %N"], f"the read is not read-only as agreed: {argv}"
+            assert argv == ["squeue", "--me", "-h", "--all", "-o", "%i %j %T %N"], f"the read is not as agreed: {argv}"
             self.me_reads += 1
-            listed = self.me_rows()
+            listed = [row for row in self.me_rows() if row.split()[2] in DEFAULT_STATES]  # as squeue lists by default
             answer = self.on_me(self.me_reads, listed) if self.on_me is not None else None
             return answer or Completed(0, "".join(f"{row}\n" for row in listed), "")
         if tool == "sbatch":
@@ -621,7 +631,8 @@ class FakeSlurm:
         return rows
 
     def me_rows(self) -> list:
-        """Every row `squeue --me` lists now: this fake's own jobs, its peers', and the account's other jobs."""
+        """Every row `squeue --me` lists now, whatever its state: this fake's own jobs, its peers', and the account's
+        other jobs (`run` keeps the states `squeue` was asked for, as squeue does)."""
         if self.others_by_read:
             others = self.others_by_read[min(self.me_reads, len(self.others_by_read)) - 1]
         else:

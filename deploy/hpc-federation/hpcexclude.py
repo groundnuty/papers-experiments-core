@@ -12,8 +12,8 @@ and memory, so nothing else keeps them apart. `up` therefore reads the account's
 
 The prefix is every held job's: `hpcop-<project>-<random>`, the agent's own job under "separate" with `-sandbox`
 after it, and the older bundle's batch scripts (`hpcop-zone`, `hpcop-provider`). A job is read whole, so another
-federation's agent's node is one of its nodes too. Every message here and in its callers names a role or a count,
-never a node, and never says what squeue said.
+federation's agent's node is one of its nodes too. Every message here and in its callers names a role, a count
+or a job's own name, never a node, and never says what squeue said.
 """
 
 import re
@@ -22,7 +22,22 @@ from typing import Dict, Iterable, List, NamedTuple, Sequence, Set, Tuple
 from hpcslurm import JOB_LISTED, Slurm, SlurmError
 
 JOB_PREFIX = "hpcop-"
-LIVE = ["squeue", "--me", "-h", "-o", "%i %j %T %N"]  # id, name, state, node list: nothing else of a job is read
+# The read names no state (`-t`): squeue's own default lists every job that holds a node, a suspended one, one staging
+# out, and a running one with a stop or a signal pending among them (Slurm's `_filter_job`, read on master and on 23.02;
+# its manual says only "pending, running, and completing", which is less than the code does). An explicit list of the
+# base state names is narrower than that default, since a base name matches a job's whole state, flags included: it
+# would hide a running job that has been sent a stop or a signal. A login shell's `SQUEUE_STATES` cannot narrow the
+# default either: `hpcslurm.Runner` runs the call with no `SQUEUE_*` variable.
+# `--all`: in every partition, a hidden one included, whatever the environment says (`SQUEUE_ALL` is what a site that
+# hides its partition would otherwise rely on); it only widens what the guard sees
+LIVE = [
+    "squeue",
+    "--me",
+    "-h",
+    "--all",
+    "-o",
+    "%i %j %T %N",
+]  # id, name, state, node list: nothing else of a job is read
 STATE = re.compile(r"[A-Z_]{2,32}")
 LENIENT = ("PENDING", "COMPLETING")  # states whose node list may be none: not yet placed, or all returned to service
 NODE_LIST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._,\[\]-]{0,4095}")  # a compressed host list: `node[01-03],node07`
@@ -57,18 +72,19 @@ def live_jobs(slurm: Slurm) -> List[LiveJob]:
         listed = JOB_LISTED.fullmatch(words[0])
         if listed is None or not 3 <= len(words) <= 4 or not STATE.fullmatch(words[2]):
             raise SlurmError("a line of a live federation job is not '<id> <name> <state> [<nodes>]'")
-        nodes = _nodes(slurm, words[2], words[3] if len(words) == 4 else "")
+        nodes = _nodes(slurm, words[1], words[2], words[3] if len(words) == 4 else "")
         held = found.setdefault(listed.group(1), (words[1], set()))[1]
         held.update(nodes)
     return [LiveJob(job, name, tuple(sorted(held))) for job, (name, held) in found.items()]
 
 
-def _nodes(slurm: Slurm, state: str, listed: str) -> List[str]:
-    """The nodes of one row. A job that runs (or is configuring) holds nodes, so a row without a list that can be
-    expanded refuses. A pending job's list, if it has one that can be expanded, is kept (the scheduler may have set its
-    nodes aside), and its list that is none (`(null)`, empty) is no node; so is a completing job's empty list, since
-    squeue lists only the nodes not yet returned to service and a job right after a `down` may have none left. A
-    completing job's list that is there and cannot be read refuses."""
+def _nodes(slurm: Slurm, name: str, state: str, listed: str) -> List[str]:
+    """The nodes of one row (`name`: the job's own, which a refusal names). A job that runs (or is configuring) holds
+    nodes, so a row without a list that can be expanded refuses. A pending job's list, if it has one that can be
+    expanded, is kept (the scheduler may have set its nodes aside), and its list that is none (`(null)`, empty) is no
+    node; so is a completing job's empty list, since squeue lists only the nodes not yet returned to service and a job
+    right after a `down` may have none left. A list that is there and cannot be expanded refuses, for a pending job
+    as for any other: the nodes the scheduler set aside for it are nodes the read could not exclude."""
     leniently = state in LENIENT
     if NODE_LIST.fullmatch(listed) is None:
         if leniently and (state != "COMPLETING" or not listed):
@@ -77,9 +93,7 @@ def _nodes(slurm: Slurm, state: str, listed: str) -> List[str]:
     try:
         return slurm.hostnames(listed)
     except SlurmError:
-        if state == "PENDING":
-            return []
-        raise SlurmError("the node list of a live federation job could not be expanded") from None
+        raise SlurmError(f"the node list of live federation job {name} could not be expanded") from None
 
 
 def nodes_of(jobs: Iterable[LiveJob], own: Sequence[str] = ()) -> List[str]:

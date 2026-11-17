@@ -199,7 +199,7 @@ against `tests/fake_couchbase.py`, a loopback stand-in with Couchbase 4.5's acce
 A federation's services run with no network namespace and the guard watches Couchbase's fixed port 8091, so two
 federations of one account on one node would make the second one's Couchbase fail on its bind and its `up` fail
 (issue 398). Slurm packs jobs onto a node by cores and memory and keeps nothing apart, so `up` keeps them apart itself,
-with two read-only reads of the account's live jobs (`squeue --me`: ids, names, states and node lists, nothing else).
+with two read-only reads of the account's live jobs (`squeue --me --all`, with squeue's own default states, a suspended job included, and run with no `SQUEUE_*` (but `SQUEUE_ALL`) and no output-format variable of the login shell: ids, names, states and node lists, nothing else).
 A job whose name starts with `hpcop-` is a federation's: a held job (`hpcop-<project>-<random>`), an agent's own job
 (`...-sandbox`) and the bundle's own batch scripts (`hpcop-zone`, `hpcop-provider`). A job of any other name is none of
 its business, whatever it runs. It never reads or prints a node's name into a message: only roles and counts.
@@ -672,7 +672,7 @@ section 3).
   anything, naming the slot, and the render refuses the slot on a root with no map, or a map on a template with no
   slot. A study's own HPC template needs the line.
 - **The data each space holds** (C06, O63, O57): every template's `[[spaces]]` entry names its `data_manifest`. A shared import's is the manifest its layout names; a baseline space's is written by `up` into `<root>/data-manifests/` from its baseline, the same for every federation of a layout; an ingested space's is the one it declares (below). Before the link check `up` reads every baseline space back through its owner (directories, sizes, bytes; a shared import by `verify_imports`) and fails, naming the space, when it is not exactly its manifest. So shards on two federations of one layout record one campaign fingerprint (each space by its declared identity and its data, never its Onezone id), and `shards.py plan` refuses federations whose platform files leave a space's data undeclared.
-- **An ingested space** is one whose data is the study's own, put there after `up`: `baseline = false`, no `import`, and its `@data_manifest.<space>@` named by the template (a probe space, which nothing names, is not one). Its baseline is empty, so a manifest made from that would fingerprint two federations that ingested different bytes alike; it **declares its manifest** instead, `data_manifest = "@study_artifacts@/manifests/<space>.json"` (or an absolute path) on the space in the layout, and `up` renders that path for the space. The file is in the core's import-manifest format (`expcore_onedata.importmanifest`: `{"version": 1, "files": [{"path", "size", "sha256"}, ...], "directories": [...]}`, files and directories sorted by path, every parent directory listed; `manifest_of_tree` makes one from a local copy of the data); `PlatformConfig.fingerprint()` takes `Manifest.digest()`, the SHA-256 of its canonical JSON, as for any `data_manifest`. A space that declares none is held to the empty manifest, so ingested bytes fail the check below; a template that writes a `data_manifest` path of its own is refused at `up`, since only the manifests `up` renders are checked. `up` checks it neither way (the space holds nothing yet) and prints which spaces await the check. **The order is `up`, the study's ingest, `verify-data`, `shards.py plan`:** `hpcfed.py verify-data` reads each ingested space back through its owner, compares every file's path, size and SHA-256 and every directory with the manifest, and exits 1, naming the space and how many files differ, on any difference; on a pass it records, in the state file (`data.ingested.<space>.verified`), a marker bound to the manifest's digest. `shards.py plan` and `lines` refuse a federation whose ingested spaces have no marker, whose marker is for another manifest than `up` recorded or the platform file names now, or whose state predates the record. A later ingest needs another `verify-data`: nothing watches the space after it. `verify-data` runs on the login node (it reaches the services' 8443 from there, as `core = "login"` does).
+- **An ingested space** is one whose data is the study's own, put there after `up`: `baseline = false`, no `import`, and its `@data_manifest.<space>@` named by the template (a probe space, which nothing names, is not one). Its baseline is empty, so a manifest made from that would fingerprint two federations that ingested different bytes alike; it **declares its manifest** instead, `data_manifest = "@study_artifacts@/manifests/<space>.json"` (or an absolute path) on the space in the layout, and `up` renders that path for the space. The file is in the core's import-manifest format (`expcore_onedata.importmanifest`: `{"version": 1, "files": [{"path", "size", "sha256"}, ...], "directories": [...]}`, files and directories sorted by path, every parent directory listed; `manifest_of_tree` makes one from a local copy of the data); `PlatformConfig.fingerprint()` takes `Manifest.digest()`, the SHA-256 of its canonical JSON, as for any `data_manifest`. A space that declares none is held to the empty manifest, so ingested bytes fail the check below; a template that writes a `data_manifest` path of its own is refused at `up`, since only the manifests `up` renders are checked. `up` checks it neither way (the space holds nothing yet) and prints which spaces await the check. **The order is `up`, the study's ingest, `verify-data`, `shards.py plan`:** `hpcfed.py verify-data` reads each ingested space back through its owner, compares every file's path, size and SHA-256 and every directory with the manifest, and exits 1, naming the space and how many files differ, on any difference; on a pass it records, in the state file (`data.ingested.<space>.verified`), a marker bound to the manifest's digest. `shards.py plan` and `lines` refuse a federation whose ingested spaces have no marker, whose marker is for another manifest than `up` recorded or the platform file names now, or whose state predates the record. A later ingest needs another `verify-data`: nothing watches the space after it. `verify-data` runs on the login node (it reaches the services' 8443 from there, as `core = "login"` does). The marker `verify-data` leaves is bound to the space it read by its Onezone ID (`data.ingested.<space>.space_id`, recorded by `up`): a space deleted and made again by name after the pass (a rerun of the core's phase makes it, empty, under a new ID) loses its marker, keeps the federation `bootstrapped`, and is refused by `shards.py plan`; `down` and `up` again make the federation whose data is verified anew.
 - **The render identity** (O74, `hpcidentity.py`): once `platform.toml` is rendered, `up` writes
   `<root>/render-identity.json` (mode 0600, canonical JSON, sorted keys), which holds hashes and a version and nothing
   else: `version` (`expcore-render-identity/1`), `template_sha256` (the template as the renderer read it, before it was
@@ -877,7 +877,7 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 | `<label>.out.tar` | the shard's `out/`, which the merge reads | the results |
 | `<label>.out.json` | the archive's manifest (its SHA-256, the exit status, the post-run record) | what the archive is |
 | `<label>/journals/*` (every file) | a spend journal per step (`expcore run --spend-journal`) | what a step killed outright spent, which `--resume` counts as `lost_in_kill`: nowhere else |
-| `<label>.root.tar` | the federation's **root evidence**: the state (`hpc-federation.json`), `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml`, `shard-claim.json` and `shard-claim.lock` (the study's pre-step guard: who held the root), `data-manifests/*.json` (what each space's data identity was made from), `shard-steps/*.json` (which steps ran), the **whole `fault-journal/` directory** (its journals, the holder and drain records, the lock files, read as they are and never locked) and the fault relay's `late-steps.jsonl` and request, taken and answer files (those present). **An allow-list: never `secrets/`, a file holding a token, key or password, the CA, or the relay's heartbeat and lock** | what `down` removes with the root, and the study's post-check and the facts read: nowhere else once the root is gone |
+| `<label>.root.tar` | the federation's **root evidence**: the state (`hpc-federation.json`), `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml`, `ingest-evidence.json` (a study's `ingest run --out <root>/ingest-evidence.json`: the id map the study reads back), `shard-claim.json` and `shard-claim.lock` (the study's pre-step guard: who held the root), `data-manifests/*.json` (what each space's data identity was made from), `shard-steps/*.json` (which steps ran), the **whole `fault-journal/` directory** (its journals, the holder and drain records, the lock files, read as they are and never locked) and the fault relay's `late-steps.jsonl` and request, taken and answer files (those present). **An allow-list: never `secrets/`, a file holding a token, key or password, the CA, or the relay's heartbeat and lock** | what `down` removes with the root, and the study's post-check and the facts read: nowhere else once the root is gone |
 | `<label>.root.json` | the root archive's manifest (its SHA-256 and size, and each file's name, size and SHA-256) | what the root archive is |
 | `<label>/pass-env.json`, **when there is one** | the shard's first-step `pass_env` names and values (a site path of the study's artifacts) | what the first step was given, which the archive's `out/` does not hold |
 | `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one, and `collect --run` refuses |
@@ -886,7 +886,12 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 shards are not final (see "Moving a shard" under the fleet); it writes no `archives.sha256.json`, so a full collect lists
 the archives later (a root archive whose federation the shard has left is put aside under `<label>.<12 hex digits>.root.*`
 and listed too; a full collect refuses, naming the file, an archive put aside with no manifest beside it, which cannot be
-verified). The archives are mode 0600. **Each shard has a federation root of its own:** the manifest is refused at load when
+verified). The archives are mode 0600. `collect` reads `<label>.out.tar` and `<label>.out.json` as regular files and
+never through a link, as it reads every journal, `pass-env.json` and snapshot file: a link in their place refuses the
+collect, naming the shard, since a pull that keeps links could not reproduce it. It makes the manifest durable (a sync of
+the results directory) before it marks any root: an I/O error from that sync refuses the collect (exit 2, `--into` as it
+was found, no marker, so `down` still refuses), while a filesystem that says it cannot sync a directory (`EINVAL`,
+`ENOTSUP`) is left as it always was. **Each shard has a federation root of its own:** the manifest is refused at load when
 two shards' roots are one directory (told by the path they resolve to), naming both labels, since the two would share one
 `down` gate, so `collect --roots-only` for one would unlock it for both and the full collect would then refuse for ever.
 
@@ -910,7 +915,13 @@ with a warning: the shards' own archives are not part of this form.
 
 `DIR` must be new, or empty and private (0700), and may never be the root, inside it (`down` removes the root with whatever
 is in it) or above it; a link is refused. **A copy is never replaced.** The same command run again while the evidence is
-unchanged and `DIR` holds its copy says so, exits 0 and rewrites nothing. If a journal line was written after the collect (a
+unchanged and `DIR` holds its copy says so, exits 0 and rewrites nothing; it says so only for a copy that is whole: the
+archive is the one the root's marker names, and the archive and its manifest are one another's (the check `collect`'s
+root archives get, `hpcevidence.verified_pair`), so a manifest swapped for one that does not name that archive (its hash,
+its size and exactly the files it holds) with its line in `archives.sha256.json` updated to match is refused, naming it,
+and no hash is printed (the manifest's `root_id` and `up_id` are not compared). The directory syncs that come before the
+marker (`DIR`'s entries and its parent's) fail the collect on an I/O error too, as for a marker that cannot be written:
+exit 2, this collect writes no marker (an earlier one stays) and the copy is kept, so collect into a new directory. If a journal line was written after the collect (a
 relay verb's late-step watch, or another verb), `down` refuses the root as changed, and the evidence is collected again into
 a **new** directory, which is then the copy to pull; the first directory stays as it was. A root that is not there, is a link
 (never followed), is not a directory or holds no `hpc-federation.json` as a plain file is refused with nothing made.
@@ -942,7 +953,7 @@ its federation's root when a step starts (the shard's spec and a count; a step t
 SHA-256 of each archived file. `hpcfed.py down` reads the root first, before it stops or cancels anything. What counts as
 evidence is what a run, a step or the operator leaves: **any step record, a file of `fault-journal/` with a line in it
 (at any depth), a file of the relay's journals (`late-steps.jsonl`, a request, a taken request, an answer) that is not
-empty, `shard-claim.json` (or its lock) that is not empty, and the pilot's `day0-wiring.toml`**; so a root that only ran
+empty, `shard-claim.json` (or its lock) that is not empty, the pilot's `day0-wiring.toml` and the study's `ingest-evidence.json`** (a non-empty one: what its `ingest run --out <root>/ingest-evidence.json` wrote); so a root that only ran
 Day-0 measurements, with no shard step, is refused too. An empty file (the injector's lock files, say) is no evidence, and
 a link or a special file where the journal is counts, since it proves no absence, and so does a file with a line in it at any depth (a tree nested past the archive's bound, or with an odd name, counts for what it holds). **What `up` alone
 writes does not count:** the state, `platform.toml`, `facts.json`, `render-identity.json`, the data manifests and the link
@@ -971,7 +982,9 @@ rewritten while the federation runs (by state updates, and by each link check), 
 it in the state (`evidence_rewritten_after_collect`: the time in UTC, the shards, the names); the copy `collect` took
 stays what the post-check reads, so no second archive is made. A link check a step makes also appends to the fault
 journal's holds, so a step still running after the collect is refused through the journal all the same.
-`pass-env.json` is in the results, not in the root: `verify-copy` checks it. A root that holds no evidence a run left
+The marker names each archived file by its path in the root, and takes every path the archive can hold: up to
+`MAX_DEPTH` (4) directories below a tree and names of at most 200 plain characters, the longest being 1,018 characters
+of the fault journal's. `pass-env.json` is in the results, not in the root: `verify-copy` checks it. A root that holds no evidence a run left
 (an NFS silly-rename file, a removed file still held open, is none: a `down` run again after a removal cut short finds only
 these) goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
 down's output then says which shards' evidence (or which kinds, for a root with no step record) was discarded, and **every
@@ -1002,8 +1015,9 @@ installed: take `shards.py` from a checkout. It exits 0 only when the manifest i
 the directory, as a regular file under plain directories, with its size and SHA-256. It exits 1 naming each file that is
 missing, not a regular file, cut short or changed (name and reason, never a path), and 2 for a manifest it cannot use,
 among them a manifest with no list of the files beside the archives (an earlier tip's: it checked the archives alone).
-A file in the directory that the manifest does not name (an `*.out.tar` or `*.out.json`, or a journal in a shard's
-`journals/`: a step that ran after `collect`) is a warning. **Do not run `down` until it exits 0**: `down` cannot see
+A file in the directory that the manifest does not name (an `*.out.tar` or `*.out.json`, or a journal in the `journals/`
+of any shard whose archive it names, whether or not the shard had a journal then: a step that ran after `collect`) is a
+warning. **Do not run `down` until it exits 0**: `down` cannot see
 your host and does not check that you did.
 
 > **The core on the shared filesystem is a git checkout, or a wheel built with its build identity (C06).** The core
@@ -1036,7 +1050,9 @@ federation's `platform.toml` beside it, as the step places it, and the manifest'
 step is: see `pass_env`, below; `shardresume.check_one_campaign`), and print nothing unless they are all one. A refusal names each shard that differs from the largest group of equal shards by its label and
 the first differing top-level key of the fingerprint (`platform` for a setting of the platform file, the usual one),
 never a host, a path or a value, so the fix is to compare those federations' files; a federation whose `platform.toml`
-cannot be read, or whose fingerprint cannot be taken, is refused by its label too, with the program's status and none
+cannot be read, or whose fingerprint cannot be taken, is refused by its label too (so is a study that holds a
+`platform.toml` of its own, a file or a link, as `step` refuses it: the copy is given the federation's by a write that
+would follow a link to its target), with the program's status and none
 of its output. It costs one start of the manifest's Python per shard.
 
 **What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the
@@ -1194,9 +1210,15 @@ launched through `shards.py` is refused. The manifest declares such variables by
 
     pass_env = ["FAULT_ACK_MODE"]   # an invented name; each once; the value is the operator's, read when `lines` runs
 
-A name matches `^[A-Z][A-Z0-9_]{0,63}$`, contains none of KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL or AUTH
+A name matches `^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$` (words of letters and digits joined by single underscores, none
+leading, trailing or doubled) and is at most 64 characters, contains none of KEY, TOKEN, SECRET, PASSWORD, PASSWD,
+CREDENTIAL or AUTH
 (any case, anywhere in it) and is none the step sets itself: the allowlist's, `HOME`, `TMPDIR`, the XDG, Apptainer, uv,
-pip and git variables of its own home, anything starting `EXPCORE_` or `PYTHON`. `plan` and `lines` read each value
+pip and git variables of its own home, anything starting `EXPCORE_` or `PYTHON`; and none that changes how a program
+is loaded or started: anything starting `LD_`, `DYLD_`, `PERL5`, `RUBY` or `NODE_` (the loader's and the interpreters'
+options and paths), `GLIBC_TUNABLES`, `BASH_ENV`, `ENV`, `IFS`, `PS4`, `SHELLOPTS`, `PROMPT_COMMAND` (the shell's),
+`GCONV_PATH`, `LOCPATH` and `NLSPATH` (a library named by `LD_PRELOAD` runs before Python starts, so before the step's
+own checks, and the step's `env -i` words would carry it there). `plan` and `lines` read each value
 from the environment they run in before any line is printed (`resume-line` the same, before it records its node); a
 variable that is unset, or whose value is neither a plain word (`^[A-Za-z0-9._:=,+-]{0,128}$`, but not `.` or `..`) nor
 an absolute path (`^/[A-Za-z0-9._/-]{1,1024}$`, such as `/srv/example/artifacts/tree`, with no `..` or `.` part and no
@@ -1230,7 +1252,9 @@ study's own refusal stops the run.
 
 **One value for a shard's whole life (O63).** The first step of a shard that passes variables records each name and
 value once, in `<results>/<label>/pass-env.json` (whole, mode 0600, once it holds the shard's running mark; nothing is
-written when it passes none). Every later step is compared with that record before anything is made or launched, so a
+written when it passes none, and never more than 65,536 bytes, which is what its reader takes: a step whose variables
+would make a longer record is refused, naming the limit, before its dispatcher starts). Every later step is compared
+with that record before anything is made or launched, so a
 resume or a later fleet step cannot carry a value its shard's first step did not have:
 
 - `step` does it as its first act, `--resume` or not (a first step killed before its first snapshot leaves this record
@@ -1244,8 +1268,15 @@ carries are each refused, naming the variable and never either value. A record t
 shard's, holds a name or a value a variable may not carry, is too long or is a link is refused too, never taken for
 none, so emptying it does not lift the rule. A shard with no record and no results (an archive or a snapshot) has had
 no first step: nothing is compared, and a step that passes variables records them. A shard with results and no record
-had a first step that passed nothing, so a step that now passes a declared variable adds one mid-shard, which is a
-change of value, and is refused the same way, naming the variable. Nothing here removes the record: a shard that has
+either had a first step that passed nothing or has lost the record (deleting `pass-env.json` is no way round the rule):
+its latest archive's manifest, which holds each name and value its step passed, says which, and a later step is compared
+with what it records (a step that now passes a declared variable the manifest does not hold adds one mid-shard, one that
+drops a recorded variable or gives another value is refused likewise, each naming the variable and never a value). A
+step that matches the manifest continues and writes the record again. A manifest that is there and cannot be read as
+the shard's (not JSON, another shard's, a link, a name or a value a variable may not carry) is never taken for "nothing
+was passed": it refuses a step that declares nothing, naming the manifest (a step that declares variables is refused for
+adding them, naming them). A shard with no manifest has nothing to say what its first step passed: a snapshot alone, or
+a first archive killed after its tar was written and before its manifest, which resumes from its snapshots as before. Nothing here removes the record: a shard that has
 made nothing and must start over with other values has it removed by hand, which is the operator's call.
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
@@ -1297,6 +1328,7 @@ F=<an absolute path, not there yet, on the filesystem the login node and the nod
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" --layout deploy/hpc-federation/layouts/pilot-shape-separate.toml up 4
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" plan --manifest <shard settings>
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step-stop --shard <shard-k>   # a stuck shard, below
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" status
 uv run python -I deploy/hpc-federation/shards.py collect --manifest "$F/shards.toml" --into <a new directory> --run
 # REQUIRED before down: pull the manifest's `results` directory (archives, journals and the rest, as listed in the
@@ -1366,7 +1398,12 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   `up` gave it (Slurm reuses ids). A shard is not launched again while its
   client runs; one whose step ended is relaunched only with `--shard L --resume`. A shard refused exits 1. A site that
   needs `HPC_STEP_NETWORK` gives it to each federation's own steps (`hpcfed`); a shard's step, on the agent's own job of
-  one component, carries none.
+  one component, carries none. **A step that resumes and finds its shard's running mark** (`<results>/<label>/running.json`,
+  left by a step killed outright) carries the mark's nonce as `--over`, exactly as `shards.py resume-line` builds it
+  (`fleetstuck.over_proof`, which reuses `shardresume.check_no_live_step`): only after no step of yours carries the
+  shard's step name and the step the mark names is no longer listed, in its job or anywhere (asked through every
+  federation that held or ran the shard). A shard whose holder still runs, or whose mark cannot be read as its own, is
+  refused with the reason and launched nowhere (the others are launched); a shard with no mark carries no `--over`.
 - **`status` and the first lines of `plan` say each federation's state in plain words**, by its label (`fed-k`),
   never a host: `up and ready` (linked, its relay serving), `up with no relay`, ``failed, still HOLDING 2 job(s): it
   bills until `fleet.py down --member fed-k` `` (the count is the distinct job ids its state file and the fleet's record
@@ -1384,6 +1421,35 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   checked), with the fleet's fingerprint, and only when its `platform.toml` leaves `[placement] reset_shortcut` off, so
   every reset there, the shard's first included, takes the full reads; `step` then starts it with `--resume` from its
   snapshots or archive. A federation that ran a shard is never given another.
+- **A stuck shard (`step-stop`).** A step that hangs on its federation (its client alive, its step listed, nothing
+  more written) moves to a spare through the fleet alone, in this order:
+  1. `fleet.py --fleet "$F" step-stop --shard L` ends the step the fleet launched for L, by the ids the fleet recorded
+     for it and nothing else: the srun client by its recorded pid and start tick (SIGTERM, then SIGKILL, each only
+     while the pid is still that process), and the Slurm step by its exact `<job>.<n>` id, found under the job the
+     federation's state names by the one step name the fleet gave it and cancelled through the federation's launcher,
+     which refuses a step of any other job. It never cancels by name or user, and it signals and cancels nothing when
+     the shard is not held by a federation of this fleet whose root and state are the ones its `up` made, when the
+     job's id now names another job (Slurm reuses ids), or when **the recorded pid holds another process now** (the
+     client ended and the pid was reused: the whole stop is refused, and the step is yours to look at with `squeue`).
+     **A step is cancelled only while the recorded client is alive, and only when exactly one step carries the
+     name:** the name is not the fleet's alone (a line run by hand, `shards.py lines` or `resume-line`, has the same
+     one), and a live client is what vouches that the step listed is the one it runs. With the client gone and a step
+     of the name listed, or with two of that name, nothing is cancelled and the message names the ids: cancel the stuck
+     one by hand (`scancel <job>.<n>`). With the client gone and no step listed, there is nothing to stop.
+     The stop is written to the fleet's record (`stopped`: the step's id, whether it was cancelled and the client
+     ended) before it acts and again with what happened; `status` then says `its step ended (stopped by step-stop)`.
+     A step that ignores TERM keeps running for Slurm's KillWait after the cancel (182 s on this site): the stop does
+     not wait, and `step --resume` refuses until the step is no longer listed. A step ended from outside leaves its
+     running mark (a step removes it only when it ends by itself, `shards.release_running`).
+  2. Wait until `squeue` no longer lists the step (the stop does not wait out KillWait, and a step still dying may
+     write to the root after `down`'s evidence check, which `down` then removes with the root). Then move the shard as
+     in "Moving a shard": `shards.py collect --roots-only --shard L`, `down --member fed-k`, `add 1`, `plan`.
+  3. `fleet.py --fleet "$F" step --shard L --resume` launches it on the spare with `--resume` and `--over <the mark's
+     nonce>`, which lets the new step take the mark over on another node (`shards.claim_running`), after the proof
+     above. Without a mark, or with a holder that still runs, there is no `--over`: the first never needs one, and the
+     second refuses the shard.
+  A shard that stays on its federation takes the same two commands (`step-stop`, then `step --shard L --resume`), and
+  carries `--over` the same way once its step is gone.
 - **`down`** takes down every federation the fleet made (or `--member` one), each by `hpcfed.py down` (which cancels
   its jobs by id) and each verified: the exit status and its root gone. A root that is not the directory the fleet
   made, or whose state file is another federation's (another job name, an agent's job record not the one its `up`
@@ -1391,7 +1457,9 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   nothing outside the record is ever looked at. The fleet's directory stays with its record, its logs and each root's
   lifecycle lock (hpcfed never removes one); remove it by hand once `status` shows every federation down.
 
-`tests/deploy/test_hpc_fleet.py`, `test_hpc_fleet_plan.py` and `test_hpc_fleet_relay.py` run the fleet over a fake cluster per federation, the
+`tests/deploy/test_hpc_fleet.py`, `test_hpc_fleet_plan.py`, `test_hpc_fleet_relay.py` and `test_hpc_fleet_stuck_shard.py` (a step killed
+outright resumed on a spare with the mark's nonce, a holder that still runs refused, the stop's signals and cancels only the recorded
+pid and step) run the fleet over a fake cluster per federation, the
 core's phase the real one over a bootstrap stand-in: several federations, one failing `up`, the maximum and the inode
 guard refusing before anything is made, a `het` layout refused, the bound on ups at once, `down` of all and of one, a
 federation and a job the fleet did not make left untouched (an agent's job record replaced included), the fingerprint

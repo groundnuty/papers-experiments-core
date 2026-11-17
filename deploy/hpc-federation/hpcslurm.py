@@ -151,6 +151,9 @@ class Client(NamedTuple):
     start: int
 
 
+ALIVE, GONE, ANOTHER = "alive", "gone", "another process"  # what a recorded client is now (`Runner.client_state`)
+
+
 class Process:
     """A running command whose output is kept: wait for it with a bound, read its result, or kill it."""
 
@@ -216,13 +219,40 @@ def clients_of(job: str, proc: str = "/proc") -> List[Client]:
     return found
 
 
+# squeue takes its defaults (the states, names, accounts and partitions it lists) from SQUEUE_* variables, and the
+# form of what Slurm's commands print from a few SLURM_* ones: a login shell that exported one (`SQUEUE_NAMES=x` hides
+# every federation job) would change what a read of the driver answers, and the guards that read the account's jobs
+# would fail open without a word. The commands `Runner.run` runs get an environment without them; every other variable,
+# the site's own SLURM_CONF and SBATCH_* among them, reaches them as it was.
+OUTPUT_FORMAT_VARIABLES = ("SLURM_TIME_FORMAT", "SLURM_BITSTR_LEN")
+WIDENING_VARIABLES = (
+    "SQUEUE_ALL",
+)  # `--all`: jobs of hidden partitions too. It only widens, and a site that hides its
+# partition may rely on it for every squeue read of the driver, so it is the one SQUEUE_* variable that is kept
+
+
+def read_environment(environ: Mapping[str, str]) -> Dict[str, str]:
+    """`environ` without every SQUEUE_* variable that narrows or reshapes what squeue lists (all but `SQUEUE_ALL`) and
+    without Slurm's output-format variables."""
+    return {
+        k: v
+        for k, v in environ.items()
+        if (not k.startswith("SQUEUE_") or k in WIDENING_VARIABLES) and k not in OUTPUT_FORMAT_VARIABLES
+    }
+
+
 class Runner:
     """Runs the commands on the login node. The tests replace it with a fake Slurm."""
 
     def run(self, argv: Sequence[str], timeout: float) -> Completed:
         try:
             done = subprocess.run(
-                list(argv), capture_output=True, timeout=timeout, check=False, stdin=subprocess.DEVNULL
+                list(argv),
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                env=read_environment(os.environ),
             )
         except subprocess.TimeoutExpired:
             raise SlurmError(f"{argv[0]} did not answer in {timeout:.0f} s") from None
@@ -258,8 +288,17 @@ class Runner:
         start = proc_start(popen.pid)
         return Client(popen.pid, start if start is not None else -1)
 
+    def client_state(self, client: Client) -> str:
+        """What the process a client was recorded as is now: `ALIVE` while its pid holds a process of the recorded start
+        tick; `GONE` when no process (or a zombie) holds the pid; `ANOTHER` when one does with another start tick, or
+        when the client's own tick was never read (-1). A pid is never signalled on less than its start tick."""
+        now = proc_start(client.pid)
+        if now is None:
+            return GONE
+        return ALIVE if client.start >= 0 and now == client.start else ANOTHER
+
     def client_alive(self, client: Client) -> bool:
-        return client.start >= 0 and proc_start(client.pid) == client.start
+        return self.client_state(client) == ALIVE
 
     def clients_of(self, job: str) -> List[Client]:
         return clients_of(job)
@@ -662,19 +701,29 @@ class Slurm:
 
     # -- steps --------------------------------------------------------------------------------------------------------
 
-    def steps(self, job: str) -> Dict[str, str]:
-        """The job's steps listed now, as name to step id (the batch and extern steps left out)."""
+    def step_listing(self, job: str) -> List[Tuple[str, str]]:
+        """The job's steps listed now, as (step id, name) in listing order, one for each step (the batch and extern
+        steps left out): Slurm lists as many steps of one name as were started."""
         done = self.runner.run(["squeue", "-s", "-j", job, "-h", "-o", "%i %j"], self.command_timeout_s)
         if done.returncode != 0:
             if "Invalid job id" in done.stderr:
-                return {}
+                return []
             raise SlurmError(f"squeue -s failed with status {done.returncode}: {done.stderr.strip()[:300]}")
-        found = {}
+        found = []
         for line in done.stdout.splitlines():
             match = STEP_LINE.fullmatch(line.strip())
             if match and not match.group(1).endswith((".batch", ".extern")):
-                found[match.group(2)] = match.group(1)
+                found.append((match.group(1), match.group(2)))
         return found
+
+    def steps(self, job: str) -> Dict[str, str]:
+        """The job's steps listed now, as name to step id (the batch and extern steps left out); of two steps of one
+        name the later is kept (`steps_named` lists them all)."""
+        return {name: step_id for step_id, name in self.step_listing(job)}
+
+    def steps_named(self, job: str, name: str) -> List[str]:
+        """The ids of every step of the job listed under `name` now, in listing order."""
+        return [step_id for step_id, listed in self.step_listing(job) if listed == name]
 
     def cancel_step(self, step_id: str) -> None:
         """Cancel one step by the id squeue -s lists it under: `<job>.<n>`, or a component's `<leader>+<k>.<n>`."""

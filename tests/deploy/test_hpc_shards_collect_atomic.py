@@ -4,10 +4,13 @@ check there, and only then moves the trees into `--into`, publishes the root arc
 A refusal anywhere before that leaves `--into` exactly as it was found and writes no manifest, no root archive and no
 marker. Every path and name here is invented."""
 
+import errno
 import hashlib
 import importlib.util
 import io
 import json
+import os
+import stat
 import sys
 import tarfile
 from pathlib import Path
@@ -216,6 +219,70 @@ def test_any_failure_between_the_move_and_the_manifest_puts_into_back_not_only_a
     assert not (plan.results / MANIFEST).exists()
     assert not [s.root for s in plan.shards if (s.root / "evidence-collected.json").exists()]
     assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".collect-")]
+
+
+def _directory_sync_fails(monkeypatch, number: int) -> list[int]:
+    """`os.fsync` fails with `number` for a directory (files are synced as ever: `_write_whole` syncs its drafts)."""
+    real, seen = os.fsync, []
+
+    def fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            seen.append(descriptor)
+            raise OSError(number, os.strerror(number))
+        return real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    return seen
+
+
+@pytest.mark.parametrize("existed", [False, True], ids=["a new into", "an empty into"])
+def test_a_results_directory_that_cannot_be_synced_refuses_the_collect_and_writes_no_marker(
+    shards, tmp_path, monkeypatch, existed
+):
+    """O63 (G9): an I/O error from the sync of the results directory (the manifest's rename not known to be durable)
+    was swallowed, so the collect succeeded, the markers were written and `down` was allowed to remove the only copy
+    of evidence a crash could still lose. It refuses now, naming the error, as a full disk at the manifest does:
+    `--into` as it was found and no marker written."""
+    plan = make_plan(shards, tmp_path)
+    into = tmp_path / "merge"
+    if existed:
+        into.mkdir(mode=0o700)
+    seen = _directory_sync_fails(monkeypatch, errno.EIO)
+    with pytest.raises(shards.ShardsError, match=r"results directory.*EIO"):
+        shards.collect(plan, into)
+    assert seen  # the failure was injected where the collect syncs a directory
+    assert into.is_dir() is existed
+    assert not existed or list(into.iterdir()) == []
+    assert not [s.root for s in plan.shards if (s.root / "evidence-collected.json").exists()]
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".collect-")]
+
+
+def test_the_command_exits_2_and_prints_no_hash_when_the_results_directory_cannot_be_synced(
+    shards, tmp_path, monkeypatch, capsys
+):
+    """O63 (G9): what an operator sees: exit 2, the refusal on stderr, no merge line and no hash to pull against."""
+    make_plan(shards, tmp_path)
+    _directory_sync_fails(monkeypatch, errno.EIO)
+    code = shards.main(["collect", "--manifest", str(plan_file(tmp_path)), "--into", str(tmp_path / "merge")])
+    out, err = capsys.readouterr()
+    assert code == 2
+    assert out == ""
+    assert "results directory" in err
+    assert "sha256" not in err
+    assert not (tmp_path / "merge").exists()
+
+
+@pytest.mark.parametrize("number", [errno.EINVAL, errno.ENOTSUP], ids=["EINVAL", "ENOTSUP"])
+def test_a_filesystem_that_cannot_sync_a_directory_is_still_collected_on(shards, tmp_path, monkeypatch, number):
+    """O63 (G9): only EINVAL and ENOTSUP, what a filesystem says of a directory it cannot sync, are tolerated: the
+    collect completes and the markers are written, as it did before."""
+    plan = make_plan(shards, tmp_path)
+    seen = _directory_sync_fails(monkeypatch, number)
+    outs = shards.collect(plan, tmp_path / "merge")
+    assert seen
+    assert [out.parent.name for out in outs] == ["fed-a", "fed-b"]
+    assert (plan.results / MANIFEST).is_file()
+    assert all((s.root / "evidence-collected.json").is_file() for s in plan.shards)
 
 
 def test_a_marker_that_cannot_be_written_is_a_warning_naming_the_shard_and_the_collect_still_succeeds(

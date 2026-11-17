@@ -69,6 +69,57 @@ def test_o87_the_node_facts_step_and_the_sandbox_read_the_same_machine_alike(nod
     assert nodefacts.readings(**here) == hostfacts.readings(**there)
 
 
+BODY = "ID=rocky\nVERSION_ID=9.4\n"
+
+
+def cut_after(kept: int) -> str:
+    """An os-release longer than the read bound, whose first `kept` bytes of `BODY` fall inside it."""
+    text = "#" * (hostfacts.READ_BYTES - kept - 1) + "\n" + BODY
+    assert len(text.encode()) == hostfacts.READ_BYTES + len(BODY) - kept > hostfacts.READ_BYTES
+    return text
+
+
+@pytest.mark.parametrize(
+    ("kept", "os_read", "reasons"),
+    [
+        (6, {"id": "unknown", "version_id": "unknown"}, {"os.id": "too long", "os.version_id": "no VERSION_ID line"}),
+        (19, {"id": "rocky", "version_id": "unknown"}, {"os.version_id": "too long"}),
+        (23, {"id": "rocky", "version_id": "unknown"}, {"os.version_id": "too long"}),
+    ],
+    ids=["inside ID", "inside the key VERSION_ID", "inside VERSION_ID's value"],
+)
+def test_o87_an_os_release_cut_inside_a_value_is_unknown_in_both_readers_and_never_a_prefix(
+    nodefacts, tmp_path, kept, os_read, reasons
+):
+    """O87 (Codex, 17 Nov 2026): a file longer than the read bound whose cut fell inside the `ID=` line gave the prefix
+    of the value (`roc` for `rocky`) as a verified `os.id`. The bound is read plus one byte, the line it cut is not one
+    that was read, and a key the cut line may have assigned is unknown ("too long"), the same in both readers."""
+    assert nodefacts.READ_BYTES == hostfacts.READ_BYTES
+    found = [reader.readings(**machine(tmp_path, cut_after(kept))) for reader in (nodefacts, hostfacts)]
+    assert found[0] == found[1]
+    assert found[0]["os"] == os_read
+    assert found[0]["unknown"] == reasons
+
+
+def test_o87_a_bound_that_cuts_a_multibyte_character_leaves_the_whole_lines_before_it_readable(nodefacts, tmp_path):
+    """O87: the cut line is dropped whole, so a bound that falls inside a character of a later line (which was `not
+    text`, and so unknown for the wrong reason) leaves `ID` and `VERSION_ID` as the lines before it hold them."""
+    bound = hostfacts.READ_BYTES
+    text = BODY + "#" * (bound - len(BODY) - 2) + "\n" + "\u00e9" * 4  # the first byte of an `é` is the bound's last
+    for reader in (nodefacts, hostfacts):
+        assert reader.readings(**machine(tmp_path, text))["os"] == {"id": "rocky", "version_id": "9.4"}
+
+
+def test_o87_an_os_release_that_ends_exactly_at_the_read_bound_is_read_whole(nodefacts, tmp_path):
+    """O87: the check refuses nothing a file of the bound's size holds: its last byte is the bound's, nothing is cut."""
+    bound = hostfacts.READ_BYTES
+    body = "ID=rocky\nVERSION_ID=9.4\n"
+    text = body + "#" * (bound - len(body) - 1) + "\n"
+    assert len(text.encode()) == bound
+    for reader in (nodefacts, hostfacts):
+        assert reader.readings(**machine(tmp_path, text))["os"] == {"id": "rocky", "version_id": "9.4"}
+
+
 def test_o87_the_node_facts_step_carries_the_three_readings(nodefacts, tmp_path):
     assert nodefacts.readings(**machine(tmp_path, 'ID=invented\nVERSION_ID="9.4"\n')) == {
         "os": {"id": "invented", "version_id": "9.4"},
