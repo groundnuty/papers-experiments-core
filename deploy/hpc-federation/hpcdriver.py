@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import hpcimport
 import hpcpins
+import hpcplacement
 import hpcquota
 import hpcrelay
 import hpcstate
@@ -185,7 +186,11 @@ class Driver(Down):
         if self.settings.core == "step" and not site.core_python:
             raise RuntimeError('[hpc] core = "step" needs HPC_CORE_PYTHON, the core\'s Python on the nodes')
         template = self.spec.platform_template
-        hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None)
+        text = template.read_text(encoding="utf-8") if template is not None else None
+        hpcpins.check(site, text)
+        hpcplacement.check_template(
+            text
+        )  # a template declares [placement] holder (O79), which the core has no default for
         self.check_scratch(site)
         if self.settings.sandbox is not None:
             self.say(
