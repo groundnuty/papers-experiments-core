@@ -143,16 +143,15 @@ def test_o63_a_platform_file_that_cannot_be_read_refuses_naming_the_shard(shards
     assert seen_platforms(tmp_path / "venv") == []
 
 
-def test_o63_lines_refuse_a_federation_whose_platform_file_is_gone_on_a_manifest_of_one_federation(
-    shards, tmp_path, capsys
-):
-    """O63: every shard on one federation, whose platform.toml is gone: the data check (which needs two federations to
-    compare) asks nothing of it, so the fingerprint check is the one that refuses, and prints nothing."""
+def test_o63_lines_refuse_a_manifest_of_one_federation_before_any_check_of_its_files(shards, tmp_path, capsys):
+    """O63: every shard on one federation (one shard per federation), whose platform.toml is gone besides: the
+    manifest is refused at load, naming two labels and no path, and nothing is printed."""
     path = manifest(tmp_path, same_root=True)
     (tmp_path / "fed" / "a" / "platform.toml").unlink()
     code, out, err = run(shards, path, capsys)
     assert (code, out) == (2, "")
-    assert "shard fed-a: its federation's platform.toml could not be read" in err
+    assert "shards fed-a and fed-b have one federation root between them" in err
+    assert str(tmp_path) not in err
 
 
 @pytest.mark.parametrize("failure", ["exits", "is missing"])

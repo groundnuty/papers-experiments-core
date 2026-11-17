@@ -35,8 +35,10 @@ that no module on its path imports what does, directly), and the relay it starts
 `relay.lock` and a heartbeat, which are in no set: so a root after `up` alone, or a failed `up`'s, holds none, and
 `down` removes it as it always did. The marker names the archive's SHA-256, the digest of the step records
 (`steps_digest`) and the SHA-256 of each archived file (`files`), all as they were when the evidence was read;
-`collect --roots-only` writes one from the plan, whatever the root holds, so a Day-0-only root can be marked. `down`
-reads the root's evidence again (`check_collected`) and compares it with the marker file by file.
+`collect --roots-only` writes one whatever the root holds, from a plan (`--shard`) or, for a single federation that ran
+no campaign, from the root itself (`--root R --into DIR`, which needs no plan), so a Day-0-only root, or one that only
+ran stop measurements through the relay, can be marked. `down` reads the root's evidence again (`check_collected`) and
+compares it with the marker file by file.
 
 **Two sets, compared differently.** `STRICT_FILES` and the trees (`STRICT_TREES`) hold what a
 step, the study or `up` writes: the fault journal, the relay's journals (`late-steps.jsonl` and its request, taken and
@@ -755,8 +757,8 @@ class Check:
     (`labels`, none for a root that only ran Day-0 measurements); whether a current marker exists (`marked`); whether
     the evidence can no longer be read or archived (`unreadable`); the names of the strict files that differ from the
     marker's (`changed`); the names of the self-rewritten files that do (`rewritten`: no reason to refuse, named for the
-    record); and the kinds of evidence present (`present`, `KINDS`' order: what the output names when there is no
-    shard to name)."""
+    record); the kinds of evidence present (`present`, `KINDS`' order: what the output names when there is no shard to
+    name); and the SHA-256 of the root archive the marker names (`archive_sha256`; None with no well formed marker)."""
 
     labels: tuple[str, ...]
     marked: bool = True
@@ -764,6 +766,7 @@ class Check:
     changed: tuple[str, ...] = ()
     rewritten: tuple[str, ...] = ()
     present: tuple[str, ...] = ()
+    archive_sha256: str | None = None
 
     @property
     def named(self) -> str:
@@ -792,10 +795,13 @@ def _differing(before: Mapping[str, str], now: Mapping[str, str]) -> tuple[list[
     return strict, rewritten
 
 
-def check_collected(root: Path) -> Check | None:
+def check_collected(root: Path, judge_all: bool = False) -> Check | None:
     """None when the root holds no evidence a run left (or there is no root): `down` has nothing to gate. That is a root
     with no step record and none of the files of `RUN_FILES` and `RUN_TREES` with anything in them (`_present`): one
-    after `up` alone, or a failed `up`'s. Otherwise the `Check` of its evidence against the marker `collect` wrote: no
+    after `up` alone, or a failed `up`'s (with `judge_all`, such a root is judged against its marker all the same: the
+    question whether a marker is current, which `collected_hash` asks). Otherwise the `Check` of its evidence against
+    the
+    marker `collect` wrote: no
     current marker; a strict file (one a step, the study or `up` writes) that is not what the marker's hash names, or a
     root that no longer archives (a link, a file that holds a secret, a required file missing); and, of no consequence,
     the self-rewritten files that changed. Reads below a descriptor of the root, no link followed; a marker without
@@ -809,7 +815,7 @@ def check_collected(root: Path) -> Check | None:
     try:
         entries = _step_entries(fd)
         present = _present(fd, entries)
-        if not present:
+        if not present and not judge_all:
             return None
         labels = tuple(
             ["(its records cannot be read)"]
@@ -826,17 +832,27 @@ def check_collected(root: Path) -> Check | None:
         os.close(fd)
     if marker is None:
         return Check(labels, marked=False, present=present)
+    named = marker["root_archive_sha256"]
     try:
         held = archive_root(root, "")
     except (EvidenceError, OSError):
-        return Check(labels, unreadable=True, present=present)
+        return Check(labels, unreadable=True, present=present, archive_sha256=named)
     if "files" not in marker:
-        whole = steps_moved or held.sha256 != marker["root_archive_sha256"]
-        return Check(labels, changed=("the root archive as a whole",) if whole else (), present=present)
+        whole = steps_moved or held.sha256 != named
+        changed = ("the root archive as a whole",) if whole else ()
+        return Check(labels, changed=changed, present=present, archive_sha256=named)
     strict, rewritten = _differing(marker["files"], held.hashes)
     if steps_moved and not any(name.startswith(f"{STEPS_DIR}/") for name in strict):
         strict.append(f"{STEPS_DIR}/")  # a record that cannot be told by file: unreadable, or not a plain file
-    return Check(labels, changed=tuple(strict), rewritten=tuple(rewritten), present=present)
+    return Check(labels, changed=tuple(strict), rewritten=tuple(rewritten), present=present, archive_sha256=named)
+
+
+def collected_hash(root: Path) -> str | None:
+    """The SHA-256 of the root archive the root's marker names, when the marker is current (no strict file changed since
+    it, no step record added, the evidence still archivable: what `down` would pass), else None: no root, no marker, a
+    marker that cannot be read, or a root changed since. Whatever the root holds, as for `down`'s own comparison."""
+    found = check_collected(root, judge_all=True)
+    return None if found is None or found.refused else found.archive_sha256
 
 
 def uncollected(root: Path) -> tuple[list[str], bool] | None:

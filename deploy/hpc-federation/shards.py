@@ -5,6 +5,7 @@
     <python> -I -B deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
         --results DIR --core-src DIR --job J --step-name S  # inside the step on the sandbox node; `lines` writes it
     <python> -I -B deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
+    <python> -I -B deploy/hpc-federation/shards.py collect --roots-only --root ROOT --into DIR  # one root, no plan
     python3 -I -B deploy/hpc-federation/shards.py verify-copy ARCHIVES_MANIFEST LOCAL_DIR --manifest-sha256 HASH
                                                         # on the operator's host, after the pull, before `down`
     <python> -I -B deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
@@ -271,7 +272,8 @@ The manifest (`shards.toml`, operator-local, never committed, since it names the
     expect_render_identity = "render-identity.expected.json"  # optional: the render a federation must have (see above)
     [[shards]]                        # in order: shard i is the i-th entry
     label = "fed-a"                   # the shard's label (no host name: it travels with the export)
-    root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml
+    root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml; one
+                                      # shard's own: two shards at one root (by the path it resolves to) are refused
     sandbox_node = "..."              # optional when the state file names the sandbox's node
 """
 
@@ -355,9 +357,15 @@ ARCHIVES_FORMAT = "expcore-hpc-archives/1"  # the copy back's manifest: what `co
 ARCHIVES_MANIFEST = "archives.sha256.json"  # in <results>, beside the archives
 PASS_ENV = "pass-env.json"  # <results>/<label>/: the shard's first-step pass_env names and values; PRIVATE evidence
 ROOT_SUFFIXES = (".root.tar", ".root.json")
+# `collect --roots-only --root R --into DIR`: ONE federation's root evidence with no plan. Its copy is `<stem>.root.tar`
+# and `<stem>.root.json` (the suffixes `expcore package` and `verify-copy` already key on) and an `archives.sha256.json`
+# of a form of its own, which lists exactly that pair: the full form's refusal of an empty `archives` list is unchanged.
+ROOT_ARCHIVES_FORMAT = "expcore-hpc-root-archives/1"
+ROOT_ONLY_STEM = "federation"
 ASIDE_NAME = re.compile(
     r"(?P<label>[A-Za-z0-9][A-Za-z0-9-]*)\.[0-9a-f]{12}\.root\.json"
 )  # <results>/<label>: a federation's root evidence and its manifest
+ASIDE_TAR = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*\.[0-9a-f]{12}\.root\.tar")  # the archive beside such a manifest
 # The step's record in its federation's root that `down` reads (`hpcevidence`, the source: this file runs alone on a
 # node and keeps its own copy of the two names; a test compares them).
 STEP_RECORDS = "shard-steps"
@@ -728,6 +736,26 @@ def record_pass_env_origin(results: Path, spec: Mapping[str, Any], passed: Mappi
         draft.unlink(missing_ok=True)
 
 
+def one_root_each(shards: Sequence[Shard]) -> None:
+    """Refuse two shards whose roots are one directory, naming both labels and no path (O63). They would share one
+    federation's `down` gate: `collect --roots-only` for one shard writes the marker `down` reads for both, after which
+    the full collect, which archives the root for each shard, refuses for ever. A root is told by the path it resolves
+    to (a link, a `..` part, a trailing slash); one that cannot be resolved against the file system is told by the path
+    as written."""
+    seen: dict[str, str] = {}
+    for shard in shards:
+        try:
+            where = os.path.realpath(shard.root)
+        except (OSError, ValueError, RuntimeError):
+            where = os.path.normpath(str(shard.root))
+        if where in seen:
+            raise ShardsError(
+                f"shards {seen[where]} and {shard.label} have one federation root between them: "
+                "each shard needs a federation of its own"
+            )
+        seen[where] = shard.label
+
+
 def load_plan(path: Path) -> Plan:
     """Read and check the manifest: every key present, absolute paths, at least two shards, labels by the core's rule
     and each once. The optional `pass_env` names the operator's variables a step passes to its dispatcher (names
@@ -779,6 +807,7 @@ def load_plan(path: Path) -> Plan:
     labels = [s.label for s in shards]
     if len(set(labels)) != len(labels):
         raise ShardsError("a label is given to two shards")
+    one_root_each(shards)
     return Plan(Path(data["study"]), str(data["python"]), Path(data["core_src"]), Path(data["results"]),
                 Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
                 float(every), data.get("pre_step"), None, float(bounds["pre_step"]), data.get("post_run"), None,
@@ -1502,16 +1531,27 @@ def root_archives(plan: Plan) -> list[Any]:
 def root_id_of(shard: Shard) -> str:
     """A hash of the shard's federation's root path, which the root archive's manifest records (no path): the root
     archives of one shard label that were made of two federations (a shard that moved) are told apart by it."""
-    return hashlib.sha256(f"expcore-root-id:{shard.root}".encode()).hexdigest()
+    return root_id_for(shard.root)
+
+
+def root_id_for(root: Path) -> str:
+    return hashlib.sha256(f"expcore-root-id:{root}".encode()).hexdigest()
+
+
+def pair_entries(stem: str, held: Any) -> list[dict[str, Any]]:
+    """A root archive and its manifest, as `<stem>.root.tar` and `<stem>.root.json`: name, size and SHA-256 of the bytes
+    that are written (or, kept, were)."""
+    return [
+        {"name": f"{stem}{suffix}", "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+        for suffix, payload in ((".root.tar", held.tar), (".root.json", held.manifest))
+    ]
 
 
 def root_entries(plan: Plan, archives: Sequence[Any]) -> list[dict[str, Any]]:
     """Each root archive and its manifest as name, size and SHA-256 of the bytes that are written (or, kept, were)."""
-    entries = []
+    entries: list[dict[str, Any]] = []
     for shard, held in zip(plan.shards, archives, strict=True):
-        for suffix, payload in ((".root.tar", held.tar), (".root.json", held.manifest)):
-            entries.append({"name": f"{shard.label}{suffix}", "bytes": len(payload),
-                            "sha256": hashlib.sha256(payload).hexdigest()})  # fmt: skip
+        entries += pair_entries(shard.label, held)
     return entries
 
 
@@ -1622,8 +1662,17 @@ def _set_aside(plan: Plan, shard: Shard, up_id: str) -> None:
 def aside_entries(plan: Plan) -> list[dict[str, Any]]:
     """The root archives an earlier collect put aside (`_set_aside`: `<label>.<12 hex digits>.root.tar` and its
     manifest), each pair shown to be one another's, as name, size and SHA-256, so that `verify-copy` checks what a moved
-    shard's first federation left: `ShardsError` for a pair that is not."""
+    shard's first federation left: `ShardsError` for a pair that is not, and for an archive with no manifest beside it
+    (it cannot be verified, and the listing is made from the manifests)."""
     module, entries = _evidence(), []
+    for path in sorted(plan.results.glob("*.root.tar")):  # one with no manifest beside it is listed by none
+        if ASIDE_TAR.fullmatch(path.name) and not os.path.lexists(
+            path.with_name(path.name.removesuffix(".tar") + ".json")
+        ):
+            raise ShardsError(
+                f"{path.name} is a root archive put aside for a shard that moved with no manifest beside it, so it "
+                "cannot be verified: restore its manifest, or move the archive out of the results directory"
+            )
     for path in sorted(plan.results.glob("*.root.json")):
         found = ASIDE_NAME.fullmatch(path.name)
         if found is None:
@@ -1796,6 +1845,198 @@ def collect_roots(plan: Plan, label: str | None = None) -> list[tuple[str, str]]
     return [(shard.label, held.sha256) for shard, held in zip(chosen, archives, strict=True)]
 
 
+# ------------------------------------------------------------------------------------------------ one root, no plan
+def federation_root(root: Path) -> Path:
+    """`root` as it is given, made absolute, shown to be a federation's root: a real directory (a link is never
+    followed) that holds its state file as a regular file. `ShardsError` naming what is wrong otherwise."""
+    path = Path(os.path.abspath(root))
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise ShardsError("the root is not there") from None
+    except OSError as error:
+        raise ShardsError(f"the root cannot be read ({type(error).__name__})") from None
+    if stat.S_ISLNK(info.st_mode):
+        raise ShardsError("the root is a link, which is never followed: give the federation's own directory")
+    if not stat.S_ISDIR(info.st_mode):
+        raise ShardsError("the root is not a directory")
+    try:
+        state = os.lstat(path / STATE_FILE)
+    except OSError:
+        state = None
+    if state is None or not stat.S_ISREG(state.st_mode):
+        raise ShardsError(f"the root is not a federation root: {STATE_FILE} is missing there, or is not a plain file")
+    return path
+
+
+def copy_directory(root: Path, into: Path) -> Path:
+    """`into` made absolute and shown fit to hold a root's copy: not the root, inside it or above it (`down` removes
+    the root with whatever is in it, so a copy there is no copy), not a link, and, where it exists, a directory that
+    is private to this user. Whether it is empty is for the caller. `ShardsError` otherwise."""
+    path = Path(os.path.abspath(into))
+    here, there = Path(os.path.realpath(path)), Path(os.path.realpath(root))
+    if here == there or here.is_relative_to(there):
+        raise ShardsError("the directory to collect into is the root or inside it: `down` removes it with the root")
+    if there.is_relative_to(here):
+        raise ShardsError(
+            "the directory to collect into holds the root: the copy would sit beside the evidence it copies"
+        )
+    try:
+        seen = os.lstat(path)
+    except FileNotFoundError:
+        return path
+    except OSError as error:
+        raise ShardsError(f"the directory to collect into cannot be read ({type(error).__name__})") from None
+    if stat.S_ISLNK(seen.st_mode):
+        raise ShardsError("the directory to collect into is a link, which is never followed")
+    if not stat.S_ISDIR(seen.st_mode) or seen.st_uid != os.getuid() or seen.st_mode & 0o077:
+        raise ShardsError("the directory to collect into must be a private directory of this user (0700)")
+    return path
+
+
+def holds_copy(into: Path, archive_sha256: str | None) -> str | None:
+    """The SHA-256 of the archives manifest in `into`, when `into` holds exactly the copy a root-only collect makes
+    (the manifest, the archive and its manifest and no other file), the copy verifies against the manifest and the
+    archive is the one the root's marker names (`archive_sha256`); None otherwise, and when there is no marker."""
+    if archive_sha256 is None or {entry.name for entry in into.iterdir()} != {
+        *(f"{ROOT_ONLY_STEM}{s}" for s in ROOT_SUFFIXES),
+        ARCHIVES_MANIFEST,
+    }:
+        return None
+    try:
+        raw = (into / ARCHIVES_MANIFEST).read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        document = json.loads(raw)
+        if (
+            document.get("format") != ROOT_ARCHIVES_FORMAT
+            or verify_copy(into / ARCHIVES_MANIFEST, into, digest).problems
+        ):
+            return None
+        archive = {entry["name"]: entry["sha256"] for entry in document["evidence"]}[f"{ROOT_ONLY_STEM}.root.tar"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, ShardsError):
+        return None
+    return digest if archive == archive_sha256 else None
+
+
+def root_only_payload(held: Any) -> bytes:
+    """The bytes of `archives.sha256.json` of a root-only collect: the format and the `evidence` list, which names the
+    archive and its manifest by size and SHA-256 (no path, no time: the same root, the same bytes)."""
+    document = {
+        "format": ROOT_ARCHIVES_FORMAT,
+        "evidence": sorted(pair_entries(ROOT_ONLY_STEM, held), key=lambda entry: entry["name"]),
+    }
+    return (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
+
+
+def read_root(module: Any, root: Path) -> Any:
+    """`hpcevidence.archive_root` of the root as `ROOT_ONLY_STEM`, its refusals as `ShardsError` (a file named, never a
+    value); a warning on stderr when the root holds step records, which this collect does not archive the shards of."""
+    try:
+        held = module.archive_root(root, ROOT_ONLY_STEM, root_id_for(root))
+    except module.RootGone:
+        raise ShardsError("the root is not there") from None
+    except module.EvidenceError as error:
+        raise ShardsError(str(error)) from None
+    except OSError as error:
+        raise ShardsError(f"the root's evidence could not be read ({type(error).__name__})") from None
+    if any(name.startswith(f"{STEP_RECORDS}/") for name in held.names):
+        print(
+            "shards: WARNING: the root holds shard step records: this collects its root evidence only, never a shard's "
+            "archive (`collect --manifest`, which needs the plan, does)",
+            file=sys.stderr,
+        )
+    return held
+
+
+def collect_root(root: Path, into: Path) -> tuple[str, str]:
+    """ONE federation's root evidence with no plan (`collect --roots-only --root R --into DIR`): the root archive and
+    its manifest (`hpcevidence.archive_root`: the same allow-list, the same refusal of a link and of a file holding a
+    secret) and an `archives.sha256.json` of the root-only form for `verify-copy`, all mode 0600, in `into`; then, last,
+    the collected-evidence marker in the root, which is what lets `down` go on. Returns the SHA-256 of that manifest and
+    what was done: `collected`; `again`, the root was marked and unchanged but its copy was not in `into`; `already`,
+    it was and the copy is in `into`, so nothing is written (a retry).
+
+    `into` must be new, or empty and private, and a copy is never replaced: the evidence of a root that changed since
+    is collected into another directory, the first copy left as it was. Everything is made in a private directory beside
+    `into`, checked against its own manifest, and moved in with one rename. **The copy is never removed once it is in
+    place.** A marker that cannot be written (it unlocks `down`) fails the collect, but the error can come after the
+    marker landed (the directory sync that follows its rename), and a copy deleted then would leave a current marker and
+    no evidence: so the copy stays, complete, and the same command run again says `already` (exit 0) if the marker
+    landed; otherwise the evidence is collected into a new directory."""
+    root = federation_root(root)
+    into = copy_directory(root, into)
+    module = _evidence()
+    marked = module.collected_hash(root)
+    if into.exists() and any(into.iterdir()):
+        digest = holds_copy(into, marked)
+        if digest is None:
+            raise ShardsError("the directory to collect into must be new or empty (an earlier copy is never replaced)")
+        return digest, "already"
+    made: list[Path] = []
+    stage: Path | None = None
+    done = False
+    try:
+        made += _make_parents(into.parent)
+        stage = Path(tempfile.mkdtemp(prefix=".collect-", dir=into.parent))  # 0700, ours, beside `into`
+        held = read_root(module, root)
+        payload = root_only_payload(held)
+        digest = hashlib.sha256(payload).hexdigest()
+        for name, data in ((f"{ROOT_ONLY_STEM}.root.tar", held.tar), (f"{ROOT_ONLY_STEM}.root.json", held.manifest),
+                           (ARCHIVES_MANIFEST, payload)):  # fmt: skip
+            _write_whole(stage / name, _private_bytes(data))
+        if verify_copy(stage / ARCHIVES_MANIFEST, stage, digest).problems:
+            raise ShardsError("the copy written does not match its own manifest (nothing is kept)")
+        os.rename(stage, into)  # onto nothing, or onto the empty directory: one step, never a partial one
+        _fsync_dir(into)  # its entries durable before the marker says they are there
+        _fsync_dir(into.parent)
+        try:
+            module.write_marker(root, ROOT_ONLY_STEM, held.sha256, held.steps_sha256, held.hashes)
+        except (OSError, module.EvidenceError) as error:
+            raise ShardsError(
+                f"the collected-evidence marker could not be written in the root ({type(error).__name__}), but the "
+                "copy is complete and stays in the directory; the marker may or may not be in place: run the same "
+                "command again (it says `already collected` and exits 0 if it is) or collect into a new directory"
+            ) from None
+        done = True
+    except OSError as error:
+        raise ShardsError(f"the root's copy could not be written ({type(error).__name__})") from None
+    finally:
+        if stage is not None and stage.exists():
+            remove_tree(stage)
+        if not done:  # the directories this collect made above `into`, once empty (rmdir refuses the others)
+            for directory in reversed(made):
+                with contextlib.suppress(OSError):
+                    directory.rmdir()
+    return digest, "again" if marked is not None else "collected"
+
+
+def run_collect_root(args: argparse.Namespace) -> int:
+    """`collect --roots-only --root R --into DIR`: `collect_root`, its manifest's hash alone on stdout (what
+    `verify-copy` takes), and what was done on stderr. `ShardsError` for flags that do not go together (`main` reports
+    it as 2)."""
+    if args.manifest is not None or args.shard is not None or args.run:
+        raise ShardsError(
+            "--root takes no --manifest, --shard or --run (a plan's shards are collected with --manifest)"
+        )
+    if not args.roots_only:
+        raise ShardsError("--root belongs to `collect --roots-only` (one federation's root, no plan)")
+    if args.into is None:
+        raise ShardsError("collect --roots-only --root needs --into (the new or empty directory that holds the copy)")
+    digest, done = collect_root(args.root, args.into)
+    said = {
+        "collected": "the root's evidence is archived and marked collected",
+        "again": "the root's evidence was collected before and has not changed, but its copy is not in this directory: "
+        "it is collected again here",
+        "already": "the root's evidence was already collected and has not changed: nothing is rewritten",
+    }[done]
+    print(f"shards: {said} (archives manifest {ARCHIVES_MANIFEST} sha256 {digest})", file=sys.stderr)
+    if done != "already":
+        print("shards: pull the directory and run verify-copy with that hash before down (README); evidence the root "
+              "writes after this needs another collect, into a new directory", file=sys.stderr)  # fmt: skip
+    print(digest)
+    return 0
+
+
 def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
     """`python -I -B -m expcore merge`: isolated, no bytecode written: no module of the directory it is run from is
     imported."""
@@ -1848,9 +2089,27 @@ def _entries(items: object, noun: str, nested: bool, seen: set[str]) -> list[Ent
     return entries
 
 
+def _root_only_entries(document: Mapping[str, Any]) -> list[Entry]:
+    """The evidence of a root-only manifest (`ROOT_ARCHIVES_FORMAT`): exactly a `.root.tar` and the `.root.json` of the
+    same stem, each well formed, and no other key, so that nothing the manifest says goes unchecked."""
+    if set(document) - {"format", "evidence"}:
+        raise ShardsError("the root-only manifest has a key that nothing checks, so what it says would go unverified")
+    evidence = _entries(document.get("evidence"), "evidence file", False, set())
+    by_suffix = {suffix: [name for name, _, _ in evidence if name.endswith(suffix)] for suffix in ROOT_SUFFIXES}
+    tar, info = (by_suffix[suffix] for suffix in ROOT_SUFFIXES)
+    stems = {name.removesuffix(suffix) for suffix, names in by_suffix.items() for name in names}
+    if len(evidence) != 2 or len(tar) != 1 or len(info) != 1 or len(stems) != 1:
+        raise ShardsError("the root-only manifest must name exactly a .root.tar and the .root.json of the same stem")
+    return evidence
+
+
 def _manifest_entries(document: object) -> tuple[list[Entry], list[Entry]]:
     """The manifest's archives and its evidence (the files beside them), each shown well formed. A manifest with no
-    evidence is one of an earlier tip, which checked the archives alone: it is refused, not passed on them."""
+    evidence is one of an earlier tip, which checked the archives alone: it is refused, not passed on them. A root-only
+    manifest (`collect --roots-only --root`) has no archives, and says so by its format: it is exactly the pair of
+    files of one root's evidence."""
+    if isinstance(document, Mapping) and document.get("format") == ROOT_ARCHIVES_FORMAT:
+        return [], _root_only_entries(document)
     if not isinstance(document, Mapping) or document.get("format") != ARCHIVES_FORMAT:
         raise ShardsError(f"the manifest is not {ARCHIVES_FORMAT}")
     seen: set[str] = set()
@@ -1956,8 +2215,12 @@ def run_verify_copy(args: argparse.Namespace) -> int:
         for problem in check.problems:
             print(f"  {problem}", file=sys.stderr)
         return 1
-    archives = f"{check.archives} {'archive' if check.archives == 1 else 'archives'}"
     evidence = f"{check.evidence} evidence {'file' if check.evidence == 1 else 'files'}"
+    if check.archives == 0:  # a root-only manifest: the root evidence archive and its manifest, nothing else
+        print(f"shards: verify-copy: ok: the root's evidence archive and manifest ({evidence}), each with the size "
+              "and SHA-256 the manifest names")  # fmt: skip
+        return 0
+    archives = f"{check.archives} {'archive' if check.archives == 1 else 'archives'}"
     print(f"shards: verify-copy: ok: {archives} and {evidence}, each with the size and SHA-256 the manifest names")
     return 0
 
@@ -3300,13 +3563,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("plan", "lines", "collect"):
         command = sub.add_parser(name)
-        command.add_argument("--manifest", type=Path, required=True)
+        command.add_argument("--manifest", type=Path, required=name != "collect")  # collect: or --root, below
         if name == "collect":
             command.add_argument("--into", type=Path, help="the new or empty directory to unpack into")
             command.add_argument("--run", action="store_true")
             command.add_argument("--roots-only", dest="roots_only", action="store_true",
-                                 help="only each root's evidence (no --into): for a shard about to move")  # fmt: skip
+                                 help="only each root's evidence (a plan: no --into): for a shard about to move, or "
+                                 "with --root and --into, one federation's")  # fmt: skip
             command.add_argument("--shard", help="with --roots-only: the one shard's root")
+            command.add_argument("--root", type=Path, help="with --roots-only and --into, no --manifest: ONE root")
     one = sub.add_parser("step")
     for key in ("study", "tmpfs", "results", "core_src"):
         one.add_argument(f"--{key.replace('_', '-')}", dest=key, type=Path, required=True)
@@ -3355,6 +3620,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "step":
             return archive_left(args) if args.archive_left else step(args)
+        if args.command == "collect" and args.root is not None:  # one root, no plan to load
+            return run_collect_root(args)
+        if args.command == "collect" and args.manifest is None:
+            raise ShardsError("collect takes --manifest (a plan), or --roots-only --root and --into (no plan)")
         plan = load_plan(args.manifest)
         if args.command == "collect" and args.roots_only:
             if args.into is not None or args.run:
