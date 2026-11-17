@@ -113,9 +113,7 @@ class HealthReading:
 
     spaces: tuple[SpaceReading, ...] = ()
     targets: frozenset[str] | None = None
-    held: frozenset[str] = (
-        frozenset()
-    )  # the targets whose injection is still open: held down by the run's own injection
+    held: frozenset[str] = frozenset()  # of the targets, those whose injection is still open (held down by the run)
 
     def __post_init__(self) -> None:
         if not self.held <= (self.targets or frozenset()):

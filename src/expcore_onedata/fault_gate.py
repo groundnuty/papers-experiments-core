@@ -28,7 +28,8 @@ too; only an acquisition of the lock, which proves it usable, clears it.
 **A run's own open injection is no unsettled one under its own admission (O90).** A check that runs under the judged
 attempt's admission (`_held_check`) while that attempt holds a target down, an executor that reads health inside its
 injection and restores after, does not answer "unsettled" for the entry that attempt journalled itself
-(`fault_owner.in_progress_of`: owner exactly the attempt, seen down, no failed restore, no heal's mark): the space is
+(`fault_owner.in_progress_of`: owner exactly the attempt, seen down, no failed restore, no heal's mark, and a live
+injector still holding the target's lock, `_held_down`): the space is
 compared as usual, and the structured reading (`healthreading`) names the target as held. Every other open entry still
 fails the check: another attempt's, one that names no attempt, a failed restore, a heal's restart.
 
@@ -435,10 +436,25 @@ class FaultGate:
         entries = self._recovery.entries()
         if own:
             here = liveness.current()
-            entries = [entry for entry in entries if not in_progress_of(entry, here)]
+            entries = [entry for entry in entries if not (in_progress_of(entry, here) and self._held_down(entry))]
         if entries:
             return self._operator(_unsettled(entries))
         return read_health(self._inner) if self._inner is not None else Health(True, "no injection is unsettled")
+
+    def _held_down(self, entry: Mapping[str, Any]) -> bool:
+        """Whether a live injector still holds the entry's target down: the target's lock is held, as an injector holds
+        it for as long as it may have the target down and the kernel drops it with its holder. An entry whose lock is
+        free was left by an injector that is gone (an executor that returned without restoring, a dead process): it is
+        no injection in progress, whoever journalled it, and the check fails it as unsettled. A lock that cannot be
+        tried is no proof: not held."""
+        try:
+            lock = self._journal.try_lock(entry["target"])
+        except OSError:
+            return False
+        if lock is None:
+            return True
+        lock.close()
+        return False
 
     def _taken(self) -> Any:
         return None if self._links is None else self._links()
