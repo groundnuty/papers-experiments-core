@@ -147,8 +147,13 @@ def run_line(shards, monkeypatch, line, runner, node=None) -> int:
         monkeypatch.delenv(key, raising=False)
     for key, value in {**{k: v for k, v in environ.items() if k not in HOME_NAMES}, **(node or {})}.items():
         monkeypatch.setenv(key, value)
-    original = shards.step
-    monkeypatch.setattr(shards, "step", lambda args: original(args, runner=runner, core_found=lambda path: True))
+    real = getattr(shards.step, "real", shards.step)  # a second line in one test replaces the first's stand-ins
+
+    def stood_in(args):
+        return real(args, runner=runner, core_found=lambda path: True)
+
+    stood_in.real = real
+    monkeypatch.setattr(shards, "step", stood_in)
     return shards.main(argv)
 
 
