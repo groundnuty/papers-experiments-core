@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import hpcdata
+import hpcexclude
 import hpcidentity
 import hpcimport
 import hpcpins
@@ -234,14 +235,15 @@ class Driver(Down):
         self.layout.ca_pem.parent.mkdir(exist_ok=True)
         self.layout.journal.mkdir(exist_ok=True)
 
-    def initial_state(self, site: Site, tree: Optional[str] = None) -> Dict[str, Any]:
+    def initial_state(self, site: Site, tree: Optional[str] = None, excluded: int = 0) -> Dict[str, Any]:
         """The state file as `up` first writes it. `tree` is the digest of the study's artifacts directory
         (`study_artifacts_tree`), kept under `hpcidentity.ARTIFACTS` so the core's phase, here or in a step on a node
         whose environment is an allowlist, is handed the digest `up` took and never reads the directory again; the
-        key is left out when there is none."""
+        key is left out when there is none. `excluded` is how many nodes of the account's other live federations the
+        held job excludes (`other_federations_nodes`), a count and never a name."""
         roles = self.settings.roles(tuple(p.name for p in self.spec.providers))
         node = self.settings.node()
-        name = f"hpcop-{self.spec.project[:40]}-{secrets.token_hex(4)}"
+        name = f"{hpcexclude.JOB_PREFIX}{self.spec.project[:40]}-{secrets.token_hex(4)}"
         state = {
             "format": hpcstate.FORMAT,
             "project": self.spec.project,
@@ -259,6 +261,7 @@ class Driver(Down):
                 "readback": None,
                 "started": None,
                 "ends": None,
+                "excluded_nodes": excluded,
             },
             "sandbox": self.sandbox_record(name),
             "storage": hpcstorage.plan(site, name, [p.name for p in self.spec.providers]),
@@ -297,8 +300,9 @@ class Driver(Down):
             "ends": None,
         }
 
-    def allocation(self, state: Mapping[str, Any], site: Site) -> Allocation:
-        """The held job: the service nodes, and the agent's node as its component 1 under `het`."""
+    def allocation(self, state: Mapping[str, Any], site: Site, exclude: Sequence[str] = ()) -> Allocation:
+        """The held job: the service nodes, and the agent's node as its component 1 under `het`. `exclude` are the
+        nodes of other federations' live jobs, which only this job (the services') keeps off."""
         node, agent = self.settings.node(), self.settings.sandbox_node()
         het = agent is not None and self.settings.sandbox_placement == "het"
         return Allocation(
@@ -311,6 +315,7 @@ class Driver(Down):
             time=self.settings.time,
             time_s=self.settings.time_s,
             het=(Shape(1, agent.cpus, agent.memory_mib),) if het and agent is not None else (),
+            exclude=tuple(exclude),
         )
 
     def sandbox_allocation(self, state: Mapping[str, Any], site: Site) -> Optional[Allocation]:
@@ -360,18 +365,20 @@ class Driver(Down):
         return digest
 
     def bring_up(self, site: Site, tree: Optional[str] = None) -> str:
-        state = self.store.create(self.initial_state(site, tree))
+        excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
+        state = self.store.create(self.initial_state(site, tree, len(excluded)))
         self.make_storage(state)  # recorded above, made before any job exists to bill for it
-        asked, alone = self.allocation(state, site), self.sandbox_allocation(state, site)
+        asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site)
         held = [(self.submit(asked, "allocation"), asked)]
         if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
             held.append((self.submit(alone, "sandbox"), alone))
         for job, wanted in held:
-            self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name)
+            self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name, note=self.queue_note(wanted))
         # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
         records = [(job, shape, record) for job, wanted in held for shape, record in zip(
             wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
         placed = self.placed_nodes(records)
+        self.keep_off_other_federations([job for job, _ in held], placed[0], state)
         self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
         self.node_facts()
         self.zone_up()
@@ -380,6 +387,64 @@ class Driver(Down):
         out = self.run_core()
         self.set(lambda s: s.update(phase="linked"))
         return f"{out}\n{self.start_relay()}"
+
+    def other_federations_nodes(self) -> List[str]:
+        """The nodes of every live job of the account that carries the federation prefix (`hpcexclude`, DESIGN.md
+        section 1), read before the held job is submitted, to be excluded from it: two federations' services of one
+        account on one node would share Couchbase's fixed port. A read that fails refuses, and nothing is submitted:
+        the held job never goes without the exclusion. The line says how many, never which."""
+        try:
+            nodes = hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm))
+        except SlurmError as error:
+            raise SlurmError(f"{error}; refusing to submit without keeping off the other federations' nodes") from None
+        if nodes:
+            self.say(f"{len(nodes)} node(s) of the account's other live federation jobs are excluded from the held job")
+        else:
+            self.say("no other live federation job of the account holds a node: nothing is excluded")
+        return nodes
+
+    @staticmethod
+    def queue_note(wanted: Allocation) -> str:
+        """What the queue bound's failure adds for a job that excluded nodes: Slurm keeps a job pending when what is
+        left does not fit it, and the bound is the one `up` always had."""
+        if not wanted.exclude:
+            return ""
+        return (
+            f" (it excluded {len(wanted.exclude)} node(s) of other live federations of this account: Slurm may be "
+            "keeping it pending for lack of others)"
+        )
+
+    def keep_off_other_federations(
+        self, jobs: Sequence[str], service_nodes: Sequence[str], state: Mapping[str, Any]
+    ) -> None:
+        """Once the held job runs and before any step, no service node may hold another live federation's job: two
+        ups that read the account's jobs at once both excluded nothing. One that does is refused, every held job of
+        this up cancelled by its own id, and the roles named (the zone, providers[i]), never a host. Fail closed: with
+        the jobs unreadable nothing proves the nodes are this federation's own, and the same release follows."""
+        try:
+            others = hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs)
+        except SlurmError as error:
+            raise SlurmError(f"{error}; {self.release(jobs)}") from None
+        roles = [r for r in state["roles"] if state["services"][r]["kind"] != "sandbox"]
+        shared = [hpcexclude.role(index) for index, node in enumerate(service_nodes[: len(roles)]) if node in others]
+        if shared:
+            raise SlurmError(
+                f"{', '.join(shared)} would run on a node another live federation of this account holds (Couchbase's "
+                f"port is one per node); no service started, and {self.release(jobs)}"
+            )
+
+    def release(self, jobs: Sequence[str]) -> str:
+        """Cancel each held job of this up by its own id, and say so; a cancel that fails is said, and `down` finishes
+        it."""
+        failed = []
+        for job in jobs:
+            try:
+                self.slurm.cancel(job)
+            except SlurmError:
+                failed.append(job)
+        if failed:
+            return f"cancelling job(s) {', '.join(failed)} failed: run down to release them"
+        return f"the held job(s) {', '.join(jobs)} were cancelled"
 
     def make_storage(self, state: Mapping[str, Any]) -> None:
         """The providers' storage directories on scratch, as the state records them (hpcstorage.create); none without a

@@ -41,6 +41,7 @@ OFFSET = re.compile(r"[0-9]{1,6}")
 # A value of srun's --network (HPC_STEP_NETWORK): letters, digits and `_ . , = : + -`, led by a letter or digit, so no
 # shell character, space or option of its own reaches the argv. It names no plugin's words: other sites take others.
 NETWORK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.,=:+-]{0,127}")
+NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}")  # a node name, as `Slurm.hostnames` accepts one
 
 
 def valid_network(value: object) -> bool:
@@ -51,6 +52,14 @@ def valid_network(value: object) -> bool:
 
 class SlurmError(RuntimeError):
     """A Slurm command that failed, or a job or step that is not what was asked for."""
+
+
+def scrubbed(text: str, names: Sequence[str]) -> str:
+    """`text` with each of `names` (nodes) replaced by `<node>`, the longest first, so that what Slurm says of a request
+    that excluded nodes never carries one into a message."""
+    for name in sorted(names, key=len, reverse=True):
+        text = text.replace(name, "<node>")
+    return text
 
 
 class StepTimeout(SlurmError, TimeoutError):
@@ -220,6 +229,7 @@ class Allocation:
     time: str
     time_s: int
     het: Tuple[Shape, ...] = ()
+    exclude: Tuple[str, ...] = ()  # the nodes of other federations' live jobs (hpcexclude): component 0's `--exclude`
 
     def shapes(self) -> Tuple[Shape, ...]:
         """Every component's shape, component 0 first."""
@@ -228,7 +238,12 @@ class Allocation:
     def argv(self) -> List[str]:
         """sbatch's argv. A further component follows a `:` and names its account, partition and time again (Slurm
         propagates no partition, nodes or cores to it, and the read-back checks what it recorded) with its own nodes,
-        cores and memory; `--wrap` stands once, in component 0's options, as sbatch builds the script once."""
+        cores and memory; `--wrap` stands once, in component 0's options, as sbatch builds the script once. `--exclude`
+        is component 0's alone, and only when it has nodes to name: without them the argv is what it was before the
+        option existed."""
+        if not all(NODE.fullmatch(node) for node in self.exclude):
+            raise SlurmError("an excluded node's name is not one an sbatch argv may carry")
+        exclude = [f"--exclude={','.join(self.exclude)}"] if self.exclude else []
         argv = [
             "sbatch",
             "--parsable",
@@ -241,6 +256,7 @@ class Allocation:
             "--ntasks-per-node=1",
             f"--cpus-per-task={self.cpus_per_node}",
             f"--mem={self.memory_mib}M",
+            *exclude,
             "--chdir=/",
             "--output=/dev/null",
             "--export=NONE",
@@ -448,8 +464,17 @@ class Slurm:
     # -- the held job ------------------------------------------------------------------------------------------------
 
     def submit(self, asked: Allocation) -> str:
-        """Submit the held job; return its id. sbatch's stderr is kept apart from the id it prints."""
-        done = self._call(asked.argv())
+        """Submit the held job; return its id. sbatch's stderr is kept apart from the id it prints. A request that
+        excluded nodes which sbatch refuses says how many it excluded, and no node name of sbatch's own words stays."""
+        try:
+            done = self._call(asked.argv())
+        except SlurmError as error:
+            if not asked.exclude:
+                raise
+            raise SlurmError(
+                f"{scrubbed(str(error), asked.exclude)}; the request excluded {len(asked.exclude)} node(s) of other "
+                "live federations of this account, which may leave none that fit"
+            ) from None
         line = done.stdout.strip()
         match = JOB_LINE.fullmatch(line)
         if match is None:
@@ -510,9 +535,10 @@ class Slurm:
         if records and name is not None and records[0].get("JobName") != name:
             raise SlurmError(f"job {job} carries another job's name: not the job submitted, and not cancelled")
 
-    def wait_running(self, job: str, timeout_s: float, name: Optional[str] = None) -> Dict[str, str]:
+    def wait_running(self, job: str, timeout_s: float, name: Optional[str] = None, note: str = "") -> Dict[str, str]:
         """Wait for the held job (every component of it) to run; at the bound, or if it ends first, cancel it by its
-        id and fail. With `name`, a job that carries another is never cancelled (`_ours`)."""
+        id and fail. With `name`, a job that carries another is never cancelled (`_ours`). `note` ends the failure at
+        the bound: what the caller knows that may keep the job waiting."""
         deadline = self.clock() + timeout_s
         while True:
             records = self.components(job) or []
@@ -526,7 +552,7 @@ class Slurm:
                 raise SlurmError(f"the held job is {(ended or ['gone'])[0]} before it ran")
             if self.clock() >= deadline:
                 self.cancel(job)
-                raise SlurmError(f"the held job did not start within {timeout_s:.0f} s; it was cancelled")
+                raise SlurmError(f"the held job did not start within {timeout_s:.0f} s; it was cancelled{note}")
             self.sleep(self.poll_s)
 
     def hostnames(self, nodelist: str) -> List[str]:

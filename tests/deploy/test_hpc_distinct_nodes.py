@@ -77,7 +77,7 @@ def test_o57_the_name_up_gives_its_jobs_is_the_prefix_the_live_read_matches(hpc,
     the one the live read matches, so a federation's job is never read as no federation's; the bundle's batch scripts
     carry it too."""
     for index, layout in enumerate((LAYOUT, SEPARATE_LAYOUT)):
-        (tmp_path / str(index)).mkdir()
+        (tmp_path / str(index) / "fed").mkdir(parents=True)
         rig = Rig(hpc, tmp_path / str(index), site, layout)
         state = rig.driver.initial_state(hpc.settings.site_from_environment(site))
         assert state["allocation"]["name"].startswith(hpc.exclude.JOB_PREFIX)
@@ -123,7 +123,7 @@ def test_o57_the_services_job_alone_excludes_and_the_agents_component_and_job_do
     under "separate" do not): the agent's node runs no Couchbase, and the exclusion costs capacity."""
     other = [OtherJob("5001", OTHER, "RUNNING", ("node01", "node02"))]
     for index, layout in enumerate((LAYOUT, SEPARATE_LAYOUT)):
-        (tmp_path / str(index)).mkdir()
+        (tmp_path / str(index) / "fed").mkdir(parents=True)
         rig = Rig(hpc, tmp_path / str(index), site, layout, FakeSlurm(others=other, nodes=POOL))
         rig.up()
         first, *rest = rig.calls("sbatch")
@@ -174,7 +174,7 @@ def test_o57_up_refuses_when_the_accounts_live_jobs_cannot_be_read_and_submits_n
         "timeout": FakeSlurm(on_me=lambda read, listed: (_ for _ in ()).throw(hpc.slurm.SlurmError(stderr))),
     }
     for kind, fake in refusals.items():
-        (tmp_path / kind).mkdir()
+        (tmp_path / kind / "fed").mkdir(parents=True)
         rig = Rig(hpc, tmp_path / kind, site, fake=fake)
         with pytest.raises(hpc.slurm.SlurmError, match="refusing to submit") as refused:
             rig.up()
@@ -243,7 +243,7 @@ def test_o57_this_federations_own_jobs_are_never_another_federations(hpc, tmp_pa
     """O57: the second read lists this federation's own jobs too (a heterogeneous job as `<leader>+0` and `+1`, the
     agent's own job as a second id under "separate"): none refuses it, and a job of no federation's never does."""
     for index, layout in enumerate((LAYOUT, SEPARATE_LAYOUT)):
-        (tmp_path / str(index)).mkdir()
+        (tmp_path / str(index) / "fed").mkdir(parents=True)
         fake = FakeSlurm(others=[OtherJob("5005", "my analysis", "RUNNING", ("node01", "node02"))])
         rig = Rig(hpc, tmp_path / str(index), site, layout, fake)
         rig.up()
