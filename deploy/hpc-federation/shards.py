@@ -1438,15 +1438,16 @@ def root_entries(plan: Plan, archives: Sequence[Any]) -> list[dict[str, Any]]:
 
 
 def _fsync_dir(path: Path) -> None:
-    """The directory's entries made durable, where the filesystem lets a directory be synced."""
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    """The directory's entries made durable, where the filesystem lets a directory be synced: one that says it cannot
+    (`EINVAL`, `ENOTSUP`) is left as it is, as it always was. Every other error, an I/O error above all, is raised
+    (`OSError`) with the open's too: a collect that could not make its manifest durable must not mark its roots
+    collected, so that `down` cannot remove evidence a crash could still lose."""
+    descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as error:
+        if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+            raise
     finally:
         os.close(descriptor)
 
@@ -1605,8 +1606,9 @@ def _install(
     listed: Sequence[Mapping[str, Any]],
 ) -> bytes:
     """The trees into `into` (one rename of `stage` onto it, which may exist only if empty), then
-    `archives.sha256.json` as the last write (a draft, fsynced, renamed); its bytes. Anything that goes wrong after the
-    trees are in, whatever it is, puts `into` back as it was found."""
+    `archives.sha256.json` as the last write (a draft, fsynced, renamed), then the results directory synced so that its
+    rename is durable (`_fsync_dir`); its bytes. Anything that goes wrong after the trees are in, whatever it is, puts
+    `into` back as it was found, and the markers that unlock `down` are written only after this returns."""
     try:
         os.rename(stage, into)  # onto nothing, or onto the empty directory: one step, never a partial one
     except OSError as error:
@@ -1619,7 +1621,17 @@ def _install(
         if isinstance(error, OSError):
             raise ShardsError(f"the archives manifest could not be written ({type(error).__name__})") from None
         raise
-    _fsync_dir(plan.results)
+    try:
+        _fsync_dir(plan.results)
+    except BaseException as error:
+        _put_back(into, existed)
+        if isinstance(error, OSError):
+            kind = errno.errorcode.get(error.errno or 0, type(error).__name__)
+            raise ShardsError(
+                f"the results directory could not be synced ({kind}): the manifest is not known to be durable, so "
+                "the collect is refused and no root is marked collected"
+            ) from None
+        raise
     return payload
 
 
