@@ -17,6 +17,7 @@ import shutil
 import threading
 import uuid
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from apptainer_support import make_settings
@@ -24,6 +25,9 @@ from apptainer_support import options as node_options
 from fake_host import FakeHost
 from fake_node import FakeNode
 from fault_support import OUTAGE_TARGET, SERVICE_NAMES, FakeServices, faults_table, injector_for
+from hpc_fed_support import hpc_on_path
+from observe_lag_support import STOP, Clock, Step, state_of
+from observe_lag_support import Cluster as SlurmCluster
 from sandbox_support import FAST, add_sandbox
 
 from expcore.campaign import liveness
@@ -888,3 +892,105 @@ def test_o86_an_apptainer_runs_window_is_persisted_beside_its_metadata_json(conf
     assert persisted["verdict"] == "stable"
     collected = json.loads((evidence / "metadata.json").read_text(encoding="utf-8"))
     assert collected["infrastructure_facts"][fedwindow.KEY]["verdict"] == "unknown"
+
+
+# --- an HPC federation whose accounting trails a stop, in the pilot's order ----------------------------------------
+
+
+class Sink:
+    text = ""
+
+    def write(self, value):
+        self.text += value
+
+    def flush(self):
+        pass
+
+
+class FakeSlurm:
+    """The injector's fake services seen as an HPC federation, read by the real `hpcobserve.py` over a fake Slurm: each
+    service is a step the state names, a stopped one is `state` stopped with its stop recorded, and `sacct` shows it
+    ended only `lag_s` seconds (of a fake clock the waits move) after the injector stopped it. As the watch's runner it
+    answers the command `watch_for` was given, with its own flag, and notes each bound it was handed."""
+
+    IDS: ClassVar[dict] = {
+        ZONE_SERVICE: ("oz", "4242.3"),
+        PROVIDER_SERVICES[0]: ("op", "4242.5"),
+        PROVIDER_SERVICES[1]: ("op", "4242.6"),
+    }
+
+    def __init__(self, observe, services, root, lag_s):
+        self.observe, self.services, self.root, self.lag_s = observe, services, root, lag_s
+        self.clock, self.cluster, self.stopped_at, self.bounds = Clock(), None, {}, []
+        self.cluster = SlurmCluster(self.clock)
+
+    def stopping(self, service):
+        self.stopped_at[service] = self.clock.now - 1000.0
+
+    def __call__(self, argv, *, timeout_s):
+        self.bounds.append(argv[argv.index("--accounting-wait-s") + 1])
+        records, steps = {}, []
+        for service, (kind, step_id) in self.IDS.items():
+            down = not self.services.running(service)
+            name = f"alloc-{service}-run-1"
+            records[service] = (kind, 1, step_id, [STOP] if down else [], "stopped" if down else "running")
+            lag = self.stopped_at.get(service, 0.0) + self.lag_s
+            steps.append(Step(step_id, name, stopped=down, lag=lag))
+        self.cluster.steps = tuple(steps)
+        (self.root / "hpc-federation.json").write_text(json.dumps(state_of(**records)), encoding="utf-8")
+        out = Sink()
+        code = self.observe.main(
+            argv[1:], runner=self.cluster, out=out, err=Sink(), sleep=self.clock.sleep, clock=self.clock.monotonic
+        )  # fmt: skip
+        return CommandResult(code, out.text, "")
+
+
+@pytest.mark.parametrize(
+    ("wait_s", "verdict"), [(None, "held"), (0, "unknown")], ids=["the default bound", "a bound of zero"]
+)
+def test_o86_in_the_pilots_order_an_hpc_target_stopped_just_before_the_start_read_is_held_once_accounting_catches_up(
+    config, issuer, slots, tmp_path, wait_s, verdict
+):
+    """O86: the first study's order on an HPC federation: the real injector stops the target, then the launch reads the
+    window's start at once, while Slurm's accounting still shows the step running (5 s). With the default bound the
+    read waits for it (6 s on the fake clock, recorded in the facts) and reads the stop: the target is `held` by the
+    run's own injection, no finding, nothing unknown. With no wait the same read is unknown, `accounting_lag`, never
+    held and never stable: the post-check would stop the batch."""
+    federation = Federation(config)
+    root = tmp_path / "hpc-root"
+    root.mkdir()
+    settings = dataclasses.replace(federation.settings, backend="hpc")
+    with hpc_on_path():
+        import hpcobserve
+
+        slurm = FakeSlurm(hpcobserve, federation.services, root, lag_s=5.0)
+        federation.services.on_stop = lambda service: (federation.events.append("stop"), slurm.stopping(service))
+        extra = {} if wait_s is None else {"accounting_wait_s": wait_s}
+        watch = watch_for(
+            config, settings, Client(), zone=ZONE_SERVICE, hpc_command=["observe", "--root", str(root)],
+            runner=slurm, **extra,
+        )  # fmt: skip
+        platform, host = build(config, issuer, slots, tmp_path, federation.spy(watch))
+        box, restore, _ = pilots_order(federation, platform)
+    assert federation.events == ["stop", "read", "window", "start"]
+    assert slurm.bounds == [str(60 if wait_s is None else wait_s)] * 2
+    window = window_of(box)
+    target = window["services"]["providers[1]"]
+    assert window["backend"] == "hpc"
+    assert (window["verdict"], target["status"]) == (verdict, "held" if verdict == "held" else "unknown")
+    assert window["findings"] == []
+    others = [window["services"][label] for label in ("zone", "providers[0]")]
+    assert [seen["status"] for seen in others] == ["stable", "stable"]
+    assert [seen["accounting_wait_s"] for seen in others] == [{"start": 0.0, "end": 0.0}] * 2
+    if verdict == "held":
+        assert window["unknown"] == []
+        assert (target["start"], target["end"], target["restarts"]) == ("not_running", "not_running", [])
+        assert target["accounting_wait_s"] == {"start": 6.0, "end": 0.0}
+        assert target["held"]["injections"] == 1
+        assert window["restore"]["field"] == "restore_verified"
+    else:
+        assert any("accounting_lag" in text for text in window["unknown"])
+        assert (target["start"], target["end"], target["held"]) == ("unknown", "unknown", None)
+        assert target["accounting_wait_s"] == {"start": 0.0, "end": 0.0}
+    assert restore["ok"] is True  # the restore is the injector's own, whatever the window could read
+    assert not host.containers

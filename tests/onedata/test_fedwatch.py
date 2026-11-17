@@ -606,10 +606,11 @@ class Cluster:
 
     def __init__(self, **services):
         self.services = dict(services)
-        self.returncode, self.raises, self.commands = 0, None, []
+        self.returncode, self.raises, self.commands, self.timeouts = 0, None, [], []
 
     def __call__(self, argv, *, timeout_s):
         self.commands.append(list(argv))
+        self.timeouts.append(timeout_s)
         if self.raises is not None:
             raise self.raises
         doc = {"format": "expcore-hpc-observe/1", "at": DOC_AT, "services": self.services}
@@ -850,3 +851,118 @@ def test_o86_an_hpc_target_down_at_both_ends_by_the_runs_own_open_injection_is_h
     assert (result["verdict"], result["findings"], result["unknown"]) == ("held", [], [])
     cluster.services[BETA] = hpc_record("4242.6", running=False, stops=1)
     assert watch.window(start, owner=ANOTHER)["verdict"] == "finding"
+
+
+# --- HPC: a stop that Slurm's accounting is behind on ------------------------------------------------------------
+
+
+def lagging(**service):
+    """What hpcobserve prints for a service the state says was stopped when accounting never caught up in its bound."""
+    return hpc_record("4242.6", running=None, started=None, unknown="accounting_lag", stops=1, **service)
+
+
+def test_o86_a_side_carries_the_seconds_the_read_waited_for_accounting(tmp_path):
+    """O86: hpcobserve records how long it waited for Slurm's accounting to show a step stopped, per service; the side
+    keeps it as `accounting_wait_s_used` (none for a document that predates it, none on Compose), and says so in its
+    notes only when it did wait."""
+    cluster = hpc_steady()
+    cluster.services[BETA] = hpc_record("4242.6", running=False, stops=1, accounting_wait_s_used=6.0)
+    cluster.services[ALPHA]["accounting_wait_s_used"] = 0.0
+    sides = hpc_watch(cluster, tmp_path).read()["services"]
+    assert sides["providers[1]"]["accounting_wait_s_used"] == 6.0
+    assert sides["providers[1]"]["unknown"] == []
+    assert any("waited 6 s" in note and "accounting" in note for note in sides["providers[1]"]["notes"])
+    assert sides["providers[0]"]["accounting_wait_s_used"] == 0.0
+    assert sides["providers[0]"]["notes"] == []
+    assert sides["zone"]["accounting_wait_s_used"] is None  # a document of an older hpcobserve
+    compose = compose_watch(steady(), tmp_path / "c").read()
+    assert all(side["accounting_wait_s_used"] is None for side in compose["services"].values())
+
+
+@pytest.mark.parametrize("bad", ["6", True, -1.0, float("nan"), [6]], ids=["text", "bool", "negative", "nan", "list"])
+def test_o86_a_wait_that_is_not_a_number_of_seconds_makes_the_document_unreadable(tmp_path, bad):
+    """O86: a figure the side cannot trust is not carried: the service's answer is not readable, so unknown."""
+    cluster = hpc_steady()
+    cluster.services[ALPHA]["accounting_wait_s_used"] = bad
+    side = hpc_watch(cluster, tmp_path).read()["services"]["providers[0]"]
+    assert side["state"] == "unknown"
+    assert any("not readable" in why for why in side["unknown"])
+
+
+def test_o86_accounting_that_never_caught_up_is_unknown_with_that_reason_never_running_or_held(tmp_path):
+    """O86: hpcobserve gave up at its bound (`accounting_lag`) for a target the state says was stopped: at the start
+    the window has no reading of it, so it is unknown with the reason and the wait, never held, never stable, and no
+    finding; read at the end instead, the same."""
+    for where in ("start", "end"):
+        cluster = hpc_steady()
+        lagged = lagging(accounting_wait_s_used=60.0)
+        injection(journal_of(tmp_path / where), BETA, clears=None, owner=ME)
+        if where == "start":
+            cluster.services[BETA] = lagged
+        watch = hpc_watch(cluster, tmp_path / where)
+        start = watch.read()
+        assert (start["services"]["providers[1]"]["state"] == "unknown") is (where == "start")
+        cluster.services[BETA] = lagged
+        result = watch.window(start, owner=ME)
+        seen = result["services"]["providers[1]"]
+        assert (seen["status"], result["verdict"], result["findings"]) == ("unknown", "unknown", [])
+        assert seen["end"]["unknown"] == ["accounting_lag"]
+        assert seen["end"]["running"] is None
+        assert seen["end"]["accounting_wait_s_used"] == 60.0
+        assert any("accounting_lag" in reason for reason in result["unknown"])
+        assert any("did not catch up" in note and "60 s" in note for note in seen["end"]["notes"])
+
+
+def test_o86_watch_for_hands_the_read_its_bound_and_allows_for_it_in_the_time_it_gives_the_command(fake, tmp_path):
+    """O86: the HPC watch appends `--accounting-wait-s <bound>` to the caller's command (60 unless declared) and gives
+    the command that long on top of `command_timeout_s`, so a read that waits is never cut off for waiting."""
+    path = write_faults(tmp_path)
+    config = load_platform(path)
+    hpc = replace(load_faults(path, config), backend="hpc")
+    seen = {}
+    for wait, shown in ((None, "60"), (0, "0"), (12.5, "12.5"), (300, "300")):
+        cluster = Cluster(
+            **{
+                ZONE: hpc_record("4242.3", kind="oz"),
+                "store-one": hpc_record("4242.5"),
+                "store-two": hpc_record("4242.6"),
+            }
+        )
+        extra = {} if wait is None else {"accounting_wait_s": wait}
+        watch = watch_for(
+            config, hpc, Client(), zone=ZONE, hpc_command=["python", "-I", "x.py"], runner=cluster, **extra
+        )
+        watch.read()
+        assert cluster.commands[0] == ["python", "-I", "x.py", "--accounting-wait-s", shown]
+        seen[shown] = cluster.timeouts[0]
+    assert seen == {"60": hpc.command_timeout_s + 60, "0": hpc.command_timeout_s,
+                    "12.5": hpc.command_timeout_s + 12.5, "300": hpc.command_timeout_s + 300}  # fmt: skip
+
+
+@pytest.mark.parametrize("wait", [-1, 300.5, float("nan"), float("inf"), True, "60", None])
+def test_o86_watch_for_refuses_a_bound_outside_zero_to_three_hundred(fake, tmp_path, wait):
+    """O86: the bound is a number of seconds from 0 to 300 on either backend; anything else is refused, naming it."""
+    path = write_faults(tmp_path)
+    config = load_platform(path)
+    settings = load_faults(path, config)
+    for backend in ("compose", "hpc"):
+        with pytest.raises(ValueError, match="accounting_wait_s"):
+            watch_for(
+                config,
+                replace(settings, backend=backend),
+                Client(),
+                zone=ZONE,
+                hpc_command=["x"],
+                accounting_wait_s=wait,
+            )
+
+
+def test_o86_a_compose_watch_adds_no_flag_and_no_wait(fake, tmp_path):
+    """O86: the bound is the HPC read's: Compose's runner sees the commands it saw before."""
+    path = write_faults(tmp_path)
+    config = load_platform(path)
+    containers = Containers(
+        **{ZONE: container("ctr-z"), "store-one": container("ctr-a"), "store-two": container("ctr-b")}
+    )
+    watch_for(config, load_faults(path, config), Client(), zone=ZONE, runner=containers, accounting_wait_s=5).read()
+    assert all("--accounting-wait-s" not in command for command in containers.commands)
