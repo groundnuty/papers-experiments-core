@@ -1367,6 +1367,8 @@ work_disk_mkfs = ["mkfs.ext3"]      # optional: the node's mkfs.ext3 (e2fsprogs 
 
 - **The federation's window** (O86; `federation_window`), in every run of a platform: from the run's preparation on it is `unknown` ("no federation watch configured", or pending for a platform built with `SandboxPlatform(..., federation_watch=)`), and the launch closes it once the run's body has ended: the verdict, each service's status and restarts, the seconds an HPC read waited at each end for Slurm's accounting (`accounting_wait_s_used`), the findings and the unknowns. It sits beside the keys above, not among `facts`, and a Docker run holds it in an `infrastructure_facts` of its own. See "The platform layer's read of the federation's own services".
 
+- **One writer for the facts** (O89; `sandbox.infrafacts`). Every write to a run's `infrastructure_facts`, on both backends, goes through one helper that merges under the sandbox's lock and raises `FactsConflict` (a bug of the writer) for a key another writer owns, so no feature drops another's fact; `record_infrastructure_fact(key, value, *, owner)` names the owner, and `record(**fields)` refuses a field named for the table.
+
 ## The platform layer's read of the federation's own services
 
 `expcore_onedata.fedwatch` (O86). A study's post-check asks of a run's or a batch's window: did the federation's services, the zone and each provider, run and answer throughout, and was a restart the injector's doing? One watch, the same on Compose and on HPC; every call only reads (`docker compose ps` and `docker inspect`; `squeue -s` and `sacct`; `GET /configuration`; the journal's file, opened read-only and without its lock).

@@ -62,7 +62,7 @@ from expcore.egress import Declaration, declaration
 from expcore_onedata import tls as TLS
 from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import deadline as DL
-from expcore_onedata.sandbox import gatelog, gatepolicy, hostfacts, inputs, kinds, tokenfiles
+from expcore_onedata.sandbox import gatelog, gatepolicy, hostfacts, infrafacts, inputs, kinds, tokenfiles
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
     DataPathMode,
@@ -140,7 +140,6 @@ class ApptainerSandbox:
             "data_path": spec.mode.value,
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,
             "backend": self.app.record() if self.app is not None else {"backend": "apptainer"},
-            "infrastructure_facts": self._facts_record("image_unverified" if self.work_image else "directory"),
             "images": {},
             "tls": settings.tls.record(),
             "certifi": None,
@@ -149,6 +148,8 @@ class ApptainerSandbox:
         if config_sha256:
             self._meta["platform_config_sha256"] = config_sha256
         self._meta_lock = threading.RLock()
+        self._facts = infrafacts.InfrastructureFacts(self._meta, self._meta_lock)  # the one writer of its facts (O89)
+        self._set_facts_record("image_unverified" if self.work_image else "directory")
         self._evidence: list[Path] = []  # where `collect` wrote its evidence: a host path, never in the metadata
         self._phase = threading.Lock()
         self._agent_began, self._steps_running, self._refusals_seen = False, 0, 0
@@ -238,13 +239,11 @@ class ApptainerSandbox:
         )
 
     def _set_facts_record(self, work_disk: str) -> None:
-        """Set the keys `facts.record` makes for the work disk's state in the run's `infrastructure_facts`, in place and
-        under the meta lock, and leave every other key as it is: the node's readings (`node`, O87), the federation's
-        window (`federation_window`, which the platform records from the run's preparation on, O86) and whatever else
-        was recorded since the run was made. Replacing the dict would drop them."""
-        fresh = self._facts_record(work_disk)
-        with self._meta_lock:
-            self._meta.setdefault("infrastructure_facts", {}).update(fresh)
+        """Set the keys `facts.record` makes for the work disk's state in the run's `infrastructure_facts`, as the
+        work disk's own (`infrafacts`, O89), and leave every other key as it is: the node's readings (`node`, O87), the
+        federation's window (`federation_window`, which the platform records from the run's preparation on, O86) and
+        whatever else was recorded since the run was made."""
+        self._facts.write(infrafacts.WORK_DISK, self._facts_record(work_disk))
 
     def _validate(self) -> None:
         sp, s = self.spec, self.s
@@ -330,7 +329,7 @@ class ApptainerSandbox:
         self._started = time.time()
         self._meta.update(host=self.node.node_facts(self.app.apptainer),
                           started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))  # fmt: skip
-        self._meta["infrastructure_facts"]["node"] = hostfacts.of_node(lambda: self.node.node_readings())  # O87
+        self._facts.write(infrafacts.NODE, {"node": hostfacts.of_node(lambda: self.node.node_readings())})  # O87
         self._checkpoint()
         self._start_collector()
         self._checkpoint()
@@ -1012,12 +1011,11 @@ class ApptainerSandbox:
         """O87: the tool server's host's OS release, glibc and kernel, beside the node's, when they differ from it: on
         the node's own host (the driver's child) they are the node's and nothing is added. Recorded, never refused."""
         theirs = hostfacts.of_node(lambda: self.node.tool_server_readings())  # the lookup is guarded too
-        with self._meta_lock:
-            facts = self._meta["infrastructure_facts"]
-            if theirs != facts.get("node"):
-                facts["tool_server_host"] = theirs
+        if theirs != self._facts.get("node"):
+            self._facts.write(infrafacts.NODE, {"tool_server_host": theirs})
 
     def record(self, **fields: Any) -> None:
+        infrafacts.refuse_replacement(fields)  # a fact of the run's infrastructure goes in one at a time (O89)
         with self._meta_lock:
             self._meta.update(fields)
 
@@ -1031,10 +1029,10 @@ class ApptainerSandbox:
         with self._meta_lock:
             return tuple(self._evidence)
 
-    def record_infrastructure_fact(self, key: str, value: Any) -> None:
-        """Add one fact beside the departures in `infrastructure_facts` (as Docker's: the federation's window, O86)."""
-        with self._meta_lock:
-            self._meta.setdefault("infrastructure_facts", {})[key] = value
+    def record_infrastructure_fact(self, key: str, value: Any, *, owner: str) -> None:
+        """Add one fact beside the departures in `infrastructure_facts` (as Docker's: the federation's window, O86),
+        for `owner` (`infrafacts`, O89)."""
+        self._facts.write(owner, {key: value})
 
     def note_end(self, kind: str) -> None:
         with self._meta_lock:
@@ -1069,12 +1067,13 @@ class ApptainerSandbox:
             ended = None if self._cells is None else self._cells.ended
         if self._cells is not None:
             meta["cells"] = len(self._cells.cells)
+        read = {}  # what exists only when the metadata is read, added to this copy (`infrafacts.annotate`, O89)
         if ended is not None and ended.get("scope") == "run":  # the watch ended the run: a fact of the run (O72)
-            meta["infrastructure_facts"]["run_ended"] = {key: ended.get(key) for key in RUN_ENDED_FACT}
+            read["run_ended"] = {key: ended.get(key) for key in RUN_ENDED_FACT}
         if self._watch is not None:
             meta["watch"] = self._watch.summary()
-            meta["infrastructure_facts"]["memory"] = meta["watch"]["memory"]  # never `within` unless the check held
-        meta["infrastructure_facts"]["limits"] = self._limits_record()  # every key; a reading shown or unknown (O70)
+            read["memory"] = meta["watch"]["memory"]  # never `within` unless the check held
+        read["limits"] = self._limits_record()  # every key; a reading shown or unknown (O70)
         if self.spec.mode is DataPathMode.REST:
             lines = self.gate_log_lines()
             meta["gate_log"] = gatelog.unknown("the gate log could not be read") if lines is None else (
@@ -1088,13 +1087,10 @@ class ApptainerSandbox:
         meta["served_bytes"] = self.served_bytes()
         counted, timed = meta.pop("rest_node_name_hits", None), meta.pop("rest_request_durations", None)
         if self.spec.node_names and self.spec.mode is DataPathMode.REST:  # O73: scanned, so never silently absent
-            meta["infrastructure_facts"]["rest_node_name_hits"] = counted or gatelog.node_name_hits_unknown(
-                gatelog.GATE_NOT_COLLECTED
-            )
+            read["rest_node_name_hits"] = counted or gatelog.node_name_hits_unknown(gatelog.GATE_NOT_COLLECTED)
         if self.spec.mode is DataPathMode.REST:  # O73: every gate's requests are timed, so never silently absent
-            meta["infrastructure_facts"]["rest_request_durations"] = timed or gatelog.request_durations_unknown(
-                gatelog.GATE_NOT_COLLECTED
-            )
+            read["rest_request_durations"] = timed or gatelog.request_durations_unknown(gatelog.GATE_NOT_COLLECTED)
+        self._facts.annotate(meta, infrafacts.METADATA, read)
         return meta
 
     def _limits_record(self) -> dict[str, Any]:
