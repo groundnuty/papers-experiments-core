@@ -19,8 +19,10 @@ them in the state file in the root, so `down` and the service verbs need no envi
   (a control step on the zone's node, the core's Python).
 - down: every service torn down (the providers, then the zone), every step gone, each node checked, the held job
   (and the agent's own job, when it has one) cancelled by its id, then the root removed; on whatever up reached. A
-  root that a shard step ran against and whose evidence `shards.py collect` did not collect (no current marker) is
-  refused first, with nothing stopped; `down --discard-evidence` removes it all the same and its output says so (O63).
+  root that a shard step ran against and whose evidence `shards.py collect` did not collect (no current marker), or
+  whose step- or study-written evidence changed after it did, is refused first, with nothing stopped; the state and the
+  link check, which the federation rewrites itself, are named in the output and the state, never refused. `down
+  --discard-evidence` removes it all the same and its output says so (O63).
 - describe: the plan: the nodes and their shape, every step's size, and what the job bills per hour.
 - verify-data: after the study's ingest, read each ingested space (a space that is neither a baseline space nor a
   shared import, whose data is the study's own) back through its owner and compare every file's path, size and SHA-256

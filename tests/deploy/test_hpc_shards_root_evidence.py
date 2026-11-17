@@ -502,6 +502,17 @@ def test_a_collect_writes_the_marker_into_each_root_naming_the_root_archive_s_ha
         assert str(tmp_path) not in marker.read_text()
 
 
+def test_the_marker_names_each_archived_file_by_the_hash_the_archive_manifest_lists(shards, tmp_path):
+    """O63: `down` cannot see the results directory, so the marker carries the hash of each file as it was archived
+    (the same bytes the archive's own manifest lists): that is what tells a file a step wrote from one the federation
+    rewrote."""
+    plan = _collect(shards, tmp_path)
+    for shard in plan.shards:
+        found = json.loads((shard.root / "evidence-collected.json").read_text())
+        listed = json.loads((plan.results / f"{shard.label}.root.json").read_text())["files"]
+        assert found["files"] == {entry["name"]: entry["sha256"] for entry in listed}
+
+
 def test_the_marker_is_not_itself_evidence(shards, tmp_path):
     """O63: a second collect does not archive the first's marker: the archive of an unchanged root is the same."""
     plan = _collect(shards, tmp_path, "first")
