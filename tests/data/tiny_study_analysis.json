@@ -362,6 +362,107 @@
    "reject": false
   }
  ],
+ "model_usage": {
+  "dollars": {
+   "known": true,
+   "reason": null
+  },
+  "format": "model-usage-1",
+  "models": [
+   {
+    "classes": [
+     {
+      "attempts": 11,
+      "bounded_attempts": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "class": "analysed",
+      "input_tokens": 1972,
+      "output_tokens": 164,
+      "unpriced_attempts": 0,
+      "usage_incomplete_attempts": 0,
+      "usd": {
+       "bound": 0.0,
+       "charges": 0.0,
+       "measured": 0.0023,
+       "measured_plus_inflight": 0.0,
+       "total": 0.0023
+      }
+     }
+    ],
+    "model": "alpha-stub",
+    "price": "priced",
+    "probes_usd": 0.0,
+    "records": 11,
+    "retries": {
+     "by_kind": [],
+     "events": 0,
+     "turns_retried": 0,
+     "wait_s": 0.0
+    },
+    "served": [
+     {
+      "records": 11,
+      "served_model": null,
+      "system_fingerprint": null,
+      "turns": 30
+     }
+    ],
+    "turns": 30,
+    "usd": {
+     "analysed": 0.0023,
+     "not_analysed": 0.0,
+     "total": 0.0023
+    }
+   },
+   {
+    "classes": [
+     {
+      "attempts": 11,
+      "bounded_attempts": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "class": "analysed",
+      "input_tokens": 1972,
+      "output_tokens": 167,
+      "unpriced_attempts": 0,
+      "usage_incomplete_attempts": 0,
+      "usd": {
+       "bound": 0.0,
+       "charges": 0.0,
+       "measured": 0.0012365,
+       "measured_plus_inflight": 0.0,
+       "total": 0.0012365
+      }
+     }
+    ],
+    "model": "beta-stub",
+    "price": "priced",
+    "probes_usd": 0.0,
+    "records": 11,
+    "retries": {
+     "by_kind": [],
+     "events": 0,
+     "turns_retried": 0,
+     "wait_s": 0.0
+    },
+    "served": [
+     {
+      "records": 11,
+      "served_model": null,
+      "system_fingerprint": null,
+      "turns": 30
+     }
+    ],
+    "turns": 30,
+    "usd": {
+     "analysed": 0.0012365,
+     "not_analysed": 0.0,
+     "total": 0.0012365
+    }
+   }
+  ]
+ },
  "partial": false,
  "preregistration": {
   "factor_schema_sha256": "dccda65c82f6030717ea12ca7a0c9654bda6e9073e04e93a0663bf6d313796e5",
