@@ -30,8 +30,9 @@ class Down:
     """down, and what it is made of; `hpcdriver.Driver` provides the rest."""
 
     def down(self, discard_evidence: bool = False, discard_reason: Optional[str] = None) -> str:
-        """The federation taken down and its root removed. A root that a shard step ran against and whose evidence was
-        not collected, or changed after it was (`evidence_gate`: the files a step or the study writes; the
+        """The federation taken down and its root removed. A root that holds evidence a run left (a shard step's
+        record, a fault-journal line, the relay's journals, a claim, the pilot's wiring: what `up` alone writes is none)
+        that was not collected, or changed after it was (`evidence_gate`: the files a step or the study writes; the
         federation's own rewritten files are named, not refused), is refused before anything is stopped, unless
         `discard_evidence`, which the output records."""
         if not self.root.exists():
@@ -54,75 +55,88 @@ class Down:
     def evidence_gate(self, discard: bool, reason: Optional[str] = None) -> str:
         """O63: down removes the root, which holds the evidence the study's post-check and the facts read (the state,
         `platform.toml`, `facts.json`, the link check, the render identity, the fault journals), so it refuses, before
-        it stops or cancels anything, a root that has shard results recorded against it (a step of a shard started
-        there, `shards.py step`) unless `shards.py collect` marked it and the evidence a step, the study or `up` writes
-        (the strict files of `hpcevidence`: the journals, the claims, the step records, the manifests) is still exactly
-        what the marker names (`hpcevidence.check_collected`): a step that started or wrote since, or a changed file,
-        makes it stale. The files the running federation rewrites itself (the state, the link check) post-date every
-        run once the collect has run, so a change to them is no reason to refuse: down goes on, says which of them
-        changed (names only) and records it in the state. A root where no step ever ran goes as before, and so does one
-        whose down already began (its phase `stopping` or `down`: a down that failed halfway and is run again passed
-        this gate before, and its own changes to the state are no change of the evidence). `discard`
-        (`--discard-evidence`) goes on past a refusal, and the lines it returns, which the output and `say` carry,
-        record what was discarded. Nothing is written to the state before the comparison has decided that down goes on.
-        Empty when there was nothing to refuse, discard or name."""
+        it stops or cancels anything, a root that holds evidence a run left (`hpcevidence.present_evidence`: a step of
+        a shard started there, `shards.py step`, or the fault journal, the relay's journals, a shard claim or the
+        pilot's wiring has something in it, as after Day-0 measurements with no step) unless `shards.py collect` marked
+        it and the evidence a step, the study or `up` writes (the strict files of `hpcevidence`: the journals, the
+        claims, the step records, the manifests) is still exactly what the marker names
+        (`hpcevidence.check_collected`): a step or a run that wrote since, or a changed file, makes it stale. The files
+        the running federation rewrites itself (the state, the link check) post-date every run once the collect has
+        run, so a change to them is no reason to refuse: down goes on, says which of them changed (names only) and
+        records it in the state. A root that holds none of that goes as before (one after `up` alone, or a failed
+        `up`'s: an emergency teardown is never blocked), and so does one whose down already began (its phase `stopping`
+        or `down`: a down that failed halfway and is run again passed this gate before, and its own changes to the
+        state are no change of the evidence). `discard` (`--discard-evidence`) goes on past a refusal, and the lines it
+        returns, which the output and `say` carry, record what was discarded. Nothing is written to the state before
+        the comparison has decided that down goes on. Empty when there was nothing to refuse, discard or name."""
         if self.store.exists() and self.store.read().get("phase") in ("stopping", "down"):
             return ""
         found = hpcevidence.check_collected(self.root)
         if found is None:
             return ""
-        shown = ", ".join(found.labels)
         if found.refused and not discard:
-            raise RuntimeError(self.refusal(found, shown))
+            raise RuntimeError(self.refusal(found))
         lines = []
         if found.refused:
-            lines.append(self.discarded(found, shown, reason))
+            lines.append(self.discarded(found, reason))
         if found.rewritten:
-            lines.append(self.rewritten(found, shown))
+            lines.append(self.rewritten(found))
         return "\n".join(lines)
 
     @staticmethod
-    def refusal(found: "hpcevidence.Check", shown: str) -> str:
-        """The refusal of a root whose evidence has no current marker, or whose strict evidence changed since it."""
+    def refusal(found: "hpcevidence.Check") -> str:
+        """The refusal of a root whose evidence has no current marker, or whose strict evidence changed since it. A root
+        with step records names its shards; one that only ran Day-0 measurements names the kinds of evidence it holds
+        (never a file or a path), and the remedy `collect --roots-only`, which needs a plan that names the root."""
         if found.stale:
             what = (
                 "it can no longer be read or archived"
                 if found.unreadable
                 else f"{', '.join(found.changed)}: a step started or wrote since, or a file was changed"
             )
-            why = f"the evidence of {shown} changed after it was collected ({what}), so what was collected lacks it"
-            remedy = "end the shard's step, run `shards.py collect` (or `collect --roots-only`) again while it is up"
-        else:
-            why = f"shard results are recorded in this root ({shown}) and its evidence was not collected"
+            why = f"the {found.named} changed after it was collected ({what}), so what was collected lacks it"
+            remedy = (
+                "end the shard's step, run `shards.py collect` (or `collect --roots-only`) again while it is up"
+                if found.labels
+                else "end whatever still writes the journals, run `shards.py collect --roots-only` again while up"
+            )
+        elif found.labels:
+            shards = ", ".join(found.labels)
+            why = f"shard results are recorded in this root ({shards}) and its evidence was not collected"
             remedy = "run `shards.py collect` (or `collect --roots-only`, which needs no final shard) while it is up"
+        else:
+            why = f"this root holds evidence a run left in it ({', '.join(found.present)}) and it was not collected"
+            remedy = "run `shards.py collect --roots-only` (it takes a plan that names this root) while it is up"
         return (
             f"{why}: down would remove the state, facts, link check, render identity and fault journals the "
             f"post-check needs. Nothing was stopped or removed: {remedy}, pull the results and `verify-copy` them; "
             "or give --discard-evidence to remove the root without it"
         )
 
-    def discarded(self, found: "hpcevidence.Check", shown: str, reason: Optional[str]) -> str:
+    def discarded(self, found: "hpcevidence.Check", reason: Optional[str]) -> str:
         """The line of a `--discard-evidence` that discards something, recorded in the state when there is one (the
-        state goes with the root at the end of a whole down, so this line, in down's output, is what outlives it)."""
+        state goes with the root at the end of a whole down, so this line, in down's output, is what outlives it): the
+        shards with step records, and the kinds of evidence, which are all there is to name for a Day-0-only root."""
         line = (
-            f"down: --discard-evidence: the root's evidence of {shown} "
+            f"down: --discard-evidence: the root's {found.named} "
             f"{'changed after it was collected' if found.stale else 'was not collected'} and is removed with it"
             + (f" (reason given: {reason})" if reason else "")
         )
         if self.store.exists():
             entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "shards": list(found.labels),
+                     "evidence": list(found.present),
                      "changed_since_collect": found.stale, "reason": reason}  # fmt: skip
             self.set(lambda state: state.setdefault("evidence_discarded", []).append(entry))
             line += "; recorded in the state file"
         self.say(line)
         return line
 
-    def rewritten(self, found: "hpcevidence.Check", shown: str) -> str:
+    def rewritten(self, found: "hpcevidence.Check") -> str:
         """The line naming the files the federation rewrites itself that changed after the collect, and their record in
         the state: names only, never a value. They are no reason to refuse: the collect-time copy is what the
         post-check reads."""
         line = (
-            f"down: {', '.join(found.rewritten)} changed after the evidence of {shown} was collected: the federation "
+            f"down: {', '.join(found.rewritten)} changed after the {found.named} was collected: the federation "
             "rewrites it itself, so this is no reason to refuse, and what was collected stays what the post-check reads"
         )
         if self.store.exists():

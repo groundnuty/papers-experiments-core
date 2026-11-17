@@ -5,7 +5,7 @@
 hashes of, the step records, the fault journal and the fault relay's journal.
 `shards.py collect`, run while the federation is up, archives exactly those files (`archive_root`) to
 `<results>/<label>.root.tar` with a manifest of its own, and writes a marker into the root (`write_marker`); `down`
-refuses a root that has shard results recorded against it and no current marker (`uncollected`).
+refuses a root that holds evidence a run left (`present_evidence`) and no current marker (`uncollected`).
 
 **An allow-list, never a deny-list.** The archive holds the files named in `EVIDENCE_FILES` and the files of
 `EVIDENCE_TREES` whose names match, and nothing else: not `secrets/`, not any file that holds a token, key or password
@@ -16,11 +16,23 @@ what was checked is what is archived. As a last check no archived file may hold 
 (its whole stripped content, or the value of a `KEY=value` line of a `.env` file): such a file is refused, naming it
 and never the value.
 
-**A step ran.** `down` cannot see the results directory, so `shards.py step` leaves `shard-steps/<label>.json` in the
-root when a step of that shard starts (`STEPS_DIR`: the shard's spec and how many steps of it started; no path, host or
-secret). The marker names the archive's SHA-256, the digest of those records (`steps_digest`) and the SHA-256 of each
-archived file (`files`), all as they were when the evidence was read; `down` reads the root's evidence again
-(`check_collected`) and compares it with the marker file by file.
+**Evidence present, not a step run.** `down` cannot see the results directory, so what gates it is what the root
+holds. A root that only ran Day-0 measurements has no shard step, and holds evidence all the same, so the gate keys on
+the evidence a run left (`present_evidence`), by who writes it: `UP_FILES` and `UP_TREES` are what `up` writes (the
+state, the link check, the platform file, the facts, the render identity, the data manifests), present in every root
+`up` finished, and count for nothing; `RUN_FILES` and `RUN_TREES` are what a run, a step or the operator leaves, and
+each one with something in it counts: a file of the fault journal at any depth, a relay request, taken request, answer
+or `late-steps.jsonl`, a shard claim, the pilot's `day0-wiring.toml`, and any step record (`shard-steps/<label>.json`,
+which `shards.py step` leaves in the root when a step of that shard starts: the shard's spec and how many steps of it
+started; no path, host or secret). An empty file does not (the injector's lock files, the claim's lock), and a thing
+that cannot be looked at (a link, a special file, a tree nested past `MAX_DEPTH`) does, since it proves no absence.
+`up` writes no line of the fault journal and takes no admission (a test pins that nothing on its path imports what
+does), and the relay it starts makes only empty directories, `relay.lock` and a heartbeat, which are in no set: so a
+root after `up` alone, or a failed `up`'s, holds none, and `down` removes it as it always did. The marker names the
+archive's SHA-256, the digest of the step records (`steps_digest`) and the SHA-256 of each archived file (`files`),
+all as they were when the evidence was read; `collect --roots-only` writes one from the plan, whatever the root holds,
+so a Day-0-only root can be marked. `down` reads the root's evidence again (`check_collected`) and compares it with
+the marker file by file.
 
 **Two sets, compared differently.** `STRICT_FILES` and the trees (`STRICT_TREES`) hold what a
 step, the study or `up` writes: the fault journal, the relay's journals (`late-steps.jsonl` and its request, taken and
@@ -64,17 +76,36 @@ LINK_CHECK = "link-check.json"
 # needs). One line each: a file the post-check reads is added to the set it belongs to, which is the question whether a
 # process of the federation's own rewrites it while the federation is up.
 SELF_REWRITTEN_FILES = (STATE, LINK_CHECK)
-STRICT_FILES = (
-    "platform.toml",
-    "facts.json",
-    "render-identity.json",
-    "day0-wiring.toml",
-    "shard-claim.json",
-    "shard-claim.lock",
-)
+# The allow-list is also split by who writes a file, which decides whether `down` counts it as evidence a run left:
+# `UP_FILES` and `UP_TREES` are what `up` writes (and the federation rewrites), present in every root `up` finished, so
+# they say nothing of what ran; `RUN_FILES` and `RUN_TREES` (below) are what a run, a step or the operator leaves, and
+# are the evidence `down` refuses to remove uncollected. Every file of the allow-list is in exactly one of the two.
+UP_FILES = (STATE, LINK_CHECK, "platform.toml", "facts.json", "render-identity.json")
+UP_TREES = ("data-manifests",)  # `hpcdata.data_manifests`: each non-imported space's manifest, written by `up`
+STEPS_KIND = "step records"
+JOURNAL_KIND = "the fault journal"
+RELAY_KIND = "the relay's journals"
+CLAIM_KIND = "a shard claim"
+WIRING_KIND = "the day-0 wiring"
+KINDS = (STEPS_KIND, JOURNAL_KIND, RELAY_KIND, CLAIM_KIND, WIRING_KIND)  # the order `down` names them in
+RUN_FILES = {  # left by the pilot (the wiring a day-0 run reads) or by a step's pre-step guard (who held the root)
+    "day0-wiring.toml": WIRING_KIND,
+    "shard-claim.json": CLAIM_KIND,
+    "shard-claim.lock": CLAIM_KIND,
+}
+RUN_TREES = {  # the injector's journal, the relay's journals and the step records: written by a run, never by `up`
+    "fault-journal": JOURNAL_KIND,
+    "fault-relay": RELAY_KIND,
+    "fault-relay/requests": RELAY_KIND,
+    "fault-relay/taken": RELAY_KIND,
+    "fault-relay/answers": RELAY_KIND,
+    "shard-steps": STEPS_KIND,
+}
+STRICT_FILES = (*(name for name in UP_FILES if name not in SELF_REWRITTEN_FILES), *RUN_FILES)
 EVIDENCE_FILES = (*SELF_REWRITTEN_FILES, *STRICT_FILES)  # the allow-list: every file in exactly one of the two sets
 STRICT = "strict"
 SELF_REWRITTEN = "self-rewritten"
+UP, RUN = "up", "run"  # `kind_of`
 REQUIRED = (STATE, "facts.json")  # what `up` always writes: a root without one is not the evidence the post-check needs
 _REQUEST_FILE = re.compile(r"[0-9a-f]{32}\.json")  # the relay's requests, the ones it took and its answers
 _JSON_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.json")
@@ -132,6 +163,16 @@ def set_of(name: str) -> str | None:
 def compared_strictly(name: str) -> bool:
     """Whether a change to `name` since the collect makes `down` refuse: every file but the federation's own."""
     return set_of(name) != SELF_REWRITTEN
+
+
+def kind_of(name: str) -> str | None:
+    """Who writes the archived file `name` (relative to the root): `UP` for one `up` writes or the federation rewrites,
+    `RUN` for one a run, a step or the operator leaves (evidence `down` counts), None for one that is in neither."""
+    if name in UP_FILES or any(name.startswith(f"{tree}/") for tree in UP_TREES):
+        return UP
+    if name in RUN_FILES or any(name.startswith(f"{tree}/") for tree in RUN_TREES):
+        return RUN
+    return None
 
 
 @dataclass(frozen=True)
@@ -370,6 +411,100 @@ def steps_digest(root: Path) -> str:
         os.close(fd)
 
 
+# ------------------------------------------------------------------------------------------------ evidence present
+def _journal_has(directory: int, depth: int) -> bool:
+    """Whether the fault journal below `directory` (a descriptor; `depth` 0 at its top) holds a file with something in
+    it, or a thing no collect could archive (a link or another special file, a name that is not plain, a tree nested
+    past `MAX_DEPTH`): the last proves no absence, so it counts. OSError and EvidenceError are for the caller."""
+    if depth > MAX_DEPTH:
+        return True
+    with os.scandir(directory) as listing:
+        entries = [(entry.name, entry.stat(follow_symlinks=False)) for entry in listing]
+    for name, info in entries:
+        if not _PLAIN_NAME.fullmatch(name):
+            return True
+        if stat.S_ISREG(info.st_mode):
+            if info.st_size > 0:  # a lock file the injector took and wrote nothing to is empty: no evidence
+                return True
+        elif stat.S_ISDIR(info.st_mode):
+            below = _open_dir(directory, name, name)
+            try:
+                if _journal_has(below, depth + 1):
+                    return True
+            finally:
+                os.close(below)
+        else:
+            return True
+    return False
+
+
+def _tree_has(root_fd: int, relative: str, pattern: re.Pattern[str] | None) -> bool:
+    """Whether the allow-list's directory `relative` of the root holds evidence: with a `pattern`, a file of that name
+    that is not empty (or not a regular file); without one, the fault journal's tree (`_journal_has`). A directory that
+    is not there holds none; one that is a link or cannot be read proves no absence, so it counts."""
+    try:
+        directory = _tree(root_fd, relative)
+        if directory is None:
+            return False
+        try:
+            if pattern is None:
+                return _journal_has(directory, 0)
+            with os.scandir(directory) as listing:
+                for entry in listing:
+                    if pattern.fullmatch(entry.name):
+                        info = entry.stat(follow_symlinks=False)
+                        if not stat.S_ISREG(info.st_mode) or info.st_size > 0:
+                            return True
+            return False
+        finally:
+            os.close(directory)
+    except (EvidenceError, OSError):
+        return True
+
+
+def _present(root_fd: int, steps: list[tuple[str, bytes | None]] | None) -> tuple[str, ...]:
+    """The kinds of evidence (`KINDS`) a run left in the root, by `RUN_FILES` and `RUN_TREES`: a step record of any
+    kind (`steps`, which `_step_entries` read: a record counts whatever it holds, and records that cannot be read count
+    too), a fault-journal file or a relay journal with something in it, a claim file or the pilot's wiring that is not
+    empty. Nothing `up` writes counts (`UP_FILES`, `UP_TREES`): it writes no line of the journal and takes no
+    admission, so a root after `up` alone holds none. Every read is below the root's descriptor with no link followed,
+    and only sizes are read: a thing that cannot be looked at counts, never passes for nothing."""
+    found: set[str] = set()
+    if steps != []:
+        found.add(STEPS_KIND)
+    for name, kind in RUN_FILES.items():
+        try:
+            info = os.lstat(name, dir_fd=root_fd)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            found.add(kind)
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 0:
+            found.add(kind)
+    for relative, pattern in EVIDENCE_TREES:
+        kind = RUN_TREES.get(relative)
+        if kind is not None and kind != STEPS_KIND and _tree_has(root_fd, relative, pattern):
+            found.add(kind)
+    for relative in WHOLE_TREES:
+        if _tree_has(root_fd, relative, None):
+            found.add(RUN_TREES[relative])
+    return tuple(kind for kind in KINDS if kind in found)
+
+
+def present_evidence(root: Path) -> tuple[str, ...]:
+    """The kinds of evidence a run left in `root` (`_present`), in `KINDS`' order; empty for a root after `up` alone, a
+    failed `up`'s, and one that is not there."""
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return ()
+    try:
+        return _present(fd, _step_entries(fd))
+    finally:
+        os.close(fd)
+
+
 # ------------------------------------------------------------------------------------------------ the root archive
 def _up_id(state: bytes) -> str:
     """A hash of the allocation's name in the state file (`hpcop-<project>-<random>`: a new one for each `up`, no path):
@@ -592,16 +727,24 @@ def _marker(root_fd: int) -> dict | None:
 
 @dataclass(frozen=True)
 class Check:
-    """What `down` finds when it reads a root a step ran against: the shards that have step records (`labels`); whether
-    a current marker exists (`marked`); whether the evidence can no longer be read or archived (`unreadable`); the names
-    of the strict files that differ from the marker's (`changed`); and the names of the self-rewritten files that do
-    (`rewritten`: no reason to refuse, named for the record)."""
+    """What `down` finds when it reads a root that holds evidence a run left: the shards that have step records
+    (`labels`, none for a root that only ran Day-0 measurements); whether a current marker exists (`marked`); whether
+    the evidence can no longer be read or archived (`unreadable`); the names of the strict files that differ from the
+    marker's (`changed`); the names of the self-rewritten files that do (`rewritten`: no reason to refuse, named for the
+    record); and the kinds of evidence present (`present`, `KINDS`' order: what the output names when there is no
+    shard to name)."""
 
     labels: tuple[str, ...]
     marked: bool = True
     unreadable: bool = False
     changed: tuple[str, ...] = ()
     rewritten: tuple[str, ...] = ()
+    present: tuple[str, ...] = ()
+
+    @property
+    def named(self) -> str:
+        """What the output calls the evidence: that of the shards that have step records, else the kinds present."""
+        return f"evidence of {', '.join(self.labels)}" if self.labels else f"evidence ({', '.join(self.present)})"
 
     @property
     def refused(self) -> bool:
@@ -626,12 +769,13 @@ def _differing(before: Mapping[str, str], now: Mapping[str, str]) -> tuple[list[
 
 
 def check_collected(root: Path) -> Check | None:
-    """None when no step ever ran against `root` (or there is no root): `down` has nothing to gate. Otherwise the
-    `Check` of its evidence against the marker `collect` wrote: no current marker; a strict file (one a step, the
-    study or `up` writes) that is not what the marker's hash names, or a root that no longer archives (a link, a file
-    that holds a secret, a required file missing); and, of no consequence, the self-rewritten files that changed.
-    Reads below a descriptor of the root, no link followed; a marker without per-file hashes compares the archive as a
-    whole, so any change refuses."""
+    """None when the root holds no evidence a run left (or there is no root): `down` has nothing to gate. That is a root
+    with no step record and none of the files of `RUN_FILES` and `RUN_TREES` with anything in them (`_present`): one
+    after `up` alone, or a failed `up`'s. Otherwise the `Check` of its evidence against the marker `collect` wrote: no
+    current marker; a strict file (one a step, the study or `up` writes) that is not what the marker's hash names, or a
+    root that no longer archives (a link, a file that holds a secret, a required file missing); and, of no consequence,
+    the self-rewritten files that changed. Reads below a descriptor of the root, no link followed; a marker without
+    per-file hashes compares the archive as a whole, so any change refuses."""
     try:
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except FileNotFoundError:
@@ -640,7 +784,8 @@ def check_collected(root: Path) -> Check | None:
         return Check(("(its root cannot be read)",), marked=False)  # nothing can be said of what ran: refused
     try:
         entries = _step_entries(fd)
-        if entries == []:
+        present = _present(fd, entries)
+        if not present:
             return None
         labels = tuple(
             ["(its records cannot be read)"]
@@ -652,26 +797,28 @@ def check_collected(root: Path) -> Check | None:
     finally:
         os.close(fd)
     if marker is None:
-        return Check(labels, marked=False)
+        return Check(labels, marked=False, present=present)
     try:
         held = archive_root(root, "")
     except (EvidenceError, OSError):
-        return Check(labels, unreadable=True)
+        return Check(labels, unreadable=True, present=present)
     if "files" not in marker:
         whole = steps_moved or held.sha256 != marker["root_archive_sha256"]
-        return Check(labels, changed=("the root archive as a whole",) if whole else ())
+        return Check(labels, changed=("the root archive as a whole",) if whole else (), present=present)
     strict, rewritten = _differing(marker["files"], held.hashes)
     if steps_moved and not any(name.startswith(f"{STEPS_DIR}/") for name in strict):
         strict.append(f"{STEPS_DIR}/")  # a record that cannot be told by file: unreadable, or not a plain file
-    return Check(labels, changed=tuple(strict), rewritten=tuple(rewritten))
+    return Check(labels, changed=tuple(strict), rewritten=tuple(rewritten), present=present)
 
 
 def uncollected(root: Path) -> tuple[list[str], bool] | None:
-    """None when `down` may remove `root` for want of evidence: no step ever ran against it, or its evidence was
-    collected and no strict file has changed since (`check_collected`). Otherwise (the shards that have records, and
-    whether a marker exists but is stale): a root with shard results and no marker (or one that cannot be read) is
-    `(labels, False)`; one whose marker names other step records than there are now, or a strict file that changed (a
-    running step wrote since, or a file was edited), or whose evidence cannot be archived, is `(labels, True)`."""
+    """None when `down` may remove `root` for want of evidence: the root holds none a run left (no step record, no
+    journal, relay file, claim or wiring with anything in it), or its evidence was collected and no strict file has
+    changed since (`check_collected`). Otherwise (the shards that have records, and whether a marker exists but is
+    stale): a root with evidence and no marker (or one that cannot be read) is `(labels, False)`; one whose marker
+    names other step records than there are now, or a strict file that changed (a running step wrote since, or a file
+    was edited), or whose evidence cannot be archived, is `(labels, True)`. The labels are empty for a root that only
+    ran Day-0 measurements: it has no step record (`Check.present` names what it holds)."""
     found = check_collected(root)
     if found is None or not found.refused:
         return None

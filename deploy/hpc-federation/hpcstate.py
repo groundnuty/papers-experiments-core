@@ -149,17 +149,22 @@ def checked_shard_nodes(entries: Any) -> None:
 
 def checked_discards(entries: Any) -> None:
     """Each use of `down --discard-evidence` (O63): when it was, the shards whose evidence was not collected, or changed
-    after it was, and so went with the root, and the reason given on the command line (None when none was)."""
+    after it was, and so went with the root (none for a root that only ran Day-0 measurements), the kinds of evidence
+    it held (`evidence`: a key an earlier down did not write, so optional), and the reason given on the command line
+    (None when none was)."""
     if not isinstance(entries, list):
         raise StateError(f"{STATE}: evidence_discarded is not a list")
+    keys = {"at", "shards", "changed_since_collect", "reason"}
     for entry in entries:
-        ok = isinstance(entry, dict) and set(entry) == {"at", "shards", "changed_since_collect", "reason"}
+        ok = isinstance(entry, dict) and set(entry) in (keys, keys | {"evidence"})
         ok = ok and isinstance(entry["at"], str) and isinstance(entry["changed_since_collect"], bool)
         ok = ok and isinstance(entry["shards"], list) and all(isinstance(label, str) for label in entry["shards"])
         ok = ok and (entry["reason"] is None or isinstance(entry["reason"], str))
+        ok = ok and isinstance(entry.get("evidence", []), list)
+        ok = ok and all(isinstance(kind, str) for kind in entry.get("evidence", []))
         if not ok:
             raise StateError(
-                f"{STATE}: an evidence_discarded entry is not {{at, shards, changed_since_collect, reason}}"
+                f"{STATE}: an evidence_discarded entry is not {{at, shards, [evidence,] changed_since_collect, reason}}"
             )
 
 
