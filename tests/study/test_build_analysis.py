@@ -5,8 +5,9 @@ batch is analysed after copy-back. A plugin module may also define `build_analys
 (`analyse_study`, so `analyze`, `report`, `regenerate` and a package's check) call it, and fall back to `build` without
 it. It is never called for a run. The campaign fingerprint records the run plugin's `scorer_digest`, and an analysis
 built by `build_analysis` is refused when its scorers' digest is another one, or when a snapshot records none. With
-`--rescore` a digest that is another one is let through and recorded, as the last section tests; a snapshot that
-records none is refused with it too.
+`--rescore` a digest that is another one is let through and recorded, as the next section tests; a snapshot that
+records none is refused with it too. A package's build and check pass no flag but honour the entry the recorded
+analysis holds, as the last section tests (the packages themselves, in tests/package/test_rescored_package.py).
 
 The example is copied, and its plugin gains both builders: each notes its call in a file the test names, `build` fails
 when the test says the federation is gone, and `build_analysis` gives the scorers the test asks for.
@@ -20,12 +21,12 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from study_support import HEAD, Campaign, clean_environment, cli, copy_campaign, finish, make_copy
+from build_analysis_support import GONE, LOG, SCORERS, edit_analysis, with_builders
+from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
 from expcore.campaign.shard import ShardSpec
 from expcore.cli import build_parser
 from expcore.config.loading import ConfigError
-from expcore.provenance.codestamp import write_stamp
 from expcore.study import analysis_plugin, pipeline
 from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, require_run_scorers
 from expcore.study.config import load_study
@@ -36,67 +37,7 @@ __all__ = ["clean_environment"]  # a fixture the tests below use, imported from 
 
 ROOT = Path(__file__).resolve().parents[2]
 SCANNED = (ROOT / "src", ROOT / "deploy")  # every Python file the repository ships
-LOG = "TINY_BUILD_LOG"  # the file each builder notes its call in
-GONE = "TINY_NO_FEDERATION"  # "1": `build` fails, as it does where the federation no longer exists
-SCORERS = "TINY_ANALYSIS_SCORERS"  # which scorers `build_analysis` gives: same, other, extra or none
 DIGEST = re.compile(r"[0-9a-f]{64}")
-
-# What the copy's plugin gains: the run's `build` keeps its body under another name and wraps it.
-BOTH_BUILDERS = """
-
-# --- the test's two builders ---------------------------------------------------------------------------------------
-import os
-
-_RUN_BUILD = build
-
-
-def _note(name):
-    path = os.environ.get("TINY_BUILD_LOG")
-    if path:
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(name + "\\n")
-
-
-def build(context):
-    _note("build")
-    if os.environ.get("TINY_NO_FEDERATION") == "1":
-        raise RuntimeError("the federation is gone")
-    return _RUN_BUILD(context)
-
-
-class OtherScorer(TinyScorer):
-    version = "2"
-
-
-class ExtraScorer(TinyScorer):
-    name = "extra"
-
-
-def build_analysis(context):
-    _note("build_analysis")
-    chosen = {
-        "same": [TinyScorer()],
-        "other": [OtherScorer()],
-        "extra": [TinyScorer(), ExtraScorer()],
-        "none": [],
-    }[os.environ.get("TINY_ANALYSIS_SCORERS", "same")]
-    return StudyPlugin(executor=None, scorers=chosen, prompts={}, tools={})
-"""
-
-
-def with_builders(base: Path, name: str, extra: str = BOTH_BUILDERS, *, held: bool = False) -> Path:
-    """A stamped copy of the example whose plugin gains `extra`; the scorer is code, so the stamp is made after. With
-    `held`, a budget too small for any run, so a start opens the store, pins its fingerprint and returns, and room for
-    two shards (a model's cap is at least the number of shards)."""
-    copy = make_copy(base, name)
-    if held:
-        text = (copy / "campaign.toml").read_text(encoding="utf-8").replace("max_usd = 5.0", "max_usd = 0.00001")
-        text = text.replace("alpha-stub = 1", "alpha-stub = 2").replace("beta-stub = 1", "beta-stub = 2")
-        (copy / "campaign.toml").write_text(text, encoding="utf-8")
-    plugin = copy / "plugin.py"
-    plugin.write_text(plugin.read_text(encoding="utf-8") + extra, encoding="utf-8")
-    write_stamp(copy, HEAD, load_study(copy).scope)
-    return copy
 
 
 def calls(log: Path) -> list[str]:
@@ -570,3 +511,130 @@ def test_r17_rescore_is_an_option_of_analyze_and_report_only():
     for argv in (["run", "study", "--rescore"], ["check", "batch", "--rescore"], ["merge", "out", "s", "--rescore"]):
         with pytest.raises(SystemExit):
             parser.parse_args(argv)
+
+
+# --- a package's build and check honour the re-score its shipped analysis.json records --------------------------------
+
+
+def entry_of(old: str, mine: list[Scorer]) -> dict:
+    """The `rescore` entry of an analysis that re-scored a store recording `old` with the scorers `mine`."""
+    return {"run_scorer_digests": [old], "analysis_scorer_digest": digest_of(*mine)}
+
+
+def test_r17_a_shipped_entry_equal_to_what_the_guard_records_lets_a_differing_digest_through_and_returns_it():
+    """R17: the decision was recorded at analyze, so the entry the shipped analysis.json holds is honoured when it is
+    exactly what the guard would record now, and the guard returns that same record, as `rescore=True` does."""
+    mine, old = [Scorer("tiny", "2")], digest_of(Scorer("tiny", "1"))
+    shipped = entry_of(old, mine)
+    assert require_run_scorers(mine, "plugin.py", [{"scorer_digest": old}], shipped=shipped) == shipped
+    assert require_run_scorers(mine, "plugin.py", [{"scorer_digest": old}], rescore=True) == shipped
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda e: {**e, "analysis_scorer_digest": "0" * 64}, id="another analysis digest"),
+        pytest.param(lambda e: {**e, "run_scorer_digests": ["1" * 64]}, id="another run digest"),
+        pytest.param(lambda e: {**e, "run_scorer_digests": [*e["run_scorer_digests"], "1" * 64]}, id="an extra digest"),
+        pytest.param(lambda e: {**e, "run_scorer_digests": []}, id="no run digest"),
+        pytest.param(lambda e: {**e, "note": "kept"}, id="an extra key"),
+        pytest.param(lambda e: {"run_scorer_digests": e["run_scorer_digests"]}, id="no analysis digest"),
+        pytest.param(lambda e: {**e, "run_scorer_digests": e["run_scorer_digests"][0]}, id="a digest, not a list"),
+        pytest.param(lambda e: [e], id="a list"),
+        pytest.param(lambda e: "rescored", id="a string"),
+        pytest.param(lambda e: {}, id="an empty mapping"),
+        pytest.param(lambda e: None, id="no entry"),
+    ],
+)
+def test_r17_a_shipped_entry_that_is_not_exactly_the_record_is_refused_naming_the_scorers(mutate):
+    """R17: a differing digest is honoured only for an entry equal to what the guard records now: another digest on
+    either side, an extra, a missing or an extra key, a wrong type or no entry at all is the refusal of an analysis
+    that was not asked to re-score. The message names the scorers and shows no digest."""
+    mine, old = [Scorer("tiny", "2")], digest_of(Scorer("tiny", "1"))
+    with pytest.raises(ScorersDiffer) as refused:
+        require_run_scorers(mine, "plugin.py", [{"scorer_digest": old}], shipped=mutate(entry_of(old, mine)))
+    assert "'tiny'" in str(refused.value)
+    assert "build_analysis" in str(refused.value)
+    assert not DIGEST.search(str(refused.value))
+
+
+def test_r17_a_refusal_with_a_shipped_entry_says_the_entry_is_not_for_these_scorers_and_one_without_does_not():
+    """R17: a package whose analysis.json records a re-score that is not this one is told so, which a package with no
+    entry is not; the other says how to record one."""
+    mine, old = [Scorer("tiny", "2")], digest_of(Scorer("tiny", "1"))
+    wrong = entry_of(old, [Scorer("tiny", "3")])
+    with pytest.raises(ScorersDiffer, match="records a re-score that is not of these scorers on this store"):
+        require_run_scorers(mine, "plugin.py", [{"scorer_digest": old}], shipped=wrong)
+    with pytest.raises(ScorersDiffer) as bare:
+        require_run_scorers(mine, "plugin.py", [{"scorer_digest": old}])
+    assert "records a re-score" not in str(bare.value)
+    assert "--rescore" in str(bare.value)
+
+
+def test_r17_a_matching_shipped_entry_relaxes_only_the_differing_digest_never_a_missing_one():
+    """R17: honoured as the flag is: a snapshot that records no valid digest, or no snapshot, is refused even when the
+    entry equals what the digests of the others give."""
+    mine, old = [Scorer("tiny", "2")], digest_of(Scorer("tiny", "1"))
+    shipped = entry_of(old, mine)
+    with pytest.raises(ScorersDiffer, match=r"1 of 2 snapshots of the store record no valid scorer digest"):
+        require_run_scorers(mine, "plugin.py", [{"scorer_digest": old}, {}], shipped=shipped)
+    with pytest.raises(ScorersDiffer, match="no snapshot of the store was read"):
+        require_run_scorers(mine, "plugin.py", [], shipped=shipped)
+
+
+def test_r17_a_shipped_entry_beside_the_runs_own_scorers_records_nothing():
+    """R17: with the scorers the run had there is no re-score, whatever the entry says: the guard returns none, so the
+    outputs derive without the entry and the shipped one fails the byte comparison."""
+    mine = [Scorer("tiny", "1")]
+    own = digest_of(*mine)
+    assert require_run_scorers(mine, "plugin.py", [{"scorer_digest": own}], shipped=entry_of(own, mine)) is None
+
+
+def test_r17_the_entry_of_a_shipped_analysis_is_read_only_when_it_is_a_mapping_in_an_object():
+    """R17: `rescore_entry` reads the key of an analysis.json given as bytes; a missing file, invalid JSON, a value
+    that is not an object, no key or a value that is not an object under it give no entry."""
+    entry = {"run_scorer_digests": ["a" * 64], "analysis_scorer_digest": "b" * 64}
+    assert analysis_plugin.rescore_entry(json.dumps({"alpha": 0.05, "rescore": entry}).encode()) == entry
+    for held in (None, b"", b"not json", b"[]", b'"x"', b"{}", b'{"rescore": 3}', b'{"rescore": [1]}', b"\xff\xfe"):
+        assert analysis_plugin.rescore_entry(held) is None
+
+
+def test_r17_regenerate_honours_the_re_score_the_batch_records_only_when_asked_to(copy, monkeypatch, clean_environment):
+    """R17: `honour_shipped_rescore` is what a package's build and check pass: it derives what a re-scored analysis
+    wrote, with the entry its analysis.json holds and no flag, while a plain `regenerate` and `analyze` still refuse."""
+    monkeypatch.setenv(SCORERS, "other")
+    rescored(copy, clean_environment)
+    assert regenerate(copy.root, honour_shipped_rescore=True) == []
+    with pytest.raises(Refused, match="--rescore"):
+        regenerate(copy.root)
+    status, errors = cli(clean_environment, "analyze", str(copy.root))  # analyze does not re-read the decision
+    assert status == 1
+    assert "--rescore" in errors
+
+
+def test_r17_honouring_needs_the_entry_a_batch_with_none_is_refused_as_ever(copy, monkeypatch):
+    """R17: the corrected scorers on a batch that nobody re-scored: no entry in analysis.json, so the refusal stands
+    even when asked to honour one."""
+    monkeypatch.setenv(SCORERS, "other")
+    with pytest.raises(Refused, match="--rescore"):
+        regenerate(copy.root, honour_shipped_rescore=True)
+    with pytest.raises(Refused, match="--rescore"):
+        analyse_study(copy.root, shipped_rescore=None)
+
+
+def test_r17_an_entry_on_an_analysis_that_re_scored_nothing_fails_the_byte_comparison(copy):
+    """R17: with the run's own scorers nothing is re-scored, so an entry in analysis.json cannot be honoured: the
+    derived analysis has none and `regenerate` reports the file as differing."""
+    mine = [Scorer("tiny", "1")]
+    edit_analysis(copy.root, lambda data: data.update(rescore=entry_of(recorded_digest(copy), mine)))
+    assert regenerate(copy.root, honour_shipped_rescore=True) == ["analysis.json: differs from what the records give"]
+
+
+def test_r17_regenerate_compares_the_bytes_it_read_the_entry_from(copy, monkeypatch, clean_environment):
+    """R17: analysis.json is read once, so the entry that is honoured and the bytes that are compared are the same:
+    an entry changed to another digest is refused by the guard, not passed on to a comparison."""
+    monkeypatch.setenv(SCORERS, "other")
+    rescored(copy, clean_environment)
+    edit_analysis(copy.root, lambda data: data["rescore"].update(run_scorer_digests=["1" * 64]))
+    with pytest.raises(Refused, match="records a re-score that is not of these scorers on this store"):
+        regenerate(copy.root, honour_shipped_rescore=True)

@@ -45,7 +45,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   recorded, so the outputs are the same bytes whichever builder served an analysis that re-scored nothing. With
   `allow_rescore` (`analyze --rescore`) a digest that differs is let through, and `analysis.json` (`rescore`) and the
   report's provenance say so, naming both digests: a scorer corrected after an HPC batch is re-scored on the record,
-  never silently.
+  never silently. A package's build and check pass no flag: `regenerate` with `honour_shipped_rescore` (and the
+  anonymised package's analysis) give `analyse_study` the `rescore` entry of the analysis.json shipped with the store
+  (`shipped_rescore`), which lets a differing digest through exactly when it is what the guard would record now.
 - `output_bytes` is the one place the bytes of `export.json`, `scores.json`, `analysis.json` and `report.md` are made;
   `write_analysis` and `write_report` write them and `regenerate` compares them with the files in `out/`, which is
   what a replication package's `make check` runs. Every time in them comes from the records and the store, every
@@ -131,7 +133,7 @@ from expcore.stats.ratio import OMIT_NONE
 from expcore.stats.reruns import difference as reruns_difference
 from expcore.stats.reruns import missing_table, ran_reruns
 from expcore.stats.rows import AbsentRun, Row
-from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, require_run_scorers
+from expcore.study.analysis_plugin import ScorersDiffer, load_analysis_plugin, require_run_scorers, rescore_entry
 from expcore.study.config import (
     MODELS_FILE,
     OUT_DIR,
@@ -847,6 +849,7 @@ def analyse_study(
     partial: bool = False,
     stamped: bool = False,
     allow_rescore: bool = False,
+    shipped_rescore: Mapping[str, Any] | None = None,
 ) -> StudyAnalysis:
     """Export the campaign, score its records and run the preregistered analysis; refuse without a current check.
 
@@ -857,10 +860,13 @@ def analyse_study(
     the study and never from a repository around it, as in a replication package. With `allow_rescore`, an analysis
     built by a plugin module's `build_analysis` may score with scorers other than the campaign's (R17): the result then
     holds `rescore`, the digests of both, and every output says so; a module without `build_analysis` is unaffected.
+    `shipped_rescore` is the `rescore` entry of the analysis.json shipped with the store, which a package's build and
+    check pass instead of the flag: the same differing digest is let through exactly when the entry equals what the
+    guard would record now (`analysis_plugin.require_run_scorers`), and nothing else is relaxed.
     """
     study = load_study(path)
     with study_kinds(study.kinds):  # the snapshot's attempts and the records may end in one of the study's own kinds
-        return _analyse_loaded(study, allow_dirty, code_root, partial, stamped, allow_rescore)
+        return _analyse_loaded(study, allow_dirty, code_root, partial, stamped, allow_rescore, shipped_rescore)
 
 
 def _analyse_loaded(
@@ -870,6 +876,7 @@ def _analyse_loaded(
     partial: bool,
     stamped: bool,
     allow_rescore: bool = False,
+    shipped_rescore: Mapping[str, Any] | None = None,
 ) -> StudyAnalysis:
     """Analyse the records of a loaded study, with its own infrastructure kinds in scope."""
     out = out_dir(study)
@@ -925,7 +932,9 @@ def _analyse_loaded(
     rescored = None
     if loaded.from_build_analysis:  # the run's own `build` is not compared: re-scoring after a scorer change is R13
         try:
-            rescored = require_run_scorers(plugin.scorers, study.plugin_file.name, fingerprints, rescore=allow_rescore)
+            rescored = require_run_scorers(
+                plugin.scorers, study.plugin_file.name, fingerprints, rescore=allow_rescore, shipped=shipped_rescore
+            )
         except ScorersDiffer as error:
             verified.close()
             raise Refused(str(error)) from None
@@ -1223,25 +1232,36 @@ def regenerate(
     partial: bool = False,
     stamped: bool = False,
     allow_rescore: bool = False,
+    honour_shipped_rescore: bool = False,
 ) -> list[str]:
     """Derive every output anew from the records and compare it byte for byte with the file in out/; write nothing.
 
     Returns one line per output that is missing or differs, empty when all four match. The refusals of
     `analyse_study` (no current check, records changed since) are raised as they are. `allow_rescore` is as for
-    `analyse_study`: outputs written by a re-score derive only with it.
+    `analyse_study`: outputs written by a re-score derive only with it. `honour_shipped_rescore` is what a package's
+    build and check pass: out/analysis.json is read once and its `rescore` entry, if it has one, is given to the
+    analysis as `shipped_rescore`, so a batch re-scored at `analyze` derives what was written with no flag; the bytes
+    compared with the derived ones are those same bytes, and a store with no such entry is refused as ever.
     """
-    analysis = analyse_study(
-        path, allow_dirty=allow_dirty, partial=partial, stamped=stamped, allow_rescore=allow_rescore
-    )
-    out, problems = out_dir(analysis.study), []
+    study = load_study(path)
+    out, problems = out_dir(study), []
+    held_analysis = _held(out / ANALYSIS_FILE)
+    shipped = rescore_entry(held_analysis) if honour_shipped_rescore else None
+    with study_kinds(study.kinds):
+        analysis = _analyse_loaded(study, allow_dirty, None, partial, stamped, allow_rescore, shipped)
     for name, made in output_bytes(analysis).items():
-        target = out / name
-        if not target.is_file():
+        held = held_analysis if name == ANALYSIS_FILE else _held(out / name)
+        if held is None:
             problems.append(f"{name}: missing")
-        elif target.read_bytes() != made:
-            why = _export_difference(analysis.export, target.read_bytes()) if name == EXPORT_FILE else None
+        elif held != made:
+            why = _export_difference(analysis.export, held) if name == EXPORT_FILE else None
             problems.append(f"{name}: {why or 'differs from what the records give'}")
     return problems
+
+
+def _held(target: Path) -> bytes | None:
+    """The bytes of a file in out/, or None when there is none."""
+    return target.read_bytes() if target.is_file() else None
 
 
 def _export_difference(derived: Mapping[str, Any], held: bytes) -> str | None:

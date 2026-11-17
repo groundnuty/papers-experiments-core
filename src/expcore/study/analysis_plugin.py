@@ -28,8 +28,16 @@ provenance shows. R13 records the corrected scorers' versions (`scorers`, every 
 what the flag adds, so a re-score is never silent. A store holds one hash of all the run's scorers, so which scorer
 changed is not recorded and cannot be said. Nothing else is relaxed: no snapshot and a snapshot with no valid digest
 are refused with the flag as without it, and nothing is recorded when the digests are the analysis plugin's own.
+
+A replication package of a re-scored batch is built and checked with no flag: the decision was recorded at `analyze`, so
+the package's build and check honour it and never ask again. They pass the `rescore` entry of the analysis.json shipped
+with the store (`rescore_entry`) as `shipped`, and a differing digest is let through exactly when that entry equals what
+the guard would record now: the digests the snapshots hold, and the digest of the analysis plugin's scorers. Any other
+entry, or none, is the refusal of an analysis that was not asked to re-score. The entry is only the decision, never
+trusted for the outputs: the package's analysis.json is still compared byte for byte with what the records give.
 """
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -76,6 +84,7 @@ def require_run_scorers(
     recorded: Sequence[Mapping[str, Any] | None],
     *,
     rescore: bool = False,
+    shipped: Any = None,
 ) -> dict[str, Any] | None:
     """Refuse unless the analysis plugin's scorers have the digest every snapshot of the store recorded of the run's;
     raise `ScorersDiffer`, naming the scorers and never a digest or a version. Return None when they have it.
@@ -89,6 +98,12 @@ def require_run_scorers(
     `{RUN_DIGESTS: the distinct digests the snapshots hold, sorted, ANALYSIS_DIGEST: the analysis plugin's}`. The flag
     relaxes nothing else: with it a snapshot that records no valid digest, or no snapshot at all, is still refused,
     including beside a snapshot that differs.
+
+    `shipped` is the `rescore` entry of the analysis.json shipped with the store (`rescore_entry`), which a package's
+    build and check pass instead of the flag: a digest that differs is let through, as with `rescore`, exactly when
+    `shipped` equals the record this returns, so the decision recorded at `analyze` is honoured and nothing else is. An
+    entry of another value or shape is refused, saying that the shipped analysis records a re-score that is not this
+    one; so is no entry (None), which says only how to record one.
     """
     if not recorded:
         raise ScorersDiffer(
@@ -99,13 +114,20 @@ def require_run_scorers(
     digests = [d for d in held if isinstance(d, str) and _DIGEST.fullmatch(d)]
     mine = scorers_digest(scorers)
     differs = any(d != mine for d in digests)
-    if differs and not rescore:
+    record = {RUN_DIGESTS: sorted(set(digests)), ANALYSIS_DIGEST: mine}
+    honoured = isinstance(shipped, Mapping) and dict(shipped) == record
+    if differs and not (rescore or honoured):
         names = ", ".join(repr(scorer_name(s)) for s in scorers)
+        why = (
+            "; the analysis.json shipped with the store records a re-score that is not of these scorers on this store"
+            if shipped is not None
+            else ""
+        )
         raise ScorersDiffer(
             f"{plugin_file}: {BUILD_ANALYSIS} gives the scorers {names}, but the campaign was run with other scorers "
             f"(the scorer digest its fingerprint records is not theirs): give {BUILD_ANALYSIS} the scorers `build` "
             "gives, with the same names and versions; to analyse with a scorer corrected since the run, on purpose "
-            "and on the record, run `analyze --rescore` and `report --rescore`"
+            f"and on the record, run `analyze --rescore` and `report --rescore`{why}"
         )
     missing = len(held) - len(digests)
     if missing:
@@ -115,6 +137,18 @@ def require_run_scorers(
             f"{noun} of the store {verb} no valid scorer digest (every campaign fingerprint the core writes holds one, "
             "so this store was changed or is damaged)"
         )
-    if differs:
-        return {RUN_DIGESTS: sorted(set(digests)), ANALYSIS_DIGEST: mine}
-    return None
+    return record if differs else None
+
+
+def rescore_entry(analysis_json: bytes | None) -> dict[str, Any] | None:
+    """The `rescore` entry of an analysis.json given as its bytes, as the guard's `shipped`: None when there are no
+    bytes, they are not JSON, the document is not an object, or it holds no `rescore` key or one that is not an
+    object. The guard then reads the absence or the wrong shape as an entry that is not the record, and refuses."""
+    if analysis_json is None:
+        return None
+    try:
+        data = json.loads(analysis_json)
+    except ValueError:
+        return None
+    entry = data.get("rescore") if isinstance(data, dict) else None
+    return entry if isinstance(entry, dict) else None
