@@ -206,6 +206,7 @@ FAKE_APPTAINER = r"""#!/bin/bash
 # guard's verdict, becomes ready and waits for SIGTERM; any other use is exec.sh's: log the arguments, count stdin.
 if [[ " $* " == *" --writable "* ]]; then
   R=${*: -2:1}; W=${R%/rootfs}
+  if [[ -n ${FAKE_SERVICE_ARGS:-} ]]; then printf '%s\n' "$@" > "$FAKE_SERVICE_ARGS"; fi   # how the service was started
   for f in stop-requested service-verified rootfs/root/service-ready.lock; do
     if [[ -e $W/$f ]]; then echo "present $f" >> "$FAKE_LOG"; else echo "absent $f" >> "$FAKE_LOG"; fi
   done
@@ -248,6 +249,8 @@ while i < len(args) - 1:
         i += 2
     else:
         i += 1
+if os.environ.get("FAKE_CURL_LOG"):  # every call's arguments, for a test of what a script dialled
+    open(os.environ["FAKE_CURL_LOG"], "a").write(" ".join(args) + "\n")
 state = json.load(open(os.environ["FAKE_CURL_STATE"]))
 creds = None
 if cfg:
@@ -273,6 +276,8 @@ if url.endswith(":8443/configuration"):
     reply(200, {"providerId": state["providerId"], "domain": state["domain"]})
 if url.endswith(":8443/api/v3/onezone/configuration"):
     reply(200, {"name": "zone-a", "domain": state["domain"]})
+if url.endswith(":8443/api/v3/onezone/user/tokens/named") and method == "POST":
+    reply(201, {"token": "minted-registration-token"})
 if url.endswith(":8443/api/v3/onezone/user"):
     reply(200 if creds and creds[0] == "admin" else 401, {"userId": state["adminUserId"]})
 if url.endswith(":9443/api/v3/onepanel/provider/storages") and method == "GET":
