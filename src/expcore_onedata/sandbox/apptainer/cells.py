@@ -37,7 +37,14 @@ from expcore_onedata.sandbox.api import RAN, ExecResult
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer.node import NodeOps
 from expcore_onedata.sandbox.apptainer.watch import Watch
-from expcore_onedata.sandbox.cells import CAP_MARGIN_S, HOST_CALL_MARGIN_S, QUIESCE_ROUNDS, CellRunner, CellTimer
+from expcore_onedata.sandbox.cells import (
+    CAP_MARGIN_S,
+    HOST_CALL_MARGIN_S,
+    QUIESCE_ROUNDS,
+    CellRunner,
+    CellTimer,
+    _left_record,
+)
 from expcore_onedata.sandbox.cells import _output_cut as output_cut
 from expcore_onedata.sandbox.completion import Completion, ExecIncomplete
 from expcore_onedata.sandbox.hostops import TIMED_OUT, describe_error
@@ -158,7 +165,7 @@ class AppCellRunner(CellRunner):
         """`quiesce` without its record."""
         state: dict[str, Any] = {"reason": reason, "killed": None, "left": None}
         try:
-            killed, seen, left = 0, set(), []
+            killed, seen, left, unsent = 0, set(), [], False
             for _ in range(QUIESCE_ROUNDS):
                 procs = self.agent_processes()
                 if procs is None:
@@ -168,14 +175,18 @@ class AppCellRunner(CellRunner):
                 left = procs
                 if not fresh:
                     break
-                killed += self.kill(fresh)
+                sent = self.kill(fresh)
+                killed += sent
+                unsent = unsent or sent < len(fresh)  # one signal not known to have been sent
                 seen.update((p["pid"], p["start"]) for p in fresh)
                 left = self._wait_gone(fresh, GONE_WAIT_S)
                 if left is None:
                     killed = None
                     break
             if killed is not None:
-                state.update(killed=killed, left=[{k: p[k] for k in ("pid", "comm", "state")} for p in left[:16]])
+                state.update(killed=killed, **_left_record(left))
+                if unsent and state["left_alive"]:
+                    state.update(killed=None, error="a signal was not sent and a process is left")
         except Exception as error:
             state.update(killed=None, left=None, error=describe_error(error))
         return state

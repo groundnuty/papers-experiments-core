@@ -320,4 +320,4 @@ def test_o70_the_facts_name_what_is_still_not_kept_as_a_cgroup_would(node, tmp_p
     assert "EAGAIN" in facts.FACTS["pids_watch"]
     assert "hidden" in facts.FACTS["pids_watch"]
     assert "poll" in facts.FACTS["gate_memory_watch"]
-    assert set(facts.record()["facts"]) == set(facts.FACTS)
+    assert set(facts.record(mount_refused=True)["facts"]) == set(facts.FACTS)

@@ -236,6 +236,23 @@ def test_a_worker_a_cell_left_running_is_killed_at_the_cell_s_end(node, box):
     assert box._cells.cells[-1]["left_after_exec"] == 1
 
 
+def test_o69_every_process_a_cell_left_counts_not_only_the_first_sixteen_recorded(node, box):
+    """O69: whether the run goes on is judged on every process left after the kill, never only the 16 the record
+    keeps: sixteen in D and a seventeenth still running end the run as `survived_kill`."""
+
+    def stuck(cell):
+        for n in range(17):
+            proc = node._new_proc(cell.pidns, "reader", state="D" if n < 16 else "S", unkillable=True)
+            node.cell_left.append(proc)
+        return CmdResult(0, "")
+
+    node.cell_handler = stuck
+    box.exec("start_readers()", 30)
+    assert box._cells.ended["outcome"] == DL.SURVIVED
+    swept = [q for q in box.metadata()["quiesced"] if q.get("cell") == 1]
+    assert (len(swept[0]["left"]), swept[0]["left_running"]) == (16, 1)
+
+
 def test_an_oom_of_the_step_s_cgroup_comes_before_the_watch_s_kill(node, box):
     """O56, O17: infrastructure first: a cell the watch killed while the shared cgroup counted an OOM kill is
     `host_oom`, never the agent's `memory_limit`."""

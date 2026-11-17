@@ -79,6 +79,21 @@ def docker_failed(rc: int, err: str) -> bool:
     return rc in (125, 126) or "is not running" in err or "No such container" in err
 
 
+def _running(procs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The processes that can still run code: neither in D (a pending SIGKILL ends it on its return) nor a zombie."""
+    return [p for p in procs if p["state"] not in ("D", "Z")]
+
+
+def _left_record(left: list[dict[str, Any]]) -> dict[str, Any]:
+    """What a quiesce's record keeps of the processes left: the first 16 by pid, comm and state, and how many of all
+    of them can still run (`left_running`) or are not dead (`left_alive`), which decide what follows."""
+    return {
+        "left": [{k: p[k] for k in ("pid", "comm", "state")} for p in left[:16]],
+        "left_running": len(_running(left)),
+        "left_alive": sum(1 for p in left if p["state"] != "Z"),
+    }
+
+
 def _output_cut(done: Any, gave_up: bool) -> dict[str, dict[str, int]] | None:
     """The streams of a finished `docker exec` that were cut to the output cap (O43), by what each wrote and what was
     kept; None when none was. The stderr of a call that was given up on is the harness's own words, not the cell's."""
@@ -308,7 +323,7 @@ class CellRunner:
         """`quiesce` without its record."""
         state: dict[str, Any] = {"reason": reason, "killed": None, "left": None}
         try:
-            killed, left, seen = 0, [], set()
+            killed, left, seen, unsent = 0, [], set(), False
             for _ in range(QUIESCE_ROUNDS):
                 procs = self.agent_processes()
                 if procs is None:
@@ -318,7 +333,8 @@ class CellRunner:
                 fresh = [p for p in procs if (p["pid"], p["start"]) not in seen]
                 if not fresh:
                     break
-                TD._sudo(self._host, "kill", "-s", "KILL", *[str(p["pid"]) for p in fresh], timeout_s=20.0)
+                sent = TD._sudo(self._host, "kill", "-s", "KILL", *[str(p["pid"]) for p in fresh], timeout_s=20.0)
+                unsent = unsent or sent.returncode != 0  # not known to have reached each of them
                 seen.update((p["pid"], p["start"]) for p in fresh)
                 killed += len(fresh)
                 left = TD._wait_gone(self._host, fresh, 10.0, 0.2)
@@ -326,7 +342,9 @@ class CellRunner:
                 left = self.agent_processes()
                 killed = None if left is None else killed
             if killed is not None:
-                state.update(killed=killed, left=[{k: p[k] for k in ("pid", "comm", "state")} for p in left[:16]])
+                state.update(killed=killed, **_left_record(left))
+                if unsent and state["left_alive"]:
+                    state.update(killed=None, error="a kill command failed and a process is left")
         except Exception as e:
             state.update(killed=None, left=None, error=describe_error(e))
         return state
@@ -334,8 +352,12 @@ class CellRunner:
     @staticmethod
     def quiet(state: dict[str, Any]) -> bool:
         """Nothing of the agent's can run any more. A process in D (a read of a slow mount) or a zombie has
-        SIGKILL pending or is dead: it returns to no user code, so it changes nothing."""
-        return state["killed"] is not None and not [p for p in state["left"] if p["state"] not in ("D", "Z")]
+        SIGKILL pending or is dead: it returns to no user code, so it changes nothing. Judged on every process left,
+        never only the ones the record keeps (`left_running`)."""
+        if state["killed"] is None:
+            return False
+        running = state.get("left_running")
+        return (running if running is not None else len(_running(state["left"]))) == 0
 
     def _kill_at_the_cap(self, cell: int) -> Callable[[], None] | None:
         """In the timer's thread, when a cell's time runs out: its deadline (deadline.py). Every process of the agent's
