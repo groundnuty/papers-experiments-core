@@ -166,7 +166,8 @@ naming each file that is missing, not a regular file, of another size or of anot
 never a path), 2 for a manifest it cannot use (one without the list of files beside the archives is an earlier tip's,
 which checked the archives alone), and 0 when every file matches. A file of the directory that the manifest does not
 name (an archive, an archive manifest, a journal) is a warning. It uses the standard library alone (Python 3.11 or
-later, for `tomllib`), so it runs on a host without the core.
+later, for `tomllib`), so it runs on a host without the core. `collect` does not: it reads each shard's snapshots as
+`--resume` does, so it needs the core importable by its interpreter, and exits 2 naming the shard when it is not.
 
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
@@ -1117,7 +1118,8 @@ def _extras(local: Path, named: set[str]) -> tuple[str, ...]:
     (`*.out.tar`, `*.out.json`) in the directory, and a file in a shard's `journals/` (a step that ran after `collect`).
     Only a warning: another campaign's files, or a later step's, are not this pull's to fail."""
     found = [f.name for f in local.iterdir() if f.name.endswith((".out.tar", ".out.json")) and f.name not in named]
-    for directory in sorted({name.rsplit("/", 1)[0] for name in named if "/journals/" in name}):
+    journal_dirs = {"/".join(parts[:2]) for parts in (name.split("/") for name in named) if parts[1:2] == [JOURNALS]}
+    for directory in sorted(journal_dirs):  # `<label>/journals`, once, whatever lies under it
         base = local / directory
         if base.is_symlink() or not base.is_dir():
             continue
