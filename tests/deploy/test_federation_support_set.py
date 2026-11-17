@@ -3,6 +3,7 @@ Onezone lists them, compared with the layout's declaration before the federation
 HPC alike. The zone is a fake that lists what a test says it lists; nothing starts a container or reaches a panel."""
 
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from federation_support import MINIMAL, WITH_IMPORT, import_layout
 from hpc_fed_support import hpc_on_path
 from hpc_import_support import IMPORT_LAYOUT
 from slots_boot import modules
+from slots_support import ids_of, layout_with_template, make_root
 
 NOW = 1_700_000_000.0  # 2023-11-14 22:13:20 UTC
 STAMP = "2023-11-14T22:13:20Z"
@@ -283,3 +285,108 @@ def test_o35_the_hpc_core_phase_steps_measure_after_the_support_and_the_facts_it
     facts = hpc.fedfacts.facts_of(SimpleNamespace(layout=boot.layout, ids=boot.ids))
     assert facts["spaces"]["link-probes"]["supported_by_measured"] == sorted(boot.spec.space("link-probes").supporters)
     assert facts["spaces"]["link-probes"]["support_read_at"] == STAMP
+
+
+# -- the rendered platform file ---------------------------------------------------------------------------------------
+
+# a study's platform file is rendered from a template that declares its own support sets; the link check, the import
+# verification and a campaign read those, so they are held to what the zone listed
+WIDE = THREE.replace('mirrors = ["elm"]', 'mirrors = ["elm", "ash"]')  # alpha-space: oak, elm and ash
+NARROW = THREE.replace('[spaces.beta-space]\nowner = "oak"\nmirrors = ["ash"]', '[spaces.beta-space]\nowner = "ash"')
+
+
+def template(*support: str, extra: str = "") -> str:
+    """A platform template over the three providers whose study space declares `support` as its supporters."""
+    providers = "\n".join(
+        f'providers.{p} = {{ url = "@provider_url.{p}@", id = "@provider_id.{p}@" }}' for p in ("oak", "elm", "ash")
+    )
+    return f"""\
+zone = {{ name = "zone", url = "@zone_url@" }}
+{providers}
+{extra}
+space = {{ name = "@space_name@", id = "@space_id.alpha-space@", prefixes = ["alpha-"] }}
+support = {{ providers = {json.dumps(list(support))}, local = "oak" }}
+credentials.admin = {{ file = "secrets/admin.token" }}
+credentials.users = {{ directory = "secrets/users", pattern = "{{user}}.pass" }}
+principals.data_path = {{ username = "alpha-reader", user_id = "@user_id.alpha-reader@" }}
+placement = {{ holder = "oak" }}
+"""
+
+
+def staged(tmp_path, layout_text, platform_template):
+    """The layout with its template beside it, a root holding the credentials, and the zone listing what the layout
+    declares: the spec, the layout and the zone's listing, for a bootstrap to measure."""
+    import fedlayout
+    import fedspec
+
+    spec = fedspec.load_spec(layout_with_template(platform_template, tmp_path, layout_text))
+    layout = fedlayout.Layout(tmp_path / "root", spec=spec)
+    make_root(layout)
+    return SimpleNamespace(spec=spec, layout=layout, zone=SupportZone(spec, provider_ids(spec)))
+
+
+def compose_staged(fed, tmp_path, layout_text, platform_template):
+    stage = staged(tmp_path, layout_text, platform_template)
+    boot = fed.boot.Bootstrap.__new__(fed.boot.Bootstrap)
+    boot.layout, boot.spec, boot.zone, boot._clock = stage.layout, stage.spec, stage.zone, lambda: NOW
+    boot.ids = fed.boot.Ids(admin="uid-admin", **ids_of(stage.spec))
+    boot.verify_support()  # the zone bears out the layout: what is under test is the file rendered from the template
+    return boot
+
+
+def test_o35_a_template_that_declares_fewer_supporters_than_the_zone_lists_is_refused_when_the_file_is_written(
+    fed, tmp_path
+):
+    """O35: the link check's pairs and a campaign's support set come from the rendered file. The layout and the zone
+    both have oak, elm and ash for alpha-space, and the template declares only oak and elm: the ash pairs would never
+    be tested, so up is refused naming the space and the provider by label."""
+    boot = compose_staged(fed, tmp_path, WIDE, template("oak", "elm"))
+    with pytest.raises(RuntimeError) as refused:
+        fed.facts.write_facts(boot.layout, boot)
+    assert "space alpha-space: supported by ash but platform.toml doesn't declare it" in str(refused.value)
+    for leaked in ("pid-", "sid-", "127.0.0.1", "http"):
+        assert leaked not in str(refused.value)
+
+
+def test_o35_a_template_that_declares_a_provider_the_space_does_not_have_is_refused_by_label(fed, tmp_path):
+    """O35: the file claims oak, elm and ash for alpha-space; the zone lists oak and elm only."""
+    boot = compose_staged(fed, tmp_path, NARROW, template("oak", "elm", "ash"))
+    with pytest.raises(
+        RuntimeError, match=re.escape("space alpha-space: platform.toml declares ash but it doesn't support the")
+    ):
+        fed.facts.write_facts(boot.layout, boot)
+
+
+def test_o35_a_template_provider_with_an_id_that_is_no_provider_of_the_federation_is_an_undeclared_provider(
+    fed, tmp_path
+):
+    """O35: a hand-typed id maps to no label: counted, and the id is never in the message."""
+    extra = 'providers.stray = { url = "https://stray.test", id = "typed-by-hand-9" }'
+    boot = compose_staged(fed, tmp_path, NARROW, template("oak", "elm", "stray", extra=extra))
+    with pytest.raises(RuntimeError) as refused:
+        fed.facts.write_facts(boot.layout, boot)
+    assert "space alpha-space: platform.toml declares an undeclared provider that doesn't support the space" in str(
+        refused.value
+    )
+    assert "typed-by-hand" not in str(refused.value)
+
+
+def test_o35_a_template_that_declares_what_the_zone_lists_is_written(fed, tmp_path):
+    """O35: the same sets, in the template's own order and names: nothing is refused, on three providers."""
+    boot = compose_staged(fed, tmp_path, WIDE, template("ash", "oak", "elm"))
+    assert fed.facts.write_facts(boot.layout, boot) == "facts.json and platform.toml written"
+    assert boot.layout.platform.is_file()
+
+
+def test_o35_the_hpc_render_refuses_a_template_that_declares_fewer_supporters_than_the_zone_lists(hpc, tmp_path):
+    """O35: the HPC `write_facts` renders the file and checks it as the Compose one does."""
+    stage = staged(tmp_path, WIDE, template("oak", "elm"))
+    boot = hpc.boot.HpcBootstrap(None, stage.layout, (5001, 5001))
+    boot.spec, boot.zone, boot._clock = stage.spec, stage.zone, lambda: NOW
+    boot.ids = hpc.fedboot.Ids(admin="uid-admin", **ids_of(stage.spec))
+    boot.verify_support()
+    values = hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, stage.layout.root)
+    with pytest.raises(
+        RuntimeError, match=re.escape("space alpha-space: supported by ash but platform.toml doesn't declare it")
+    ):
+        hpc.boot.write_facts(stage.layout, boot, values)
