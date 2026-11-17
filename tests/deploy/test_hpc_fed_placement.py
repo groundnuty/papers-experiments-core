@@ -14,7 +14,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import LAYOUT, PEM, PILOT_TEMPLATE, hpc_on_path, manifest_values, pin_values
+from hpc_fed_support import LAYOUT, PILOT_TEMPLATE, hpc_on_path, manifest_values, pin_values
 
 from expcore_onedata.config import ConfigError, load_platform
 from expcore_onedata.rangemap import PlacementSettings, load_placement
@@ -56,17 +56,17 @@ def first_provider() -> str:
 
 @pytest.fixture(scope="module")
 def ca(tmp_path_factory) -> bytes:
-    """A real CA bundle, for a render the platform layer loads (it refuses a file whose `ca_file` is no certificate)."""
+    """A real CA bundle: the render reads its own file back through the platform layer (to size the token margin), which
+    refuses one whose `ca_file` is no certificate."""
     tls = pytest.importorskip("tls_support")
     if not tls.HAS_OPENSSL:
         pytest.skip("no openssl on this host")
     return tls.make_federation_ca(tmp_path_factory.mktemp("ca")).ca.read_bytes()
 
 
-def render(hpc, root: Path, template: str = TEMPLATE, ca: bytes = PEM.encode()) -> tuple[Path, str]:
+def render(hpc, root: Path, template: str, ca: bytes) -> tuple[Path, str]:
     """The pilot-shape platform.toml as `up` writes it from `template` (`hpcboot.write_platform`), over invented ids, in
-    a root holding the files it names; the file's path and the text `write_platform` returned. Given a real `ca`, the
-    file loads as a platform."""
+    a root holding the files it names; the file's path and the text `write_platform` returned."""
     spec = pilot_spec()
     settings = hpc.settings.load_settings(spec.hpc)
     facts = {
@@ -99,22 +99,24 @@ def render(hpc, root: Path, template: str = TEMPLATE, ca: bytes = PEM.encode()) 
 # -- what the render writes ------------------------------------------------------------------------------------------
 
 
-def test_o63_the_render_of_a_template_that_declares_no_placement_carries_one(hpc, tmp_path):
+def test_o63_the_render_of_a_template_that_declares_no_placement_carries_one(hpc, tmp_path, ca):
     """O63: the pilot's template declares no `[placement]` (its spaces name their own data providers) and
     `load_placement` requires the table, so the file `up` rendered was refused by it and every tool that read the
     render patched a default table in on its own. The file on disk, the last of the two passes that fill the token
     margin, and the text `write_platform` returns both carry it."""
     assert "placement" not in TEMPLATE
     assert "@hpc_token_margin_s@" in TEMPLATE  # two passes: the file left is the second's
-    path, text = render(hpc, tmp_path / "root")
+    path, text = render(hpc, tmp_path / "root", TEMPLATE, ca)
     assert path.read_text(encoding="utf-8") == text
     assert "placement" in tomllib.loads(text)
 
 
-def test_o63_the_table_a_render_writes_is_the_cores_defaults_in_full_and_the_first_provider_as_holder(hpc, tmp_path):
+def test_o63_the_table_a_render_writes_is_the_cores_defaults_in_full_and_the_first_provider_as_holder(
+    hpc, tmp_path, ca
+):
     """O63: every setting of `PlacementSettings` is written out at its default, with its own type (a float stays a
     float, `reset_shortcut` a boolean), in the dataclass's order, the holder first; nothing else is in the table."""
-    _, text = render(hpc, tmp_path / "root")
+    _, text = render(hpc, tmp_path / "root", TEMPLATE, ca)
     written = tomllib.loads(text)["placement"]
     expected = {"holder": first_provider(), **CORE_DEFAULTS}
     assert written == expected
@@ -128,7 +130,7 @@ def test_o63_the_loader_reads_the_written_table_as_the_defaults_of_a_file_that_n
     dataclass's own defaults must all read as one `PlacementSettings`, and as one record at a resume
     (`reset_settings`)."""
     holder = first_provider()
-    written_file, _ = render(hpc, tmp_path / "written", ca=ca)
+    written_file, _ = render(hpc, tmp_path / "written", TEMPLATE, ca)
     implied_file, _ = render(hpc, tmp_path / "implied", f'placement = {{ holder = "{holder}" }}\n' + TEMPLATE, ca)
     written = load_placement(written_file, load_platform(written_file))
     implied = load_placement(implied_file, load_platform(implied_file))
@@ -141,13 +143,13 @@ def test_o63_the_platform_fingerprint_is_the_same_with_the_defaults_written_out_
     alone) are one platform: `PlatformConfig.fingerprint()` is equal, so shards of two federations rendered either
     way still merge as one campaign."""
     holder = first_provider()
-    written_file, _ = render(hpc, tmp_path / "written", ca=ca)
+    written_file, _ = render(hpc, tmp_path / "written", TEMPLATE, ca)
     implied_file, _ = render(hpc, tmp_path / "implied", f'placement = {{ holder = "{holder}" }}\n' + TEMPLATE, ca)
     assert load_platform(written_file).fingerprint() == load_platform(implied_file).fingerprint()
 
 
 @pytest.mark.parametrize("form", ["inline", "header"])
-def test_o63_a_template_that_declares_placement_keeps_its_values_and_gains_no_others(hpc, tmp_path, form):
+def test_o63_a_template_that_declares_placement_keeps_its_values_and_gains_no_others(hpc, tmp_path, ca, form):
     """O63: the table a template declares, as an inline key or as a header, is rendered as it is: its values, and no
     default of the core's added beside them (the loader supplies those, as it does for every other file)."""
     declared = {"holder": "larch", "poll_s": 5.0, "concurrency": 4}
@@ -155,7 +157,7 @@ def test_o63_a_template_that_declares_placement_keeps_its_values_and_gains_no_ot
         template = 'placement = { holder = "larch", poll_s = 5.0, concurrency = 4 }\n' + TEMPLATE
     else:
         template = TEMPLATE + '\n[placement]\nholder = "larch"\npoll_s = 5.0\nconcurrency = 4\n'
-    path, text = render(hpc, tmp_path / "root", template)
+    path, text = render(hpc, tmp_path / "root", template, ca)
     assert tomllib.loads(text)["placement"] == declared
     assert text.count("[placement]") == (1 if form == "header" else 0)
     assert path.read_text(encoding="utf-8") == text
@@ -211,7 +213,7 @@ def step_args(tmp_path):
     (study / "study.toml").write_text("[study]\n")
     for name in ("tmpfs", "results"):
         (tmp_path / name).mkdir(exist_ok=True)
-    return argparse.Namespace(study=study, index=1, count=1, label="fed-a", tmpfs=tmp_path / "tmpfs",
+    return argparse.Namespace(study=study, index=1, count=2, label="fed-a", tmpfs=tmp_path / "tmpfs",
                               results=tmp_path / "results", core_src=tmp_path, resume=False,
                               archive_left=False, snapshot_every=3600.0)  # fmt: skip
 
