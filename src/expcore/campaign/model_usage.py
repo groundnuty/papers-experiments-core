@@ -55,6 +55,11 @@ CLASSES = (
 BUCKETS = (MEASURED, INFLIGHT, BOUND, "charges")  # where an attempt's dollars are counted, then their `total`
 _TOKENS = ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens")
 _COUNTS = ("attempts", *_TOKENS, "usage_incomplete_attempts", "bounded_attempts", "unpriced_attempts")
+_DECIMALS = 12  # a sum of dollars is kept to a millionth of a millionth: no float noise in the bytes of an output
+
+
+def _money(value: float) -> float:
+    return round(float(value), _DECIMALS)
 
 
 def usage_of(
@@ -197,7 +202,7 @@ def _entry(
         if cell is None or not (cell["attempts"] or cell["charged"]):
             continue
         classes.append({"class": kind, **{name: cell[name] for name in _COUNTS}, "usd": _usd(cell, found)})
-    probes = None if found is None else float(found.probes.get(model, 0.0))
+    probes = None if found is None else _money(found.probes.get(model, 0.0))
     entry = {"model": model, "price": _price(model, pricing), "classes": classes, "probes_usd": probes}
     entry["usd"] = _model_usd(entry)
     return entry
@@ -218,7 +223,7 @@ def _usd(cell: Mapping[str, Any], found: Any) -> dict[str, float] | None:
     if found is None or cell["unknown"]:
         return None
     buckets = dict(cell["buckets"])
-    return {**buckets, "total": float(sum(buckets.values()))}
+    return {**{name: _money(value) for name, value in buckets.items()}, "total": _money(sum(buckets.values()))}
 
 
 def _model_usd(entry: Mapping[str, Any]) -> dict[str, float] | None:
@@ -227,9 +232,9 @@ def _model_usd(entry: Mapping[str, Any]) -> dict[str, float] | None:
     probes = entry["probes_usd"]
     if probes is None or any(c["usd"] is None for c in entry["classes"]):
         return None
-    analysed = float(sum(c["usd"]["total"] for c in entry["classes"] if c["class"] == "analysed"))
-    other = float(sum(c["usd"]["total"] for c in entry["classes"] if c["class"] != "analysed")) + probes
-    return {"total": analysed + other, "analysed": analysed, "not_analysed": other}
+    analysed = _money(sum(c["usd"]["total"] for c in entry["classes"] if c["class"] == "analysed"))
+    other = _money(sum(c["usd"]["total"] for c in entry["classes"] if c["class"] != "analysed") + probes)
+    return {"total": _money(analysed + other), "analysed": analysed, "not_analysed": other}
 
 
 def prices_apply(pricing: Pricing, fingerprint: Mapping[str, Any] | None) -> str | None:
@@ -287,7 +292,7 @@ def _merged_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
         "model": entry["model"],
         "price": entry["price"],
         "classes": classes,
-        "probes_usd": None if any(p is None for p in probes) else float(sum(probes)),
+        "probes_usd": None if any(p is None for p in probes) else _money(sum(probes)),
     }
     merged_entry["usd"] = _model_usd(merged_entry)
     return merged_entry
@@ -295,7 +300,7 @@ def _merged_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
 
 def _sum_usd(parts: Iterable[Mapping[str, float]]) -> dict[str, float]:
     held = list(parts)
-    return {name: float(sum(p[name] for p in held)) for name in (*BUCKETS, "total")}
+    return {name: _money(sum(p[name] for p in held)) for name in (*BUCKETS, "total")}
 
 
 # ----------------------------------------------------------------------------------------- what the records say
@@ -352,7 +357,7 @@ def attach_observed(usage: Mapping[str, Any], observed: Mapping[str, Mapping[str
                 "retries": {
                     "events": sum(v["events"] for _, v in by_kind),
                     "turns_retried": seen.get("turns_retried", 0),
-                    "wait_s": sum(v["wait_s"] for _, v in by_kind),
+                    "wait_s": float(sum(v["wait_s"] for _, v in by_kind)),
                     "by_kind": [{"kind": kind, **counts} for kind, counts in by_kind],
                 },
             }
