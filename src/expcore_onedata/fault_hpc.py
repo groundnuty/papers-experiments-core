@@ -367,6 +367,8 @@ def timing_evidence(timing: Any) -> dict[str, Any] | None:
     that is None, why. Names are left out (they carry the allocation's). None when there is nothing of the sort."""
     if not isinstance(timing, Mapping) or timing.get("accounting") not in ("read", "unreadable", "skipped"):
         return None
+    if not isinstance(timing.get("steps"), list):
+        return None
     reason = timing.get("reason")
     steps = []
     for raw in (timing.get("steps") if isinstance(timing.get("steps"), list) else [])[:8]:

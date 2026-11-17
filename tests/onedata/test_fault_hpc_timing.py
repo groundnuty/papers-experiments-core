@@ -15,6 +15,7 @@ from fault_support import SERVICES, FakeClock, injector_for, write_faults
 from heal_support import CRASHED, LABEL, READER, TARGET, four_providers
 from hpc_support import PING, TOOL, FakeHpc
 
+from expcore.errors import InfraError
 from expcore_onedata.compose import CommandResult
 from expcore_onedata.fault_hpc import HpcDriver, VerbCommand, timing_evidence
 from expcore_onedata.fault_journal import JOURNAL
@@ -122,21 +123,24 @@ def test_o58_a_stops_timing_is_journalled_with_the_stops_evidence(tmp_path):
 
 
 def test_o58_a_stop_that_timed_out_journals_its_timing_with_no_evidence_of_the_stop(tmp_path):
-    """O58: a stop with no answer has no evidence, but where its time went (the step started STALL seconds late, or
-    never) is the very figure that attributes the stall to the site: `stop_unknown` holds it, and the stop is still of
-    unknown outcome."""
-    injector, driver, _ = outage(
-        tmp_path,
-        {"stop": timing("stop", None, None, unknown={"start_after_issue_s": "no_such_step"})},
-        {"stop_hangs": True},
+    """O58: a stop with no answer has no evidence, but where its time went (the step never began, or began late) is the
+    very figure that attributes a stall to the site: `stop_unknown` holds it, the stop is still of unknown outcome
+    (the injector waits it out and restores), and the driver keeps no evidence of the stop's own."""
+    unknown = {"start_after_issue_s": "no_such_step", "end_after_answer_s": "no_such_step"}
+    injector, driver, federation = outage(
+        tmp_path, {"stop": timing("stop", None, None, unknown=unknown)}, {"stop_hangs": True, "exit_after_s": 5}
     )
-    injector.start(RUN)
-    unknown = next(line for line in lines_of(tmp_path) if line["event"] == "stop_unknown")
-    assert set(unknown["stop"]) == {"timing"}
-    (step,) = unknown["stop"]["timing"]["steps"]
+    with pytest.raises(
+        InfraError
+    ):  # the stop's outcome is unknown: the injection fails, and the restore brings it back
+        injector.start(RUN)
+    line = next(line for line in lines_of(tmp_path) if line["event"] == "stop_unknown")
+    assert set(line["stop"]) == {"timing"}
+    (step,) = line["stop"]["timing"]["steps"]
     assert step["start_after_issue_s"] is None
     assert step["unknown"]["start_after_issue_s"] == "no_such_step"
     assert driver.last_stop is None  # still no evidence of the stop's own
+    assert federation.launches(SERVICE) == 2
 
 
 def test_o58_a_starts_timing_is_recorded_in_the_restore_served_or_not(tmp_path):

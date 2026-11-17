@@ -569,10 +569,14 @@ process group, and watches for its late steps (O58):** each verb runs in a group
 timed-out verb, nor of one that exited early with its `srun` still waiting, survives to make its step after the relay has
 answered (the controller can stall for about 200 s first);
 the relay names the verb's control steps with a tag of its own (`hpcfed.py --step-tag`), and `hpcfed.py late-steps`, a
-detached watch of 400 s, cancels a step of those exact names that appears in the federation's job, by its exact
+detached watch of 400 s (also opened for a verb that ran 25 s or more, since hpcfed ends its own `srun` only after its
+own bound), cancels a step of those exact names that appears in the federation's job, by its exact
 `<job>.<step>` id and no other, and writes what it saw to `<root>/fault-relay/late-steps.jsonl`. A `watch_opened` there
 with no `watch_closed` is a window nobody watched to its end, and `none_seen` is written only when the looks and the
-accounting were read (DESIGN.md section 7). The answer is still `timed_out`. Tested offline, none of it run live: a kept stop and a start again
+accounting were read (DESIGN.md section 7). The answer is still `timed_out`. **The answer also says where the verb's time went:** from one accounting call per verb,
+the time from its issue to each step's accounted Start and from its answer to each End, so a controller stall is the
+site's in the record (`timing`, journalled with the stop, the start's restore and the heal's link restart; DESIGN.md
+section 7). Tested offline, none of it run live: a kept stop and a start again
 over the same work directory, `exec.sh` beside a running service, and every stop's real duration (from which `[hpc]
 stop_seconds` is to be set) are the live slot's. The agent's node's step (M5) is not built here. A layout with a shared
 import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
