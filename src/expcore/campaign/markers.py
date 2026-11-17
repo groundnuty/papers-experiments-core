@@ -19,6 +19,10 @@ without the check, so an attempt of no turn is charged its bound).
 Schema 3 added the target of a fault: the outcome's target, the targets the record's condition declares, the targets
 its fault injector recorded as injected in the attempt, and the target rule of its record's version. A schema-2 marker
 declares no target, and is read without the target rule.
+
+A schema-3 marker may also carry `spend_basis`, optional: how an attempt that raised after its model loop was charged
+(`measured` or `bound`, `campaign.after_loop`). It is written only when there is one, so every other marker is as it
+was, and a marker without it reads with none.
 """
 
 import json
@@ -32,6 +36,7 @@ from expcore.errors import check_target, infra_kinds
 from expcore.loop.outcomes import HarnessDefect, Outcome
 
 MARKER_NAME = "attempt-marker.json"
+SPEND_BASES = ("measured", "bound")  # what `interrupted_spend.MEASURED` and `BOUND` say; this module cannot import it
 MARKER_SCHEMA = 3  # 3: the result carries the fault's target, the declared and injected targets and the target rule
 SCHEMA_2 = 2  # still readable: the model turns, the record's flag and the first-turn rule, and no target
 LEGACY_MARKER_SCHEMA = 1  # still readable: it has no model-turn count, so it is read under the version-1 rule
@@ -53,6 +58,7 @@ _RESULT_FIELDS = (
     "target_rule",
     "treatment_targets",
     "injected_targets",
+    "spend_basis",
 )
 # What a schema-2 marker holds of a result; the target fields take their version-2 values.
 _SCHEMA_2_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("target_rule")]
@@ -60,6 +66,8 @@ _SCHEMA_2_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("target_rule")]
 _LEGACY_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("model_turns")]
 # Fields added to schema 2 after its first markers were written: a schema-2 marker without one reads with its default.
 _ADDED_FIELDS = ("first_turn_rule", "turn_usage", "replies_checked")
+# A schema-3 marker written before `spend_basis` existed holds none: it reads as None, the attempt's usage as it says.
+_ADDED_SCHEMA_3 = ("spend_basis",)
 
 
 class MarkerError(RuntimeError):
@@ -103,6 +111,11 @@ class AttemptResult:
       billed reply it could not read leaves the usage incomplete (C26). Only then does an attempt known to hold no turn
       cost nothing but its top-ups; a result from before the check (an older marker, a row an upgrade brought forward)
       may hide such a reply, and is charged its bound.
+    - `spend_basis`: how the usage of an attempt that raised after its model loop was settled (`campaign.after_loop`):
+      `measured` when its call log held every request answered and read, so the counts above are what its replies
+      reported, or `bound` when the log was unreadable or incomplete, so its usage is unknown and it is charged its
+      bound. None for every other attempt: one with a record, whose counts are the record's, and one that raised
+      during its loop or before it, or that kept no call log (an interrupted attempt's basis is set by recovery).
     """
 
     outcome: Outcome
@@ -124,6 +137,7 @@ class AttemptResult:
     target_rule: bool = True
     treatment_targets: Mapping[str, str] = field(default_factory=dict)
     injected_targets: tuple[str, ...] = ()
+    spend_basis: str | None = None
 
     def __post_init__(self) -> None:
         """Refuse a kind or target outside the vocabulary, so a typo never reaches the store; keep each list sorted;
@@ -137,6 +151,8 @@ class AttemptResult:
         flags = (self.first_turn_rule, self.legacy_marker, self.replies_checked, self.target_rule)
         if not all(isinstance(flag, bool) for flag in flags):
             raise ValueError("first_turn_rule, legacy_marker, replies_checked and target_rule must be True or False")
+        if self.spend_basis is not None and self.spend_basis not in SPEND_BASES:
+            raise ValueError(f"spend_basis is one of {', '.join(SPEND_BASES)} or None, not {self.spend_basis!r}")
         for kind in (*(() if self.outage_kind is None else (self.outage_kind,)), *self.treatment_kinds):
             if kind not in infra_kinds():
                 raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")
@@ -201,7 +217,8 @@ def write_marker(run_dir: Path, run_key: str, attempt_id: int, result: AttemptRe
         "attempt_id": attempt_id,
         "result": {
             "outcome": _outcome_json(result.outcome),
-            **{f: getattr(result, f) for f in _RESULT_FIELDS},
+            **{f: getattr(result, f) for f in _RESULT_FIELDS if f != "spend_basis"},
+            **({} if result.spend_basis is None else {"spend_basis": result.spend_basis}),  # only when there is one
             "treatment_kinds": list(result.treatment_kinds),
             "treatment_targets": dict(result.treatment_targets),
             "injected_targets": list(result.injected_targets),
@@ -251,7 +268,7 @@ def read_marker(run_dir: Path, run_key: str, attempt_id: int) -> AttemptResult |
             raise MarkerError(f"{path}: a schema-{schema} marker names a target, which its schema predates")
         # A schema-2 marker written before `first_turn_rule` was added holds a version-2 record: read it as such; one
         # written before `turn_usage` was added has none, which leaves a tiered attempt's cost to its bound.
-        optional = _ADDED_FIELDS if schema == SCHEMA_2 else ()
+        optional = _ADDED_FIELDS if schema == SCHEMA_2 else _ADDED_SCHEMA_3
         kept = {f: data[f] for f in fields if f not in optional or f in data}
         if schema == SCHEMA_2:  # the first-turn rule unless it says otherwise, and no target
             kept.setdefault("first_turn_rule", True)

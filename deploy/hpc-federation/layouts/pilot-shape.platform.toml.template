@@ -18,6 +18,7 @@ principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-re
 principals.toolserver = { username = "alpha-tools", user_id = "@user_id.alpha-tools@" }
 principals.service = { username = "alpha-health", user_id = "@user_id.alpha-health@" }
 tls = { ca_file = "@hpc_root@/ca/federation-ca.pem" }   # the Onedata test CA here: each service's generated web certificate
+placement = { holder = "aspen" }   # the platform layer requires [placement] and the core has no default for `holder`, so it is declared here: the file-wide data provider of a space that names none (each [[spaces]] entry's own holder is the one its provisioner uses); `up` writes every other setting at the core's default beside it
 link_check = { name = "link-probes", id = "@space_id.link-probes@", prefixes = ["link-"], providers = ["aspen", "larch", "rowan", "alder", "hazel"] }
 
 [tokens]
@@ -105,3 +106,6 @@ egress_collector = "@hpc_egress_collector@"  # bundle/egress-collector.py of thi
 egress_collector_sha256 = "@hpc_egress_collector_sha@"
 oneclient_bundle = "@hpc_oneclient_bundle@"  # the host mount's oneclient (oneclient_bundle.py), for the mount level
 oneclient_bundle_sha256 = "@hpc_oneclient_bundle_sha@"
+provider_storage = "@hpc_provider_storage@"  # O57: where the providers keep their data, "tmpfs" or "shared_filesystem"
+                                             # (up fills it from HPC_STORAGE_ROOT): it shapes a run's I/O timing, so the
+                                             # campaign fingerprint holds it and two kinds of storage never merge

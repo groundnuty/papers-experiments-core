@@ -188,6 +188,12 @@ def driver_maker(deploy: Deploy, fed: Federation) -> Any:
             content=lambda b: SimpleNamespace(reset=lambda timeout: None),
             data=fed.data,
         )
+        driver.verify = functools.partial(  # `verify-data`: each ingested space read back as the same stand-in holds it
+            boot.verify_ingested,
+            rest=lambda ca: SimpleNamespace(close=lambda: None),
+            bootstrap=BootStandIn(fed.label),
+            data=fed.data,
+        )
         return driver
 
     return make
@@ -339,15 +345,35 @@ def attempts_in(snapshot: Path) -> list[tuple[str, str]]:
         connection.close()
 
 
+def attempt_starts_in(snapshot: Path) -> set[tuple[str, str]]:
+    """The (run key, started_utc) of every attempt a snapshot's store copy holds: what names an attempt alike in the
+    store, in the spend journal and among the export's lost entries."""
+    connection = sqlite3.connect(f"file:{quote(str(snapshot / 'state.sqlite'))}?mode=ro", uri=True)
+    try:
+        return {(key, started) for key, started in connection.execute("SELECT run_key, started_utc FROM attempts")}
+    finally:
+        connection.close()
+
+
+def journaled_starts(journal: Path) -> set[tuple[str, str]]:
+    """The (run key, started_utc) of every attempt a spend journal has a line of. A kill can cut the file's last line
+    short, which reads as not written (`spend_journal.read_journal`); every other line must be one JSON object."""
+    whole = journal.read_text(encoding="utf-8").split("\n")[:-1]  # what follows the last newline is empty or cut short
+    lines = [json.loads(line) for line in whole]
+    return {(line["run_key"], line["started_utc"]) for line in lines if line["kind"] == "attempt"}
+
+
 __all__ = [
     "LABELS",
     "Control",
     "Deploy",
     "Federation",
     "StepLine",
+    "attempt_starts_in",
     "attempts_in",
     "deploy_modules",
     "hpcfed",
+    "journaled_starts",
     "kill_outright",
     "link_check_stand_in",
     "make_ca",

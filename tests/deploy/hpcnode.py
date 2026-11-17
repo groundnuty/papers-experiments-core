@@ -205,6 +205,8 @@ FAKE_APPTAINER = r"""#!/bin/bash
 # The service (exec --writable ... ROOTFS /root/hpcop-start.sh) logs which markers existed when it started, prints the
 # guard's verdict, becomes ready and waits for SIGTERM; any other use is exec.sh's: log the arguments, count stdin.
 if [[ " $* " == *" --writable "* ]]; then
+  # FAKE_RUN_ARGS: record the service's argv, one word per line, and end at once (the bind tests, O57)
+  if [[ -n ${FAKE_RUN_ARGS:-} ]]; then printf '%s\n' "$@" > "$FAKE_RUN_ARGS"; exit 0; fi
   R=${*: -2:1}; W=${R%/rootfs}
   if [[ -n ${FAKE_SERVICE_ARGS:-} ]]; then printf '%s\n' "$@" > "$FAKE_SERVICE_ARGS"; fi   # how the service was started
   for f in stop-requested service-verified rootfs/root/service-ready.lock; do
@@ -273,13 +275,27 @@ if url == "http://127.0.0.1:8091/settings/web":
 if url == "http://127.0.0.1:8091/pools/default":
     reply(200 if admin else 401, {})
 if url.endswith(":8443/configuration"):
-    reply(200, {"providerId": state["providerId"], "domain": state["domain"]})
+    # op_worker reads its domain over its Onezone connection: for the first `domain_early.reads` answers it says
+    # `domain_early.value` (null or "") although REST already answers, as a start whose connection is not up yet does.
+    # `domain_missing` leaves the field out. Every answer is counted in `config_reads`.
+    seen = state.get("config_reads", 0) + 1
+    state["config_reads"] = seen
+    json.dump(state, open(os.environ["FAKE_CURL_STATE"], "w"))
+    early = state.get("domain_early")
+    body = {"providerId": state["providerId"], "domain": state["domain"]}
+    if early and seen <= early["reads"]:
+        body["domain"] = early["value"]
+    if state.get("domain_missing"):
+        del body["domain"]
+    reply(200, body)
 if url.endswith(":8443/api/v3/onezone/configuration"):
     reply(200, {"name": "zone-a", "domain": state["domain"]})
 if url.endswith(":8443/api/v3/onezone/user/tokens/named") and method == "POST":
     reply(201, {"token": "minted-registration-token"})
 if url.endswith(":8443/api/v3/onezone/user"):
     reply(200 if creds and creds[0] == "admin" else 401, {"userId": state["adminUserId"]})
+if url.endswith(":8443/api/v3/onezone/user/tokens/named") and method == "POST":
+    reply(200 if creds and creds[0] == "admin" else 401, {"token": state.get("token", "token-1")})
 if url.endswith(":9443/api/v3/onepanel/provider/storages") and method == "GET":
     reply(200, {"ids": ["storage-1"]})
 reply(599, {"unexpected": url})

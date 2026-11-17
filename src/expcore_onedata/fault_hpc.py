@@ -26,6 +26,15 @@ never a guess. `ready` is the service script's own checks for this launch (the C
 default and port checks), which run after its REST API first answers: a service running and not yet ready is read as a
 container whose health check is still `starting`, so `serves` answers no, and a restore is never verified before them.
 
+**The start's evidence (O58).** A restarted service waits, inside its readiness budget, for op_worker's domain, which
+op_worker says null until its Onezone connection is up, before its identity is checked; the wait is part of the
+provider's down time, which a live slot measures. Its status carries `domain_wait_s`, the seconds that wait took as the
+node measured it (0 when none was needed), while the service is ready. The driver keeps the figure of the latest
+status of a ready service as `last_domain_wait_s`, checked (a finite number of at least 0, else None; None too for a
+status that is not ready, one that carries none, a status that cannot be read, and after a start), and the injector
+records it beside `ready_after_s` in the restore. A status without it is no figure, never 0: only the node's own
+measurement is.
+
 **The stop's own bound.** A service's stop waits for its graceful end, then the kill, then the step's end: up to
 `stop_seconds` plus about 90 s, 690 s with the layout's default (DESIGN.md section 7 (e)). The driver bounds `stop` by
 `stop_timeout_s` (`[faults] settle_timeout_s` for this backend, refused below that figure at load), not by the
@@ -161,6 +170,9 @@ class HpcDriver:
         self._transport, self._timeout_s, self._probe = transport, timeout_s, probe
         self._stop_timeout_s = timeout_s if stop_timeout_s is None else stop_timeout_s
         self.last_stop: dict[str, Any] | None = None  # the latest stop's evidence, once it answered (see the docstring)
+        self.last_domain_wait_s: float | None = (
+            None  # the latest ready status's `domain_wait_s`, if any (the docstring)
+        )
 
     def _ask(self, request: Request, step: str, timeout_s: float) -> CommandResult:
         """Send a request; raise DriverError, naming only the step, when it is refused, cannot be sent, has no answer in
@@ -192,13 +204,19 @@ class HpcDriver:
             raise DriverError(f"the command to {step} failed with exit code {done.returncode}")
 
     def start(self, service: str) -> None:
-        """Start the provider's stopped service again."""
+        """Start the provider's stopped service again. The figure of an earlier launch is gone: this one has not
+        reported."""
+        self.last_domain_wait_s = None
         self._ask(Request("start", service), "start the service", self._timeout_s)
 
     def observe(self, service: str) -> Observation:
         """Read whether the service runs, its identity and whether it is ready; raise DriverError when the status
-        cannot be read."""
-        return parse_status(self._ask(Request("status", service), STATUS, self._timeout_s).stdout)
+        cannot be read. `last_domain_wait_s` is the figure of this status when the service is ready, else None."""
+        self.last_domain_wait_s = None
+        stdout = self._ask(Request("status", service), STATUS, self._timeout_s).stdout
+        seen = parse_status(stdout)
+        self.last_domain_wait_s = status_domain_wait(stdout) if seen.health == "healthy" else None
+        return seen
 
     def serves(self, service: str) -> bool:
         """Whether the service serves now: it runs, its own checks passed for this launch (when its status says), and
@@ -302,6 +320,13 @@ def _duration(value: Any) -> float | None:
     """A finite number of at least 0, rounded to the millisecond; None for anything else."""
     numeric = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
     return round(float(value), 3) if numeric and value >= 0 else None
+
+
+def status_domain_wait(stdout: str) -> float | None:
+    """The seconds a start waited for the provider's domain (O58), from a status's answer: `domain_wait_s`, a finite
+    number of at least 0, else None. A status that does not carry it, or carries anything else, has no figure."""
+    record = _record(stdout)
+    return None if record is None else _duration(record.get("domain_wait_s"))
 
 
 def stop_evidence(stdout: str) -> dict[str, Any] | None:
