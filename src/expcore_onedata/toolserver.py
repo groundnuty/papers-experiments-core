@@ -45,6 +45,14 @@ and the spawn) and around the stop. What the agent triggers through the tools, a
 is the agent's own time and is never an infrastructure wait. Health polling before dispatch is the scheduler's
 (C11, `PlatformHealth`) and is not a wait either.
 
+The server reads no `.env` file and starts in a directory of its own (O84). onedata-mcp read a `.env` when its config
+module was imported, searching from the directory of its installed package up to `/`, so a `.env` in any ancestor of
+the package (on a cluster account, its shared home) could set any `ONEDATA_*` setting the launch left unset, with
+nothing in the launch saying so. The environment this module builds says `ONEDATA_MCP_DOTENV=0` on every platform (the
+server's guard: with it no `.env` is read), and the server's working directory is a new, empty directory of mode 0700
+made for each start and removed after it (`_private_workdir`), because the working directory is where FastMCP reads
+a `.env` for its own settings and where the server's relative paths would otherwise land in the driver's.
+
 The checks (`_prepare` before the spawn, `_recheck` after the stop) read Onezone in worker threads, and each holds a share
 of the run's federation admission while it runs (`expcore_onedata.admission_share`, O11): a launch cancelled while one
 runs stops waiting for it, and its run may leave its admission, but the federation stays held until the thread has ended,
@@ -103,6 +111,8 @@ ENV_PROVIDER_HOST = "ONEDATA_ONEPROVIDER_HOST"
 ENV_PROVIDER_TOKEN = "ONEDATA_ONEPROVIDER_TOKEN"
 ENV_TOOLS = "ONEDATA_MCP_TOOLS"
 ENV_INSECURE_TLS = "ONEDATA_ALLOW_INSECURE_TLS"
+ENV_DOTENV = "ONEDATA_MCP_DOTENV"  # `0`: the server reads no `.env` file (O84); only the launch says so
+DOTENV_OFF = "0"
 MANAGED_ENV = (
     ENV_ZONE_HOST,
     ENV_ZONE_TOKEN,
@@ -110,6 +120,7 @@ MANAGED_ENV = (
     ENV_PROVIDER_TOKEN,
     ENV_TOOLS,
     ENV_INSECURE_TLS,
+    ENV_DOTENV,
     *CA_BUNDLE_ENV,
 )
 
@@ -148,6 +159,11 @@ def server_environment(
     node name to map, so onedata-mcp runs unset and its text is a Compose federation's. A platform whose names resolve
     nowhere starts the server through the resolve launcher instead (`server_argv`).
 
+    It sets `ONEDATA_MCP_DOTENV=0` on every platform, the launcher's included (O84): the server reads no `.env` file, so
+    nothing it is configured with comes from a file the launch does not name, and a caller cannot change it. The word
+    stops onedata-mcp's own read only, from a version that has the guard; the server's working directory is the other
+    half (`_private_workdir`).
+
     Its certificate check is the platform's `[tls]`: by default the server's own (it verifies with httpx's CAs); with
     `ca_file`, `ca_copy`, the run's own read-only copy of the verified bundle (`tls.write_private_copy`), never the
     configured file, is named by the settings a client reads for its CA file (`CA_BUNDLE_ENV`, of which the server's
@@ -167,6 +183,7 @@ def server_environment(
             ENV_PROVIDER_HOST: config.local_provider.url,
             ENV_PROVIDER_TOKEN: token.reveal(),
             ENV_TOOLS: ",".join(condition.allow),
+            ENV_DOTENV: DOTENV_OFF,
         }
     )
     if config.tls.insecure:
@@ -186,6 +203,19 @@ def _private_bundle(config: PlatformConfig) -> Iterator[Path | None]:
     content = config.tls.bundle()
     with tempfile.TemporaryDirectory(prefix="expcore-tls-") as directory:
         yield write_private_copy(content, Path(directory))
+
+
+@contextlib.contextmanager
+def _private_workdir() -> Iterator[Path]:
+    """The server's working directory (O84): a new, empty directory of this launch's own, mode 0700 whatever the
+    driver's umask, made for each start beside the run's other private files (`_private_bundle`'s: `mkdtemp`, owner only)
+    and removed with what the server left in it when the server has stopped. The server inherits nothing from the
+    driver's working directory, a `.env` in it included (FastMCP reads one there), and never finds one in the directory
+    it starts in."""
+    with tempfile.TemporaryDirectory(prefix="expcore-toolserver-") as directory:
+        path = Path(directory)
+        path.chmod(0o700)
+        yield path
 
 
 def _server(config: PlatformConfig) -> ToolServer:
@@ -361,6 +391,7 @@ class ToolServerLauncher:
         with (
             token_step(TOOL_SERVER_STEP),  # ended only once the re-verification at teardown has ended
             _private_bundle(self._config) as ca_copy,  # the run's copy of the verified CA bytes, gone with the server
+            _private_workdir() as workdir,  # the server's own empty directory, gone with it (O84)
         ):
             env = server_environment(self._config, chosen, token, extra_env, ca_copy=ca_copy)
             command, args = server_argv(self._config)
@@ -371,6 +402,7 @@ class ToolServerLauncher:
                 env=env,
                 allowed_tools=chosen.allow,
                 start_timeout_s=server.start_timeout_s,
+                cwd=workdir,
             )
             async with ctx.infrastructure_wait(WAIT_KIND):
                 try:

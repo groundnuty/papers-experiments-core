@@ -228,7 +228,7 @@ def test_o84_a_real_server_process_started_by_the_launch_reads_no_dotenv_file_ab
     assert import_standin(code, None) == NAMES  # the control: unguarded, the `.env` above the code is read
     assert import_standin(code, "1") == NAMES
     assert import_standin(code, "0") is None
-    _, launcher, token = launching(tmp_path, fake, frozen, events, kind, [str(code / "wrapper.py")])
+    _, launcher, token = launching(tmp_path, fake, frozen, events, kind, [str(code / "wrapper.py"), "serve"])
     seen = start(launcher, token, tmp_path)
     assert seen[DOTENV] == "0"
     assert seen[NODE_NAMES] is None
