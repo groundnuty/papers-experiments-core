@@ -497,6 +497,18 @@ def load_readings(found: Any) -> Dict[str, Any]:
     return out
 
 
+def recorded_space_ids(layout: Layout) -> Dict[str, str]:
+    """The Onezone ID of each space as facts.json records it, which the core's phase writes from the ids its bootstrap
+    found or made (a space missing from the zone is made again by name, under a new ID, and the file then holds that
+    one); RuntimeError, in fixed words that name no path, when the file cannot be read as the facts `up` writes."""
+    try:
+        recorded = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]
+        return {name: space["id"] for name, space in recorded.items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        why = type(error).__name__
+        raise RuntimeError(f"{layout.facts.name} cannot be read as the facts up writes ({why})") from None
+
+
 def verify_ingested(
     layout: Layout,
     owner: Tuple[int, int],
@@ -512,12 +524,7 @@ def verify_ingested(
     are the placed layout's, dialled through the root's address map as the core phase's are (`service_client`, O73:
     every service's URL carries its declared name, which resolves nowhere on the site, so a root with no usable map is
     refused). `rest`, `bootstrap` and `data` are the core phase's own, for a stand-in."""
-    try:
-        recorded = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]
-        ids = {name: space["id"] for name, space in recorded.items()}
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        why = type(error).__name__
-        raise RuntimeError(f"{layout.facts.name} cannot be read as the facts up writes ({why})") from None
+    ids = recorded_space_ids(layout)
     client = service_client(layout, rest)
     try:
         boot = bootstrap(client, layout, owner)

@@ -12,7 +12,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
 import hpcexclude
@@ -30,7 +30,7 @@ from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
 from fedtools import check_artifacts, check_launchable
-from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, load_readings, verify_ingested
+from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, load_readings, recorded_space_ids, verify_ingested
 from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
 from hpclaunch import Launcher, StateStore, client_log
@@ -436,18 +436,60 @@ class Driver(Down):
         """`up`'s last write, with the core-phase lock held: `bootstrapped` becomes `linked`, and nothing else does. A
         phase another command wrote since `up`'s own core phase ended (a `down`'s `stopping`) is never overwritten, and
         a core phase that began after it and did not end (its link check failed, or it died: `core_unfinished`) is
-        no check `up` may say `linked` over. Either fails `up` in fixed words and leaves the state as it was."""
+        no check `up` may say `linked` over. Either fails `up` in fixed words and leaves the state as it was. Before it
+        says `linked` it records each ingested space's Onezone ID from the facts its core's phase wrote
+        (`record_space_ids`), which the marker `verify-data` leaves is bound to."""
         state = self.store.read()
         if state.get("core_unfinished"):
             raise RuntimeError(
                 "a core phase run on this federation after up's own did not end (its link check failed, or it died): "
                 "the federation stays bootstrapped, which shards plan refuses; down, then up again"
             )
+        self.record_space_ids(state)
         if not self.move_phase("bootstrapped", "linked"):
             raise RuntimeError(
                 f"the federation's phase is not bootstrapped (it is {self.store.read().get('phase')}): up does not "
                 "say linked"
             )
+
+    def record_space_ids(self, state: Mapping[str, Any]) -> None:
+        """Record in `data.ingested` the Onezone ID facts.json holds for each ingested space, as `up` leaves the
+        federation: the ID a later `verify-data`, rerun and `shards.py plan` compare the space with. A root with no
+        facts file (a core's phase that wrote none) records none, says so, and has no marker that `plan` takes (a
+        space with no recorded ID is verified by no one); a facts file that holds no ID for a space fails `up`."""
+        recorded = (state.get("data") or {}).get("ingested") or {}
+        if not recorded:
+            return
+        if not self.layout.facts.exists():
+            self.say("no facts file: the ingested spaces' IDs are not recorded, so verify-data will refuse them")
+            return
+        ids = recorded_space_ids(self.layout)
+        absent = sorted(space for space in recorded if not ids.get(space))
+        if absent:
+            raise RuntimeError(f"{', '.join(absent)}: the facts hold no ID for the space: up does not say linked")
+        self.set(lambda s: [s["data"]["ingested"][space].update(space_id=ids[space]) for space in recorded])
+
+    def space_identity(self, state: Mapping[str, Any]) -> Tuple[Optional[str], List[str]]:
+        """Whether each ingested space is the one `up` recorded, by the Onezone ID facts.json holds for it now (the
+        core's phase rewrites it from the zone it finds, and makes a space that is missing again by name under a new
+        ID): None and no names when each is, else the refusal, in fixed words that name the spaces and no ID, and the
+        names of the spaces to clear the marker of. A space whose ID `up` never recorded (a state an older `up` wrote)
+        cannot be shown to be the one verified. RuntimeError when facts.json cannot be read."""
+        recorded = (state.get("data") or {}).get("ingested") or {}
+        ids = recorded_space_ids(self.layout)
+        moved = sorted(s for s, r in recorded.items() if r.get("space_id") is not None and ids.get(s) != r["space_id"])
+        if moved:
+            return f"{', '.join(moved)}: the space is not the one up recorded (it was made again since up)", moved
+        unknown = sorted(s for s, r in recorded.items() if r.get("space_id") is None)
+        if unknown:
+            return f"{', '.join(unknown)}: its state records no ID for the space (its up predates it)", unknown
+        return None, []
+
+    def forget_markers(self, spaces: Sequence[str]) -> None:
+        """Clear the verified marker of each of `spaces`: no pass of `verify-data` outlives the space it read."""
+        self.set(
+            lambda s: [s["data"]["ingested"][n].update(verified=None) for n in spaces if n in s["data"]["ingested"]]
+        )
 
     def other_federations_nodes(self) -> List[str]:
         """The nodes of every live job of the account that carries the federation prefix (`hpcexclude`, DESIGN.md
@@ -1012,6 +1054,8 @@ class Driver(Down):
                 self.say("the core's phase failed: the federation stays bootstrapped, which shards plan refuses")
             raise
         self.set(lambda s: s.update(core_unfinished=False))
+        if relink:  # the core's phase made a space that was missing again by name: its facts are read after it ran
+            why = self.refuse_moved_spaces() or why
         if not was_linked:
             self.move_phase(before, "bootstrapped")  # a `down`'s `stopping`, written meanwhile, is kept
         elif relink and why is not None:
@@ -1019,6 +1063,19 @@ class Driver(Down):
         elif relink and self.move_phase("bootstrapped", "linked"):
             self.say("the core's phase and its link check passed: the federation is linked again")
         return out
+
+    def refuse_moved_spaces(self) -> Optional[str]:
+        """The reason a rerun that has just run its core's phase must not link the federation again for the ingested
+        spaces' IDs, or None: a space whose ID in the facts it wrote is not the one `up` recorded was made again
+        (empty), so its marker is cleared, and facts that cannot be compared refuse in fixed words too. Read after the
+        phase, which is what rewrites the IDs (`relink_refusal`'s own checks are made before it)."""
+        try:
+            said, spaces = self.space_identity(self.store.read())
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+            return "its ingested spaces' IDs could not be compared with the ones up recorded"
+        if spaces:
+            self.forget_markers(spaces)
+        return said
 
     def verify_data(self) -> str:
         """After the study's ingest, show that each ingested space holds exactly the data its manifest declares (O57,
@@ -1040,6 +1097,11 @@ class Driver(Down):
         owner = tuple(state["owner"] or ())
         if len(owner) != 2:
             raise RuntimeError("the state names no owner of the providers' storage: the node facts did not run")
+        # the spaces read are the ones up recorded, by ID: a marker is bound to the space it read, never to a name
+        refusal, _ = self.space_identity(state)
+        if refusal is not None:
+            raise RuntimeError(f"{refusal}: not verified; down, then up")
+        ids = recorded_space_ids(self.layout)
         found = self.verify(self.placed_layout(state), owner, manifests)
         passed = {space: manifests[space] for space, said in found.items() if not said}
 
@@ -1047,7 +1109,8 @@ class Driver(Down):
             for space, record in state["data"]["ingested"].items():
                 manifest = passed.get(space)
                 record["verified"] = None if manifest is None else {
-                    "manifest": manifest.digest(), "files": len(manifest.files), "bytes": manifest.bytes}  # fmt: skip
+                    "manifest": manifest.digest(), "files": len(manifest.files), "bytes": manifest.bytes,
+                    "space_id": ids[space]}  # fmt: skip
 
         self.set(mark)
         failed = [hpcdata.failure(space, said, recorded[space]["declared"]) for space, said in found.items() if said]
