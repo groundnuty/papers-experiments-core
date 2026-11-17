@@ -5,7 +5,8 @@
 
 The allow-list comes from ONEDATA_MCP_TOOLS, as the real server reads it. When FAKE_MCP_RECORD names a file, the
 server writes the Onedata settings it received there as JSON, so a test can see what the launcher passed it, with the
-SHA-256 and the mode of the file SSL_CERT_FILE names. The values are test values.
+SHA-256 and the mode of the file SSL_CERT_FILE names, and the working directory it was started in (its path, mode,
+owner and listing). The values are test values.
 
 When FAKE_MCP_TLS_PROBE names HTTPS URLs (separated by commas), the server first opens each with an httpx client that
 verifies unless ONEDATA_ALLOW_INSECURE_TLS is "true" and otherwise takes its CA bundle from the environment as httpx
@@ -35,6 +36,8 @@ SETTINGS = (
     "ONEDATA_ONEPROVIDER_TOKEN",
     "ONEDATA_MCP_TOOLS",
     "ONEDATA_ALLOW_INSECURE_TLS",
+    "ONEDATA_MCP_DOTENV",
+    "ONEDATA_MCP_NODE_NAMES",
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
@@ -62,9 +65,22 @@ def bundle_facts(path: str | None) -> dict[str, str | None]:
     return {"ssl_cert_file_sha256": digest, "ssl_cert_file_mode": oct(stat.S_IMODE(os.stat(path).st_mode))}
 
 
+def cwd_facts() -> dict[str, str | int | list[str]]:
+    """The working directory the server was started in, its permission bits, owner and listing (O84)."""
+    here = os.getcwd()
+    info = os.stat(here)
+    return {
+        "cwd": here,
+        "cwd_mode": oct(stat.S_IMODE(info.st_mode)),
+        "cwd_uid": info.st_uid,
+        "cwd_entries": sorted(os.listdir(here)),
+    }
+
+
 def main() -> None:
-    seen: dict[str, str | None] = {name: os.environ.get(name) for name in SETTINGS}
+    seen: dict[str, str | int | list[str] | None] = {name: os.environ.get(name) for name in SETTINGS}
     seen.update(bundle_facts(os.environ.get("SSL_CERT_FILE")))
+    seen.update(cwd_facts())
     probe = os.environ.get("FAKE_MCP_TLS_PROBE")
     if probe:
         seen["tls_probe"] = ",".join(probe_tls(url) for url in probe.split(","))
