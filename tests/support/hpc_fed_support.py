@@ -21,6 +21,12 @@ As the site's Slurm does (its first live slot, 16 Nov 2026): a step of a heterog
 is refused, its srun exiting 1 with `HET_REFUSAL` on stderr and no step made, component 0 included; and a step of
 component k > 0 is listed by `squeue -s -j <component k's own id>` alone, as `<component id>.<n>`, never under the
 leader's id. How a step of component 0 is listed was not seen live; here it is `<leader>.<n>`, under the leader's id.
+
+On a site whose switch plugin gives each job a virtual network identifier, a heterogeneous job's steps on component 0
+failed with `INTERCONNECT_REFUSAL` from a point on (the live slot of 16 Nov 2026), while the same steps with
+`--network=no_vni` ran, and component 1's ran without it. `interconnect_after=N` stands for that: the Nth step of
+component 0 that names no `--network` is the last to start, and every later one is refused as that site's was. The cause
+(a count of steps per component, or exhausted identifiers) was not established, so the fake counts and nothing more.
 """
 
 import hashlib
@@ -143,6 +149,7 @@ def pin_values(directory: Path) -> dict:
 PROPAGATED = ("--job-name", "--account", "--time", "--mem", "--no-requeue", "--export", "--output", "--chdir")
 # What the site's srun says, exiting 1, of a step of a heterogeneous job with no --het-group (live slot 1).
 HET_REFUSAL = "srun: error: No directives to start application on any available hetjob components\n"
+INTERCONNECT_REFUSAL = "srun: error: task 0 launch failed: Error configuring interconnect\n"
 
 
 @contextmanager
@@ -221,7 +228,9 @@ class Srun:
     exact: bool
     overlap: bool
     het_group: int | None = None
-    refused: bool = False  # a step of a heterogeneous job that names no component: srun refuses it, as the site's does
+    refused: bool = False  # srun refuses the step, as the site's does: it names no component, or its interconnect fails
+    refusal: str = HET_REFUSAL  # what srun prints to stderr when it refuses the step
+    network: str | None = None  # srun's --network=<value>, when the step names one (the site's HPC_STEP_NETWORK)
 
 
 def parse_srun(argv: list) -> Srun:
@@ -235,6 +244,8 @@ def parse_srun(argv: list) -> Srun:
             found["job"] = word.split("=", 1)[1]
         elif word.startswith("--het-group="):
             found["het_group"] = int(word.split("=", 1)[1])
+        elif word.startswith("--network="):
+            found["network"] = word.split("=", 1)[1]
         elif word == "--exact":
             found["exact"] = True
         elif word == "--overlap":
@@ -295,6 +306,8 @@ class FakeSlurm:
     sweep_here: bool = False  # run down's sweep of the agent's node on this host (its tmpfs is here), else answer it
     sweeps: list = field(default_factory=list)  # each sweep step down launched
     leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
+    interconnect_after: int | None = None  # the steps of component 0 with no --network that start before the rest fail
+    component_zero_steps: int = 0  # the steps of component 0 that named no --network, so far
     # A command of the login node beyond Slurm's, by its first word (the site's quota command, invented): a test's
     # answer, `(argv, timeout) -> Completed`, which may raise what the real Runner does. Every call is in `calls`.
     tools: dict = field(default_factory=dict)
@@ -454,6 +467,10 @@ class FakeSlurm:
                 f"a step on {srun.node}, outside component {srun.het_group or 0} of job {srun.job}"
             )
             srun.refused = srun.het_group is None and len(self.submitted[srun.job]) > 1
+            if srun.het_group == 0 and srun.network is None:
+                self.component_zero_steps += 1
+                if self.interconnect_after is not None and self.component_zero_steps > self.interconnect_after:
+                    srun.refused, srun.refusal = True, INTERCONNECT_REFUSAL
         return srun
 
     def start(self, argv, data=None):
@@ -461,7 +478,7 @@ class FakeSlurm:
 
         srun = self._step(argv)
         if srun.refused:
-            return FakeProcess(Completed(1, "", HET_REFUSAL))
+            return FakeProcess(Completed(1, "", srun.refusal))
         if self.on_control is not None:
             answer = self.on_control(srun)
             if answer is not None:
@@ -514,7 +531,7 @@ class FakeSlurm:
         assert Path(mint.command[1]).name == "mint-registration-token.sh"
         assert Path(deliver.command[1]).name == "deliver-token.sh"
         if mint.refused or deliver.refused:  # no token is minted, or none delivered
-            ends = [Completed(1, "", HET_REFUSAL) if s.refused else Completed(0, "", "") for s in (mint, deliver)]
+            ends = [Completed(1, "", s.refusal) if s.refused else Completed(0, "", "") for s in (mint, deliver)]
             return FakeProcess(ends[0]), FakeProcess(ends[1])
         provider = mint.command[2]
         self.delivered.append(provider)
@@ -532,7 +549,7 @@ class FakeSlurm:
         srun = self._step(argv)
         self.spawned.append(srun)
         if srun.refused:  # srun exits at once with its error in the client's log; no step is made, no log written
-            Path(client_log).write_text(HET_REFUSAL, encoding="utf-8")
+            Path(client_log).write_text(srun.refusal, encoding="utf-8")
             self.dead_clients.append(Client(20000 + len(self.spawned), 77))
             return self.dead_clients[-1]
         self.next_step += 1

@@ -405,6 +405,18 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   back as the services' job is, and `down` releases both. The state file's `sandbox` record names its node, its job
   and its het group, which M5's shard step takes. With the pilot's shape and a memory weight of 0.5 this bills about
   42 units per hour, against 63 for one uniform 18 GB shape (`DESIGN.md`, section 1).
+- **A site whose switch plugin gives each job a virtual network identifier (VNI)** (HPE Slingshot's does) refused a
+  heterogeneous job's steps on component 0 from a point on, in the second live slot (16 Nov 2026): after the zone and
+  five providers had started, every further step on a service node failed with `srun: error: task 0 launch failed:
+  Error configuring interconnect`, so `up` failed at the first provider's registration. A step on component 1 ran,
+  `--network=no_vni` ran on component 0 and `--network=single_node_vni` failed like no option, and the same steps ran
+  in a held job of one component in two earlier live runs. Whether a count of steps per component or exhausted
+  identifiers is the cause is not established. **Two ways round it, neither the default (another site is unchanged by
+  either):** `HPC_STEP_NETWORK=no_vni` in `site.env`, which puts `--network=no_vni` on every step the driver launches
+  (the services talk over TCP and need no VNI), and `sandbox_placement = "separate"` in the layout, which makes the
+  services' job a job of one component. **On such a site, start from `separate`:** it changes nothing about the steps,
+  where `no_vni` does, though it needs a second held job the partition may refuse. Not yet seen live on such a site: a
+  whole `up` with either, and a step on component 1 with `no_vni`.
 - **The agent's sandbox** (O63): the pilot's template declares the Apptainer sandbox, whose limits size the agent's
   node (an 8-core, 17 GiB step), and names the site's values as placeholders `up` fills from `site.env`:
   `HPC_AGENT_SIF`, `HPC_EGRESS_SHIM` and `HPC_ONECLIENT_BUNDLE` (the mount level's oneclient, O65) with their
@@ -432,10 +444,12 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   shows by a count that none of it remains (the previous section), and removes the root. After a partial `up` it finds the
   job by its recorded id, or by its allocation's exact name.
 - **Every step** is `srun --jobid --exact` with a name, its size and `/usr/bin/env -i PATH=... LC_ALL=C TMPDIR=<node
-  tmpfs>`; no step uses `--overlap`; a control step's srun client is ended only once its step is gone from `squeue
+  tmpfs>` (and `--network=<value>` when `site.env` sets `HPC_STEP_NETWORK`, on every step `up`, `down` and the service
+  verbs launch; the line `shards.py lines` prints for a shard step is the manifest's own and does not carry it); no
+  step uses `--overlap`; a control step's srun client is ended only once its step is gone from `squeue
   -s`, and one still listed at its bound is cancelled by its own id.
 - **The site** comes from `site.env` (`HPC_ACCOUNT`, `HPC_PARTITION`, `SH`, `L`, and optionally `HPC_STEP_PATH`,
-  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, and the four keys of the
+  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, and the four keys of the
   provider storage on scratch), recorded in the state file at `up` (of the storage keys, only `HPC_STORAGE_ROOT`), so `down` and the service verbs need no environment. The bundle is this checkout's own, which must lie on a
   filesystem the nodes see. The first `python3.11` on `HPC_STEP_PATH` must be the node's own, not a uv-installed one:
   the bundle's `supervise.py` needs `os.pidfd_open`.

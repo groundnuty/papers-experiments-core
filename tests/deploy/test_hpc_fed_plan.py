@@ -107,6 +107,79 @@ def test_the_site_comes_from_the_environment_and_a_missing_value_is_named(hpc):
         hpc.settings.site_from_environment({**environ, "HPC_NODE_TMP": "tmp"})
 
 
+SITE_ENVIRON = {
+    "HPC_ACCOUNT": "test-account",
+    "HPC_PARTITION": "test-partition",
+    "SH": "/site/images",
+    "L": "/site/logs",
+}
+
+
+def test_the_site_may_name_a_network_option_for_every_step_and_by_default_names_none(hpc):
+    """O57: HPC_STEP_NETWORK is optional and empty by default, so a site that sets nothing is unchanged; the value is
+    kept as given, recorded in the state's site record, and a record written before the key existed still loads."""
+    assert hpc.settings.site_from_environment(SITE_ENVIRON).step_network == ""
+    assert hpc.settings.site_from_environment({**SITE_ENVIRON, "HPC_STEP_NETWORK": ""}).step_network == ""
+    for value in ("no_vni", "single_node_vni,job_vni", "def_acs=100"):
+        site = hpc.settings.site_from_environment({**SITE_ENVIRON, "HPC_STEP_NETWORK": value})
+        assert site.step_network == value
+        assert hpc.settings.Site.from_json(site.to_json()) == site
+    old = hpc.settings.site_from_environment(SITE_ENVIRON).to_json()
+    del old["step_network"]
+    assert hpc.settings.Site.from_json(old).step_network == ""
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["no vni", "no_vni ", " no_vni", "no_vni;true", "$(id)", "`id`", "a|b", "a&b", "a>b", "a<b", "'x'", '"x"', "a\\b",
+     "a\nb", "a\tb", "<network>", "--exec", "-x", "a" * 129, "no_vni\x00"],
+    ids=lambda value: repr(value)[:20],
+)  # fmt: skip
+def test_a_step_network_with_a_space_or_a_shell_character_is_refused_naming_the_variable_not_the_value(hpc, value):
+    """O57: the value reaches an srun argv, so it is a short option string of letters, digits and _ . , = : + - only;
+    the message names HPC_STEP_NETWORK and never repeats what was given, and the state's record is held to the same."""
+    with pytest.raises(hpc.settings.SettingsError, match="HPC_STEP_NETWORK") as refused:
+        hpc.settings.site_from_environment({**SITE_ENVIRON, "HPC_STEP_NETWORK": value})
+    assert value not in str(refused.value)
+    recorded = hpc.settings.site_from_environment(SITE_ENVIRON).to_json()
+    with pytest.raises(hpc.settings.SettingsError, match="HPC_STEP_NETWORK"):
+        hpc.settings.Site.from_json({**recorded, "step_network": value})
+
+
+@pytest.mark.parametrize("value", [None, False, True, 0, 5, [], ["no_vni"], {}, {"no_vni": 1}, b"no_vni"], ids=repr)
+def test_a_step_network_in_the_state_that_is_not_a_string_is_refused_naming_the_variable(hpc, value):
+    """O57: a state record is read back as data, so `step_network` must be a string: a false, a null, a number or a
+    list is no option and no empty one, and is refused naming HPC_STEP_NETWORK (never read as none, never a TypeError);
+    a step handed one refuses it too."""
+    recorded = hpc.settings.site_from_environment(SITE_ENVIRON).to_json()
+    with pytest.raises(hpc.settings.SettingsError, match="HPC_STEP_NETWORK"):
+        hpc.settings.Site.from_json({**recorded, "step_network": value})
+    step = hpc.slurm.Step("4242", "node01", "hpcop-x-zone-facts", 1, 1024, (), ("true",), het_group=0, network=value)
+    with pytest.raises(hpc.slurm.SlurmError, match="HPC_STEP_NETWORK"):  # a falsy one is no "no option" to its guard
+        step.argv()
+
+
+def test_a_step_names_a_network_option_only_when_it_has_one(hpc):
+    """O57: without one the step's whole srun line is what it was before the setting existed (an empty value is none);
+    with one, that line plus `--network=<value>` after `--export=PATH`, so the prefix every test and tool slices
+    (`--jobid`, `--het-group`, `--exact`) does not move; a value an argv must not carry is refused."""
+    env = hpc.slurm.allowlist("/usr/bin:/bin", "/tmp")
+    plain = hpc.slurm.Step("4242", "node01", "hpcop-x-zone-facts", 1, 1024, env, ("python3.11", "x.py"), het_group=0)
+    wanted = ["srun", "--jobid=4242", "--het-group=0", "--exact", "-N1", "-n1", "-w", "node01", "-c", "1",
+              "--mem=1024M", "-J", "hpcop-x-zone-facts", "--export=PATH", "/usr/bin/env", "-i", *env, "python3.11",
+              "x.py"]  # fmt: skip
+    assert plain.argv() == wanted
+    assert replace(plain, network="").argv() == wanted
+    command = wanted.index("/usr/bin/env")
+    named = replace(plain, network="no_vni").argv()
+    assert named == [*wanted[:command], "--network=no_vni", *wanted[command:]]
+    assert parse_srun(named).network == "no_vni"
+    assert parse_srun(wanted).network is None
+    for bad in ("no vni", "a;b", "$x", "-x"):
+        with pytest.raises(hpc.slurm.SlurmError, match="HPC_STEP_NETWORK"):
+            replace(plain, network=bad).argv()
+
+
 def test_the_default_step_path_holds_the_sbin_directories_where_the_sites_nodes_keep_ss(hpc):
     """O57: under env -i a step finds its tools on the allowlist's PATH alone; the site's nodes keep ss (the bundle's
     port checks) in /usr/sbin, and the first live zone step failed in its first second without it."""
