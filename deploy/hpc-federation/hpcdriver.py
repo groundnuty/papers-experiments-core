@@ -887,14 +887,43 @@ class Driver(Down):
         self.set(change)
         return bool(moved)
 
+    def recorded_manifests(self, state: Mapping[str, Any], recorded: Mapping[str, Any]) -> Dict[str, Any]:
+        """The manifests of the layout's ingested spaces, once they are the ones `up` recorded (`recorded`, the state's
+        `data.ingested`): the same spaces, each manifest the digest `up` took; RuntimeError naming the space if not."""
+        values = hpcdata.study_values(Site.from_json(state["site"]).study_artifacts)
+        now = hpcdata.ingested(self.layout)
+        if set(now) != set(recorded):
+            raise RuntimeError("the layout's ingested spaces are not the ones this up recorded: it changed since up")
+        manifests = hpcdata.ingested_manifests(self.layout, values)
+        for space, manifest in manifests.items():
+            if manifest.digest() != recorded[space]["manifest"]:
+                raise RuntimeError(f"{space}: its manifest is not the one up recorded (its file changed since up)")
+        return manifests
+
+    def relink_refusal(self, state: Mapping[str, Any]) -> Optional[str]:
+        """Why a rerun on a `linked` federation cannot say `linked` again, whatever its own checks find, or None. The
+        rerun never reads an ingested space, and `shards.py plan` takes the markers `verify-data` left as read. So a
+        rerun that found no facts file (the core's phase then resets every space's content, an ingested one's too), or
+        one over a layout whose ingested spaces or manifests are not what `up` recorded, does not vouch for them."""
+        if not self.layout.facts.exists():
+            return "its facts file was missing, so the core's phase reset every space's content"
+        recorded = (state.get("data") or {}).get("ingested")
+        if recorded is None:
+            return "its state holds no record of the ingested spaces (its up predates it)"
+        try:
+            self.recorded_manifests(state, recorded)
+        except RuntimeError as error:
+            return str(error)
+        return None
+
     def core_here(self) -> str:
         """The core's phase in this process: the bootstrap, the baseline, the facts, platform.toml, the link check.
 
         On a federation that is `linked` (`hpcfed.py core` run again on a finished root) the phase is `bootstrapped`
         from before the core's phase runs, and `linked` again only if it returns, which it does only when its link
-        check passed: `up`'s own condition for `linked`. A rerun that fails, or dies, leaves `bootstrapped`, which
-        `shards.py plan` refuses, and no `linked` it did not earn. On any other state the phase ends `bootstrapped`
-        and only `up` says `linked`."""
+        check passed: `up`'s own condition for `linked`, and `relink_refusal` finds nothing against it. A rerun that
+        fails, or dies, leaves `bootstrapped`, which `shards.py plan` refuses, and no `linked` it did not earn. On any
+        other state the phase ends `bootstrapped` and only `up` says `linked`."""
         state = self.store.read()
         owner = tuple(state["owner"] or ())
         if len(owner) != 2:
@@ -906,18 +935,22 @@ class Driver(Down):
         # the study's artifacts digest, as up took it: a step on a node has no site variable and never reads the tree
         if state.get(hpcidentity.ARTIFACTS) is not None:
             values[hpcidentity.ARTIFACTS] = state[hpcidentity.ARTIFACTS]
+        placed = self.placed_layout(state)
         was_linked = state.get("phase") == "linked"
+        why = self.relink_refusal(state) if was_linked else None  # before the core's phase changes what it reads
         relink = was_linked and self.move_phase("linked", "bootstrapped")
         if relink:
             self.say("the federation was linked: it is bootstrapped unless this core phase's link check passes")
         try:
-            out = self.core(self.placed_layout(state), owner, values, environ=self.environ)
+            out = self.core(placed, owner, values, environ=self.environ)
         except Exception:
             if relink:
                 self.say("the core's phase failed: the federation stays bootstrapped, which shards plan refuses")
             raise
         if not was_linked:
             self.set(lambda s: s.update(phase="bootstrapped"))
+        elif relink and why is not None:
+            self.say(f"the core's phase passed, but the federation stays bootstrapped: {why}")
         elif relink and self.move_phase("bootstrapped", "linked"):
             self.say("the core's phase and its link check passed: the federation is linked again")
         return out
@@ -936,14 +969,7 @@ class Driver(Down):
             raise RuntimeError("the state holds no record of the ingested spaces (its up predates it): down, then up")
         # a verification that fails, or dies mid-read, leaves no marker an earlier pass gave
         self.set(lambda s: [record.update(verified=None) for record in s["data"]["ingested"].values()])
-        values = hpcdata.study_values(Site.from_json(state["site"]).study_artifacts)
-        now = hpcdata.ingested(self.layout)
-        if set(now) != set(recorded):
-            raise RuntimeError("the layout's ingested spaces are not the ones this up recorded: it changed since up")
-        manifests = hpcdata.ingested_manifests(self.layout, values)
-        for space, manifest in manifests.items():
-            if manifest.digest() != recorded[space]["manifest"]:
-                raise RuntimeError(f"{space}: its manifest is not the one up recorded (its file changed since up)")
+        manifests = self.recorded_manifests(state, recorded)
         if not manifests:
             return "data: no ingested space: nothing to verify"
         owner = tuple(state["owner"] or ())
