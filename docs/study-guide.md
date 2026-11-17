@@ -485,11 +485,9 @@ On an HPC federation of `deploy/hpc-federation`, its shard driver does both for 
 
 When your executor asks, after the agent's loop, whether the data path was healthy (a gate that answered errors, a mount whose oneclient died), read the sandbox, not the backend:
 
-```python
-check = sandbox.infra_check()  # {"containers": {role: ...}, "deaths": [...], "death": [problem lines]}
-errors = sandbox.mount_errors()  # oneclient's warnings and errors, summarised; None without a mount
-log = sandbox.mount_log()  # {"text": oneclient's INFO log, the token as <token>}; None without a mount
-```
+    check = sandbox.infra_check()  # {"containers": {role: ...}, "deaths": [...], "death": [problem lines]}
+    errors = sandbox.mount_errors()  # oneclient's warnings and errors, summarised; None without a mount
+    log = sandbox.mount_log()  # {"text": oneclient's INFO log, the token as <token>}; None without a mount
 
 The three have the same names and shapes on Docker and on an HPC node (`docs/interfaces.md`, "Reading a run's infrastructure after its loop"). Read them while the sandbox is up, before its collection or after: a component the collection stops itself is judged by its state just before. A state that cannot be read is a problem, never a healthy one, and `{"unavailable": ...}` from `mount_errors()` means the same. `oneclient_log.platform_errors(errors)` counts what is the platform's and not your agent's (O18). `mount_log()` may be read before the agent's first turn too: it is no access the mount guard counts.
 
