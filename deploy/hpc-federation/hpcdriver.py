@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import hpcdata
+import hpcidentity
 import hpcimport
 import hpcpins
 import hpcquota
@@ -228,11 +229,15 @@ class Driver(Down):
         self.layout.ca_pem.parent.mkdir(exist_ok=True)
         self.layout.journal.mkdir(exist_ok=True)
 
-    def initial_state(self, site: Site) -> Dict[str, Any]:
+    def initial_state(self, site: Site, tree: Optional[str] = None) -> Dict[str, Any]:
+        """The state file as `up` first writes it. `tree` is the digest of the study's artifacts directory
+        (`study_artifacts_tree`), kept under `hpcidentity.ARTIFACTS` so the core's phase, here or in a step on a node
+        whose environment is an allowlist, is handed the digest `up` took and never reads the directory again; the
+        key is left out when there is none."""
         roles = self.settings.roles(tuple(p.name for p in self.spec.providers))
         node = self.settings.node()
         name = f"hpcop-{self.spec.project[:40]}-{secrets.token_hex(4)}"
-        return {
+        state = {
             "format": hpcstate.FORMAT,
             "project": self.spec.project,
             "layout": {"source": self.spec.source, "digest": self.spec.digest, "path": str(self.layout_path)},
@@ -260,6 +265,9 @@ class Driver(Down):
             "data": {"ingested": hpcdata.ingested_record(self.layout, hpcdata.study_values(site.study_artifacts))},
             "phase": "preflight",
         }
+        if tree is not None:
+            state[hpcidentity.ARTIFACTS] = tree
+        return state
 
     def sandbox_record(self, name: str) -> Optional[Dict[str, Any]]:
         """Where the agent's node is held (DESIGN.md, section 4), None without one: M5's shard driver reads `node`, and
@@ -320,12 +328,34 @@ class Driver(Down):
 
     def up(self, site: Site) -> str:
         self.preflight(site)
+        tree = self.study_artifacts_tree(site)
         self.prepare_root()
         with self.store.lifecycle("up"):  # a down cannot run between the state and the sbatch
-            return self.bring_up(site)
+            return self.bring_up(site, tree)
 
-    def bring_up(self, site: Site) -> str:
-        state = self.store.create(self.initial_state(site))
+    def study_artifacts_tree(self, site: Site) -> Optional[str]:
+        """The digest of the study's artifacts directory (`HPC_STUDY_ARTIFACTS`, O74), taken here, on the login node
+        and before anything is made or submitted, so a tree that cannot be digested (a special file, a directory that
+        is not one, a link whose target leaves the directory: it must be self-contained) fails `up` at once, naming
+        the variable and a path relative to the directory, never an absolute one. None when the site declares no
+        directory, or the layout names no platform template, which writes no render identity to hold it. The tree is
+        only read: it may be read-only."""
+        if not site.study_artifacts:
+            return None
+        if self.spec.platform_template is None:
+            self.say(
+                "HPC_STUDY_ARTIFACTS is set and the layout names no platform template: it writes no render identity"
+            )
+            return None
+        try:
+            digest = hpcidentity.tree_sha256(Path(site.study_artifacts))
+        except hpcidentity.TreeError as error:
+            raise RuntimeError(f"HPC_STUDY_ARTIFACTS: {error}") from None
+        self.say("the study's artifacts directory (HPC_STUDY_ARTIFACTS) is digested for the render identity")
+        return digest
+
+    def bring_up(self, site: Site, tree: Optional[str] = None) -> str:
+        state = self.store.create(self.initial_state(site, tree))
         self.make_storage(state)  # recorded above, made before any job exists to bill for it
         asked, alone = self.allocation(state, site), self.sandbox_allocation(state, site)
         held = [(self.submit(asked, "allocation"), asked)]
@@ -636,6 +666,9 @@ class Driver(Down):
         s, site = self.settings, Site.from_json(state["site"])
         # the agent's sandbox's values, as up recorded the site (its files' pins checked in the preflight)
         values = {**hpc_values(state["command"], s.stop_bound_s, s.settle_timeout_s, self.root), **hpcpins.values(site)}
+        # the study's artifacts digest, as up took it: a step on a node has no site variable and never reads the tree
+        if state.get(hpcidentity.ARTIFACTS) is not None:
+            values[hpcidentity.ARTIFACTS] = state[hpcidentity.ARTIFACTS]
         out = self.core(self.placed_layout(state), owner, values, environ=self.environ)
         self.set(lambda s: s.update(phase="bootstrapped"))
         return out

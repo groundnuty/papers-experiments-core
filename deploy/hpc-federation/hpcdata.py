@@ -141,14 +141,22 @@ def data_manifests(
     return found
 
 
-def declared(layout: Layout, environ: Mapping[str, str]) -> Dict[str, Manifest]:
+def declared(
+    layout: Layout, environ: Mapping[str, str], values: Optional[Mapping[str, str]] = None
+) -> Dict[str, Manifest]:
     """Each space's manifest as `data_manifests` will have it, loaded and with nothing written: a shared import's, the
-    layout's own file (its variable, checked as `Layout.load_manifest` does), every other space's from its baseline. For
-    what must know a space's data before the root exists (the inode guard, `hpcquota`)."""
+    layout's own file (its variable, checked as `Layout.load_manifest` does), an ingested space's declared file, where
+    the study keeps it (`ingested_manifests`, `values` filling `@study_artifacts@`), every other space's from its
+    baseline. For what must know a space's data before the root exists (the inode guard, `hpcquota`): the study's own
+    ingest is in it, since `up` loads that manifest and the space will hold what it declares."""
     plan, imported = baseline_plan(layout.spec), {s.name for s in layout.shared_imports()}
+    study = ingested(layout)
+    loaded = ingested_manifests(layout, values or {}) if any(study.values()) else {}
     return {
         space.name: layout.load_manifest(space.name, environ)
         if space.name in imported
+        else loaded[space.name]
+        if study.get(space.name)
         else baseline_manifest(plan[space.name])
         for space in layout.spec.spaces
     }
