@@ -295,5 +295,5 @@ def read_marker(run_dir: Path, run_key: str, attempt_id: int) -> AttemptResult |
         if "injected_targets" in kept:
             kept["injected_targets"] = tuple(kept["injected_targets"])
         return AttemptResult(outcome=_outcome_from(data["outcome"]), **kept)
-    except (ValueError, KeyError, TypeError) as error:
+    except (ValueError, KeyError, TypeError, RecursionError) as error:  # a marker nested past the parser's limit too
         raise MarkerError(f"{path}: not a valid marker ({type(error).__name__}: {error})") from None
