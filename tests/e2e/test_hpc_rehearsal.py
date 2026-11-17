@@ -446,8 +446,7 @@ def test_down_swept_the_agents_node_and_left_no_step_directory_there(downed, sha
 
 
 def test_the_sandbox_left_no_run_record_on_either_agent_node(downed):
-    """The resumed dispatcher's first sandbox reaped what the killed one left; every other run's teardown removed its
-    own record."""
+    """The resumed dispatcher's first sandbox reaped what the killed one left, and every other run's teardown removed
+    its own record; so down's sweep found the work root empty, and removed it (W1, live slot 5)."""
     for fed in downed.values():
-        assert sorted(p.name for p in fed.work_root.iterdir()) == ["_runs"], fed.label
-        assert not list((fed.work_root / "_runs").iterdir()), fed.label
+        assert not fed.work_root.exists(), fed.label

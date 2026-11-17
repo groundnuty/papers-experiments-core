@@ -237,6 +237,19 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
     )
 
 
+def campaign_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """The campaign fingerprint a start of the study at `path` pins (C06), without starting it or opening a store:
+    its configuration checked and its code vouched for as `run` holds them (`require_known`, no dirty code), its plugin
+    loaded with the study's kinds in scope, and `fingerprint_of` of both, as `_build` makes it. The HPC shard driver's
+    `resume-line` (deploy/hpc-federation/shardresume.py) compares it with what a shard's snapshot pins before a node
+    is taken for its resume."""
+    study = load_study(path)
+    check_study(study)
+    with study_kinds(study.kinds):
+        code = require_known("run", study.root, study.scope, allow_dirty=False)
+        return fingerprint_of(study, load_plugin(StudyContext(study, code)))
+
+
 def run_study(
     path: str | os.PathLike[str],
     *,

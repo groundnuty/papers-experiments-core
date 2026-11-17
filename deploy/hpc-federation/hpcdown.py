@@ -96,6 +96,12 @@ class Down:
             except (RuntimeError, OSError, TimeoutError) as error:
                 self.say(f"the agent's node could not be swept ({error}); the held job is cancelled all the same")
                 unverified.append("the agent's node")
+        for entry in state.get("shard_nodes", []):  # W1: every other node a shard step of this federation ran on
+            try:
+                swept = "\n".join(filter(None, [swept, self.sweep_shard_node(state, entry)]))
+            except (RuntimeError, OSError, TimeoutError) as error:
+                self.say(f"the node shard {entry['label']} was resumed on could not be swept ({error})")
+                unverified.append(f"the node shard {entry['label']} was resumed on")
         self.cancel_all([j for j, i in ((job, info), (agent, agent_info)) if i is not None], lost)
         unverified += self.end_clients([j for j in (job, agent) if j is not None])
         if unverified:
@@ -111,17 +117,41 @@ class Down:
     def sweep_agent_node(self, state: Mapping[str, Any]) -> str:
         """`shards.py sweep` in a control step on the agent's node: every shard step's directory of this federation on
         its tmpfs whose step is shown gone is removed, and one holding an out/ that could not be archived is kept and
-        named (the node's tmpfs is the node's, not the job's: no job end removes it). What the sweep printed; nothing
-        without an agent's node. RuntimeError when the sweep fails."""
+        named (the node's tmpfs is the node's, not the job's: no job end removes it); then the sandbox's work root,
+        its killed runs reaped (a dead FUSE mount among them) and itself removed once empty (W1, W2). What the sweep
+        printed; nothing without an agent's node. RuntimeError when the sweep fails."""
         record = state.get("sandbox") or {}
         if not record.get("node"):
             return ""
+        return self.sweep_node(state, record["node"], f"{state['allocation']['name']}-sandbox-sweep")
+
+    def sweep_shard_node(self, state: Mapping[str, Any], entry: Mapping[str, str]) -> str:
+        """The sweep on a node a shard was resumed on (`shard_nodes`, which `shards.py resume-line` records), in the job
+        it was resumed in, which down never cancels: only while that job runs and is still the one recorded (Slurm
+        reuses ids, `ours`); one that ended is said, and its node's leftovers wait for the next shard step there, which
+        reaps them before it uses its work root. The agent's node in the agent's own job was swept already."""
+        sandbox = state.get("sandbox") or {}
+        if entry["node"] == sandbox.get("node") and entry["job"] in (sandbox.get("job"), state["allocation"]["job"]):
+            return ""
+        info = self.slurm.job(entry["job"])
+        if info is None or info.get("JobName") != entry["name"] or info.get("JobState") != "RUNNING":
+            self.say(f"shard {entry['label']} was resumed in job {entry['job']}, which has ended: its node is not "
+                     "swept here (the next shard step there reaps what it left)")  # fmt: skip
+            return ""
+        name = f"{state['allocation']['name']}-shard-{entry['label']}-sweep"
+        return self.sweep_node(state, entry["node"], name, job=entry["job"])
+
+    def sweep_node(self, state: Mapping[str, Any], node: str, name: str, job: Optional[str] = None) -> str:
+        """`shards.py sweep` on `node` (in `job`, a recorded resume's, when given), by the core's Python on the nodes
+        (`HPC_CORE_PYTHON`, which up asks for with an agent's node: the reaper of the sandbox's runs is the core's), or
+        the nodes' own for a state an earlier up wrote without it, whose sweep then fails when it finds a work root."""
         site = Site.from_json(state["site"])
-        argv = [site.node_python, "-I", "-B", str(SHARDS), "sweep", "--tmpfs", site.node_tmp, "--root", str(self.root)]
-        name = f"{state['allocation']['name']}-sandbox-sweep"
-        done = self.launcher.control(record["node"], argv, name=name, timeout_s=self.timeouts["step"])
+        python = site.core_python or site.node_python
+        argv = [python, "-I", "-B", str(SHARDS), "sweep", "--tmpfs", site.node_tmp, "--root", str(self.root)]
+        done = self.launcher.control(node, argv, name=name, timeout_s=self.timeouts["step"], job=job)
         if done.returncode != 0:
-            raise RuntimeError(f"its sweep ended with status {done.returncode}")
+            tail = (done.stdout or "").strip().splitlines()[-1:]
+            raise RuntimeError(f"its sweep ended with status {done.returncode}{': ' + tail[0] if tail else ''}")
         return done.stdout.strip()
 
     @staticmethod

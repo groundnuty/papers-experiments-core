@@ -25,6 +25,7 @@ leader's id. How a step of component 0 is listed was not seen live; here it is `
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -85,6 +86,7 @@ def agent_site(directory: Path, sif: bytes = b"an invented SIF image\n", shim: b
         "HPC_ONECLIENT_BUNDLE": str(bundle),
         "HPC_ONECLIENT_BUNDLE_SHA256": write_tar(bundle, bundle_members()),
         "HPC_AGENT_WORK_ROOT": str(work_root or directory / "agent-work"),
+        "HPC_CORE_PYTHON": "/shared/venv/bin/python",  # down's sweep of the agent's node reaps with the core's (W2)
     }
 
 
@@ -315,6 +317,7 @@ class FakeSlurm:
     sweeps: list = field(default_factory=list)  # each sweep step down launched
     leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
     step_cancel_rc: int = 0  # a step's scancel ends it but exits so (225: as the site's did on a het job, live slot 5)
+    accounting: dict = field(default_factory=dict)  # job id -> what `sacct -o JobID,State,AllocTRES` prints of it
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -339,6 +342,13 @@ class FakeSlurm:
             return Completed(0, self.scontrol_lines(ident), "")
         if argv[:3] == ["scontrol", "show", "hostnames"]:
             return Completed(0, "\n".join(n for n in argv[3].split(",") if n) + "\n", "")
+        if tool == "squeue" and "-s" in argv and "-u" in argv:  # every step of this user's, of every job still known
+            lines = [
+                f"{step} {name}"
+                for name, step in self.steps.items()
+                if self.leader_of(step.split(".")[0]) and not self.gone_job(self.leader_of(step.split(".")[0]))
+            ]
+            return Completed(0, "".join(f"{line}\n" for line in lines), "")
         if tool == "squeue" and "-s" in argv:
             lines = []
             for ident in argv[argv.index("-j") + 1].split(","):  # a job's or a component's own id
@@ -368,7 +378,9 @@ class FakeSlurm:
                 self.steps = {n: s for n, s in self.steps.items() if self.leader_of(s.split(".")[0]) != target}
             return Completed(0, "", "")
         if tool == "sacct":
-            return Completed(0, "", "")
+            ident = argv[argv.index("-j") + 1]
+            wanted = argv[argv.index("-o") + 1] == "JobID,State,AllocTRES"
+            return Completed(0, self.accounting.get(ident, "") if wanted else "", "")
         if argv[1:5] == ["-I", "-B", "-m", "expcore_onedata.fault_relay"]:
             self.relay_calls.append(argv[5])
             return Completed(self.relay_rc.get(argv[5], 0), "", "")
@@ -444,6 +456,7 @@ class FakeSlurm:
                 "JobId": str(int(ident) + index),
                 **het,
                 "JobName": options.get("--job-name"),
+                "UserId": f"someone({os.getuid()})",
                 "JobState": self.state if ident == self.job_id else self.job_states.get(ident, "RUNNING"),
                 "TimeLimit": options.get("--time"),
                 "Requeue": "0" if "--no-requeue" in options else "1",

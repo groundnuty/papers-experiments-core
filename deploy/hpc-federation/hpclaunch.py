@@ -118,7 +118,7 @@ class Launcher:
         self.store = store
         self.settings = settings
 
-    def _where(self, node: str, name: str) -> Tuple[str, Optional[int], Optional[str], Site]:
+    def _where(self, node: str, name: str, job: Optional[str] = None) -> Tuple[str, Optional[int], Optional[str], Site]:
         """The job a step on this node belongs to, the heterogeneous job's component it runs in (None for a job of one
         component, where no step names one) and that component's own id (None: the job's): a service node is the
         services' job's, component 0 of a heterogeneous job; the agent's node is the last component of the same job
@@ -126,6 +126,12 @@ class Launcher:
         included: on the site's Slurm a step of one with no `--het-group` is refused ("No directives to start
         application on any available hetjob components")."""
         state = self.store.read()
+        if job is not None:  # a node a shard was resumed on, in the job it was resumed in (`shard_nodes`), alone
+            if not any(e["job"] == job and e["node"] == node for e in state.get("shard_nodes", [])):
+                raise hpcstate.StateError("refusing a step in a job no shard of this federation was resumed in")
+            if not STEP_NAME.fullmatch(name):
+                raise hpcstate.StateError("a step name must be letters, digits, '_', '.' and '-'")
+            return job, None, None, Site.from_json(state["site"])
         job = state["allocation"].get("job")
         if job is None:
             raise hpcstate.StateError("the state names no held job")
@@ -141,17 +147,28 @@ class Launcher:
             raise hpcstate.StateError("a step name must be letters, digits, '_', '.' and '-'")
         return (*where, Site.from_json(state["site"]))
 
-    def _step(self, node: str, argv: Sequence[str], name: str, kind: str, output: Optional[str] = None) -> Step:
-        job, group, component, site = self._where(node, name)
+    def _step(
+        self,
+        node: str,
+        argv: Sequence[str],
+        name: str,
+        kind: str,
+        output: Optional[str] = None,
+        job: Optional[str] = None,
+    ) -> Step:
+        job, group, component, site = self._where(node, name, job)
         size = self.settings.control if kind == "control" else self.settings.size(kind)
         # never the account's home: none at all, until the bundle's scripts point it into the service's own work
         # directory on the node's tmpfs, once they know it (lib.sh, home_in)
         env = allowlist(site.step_path, site.node_tmp, home_env(NO_HOME))
         return Step(job, node, name, size.cpus, size.memory_mib, env, tuple(argv), output, group, component)
 
-    def control(self, node: str, argv: Sequence[str], *, name: str, timeout_s: float) -> Completed:
-        """A bounded control step, stdin /dev/null; `TimeoutError` (`StepTimeout`) at its bound, the step cancelled."""
-        return self.slurm.control(self._step(node, argv, name, "control"), timeout_s)
+    def control(
+        self, node: str, argv: Sequence[str], *, name: str, timeout_s: float, job: Optional[str] = None
+    ) -> Completed:
+        """A bounded control step, stdin /dev/null; `TimeoutError` (`StepTimeout`) at its bound, the step cancelled.
+        `job`: a job a shard of this federation was resumed in (`shard_nodes`), for down's sweep of its node."""
+        return self.slurm.control(self._step(node, argv, name, "control", job=job), timeout_s)
 
     def control_pipe(
         self, first: Tuple[str, Sequence[str], str], second: Tuple[str, Sequence[str], str], timeout_s: float

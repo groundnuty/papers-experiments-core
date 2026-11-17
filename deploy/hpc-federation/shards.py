@@ -148,6 +148,7 @@ OWNER_STATUS = ".step.status.json"  # the same with the dispatcher's exit status
 RUNNING, ARCHIVING = "running", "archiving"  # the step's phase: its dispatcher runs; it ended and out/ is whole
 ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not be archived, so it is kept
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
+RUNNING_MARK, RUNNING_FORMAT = "running.json", "expcore-hpc-shard-running/1"  # <results>/<label>/: a step runs it
 
 
 # The step's HOME, and every directory a tool writes under one, until it has made its directory on the tmpfs: a path
@@ -296,7 +297,8 @@ def federation(shard: Shard) -> dict[str, Any]:
         raise ShardsError(f"shard {shard.label}: no sandbox node: the state file names none and the manifest neither")
     if shard.node and node != shard.node:
         raise ShardsError(f"shard {shard.label}: the manifest's sandbox_node is not the one its state file names")
-    return {"job": job, "name": name, "node": node, "placement": placement, "het_group": group}
+    listed = (record.get("component_job") or job) if placement == "het" else job  # `squeue -s`'s id for its steps
+    return {"job": job, "name": name, "node": node, "placement": placement, "het_group": group, "listed": listed}
 
 
 def undeclared_data(plan: Plan) -> list[str]:
@@ -325,19 +327,31 @@ def _job_id(job: Any) -> bool:
     return isinstance(job, str) and job.isdigit()
 
 
-def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) -> list[str]:
-    """The login node's `srun` of one shard's step (the module's docstring): `--exact`, never `--overlap`; an
-    environment of the allowlist alone, set on the node by `env -i`, with no secret in it."""
+def step_name(fed: Mapping[str, Any], shard: Shard) -> str:
+    """The name of every step of the shard, wherever it runs (`lines`, `resume-line`): the one name a search of every
+    step of this user's finds it by."""
+    return f"{fed['name']}-shard-{shard.index}"
+
+
+def step_argv(
+    plan: Plan, shard: Shard, fed: Mapping[str, Any], script: Path, *, resume: bool = False, over: str | None = None
+) -> list[str]:
+    """The login node's `srun` of one shard's step (the module's docstring): `--exact`, never `--overlap`, in `/` on
+    the node (`--chdir=/`); an environment of the allowlist alone, set on the node by `env -i`, with no secret in it.
+    The step is told the id its step is listed under and its name, which its running mark records (`claim_running`);
+    `resume` and `over` are `resume-line`'s."""
     env = [f"PATH={plan.step_path}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={shard.root.parent}",
            f"EXPCORE_FED_ROOT={shard.root}", *(f"{k}={v}" for k, v in home_env(NO_HOME).items())]  # fmt: skip
     step = [plan.python, "-I", "-B", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
             "--results", str(plan.results), "--core-src", str(plan.core_src),
-            "--snapshot-every", f"{plan.snapshot_every_s:g}"]  # fmt: skip
+            "--snapshot-every", f"{plan.snapshot_every_s:g}",
+            "--job", str(fed.get("listed") or fed["job"]), "--step-name", step_name(fed, shard),
+            *(["--resume"] if resume else []), *(["--over", over] if over else [])]  # fmt: skip
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
-        f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH", "--chdir=/",
+        f"--mem={plan.memory}", "-J", step_name(fed, shard), "--export=PATH", "--chdir=/",
         "/usr/bin/env", "-i", *env, *step,
     ]  # fmt: skip
 
@@ -641,6 +655,32 @@ def archive_named(results: Path, label: str) -> str | None:
     return named if isinstance(named, str) else "unreadable"
 
 
+def restore_newest(results: Path, label: str, spec: Mapping[str, Any], base: str | None, out: Path) -> Path | None:
+    """Restore into `out` the newest snapshot of the shard that verifies (`out_snapshot.restore`: every file against
+    its hash, the store's integrity, every ended attempt's marker) and return it; None when there is none, or when the
+    archive is newer (a snapshot that does not name `base`, the archive's SHA-256, was taken before it). A snapshot of
+    another shard is `ShardsError`. `resume_into` restores what this picks, and `resume-line` checks the same pick."""
+    from expcore.campaign import out_snapshot
+
+    for snapshot in out_snapshot.snapshots(results / label / SNAPSHOTS):
+        try:
+            facts = out_snapshot.manifest_of(snapshot)["facts"]
+        except out_snapshot.OutSnapshotError as error:
+            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
+            continue
+        if facts.get("shard") != dict(spec):
+            raise ShardsError(f"shard {label}: snapshot {snapshot.name} is of shard {facts.get('shard')}")
+        if base is not None and facts.get("base") != base:
+            return None  # taken before the archive: the archive is newer than it and every older one
+        try:
+            out_snapshot.restore(snapshot, out)
+        except out_snapshot.OutSnapshotError as error:
+            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
+            continue
+        return snapshot
+    return None
+
+
 def resume_into(args: argparse.Namespace, spec: Mapping[str, Any], base: str | None, work: Path, out: Path) -> None:
     """Put the shard's latest `out/` at `out`: the newest snapshot that verifies, unless the archive is newer (a
     snapshot that does not name it was taken before it), else the archive, else nothing (a fresh start, only when the
@@ -651,21 +691,8 @@ def resume_into(args: argparse.Namespace, spec: Mapping[str, Any], base: str | N
     from expcore.campaign.snapshot import rebase_run_dirs
 
     found = out_snapshot.snapshots(args.results / args.label / SNAPSHOTS)
-    for snapshot in found:
-        try:
-            facts = out_snapshot.manifest_of(snapshot)["facts"]
-        except out_snapshot.OutSnapshotError as error:
-            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
-            continue
-        if facts.get("shard") != dict(spec):
-            raise ShardsError(f"shard {args.label}: snapshot {snapshot.name} is of shard {facts.get('shard')}")
-        if base is not None and facts.get("base") != base:
-            break  # taken before the archive: the archive is newer than it and every older one
-        try:
-            out_snapshot.restore(snapshot, out)
-        except out_snapshot.OutSnapshotError as error:
-            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
-            continue
+    snapshot = restore_newest(args.results, args.label, spec, base, out)
+    if snapshot is not None:
         print(f"shards: shard {args.label} resumes from snapshot {snapshot.name}", file=sys.stderr)
         return
     if found and not (args.results / f"{args.label}.out.tar").exists():
@@ -728,6 +755,57 @@ def make_work_root(path: Path, tmpfs: Path) -> None:
         raise ShardsError("[sandbox] work_root is not this user's")
     if stat.S_IMODE(info.st_mode) & 0o077:
         raise ShardsError("[sandbox] work_root gives others access: it must be 0700")
+
+
+def _private_work_root(path: Path) -> None:
+    """The work root is a directory of this user's, not a link, with no access for others: anything else is never
+    reaped or removed (a link would take the reaper out of it). `ShardsError` names what is wrong, never the path."""
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ShardsError("[sandbox] work_root is a link or not a directory")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ShardsError("[sandbox] work_root is not this user's alone (0700)")
+
+
+def reap_work_root(work_root: Path, node: Any = None) -> dict[str, int]:
+    """The Apptainer run reaper (`expcore_onedata.sandbox.apptainer.runs.reap`) over the sandbox's work root on this
+    node (W2, live slot 5): a run whose driver is shown gone, as a step killed outright leaves it, has its token files
+    removed, its helpers and every process carrying its tag ended, each mount in its directory unmounted (`fusermount3
+    -u`, then `-uz` for a dead FUSE mount, "Transport endpoint is not connected"), shown gone by the mount table, then
+    its directory and its record removed. A run whose driver lives, or cannot be told gone, is never touched. The
+    reaper's counts; `ShardsError` when a dead run's leftovers could not all be removed, or its records could not be
+    read: never "nothing to reap". It needs the core (`node`: the node it acts on, `LocalNode` by default)."""
+    if not os.path.lexists(work_root):
+        return {"runs": 0, "processes": 0, "left": 0}
+    _private_work_root(work_root)
+    from expcore_onedata.sandbox.apptainer import runs
+
+    if node is None:
+        from expcore_onedata.sandbox.apptainer.node import LocalNode
+
+        node = LocalNode()
+    found = runs.reap(node, work_root, own="")
+    if found.get("error") or found.get("left"):
+        raise ShardsError(
+            f"the sandbox's work root on this node holds a killed run's leftovers that could not all be removed "
+            f"({found.get('error') or str(found.get('left')) + ' run(s) left'})"
+        )
+    return found
+
+
+def remove_empty_work_root(work_root: Path) -> bool:
+    """The work root removed once nothing is left in it but an empty run-record directory (W1: the step makes it and
+    nothing else removes it, so every node a shard step ran on kept one): `rmdir` alone, never a removal of anything
+    in it. False when anything is left (a run of a live driver, say) or it is not there."""
+    from_runs = work_root / "_runs"  # expcore_onedata.sandbox.apptainer.runs.RUNS
+    try:
+        _private_work_root(work_root)
+        if os.path.lexists(from_runs):
+            os.rmdir(from_runs)
+        os.rmdir(work_root)
+    except (OSError, ShardsError):
+        return False
+    return True
 
 
 def _start_of(pid: int) -> str | None:
@@ -882,10 +960,14 @@ def archive_left(args: argparse.Namespace) -> int:
     return 0
 
 
-def sweep(tmpfs: Path, root: str) -> int:
-    """On the agent's node, at the federation's down: remove every step's directory of this federation (its owner
-    record names `root`) whose step was killed while its dispatcher ran and is shown gone; name each one kept (an out/
-    not archived, a step still running). Stdlib alone: it runs under the node's own Python."""
+def sweep(tmpfs: Path, root: str, node: Any = None) -> int:
+    """On a node a shard step of this federation ran on, at the federation's down: remove every step's directory of
+    this federation (its owner record names `root`) whose step was killed while its dispatcher ran and is shown gone;
+    name each one kept (an out/ not archived, a step still running). Then the sandbox's work root that the federation's
+    `platform.toml` names: its killed runs reaped (`reap_work_root`, W2), and the root itself removed once empty (W1),
+    unless a step directory of ours on this node is kept (its step may still use it). Exit 1 when the work root could
+    not be reaped (its leftovers, or a Python that cannot import the core's reaper: down's `HPC_CORE_PYTHON`), so down
+    never takes a work root it could not reap for a clean one."""
     removed, kept = 0, []
     for left in leftovers(tmpfs):
         if left.owner is None or left.owner.get("root") != root:
@@ -897,7 +979,28 @@ def sweep(tmpfs: Path, root: str) -> int:
         else:
             remove_tree(left.path)
             removed += 1
-    print(f"shards: sweep: {removed} step directory(ies) removed; kept: {'; '.join(kept) or 'none'}")
+    try:
+        work_root = sandbox_work_root(root)
+        reaped = reap_work_root(work_root, node) if work_root is not None else {"runs": 0}
+    except ImportError:
+        print("shards: sweep: ERROR: this Python cannot import the core's reaper, so the sandbox's work root here is "
+              "not reaped (down runs the sweep with HPC_CORE_PYTHON)")  # fmt: skip
+        return 1
+    except (ShardsError, OSError) as error:
+        print(f"shards: sweep: ERROR: the sandbox's work root here could not be reaped ({error})")
+        return 1
+    busy = bool(leftovers(tmpfs))  # a step directory still here: its step may yet use the work root
+    root_gone = work_root is not None and not busy and remove_empty_work_root(work_root)
+    if work_root is None:
+        state = "none declared"
+    elif root_gone:
+        state = "removed"
+    elif not os.path.lexists(work_root):
+        state = "none here"
+    else:
+        state = "kept (a live run, or a step directory on this node, may use it)"
+    print(f"shards: sweep: {removed} step directory(ies) removed; kept: {'; '.join(kept) or 'none'}; "
+          f"killed sandbox run(s) reaped: {reaped['runs']}; the sandbox's work root: {state}")  # fmt: skip
     return 0
 
 
@@ -927,16 +1030,90 @@ def _ended(work: Path, status: int) -> bool:
     return True
 
 
+def _mark_path(args: argparse.Namespace) -> Path:
+    return args.results / args.label / RUNNING_MARK
+
+
+def taking_over(found: Mapping[str, Any] | None, args: argparse.Namespace, spec: Mapping[str, Any]) -> bool:
+    """Whether a `--resume` may take over the running mark an earlier step of the shard left: only when its step is
+    shown gone, by `resume-line` on the login node (it found no step of the shard listed anywhere and passed this
+    mark's nonce as `--over`), or here, the mark naming this very node and a process of it that has ended. Anything
+    else (another node with no `--over`, a mark that cannot be read, of another shard) may be a step that still runs:
+    never taken over."""
+    if found is None or found.get("format") != RUNNING_FORMAT or found.get("shard") != dict(spec):
+        return False
+    over = getattr(args, "over", None)
+    if over:
+        return found.get("nonce") == over
+    return found.get("node") == os.uname().nodename and alive(found.get("pid"), found.get("start")) is False
+
+
+def claim_running(args: argparse.Namespace, spec: Mapping[str, Any]) -> dict[str, Any]:
+    """The shard's running mark, `<results>/<label>/running.json`, taken for this step before anything else (O62):
+    which node, process, job and step run the shard, and a nonce. A step's directory on one node's tmpfs cannot be
+    seen from another (`clear_leftovers`), so this mark on the shared results directory is what stops two steps of
+    one shard on two nodes. Written exclusively, and removed when the step ends by itself (`release_running`): a step
+    killed outright leaves it. A start finds none, or is refused; a `--resume` takes one over only as `taking_over`
+    says, by renaming it aside first (of two that try, one alone succeeds) and making its own exclusively. `ShardsError`
+    on any refusal; nothing of the shard is touched then."""
+    path = _mark_path(args)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mark = {"format": RUNNING_FORMAT, "shard": dict(spec), "nonce": secrets.token_hex(16),
+            "node": os.uname().nodename, "pid": os.getpid(), "start": _start_of(os.getpid()),
+            "job": getattr(args, "job", None), "step": getattr(args, "step_name", None),
+            "root": os.environ.get("EXPCORE_FED_ROOT"), "started": _stamp()}  # fmt: skip
+    if os.path.lexists(path):
+        found = _record(path)
+        if not args.resume:
+            raise ShardsError(f"shard {args.label}: a step of it runs, or was killed outright (its running mark is "
+                              "there): --resume continues it")  # fmt: skip
+        if not taking_over(found, args, spec):
+            raise ShardsError(f"shard {args.label}: a step of it may still run on another node (its running mark "
+                              "names it); `shards.py resume-line` shows it gone and continues it")  # fmt: skip
+        aside = path.with_name(f".{RUNNING_MARK}.{mark['nonce']}.taken")
+        try:
+            os.rename(path, aside)
+        except FileNotFoundError:
+            raise ShardsError(f"shard {args.label}: another step took its running mark over first") from None
+        if _record(aside) != found:  # another step's, made between the reading and the rename: put back
+            try:
+                os.link(aside, path)
+                os.unlink(aside)
+            except OSError:
+                pass  # left aside, never removed: it names a step that may run
+            raise ShardsError(f"shard {args.label}: another step took its running mark over first")
+        os.unlink(aside)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        raise ShardsError(f"shard {args.label}: another step of it started meanwhile") from None
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(mark, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return mark
+
+
+def release_running(args: argparse.Namespace, mark: Mapping[str, Any]) -> None:
+    """Remove the shard's running mark at the step's own end, only while it is still this step's (its nonce)."""
+    path = _mark_path(args)
+    found = _record(path)
+    if found is not None and found.get("nonce") == mark["nonce"]:
+        path.unlink(missing_ok=True)
+
+
 def step(
     args: argparse.Namespace,
     *,
     runner: Callable[[Sequence[str], Mapping[str, str], Path], int] = run_dispatcher,
     core_found: Callable[[Path], bool] = imports_core_from,
     snapshots: Snapshots | None = None,
+    node: Any = None,
 ) -> int:
     """One shard on its node (the module's docstring): copy, restore, run, archive, clean up; the dispatcher's exit
     status. `snapshots` says when `out/` is snapshotted; by default every `--snapshot-every` seconds and at each run's
-    end, into `<results>/<label>/snapshots/`."""
+    end, into `<results>/<label>/snapshots/`. `node` is what the reaper of the sandbox's work root acts on (the
+    Apptainer backend's `NodeOps`; `LocalNode` by default)."""
     if not core_found(args.core_src):
         print("shards: ERROR: this interpreter does not import the core from --core-src", file=sys.stderr)
         return CORE_MISMATCH
@@ -960,9 +1137,26 @@ def step(
         return 2
     if args.resume:  # an earlier step killed outright left its directory here: removed, or the resume refused
         clear_leftovers(args.tmpfs, spec, os.environ.get("EXPCORE_FED_ROOT"), args.results)
-    work_root = sandbox_work_root(os.environ.get("EXPCORE_FED_ROOT"))
-    if work_root is not None:  # the Apptainer sandbox's, which it refuses to start without
-        make_work_root(work_root, args.tmpfs)
+    mark = claim_running(args, spec)  # no other step of the shard runs anywhere from here until this one ends
+    try:
+        return _run_step(args, spec, runner, snapshots, node)
+    finally:
+        release_running(args, mark)
+
+
+def _run_step(
+    args: argparse.Namespace,
+    spec: Mapping[str, Any],
+    runner: Callable[[Sequence[str], Mapping[str, str], Path], int],
+    snapshots: Snapshots | None,
+    node: Any,
+) -> int:
+    """`step` once its checks passed and it holds the shard's running mark: its directory on the tmpfs first (so a
+    sweep finds a step of ours here before its work root is used), the sandbox's work root made and its killed runs
+    reaped, then copy, restore, run, archive, clean up."""
+    from expcore.campaign import out_snapshot
+
+    snapdir = args.results / args.label / SNAPSHOTS
     base = archive_named(args.results, args.label)  # the archive this step starts from: its snapshots name it
     work = Path(tempfile.mkdtemp(prefix=f"{WORK_PREFIX}{args.label}.", dir=args.tmpfs))
     keep = False
@@ -973,6 +1167,13 @@ def step(
                  "phase": RUNNING}  # fmt: skip
         (work / OWNER).write_text(json.dumps(owner, sort_keys=True) + "\n", encoding="utf-8")
         (work / OWNER_ENDING).write_text(json.dumps({**owner, "phase": ARCHIVING}, sort_keys=True) + "\n", "utf-8")
+        work_root = sandbox_work_root(os.environ.get("EXPCORE_FED_ROOT"))
+        if work_root is not None:  # the Apptainer sandbox's, which it refuses to start without
+            make_work_root(work_root, args.tmpfs)
+            reaped = reap_work_root(work_root, node)  # W2: what a step killed here left, before any use
+            if reaped["runs"]:
+                print(f"shards: shard {args.label}: {reaped['runs']} killed sandbox run(s) on this node reaped "
+                      "(mounts, directories, records)", file=sys.stderr)  # fmt: skip
         copy = work / "study"
         shutil.copytree(args.study, copy, symlinks=True)
         platform = Path(os.environ.get("EXPCORE_FED_ROOT") or "/nonexistent") / PLATFORM
@@ -1028,6 +1229,20 @@ def step(
 
 
 # ------------------------------------------------------------------------------------------------ the command line
+def _sibling(name: str) -> Any:
+    """A module beside this file, by its path, without putting this directory on `sys.path` (`-I` leaves it off)."""
+    import importlib.util
+
+    loaded = sys.modules.get(f"hpc_{name}")
+    if loaded is not None:
+        return loaded
+    spec = importlib.util.spec_from_file_location(f"hpc_{name}", Path(__file__).resolve().parent / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # its dataclasses look their module up by name
+    spec.loader.exec_module(module)
+    return module
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="shards.py", description="One campaign shard per HPC federation.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1046,13 +1261,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--resume", action="store_true")
     one.add_argument("--archive-left", dest="archive_left", action="store_true")
     one.add_argument("--snapshot-every", dest="snapshot_every", type=float, default=SNAPSHOT_EVERY_S)
+    one.add_argument("--job", help="the id squeue -s lists this step under (its running mark records it)")
+    one.add_argument("--step-name", dest="step_name", help="this step's name (its running mark records it)")
+    one.add_argument("--over", help="the nonce of the running mark resume-line showed the step of gone")
     left = sub.add_parser("sweep")
     left.add_argument("--tmpfs", type=Path, required=True)
     left.add_argument("--root", required=True)
+    again = sub.add_parser("resume-line")
+    again.add_argument("--manifest", type=Path, required=True)
+    again.add_argument("--label", required=True)
+    again.add_argument("--job", required=True)
+    again.add_argument("--node", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "sweep":
             return sweep(args.tmpfs, args.root)
+        if args.command == "resume-line":
+            line = _sibling("shardresume").resume_line(sys.modules[__name__], args.manifest, args.label, args.job,
+                                                       args.node, script=Path(__file__).resolve())  # fmt: skip
+            print(shlex.join(line))
+            return 0
         if args.command == "step":
             return archive_left(args) if args.archive_left else step(args)
         plan = load_plan(args.manifest)
