@@ -71,6 +71,8 @@ class FakeProc:
     cgroup: str | None = CGROUP
     hidden: bool = False  # non-dumpable under hidepid: never listed, charged all the same
     parent: int | None = None  # the pid whose children name it
+    threads: int | None = 1  # its tasks (`Threads:`); None: the status file has no such line
+    cores: frozenset[int] | None = None  # the cores its tasks may run on; None: every core of the node
 
     @property
     def anon_bytes(self) -> int:
@@ -81,7 +83,7 @@ class FakeProc:
             t for t in tags if any(e.startswith(t) for e in self.environ) or any(t in a for a in self.cmdline)
         )
         return Proc(self.pid, self.start, 1, self.state, self.comm, self.pidns, self.rss, found, self.anon_bytes,
-                    self.cgroup)  # fmt: skip
+                    self.cgroup, self.threads)  # fmt: skip
 
 
 @dataclass
@@ -95,6 +97,8 @@ class Exec:
     image: str
     command: list[str]
     stdin: str | None
+    nofile: int | None = None  # the `prlimit --nofile=N:N` in front of a cell's `apptainer` (O70)
+    cpus: list[int] | None = None  # the `taskset -c` in front of it
 
 
 @dataclass
@@ -175,6 +179,12 @@ class FakeNode:
         self.cgroup_slack = 0  # anonymous bytes the cgroup charges that no process holds
         self.cgroup_unreadable = False
         self.children_unreadable = False
+        self.cores = [0, 1, 2, 3]  # the driver's own affinity: the step's cores (`own_affinity`)
+        self.step_set_unreadable = False
+        self.affinity_unreadable = False  # a task's `Cpus_allowed_list` cannot be read
+        self.starter_nofile: int | None = None  # a starter that sets the cell's hard open-file limit itself
+        self.starter_cpus: frozenset[int] | None = None  # a starter that leaves the cell on these cores whatever
+        self.canary_limits_missing = False  # a canary whose second line never comes
         self.host = LocalNode() if own_process else None
         self.owner = self.host.identity() if self.host is not None else Spawned(999, "4242")
         self.procs[self.owner.pid] = FakeProc(self.owner.pid, self.owner.start, OWN_NS, "driver", role="driver")
@@ -223,6 +233,18 @@ class FakeNode:
             if self.children_unreadable:
                 return None
             return sorted(p.pid for p in self.procs.values() if p.alive and p.hidden and p.parent == pid)
+
+    def own_affinity(self) -> list[int] | None:
+        return None if self.step_set_unreadable else sorted(self.cores)
+
+    def task_affinity(self, pid: int, start: str) -> frozenset[int] | None:
+        with self.lock:
+            proc = self._find(pid, start)
+            if proc is None or not proc.alive or proc.hidden:
+                return frozenset()
+            if self.affinity_unreadable:
+                return None
+            return proc.cores if proc.cores is not None else frozenset(self.cores)
 
     def _find(self, pid: int, start: str) -> FakeProc | None:
         proc = self.procs.get(pid)
@@ -425,8 +447,10 @@ class FakeNode:
         """The cell's processes appear in a namespace of their own; the watch lists them twice before it goes on."""
         pidns = self.new_namespace()
         env = tuple(f"{k}={v}" for k, v in parsed.env.items())
-        top = self._new_proc(pidns, "timeout", environ=env, cmdline=tuple(parsed.command))
-        worker = self._new_proc(pidns, "python3", environ=env, cmdline=(parsed.command[4], "-"))
+        cores = None if parsed.cpus is None else frozenset(parsed.cpus)
+        cores = self.starter_cpus if self.starter_cpus is not None else cores
+        top = self._new_proc(pidns, "timeout", environ=env, cmdline=tuple(parsed.command), cores=cores)
+        worker = self._new_proc(pidns, "python3", environ=env, cmdline=(parsed.command[4], "-"), cores=cores)
         cell = Cell(self, parsed, program, nonce, pidns, [top, worker])
         if self.wait_for_watch:
             seen, until = self.listed, time.monotonic() + 5.0
@@ -444,19 +468,44 @@ class FakeNode:
 
     def default_cell(self, cell: Cell) -> CmdResult:
         """The harness's own programs, as a cell would answer them; any other program prints nothing and exits 0."""
-        if cell.program.startswith("import socket, time"):  # the egress canary
+        if cell.program.startswith("import os, resource, socket, time"):  # the egress canary
             port = int(cell.program.split("'127.0.0.1', ")[1].split(")")[0])
             self.collector().connect("127.0.0.1", port)
-            return CmdResult(0, CANARY_MARK + "\n")
+            return CmdResult(0, CANARY_MARK + "\n" + ("" if self.canary_limits_missing else self.limits_line(cell)))
         if cell.program == READ_ONLY_PROBE.format(path="/ro-probe"):
             return CmdResult(0, "blocked 30\n")
         return CmdResult(0, "")
+
+    def limits_line(self, cell: Cell) -> str:
+        """What the canary's second line says in a cell: the open-file limit and the cores the cell was given, from the
+        exec's `prlimit` and `taskset` as the kernel would apply them, unless the starter overrides them."""
+        hard = self.starter_nofile or cell.exec.nofile or 1048576
+        cores = sorted(self.starter_cpus or cell.exec.cpus or self.cores)
+        return f"limits {hard} {hard} {','.join(str(c) for c in cores)}\n"
+
+
+def _wrapper(head: list[str]) -> tuple[list[str], int | None, list[int] | None]:
+    """The `prlimit` and `taskset` words in front of a cell's `apptainer` (`limits.prefix`), parsed; anything else in
+    front of it fails loudly. `(the rest, the file limit, the cores)`."""
+    nofile = cores = None
+    if head[:1] == ["prlimit"]:
+        assert head[1].startswith("--nofile="), f"the prefix's limit: {head[1]}"
+        soft, _, hard = head[1].removeprefix("--nofile=").partition(":")
+        assert soft == hard, f"a hard and soft limit alike: {head[1]}"
+        assert soft.isdigit(), f"a number: {head[1]}"
+        assert head[2] == "--", f"the prefix's separator: {head[2]}"
+        nofile, head = int(soft), head[3:]
+        if head[:2] == ["taskset", "-c"]:
+            cores, head = [int(c) for c in head[2].split(",")], head[3:]
+    assert head[:1] == ["apptainer"], f"an unexpected word in front of the exec: {head[:3]}"
+    return head, nofile, cores
 
 
 def parse_exec(argv: list[str], stdin: str | None) -> Exec:
     """An `apptainer exec` command line back into its parts; anything the backend does not write fails loudly."""
     at = argv.index("exec")
-    flags, rest = argv[: at + 1], argv[at + 1 :]
+    head, nofile, cpus = _wrapper(argv[: at + 1])
+    flags, rest = head, argv[at + 1 :]
     expected = ["--containall", "--cleanenv", "--no-home", "--no-mount", AV.NO_MOUNT, "--pwd", "/work"]
     assert rest[: len(expected)] == expected, f"the exec's flags: {rest[: len(expected)]}"
     rest = rest[len(expected) :]
@@ -473,7 +522,7 @@ def parse_exec(argv: list[str], stdin: str | None) -> Exec:
         else:
             name, _, text = value.partition("=")
             env[name] = text
-    return Exec(argv, flags, binds, env, rest[0], rest[1:], stdin)
+    return Exec(argv, flags, binds, env, rest[0], rest[1:], stdin, nofile, cpus)
 
 
 __all__ = ["CANARY_MARK", "CGROUP", "Cell", "Exec", "FakeNode", "FakeProc", "Unrecorded", "parse_exec"]

@@ -6,8 +6,8 @@
 backend = "apptainer"            # the Docker backend when absent
 work_root = "/node/tmpfs/dir"    # an existing 0700 directory of the driver's uid, not a link, on the node's tmpfs
 [sandbox.limits]                 # as for Docker; on this backend memory_bytes, tmp_bytes, shm_bytes and
-                                 # work_disk_bytes are the harness's watch's bounds, and cpus, pids, nofile and
-                                 # gate_memory_bytes are recorded, not enforced (facts.py)
+                                 # work_disk_bytes are the harness's watch's bounds, pids and gate_memory_bytes its
+                                 # polls', nofile a prlimit and cpus a taskset pin before each cell (limits.py, O70)
 [sandbox.data_paths]             # as for Docker; a mount level needs oneclient_bundle below
 
 [sandbox.apptainer]
