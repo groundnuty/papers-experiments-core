@@ -64,6 +64,16 @@ def stand_in(template: str, study_artifacts: str | None) -> dict[str, Any] | Non
         return None
 
 
+def require_study_artifacts(template: str, study_artifacts: str | None) -> None:
+    """Refuse a template that names `@study_artifacts@` when no directory was given for it, naming both platforms'
+    settings: the renderer would refuse a placeholder nothing filled, without saying where this one comes from."""
+    if STUDY_ARTIFACTS in template and not study_artifacts:
+        raise RuntimeError(
+            f"the platform template names {STUDY_ARTIFACTS} and no directory was given for it "
+            f"({ENVIRONMENT} for Compose, HPC_STUDY_ARTIFACTS in site.env for HPC)"
+        )
+
+
 def _template(spec: Spec) -> str:
     return spec.platform_template.read_text(encoding="utf-8") if spec.platform_template is not None else ""
 
@@ -103,11 +113,7 @@ def check_artifacts(
     from expcore_onedata.pin import PinError, verify_pin
 
     text = _template(spec)
-    if STUDY_ARTIFACTS in text and not study_artifacts:
-        raise RuntimeError(
-            f"the platform template names {STUDY_ARTIFACTS} and no directory was given for it "
-            f"({ENVIRONMENT} for Compose, HPC_STUDY_ARTIFACTS in site.env for HPC)"
-        )
+    require_study_artifacts(text, study_artifacts)
     tool = (stand_in(text, study_artifacts) or {}).get("toolserver")
     if not isinstance(tool, dict):
         return

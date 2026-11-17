@@ -41,7 +41,7 @@ from fedlayout import Layout, import_storage_name
 from fedlinks import check_after_up
 from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
-from fedtools import check_rendered
+from fedtools import check_rendered, require_study_artifacts
 
 from expcore_onedata.addresses import AddressMap
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
@@ -285,7 +285,9 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
             layout.toolshim / hpcnames.LAUNCHER
         ).is_file():  # the launcher `up` copied into the root, for a Python server
             values["hpc_resolver"] = str(layout.toolshim / hpcnames.LAUNCHER)
-    write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values)
+    text = template.read_text(encoding="utf-8")
+    require_study_artifacts(text, values.get("study_artifacts"))
+    write_platform(layout.platform, text, facts, values)
     check_rendered(
         layout, facts
     )  # O83: the slots the file declares, against the layout's principals; as a campaign loads it

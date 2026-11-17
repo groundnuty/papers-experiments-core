@@ -32,6 +32,7 @@ from slots_support import (
     ids_of,
     layout_with_template,
     make_root,
+    principal_of,
     secret_of,
 )
 
@@ -90,7 +91,7 @@ def test_o83_up_audits_the_slot_users_after_the_members_and_before_it_waits_for_
     assert names.index("ensure_users") < names.index("ensure_members") < names.index("audit_slot_users")
     assert names.index("audit_slot_users") < names.index("wait_import")
     member_spaces = {args[0] for name, args in taken if name == "ensure_members"}
-    assert {s for user in SLOT_USERS for s in spec.principal(user).spaces} <= member_spaces
+    assert {s for user in SLOT_USERS for s in principal_of(spec, user).spaces} <= member_spaces
 
 
 def test_o83_each_slot_user_has_a_password_file_of_mode_0600_and_no_other_file_of_the_root_holds_a_password(
@@ -269,7 +270,7 @@ def test_o83_the_pilots_platform_file_holds_the_rights_the_layout_declares_for_e
     config = load_platform(phase.root / "platform.toml")
     slots = load_slots(phase.root / "platform.toml", config)
     for slot, user in zip(slots.slots, ("slot1-tools", "slot2-tools"), strict=True):
-        assert slot.rights == tuple(sorted(phase.spec.principal(user).privileges))
+        assert slot.rights == tuple(sorted(principal_of(phase.spec, user).privileges))
     for name in ("knowledge", "writing"):
         group = slots.group_for(config.condition(name).rights)
         assert slots.keys_of(group)
@@ -325,7 +326,7 @@ def test_o83_without_the_study_artifacts_the_core_phase_refuses_naming_the_place
     """O83: a `[toolserver]` that names `@study_artifacts@` with no directory given is refused when the file is rendered
     (the driver refuses it earlier, in its preflight)."""
     values = {**hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, phase.root)}
-    with pytest.raises(RuntimeError, match="placeholder"):
+    with pytest.raises(RuntimeError, match="@study_artifacts@"):
         hpc.boot.core_phase(
             phase.layout,
             (5001, 5001),

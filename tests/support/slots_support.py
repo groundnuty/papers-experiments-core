@@ -130,6 +130,11 @@ def artifacts(directory: Path) -> Path:
     return directory
 
 
+def principal_of(spec, name: str):
+    """A layout's principal by name."""
+    return next(p for p in spec.principals if p.name == name)
+
+
 def secret_of(user: str) -> str:
     """The password a test gives a user: one nothing else in the root may hold."""
     return f"pw-{user}-" + hashlib.sha256(user.encode()).hexdigest()[:20]

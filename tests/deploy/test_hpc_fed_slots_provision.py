@@ -181,8 +181,8 @@ def test_o83_a_template_with_no_slots_has_no_slot_users_and_every_user_is_made_a
 
 def test_o83_a_template_that_declares_slots_and_cannot_be_read_before_it_is_rendered_is_refused(hpc, tmp_path):
     """O83: provisioning must know which users it may never change before the file is rendered, so `[slots]` is read
-    from the template as it stands; a placeholder in a table's name leaves nothing to read, and is refused."""
-    template = WITH_SLOTS.replace("[slots.slot-1.data_path]", "[slots.@user_id.slot1-data@.data_path]")
+    from the template as it stands; one that is no TOML then leaves nothing to read, and is refused, not ignored."""
+    template = WITH_SLOTS + "\nnot toml at all ===\n"
     spec = hpc.fedspec.load_spec(layout_with_template(template, tmp_path))
     with pytest.raises(RuntimeError, match="no TOML before it is rendered"):
         hpc.fedtools.slot_users(spec)

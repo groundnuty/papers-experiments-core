@@ -16,7 +16,7 @@ from fedboot import Bootstrap, Ids
 from feddocker import gib
 from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout, import_storage_name
 from fedspec import Space, Spec
-from fedtools import check_rendered
+from fedtools import check_rendered, require_study_artifacts
 
 PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")
 
@@ -159,8 +159,10 @@ def write_facts(layout: Layout, boot: Bootstrap, study_artifacts: str | None = N
     template = layout.spec.platform_template
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
+    text = template.read_text(encoding="utf-8")
+    require_study_artifacts(text, study_artifacts)
     values = {**placeholders(facts), **({"study_artifacts": study_artifacts} if study_artifacts else {})}
-    write_private(layout.platform, render(template.read_text(encoding="utf-8"), values))
+    write_private(layout.platform, render(text, values))
     check_rendered(layout, facts)
     return "facts.json and platform.toml written"
 
