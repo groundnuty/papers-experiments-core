@@ -152,7 +152,7 @@ def test_c05_an_unreadable_or_incomplete_log_or_a_send_charges_the_bound_as_befo
     assert (cost.usd, cost.bounded) == (pytest.approx(bound + (row["topup_usd"] or 0.0)), True), why
 
 
-class SendsOutsideTheRecording(FailsAtStart):
+class SendsOutsideTheRecording(FakeExecutor):
     """An executor that sends a request to the backend itself, so no request is in its call log, and then fails."""
 
     async def __call__(self, request):
