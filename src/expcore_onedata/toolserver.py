@@ -45,6 +45,27 @@ and the spawn) and around the stop. What the agent triggers through the tools, a
 is the agent's own time and is never an infrastructure wait. Health polling before dispatch is the scheduler's
 (C11, `PlatformHealth`) and is not a wait either.
 
+The server reads no `.env` file and starts in a directory of its own (O84). onedata-mcp read a `.env` when its config
+module was imported, searching from the directory of its installed package up to `/`, so a `.env` in any ancestor of
+the package (on a cluster account, its shared home) could set any `ONEDATA_*` setting the launch left unset, with
+nothing in the launch saying so. The environment this module builds says `ONEDATA_MCP_DOTENV=0` on every platform (the
+server's guard: with it no `.env` is read), and the server's working directory is a new, empty directory of mode 0700
+made for each start and removed after it (`expcore.tools.workdir.private_workdir`), because the working directory is
+where FastMCP reads a `.env` for its own settings and where the server's relative paths would otherwise land in the
+driver's.
+
+The server writes no bytecode either (O84). A Python that imports a module writes its `.pyc` beside it, and the server
+imports from trees a study freezes (its clone, its virtualenv, the interpreter's own library), so a start, a launch or
+a `check` of its manifest, changed the tree it certified: the digest of the frozen artifacts with it. The resolve
+launcher runs the server `-I -B`; every other start ran it with neither `-B` nor the variable. The
+environment this module builds says `PYTHONDONTWRITEBYTECODE=1` on every platform, a managed setting, so both starts
+write nothing.
+
+What the server is started with is built in one place, `server_start`: the command and arguments, the environment, the
+private CA copy and the private directory. The launch starts the server from it, and so does the command line that
+freezes and checks a condition's manifest (`expcore_onedata.toolmanifest`), so a manifest is frozen from the server a
+run has, never from one configured by what the driver's own environment and directory happen to hold.
+
 The checks (`_prepare` before the spawn, `_recheck` after the stop) read Onezone in worker threads, and each holds a share
 of the run's federation admission while it runs (`expcore_onedata.admission_share`, O11): a launch cancelled while one
 runs stops waiting for it, and its run may leave its admission, but the federation stays held until the thread has ended,
@@ -55,9 +76,11 @@ executor has before the loop starts.
 
 The server's process. The MCP client spawns it as a child of the driver, in a session of its own, with the client's
 inherited variables of the driver's environment (`HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER`) beside the settings
-here, in the driver's working directory: on Docker that child is a process on the host, outside every container. A
-backend may name where it runs instead (`process`, an `api.ServerProcess`; the Apptainer backend's
-`tool_server_process`, O56): then its `HOME` and working directory are the backend's directory, its settings include
+here, in the launch's own empty directory (O84, above): on Docker that child is a process on the host, outside every
+container. A backend may name where it runs instead (`process`, an `api.ServerProcess`; the Apptainer backend's
+`tool_server_process`, O56): then its `HOME` and working directory are the backend's directory (a new one, mode 0700,
+which holds only the server's `TMPDIR`, so the working directory is as private and as free of a `.env` as the launch's
+own), its settings include
 the backend's (the run's tag), and its environment is named whole: the client's inherited variables that the settings do
 not set are unset by `env -u ... --` before the command, so nothing of the driver's reaches it but `PATH`, and no value,
 the token least of all, is ever an argument (`env -i` would need every value as one).
@@ -71,12 +94,16 @@ import sys
 import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
+from typing import Protocol
 
 from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS
 
+from expcore.config.loading import ConfigError
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
+from expcore.tools.workdir import private_workdir
+from expcore_onedata.addresses import AddressMapError, launch_argv
 from expcore_onedata.admission import (
     TOOL_SERVER_STEP,
     TokenStepRefused,
@@ -113,6 +140,10 @@ ENV_PROVIDER_HOST = "ONEDATA_ONEPROVIDER_HOST"
 ENV_PROVIDER_TOKEN = "ONEDATA_ONEPROVIDER_TOKEN"
 ENV_TOOLS = "ONEDATA_MCP_TOOLS"
 ENV_INSECURE_TLS = "ONEDATA_ALLOW_INSECURE_TLS"
+ENV_DOTENV = "ONEDATA_MCP_DOTENV"  # `0`: the server reads no `.env` file (O84); only the launch says so
+DOTENV_OFF = "0"
+ENV_BYTECODE = "PYTHONDONTWRITEBYTECODE"  # any non-empty value: the server's Python writes no `.pyc` (O84)
+BYTECODE_OFF = "1"
 MANAGED_ENV = (
     ENV_ZONE_HOST,
     ENV_ZONE_TOKEN,
@@ -120,14 +151,40 @@ MANAGED_ENV = (
     ENV_PROVIDER_TOKEN,
     ENV_TOOLS,
     ENV_INSECURE_TLS,
+    ENV_DOTENV,
+    ENV_BYTECODE,
     *CA_BUNDLE_ENV,
 )
+OVERRIDDEN_ENV = ("FASTMCP_LOG_LEVEL", "PATH")  # always the launch's own: a caller's value of either is replaced
+
+
+def server_argv(config: PlatformConfig) -> tuple[str, list[str]]:
+    """The server's command and arguments (O73): `[toolserver]`'s as declared, or, for a platform whose names resolve
+    nowhere (`[addresses] resolver`), started through the resolve launcher (`addresses.launch_argv`): the declared
+    interpreter, `-I -B`, the launcher, the private map as an argument, `--`, and the declared arguments. The server
+    then resolves exactly the map's names, to their addresses, and every other host as before; nothing is put in its
+    environment for it (no `PYTHONPATH`, no setting naming the map), every Python of the driver's running `-I -B`; it
+    covers Python servers only."""
+    server = _server(config)
+    if config.addresses_resolver is None or config.addresses_file is None:
+        return server.command, list(server.args)
+    try:
+        wrapped = launch_argv(server.command, server.args, config.addresses_resolver, config.addresses_file)
+    except AddressMapError as error:
+        raise ConfigError(f"{config.file}: [toolserver]: {error}") from None
+    return wrapped[0], wrapped[1:]
+
+
+class Revealable(Protocol):
+    """What the server's environment asks of a token: its value, and nothing else."""
+
+    def reveal(self) -> str: ...
 
 
 def server_environment(
     config: PlatformConfig,
     condition: Condition,
-    token: MintedToken,
+    token: Revealable,
     extra: Mapping[str, str] | None = None,
     *,
     ca_copy: Path | None = None,
@@ -136,6 +193,20 @@ def server_environment(
 
     The one token serves the server's Onezone and Oneprovider settings. The provider is the agent's pinned local one.
     The allow-list is the condition's, and a caller cannot set it or any other managed setting.
+
+    It sets no `ONEDATA_MCP_NODE_NAMES`, on any platform: once the services register the declared names there is no
+    node name to map, so onedata-mcp runs unset and its text is a Compose federation's. A platform whose names resolve
+    nowhere starts the server through the resolve launcher instead (`server_argv`).
+
+    It sets `ONEDATA_MCP_DOTENV=0` on every platform, the launcher's included (O84): the server reads no `.env` file, so
+    nothing it is configured with comes from a file the launch does not name, and a caller cannot change it. The word
+    stops onedata-mcp's own read only, from a version that has the guard; the server's working directory is the other
+    half (`expcore.tools.workdir.private_workdir`).
+
+    It sets `PYTHONDONTWRITEBYTECODE=1` on every platform too (O84), a managed setting a caller can neither give nor
+    clear: the server's Python writes no `.pyc` into the clone, the virtualenv or the interpreter's library it imports
+    from, which a start would otherwise change under a study's frozen artifacts. The resolve launcher's `-I` ignores the
+    variable, and its `-B` does the same on that path.
 
     Its certificate check is the platform's `[tls]`: by default the server's own (it verifies with httpx's CAs); with
     `ca_file`, `ca_copy`, the run's own read-only copy of the verified bundle (`tls.write_private_copy`), never the
@@ -156,6 +227,8 @@ def server_environment(
             ENV_PROVIDER_HOST: config.local_provider.url,
             ENV_PROVIDER_TOKEN: token.reveal(),
             ENV_TOOLS: ",".join(condition.allow),
+            ENV_DOTENV: DOTENV_OFF,
+            ENV_BYTECODE: BYTECODE_OFF,
         }
     )
     if config.tls.insecure:
@@ -183,13 +256,16 @@ def _placed(extra: Mapping[str, str] | None, process: ServerProcess | None) -> M
     return {**(extra or {}), **ours}
 
 
-def _spawned(server: ToolServer, env: Mapping[str, str], process: ServerProcess | None) -> tuple[str, list[str]]:
-    """The command and arguments the client spawns: the server's own, or, with a backend's placement, the same behind
-    `env -u <each inherited variable the settings do not set> --`, so that the server's environment is `env` alone."""
+def _spawned(
+    command: str, args: list[str], env: Mapping[str, str], process: ServerProcess | None
+) -> tuple[str, list[str]]:
+    """The command and arguments the client spawns: `command` and `args` (the server's own, or through the resolve
+    launcher, `server_argv`), or, with a backend's placement, the same behind `env -u <each inherited variable the
+    settings do not set> --`, so that the server's environment is `env` alone."""
     if process is None:
-        return server.command, list(server.args)
+        return command, list(args)
     unset = [word for name in inherited_by_the_client() if name not in env for word in ("-u", name)]
-    return "env", [*unset, "--", server.command, *server.args]
+    return "env", [*unset, "--", command, *args]
 
 
 @contextlib.contextmanager
@@ -202,6 +278,40 @@ def _private_bundle(config: PlatformConfig) -> Iterator[Path | None]:
     content = config.tls.bundle()
     with tempfile.TemporaryDirectory(prefix="expcore-tls-") as directory:
         yield write_private_copy(content, Path(directory))
+
+
+@dataclasses.dataclass(frozen=True)
+class ServerStart:
+    """What the tool server child is started with: its command and arguments, its whole environment beyond the SDK's
+    few defaults, and its working directory."""
+
+    command: str
+    args: list[str]
+    env: dict[str, str]
+    cwd: Path
+
+
+@contextlib.contextmanager
+def server_start(
+    config: PlatformConfig,
+    condition: Condition,
+    token: Revealable,
+    extra: Mapping[str, str] | None = None,
+    process: ServerProcess | None = None,
+) -> Iterator[ServerStart]:
+    """Build what the server of a condition is started with, and keep what it needs until the server has stopped: the
+    run's private copy of the CA bundle, when the platform has one (`_private_bundle`), and a new, empty, private
+    working directory (`private_workdir`, O84). The launch and the manifest tool both start the server from this, so
+    the server's environment (`server_environment`, a caller's `extra` refused where it clashes with the managed
+    settings), its command (`server_argv`) and its directory are one definition, not two that can drift.
+
+    `process` is where a backend runs the server (O56): its settings are added to the caller's (which may not set them,
+    `ValueError`), the server's environment is named whole (`_spawned`), and its working directory is the backend's own
+    new home (0700, holding only the server's `TMPDIR`) instead of the launch's empty one."""
+    with _private_bundle(config) as ca_copy, private_workdir() as workdir:
+        env = server_environment(config, condition, token, _placed(extra, process), ca_copy=ca_copy)
+        command, args = _spawned(*server_argv(config), env, process)
+        yield ServerStart(command, args, env, workdir if process is None else process.home)
 
 
 def _server(config: PlatformConfig) -> ToolServer:
@@ -382,18 +492,18 @@ class ToolServerLauncher:
         server, chosen = _server(self._config), self._config.condition(condition)
         with (
             token_step(TOOL_SERVER_STEP),  # ended only once the re-verification at teardown has ended
-            _private_bundle(self._config) as ca_copy,  # the run's copy of the verified CA bytes, gone with the server
+            server_start(
+                self._config, chosen, token, extra_env, process
+            ) as begun,  # its CA copy and directory, gone with it
         ):
-            env = server_environment(self._config, chosen, token, _placed(extra_env, process), ca_copy=ca_copy)
-            command, args = _spawned(server, env, process)
             provider = McpToolProvider(
-                command,
-                args,
+                begun.command,
+                begun.args,
                 frozen=chosen.manifest,
-                env=env,
-                cwd=None if process is None else process.home,
+                env=begun.env,
                 allowed_tools=chosen.allow,
                 start_timeout_s=server.start_timeout_s,
+                cwd=begun.cwd,
             )
             async with ctx.infrastructure_wait(WAIT_KIND):
                 try:

@@ -6,7 +6,7 @@ from sandbox_support import add_sandbox
 
 from expcore.config.loading import ConfigError, Section
 from expcore_onedata.sandbox.api import DataPathMode
-from expcore_onedata.sandbox.settings import load_sandbox
+from expcore_onedata.sandbox.settings import FederationNetwork, load_sandbox
 
 SHA = "a" * 64
 BUNDLE = {"oneclient_bundle": "files/oneclient-bundle.tar", "oneclient_bundle_sha256": "d" * 64}
@@ -52,13 +52,86 @@ def test_the_apptainer_backend_loads_its_pins_and_resolves_its_paths(tmp_path):
     assert str(tmp_path) not in str(record)
 
 
-@pytest.mark.parametrize("table", ["images", "network", "federation", "sudo", "agent_uid"])
+@pytest.mark.parametrize("table", ["images", "network", "sudo", "agent_uid"])
 def test_the_docker_backend_s_tables_and_keys_are_refused(tmp_path, table):
     """O56: what only the Docker backend reads is refused, never silently ignored."""
     document = _document()
-    document[table] = {} if table in ("images", "network", "federation") else 1000
+    document[table] = {} if table in ("images", "network") else 1000
     with pytest.raises(ConfigError, match="Docker backend alone"):
         _load(tmp_path, document)
+
+
+# -- [sandbox.federation] on this backend: the names the gate serves the agent (O69) -----------------------------------
+
+DECLARED_ZONE, DECLARED_PROVIDER = "zone.layout.test", "alpha.layout.test"  # invented, as a layout declares them
+
+
+def _named(**changes):
+    """The document with `[sandbox.federation]`'s names for the local provider `alpha`, after `changes` to the table."""
+    document = _document()
+    document["federation"] = {"zone": DECLARED_ZONE, "providers": {"alpha": DECLARED_PROVIDER}, **changes}
+    return document
+
+
+def _load_named(tmp_path, document):
+    section = Section(document, tmp_path / "platform.toml", "[sandbox]")
+    return load_sandbox(section, tmp_path, providers=("alpha", "beta"), local="alpha")
+
+
+def test_o69_the_federation_table_gives_this_backend_the_names_its_gate_serves_and_no_network(tmp_path):
+    """O69: the zone's and the local provider's names alone; there is no network to join, and without the table the
+    cell is given the URLs' hosts as before."""
+    loaded = _load_named(tmp_path, _named())
+    assert loaded.federation == FederationNetwork(network=None, local_provider=DECLARED_PROVIDER, zone=DECLARED_ZONE)
+    assert _load_named(tmp_path, _document()).federation is None
+
+
+def test_o69_a_network_in_the_federation_table_is_refused_on_this_backend(tmp_path):
+    """O69: the cells share the node's network, so a docker network here would be read by nothing."""
+    refused = r"\[sandbox\.federation\]: key 'network' is read by the Docker backend alone"
+    with pytest.raises(ConfigError, match=refused):
+        _load_named(tmp_path, _named(network="fed_net"))
+
+
+def test_o69_the_federation_table_without_a_rest_level_is_refused(tmp_path):
+    """O69: only the REST data path's gate serves the names; the host mount dials the provider's URL."""
+    document = _named()
+    document["data_paths"] = {"isolated": "none"}
+    with pytest.raises(ConfigError, match=r"\[sandbox\.federation\]: is read by the REST data path's gate alone"):
+        _load_named(tmp_path, document)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"zone": DECLARED_PROVIDER.upper()}, "key 'zone' must differ from the local provider's name"),
+        ({"providers": {"beta": DECLARED_PROVIDER}}, "entry 0: only the local provider's name is read"),
+        ({"providers": {}}, "must name the local provider"),
+        ({"zone": "https://zone.layout.test:443"}, "key 'zone' must be a host name"),
+        ({"other": "x"}, "key 'other' is not a known key"),
+    ],
+)
+def test_o69_the_names_are_checked_as_docker_s_are_and_are_two(tmp_path, change, message):
+    """O69: the local provider's name and no other, host names without a scheme or a port, two different names (the
+    gate serves one host by a name), and the message names a key or an entry, never a name."""
+    with pytest.raises(ConfigError, match=message) as raised:
+        _load_named(tmp_path, _named(**change))
+    assert DECLARED_PROVIDER.lower() not in str(raised.value).lower()
+
+
+def test_o69_the_names_are_kept_in_lower_case_as_the_gate_matches_them(tmp_path):
+    """O69: the gate matches a request's Host and SNI in lower case, as a URL's host is, so a name declared in capitals
+    is served all the same."""
+    loaded = _load_named(tmp_path, _named(zone=DECLARED_ZONE.upper(), providers={"alpha": DECLARED_PROVIDER.title()}))
+    assert loaded.federation == FederationNetwork(network=None, local_provider=DECLARED_PROVIDER, zone=DECLARED_ZONE)
+
+
+def test_o69_the_federation_table_needs_the_zone_s_name(tmp_path):
+    """O69: a REST data path's gate serves the zone too, so its name is required."""
+    document = _named()
+    del document["federation"]["zone"]
+    with pytest.raises(ConfigError, match="zone"):
+        _load_named(tmp_path, document)
 
 
 def test_a_pin_that_is_not_a_sha256_is_refused_naming_the_key(tmp_path):

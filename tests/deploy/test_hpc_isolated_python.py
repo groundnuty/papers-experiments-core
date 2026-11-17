@@ -250,9 +250,10 @@ def python_findings(source: str) -> list[str]:
 
 SRC = DEPLOY.parent / "src"  # the core's own code, which the driver and the sandbox launch on the nodes
 # The Python launches of the core's own code that run on a node, each by the file it is in (the sandbox's gate, the
-# mount watcher, the egress collector, the completion check and the copy-out): each must exist, so the scan below
-# cannot go silent because a launch moved. They are the only `-I` displays in `src/`.
+# mount watcher, the egress collector, the completion check, the copy-out and the resolve launcher's flags): each must
+# exist, so the scan below cannot go silent because a launch moved. They are the only `-I` displays in `src/`.
 SRC_LAUNCHES = {
+    "expcore_onedata/addresses.py": 1,  # the tool server behind the resolve launcher (O73)
     "expcore_onedata/sandbox/apptainer/gaterun.py": 1,
     "expcore_onedata/sandbox/apptainer/hostmount.py": 1,
     "expcore_onedata/sandbox/apptainer/sandbox.py": 1,

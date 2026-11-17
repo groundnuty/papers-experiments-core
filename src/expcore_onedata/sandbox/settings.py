@@ -8,8 +8,8 @@ in strict mode (no host bits set), so a typo fails at load and not when the thir
 ```toml
 [sandbox]
 backend = "docker"              # optional: docker, or apptainer for an HPC batch node with [sandbox.apptainer] (O56,
-                                # apptainer/settings.py), which reads neither images, network, federation, sudo,
-                                # agent_uid, earlyoom_comm, python nor label_namespace
+                                # apptainer/settings.py), which reads neither images, network, sudo, agent_uid,
+                                # earlyoom_comm, python, label_namespace nor [sandbox.federation]'s network
 work_root = "/path"             # host directory for the per-sandbox directories and the teardown log
 name_prefix = "sbx"             # prefix of container, network and directory names; letters, digits and '-'
 label_namespace = "org.expcore" # docker labels are <namespace>.sandbox, .owner, .dir, .lease
@@ -74,6 +74,16 @@ zone = "host"                   # the zone's host name on that network, the one 
 providers.<local> = "host"      # the local provider's host name on that network, the one its certificate holds;
                                 # keyed by [support] local, the only provider accepted (the agent is pinned to it)
 ```
+
+On the Apptainer backend `[sandbox.federation]` holds the two names alone, `zone` and `providers.<local>`, and only with
+a rest level (O69). There is no network to join: they are the names the cell resolves to the gate on the loopback, the
+names the gate certifies and serves on port 443, the zone's name in `ONEDATA_ONEZONE_HOST` and the names the run's
+egress declaration holds, while the gate dials the hosts and ports of the URLs of `[zone]` and the local provider
+behind them and checks their certificates there, as `[tls]` says. So the agent sees the names the layout declares, as
+on Docker, never a node's name or its port. Without the table the cell is given the URLs' hosts, as before; with it,
+`network` is refused, and so is a zone named as the provider is. The published client dials the provider's registered
+domain, from the zone's scope answer, so declare the table only where the local provider registered its declared name:
+the cell resolves no other.
 
 `io_mode` is declared, never detected (O36). oneclient 25.0 started with neither force option detects each storage's
 access type at the first read of each space, and for a second space on a storage already detected as proxied it takes a
@@ -163,7 +173,7 @@ KILL_GRACE_S = 5.0  # [sandbox] kill_grace_s unless declared: a few seconds, so 
 # abort) and `deadline.COMMANDS_S` for its commands; 30 s at the default grace, 140 s at this maximum
 KILL_GRACE_MAX_S = 60.0
 BACKENDS = ("docker", "apptainer")  # `[sandbox] backend` (O56)
-DOCKER_ONLY = ("images", "network", "federation")  # tables only the Docker backend reads
+DOCKER_ONLY = ("images", "network")  # tables only the Docker backend reads; [sandbox.federation] in part (O69)
 
 
 IO_MODE_REFUSAL = (
@@ -231,11 +241,12 @@ class MountSettings:
 @dataclass(frozen=True)
 class FederationNetwork:
     """The docker network the oneclient sidecar and the REST data path's gate reach the federation on, and the names
-    they dial there."""
+    they dial there. On the Apptainer backend there is no network (`network` is None) and the names are the ones the
+    gate serves the agent on 443, its address and port behind them the URLs' (O69)."""
 
-    network: str  # an existing network of the federation's deployment; the sidecar or gate joins it, the agent never
-    local_provider: str  # the host name the sidecar and the gate dial on it: the local provider's, its certificate's
-    zone: str | None = None  # the zone's host name there, which the gate dials; required with a rest level, else None
+    network: str | None  # the federation's deployment's network, which the sidecar or gate joins; None on Apptainer
+    local_provider: str  # the local provider's host name there, its certificate's; on Apptainer, its served name
+    zone: str | None = None  # the zone's name, likewise; required with a rest level, else None
 
 
 @dataclass(frozen=True)
@@ -507,6 +518,12 @@ def _federation(section: Section, providers: Sequence[str], local: str | None, *
             "must name the federation's own docker network: not docker's default bridge, the host's network, none or "
             "a container's",
         )
+    return FederationNetwork(network, _federation_provider(section, providers, local), _federation_zone(section, rest))
+
+
+def _federation_provider(section: Section, providers: Sequence[str], local: str | None) -> str:
+    """The local provider's name in `[sandbox.federation] providers`, keyed by the provider it belongs to: only the
+    local one's is accepted, and a message names an entry by its position, never a provider or a name."""
     table = section.section("providers")
     address = None
     for position, name in enumerate(table.data):
@@ -519,7 +536,26 @@ def _federation(section: Section, providers: Sequence[str], local: str | None, *
             raise table.fail(None, f"entry {position}: must be a host name on that network, with no scheme or port")
     if address is None:
         raise table.fail(None, "must name the local provider (the support's `local`), which the agent is pinned to")
-    return FederationNetwork(network, address, _federation_zone(section, rest))
+    return address
+
+
+def _apptainer_federation(
+    section: Section, providers: Sequence[str], local: str | None, data_paths: Mapping[str, DataPathMode]
+) -> FederationNetwork:
+    """`[sandbox.federation]` on the Apptainer backend (O69): the zone's and the local provider's names alone, which the
+    gate serves the agent on 443 with the URLs' hosts and ports behind them. It has no network to join, and nothing
+    but the REST data path's gate reads the names (the host mount dials the provider's URL), so a network and a table
+    without a rest level are refused, and so is one name for both, which would serve the agent one host for two. The
+    names are kept in lower case, as a URL's host is: the gate matches a request's `Host` and SNI in lower case."""
+    if "network" in section.data:
+        raise section.fail("network", 'is read by the Docker backend alone, and backend is "apptainer"')
+    if DataPathMode.REST not in data_paths.values():
+        raise section.fail(None, "is read by the REST data path's gate alone on this backend, and no data path is rest")
+    section.reject_unknown(("zone", "providers"))
+    provider, zone = _federation_provider(section, providers, local).lower(), str(_federation_zone(section, True))
+    if zone.lower() == provider:
+        raise section.fail("zone", "must differ from the local provider's name: the gate serves each name one host")
+    return FederationNetwork(None, provider, zone.lower())
 
 
 def _space_path(section: Section, key: str) -> str | None:
@@ -559,11 +595,13 @@ def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, .
     return tuple(words)
 
 
-def _apptainer_sandbox(section: Section, base: Path, tls: TlsSettings | None) -> SandboxSettings:
+def _apptainer_sandbox(
+    section: Section, base: Path, tls: TlsSettings | None, providers: Sequence[str], local: str | None
+) -> SandboxSettings:
     """`[sandbox]` of the Apptainer backend (O56): `[sandbox.apptainer]` names the image and the egress logger, and the
-    Docker backend's images, network, federation, user, privilege command and earlyoom are refused, since nothing here
-    would read them. A mount level needs `[sandbox.mount]`'s path and `[sandbox.apptainer]`'s oneclient bundle (the host
-    mount's oneclient, pinned)."""
+    Docker backend's images, network, user, privilege command and earlyoom are refused, since nothing here would read
+    them; `[sandbox.federation]` is read for its names alone (O69, `_apptainer_federation`). A mount level needs
+    `[sandbox.mount]`'s path and `[sandbox.apptainer]`'s oneclient bundle (the host mount's oneclient, pinned)."""
     for key in (*DOCKER_ONLY, "sudo", "agent_uid", "earlyoom_comm", "python", "label_namespace"):
         if key in section.data:
             raise section.fail(key, 'is read by the Docker backend alone, and backend is "apptainer"')
@@ -586,6 +624,9 @@ def _apptainer_sandbox(section: Section, base: Path, tls: TlsSettings | None) ->
     check_file = _space_path(section, "content_check_file")
     if DataPathMode.REST in data_paths.values() and check_file is None:
         raise section.fail("content_check_file", "is required when a data path is rest")
+    federation = None
+    if "federation" in section.data:
+        federation = _apptainer_federation(section.section("federation"), providers, local, data_paths)
     image = ImageRef(str(app.image.path), f"sha256:{app.image.sha256}")
     return SandboxSettings(
         work_root=work_root,
@@ -607,6 +648,7 @@ def _apptainer_sandbox(section: Section, base: Path, tls: TlsSettings | None) ->
         listings=listings,
         served_caps=_served_caps(section.section("served_bytes")) if "served_bytes" in section.data else DEFAULT_CAPS,
         served_caps_declared="served_bytes" in section.data,
+        federation=federation,
         placeholder_token=_placeholder(section),
         kill_grace_s=_kill_grace(section),
         backend="apptainer",
@@ -654,7 +696,7 @@ def load_sandbox(
     if backend not in BACKENDS:
         raise section.fail("backend", f"must be one of: {', '.join(BACKENDS)}")
     if backend == "apptainer":
-        return _apptainer_sandbox(section, base, tls)
+        return _apptainer_sandbox(section, base, tls, providers, local)
     if "apptainer" in section.data:
         raise section.fail("apptainer", 'is read by the Apptainer backend alone: set backend = "apptainer"')
     work_root = (base / section.string("work_root")).resolve()

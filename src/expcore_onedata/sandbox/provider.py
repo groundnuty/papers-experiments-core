@@ -49,6 +49,13 @@ Waits. Start and teardown (the token mint, the image checks, the containers, the
 `ctx.infrastructure_wait("sandbox_lifecycle")`. What the agent's code does in the sandbox and its reads of data are the
 agent's own time and are never waits (see `codetool.py`).
 
+**The federation's window (O86).** A platform built with `federation_watch=` (`fedwatch.watch_for`, built once for the
+platform) reads the federation before each run's sandbox exists and again after its body, before the stop, each inside
+a `sandbox_lifecycle` wait, and records the window in the sandbox's `infrastructure_facts` (`fedwindow`) and, after the
+run's `collect`, in `federation-window.json` beside its `metadata.json`. A read that fails is recorded unknown and never
+fails the run. A platform given none reads nothing and records `unknown` ("no federation watch configured"), so no run
+has the key absent.
+
 The study's `data_path` factor names its levels in the study's words; `[sandbox.data_paths]` of platform.toml maps each to
 mount, rest or none. Which runs have a tool server, and of which condition, is the study's to say (`tool_condition`).
 """
@@ -86,7 +93,7 @@ from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.fault_drain import SessionTicket
-from expcore_onedata.sandbox import gatelog, kinds
+from expcore_onedata.sandbox import fedwindow, gatelog, kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.apptainer.runs import ApptainerProbe
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
@@ -329,12 +336,13 @@ class SandboxPlatform:
         clock: Callable[[], float] = time.time,
         read_only_inputs: Mapping[str, Sequence[ReadOnlyInput]] | None = None,
         teardown_deadline_s: float = TEARDOWN_DEADLINE_S,
+        federation_watch: fedwindow.Watch | None = None,
     ) -> None:
         if isinstance(teardown_deadline_s, bool) or not isinstance(teardown_deadline_s, int | float):
             raise ValueError("teardown_deadline_s must be a number of seconds")
         if not 0 < teardown_deadline_s < float("inf"):
             raise ValueError("teardown_deadline_s must be a positive, finite number of seconds")
-        self._teardown_s = teardown_deadline_s
+        self._teardown_s, self._watch = teardown_deadline_s, federation_watch
         if config.sandbox is None:
             raise ValueError(f"{config.file}: has no [sandbox] section")
         if (slots is None) != (journal is None):
@@ -456,11 +464,13 @@ class SandboxPlatform:
             run_key=run_key,
             mode=mode,
             token=token,
-            zone=Endpoint.from_url(self._config.zone.url),
-            provider=Endpoint.from_url(self._config.local_provider.url),  # the agent is pinned to its local provider
+            zone=Endpoint.from_url(self._config.zone.url, self._config.addresses),
+            # the agent is pinned to its local provider; with `[addresses]` (O73) each is dialled at its mapped address
+            provider=Endpoint.from_url(self._config.local_provider.url, self._config.addresses),
             lease_key=lease_key,
             listing=self._s.listing_of(level) or PAGED,  # the level's listing mode (O21)
             inputs=given,
+            node_names=self._config.addresses.real_hosts() if self._config.addresses is not None else (),
         )
 
     def _mint(
@@ -517,6 +527,10 @@ class SandboxPlatform:
             registry=self._registry,
             config_sha256=self._config.sha256,
             **self._options,
+        )
+        # the window is a fact of every run from its preparation on: unknown until a watch closes it, never absent (O86)
+        sandbox.record_infrastructure_fact(
+            fedwindow.KEY, fedwindow.unwatched() if self._watch is None else fedwindow.pending()
         )
         # never a value, and the slot by its place in the file, never by its name (O12)
         slot = self._slots.keys_of(GROUP).index(lease.key) if lease is not None else "principals.data_path"
@@ -579,6 +593,13 @@ class SandboxPlatform:
 
         On leaving, however it leaves, a launch that held a lease revokes the slot's tokens after the sandbox's stop,
         in the same wait (this module's docstring says when it does not).
+
+        A platform with a `federation_watch` reads the federation first, after the refusals above and before anything
+        is minted, and reads it again once the body has ended, before the stop, each in a `sandbox_lifecycle` wait
+        (`fedwindow`, O86). A fault injector whose `running` is inside the launch has restored by then. The window is in
+        the sandbox's `metadata()["infrastructure_facts"]["federation_window"]`, read after the launch, and in
+        `federation-window.json` beside the `metadata.json` of each directory `collect` wrote into; a read that fails is
+        recorded unknown and the run's outcome is the body's own. A platform with no watch records `unknown`, never nothing.
 
         The start runs in a thread, and cancelling the launch does not stop a thread: it goes on creating the sandbox.
         So the sandbox is built before the thread begins, and the launch holds it. On cancellation, or any failure of
@@ -643,10 +664,14 @@ class SandboxPlatform:
         # run can seal the admission while the sandbox is authorised and started (O11)
         authorised = retain_to_act()
         sandbox: DockerSandbox | None = None
+        opened: fedwindow.Opened | None = None
         started: asyncio.Future[None] | None = None
         minting: asyncio.Future[RunTokens | None] | None = None
         revoking = lease if mode is not DataPathMode.NONE or condition is not None else None  # its slot's, at the end
         try:
+            # the run's window opens here: nothing of it exists yet, so no injection its body makes is before this, and the
+            # admission's share is held, as it is from the check above to the start thread's own (O11)
+            opened = await self._open_window(ctx)
             async with ctx.infrastructure_wait(WAIT_KIND):
                 key = lease.key if lease is not None else None
                 minted = _counted(self._threads.began(key), self._config, "the sandbox's mint")  # before the thread
@@ -682,12 +707,49 @@ class SandboxPlatform:
         try:
             yield sandbox
         except Exception as error:
-            await self._end_run(ctx, sandbox, error)
+            await self._end_with_window(ctx, sandbox, opened, error)
             raise
-        except BaseException:  # a cancellation: the stop waits for a deadline under way, and the run is not classified
+        except BaseException as interrupted:
+            # a cancellation: the stop waits for a deadline under way, and the run is not classified
+            if opened is not None:  # no read is awaited under a cancellation, and the window says so
+                self._record_window(sandbox, fedwindow.interrupted(interrupted))
             await self._stop(ctx, sandbox, quiet=True)
             raise
-        await self._end_run(ctx, sandbox, None)
+        await self._end_with_window(ctx, sandbox, opened, None)
+
+    async def _open_window(self, ctx: CallContext) -> fedwindow.Opened | None:
+        """The federation read that opens the run's window; None when the platform has no watch. A read that fails is
+        an `Opened` with no reading: nothing is raised for it (O86)."""
+        if self._watch is None:
+            return None
+        async with ctx.infrastructure_wait(WAIT_KIND):
+            return await fedwindow.open_window(self._watch)
+
+    @staticmethod
+    def _record_window(sandbox: DockerSandbox, facts: dict[str, Any]) -> None:
+        """Put the closed window in the sandbox's metadata and, beside each `metadata.json` its `collect` wrote (which
+        came before the window existed), in `federation-window.json`. Never raises: a file that cannot be written is
+        logged (O86)."""
+        sandbox.record_infrastructure_fact(fedwindow.KEY, facts)
+        fedwindow.persist(sandbox, facts)
+
+    async def _end_with_window(
+        self, ctx: CallContext, sandbox: DockerSandbox, opened: fedwindow.Opened | None, error: Exception | None
+    ) -> None:
+        """The run's body has ended, by returning or by `error`: close its window, then stop as `_end_run` does. The
+        window is read after the body, so after the restore of an injector inside the launch, and before the stop. A
+        cancellation during the read still stops the sandbox before it is raised, and nothing the read raises is
+        raised: the body's own outcome is the run's (O86)."""
+        if self._watch is not None and opened is not None:
+            try:
+                async with ctx.infrastructure_wait(WAIT_KIND):
+                    facts = await fedwindow.close_window(self._watch, opened)
+                self._record_window(sandbox, facts)
+            except BaseException as interrupted:  # cancelled during the read: say so, stop, then raise it
+                self._record_window(sandbox, fedwindow.interrupted(interrupted))
+                await self._stop(ctx, sandbox, quiet=True)
+                raise
+        await self._end_run(ctx, sandbox, error)
 
     @contextlib.asynccontextmanager
     async def tool_server(

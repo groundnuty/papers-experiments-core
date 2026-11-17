@@ -225,7 +225,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `B` | the bundle on a filesystem the nodes see (`<shared_root>/hpc-federation/bundle`), `chmod -R go-w` |
 | `SH` | a 0700 directory for the two rootfs tarballs, each with its `.provenance` (SHA-256): single files only (`<scratch_root>/hpcop-images`) |
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
-| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's venv, clone and data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it. `up` also digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
+| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's interpreter and venv, the pinned clone, the frozen manifests and its data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it. `up` also digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository. The optional keys of the driver, the agent's sandbox and the study's artifacts are in `site.env.example`; the four of the next
@@ -384,6 +384,60 @@ script stops the service, deletes and redacts every secret (`scrub.py`) and keep
 ends any other way fails the job, with its own status. `--exclusive` keeps other users off a node, at the price of
 the whole node for the job.
 
+## Registered names (O73)
+
+By default a service registers under its node's own FQDN, and its certificate is made for it. A federation reached by
+the names its layout declares registers each service under its declared name instead, so that no node's name, address
+or port 8443 is in anything the agent can read (the scope answer and the no-connection errors carry the registered
+domain). `hpcfed.py up` does this for every layout; by hand, give each batch script the name and every service's
+address:
+
+```bash
+"$B/zone.sbatch" "$B" "$SH/onezone.tar" <zone-name> <provider-address> \
+  --declared=zone.<domain> --host=zone.<domain>=<zone-address> --host=<provider>.<domain>=<provider-address>
+"$B/provider.sbatch" "$B" "$SH/oneprovider.tar" <provider-name> zone.<domain> <admin-email> <zone-address> \
+  --declared=<provider>.<domain> --host=zone.<domain>=<zone-address> --host=<provider>.<domain>=<provider-address>
+```
+
+`configure.sh` then registers the service under `--declared` (`onezone.domainName`, `oneprovider.domain`, the
+generated certificate's domain), writes the work directory's `hosts` (the loopback, the node's own names on its
+address, every `--host`) and `declared-name`, and `run_service` binds the hosts file read-only over `/etc/hosts` with
+`--no-mount bind-paths`: the site's own bind of the node's `/etc/hosts` is off, so `/etc/localtime` is the image's. A
+provider's lookup of a peer crashes when the name does not resolve, so the script refuses, before it writes anything, a
+peer address with no `--host`, a `--host` that is no peer, a name or an address listed twice, and a missing entry for
+its own name or the zone's. The readiness calls, the token mint and the registration read-back dial the declared name
+pinned to the loopback (`curl --resolve`), the one name the certificate holds. Onepanel's DNS check resolves through DNS
+alone and reports the declared names `unresolvable`; it is advisory, and `facts.json` records that. From the login
+node the names are reached through the address map `up` writes into the root (`secrets/address-map.json`, 0600),
+which `platform.toml` names; see `DESIGN.md`, "The registered names". The first sandbox slot on a federation brought up
+this way is owed the checks of `DESIGN.md` section 9, item 7.
+
+## Slots and the tool server (O83)
+
+The tool-server arm needs a slot's users. `layouts/pilot-shape-slots.toml` is the pilot's shape with the four users of two
+slots as ordinary principals, and its template, `pilot-shape-slots.platform.toml.template`, is the pilot's with the
+slots and a `[toolserver]` after it (the Compose federation's own form, `deploy/compose-federation/README.md`, "Slots
+and a tool server"). `up` provisions the users with the Compose bootstrap's own steps: the zone user, its password in a
+0600 file of `secrets/users/` (in no cell, `gate.json`, fact, record, log or message), its membership of each declared
+space with exactly the declared privileges, and the storage mapping to the job's uid that every principal gets. **A slot
+user that already exists is verified and never changed**: exactly as declared, it is recorded `matched` in `facts.json`
+with nothing sent; any difference is refused naming the user and the attribute. The template's `[slots]` takes each id as
+`@user_id.<username>@` from the facts, and the written file is checked against the layout (a slot user that is no
+principal, `rights` that are not exactly the privileges the layout gave the user, a data-path user with more than the
+baseline are refused) and loaded as a campaign loads it, so `up` fails there, not at the first run.
+
+The tool server runs from the study's artifacts directory, `HPC_STUDY_ARTIFACTS` in `site.env`, which the pilot fills
+with its interpreter and venv, the pinned onedata-mcp clone and one frozen manifest per condition
+(`python -m expcore.tools.manifest freeze`, run with the condition's allow-list). Before any job is held `up` refuses a
+site without the variable when the template names it, a command that is no executable file, a clone that is not at the
+pinned commit with no change to a tracked file, and a manifest that is not its condition's (edited, or showing other
+tools than the allow-list); each message names the condition by its position and no path. The server is started through
+the resolve launcher (`<interpreter> -I -B resolve_launch.py <map> -- -m <module>`, "Registered names"), so `command` is a
+Python interpreter and `args` start with `-m <module>`: a console script behind `/usr/bin/env` is refused by `up`'s
+preflight, before any job is held, and when the file is loaded, saying to use `<venv>/bin/python` with `args = ['-m',
+'<module>', ...]`. Owed to the next HPC slot: a B2 run whose tool calls succeed, whose rights refusals match Compose's for the same
+layout, and whose visible-names counts are zero.
+
 ## The driver: `hpcfed.py`
 
 `hpcfed.py` brings a zone and the layout's providers up on batch nodes, and takes them down, from the Compose
@@ -483,13 +537,22 @@ section 3).
   state file (`study_artifacts_tree_sha256`, beside the site's `study_artifacts`) to the core's phase, so `[hpc] core =
   "step"` has it though a node's environment is an allowlist, and the core never reads the tree again. A layout with no
   platform template writes no record and reads no tree; each federation of a fleet reads the tree itself.
+- **`[placement]` is always in the rendered file, complete** (O79): the platform layer requires it, and a reader that
+  finds none patches in a default of its own. The core has no default for `holder`, so every template declares it
+  (`placement = { holder = "..." }`, a provider the template declares) and `up` refuses one that does not, before
+  anything is submitted, naming the key (`hpcplacement.py`). The render keeps what the template declares and writes
+  every other setting at the core's default beside it, read from `PlacementSettings` (never a copy of the numbers),
+  where the template declares the table: as one `placement = { ... }` line of the root or one `[placement]` table
+  (any other spelling is refused). So every reader, a shard's step and an ingest tool alike, reads the same file, and
+  none patches a default table in on its own.
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
-  address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
-  with every peer address, and pipes a registration token from the zone into each provider; copies the zone's
+  address in a control step (`bundle/nodefacts.py`); writes the address map; runs `zone.sbatch` and `provider.sbatch`
+  as service steps, each with every peer address and every service's declared name, and pipes a registration token from the zone into each provider; copies the zone's
   passphrase (0600) and the Onedata test CA's certificates, never its key, into the root (`bundle/zone-export.sh`,
   `hpcca.py`); then bootstraps the federation
-  through the Compose bootstrap over `https://<node FQDN>:8443`, writes its baseline, `facts.json` and
+  through the Compose bootstrap over `https://<declared name>:8443` (the layout's names, dialled through the address
+  map `up` writes into the root), writes its baseline, `facts.json` and
   `platform.toml` and its render identity (`render-identity.json`), and runs the platform layer's link check, which
   writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
@@ -532,6 +595,10 @@ over the same work directory, `exec.sh` beside a running service, and every stop
 stop_seconds` is to be set) are the live slot's. The agent's node's step (M5) is not built here. A layout with a shared
 import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
 
+## An observed read of the services (`hpcobserve.py`)
+
+`python -I -B hpcobserve.py --root <root>` prints one JSON line (`expcore-hpc-observe/1`) for the zone and each provider the state file lists: whether the service's step runs, its start, its end and its exit, as Slurm shows them now, by the step's EXACT id (`hpcslurm.Slurm.step_observed`: `squeue -s` and `sacct`; an id neither listed nor recorded, or the two disagreeing, is unknown with the reason, never running). The state file names the step to start from (`services.<n>.step`, `launch`, `stops`); a service whose step name is listed under another id than the state's is read as the listed one (`state_differs`). **Slurm's accounting trails a stop.** The driver confirms a stop once `squeue -s` no longer lists the step; `sacct` follows seconds later, and a read in between finds the step neither listed nor recorded as ended. When the state says the step was stopped (`state` `stopped`, the last recorded stop confirmed, the step the one of its `launch`) and the two commands do not yet agree that it ended (`hpcslurm.accounting_behind`), the read waits, polling every 2 s, for every such service at once, up to `--accounting-wait-s` (default 60 s, at most 300, 0 for none), and each service records the seconds it waited (`accounting_wait_s_used`). At the bound the service reads `unknown` with the reason `accounting_lag`: never running, never stopped by assumption. It never waits for a service the state does not say was stopped, for a step `squeue` lists under another id than the state's, or for a command that failed. `expcore_onedata.fedwatch.watch_for(..., accounting_wait_s=)` passes the bound as this option, so the copy run on the login node must be of this version: an older one exits 2 on the option. It runs where Slurm's client commands answer, the login node, and does nothing but `squeue` and `sacct`: it changes no job, no step and no file, takes no lock, and prints no node, address or path. `expcore_onedata.fedwatch` runs it for a study's post-check and adds each service's own `/configuration` answer and the cross-check against the fault journal and the state's recorded stops (O86; `docs/interfaces.md`, "The platform layer's read of the federation's own services"). The `status` verb is not used: it launches a control step and may record state.
+
 ## The scripts
 
 | Script | Where | Purpose |
@@ -543,7 +610,7 @@ import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs
 | `hpcop-cb-init.py` | in container | `--watch`: the Couchbase guard; `--wait-listener`: the launcher's wait for our 9443 |
 | `build-rootfs.sh` | job | pull, build the shim with the image's gcc, prep, preload check, tar, SHA-256 |
 | `node-init.sh` | batch step | node checks, leftovers of earlier jobs removed, tarball checks, work directory, per-launch secrets, file default check |
-| `configure.sh`, `run-node.sh`, `run-zone.sh` | batch step | configuration, peers, the service under `supervise.py` |
+| `configure.sh`, `run-node.sh`, `run-zone.sh` | batch step | configuration, peers, the name the service registers under and its hosts file (`--declared`, `--host`, below), the service under `supervise.py` |
 | `importstorage.py`, `posixstorage.py` | batch step | a shared imported tree's read-only bind (O59); a provider's own storage directory on scratch, checked and bound onto `/volumes/posix` (O57) |
 | `finish.sh`, `finish-zone.sh` | batch step | readiness and the guard's verdict, the host-side guard, storage, REST checks, rotation, live default and port check |
 | `check-defaults.sh` | node | fails on an image default, a leaked secret or a listener outside the model |
@@ -895,7 +962,10 @@ allowed). `tests/deploy/test_hpc_fed_plan.py`, `test_hpc_fed_updown.py` and `tes
 against a fake Slurm (O57): the layout's sizes and the held job's shape, the submit read-back, every step's form and
 allowlist, a hung client and a step past its bound, the state file, `up`'s placement, peers and token pipes, `down`
 after a whole or a partial `up`, the core's phase writing `platform.toml` and the ten-pair link-check record, and
-`zone-export.sh` on a stand-in work directory. `tests/deploy/test_hpc_inode_guard.py` and `test_hpc_fed_storage.py` run
+`zone-export.sh` on a stand-in work directory. `tests/deploy/test_hpc_fed_slots.py` and `test_hpc_fed_slots_provision.py` (O83) provision a layout's slots with
+the Compose bootstrap and the HPC one over a fake zone each (an existing slot user matched or refused, never changed),
+render the pilot's slot layout through the core's phase and load the file with its map, slots and tool server, and run the
+driver's preflight over the site's study directory. `tests/deploy/test_hpc_inode_guard.py` and `test_hpc_fed_storage.py` run
 the provider storage on scratch (O57) against the same fake Slurm, with an invented quota command and a temporary
 directory for scratch: usage under, at and one past the 95% line, every way a quota can fail to be read, the override
 refused on scratch, the estimate against the manifests `up` writes, the directories `up` makes and records first, and

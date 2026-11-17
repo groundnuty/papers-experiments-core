@@ -17,7 +17,8 @@ in argv[1]:
    "upstream_ca_file": "/etc/gate/federation-ca.pem", "tls_dir": "/etc/gate/tls",
    "listing": "paged|complete", "peer_uid_check": false,
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
-                        "port": 443, "tls": true}},
+                        "port": 443, "tls": true, "dial": "<address to connect to>"}},
+   "scan_names": ["<a node's name or address>", ...],
    "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
 
 `peer_uid_check` (true or false, false when absent; anything else refuses the start) is for a node whose loopback other
@@ -67,7 +68,12 @@ platform's (O16).
 Connections are kept alive on both sides: each request is still decided by gatepolicy on its own, and logged on its
 own, whatever came before it on the connection; a refusal or an error closes the client's connection. Each client
 connection is served by its own thread and owns its upstream connections: nothing is shared between threads but the
-TLS context and the log.
+TLS context and the log. An upstream connection is kept for the next request only when the request it just carried had
+no body: after a request that carried one (the body handed to the upstream, whatever the method; a complete listing's
+page included) the gate closes the upstream connection once the answer is read, and the next request opens a new one
+(`upstream_closed` "after_body", O85). A kept connection stalled the request after a body of about 1.5 MiB in about
+half the tries (measured against two providers, 17 Nov), and the gate would have waited on it for its whole read
+timeout. This changes only whether a connection is reused: never what is sent, retried, answered or timed out.
 
 Every line the handler of a client connection logs carries that connection's `conn` (unique in this process), and a request's line carries
 `req_headers`: the few request headers that say what client it was (REQ_HEADERS_LOGGED), never any other. A response's line says what its body was
@@ -87,19 +93,26 @@ Errors and retries, identical on every path: an upstream attempt that fails befo
 an answer arrives (connect, handshake, send, or the peer closing first) is retried once, on a new connection, before
 anything reaches the client; nothing is retried after an answer began, and a read timeout is never retried. Every
 failure is logged with its origin, `upstream` (the platform) or `gate` (the gate itself), and with what the client saw
-(`5xx` or `reset`), so a run can tell an error the gate made from one the platform made.
+(`5xx` or `reset`), so a run can tell an error the gate made from one the platform made. The 502 of a failed upstream
+call carries the failure's text, with the host the gate dialled (`addr`, and `addr:port`, as a certificate's name
+mismatch quotes them) named by the name it serves and port 443 (`_as_served`, O69): a gate whose names are not the
+hosts behind them never gives its client those hosts. The log's line keeps the text as it was.
 """
 
 from __future__ import annotations
 
 import contextlib
 import errno
+import functools
 import http.client
 import importlib.util
 import io
+import ipaddress
 import itertools
 import json
+import math
 import os
+import re
 import select
 import signal
 import socket
@@ -177,11 +190,22 @@ _LISTING_SLOT = threading.BoundedSemaphore(1)
 CLIENT_WRITE_TIMEOUT_S = 60
 
 
+_ECHOED = ("request_line", "reason", "path", "query")  # the log's fields that hold what the client wrote
+
+_clock = time.monotonic  # the clock of the timing on a request's line (O73); a test's own clock replaces it
+
+
+def _ms(seconds: float) -> int:
+    """Whole milliseconds, rounded up, so that "took more than N s" is true of the line exactly when it was of the request."""
+    return max(0, math.ceil(seconds * 1000))
+
+
 def _log(rec: dict) -> None:
     rec["t"] = time.time()
+    line = {k: _redact_node_names(v) if k in _ECHOED and isinstance(v, str) else v for k, v in rec.items()}  # O73
     try:
         with _LOCK, open(CFG["log"], "a") as f:
-            f.write(json.dumps(rec) + "\n")
+            f.write(json.dumps(line) + "\n")
     except OSError as e:  # never take the request down, but never be silent
         print("GATE LOG FAILED", e, file=sys.stderr, flush=True)
 
@@ -242,6 +266,7 @@ def _tcp_facts(sock) -> dict:
 # the hop to the gate, and it then waits up to 4 h for the answer. So upstream (Onezone and Oneprovider alike) the gate
 # allows 60 s to connect and hand-shake, plus one transparent retry, and 4 h to read. An earlier gate with an 8 s
 # bound returned a 502 when a TLS handshake to the zone ran out of it under load.
+UPSTREAM_CLOSED_AFTER_BODY = "after_body"  # the fixed word of the line's `upstream_closed` (O85)
 CONNECT_TIMEOUT = 60  # gate config `upstream_connect_timeout_s` overrides
 READ_TIMEOUT = 14400  # not below the client's read timeout: the gate must never fail first
 LOCAL_ERRNOS = {
@@ -276,6 +301,9 @@ def _upstream_ctx(verify: bool) -> ssl.SSLContext:
 
 
 def _upstream_conn(h: dict) -> http.client.HTTPConnection:
+    """A connection to the host's upstream: `addr` is the name the handshake asks for, the certificate is checked
+    against and the request's `Host` names; `dial`, when the host has one, is the address the TCP connection goes to
+    (O73: `addr` is then a declared name that resolves nowhere)."""
     if h.get("tls", True):
         conn = http.client.HTTPSConnection(
             h["addr"],
@@ -287,9 +315,29 @@ def _upstream_conn(h: dict) -> http.client.HTTPConnection:
         conn = http.client.HTTPConnection(
             h["addr"], h.get("port", 80), timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT)
         )
+    dial = h.get("dial")
+    if dial:  # the connection's own hook for making its socket: the name stays the host, the address is where it goes
+        conn._create_connection = lambda address, timeout, source: socket.create_connection(
+            (dial, address[1]), timeout, source
+        )
     conn.connect()
     conn.sock.settimeout(READ_TIMEOUT)  # short connect, then a read timeout that outlasts the client's
     return conn
+
+
+def _note_wait(rec: dict, kind: str, began: float, seen: dict) -> None:
+    """One upstream attempt's wait for an answer is on the request's line when it is the longest so far (O73): how long
+    (`upstream_wait_ms`) from `began` to the attempt's first answer byte (`seen["first"]`), or to now when none came, on
+    which kind of connection (`upstream_wait_conn`), and what ended it (`upstream_wait_end`: `first_byte` or `failure`).
+    `upstream_conn` stays the connection of the last attempt, so a kept connection that hung and was dropped, and the
+    retry on a new one that answered, leave the long wait on `reused` and the answer on `new`. A complete listing's
+    pages are one request: the longest wait of any of them. Integers and fixed words, never a byte of any exchange."""
+    first = seen.get("first")
+    waited = _ms((_clock() if first is None else first) - began)
+    if waited > rec.get("upstream_wait_ms", -1):
+        rec["upstream_wait_ms"] = waited
+        rec["upstream_wait_conn"] = kind
+        rec["upstream_wait_end"] = "failure" if first is None else "first_byte"
 
 
 def _went_stale(conn: http.client.HTTPConnection) -> bool:
@@ -315,6 +363,8 @@ class _CountingRaw(io.RawIOBase):
     def readinto(self, b) -> int:
         n = self._raw.readinto(b)
         self._seen["bytes"] += n or 0
+        if n and "first" not in self._seen:
+            self._seen["first"] = _clock()  # when the first byte of this attempt's answer arrived (O73)
         return n
 
     def close(self) -> None:
@@ -390,6 +440,174 @@ class _Upstream(Exception):
         super().__init__(repr(cause))
         self.cause = cause
         self.origin = origin_of(cause)
+
+
+_SCAN: dict[tuple[str, ...], tuple[re.Pattern[bytes] | None, frozenset[bytes], frozenset[bytes]]] = {}
+_V6_TOKEN = re.compile(rb"(?<![0-9A-Fa-f:.])[0-9A-Fa-f:.]{3,45}(?![0-9A-Fa-f:.])")  # a run that may be an IPv6 address
+NODE_MARK = "<node>"  # what a known name becomes in the log's fields that echo the client's request
+
+
+def _scan_of(names: tuple[str, ...]) -> tuple[re.Pattern[bytes] | None, frozenset[bytes], frozenset[bytes]]:
+    """The scan of `names` (O73), built once per list: a pattern for the plain names (host names and IPv4 addresses) and
+    the packed IPv6 addresses and IPv4 addresses to compare candidates with. A plain name is a whole name, in any case,
+    longest first, bare or with a port after it: no word character, dot or hyphen before it (but a backslash escape
+    such as `\\t`, as a parser's `%r` prints one, is no part of a name) or word character or hyphen after it, and not the
+    start of a longer name (a dot and a word character after it)."""
+    with _LOCK:
+        if names not in _SCAN:
+            found = sorted({n.lower() for n in names if isinstance(n, str) and n}, key=len, reverse=True)
+            plain, six, four = [], set(), set()
+            for name in found:
+                try:
+                    address = ipaddress.ip_address(name)
+                except ValueError:
+                    plain.append(re.escape(name.encode("ascii", "ignore")))
+                    continue
+                if address.version == 6:
+                    six.add(address.packed)  # any spelling of it is found by parsing the candidates (`_spans`)
+                else:
+                    four.add(address.packed)
+                    plain.append(re.escape(name.encode("ascii")))
+            pattern = (
+                rb"(?:(?<![\w.-])|(?<=\\[ntrbfv]))(?:" + b"|".join(plain) + rb")(?![\w-])(?!\.\w)" if plain else None
+            )
+            _SCAN[names] = (re.compile(pattern, re.IGNORECASE) if pattern else None, frozenset(six), frozenset(four))
+        return _SCAN[names]
+
+
+def _as_the_client_reads(body: bytes) -> bytes:
+    """What a client reads of a body: the strings of a JSON document decoded (an escape such as `\\n`, or a name
+    written with `\\uXXXX`, would otherwise hide it from the raw text), every key and string value on a line of its
+    own; any other body, or a JSON one too deep for the decoder, as it is."""
+    if body.lstrip()[:1] not in (b"{", b"[", b'"'):
+        return body
+    try:
+        document = json.loads(body)
+    except (ValueError, RecursionError):
+        return body
+    strings, stack = [], [document]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            strings.append(item)
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return "\n".join(strings).encode("utf-8", "replace")
+
+
+MAX_V6_COLONS = 8  # the most colons of an IPv6 address (seven groups' separators, or `::ffff:` and a dotted tail)
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_of(candidate: bytes) -> tuple[bytes | None, bytes | None]:
+    """The packed IPv6 address a candidate is and the packed IPv4 address inside it when it is an IPv4-mapped one; both
+    None when it is no address. Cached: a body repeats its tokens, and the parse is the scan's cost."""
+    try:
+        address = ipaddress.IPv6Address(candidate.decode("ascii"))
+    except ValueError:
+        return None, None
+    mapped = address.ipv4_mapped
+    return address.packed, None if mapped is None else mapped.packed
+
+
+def _spans(text: bytes, names: tuple[str, ...]) -> list[tuple[int, int]]:
+    """Where the known names are in `text`, as spans, one per occurrence: the plain names by pattern, an IPv6 address
+    in any spelling (a run of hex digits, colons and dots is parsed, and so are its suffixes after each colon, since a
+    word that ends in hex digits may precede it: `node:2001:db8::2`) and an IPv4 address written as an IPv4-mapped IPv6
+    address. Spans that overlap (the dotted tail of a mapped address, and the whole of it) are one occurrence."""
+    pattern, six, four = _scan_of(names)
+    found = [m.span() for m in pattern.finditer(text)] if pattern is not None else []
+    if (six or four) and b":" in text:
+        for match in _V6_TOKEN.finditer(text):
+            token = match.group().rstrip(b".")
+            if token.endswith(b":") and not token.endswith(b"::"):
+                token = token[:-1]
+            colons = [i for i, byte in enumerate(token) if byte == 0x3A]
+            # the token, then after each colon: an address has at most 8, so a longer suffix cannot be one (bounded work)
+            for at in [0, *(i + 1 for i in colons)]:
+                candidate = token[at:]
+                colons_here = candidate.count(b":")
+                if colons_here == 0:
+                    break
+                if colons_here > MAX_V6_COLONS or (
+                    b"::" not in candidate and b"." not in candidate and colons_here != 7
+                ):
+                    continue  # without `::` or a dotted tail, an address has exactly eight groups
+                packed, mapped = _v6_of(candidate)
+                if packed in six or (mapped is not None and mapped in four):
+                    found.append((match.start() + at, match.start() + at + len(candidate)))
+                    break
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(found):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _node_name_hits(body: bytes) -> int:
+    """How many known node names or addresses (`scan_names` of the gate's configuration, O73) a body holds as its
+    client reads it: counted in memory, and nothing of the body, of a match or of its context is kept. 0 when the gate
+    has no names to scan (a Compose federation's). A body is scanned whole: an answer that is no file's content is read
+    whole before it goes."""
+    names = tuple(CFG.get("scan_names") or ())
+    if not names or not body:
+        return 0
+    return len(_spans(_as_the_client_reads(body), names))
+
+
+def _redact_node_names(value: str) -> str:
+    """`value` with each known node name or address replaced by `NODE_MARK`: for the log's fields that hold what the
+    client wrote, which a published log must not hold whoever wrote it. `value` as it was when there are no names."""
+    names = tuple(CFG.get("scan_names") or ())
+    if not names or not value:
+        return value
+    data = value.encode("utf-8", "replace")
+    spans = _spans(data, names)
+    if not spans:
+        return value
+    out, last = [], 0
+    for start, end in spans:
+        if start >= last:  # a span inside the last one (the dotted tail of a mapped address) is not cut again
+            out += [data[last:start], NODE_MARK.encode()]
+            last = end
+    return b"".join([*out, data[last:]]).decode("utf-8", "replace")
+
+
+def _count_node_names(rec: dict, body: bytes) -> None:
+    """The request's line says how many node names the answer held, when it held any (`node_name_hits`, an integer)."""
+    hits = _node_name_hits(body)
+    if hits:
+        rec["node_name_hits"] = rec.get("node_name_hits", 0) + hits
+
+
+SERVED_PORT = 443  # where a client of the gate dials every name it serves: the gate's own port, or the 443 mapped to it
+
+
+def _as_served(text: str, name: str, hcfg: dict) -> str:
+    """The text of a failure as the gate's answer gives it to its client: the host it dialled upstream (`addr`, and
+    `addr:port`), which a certificate's name mismatch quotes, named as the client knows it, by the name the gate
+    serves on 443 (O69), and the address it connected to (`dial`, O73) by that name too. A gate whose name is the host it
+    dials (Docker's) gives the text unchanged; the log's line keeps the text as it was.
+
+    A host that is the served name itself but is dialled at a mapped address (O73: the URL's host is the declared name)
+    needs no replacement, yet its port is the nodes' public one, so `name:port` still becomes `name:443`."""
+    port = hcfg.get("port", 443 if hcfg.get("tls", True) else 80)
+    named = name.lower()
+    hosts = [h for h in dict.fromkeys(str(hcfg.get(key) or "") for key in ("addr", "dial")) if h]  # O73: `dial` too
+    bare = [h for h in hosts if h.lower() != named]  # the name itself is not replaced by itself
+    ported = bare + ([name] if hcfg.get("dial") and any(h.lower() == named for h in hosts) else [])  # O73: its port is
+    if not ported:
+        return text
+    with_port = tuple(form for h in ported for form in (f"[{h}]:{port}", f"{h}:{port}"))
+    forms = sorted((*with_port, *bare), key=len, reverse=True)  # the longest first: a host's own port goes with it
+    dialled = re.compile("|".join(re.escape(form) for form in forms), re.IGNORECASE)  # one pass
+    held = {f.lower() for f in with_port}
+    return dialled.sub(lambda m: f"{name}:{SERVED_PORT}" if m.group(0).lower() in held else name, text)
 
 
 _LOST = (
@@ -553,6 +771,7 @@ class Handler(BaseHTTPRequestHandler):
         self.rfile = io.BufferedReader(self._probe, io.DEFAULT_BUFFER_SIZE)  # the size `makefile` gives it
         self._pool: dict[tuple, http.client.HTTPConnection] = {}  # this client connection's upstream connections
         self._served = 0  # requests so far on this client connection
+        self._began: float | None = None  # when the request being answered was read (O73): `_clock`'s reading
         self._response_started = False
         with _LIVE_LOCK:  # last: a handler whose setup failed was never live
             _LIVE[self._conn] = self
@@ -569,6 +788,7 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(IDLE_TIMEOUT_S)  # only while waiting for a request: `_handle` lifts it
         self.raw_requestline = b""  # set by the parser once a request line has arrived
         self._head_folded = False  # set by `parse_request` once the request's header block is read
+        self._began = None  # a request's own, set by `_handle`: a keep-alive wait before the head is no request's time
         self._w.reset()
         self._timed_out = False
         after = self._served
@@ -625,7 +845,10 @@ class Handler(BaseHTTPRequestHandler):
         if self._close_logged:
             return
         after = self._last_logged
-        self._conn_close("teardown", after, in_request=self._served > after)
+        waiting = self._served > after
+        # the request that never got its line says how long it had been waiting, so the stall is not lost (O73)
+        age = {"request_age_ms": _ms(_clock() - self._began)} if waiting and self._began is not None else {}
+        self._conn_close("teardown", after, in_request=waiting, **age)
 
     def _peer_gone(self) -> bool:
         """After a response and before the next request: has the client gone? If so the line `conn_close` is logged and True is returned (the connection ends here).
@@ -710,6 +933,9 @@ class Handler(BaseHTTPRequestHandler):
         headers is the body not sent at all."""
         w = self._w
         rec.setdefault("conn", self._conn)
+        # a request relayed upstream says how long it took, to the last byte relayed or the failure (O73)
+        if "upstream_conn" in rec and self._began is not None:
+            rec["duration_ms"] = _ms(_clock() - self._began)
         body = 0 if w.mark is None else w.n - w.mark
         rec["body_bytes"] = body
         if w.failed:
@@ -750,6 +976,9 @@ class Handler(BaseHTTPRequestHandler):
             "request_line": (getattr(self, "raw_requestline", b"") or b"")[:200].decode("latin-1", "replace").strip(),
             "body": "gate",
         }
+        _count_node_names(
+            rec, f"{message or ''}\n{explain or ''}".encode("utf-8", "replace")
+        )  # the page quotes the client
         try:
             super().send_error(code, message, explain)
         finally:
@@ -759,12 +988,14 @@ class Handler(BaseHTTPRequestHandler):
         """The gate's own answer, and then its line, so the line has the answer's body bytes; logged whatever the client did meanwhile."""
         rec["body"] = "gate"
         try:
-            self._send_json(code, obj)
+            self._send_json(code, obj, rec=rec)
         finally:
             self._log(rec)
 
-    def _send_json(self, code: int, obj: dict, *, close: bool = True) -> int:
+    def _send_json(self, code: int, obj: dict, *, close: bool = True, rec: dict | None = None) -> int:
         body = json.dumps(obj).encode()
+        if rec is not None:  # the gate's own answer reaches the agent too: it is scanned like an upstream's (O73)
+            _count_node_names(rec, body)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -820,15 +1051,20 @@ class Handler(BaseHTTPRequestHandler):
             conn = None
         for attempt in (1, 2):
             seen = {"bytes": 0}
-            rec["upstream_conn"] = "reused" if conn is not None else "new"
+            kind = "reused" if conn is not None else "new"
+            rec["upstream_conn"] = kind
             phase = "connect"
+            began = _clock()  # a connect that fails is waited on from here
             try:
                 if conn is None:
                     conn = self._pool[key] = _upstream_conn(hcfg)
                 phase = "exchange"
                 conn.response_class = lambda sock, *a, seen=seen, **kw: _CountingResponse(sock, *a, seen=seen, **kw)
+                began = _clock()  # the wait for an answer begins as the request goes: the connect is over
                 conn.request(method, target, body=body, headers=headers)
-                return _checked(conn.getresponse(), seen)
+                resp = _checked(conn.getresponse(), seen)
+                resp.carried_body = bool(body)  # what `_settle` decides reuse by: the body handed to the upstream
+                return resp
             except _Framing as e:
                 self._drop(hcfg)
                 raise _Upstream(e) from e
@@ -839,12 +1075,20 @@ class Handler(BaseHTTPRequestHandler):
                 rec["upstream_retries"] = rec.get("upstream_retries", 0) + 1
                 rec["upstream_retry_cause"] = repr(e)[:200]
                 conn = None
+            finally:
+                _note_wait(rec, kind, began, seen)
         raise AssertionError("unreachable")
 
-    def _settle(self, hcfg: dict, resp) -> None:
-        """After a response is read to its end: the connection goes back to the pool unless the peer is closing it."""
+    def _settle(self, hcfg: dict, resp, rec: dict) -> None:
+        """After a response is read to its end: the connection goes back to the pool unless the peer is closing it or
+        the request it answered carried a body (O85), in which case it is closed here, whatever the status, and the
+        line says so (`upstream_closed`). The closing is the whole of the rule: the request was sent once, its answer
+        is the one relayed, and nothing is re-sent, whatever the connection did meanwhile."""
         if resp.will_close:
             self._drop(hcfg)
+        elif resp.carried_body:
+            self._drop(hcfg)
+            rec["upstream_closed"] = UPSTREAM_CLOSED_AFTER_BODY
 
     def _abort_client(self) -> None:
         """End the client's connection with a reset: a body already begun must not look complete."""
@@ -860,6 +1104,7 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(BODY_TIMEOUT_S)  # the head has arrived; the body gets a bounded time
         if not self._begin_request():
             return
+        self._began = _clock()
         self._response_started = False
         host = (self.headers.get("Host") or "").split(":")[0].lower()
         hcfg = CFG["hosts"].get(host)
@@ -944,7 +1189,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._abort_client()
                 return
             rec["client_saw"] = "5xx"
-            details = str(e)
+            details = _as_served(str(e), host, hcfg)  # the line's `error` keeps the host dialled; the answer, the name
             if gateboundary.holds_token(details.encode(errors="replace"), CFG.get("token")):  # an upstream's echo
                 details = gateboundary.CREDENTIAL_DETAILS
             with contextlib.suppress(OSError):
@@ -1069,7 +1314,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_whole(self, resp, passed, body: bytes, rec, kind: str) -> tuple[int | None, int, str | None, str]:
         """A checked body and its head, written within CLIENT_WRITE_TIMEOUT_S: (length framed, bytes sent, failure, its
-        origin). A client that stops reading frees its slot: its connection is closed (`client_stalled`)."""
+        origin). A client that stops reading frees its slot: its connection is closed (`client_stalled`). The body is
+        scanned for the nodes' names first (O73), a merged listing's too."""
+        _count_node_names(rec, body)
         self.connection.settimeout(CLIENT_WRITE_TIMEOUT_S)
         rec["body"] = kind
         try:
@@ -1119,7 +1366,7 @@ class Handler(BaseHTTPRequestHandler):
                     data = self._buffered(hcfg, resp, rec, None if resp.chunked else resp.length, token)
                     if data is None:
                         return  # refused: answered and logged
-                    self._settle(hcfg, resp)
+                    self._settle(hcfg, resp, rec)
                     try:
                         children, after = walk.page(data)
                     except ValueError as e:
@@ -1266,7 +1513,7 @@ class Handler(BaseHTTPRequestHandler):
             self._drop(hcfg)
             self._abort_client()
         else:
-            self._settle(hcfg, resp)
+            self._settle(hcfg, resp, rec)
         if failure:
             rec.update(
                 status=502,
