@@ -503,6 +503,7 @@ def test_o74_a_record_whose_artifacts_entry_is_no_sha256_is_not_a_record_and_ech
     assert code == 73
     nothing_made(tmp_path, seen, checks)
     assert "not a well-formed render identity" in err
+    assert "an entry is no SHA-256" in err  # the value is what is wrong, not that the key is undeclared
     assert not re.search(r"[0-9a-fA-F]{40}", err)
 
 
