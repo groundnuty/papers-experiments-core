@@ -417,3 +417,55 @@ def test_o35_the_hpc_render_refuses_a_template_that_declares_fewer_supporters_th
         RuntimeError, match=re.escape("space alpha-space: supported by ash but platform.toml doesn't declare it")
     ):
         hpc.boot.write_facts(stage.layout, boot, values)
+
+
+def entries(alpha: tuple[str, ...], beta: tuple[str, ...]) -> str:
+    """A platform template in the `[[spaces]]` form the HPC templates use: two spaces, each with its own support set."""
+    providers = "\n".join(
+        f'providers.{p} = {{ url = "@provider_url.{p}@", id = "@provider_id.{p}@" }}' for p in ("oak", "elm", "ash")
+    )
+    spaces = "\n".join(
+        f"""
+[[spaces]]
+label = "{label}"
+name = "{label}-space"
+id = "@space_id.{label}-space@"
+prefixes = ["{label}-"]
+providers = {json.dumps(list(support))}
+local = "oak"
+holder = "oak"
+"""
+        for label, support in (("alpha", alpha), ("beta", beta))
+    )
+    return f"""\
+zone = {{ name = "zone", url = "@zone_url@" }}
+{providers}
+credentials.admin = {{ file = "secrets/admin.token" }}
+credentials.users = {{ directory = "secrets/users", pattern = "{{user}}.pass" }}
+principals.data_path = {{ username = "alpha-reader", user_id = "@user_id.alpha-reader@" }}
+{spaces}"""
+
+
+def test_o35_the_spaces_entry_form_is_checked_entry_by_entry_and_names_only_the_entry_that_differs(fed, tmp_path):
+    """O35: every shipped HPC template declares its support sets per `[[spaces]]` entry: beta-space is oak's, mirrored
+    by ash in the layout and the zone, and its entry leaves ash out, while alpha-space's entry is right."""
+    boot = compose_staged(fed, tmp_path, WIDE, entries(("oak", "elm", "ash"), ("oak",)))
+    with pytest.raises(RuntimeError) as refused:
+        fed.facts.write_facts(boot.layout, boot)
+    assert "space beta-space: supported by ash but platform.toml doesn't declare it" in str(refused.value)
+    assert "space alpha-space" not in str(refused.value)
+
+
+def test_o35_the_spaces_entry_form_passes_when_every_entry_declares_what_the_zone_lists(fed, tmp_path):
+    """O35: the same two entries, each declaring its space's supporters, in a different order from the layout's."""
+    boot = compose_staged(fed, tmp_path, WIDE, entries(("ash", "elm", "oak"), ("ash", "oak")))
+    assert fed.facts.write_facts(boot.layout, boot) == "facts.json and platform.toml written"
+
+
+def test_o35_a_platform_file_the_check_cannot_load_is_refused_without_the_roots_path(fed, tmp_path):
+    """O35: the platform layer's refusal is passed on, with the root named `<root>` and never by its path."""
+    boot = compose_staged(fed, tmp_path, WIDE, template("oak", "elm", "ash", extra="bogus_key = 1"))
+    with pytest.raises(RuntimeError, match="the rendered platform file is refused") as refused:
+        fed.facts.write_facts(boot.layout, boot)
+    assert str(boot.layout.root) not in str(refused.value)
+    assert "<root>" in str(refused.value)
