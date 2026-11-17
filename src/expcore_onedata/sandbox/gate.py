@@ -98,6 +98,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import functools
 import http.client
 import importlib.util
 import io
@@ -466,6 +467,21 @@ def _as_the_client_reads(body: bytes) -> bytes:
     return "\n".join(strings).encode("utf-8", "replace")
 
 
+MAX_V6_COLONS = 8  # the most colons of an IPv6 address (seven groups' separators, or `::ffff:` and a dotted tail)
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_of(candidate: bytes) -> tuple[bytes | None, bytes | None]:
+    """The packed IPv6 address a candidate is and the packed IPv4 address inside it when it is an IPv4-mapped one; both
+    None when it is no address. Cached: a body repeats its tokens, and the parse is the scan's cost."""
+    try:
+        address = ipaddress.IPv6Address(candidate.decode("ascii"))
+    except ValueError:
+        return None, None
+    mapped = address.ipv4_mapped
+    return address.packed, None if mapped is None else mapped.packed
+
+
 def _spans(text: bytes, names: tuple[str, ...]) -> list[tuple[int, int]]:
     """Where the known names are in `text`, as spans, one per occurrence: the plain names by pattern, an IPv6 address
     in any spelling (a run of hex digits, colons and dots is parsed, and so are its suffixes after each colon, since a
@@ -478,17 +494,19 @@ def _spans(text: bytes, names: tuple[str, ...]) -> list[tuple[int, int]]:
             token = match.group().rstrip(b".")
             if token.endswith(b":") and not token.endswith(b"::"):
                 token = token[:-1]
-            starts = [0] + [i + 1 for i, byte in enumerate(token) if byte == 0x3A]  # the token, then after each colon
-            for at in starts:
+            colons = [i for i, byte in enumerate(token) if byte == 0x3A]
+            # the token, then after each colon: an address has at most 8, so a longer suffix cannot be one (bounded work)
+            for at in [0, *(i + 1 for i in colons)]:
                 candidate = token[at:]
-                if b":" not in candidate:
+                colons_here = candidate.count(b":")
+                if colons_here == 0:
                     break
-                try:
-                    address = ipaddress.IPv6Address(candidate.decode("ascii"))
-                except ValueError:
-                    continue
-                mapped = address.ipv4_mapped
-                if address.packed in six or (mapped is not None and mapped.packed in four):
+                if colons_here > MAX_V6_COLONS or (
+                    b"::" not in candidate and b"." not in candidate and colons_here != 7
+                ):
+                    continue  # without `::` or a dotted tail, an address has exactly eight groups
+                packed, mapped = _v6_of(candidate)
+                if packed in six or (mapped is not None and mapped in four):
                     found.append((match.start() + at, match.start() + at + len(candidate)))
                     break
     merged: list[tuple[int, int]] = []
