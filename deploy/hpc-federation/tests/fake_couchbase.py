@@ -17,6 +17,11 @@ onepanel creates it). FAKE_CB_ANON_ADMIN=1 breaks the rules on purpose: an anony
 administrator after one exists, for the guard's negative test.
 It opens its port only after DELAY seconds, so the polling of its clients is exercised, and serves for LIFETIME
 seconds. Every request is logged on stdout ("request <method> <path>"), so a test can tell that none arrived.
+FAKE_CB_LISTEN_FD=N: file descriptor N is a TCP socket its parent bound to 127.0.0.1:PORT and keeps bound, not
+listening, until this process has it. After DELAY it listens on that socket instead of binding PORT itself, so
+the port is never free between the parent's choice and the listen: a port that was only looked up and closed can
+be handed to another process of the node in that gap (an EADDRINUSE here). The parent closes its own copy once
+this process has started, so the listener ends with this process.
 Usage: fake_couchbase.py PORT DELAY LIFETIME [USER:PASSWORD (start already provisioned)]
 """
 
@@ -25,6 +30,7 @@ import binascii
 import http.server
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -121,13 +127,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(404)
 
 
+def open_server(port):
+    """The server on 127.0.0.1:port: on the socket the parent holds bound for it (FAKE_CB_LISTEN_FD), else a new one."""
+    fd = os.environ.get("FAKE_CB_LISTEN_FD")
+    if fd is None:
+        return http.server.HTTPServer(("127.0.0.1", port), Handler)
+    held = socket.socket(fileno=int(fd))
+    if held.getsockname() != ("127.0.0.1", port):
+        sys.exit("fake_couchbase: FAKE_CB_LISTEN_FD is bound to %s, not to 127.0.0.1:%d" % (held.getsockname(), port))
+    server = http.server.HTTPServer(held.getsockname(), Handler, bind_and_activate=False)
+    server.socket.close()  # the server made its own, which it would have bound
+    server.socket = held
+    server.server_port = port  # server_bind sets it; the handler of GET /settings/web reads it
+    server.server_activate()  # listen()
+    return server
+
+
 def main():
     port, delay, lifetime = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
     if len(sys.argv) > 4:
         state["creds"] = sys.argv[4]
         state["services"] = "kv"
     time.sleep(delay)
-    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    server = open_server(port)
     threading.Timer(lifetime, server.shutdown).start()
     print("listening", flush=True)
     server.serve_forever()
