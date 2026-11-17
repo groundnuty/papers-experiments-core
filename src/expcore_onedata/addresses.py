@@ -222,12 +222,17 @@ LAUNCHER_FLAGS = ("-I", "-B")  # every Python of the driver's runs isolated, and
 _PYTHON = re.compile(r"python(3(\.[0-9]+)?)?")
 
 
+def is_python_interpreter(command: str) -> bool:
+    """Whether `command` is a Python interpreter by its file name: `python`, `python3` or `python3.N`."""
+    return _PYTHON.fullmatch(Path(command).name) is not None
+
+
 def launch_argv(command: str, args: Sequence[str], launcher: Path, map_file: Path) -> list[str]:
     """The tool server's whole command line, started through the resolve launcher (O73): the interpreter the study
     declared, `-I -B`, the launcher, the private map as an argument (never the environment), `--`, and the server as
     that interpreter would have been given it. The server must be a Python started by `-m <module>` or by a script,
     since only then can the launcher run it; anything else is an AddressMapError naming what to change."""
-    if not _PYTHON.fullmatch(Path(command).name):
+    if not is_python_interpreter(command):
         raise AddressMapError(
             "[toolserver] command must be a Python interpreter; use <venv>/bin/python with args "
             "['-m', '<module>', ...]: the resolver starts the server by it"
@@ -263,4 +268,13 @@ def build(hosts: Mapping[str, tuple[str, Sequence[str]]]) -> AddressMap:
     )
 
 
-__all__ = ["FORMAT", "AddressMap", "AddressMapError", "Node", "build", "launch_argv", "load_addresses"]
+__all__ = [
+    "FORMAT",
+    "AddressMap",
+    "AddressMapError",
+    "Node",
+    "build",
+    "is_python_interpreter",
+    "launch_argv",
+    "load_addresses",
+]

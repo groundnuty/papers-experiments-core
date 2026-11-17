@@ -87,6 +87,7 @@ def test_o73_the_gates_configuration_carries_the_names_when_given_and_a_gate_opt
     base = {
         "run_key": "r", "tls": TlsSettings(), "served": {}, "listing": "paged", "directory": Path("/x"),
         "tls_dir": Path("/y"), "token_file": Path("/z"), "port": 1, "upstream_ca": None, "options": {},
+        "upstream_read_timeout_s": 14400.0,
     }  # fmt: skip
     assert gaterun.config(**base, scan_names=NAMES)["scan_names"] == list(NAMES)
     assert "scan_names" not in gaterun.config(**base, scan_names=())

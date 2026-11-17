@@ -15,7 +15,7 @@ from fault_support import SERVICES, FakeClock
 from hpc_support import FEDERATION
 
 from expcore_onedata.compose import CommandResult
-from expcore_onedata.fault_hpc import Request
+from expcore_onedata.fault_hpc import Request, timing_evidence
 from expcore_onedata.fault_relay import Relay, RelayClient
 from expcore_onedata.fault_relay_late import step_name
 from expcore_onedata.fault_relay_timing import read_timing, step_names
@@ -307,6 +307,75 @@ def test_o58_a_start_that_launched_has_its_service_step_timed_and_one_that_did_n
     with relay.holding():
         done = ask(root, relay, Request("start", SERVICE))  # the verb changes nothing: no new launch
     assert [step["word"] for step in done.timing["steps"]] == ["status"]
+
+
+def pending_state(launch, name, listed=None):
+    """The state file of a start whose service step an earlier attempt launched: `starting`, its step recorded by name,
+    its id not yet (hpcfed claims the launch before the step exists); `listed` is the id once it was listed."""
+    state = state_of()
+    state["services"][SERVICE].update(
+        launch=launch, state="starting" if listed is None else "running", step={"name": name, "id": listed}
+    )
+    return state
+
+
+def test_o58_a_start_that_adopts_the_step_an_earlier_attempt_launched_has_that_step_timed(tmp_path):
+    """O58: a start that stalled past its 60 s wait for its service step to be listed leaves the state `starting`, the
+    step recorded by name only; the retried start finds the step listed and takes it over (`running`) with the launch
+    count unchanged. The count alone said it launched nothing, so the step's own timing, which is where the stalled
+    start's time went, was lost: the answer of the start that adopts it holds it (its `start_after_issue_s` is
+    negative: the step began before this verb was issued)."""
+    run = f"{FEDERATION}-{SERVICE}-run-2"
+    root, relay, verbs = make(
+        tmp_path, sacct=accounting(row(run, 12, f"{HEAD}03", f"{HEAD}08")), state=pending_state(2, run)
+    )
+
+    def adopts(argv):
+        state = json.loads((root / "hpc-federation.json").read_text(encoding="utf-8"))
+        state["services"][SERVICE].update(state="running", step={"name": run, "id": f"{JOB}.12"})
+        (root / "hpc-federation.json").write_text(json.dumps(state), encoding="utf-8")
+        return CommandResult(0, "")
+
+    verbs.behaviour = adopts
+    with relay.holding():
+        done = ask(root, relay, Request("start", SERVICE))
+    assert [step["word"] for step in done.timing["steps"]] == ["status", "run"]
+    assert (done.timing["steps"][1]["id"], done.timing["steps"][1]["state"]) == (f"{JOB}.12", "COMPLETED")
+
+
+def test_o58_a_start_that_found_its_service_already_up_adopts_nothing(tmp_path):
+    """O58: a start on a service that was `running` before it (nothing launched, nothing adopted) leaves the step of
+    the launch long ago, which is never this verb's."""
+    run = f"{FEDERATION}-{SERVICE}-run-2"
+    running = pending_state(2, run, listed=f"{JOB}.12")
+    root, relay, _ = make(tmp_path, sacct=accounting(row(run, 12, f"{HEAD}03", f"{HEAD}08")), state=running)
+    with relay.holding():
+        done = ask(root, relay, Request("start", SERVICE))
+    assert [step["word"] for step in done.timing["steps"]] == ["status"]
+
+
+def test_o58_a_retried_start_whose_step_is_still_not_listed_has_no_service_step_to_time(tmp_path):
+    """O58: the retry did not see the step listed either: the state is as it was (`starting`, no id), so nothing was
+    adopted and no figure is invented for a step that is not known to exist."""
+    run = f"{FEDERATION}-{SERVICE}-run-2"
+    root, relay, _ = make(tmp_path, sacct=accounting(), state=pending_state(2, run))
+    with relay.holding():
+        done = ask(root, relay, Request("start", SERVICE))
+    assert [step["word"] for step in done.timing["steps"]] == ["status"]
+
+
+def test_o58_an_adopted_steps_negative_start_figure_reaches_the_driver_as_it_is():
+    """O58: the figure is negative when the step began before the verb was issued, and the driver's check keeps a
+    finite number's sign (a step that ended before the answer has one too)."""
+    timing = read_timing(
+        accounting(row("any-run-2", 12, f"{HEAD}03", f"{HEAD}08")),
+        job=JOB,
+        names=[("run", "any-run-2")],
+        issued=moment(40),
+        answered=moment(50),
+    )
+    (step,) = timing_evidence(timing)["steps"]
+    assert (step["word"], step["start_after_issue_s"], step["end_after_answer_s"]) == ("run", -37.0, -42.0)
 
 
 def test_o58_a_timing_that_is_no_object_is_no_timing_to_the_client(tmp_path):

@@ -36,6 +36,7 @@ def agent(s, names, mode, **kw):
         "image_id": s.agent.id,
         "mode": mode,
         "work": Path("/w/work"),
+        "resolv": Path("/w/resolv.conf"),
         "share": None,
         "gate_ip": None,
         "gate_hosts": [],
@@ -571,7 +572,7 @@ def test_o05_the_federation_network_is_the_sidecars_alone_and_the_agent_never_jo
         DataPathMode.NONE: {},
     }[mode]
     args, _ = C.agent_run_args(
-        federated, names, LABELS, image_id=s.agent.id, mode=mode, work=Path("/w/work"),
+        federated, names, LABELS, image_id=s.agent.id, mode=mode, work=Path("/w/work"), resolv=Path("/w/resolv.conf"),
         **({"share": None, "gate_ip": None, "gate_hosts": [], "ca": None, "trust_bundles": {}, "zone_host": None}
            | extra),
     )  # fmt: skip
