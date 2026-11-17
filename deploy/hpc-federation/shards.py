@@ -169,7 +169,8 @@ its name relative to `<results>`, size and SHA-256 from the bytes `collect` read
 directory beside `--into`, checks it all, and only then moves the trees in, publishes the root archives and writes the
 manifest last; a refusal leaves `--into` as it was and writes no manifest. Then it writes `evidence-collected.json`
 into each root, which `hpcfed.py down` requires of a root a step ran against (`shard-steps/<label>.json`, which `step`
-leaves there): `down` refuses one without it, or whose step records changed since, unless `--discard-evidence`.
+leaves there): `down` refuses one without it, or whose evidence is no longer what the marked archive holds, unless
+`--discard-evidence`.
 `verify-copy` takes the pulled manifest, the local directory and that
 hash (`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1
 naming each file that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only,
@@ -1165,10 +1166,10 @@ def _private_bytes(payload: bytes) -> Callable[[Path], None]:
     return write
 
 
-def _set_aside(plan: Plan, shard: Shard) -> None:
+def _set_aside(plan: Plan, shard: Shard, up_id: str) -> None:
     """The root archive of another federation under this shard's label (the shard moved) put aside, not overwritten:
     both files renamed to `<label>.<12 hex digits of the archive's SHA-256>.root.*`, which `aside_entries` lists."""
-    stem = _evidence().stem_of(plan.results, shard.label, root_id_of(shard))
+    stem = _evidence().stem_of(plan.results, shard.label, root_id_of(shard), up_id)
     if stem is None:
         return
     for suffix in ROOT_SUFFIXES:
@@ -1204,7 +1205,7 @@ def _publish(plan: Plan, archives: Sequence[Any]) -> None:
         for shard, held in zip(plan.shards, archives, strict=True):
             if held.reused:
                 continue
-            _set_aside(plan, shard)
+            _set_aside(plan, shard, held.up_id)
             _write_whole(plan.results / f"{shard.label}.root.tar", _private_bytes(held.tar))
             _write_whole(plan.results / f"{shard.label}.root.json", _private_bytes(held.manifest))
     except OSError as error:

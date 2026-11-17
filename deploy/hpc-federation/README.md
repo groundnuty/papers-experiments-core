@@ -690,11 +690,13 @@ can name a site's details before they are known.
 federation's root when a step starts (the shard's spec and a count; a step that cannot write it does not start), and
 `collect` writes `evidence-collected.json` there, naming the root archive's SHA-256 and the digest of those records.
 `hpcfed.py down` reads them first, before it stops or cancels anything: a root with step records and **no current marker**
-is refused, naming the shards, and stays whole so that a `collect` can still read it. A step that started after the
-collect (a resume) makes the marker stale and `down` refuses again until `collect` is run again. A root where no step ever
+is refused, naming the shards, and stays whole so that a `collect` can still read it. The marker names the root archive's hash, and `down` archives the root's evidence again to compare:
+a step that started after the collect (a resume), a running step that goes on writing the journals (the collect ran
+while it ran), or any changed evidence file makes the marker stale, and `down` refuses until the step has ended and
+`collect` is run again (a `down` that began and failed halfway is not gated again). A root where no step ever
 ran goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
 down's output then says which shards' evidence was discarded, and **every use is recorded in the federation's state file**
-(`evidence_discarded`: the time in UTC, the shards, whether their evidence had been collected before a later step, and
+(`evidence_discarded`: the time in UTC, the shards, whether their evidence had been collected and changed since, and
 the reason given with `--discard-reason TEXT`, at most 500 characters, if any). The state file goes with the root when
 `down` ends, so that line in down's output is what outlives it: keep it. (`fleet.py down` takes no such flag: it reports the refusal,
 and `hpcfed.py down --discard-evidence` is run for that root by hand.) A `collect` after the root is gone (a down that
@@ -966,8 +968,8 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   client runs; one whose step ended is relaunched only with `--shard L --resume`. A shard refused exits 1. A site that
   needs `HPC_STEP_NETWORK` gives it to each federation's own steps (`hpcfed`); a shard's step, on the agent's own job of
   one component, carries none.
-- **Moving a shard.** First collect the federation's root evidence: `shards.py collect --manifest M --roots-only --shard L`
-  (no archive, no `--into`: the other shards need not be final), since `down --member fed-k` refuses a root a step ran
+- **Moving a shard.** End its step, then collect the federation's root evidence: `shards.py collect --manifest M --roots-only --shard L`
+  (no archive, no `--into`: the other shards need not be final; a step still writing makes `down` refuse the collect as stale), since `down --member fed-k` refuses a root a step ran
   against whose evidence is not collected (or `hpcfed.py down --discard-evidence --discard-reason ...` by hand: recorded).
   The shard's archive under its label is named by the shard, so the root archive the move leaves (`<label>.root.*`, made of
   the first federation) is put aside by the next collect as `<label>.<12 hex digits>.root.*` and listed in

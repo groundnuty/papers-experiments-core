@@ -12,8 +12,6 @@ import pytest
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
 from root_evidence_support import record_step
 
-ARCHIVE = "9" * 64  # a root archive's SHA-256, as a marker names it
-
 
 @pytest.fixture(scope="module")
 def hpc():
@@ -49,11 +47,14 @@ class Rig:
         self.driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
         self.driver.relay_available = lambda: False
         self.driver.up(hpc.settings.site_from_environment(site))
+        (self.root / "facts.json").write_text("{}")  # what the core's phase writes, which this rig stands in for
         self.fake.calls.clear()
 
     def collected(self, label="shard-1"):
-        """What `collect` leaves in the root once it has archived it (the marker, as `hpcevidence` writes it)."""
-        self.hpc.evidence.write_marker(self.root, label, ARCHIVE)
+        """What `collect` leaves in the root once it has archived it: the marker naming the archive of the evidence
+        as it is now, as `hpcevidence` writes it."""
+        held = self.hpc.evidence.archive_root(self.root, label)
+        self.hpc.evidence.write_marker(self.root, label, held.sha256, held.steps_sha256)
 
 
 def test_down_refuses_a_root_with_a_step_record_and_no_marker_before_it_stops_anything(hpc, tmp_path, site):
@@ -100,7 +101,7 @@ def test_down_refuses_when_a_step_started_after_the_evidence_was_collected(hpc, 
     record_step(rig.root, "shard-1")
     rig.collected()
     record_step(rig.root, "shard-1", starts=2)
-    with pytest.raises(RuntimeError, match=r"shard-1.*after.*collect"):
+    with pytest.raises(RuntimeError, match=r"evidence of shard-1 changed after it was collected"):
         rig.driver.down()
     assert rig.fake.cancelled == []
     assert rig.root.exists()
@@ -114,6 +115,47 @@ def test_down_refuses_when_a_second_shard_started_after_the_evidence_was_collect
     record_step(rig.root, "shard-2")
     with pytest.raises(RuntimeError, match=r"shard-2"):
         rig.driver.down()
+
+
+def test_down_refuses_when_the_evidence_changed_after_it_was_collected_though_no_step_started(hpc, tmp_path, site):
+    """O63: a step that was running when `collect --roots-only` ran goes on writing the fault journal, the link check
+    and the relay's files until its job is cancelled: the marker names the archive's hash, and a root whose evidence no
+    longer archives to it is refused, so nothing a running step wrote after the collect goes with the root."""
+    rig = Rig(hpc, tmp_path, site)
+    record_step(rig.root, "shard-1")
+    rig.collected()
+    (rig.root / "fault-journal").mkdir()
+    (rig.root / "fault-journal" / "injections.jsonl").write_text('{"event": "injecting"}\n')
+    with pytest.raises(RuntimeError, match=r"changed after it was collected.*end the shard's step"):
+        rig.driver.down()
+    assert rig.fake.cancelled == []
+    assert rig.root.exists()
+    rig.collected()  # collected again, once the step has ended
+    assert rig.driver.down().startswith("down: the held job 4242 is gone")
+
+
+def test_down_refuses_a_changed_evidence_file_and_one_that_can_no_longer_be_archived(hpc, tmp_path, site):
+    """O63: an edited `facts.json`, or a link where an evidence file was, is no evidence of what was collected."""
+    rig = Rig(hpc, tmp_path, site)
+    record_step(rig.root, "shard-1")
+    rig.collected()
+    (rig.root / "facts.json").write_text('{"changed": true}')
+    with pytest.raises(RuntimeError, match="changed after it was collected"):
+        rig.driver.down()
+    rig.collected()
+    (rig.root / "link-check.json").symlink_to(rig.root / "facts.json")
+    with pytest.raises(RuntimeError, match="changed after it was collected"):
+        rig.driver.down()
+
+
+def test_a_down_that_began_is_not_gated_again(hpc, tmp_path, site):
+    """O63: a first down passed the gate and set the state's phase, which is part of the evidence; run again after a
+    failure halfway, it is not refused for its own change."""
+    rig = Rig(hpc, tmp_path, site)
+    record_step(rig.root, "shard-1")
+    rig.collected()
+    rig.driver.set(lambda state: state.update(phase="stopping"))
+    assert rig.driver.down().startswith("down: the held job 4242 is gone")
 
 
 @pytest.mark.parametrize("content", ["", "not json", "[]", '{"format": "something else"}',
@@ -181,7 +223,7 @@ def test_every_use_of_discard_evidence_is_recorded_in_the_state_with_its_time_an
     rig.reason = "the pilot's batch was abandoned"
     (entry,) = _discarded(rig)
     assert entry["shards"] == ["shard-1"]
-    assert entry["after_a_later_step"] is False
+    assert entry["changed_since_collect"] is False
     assert entry["reason"] == "the pilot's batch was abandoned"
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", entry["at"])
     assert any(
@@ -201,7 +243,7 @@ def test_a_discard_of_a_marker_made_stale_by_a_later_step_says_so_in_the_state(h
     record_step(rig.root, "shard-1", starts=2)
     rig.reason = None
     (entry,) = _discarded(rig)
-    assert entry["after_a_later_step"] is True
+    assert entry["changed_since_collect"] is True
 
 
 def test_nothing_is_recorded_when_there_was_nothing_to_discard(hpc, tmp_path, site):

@@ -88,7 +88,14 @@ def test_l08_the_harness_defect_log_is_never_selected_whatever_the_patterns_say(
             select(tree, spec_with(tree, ["study.toml", pattern]))
 
 
-PRIVATE_EVIDENCE = ["results/fed-a.root.tar", "results/fed-a.root.json", "results/fed-a/pass-env.json", "pass-env.json"]
+PRIVATE_EVIDENCE = [
+    "results/fed-a.root.tar",
+    "results/fed-a.root.json",
+    "results/fed-a.root.tar.part",
+    "results/fed-a.root.json.part",
+    "results/fed-a/pass-env.json",
+    "pass-env.json",
+]
 
 
 def test_o63_an_hpc_campaigns_private_evidence_is_never_selected_whatever_the_patterns_say(tree):
@@ -98,9 +105,15 @@ def test_o63_an_hpc_campaigns_private_evidence_is_never_selected_whatever_the_pa
     write(tree, dict.fromkeys([*PRIVATE_EVIDENCE, "results/fed-a/journals/one.jsonl"], ""))
     for pattern in ("results", "results/**", "**/*", "**"):
         chosen = select(tree, spec_with(tree, ["study.toml", pattern]))
-        assert not [path for path in chosen if path.endswith((".root.tar", ".root.json", "pass-env.json"))], pattern
+        assert not [path for path in chosen if ".root." in path or path.endswith("pass-env.json")], pattern
     assert "results/fed-a/journals/one.jsonl" in select(tree, spec_with(tree, ["results"]))  # the rest is as it was
-    for pattern in ("results/*.root.tar", "results/*.root.json", "**/pass-env.json", *PRIVATE_EVIDENCE):
+    for pattern in (
+        "results/*.root.tar",
+        "results/*.root.json",
+        "results/*.part",
+        "**/pass-env.json",
+        *PRIVATE_EVIDENCE,
+    ):
         with pytest.raises(PackageError, match="selects no file"):  # naming only them selects nothing
             select(tree, spec_with(tree, ["study.toml", pattern]))
 

@@ -55,7 +55,7 @@ LIVE_CAMPAIGN = ("out/state.sqlite", "out/campaign.lock", "out/leases")
 LOCAL_ONLY = ("out/logs",)  # the campaign's local logs (`campaign.defect_log`): never committed, never packaged
 # An HPC campaign's private evidence (`deploy/hpc-federation/shards.py collect`): by what a file is called, wherever it
 # lies. The root archive's files are not named here, since they are `facts.json` and the like: the archive is.
-PRIVATE_EVIDENCE_SUFFIXES = (".root.tar", ".root.json")
+PRIVATE_EVIDENCE_SUFFIXES = (".root.tar", ".root.json", ".root.tar.part", ".root.json.part")  # and a killed draft
 PRIVATE_EVIDENCE_NAMES = ("pass-env.json",)
 WHEELS_DIR = "wheels"  # the build fills it with the wheels of the environment (`package.wheels`)
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")

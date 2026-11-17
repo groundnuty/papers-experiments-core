@@ -13,7 +13,7 @@ TAKEN_ID = "fedcba9876543210fedcba9876543210"
 
 # What a collect archives from a root: every file below, by this name (the allow-list), and nothing else.
 EVIDENCE = {
-    "hpc-federation.json": b'{"format": "expcore-hpc-federation/1", "phase": "linked", "site": {"queue": "batch"}}\n',
+    "hpc-federation.json": b'{"format": "expcore-hpc-federation/1", "phase": "linked", "allocation": {"name": "x"}}\n',
     "facts.json": b'{"layout": {"file": "federation.toml"}, "zone": {"url": "https://zone.example:8443"}}\n',
     "platform.toml": b'[space]\nname = "s"\ndata_manifest = "m.json"\n[tokens]\nfile = "secrets/admin.token"\n',
     "link-check.json": b'{"format": "expcore-link-check/1", "ok": true}\n',

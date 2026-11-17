@@ -18,8 +18,10 @@ and never the value.
 
 **A step ran.** `down` cannot see the results directory, so `shards.py step` leaves `shard-steps/<label>.json` in the
 root when a step of that shard starts (`STEPS_DIR`: the shard's spec and how many steps of it started; no path, host or
-secret). The marker names the digest of those records (`steps_digest`) as they were when the evidence was read, so a
-step that started after the collect (a resume) makes the marker stale and `down` refuses again.
+secret). The marker names the archive's SHA-256 and the digest of those records (`steps_digest`) as they were when the
+evidence was read; `down` archives the root again (`uncollected`) and refuses one that no longer archives to the hash:
+a step that started after the collect (a resume), one that went on writing the journals, or a changed file makes the
+marker stale.
 
 This module uses the standard library alone: `down` imports it, `collect` loads it by its path, and `shards.py`, which
 runs alone on a node, keeps its own copy of the two names of the step's record (a test compares them).
@@ -108,6 +110,7 @@ class RootArchive:
     steps_sha256: str
     names: tuple[str, ...]
     reused: bool = False
+    up_id: str = ""  # a hash of the allocation's name: which `up` of the root's path made the federation
 
 
 # ------------------------------------------------------------------------------------------------ reading below a root
@@ -330,6 +333,16 @@ def steps_digest(root: Path) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ the root archive
+def _up_id(state: bytes) -> str:
+    """A hash of the allocation's name in the state file (`hpcop-<project>-<random>`: a new one for each `up`, no path):
+    two federations brought up one after the other at one root are told apart by it. Empty when the state names none."""
+    try:
+        name = json.loads(state)["allocation"]["name"]
+    except (ValueError, KeyError, TypeError):
+        return ""
+    return hashlib.sha256(f"expcore-up-id:{name}".encode()).hexdigest() if isinstance(name, str) and name else ""
+
+
 def _tar_of(files: dict[str, bytes]) -> bytes:
     """The files as a tar built from bytes: sorted, fixed mode, owner and time, so that the same files give the same
     bytes."""
@@ -343,11 +356,12 @@ def _tar_of(files: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
-def _manifest_of(label: str, tar: bytes, files: dict[str, bytes], root_id: str) -> bytes:
+def _manifest_of(label: str, tar: bytes, files: dict[str, bytes], root_id: str, up_id: str) -> bytes:
     document = {
         "format": ROOT_FORMAT,
         "label": label,
         "root_id": root_id,
+        "up_id": up_id,
         "sha256": hashlib.sha256(tar).hexdigest(),
         "bytes": len(tar),
         "files": [
@@ -387,8 +401,9 @@ def archive_root(root: Path, label: str, root_id: str = "") -> RootArchive:
         if any(value in data for value in secrets_found):
             raise EvidenceError(f"{name} holds the content of a file of {SECRETS}/: not archived")
     tar = _tar_of(files)
-    manifest = _manifest_of(label, tar, files, root_id)
-    return RootArchive(label, tar, manifest, hashlib.sha256(tar).hexdigest(), steps, tuple(sorted(files)))
+    up_id = _up_id(files[STATE])
+    manifest = _manifest_of(label, tar, files, root_id, up_id)
+    return RootArchive(label, tar, manifest, hashlib.sha256(tar).hexdigest(), steps, tuple(sorted(files)), up_id=up_id)
 
 
 def _plain_file(path: Path) -> bytes:
@@ -436,15 +451,17 @@ def earlier_archive(results: Path, label: str, root_id: str | None = None) -> Ro
     return verified_pair(results, label, label, root_id)
 
 
-def stem_of(results: Path, label: str, root_id: str) -> str | None:
-    """What `<label>.root.tar` of `results` is, when it is the archive of another federation than `root_id`'s (a shard
-    that moved): the first 12 hex digits of its SHA-256, the name it is set aside under (`<label>.<12 digits>`, which
-    keeps the archive and no path); None when there is none, or it is this root's."""
+def stem_of(results: Path, label: str, root_id: str, up_id: str = "") -> str | None:
+    """What `<label>.root.tar` of `results` is, when it is the archive of another federation than this one (a shard
+    that moved to another root, or a federation brought up again at the same root: `root_id` or `up_id` differs): the
+    first 12 hex digits of its SHA-256, the name it is set aside under (`<label>.<12 digits>`, which keeps the archive
+    and no path); None when there is none, or it is this federation's."""
     tar, manifest = results / f"{label}.root.tar", results / f"{label}.root.json"
     if not (os.path.lexists(tar) or os.path.lexists(manifest)):
         return None
     try:
-        if json.loads(_plain_file(manifest)).get("root_id") == root_id:
+        found = json.loads(_plain_file(manifest))
+        if found.get("root_id") == root_id and found.get("up_id", "") == up_id:
             return None
     except (EvidenceError, ValueError, AttributeError):
         pass
@@ -508,10 +525,11 @@ def _marker(root_fd: int) -> dict | None:
 
 def uncollected(root: Path) -> tuple[list[str], bool] | None:
     """None when `down` may remove `root` for want of evidence: no step ever ran against it, or its evidence was
-    collected and no step started since. Otherwise (the shards that have records, whether a marker exists but is
-    stale): a root with shard results and no marker (or one that cannot be read) is `(labels, False)`, one whose marker
-    names other step records than there are now is `(labels, True)`. Reads below a descriptor of the root, no link
-    followed."""
+    collected and is exactly what the marker's root archive holds still. Otherwise (the shards that have records, and
+    whether a marker exists but is stale): a root with shard results and no marker (or one that cannot be read) is
+    `(labels, False)`; one whose marker names other step records than there are now, or whose evidence no longer
+    archives to the hash the marker names (a running step wrote since, a file was changed, or one cannot be read), is
+    `(labels, True)`. Reads below a descriptor of the root, no link followed."""
     try:
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except FileNotFoundError:
@@ -528,6 +546,12 @@ def uncollected(root: Path) -> tuple[list[str], bool] | None:
         marker = _marker(fd)
         if marker is None:
             return labels, False
-        return (labels, True) if marker["steps_sha256"] != _digest_of(entries) else None
+        if marker["steps_sha256"] != _digest_of(entries):
+            return labels, True
     finally:
         os.close(fd)
+    try:
+        current = archive_root(root, "").sha256
+    except (EvidenceError, OSError):
+        return labels, True
+    return (labels, True) if current != marker["root_archive_sha256"] else None

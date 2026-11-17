@@ -347,6 +347,23 @@ def test_a_shard_that_moved_to_another_federation_does_not_overwrite_its_first_f
     assert str(tmp_path) not in first["fed-a.root.json"].decode() + (plan.results / "fed-a.root.json").read_text()
 
 
+def test_a_federation_brought_up_again_at_the_same_root_does_not_overwrite_the_first_ones_archive(shards, tmp_path):
+    """O63: the same shard, the same root path, a new `up` (its allocation's name is new): the evidence of the first is
+    put aside like a moved shard's, never overwritten by the second's."""
+    plan = _collect(shards, tmp_path, "first")
+    first = {name: (plan.results / name).read_bytes() for name in ("fed-a.root.tar", "fed-a.root.json")}
+    state = plan.shards[0].root / "hpc-federation.json"
+    document = json.loads(state.read_text())
+    document["allocation"] = {"name": "y"}
+    state.write_text(json.dumps(document))
+    shards.collect(plan, tmp_path / "second")
+    aside = _aside(plan)
+    assert len(aside) == 2
+    assert [(plan.results / name).read_bytes() for name in aside] == [first["fed-a.root.json"], first["fed-a.root.tar"]]
+    assert (plan.results / "fed-a.root.tar").read_bytes() != first["fed-a.root.tar"]
+    assert '"y"' not in (plan.results / "fed-a.root.json").read_text()  # a hash of the name, not the name
+
+
 def test_the_set_aside_archive_is_checked_by_verify_copy_and_a_second_collect_finds_it_again(shards, tmp_path, capsys):
     """O63: pulled with the directory, the set-aside pair is checked like the others; a collect that follows lists it as
     before and sets nothing more aside."""
