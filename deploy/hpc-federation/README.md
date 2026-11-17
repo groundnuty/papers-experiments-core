@@ -551,14 +551,18 @@ so does a federation with no record in its root, an unreadable or malformed one,
 made. A record is only the file `up` wrote: a `platform.toml` edited by hand afterwards is not seen, and a line edited
 to drop the two words runs unchecked.
 
-Whether or not one is expected, a step that has the federation's record copies it into
-`out/study-state/render-identity.json` (the record as it validated, in canonical form: the bytes `up` wrote, never
-anything else the file held; a key given twice refuses the record) once the dispatcher has ended, before the post-run script and the archive, so the
-archive, an `out/` kept after a failed archive, and a post-run script all see which render the shard ran against. (A step killed between its dispatcher's end and the copy leaves an `out/` without it, which `--archive-left` archives as it is.) A
-failure to write it is said on stderr and never stops the archive. A federation whose `up` wrote no record (one brought
-up before O74, or a layout with no platform template) and a plan that expects none run as they did and archive none;
-`collect` and the core's `merge` take an `out/` with the directory as it is (the merge reads `out/runs` alone). A resume
-writes the record of the federation it ran against, in place of an earlier step's.
+Whether or not one is expected, a step that has the federation's record writes it into
+`out/study-state/render-identity.<step id>.json` (the record as it validated, in canonical form: the bytes `up` wrote,
+never anything else the file held; a key given twice refuses the record) at its start: after a `--resume` has restored
+its `out/` and before the dispatcher starts. The file is the step's own (its name holds the UTC time and four random
+bytes of that step, and it is made new, mode 0600), so a resumed shard keeps the record of every step that ran, each
+under the render it ran under, and none overwrites an earlier one. Being in `out/` from the start, it is in every
+snapshot (a snapshot copies each file of `out/`), in the `out/` of a step killed mid-shard, in an `out/` kept for
+`--archive-left`, in the archive, and where a post-run script can read it. A step that cannot write it does not start
+(exit 2, nothing spent). A dispatcher that leaves nothing in `out/` but the record leaves no `out/` to archive, as one
+that leaves none. A federation whose `up` wrote no record (one brought up before O74, or a layout with no platform
+template) and a plan that expects none run as they did and write none; `collect` and the core's `merge` take an
+`out/` with the directory as it is (the merge reads `out/runs` alone).
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into

@@ -588,8 +588,10 @@ id, job, node, path, user or secret, so it can travel with a shard's results and
 template does not name is left out; a layout with no template writes no record. A manifest's `expect_render_identity`
 (a path of the study; the lines carry it with its hash as `--expect-render-identity*`) makes `step` compare the
 federation's record with the expected one before it makes anything, beside the pre-step guard and before it, refusing
-with 73 and naming the keys that differ; and every step copies the record it read into `out/study-state/` so the archive
-carries it. `shards.py` keeps its own copy of the record's names, since it runs alone with `-I`; a test compares them.
+with 73 and naming the keys that differ; and every step writes the record it validated into
+`out/study-state/render-identity.<step id>.json` at its start (after a resume has restored `out/`, before the
+dispatcher), a file of its own per step, so every snapshot, a killed step's `out/` and the archive carry it and a
+resumed shard keeps the identity each step ran under. `shards.py` keeps its own copy of the record's names, since it runs alone with `-I`; a test compares them.
 
 **The study's own scripts: a pre-step guard and a post-run script.** A study's own refusals (one worker, every
 planned model's cap 1, a federation root of its own) must hold at every shard's start, and `step` makes the work root and

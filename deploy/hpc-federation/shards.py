@@ -93,12 +93,15 @@ reads the expected file below the held study root, shows it is the file the plan
 record once from `$EXPCORE_FED_ROOT` (below that root, no link followed, a root of this user's that no group or other
 can write to), and refuses with `PRE_STEP_REFUSED` (73), naming the keys that differ and never a value, when they are
 not equal key by key, when either is not well formed, or when the federation has no record, an unreadable one, or no
-root named. Whether or not one is expected, a step that has the federation's record copies it, as validated (its
-canonical text: the bytes `up` wrote), into `out/study-state/render-identity.json` once the dispatcher has ended,
-before the post-run script and the archive, so
-the archive carries them; a federation whose `up` wrote none (before O74, or a layout with no platform template) and a
-plan with no expectation run as they did, and archive none. The record is what `up` wrote: a `platform.toml` edited
-by hand afterwards is not seen, and a line edited to drop the two words runs unchecked.
+root named. Whether or not one is expected, a step that has the federation's record writes it, as validated (its
+canonical text: the bytes `up` wrote), into its `out/study-state/render-identity.<step id>.json` at its start, once a
+resume has restored `out/` and before the dispatcher starts, a file of this step's own (UTC time and four random
+bytes), so a snapshot, a step killed mid-shard, the archive and a post-run script all carry it, and a resumed shard
+keeps the identity each of its steps ran under; a step that cannot write it does not start. A federation whose `up`
+wrote none (before O74, or a layout with no platform template) and a plan with no expectation run as they did, and
+write none. A dispatcher that leaves nothing but the record leaves no `out/` to archive. The record
+is what `up` wrote: a `platform.toml` edited by hand afterwards is not seen, and a line edited to drop the two words
+runs unchecked.
 
 **The node's tmpfs is the node's, not the job's.** Each step's directory there (`expcore-shard-<label>.<random>`)
 records its step (`step.json`: its pid and start time, its shard, its federation's root, its results directory, the
@@ -1566,21 +1569,25 @@ def check_render_identity(args: argparse.Namespace) -> bytes | None:
     return canonical_render_identity(actual)
 
 
-def note_render_identity(out: Path, record: bytes, label: str) -> None:
+def note_render_identity(out: Path, record: bytes, step_id: str) -> None:
     """Put the federation's render identity, the text `check_render_identity` gave, into the step's out/ as
-    `study-state/render-identity.json` (mode 0600, no link followed), so the archive carries it. A failure is said and
-    never fatal: the results are archived all the same."""
+    `study-state/render-identity.<step_id>.json` (mode 0600, made new, no link followed): a file of this step's own, so
+    a resumed shard keeps the identity each of its steps ran under. `out` need not exist yet. `ShardsError` when it
+    cannot be written: a step that cannot carry the proof of its render does not start."""
     try:
         folder = out / STUDY_STATE
-        folder.mkdir(exist_ok=True)
+        folder.mkdir(parents=True, exist_ok=True)
         if folder.is_symlink() or not folder.is_dir():
             raise OSError(errno.ENOTDIR, "not a directory")
-        descriptor = os.open(folder / RENDER_IDENTITY, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        descriptor = os.open(folder / f"render-identity.{step_id}.json", flags, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(record)
     except OSError as error:
-        print(f"shards: ERROR: shard {label}'s render identity could not be written into out/{STUDY_STATE}/ "
-              f"({type(error).__name__}); its archive will not carry it", file=sys.stderr)  # fmt: skip
+        raise ShardsError(
+            f"the federation's render identity could not be written into out/{STUDY_STATE}/ ({type(error).__name__}): "
+            "a step that cannot carry it does not start"
+        ) from None
 
 
 def step(
@@ -1595,7 +1602,8 @@ def step(
     end, into `<results>/<label>/snapshots/`. Its first acts are the check of the federation's render identity against
     the one the line expects (`check_render_identity`) and then the study's pre-step guard, when its line declares one
     (`start_hooks`): nothing is made, removed or read before them, and `PRE_STEP_REFUSED` ends a step they refuse. The
-    federation's render identity is copied into `out/study-state/` once the dispatcher has ended. A
+    federation's render identity is written into `out/study-state/` before the dispatcher starts, after a resume has
+    restored its `out/`, in a file of this step's own (`note_render_identity`). A
     declared post-run script runs after the dispatcher exits 0 and before the archive (`run_post_run`): a step whose
     script does not pass archives its results marked not final and ends with `POST_RUN_FAILED`."""
     try:
@@ -1656,6 +1664,8 @@ def step(
             (copy / "out" / NOT_FINAL).unlink(
                 missing_ok=True
             )  # an archive not final is resumed; this step decides afresh
+        if identity is not None:  # the proof of the render is in out/ from the start: in every snapshot, and a kill's
+            note_render_identity(copy / "out", identity, f"{_stamp()}-{secrets.token_hex(4)}")
         for name in ("home", "tmp", *(f"home/{sub}" for sub in HOME_DIRS)):
             (work / name).mkdir(mode=0o700)
         env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
@@ -1683,11 +1693,9 @@ def step(
             live.clear()  # the dispatcher has exited: the last snapshot reads a private copy of the store
             snapshots.stop(out)
         settle_quietly(out)
-        if not out.is_dir():
+        if not out.is_dir() or {entry.name for entry in out.iterdir()} <= {STUDY_STATE}:  # the record alone is none
             print(f"shards: shard {args.label} left no out/ to archive (exit status {status})", file=sys.stderr)
             return status
-        if identity is not None:  # before the post-run script and the archive, so both see the out/ that is archived
-            note_render_identity(out, identity, args.label)
         post = None
         if post_hook is not None:  # the dispatcher has exited and the federation is up: the study's own check
             try:

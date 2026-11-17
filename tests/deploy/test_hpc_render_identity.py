@@ -256,7 +256,7 @@ def federation_root(tmp_path: Path, record: dict | str | None = None, name: str 
 
 
 def step_args(tmp_path: Path, expected: dict | str | None = None, *, path: str | None = EXPECTED,
-              digest: str | None = None, **more):  # fmt: skip
+              digest: str | None = None, resume: bool = False, **more):  # fmt: skip
     """The step's arguments as its generated line gives them: the expected record's path in the study and its SHA-256
     as the plan hashed it (`digest` to say another); `expected=None` with `path=None` declares none."""
     study = make_study(tmp_path, expected)
@@ -265,33 +265,37 @@ def step_args(tmp_path: Path, expected: dict | str | None = None, *, path: str |
         hashed = digest or (sha((study / path).read_bytes()) if (study / path).is_file() else sha(""))
         declared = {"expect_render_identity": path, "expect_render_identity_sha256": hashed}
     return argparse.Namespace(study=study, index=1, count=2, label="fed-a", tmpfs=tmp_path / "tmpfs",
-                              results=tmp_path / "results", core_src=tmp_path, resume=False, archive_left=False,
+                              results=tmp_path / "results", core_src=tmp_path, resume=resume, archive_left=False,
                               snapshot_every=3600.0, **declared, **more)  # fmt: skip
 
 
-def dispatcher(status: int = 0):
+def dispatcher(status: int = 0, *, makes_out: bool = True):
+    """A stand-in dispatcher; what `out/study-state/` held when it started goes into `seen["at_start"]`."""
     seen = {}
 
     def run(argv, env, cwd):
-        seen.update(argv=list(argv))
         out = Path(argv[argv.index("run") + 1]) / "out"
-        (out / "runs").mkdir(parents=True, exist_ok=True)
-        (out / "campaign.lock").write_text("")
+        held = {p.name: p.read_bytes() for p in (out / STUDY_STATE).glob("render-identity.*.json")}
+        seen.update(argv=list(argv), at_start=held)
+        if makes_out:
+            (out / "runs").mkdir(parents=True, exist_ok=True)
+            (out / "campaign.lock").write_text("")
         return status
 
     return run, seen
 
 
-def run_step(shards, args, root: Path | None, monkeypatch):
+def run_step(shards, args, root: Path | None, monkeypatch, **dispatching):
     """The step over the federation `root` (its EXPCORE_FED_ROOT; unset when None); status, the dispatcher's calls and
-    the core checks made."""
+    the core checks made. `dispatching` is for the stand-in dispatcher (`dispatcher`); `snapshots` goes to the step."""
     if root is None:
         monkeypatch.delenv("EXPCORE_FED_ROOT", raising=False)
     else:
         monkeypatch.setenv("EXPCORE_FED_ROOT", str(root))
-    run, seen = dispatcher()
+    snapshots = dispatching.pop("snapshots", None)
+    run, seen = dispatcher(**dispatching)
     checks = []
-    code = shards.step(args, runner=run, core_found=lambda path: checks.append(path) or True)
+    code = shards.step(args, runner=run, core_found=lambda path: checks.append(path) or True, snapshots=snapshots)
     return code, seen, checks
 
 
@@ -303,11 +307,24 @@ def nothing_made(tmp_path: Path, seen: dict, checks: list) -> None:
     assert not list((tmp_path / "results").iterdir())
 
 
-def archived(tmp_path: Path, name: str = f"out/{STUDY_STATE}/{FILE}") -> bytes | None:
+RECORD_NAME = re.compile(rf"out/{STUDY_STATE}/render-identity\.[0-9]{{8}}T[0-9]{{6}}Z-[0-9a-f]{{8}}\.json")
+
+
+def archived_records(tmp_path: Path) -> dict[str, bytes]:
+    """Every record the shard's archive carries under out/study-state/, by its name in the archive."""
     with tarfile.open(tmp_path / "results" / "fed-a.out.tar") as tar:
-        if name not in tar.getnames():
-            return None
-        return tar.extractfile(name).read()
+        names = tar.getnames()
+        assert not [
+            n for n in names if STUDY_STATE in n and not (RECORD_NAME.fullmatch(n) or n == f"out/{STUDY_STATE}")
+        ]
+        return {n: tar.extractfile(n).read() for n in names if RECORD_NAME.fullmatch(n)}
+
+
+def archived(tmp_path: Path) -> bytes | None:
+    """The one record of a shard of one step, or None."""
+    found = archived_records(tmp_path)
+    assert len(found) <= 1
+    return next(iter(found.values()), None)
 
 
 def test_o74_a_step_expecting_the_federations_own_record_runs_and_its_archive_carries_the_record(
@@ -371,6 +388,80 @@ def test_o74_a_step_with_the_record_but_no_expectation_runs_and_archives_it(shar
     assert archived(tmp_path) == (root / FILE).read_bytes()
 
 
+def test_o74_the_record_is_in_out_before_the_dispatcher_starts_and_before_the_snapshots_do(
+    shards, tmp_path, monkeypatch
+):
+    """O74: a step writes the record into `out/study-state/` after the check and before the dispatcher, so a step killed
+    mid-shard carries it, and before the snapshots start, which copy each file of `out/`; the file is the step's own,
+    0600, and the canonical text of the record."""
+    root = federation_root(tmp_path, identity())
+    snapped = []
+    snapshots = SimpleNamespace(
+        start=lambda out: snapped.append(sorted(p.name for p in (out / STUDY_STATE).iterdir())), stop=lambda out: None
+    )
+    code, seen, _ = run_step(shards, step_args(tmp_path, identity()), root, monkeypatch, snapshots=snapshots)
+    assert code == 0
+    assert list(seen["at_start"].values()) == [canonical(identity()).encode()]
+    assert snapped == [list(seen["at_start"])]
+    assert RECORD_NAME.fullmatch(f"out/{STUDY_STATE}/{next(iter(seen['at_start']))}")
+
+
+def test_o74_a_resumed_shard_keeps_the_record_of_every_step_each_under_its_own_name(shards, tmp_path, monkeypatch):
+    """O74: a resume restores the earlier step's `out/` (with its record) and adds its own, under a name of its own:
+    the archive holds both, the first one's unchanged, whatever federation the second ran against."""
+    first = federation_root(tmp_path, identity(), name="first")
+    assert run_step(shards, step_args(tmp_path, path=None), first, monkeypatch)[0] == 0
+    before = archived_records(tmp_path)
+    second = federation_root(tmp_path, identity(template_sha256=sha("another template")), name="second")
+    code, seen, _ = run_step(shards, step_args(tmp_path, path=None, resume=True), second, monkeypatch)
+    assert code == 0
+    assert len(seen["at_start"]) == 2  # the restored one is there when the dispatcher starts, beside the new
+    after = archived_records(tmp_path)
+    assert len(after) == 2
+    assert {name: after[name] for name in before} == before
+    second_text = canonical(identity(template_sha256=sha("another template"))).encode()
+    assert sorted(after.values()) == sorted([canonical(identity()).encode(), second_text])
+
+
+def test_o74_a_record_is_never_written_over_another_and_a_step_that_cannot_write_it_does_not_start(
+    shards, tmp_path, monkeypatch
+):
+    """O74: the step's file is made new (`O_EXCL`), in a directory that is no link: a name taken, or a link in place of
+    the directory, refuses the write; and a step whose write fails makes no dispatcher run and leaves nothing."""
+    out = tmp_path / "out"
+    shards.note_render_identity(out, b"one\n", "an-id")
+    with pytest.raises(shards.ShardsError, match="does not start"):
+        shards.note_render_identity(out, b"two\n", "an-id")
+    assert (out / STUDY_STATE / "render-identity.an-id.json").read_bytes() == b"one\n"
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / STUDY_STATE).symlink_to(tmp_path)
+    with pytest.raises(shards.ShardsError, match="does not start"):
+        shards.note_render_identity(linked, b"x\n", "an-id")
+    assert not list(tmp_path.glob("render-identity.*"))
+    root = federation_root(tmp_path, identity())
+
+    def failing(*_):
+        raise shards.ShardsError("the federation's render identity could not be written (OSError): does not start")
+
+    monkeypatch.setattr(shards, "note_render_identity", failing)
+    with pytest.raises(shards.ShardsError):
+        run_step(shards, step_args(tmp_path / "step", identity()), root, monkeypatch)
+    assert not list((tmp_path / "step" / "tmpfs").iterdir())
+    assert not list((tmp_path / "step" / "results").glob("*.out.*"))
+
+
+def test_o74_a_dispatcher_that_leaves_nothing_but_the_record_leaves_no_out_to_archive(shards, tmp_path, monkeypatch):
+    """O74: the record is no `out/`: a dispatcher that made nothing (it failed at its start) ends the step with its
+    status and no archive, so a fresh start is not refused as a shard that has results."""
+    root = federation_root(tmp_path, identity())
+    code, seen, _ = run_step(shards, step_args(tmp_path, identity()), root, monkeypatch, status=3, makes_out=False)
+    assert code == 3
+    assert len(seen["at_start"]) == 1
+    assert not list((tmp_path / "results").glob("*.out.*"))
+    assert not list((tmp_path / "tmpfs").iterdir())
+
+
 def test_o74_a_step_with_no_expectation_and_no_record_runs_as_it_did_and_archives_none(shards, tmp_path, monkeypatch):
     """O74: a federation `up` rendered before the record existed (or one that renders no platform file) is run as
     before: nothing is refused and the archive has no out/study-state/."""
@@ -383,9 +474,11 @@ def test_o74_a_step_with_no_expectation_and_no_record_runs_as_it_did_and_archive
 
 
 def test_o74_the_record_is_in_out_when_the_post_run_script_runs(shards, tmp_path, monkeypatch):
-    """O74: the record is copied once the dispatcher has ended, before the post-run script and the archive: a script
-    that reads it from `out/study-state/` passes."""
-    post = f"import pathlib, sys\npathlib.Path(sys.argv[2], '{STUDY_STATE}', '{FILE}').read_text()\n"
+    """O74: the record is in `out/study-state/` when the post-run script runs: a script that reads it there passes."""
+    post = (
+        "import pathlib, sys\n"
+        f"next(pathlib.Path(sys.argv[2], '{STUDY_STATE}').glob('render-identity.*.json')).read_text()\n"
+    )
     root = federation_root(tmp_path, identity())
     args = step_args(tmp_path, identity(), post_run="post.py", post_run_sha256=sha(post), post_run_timeout=20.0)
     (args.study / "post.py").write_text(post)
@@ -681,8 +774,8 @@ def test_o74_the_step_s_own_copy_of_the_records_names_is_the_driver_s(hpc, shard
 
 
 def test_o74_collect_accepts_a_shard_whose_out_holds_the_record_in_study_state(shards, tmp_path):
-    """O74: `collect` unpacks an out/ that holds `study-state/render-identity.json`, with its lock, read-only, and
-    leaves the record in it for whoever reads the shard's archive."""
+    """O74: `collect` unpacks an out/ that holds a step's `study-state/render-identity.<step id>.json`, with its lock,
+    read-only, and leaves the record in it for whoever reads the shard's archive."""
     results = tmp_path / "results"
     results.mkdir()
     for index, label in ((1, "fed-a"), (2, "fed-b")):
@@ -690,10 +783,11 @@ def test_o74_collect_accepts_a_shard_whose_out_holds_the_record_in_study_state(s
         (out / "runs").mkdir(parents=True)
         (out / "runs" / "r.json").write_text("{}")
         (out / "campaign.lock").write_text("")
-        put(out / STUDY_STATE / FILE, identity())
+        put(out / STUDY_STATE / "render-identity.20261117T010203Z-0a1b2c3d.json", identity())
         shards.archive(out, results, {"index": index, "count": 2, "label": label}, 0)
     plan = shards.load_plan(manifest(tmp_path / "m"))
     plan = replace(plan, results=results)
     outs = shards.collect(plan, tmp_path / "merge")
-    assert [(o / STUDY_STATE / FILE).read_bytes() for o in outs] == [canonical(identity()).encode()] * 2
-    assert not os.access(outs[0] / STUDY_STATE / FILE, os.W_OK)
+    kept = [next((o / STUDY_STATE).glob("render-identity.*.json")) for o in outs]
+    assert [path.read_bytes() for path in kept] == [canonical(identity()).encode()] * 2
+    assert not os.access(kept[0], os.W_OK)
