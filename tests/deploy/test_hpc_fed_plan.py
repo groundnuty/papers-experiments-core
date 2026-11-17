@@ -391,17 +391,22 @@ def test_a_core_without_the_hpc_backend_takes_the_restores_rule_with_the_hpc_set
     hpc, tmp_path, make_ca, monkeypatch
 ):
     """O57: a core whose loader cannot read the HPC [faults] (no backend "hpc" yet) still gets a margin: the restore's
-    rule over the keys it knows, with the HPC settle time (stop bound + 60 s) and poll (10 s). Such a core's settings
-    know none of the HPC backend's keys (O58's `backend`, `stop_bound_s` and `relay_wait_s`), so they are left out
+    rule over the keys it knows, with the HPC settle time (stop bound + launch wait + 60 s) and poll (10 s), and the
+    relay verb bound `up` declares (300 s, a key every core knows). Such a core's settings know none of the HPC
+    backend's own keys (O58's `backend`, `stop_bound_s`, `relay_wait_s` and `step_launch_wait_s`), so they are left out
     here as that core leaves them out."""
     import tomllib
 
     monkeypatch.setattr(hpc.boot, "has_hpc_backend", lambda: False)
-    monkeypatch.setattr(hpc.boot, "NOT_A_BOUND", hpc.boot.NOT_A_BOUND | {"backend", "stop_bound_s", "relay_wait_s"})
+    monkeypatch.setattr(
+        hpc.boot,
+        "NOT_A_BOUND",
+        hpc.boot.NOT_A_BOUND | {"backend", "stop_bound_s", "relay_wait_s", "step_launch_wait_s"},
+    )
     document = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))
     rule = FaultSettings(
         file=Path("p"), sanctioned=False, journal=Path("j"), compose_file=Path("c"), services={},
-        settle_timeout_s=440.0, poll_s=10.0,
+        settle_timeout_s=440.0, poll_s=10.0, command_timeout_s=300.0,
     )  # fmt: skip
     assert document["tokens"]["margin_s"] == math.ceil(restore_token_margin_s(rule))
 
