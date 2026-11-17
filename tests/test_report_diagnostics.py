@@ -16,6 +16,8 @@ HEADING = "### Instrument start failures"
 STARTED = {"phase": "start", "instrument": "state_inducer", "diagnostic": {"checked": "replicas", "seen": "2 of 3"}}
 UNKEPT = {"phase": "start", "instrument": "state_inducer", "ok": False, "error": "TypeError"}
 WITHHELD_STUB = {"phase": "start", "ok": False, "error": "Withheld", "why": "the executor declared no secrets"}
+NO_TEXT_UNDECLARED = {"phase": "start"}  # a failed start that gave no diagnostic, whose executor declared no secrets
+NO_TEXT_DECLARED = {"phase": "start", "instrument": "state_inducer"}  # the same, from an executor that declared
 
 
 def run(key: str, condition: str) -> dict:
@@ -74,11 +76,14 @@ def test_c40_the_report_counts_the_failed_starts_per_condition_instrument_kind_a
         ]
     )
     section = section_of(render(data))
-    assert "| Condition | Instrument | Kind | State | Attempts | Charged | Withheld | Not kept |" in section
+    assert (
+        "| Condition | Instrument | Kind | State | Attempts | Charged | Shown | Withheld | No diagnostic | Not kept |"
+        in section
+    )
     assert rows(section) == [
-        "| api-none | - | sandbox | infra_fail | 1 | 1 | 0 | 0 |",
-        "| download-write | - | - | - | 0 | 0 | 0 | 0 |",
-        "| mount-read | state_inducer | sandbox | infra_fail | 3 | 2 | 0 | 1 |",
+        "| api-none | - | sandbox | infra_fail | 1 | 1 | 1 | 0 | 0 | 0 |",
+        "| download-write | - | - | - | 0 | 0 | 0 | 0 | 0 | 0 |",
+        "| mount-read | state_inducer | sandbox | infra_fail | 3 | 2 | 2 | 0 | 0 | 1 |",
     ]
 
 
@@ -96,8 +101,8 @@ def test_c40_a_merged_batchs_rows_name_the_shard():
     section = section_of(render(data))
     assert "| Shard | Condition | Instrument |" in section
     assert [r for r in rows(section) if r.startswith(("| 1 |", "| 2 |"))] == [
-        "| 1 | mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 0 |",
-        "| 2 | mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 0 |",
+        "| 1 | mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 1 | 0 | 0 | 0 |",
+        "| 2 | mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 1 | 0 | 0 | 0 |",
     ]
 
 
@@ -120,9 +125,57 @@ def test_c40_a_withheld_diagnostic_is_counted_apart_with_its_reason_and_never_it
         ]
     )
     section = section_of(render(data))
-    assert "| mount-read | - | sandbox | infra_fail | 2 | 1 | 2 | 0 |" in rows(section)
-    assert "| mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 1 |" in rows(section)
+    assert "| mount-read | - | sandbox | infra_fail | 2 | 1 | 0 | 2 | 0 | 0 |" in rows(section)
+    assert "| mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 0 | 0 | 1 |" in rows(section)
     notes = " ".join(section.split())
     assert "declared no secrets" in notes
     assert "declare_secrets" in notes
     assert "local log" in notes
+
+
+def test_c40_a_failed_start_that_gave_no_diagnostic_is_counted_apart_from_a_withheld_one(tmp_path):
+    """C40: an undeclared executor's start that gave no diagnostic has the phase alone as its snapshot: nothing was
+    withheld from it, since nothing was given, and nothing failed to be kept, so it is counted in its own column and
+    the notes say so; a withheld diagnostic and an unkept one stay where they were."""
+    data = export(
+        attempt_diagnostics=[
+            kept(1, "mount-read", NO_TEXT_UNDECLARED),
+            kept(2, "mount-read", WITHHELD_STUB),
+            kept(3, "mount-read", UNKEPT),
+        ]
+    )
+    section = section_of(render(data))
+    assert "| mount-read | - | sandbox | infra_fail | 2 | 2 | 0 | 1 | 1 | 0 |" in rows(section)
+    assert "| mount-read | state_inducer | sandbox | infra_fail | 1 | 1 | 0 | 0 | 0 | 1 |" in rows(section)
+    notes = " ".join(section.split())
+    assert "No diagnostic counts" in notes
+    assert "Attempts is the sum of Shown, Withheld, No diagnostic and Not kept" in notes
+
+
+def cells(row: str) -> list[str]:
+    return [cell.strip() for cell in row.strip("|").split("|")]
+
+
+def test_c40_the_four_categories_sum_to_the_failed_starts_the_section_shows():
+    """C40: over a mix of declared and undeclared executors (a diagnostic shown, a start with none, a withheld one, an
+    unkept one, an error from elsewhere that carried one), every row's Shown, Withheld, No diagnostic and Not kept add
+    up to its Attempts, and the table's Attempts add up to the failed starts of the export: none counted twice or in
+    none, and each count is what the mix holds."""
+    mix = [
+        kept(1, "mount-read", STARTED),  # declared, a diagnostic: shown
+        kept(2, "mount-read", NO_TEXT_DECLARED),  # declared, none given
+        kept(3, "mount-read", NO_TEXT_UNDECLARED),  # undeclared, none given
+        kept(4, "mount-read", WITHHELD_STUB),  # undeclared, a diagnostic: withheld
+        kept(5, "mount-read", UNKEPT),  # declared, could not be kept
+        kept(6, "api-none", {"diagnostic": {"seen": "x"}}),  # an error from elsewhere: shown, no instrument
+        kept(7, "api-none", NO_TEXT_UNDECLARED, shard=2),
+        kept(8, "api-none", WITHHELD_STUB, shard=2),
+    ]
+    section = section_of(render(export(attempt_diagnostics=mix)))
+    table = [cells(row) for row in rows(section) if not row.startswith("| Shard")]
+    header = cells(next(line for line in section.splitlines() if line.startswith("| Shard")))
+    column = {name: header.index(name) for name in ("Attempts", "Shown", "Withheld", "No diagnostic", "Not kept")}
+    for row in table:
+        assert int(row[column["Attempts"]]) == sum(int(row[column[name]]) for name in list(column)[1:]), row
+    total = {name: sum(int(row[index]) for row in table) for name, index in column.items()}
+    assert total == {"Attempts": len(mix), "Shown": 2, "Withheld": 2, "No diagnostic": 3, "Not kept": 1}

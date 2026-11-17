@@ -52,8 +52,9 @@ are the same text: no clock, no path and no random number enters it.
   measured plus a request in flight, or at their bound. A report of an export without it is the text it was before.
 - A campaign whose attempts kept a diagnostic snapshot (its export has `attempt_diagnostics`, C40) gets a section
   "Instrument start failures" after that (`expcore.report_diagnostics`): per condition, instrument, kind and state, the
-  attempts, how many were charged and how many snapshots could not be kept, with a row of zeros for a condition that
-  had none. A report of an export without it is the text it was.
+  attempts, how many were charged and, in four columns that add up to the attempts, how many diagnostics were shown,
+  withheld, never given or could not be kept, with a row of zeros for a condition that had none. A report of an export
+  without it is the text it was.
 - A batch merged from shards (its export has `shards`, and each run entry its `shard`) gets one more section after the
   conditions (`expcore.report_shards`): per shard, with its label and start, the runs of each condition by how they
   ended with their rates, the infrastructure attempts by kind, and the wall time, turn latency and reset time, each
