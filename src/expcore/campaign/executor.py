@@ -31,6 +31,7 @@ from expcore.prompt.templates import RenderedPrompt
 from expcore.records.build import DefectSink, PromptText, RunIdentity, record_attempt, redactor_for
 from expcore.records.injections import injected_targets
 from expcore.records.record import RunRecord
+from expcore.records.redact import Redactor
 from expcore.records.schema import first_turn_rule, outcome_from_entry, target_rule, unread_replies
 
 
@@ -156,11 +157,21 @@ class RunRequest:
         secret or one name, not its characters.
 
         A secret too short to redact (a value, or the value of a variable) is refused here with a `ConfigError` that
-        names the variable and never shows the value, as `record_attempt` refuses it, and nothing of this call is kept.
+        names the variable and never shows the value, as `record_attempt` refuses it: nothing of this call is kept, and
+        the attempt's redaction context is left one that cannot be built, so what it would redact (the traceback of
+        the error that escapes the executor, a diagnostic) is withheld and not written with the secret in it.
         """
         given, names = _values(secrets), _values(secret_env)
-        shown = os.environ if environ is None else environ
-        redactor_for(self.backend, environ=shown, secrets=given, secret_env=names, models=self.models)  # refuses short
+        shown = dict(os.environ if environ is None else environ)  # a copy: the caller may change its own later
+
+        def checked() -> Redactor:
+            return redactor_for(self.backend, environ=shown, secrets=given, secret_env=names, models=self.models)
+
+        if self.defect_log is not None:
+            # as `record_attempt` does: the redactor goes in before it is checked, so a secret too short to redact
+            # leaves the log one that cannot be built, which withholds the traceback of the ConfigError and not writes it
+            self.defect_log.redact_with(checked)
+        checked()  # refuses a secret too short to redact, naming the variable
         read = tuple(shown[name] for name in names if shown.get(name, "").strip())
         held = tuple(dict.fromkeys([*self.declared.secrets, *given, *read]))
         self.declared.secrets = held
