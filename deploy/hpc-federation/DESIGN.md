@@ -160,6 +160,7 @@ under one record. One federation's job failing ends one shard's step, never anot
   step carries into the study: it moves a shard only to a federation whose `platform.toml` leaves `[placement]
   reset_shortcut` off (the default), under which every reset takes the full reads; one that turns it on is refused.
   It cannot see a study's own request for one full reset (O51), so a study that turns the shortcut on moves no shard.
+- **The archives are copied back before `down`.** The shards' archives are on the shared filesystem the site's scratch policy cleans, and `down` ends the federation: the operator pulls the archives to their own host after `collect` and checks them with `shards.py verify-copy` before `down` (section 5, "Before `down`").
 - **Not built:** a fleet's `down` of a failed federation on its own (the operator decides when a failed `up`'s job
   goes), a watch of each job's walltime, and a fleet across accounts (the maximum is one fleet's, not the account's:
   two fleets of one account must share it by hand).
@@ -591,6 +592,8 @@ removed while held would let the next `up` or `down` lock another file of the sa
    the removal. A root a removal left unmarked (empty, or of nothing but silly files, with its lifecycle lock beside
    it) is finished by a second `down` too, by `rmdir` alone; any other unmarked root is refused. The service logs stay
    in the log directory (no secret: the bundle redacts them), named in the run's output.
+
+**Before `down`: the copy back, a required step of the operator's, not of `down`'s.** Nothing durable may live only on scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all of scratch after 20 days with no job submitted. The cluster cannot push to the operator's host, so after `shards.py collect` the operator pulls the results directory (rsync or scp, from their host) and runs `shards.py verify-copy MANIFEST LOCAL_DIR --manifest-sha256 HASH` there. `collect` writes `archives.sha256.json` beside the archives from the private copies it verified (the plan's id, and each archive's relative name, size and SHA-256) and prints the file's own hash on stderr; the hash must come from that output, never from the pulled files, or a manifest damaged or swapped in the pull would vouch for itself. `verify-copy` is standard library only and is dispatched before the plan is loaded, so it runs on a host without the core (a test runs it under `python -I -S`). `down` does not see the operator's host and does not check that this was done: the order is the operator's rule, and the README states it as a required step.
 
 A job already ended (its `--time`, a failure) skips 2 and 3: Slurm stopped its steps, the bundle's cleanup removed
 what its time allowed, and the next job of ours on a node sweeps what is left (`sweep_leftovers`). `down` says which

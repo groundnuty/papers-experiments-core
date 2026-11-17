@@ -5,6 +5,8 @@
     <python> -I -B deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
         --results DIR --core-src DIR --job J --step-name S  # inside the step on the sandbox node; `lines` writes it
     <python> -I -B deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
+    python3 -I -B deploy/hpc-federation/shards.py verify-copy ARCHIVES_MANIFEST LOCAL_DIR --manifest-sha256 HASH
+                                                        # on the operator's host, after the pull, before `down`
     <python> -I -B deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
     # a step's line may end in: --pre-step REL --pre-step-sha256 HEX --pre-step-timeout S  (`lines` writes them)
     #   and: --expect-render-identity REL --expect-render-identity-sha256 HEX  (the render the plan expects)
@@ -145,6 +147,20 @@ copy of every shard's archive against its manifest and the manifest against the 
 -B -m expcore merge`. A shard whose archive has no `campaign.lock`, does not verify, or is missing is refused, naming
 its label: the merge would refuse it too.
 
+**The copy back (required, after `collect` and before `down`).** Nothing durable may live only on the cluster's
+scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all
+of scratch after 20 days with no job submitted. The cluster cannot push to the operator's host, so the operator PULLS
+the archives (rsync or scp, run from their host). `collect` writes `<results>/archives.sha256.json` beside them from the
+private copies it verified (`expcore-hpc-archives/1`: a `plan_id`, which is the SHA-256 of the plan's study and results
+directories and each shard's index, count, label and root, and each archive's name, size and SHA-256) and prints that
+file's own SHA-256 on stderr. `verify-copy` takes the pulled manifest, the local directory and that hash
+(`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1 naming
+each archive that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only, never
+a path), 2 for a manifest it cannot use, and 0 when every archive matches. An archive of the directory that the manifest
+does not name is a warning. It uses the standard library alone (Python 3.11 or later, for `tomllib`), so it runs on a
+host without the core; it checks the archives only, which are what the merge needs (their `<label>.out.json` files come
+along in the same pull but are not checked).
+
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
 own, and `EXPCORE_FED_ROOT` is how it finds that root. Outage runs on HPC depend on that relay.
@@ -259,6 +275,8 @@ OWNER_POST = ".step.post.json"  # the same with the post-run script's record, wr
 RUNNING, ARCHIVING = "running", "archiving"  # the step's phase: its dispatcher runs; it ended and out/ is whole
 ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not be archived, so it is kept
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
+ARCHIVES_FORMAT = "expcore-hpc-archives/1"  # the copy back's manifest: what `collect` read, for `verify-copy`
+ARCHIVES_MANIFEST = "archives.sha256.json"  # in <results>, beside the archives
 RUNNING_MARK, RUNNING_FORMAT = "running.json", "expcore-hpc-shard-running/1"  # <results>/<label>/: a step runs it
 # The federation's render identity (O74): the record `hpcfed.py up` writes in its root (hpcidentity.py: hashes and a
 # version, no address, id, path or secret). This file runs alone on a node, so it keeps its own copy of the names; a
@@ -802,6 +820,39 @@ def _read_only(root: Path) -> None:
     root.chmod(stat.S_IMODE(root.stat().st_mode) & ~0o222)
 
 
+def plan_id(plan: Plan) -> str:
+    """The SHA-256 of the plan as its manifest declares it: the study and results directories, and each shard's index,
+    count, label and federation root, in order. It names the plan, not the campaign: a shard's own manifest carries only
+    an index, a count and a label, and the campaign's fingerprint travels in each shard's export, which the merge
+    compares (C36). Labels alone would not tell plans apart, since a fleet's shards are always `shard-1` to `shard-N`.
+    It is a hash, so no path is in the manifest, and every `collect` of one plan gives the same."""
+    declared = {
+        "study": str(plan.study),
+        "results": str(plan.results),
+        "shards": [[s.index, s.count, s.label, str(s.root)] for s in plan.shards],
+    }
+    return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def write_archives_manifest(plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]]) -> Path:
+    """`<results>/archives.sha256.json`, written whole beside the archives `verified` read (`found`, in the plan's
+    order): the plan's id and each archive's name, size and SHA-256. The size is the private copy's, whose bytes were
+    hashed, never a step's claim; `verified` raised unless the SHA-256 of those bytes is the manifest's, so that value
+    is theirs. Names are relative and there is no timestamp: collecting one plan twice writes the same bytes."""
+    entries = [
+        {"name": f"{shard.label}.out.tar", "bytes": copy.stat().st_size, "sha256": manifest["sha256"]}
+        for shard, (copy, manifest) in zip(plan.shards, found, strict=True)
+    ]
+    document = {"format": ARCHIVES_FORMAT, "plan_id": plan_id(plan), "archives": entries}
+    payload = (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
+    path = plan.results / ARCHIVES_MANIFEST
+    try:
+        _write_whole(path, lambda draft: draft.write_bytes(payload))
+    except OSError as error:
+        raise ShardsError(f"the archives manifest could not be written ({type(error).__name__})") from None
+    return path
+
+
 def final_problem(shard: Shard, manifest: Mapping[str, Any], wanted: str | None) -> str | None:
     """Why a verified shard's results are not to be merged, or None: its manifest says they are not final (the
     study's post-run script did not pass), or, with `wanted` (the plan's SHA-256 of the post-run script), does not say
@@ -821,7 +872,9 @@ def final_problem(shard: Shard, manifest: Mapping[str, Any], wanted: str | None)
 
 def collect(plan: Plan, into: Path) -> list[Path]:
     """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails, and
-    when any is not final (`final_problem`), naming it."""
+    when any is not final (`final_problem`), naming it. Once every archive has verified and is final, and before
+    anything is unpacked, `archives.sha256.json` is written beside them for the copy back (`verify-copy`): a refused
+    collect writes none."""
     if into.exists() and any(into.iterdir()):
         raise ShardsError("the directory to collect into must be new or empty")
     wanted = None
@@ -840,6 +893,7 @@ def collect(plan: Plan, into: Path) -> list[Path]:
             found.append(verified(plan.results, shard, into))
             if problem := final_problem(shard, found[-1][1], wanted):
                 raise ShardsError(problem)
+        write_archives_manifest(plan, found)
     except ShardsError:  # refused whole: nothing of it is left behind
         for leftover in into.glob(".*.out.tar"):
             leftover.unlink()
@@ -863,6 +917,109 @@ def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
     """`python -I -B -m expcore merge`: isolated, no bytecode written: no module of the directory it is run from is
     imported."""
     return [plan.python, "-I", "-B", "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
+
+
+# ------------------------------------------------------------------------------------------------ the copy back
+# Run on the operator's host, possibly without the core: nothing here may import it (a test runs it under `-I -S`).
+@dataclass(frozen=True)
+class CopyCheck:
+    checked: int  # the archives the manifest names
+    problems: tuple[str, ...]  # "<name>: <what is wrong>" for each archive missing or differing
+    extras: tuple[str, ...]  # `*.out.tar` files of the directory that the manifest does not name
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _archive_entries(document: object) -> list[tuple[str, int, str]]:
+    """The manifest's archives as (name, bytes, sha256), shown well formed; `ShardsError` otherwise. A name that is not
+    a plain file name is refused before any file is read, and a bad name is never echoed back."""
+    if not isinstance(document, Mapping) or document.get("format") != ARCHIVES_FORMAT:
+        raise ShardsError(f"the manifest is not {ARCHIVES_FORMAT}")
+    archives = document.get("archives")
+    if not isinstance(archives, list) or not archives:
+        raise ShardsError("the manifest names no archive, so it would verify nothing")
+    entries: list[tuple[str, int, str]] = []
+    for n, item in enumerate(archives, 1):
+        entry = item if isinstance(item, Mapping) else {}
+        name, size, digest = entry.get("name"), entry.get("bytes"), entry.get("sha256")
+        if not isinstance(name, str) or name in ("", ".", "..") or any(c in name for c in "/\\\0"):
+            raise ShardsError(f"the manifest's archive {n} has no plain file name")
+        if any(name == seen for seen, _, _ in entries):
+            raise ShardsError(f"the manifest names {name} twice")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ShardsError(f"the manifest gives {name} no size in bytes")
+        if not _is_sha256(digest):
+            raise ShardsError(f"the manifest gives {name} no SHA-256")
+        entries.append((name, size, digest))
+    return entries
+
+
+def _copy_problem(path: Path, size: int, digest: str) -> str | None:
+    """What is wrong with one pulled archive, or None. Only a regular file is one: a link or a directory of the name is
+    never followed, and a pipe never read."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+    if not stat.S_ISREG(info.st_mode):
+        return "not a regular file"
+    if info.st_size != size:
+        return "size differs"
+    try:
+        return None if _sha256(path) == digest else "SHA-256 differs"
+    except OSError:
+        return "unreadable"
+
+
+def verify_copy(manifest: Path, local: Path, manifest_sha256: str) -> CopyCheck:
+    """Whether `local` holds every archive `manifest` names, with its size and SHA-256, and whether `manifest` is the
+    file whose hash `collect` printed (`manifest_sha256`); `ShardsError` when it is not, or cannot be used, before any
+    archive is read. Every archive is checked, so one run names them all."""
+    expected = manifest_sha256.lower()
+    if not _is_sha256(expected):
+        raise ShardsError("the hash given for the manifest is not a SHA-256 (64 hex digits)")
+    try:
+        raw = manifest.read_bytes()
+    except OSError as error:
+        raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ShardsError("the manifest's SHA-256 is not the one given: this is not the manifest collect printed")
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        raise ShardsError("the manifest is not JSON") from None
+    entries = _archive_entries(document)
+    if not local.is_dir():
+        raise ShardsError("the local directory does not exist")
+    problems = [
+        f"{name}: {why}" for name, size, digest in entries if (why := _copy_problem(local / name, size, digest))
+    ]
+    named = {name for name, _, _ in entries}
+    try:
+        extras = sorted(p.name for p in local.iterdir() if p.name.endswith(".out.tar") and p.name not in named)
+    except OSError as error:
+        raise ShardsError(f"the local directory could not be listed ({type(error).__name__})") from None
+    return CopyCheck(len(entries), tuple(problems), tuple(extras))
+
+
+def run_verify_copy(args: argparse.Namespace) -> int:
+    """0 when every archive matches (warnings for extras), 1 naming each that does not; a manifest that cannot be used
+    is `ShardsError`, which `main` reports as 2."""
+    check = verify_copy(args.manifest, args.local_dir, args.manifest_sha256)
+    for name in check.extras:
+        print(f"shards: verify-copy: WARNING: {name} is not named by the manifest", file=sys.stderr)
+    if check.problems:
+        print(f"shards: verify-copy: FAILED: {len(check.problems)} of {check.checked} archives", file=sys.stderr)
+        for problem in check.problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+    noun = "archive" if check.checked == 1 else "archives"
+    print(f"shards: verify-copy: ok: {check.checked} {noun}, each with the size and SHA-256 the manifest names")
+    return 0
 
 
 # ------------------------------------------------------------------------------------------------ the step
@@ -2101,8 +2258,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     again.add_argument("--label", required=True)
     again.add_argument("--job", required=True)
     again.add_argument("--node", required=True)
+    copy = sub.add_parser("verify-copy", help="check the archives pulled to this host against collect's manifest")
+    copy.add_argument("manifest", type=Path, help="the pulled archives.sha256.json")
+    copy.add_argument("local_dir", type=Path, help="the directory the archives were pulled into")
+    copy.add_argument("--manifest-sha256", dest="manifest_sha256", required=True, help="the hash collect printed")
     args = parser.parse_args(argv)
     try:
+        if args.command == "verify-copy":  # before the manifest of the plan: this runs where the core may not be
+            return run_verify_copy(args)
         if args.command == "sweep":
             return sweep(args.tmpfs, args.root, live_fails=args.live_fails)
         if args.command == "resume-line":
@@ -2114,8 +2277,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return archive_left(args) if args.archive_left else step(args)
         plan = load_plan(args.manifest)
         if args.command == "collect":
-            line = merge_argv(plan, collect(plan, args.into))
-            print(shlex.join(line))
+            outs = collect(plan, args.into)
+            line = merge_argv(plan, outs)
+            print(shlex.join(line))  # first, and alone on stdout: callers read it as the merge line
+            manifest_hash = _sha256(plan.results / ARCHIVES_MANIFEST)
+            print(f"shards: archives manifest {ARCHIVES_MANIFEST} sha256 {manifest_hash}", file=sys.stderr)
+            print("shards: pull the archives and run verify-copy with that hash before down (README)", file=sys.stderr)
             return subprocess.run(line, check=False, cwd=args.into).returncode if args.run else 0
         missing = undeclared_data(plan)
         if missing:
