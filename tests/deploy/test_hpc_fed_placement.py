@@ -54,9 +54,19 @@ def first_provider() -> str:
     return pilot_spec().providers[0].name
 
 
-def render(hpc, root: Path, template: str = TEMPLATE) -> tuple[Path, str]:
+@pytest.fixture(scope="module")
+def ca(tmp_path_factory) -> bytes:
+    """A real CA bundle, for a render the platform layer loads (it refuses a file whose `ca_file` is no certificate)."""
+    tls = pytest.importorskip("tls_support")
+    if not tls.HAS_OPENSSL:
+        pytest.skip("no openssl on this host")
+    return tls.make_federation_ca(tmp_path_factory.mktemp("ca")).ca.read_bytes()
+
+
+def render(hpc, root: Path, template: str = TEMPLATE, ca: bytes = PEM.encode()) -> tuple[Path, str]:
     """The pilot-shape platform.toml as `up` writes it from `template` (`hpcboot.write_platform`), over invented ids, in
-    a root holding the files it names; the file's path and the text `write_platform` returned."""
+    a root holding the files it names; the file's path and the text `write_platform` returned. Given a real `ca`, the
+    file loads as a platform."""
     spec = pilot_spec()
     settings = hpc.settings.load_settings(spec.hpc)
     facts = {
@@ -73,7 +83,7 @@ def render(hpc, root: Path, template: str = TEMPLATE) -> tuple[Path, str]:
         (root / name).write_text("an-invented-secret", encoding="utf-8")
         (root / name).chmod(0o600)
     (root / "ca").mkdir()
-    (root / "ca" / "federation-ca.pem").write_text(PEM, encoding="utf-8")
+    (root / "ca" / "federation-ca.pem").write_bytes(ca)
     (root / "fault-journal").mkdir()
     values = {
         **hpc.boot.hpc_values(
@@ -112,27 +122,27 @@ def test_o63_the_table_a_render_writes_is_the_cores_defaults_in_full_and_the_fir
     assert {key: type(value) for key, value in written.items()} == {key: type(v) for key, v in expected.items()}
 
 
-def test_o63_the_loader_reads_the_written_table_as_the_defaults_of_a_file_that_names_only_its_holder(hpc, tmp_path):
+def test_o63_the_loader_reads_the_written_table_as_the_defaults_of_a_file_that_names_only_its_holder(hpc, tmp_path, ca):
     """O63: defaults written out and defaults implied are one setting. The loader keeps its own literal copy of every
     default, so the render's table (from the dataclass), a table of the holder alone (the loader's copy) and the
     dataclass's own defaults must all read as one `PlacementSettings`, and as one record at a resume
     (`reset_settings`)."""
     holder = first_provider()
-    written_file, _ = render(hpc, tmp_path / "written")
-    implied_file, _ = render(hpc, tmp_path / "implied", f'placement = {{ holder = "{holder}" }}\n' + TEMPLATE)
+    written_file, _ = render(hpc, tmp_path / "written", ca=ca)
+    implied_file, _ = render(hpc, tmp_path / "implied", f'placement = {{ holder = "{holder}" }}\n' + TEMPLATE, ca)
     written = load_placement(written_file, load_platform(written_file))
     implied = load_placement(implied_file, load_platform(implied_file))
     assert written.settings == implied.settings == PlacementSettings(holder=holder)
     assert written.reset_settings() == implied.reset_settings()
 
 
-def test_o63_the_platform_fingerprint_is_the_same_with_the_defaults_written_out_or_implied(hpc, tmp_path):
+def test_o63_the_platform_fingerprint_is_the_same_with_the_defaults_written_out_or_implied(hpc, tmp_path, ca):
     """O63: a render that writes the defaults out and one whose template implies them (a table naming the holder
     alone) are one platform: `PlatformConfig.fingerprint()` is equal, so shards of two federations rendered either
     way still merge as one campaign."""
     holder = first_provider()
-    written_file, _ = render(hpc, tmp_path / "written")
-    implied_file, _ = render(hpc, tmp_path / "implied", f'placement = {{ holder = "{holder}" }}\n' + TEMPLATE)
+    written_file, _ = render(hpc, tmp_path / "written", ca=ca)
+    implied_file, _ = render(hpc, tmp_path / "implied", f'placement = {{ holder = "{holder}" }}\n' + TEMPLATE, ca)
     assert load_platform(written_file).fingerprint() == load_platform(implied_file).fingerprint()
 
 
@@ -149,9 +159,15 @@ def test_o63_a_template_that_declares_placement_keeps_its_values_and_gains_no_ot
     assert tomllib.loads(text)["placement"] == declared
     assert text.count("[placement]") == (1 if form == "header" else 0)
     assert path.read_text(encoding="utf-8") == text
+
+
+def test_o63_the_loader_reads_a_declared_table_as_declared_and_every_other_setting_at_its_default(hpc, tmp_path, ca):
+    """O63: what a template declares is what a reader gets: the declared settings, and the core's default for the rest
+    (the loader's own, as for every file that declares a table in part)."""
+    template = 'placement = { holder = "larch", poll_s = 5.0, concurrency = 4 }\n' + TEMPLATE
+    path, _ = render(hpc, tmp_path / "root", template, ca)
     settings = load_placement(path, load_platform(path)).settings
-    assert (settings.holder, settings.poll_s, settings.concurrency) == ("larch", 5.0, 4)
-    assert settings.transfer_timeout_s == CORE_DEFAULTS["transfer_timeout_s"]
+    assert settings == PlacementSettings(holder="larch", poll_s=5.0, concurrency=4)
 
 
 def test_o63_a_template_with_no_provider_is_refused_naming_what_is_missing_and_writes_nothing(hpc, tmp_path):
@@ -211,7 +227,7 @@ def test_o63_a_shard_step_places_the_platform_file_as_it_is_and_the_loader_refus
     root = tmp_path / "fed"
     root.mkdir()
     source = write_platform(root)  # a platform file with no [placement]
-    config = load_platform(source)
+    config = load_platform(source, require_secrets=False)
     monkeypatch.setenv("EXPCORE_FED_ROOT", str(root))
     seen = {}
 
