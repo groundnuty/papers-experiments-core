@@ -11,7 +11,7 @@ ev Z
 rm -f -- "$LOG"
 cd /
 detached "$E/Z/service-step.rc.json" service_step \
-  srun --jobid="$HPC_JOB" --overlap --export=PATH -w "$NODE_Z" -N1 -n1 -c"$SVC_CPUS" --mem="$SVC_MEM" --output="$LOG" \
+  srun --jobid="$HPC_JOB" --overlap --export=PATH --chdir=/ -w "$NODE_Z" -N1 -n1 -c"$SVC_CPUS" --mem="$SVC_MEM" --output="$LOG" \
   bash "$B/zone.sbatch" "$B" "$SH/onezone.tar" "$ZONE_NAME" "$ADDR_P1" "$ADDR_P2" "$ADDR_P3"
 say "zone step launched $(date -u +%T)"
 verdict=0

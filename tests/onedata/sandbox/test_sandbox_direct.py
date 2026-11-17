@@ -85,7 +85,7 @@ def test_o40_a_direct_mount_starts_once_its_check_shows_direct_io_and_records_it
         "forced_direct": "1", "forced_proxy": "0", "size": 8192, "read": 8192, "seconds": 0.05, "held": "100%",
         "storage": 1, "lines": [],
     }  # fmt: skip
-    assert direct.direct.order[:2] == ["probe", "log"]  # then `sidecar_errors` reads it again for the metadata
+    assert direct.direct.order[:2] == ["probe", "log"]  # then `mount_errors` reads it again for the metadata
     text = json.dumps(sbx.metadata(), default=str)
     for value in (*STORAGE_IDS, *direct.storage_paths, CHECK, DIRECT_STORAGE_ROOT):
         assert value not in text

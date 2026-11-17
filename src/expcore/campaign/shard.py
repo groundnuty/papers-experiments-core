@@ -77,6 +77,10 @@ EXPORT_KEY = "shard"
 MERGE_FILE = "merge.json"
 """The file a merge writes at the top of the merged batch, naming its shards (`expcore-merge/1`)."""
 MERGE_SCHEMA = "expcore-merge/1"
+NOT_FINAL_FILE = "NOT-FINAL.json"
+"""A file at the top of a shard's `out/` that says the shard's results are not final: a driver that runs a check on the
+results before it archives them (the HPC shard driver's post-run script, `deploy/hpc-federation/shards.py`, O63)
+writes it when the check did not pass. The merge refuses a shard that holds it."""
 
 _LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _LABEL_WIDE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
@@ -398,6 +402,7 @@ __all__ = [
     "META_SHARD",
     "META_SHARES",
     "META_STARTED",
+    "NOT_FINAL_FILE",
     "RULE",
     "RULES",
     "RULE_BY_MODEL",
