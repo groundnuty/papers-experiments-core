@@ -372,6 +372,16 @@ class FakeSlurm:
     # A command of the login node beyond Slurm's, by its first word (the site's quota command, invented): a test's
     # answer, `(argv, timeout) -> Completed`, which may raise what the real Runner does. Every call is in `calls`.
     tools: dict = field(default_factory=dict)
+    # Launches that fail at launch, as two live ones did (17 Nov 2026): the srun client cannot find the node's address,
+    # Slurm accounts the step CANCELLED with exit 0:116, and the run log is made, empty. `launch_failures` maps a
+    # service's name to one dict per launch of it that fails, in order (`{}` is the live shape); a launch with no
+    # entry left succeeds. Keys of an entry: `log` (what the run log holds, "" by default), `no_log` (no run log at
+    # all), `state` and `exit` (the accounted step's, "CANCELLED" and "0:116"), `no_row` (accounting holds no row),
+    # `row_id` (the id accounting shows, when not the step's), `client` (the client log's text instead), `reason` (the
+    # failure's reason in the client log), `client_id` (the StepId the client log names, when not the step's).
+    launch_failures: dict = field(default_factory=dict)
+    step_rows: dict = field(default_factory=dict)  # job id -> the `JobID|JobName|State|ExitCode` rows sacct prints
+    sacct_steps: Callable | None = None  # a test's own answer to that sacct query, `(argv) -> Completed`, or raises
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -433,7 +443,14 @@ class FakeSlurm:
             return Completed(0, "", "")
         if tool == "sacct":
             ident = argv[argv.index("-j") + 1]
-            wanted = argv[argv.index("-o") + 1] == "JobID,State,AllocTRES"
+            fields = argv[argv.index("-o") + 1]
+            if (
+                fields == "JobID,JobName,State,ExitCode"
+            ):  # the rows of a job's steps, with their raw state and exit code
+                if self.sacct_steps is not None:
+                    return self.sacct_steps(argv)
+                return Completed(0, "".join(f"{row}\n" for row in self.step_rows.get(ident, [])), "")
+            wanted = fields == "JobID,State,AllocTRES"
             return Completed(0, self.accounting.get(ident, "") if wanted else "", "")
         if RELAY_MODULE in argv and argv[argv.index(RELAY_MODULE) - 1] == "-m":
             verb = argv[argv.index(RELAY_MODULE) + 1]
@@ -577,7 +594,8 @@ class FakeSlurm:
             return (0, "A1b2C3d4E5f6G7h8I9j0K1l2\n", "") if command[2] == "passphrase" else (0, self.ca_pem, "")
         if script == "teardown.sh":
             workdir = command[command.index("--workdir") + 1]
-            self.steps = {n: s for n, s in self.steps.items() if not n.endswith(self._service_of(workdir))}
+            service = re.escape(self._service_of(workdir))  # whichever launch of it is listed: -run-1, -run-2
+            self.steps = {n: s for n, s in self.steps.items() if not re.search(service + "[0-9]+$", n)}
             return self.teardown_rc, "", "ok: service stopped\n"
         if command[0] == "test":
             return 0, "", ""
@@ -596,9 +614,9 @@ class FakeSlurm:
 
     def _service_of(self, workdir: str) -> str:
         for name, log in self.logs.items():
-            if workdir in Path(log).read_text(encoding="utf-8"):
-                return f"-{name}-run-1"
-        return "-no-such-service"
+            if Path(log).is_file() and workdir in Path(log).read_text(encoding="utf-8"):
+                return f"-{name}-run-"
+        return "-no-such-service-run-"
 
     def pipe(self, first, second):
         from hpcslurm import Completed
@@ -630,17 +648,48 @@ class FakeSlurm:
             Path(client_log).write_text(srun.refusal, encoding="utf-8")
             self.dead_clients.append(Client(20000 + len(self.spawned), 77))
             return self.dead_clients[-1]
-        self.next_step += 1
-        self.steps[srun.name] = f"{self.listing_of(srun)}.{self.next_step}"
         script = Path(srun.command[1]).name
         kind = "oz" if script == "zone.sbatch" else "op"
         service = "zone" if kind == "oz" else srun.command[4]
+        if self.launch_failures.get(service):
+            return self._failed_launch(srun, service, client_log, self.launch_failures[service].pop(0))
+        self.next_step += 1
+        self.steps[srun.name] = f"{self.listing_of(srun)}.{self.next_step}"
         self.logs[service] = srun.output
         workdir = f"{self.node_tmp}/hpcop-{kind}.{'abcdef' if kind == 'oz' else service[:3] + 'xyz'}"
         lines = [f"hpcop: work directory {workdir}"]
         lines.append("hpcop: OK zone" if kind == "oz" else "hpcop: waiting for the registration token (mint | deliver)")
         Path(srun.output).write_text("\n".join(lines) + "\n", encoding="utf-8")
         return Client(10000 + self.next_step, 77)
+
+    def _failed_launch(self, srun: Srun, service: str, client_log: str, how: dict):
+        """A launch that fails at launch, as the live two did: the step takes an id (never listed here: the driver reads
+        its id from the client's log, as it must where it never saw the step), its run log is made empty, the client
+        names the failure and exits, and accounting shows the step CANCELLED 0:116. The node's name is invented."""
+        from hpcslurm import Client
+
+        self.next_step += 1
+        step = f"{self.listing_of(srun)}.{self.next_step}"
+        self.logs[service] = srun.output
+        if not how.get("no_log"):
+            Path(srun.output).write_text(how.get("log", ""), encoding="utf-8")
+        reason = how.get("reason", "Can't find an address, check slurm.conf")
+        named = how.get("client_id", step)
+        Path(client_log).write_text(
+            how.get(
+                "client",
+                f"srun: error: _fwd_tree_get_addr: can't find address for host {srun.node}, check slurm.conf\n"
+                f"srun: error: Task launch for StepId={named} failed on node {srun.node}: {reason}\n"
+                f"srun: error: Application launch failed: {reason}\n"
+                "srun: Job step aborted\n",
+            ),
+            encoding="utf-8",
+        )
+        if not how.get("no_row"):
+            row = f"{how.get('row_id', step)}|{srun.name}|{how.get('state', 'CANCELLED')}|{how.get('exit', '0:116')}"
+            self.step_rows.setdefault(self.listing_of(srun), []).append(row)
+        self.dead_clients.append(Client(30000 + self.next_step, 77))
+        return self.dead_clients[-1]
 
     def client_alive(self, client) -> bool:
         return client not in self.ended_clients and client not in self.dead_clients
