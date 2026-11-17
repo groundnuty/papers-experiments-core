@@ -48,12 +48,12 @@ its settle. Whatever the heal did, the next check makes the link
 check afresh (`relink`), so no pass from before the heal's end opens the gate: a heal that left a pair failing leaves it
 to the next check, which finds it stuck and fails closed, and none runs again until the gate's link check passes. A
 check under a run's admission keeps a share of it until it ends, so one that outlives its caller's wait still holds the
-federation and no shortcut section of the run begins while it reads; while the run's own shortcut reset holds the
+federation and no reset section of the run begins while it reads; while the run's own reset holds the
 federation's reset lock (`federation.reset`) the check is deferred, uncharged.
 
 **The heal takes no reset lock.** Its exclusive admission of `federation.lock` waits for the turnstile holding nothing
 and for the main lock holding the turnstile, as every exclusive admission does (`admission`, the lock order), and so it
-already excludes every shared holder, each with its share of `federation.reset`, and every shortcut reset, whose run
+already excludes every shared holder, each with its share of `federation.reset`, and every reset, whose run
 keeps its share of `federation.lock` for the whole section. No section runs while the heal restarts links and reads the
 links again, and no holder of `federation.reset` waits for what the heal holds, so the heal never deadlocks with one:
 a section under way keeps the heal out until `health_wait_s` runs out, and the gate stays closed, uncharged.
@@ -383,7 +383,7 @@ class FaultGate:
                 give_up()
             return Health(
                 False,
-                "the run's own shortcut reset holds the federation's reset lock: the check waits for it",
+                "the run's own reset holds the federation's reset lock: the check waits for it",
                 deferred=True,
                 charge=False,
             )
@@ -507,7 +507,7 @@ class FaultGate:
         heal never runs past the core's wait for this check (`health_timeout_s`) and no run is charged for it; fail
         closed whenever it cannot begin. The admission takes no reset lock (see the module docstring): the check's own
         shared hold, with its share of `federation.reset`, is let go before it, and the exclusive hold of
-        `federation.lock` already keeps every shortcut reset out."""
+        `federation.lock` already keeps every reset out."""
         if self._healer is None or self._relink is None:  # no heal declared, or no sanction, services or reports
             return verdict
         refused = self._refused(verdict)  # read first, so a latched gate waits for nobody
