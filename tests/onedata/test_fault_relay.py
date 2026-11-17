@@ -319,7 +319,7 @@ def test_o58_a_verb_past_its_relay_bound_is_unknown_and_fails_closed(tmp_path):
     asked = []
 
     def overrun(argv, *, timeout_s):
-        asked.append((argv[len(PREFIX) :], timeout_s))
+        asked.append((untagged(argv)[len(PREFIX) :], timeout_s))
         raise subprocess.TimeoutExpired(argv, timeout_s)
 
     relay, clock = relay_of(tmp_path, overrun), FakeClock()

@@ -383,23 +383,51 @@ def test_o58_a_job_check_that_raises_something_unforeseen_does_not_kill_the_watc
 def test_o58_the_relays_tables_and_threshold_hold_to_hpcfeds_own(hpc):
     """O58: the words the relay looks for are the words hpcfed's verbs name their steps by, and the elapsed time at
     which the relay watches a verb is below every bound hpcfed ends a control step at (it kills an srun only after its
-    step's own bound, so a verb quicker than that cannot have left one pending that the group kill missed)."""
+    step's own bound, so a verb quicker than that cannot have left one pending that the group kill missed). Every
+    bound is the step's own and the layout's launch wait (`step_launch_wait_s`, 0 or more), so the shortest is the
+    read-only check's 30 s with a launch wait of 0, which is what the threshold is held under."""
     import inspect
     import re
 
     from expcore_onedata.fault_relay_late import CONTROL_WORDS, LATE_ELAPSED_S
 
     assert hpc.control.CONTROL_WORDS == CONTROL_WORDS
-    bounds = re.findall(r"timeout_s=([^,\n)]+)", inspect.getsource(hpc.control))
+    source = inspect.getsource(hpc.control)
+    bounds = re.findall(r"timeout_s=([^,\n)]+)", source) + re.findall(r"^\s+bound = (.+)$", source, re.MULTILINE)
+    launch = 0  # the least a layout declares: `run` refuses a negative launch wait
     known = {
-        "STATUS_TIMEOUT_S": hpc.control.STATUS_TIMEOUT_S,
-        "MOUNT_CHECK_TIMEOUT_S": hpc.control.MOUNT_CHECK_TIMEOUT_S,
-        "EXEC_TIMEOUT_S": hpc.control.EXEC_TIMEOUT_S,
-        "stop_seconds + STOP_MARGIN_S": 1 + hpc.control.STOP_MARGIN_S,  # a stop's bound, `stop_seconds` at least 1
+        "target.launch_wait_s + STATUS_TIMEOUT_S": launch + hpc.control.STATUS_TIMEOUT_S,
+        "target.launch_wait_s + MOUNT_CHECK_TIMEOUT_S": launch + hpc.control.MOUNT_CHECK_TIMEOUT_S,
+        "target.launch_wait_s + EXEC_TIMEOUT_S": launch + hpc.control.EXEC_TIMEOUT_S,
+        # a stop's bound, `stop_seconds` at least 1
+        "stop_seconds + target.launch_wait_s + STOP_MARGIN_S": 1 + launch + hpc.control.STOP_MARGIN_S,
     }
-    control_bounds = [bound.strip() for bound in bounds if bound.strip() not in ("timeout_s", "timeout")]
+    control_bounds = [bound.strip() for bound in bounds if bound.strip() not in ("timeout_s", "timeout", "bound")]
     assert set(control_bounds) <= set(known), "a control step has a bound the relay's threshold does not know"
     assert min(known.values()) >= LATE_ELAPSED_S
+
+
+def test_o58_the_watch_and_the_threshold_hold_under_the_per_verb_bounds_and_the_launch_wait():
+    """O58, with the per-verb relay bounds (`fault_hpc.verb_bounds`) and the launch wait they rest on: a verb the relay
+    ends at its bound ran far past the threshold, so it is watched either way; the watch's window outlasts the longest a
+    step may wait on the controller (the launch wait, which was derived from the site's message timeout) and a look;
+    and a verb ended at its bound is still answered inside the client's wait, which the group's kill and the one
+    accounting read share (30 s beyond the bound)."""
+    from expcore_onedata.fault_hpc import HPC_STEP_LAUNCH_WAIT_S, verb_bounds
+    from expcore_onedata.fault_relay_group import GRACE_S
+    from expcore_onedata.fault_relay_late import LATE_ELAPSED_S
+    from expcore_onedata.fault_relay_timing import SACCT_TIMEOUT_S
+    from expcore_onedata.fault_settings import DEFAULT_RELAY_WAIT_S
+
+    stop_bound_s = 50 + 90  # the layouts' `stop_seconds` and what the service's own stop adds (`HPC_STOP_EXTRA_S`)
+    bounds = verb_bounds(
+        step_launch_wait_s=HPC_STEP_LAUNCH_WAIT_S, stop_bound_s=stop_bound_s, command_timeout_s=300.0,
+        settle_timeout_s=stop_bound_s + HPC_STEP_LAUNCH_WAIT_S + 70,
+    )  # fmt: skip
+    assert set(bounds) == {"status", "start", "stop", "ping", "restart_link"}
+    assert all(bound > LATE_ELAPSED_S for bound in bounds.values())
+    assert LATE_WINDOW_S >= HPC_STEP_LAUNCH_WAIT_S + LATE_POLL_S
+    assert GRACE_S + SACCT_TIMEOUT_S < DEFAULT_RELAY_WAIT_S
 
 
 def test_o58_the_watch_ends_early_once_the_held_job_is_gone(hpc, tmp_path):
