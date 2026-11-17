@@ -53,6 +53,8 @@ CERTIFI = "/usr/lib/invented/certifi/cacert.pem"
 IMAGE_BUNDLE = "-----BEGIN CERTIFICATE-----\ninvented image bundle\n-----END CERTIFICATE-----\n"
 CANARY_MARK = "canary open"
 READINGS = {"os": {"id": "invented", "version_id": "9.9"}, "glibc": "glibc 2.99", "kernel": "9.99.0-invented"}
+OWN_HOST = "cn-invented-n01"  # the invented agent node's own host name, and its fully qualified form: a site's, private
+OWN_FQDN = "cn-invented-n01.cluster.example.invalid"
 
 
 @dataclass
@@ -192,6 +194,7 @@ class FakeNode:
         self.busy_mounts: set[str] = set()  # those only a lazy unmount takes
         self.unmounts: list[list[str]] = []
         self.mount_table_unreadable = False
+        self.own_hosts: tuple[str, ...] | Exception = (OWN_HOST, OWN_FQDN)  # what `own_names` answers (O73)
         self.readings: Any = READINGS  # what `node_readings` answers (O87); a test sets another, or `readings_error`
         self.readings_error: Exception | None = None
         self.tool_server_host: Any = None  # the tool server's host's readings; None: the node's own host
@@ -299,6 +302,11 @@ class FakeNode:
 
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         return {"kernel": "invented", "apptainer": "apptainer version invented"}
+
+    def own_names(self) -> tuple[str, ...]:
+        if isinstance(self.own_hosts, Exception):
+            raise self.own_hosts
+        return self.own_hosts
 
     def node_readings(self) -> dict[str, Any]:
         if self.readings_error is not None:
@@ -501,4 +509,6 @@ def parse_exec(argv: list[str], stdin: str | None) -> Exec:
     return Exec(argv, flags, binds, env, rest[0], rest[1:], stdin, hostname=hostname)
 
 
-__all__ = ["CANARY_MARK", "CGROUP", "Cell", "Exec", "FakeNode", "FakeProc", "Unrecorded", "parse_exec"]
+__all__ = [
+    "CANARY_MARK", "CGROUP", "OWN_FQDN", "OWN_HOST", "Cell", "Exec", "FakeNode", "FakeProc", "Unrecorded", "parse_exec",
+]  # fmt: skip
