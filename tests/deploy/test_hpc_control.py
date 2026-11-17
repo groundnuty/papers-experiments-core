@@ -318,6 +318,47 @@ def test_o58_a_service_is_ready_only_when_it_runs_and_its_marker_is_current(worl
     assert json.loads(verb(world, "status")[1])["ready"] is False
 
 
+def waited(figure, **extra):
+    """What status.sh printed for a ready service whose start waited `figure` seconds for the provider's domain."""
+    record = {"alive": True, "pid": 4242, "start": "777", "ready": True, "domain_wait_s": figure, **extra}
+    return Done(0, json.dumps(record) + "\n")
+
+
+@pytest.mark.parametrize("figure", [0.0, 2.013, 17], ids=["no wait", "a wait", "an integer"])
+def test_o58_status_passes_on_the_seconds_the_start_waited_for_the_domain(figure, world):
+    """O58: a ready service's status carries `domain_wait_s` as status.sh printed it, for the injector's snapshot."""
+    world.launcher.on_control = lambda argv: waited(figure)
+    status, out, err = verb(world, "status")
+    assert status == 0, err
+    assert json.loads(out)["domain_wait_s"] == figure
+
+
+def test_o58_status_without_the_figure_prints_none(world):
+    """O58: status.sh printed none (a service of an earlier bundle, or not ready): the status has no such key."""
+    world.launcher.on_control = lambda argv: alive(ready=True)
+    assert "domain_wait_s" not in json.loads(verb(world, "status")[1])
+    world.launcher.on_control = lambda argv: waited(1.0, ready=False)
+    assert "domain_wait_s" not in json.loads(verb(world, "status")[1])
+
+
+@pytest.mark.parametrize("figure", [-1, "2", True, None, float("nan")], ids=repr)
+def test_o58_a_figure_that_is_not_a_duration_is_not_passed_on(figure, world):
+    """O58: anything but a finite number of at least 0 is dropped, and the status is still a status."""
+    world.launcher.on_control = lambda argv: waited(figure)
+    status, out, _ = verb(world, "status")
+    assert status == 0
+    record = json.loads(out)
+    assert record["ready"] is True
+    assert "domain_wait_s" not in record
+
+
+def test_o58_a_service_not_running_reports_no_figure_whatever_status_sh_printed(world):
+    """O58: the figure belongs to a running, ready launch: a step that is not listed has none."""
+    world.launcher.on_control = lambda argv: waited(3.0)
+    world.launcher.steps.clear()
+    assert "domain_wait_s" not in json.loads(verb(world, "status")[1])
+
+
 @pytest.mark.parametrize(
     "answer",
     [

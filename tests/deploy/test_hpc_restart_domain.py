@@ -270,3 +270,111 @@ def test_o58_a_null_registration_token_is_not_printed_as_a_token(oz):
     assert done.returncode != 0
     assert done.stdout == ""
     assert "hpcop: ERROR" in done.stderr
+
+
+# --- the seconds the wait took, as the status reports them (O58) ---
+
+FIGURE = "domain-wait"  # <workdir>/domain-wait: what finish.sh wrote for this launch, which status.sh reads
+
+
+def status_of(work, env, kind="op"):
+    done = node.script("status.sh", kind, "--workdir", str(work), env=env)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def ready_service(holder, processes):
+    """A work directory whose service runs and whose ready marker is current (status.sh: ready)."""
+    work = node.make_work(holder)
+    node.record(work, node.spawn(processes))
+    (work / "service-verified").write_bytes((work / "service.pid").read_bytes())
+    return work
+
+
+@node.needs_pidfd
+def test_o58_a_restart_that_needed_no_wait_reports_zero_seconds_and_replaces_an_earlier_launchs_figure(op):
+    """O58: the status of a restarted, ready service carries `domain_wait_s`, 0 when the first read held the domain;
+    the figure a launch before it left in the work directory is gone before this one starts."""
+    node.put(op.work / FIGURE, "99.000\n")
+    proc = op.start()
+    op.wait_ready(proc)
+    reading = status_of(op.work, op.env)
+    assert reading["ready"] is True
+    assert "domain_wait_s" in reading
+    assert reading["domain_wait_s"] == 0
+    assert op.stop().returncode == 0
+    assert proc.wait(timeout=60) == 0, proc.stdout
+
+
+@node.needs_pidfd
+def test_o58_a_restart_that_waited_reports_the_seconds_it_waited(op):
+    """O58: three null answers at 0.2 s apart: the status carries at least the sleeps' 0.6 s, measured by the node."""
+    op.env["HPCOP_POLL_S"] = "0.2"
+    op.set_state(domain_early={"reads": 3, "value": None})
+    proc = op.start()
+    op.wait_ready(proc)
+    figure = status_of(op.work, op.env)["domain_wait_s"]
+    assert 0.5 <= figure < 60
+    assert op.stop().returncode == 0
+    assert proc.wait(timeout=60) == 0, proc.stdout
+
+
+@pytest.mark.parametrize("text", ["0.000\n", "2.013\n", "123456.789\n"])
+def test_o58_status_reports_the_figure_finish_sh_writes(text, holder, env, processes):
+    """O58: a ready service's status prints the number in its record, whole, as it is."""
+    work = ready_service(holder, processes)
+    node.put(work / FIGURE, text)
+    assert status_of(work, env)["domain_wait_s"] == float(text)
+
+
+@pytest.mark.parametrize("text", ["abc\n", "-1.000\n", "1e3\n", "2\n", "2.5\n", "", "1234567.000\n", "0.000 x\n"])
+def test_o58_status_ignores_a_record_that_is_not_the_figure_finish_sh_writes(text, holder, env, processes):
+    """O58: only a number of whole seconds and three decimals (the node's own measurement) is printed; the status stays
+    a status, ready as before."""
+    work = ready_service(holder, processes)
+    node.put(work / FIGURE, text)
+    reading = status_of(work, env)
+    assert reading["ready"] is True
+    assert "domain_wait_s" not in reading
+
+
+def test_o58_status_prints_no_figure_for_a_service_that_is_not_ready_or_whose_record_is_not_a_file(
+    holder, env, processes
+):
+    """O58: the figure belongs to a launch whose checks passed: no ready marker, no figure; and a link, which could
+    point anywhere, is no record."""
+    work = ready_service(holder, processes)
+    node.put(work / FIGURE, "2.000\n")
+    (work / "service-verified").unlink()
+    reading = status_of(work, env)
+    assert (reading["ready"], "domain_wait_s" in reading) == (False, False)
+    (work / "service-verified").write_bytes((work / "service.pid").read_bytes())
+    (work / FIGURE).unlink()
+    (work / FIGURE).symlink_to(work / "service.pid")
+    assert "domain_wait_s" not in status_of(work, env)
+
+
+def test_o58_a_first_start_records_how_long_it_waited_for_the_domain(op, processes):
+    """O58: finish.sh writes the figure for a first start as for a restart (provider.sbatch then writes the marker)."""
+    op.env["HPCOP_POLL_S"] = "0.2"
+    op.set_state(domain_early={"reads": 2, "value": None})
+    done = first_start(op, processes)
+    assert done.returncode == 0, done.stderr
+    figure = float((op.work / FIGURE).read_text(encoding="utf-8"))
+    assert 0.3 <= figure < 60
+
+
+def test_o58_a_first_start_that_needed_no_wait_records_zero(op, processes):
+    """O58: the first read held the domain: exactly 0.000, not a measurement of the request."""
+    done = first_start(op, processes)
+    assert done.returncode == 0, done.stderr
+    assert (op.work / FIGURE).read_text(encoding="utf-8") == "0.000\n"
+
+
+def test_o58_a_start_whose_domain_stays_null_leaves_no_figure(op, processes):
+    """O58: no domain, no figure: nothing a later status could take for this launch's."""
+    op.env["HPCOP_READY_SECONDS"] = FIRST_START_BOUND
+    op.set_state(domain_early={"reads": FOREVER, "value": None})
+    done = first_start(op, processes)
+    assert done.returncode != 0
+    assert not (op.work / FIGURE).exists()

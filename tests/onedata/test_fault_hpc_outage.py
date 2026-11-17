@@ -249,3 +249,81 @@ def test_o58_a_start_that_fails_leaves_the_injection_open_and_the_fault_gate_clo
     assert opened.ok is True, opened.detail
     assert federation.running(SERVICE) is True
     assert open_injections(tmp_path) == []
+
+
+# --- the seconds a start waited for the provider's domain (O58) ---
+
+
+def verified_step(injector):
+    return [step for step in injector.snapshot()["steps"] if step["step"] == "verified"][-1]
+
+
+@pytest.mark.parametrize("waited", [0, 2.5], ids=["no wait needed", "a wait"])
+def test_o58_a_restore_records_the_seconds_the_start_waited_for_the_providers_domain(waited, tmp_path):
+    """O58: the restored service's status carries `domain_wait_s`, the seconds its start waited for the provider's
+    domain (op_worker says null until its Onezone connection is up): the `verified` step and the injection carry it
+    as it was reported, and 0 is a figure (no wait was needed), not an absence. The wait lengthens the provider's
+    down time, which the snapshot's `ready_after_s` counts whole."""
+    injector, federation = hpc(tmp_path)
+    federation.domain_wait[SERVICE] = waited
+    injector.start(RUN)
+    assert injector.clear() is True
+    assert "domain_wait_s" in verified_step(injector)
+    assert verified_step(injector)["domain_wait_s"] == waited
+    (injection,) = injector.snapshot()["injections"]
+    assert injection["domain_wait_s"] == waited
+
+
+def test_o58_a_status_without_the_figure_leaves_the_restore_without_it(tmp_path):
+    """O58: nothing reported, nothing recorded: never a 0 nobody measured (a bundle that does not report it, and the
+    Compose driver, which has no such wait, leave the snapshot as it was)."""
+    injector, _federation = hpc(tmp_path)
+    injector.start(RUN)
+    assert injector.clear() is True
+    assert "domain_wait_s" not in verified_step(injector)
+    (injection,) = injector.snapshot()["injections"]
+    assert "domain_wait_s" not in injection
+
+
+@pytest.mark.parametrize("bad", [-1, "2", True, float("nan"), float("inf"), None], ids=repr)
+def test_o58_a_figure_that_is_not_a_duration_is_not_recorded_and_does_not_fail_the_restore(bad, tmp_path):
+    """O58: an optional key of the status that holds anything but a finite number of at least 0 is left out."""
+    injector, federation = hpc(tmp_path)
+    federation.domain_wait[SERVICE] = bad
+    injector.start(RUN)
+    assert injector.clear() is True
+    assert "domain_wait_s" not in verified_step(injector)
+    assert injector.snapshot()["restore_verified"] is True
+
+
+def test_o58_the_driver_keeps_the_figure_of_the_latest_ready_status_and_a_start_clears_it(tmp_path):
+    """O58: `last_domain_wait_s` is the figure the latest status carried while the service was ready; a status of a
+    service that is not ready, or that carries none, leaves None, and so does a start, whose launch has not reported."""
+    federation = FakeHpc(FakeClock(), LABELS)
+    driver = hpc_driver(federation, timeout_s=COMMAND_TIMEOUT_S)
+    assert driver.last_domain_wait_s is None
+    federation.domain_wait[SERVICE] = 1.5
+    driver.observe(SERVICE)
+    assert driver.last_domain_wait_s == 1.5
+    federation.not_ready.add(SERVICE)
+    driver.observe(SERVICE)
+    assert driver.last_domain_wait_s is None
+    federation.not_ready.clear()
+    driver.observe(SERVICE)
+    assert driver.last_domain_wait_s == 1.5
+    driver.stop(SERVICE)
+    driver.start(SERVICE)
+    assert driver.last_domain_wait_s is None
+
+
+def test_o58_a_restore_a_recovery_makes_carries_the_figure_too(tmp_path):
+    """O58: the recovery of an injection an earlier run left open reports the same figure in its `recovered` step."""
+    recovery, federation, _ = crashed(tmp_path, stopping=True)
+    federation.stop_noop = False
+    federation.exit_after_s = 0.0
+    federation.domain_wait[SERVICE] = 4.0
+    federation.state[SERVICE]["running"] = False  # the earlier run's stop did take effect
+    told = []
+    recovery.recover(lambda *args, **kwargs: told.append((args, kwargs)))
+    ((args, kwargs),) = told
+    assert (args, kwargs["how"], kwargs["domain_wait_s"]) == (("recovered", True), "restored", 4.0)
