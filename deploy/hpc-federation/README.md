@@ -574,8 +574,10 @@ message timeout (47 to 103 s measured, up to 200 s possible on the site), so eve
 `step_launch_wait_s` 240 (the 200 s plus 20 %), what a control step may wait to start. It is added to every bound
 that waits on a step's client from its start (the stop, status, exec and mount-check steps, `down`'s teardown step, a
 start's wait to see its service step listed, the stop verb's `settle_timeout_s`, a link restart's bound), and the
-relay's per-verb bound (`[faults] command_timeout_s` on this backend, declared in the platform file) is the launch
-wait and 60 s, 300 s, not 120 s. **The launch wait widens timeouts only**, how long the harness waits before it fails
+relay's floor for every verb (`[faults] command_timeout_s` on this backend, declared in the platform file) is the launch
+wait and 60 s, 300 s, not 120 s, and each verb's own bound is its longest run and 30 s (a status 600 s, a start 630 s, a
+stop 450 s, a ping and a link restart 570 s): one bound of 300 s was below a start after an unrecorded stop (600 s) and
+a restarted shared-import owner's status (570 s). **The launch wait widens timeouts only**, how long the harness waits before it fails
 closed: it never lengthens an outage or a hold. The agent's node's step (M5) is not built here. A layout with a shared
 import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
 

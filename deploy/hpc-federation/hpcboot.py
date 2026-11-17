@@ -18,9 +18,9 @@ real addresses (DESIGN.md, sections 5 and 6).
   may name: `@hpc_root@` (the root, so every path into it is absolute and a copy of the file beside a study reads the
   root's files), `@hpc_stop_bound_s@` (the service's own stop bound, `[hpc] stop_seconds` + 90 s),
   `@hpc_step_launch_wait_s@` (what a control step may wait to start, `[hpc] step_launch_wait_s`),
-  `@hpc_command_timeout_s@` (a relay verb's bound: that and 60 s), `@hpc_settle_timeout_s@` (above the stop and the
-  wait), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of each direct-I/O
-  import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and
+  `@hpc_command_timeout_s@` (the floor of every relay verb's bound: that and 60 s), `@hpc_settle_timeout_s@` (above
+  the stop and the wait), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of
+  each direct-I/O import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and
   `@hpc_token_margin_s@`: the least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file
   (`least_margin_s`).
   The site's values come from `hpcpins` (the agent's sandbox's pins and `@study_artifacts@`, the study's own directory

@@ -617,8 +617,8 @@ serves both:
 - `[faults]` for the HPC backend (M4's loader): `backend = "hpc"`, `stop_bound_s`, `journal`, `[faults.services]`
   naming every provider, and none of `compose_file`, `project`, `command` or `docker`, which that backend refuses;
   `step_launch_wait_s` (from the layout's `[hpc]`, 240) and `command_timeout_s` (`step_launch_wait_s + 60`, 300: the
-  longest one relay verb may take; a Compose table's is 120), both declared by `up`; its defaults are
-  `settle_timeout_s = stop_bound_s + step_launch_wait_s + 60`, `poll_s` 10 and `relay_wait_s` 30;
+  floor of every relay verb's own bound; a Compose table's is 120), both declared by `up`; its defaults are
+  `settle_timeout_s = stop_bound_s + step_launch_wait_s + 70`, `poll_s` 10 and `relay_wait_s` 30;
 - **`@study_artifacts@`**, from `site.env`'s `HPC_STUDY_ARTIFACTS` (section 6a): the study's own directory on the nodes,
   so a template names the paths of its tool server's venv, clone and manifests under it and a public replication package
   carries no site path. A template that names it without the key is refused at the preflight, naming the variable; an
@@ -626,10 +626,10 @@ serves both:
 - the values only the HPC driver fills, for a template that names them: **`@hpc_stop_bound_s@`**, `stop_seconds + 90`
   (140 by default, section 7e); **`@hpc_step_launch_wait_s@`**, `[hpc] step_launch_wait_s` (240 by
   default); **`@hpc_command_timeout_s@`**, that and 60 (300); **`@hpc_settle_timeout_s@`**, `stop_bound_s +
-  step_launch_wait_s + 60` (440); **`@hpc_command@`**, this
+  step_launch_wait_s + 70` (450); **`@hpc_command@`**, this
   driver's argv prefix as a TOML array; and **`@hpc_token_margin_s@`**, the least `[tokens] margin_s` the platform
   layer's own loader accepts for the rest of the file: `up` writes the file with a provisional margin no rule refuses,
-  reads it with `load_faults` as a campaign would, and writes it again with the least that loader's rule gives (4,330 s
+  reads it with `load_faults` as a campaign would, and writes it again with the least that loader's rule gives (5,370 s
   with M4's defaults), so a measured `stop_seconds`, or a term the loader adds, moves it. A core whose loader cannot
   read the HPC `[faults]` (one without M4's backend) gets the restore's rule over the keys it knows, with the HPC
   settle time and poll;
@@ -815,27 +815,34 @@ therefore apart: `stop_seconds` bounds the service's stop, which was measured, a
 start, added to **every bound that waits on a step's client from its start**: the stop's control step
 (`stop_seconds` + launch wait + 60 s, 350 s), `down`'s teardown step (launch wait + `stop_seconds` + the 30 s kill +
 90 s, 410 s), the status step (launch wait + 60 s), the exec step (launch wait + 300 s), the mount check (launch wait
-+ 30 s), a start's wait to see its new service step listed (launch wait + 60 s), the relay stop verb's
-`settle_timeout_s` (the service's stop bound + launch wait + 60 s, 440 s, with `relay_wait_s` on top), a link
-restart's bound (launch wait + the RPC's 120 s + 30 s + 60 s, 450 s) and the relay's per-verb bound
-`command_timeout_s` (launch wait + 60 s of work, 300 s), which `up` declares in `platform.toml` beside the launch
-wait. The held job's `time` must exceed twice the stop verb's whole bound (launch wait + stop bound, 380 s). The
++ 30 s), a start's wait to see its new service step listed (launch wait + 60 s), and every relay verb's bound. The
 setting is rendered into `[faults]` (`step_launch_wait_s`), where it is in the faults fingerprint with the other
-bounds, and the heal's reserves, the restore's bound, the token margin and the platform's deferral are counted from
-the bounds it widens, so they carry it (a `max_defer_s` check sees the true figure). **It widens timeouts only:** how
-long the harness waits before it fails closed. It never lengthens an outage or a hold, and a step that starts at once
-costs nothing. A step's other bounds (`up`'s control steps at 600 s, `down`'s node checks) already exceed it.
+bounds. **It widens timeouts only:** how long the harness waits before it fails closed. It never lengthens an outage
+or a hold, and a step that starts at once costs nothing. A step's other bounds (`up`'s control steps at 600 s, `down`'s
+node checks) already exceed it. The held job's `time` must exceed twice the stop verb's whole bound (launch wait + stop
+bound, 380 s).
 
-For backend `"hpc"` (M4's loader): the core bounds `hpcfed.py stop` by `settle_timeout_s`, not the command timeout; `up`
-renders `stop_bound_s`, `step_launch_wait_s` and `command_timeout_s` (section 6), from which `settle_timeout_s`
-defaults to the first two + 60 (440), and the least `[tokens] margin_s` that loader accepts, the start's stop entering
-it as its own term (4,330 s with the defaults); `poll_s` defaults to 10 s (every status is a step on the one control
-core). A relay verb's bound is the request's `bound_s`, in the faults fingerprint after its default, and a verb past it
-is answered `timed_out` and read as a command with no answer, never as done. `restart_link`'s bound gets 60 s more (the
-client's end polling), and the heal's reserves count it. **`stop_seconds` is to be set from live measurement**: the core
-journals every stop's evidence, confirmed or not (the injection's `injected` line, or its `stop_unknown` line for a stop
-that answered unconfirmed, key `stop`), so a live slot's journal gives each stop's `seconds` and the service's own
-`service_seconds`.
+**Each relay verb has a bound of its own,** the longest the verb can run and 30 s, never below the declared floor
+`command_timeout_s` (launch wait + 60 s, 300 s, declared in `platform.toml` beside the launch wait). The longest a verb
+runs is its steps, each at its whole bound with the launch wait in each, and its waits at their whole wait
+(`fault_hpc.verb_inner_worst_s`, which a test runs against this module's own verbs): a **status** is its step and, for
+a restarted shared-import owner, the mount check after it (240 + 60 + 240 + 30 = 570 s, so 600 s); a **start** after an
+unrecorded stop is a status step and then the wait to see its new service step listed (300 + 300 = 600 s, so 630 s); a
+**stop** is its control step (350 s), the wait for the service step to leave the list (60 s) and after a cancel (10 s),
+420 s, so 450 s (`settle_timeout_s`'s default is that, and it is the stop's floor); a **ping** and a **link restart**
+are the exec step, bounded alike for every command (240 + 300 = 540 s, so 570 s). One bound of 300 s was below the
+first, the second and the fourth, and a relay that cuts a verb short times out one about to complete (and, with the
+orphan fix, kills it): a restore after a stop of unknown outcome would then fail when it matters. The bounds are
+recorded in the faults fingerprint, and the heal's reserves, the restore's bound, the token margin (5,370 s with the
+defaults) and the platform's deferral are counted from them (a `max_defer_s` check sees the true figure).
+
+For backend `"hpc"` (M4's loader): the core bounds `hpcfed.py stop` by its verb's bound, not the command timeout; `up`
+renders `stop_bound_s`, `step_launch_wait_s` and `command_timeout_s` (section 6), from which `settle_timeout_s` defaults
+to the stop's own worst case and 30 s (450); `poll_s` defaults to 10 s (every status is a step on the one control core).
+A verb's bound is the request's `bound_s`, and a verb past it is answered `timed_out` and read as a command with no
+answer, never as done. **`stop_seconds` is to be set from live measurement**: the core journals every stop's evidence,
+confirmed or not (the injection's `injected` line, or its `stop_unknown` line for a stop that answered unconfirmed, key
+`stop`), so a live slot's journal gives each stop's `seconds` and the service's own `service_seconds`.
 
 **(f) The state file**: section 4. `services.<name>` gives the job, the step, the node, the work directory and the
 identity; it holds no secret.
