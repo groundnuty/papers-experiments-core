@@ -68,7 +68,7 @@ pytestmark = [
 ]
 
 KILLED, WHOLE = LABELS  # fed-a is killed outright and resumed; fed-b runs to its end
-SNAPSHOT_AT, KILL_AT = 3, 5  # the attempts of fed-a's first life that are held: the snapshot, then the kill
+PINNED_AT, SNAPSHOT_AT, KILL_AT = 2, 3, 5  # fed-a's first life holds: the first look, then the snapshot, then the kill
 SERVICES = ["zone", "aspen", "larch", "rowan", "alder", "hazel"]
 
 
@@ -226,12 +226,15 @@ def shards(plan, federations, shared) -> Shards:
     run again with `--resume`."""
     found, control = Shards(), shared.control
     snapdir = plan.results / KILLED / "snapshots"
-    for n in (SNAPSHOT_AT, KILL_AT):
+    for n in (PINNED_AT, SNAPSHOT_AT, KILL_AT):
         control.hold(KILLED, n)
     found.logs = {life: plan.logs / f"{life}.log" for life in (f"{KILLED}-1", f"{KILLED}-2", WHOLE)}
     killed = plan.lines[KILLED].start(found.logs[f"{KILLED}-1"])
     whole = plan.lines[WHOLE].start(found.logs[WHOLE])
     try:
+        control.wait_held(KILLED, PINNED_AT, killed)  # the first look comes with this attempt in flight: pinned, so
+        wait_for(lambda: any(snapdir.glob("snap-*")), killed, 150.0, "the snapshot of the first look")  # every run
+        control.release(KILLED, PINNED_AT)  # of the module takes that early snapshot, not only a slow host's
         control.wait_held(KILLED, SNAPSHOT_AT, killed)
 
         def snapshot_with_the_held_attempt() -> bool:
