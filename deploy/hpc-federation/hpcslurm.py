@@ -50,6 +50,17 @@ ENDED_STATES = (
 )  # fmt: skip
 
 
+# What `Slurm.step_observed` says when the two reads do not settle a step. These are what Slurm's accounting being
+# behind explains (a step just stopped: squeue no longer lists it and sacct has not caught up, or the reverse);
+# `accounting_behind` names them, so a caller that knows the step was stopped can wait for them and for nothing else.
+UNSEEN = "the step is not listed by squeue and accounting holds no record of it"
+UNLISTED_RUNNING = "accounting says the step runs and squeue does not list it"
+UNLISTED_NOT_ENDED = "the accounting state of the step is not known, or has no end time"
+LISTED_ENDED = "squeue lists the step and accounting records it as an ended one"
+LISTED_NOT_ENDED = "the accounting state of the step is not known"
+BEHIND = (UNSEEN, UNLISTED_RUNNING, UNLISTED_NOT_ENDED, LISTED_ENDED, LISTED_NOT_ENDED)
+
+
 ACCOUNT_ID = re.compile(
     r"[0-9]{1,12}(?:\+[0-9]{1,6})?(?:\.[A-Za-z0-9_-]{1,32})?"
 )  # sacct's JobID: job, step or its word
@@ -91,6 +102,15 @@ def _step_answer(
 def _unknown_step(reason: str) -> Dict[str, Any]:
     """`Slurm.step_observed`'s answer for a step that could not be told, and why."""
     return {**_step_answer(None, None, None, None, None), "unknown": reason}
+
+
+def accounting_behind(answer: Mapping[str, Any]) -> bool:
+    """Whether a `Slurm.step_observed` answer is one that Slurm's accounting being behind explains, for a caller that
+    knows the step was stopped: the step reads as running (squeue lists it, or no row of accounting says otherwise), or
+    is unknown for a reason of `BEHIND` (not listed and not recorded, recorded as running or as not ended, listed and
+    recorded as ended). An ended step is no lag, and nor is a command that failed or answered something unreadable, a
+    step recorded twice or listed under another name, or an id that is not a step id: each keeps its own reason."""
+    return answer.get("running") is True or (answer.get("running") is None and answer.get("unknown") in BEHIND)
 
 
 def valid_network(value: object) -> bool:
@@ -673,18 +693,17 @@ class Slurm:
         if not rows:
             if step_id in listed:  # squeue lists it and accounting has not recorded it yet
                 return _step_answer(True, "RUNNING", None, None, None)
-            return _unknown_step("the step is not listed by squeue and accounting holds no record of it")
+            return _unknown_step(UNSEEN)
         state, started, ended, code = rows[0]
         if step_id in listed:
             if state == "RUNNING":
                 return _step_answer(True, state, started, None, None)
-            reason = "squeue lists the step and accounting records it as an ended one"
-            return _unknown_step(reason if state in ENDED_STATES else "the accounting state of the step is not known")
+            return _unknown_step(LISTED_ENDED if state in ENDED_STATES else LISTED_NOT_ENDED)
         if state in ENDED_STATES and ended is not None:
             return _step_answer(False, state, started, ended, code)
         if state == "RUNNING":
-            return _unknown_step("accounting says the step runs and squeue does not list it")
-        return _unknown_step("the accounting state of the step is not known, or has no end time")
+            return _unknown_step(UNLISTED_RUNNING)
+        return _unknown_step(UNLISTED_NOT_ENDED)
 
     def _listed_steps(self, job: str) -> Dict[str, str]:
         """The job's steps squeue -s lists now, as id to name (the batch and extern steps left out); a job Slurm no

@@ -14,6 +14,15 @@ injected `command` where the Slurm client commands answer. And the service's own
 says; an address map for declared names is the caller's client's concern, not read here). A service that is not running
 is not asked.
 
+**A stop Slurm's accounting has not caught up with.** The driver confirms a stop once `squeue -s` no longer lists the
+step, and `sacct` follows seconds later, so a read made at once, as the first study's order does (the target is stopped
+just before the window's start reading), finds the step neither listed nor recorded as ended. When the driver's state
+says the step was stopped and Slurm's commands do not yet agree, `hpcobserve.py` waits for them, polling every 2 s, up
+to `accounting_wait_s` (an argument of `watch_for`: 60 s unless declared, from 0 to 300), and each side records the
+seconds it waited (`accounting_wait_s_used`). At the bound the service is `unknown` with the reason `accounting_lag`:
+never running, never stopped by assumption. It never waits for a service the state does not say was stopped, and the
+cross-check below is unchanged: the state's stops and launches must still agree with what is read.
+
 **Unknown is never healthy.** A state or an answer that cannot be read (a command that fails or does not finish, a
 container or step missing, Slurm and accounting disagreeing, a liveness read that fails, no reading at the window's
 start) makes the service `unknown`, with the reason, and the window `unknown` unless a finding outranks it.
@@ -46,6 +55,7 @@ another outage). The window comes before its restore, so `held` is read with the
 """
 
 import json
+import math
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -65,6 +75,11 @@ if TYPE_CHECKING:
 
 FORMAT = "expcore-fedwatch/1"
 HPC_FORMAT = "expcore-hpc-observe/1"  # what `hpcobserve.py` prints
+# `hpcobserve.py` waits this long, at most, for Slurm's accounting to show a step the state says was stopped; it keeps
+# its own copy of the three (a deploy script imports nothing of the package), and a test holds them equal.
+DEFAULT_ACCOUNTING_WAIT_S = 60.0
+MAX_ACCOUNTING_WAIT_S = 300.0
+ACCOUNTING_LAG = "accounting_lag"  # the reason it gives when the wait ended and accounting still had not caught up
 PROBE_TIMEOUT_S = 10.0
 STOP_ASKED = ("stopping", "injected", "stop_unknown")  # a journal line says the service's stop was asked for
 NOT_RUNNING = "the service is not running"
@@ -192,6 +207,7 @@ class HpcSource:
         if not isinstance(record, dict):
             return {"unknown": ["the HPC read lists no such service"]}
         running, stops, launch = record.get("running"), record.get("stops"), record.get("launch")
+        waited = record.get("accounting_wait_s_used")  # absent from a document that predates the wait
         texts = [record.get(key) for key in ("step", "state", "started_at", "ended_at")]
         sound = (
             (running is None or isinstance(running, bool))
@@ -199,11 +215,18 @@ class HpcSource:
             and isinstance(stops, list)
             and (launch is None or (isinstance(launch, int) and not isinstance(launch, bool)))
             and (record.get("exit_code") is None or isinstance(record["exit_code"], int))
+            and (waited is None or HpcSource._seconds(waited))
         )
         if not sound:
             return {"unknown": ["the HPC read's answer for the service is not readable"]}
         why = record.get("unknown")
         unknown = [str(why)[:200]] if why else ([] if running is not None else ["the step could not be told"])
+        notes = ["the state file names another step than the one squeue lists"] if record.get("state_differs") else []
+        if why == ACCOUNTING_LAG:
+            took = "its bound" if waited is None else f"{waited:g} s"
+            notes.append(f"the state records the step stopped, and Slurm's accounting did not catch up within {took}")
+        elif waited:
+            notes.append(f"the read waited {waited:g} s for Slurm's accounting to show the stopped step")
         return {
             "running": running,
             "step": record["step"],
@@ -213,11 +236,15 @@ class HpcSource:
             "launch": launch,
             "stops": len(stops),
             "unrecorded": record.get("state_differs") is True,
-            "notes": ["the state file names another step than the one squeue lists"]
-            if record.get("state_differs")
-            else [],
+            "accounting_wait_s_used": None if waited is None else float(waited),
+            "notes": notes,
             "unknown": unknown,
         }
+
+    @staticmethod
+    def _seconds(value: Any) -> bool:
+        """Whether a figure of the document is a number of seconds: finite, never negative, never a bool."""
+        return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
 
 
 def _side(raw: Mapping[str, Any], live: dict[str, Any]) -> dict[str, Any]:
@@ -225,7 +252,7 @@ def _side(raw: Mapping[str, Any], live: dict[str, Any]) -> dict[str, Any]:
     side: dict[str, Any] = {
         "state": "unknown", "running": None, "identity": None, "container": None, "step": None, "health": None,
         "started_at": None, "ended_at": None, "exit_code": None, "restart_count": None, "launch": None, "stops": None,
-        "unrecorded": False, "notes": [], "live": live, "unknown": [],
+        "unrecorded": False, "accounting_wait_s_used": None, "notes": [], "live": live, "unknown": [],
     }  # fmt: skip
     side.update(raw)
     if side["unknown"] or side["running"] is None:
@@ -695,6 +722,15 @@ class FederationWatch:
         }
 
 
+def _accounting_wait(value: Any) -> float:
+    """`watch_for`'s `accounting_wait_s`: a number of seconds from 0 to `MAX_ACCOUNTING_WAIT_S`, never a bool."""
+    if isinstance(value, bool) or not isinstance(value, int | float) or not 0 <= value <= MAX_ACCOUNTING_WAIT_S:
+        raise ValueError(
+            f"accounting_wait_s must be a number of seconds from 0 to {MAX_ACCOUNTING_WAIT_S:g}, not {value!r}"
+        )
+    return float(value)
+
+
 def watch_for(
     config: "PlatformConfig",
     settings: FaultSettings,
@@ -704,16 +740,24 @@ def watch_for(
     hpc_command: Sequence[str] | None = None,
     runner: CommandRunner = run_command,
     clock: Callable[[], float] = time.time,
+    accounting_wait_s: float = DEFAULT_ACCOUNTING_WAIT_S,
 ) -> FederationWatch:
     """The watch `[faults]` of platform.toml describes: the zone (`zone`, its backend's name for the service) and each
     provider of `[faults.services]`, read through Compose's driver or, for `backend = "hpc"`, through `hpc_command` (an
     argv that runs `hpcobserve.py --root <the federation's root>` where Slurm's client commands answer), with the
-    injection journal `[faults] journal` names. `runner` runs the commands, a test's fake or the subprocess one."""
+    injection journal `[faults] journal` names. `runner` runs the commands, a test's fake or the subprocess one.
+
+    `accounting_wait_s` is the HPC read's: the longest, from 0 to 300 s (60 unless declared), that `hpcobserve.py` waits
+    for Slurm's accounting to show a step the driver's state says was stopped (see the module docstring). The watch
+    appends it to `hpc_command` as `--accounting-wait-s` and gives the command that long on top of
+    `command_timeout_s`. A Compose watch has no such wait; the bound is still checked."""
+    wait = _accounting_wait(accounting_wait_s)
     members = members_of(config, zone=zone, providers=settings.services)
     if settings.backend == "hpc":
         if hpc_command is None:
             raise ValueError("an HPC federation is read through hpcobserve.py: name the command that runs it")
-        source: ServiceSource = HpcSource(hpc_command, runner=runner, timeout_s=settings.command_timeout_s)
+        command = [*hpc_command, "--accounting-wait-s", f"{wait:g}"]
+        source: ServiceSource = HpcSource(command, runner=runner, timeout_s=settings.command_timeout_s + wait)
     else:
         source = ComposeSource(compose_driver(settings, runner, probe=_never_asked))
     return FederationWatch(members, source, client, journal=settings.journal, clock=clock)

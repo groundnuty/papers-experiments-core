@@ -14,9 +14,10 @@ is never held up) is recorded and nothing else happens. The study's post-check d
 
 **What is recorded** is the watch's window, projected: the verdict, the backend, the window's two times, each service by
 its label (`zone`, `providers[i]`) with its status, its state at each end and its restarts (`label` `outage`, `heal` or
-`finding`, `explained`, `reason`), the findings and the unknowns, and the journal's reading. Never a service's name, a
-container or step id, an address, a path or a secret: the watch's own result holds none (`fedwatch`), and nothing the
-backend's commands print is copied.
+`finding`, `explained`, `reason`), the seconds an HPC read waited at each end for Slurm's accounting to show a stopped
+step (`accounting_wait_s`: `start` and `end`, None on Compose), the findings and the unknowns, and the journal's
+reading. Never a service's name, a container or step id, an address, a path or a secret: the watch's own result holds
+none (`fedwatch`), and nothing the backend's commands print is copied.
 
 **Where it is written, and when.** Every run of a platform has the key from its preparation on, so a reader never meets
 a silent absence: a platform given no watch records `unknown` with the reason "no federation watch configured"
@@ -160,6 +161,13 @@ def interrupted(error: BaseException) -> dict[str, Any]:
     return unread(CANCELLED if isinstance(error, asyncio.CancelledError) else INTERRUPTED)
 
 
+def _waited(side: Mapping[str, Any] | None) -> float | None:
+    """The seconds an HPC read waited for Slurm's accounting to show a stopped step, as the side recorded them: None for
+    no reading, for Compose and for a reading that predates the wait."""
+    value = None if side is None else side.get("accounting_wait_s_used")
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+
 def project(window: Mapping[str, Any]) -> dict[str, Any]:
     """The facts of a watch's window: its verdict and its readings' summaries, and no service's own reading."""
     services = {
@@ -167,6 +175,7 @@ def project(window: Mapping[str, Any]) -> dict[str, Any]:
             "status": _text(seen["status"]),
             "start": None if seen["start"] is None else _text(seen["start"]["state"]),
             "end": _text(seen["end"]["state"]),
+            "accounting_wait_s": {"start": _waited(seen["start"]), "end": _waited(seen["end"])},
             "restarts": [
                 {"label": _text(r["label"]), "explained": r["explained"] is True, "reason": _text(r["reason"])}
                 for r in seen["restarts"]
