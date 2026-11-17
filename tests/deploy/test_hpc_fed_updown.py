@@ -268,7 +268,7 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_r
     assert layout.spec.zone.url == "https://node01.cluster.example.org:8443"
     assert layout.spec.provider("hazel").url == "https://node06.cluster.example.org:8443"
     assert owner == (5001, 5001)
-    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("690", "750")
+    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("140", "200")
     command = json.loads(values["hpc_command"])
     assert command[1:3] == ["-I", "-B"]  # isolated (O58): the relay runs every verb through it
     assert command[3:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
@@ -307,7 +307,7 @@ def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancel
     teardowns = [s for s in rig.fake.sruns if s.command[1:2] and s.command[1].endswith("teardown.sh")]
     assert [s.command[s.command.index("--workdir") + 1].split(".")[0] for s in teardowns][-1] == "/tmp/hpcop-oz"
     assert [s.node for s in teardowns] == [f"node{i:02d}" for i in (2, 3, 4, 5, 6, 1)]
-    assert all(s.command[-2:] == ["--timeout", "600"] for s in teardowns)
+    assert all(s.command[-2:] == ["--timeout", "50"] for s in teardowns)
     checks = [s for s in rig.fake.sruns if s.command[0] == "test"]
     assert len(checks) == 6
     assert all(s.command[1:3] == ["!", "-e"] for s in checks)
@@ -723,7 +723,7 @@ def test_the_service_verbs_go_through_the_stable_hook_with_the_launcher_and_the_
     (verb, service, argv), keywords = calls[0]
     assert (verb, service, argv) == ("exec", "aspen", ["op_worker", "ping"])
     assert calls[1][0] == ("status", "aspen", [])
-    assert keywords["stop_seconds"] == 600
+    assert keywords["stop_seconds"] == 50
     assert isinstance(keywords["launcher"], hpc.launch.Launcher)
     assert isinstance(keywords["state"], hpc.launch.StateStore)
 

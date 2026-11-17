@@ -289,6 +289,37 @@ def test_o58_a_request_the_relay_took_and_never_answered_is_unknown_never_done(t
         assert driver.restart_link(SERVICE) == "command_timeout"
 
 
+def test_o58_a_verb_past_the_relays_240_s_bound_is_unknown_and_fails_closed(tmp_path):
+    """O58: the HPC driver's relay verb is bounded at 240 s (`command_timeout_s`, which was 120 s until three provider
+    outages on one HPC federation showed relay steps starting 47 to 103 s after they were issued, one round trip
+    taking 104.6 s). The relay hands the verb that bound; a verb the runner cuts at it is answered `timed_out`, and
+    the driver reads it as a command with no answer, never as done: a status raises, a start raises, a ping is no
+    pong, and no verb is retried."""
+    platform = write_hpc_platform(tmp_path)
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    assert settings.command_timeout_s == 240.0
+    asked = []
+
+    def overrun(argv, *, timeout_s):
+        asked.append((argv[len(PREFIX) :], timeout_s))
+        raise subprocess.TimeoutExpired(argv, timeout_s)
+
+    relay, clock = relay_of(tmp_path, overrun), FakeClock()
+    client = RelayClient(tmp_path, wait_s=settings.relay_wait_s, clock=clock, sleep=serving(relay, clock))
+    driver = hpc_driver(settings, probe=lambda service: True, transport=client)
+    with relay.holding():
+        with pytest.raises(DriverError, match="did not finish within 240 s"):
+            driver.observe(SERVICE)
+        with pytest.raises(DriverError, match="did not finish within 240 s"):
+            driver.start(SERVICE)
+        assert driver.ping(SERVICE) is False
+    assert asked == [
+        (["status", SERVICE], 240.0),
+        (["start", SERVICE], 240.0),
+        (["exec", SERVICE, "--", "/usr/sbin/op_worker", "ping"], 240.0),
+    ]
+
+
 def test_o58_an_outage_whose_stop_the_relay_never_answers_is_journalled_unknown_and_stays_open(tmp_path):
     """O58: the relay takes every request and answers none: the injector's stop is of unknown outcome (journalled
     `stop_unknown`), its restore never sees the provider down (every status unanswered), so the injection stays open,

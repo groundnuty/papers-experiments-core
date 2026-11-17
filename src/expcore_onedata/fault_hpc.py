@@ -36,8 +36,8 @@ records it beside `ready_after_s` in the restore. A status without it is no figu
 measurement is.
 
 **The stop's own bound.** A service's stop waits for its graceful end, then the kill, then the step's end: up to
-`stop_seconds` plus about 90 s, 690 s with the layout's default (DESIGN.md section 7 (e)). The driver bounds `stop` by
-`stop_timeout_s` (`[faults] settle_timeout_s` for this backend, refused below that figure at load), not by the
+`stop_seconds` plus about 90 s, 140 s with the layout's default of 50 s (DESIGN.md section 7 (e)). The driver bounds
+`stop` by `stop_timeout_s` (`[faults] settle_timeout_s` for this backend, refused below that figure at load), not by the
 command timeout: a stop that runs past the command timeout would otherwise always be one of unknown outcome. A stop
 that does time out is the Compose case: the injector journals it `stop_unknown` and the restore waits for it to show
 down (`faults.py`, "A stop of unknown outcome").
@@ -95,7 +95,13 @@ EXEC_COMMANDS: Mapping[str, tuple[str, ...]] = {
     "ping": (OP_WORKER, "ping"),
     "restart_link": ("bash", "-c", RESTART_LINK_SCRIPT),
 }
-HPC_STOP_BOUND_S = 690.0  # the layout's stop_seconds (600), supervise.py's kill tail (30 s), the step's end (60 s)
+# The layout's stop_seconds (50: three provider outages on one HPC federation, 17 Nov, ended a service 26.1 to 33.1 s
+# after its SIGTERM, the largest plus 50 %), supervise.py's kill tail (30 s) and the step's end (60 s).
+HPC_STOP_BOUND_S = 140.0
+# What one relay verb (a status, a start, a ping) may take: [faults] command_timeout_s on this backend. The same three
+# outages showed relay verb steps starting 47 to 103 s after they were issued, and one round trip took 104.6 s, against
+# the 120 s a command had until then (Compose's, which keeps it).
+HPC_COMMAND_TIMEOUT_S = 240.0
 HPC_EXEC_MARGIN_S = 60.0  # what an exec's step launch and its client's end add to the command's own bound
 HPC_POLL_S = 10.0  # every status is a Slurm step on the node's one control core: read every 10 s, not every 2
 IDENTITY = re.compile(r"[A-Za-z0-9@:._+-]{1,200}")  # an identity as a status prints it: one word, never a path
@@ -160,7 +166,7 @@ class HpcDriver:
         self,
         transport: Transport,
         *,
-        timeout_s: float = 120.0,
+        timeout_s: float = HPC_COMMAND_TIMEOUT_S,
         stop_timeout_s: float | None = None,
         probe: Callable[[str], bool],
     ) -> None:

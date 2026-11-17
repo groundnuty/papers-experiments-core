@@ -60,7 +60,9 @@ DEFAULTS = {
     # 2.5 GB rootfs, plus its posix storage on the same tmpfs; the largest control step (a token's delivery) about
     # 180 MB, killed under 100 MB.
     "time": "02:00:00",
-    "stop_seconds": 600,
+    # Three provider outages on one HPC federation (17 Nov): the largest service-side stop after SIGTERM was 33.1 s
+    # (the others 27.1 s and 26.1 s), plus 50 %.
+    "stop_seconds": 50,
     "core": "login",
     "zone": {"cpus": 4, "memory": "8g"},
     "provider": {"cpus": 4, "memory": "10g"},

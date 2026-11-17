@@ -11,7 +11,7 @@ The hook, in `hpcfed.py`'s command dispatch:
         return hpcfed_control.run(verb, service, argv, launcher=launcher, state=state, stop_seconds=stop_seconds,
                                   mounts=mounts)
 
-`run(verb, service, argv, *, launcher, state, stop_seconds=600, mounts=None, out=None, err=None)` returns the exit
+`run(verb, service, argv, *, launcher, state, stop_seconds=50, mounts=None, out=None, err=None)` returns the exit
 status. `argv` is what followed `--` for exec, and empty for the other verbs; `out` and `err` are this process's
 standard output and error when None.
 
@@ -625,7 +625,7 @@ def run(
     *,
     launcher: Any,
     state: Any,
-    stop_seconds: int = 600,
+    stop_seconds: int = 50,  # the layout's default (hpcsettings.DEFAULTS); `hpcfed.py` passes the layout's own
     mounts: Any = None,
     out: Any = None,
     err: Any = None,

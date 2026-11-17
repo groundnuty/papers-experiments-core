@@ -38,7 +38,8 @@ SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 # own bounds only (the relay's wait, the exec's step and the stop's own bound).
 SHARED = {
     "heal": "all_links",
-    "settle_timeout_s": 750,
+    "settle_timeout_s": 200,
+    "command_timeout_s": 240,
     "ready_timeout_s": DEFAULT_READY_TIMEOUT_S,
     "poll_s": 10,
     "clear_attempts": 3,
@@ -116,13 +117,13 @@ def test_o35_each_backend_gets_its_own_figure_from_its_own_file(tmp_path):
 
 
 def test_o35_a_backends_own_token_margin_is_held_to_through_the_hook(tmp_path):
-    """O35: the hook loads the file as the platform layer does, so the least `[tokens] margin_s` of its backend (5,340 s
+    """O35: the hook loads the file as the platform layer does, so the least `[tokens] margin_s` of its backend (2,950 s
     on HPC, 2,134 s on Compose) is held to on this path as well: an HPC file with Compose's margin is refused naming the
     margin it needs, and each file with its own backend's margin is read."""
     short = hpc_platform(tmp_path / "short", margin_s=2134)
-    with pytest.raises(ConfigError, match=r"margin_s = 2134 is too small.*set: \[tokens\] margin_s = 5340"):
+    with pytest.raises(ConfigError, match=r"margin_s = 2134 is too small.*set: \[tokens\] margin_s = 2950"):
         getattr(kinds, PLATFORM_HOOK)(short)
-    enough = hpc_platform(tmp_path / "enough", margin_s=5340)
+    enough = hpc_platform(tmp_path / "enough", margin_s=2950)
     assert getattr(kinds, PLATFORM_HOOK)(enough) == bound_of(enough)
     small = compose_platform(tmp_path / "compose", margin_s=2133)
     with pytest.raises(ConfigError, match=r"margin_s = 2133 is too small"):
