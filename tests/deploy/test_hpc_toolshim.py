@@ -220,15 +220,14 @@ def _launch(map_path, server, *, tmp_path):
 
 
 PROBE = """
-import socket, sys
-calls = []
-real = socket.getaddrinfo
+import json, socket, sys
+found = {}
 for host in sys.argv[1:]:
     try:
-        calls.append((host, socket.getaddrinfo(host, 8443, 0, socket.SOCK_STREAM)[0][4][0]))
-    except OSError as error:
-        calls.append((host, "unresolved"))
-print(calls)
+        found[host] = socket.getaddrinfo(host, 8443, 0, socket.SOCK_STREAM)[0][4][0]
+    except OSError:
+        found[host] = "unresolved"
+print(json.dumps(found))
 """
 
 
