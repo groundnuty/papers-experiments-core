@@ -55,7 +55,7 @@ def test_o73_the_federation_s_names_stay_as_they_are_and_the_node_s_follow_once(
     """O73: the services' names come first and unchanged, the agent node's after them, none twice in any case."""
     given = ("198.51.100.7", "CN-A.example.invalid")
     found = cellhost.scan_names(given, ("cn-own-n01", "cn-a.example.invalid", "CN-OWN-N01.cluster.example.invalid"))
-    assert found == (*given, "cn-own-n01", "cn-own-n01.cluster.example.invalid", "cn-a")
+    assert found == (*given, "cn-own-n01", "cn-a", "cn-own-n01.cluster.example.invalid")
 
 
 @pytest.mark.parametrize(

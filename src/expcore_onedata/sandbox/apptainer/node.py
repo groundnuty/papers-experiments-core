@@ -149,6 +149,11 @@ class NodeOps(Protocol):
         and no address."""
         ...
 
+    def own_names(self) -> tuple[str, ...]:
+        """The node's own host name and its fully qualified form, as it reports them (O73): for the gate's scan for node
+        names alone, never a record or a message. A form it cannot read is left out."""
+        ...
+
     def node_readings(self) -> dict[str, Any]:
         """The node's OS release (ID, VERSION_ID), glibc version and kernel release (`hostfacts.readings`, O87): files
         read as text and system values asked, nothing executed; a reading that fails is `unknown` with its reason."""
@@ -473,6 +478,9 @@ class LocalNode:
         done = self.apptainer([*apptainer, "--version"], VERSION_S)
         version = done.stdout.strip() if done.returncode == 0 else None
         return {"kernel": platform.release(), "apptainer": version[:80] if version else None}
+
+    def own_names(self) -> tuple[str, ...]:
+        return loopback.own_names()
 
     def node_readings(self) -> dict[str, Any]:
         return hostfacts.readings()

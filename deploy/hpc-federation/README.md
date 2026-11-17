@@ -500,7 +500,10 @@ must not read (the gate's count of node names, `rest_node_name_hits` in `docs/in
 and a Compose cell, which reads its own container's name, does not show it. The core gives every cell on both backends
 one fixed, neutral host name, `sandbox` (`expcore_onedata/sandbox/cellhost.py`, a constant of the core and no setting):
 each `apptainer exec` carries `--uts --hostname sandbox`, and the Docker agent's container is created with
-`--hostname sandbox`. A federation with a node of that name is refused at the start.
+`--hostname sandbox`. A federation with a node of that name is refused at the start. The gate's scan for node names
+(`rest_node_name_hits`) holds the agent node's own host name instead, in its fully qualified and one-label forms, read
+from the node at the start (`NodeOps.own_names`), after the federation's nodes' names, so a leak of the name the cell
+no longer shows is still counted; never `sandbox`, which is the allowed name and would count false hits.
 
 **`/etc/hostname`:** the sandbox binds none of its own. From Apptainer's source (read on its `main` branch, not on this
 site's release), `--uts` with a `--hostname` makes Apptainer write an `/etc/hostname` of the name and bind it, and it

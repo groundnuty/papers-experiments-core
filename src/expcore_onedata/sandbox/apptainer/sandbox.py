@@ -361,6 +361,14 @@ class ApptainerSandbox:
         declared = self._declared()
         return gaterun.hosts(self.spec.zone, self.spec.provider, declared)
 
+    def _scan_names(self, served: dict[str, dict[str, Any]]) -> tuple[str, ...]:
+        """The names the gate counts in the answers it relays (O73): the federation's nodes' and then the agent node's
+        own, in both forms, read from the node (`cellhost.scan_names`); none when the run has no names to scan, which is
+        a federation whose names are the real ones. The gate's own configuration alone holds them."""
+        if not self.spec.node_names:
+            return ()
+        return cellhost.scan_names(self.spec.node_names, self.node.own_names(), declared=served)
+
     def _declared(self) -> tuple[str, str] | None:
         """`[sandbox.federation]`'s zone and provider names in lower case, as the gate matches `Host` and SNI (O69);
         None when the platform declares none."""
@@ -393,7 +401,7 @@ class ApptainerSandbox:
             gaterun.write_config(config, gaterun.config(
                 run_key=sp.run_key, tls=self.s.tls, served=served, listing=sp.listing, directory=gate_dir,
                 tls_dir=tls_dir, token_file=token, port=self._gate_port, upstream_ca=self._ca_copy,
-                options=self.app.gate_options, scan_names=sp.node_names,
+                options=self.app.gate_options, scan_names=self._scan_names(served),
             ))  # fmt: skip
             self._token_files = [token]  # before it exists: every teardown removes it, whatever fails from here
             self.run_record()

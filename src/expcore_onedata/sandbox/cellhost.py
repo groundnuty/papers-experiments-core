@@ -17,17 +17,21 @@ a change of it is a change of the core's version. Each run records the name its 
 
 It must never be a node's name. The gate counts the node names the answers it relays hold (`rest_node_name_hits`), and
 the cell's own host name would be one of them; a federation with a node of that name, or whose fully qualified name
-starts with it, is refused at the start (`is_node_name`).
+starts with it, is refused at the start (`is_node_name`). The scan holds the agent node's own host name instead, in its
+fully qualified and one-label forms, as the node reports them (`scan_names`): a leak of the one name the cell no longer
+shows is still counted, and the declared name, which is the allowed one, never is.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from collections.abc import Iterable, MutableMapping
 from typing import Any
 
 CELL_HOSTNAME = "sandbox"
 FACT = "cell_hostname"  # the key of the run's `infrastructure_facts`
+LOCAL_NAMES = frozenset({"localhost", "localhost.localdomain"})  # nobody's name: scanned, they would count false hits
 LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")  # one DNS label: what a host name without a domain is
 REFUSAL = (
     "the cells' fixed host name is also the name of a node of the federation: a node's own name may not be the neutral "
@@ -46,9 +50,40 @@ def is_node_name(node_names: Iterable[str], name: str = CELL_HOSTNAME) -> bool:
     return any(n.lower().split(".", 1)[0] == name for n in node_names)
 
 
+def scan_names(node_names: Iterable[str], own: Iterable[str], declared: Iterable[str] = ()) -> tuple[str, ...]:
+    """The names the gate scans the answers it relays for (O73): the federation's nodes' (`node_names`, as they are),
+    then the agent node's own, `own` as the node reports them, each as it is lower-cased and by its first label, since
+    the scan takes a label followed by a dot for no match of the whole name. None twice in any case; never the declared
+    cell name, `localhost`, a name the federation declares (`declared`, what the agent is meant to see) or a blank; an
+    address is kept whole."""
+    found = list(node_names)
+    seen = {n.lower() for n in found}
+    skip = {CELL_HOSTNAME, *LOCAL_NAMES, *(d.lower() for d in declared)}
+    for raw in own:
+        name = raw.strip().lower().rstrip(".")
+        if not name or name in skip:
+            continue
+        for form in (name, *_first_label(name)):
+            if form not in seen and form not in skip:
+                found.append(form)
+                seen.add(form)
+    return tuple(found)
+
+
+def _first_label(name: str) -> tuple[str, ...]:
+    """The first label of a fully qualified name; nothing for a name of one label or an address."""
+    if "." not in name:
+        return ()
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return (name.split(".", 1)[0],)
+    return ()
+
+
 def note(meta: MutableMapping[str, Any], name: str = CELL_HOSTNAME) -> None:
     """Put the name the run's cells were given in `meta`'s `infrastructure_facts`, beside what that holds."""
     meta.setdefault("infrastructure_facts", {})[FACT] = name
 
 
-__all__ = ["CELL_HOSTNAME", "FACT", "REFUSAL", "is_node_name", "note", "valid"]
+__all__ = ["CELL_HOSTNAME", "FACT", "LOCAL_NAMES", "REFUSAL", "is_node_name", "note", "scan_names", "valid"]
