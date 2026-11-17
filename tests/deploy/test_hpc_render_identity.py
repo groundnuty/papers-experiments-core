@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 import tarfile
@@ -29,7 +30,9 @@ EXPECTED = "render-identity.expected.json"
 STUDY_STATE = "study-state"
 VERSION = "expcore-render-identity/1"
 PINS = {"sandbox_sif_sha256", "egress_shim_sha256", "egress_collector_sha256", "oneclient_bundle_sha256"}
-KEYS = {"version", "template_sha256", "platform_fingerprint_sha256"} | PINS
+ARTIFACTS = "study_artifacts_tree_sha256"  # in the record only when the site declares HPC_STUDY_ARTIFACTS
+RENDERED = {"version", "template_sha256", "platform_fingerprint_sha256"} | PINS  # a render with no artifacts directory
+KEYS = RENDERED | {ARTIFACTS}
 HEX = re.compile(r"[0-9a-f]{64}")
 SIF = b"an invented SIF image\n"
 
@@ -81,10 +84,12 @@ def render(
     layout: Path = LAYOUT,
     printed: list | None = None,
     work_root: Path | None = None,
+    tree: Path | None = None,
 ) -> Path:
     """The core's phase of `layout` over a root of its own (as `hpcfed.py up` runs it), its pins the site's files
     `agent_site(…, sif=sif)` as declared and its sandbox's work root `work_root` (the step makes it under its tmpfs);
-    the federation's root. What the phase prints is appended to `printed`."""
+    the federation's root. What the phase prints is appended to `printed`. With `tree`, the site declares that
+    artifacts directory: the digest `up` took of it in its preflight is among the values the phase is handed."""
     import fedlayout
     import fedspec
     import hpcpins
@@ -107,6 +112,8 @@ def render(
     }
     pins = hpcpins.values(hpc.settings.site_from_environment(site))
     values = {**hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, root), **pins}
+    if tree is not None:
+        values[ARTIFACTS] = hpc.identity.tree_sha256(tree)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(hpc.fedlinks, "check_links", link_check_stand_in([]))
         out = hpc.boot.core_phase(
@@ -139,13 +146,14 @@ def edited_layout(folder: Path, comment: str) -> Path:
 
 def test_o74_up_writes_the_record_0600_with_exactly_the_declared_keys_and_nothing_of_the_site(hpc, tmp_path, ca):
     """O74: the root holds `render-identity.json`, mode 0600, canonical JSON with sorted keys; its keys are exactly the
-    declared set, each value a SHA-256 or the version; no address, id, node, path or secret is in it."""
+    declared set (of a render whose site declares no artifacts directory), each value a SHA-256 or the version; no
+    address, id, node, path or secret is in it."""
     root = render(hpc, tmp_path / "a" / "root", ca)
     path = root / FILE
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     text = path.read_text(encoding="utf-8")
     record = json.loads(text)
-    assert set(record) == KEYS
+    assert set(record) == RENDERED
     assert record["version"] == VERSION
     assert all(HEX.fullmatch(value) for key, value in record.items() if key != "version")
     assert text == json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
@@ -209,6 +217,74 @@ def test_o74_up_says_the_record_was_written_beside_the_platform_file(hpc, tmp_pa
     printed = []
     render(hpc, tmp_path / "a" / "root", ca, printed=printed)
     assert f"facts.json and platform.toml written; {FILE} written" in printed[0]
+
+
+def artifacts_tree(folder: Path, **changes: bytes) -> Path:
+    """A study's artifacts directory made by hand under `folder`: a clone, a venv with its links, a manifest."""
+    files = {"clone/server.py": b"print('serve')\n", "manifests/space.json": b"{}\n",
+             "venv/lib/python3.12/site-packages/pkg/__init__.py": b"VALUE = 1\n"}  # fmt: skip
+    for name, data in {**files, **changes}.items():
+        (folder / name).parent.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_bytes(data)
+    (folder / "venv" / "bin").mkdir(exist_ok=True)
+    (folder / "venv" / "bin" / "python").symlink_to("/an/interpreter/bin/python3.12")
+    return folder
+
+
+def test_o74_up_with_a_study_artifacts_directory_records_the_digest_of_its_tree_and_no_path(hpc, tmp_path, ca):
+    """O74: the site declares `HPC_STUDY_ARTIFACTS`: the record holds `study_artifacts_tree_sha256`, the SHA-256 of the
+    tree's canonical listing (`hpcidentity.tree_sha256`), beside every other key, and neither the directory's path nor
+    any of the path it lies under is anywhere in the file (mode 0600, as the rest)."""
+    tree = artifacts_tree(tmp_path / "studies" / "a-study" / "artifacts")
+    root = render(hpc, tmp_path / "a" / "root", ca, tree=tree)
+    text = (root / FILE).read_text(encoding="utf-8")
+    record = json.loads(text)
+    assert set(record) == KEYS
+    assert record[ARTIFACTS] == hpc.identity.tree_sha256(tree)
+    assert HEX.fullmatch(record[ARTIFACTS])
+    assert text == json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    assert stat.S_IMODE((root / FILE).stat().st_mode) == 0o600
+    for part in (str(tree), str(tmp_path), "a-study", "artifacts", "/an/interpreter"):
+        assert part not in text
+
+
+def test_o74_up_with_no_study_artifacts_directory_records_no_such_key_and_the_record_is_what_it_was(hpc, tmp_path, ca):
+    """O74: a federation with no artifacts directory has no `study_artifacts_tree_sha256`, never a null or an empty
+    one, and the rest of its record is that of a federation with one: the key is the only difference."""
+    with_tree = render(hpc, tmp_path / "a" / "root", ca, tree=artifacts_tree(tmp_path / "artifacts"))
+    without = render(hpc, tmp_path / "b" / "root", ca)
+    assert ARTIFACTS in record_of(with_tree)
+    assert ARTIFACTS not in (without / FILE).read_text(encoding="utf-8")
+    assert set(record_of(without)) == RENDERED
+    assert {k: v for k, v in record_of(with_tree).items() if k != ARTIFACTS} == record_of(without)
+
+
+def test_o74_two_federations_with_copies_of_one_artifacts_tree_at_other_paths_give_equal_records(hpc, tmp_path, ca):
+    """O74: the same tree at two paths, in two federations of one template: equal records, byte for byte."""
+    one = artifacts_tree(tmp_path / "one" / "artifacts")
+    other = tmp_path / "elsewhere" / "copy"
+    shutil.copytree(one, other, symlinks=True)
+    first = render(hpc, tmp_path / "a" / "root", ca, label="fed-a", tree=one)
+    second = render(hpc, tmp_path / "b" / "root", ca, label="fed-b", tree=other)
+    assert (first / FILE).read_bytes() == (second / FILE).read_bytes()
+    assert ARTIFACTS in record_of(first)
+
+
+def test_o74_a_changed_artifacts_tree_gives_another_record_in_the_artifacts_entry_alone(hpc, tmp_path, ca):
+    """O74: one byte of one file of the tree (its venv's) differs: the record differs in the tree's digest and in
+    nothing else, since the rendered platform does not hold the tree."""
+    one = render(hpc, tmp_path / "a" / "root", ca, tree=artifacts_tree(tmp_path / "one"))
+    pkg = "venv/lib/python3.12/site-packages/pkg/__init__.py"
+    other = render(hpc, tmp_path / "b" / "root", ca, tree=artifacts_tree(tmp_path / "two", **{pkg: b"VALUE = 2\n"}))
+    assert differing(record_of(one), record_of(other)) == {ARTIFACTS}
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "G" * 64, "A" * 64])
+def test_o74_a_digest_that_is_no_sha256_is_refused_by_the_record_naming_the_key(hpc, tmp_path, bad):
+    """O74: the record takes the digest `up` took and recorded, and refuses one that is no 64 lower-case hex digits,
+    naming the key."""
+    with pytest.raises(RuntimeError, match=ARTIFACTS):
+        hpc.identity.build("# a template\n", {ARTIFACTS: bad}, tmp_path / "platform.toml")
 
 
 # -- step: the expected record, the federation's record ------------------------------------------------------------
@@ -378,6 +454,56 @@ def test_o74_every_entry_that_differs_is_named_and_only_those(shards, tmp_path, 
     assert code == 73
     nothing_made(tmp_path, seen, checks)
     assert {key for key in KEYS if re.search(rf"\b{key}\b", err)} == named
+
+
+@pytest.mark.parametrize(
+    ("expected", "held"),
+    [(identity(), identity(**{ARTIFACTS: sha("another tree")})),  # both hold a digest, and they differ
+     (identity(), identity(**{ARTIFACTS: None})),  # only the expected record has one: the federation has no directory
+     (identity(**{ARTIFACTS: None}), identity())],  # only the federation's does: the plan expected none
+    ids=["the digests differ", "only the expected record has one", "only the federation's record has one"],
+)  # fmt: skip
+def test_o74_a_step_refuses_a_federation_whose_artifacts_digest_is_not_the_expected_one_naming_the_key(
+    shards, tmp_path, monkeypatch, capsys, expected, held
+):
+    """O74: the artifacts directory's digest is compared like any other key: a federation whose digest differs, has
+    none where one is expected or has one where none is expected is refused with status 73 before anything is made,
+    naming `study_artifacts_tree_sha256` and no other key, and never a hash or a path."""
+    root = federation_root(tmp_path, held)
+    code, seen, checks = run_step(shards, step_args(tmp_path, expected), root, monkeypatch)
+    err = capsys.readouterr().err
+    assert code == shards.PRE_STEP_REFUSED == 73
+    nothing_made(tmp_path, seen, checks)
+    assert {key for key in KEYS if re.search(rf"\b{key}\b", err)} == {ARTIFACTS}
+    assert not HEX.search(err)
+    assert str(tmp_path) not in err
+
+
+def test_o74_a_step_expecting_the_federations_own_artifacts_digest_runs_and_archives_the_record(
+    shards, tmp_path, monkeypatch
+):
+    """O74: the expected record and the federation's hold one digest: the step runs, and the archive carries the
+    federation's record with the key in it, byte for byte."""
+    root = federation_root(tmp_path, identity())
+    code, _, _ = run_step(shards, step_args(tmp_path, identity()), root, monkeypatch)
+    assert code == 0
+    assert json.loads(archived(tmp_path))[ARTIFACTS] == sha(ARTIFACTS)
+    assert archived(tmp_path) == (root / FILE).read_bytes()
+
+
+@pytest.mark.parametrize("bad", ["abc", sha("x").upper(), "", 7, None])
+def test_o74_a_record_whose_artifacts_entry_is_no_sha256_is_not_a_record_and_echoes_none_of_it(
+    shards, tmp_path, monkeypatch, capsys, bad
+):
+    """O74: the key is declared, and its value must be a SHA-256 like every hash of the record: any other is a
+    malformed federation record, refused without echoing it."""
+    root = federation_root(tmp_path, canonical(identity() | {ARTIFACTS: bad}))
+    code, seen, checks = run_step(shards, step_args(tmp_path, identity()), root, monkeypatch)
+    err = capsys.readouterr().err
+    assert code == 73
+    nothing_made(tmp_path, seen, checks)
+    assert "not a well-formed render identity" in err
+    assert not re.search(r"[0-9a-fA-F]{40}", err)
 
 
 def test_o74_a_step_with_the_record_but_no_expectation_runs_and_archives_it(shards, tmp_path, monkeypatch):
@@ -767,6 +893,7 @@ def test_o74_the_step_s_own_copy_of_the_records_names_is_the_driver_s(hpc, shard
     assert shards.RENDER_IDENTITY == identity_module.FILE == FILE
     assert shards.RENDER_IDENTITY_VERSION == identity_module.VERSION == VERSION
     assert set(shards.RENDER_IDENTITY_PINS) == set(identity_module.PINS) == PINS
+    assert shards.RENDER_IDENTITY_ARTIFACTS == identity_module.ARTIFACTS == ARTIFACTS
     assert set(shards.RENDER_IDENTITY_KEYS) == set(identity_module.KEYS) == KEYS
     assert shards.STUDY_STATE == STUDY_STATE
     assert shards.canonical_render_identity(identity()) == canonical(identity()).encode()
