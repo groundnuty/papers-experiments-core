@@ -397,6 +397,51 @@ def _run_start_reasons(run_start: Mapping[str, Any] | None, marks: int, late: bo
     return set()
 
 
+GATE_NOT_COLLECTED = "gate_not_collected"
+NODE_NAME_HITS_VERSION = 1
+
+
+def node_name_hits_unknown(*reasons: str) -> dict[str, Any]:
+    """A count of node names the gate's scan found that cannot be shown: `rest_answers` is None, with the reasons."""
+    return {"version": NODE_NAME_HITS_VERSION, "rest_answers": None, "unknown": sorted(reasons)}
+
+
+def node_name_hits(lines: list[str] | None, stop: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The node names and addresses the gate counted in the answers it relayed (O73), from its log once it was stopped:
+    one channel, `rest_answers` (what the platform answered, and what the gate itself answered), the sum of the request
+    lines' `node_name_hits`. The data a file's content holds is no answer and is not scanned. Never a body, a matched
+    name or its context: the lines hold an integer. As for the bytes served, the count is shown or unknown, never a
+    partial sum taken for the whole: a log that could not be read, a gate not shown stopped, a failed write, a line
+    that is no count, an answer in flight at the stop or no `teardown_complete` line make it `None` with the reasons."""
+    reasons = _stop_reasons(stop) | (set() if lines is not None else {UNREADABLE})
+    total, confirmed = 0, False
+    for text in lines or ():
+        if not text.strip():
+            continue
+        try:
+            record = json.loads(text)
+        except ValueError:
+            reasons.add(GATE_LOG_MALFORMED)
+            continue
+        if not isinstance(record, dict):
+            reasons.add(GATE_LOG_MALFORMED)
+            continue
+        if record.get("event") == "conn_close" and record.get("in_request") is True:
+            reasons.add(REQUEST_IN_FLIGHT)
+        confirmed = confirmed or record.get("event") == TEARDOWN_COMPLETE
+        if "node_name_hits" in record:
+            hits = record["node_name_hits"]
+            if isinstance(hits, bool) or not isinstance(hits, int) or hits < 0:
+                reasons.add(GATE_LOG_MALFORMED)
+            else:
+                total += hits
+    if lines is not None and not confirmed:
+        reasons.add(GATE_TEARDOWN_UNCONFIRMED)
+    if reasons:
+        return node_name_hits_unknown(*reasons)
+    return {"version": NODE_NAME_HITS_VERSION, "rest_answers": total, "unknown": []}
+
+
 def served(
     lines: list[str] | None,
     stop: Mapping[str, Any] | None,

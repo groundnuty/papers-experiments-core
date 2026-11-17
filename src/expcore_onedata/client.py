@@ -251,6 +251,7 @@ import httpx
 
 from expcore.config.loading import ConfigError
 from expcore.records.redact import register_secret
+from expcore_onedata.addresses import AddressMap
 from expcore_onedata.collectbudget import COLLECT_AFTER_BYTES, CollectBudget
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
@@ -452,13 +453,47 @@ _ONE_ATTEMPT = _GateReads()  # the choice of whatever measures the platform, and
 _REQUEST_COUNT = re.compile(r"Request Count: (\d+)$")  # the end of httpcore's `ConnectionInterface.info()`
 
 
+class MappedTransport(httpx.HTTPTransport):
+    """An HTTP transport that dials a declared name at the address the map holds for it (O73).
+
+    The request keeps its URL, so its `Host` is the declared name; the connection is made to the mapped address, and the
+    TLS handshake asks for the declared name and checks the certificate against it (httpcore's `sni_hostname`
+    extension). A host the map does not hold is sent as it is. The request the transport is given is never changed: the
+    one it sends is a copy, so no answer, error or log of the client's holds the address, and the connection pool is
+    keyed by the address, which the map gives to one declared name only."""
+
+    def __init__(self, addresses: AddressMap, **options: Any) -> None:
+        super().__init__(**options)
+        self._addresses = addresses
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        address = self._addresses.address_of(host)
+        if address is None:
+            return super().handle_request(request)
+        redirected = httpx.Request(
+            request.method,
+            request.url.copy_with(host=address),
+            headers=request.headers,
+            stream=request.stream,
+            extensions={**request.extensions, "sni_hostname": host},
+        )
+        return super().handle_request(redirected)
+
+
 def _build_http(config: PlatformConfig, timeout_s: float) -> httpx.Client:
     """The HTTP client the layer sends through when none is injected, checking certificates as `[tls]` says. A retried
     read is sent through one more of them, made for that read alone, so it has a connection of its own
     (`readretry.py`). Its pool keeps every idle connection it may open alive (`POOL_CONNECTIONS`), for httpx's own
-    5 s, so a reading with many requests in flight reuses its connections."""
+    5 s, so a reading with many requests in flight reuses its connections. With `[addresses]` (O73) it dials each
+    declared name at its mapped address (`MappedTransport`), and trusts no proxy of the environment, which could not
+    resolve the names."""
     limits = httpx.Limits(max_connections=POOL_CONNECTIONS, max_keepalive_connections=POOL_CONNECTIONS)
-    return httpx.Client(timeout=timeout_s, verify=config.tls.client_verify(), limits=limits)
+    verify = config.tls.client_verify()
+    if config.addresses is None:
+        return httpx.Client(timeout=timeout_s, verify=verify, limits=limits)
+    transport = MappedTransport(config.addresses, verify=verify, limits=limits)
+    return httpx.Client(timeout=timeout_s, transport=transport, trust_env=False)
 
 
 _NO_BODY = httpx.ByteStream(b"")  # holds nothing and points at nothing: what a released answer's stream is made

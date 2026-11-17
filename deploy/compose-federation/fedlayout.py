@@ -187,6 +187,18 @@ class Layout:
         return self.secrets / "users"
 
     @property
+    def address_map(self) -> Path:
+        """The HPC federation's address map (O73): each declared name's node address, private, which only a federation
+        whose names resolve nowhere has."""
+        return self.secrets / "address-map.json"
+
+    @property
+    def toolshim(self) -> Path:
+        """The directory of the launcher a Python tool server is started through (O73): the HPC federation's `up`
+        copies it into the root, so a copy of the platform file beside a study reads the root's own."""
+        return self.root / "toolshim"
+
+    @property
     def ca_pem(self) -> Path:
         return self.root / "ca" / "federation-ca.pem"
 

@@ -606,7 +606,12 @@ def test_o59_the_run_binds_the_trees_read_only_before_the_image_and_through_the_
     exec_line = body[body.index("exec ") :]
     assert exec_line.index('"${binds[@]}"') < exec_line.index('"$R"')
     assert "--writable --containall --no-home" in exec_line
-    assert not re.search(r"--bind[ =]", exec_line)  # no bind of its own: every one is read from the list
+    # no bind of its own: every tree's is read from the list. The one other bind is our own hosts file over /etc/hosts
+    # (O73), made only for a service registered under a declared name, never a tree of the node's filesystems.
+    ours = 'naming=(--no-mount bind-paths --bind "$W/hosts:/etc/hosts:ro")'
+    assert ours in body
+    assert not re.search(r"--bind[ =]", exec_line.replace('"${naming[@]}"', "").replace(ours, ""))
+    assert exec_line.index('"${naming[@]}"') < exec_line.index('"${binds[@]}"')
 
 
 def test_o59_the_provider_job_and_its_configuration_pass_the_imports_through_and_the_zone_takes_none():

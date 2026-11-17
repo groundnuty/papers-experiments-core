@@ -118,7 +118,7 @@ def render(
         patch.setattr(hpc.fedlinks, "check_links", link_check_stand_in([]))
         out = hpc.boot.core_phase(
             federation, (5001, 5001), values, environ={},
-            rest=lambda ca_file: SimpleNamespace(close=lambda: None), bootstrap=BootStandIn(label),
+            rest=lambda ca_file, **kwargs: SimpleNamespace(close=lambda: None), bootstrap=BootStandIn(label),
             steps=lambda boot: None, content=lambda boot: SimpleNamespace(reset=lambda timeout: None),
             data=data_stand_in(),
         )  # fmt: skip
