@@ -118,6 +118,12 @@ def test_b18_a_declared_set_and_a_baseline_fingerprint_together_are_refused():
         judged([KESTREL], expected_fingerprint=KESTREL, accepted_fingerprints=DECLARED)
 
 
+def test_b18_the_set_is_a_collection_of_fingerprints_not_one_string():
+    """B18: a bare string would be read as its characters, so it is refused."""
+    with pytest.raises(TypeError, match="not one string"):
+        judged([KESTREL], accepted_fingerprints=KESTREL)
+
+
 def test_b18_the_set_may_be_any_iterable_and_is_read_once():
     """B18: a generator of the declared fingerprints judges every reply, not only the first."""
     result = judged([KESTREL, PLOVER], accepted_fingerprints=(name for name in DECLARED))

@@ -30,13 +30,19 @@ System fingerprints. The first fingerprint a model is served with is its baselin
 a change. A reply that carries several fingerprints (joined with `MIXED_FINGERPRINTS`, as a reply spliced from
 servers that differ is) is a change by itself and never becomes a baseline. A reply without a fingerprint is no
 change and sets nothing.
+
+A declared set (B18). A model whose entry declares `accepted_fingerprints` is served by several deployments the study
+decided are one model, and the set replaces the baseline: a reply is the model when it carried no fingerprint or when
+the set lists each fingerprint it carried (a mixed reply too), and a change otherwise. `outside_accepted` is that
+rule, the one definition: the campaign's check (`expcore.campaign.identity`) and `judge` both call it, so a preflight
+and a campaign agree on the same replies.
 """
 
 from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
 NOT_REPORTED = "not reported"
@@ -77,6 +83,21 @@ def same_model(expected: str, served: str) -> bool:
 def is_mixed(fingerprint: str | None) -> bool:
     """Tell whether a fingerprint is really several, joined because one reply carried more than one."""
     return bool(fingerprint) and MIXED_FINGERPRINTS in (fingerprint or "")
+
+
+def fingerprint_parts(fingerprint: str) -> list[str]:
+    """The fingerprints a reply carried: one, or several joined into a mixed value."""
+    return fingerprint.split(MIXED_FINGERPRINTS)
+
+
+def outside_accepted(accepted: Collection[str], fingerprint: str | None) -> bool:
+    """Tell whether a reply's fingerprint is a change under a model's declared set (B18).
+
+    A reply that carried none is not; one that carried several is the model only when the set lists each of them.
+    """
+    if not fingerprint:
+        return False
+    return not all(part in accepted for part in fingerprint_parts(fingerprint))
 
 
 def _fingerprint_of(resp: Any) -> str | None:
@@ -257,11 +278,24 @@ def judge(
     *,
     served_fingerprints: Iterable[str] = (),
     expected_fingerprint: str | None = None,
+    accepted_fingerprints: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Return {"state": match|mismatch|unreported, "reasons": [...], "not_reported": [settings never reported]}.
 
     `accepted_ids` are other ids the server reports for the same model (the model table's aliases).
+    `accepted_fingerprints` is the set the model's entry declares (B18; `ModelSpec.accepted_fingerprints`), judged as
+    the campaign judges it (`outside_accepted`): a reply from any member is the model, a reply from another
+    fingerprint is a mismatch, and the set replaces the baseline, so `expected_fingerprint` is refused with it. An
+    empty set judges as if none were given.
     """
+    if isinstance(accepted_fingerprints, str):
+        raise TypeError("accepted_fingerprints is a collection of fingerprints, not one string")
+    declared = tuple(accepted_fingerprints)  # read once: any iterable will do
+    if declared and expected_fingerprint is not None:
+        raise ValueError(
+            "accepted_fingerprints replaces the fingerprint baseline, as the campaign's check does: "
+            "give it or expected_fingerprint, not both"
+        )
     ids = sorted({str(x) for x in served_ids if x})
     ok_ids = {expected_id, *accepted_ids}
     reported_by = served_settings or {}
@@ -269,7 +303,7 @@ def judge(
     bad = [i for i in ids if not any(same_model(ok, i) for ok in ok_ids)]
     if bad:
         reasons.append(f"served model id {bad} is not the expected {expected_id!r}")
-    reasons += _fingerprint_reasons(served_fingerprints, expected_fingerprint)
+    reasons += _fingerprint_reasons(served_fingerprints, expected_fingerprint, declared)
     for k, vv in reported_by.items():
         if vv == NOT_REPORTED or vv is None or (k not in requested and k not in KNOWN_SETTINGS):
             continue  # not reported, or reply metadata that is neither requested nor a known setting
@@ -292,9 +326,21 @@ def judge(
     return {"state": "match", "reasons": [], "not_reported": not_rep}
 
 
-def _fingerprint_reasons(fingerprints: Iterable[str], expected: str | None) -> list[str]:
-    """List why the fingerprints of a run are a change: a mixed reply, different replies, or a moved baseline."""
+def _fingerprint_reasons(
+    fingerprints: Iterable[str], expected: str | None, accepted: Collection[str] = ()
+) -> list[str]:
+    """List why the fingerprints of a run are a change: a mixed reply, different replies, or a moved baseline.
+
+    Under a declared set only a fingerprint the set does not list is a change (B18), however many replies differ.
+    """
     seen = list(dict.fromkeys(f for f in fingerprints if f))
+    if accepted:
+        listed = ", ".join(sorted(set(accepted)))
+        return [
+            f"system fingerprint {f!r} is not in accepted_fingerprints ({listed})"
+            for f in seen
+            if outside_accepted(accepted, f)
+        ]
     reasons = []
     if any(is_mixed(f) for f in seen):
         reasons.append("a reply carried several system fingerprints")

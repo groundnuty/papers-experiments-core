@@ -18,7 +18,8 @@ that set instead of a fingerprint baseline: a reply served under a fingerprint o
 other is a change as above, and a reply that carries several fingerprints is the model only when the set lists each
 of them. The served model id is checked against its baseline as before. Whether the deployments are the same model
 (the same weights, the same precision) is the study's decision; the set records it, and the campaign fingerprint
-freezes it (`expcore.study.pipeline.model_digest`).
+freezes it (`expcore.study.pipeline.model_digest`). A preflight judges the same replies by the same rule:
+`expcore.models.served.judge` takes the model's set (`accepted_fingerprints=`) and both call `outside_accepted`.
 
 A declared fingerprint is confirmed by its first witness: the admission probe, or the first run with a reply that
 showed it under the model's own id (its API id or an alias). That is a record of observation, not a gate: a run is
@@ -39,18 +40,14 @@ from typing import Any
 from expcore.campaign.deployments import ACCEPTED_META
 from expcore.campaign.store import Store
 from expcore.config.models import ModelSpec
-from expcore.models.served import MIXED_FINGERPRINTS, Baseline, same_model
+from expcore.models.served import Baseline, outside_accepted, same_model
+from expcore.models.served import fingerprint_parts as parts  # the served module's split, kept under its old name
 
 __all__ = ["ACCEPTED_META", "META", "ServedIdentities", "parts"]
 
 META = "served_baselines"
 ADMISSION_PROBE = "admission_probe"
 RUN = "run"
-
-
-def parts(fingerprint: str) -> list[str]:
-    """The fingerprints a reply carried: one, or several joined into a mixed value."""
-    return fingerprint.split(MIXED_FINGERPRINTS)
 
 
 class ServedIdentities:
@@ -211,7 +208,7 @@ def _own(spec: ModelSpec, served: str | None) -> bool:
 
 def _outside(spec: ModelSpec, fingerprint: str | None) -> dict[str, Any] | None:
     """The change a fingerprint is under the entry's declared set: None when the reply carried none, or when the set
-    lists every fingerprint it carried."""
-    if not fingerprint or all(p in spec.accepted_fingerprints for p in parts(fingerprint)):
+    lists every fingerprint it carried (`expcore.models.served.outside_accepted`, which `judge` applies too)."""
+    if not outside_accepted(spec.accepted_fingerprints, fingerprint):
         return None
     return {"system_fingerprint": fingerprint, "accepted_fingerprints": list(spec.accepted_fingerprints)}
