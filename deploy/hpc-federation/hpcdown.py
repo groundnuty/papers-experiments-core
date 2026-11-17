@@ -55,7 +55,7 @@ class Down:
     def evidence_gate(self, discard: bool, reason: Optional[str] = None) -> str:
         """O63: down removes the root, which holds the evidence the study's post-check and the facts read (the state,
         `platform.toml`, `facts.json`, the link check, the render identity, the fault journals), so it refuses, before
-        it stops or cancels anything, a root that holds evidence a run left (`hpcevidence.present_evidence`: a step of
+        it stops or cancels anything, a root that holds evidence a run left (`hpcevidence.check_collected`: a step of
         a shard started there, `shards.py step`, or the fault journal, the relay's journals, a shard claim or the
         pilot's wiring has something in it, as after Day-0 measurements with no step) unless `shards.py collect` marked
         it and the evidence a step, the study or `up` writes (the strict files of `hpcevidence`: the journals, the
@@ -89,10 +89,11 @@ class Down:
         with step records names its shards; one that only ran Day-0 measurements names the kinds of evidence it holds
         (never a file or a path), and the remedy `collect --roots-only`, which needs a plan that names the root."""
         if found.stale:
+            since = "a step started or wrote since" if found.labels else "something wrote since"
             what = (
                 "it can no longer be read or archived"
                 if found.unreadable
-                else f"{', '.join(found.changed)}: a step started or wrote since, or a file was changed"
+                else f"{', '.join(found.changed)}: {since}, or a file was changed"
             )
             why = f"the {found.named} changed after it was collected ({what}), so what was collected lacks it"
             remedy = (
@@ -106,7 +107,10 @@ class Down:
             remedy = "run `shards.py collect` (or `collect --roots-only`, which needs no final shard) while it is up"
         else:
             why = f"this root holds evidence a run left in it ({', '.join(found.present)}) and it was not collected"
-            remedy = "run `shards.py collect --roots-only` (it takes a plan that names this root) while it is up"
+            remedy = (
+                "run `shards.py collect --roots-only --shard L` (it needs a shard plan that names this root) while it "
+                "is up (a collect that refuses a file, a link or one holding a secret, leaves only --discard-evidence)"
+            )
         return (
             f"{why}: down would remove the state, facts, link check, render identity and fault journals the "
             f"post-check needs. Nothing was stopped or removed: {remedy}, pull the results and `verify-copy` them; "

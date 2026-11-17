@@ -702,8 +702,12 @@ empty directories, a lock and a heartbeat). A root after `up` alone, or a failed
 as it always did, so an emergency teardown is never blocked. A root with evidence and **no current marker** is refused,
 naming its shards (or, with no step record, the kinds of evidence it holds: the fault journal, the relay's journals, a
 shard claim, the day-0 wiring; never a file), and stays whole so that a `collect` can still read it; **`shards.py collect
---roots-only` marks a root with no step record** (it works from the plan, which must name the root), and a root no plan
-names is removed with `--discard-evidence`.
+--roots-only --shard L` marks a root with no step record** (it works from the shard plan, which must name the root; a
+plan has at least two shards, so a single federation's Day-0 root needs a manifest that names another shard too), and a
+root no plan names, or one the collect refuses (a link, a special file, a file holding a secret), is removed with
+`--discard-evidence`. A Day-0 run leaves evidence in the root only through the injector's journal and the relay's files,
+which need a platform with `[faults]`: its own report, and the checks that only read, are written under its `--out`
+directory, never in the root, so `down` does not see them.
 The runbook order stays **collect, pull and verify, then `down`.** `down` reads the root's evidence again and compares it
 with the marker file by file, **strictly only for the evidence a step or the study writes:** the fault journal
 (`fault-journal/`), the relay's journals (`fault-relay/`, `late-steps.jsonl` among them), the shard claims
@@ -719,7 +723,8 @@ it in the state (`evidence_rewritten_after_collect`: the time in UTC, the shards
 stays what the post-check reads, so no second archive is made. A link check a step makes also appends to the fault
 journal's holds, so a step still running after the collect is refused through the journal all the same.
 `pass-env.json` is in the results, not in the root: `verify-copy` checks it. A root that holds no evidence a run left
-goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
+(an NFS silly-rename file, a removed file still held open, is none: a `down` run again after a removal cut short finds only
+these) goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
 down's output then says which shards' evidence (or which kinds, for a root with no step record) was discarded, and **every
 use is recorded in the federation's state file** (`evidence_discarded`: the time in UTC, the shards, the kinds of
 evidence, whether their evidence had been collected and changed since, and the reason given with `--discard-reason TEXT`,

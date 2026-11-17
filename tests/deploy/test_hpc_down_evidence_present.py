@@ -237,6 +237,26 @@ def test_a_thing_in_the_evidence_trees_that_cannot_be_read_as_a_file_counts_as_e
     assert rig.fake.cancelled == []
 
 
+def test_an_nfs_silly_rename_file_is_no_evidence_and_is_not_named_as_a_shard(hpc, tmp_path, site):
+    """O63: a file removed while another process holds it open stays as `.nfsXXXX` until the last close. It is a
+    removed file: in the journal, or among the step records, it counts for nothing, so a `down` run again after a
+    removal cut short (which left the marker, no state and such files) is not refused for what it already removed."""
+    import hpcremove
+
+    assert hpc.evidence.SILLY.pattern == hpcremove.SILLY.pattern
+    rig = Rig(hpc, tmp_path, site)
+    leave_what_up_leaves(rig.root)
+    _write(rig.root, "fault-journal/.nfs00000000deadbeef0001", JOURNAL_LINE)
+    _write(rig.root, "fault-journal/old/.nfs00000000deadbeef0002", JOURNAL_LINE)
+    _write(rig.root, "shard-steps/.nfs00000000deadbeef0003", b"{}\n")
+    assert hpc.evidence.present_evidence(rig.root) == ()
+    assert hpc.evidence.uncollected(rig.root) is None
+    _write(rig.root, "fault-journal/injections.jsonl", JOURNAL_LINE)  # a real one beside them still counts
+    assert hpc.evidence.present_evidence(rig.root) == ("the fault journal",)
+    _write(rig.root, "shard-steps/shard-1.json", b"{}\n")
+    assert hpc.evidence.uncollected(rig.root) == (["shard-1"], False)  # the silly file is no shard
+
+
 def test_the_relays_directory_being_a_link_counts_as_evidence(hpc, tmp_path, site):
     """O63: `fault-relay/answers` a link: nothing can be said of what it holds, so it counts."""
     rig = Rig(hpc, tmp_path, site)
@@ -290,6 +310,25 @@ def test_a_line_appended_to_the_journal_after_the_collect_of_a_day0_only_root_re
     assert f"fault-relay/answers/{TAKEN_ID}.json" in str(another.value)
     rig.collected()
     assert rig.driver.down().startswith("down: the held job 4242 is gone")
+
+
+def test_the_stale_refusal_of_a_day0_only_root_does_not_say_a_step_started(hpc, tmp_path, site):
+    """O63: with no step record there is no step to name: the refusal says something wrote since, and the remedy names
+    `collect --roots-only --shard L`, which needs a plan that names the root."""
+    rig = _day0_rig(hpc, tmp_path, site)
+    rig.collected()
+    journal = rig.root / "fault-journal" / "injections.jsonl"
+    journal.write_bytes(journal.read_bytes() + b'{"event": "cleared"}\n')
+    with pytest.raises(RuntimeError, match=r"changed after it was collected") as late:
+        rig.driver.down()
+    assert "something wrote since" in str(late.value)
+    assert "a step started" not in str(late.value)
+    rig.root.joinpath("evidence-collected.json").unlink()
+    with pytest.raises(
+        RuntimeError, match=r"collect --roots-only --shard L.*a shard plan that names this root"
+    ) as bare:
+        rig.driver.down()
+    assert "--discard-evidence" in str(bare.value)
 
 
 def test_a_link_check_rewritten_after_the_collect_of_a_day0_only_root_is_named_not_refused(hpc, tmp_path, site):
@@ -395,6 +434,9 @@ UP_PATH = (
     "deploy/hpc-federation/hpcplacement.py",
     "deploy/hpc-federation/hpcpins.py",
     "deploy/hpc-federation/hpcstorage.py",
+    "deploy/hpc-federation/hpcrelay.py",
+    "deploy/compose-federation/fedrest.py",
+    "deploy/compose-federation/fedtools.py",
     "deploy/compose-federation/fedboot.py",
     "deploy/compose-federation/fedcontent.py",
     "deploy/compose-federation/fedfacts.py",

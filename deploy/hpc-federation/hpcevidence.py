@@ -17,22 +17,25 @@ what was checked is what is archived. As a last check no archived file may hold 
 and never the value.
 
 **Evidence present, not a step run.** `down` cannot see the results directory, so what gates it is what the root
-holds. A root that only ran Day-0 measurements has no shard step, and holds evidence all the same, so the gate keys on
-the evidence a run left (`present_evidence`), by who writes it: `UP_FILES` and `UP_TREES` are what `up` writes (the
-state, the link check, the platform file, the facts, the render identity, the data manifests), present in every root
-`up` finished, and count for nothing; `RUN_FILES` and `RUN_TREES` are what a run, a step or the operator leaves, and
-each one with something in it counts: a file of the fault journal at any depth, a relay request, taken request, answer
-or `late-steps.jsonl`, a shard claim, the pilot's `day0-wiring.toml`, and any step record (`shard-steps/<label>.json`,
-which `shards.py step` leaves in the root when a step of that shard starts: the shard's spec and how many steps of it
-started; no path, host or secret). An empty file does not (the injector's lock files, the claim's lock), and a thing
-that cannot be looked at (a link, a special file, a tree nested past `MAX_DEPTH`) does, since it proves no absence.
-`up` writes no line of the fault journal and takes no admission (a test pins that nothing on its path imports what
-does), and the relay it starts makes only empty directories, `relay.lock` and a heartbeat, which are in no set: so a
-root after `up` alone, or a failed `up`'s, holds none, and `down` removes it as it always did. The marker names the
-archive's SHA-256, the digest of the step records (`steps_digest`) and the SHA-256 of each archived file (`files`),
-all as they were when the evidence was read; `collect --roots-only` writes one from the plan, whatever the root holds,
-so a Day-0-only root can be marked. `down` reads the root's evidence again (`check_collected`) and compares it with
-the marker file by file.
+holds. A root that only ran Day-0 measurements has no shard step, and holds evidence all the same when the platform
+declares `[faults]` (the injector's journal and the relay's files are written there; a Day-0 run's own report and
+the checks that only read go to its `--out` directory, never to the root), so the gate keys on the evidence a run
+left (`present_evidence`), by who writes it: `UP_FILES` and `UP_TREES` are what `up` writes (the state, the link
+check, the platform file, the facts, the render identity, the data manifests), present in every root `up` finished,
+and count for nothing; `RUN_FILES` and `RUN_TREES` are what a run, a step or the operator leaves, and each one with
+something in it counts: a file of the fault journal at any depth, a relay request, taken request, answer or
+`late-steps.jsonl`, a shard claim, the pilot's `day0-wiring.toml`, and any step record (`shard-steps/<label>.json`,
+which `shards.py step` leaves in the root when a step of that shard starts: the shard's spec and how many steps of
+it started; no path, host or secret). An empty file does not (the injector's lock files, the claim's lock), nor does
+an NFS silly-rename file (a removed file still held open, which a `down` run again after a removal cut short finds),
+and a thing that cannot be looked at (a link, a special file, a tree nested past `MAX_DEPTH`) does, since it proves
+no absence. `up` writes no line of the fault journal and takes no admission (a test pins that no module on its path
+imports what does, directly), and the relay it starts makes only empty directories, `relay.lock` and a heartbeat,
+which are in no set: so a root after `up` alone, or a failed `up`'s, holds none, and `down` removes it as it always
+did. The marker names the archive's SHA-256, the digest of the step records (`steps_digest`) and the SHA-256 of each
+archived file (`files`), all as they were when the evidence was read; `collect --roots-only` writes one from the
+plan, whatever the root holds, so a Day-0-only root can be marked. `down` reads the root's evidence again
+(`check_collected`) and compares it with the marker file by file.
 
 **Two sets, compared differently.** `STRICT_FILES` and the trees (`STRICT_TREES`) hold what a
 step, the study or `up` writes: the fault journal, the relay's journals (`late-steps.jsonl` and its request, taken and
@@ -126,6 +129,11 @@ WHOLE_TREES = ("fault-journal",)
 # Every directory of the allow-list is strict: no process of the federation's own rewrites a file in one.
 STRICT_TREES = (*(directory for directory, _ in EVIDENCE_TREES), *WHOLE_TREES)
 _PLAIN_NAME = re.compile(r"[A-Za-z0-9._-]{1,200}")
+# An NFS client's silly-rename file: a file removed while a process still holds it open, which stays (as `.nfsXXXX`)
+# until the last close. It is a removed file, so no evidence: a `down` run again after a removal cut short finds only
+# these, once its state is gone. The same pattern as `hpcremove.SILLY`, which this module cannot import (it uses the
+# standard library alone: `collect` loads it by its path); a test compares the two.
+SILLY = re.compile(r"\.nfs[0-9A-Fa-f]+")
 MAX_DEPTH = 4
 SECRETS = "secrets"  # never archived; its files' contents are what no archived file may hold
 MIN_SECRET = 8  # the shortest value taken for a secret when scanning (a shorter one would match by chance)
@@ -421,6 +429,8 @@ def _journal_has(directory: int, depth: int) -> bool:
     with os.scandir(directory) as listing:
         entries = [(entry.name, entry.stat(follow_symlinks=False)) for entry in listing]
     for name, info in entries:
+        if SILLY.fullmatch(name):  # a removed file still held open: the file is gone
+            continue
         if not _PLAIN_NAME.fullmatch(name):
             return True
         if stat.S_ISREG(info.st_mode):
@@ -470,7 +480,7 @@ def _present(root_fd: int, steps: list[tuple[str, bytes | None]] | None) -> tupl
     admission, so a root after `up` alone holds none. Every read is below the root's descriptor with no link followed,
     and only sizes are read: a thing that cannot be looked at counts, never passes for nothing."""
     found: set[str] = set()
-    if steps != []:
+    if steps is None or any(not SILLY.fullmatch(name) for name, _ in steps):
         found.add(STEPS_KIND)
     for name, kind in RUN_FILES.items():
         try:
@@ -790,7 +800,11 @@ def check_collected(root: Path) -> Check | None:
         labels = tuple(
             ["(its records cannot be read)"]
             if entries is None
-            else [name[: -len(".json")] if name.endswith(".json") else name for name, _ in entries]
+            else [
+                name[: -len(".json")] if name.endswith(".json") else name
+                for name, _ in entries
+                if not SILLY.fullmatch(name)
+            ]
         )
         marker = _marker(fd)
         steps_moved = marker is not None and marker["steps_sha256"] != _digest_of(entries)
