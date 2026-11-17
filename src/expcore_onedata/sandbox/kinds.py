@@ -74,7 +74,7 @@ from typing import TYPE_CHECKING, Any
 
 from expcore.errors import PROVIDER_OUTAGE, InfraError, register_infra_kind
 from expcore.records.injections import INJECTOR_FAILURE  # the core names it: it sets an attempt aside as this kind
-from expcore_onedata.sandbox import infradeath, killcause
+from expcore_onedata.sandbox import deadline, infradeath, killcause
 
 if TYPE_CHECKING:
     from expcore.campaign.healthgate import DeferralBound
@@ -185,6 +185,12 @@ def run_ended_error(record: Mapping[str, Any]) -> InfraError:
         reason = record.get("reason")
         return InfraError(CELL_NOT_ISOLATED, f"the run was ended by the watch ({reason}: {why}): nothing more runs")
     outcome = record.get("outcome", "unknown")
+    if record.get("by") == deadline.SWEEP:  # the cell itself ran to its end: its own result stands apart from this
+        return InfraError(
+            CELL_UNKILLABLE,
+            f"the run was ended by the end-of-cell sweep after cell {record.get('cell')} ({outcome}): "
+            f"{record.get('why')}; the cell's own result stands: nothing more runs",
+        )
     return InfraError(CELL_UNKILLABLE, f"the run was ended at a cell's deadline ({outcome}): nothing more runs")
 
 

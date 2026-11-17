@@ -59,6 +59,7 @@ ESCALATED = (SURVIVED, MOUNT_ABORTED, SANDBOX_STOPPED)  # each makes the attempt
 # order the same stop, so their order never changes what is done; `survived_kill`, where nothing shows the cell gone, is
 # above them all
 SEVERITY = (KILLED, MOUNT_ABORTED, SANDBOX_STOPPED, SURVIVED)
+SWEEP = "end_of_cell_sweep"  # what ended a run that no deadline ended: the sweep after a cell found a survivor (O72)
 STOPS = (SURVIVED, SANDBOX_STOPPED)  # each orders the sandbox's stop: the caller runs it once the outcome is recorded
 KILL_ROUNDS = 5  # a forking worker can start a child between a listing and the kill: listed again until none is new
 POLL_S = 0.25
