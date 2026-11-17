@@ -507,7 +507,7 @@ def test_o63_a_line_with_no_guard_is_byte_for_byte_the_line_it_was(shards, tmp_p
         str(tmp_path / "venv" / "python"), "-I", "-B", str(SCRIPT), "step", "--study", str(tmp_path / "study"),
         "--index", "1", "--count", "2", "--label", "fed-a", "--tmpfs", str(tmp_path / "tmpfs"),
         "--results", str(tmp_path / "results"), "--core-src", str(tmp_path / "core" / "src"),
-        "--snapshot-every", "900",
+        "--snapshot-every", "900", "--job", "101", "--step-name", "hpcop-x-1-shard-1",
     ]  # fmt: skip
 
 
