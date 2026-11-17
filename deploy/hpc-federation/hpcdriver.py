@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 import hpcdata
 import hpcidentity
 import hpcimport
+import hpclaunchproof
 import hpcpins
 import hpcplacement
 import hpcquota
@@ -29,7 +30,7 @@ from fedspec import Spec
 from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, verify_ingested
 from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
-from hpclaunch import Launcher, StateStore
+from hpclaunch import Launcher, StateStore, client_log
 from hpcsettings import HpcSettings, Site
 from hpcslurm import READBACK, Allocation, Client, Shape, Slurm, SlurmError
 
@@ -50,10 +51,16 @@ IPV4 = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}")
 PASSPHRASE = re.compile(r"[A-Za-z0-9]{16,128}")
 GONE_POLLS = 3
 STDERR_TAIL = 300  # the most of a step's stderr a message repeats
+LAUNCH_STAGGER_S = 1.0  # declared bound: the pause between two provider launches, so five do not start in one second
 
 
 class CoreMismatch(RuntimeError):
     """The core an interpreter imports is not this checkout's."""
+
+
+class StepGone(RuntimeError):
+    """A service's step ended before its log said what `up` waited for: the one failure `await_start` weighs a retry
+    for, and the same failure `up` has always raised (its message is unchanged)."""
 
 
 def stderr_tail(text: str, limit: int = STDERR_TAIL) -> str:
@@ -87,6 +94,7 @@ class Driver(Down):
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     poll_s: float = 5.0
+    launch_stagger_s: float = LAUNCH_STAGGER_S  # recorded in the state file by `initial_state`
     core_paths: Dict[str, str] = field(default_factory=dict)
     relay_available: Callable[[], bool] = hpcrelay.available
     environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
@@ -265,6 +273,7 @@ class Driver(Down):
             "roles": [role.name for role in roles],
             "services": {role.name: hpcstate.new_service(role.kind) for role in roles},
             "clients": {},
+            "launch": {"stagger_s": self.launch_stagger_s, "retry_limit": hpclaunchproof.RETRY_LIMIT},
             "owner": None,
             # the spaces the study ingests into, each to be verified after its ingest (`verify_data`); plan reads it
             "data": {"ingested": hpcdata.ingested_record(self.layout, hpcdata.study_values(site.study_artifacts))},
@@ -379,7 +388,8 @@ class Driver(Down):
         self.export_zone()
         out = self.run_core()
         self.set(lambda s: s.update(phase="linked"))
-        return f"{out}\n{self.start_relay()}"
+        retried = self.retried()
+        return f"{out}\n{retried}\n{self.start_relay()}" if retried else f"{out}\n{self.start_relay()}"
 
     def make_storage(self, state: Mapping[str, Any]) -> None:
         """The providers' storage directories on scratch, as the state records them (hpcstorage.create); none without a
@@ -527,10 +537,63 @@ class Driver(Down):
             absent = absent + 1 if listed is None and (seen or dead) else 0
             if absent >= GONE_POLLS:
                 self.set(lambda s: s["services"][service].update(state="failed"))
-                raise RuntimeError(f"{service}'s step ended before its log said '{wanted}'")
+                raise StepGone(f"{service}'s step ended before its log said '{wanted}'")
             if self.clock() >= deadline:
                 raise RuntimeError(f"{service} did not say '{wanted}' within {self.timeouts['service']:.0f} s")
             self.sleep(self.poll_s)
+
+    def await_start(self, service: str, wanted: str, argv: Sequence[str]) -> str:
+        """The service's log once it holds `wanted` (`wait_log`), after a launch that failed at launch is repeated ONCE.
+
+        The only failure considered is `StepGone`: the step ended before its log said anything it waited for. It is
+        launched again only when `launch_proof` shows, from three sources read now, that nothing of it ran (both
+        proofs, `hpclaunchproof`); the retry is written to the state, with its proofs, before the launch. Every other
+        failure, a second failure of the same service, and a deadline that ran out (the step may be running) are
+        raised as they always were."""
+        try:
+            return self.wait_log(service, wanted)
+        except StepGone:
+            retry = self.launch_proof(service)
+            if retry is None or not self.record_retry(service, retry):
+                raise
+        self.launch(service, argv)
+        return self.wait_log(service, wanted)
+
+    def launch_proof(self, service: str) -> Optional[Dict[str, Any]]:
+        """The proofs that this service's last launch failed before anything of it ran, or None. Never a second
+        retry: that is read from the state file, which outlives this process. The run log is read last."""
+        record = self.store.read()["services"][service]
+        if len(record.get("launch_retries") or []) >= hpclaunchproof.RETRY_LIMIT or not record["step"]:
+            return None
+        name, log = record["step"]["name"], str(record["log"])
+        client = hpclaunchproof.read_client_log(Path(client_log(log)))
+        try:
+            rows = self.launcher.accounted_steps(record["node"], name)
+        except hpcstate.StateError:
+            rows = None
+        found = hpclaunchproof.prove(
+            name, record["step"].get("id"), client, rows, hpclaunchproof.run_log_size(Path(log))
+        )
+        return None if found is None else {"launch": record["launch"], **found}
+
+    def record_retry(self, service: str, retry: Dict[str, Any]) -> bool:
+        """Write the retry and its proofs to the state, once the run log is seen empty again, immediately before the
+        launch; False (nothing written) when it holds a byte now."""
+        log = Path(self.store.read()["services"][service]["log"])
+        if hpclaunchproof.run_log_size(log) != 0:
+            return False
+        self.set(lambda s: s["services"][service].setdefault("launch_retries", []).append(retry))
+        self.say(hpclaunchproof.evidence(service, retry) + "; launching it once more")
+        return True
+
+    def retried(self) -> str:
+        """`up`'s evidence of its retries: one line per retry, as the state records it; nothing when there was none."""
+        services = self.store.read()["services"]
+        return "\n".join(
+            hpclaunchproof.evidence(name, entry)
+            for name, record in services.items()
+            for entry in record.get("launch_retries") or []
+        )
 
     def record_workdir(self, service: str, text: str) -> str:
         state = self.store.read()
@@ -551,7 +614,7 @@ class Driver(Down):
         argv = ["bash", str(BUNDLE / "zone.sbatch"), str(BUNDLE), tar, self.spec.project[:40], *peers]
         self.launch("zone", argv)
         self.say("zone launched; waiting for its verdict")
-        self.record_workdir("zone", self.wait_log("zone", VERDICT["oz"]))
+        self.record_workdir("zone", self.await_start("zone", VERDICT["oz"], argv))
         self.set(lambda s: (s["services"]["zone"].update(state="running"), s.update(phase="zone")))
 
     def providers_up(self) -> None:
@@ -560,17 +623,23 @@ class Driver(Down):
         site, services = Site.from_json(state["site"]), state["services"]
         zone, tar = services["zone"], str(Path(site.images) / "oneprovider.tar")
         names = [p.name for p in self.spec.providers]
-        for name in names:
+        argvs: Dict[str, List[str]] = {}
+        for index, name in enumerate(names):
             peers = [services[p]["address"] for p in names if p != name]
             argv = ["bash", str(BUNDLE / "provider.sbatch"), str(BUNDLE), tar, name, zone["fqdn"], site.admin_mail]
             # --import=SPACE=PATH for each tree it owns, none for a mirror
             imports = hpcimport.provider_import_args(self.layout, name, self.environ)
             # --storage=PATH, its own directory on scratch, bound onto /volumes/posix; none without a scratch root
             storage = hpcstorage.provider_args(state, name)
-            self.launch(name, [*argv, zone["address"], *peers, *imports, *storage])
-        self.say(f"{len(names)} provider(s) launched; registering each")
+            argvs[name] = [*argv, zone["address"], *peers, *imports, *storage]
+            if (
+                index and self.launch_stagger_s > 0
+            ):  # between two launches: five srun fan-outs in one second failed live
+                self.sleep(self.launch_stagger_s)
+            self.launch(name, argvs[name])
+        self.say(f"{len(names)} provider(s) launched, {self.launch_stagger_s:g} s apart; registering each")
         for name in names:
-            self.register(name, self.record_workdir(name, self.wait_log(name, TOKEN_WAIT)))
+            self.register(name, self.record_workdir(name, self.await_start(name, TOKEN_WAIT, argvs[name])))
         for name in names:
             self.wait_log(name, VERDICT["op"])
             self.set(lambda s, n=name: s["services"][n].update(state="running"))

@@ -62,6 +62,7 @@ def new_service(kind: str) -> Dict[str, Any]:
         "workdir": None,
         "rootfs": None,
         "launch": 0,
+        "launch_retries": [],  # each launch `up` repeated, with the proofs that nothing of it ran (hpclaunchproof)
         "step": None,
         "client": None,
         "log": None,

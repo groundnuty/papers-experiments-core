@@ -32,6 +32,12 @@ STEP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 # tool reads nothing there and writes nothing anywhere. Not a path on the node's shared tmpfs, which another user could
 # make first and fill (a ~/.curlrc, a git configuration) before the step reads it.
 NO_HOME = "/dev/null/hpcop-home"
+CLIENT_LOG_SUFFIX = ".client"  # a service step's srun client writes its own log beside the step's run log
+
+
+def client_log(log: str) -> str:
+    """Where the srun client of the service step whose run log is `log` writes what it prints."""
+    return log + CLIENT_LOG_SUFFIX
 
 
 class StateStore:
@@ -185,13 +191,19 @@ class Launcher:
         in the state, by the step's name, for `down` to end once the step is gone."""
         if kind not in ("oz", "op"):
             raise ValueError("a service step is of kind oz or op")
-        client = self.slurm.service(self._step(node, argv, name, kind, output=log), log + ".client")
+        client = self.slurm.service(self._step(node, argv, name, kind, output=log), client_log(log))
 
         def record(state: Dict[str, Any]) -> Dict[str, Any]:
             state.setdefault("clients", {})[name] = {"pid": client.pid, "start": client.start}
             return state
 
         self.store.update(record)
+
+    def accounted_steps(self, node: str, name: str) -> Optional[str]:
+        """sacct's rows of the steps of the job a step of this name on this node belongs to (`Slurm.step_rows`: the
+        id it is listed under, a component's own where it has one), None when they cannot be read."""
+        job, _, component, _ = self._where(node, name)
+        return self.slurm.step_rows(component or job)
 
     def listed(self, name: str) -> Optional[str]:
         """The id `squeue -s` lists a step of the federation's under, by its name, or None: asked of every id its

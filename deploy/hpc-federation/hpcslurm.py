@@ -594,6 +594,19 @@ class Slurm:
                 return 128 + killed if killed else status  # a step a signal ended never reads as a success
         return None
 
+    def step_rows(self, job: str) -> Optional[str]:
+        """sacct's rows of a job's steps, `JobID|JobName|State|ExitCode` one per line, as sacct prints them: the state
+        (`CANCELLED by <uid>` is a step a user cancelled) and the exit code (`exit:signal`) raw, where `step_status`
+        folds the code. None when sacct fails, does not answer or cannot run: no row is no proof, and the caller keeps
+        its own failure (`up`'s launch retry, `hpclaunchproof`)."""
+        try:
+            done = self.runner.run(
+                ["sacct", "-j", job, "-n", "-P", "-o", "JobID,JobName,State,ExitCode"], self.command_timeout_s
+            )
+        except (SlurmError, OSError):
+            return None
+        return done.stdout if done.returncode == 0 else None
+
     def _finish(self, process: Process, step: Step, timeout_s: float) -> Completed:
         """The result of a control step within its bound; past it, end a client whose step is gone (three polls in a
         row), and cancel a step still listed, by its own id."""
