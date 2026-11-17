@@ -25,6 +25,7 @@ import threading
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore.loop.outcomes import HarnessDefect
@@ -37,6 +38,30 @@ LOG_RULE = f"/{LOG_NAME}"  # the line that ignores the log in its directory's ig
 IGNORE_ALL = "# written by expcore: local logs, never committed or packaged\n*\n"
 
 _lock = threading.Lock()
+
+
+class Chained:
+    """Several redactors applied one after the other: what is redacted loses every one's secrets, so it is never
+    redacted against the shorter list of any of them (the attempt's own context, which `record_attempt` narrows to the
+    environment `record_run` was given, and the runner's base: the process, the models, the registry)."""
+
+    def __init__(self, *redactors: Redactor):
+        self._redactors = redactors
+
+    def with_lines(self) -> "Chained":
+        return Chained(*(redactor.with_lines() for redactor in self._redactors))
+
+    def text(self, value: str) -> str:
+        for redactor in self._redactors:
+            value = redactor.text(value)
+        return value
+
+    def structure(self, obj: Any) -> tuple[Any, list[str]]:
+        paths: list[str] = []
+        for redactor in self._redactors:
+            obj, changed = redactor.structure(obj)
+            paths += changed
+        return obj, paths
 
 
 def log_path(root: Path) -> Path:
@@ -52,7 +77,7 @@ def write_defect(
     stamp: str,
     run_key: str,
     attempt: int,
-    redactor: Callable[[], Redactor],
+    redactor: Callable[[], Redactor | Chained],
 ) -> Path:
     """Append the redacted traceback of a harness defect to the campaign's log; return the log's path.
 
@@ -63,7 +88,7 @@ def write_defect(
 
 
 def write_failure(
-    root: Path, error: BaseException, *, title: str, stamp: str, redactor: Callable[[], Redactor]
+    root: Path, error: BaseException, *, title: str, stamp: str, redactor: Callable[[], Redactor | Chained]
 ) -> Path:
     """Append the redacted traceback of any failure of the harness to the campaign's log, headed by the time and
     `title`; return the log's path. A study's plugin that fails on import is one (`study.plugin`)."""
@@ -107,9 +132,15 @@ class DefectLog:
     """
 
     def __init__(
-        self, root: Path, run_key: str, attempt: int, stamp: Callable[[], str], redactor: Callable[[], Redactor]
+        self,
+        root: Path,
+        run_key: str,
+        attempt: int,
+        stamp: Callable[[], str],
+        redactor: Callable[[], Redactor | Chained],
     ):
         self.root, self.run_key, self.attempt, self._stamp = Path(root), run_key, attempt, stamp
+        self._base = redactor  # the runner's own: the process, the models and the registry, whatever is installed after
         self._redactor = redactor
         # whether the executor said the redaction context is the attempt's whole one (`redact_with`); until then it is
         # the environment's, the models' and the registry's secrets, and a secret only the executor knows is not in it
@@ -123,12 +154,13 @@ class DefectLog:
         self._redactor = redactor
         self.context_given = True
 
-    def build_redactor(self) -> Redactor:
-        """The redactor of the attempt's redaction context as it stands now: the one it started with, the one the
-        executor's `declare_secrets` gave it, or, once the executor has called `record_attempt`, the whole context
-        that gave it. What else of the attempt is kept redacted (the diagnostic of a failed instrument start, C40)
-        uses it too, so it knows what the log does at that moment."""
-        return self._redactor()
+    def build_redactor(self) -> Chained:
+        """The redactor of the attempt's redaction context as it stands now: the runner's own base and the one
+        installed after it (the executor's `declare_secrets`, or the whole context `record_attempt` gave it), one after
+        the other, so it is never the shorter of the two: `record_attempt` builds its own from the environment
+        `record_run` was given. What else of the attempt is kept redacted (the diagnostic of a failed instrument start,
+        C40) uses it too, and knows what the log does at that moment."""
+        return Chained(self._base(), self._redactor()) if self._redactor is not self._base else Chained(self._base())
 
     def __call__(self, error: BaseException, defect: HarnessDefect) -> Path | None:
         """Write the redacted traceback of a harness defect of this attempt; return the log's path, or None when the
@@ -141,7 +173,7 @@ class DefectLog:
                 stamp=self._stamp(),
                 run_key=self.run_key,
                 attempt=self.attempt,
-                redactor=self._redactor,
+                redactor=self.build_redactor,
             )
         except Exception as failure:  # kept, and raised by the attempt once its result is stored
             if self.failure is None:

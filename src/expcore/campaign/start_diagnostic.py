@@ -19,19 +19,21 @@ declared (`RunRequest.declare_secrets`: an executor starts its instruments befor
 only to `record_run` is not known when a start fails, and it declares it first, or declares none to say there is
 nothing more). **Never a diagnostic redacted against a partial list of the run's secrets**: until the executor has
 declared (or `record_attempt` has given the attempt's whole context) a diagnostic is withheld: the snapshot keeps the
-phase and the instrument and is `{"ok": false, "error": "Withheld", "why": ...}`. It is kept on the
-attempt's row (`attempts.diagnostic`, canonical JSON), in its outcome marker (so recovery commits it after a kill) and
-in the export (`attempt_diagnostics`, only when an attempt kept one). A snapshot that cannot be kept (not a JSON
-object, a number JSON cannot hold, more than `LIMIT_BYTES`, a redaction that raised) is `{"ok": false, "error":
-<class>}` with the phase and the instrument's name, redacted like the rest (only the phase, when the redactor cannot
-be built), as an instrument whose `finish` failed is (O08): it is never
-dropped, never guessed, and never an exception, since one that escaped the attempt runner would stop dispatch (C17).
+phase alone (the instrument's name is the study's own word, and can be a secret only the executor knows) and is
+`{"ok": false, "error": "Withheld", "why": ...}`; a failed start that gave no diagnostic is `{"phase": "start"}`. It
+is kept on the attempt's row (`attempts.diagnostic`, canonical JSON), in its outcome marker (so recovery commits it
+after a kill) and in the export (`attempt_diagnostics`, only when an attempt kept one). A snapshot that cannot be kept
+(not a JSON object, a number JSON cannot hold, more than `LIMIT_BYTES`, a redaction that raised) is `{"ok": false,
+"error": <class>}` with the phase and the instrument's name, redacted like the rest (only the phase, when the redactor
+cannot be built), as an instrument whose `finish` failed is (O08): it is never dropped, never guessed, and never an
+exception, since one that escaped the attempt runner would stop dispatch (C17).
 """
 
 import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from expcore.campaign.defect_log import Chained
 from expcore.errors import InfraError
 from expcore.records.redact import Redactor
 
@@ -41,23 +43,6 @@ WITHHELD = (
     "the executor did not tell the core its secrets (RunRequest.declare_secrets) before it started its instruments, so "
     "the diagnostic cannot be shown redacted with all of them; declare them, or declare none, and it is kept"
 )
-
-
-class Chained:
-    """Several redactors applied one after the other: what is kept is redacted with every one's secrets, so a snapshot
-    is never redacted against the shorter list of any of them (the attempt's own context, which `record_attempt` may
-    have narrowed to the environment `record_run` was given, and the runner's base: the process, the models, the
-    registry)."""
-
-    def __init__(self, *redactors: Redactor):
-        self._redactors = redactors
-
-    def structure(self, obj: Any) -> tuple[Any, list[str]]:
-        paths: list[str] = []
-        for redactor in self._redactors:
-            obj, changed = redactor.structure(obj)
-            paths += changed
-        return obj, paths
 
 
 class DiagnosticTooLarge(ValueError):
@@ -82,9 +67,10 @@ def snapshot_of(
     given, origin = getattr(error, "diagnostic", None), getattr(error, "origin", None)  # a subclass may skip the base
     if not isinstance(error, InfraError) or (given is None and origin is None):
         return None
+    if not complete:  # only the literal phase: the instrument's name is the study's own word, a secret's value perhaps
+        head = _phase(origin)
+        return head if given is None else {**head, "ok": False, "error": "Withheld", "why": WITHHELD}
     try:
-        if given is not None and not complete:
-            return {**_head(origin, redactor), "ok": False, "error": "Withheld", "why": WITHHELD}
         if given is not None and not isinstance(given, Mapping):
             raise TypeError("a diagnostic is a JSON object")
         text = json.dumps(
@@ -100,16 +86,20 @@ def snapshot_of(
         return {**_head(origin, redactor), "ok": False, "error": type(problem).__name__}
 
 
-def _head(origin: Any, redactor: Callable[[], Redactor | Chained]) -> dict[str, Any]:
-    """The phase and the instrument a snapshot that holds no evidence keeps, redacted like the rest (an instrument's
-    name can be any word, a secret's value among them). When they cannot be redacted only the phase is kept: it is the
-    literal `start_instruments` sets, never a name the study chose."""
+def _phase(origin: Any) -> dict[str, Any]:
+    """The phase of an origin when it is the literal `start_instruments` sets; nothing otherwise."""
     held = dict(origin or {})
+    return {"phase": held["phase"]} if held.get("phase") == "start" else {}
+
+
+def _head(origin: Any, redactor: Callable[[], Redactor | Chained]) -> dict[str, Any]:
+    """The phase and the instrument a snapshot that failed to be kept keeps, redacted like the rest (an instrument's
+    name can be any word, a secret's value among them). When they cannot be redacted only the phase is kept."""
     try:
-        redacted, _ = redactor().structure(held)
+        redacted, _ = redactor().structure(dict(origin or {}))
         return dict(redacted)
     except Exception:
-        return {"phase": held["phase"]} if held.get("phase") == "start" else {}
+        return _phase(origin)
 
 
 def exported(store: Any, conditions: Mapping[str, str], models: Mapping[str, str]) -> list[dict[str, Any]] | None:
