@@ -707,6 +707,11 @@ class SandboxPlatform:
         has to be the ceiling the token was minted for (O06): a longer one would refuse a correct token, and a shorter
         one would pass a token the run could outlive. So `ceiling_s` is best left out: it then defaults to the one
         `launch` was given, and any other value raises `ValueError` before anything starts.
+
+        The server is a process of the driver's, outside every container or cell. A sandbox that names where it runs
+        (`tool_server_process()`, the Apptainer backend's, O56) gives it a home of the run's own and the run's tag, and
+        the launcher names its whole environment (`launch`'s `process`); Docker's names none, and its launcher is
+        called as it always was.
         """
         plane = self._planes.get(sandbox)
         if plane is None:
@@ -720,17 +725,21 @@ class SandboxPlatform:
                 f"the tool-server token was minted for a whole-time ceiling of {plane.ceiling_s:g} s, "
                 f"not {ceiling_s:g} s: the server's checks of it use the ceiling it was minted for"
             )
+        placement = getattr(sandbox, "tool_server_process", None)
         self._serving.add(sandbox)  # the run's end revokes nothing while it runs: its teardown reads as the token
         try:
-            async with self._launcher.launch(
-                ctx,
-                plane.condition,
-                plane.token,
-                ceiling_s=plane.ceiling_s,
-                extra_env=extra_env,
-                principal=plane.principal,
-            ) as provider:
-                yield provider
+            with placement() if placement is not None else contextlib.nullcontext() as process:
+                where = {} if process is None else {"process": process}
+                async with self._launcher.launch(
+                    ctx,
+                    plane.condition,
+                    plane.token,
+                    ceiling_s=plane.ceiling_s,
+                    extra_env=extra_env,
+                    principal=plane.principal,
+                    **where,
+                ) as provider:
+                    yield provider
         finally:
             self._serving.discard(sandbox)
 

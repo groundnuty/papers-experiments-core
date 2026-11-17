@@ -14,7 +14,9 @@ the provider that wrote it, owner or not. A space with an `import` table is held
 storage (Onedata's storage import) whose directory is a dataset the layout does not hold: the table names the
 environment variable that gives its path, never the path, since a layout is public. An import may be `shared` with
 other federations (O59): it is then read-only and names the variable of its manifest. Every key is checked when the file
-is read, and a refusal names the file and the key. The two images stay pinned by the deployment itself
+is read, and a refusal names the file and the key. A space that is neither a baseline space nor an import may declare
+the manifest of the data its owner will hold once the study has ingested it (`data_manifest`, C06): read by
+`deploy/hpc-federation` only, as `[hpc]` is. The two images stay pinned by the deployment itself
 (fedlayout.IMAGES): a layout cannot name another.
 """
 
@@ -44,6 +46,10 @@ DOMAIN_NAME = re.compile(rf"(?:{DOMAIN_LABEL}\.)+test")  # under the reserved .t
 SERVICE_NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?")  # a Compose service name and a domain label
 SPACE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 IMPORT_ENV = re.compile(r"EXPCORE_FED_IMPORT_[A-Z0-9_]{1,48}")  # the variable holding an import's source directory
+STUDY_ARTIFACTS = "@study_artifacts@"  # the HPC driver's placeholder for the study's own directory (site.env)
+# A space's declared data manifest: an absolute path, or one under the study's artifacts, plain names only (it is
+# written into a quoted string of the rendered platform file).
+DATA_MANIFEST = re.compile(rf"(?:{STUDY_ARTIFACTS}|(?=/))(?:/[A-Za-z0-9_.-]+)+")
 USER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,62}")
 PRIVILEGE = re.compile(r"space_[a-z_]+")
 MEMORY = re.compile(r"([1-9][0-9]{0,5})([mg])")
@@ -64,7 +70,7 @@ TOP_KEYS = {
     "hpc",  # read by deploy/hpc-federation (hpcsettings.py) only; kept here unread, and Compose ignores it
 }
 SERVICE_KEYS = {"port", "memory_limit"}
-SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible", "baseline", "import"}
+SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible", "baseline", "import", "data_manifest"}
 IMPORT_KEYS = {"readonly", "source_env", "shared", "manifest_env", "direct_io"}
 IMPORT_REQUIRED = {"readonly", "source_env"}
 PRINCIPAL_KEYS = {"privileges", "spaces", "agent"}
@@ -133,7 +139,12 @@ class Space:
 
     A space with `imported` is held by its owner alone on an imported storage, whose files the platform finds by a scan
     of the directory; its mirrors keep their regular storage and fetch what the owner holds. Its baseline is always
-    off, since the core's baseline files would be written into the dataset."""
+    off, since the core's baseline files would be written into the dataset.
+
+    A space with `data_manifest` declares the data the study will ingest into it: a path, absolute or under the
+    study's artifacts (`@study_artifacts@/...`), to a manifest in the core's import-manifest format
+    (`expcore_onedata.importmanifest`). It needs `baseline = false` (a baseline space's data is its baseline) and no
+    `import` (an import names its manifest by `manifest_env`). Only `deploy/hpc-federation` reads it."""
 
     name: str
     owner: str
@@ -142,6 +153,7 @@ class Space:
     agent_visible: bool = True
     baseline: bool = True
     imported: Import | None = None
+    data_manifest: str | None = None  # the manifest of the data the study ingests into it, as declared (C06)
 
     @property
     def supporters(self) -> tuple[str, ...]:
@@ -357,6 +369,26 @@ def _import(read: _Reader, table: Mapping[str, Any], key: str, has_baseline: boo
     return Import(readonly, variable, shared, manifest, direct)
 
 
+def _data_manifest(
+    read: _Reader, table: Mapping[str, Any], key: str, has_baseline: bool, imported: Import | None
+) -> str:
+    """The `data_manifest` of a space: its manifest as declared, for a space the study ingests into. Its data is not
+    the baseline's, so the space declares `baseline = false`, and not an import's, which names its manifest by
+    `manifest_env`: one identity has one declaration."""
+    where = f"{key}.data_manifest"
+    if has_baseline:
+        raise read.fail(where, "needs baseline = false: a baseline space holds what up writes, its own manifest")
+    if imported is not None:
+        raise read.fail(where, "may not be declared on an import, whose manifest is its import's manifest_env")
+    value = table["data_manifest"]
+    plain = isinstance(value, str) and DATA_MANIFEST.fullmatch(value) and not {"..", "."} & set(value.split("/"))
+    if not plain:
+        raise read.fail(
+            where, f"must be an absolute path, or one under {STUDY_ARTIFACTS}, of plain names (letters, digits, _ . -)"
+        )
+    return value
+
+
 def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
     top = read.table(data, "", TOP_KEYS, required={"project", "domain", "study_space", "zone", "providers", "spaces"})
     project = read.string(top["project"], "project", PROJECT_NAME, "a Compose project name")
@@ -399,7 +431,8 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         visible = read.boolean(table.get("agent_visible", True), f"{key}.agent_visible")
         has_baseline = read.boolean(table.get("baseline", True), f"{key}.baseline")
         imported = _import(read, table, key, has_baseline, spaces) if "import" in table else None
-        spaces.append(Space(name, owner, mirrors, size, visible, has_baseline, imported))
+        manifest = _data_manifest(read, table, key, has_baseline, imported) if "data_manifest" in table else None
+        spaces.append(Space(name, owner, mirrors, size, visible, has_baseline, imported, manifest))
     space_names = {space.name for space in spaces}
     study = read.name(top["study_space"], "study_space", space_names, "space")
     hidden = {space.name for space in spaces if not space.agent_visible}

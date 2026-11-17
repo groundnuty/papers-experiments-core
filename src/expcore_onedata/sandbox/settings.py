@@ -108,8 +108,9 @@ network, in a Compose federation) comes back to the gate. The network must exist
 
 `placeholder_token` is what the agent's environment holds as `ONEDATA_TOKEN` on a REST data path (O23): the published
 client (`onedatarestfsspec`) refuses to start without a token, and the agent holds none, since the gate adds its own to
-every request and drops every token the agent sends. It is not a credential and goes in no fingerprint; the agent sees
-it, so a study whose check of the words its agent sees refuses the default names another. A value equal to the run's
+every request and drops every token the agent sends. It is not a credential; the agent sees it, so it is in the
+campaign fingerprint by its SHA-256 (`runsettings.sandbox_record`), and a study whose check of the words its agent sees
+refuses the default names another. A value equal to the run's
 token refuses the start.
 
 The certificate check of the data gate's upstream and of oneclient is not declared here either: it is the platform's one

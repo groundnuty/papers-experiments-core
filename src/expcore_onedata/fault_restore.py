@@ -54,6 +54,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from expcore.campaign import liveness
 from expcore.errors import InfraError
 from expcore_onedata.compose import DriverError, Observation
 from expcore_onedata.fault_epoch import HEAL, LinkEpoch
@@ -403,7 +404,14 @@ class LinkSettling:
             if not seen.running or seen.identity is None:
                 return {"ok": False, "how": "not_running", "serves_after_s": None, "entry": None}
             before, entry = digest(seen.identity), uuid.uuid4().hex
-            line = {"target": label, "service": service, "identity_sha256": before, "holder": holder(), "heal": True}
+            line = {
+                "target": label,
+                "service": service,
+                "identity_sha256": before,
+                "holder": holder(),
+                "owner": liveness.owner(),  # a heal runs in the gate, outside any attempt: a process alone (O80)
+                "heal": True,
+            }
             probe = {} if gate_probe is None else {"gate_probe": gate_probe}
             self.journal.append({"event": "injecting", "id": entry, **line, **probe})
             self.journal.append({"event": "stopping", "id": entry})

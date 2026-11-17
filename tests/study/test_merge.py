@@ -690,6 +690,32 @@ def test_c29_a_snapshot_merge_json_does_not_list_is_refused_by_the_check(base, c
 # --- what a merge refuses -------------------------------------------------------------------------------------------
 
 
+def test_o63_a_merge_refuses_a_shard_marked_not_final_naming_it_and_the_reason(
+    base, clean_environment, whole, shard1, shard2
+):
+    """O63: a shard whose out/ holds NOT-FINAL.json (the HPC shard driver's post-run script did not pass) is refused,
+    naming the shard and the reason the file gives, whether the file is readable or not, and nothing is written."""
+    marked = copy_out(shard2, base / "o63-marked")
+    (marked / "NOT-FINAL.json").write_text(json.dumps({"final": False, "reason": "the post-run script exited with 3"}))
+    refused(
+        clean_environment,
+        whole,
+        base / "o63-refused" / "out",
+        shard1.root / "out",
+        marked,
+        fragments=("shard 2 (shard-2)", "marked not final", "the post-run script exited with 3"),
+    )
+    (marked / "NOT-FINAL.json").write_text("{")
+    refused(
+        clean_environment,
+        whole,
+        base / "o63-refused-2" / "out",
+        shard1.root / "out",
+        marked,
+        fragments=("shard 2 (shard-2)", "marked not final", "NOT-FINAL.json says so"),
+    )
+
+
 def test_c29_a_merge_needs_every_shard_exactly_once(base, clean_environment, whole, shard1, shard2):
     """C29: shards 1..N each exactly once: a missing index and a duplicated one are refused, naming the shard."""
     out = base / "refused-missing" / "out"

@@ -5,7 +5,7 @@
 # stays the ingest-based layout: the ingest path is the primary one until a live slot shows the two equivalent.
 #
 #   set -a; . deploy/hpc-federation/site.env; set +a        # site.env sets the eight EXPCORE_FED_IMPORT_ variables below
-#   uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape-import.toml \
+#   uv run python -I -B deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape-import.toml \
 #     --root <a directory on a filesystem the login node and the nodes see> up
 #
 # The layout holds no path: each import names the two variables of site.env that hold its tree's directory and its
