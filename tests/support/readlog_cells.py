@@ -28,7 +28,11 @@ FORGING = {
     "client module by its bound path": (
         "import importlib.util as u\n"
         "spec = u.spec_from_file_location('c', '/expcore-readlog-client/expcore_readlog_client.py')\n",
-        [("client", "/expcore-readlog-client"), ("client", "expcore_readlog_client")],
+        [
+            ("client", "/expcore-readlog-client"),
+            ("client", "expcore_readlog_client"),
+            ("channel_patch", "module reload or load by path"),
+        ],
     ),
     "client module under an earlier name": (
         "from expcore_readlog import log_read",

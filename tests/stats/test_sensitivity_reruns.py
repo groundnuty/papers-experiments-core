@@ -189,8 +189,7 @@ def test_s20_a_declared_read_log_rerun_that_cannot_run_is_named_with_why():
 
 
 def test_s20_any_guard_names_the_read_log_scan_among_the_guards_that_checked_the_batch():
-    said = difference(("any_guard",), ("egress", "read_log"))
-    assert said is None
+    assert difference(("egress", "read_log", "any_guard"), ("egress", "read_log", "any_guard")) is None
     said = difference(("any_guard",), ("read_log",))
     assert "only read_log did" in said
 

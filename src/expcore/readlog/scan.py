@@ -1,13 +1,14 @@
 # Provenance: new
-"""The static scan of an agent's code cells for anything that could forge a record of the read-log channel, one run's
-verdict, the analysis again without the flagged runs, and the report section (O-readlog).
+"""The static scan of an agent's code cells for anything that could forge a record of the read-log channel or hide a
+real read from it (O91).
 
 A study's canonical scripts log every read they make to a datagram socket the harness binds read-only into the cell
 (`SOCKET_PATH`), through a client module bound the same way (`CLIENT_PATH`). The agent's own code runs in the same cell,
 so it can send a datagram of its own: **a forged append cannot be prevented, only detected**, and an item the agent
-never read then looks read. This scan is one detection. It reads the code cells of a record as the egress scan does
-(`expcore.egress.scan.code_cells`: the `code` argument of every call to a tool with a string `code` property, run or
-not) and finds:
+never read then looks read. Code that runs a canonical script in its own process can also patch the client or the
+`socket` module first, so that a real read is never logged. This scan is one detection. It reads the code cells of a
+record as the egress scan does (`expcore.egress.scan.code_cells`: the `code` argument of every call to a tool with a
+string `code` property, run or not) and finds:
 
 - `channel_path`: the socket directory or the socket (`/expcore-readlog`, `/expcore-readlog/sock`), with or without the
   leading slash, or the prefix of their name (`/expcore-*`, `startswith('expcore')`);
@@ -25,6 +26,10 @@ not) and finds:
   `-name` with `sock`, a glob `*/sock`) and a tool that lists Unix sockets (`ss -x`, `netstat -x`, `lsof -U`). The
   mount table is no hit: it sends nothing, the socket's path is fixed and public, and an agent that looks for its data
   mount reads it for its own reasons, in some conditions more than in others;
+- `channel_patch`: a patch of the client or of `socket` that would hide a real read: an assignment to or a `setattr` on
+  an attribute of `socket` or of the client module, a use of `sys.modules`, an `importlib.reload` or a load of a module
+  from a file (`spec_from_file_location`, `module_from_spec`, `SourceFileLoader`), `monkeypatch`, `mock.patch` or
+  `unittest.mock`, and `builtins` or `__builtins__`;
 - `channel_name`: the bare word `readlog`, in any case and set off from letters and digits (`readLogFile` is not it),
   where nothing above names the channel in the cell (a directory listing filtered by it, say). A study should not name
   its own scripts or functions `readlog`.
@@ -34,30 +39,25 @@ text is not part of the cell. Each hit names its cell and a fixed name for what 
 (a process number or the tail of a path stays out), once per cell. Any hit flags the run.
 
 **It is a heuristic over text, and the second line, not the first.** Code that builds a name at run time, decodes it,
-reads it from a file, or copies a canonical script and edits its logging passes it, as the egress scan's code does; a
-run it does not flag is not shown to have an unforged log. It over-flags too: a cell that names `AF_UNIX` and
-`SOCK_DGRAM` for two unrelated sockets is flagged, and a flagged run is only reported and left out of a sensitivity
-analysis. The scan has a version of its own (`SCAN_VERSION`), separate from the egress scan's, and changes none of its
-verdicts.
+reads it from a file, reaches the system call without a name (`ctypes`, a raw syscall number), nests the arguments of
+`socket(...)` in calls, or copies a canonical script and edits its logging passes it, as the egress scan's code does; a
+run it does not flag is not shown to have an unforged log or an unhidden read. It over-flags too: a cell that names
+`AF_UNIX` and `SOCK_DGRAM` for two unrelated sockets, or reloads a module of its own, is flagged, and a flagged run is
+only reported and left out of a sensitivity analysis. On a REST data path the gate's per-file served table (O22) is the
+check that does not read code, and the backstop of this one. The scan has a version of its own (`SCAN_VERSION`),
+separate from the egress scan's, and changes none of its verdicts.
 
-`judge(record, condition)` is one run's verdict, computed at analysis time from the record alone and never stored in it.
-`read_log_analysis(runs, rows, absent, prereg)` is every analysed run's verdict and the preregistered analysis again
-without the flagged runs, built as `expcore.visibility.sensitivity.visibility_analysis` is; it returns None unless an
-analysed record carries the `read_log` instrument, so the report of any other batch is the text it always was.
-`read_log_lines` renders the section. The state of the log itself, intact or unknown, is the instrument's snapshot and
-the reader's, not this scan's.
+The verdict of one run is `expcore.readlog.flags`, the analysis without the flagged runs `expcore.readlog.sensitivity`,
+and the report section `expcore.report_readlog`. The state of the log itself, intact or unknown, is the instrument's
+snapshot and the reader's (`expcore_onedata.readlog`), not this scan's.
 """
 
 import re
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any
 
-from expcore.egress.scan import code_cells
-from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
-from expcore.stats.rows import AbsentRun, Row
-
-# The fixed names of the channel (the read-log interface): the same values as `expcore_onedata.readlog.paths` holds
+# The fixed names of the channel (the read-log interface). The core does not import the platform layer, so they are
+# repeated here as literals; tests/readlog/test_readlog_scan.py holds them equal to `expcore_onedata.readlog.paths`.
 NAMESPACE = "read_log"  # the instrument's name
 SOCKET_DIR = "/expcore-readlog"
 SOCKET_PATH = f"{SOCKET_DIR}/sock"
@@ -67,12 +67,11 @@ CLIENT_PATH = f"{CLIENT_DIR}/{CLIENT_MODULE}.py"
 
 SCAN_VERSION = 1  # this scan's own; the egress scan's `SCAN_VERSION` is separate and does not move with it
 MAX_HITS = 200  # per run; `hits_cut` says when more were found
-CELL_ITEMS = 5  # hits shown in one cell of the report before "and N more"
-LEFT_OUT_AS = "excluded"  # the reason a flagged run is passed to the sensitivity analysis with
 
 CHANNEL_PATH, CLIENT, UNIX_DATAGRAM = "channel_path", "client", "unix_datagram"
 PROC_ENVIRON, CHANNEL_DISCOVERY, CHANNEL_NAME = "proc_environ", "channel_discovery", "channel_name"
-KINDS = (CHANNEL_PATH, CLIENT, UNIX_DATAGRAM, PROC_ENVIRON, CHANNEL_DISCOVERY, CHANNEL_NAME)
+CHANNEL_PATCH = "channel_patch"
+KINDS = (CHANNEL_PATH, CLIENT, UNIX_DATAGRAM, PROC_ENVIRON, CHANNEL_DISCOVERY, CHANNEL_PATCH, CHANNEL_NAME)
 
 PROC_ENVIRON_WHAT = "/proc/*/environ"
 PREFIX = "/expcore-* prefix"
@@ -94,6 +93,11 @@ NAMES = (
     (CHANNEL_DISCOVERY, "socket file test"),
     (CHANNEL_DISCOVERY, "socket file search"),
     (CHANNEL_DISCOVERY, "socket listing tool"),
+    (CHANNEL_PATCH, "socket or client attribute assignment"),
+    (CHANNEL_PATCH, "sys.modules"),
+    (CHANNEL_PATCH, "module reload or load by path"),
+    (CHANNEL_PATCH, "patch or mock"),
+    (CHANNEL_PATCH, "builtins override"),
     (CHANNEL_NAME, "readlog"),
 )
 
@@ -120,6 +124,22 @@ _DISCOVERY = {
     "socket file test": re.compile(r"\bS_ISSOCK\b|\bis_socket\s*\("),
     "socket file search": re.compile(r"-type\s+s\b|-name\s+\S*sock\b|\*+/sock\b"),
     "socket listing tool": re.compile(r"\b(?:ss|netstat|lsof)\s+-\w*[xU]"),
+}
+# What code in a cell patches to hide a real read: `socket` or the client by attribute, the loaded modules, a module
+# reloaded or loaded from a file, a mock, and the builtins
+_PATCHES = {
+    "socket or client attribute assignment": re.compile(
+        r"(?<![\w.])(?:socket|expcore_readlog_client)\.\w+\s*=(?!=)|\bsetattr\(\s*(?:socket|expcore_readlog_client)\b"
+    ),
+    "sys.modules": re.compile(r"\bsys\.modules\b"),
+    "module reload or load by path": re.compile(
+        r"\bimportlib\.reload\b|(?<![\w.])reload\s*\(|\bspec_from_file_location\b|\bmodule_from_spec\b"
+        r"|\bSourceFileLoader\b|\bload_source\b|\bload_module\b"
+    ),
+    "patch or mock": re.compile(
+        r"\bmonkeypatch\b|\bmock\.patch\b|\bunittest\.mock\b|\bfrom\s+unittest\s+import\s+mock\b"
+    ),
+    "builtins override": re.compile(r"\bbuiltins\b|__builtins__"),
 }
 
 
@@ -182,6 +202,7 @@ def _names_of(code: str) -> list[tuple[str, str]]:
     if _ENVIRON.search(code):
         found.add((PROC_ENVIRON, PROC_ENVIRON_WHAT))
     found |= {(CHANNEL_DISCOVERY, what) for what, pattern in _DISCOVERY.items() if pattern.search(code)}
+    found |= {(CHANNEL_PATCH, what) for what, pattern in _PATCHES.items() if pattern.search(code)}
     if not any(kind in (CHANNEL_PATH, CLIENT) for kind, _ in found) and _BARE.search(code):
         found.add((CHANNEL_NAME, "readlog"))
     return sorted(found, key=NAMES.index)
@@ -218,156 +239,3 @@ def scan_cells(cells: Sequence[str]) -> dict[str, Any]:
         "hits_cut": len(found) > MAX_HITS,
         "flagged": bool(found),
     }
-
-
-@dataclass(frozen=True)
-class RunReadLog:
-    """One run's verdict: the scan of its code cells under its run key, attempt and condition."""
-
-    run_key: str
-    attempt: int
-    condition: str
-    scan: Mapping[str, Any]
-
-    @property
-    def flagged(self) -> bool:
-        return bool(self.scan["flagged"])
-
-    @property
-    def kinds(self) -> tuple[str, ...]:
-        """The kinds of hit the run has, in the order of `KINDS`."""
-        held = {hit["kind"] for hit in self.scan["hits"]}
-        return tuple(kind for kind in KINDS if kind in held)
-
-
-def judge(record: Any, condition: str) -> RunReadLog:
-    """The read-log verdict of one analysed run: the scan of the code cells the egress scan reads."""
-    return RunReadLog(record.run_key, record.attempt, condition, scan_cells(code_cells(record)))
-
-
-@dataclass(frozen=True)
-class ReadLogAnalysis:
-    """Every analysed run's verdict, in the export's order; the sensitivity analysis without the flagged runs (None
-    when no run is flagged or when it was refused); and why it was refused, if it was."""
-
-    runs: tuple[RunReadLog, ...]
-    sensitivity: AnalysisResult | None
-    refused: str | None = None
-
-    @property
-    def flagged(self) -> tuple[RunReadLog, ...]:
-        return tuple(run for run in self.runs if run.flagged)
-
-    def counts(self) -> dict[str, int]:
-        """The analysed runs, the flagged ones, and the flagged ones by each kind of hit (a run may have several)."""
-        flagged = self.flagged
-        return {"analysed": len(self.runs), "flagged": len(flagged)} | {
-            kind: sum(1 for run in flagged if kind in run.kinds) for kind in KINDS
-        }
-
-
-def checked(records: Sequence[Any]) -> bool:
-    """True when one record carries the `read_log` instrument: the batch's runs used the channel."""
-    return any(NAMESPACE in record.instruments for record in records)
-
-
-def read_log_analysis(
-    runs: Sequence[tuple[Any, str]], rows: Sequence[Row], absent: Sequence[AbsentRun], prereg: Any
-) -> ReadLogAnalysis | None:
-    """The verdicts and the sensitivity analysis of a batch; None for a batch whose records carry no `read_log`.
-
-    The analysis is `stats.analysis.analyse` over the rows of the runs that are not flagged, with each flagged run
-    passed as an absent run of reason `excluded`: its pairs are counted as missing and its arm's runs as left out, the
-    primary analysis's own vocabulary. It stands beside the primary analysis; a rerun the kernel refuses keeps the
-    primary and records why."""
-    if len(runs) != len(rows):
-        raise ValueError(f"{len(runs)} analysed record(s) for {len(rows)} analysis row(s)")
-    if not checked([record for record, _ in runs]):
-        return None
-    for (record, _), row in zip(runs, rows, strict=True):
-        if record.run_key != row.run_key:
-            raise ValueError(f"the record of {record.run_key!r} is paired with the row of {row.run_key!r}")
-    verdicts = tuple(judge(record, condition) for record, condition in runs)
-    out = {verdict.run_key for verdict in verdicts if verdict.flagged}
-    if not out:
-        return ReadLogAnalysis(verdicts, None)
-    kept = [row for row in rows if row.run_key not in out]
-    left = [AbsentRun(row.run_key, row.condition, row.factors, LEFT_OUT_AS) for row in rows if row.run_key in out]
-    try:
-        return ReadLogAnalysis(verdicts, analyse(kept, prereg, [*absent, *left]))
-    except ContrastRefused as error:
-        return ReadLogAnalysis(verdicts, None, str(error))
-
-
-NOTES = [
-    "A study's canonical scripts log every read they make to the read-log channel, a datagram socket the harness binds",
-    "read-only into the cell, and the log is the study's evidence of what was read. **Its one weakness is a record the",
-    "agent forges:** code in a cell can send a datagram of its own, and an item the agent never read then looks read.",
-    "Nothing prevents it. A run is flagged here when the code of one of its code cells names the channel (its socket,",
-    "the client module or its bound path), builds a Unix datagram socket, reads a process's environment, or searches",
-    "for the socket or for the mount table that shows it. A canonical script run by its path names none of these.",
-    "**This is a heuristic over text and the second line of detection.** Code that builds a name at run time, decodes",
-    "it, or copies a canonical script and edits its logging passes it, so a run that is not flagged is not shown to",
-    "have an unforged log; it also flags a cell that names a Unix family and a datagram type for unrelated sockets.",
-    "On a REST data path the gate's per-file served table (O22) is the check that does not read code.",
-]
-SENSITIVITY_NOTES = [
-    "The preregistered analysis again, without the flagged runs: each one is left out as an absent run (`excluded`),",
-    "so its pairs count as `Unpaired or left out` and its arm's runs as `Left out`. The analysis above stands; this",
-    "says whether its conclusions hold without the runs whose code reached for the read-log channel. A run is left",
-    "out for what was detected about it, never for its outcome.",
-]
-
-
-def _more(items: Sequence[str]) -> str:
-    shown = ", ".join(items[:CELL_ITEMS]) or "none"
-    return shown if len(items) <= CELL_ITEMS else f"{shown} and {len(items) - CELL_ITEMS} more"
-
-
-def _hits(run: RunReadLog) -> str:
-    hits = [f"`{h['kind']} {h['what']} (cell {h['cell']})`" for h in run.scan["hits"]]
-    return _more(hits) + (" (cut)" if run.scan["hits_cut"] else "")
-
-
-def _by_condition(analysis: ReadLogAnalysis, table: Callable[..., list[str]]) -> list[str]:
-    conditions = sorted({run.condition for run in analysis.runs})
-    rows = [
-        [
-            condition,
-            sum(1 for run in analysis.runs if run.condition == condition),
-            sum(1 for run in analysis.flagged if run.condition == condition),
-        ]
-        for condition in conditions
-    ]
-    return ["### Read-log channel by condition", "", *table(["Condition", "Analysed", "Flagged"], rows), ""]
-
-
-def _flagged(analysis: ReadLogAnalysis, table: Callable[..., list[str]]) -> list[str]:
-    lines = ["### Runs that touched the channel", ""]
-    if not analysis.flagged:
-        return [*lines, "None: no analysed run's code names the channel or a way to it.", ""]
-    rows = [[run.run_key, run.attempt, run.condition, _hits(run)] for run in analysis.flagged]
-    return [*lines, *table(["Run key", "Attempt", "Condition", "Hits (kind, name, cell)"], rows), ""]
-
-
-def read_log_lines(
-    analysis: ReadLogAnalysis | None, table: Callable[..., list[str]], sensitivity: Callable[[Any], list[str]]
-) -> list[str]:
-    """The `## Read log` section, or nothing for a batch whose records carry no `read_log`. `table` renders a table;
-    `sensitivity` renders an analysis result's contrasts in the primary analysis's own tables."""
-    if analysis is None:
-        return []
-    counts = analysis.counts()
-    named = ", ".join(f"{counts[kind]} {kind}" for kind in KINDS if counts[kind])
-    lines = ["## Read log: runs that touched the channel (detected, not prevented)", "", *NOTES, ""]
-    lines.append(
-        f"{counts['flagged']} of {counts['analysed']} analysed run(s) flagged"
-        + (f" ({named}; a run may have several kinds of hit)." if named else ".")
-    )
-    lines += ["", *_by_condition(analysis, table), *_flagged(analysis, table)]
-    lines += ["### Sensitivity analysis: the flagged runs left out", "", *SENSITIVITY_NOTES, ""]
-    if analysis.refused is not None:
-        return [*lines, f"Not computed: the analysis refused the rerun ({analysis.refused}).", ""]
-    if analysis.sensitivity is None:
-        return [*lines, "No run is flagged, so the analysis without them is the analysis above.", ""]
-    return [*lines, f"Left out: {counts['flagged']} flagged run(s).", "", *sensitivity(analysis.sensitivity), ""]

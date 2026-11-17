@@ -4,7 +4,7 @@ check leave out, and a batch without the read-log instrument has the guards, cou
 
 import egress_logs as EL
 import pytest
-from readlog_support import FORGER, ON, preregistration, rows_of_pairs
+from readlog_support import ON, preregistration, rows_of_pairs
 
 from expcore.egress import NAMESPACE as EGRESS_NS
 from expcore.egress import EgressLog, declaration
@@ -15,6 +15,9 @@ from expcore.readlog.sensitivity import read_log_analysis
 from expcore.report_guards import guards_lines, summary_lines
 
 DECLARED = declaration([EL.CANARY], EL.CANARY)
+# A cell the read-log scan flags and the egress scan does not (it names no network module): a forger that is flagged
+# for the channel alone, so that a run's states say which guard left it out
+TOUCHES_THE_CHANNEL = "open('/proc/self/environ').read()"
 
 
 class EgressSource:
@@ -58,7 +61,9 @@ def analysed(rows, prereg, cases=CASES, *, egress=True, read_log=True):
             instruments.update(ON)
         runs.append(
             (
-                EL.record(run_key=row.run_key, cells=[FORGER if touched else "print(1)"], instruments=instruments),
+                EL.record(
+                    run_key=row.run_key, cells=[TOUCHES_THE_CHANNEL if touched else "print(1)"], instruments=instruments
+                ),
                 row.condition,
             )
         )
@@ -76,7 +81,7 @@ def test_s20_the_read_log_scan_is_a_guard_named_after_its_instrument_and_ordered
 def test_s20_a_run_whose_code_touched_the_channel_is_left_out_of_the_combined_rerun(prereg):
     """S20: flagged by egress alone, by the read-log scan alone and by both: each is left out of the combined rerun."""
     rows = rows_of_pairs(8)
-    first, seen, both = analysed(rows, prereg)
+    _, seen, both = analysed(rows, prereg)
     assert both.guards == ("egress", "read_log")
     assert [both.runs[i].by for i in CASES] == ["egress", "read_log", "both"]
     assert {run.run_key for run in both.left_out} == {rows[i].run_key for i in CASES}
@@ -127,7 +132,50 @@ def test_s20_the_combined_section_names_the_read_log_scan_and_says_what_its_stat
     _, _, both = analysed(rows_of_pairs(8), prereg)
     text = "\n".join(guards_lines(both, table, lambda result: ["TABLES"]))
     assert text.startswith("## Egress and read log together (detected, not prevented)")
-    assert "its read log is `flagged` when its code names the read-log channel or a way to it" in text
+    assert "`flagged` when its code names the read-log channel or a way to it" in text
     assert "Read log" in text  # the column of a row
     assert "the read-log scan alone" in text
     assert any("read-log" in line for line in summary_lines(both, lambda result, prefix: []))
+
+
+def table_of_header(header, rows):
+    return [" | ".join(header), *(" | ".join(str(c) for c in row) for row in rows)]
+
+
+def test_s20_a_batch_the_scan_did_not_check_has_the_guards_analysis_json_and_section_it_had():
+    """S20: a batch checked by the other guards alone: no read-log key, count, column, note or title anywhere, byte for
+    byte; the keys and texts below are the ones before the scan existed."""
+    from expcore.guards import GuardsAnalysis
+    from expcore.report_notes import GUARDS_NOTES, any_guard_notes
+    from expcore.study.pipeline import _guards_summary
+
+    three = GuardsAnalysis(
+        (
+            GuardedRun("k1", 1, "cond-a", "flagged", "clean", "clean"),
+            GuardedRun("k2", 1, "cond-b", "clean", "clean", "clean"),
+        ),
+        None,
+    )
+    assert three.guards == ("egress", "mount", "visibility")
+    assert three.count_keys() == ("analysed", "left_out", "egress_only", "mount_only", "visibility_only", "several")
+    summary = _guards_summary(three)
+    assert set(summary["runs"][0]) == {
+        "run_key",
+        "attempt",
+        "condition",
+        "egress",
+        "mount",
+        "visibility",
+        "left_out_by",
+    }
+    assert summary["guards"] == ["egress", "mount", "visibility"]
+    text = "\n".join(guards_lines(three, table_of_header, lambda result: []))
+    assert text.startswith("## Egress, mount isolation and process visibility together (detected, not prevented)")
+    assert all(line in text for line in any_guard_notes("egress, mount isolation and process visibility"))
+    assert not any(word in text.lower() for word in ("read log", "read-log", "read_log"))
+    legacy = GuardsAnalysis((GuardedRun("k1", 1, "cond-a", "flagged", "clean"),), None)
+    assert legacy.legacy
+    legacy_text = "\n".join(guards_lines(legacy, table_of_header, lambda result: []))
+    assert all(line in legacy_text for line in GUARDS_NOTES)
+    assert not any(word in legacy_text.lower() for word in ("read log", "read-log", "read_log"))
+    assert set(_guards_summary(legacy)["runs"][0]) == set(summary["runs"][0])

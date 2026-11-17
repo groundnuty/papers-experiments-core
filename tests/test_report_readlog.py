@@ -112,8 +112,8 @@ def test_s20_the_report_section_counts_the_flagged_runs_by_condition_and_lists_e
     assert by_condition["cond-b"][1:] == ["2", "1"]
     rows = table_of(report, "### Runs that touched the channel")
     assert set(rows) == {"Run key", "k1", "k2"}
-    assert "channel_path /expcore-readlog/sock (cell 0)" in rows["k1"][4]
-    assert "proc_environ /proc/*/environ (cell 0)" in rows["k2"][4]
+    assert "channel_path /expcore-readlog/sock (cell 0)" in rows["k1"][3]
+    assert "proc_environ /proc/*/environ (cell 0)" in rows["k2"][3]
 
 
 def test_s20_the_sensitivity_analysis_is_shown_in_the_primary_analysis_s_own_tables():
