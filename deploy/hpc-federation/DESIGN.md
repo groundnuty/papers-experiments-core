@@ -120,7 +120,10 @@ under one record. One federation's job failing ends one shard's step, never anot
   the grant and the scratch inode quota; unset refuses. `up N` past it is refused before anything is made; `add K`
   counts every federation that may still hold a job (a failed `up` may, until its `down`). The inode guard
   (`hpcquota.guard`, section 11, mandatory with a scratch root) is asked once for N: N concurrent ups would each read the same usage and pass
-  alone, so the fleet reads it against N times one federation's estimate. `HPC_FLEET_PARALLEL` (1 by default) is how
+  alone, so the fleet reads it against N times one federation's estimate. The home guard (`hpcquota.home_guard`,
+  section 11, whenever the site sets its keys) is asked once too, ahead of it, at `up` and at `add`: it has no estimate to
+  multiply, so one read answers for all N, and a full home refuses the call before the fleet's directory, a slot or a job
+  is made. `HPC_FLEET_PARALLEL` (1 by default) is how
   many ups or downs run at once.
 - **One process per federation.** A federation's driver changes process-wide state (the umask its secrets are written
   under), so each `up` and `down` is `hpcfed.py` in a child of its own, with `-I`, from the fleet's 0700 directory,
@@ -1038,6 +1041,40 @@ refused as the site is loaded (`hpcsettings.checked_site`), naming the combinati
 site however it was built; any value other than `off` is refused at the start whatever else is set. Without a scratch
 root nothing lands on scratch, there is no check, and `off` changes nothing. A site that sets `HPC_STORAGE_ROOT` and
 names no command cannot `up`.
+
+**The home guard** (`hpcquota.home_guard`; the preflight, ahead of the inode guard). The account's home is small and
+shared by every agent of the account: a checkout and its venv left in it run to thousands of files, and a full home
+breaks every agent at once. Nothing of the federation is stored there, so this guard has no estimate and no multiplier,
+and it does not depend on `HPC_STORAGE_ROOT`.
+
+1. Read the home's usage and limits through `HPC_HOME_QUOTA_CMD`, split as a shell would split it and **run without a
+   shell** on the login node (bounded: 120 s), with `HPC_HOME_QUOTA_PATTERN`: a regular expression with the named
+   groups `files_used`, `files_limit`, `bytes_used` and `bytes_limit`, matching exactly once and capturing each figure
+   whole (the same rule as the inode guard's: no letter, digit, `_`, `.`, `,`, `+`, `-` or `%` may touch a captured
+   figure). Files and bytes are separate figures with their own limit; the bytes are in the tool's unit, the same for
+   the used figure and the limit, since only their ratio is compared (no unit is named in a message). The limit
+   captured is the one that **binds**: a tool may print a soft column that reads 0 beside the hard limit, and a limit
+   of 0 is refused, so a pattern on the soft column cannot pass a full home. The command is generic: the home need not
+   be on the filesystem the scratch quota tool reads, and a site's own script may print the figures. The repository
+   holds neither the site's tool nor its output.
+2. **Refuse** when `files_used > files_limit * 95 // 100` or `bytes_used > bytes_limit * 95 // 100`, in integers, so a
+   figure exactly at the line passes. The message names each figure that is past (its used figure, its limit and the
+   95% line) and that nothing was submitted.
+
+**It guards whenever a key is set**, and fails closed as the inode guard does: a command set without its pattern or a
+pattern without its command, a pattern that does not compile or lacks one of the four groups, a command that cannot
+run, exits non-zero or does not answer, an output the pattern matches never or more than once, a figure that is no
+whole count (or is too large to be one: 10^15 files, 10^19 bytes) or is cut out of a longer one, and a limit of 0 all
+refuse `up`, naming why. **With neither key set there is no check** and `up` says nothing of the home (the inode
+guard's rule, which guards only when `HPC_STORAGE_ROOT` is set: a site is expected to set the keys, and the docs say
+so). `HPC_HOME_QUOTA_CHECK=off` (the one value; anything else is refused when the site is loaded, and unset is not off)
+skips the check, whatever else is set, and `up` says so (`home check: skipped: HPC_HOME_QUOTA_CHECK=off`).
+
+**A message holds figures and variable names only.** A home quota tool's stderr and its command line name the user and
+the home's path, which the inode guard's messages may repeat for the scratch tool (a bounded tail of stderr) and these do
+not: a failed command is named by its exit status alone, a command that could not run by its exception's class, a
+pattern that does not compile by the compiler's own reason. The three keys are not recorded in the state file
+(`Site.to_json`): `down` needs none of them, and a command line that names the user belongs in no record.
 
 **The directories** (`hpcstorage.py`): below `HPC_STORAGE_ROOT` (a directory only this user can write, owned by this user
 with no group or other write bit, named by its real path since the nodes bind through no link, which is neither the

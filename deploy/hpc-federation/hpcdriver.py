@@ -208,12 +208,22 @@ class Driver(Down):
         )  # a template declares [placement] holder (O79), which the core has no default for
         # every declared manifest loads now, so a mistake in one fails before a job is held
         hpcdata.ingested_manifests(self.layout, hpcdata.study_values(site.study_artifacts))
+        self.check_home(site)
         self.check_scratch(site)
         if self.settings.sandbox is not None:
             self.say(
                 f"the layout declares the agent's node ({self.settings.sandbox_placement}): it is held and placed, and "
                 "only its node facts step runs on it here (M5's shard step runs the agent)"
             )
+
+    def check_home(self, site: Site) -> None:
+        """The account's home guard (hpcquota.home_guard; DESIGN.md section 11): when the site sets its command or its
+        pattern, the home's files and bytes are read and the federation refused when either is past 95% of its limit,
+        or when they cannot be read, before anything is submitted; `HPC_HOME_QUOTA_CHECK=off` skips it, and `up` says
+        so. It does not depend on a scratch root, and says nothing when no key is set."""
+        said = hpcquota.home_guard(self.slurm.runner, site)
+        if said:
+            self.say(said)
 
     def check_scratch(self, site: Site) -> None:
         """The provider storage's scratch root, and the inode guard (hpcquota; DESIGN.md section 11): with a scratch

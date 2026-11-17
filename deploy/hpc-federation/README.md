@@ -290,6 +290,35 @@ contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   The bind lives only in the provider's container, so the teardown's removal of its work directory never reaches the
   storage on scratch: only `down` removes it, after the provider has stopped.
 
+## The account's home, and its guard
+
+The cluster account's home is small (a quota of files and of bytes) and shared by every agent of the account, so what a
+checkout, a venv or a slot directory leaves in it counts against everyone's work: a full home breaks every agent of the
+account at once. **A site should set the two keys below**, so that `up` reads the home before it submits anything.
+`DESIGN.md`, section 11, is the full contract; the keys are in `site.env`, and they do not depend on a scratch root:
+
+| Key | What |
+|---|---|
+| `HPC_HOME_QUOTA_CMD` | the site's command that prints the home's usage and limits (`<quota tool> --home <home>`; a site's own script may print them, and the home need not be on the filesystem the scratch quota tool reads), split as a shell would split it and **run without a shell** on the login node |
+| `HPC_HOME_QUOTA_PATTERN` | a regular expression with the named groups `files_used`, `files_limit`, `bytes_used` and `bytes_limit` that reads its output and matches **exactly once**, each figure captured whole. Capture the limit that **binds**: some tools print a soft column that reads 0 beside the hard limit, and a soft figure of 0 is refused as no limit. `files (?P<files_used>[0-9,]+) \(soft [0-9,]+; hard (?P<files_limit>[0-9,]+)\); bytes (?P<bytes_used>[0-9,]+) \(soft [0-9,]+; hard (?P<bytes_limit>[0-9,]+)\)` reads an invented line; you write it for the real output, which this repository never holds |
+| `HPC_HOME_QUOTA_CHECK` | `off` (its only value) skips the check and `up` says so; unset is not off |
+
+- **`up` checks before it submits anything:** it runs the command (bounded at 120 s), reads the four figures and
+  **refuses when the used files or the used bytes pass 95% of their limit** (`used > limit * 95 // 100`, in integers: a
+  figure exactly at the line passes), naming each figure that is past, its limit and the line. The bytes are compared with
+  their own limit, so any unit works as long as the used figure and the limit are in the same one; a figure the pattern cut
+  out of a longer one (`2G`, `1000.5`) is refused, like the inode guard's.
+- **It fails closed.** With either key set, a command or pattern that is not set (a half-set check), a pattern that does
+  not compile or lacks one of the four groups, a command that cannot run, exits non-zero or does not answer, an output
+  the pattern does not match exactly once, a figure that is no whole count and a limit of 0 all refuse `up`, naming why.
+  With **neither** key set there is no check, and `up` says nothing of the home: the keys are optional, which is why a
+  site should set them.
+- **It names figures only.** A home quota tool's stderr and command line name the user and the home's path, so a
+  refusal repeats neither: a failed command is named by its exit status alone. The three keys are not recorded in the
+  state file; `down` needs none of them.
+- **The fleet reads the home once** for all its federations, at `up` and at `add`, before its directory, a slot or a job
+  exists (each federation's own `up` then reads it again, as it reads its inode estimate again).
+
 ## A shared imported tree
 
 A space can be held on a directory of the cluster's shared filesystem that other federations import too, so several
@@ -865,6 +894,7 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   core's own (`hpcquota`, mandatory with `HPC_STORAGE_ROOT`: an override, an unset command or a quota that cannot be read
   refuses the fleet as it refuses one `up`), asked once for all N by the fleet: the account's usage against N times one
   federation's estimate (each federation's own `up` then checks its own estimate again, as it always does). Without a scratch root nothing is on scratch, and the fleet says it made no check.
+  The account's home guard (`hpcquota.home_guard`, the section "The account's home, and its guard") is read once too, ahead of the inode guard, whenever the site sets its keys: a home past 95% of its files or bytes refuses the fleet's `up` and `add` before anything is made.
   `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once. The maximum is one fleet's: two fleets of
   one account share the grant by hand.
 - **What `up` makes.** The fleet's directory (new: never adopted), and federations `fed-1` ... `fed-N`, each its own
@@ -926,6 +956,11 @@ not make. `test_hpc_storage_bind.py` and `test_hpc_posix_storage.py` run the bin
 directory and, without the key, word for word as before; the node's checks and refusals; the service's argv with the bind
 and without; two platform fingerprints for a tmpfs and a scratch federation, differing in the storage kind alone; and the
 data check reading the storage on scratch.
+`tests/deploy/test_hpc_home_guard.py` and `test_hpc_fleet_home_guard.py` run the account's home guard (O57) over the
+same fake Slurm and a real `Runner` against a small script, with an invented command and format: files and bytes under,
+at and one past the 95% line, every way the home can fail to be read (a limit of 0 included), messages that hold
+figures and never the tool's stderr or command line, the override, a site with no key, the keys not recorded in the
+state file, and the fleet reading the home once at `up` and at `add`, ahead of the inode guard.
 `tests/deploy/test_hpc_oneclient_bundle.py` builds the oneclient bundle
 from invented images against a fake Docker (O65): the closure inside the image, the scratch container's discipline, a
 reproducible tar and the self-check's refusals. The bundle's wider offline suite reads files copied out of the two pinned images

@@ -11,12 +11,14 @@
 Run on the login node with the site's values exported (`set -a; . site.env; set +a`), as `hpcfed.py up` is.
 
 - up: refused past `HPC_FLEET_MAX` (the operator's maximum, which the grant and the scratch inode quota set; unset
-  refuses), and past the quota by the inode guard (`hpcquota`, mandatory on scratch: the account's usage plus N times
-  one federation's estimate, read once, before anything is made); then the fleet's directory (new: never adopted),
-  N federations `fed-1` ... `fed-N`, each its own root `<fleet>/fed-k/root` (an exclusive mkdir), state file and held
-  job, each brought up by `hpcfed.py up` in a process of its own, `HPC_FLEET_PARALLEL` at a time (1 by default), and N
-  shards. A federation whose up fails is reported and the others stay up; it may hold a job until `down --member`
-  releases it. Each federation's output is in `<fleet>/logs/<label>.<up|down>.log`.
+  refuses), by the home guard (`hpcquota.home_guard`, when the site sets its keys: the account's home past 95% of its
+  files or bytes, read once for the whole fleet), and past the quota by the inode guard (`hpcquota`, mandatory on
+  scratch: the account's usage plus N times one federation's estimate, read once, before anything is made); then the
+  fleet's directory (new: never adopted), N federations `fed-1` ... `fed-N`, each its own root `<fleet>/fed-k/root` (an
+  exclusive mkdir), state file and held job, each brought up by `hpcfed.py up` in a process of its own,
+  `HPC_FLEET_PARALLEL` at a time (1 by default), and N shards. A federation whose up fails is reported and the
+  others stay up; it may hold a job until `down --member` releases it. Each federation's output is in
+  `<fleet>/logs/<label>.<up|down>.log`.
 - add: K fresh federations into the fleet, by the same rules, the maximum counting every one that may hold a job.
 - plan: each shard on a federation (`fleetplan`), written to `<fleet>/shards.toml`, and each one's srun line printed
   as `shards.py plan` prints it.
@@ -90,6 +92,7 @@ class Hooks:
     federation: Operate
     runner: Callable[[str], Any]  # label -> the Runner that spawns and watches its federation's shard step
     inode_guard: Callable[[int, Layout, Any, Mapping[str, str]], str]  # (count, layout, site, environ) -> its words
+    home_guard: Callable[[Any], str]  # (site) -> its words, empty for none: the account's home, read once per up or add
     self_check: Callable[[], Any] = hpcfed.self_check
     say: Callable[[str], None] = field(default=_say)
 
@@ -131,6 +134,7 @@ def default_hooks(environ: Mapping[str, str]) -> Hooks:
         federation=hpcfed_process(environ),
         runner=lambda label: runner,
         inode_guard=lambda count, layout, site, env: inode_guard(runner, count, layout, site, env),
+        home_guard=lambda site: hpcquota.home_guard(runner, site),
     )
 
 
@@ -220,6 +224,16 @@ class Fleet:
 
     # -- up and add -----------------------------------------------------------------------------------------------
 
+    def check_guards(self, count: int, spec: Any, site: Any) -> None:
+        """What `up` and `add` read before anything is made, each once for all `count` federations: the account's home
+        (it has no estimate per federation, so one read answers for all) and the scratch inode quota against `count`
+        times one federation's estimate. Either refuses the whole call; each federation's own `up` then reads both
+        again, as it always does."""
+        said = self.hooks.home_guard(site)
+        if said:
+            self.say(said)
+        self.say(self.hooks.inode_guard(count, self.scratch_layout(spec), site, self.environ))
+
     def up(self, layout: Path, count: int) -> int:
         maximum, parallel = setting(self.environ, MAX_VAR), setting(self.environ, PARALLEL_VAR, 1)
         if count < 2:
@@ -230,7 +244,7 @@ class Fleet:
         spec, site = load_spec(layout), site_from_environment(self.environ)
         separate_only(spec)
         self.hooks.self_check()
-        self.say(self.hooks.inode_guard(count, self.scratch_layout(spec), site, self.environ))
+        self.check_guards(count, spec, site)
         try:
             os.mkdir(self.directory, 0o700)
         except FileExistsError:
@@ -253,7 +267,7 @@ class Fleet:
             if spec.digest != record["layout"]["digest"]:
                 raise FleetError("the fleet's layout file changed since its up: its federations would differ")
             self.hooks.self_check()
-            self.say(self.hooks.inode_guard(count, self.scratch_layout(spec), site, self.environ))
+            self.check_guards(count, spec, site)
             first = len(record["members"]) + 1
             return self.bring_up([f"fed-{n}" for n in range(first, first + count)], layout, parallel)
 
