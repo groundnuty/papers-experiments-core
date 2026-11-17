@@ -1016,8 +1016,9 @@ def test_o63_an_origin_longer_than_the_reader_takes_is_refused_by_the_writer_bef
     for name, value in passed.items():
         monkeypatch.setenv(name, value)
     said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, list(passed)))
-    assert str(shards.PASS_ENV_ORIGIN_MAX) in said
-    assert "V0" not in said
+    refusal = next(line for line in said.splitlines() if "ERROR" in line)  # the note of what it passed names them
+    assert str(shards.PASS_ENV_ORIGIN_MAX) in refusal
+    assert "V0" not in refusal
     assert "aaaa" not in said
     results = tmp_path / "results"
     assert not origin_file(tmp_path).exists()

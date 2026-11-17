@@ -202,7 +202,7 @@ def test_verify_copy_warns_of_a_journal_added_to_a_shard_that_had_none_when_coll
         archived(shards, tmp_path, shard.label, shard.index, journals=False)
     shards.collect(plan, tmp_path / "merge")
     manifest, local, given = pull(plan, tmp_path)
-    (local / "fed-a" / "journals").mkdir()
+    (local / "fed-a" / "journals").mkdir(parents=True)
     (local / "fed-a" / "journals" / "20261117T000000Z-9-dddd0004.jsonl").write_text("{}\n")
     (local / "fed-z" / "journals").mkdir(parents=True)  # a shard of another campaign: its files are not this pull's
     (local / "fed-z" / "journals" / "other.jsonl").write_text("{}\n")
