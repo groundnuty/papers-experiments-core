@@ -229,6 +229,67 @@ def test_o91_a_collector_killed_during_the_run_gives_an_unknown_log_and_is_a_dea
         box.stop()
 
 
+def test_o91_a_collector_that_ended_before_the_harness_stopped_it_gives_an_unknown_log(node, settings, tmp_path):
+    """O91: a collector told to end by something else before the collection writes a clean end line, so its log would
+    read intact with the reads it took and none after (the client then raises); the death is reported and the log is
+    WITHHELD (`read_log()` None, no copy, `log_missing`): a lost collector is an unknown log, never a clean one."""
+    box = start(node, settings)
+    try:
+        node.readlog_collector().record({"v": 1, "op": "read", "item": "file-1", "bytes": 9})
+        proc = node.readlog_collector().proc
+        assert node.signal(proc.pid, proc.start, signal.SIGTERM) is True
+        done = box.collect(tmp_path / "out")
+        assert [d["role"] for d in done["deaths"]] == ["readlog"]
+        assert done["read_log"] is None
+        assert not (tmp_path / "out" / COPY).exists()
+        assert box.read_log() is None
+        assert box.metadata()["readlog_stop"]["ran_until_stop"] is False
+        snapshot = instrument(box).finish()
+        assert snapshot["log"] == "unknown"
+        assert "log_missing" in snapshot["unknown"]
+        assert snapshot["counts"] is None
+        assert snapshot["side_sha256"] is None
+    finally:
+        box.stop()
+
+
+def test_o91_a_stop_that_needed_the_kill_gives_an_unknown_log_even_with_an_end_line(node, settings, tmp_path):
+    """O91: a collector that wrote its end line on SIGTERM and did not end on it (the harness had to kill it) is not
+    shown to have ended itself: its log is withheld, as a stop that was not clean never gives an intact log."""
+    node.readlog_lingers = True
+    box = start(node, settings)
+    try:
+        done = box.collect(tmp_path / "out")
+        stop = box.metadata()["readlog_stop"]
+        assert stop["ran_until_stop"] is True
+        assert stop["ended_on_term"] is False
+        assert done["read_log"] is None
+        assert box.read_log() is None
+        snapshot = instrument(box).finish()
+        assert snapshot["log"] == "unknown"
+        assert "log_missing" in snapshot["unknown"]
+    finally:
+        box.stop()
+
+
+def test_o91_a_stop_whose_state_could_not_be_told_gives_an_unknown_log(node, settings, tmp_path, monkeypatch):
+    """O91: when the node cannot say whether the collector is gone after its stop, the stop failed (`readlog_stop` holds
+    the error) and its log, which may read intact, is withheld."""
+    box = start(node, settings)
+    try:
+        pid = node.readlog_collector().proc.pid
+        real = node.alive
+        with monkeypatch.context() as patch:
+            patch.setattr(node, "alive", lambda p, s: None if p == pid else real(p, s))
+            done = box.collect(tmp_path / "out")
+        assert "error" in box.metadata()["readlog_stop"]
+        assert done["read_log"] is None
+        assert box.read_log() is None
+        assert instrument(box).finish()["log"] == "unknown"
+    finally:
+        box.stop()
+
+
 def test_o91_a_log_that_cannot_be_read_is_unknown_never_a_run_that_read_nothing(node, settings, tmp_path):
     """O91: a log that is gone when the collection reads it is None, and the instrument says `log_missing`."""
     box = start(node, settings)

@@ -107,6 +107,8 @@ def signalled(node: FakeNode, proc: FakeProc, sig: int) -> None:
     collector = next(c for c in node.readlogs if c.proc is proc)
     if sig == signal.SIGTERM:
         collector.write("end", records=collector.records, malformed=0, unwritten=0, cap_reached=False)
+        if node.readlog_lingers:  # slow to exit after its end line: only SIGKILL ends it (a stop that needs the kill)
+            return
     collector.close()
     proc.alive, proc.exit_status = False, 0 if sig == signal.SIGTERM else 128 + sig
 

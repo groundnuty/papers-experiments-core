@@ -238,6 +238,7 @@ class FakeNode:
         self.collectors: list[Collector] = []
         self.readlogs: list[fake_readlog.FakeReadLog] = []  # the read-log collectors the node emulated (O91)
         self.real_readlog = False  # True: the REAL read-log collector program runs (`fake_readlog`)
+        self.readlog_lingers = False  # True: the emulated one writes its end line on SIGTERM and stays until SIGKILL
         self.real_node: LocalNode | None = None  # the host that runs it
         self.real_helpers: set[tuple[int, str]] = set()  # the real helpers' pid and start time
         self.gate_busy = 0  # this many gate starts fail as if their port were taken

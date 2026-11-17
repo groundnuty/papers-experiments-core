@@ -185,6 +185,29 @@ def test_o91_a_collector_killed_mid_run_gives_an_unknown_log_and_the_client_fail
         box.stop()
 
 
+def test_o91_a_real_collector_terminated_before_the_collection_gives_an_unknown_log(node, settings, tmp_path):
+    """O91: SIGTERM to the real collector before the collection makes it drain, write a clean end line and exit, so the
+    bytes read intact with the canary alone; the death is reported and the log is withheld, never an intact log of a
+    run whose collector was lost."""
+    box = start(node, settings)
+    try:
+        ((pid, start_time),) = node.real_helpers
+        assert node.signal(pid, start_time, signal.SIGTERM) is True
+        until = time.monotonic() + 10
+        while node.alive(pid, start_time) and time.monotonic() < until:
+            time.sleep(0.01)
+        assert (box.dir / "readlog" / "readlog.jsonl").read_bytes().endswith(b"}\n")  # it wrote its end line
+        done = box.collect(tmp_path / "out")
+        assert [d["role"] for d in done["deaths"]] == ["readlog"]
+        assert done["read_log"] is None
+        assert box.read_log() is None
+        snapshot = instrument(box).finish()
+        assert snapshot["log"] == "unknown"
+        assert "log_missing" in snapshot["unknown"]
+    finally:
+        box.stop()
+
+
 def test_o91_the_teardown_stops_the_real_collector_and_removes_the_socket_and_the_log(node, settings):
     """O91: after the stop the collector process is gone, the socket and the log with the run's directory, whether or
     not the collection ran."""
