@@ -1197,6 +1197,8 @@ The option is refused on a mount or no data path, where no gate lists, and a mod
 
 On Docker the three wrap what the sandbox always read, byte for byte; the old names, `infra_container_check()` and `sidecar_errors()`, still answer on both backends, and warn (`DeprecationWarning`) naming the new one. The collection keeps the check in the metadata as it did: `infra_check`, `container_deaths` and `infra_death` once the collection has read it (on an HPC node a collection refused before it, when the agent's processes cannot be shown stopped, has none), and, while the sandbox is up, `metadata()`'s `container_deaths` and `infra_death` are read live.
 
+**Slots of a deployment (O83).** `[slots]` is the operator's: this layer creates no user. A federation brought up from `deploy/compose-federation` or `deploy/hpc-federation` makes the slots' users as ordinary principals of its layout, and its platform template declares `[slots]` and `[toolserver]` (the ids as `@user_id.<username>@`, the paths under `@study_artifacts@`). A slot user that already exists is verified and never changed: exactly as declared it is recorded `matched`, otherwise refused naming the user and the attribute. The written file is loaded as a campaign loads it and checked against the layout's principals, so each tool-server user's `rights` here are the privileges it was given, as the lease groups above need.
+
 Core guarantees: `ctx.infrastructure_wait` is given a kind of `WAIT_KINDS`; the lease the platform declared for the run is held for the whole attempt and freed through the platform's probe, `SlotProbe.resource_gone`, whose sandbox half is `SandboxProbe.resource_gone`.
 
 Implementer (the platform layer) guarantees:
