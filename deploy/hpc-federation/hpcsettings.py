@@ -54,6 +54,7 @@ STUDY_PATHS = {"HPC_STUDY_ARTIFACTS": "study_artifacts"}
 OPTIONAL_VARIABLES = {**AGENT_PATHS, **AGENT_PINS, **STUDY_PATHS}  # each may be left out of site.env
 # HPC_QUOTA_CHECK's one value. It never applies to a federation bound onto scratch (a site that sets it with
 # HPC_STORAGE_ROOT is refused), and without a scratch root there is no check to skip (README, "Provider storage").
+# HPC_HOME_QUOTA_CHECK takes the same one value, and skips the home guard wherever it is set.
 QUOTA_CHECK_OFF = "off"
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
@@ -352,6 +353,15 @@ class Site:
     quota_cmd: str = ""
     quota_pattern: str = ""
     quota_check: str = ""
+    # The guard of the account's home (hpcquota.home_guard; README, "The account's home"). `home_quota_cmd` is the
+    # site's command that prints the home's usage and limits, `home_quota_pattern` the regular expression with the
+    # named groups `files_used`, `files_limit`, `bytes_used` and `bytes_limit` that reads its output. The check runs
+    # whenever either is set, with or without a scratch root, and refuses when the home's files or bytes are past 95%
+    # of the limit; `home_quota_check` "off" skips it. None of the three is recorded in the state file: `down` needs
+    # none, and the command line names the user and the home's path.
+    home_quota_cmd: str = ""
+    home_quota_pattern: str = ""
+    home_quota_check: str = ""
     # srun's `--network=<value>` on every step the driver launches, when not empty (HPC_STEP_NETWORK). On a site whose
     # switch plugin gives each job a virtual network identifier, a heterogeneous job's steps on component 0 were refused
     # ("Error configuring interconnect") from a point on while the same steps with `no_vni` ran; the services talk over
@@ -426,6 +436,8 @@ def checked_site(site: Site) -> Site:
         _absolute(site.storage_root, "HPC_STORAGE_ROOT")
     if site.quota_check not in ("", QUOTA_CHECK_OFF):
         raise SettingsError(f"HPC_QUOTA_CHECK: must be '{QUOTA_CHECK_OFF}' or unset (unset is not off)")
+    if site.home_quota_check not in ("", QUOTA_CHECK_OFF):
+        raise SettingsError(f"HPC_HOME_QUOTA_CHECK: must be '{QUOTA_CHECK_OFF}' or unset (unset is not off)")
     if site.storage_root and site.quota_check == QUOTA_CHECK_OFF:
         raise SettingsError(
             f"HPC_QUOTA_CHECK={QUOTA_CHECK_OFF} with HPC_STORAGE_ROOT: a federation whose provider storage is bound "
@@ -466,5 +478,8 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             quota_cmd=environ.get("HPC_QUOTA_CMD") or "",
             quota_pattern=environ.get("HPC_QUOTA_PATTERN") or "",
             quota_check=environ.get("HPC_QUOTA_CHECK") or "",
+            home_quota_cmd=environ.get("HPC_HOME_QUOTA_CMD") or "",
+            home_quota_pattern=environ.get("HPC_HOME_QUOTA_PATTERN") or "",
+            home_quota_check=environ.get("HPC_HOME_QUOTA_CHECK") or "",
         )
     )

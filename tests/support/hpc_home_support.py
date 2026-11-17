@@ -6,8 +6,8 @@ TOOL = "fake-home-quota"  # an invented command name
 # An invented format, as invented as its tool: the soft column reads 0 and the hard one binds, so the pattern captures
 # the hard figure of each (a pattern on the soft column reads a limit of 0, which is refused).
 PATTERN = (
-    r"files (?P<files_used>[0-9,]+) \(soft [0-9,]+, hard (?P<files_limit>[0-9,]+)\); "
-    r"bytes (?P<bytes_used>[0-9,]+) \(soft [0-9,]+, hard (?P<bytes_limit>[0-9,]+)\)"
+    r"files (?P<files_used>[0-9,]+) \(soft [0-9,]+; hard (?P<files_limit>[0-9,]+)\); "
+    r"bytes (?P<bytes_used>[0-9,]+) \(soft [0-9,]+; hard (?P<bytes_limit>[0-9,]+)\)"
 )
 FILES_LIMIT, BYTES_LIMIT = 40_000, 8_000_000
 FILES_LINE, BYTES_LINE = 38_000, 7_600_000  # 95% of each limit
@@ -16,7 +16,7 @@ FILES_LINE, BYTES_LINE = 38_000, 7_600_000  # 95% of each limit
 def printed(files=0, bytes_=0, files_limit=FILES_LIMIT, bytes_limit=BYTES_LIMIT, soft=0) -> str:
     """What the invented command prints for a home with these figures."""
     return (
-        f"files {files:,} (soft {soft}, hard {files_limit:,}); bytes {bytes_:,} (soft {soft}, hard {bytes_limit:,})\n"
+        f"files {files:,} (soft {soft}; hard {files_limit:,}); bytes {bytes_:,} (soft {soft}; hard {bytes_limit:,})\n"
     )
 
 

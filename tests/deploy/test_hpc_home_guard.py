@@ -186,7 +186,7 @@ def test_a_home_quota_command_that_cannot_run_or_does_not_answer_is_refused(hpc,
     ("text", "why"),
     [
         ("", "matched nothing"),
-        ("files unlimited (soft 0, hard unlimited); bytes unlimited (soft 0, hard unlimited)\n", "matched nothing"),
+        ("files unlimited (soft 0; hard unlimited); bytes unlimited (soft 0; hard unlimited)\n", "matched nothing"),
         (printed(1, 1) + printed(2, 2), "matched 2 times"),
         (printed(1, 1, files_limit=0), "files_limit.*limit of 0.*hard limit"),
         (printed(1, 1, bytes_limit=0), "bytes_limit.*limit of 0.*hard limit"),
@@ -237,8 +237,8 @@ def test_a_pattern_on_the_soft_column_reads_a_limit_of_zero_and_is_refused(hpc, 
     """O57: on a site whose soft column reads 0 and whose hard column binds, a pattern that captures the soft figure
     would read a limit of 0 and never refuse a full home: it is refused, so a mis-written pattern cannot pass."""
     soft = (
-        r"files (?P<files_used>[0-9,]+) \(soft (?P<files_limit>[0-9,]+), hard [0-9,]+\); "
-        r"bytes (?P<bytes_used>[0-9,]+) \(soft (?P<bytes_limit>[0-9,]+), hard [0-9,]+\)"
+        r"files (?P<files_used>[0-9,]+) \(soft (?P<files_limit>[0-9,]+); hard [0-9,]+\); "
+        r"bytes (?P<bytes_used>[0-9,]+) \(soft (?P<bytes_limit>[0-9,]+); hard [0-9,]+\)"
     )
     assert soft != PATTERN
     refused(hpc, site, Quota(hpc, FILES_LIMIT, BYTES_LIMIT), "limit of 0", HPC_HOME_QUOTA_PATTERN=soft)
