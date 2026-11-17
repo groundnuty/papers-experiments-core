@@ -29,9 +29,7 @@ def test_o84_a_relative_command_is_refused_at_load_naming_the_key(tmp_path, comm
     with pytest.raises(ConfigError) as refused:
         _load(tmp_path, command=command, args=["-m", "server"])
     message = str(refused.value)
-    assert "platform.toml" in message
-    assert "[toolserver]" in message
-    assert "key 'command'" in message
+    assert "platform.toml.toolserver: key 'command'" in message  # the file, the table and the key, as every key's error
     assert "absolute" in message
     assert "PATH" in message
     assert SENTINEL not in message
@@ -56,9 +54,7 @@ def test_o84_a_relative_path_in_the_arguments_is_refused_at_load_naming_the_key_
     with pytest.raises(ConfigError) as refused:
         _load(tmp_path, command=command, args=args)
     message = str(refused.value)
-    assert "platform.toml" in message
-    assert "[toolserver]" in message
-    assert "key 'args'" in message
+    assert "platform.toml.toolserver: key 'args'" in message
     assert f"argument {position} " in message
     assert "absolute" in message
     assert SENTINEL not in message
