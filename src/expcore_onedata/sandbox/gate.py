@@ -418,8 +418,9 @@ NODE_MARK = "<node>"  # what a known name becomes in the log's fields that echo 
 def _scan_of(names: tuple[str, ...]) -> tuple[re.Pattern[bytes] | None, frozenset[bytes], frozenset[bytes]]:
     """The scan of `names` (O73), built once per list: a pattern for the plain names (host names and IPv4 addresses) and
     the packed IPv6 addresses and IPv4 addresses to compare candidates with. A plain name is a whole name, in any case,
-    longest first, bare or with a port after it: no word character, dot or hyphen before it or word character or
-    hyphen after it, and not the start of a longer name (a dot and a word character after it)."""
+    longest first, bare or with a port after it: no word character, dot or hyphen before it (but a backslash escape
+    such as `\\t`, as a parser's `%r` prints one, is no part of a name) or word character or hyphen after it, and not the
+    start of a longer name (a dot and a word character after it)."""
     with _LOCK:
         if names not in _SCAN:
             found = sorted({n.lower() for n in names if isinstance(n, str) and n}, key=len, reverse=True)
@@ -435,7 +436,9 @@ def _scan_of(names: tuple[str, ...]) -> tuple[re.Pattern[bytes] | None, frozense
                 else:
                     four.add(address.packed)
                     plain.append(re.escape(name.encode("ascii")))
-            pattern = rb"(?<![\w.-])(?:" + b"|".join(plain) + rb")(?![\w-])(?!\.\w)" if plain else None
+            pattern = (
+                rb"(?:(?<![\w.-])|(?<=\\[ntrbfv]))(?:" + b"|".join(plain) + rb")(?![\w-])(?!\.\w)" if plain else None
+            )
             _SCAN[names] = (re.compile(pattern, re.IGNORECASE) if pattern else None, frozenset(six), frozenset(four))
         return _SCAN[names]
 
@@ -444,7 +447,7 @@ def _as_the_client_reads(body: bytes) -> bytes:
     """What a client reads of a body: the strings of a JSON document decoded (an escape such as `\\n`, or a name
     written with `\\uXXXX`, would otherwise hide it from the raw text), every key and string value on a line of its
     own; any other body, or a JSON one too deep for the decoder, as it is."""
-    if body.lstrip()[:1] not in (b"{", b"["):
+    if body.lstrip()[:1] not in (b"{", b"[", b'"'):
         return body
     try:
         document = json.loads(body)
@@ -464,29 +467,37 @@ def _as_the_client_reads(body: bytes) -> bytes:
 
 
 def _spans(text: bytes, names: tuple[str, ...]) -> list[tuple[int, int]]:
-    """Where the known names are in `text`, as spans: the plain names by pattern, an IPv6 address in any spelling (its
-    candidates are parsed, so `2001:0db8::2` and `2001:db8:0::2` are one address) and an IPv4 address written as a
-    hexadecimal IPv4-mapped IPv6 address (the dotted form is the plain pattern's)."""
+    """Where the known names are in `text`, as spans, one per occurrence: the plain names by pattern, an IPv6 address
+    in any spelling (a run of hex digits, colons and dots is parsed, and so are its suffixes after each colon, since a
+    word that ends in hex digits may precede it: `node:2001:db8::2`) and an IPv4 address written as an IPv4-mapped IPv6
+    address. Spans that overlap (the dotted tail of a mapped address, and the whole of it) are one occurrence."""
     pattern, six, four = _scan_of(names)
     found = [m.span() for m in pattern.finditer(text)] if pattern is not None else []
     if (six or four) and b":" in text:
         for match in _V6_TOKEN.finditer(text):
-            token, start = match.group(), match.start()
-            stripped = token.rstrip(b".")
-            if stripped.endswith(b":") and not stripped.endswith(b"::"):
-                stripped = stripped[:-1]
-            if stripped.startswith(b":") and not stripped.startswith(b"::"):  # a prose colon: `peer:2001:db8::2`
-                stripped, start = stripped[1:], start + 1
-            if b":" not in stripped:
-                continue
-            try:
-                address = ipaddress.IPv6Address(stripped.decode("ascii"))
-            except ValueError:
-                continue
-            mapped = address.ipv4_mapped
-            if address.packed in six or (mapped is not None and b"." not in stripped and mapped.packed in four):
-                found.append((start, start + len(stripped)))
-    return sorted(found)
+            token = match.group().rstrip(b".")
+            if token.endswith(b":") and not token.endswith(b"::"):
+                token = token[:-1]
+            starts = [0] + [i + 1 for i, byte in enumerate(token) if byte == 0x3A]  # the token, then after each colon
+            for at in starts:
+                candidate = token[at:]
+                if b":" not in candidate:
+                    break
+                try:
+                    address = ipaddress.IPv6Address(candidate.decode("ascii"))
+                except ValueError:
+                    continue
+                mapped = address.ipv4_mapped
+                if address.packed in six or (mapped is not None and mapped.packed in four):
+                    found.append((match.start() + at, match.start() + at + len(candidate)))
+                    break
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(found):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _node_name_hits(body: bytes) -> int:
