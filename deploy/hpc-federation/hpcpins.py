@@ -9,6 +9,13 @@ missing or its SHA-256 is not the one declared, naming the variable and never th
 the declared SHA-256s, which the sandbox checks at every start (O13) and the campaign fingerprint holds
 (`PlatformConfig.fingerprint`, `sandbox_backend`), never a path. The egress collector is the
 bundle's own, so `values` hashes this checkout's copy.
+
+The template's `[sandbox.apptainer]` also declares where the federation's providers keep their data, `provider_storage
+= "@hpc_provider_storage@"` (O57): `values` fills the one word the site's settings give (`provider_storage`: the shared
+filesystem when the site has a scratch root, `HPC_STORAGE_ROOT`, else the nodes' tmpfs, never the root's path), and
+`check` refuses a template that declares the sandbox without it, since it would give a scratch federation a
+fingerprint a tmpfs one has: where a provider stores its data shapes a run's I/O timing, so shards on the two can
+never merge. The renderer reads the file it writes back (`hpcboot.check_provider_storage`).
 """
 
 import hashlib
@@ -17,6 +24,8 @@ from typing import Dict, Optional
 
 from hpcsettings import Site
 
+TMPFS, SHARED_FILESYSTEM = "tmpfs", "shared_filesystem"  # the platform layer's PROVIDER_STORAGE_KINDS, in this order
+STORAGE_KIND = "hpc_provider_storage"  # the placeholder of `[sandbox.apptainer] provider_storage` (O57)
 COLLECTOR = Path(__file__).resolve().parent / "bundle" / "egress-collector.py"
 CHUNK = 1 << 20
 # Each placeholder a template may name, the site variable that fills it and the Site field that holds it. A name holds
@@ -53,10 +62,24 @@ def named(template: str) -> list:
     return [name for name in PLACEHOLDERS if name in found]
 
 
+def provider_storage(site: Site) -> str:
+    """Where the federation's providers keep their data, as the platform file declares it: the shared filesystem when
+    the site binds their storage onto a scratch root (`HPC_STORAGE_ROOT`), else the nodes' tmpfs. The word, never the
+    root."""
+    return SHARED_FILESYSTEM if site.storage_root else TMPFS
+
+
 def check(site: Site, template: Optional[str]) -> None:
     """Refuse a site that leaves a placeholder of the template unfilled, or whose declared file is missing or has
-    another SHA-256 than the one declared; the message names the variable, never the path."""
+    another SHA-256 than the one declared; the message names the variable, never the path. A template that names the
+    agent's sandbox and leaves out the providers' storage kind (`@hpc_provider_storage@`) is refused too (O57)."""
     wanted = named(template or "")
+    if wanted and f"@{STORAGE_KIND}@" not in (template or ""):
+        raise RuntimeError(
+            "the platform template declares the agent's sandbox without the providers' storage kind: add "
+            f'provider_storage = "@{STORAGE_KIND}@" to its [sandbox.apptainer] (a federation on scratch and one on '
+            "tmpfs would otherwise share a campaign fingerprint)"
+        )
     for name in wanted:
         variable, attribute = PLACEHOLDERS[name]
         if not getattr(site, attribute):
@@ -76,6 +99,7 @@ def check(site: Site, template: Optional[str]) -> None:
 
 
 def values(site: Site) -> Dict[str, str]:
-    """The placeholders' values: the site's, as declared, and the bundle's collector with its SHA-256."""
+    """The placeholders' values: the site's, as declared, the providers' storage kind (one word), and the bundle's
+    collector with its SHA-256."""
     found = {name: getattr(site, attribute) for name, (_, attribute) in PLACEHOLDERS.items()}
-    return {**found, OWN[0]: str(COLLECTOR), OWN[1]: sha256_of(COLLECTOR)}
+    return {**found, STORAGE_KIND: provider_storage(site), OWN[0]: str(COLLECTOR), OWN[1]: sha256_of(COLLECTOR)}

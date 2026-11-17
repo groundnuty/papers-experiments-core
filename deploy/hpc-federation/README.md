@@ -267,9 +267,15 @@ contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   start` included, which gives the start the same path again from the state: the bind happens only when the record
   names exactly it. A refusal stops the start: a provider never falls back to tmpfs or another directory. The provider runs as you in its
   cell, so 0700 is all it needs, and it never sees the marker, which stays beside the bound directory. Its storage is at
-  the same path in the cell, so it is declared to Onedata as before (`finish.sh`), `platform.toml` and its fingerprint
-  are the same as a tmpfs federation's, and the data check reads each space through its owner, wherever that stores it.
-  Without `HPC_STORAGE_ROOT` the provider's step and the service's argv are word for word what they were.
+  the same path in the cell, so it is declared to Onedata as before (`finish.sh`), and the data check reads each space
+  through its owner, wherever that stores it. Without `HPC_STORAGE_ROOT` the provider's step and the service's argv are
+  word for word what they were.
+- **The storage kind is part of the experiment.** Where a provider stores its data shapes a run's I/O timing, so the
+  rendered `platform.toml` declares `provider_storage = "shared_filesystem"` (`"tmpfs"` without a scratch root) in
+  `[sandbox.apptainer]`, never the root's path. The platform fingerprint and each run's facts carry it, so shards on
+  tmpfs and on scratch never merge, and a campaign cannot resume from one onto the other. A platform template that
+  declares the agent's sandbox must name it (`provider_storage = "@hpc_provider_storage@"`, as `layouts/pilot-shape`'s
+  does): `up` refuses one that does not, before anything is submitted. The Compose federation has no such setting.
 - **`down` removes exactly those directories,** after the job is gone and every service verified clean, and counts what
   remains: any entry fails it loudly, with the root and the state kept for a second `down`. It reads the paths from the
   state file alone, refuses a record that is not the exact form `up` writes (a state with the scratch root and no record
@@ -554,8 +560,8 @@ refused on scratch, the estimate against the manifests `up` writes, the director
 `down` removing exactly the recorded ones, shown gone by a count, never following a link and never touching what `up` did
 not make. `test_hpc_storage_bind.py` and `test_hpc_posix_storage.py` run the bind: each provider's step given its own
 directory and, without the key, word for word as before; the node's checks and refusals; the service's argv with the bind
-and without; one platform fingerprint for a tmpfs and a scratch federation; and the data check reading the storage on
-scratch.
+and without; two platform fingerprints for a tmpfs and a scratch federation, differing in the storage kind alone; and the
+data check reading the storage on scratch.
 `tests/deploy/test_hpc_oneclient_bundle.py` builds the oneclient bundle
 from invented images against a fake Docker (O65): the closure inside the image, the scratch container's discipline, a
 reproducible tar and the self-check's refusals. The bundle's wider offline suite reads files copied out of the two pinned images

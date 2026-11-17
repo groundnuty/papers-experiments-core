@@ -6,6 +6,7 @@ hpc_fed_support; the core's phase is recorded, or the renderer is run alone."""
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -292,3 +293,73 @@ def test_o63_a_copy_of_the_rendered_file_beside_a_study_reads_the_roots_secrets_
     assert config.tls.ca_file == root / "ca" / "federation-ca.pem"
     assert load_faults(copy, config).journal == root / "fault-journal"
     assert config.fingerprint() == load_platform(rendered).fingerprint()
+
+
+# -- the storage kind of the providers (O57) ---------------------------------------------------------------------------
+
+KIND_LINE = 'provider_storage = "@hpc_provider_storage@"'
+
+
+def edited_layout(folder: Path, edit) -> Path:
+    """The pilot's layout with its template's text passed through `edit`, written into `folder`."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / LAYOUT.name).write_text(LAYOUT.read_text(encoding="utf-8"), encoding="utf-8")
+    (folder / PILOT_TEMPLATE.name).write_text(edit(PILOT_TEMPLATE.read_text(encoding="utf-8")), encoding="utf-8")
+    return folder / LAYOUT.name
+
+
+def test_o57_the_pilot_template_declares_the_storage_kind_and_up_fills_it_from_the_site(pins, hpc, tmp_path, site, ca):
+    """O57: where the providers keep their data is a declared setting of the rendered platform file, `provider_storage`
+    in `[sandbox.apptainer]`: `shared_filesystem` for a site with a scratch root, `tmpfs` for one without, the word
+    alone, so the root's path is in no value of the fingerprint."""
+    assert any(line.split("#")[0].strip() == KIND_LINE for line in PILOT_TEMPLATE.read_text().splitlines())
+    scratch = {**site, "HPC_STORAGE_ROOT": str(tmp_path / "invented-scratch-root")}
+    for label, declared, kind in (("tmpfs", site, "tmpfs"), ("scratch", scratch, "shared_filesystem")):
+        config = load_platform(render(hpc, pins, tmp_path / label, declared, ca))
+        assert config.sandbox.apptainer.provider_storage == kind
+        fingerprint = config.fingerprint()
+        assert fingerprint["sandbox_backend"]["provider_storage"] == kind
+        assert "invented-scratch-root" not in json.dumps(fingerprint)
+    assert pins.values(hpc.settings.site_from_environment(site))["hpc_provider_storage"] == "tmpfs"
+    assert pins.values(hpc.settings.site_from_environment(scratch))["hpc_provider_storage"] == "shared_filesystem"
+
+
+def test_o57_the_driver_s_two_kinds_are_the_words_the_core_accepts(pins):
+    """O57: the driver names the kinds by the same two words the platform layer validates; no other word is rendered."""
+    from expcore_onedata.sandbox.apptainer.settings import PROVIDER_STORAGE_KINDS
+
+    assert (pins.TMPFS, pins.SHARED_FILESYSTEM) == PROVIDER_STORAGE_KINDS
+
+
+def test_o57_up_refuses_a_template_that_declares_the_sandbox_and_not_the_storage_kind(hpc, tmp_path, site):
+    """O57: a template whose `[sandbox.apptainer]` names the site's pins and leaves the kind out would give a scratch
+    federation the fingerprint of a tmpfs one: `up` refuses it before anything is submitted, naming the key."""
+    layout = edited_layout(tmp_path / "layout", lambda text: text.replace(KIND_LINE, ""))
+    rig = Rig(hpc, tmp_path, layout=layout)
+    with pytest.raises(RuntimeError, match="provider_storage"):
+        rig.up(site)
+    assert not [c for c in rig.fake.calls if c[0] == "sbatch"]
+    assert not (rig.root / "hpc-federation.json").exists()
+
+
+def test_o57_a_template_with_no_sandbox_declares_no_kind_and_needs_none(hpc, tmp_path, site):
+    """O57: the services alone (no `[sandbox]`, so no run to fingerprint) are not asked for a kind."""
+    rig = Rig(hpc, tmp_path, layout=services_only(tmp_path / "layout"))
+    rig.up({k: v for k, v in site.items() if k not in VARIABLES})
+    assert rig.driver.store.read()["sandbox"] is None
+
+
+@pytest.mark.parametrize("declared", ['"scratch"', '"shared_filesystem"'])
+def test_o57_a_rendered_file_that_declares_another_kind_than_the_site_s_is_refused(
+    hpc, pins, tmp_path, site, ca, monkeypatch, declared
+):
+    """O57: the renderer reads the file it renders back: a template that hard-codes a kind the site does not have (the
+    site here has no scratch root, so its kind is `tmpfs`) never reaches the campaign, whatever the word."""
+    folder = tmp_path / "template"
+    folder.mkdir()
+    hard_coded = folder / PILOT_TEMPLATE.name
+    hard_coded.write_text(PILOT_TEMPLATE.read_text(encoding="utf-8").replace('"@hpc_provider_storage@"', declared))
+    monkeypatch.setattr(sys.modules[__name__], "PILOT_TEMPLATE", hard_coded)
+    with pytest.raises(RuntimeError, match="provider_storage"):
+        render(hpc, pins, tmp_path / "root", site, ca)
+    assert not (tmp_path / "root" / "platform.toml").exists()  # nothing a campaign could read was left behind

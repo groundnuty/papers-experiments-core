@@ -419,21 +419,51 @@ def real_core(hpc, label, data=None, content=None):
     return core
 
 
-def test_o57_a_tmpfs_and_a_scratch_federation_render_one_platform_file_and_one_fingerprint(hpc, tmp_path, ca_pem):
-    """O57: the cell sees its posix storage at /volumes/posix whether it is bound from scratch or not, and the platform
-    file declares no storage path: a tmpfs federation's and a scratch one's rendered files are the same but for the
-    root's path, so their shards' platform fingerprints are one."""
+def test_o57_a_tmpfs_and_a_scratch_federation_render_two_fingerprints_that_differ_in_the_storage_kind_alone(
+    hpc, tmp_path, ca_pem
+):
+    """O57: the cell sees its posix storage at /volumes/posix whether it is bound from scratch or not, but where a
+    provider stores its data shapes a run's I/O timing, so the rendered file declares the kind (`provider_storage`) and
+    the two federations' shards can never merge: their files differ in that one line (the root's path aside), their
+    fingerprints in that one entry, and the scratch root's path is in neither."""
     tmpfs = Rig(hpc, tmp_path / "t", make_site(tmp_path / "t", scratch=False), core=real_core(hpc, "f"), ca_pem=ca_pem)
     bound = Rig(hpc, tmp_path / "s", make_site(tmp_path / "s", scratch=True), core=real_core(hpc, "f"), ca_pem=ca_pem)
     for rig in (tmpfs, bound):
         rig.up()
     assert tmpfs.state()["storage"] is None
     assert bound.state()["storage"] is not None
-    texts = [(rig.root / "platform.toml").read_text(encoding="utf-8") for rig in (tmpfs, bound)]
-    assert texts[0].replace(str(tmp_path / "t"), "<base>") == texts[1].replace(str(tmp_path / "s"), "<base>")
+    texts = [
+        (rig.root / "platform.toml").read_text(encoding="utf-8").replace(str(base), "<base>").splitlines()
+        for rig, base in ((tmpfs, tmp_path / "t"), (bound, tmp_path / "s"))
+    ]
+    assert len(texts[0]) == len(texts[1])
+    changed = [(a.split("#")[0].strip(), b.split("#")[0].strip()) for a, b in zip(*texts, strict=True) if a != b]
+    assert changed == [('provider_storage = "tmpfs"', 'provider_storage = "shared_filesystem"')]
     one, two = (load_platform(rig.root / "platform.toml") for rig in (tmpfs, bound))
-    assert one.fingerprint() == two.fingerprint()
+    assert one.fingerprint() != two.fingerprint()
+    assert one.fingerprint()["sandbox_backend"]["provider_storage"] == "tmpfs"
+    assert two.fingerprint()["sandbox_backend"]["provider_storage"] == "shared_filesystem"
+
+    def without_kind(fingerprint):
+        backend = {k: v for k, v in fingerprint["sandbox_backend"].items() if k != "provider_storage"}
+        return {**fingerprint, "sandbox_backend": backend}
+
+    assert without_kind(one.fingerprint()) == without_kind(two.fingerprint())  # nothing else tells them apart
     assert len(one.fingerprint()["spaces"]) == 4  # each space's data identity: the equality is not of empty records
+    assert str(tmp_path / "s" / "scratch") not in json.dumps(two.fingerprint())
+
+
+def test_o57_up_hands_the_core_the_storage_kind_of_its_site_and_never_the_root(hpc, tmp_path):
+    """O57: the core's phase is given `hpc_provider_storage`: the word `tmpfs` or `shared_filesystem`, by whether the
+    site has a scratch root, and the root's path is in no value of that key."""
+    kinds = {}
+    for label, scratch in (("t", False), ("s", True)):
+        rig = Rig(hpc, tmp_path / label, make_site(tmp_path / label, scratch=scratch))
+        rig.up()
+        (values,) = rig.core_calls
+        kinds[label] = values["hpc_provider_storage"]
+        assert str(tmp_path) not in kinds[label]
+    assert kinds == {"t": "tmpfs", "s": "shared_filesystem"}
 
 
 class BoundProviders:

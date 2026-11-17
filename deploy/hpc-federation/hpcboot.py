@@ -19,6 +19,10 @@ real addresses (DESIGN.md, sections 5 and 6).
   (above it), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of each direct-I/O
   import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and `@hpc_token_margin_s@`: the
   least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
+  A template that declares `[sandbox.apptainer]` also names `@hpc_provider_storage@` (`hpcpins.values`: `tmpfs`, or
+  `shared_filesystem` with a scratch root), which the platform layer records in the campaign fingerprint, and the
+  rendered file is read back for it (`check_provider_storage`): a federation on scratch and one on tmpfs are two
+  experiments.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -45,6 +49,7 @@ from fedspec import Service, Space, Spec
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
 
 HTTPS_PORT = 8443  # every service's public port: its 443, moved by the port shim
+PROVIDER_STORAGE = "hpc_provider_storage"  # the value hpcpins.values fills: the providers' storage kind (O57)
 HPC_STORAGE = "posix-local"  # the posix storage bundle/finish.sh adds to every provider, owned by the job's uid
 ZONE_TIMEOUT_S = 900.0
 PROVIDER_TIMEOUT_S = 900.0
@@ -214,11 +219,29 @@ def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int,
     }
 
 
+def check_provider_storage(rendered: str, values: Mapping[str, str]) -> None:
+    """Refuse a rendered file whose `[sandbox.apptainer]` does not declare the providers' storage kind the site has
+    (`values["hpc_provider_storage"]`, O57): the kind is in the campaign fingerprint, so a file that leaves it out, or
+    hard-codes another, would let shards on tmpfs and on scratch merge. A file with no Apptainer sandbox has no run to
+    fingerprint and is not asked. Names the key and the two kinds, never a path."""
+    table = tomllib.loads(rendered).get("sandbox", {}).get("apptainer")
+    if table is None:
+        return
+    wanted = values.get(PROVIDER_STORAGE)
+    if wanted is None or table.get("provider_storage") != wanted:
+        raise RuntimeError(
+            "the platform file's [sandbox.apptainer] must declare provider_storage as the site has it "
+            f'("{wanted}"): a federation on scratch and one on tmpfs are two experiments'
+        )
+
+
 def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, str]) -> str:
     """Write the platform file: the Compose placeholders from the facts, the HPC ones, and the token margin last, the
-    least the platform layer accepts for the rest of the file. Returns the text written."""
+    least the platform layer accepts for the rest of the file. Returns the text written. The kind of storage the
+    providers have is checked in the first render, before anything is written (`check_provider_storage`)."""
     filled = {**placeholders(facts), **values, "hpc_token_margin_s": str(PROVISIONAL_MARGIN_S)}
     text = render(template, filled)
+    check_provider_storage(text, values)
     write_private(path, text)
     if "@hpc_token_margin_s@" not in template:
         return text

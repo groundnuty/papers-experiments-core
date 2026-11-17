@@ -715,11 +715,17 @@ directories are made after the state exists and before the job is submitted, so 
   `finish.sh` declares the posix storage owned by that uid and gid (`rootUid`, `rootGid`), as on tmpfs, whose
   `/volumes/posix` is a 0700 directory of the same user: a 0700 directory of this user is what the provider needs, and the
   node's check refuses one that is not this user's (a uid that differs between the login node and the nodes included).
-- **The same storage in the cell.** The provider sees its storage at `/volumes/posix` either way, so `finish.sh` adds the
-  same `posix-local` storage, and `platform.toml`, which names no storage path, is the same: a tmpfs and a scratch
-  federation's shards share one platform fingerprint (`PlatformConfig.fingerprint`), and a test shows it. The data
-  check (`hpcdata.check`, O63) reads each space through its owner's REST, so it reads the space where that provider stores
-  it, on scratch; nothing of it changes.
+- **The same storage in the cell, a different kind in the fingerprint.** The provider sees its storage at
+  `/volumes/posix` either way, so `finish.sh` adds the same `posix-local` storage and `platform.toml` names no storage
+  path. But where a provider stores its data shapes a run's I/O timing, and so possibly its time-cap outcomes, so the
+  rendered file declares the **kind**, `provider_storage = "tmpfs"` or `"shared_filesystem"` in `[sandbox.apptainer]`
+  (`hpcpins.values` fills `@hpc_provider_storage@` from whether `HPC_STORAGE_ROOT` is set: the word, never the root's
+  path): it is in `PlatformConfig.fingerprint` (`sandbox_backend`) and in every run's `backend` and
+  `infrastructure_facts`, so shards on tmpfs and on scratch can never merge by accident, and a test shows the two files
+  differ in that one line. A template that declares the sandbox without the line is refused by `up` before anything is
+  submitted, and the renderer reads the file it wrote back for it. The Compose federation has no such setting, and its
+  fingerprint is unchanged. The data check (`hpcdata.check`, O63) reads each space through its owner's REST, so it reads
+  the space where that provider stores it, on scratch; nothing of it changes.
 - **The work directory never reaches scratch.** The bind exists only in the container's mount namespace; on the node the
   rootfs's `/volumes/posix` stays the empty mountpoint, so the teardown's removal of the work directory, the next job's
   sweep of leftovers and the failure path's scrub never touch the storage. Only `down` removes it, from the login node,

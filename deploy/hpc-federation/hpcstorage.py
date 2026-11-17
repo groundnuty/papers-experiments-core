@@ -12,7 +12,10 @@ Each provider's directory also holds, beside its marker, the directory its servi
 (`posix`, 0700, made empty): `up` gives the provider's step that one (`provider_args`, from the record checked whole),
 and the bundle binds it (`bundle/posixstorage.py`), so the provider stores its data on scratch and never sees the
 marker, which stays where `down` proves the directory by it. The cell sees its storage at the path it always did, so
-the provider's posix storage is declared to Onedata as before and nothing in `platform.toml` changes.
+the provider's posix storage is declared to Onedata as before and names no path in `platform.toml`. What changes there
+is one word, `provider_storage = "shared_filesystem"` (`tmpfs` without a scratch root, `hpcpins`): where a provider
+stores its data shapes a run's I/O timing, so the campaign fingerprint and each run's facts carry the kind, and shards
+on tmpfs and on scratch never merge.
 
 `down` removes them only once the held job and every service are gone, and removes exactly what `up` made:
 
