@@ -1,0 +1,43 @@
+{
+  "pin": "8c9b10c34efdad29498362fc4be4e785ff2a102b",
+  "source": "the tool names onedata_mcp/modules/*.py registers (@mcp.tool) and onedata_mcp/token_policy.py WRITE_TOOL_NAMES, at the pin; names only",
+  "tools": [
+    "add_file_qos_requirement",
+    "create_directory",
+    "create_file",
+    "delete_file",
+    "download_file",
+    "get_file_attributes",
+    "get_file_distribution",
+    "get_file_id",
+    "get_file_metadata",
+    "get_file_qos_summary",
+    "get_harvester_index_schema",
+    "get_qos_requirement",
+    "get_transfer",
+    "grep_file_content",
+    "list_children",
+    "list_files_recursively",
+    "list_marketplace_spaces",
+    "list_space_providers",
+    "list_space_transfers",
+    "list_user_harvesters",
+    "list_user_spaces",
+    "move_file",
+    "query_by_metadata",
+    "query_harvester_index",
+    "remove_qos_requirement",
+    "schedule_file_replication",
+    "set_file_metadata"
+  ],
+  "write_tool_names": [
+    "add_file_qos_requirement",
+    "create_directory",
+    "create_file",
+    "delete_file",
+    "move_file",
+    "remove_qos_requirement",
+    "schedule_file_replication",
+    "set_file_metadata"
+  ]
+}

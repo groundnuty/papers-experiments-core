@@ -541,7 +541,7 @@ def _verify(root: Path) -> list[str]:
             ]
         if package.get(SIDE_FILES_KEY, []) != declared(study.side_files):
             return [f"{PACKAGE_FILE} records another declaration of side files than the package's study.toml"]
-        return regenerate(root, stamped=True)
+        return regenerate(root, stamped=True, honour_shipped_rescore=True)
     except (Refused, BatchNotVerified, ConfigError, EnvironmentUnknown) as error:
         return [str(error)]
 

@@ -14,6 +14,7 @@ others fail on it.
 import errno
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -212,7 +213,11 @@ def test_o58_a_real_relay_process_answers_a_real_client_through_the_listing(tmp_
         done = RelayClient(root, wait_s=20)(Request("status", SERVICE), timeout_s=20)
         assert isinstance(done, CommandResult)
         assert done.returncode == 3
-        assert json.loads(done.stdout) == {"running": True, "argv": ["status", SERVICE]}
+        said = json.loads(done.stdout)
+        assert said["running"] is True
+        assert said["argv"][0] == "--step-tag"  # the relay's tag for the verb's steps, then the verb
+        assert re.fullmatch(r"[0-9a-f]{12}", said["argv"][1])
+        assert said["argv"][2:] == ["status", SERVICE]
         for name in ("requests", "taken", "answers"):
             assert list((relay_dir(root) / name).iterdir()) == []
     finally:

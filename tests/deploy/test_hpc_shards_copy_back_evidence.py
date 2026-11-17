@@ -60,11 +60,15 @@ def _journal_names(label):
 
 # ------------------------------------------------------------------------------------------------ collect's evidence
 def test_the_manifest_lists_each_shards_journals_and_archive_manifest_with_their_hashes(shards, tmp_path):
-    """O63: every file under `<label>/journals/` and `<label>.out.json`, with its relative name, size and SHA-256, the
-    names sorted, taken from the files and never from a step's claim."""
+    """O63: every file under `<label>/journals/`, `<label>.out.json` and (beside them) each root archive and its
+    manifest, with its relative name, size and SHA-256, the names sorted, taken from the files and never from a
+    step's claim."""
     plan = make_plan(shards, tmp_path)
     shards.collect(plan, tmp_path / "merge")
     wanted = sorted(["fed-a.out.json", "fed-b.out.json", *_journal_names("fed-a"), *_journal_names("fed-b")])
+    wanted = sorted(
+        [*wanted, *(f"{label}.{kind}" for label in ("fed-a", "fed-b") for kind in ("root.tar", "root.json"))]
+    )
     assert _evidence(plan) == [
         {"name": name, "bytes": (plan.results / name).stat().st_size, "sha256": sha_of(plan.results / name)}
         for name in wanted
@@ -91,7 +95,8 @@ def test_a_shard_with_no_journals_directory_lists_its_archive_manifest_alone(sha
     archived(shards, tmp_path, "fed-a", 1, journals=False)
     archived(shards, tmp_path, "fed-b", 2)
     shards.collect(plan, tmp_path / "merge")
-    assert _names(plan) == sorted(["fed-a.out.json", "fed-b.out.json", *_journal_names("fed-b")])
+    roots = [f"{label}.{kind}" for label in ("fed-a", "fed-b") for kind in ("root.tar", "root.json")]
+    assert _names(plan) == sorted(["fed-a.out.json", "fed-b.out.json", *_journal_names("fed-b"), *roots])
 
 
 def test_a_journal_in_a_subdirectory_is_listed_by_its_relative_name(shards, tmp_path):
@@ -101,6 +106,49 @@ def test_a_journal_in_a_subdirectory_is_listed_by_its_relative_name(shards, tmp_
     (plan.results / "fed-a" / "journals" / "old" / "one.jsonl").write_text("{}\n")
     shards.collect(plan, tmp_path / "merge")
     assert "fed-a/journals/old/one.jsonl" in _names(plan)
+
+
+def _plant_pass_env(plan, label="fed-a", content=b'{"STUDY_ARTIFACTS": "/scratch/invented/artifacts"}\n'):
+    path = plan.results / label / "pass-env.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    path.chmod(0o600)
+    return path
+
+
+def test_a_shards_pass_env_file_is_listed_with_its_hash_when_it_is_there(shards, tmp_path):
+    """O63: `<label>/pass-env.json` (the first step's `pass_env`, private: it holds a site path) is evidence like a
+    journal: listed by name, size and SHA-256 of the bytes read, and only when there is one."""
+    plan = make_plan(shards, tmp_path)
+    planted = _plant_pass_env(plan)
+    shards.collect(plan, tmp_path / "merge")
+    assert {"name": "fed-a/pass-env.json", "bytes": planted.stat().st_size, "sha256": sha_of(planted)} in _evidence(
+        plan
+    )
+    assert "fed-b/pass-env.json" not in _names(plan)
+
+
+def test_without_a_pass_env_file_the_listing_is_as_it_was(shards, tmp_path):
+    """O63: a shard of an earlier tip, or one whose step wrote none, lists nothing for it and is no error."""
+    plan = make_plan(shards, tmp_path)
+    shards.collect(plan, tmp_path / "merge")
+    assert not [name for name in _names(plan) if name.endswith("pass-env.json")]
+
+
+@pytest.mark.parametrize("kind", ["a link", "a directory"])
+def test_a_pass_env_that_is_a_link_or_a_directory_refuses_the_collect_naming_the_shard(shards, tmp_path, kind):
+    """O63: never followed, never listed: the collect is refused whole, as for a link among the journals."""
+    plan = make_plan(shards, tmp_path)
+    (plan.results / "fed-b").mkdir(exist_ok=True)
+    target = plan.results / "fed-b" / "pass-env.json"
+    if kind == "a link":
+        target.symlink_to(plan.results / "fed-a.out.json")
+    else:
+        target.mkdir()
+    with pytest.raises(shards.ShardsError, match=r"fed-b.*pass-env\.json"):
+        shards.collect(plan, tmp_path / "merge")
+    assert not (plan.results / MANIFEST).exists()
+    assert not (tmp_path / "merge").exists()
 
 
 @pytest.mark.parametrize("kind", ["file link", "directory link", "directory of links", "journals is a link"])

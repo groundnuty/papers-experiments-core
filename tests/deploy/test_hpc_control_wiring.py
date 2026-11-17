@@ -131,7 +131,7 @@ def test_o58_a_stop_through_hpcfed_runs_teardown_keep_as_an_exact_control_step_a
     assert teardown.name.startswith(f"{fed.state()['allocation']['name']}-aspen-stop-")
     until = int(datetime.fromisoformat(END_TIME).timestamp())
     script = str(fed.hpc.control.BUNDLE / "teardown.sh")
-    keep = ["--keep", "--keep-until", str(until), "--timeout", "600"]
+    keep = ["--keep", "--keep-until", str(until), "--timeout", "50"]
     assert teardown.command == ["bash", script, "op", "--workdir", record["workdir"], *keep]
     assert record["state"] == "stopped"
     assert record["stops"] == [evidence]

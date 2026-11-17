@@ -147,7 +147,10 @@ class Driver(Down):
             size = s.size(role.kind)
             lines.append(f"node {index}: {role.name} ({role.kind}), its step {size.cpus} cores, {size.memory_mib} MiB")
         lines.append(f"control reserve on every node: {s.control.cpus} core(s), {s.control.memory_mib} MiB")
-        lines.append(f"stop bound {s.stop_bound_s} s; settle_timeout_s {s.settle_timeout_s} s; core phase: {s.core}")
+        lines.append(
+            f"stop bound {s.stop_bound_s} s; step launch wait {s.step_launch_wait_s} s; relay verb bound "
+            f"{s.command_timeout_s} s; settle_timeout_s {s.settle_timeout_s} s; core phase: {s.core}"
+        )
         if weight is not None:
             billing = s.billing_per_hour(len(roles), weight)
             most = billing * s.time_s / 3600
@@ -221,6 +224,8 @@ class Driver(Down):
         hpcplacement.check_template(
             text
         )  # a template declares [placement] holder (O79), which the core has no default for
+        # O73: `up` writes the address map into every root, so the template carries the slot that names it, before a job
+        hpcnames.check_addresses_slot(text, map_written=True)
         # O83: a template that names @study_artifacts@ has its tool server's files checked, and the frozen manifests
         check_launchable(self.spec, site.study_artifacts)  # the names resolve through the launcher here (O73)
         check_artifacts(self.spec, site.study_artifacts, self.root)
@@ -498,6 +503,7 @@ class Driver(Down):
     def start_relay(self) -> str:
         """The login node's fault relay, for a campaign on a compute node (M4); none in a core without it."""
         if not self.relay_available():
+            self.set(lambda s: s.update(fault_relay="none"))  # the fleet reads this, never the line below
             return f"fault relay: none, this core has no {hpcrelay.RELAY}"
         state = self.store.read()
         log = Path(state["site"]["logs"]) / f"{state['allocation']['name']}-fault-relay.log"
@@ -509,6 +515,7 @@ class Driver(Down):
             self.slurm.runner, state["command"][0], self.root, state["command"], log, self.environ,
             record=record, clock=self.clock, sleep=self.sleep,
         )  # fmt: skip
+        self.set(lambda s: s.update(fault_relay="serving"))  # only now: `relay` above is written at the spawn
         return "fault relay: serving"
 
     def submit(self, asked: Allocation, key: str) -> str:
@@ -883,7 +890,15 @@ class Driver(Down):
         self.require_mount_proofs(state)
         s, site = self.settings, Site.from_json(state["site"])
         # the agent's sandbox's values, as up recorded the site (its files' pins checked in the preflight)
-        values = {**hpc_values(state["command"], s.stop_bound_s, s.settle_timeout_s, self.root), **hpcpins.values(site)}
+        rendered = hpc_values(
+            state["command"],
+            s.stop_bound_s,
+            s.settle_timeout_s,
+            self.root,
+            step_launch_wait_s=s.step_launch_wait_s,
+            command_timeout_s=s.command_timeout_s,
+        )
+        values = {**rendered, **hpcpins.values(site)}
         # the study's artifacts digest, as up took it: a step on a node has no site variable and never reads the tree
         if state.get(hpcidentity.ARTIFACTS) is not None:
             values[hpcidentity.ARTIFACTS] = state[hpcidentity.ARTIFACTS]

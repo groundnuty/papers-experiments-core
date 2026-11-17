@@ -178,7 +178,7 @@ RENDER_REFUSALS = {
         r"slots\[1\]: its data_path user is declared agent = false",
     ),
     "a condition whose rights no slot's tool-server user holds": (
-        swapped(f"rights = [{WRITE}]\nmanifest", f'rights = [{READ}, "space_manage_qos"]\nmanifest'),
+        swapped(f"rights = [{WRITE}]\nmanifest", f'rights = [{WRITE}, "space_view_statistics"]\nmanifest'),
         LAYOUT,
         r"conditions\[1\]: no slot's tool-server user holds its rights",
     ),
