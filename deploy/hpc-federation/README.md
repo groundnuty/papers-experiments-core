@@ -503,7 +503,11 @@ each `apptainer exec` carries `--uts --hostname sandbox`, and the Docker agent's
 `--hostname sandbox`. A federation with a node of that name is refused at the start. The gate's scan for node names
 (`rest_node_name_hits`) holds the agent node's own host name instead, in its fully qualified and one-label forms, read
 from the node at the start (`NodeOps.own_names`), after the federation's nodes' names, so a leak of the name the cell
-no longer shows is still counted; never `sandbox`, which is the allowed name and would count false hits.
+no longer shows is still counted; never `sandbox`, which is the allowed name and would count false hits. The fully
+qualified name is a resolver lookup (`getfqdn`), so it is bounded: 5 s in a thread of its own, after which the host
+name is scanned alone, and a start waits no longer for a resolver that hangs. The run's facts (`own_node_scan`) say how
+many forms were scanned and, by reason alone (`fqdn_timeout`, `fqdn_failed`, `host_name_failed`), what was not read,
+never a name. A live slot should show `own_node_scan.unread` empty.
 
 **`/etc/hostname`:** the sandbox binds none of its own. From Apptainer's source (read on its `main` branch, not on this
 site's release), `--uts` with a `--hostname` makes Apptainer write an `/etc/hostname` of the name and bind it, and it

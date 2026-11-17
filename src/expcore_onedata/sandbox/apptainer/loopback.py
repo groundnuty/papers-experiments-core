@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import contextlib
 import socket
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
+
+from expcore_onedata.sandbox.cellhost import OwnNames
 
 LOOPBACK = "127.0.0.1"
+FQDN_TIMEOUT_S = 5.0  # the most a resolver may delay a start: the lookup of the node's own fully qualified name
 
 
 def free_port() -> int:
@@ -21,16 +25,46 @@ def free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def own_names() -> tuple[str, ...]:
-    """The node's own host name and its fully qualified form, as the system says them (`gethostname`, `getfqdn`); one
-    whose lookup fails is left out. For the gate's scan (`cellhost.scan_names`), never recorded: a site's name."""
-    found: list[str] = []
-    for lookup in (socket.gethostname, socket.getfqdn):
+def _bounded(lookup: Callable[[], str], timeout_s: float) -> tuple[str | None, str | None]:
+    """`(answer, None)` of `lookup`, run in a thread of its own that is not waited for past `timeout_s`; `(None,
+    "fqdn_timeout")` when it did not answer in time (the thread is left to end by itself: it is a daemon's), and `(None,
+    "fqdn_failed")` when it raised. A resolver that hangs thus costs a start the bound and no more."""
+    box: dict[str, str] = {}
+
+    def run() -> None:
         try:
-            found.append(lookup())
-        except OSError:
-            continue
-    return tuple(name for name in found if name)
+            box["name"] = lookup()
+        except Exception:  # whatever it was, the reason recorded is `fqdn_failed`, never the exception's text
+            box["failed"] = "yes"
+
+    thread = threading.Thread(target=run, name="own-fqdn-lookup", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        return None, "fqdn_timeout"
+    return (box["name"], None) if "name" in box else (None, "fqdn_failed")
+
+
+def own_names(timeout_s: float | None = None) -> OwnNames:
+    """The node's own host name and its fully qualified form, as the system says them (`gethostname`, `getfqdn`). The
+    second is a resolver lookup, bounded (`FQDN_TIMEOUT_S`): on a timeout or a failure the host name stands alone, and
+    the reason, never a name, is in `unread`. For the gate's scan (`cellhost.scan_names`), never recorded: a site's
+    name."""
+    bound = FQDN_TIMEOUT_S if timeout_s is None else timeout_s
+    names: list[str] = []
+    unread: list[str] = []
+    try:
+        host = socket.gethostname()
+    except OSError:
+        unread.append("host_name_failed")
+    else:
+        names += [host] if host else []
+    full, why = _bounded(socket.getfqdn, bound)
+    if why is not None:
+        unread.append(why)
+    elif full:
+        names.append(full)
+    return OwnNames(tuple(names), tuple(unread))
 
 
 @contextlib.contextmanager

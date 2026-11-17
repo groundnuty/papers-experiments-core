@@ -115,6 +115,8 @@ CANARY = (
 class ApptainerSandbox:
     """The `Sandbox` of the platform layer on an HPC batch node. Build it with `start`; stop it with `stop`."""
 
+    _own_scan: dict[str, Any] | None = None  # the facts of the agent node's names in the gate's scan (O73)
+
     def __init__(
         self,
         node: NodeOps,
@@ -364,10 +366,14 @@ class ApptainerSandbox:
     def _scan_names(self, served: dict[str, dict[str, Any]]) -> tuple[str, ...]:
         """The names the gate counts in the answers it relays (O73): the federation's nodes' and then the agent node's
         own, in both forms, read from the node (`cellhost.scan_names`); none when the run has no names to scan, which is
-        a federation whose names are the real ones. The gate's own configuration alone holds them."""
+        a federation whose names are the real ones. The gate's own configuration alone holds them; the run's facts hold
+        how many forms were added and why any could not be read (`own_node_scan`), never a name."""
         if not self.spec.node_names:
             return ()
-        return cellhost.scan_names(self.spec.node_names, self.node.own_names(), declared=served)
+        own = self.node.own_names()
+        scanned = cellhost.scan_names(self.spec.node_names, own.names, declared=served)
+        self._own_scan = {"version": 1, "forms": len(scanned) - len(self.spec.node_names), "unread": list(own.unread)}
+        return scanned
 
     def _declared(self) -> tuple[str, str] | None:
         """`[sandbox.federation]`'s zone and provider names in lower case, as the gate matches `Host` and SNI (O69);
@@ -395,13 +401,14 @@ class ApptainerSandbox:
         log_path = gate_dir / "requests.jsonl"
         log_path.touch(mode=0o600)  # there from the start: a log that is missing is unreadable, never empty
         token = self.dir / gaterun.TOKEN_FILE
+        scanned = self._scan_names(served)  # once: a lookup is bounded, and the attempts share it
         for attempt in range(1, GATE_ATTEMPTS + 1):
             self._gate_port = self.node.free_port()
             config = gate_dir / f"gate-{attempt}.json"
             gaterun.write_config(config, gaterun.config(
                 run_key=sp.run_key, tls=self.s.tls, served=served, listing=sp.listing, directory=gate_dir,
                 tls_dir=tls_dir, token_file=token, port=self._gate_port, upstream_ca=self._ca_copy,
-                options=self.app.gate_options, scan_names=self._scan_names(served),
+                options=self.app.gate_options, scan_names=scanned,
             ))  # fmt: skip
             self._token_files = [token]  # before it exists: every teardown removes it, whatever fails from here
             self.run_record()
@@ -936,6 +943,9 @@ class ApptainerSandbox:
             meta["container_deaths"], meta["infra_death"] = check["deaths"], check["death"]
         meta["served_bytes"] = self.served_bytes()
         cellhost.note(meta)  # O73: added at the read, so a record of the facts made again later cannot drop it
+        if self._own_scan is not None:  # a copy, by reason alone (the module's `_scan_names`)
+            scan = {**self._own_scan, "unread": list(self._own_scan["unread"])}
+            meta.setdefault("infrastructure_facts", {})["own_node_scan"] = scan
         counted, timed = meta.pop("rest_node_name_hits", None), meta.pop("rest_request_durations", None)
         if self.spec.node_names and self.spec.mode is DataPathMode.REST:  # O73: scanned, so never silently absent
             meta["infrastructure_facts"]["rest_node_name_hits"] = counted or gatelog.node_name_hits_unknown(

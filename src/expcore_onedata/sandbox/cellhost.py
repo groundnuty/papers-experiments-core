@@ -27,6 +27,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from collections.abc import Iterable, MutableMapping
+from dataclasses import dataclass
 from typing import Any
 
 CELL_HOSTNAME = "sandbox"
@@ -37,6 +38,15 @@ REFUSAL = (
     "the cells' fixed host name is also the name of a node of the federation: a node's own name may not be the neutral "
     "one the agent reads (O73)"
 )
+
+
+@dataclass(frozen=True)
+class OwnNames:
+    """What a node says of its own names: the names it could read (its host name, its fully qualified name) and the
+    reasons, never a name, that a form could not be read (`host_name_failed`, `fqdn_failed`, `fqdn_timeout`)."""
+
+    names: tuple[str, ...] = ()
+    unread: tuple[str, ...] = ()
 
 
 def valid(name: str) -> bool:
@@ -86,4 +96,6 @@ def note(meta: MutableMapping[str, Any], name: str = CELL_HOSTNAME) -> None:
     meta.setdefault("infrastructure_facts", {})[FACT] = name
 
 
-__all__ = ["CELL_HOSTNAME", "FACT", "LOCAL_NAMES", "REFUSAL", "is_node_name", "note", "scan_names", "valid"]
+__all__ = [
+    "CELL_HOSTNAME", "FACT", "LOCAL_NAMES", "REFUSAL", "OwnNames", "is_node_name", "note", "scan_names", "valid",
+]  # fmt: skip

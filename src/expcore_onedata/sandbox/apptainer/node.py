@@ -29,6 +29,7 @@ from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import loopback
 from expcore_onedata.sandbox.apptainer import procs as P
+from expcore_onedata.sandbox.cellhost import OwnNames
 from expcore_onedata.sandbox.hostops import CmdResult, DockerHost, mounts_under, run_bounded
 
 SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434
@@ -149,9 +150,10 @@ class NodeOps(Protocol):
         and no address."""
         ...
 
-    def own_names(self) -> tuple[str, ...]:
+    def own_names(self) -> OwnNames:
         """The node's own host name and its fully qualified form, as it reports them (O73): for the gate's scan for node
-        names alone, never a record or a message. A form it cannot read is left out."""
+        names alone, never a record or a message. A form it cannot read, or not in a short bound, is left out and its
+        reason is in `unread`."""
         ...
 
     def node_readings(self) -> dict[str, Any]:
@@ -479,7 +481,7 @@ class LocalNode:
         version = done.stdout.strip() if done.returncode == 0 else None
         return {"kernel": platform.release(), "apptainer": version[:80] if version else None}
 
-    def own_names(self) -> tuple[str, ...]:
+    def own_names(self) -> OwnNames:
         return loopback.own_names()
 
     def node_readings(self) -> dict[str, Any]:
