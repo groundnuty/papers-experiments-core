@@ -25,7 +25,7 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 ENV = "/usr/bin/env"
 GONE_POLLS = 3  # a step absent from squeue -s this many polls in a row has ended
@@ -41,6 +41,56 @@ OFFSET = re.compile(r"[0-9]{1,6}")
 # A value of srun's --network (HPC_STEP_NETWORK): letters, digits and `_ . , = : + -`, led by a letter or digit, so no
 # shell character, space or option of its own reaches the argv. It names no plugin's words: other sites take others.
 NETWORK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.,=:+-]{0,127}")
+
+
+SLURM_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}")  # sacct's own, zone-less
+# What sacct calls a step that has ended; its first word, so `CANCELLED by 1234` is CANCELLED.
+ENDED_STATES = (
+    "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "DEADLINE", "PREEMPTED", "BOOT_FAIL"
+)  # fmt: skip
+
+
+ACCOUNT_ID = re.compile(
+    r"[0-9]{1,12}(?:\+[0-9]{1,6})?(?:\.[A-Za-z0-9_-]{1,32})?"
+)  # sacct's JobID: job, step or its word
+ACCOUNT_TIME = re.compile(SLURM_TIME.pattern + "|Unknown|None")  # a time sacct prints, or says there is none
+ACCOUNT_STATE = re.compile(r"[A-Z_]+")  # the first word of sacct's State
+
+
+def _accounting_row(parts: List[str]) -> bool:
+    """Whether six fields of `sacct -P -o JobID,JobName,State,Start,End,ExitCode` are a row of accounting: a JobID, a
+    state word, two times (or none) and an exit code. Six empty fields are no row, and count as no evidence."""
+    return (
+        len(parts) == 6
+        and ACCOUNT_ID.fullmatch(parts[0]) is not None
+        and ACCOUNT_STATE.fullmatch(parts[2].split()[0] if parts[2].split() else "") is not None
+        and ACCOUNT_TIME.fullmatch(parts[3]) is not None
+        and ACCOUNT_TIME.fullmatch(parts[4]) is not None
+        and re.fullmatch(r"[0-9]+:[0-9]+", parts[5]) is not None
+    )
+
+
+def _slurm_time(value: str) -> Optional[str]:
+    """A time as sacct prints it, or None for `Unknown`, `None`, nothing, or anything that is not one."""
+    return value if SLURM_TIME.fullmatch(value) else None
+
+
+def _step_answer(
+    running: Optional[bool], state: Optional[str], started: Optional[str], ended: Optional[str], code: Optional[int]
+) -> Dict[str, Any]:
+    return {
+        "running": running,
+        "state": state,
+        "started_at": started,
+        "ended_at": ended,
+        "exit_code": code,
+        "unknown": None,
+    }
+
+
+def _unknown_step(reason: str) -> Dict[str, Any]:
+    """`Slurm.step_observed`'s answer for a step that could not be told, and why."""
+    return {**_step_answer(None, None, None, None, None), "unknown": reason}
 
 
 def valid_network(value: object) -> bool:
@@ -593,6 +643,97 @@ class Slurm:
                 status, killed = (int(part) for part in parts[2].split(":"))
                 return 128 + killed if killed else status  # a step a signal ended never reads as a success
         return None
+
+    def step_observed(self, step_id: str, name: Optional[str] = None) -> Dict[str, Any]:
+        """One step as Slurm itself shows it now, by its EXACT id: read-only (`squeue -s` and `sacct`, nothing that
+        changes a job or a step), and never a guess. The answer has `running` (True, False or None), `state` (the
+        accounting's word, or `RUNNING` for a step squeue lists and accounting has no row for yet), `started_at` and
+        `ended_at` (Slurm's own text, a zone-less local time, compared as text and never as a clock), `exit_code` (an
+        ended step's, 128 plus the signal when one ended it) and `unknown` (None, or why the step could not be told).
+
+        The step is running when squeue lists exactly this id and accounting does not say it ended; ended when squeue
+        lists no such id and accounting holds a terminal row with an end time for exactly this id. Everything else is
+        unknown, with the reason: a command that failed or did not answer, an id neither listed nor recorded, the two
+        disagreeing (the driver itself waits for `GONE_POLLS` absent polls before it takes a step as ended), the id
+        listed under another name than `name`, a row twice, a state this read does not know. `step_status` reads a
+        finished step by its name and answers None for a failed command and for no record alike; this one tells them
+        apart and never takes another step's row for the one asked about (`4242.1` is not `4242.10`)."""
+        if not STEP_ID.fullmatch(step_id):
+            return _unknown_step("the step id is not a Slurm step id")
+        job = step_id.rsplit(".", 1)[0]
+        try:
+            listed = self._listed_steps(job)
+            rows = self._accounted_steps(job, step_id)
+        except SlurmError as error:
+            return _unknown_step(str(error).split(":")[0])
+        if len(rows) > 1:
+            return _unknown_step("accounting holds the step id more than once")
+        if step_id in listed and name is not None and listed[step_id] != name:
+            return _unknown_step("the step id is listed under another name than the service's step")
+        if not rows:
+            if step_id in listed:  # squeue lists it and accounting has not recorded it yet
+                return _step_answer(True, "RUNNING", None, None, None)
+            return _unknown_step("the step is not listed by squeue and accounting holds no record of it")
+        state, started, ended, code = rows[0]
+        if step_id in listed:
+            if state == "RUNNING":
+                return _step_answer(True, state, started, None, None)
+            reason = "squeue lists the step and accounting records it as an ended one"
+            return _unknown_step(reason if state in ENDED_STATES else "the accounting state of the step is not known")
+        if state in ENDED_STATES and ended is not None:
+            return _step_answer(False, state, started, ended, code)
+        if state == "RUNNING":
+            return _unknown_step("accounting says the step runs and squeue does not list it")
+        return _unknown_step("the accounting state of the step is not known, or has no end time")
+
+    def _listed_steps(self, job: str) -> Dict[str, str]:
+        """The job's steps squeue -s lists now, as id to name (the batch and extern steps left out); a job Slurm no
+        longer knows lists none."""
+        done = self.runner.run(["squeue", "-s", "-j", job, "-h", "-o", "%i %j"], self.command_timeout_s)
+        if done.returncode != 0:
+            if "Invalid job id" in done.stderr:
+                return {}
+            raise SlurmError("squeue -s failed with status %s" % done.returncode)
+        found = {}
+        for line in done.stdout.splitlines():
+            if not line.strip():
+                continue
+            match = STEP_LINE.fullmatch(line.strip())
+            if match is None:  # a row that is not one is an answer that cannot be read, never an absent step
+                raise SlurmError("squeue -s answered something unreadable")
+            if not match.group(1).endswith((".batch", ".extern")):
+                found[match.group(1)] = match.group(2)
+        return found
+
+    def _accounted_steps(self, job: str, step_id: str) -> List[Tuple[str, Optional[str], Optional[str], Optional[int]]]:
+        """The accounting's rows whose JobID is exactly `step_id`, each as (state, start, end, exit code): the state's
+        first word, the times as text or None when Slurm gives none, the exit code None for a step not ended."""
+        done = self.runner.run(
+            ["sacct", "-j", job, "-n", "-P", "-o", "JobID,JobName,State,Start,End,ExitCode"], self.command_timeout_s
+        )
+        if done.returncode != 0:
+            raise SlurmError("sacct failed with status %s" % done.returncode)
+        rows = []
+        seen = 0
+        for line in done.stdout.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("|")
+            if not _accounting_row(parts):  # a row that is not one is an answer that cannot be read, never the lag
+                raise SlurmError("sacct answered something unreadable")
+            seen += 1
+            if parts[0] != step_id:
+                continue
+            words = parts[2].split()
+            state = words[0] if words else ""
+            code = None
+            if state in ENDED_STATES and re.fullmatch(r"[0-9]+:[0-9]+", parts[5]):
+                status, killed = (int(part) for part in parts[5].split(":"))
+                code = 128 + killed if killed else status
+            rows.append((state, _slurm_time(parts[3]), _slurm_time(parts[4]), code))
+        if not seen:  # the job itself has rows (its batch step at least): none at all is no record of it
+            raise SlurmError("accounting holds no record of the job")
+        return rows
 
     def _finish(self, process: Process, step: Step, timeout_s: float) -> Completed:
         """The result of a control step within its bound; past it, end a client whose step is gone (three polls in a

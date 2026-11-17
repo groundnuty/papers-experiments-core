@@ -1309,6 +1309,42 @@ provider_storage = "tmpfs"          # optional (O57): where the federation's pro
 
 - **The providers' storage kind** (O57; `provider_storage`). Where a provider stores its data shapes a run's I/O timing, so `[sandbox.apptainer] provider_storage` declares it, `"tmpfs"` or `"shared_filesystem"` (any other word is refused at load, naming the key). The HPC driver renders it from `site.env` (`HPC_STORAGE_ROOT` set: `shared_filesystem`), the word and never the root's path. Declared, it is in `PlatformConfig.fingerprint()` (`sandbox_backend`), so shards on the two kinds never merge and a campaign never resumes from one onto the other, in each run's `metadata()["backend"]` and as `metadata()["infrastructure_facts"]["provider_storage"]`. A platform that declares none (the Docker backend, so a Compose federation, or an Apptainer platform written before the key) has no such key anywhere and keeps its fingerprint.
 
+## The platform layer's read of the federation's own services
+
+`expcore_onedata.fedwatch` (O86). A study's post-check asks of a run's or a batch's window: did the federation's services, the zone and each provider, run and answer throughout, and was a restart the injector's doing? One watch, the same on Compose and on HPC; every call only reads (`docker compose ps` and `docker inspect`; `squeue -s` and `sacct`; `GET /configuration`; the journal's file, opened read-only and without its lock).
+
+```python
+from expcore_onedata.fedwatch import watch_for
+
+watch = watch_for(config, settings, client, zone="<the zone's service>", hpc_command=None)
+start = watch.read()  # at the window's start: plain JSON, keep it
+...
+result = watch.window(start)  # now: the window since start
+```
+
+`watch_for(config, settings, client, *, zone, hpc_command=None, runner=run_command, clock=time.time)` builds the watch `[faults]` of platform.toml describes: the providers of `[faults.services]`, the journal `[faults] journal` names, Compose's containers or, for `backend = "hpc"`, `hpc_command`, the argv that runs `deploy/hpc-federation/hpcobserve.py --root <the federation's root>` (with `python -I -B`) where Slurm's client commands answer (the login node). The zone's service is not in `[faults.services]`, so the caller names it. `FederationWatch(members, source, client, *, journal, clock)` is the same with the parts given (`Member`, `ComposeSource`, `HpcSource`, `members_of`). `client` is the platform client; it goes where platform.toml says, so a deployment that reaches the federation by declared names hands it a client built for them.
+
+**A reading** (`read()`): `{"format": "expcore-fedwatch/1", "backend", "at", "journal": {"declared", "lines", "read"}, "services": {label: side}}`, keyed by `zone` and `providers[i]` (the provider's position in platform.toml), never by a name. A `side` has the same keys on both backends, `None` where a backend has no such thing:
+
+| Key | Meaning |
+|---|---|
+| `state` | `running`, `not_running` or `unknown` |
+| `running`, `identity`, `health` | the fields of `compose.Observation`, which this extends; `identity` is `<container or step id>@<start>` |
+| `container`, `restart_count` | Compose: the container id and Docker's `RestartCount` |
+| `step`, `launch`, `stops` | HPC: the step id read, the state's launch counter, how many stops the state records for the service |
+| `started_at`, `ended_at`, `exit_code` | the container's or the step's own start, end and exit (an ended one's) |
+| `unrecorded` | HPC: squeue lists a step under the service's name that the state does not name |
+| `live` | `{"answered": true, "reason": null}`, or `{"answered": null, "reason": <why>}`: the service's own `GET /configuration`, never asked of a service that is not running, never `false` (a service that does not answer is unread) |
+| `notes`, `unknown` | what was seen that is worth saying; the reasons the service could not be read |
+
+**A window** (`window(start)`): `{"format", "backend", "window": {"start", "end"}, "verdict", "services": {label: {"status", "start", "end", "restarts", "unknown"}}, "findings", "unknown", "journal": {"declared", "lines_start", "lines_end", "read"}}`. A service's `status` is `unknown`, `down`, `restarted` or `stable`; `verdict` is `finding` when any `findings` entry stands, else `unknown` when any `unknown` entry does, else `restarted` when a service restarted or is down by an open injection (each explained), else `stable`. Nothing but `stable` is a pass. A message names a service by its label only.
+
+**Unknown is never healthy.** A command that fails, does not finish or answers something unreadable (an inspection without `RestartCount` or `StartedAt`, a `sacct` or `squeue` row that is not one, accounting with no row for the job); a container or step missing (a service with no container is unknown, not down); Slurm's queue and accounting disagreeing, or an id neither listed nor recorded; a `/configuration` read that fails; no reading at the window's start (a missing one, one of another backend or federation): the service is `unknown`, with the reason, and the window is `unknown` unless a finding outranks it.
+
+**A restart** is an end reading whose container id or step id differs from the start's, whose start differs, or whose counter rose (`RestartCount`; the state's `launch`). On HPC the step is read by its exact id (`hpcslurm.Slurm.step_observed`), never the state file's word for it. It is explained only by the injector's journal (`fault_journal`), whose lines carry no time: the journal is append-only, so the window is the lines after the start reading's count. An injection of the service (its `service`, as `[faults.services]` names it) explains a restart when its stop was asked for (`stopping`, `injected` or `stop_unknown`), it did not end `never_down`, and either the stop was asked inside the window or the service was down at the start and the injection has a line in the window (its restore is the restart). The label is `heal` for an injection whose line carries `heal` (a heal's container restart), `outage` for any other. On HPC the count is checked as well: `launch` says how many starts there were, each restart of a running service owes a stop the state records (`stops`) after the start reading, and an injection explains one launch; a step squeue lists that the state does not name is a restart the driver did not make. A restart nothing explains is `finding`, and so are: a `RestartCount` that rose (Docker's restart policy, never the injector's stop and start), a journal that is not declared, cannot be read, or is shorter than at the start, a service not running at the end that no open injection holds, and a container whose health check does not report healthy.
+
+On Compose only a change is seen, so a service restarted twice in a window reads as one restart (the reason says "at least"), and the window's injections must still account for it. The relay keeps no durable request log, so the HPC cross-check uses the state's `stops` and `launch`, which the verbs write, instead of the relay's files.
+
 ## The platform layer's files in and out
 
 `expcore_onedata.provision.Provisioner` puts a study's data into its space and reads it back; every write and every range read goes through `expcore_onedata.client.OnezoneClient`'s mutation gate, bound to the provisioner's space (`space`): the target file's space is found by its parent links and its live name read right before each request, and a target in any other space is refused unsent (O09). `Digest`, `Upload`, `Slice`, `tar_members` and `ArchiveRefused` are in `expcore_onedata.streamed`.
