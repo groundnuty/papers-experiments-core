@@ -133,13 +133,14 @@ def with_data_paths(study: Path, factor: str = "data_path") -> None:
         text = text.replace(old, new)
     config.write_text(text, encoding="utf-8")
     kinds = f"{{'{rest}': {{'kind': 'rest'}}, '{mount}': {{'kind': 'mount'}}}}"
+    named = "" if factor == "data_path" else f"        data_path_factor={factor!r},\n"  # as `platform.data_path_factor`
     plugin = study / "plugin.py"
     code = plugin.read_text(encoding="utf-8")
     assert code.count("        executor=TinyExecutor(context),\n") == 1
     plugin.write_text(
         code.replace(
             "        executor=TinyExecutor(context),\n",
-            f"        executor=TinyExecutor(context),\n        platform={{'data_paths': {kinds}}},\n",
+            f"        executor=TinyExecutor(context),\n        platform={{'data_paths': {kinds}}},\n{named}",
         ),
         "utf-8",
     )

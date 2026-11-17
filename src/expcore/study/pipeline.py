@@ -138,7 +138,7 @@ from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
 from expcore.study.platform_deferral import platform_deferrals
 from expcore.study.platform_legacy import legacy_fingerprint_of
-from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
+from expcore.study.plugin import StudyContext, StudyPlugin, check_data_path_factor, import_plugin_module, load_plugin
 from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
 from expcore.visibility.sensitivity import VisibilityAnalysis, visibility_analysis
@@ -380,6 +380,7 @@ def _build(
     scheduler's settings, the campaign's fingerprint, and the manifest and the start of a shard or a selection. This is
     the study's build, which runs the study's own code (`run_built_study` watches it for platform loaders)."""
     plugin = load_plugin(StudyContext(study, code))
+    check_data_path_factor(study, plugin)  # before any run: the platform reads the data path by the study's factor
     leases = None if plugin.probe is None else LeasePool(out_dir(study) / "leases", plugin.lease_keys, plugin.probe)
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
     fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint

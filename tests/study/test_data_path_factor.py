@@ -8,13 +8,15 @@ import shutil
 from pathlib import Path
 
 import pytest
+from study_support import HEAD
 
 from expcore.campaign.factors import DATA_PATH_FACTOR
 from expcore.campaign.manifest import compare_fingerprints
 from expcore.config.loading import ConfigError
+from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import check_study, load_study
-from expcore.study.pipeline import fingerprint_of
-from expcore.study.plugin import StudyContext, load_plugin
+from expcore.study.pipeline import fingerprint_of, run_study
+from expcore.study.plugin import StudyContext, check_data_path_factor, load_plugin
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "tiny_study"
 KEY = 'data_path_factor = "path"\n'
@@ -137,3 +139,90 @@ def test_o75_a_study_that_sets_no_key_has_the_fingerprint_it_had(study_dir):
     digest = hashlib.sha256(json.dumps(decided, sort_keys=True).encode()).hexdigest()
     assert digest == "c54eecf4e4b7c525ca74a6dee4baadfb974f0e73e1c81165dced736bf5f0dad8"
     assert "data_path" not in json.dumps(plain)
+
+
+# --- a campaign starts only when the platform reads the data path by the factor the study names -----------------
+
+
+def plugin_says(study: Path, value: object) -> None:
+    """The copy's plugin passes `data_path_factor=<value>`, as `platform.data_path_factor` gives it."""
+    path = study / "plugin.py"
+    text = path.read_text(encoding="utf-8")
+    old = "        executor=TinyExecutor(context),\n"
+    assert text.count(old) == 1
+    path.write_text(text.replace(old, f"{old}        data_path_factor={value!r},\n"), encoding="utf-8")
+
+
+def loaded(study_dir: Path):
+    study = load_study(study_dir)
+    return study, load_plugin(StudyContext(study, {"commit": "0" * 40}))
+
+
+def test_o75_a_study_that_names_its_factor_and_a_platform_built_without_it_is_refused_naming_both(study_dir):
+    """O75: the platform reads `data_path` when it is built without the argument, and the study says `path`: refused,
+    with both names, never read silently by the default."""
+    with_path_factor(study_dir)
+    study, plugin = loaded(study_dir)
+    assert plugin.data_path_factor is None
+    with pytest.raises(ConfigError) as raised:
+        check_data_path_factor(study, plugin)
+    text = str(raised.value)
+    assert "study.toml" in text
+    assert "[study]: key 'data_path_factor'" in text
+    assert "'path'" in text
+    assert "'data_path'" in text
+
+
+def test_o75_a_platform_built_with_another_name_than_the_study_names_is_refused_naming_both(study_dir):
+    with_path_factor(study_dir)
+    study, plugin = loaded(study_dir)
+    with pytest.raises(ConfigError, match=r"'path'.*'route'|'route'.*'path'"):
+        check_data_path_factor(study, dataclasses.replace(plugin, data_path_factor="route"))
+
+
+def test_o75_a_platform_built_with_the_name_the_study_names_passes(study_dir):
+    with_path_factor(study_dir)
+    study, plugin = loaded(study_dir)
+    check_data_path_factor(study, dataclasses.replace(plugin, data_path_factor="path"))
+
+
+def test_o75_a_study_with_no_key_and_a_platform_at_the_default_passes_unchanged(study_dir):
+    """No key and a plugin that says nothing, or says `data_path`, as every study did: nothing is refused."""
+    study, plugin = loaded(study_dir)
+    assert (study.data_path_factor, plugin.data_path_factor) == ("data_path", None)
+    check_data_path_factor(study, plugin)
+    check_data_path_factor(study, dataclasses.replace(plugin, data_path_factor="data_path"))
+
+
+def test_o75_a_platform_that_reads_another_factor_than_the_study_without_a_key_names_is_refused(study_dir):
+    """The other direction: the platform was built with `path`, the study sets no key, so its factor is `data_path`."""
+    study, plugin = loaded(study_dir)
+    with pytest.raises(ConfigError, match=r"'data_path'.*'path'|'path'.*'data_path'"):
+        check_data_path_factor(study, dataclasses.replace(plugin, data_path_factor="path"))
+
+
+@pytest.mark.parametrize("bad", ["", " ", 3, ["path"]])
+def test_o75_a_plugin_that_names_no_factor_is_refused_when_it_is_loaded(study_dir, bad):
+    plugin_says(study_dir, bad)
+    study = load_study(study_dir)
+    with pytest.raises(ConfigError, match="data_path_factor"):
+        load_plugin(StudyContext(study, {"commit": "0" * 40}))
+
+
+def test_o75_a_campaign_whose_platform_reads_another_factor_is_refused_at_its_start_before_any_run(study_dir):
+    """The start of the campaign holds the study to its platform: nothing is run, and no run directory is made."""
+    with_path_factor(study_dir)
+    write_stamp(study_dir, HEAD, load_study(study_dir).scope)
+    with pytest.raises(ConfigError, match="data_path_factor") as raised:
+        run_study(study_dir)
+    assert "'path'" in str(raised.value)
+    runs = study_dir / "out" / "runs"
+    assert not runs.exists() or not any(runs.iterdir())
+
+
+def test_o75_a_campaign_whose_platform_reads_the_factor_the_study_names_starts_and_runs(study_dir):
+    with_path_factor(study_dir)
+    plugin_says(study_dir, "path")
+    write_stamp(study_dir, HEAD, load_study(study_dir).scope)
+    summary = run_study(study_dir)
+    assert summary.statuses == {"done": len(load_study(study_dir).manifest.rows)}
