@@ -267,9 +267,7 @@ def require_core(plan: shards.Plan) -> None:
         raise FleetError(refusal)
 
 
-def check_campaign(
-    plan: shards.Plan, labels: Sequence[str], environ: Optional[Mapping[str, str]] = None
-) -> None:
+def check_campaign(plan: shards.Plan, labels: Sequence[str], environ: Optional[Mapping[str, str]] = None) -> None:
     """The study's campaign fingerprint, taken beside each of these shards' federations' `platform.toml`, is one
     (`shards.check_one_campaign`, O63): FleetError otherwise. A study's plugin may fingerprint a setting that the
     platform's own fingerprint (`platform_fingerprint`) leaves out, and the shards would never merge. The plan is

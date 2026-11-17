@@ -26,7 +26,9 @@ It prints the line only after every check passed, each refusal naming the shard'
 
 The same fingerprint is taken before any line is printed (`check_one_campaign`, O63): `shards.py plan` and `lines`, and
 `fleet.py plan` for the shards it assigns, take each shard's beside its own federation's `platform.toml` and refuse
-unless they are all one, because shards on federations that render other settings would never merge.
+unless they are all one, because shards on federations that render other settings would never merge. Each is taken by
+a program given the manifest's `pass_env` variables with the values the step's line pins, and nothing else of the
+operator's environment (`study_fingerprint`): a plugin that needs one refuses to be built without it.
 """
 
 from __future__ import annotations
@@ -182,9 +184,16 @@ def study_fingerprint(
     shards: Any, plan: Any, shard: Any, scratch: Path, refuse: Any, out: Path | None = None, detail: bool = True
 ) -> dict[str, Any]:
     """The campaign fingerprint the study pins beside this federation's `platform.toml`, by the manifest's Python on a
-    private copy, with the step's own environment (the allowlist, a home of its own), and with `out` (a restored
-    snapshot's) moved in as the copy's `out/`, as the step places it: what the step's dispatcher would pin. A program
-    that ends non-zero is refused with the end of its stderr, unless `detail` is false (its words may hold a path)."""
+    private copy, with the step's own environment (the allowlist, a home of its own) and each variable the plan declares
+    in `pass_env` with the value its lines pin (`shards.pinned_pass_env`: a plugin that needs one refuses to be built
+    without it, as the step's dispatcher would), and with `out` (a restored snapshot's) moved in as the copy's `out/`,
+    as the step places it: what the step's dispatcher would pin. Nothing else of the operator's environment is given. A
+    plan that declares variables and has not pinned them is refused before anything is copied or run. A program that
+    ends non-zero is refused with the end of its stderr, unless `detail` is false (its words may hold a path)."""
+    try:
+        declared = dict(shards.pinned_pass_env(plan))
+    except shards.ShardsError as error:
+        refuse(str(error))
     copy = scratch / "study"
     shutil.copytree(plan.study, copy, symlinks=True)
     platform = shard.root / shards.PLATFORM
@@ -194,7 +203,8 @@ def study_fingerprint(
         shutil.move(out, copy / "out")
     for name in ("home", "tmp", *(f"home/{sub}" for sub in shards.HOME_DIRS)):
         (scratch / name).mkdir(mode=0o700)
-    env = {"PATH": plan.step_path, "LC_ALL": "C", "EXPCORE_FED_ROOT_PARENT": str(shard.root.parent),
+    # the declared variables first, the step's own words after them: no declared name may be one of those
+    env = {**declared, "PATH": plan.step_path, "LC_ALL": "C", "EXPCORE_FED_ROOT_PARENT": str(shard.root.parent),
            "EXPCORE_FED_ROOT": str(shard.root), **shards.home_env(str(scratch / "home")),
            "TMPDIR": str(scratch / "tmp")}  # fmt: skip
     try:
