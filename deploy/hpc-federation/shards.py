@@ -60,7 +60,8 @@ can be fingerprinted.
 
 **One value for a shard's whole life.** A first step that passes variables records each name and value once, in
 `<results>/<label>/pass-env.json` (`record_pass_env_origin`: whole, by an exclusive link, mode 0600, once it holds the
-shard's running mark; nothing is written when it passes none). Every later step compares what it passes with that
+shard's running mark; nothing is written when it passes none, and a record over `PASS_ENV_ORIGIN_MAX` bytes, which
+its reader refuses, is refused by the writer first, so the step is). Every later step compares what it passes with that
 record before anything is made or launched (`check_pass_env_origin`): `step` as its first act, whether or not it is a
 `--resume` (a first step killed before its first snapshot leaves the record and no archive), `resume-line` before it
 asks Slurm anything or records its node, and the fleet's `step`. A declared variable whose value differs, one the first
@@ -684,10 +685,17 @@ def record_pass_env_origin(results: Path, spec: Mapping[str, Any], passed: Mappi
     path = results / label / PASS_ENV_ORIGIN
     draft = path.with_name(f".{PASS_ENV_ORIGIN}.{secrets.token_hex(8)}.draft")
     record = {"format": PASS_ENV_ORIGIN_FORMAT, "shard": dict(spec), "pass_env": dict(passed)}
+    payload = (json.dumps(record, sort_keys=True) + "\n").encode()
+    if len(payload) > PASS_ENV_ORIGIN_MAX:  # what the reader refuses: a record no later step could be compared with
+        raise ShardsError(
+            f"shard {label}: the variables its first step passes make a record of more than {PASS_ENV_ORIGIN_MAX} "
+            f"bytes ({PASS_ENV_ORIGIN}), which no later step could read: fewer or shorter values, or the step is "
+            "refused"
+        )
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with os.fdopen(os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        with os.fdopen(os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as handle:
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         try:

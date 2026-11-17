@@ -992,3 +992,56 @@ def test_o63_a_shard_that_passed_nothing_resumes_with_nothing_as_before(shards, 
     run, _ = dispatcher()
     assert shards.step(step_args(tmp_path, resume=True), runner=run, core_found=lambda path: True) == 0
     assert not origin_file(tmp_path).exists()
+
+
+# -- the origin is never longer than the reader takes --------------------------------------------------------------
+
+
+def origin_size(passed) -> int:
+    """The bytes `record_pass_env_origin` writes for `passed`, built as it builds them."""
+    record = {"format": "expcore-hpc-shard-pass-env/1", "shard": SPEC_A, "pass_env": passed}
+    return len((json.dumps(record, sort_keys=True) + "\n").encode())
+
+
+def test_o63_an_origin_longer_than_the_reader_takes_is_refused_by_the_writer_before_it_writes(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: 64 valid names with absolute-path values of 1,025 characters each are all accepted by the checks on a
+    line, and wrote a record of 66,404 bytes that the reader (limit 65,536) refuses as a record it cannot take: the
+    step passed, and every later one, however identical, was refused. The writer measures the record first and refuses
+    the step, naming the limit and no variable or value; no draft, no origin and no running mark are left."""
+    passed = {f"V{n}": "/" + "a" * 1024 for n in range(64)}
+    assert origin_size(passed) > shards.PASS_ENV_ORIGIN_MAX
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    for name, value in passed.items():
+        monkeypatch.setenv(name, value)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, list(passed)))
+    assert str(shards.PASS_ENV_ORIGIN_MAX) in said
+    assert "V0" not in said
+    assert "aaaa" not in said
+    results = tmp_path / "results"
+    assert not origin_file(tmp_path).exists()
+    assert not list(results.glob("**/.pass-env*"))
+    assert not (results / "fed-a" / "running.json").exists()
+    assert not list((tmp_path / "tmpfs").iterdir())
+
+
+def test_o63_the_writer_takes_a_record_of_exactly_the_readers_limit_and_the_reader_reads_it_back(shards, tmp_path):
+    """O63: the limit is the reader's: a record of exactly 65,536 bytes is written, and read back whole (and the record
+    one byte longer is refused)."""
+    full = "/" + "a" * 1024
+    passed = {f"V{n}": full for n in range(63)}
+    room = shards.PASS_ENV_ORIGIN_MAX - origin_size({**passed, "W": "/"})
+    assert 0 < room <= 1024
+    passed["W"] = "/" + "a" * room
+    assert origin_size(passed) == shards.PASS_ENV_ORIGIN_MAX
+    results = tmp_path / "results"
+    shards.record_pass_env_origin(results, SPEC_A, passed)
+    assert origin_file(tmp_path).stat().st_size == shards.PASS_ENV_ORIGIN_MAX
+    assert shards.read_pass_env_origin(results, SPEC_A) == passed
+    other = tmp_path / "other"
+    longer = {**passed, "W": passed["W"] + "a"}
+    assert origin_size(longer) == shards.PASS_ENV_ORIGIN_MAX + 1
+    with pytest.raises(shards.ShardsError, match=str(shards.PASS_ENV_ORIGIN_MAX)):
+        shards.record_pass_env_origin(other / "results", SPEC_A, longer)
+    assert not (other / "results").exists()
