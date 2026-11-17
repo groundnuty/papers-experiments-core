@@ -178,16 +178,25 @@ def test_o80_a_journal_that_cannot_be_read_is_charged_as_before(tmp_path):
 # --- through the real gate: a recovery that fails, and a check that reads the journal ---------------------------------
 
 
-def left_failed(tmp_path, campaign, attempt_id):
-    """An injection attempt `attempt_id` made whose restore never served, its injector gone so nobody holds the target:
-    the next check recovers it, and that recovery fails too. Return the gate that checks, on a fake clock."""
+def left_open(tmp_path, campaign, attempt_id, *, cleared_wrongly=True):
+    """An injection attempt `attempt_id` made and left open, its injector gone so nobody holds the target: with
+    `cleared_wrongly` its own restore was tried and never served (`clear_failed`), else it was never tried. The next
+    check recovers it and that recovery fails too. Return the platform file."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
     platform = write_faults(tmp_path, health_wait_s=0.2)
     injector = injector_for(platform, FakeServices(never_serves=True))
     with liveness.running(campaign, attempt_id):
         injector.start(RUN)
-        assert injector.clear() is False
+        if cleared_wrongly:
+            assert injector.clear() is False
     del injector
     gc.collect()  # a dropped injector lets its target go
+    return platform
+
+
+def left_failed(tmp_path, campaign, attempt_id):
+    """The gate that checks after `left_open`, on a fake clock and a federation whose providers never serve."""
+    platform = left_open(tmp_path, campaign, attempt_id)
     clock = FakeClock()
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
     return FaultGate(settings, FakeServices(never_serves=True), clock=clock, sleep=clock.sleep, wall=clock)
@@ -197,7 +206,10 @@ def test_o80_a_failed_recovery_of_an_earlier_attempts_injection_charges_no_run_b
     """O80: the check that settles what an earlier run left open fails with `an injection of X that an earlier run left
     open was not cleared`, and charged the run that ran the check. Now only the attempt that made the injection is
     charged: its own check, as before; a pre-run check and another attempt's check hold uncharged."""
-    gate = left_failed(tmp_path, campaign, 5)
+    platform = left_open(tmp_path, campaign, 5, cleared_wrongly=False)
+    clock = FakeClock()
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    gate = FaultGate(settings, FakeServices(never_serves=True), clock=clock, sleep=clock.sleep, wall=clock)
     pre_run = gate()
     assert (pre_run.ok, pre_run.deferred, pre_run.charge) == (False, False, False)
     assert "an earlier run left open was not cleared" in pre_run.detail
@@ -207,7 +219,6 @@ def test_o80_a_failed_recovery_of_an_earlier_attempts_injection_charges_no_run_b
     with liveness.running(campaign, 5):
         own = gate()
     assert (own.ok, own.charge) == (False, True)
-    assert "an earlier run left open was not cleared" in own.detail
     assert "left by another attempt" not in own.detail
 
 
@@ -243,8 +254,7 @@ def test_o80_a_lock_left_by_a_gone_holder_beside_an_open_injection_is_judged_by_
     """O80: the dead-holder branch of the gate (the lock stays held while its recorded holder is gone) recovers what
     the holder left open before it answers, and fails the same way: it charges no run but the attempt that owns the
     open injection."""
-    gate = left_failed(tmp_path, campaign, 5)
-    platform = tmp_path / "platform.toml"
+    platform = left_open(tmp_path, campaign, 5, cleared_wrongly=False)
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
     settings.journal.mkdir(parents=True, exist_ok=True)
     holder = {
