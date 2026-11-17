@@ -234,7 +234,7 @@ def member_state(member: Mapping[str, Any], facts: Mapping[str, Any]) -> str:
         relay = facts.get("relay")
         if relay == "serving":
             return "up and ready"
-        return "up with no relay" + ("" if relay == "none" else " (its state file records none)")
+        return "up with no relay" + ("" if relay == "none" else " (its state file has no relay record)")
     word = {"failed": "failed", "down-failed": "down FAILED", "made": "made, its up never finished"}.get(status, status)
     if holding:
         return f"{word}, {held}"

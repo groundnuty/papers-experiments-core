@@ -232,6 +232,7 @@ def test_o68_a_state_file_with_no_relay_record_does_not_count_as_serving(bench):
     code, printed, _ = plan(bench)
     assert code == 1, printed
     assert "not used: fed-3: its fault relay is not serving (not recorded" in printed
+    assert "fleet: fed-3: up with no relay (its state file has no relay record)" in printed
     assert assigned(bench)["shard-3"] is None
 
 
