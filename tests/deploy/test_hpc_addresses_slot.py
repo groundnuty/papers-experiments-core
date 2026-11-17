@@ -36,7 +36,7 @@ def code_of(line: str) -> str:
 
 
 @pytest.mark.parametrize("path", TEMPLATES, ids=lambda path: path.name)
-def test_o73_every_shipped_hpc_template_carries_the_one_address_line_before_its_first_table(path):
+def test_o73_every_shipped_hpc_template_carries_the_one_address_line_before_its_first_table(hpc, path):
     """O73: each template this repository ships for the HPC federation has the same one line, `addresses =
     @hpc_addresses@`, among its top-level keys: a key after a table header would belong to the table."""
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -45,6 +45,9 @@ def test_o73_every_shipped_hpc_template_carries_the_one_address_line_before_its_
     assert not [line for line in lines[:at] if code_of(line).startswith("[")]
     pilot = [line for line in TEMPLATE.splitlines() if code_of(line) == LINE]
     assert lines[at] == pilot[0], "the five templates carry the line alike"
+    assert hpc.names.at_addresses_key(path.read_text(encoding="utf-8")) is True, (
+        "the preflight reads it as the key's value"
+    )
 
 
 @pytest.mark.parametrize("path", TEMPLATES, ids=lambda path: path.name)
