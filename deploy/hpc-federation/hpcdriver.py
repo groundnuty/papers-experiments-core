@@ -501,6 +501,7 @@ class Driver(Down):
     def start_relay(self) -> str:
         """The login node's fault relay, for a campaign on a compute node (M4); none in a core without it."""
         if not self.relay_available():
+            self.set(lambda s: s.update(fault_relay="none"))  # the fleet reads this, never the line below
             return f"fault relay: none, this core has no {hpcrelay.RELAY}"
         state = self.store.read()
         log = Path(state["site"]["logs"]) / f"{state['allocation']['name']}-fault-relay.log"
@@ -512,6 +513,7 @@ class Driver(Down):
             self.slurm.runner, state["command"][0], self.root, state["command"], log, self.environ,
             record=record, clock=self.clock, sleep=self.sleep,
         )  # fmt: skip
+        self.set(lambda s: s.update(fault_relay="serving"))  # only now: `relay` above is written at the spawn
         return "fault relay: serving"
 
     def submit(self, asked: Allocation, key: str) -> str:

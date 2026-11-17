@@ -192,6 +192,20 @@ under one record. One federation's job failing ends one shard's step, never anot
   gives, before each launch: a line is never built from a manifest the fleet did not write. It then asks Slurm of the
   job the line lands in: still known, running, and under the name its federation's `up` gave it, since Slurm reuses
   ids and a job that ended may have handed its id to another. Each line runs with `--chdir=/`.
+- **A campaign that injects faults needs each federation's relay.** A federation without a serving relay can neither
+  inject nor restore a provider, and its `up` still counts as finished. So `readiness` (used by `plan` and again by
+  `step`) refuses, for a campaign that injects faults, a federation whose state file does not say `fault_relay =
+  serving`, naming the federation and the reason. The campaign injects when the study's `study.toml` has a condition
+  whose treatment is a `provider_outage` (`expcore.errors.PROVIDER_OUTAGE`), or the federation's `platform.toml` has
+  `[faults] sanctioned = true`; both are read as files and nothing of the study is run. The test is the campaign's: a
+  shard's runs are a share of every condition (C28), so one outage condition makes every shard inject, and a condition
+  that names tasks is not exempted (the fleet fails closed). A `study.toml` that cannot be read counts as injecting. The
+  record is what `up` saw, so a relay that stops afterwards is not noticed here.
+- **Each federation's state is said plainly.** `status`, and `plan` before it assigns anything, print up and ready, up
+  with no relay, failed (or down failed) and still HOLDING jobs by count with the command that releases them, or down
+  (`fleetrecord.member_state`). Holding is read from the job ids the state file and the record name, not from the
+  status: a failed member may hold nothing (an up refused in its preflight), and a down-failed one still bills unless its
+  state file's phase is `down`, which `hpcdown` writes only once the held jobs are cancelled and every client ended.
 - **Moving a shard (the coordinator's rule).** The shard count is fixed at the fleet's `up`. A shard whose federation
   is taken down (`down --member`) is released, and given only to a federation brought up after (`add`), never one that
   held a shard before, with the same checks and an equal fingerprint, its step started with `--resume` from its
@@ -388,6 +402,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   },
   "clients": {"<step name>": {"pid": 0, "start": 0}},
   "relay": {"pid": 0, "start": 0, "log": "<log dir>/<allocation name>-fault-relay.log"},
+  "fault_relay": "serving | none",
   "data": {"ingested": {"<space>": {"manifest": "<sha256>", "declared": true,
                                     "verified": null}}},
   "shard_nodes": [{"job": "<the operator's job id>", "node": "<node>", "label": "<shard>", "name": "<its job name>"}],
@@ -408,7 +423,12 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 - **`site`** is what `up` read from `site.env` (no secret): every later command reads it here, so `down` and the
   service verbs need no environment. **`command`** is this driver's argv prefix, which `platform.toml`'s `[faults]
   command` holds. **`clients`** are the detached srun clients of the service steps, by step name, which `down` ends
-  once their steps are gone. **`owner`** is the job's uid and gid on the nodes (the posix storage's owner).
+  once their steps are gone. **`relay`** is the fault relay's client (pid, start, log), recorded at its spawn so that
+  `down` can end it whatever happens next; it does not say the relay serves. **`fault_relay`** does: `up` writes
+  `serving` once the relay's heartbeat is seen and `none` when the core has no relay. A state with neither (an older
+  up's, or an up that failed before the heartbeat) reads as `unrecorded` (`hpcstate.relay_of`), which is not serving.
+  The fleet reads it from here, never from the up log. **`owner`** is the job's uid and gid on the nodes (the posix
+  storage's owner).
 - **`data.ingested`** (O57, C06) names each space whose data is the study's own, put there after `up` (section 6a),
   written by `up` from the layout alone: `manifest` is the SHA-256 of the manifest it is to be verified against
   (`Manifest.digest()`: the declared file's, or the empty manifest's for a space that declares none), `declared` whether

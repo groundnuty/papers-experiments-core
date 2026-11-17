@@ -22,10 +22,12 @@ Run on the login node with the site's values exported (`set -a; . site.env; set 
 - add: K fresh federations into the fleet, by the same rules, the maximum counting every one that may hold a job.
 - plan: each shard on a federation (`fleetplan`), written to `<fleet>/shards.toml`, and each one's srun line printed
   as `shards.py plan` prints it; refused, with nothing recorded, when the manifest's python imports a core that names
-  no code (C06: unknown or stale), as `shards.py plan` refuses it.
+  no code (C06: unknown or stale), as `shards.py plan` refuses it; and, for a campaign that injects faults, a
+  federation whose fault relay does not serve (`fleetplan.injection`, read from its state file) is given no shard.
 - step: each assigned shard's line launched detached on the login node, its client recorded; the same core check
   first, when there is a line to launch.
-- status: what the record and each root's state file say; nothing is run.
+- status: what the record and each root's state file say, each federation's state in plain words (up and ready, up
+  with no relay, failed and still HOLDING jobs by count, down); nothing is run. `plan` says the same states first.
 - down: every federation this fleet made, or one, taken down by `hpcfed.py down` and verified gone; a root or state
   that is not the one this fleet's up made is refused and left untouched, and nothing else is ever looked for.
 """
@@ -54,11 +56,13 @@ from fedlayout import Layout  # noqa: E402
 from fedspec import LayoutError, load_spec  # noqa: E402
 from fleetrecord import (  # noqa: E402
     HOLDS_NOTHING,
+    LINKED,
     FleetError,
     Record,
     identity,
     jobs_of,
     member_of,
+    member_state,
     new_member,
     new_record,
     root_of,
@@ -70,7 +74,6 @@ from hpcsettings import SettingsError, agent_limits, load_settings, site_from_en
 from hpcslurm import Client, Runner, Slurm, SlurmError  # noqa: E402
 
 MAX_VAR, PARALLEL_VAR = "HPC_FLEET_MAX", "HPC_FLEET_PARALLEL"
-LINKED = "linked"  # a federation's phase once its up has finished (hpcstate.PHASES)
 CEILING = 64  # no setting of either may pass it
 COMMANDS = ("up", "add", "plan", "step", "status", "down")
 UNSAFE = set('"\\') | {chr(c) for c in range(32)} | {chr(127)}  # never in a path the fleet writes into TOML and JSON
@@ -198,7 +201,8 @@ def state_facts(root: Path) -> Dict[str, Any]:
         state = None
     if state is None:
         return {}
-    return {"name": state["allocation"].get("name"), "jobs": jobs_of(state), "phase": state.get("phase")}
+    return {"name": state["allocation"].get("name"), "jobs": jobs_of(state), "phase": state.get("phase"),
+            "relay": hpcstate.relay_of(state)}  # fmt: skip
 
 
 @dataclass
@@ -326,13 +330,14 @@ class Fleet:
     def plan(self, settings_path: Optional[Path]) -> int:
         with self.record.lifecycle("plan"):
             record = self.record.read()
+            self.say_states(record)  # first: a refused plan still shows a failed federation that bills
             given = fleetplan.read_settings(settings_path) if settings_path is not None else None
             settings = record["template"] or given
             if settings is None:
                 raise FleetError("the first plan needs --manifest: the shard settings (shards.py's keys)")
             if given is not None and given != settings:
                 raise FleetError("the shard settings differ from the ones the fleet's first plan read: refused")
-            new, reference, said = fleetplan.assignments(record, self.directory)
+            new, reference, said = fleetplan.assignments(record, self.directory, Path(settings["study"]))
             path = self.directory / fleetplan.MANIFEST
             draft = self.directory / f".{fleetplan.MANIFEST}.draft"
             fleetplan.write_whole(draft, fleetplan.manifest_text(settings, fleetplan.entries(record, self.directory,
@@ -363,6 +368,13 @@ class Fleet:
             entry = {"shard": shard_label, "federation": holding[shard_label], "argv": lines[shard_label]}
             print(json.dumps({**entry, **({"pass_env": values} if values else {})}))
         return 0 if len(holding) == len(record["shards"]) else 1
+
+    def say_states(self, record: Mapping[str, Any]) -> None:
+        """Each federation's state in plain words, as `status` says it (`fleetrecord.member_state`)."""
+        for member in record["members"]:
+            self.say(
+                f"{member['label']}: {member_state(member, state_facts(root_of(self.directory, member['label'])))}"
+            )
 
     def running(self, launch: Mapping[str, Any]) -> Optional[bool]:
         """Whether a launch's srun client still runs on the login node: None when it cannot be told."""
@@ -433,8 +445,9 @@ class Fleet:
         for member in record["members"]:
             facts = state_facts(root_of(self.directory, member["label"]))
             jobs = held(facts.get("jobs") or member.get("jobs") or {}) or "none"
-            line = f"{member['label']}: {member['status']}, phase {facts.get('phase')}, job(s) {jobs}"
-            line += f", shard {member['shard']}" if member["shard"] else ""
+            detail = f"phase {facts.get('phase')}, job(s) {jobs}"
+            detail += f", shard {member['shard']}" if member["shard"] else ""
+            line = f"{member['label']}: {member_state(member, facts)} ({detail})"
             print(line + (f" ({member['said']})" if member["said"] else ""))
         for shard in record["shards"]:
             launches = [launch for launch in shard["launches"] if launch["member"] == shard["member"]]
