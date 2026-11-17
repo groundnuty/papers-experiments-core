@@ -145,7 +145,8 @@ archive into its copy first, so a repeated launch line never replaces a finished
 copy of every shard's archive against its manifest and the manifest against the plan, unpacks that copy into
 `<into>/<label>/out`, read-only, and prints (or with `--run` runs, in `<into>`, a 0700 directory of ours) `<python> -I
 -B -m expcore merge`. A shard whose archive has no `campaign.lock`, does not verify, or is missing is refused, naming
-its label: the merge would refuse it too.
+its label: the merge would refuse it too. A shard with a snapshot newer than its archive (below) holds runs the merge
+would leave out: `collect` warns of it, and with `--run` refuses, before any merge, naming the shard and the snapshot.
 
 **The copy back (required, after `collect` and before `down`).** Nothing durable may live only on the cluster's
 scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all
@@ -894,26 +895,21 @@ def newer_snapshot(plan: Plan, shard: Shard, archive_sha: str, scratch: Path) ->
         found = restore_newest(plan.results, shard.label, spec, archive_sha, check / "out")
     finally:
         remove_tree(check)
-    if found is not None:
-        print(
-            f"shards: WARNING: shard {shard.label}: snapshot {found.name} is newer than its archive (a step resumed "
-            "from the archive was killed before it archived): it holds runs the merge will not; it is in the "
-            f"{ARCHIVES_MANIFEST} to pull and check, and `--resume` continues from it",
-            file=sys.stderr,
-        )
     return found
 
 
 def evidence_entries(
     plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]], scratch: Path
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """What lies beside each verified archive and would be lost with the scratch: its archive manifest
     (`<label>.out.json`), every file under `<label>/journals/` (a spend journal per step: what a step killed outright
     spent), and the snapshot newer than the archive when there is one (`newer_snapshot`), each as name (relative to the
     results directory), size and SHA-256 of the bytes read, sorted by name. The archive manifest is shown to name the
     archive that was verified, so the two listed are a pair. A link among them refuses the collect; so does a file that
-    cannot be read. Snapshots older than the archive are resume material and not listed (README)."""
+    cannot be read. Snapshots older than the archive are resume material and not listed (README). Returns the entries
+    and, for each shard that has a snapshot newer than its archive, its (label, snapshot name)."""
     entries: list[dict[str, Any]] = []
+    ahead: list[tuple[str, str]] = []
     for shard, (_, manifest) in zip(plan.shards, found, strict=True):
         try:
             own = (plan.results / f"{shard.label}.out.json").read_bytes()
@@ -929,12 +925,13 @@ def evidence_entries(
             snapshot = newer_snapshot(plan, shard, manifest["sha256"], scratch)
             if snapshot is not None:
                 names += _files_under(snapshot, plan.results, shard.label)
+                ahead.append((shard.label, snapshot.name))
             for name in names:
                 size, digest = _measured(plan.results / name)
                 entries.append({"name": name, "bytes": size, "sha256": digest})
         except OSError as error:
             raise ShardsError(f"shard {shard.label}: its evidence could not be read ({type(error).__name__})") from None
-    return sorted(entries, key=lambda entry: entry["name"])
+    return sorted(entries, key=lambda entry: entry["name"]), ahead
 
 
 def write_archives_manifest(
@@ -976,12 +973,16 @@ def final_problem(shard: Shard, manifest: Mapping[str, Any], wanted: str | None)
     return None
 
 
-def collect(plan: Plan, into: Path) -> list[Path]:
+def collect(plan: Plan, into: Path, refuse_newer: bool = False) -> list[Path]:
     """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails, and
     when any is not final (`final_problem`), naming it. Once every archive has verified and is final, and before
     anything is unpacked, `archives.sha256.json` is written beside them for the copy back (`verify-copy`): the archives
     and what lies beside them (`evidence_entries`). A refused collect writes none. Run it once every step has ended: a
-    journal still being written is listed as it was read, and a pull of it later would differ."""
+    journal still being written is listed as it was read, and a pull of it later would differ. A shard with a snapshot
+    newer than its archive (a step resumed from the archive was killed before it archived) holds runs the merge would
+    omit: `collect` warns, naming the shard and the snapshot, and lists the snapshot for the copy back; with
+    `refuse_newer` (the merge follows at once: `--run`) it refuses instead, since the merge has no flag to leave a shard
+    short and would analyse an incomplete campaign."""
     if into.exists() and any(into.iterdir()):
         raise ShardsError("the directory to collect into must be new or empty")
     wanted = None
@@ -1000,7 +1001,22 @@ def collect(plan: Plan, into: Path) -> list[Path]:
             found.append(verified(plan.results, shard, into))
             if problem := final_problem(shard, found[-1][1], wanted):
                 raise ShardsError(problem)
-        write_archives_manifest(plan, found, evidence_entries(plan, found, into))
+        evidence, ahead = evidence_entries(plan, found, into)
+        if ahead and refuse_newer:
+            who = "; ".join(f"shard {label}: snapshot {name}" for label, name in ahead)
+            raise ShardsError(
+                f"a snapshot is newer than its archive ({who}), so the merge would leave out the runs it holds: resume "
+                "the shard so that they reach a new archive, or run collect without --run and merge the line it prints "
+                "yourself, knowing they are left out"
+            )
+        for label, name in ahead:
+            print(
+                f"shards: WARNING: shard {label}: snapshot {name} is newer than its archive (a step resumed from the "
+                "archive was killed before it archived): it holds runs the merge leaves out; it is in the "
+                f"{ARCHIVES_MANIFEST} to pull and check, and `--resume` continues from it",
+                file=sys.stderr,
+            )
+        write_archives_manifest(plan, found, evidence)
     except ShardsError:  # refused whole: nothing of it is left behind
         for leftover in into.glob(".*.out.tar"):
             leftover.unlink()
@@ -2428,7 +2444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return archive_left(args) if args.archive_left else step(args)
         plan = load_plan(args.manifest)
         if args.command == "collect":
-            outs = collect(plan, args.into)
+            outs = collect(plan, args.into, refuse_newer=args.run)
             line = merge_argv(plan, outs)
             print(shlex.join(line))  # first, and alone on stdout: callers read it as the merge line
             manifest_hash = _sha256(plan.results / ARCHIVES_MANIFEST)

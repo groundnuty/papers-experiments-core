@@ -598,7 +598,7 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 | `<label>.out.tar` | the shard's `out/`, which the merge reads | the results |
 | `<label>.out.json` | the archive's manifest (its SHA-256, the exit status, the post-run record) | what the archive is |
 | `<label>/journals/*` (every file) | a spend journal per step (`expcore run --spend-journal`) | what a step killed outright spent, which `--resume` counts as `lost_in_kill`: nowhere else |
-| `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one |
+| `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one, and `collect --run` refuses |
 
 Every other snapshot is resume material and **not part of the required pull.** A snapshot names the archive its step
 started from (`shards.py`, `_run_step`: `facts = {"shard": spec, "base": base}`), and `--resume` restores the newest one
@@ -606,6 +606,13 @@ only if it names the shard's current archive (`restore_newest`: `facts.get("base
 of the step that wrote an archive name an earlier archive or none, and the last of them was taken before the archive was
 written, so the verified archive holds all they do. (Also not required: `<label>/running.json` and the manifest's `*.part`
 drafts.) Pulling the whole directory, as above, brings them anyway; `verify-copy` does not check them.
+
+**A snapshot newer than the archive stops `collect --run`.** A step resumed from the archive and killed before it
+archived leaves runs only in its snapshot, and the merge would leave them out. Plain `collect` warns (naming the shard
+and the snapshot), lists the snapshot for the pull and prints the merge line, so you can pull first. `collect --run`
+refuses before any merge (exit 2, nothing written): resume the shard so that its runs reach a new archive, or run
+`collect` without `--run` and run the merge line it prints yourself, knowing they are left out. `merge` has no flag to
+leave a shard short, so there is none to pass.
 
 `verify-copy` uses the standard library alone (Python 3.11 or later), so it runs on a host where the core is not
 installed: take `shards.py` from a checkout. It exits 0 only when the manifest is the file whose hash `collect` printed
