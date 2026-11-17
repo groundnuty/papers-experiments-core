@@ -1199,3 +1199,112 @@ def test_o90_a_take_that_outlives_its_run_never_overwrites_the_next_runs_snapsho
     assert not first.is_alive()
     assert instrument.finish()["ok"] is False
     assert len(calls) == 2
+
+
+def test_o90_taken_is_none_before_a_take_and_reading_it_makes_no_call():
+    """O90: `PostRunHealth.taken` is the kept snapshot, read without consuming it: None before `take()` (a study that
+    reads it before the owner has taken the reading gets no answer, never a fresh call of the check)."""
+    check = Calls(Health(True, "never asked"))
+    instrument = PostRunHealth(check)
+    assert instrument.taken is None
+    instrument.start(RUN)
+    assert instrument.taken is None
+    assert check.calls == 0
+
+
+def test_o90_taken_equals_what_finish_returns_byte_for_byte_and_does_not_consume_it(tmp_path, fake):
+    """O90: after `take()` inside the own injection, `taken` is the snapshot `finish` hands over after the restore, in
+    canonical JSON byte for byte (the target held, so it is not a reading made after the restore), and reading it any
+    number of times makes no call of the check and leaves `finish` its snapshot."""
+    world = four_spaces(tmp_path, fake, faults={})
+    seen = []
+
+    def study_reads_it(owned):
+        owned.take()
+        seen.extend([owned.taken, owned.taken])
+
+    snapshot, reading, _ = inside_injection(tmp_path, world, taking=study_reads_it)
+    assert reading.held == {TARGET}
+    assert seen[0]["reading"]["held"] == [TARGET]
+    for read in seen:
+        assert json.dumps(read, sort_keys=True) == json.dumps(snapshot, sort_keys=True)
+
+
+def test_o90_taken_does_not_consume_the_take_so_finish_still_makes_no_call_of_its_own():
+    """O90: `taken` is a read: with a take made and `taken` read, `finish` still returns the take's snapshot and the
+    check was called exactly once (the take's)."""
+    check = Calls(Health(False, "the take's"), Health(True, "a later call's"))
+    instrument = PostRunHealth(check)
+    instrument.start(RUN)
+    instrument.take()
+    assert instrument.taken == {"ok": False, "deferred": False, "reading": None}  # kept with no reading: not None
+    assert instrument.finish() == {"ok": False, "deferred": False, "reading": None}
+    assert check.calls == 1
+
+
+def test_o90_taken_is_a_deep_copy_so_the_caller_can_never_change_what_finish_returns(tmp_path, fake):
+    """O90: a study that edits the value `taken` returned (a key, a nested list of the reading) changes neither the
+    next `taken` nor what `finish` returns: every read is its own copy of the kept snapshot."""
+    world = four_spaces(tmp_path, fake, faults={})
+    kept = []
+
+    def study_edits_it(owned):
+        owned.take()
+        pristine = json.dumps(owned.taken, sort_keys=True)
+        first = owned.taken
+        assert first is not owned.taken
+        assert first["reading"]["spaces"]  # nested content to change
+        first["ok"] = "changed"
+        first["reading"]["held"].append("providers[9]")
+        first["reading"]["spaces"][0]["offline"].append("providers[9]")
+        first["reading"]["spaces"].clear()
+        del first["deferred"]
+        kept.append(pristine)
+        assert json.dumps(owned.taken, sort_keys=True) == pristine
+
+    snapshot, reading, _ = inside_injection(tmp_path, world, taking=study_edits_it)
+    assert json.dumps(snapshot, sort_keys=True) == kept[0]
+    assert target_only(reading) is True
+
+
+def test_o90_taken_is_none_after_start_and_after_finish():
+    """O90: `start` clears a take whose `finish` never ran, and `finish` returns the snapshot and clears it: `taken`
+    is None after either, so a later reader never sees a run's snapshot that was handed over or dropped."""
+    check = Calls(Health(False, "the first run's"), Health(True, "the second run's"))
+    instrument = PostRunHealth(check)
+    instrument.start(RUN)
+    instrument.take()
+    assert instrument.taken is not None
+    instrument.start(RUN)  # the next run: the first run's take is dropped
+    assert instrument.taken is None
+    instrument.take()
+    assert instrument.taken == {"ok": True, "deferred": False, "reading": None}
+    assert instrument.finish()["ok"] is True
+    assert instrument.taken is None
+
+
+def test_o90_taken_is_none_on_a_failed_take_and_does_not_raise_while_finish_still_does():
+    """O90: the check raised inside the take, so there is no snapshot: `taken` is None and never raises, and `finish`
+    still raises it again (the record's failed finish), never a fresh reading."""
+    calls = []
+
+    def broken():
+        calls.append(1)
+        raise OSError("the check could not run")
+
+    instrument = PostRunHealth(broken)
+    instrument.start(RUN)
+    instrument.take()
+    assert instrument.taken is None
+    assert instrument.taken is None
+    with pytest.raises(OSError, match="could not run"):
+        instrument.finish()
+    assert instrument.taken is None
+    assert len(calls) == 1
+
+
+def test_o90_taken_has_no_setter():
+    """O90: `taken` is read-only: a study cannot put a snapshot in place of the take's."""
+    instrument = PostRunHealth(Calls(Health(True, "ok")))
+    with pytest.raises(AttributeError):
+        instrument.taken = {"ok": True, "deferred": False, "reading": None}  # type: ignore[misc]

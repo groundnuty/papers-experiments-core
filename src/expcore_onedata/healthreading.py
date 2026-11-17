@@ -35,6 +35,7 @@ A reading is per call: `PlatformHealth` resets it at the start of every call, so
 (a deferral, a failed baseline, a content type that refused) leaves `UNREAD`, never the call before's reading.
 """
 
+import copy
 import json
 import logging
 import re
@@ -329,9 +330,11 @@ class PostRunHealth:
     not cost the run its record: its type is logged, the take is kept as failed, and `finish` raises it again, which
     `finish_instruments` records as `{"ok": False, "error": ...}` (unknown), never a fresh reading after the restore.
     `take` called once the executor has returned is within the same contract as any check: the fault gate explains
-    nothing then, and the reading is unread. The state is per run: `start` clears a take whose `finish` never ran, and a
-    take still reading when the next run begins drops its answer, so an instance that serves run after run never hands
-    one run another's reading; give each concurrent run its own."""
+    nothing then, and the reading is unread. The read-only property `taken` gives a study that judges inside its own
+    session, after `take` and before the instruments finish, a deep copy of the kept snapshot without consuming it. The
+    state is per run: `start` clears a take whose `finish` never ran, and a take still reading when the next run begins
+    drops its answer, so an instance that serves run after run never hands one run another's reading; give each
+    concurrent run its own."""
 
     namespace = NAMESPACE
 
@@ -376,6 +379,16 @@ class PostRunHealth:
                 log.warning("the %s take of an earlier run finished after its run: dropped", self.namespace)
                 return
             self._kept, self._failure = kept, failure
+
+    @property
+    def taken(self) -> dict[str, Any] | None:
+        """The snapshot `take` kept, read without consuming it, for a study that makes its own verdict inside its
+        session (after `take`, before the instruments finish). A deep copy, so the caller can never change what `finish`
+        returns; None before a `take`, after `start` clears it, after `finish` returns it, and when the take's check
+        raised (`finish` still raises that; this never does). It makes no call of the check, and has no setter."""
+        with self._lock:
+            kept = self._kept
+        return None if kept is None else copy.deepcopy(dict(kept))
 
     def finish(self) -> Mapping[str, Any]:
         """The snapshot `take` kept (and forgets it), or, when `take` was never called, one call of the check now."""
