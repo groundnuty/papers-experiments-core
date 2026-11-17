@@ -513,6 +513,71 @@ split_imports() {  # <imports-array> <other-array> args...: the --import=SPACE=P
   done
 }
 
+# The names a service registers under (O73). A federation reached by the names its layout declares gives each service
+# `--declared=NAME` (the zone's or the provider's own domain) and one `--host=NAME=ADDRESS` per service of the federation,
+# itself included: configure.sh registers the service under NAME, makes its certificate for NAME, and writes the hosts file
+# the service's cell is given in place of the node's own, so every peer's declared name resolves in it (an unresolved
+# peer's name crashes the provider's lookup of it). Without them the service registers under the node's own name.
+split_names() {  # <declared-array> <hosts-array> <other-array> args...: the --declared= and --host= arguments, then the rest
+  local -n _declared=$1 _hosts=$2 _others=$3
+  local a
+  shift 3
+  _declared=() _hosts=() _others=()
+  for a in "$@"; do
+    case $a in
+      --declared=*) _declared+=("${a#--declared=}") ;;
+      --host=*) _hosts+=("${a#--host=}") ;;
+      *) _others+=("$a") ;;
+    esac
+  done
+}
+
+service_name() {  # <workdir>: the name this service is registered under: its declared name, else the node's own
+  local f
+  if [[ ! -e $1/declared-name ]]; then node_fqdn; return; fi
+  [[ -f $1/declared-name && ! -L $1/declared-name ]] || die "$1/declared-name is not a regular file"
+  f=$(head -n 1 -- "$1/declared-name")
+  valid fqdn "$f"
+  printf '%s\n' "$f"
+}
+
+write_names() {  # <workdir> <node fqdn> <node short name> <declared name> <peer-ip ...>: W/declared-name and W/hosts (O73)
+  local W=$1 fqdn=$2 short=$3 declared=$4 entry n a own ip
+  local -A addr_of=() name_of=() peer=()
+  shift 4
+  for entry in "${HOSTS[@]}"; do
+    [[ $entry == *=* ]] || die "invalid --host '$entry': NAME=ADDRESS"
+    n=${entry%%=*} a=${entry#*=}
+    valid fqdn "$n"; valid ip "$a"
+    [[ -z ${addr_of[$n]:-} ]] || die "--host lists the name '$n' twice"
+    [[ -z ${name_of[$a]:-} ]] || die "--host lists the address '$a' under two names"
+    addr_of[$n]=$a name_of[$a]=$n
+  done
+  own=${addr_of[$declared]:-}
+  [[ -n $own ]] || die "--host does not list this service's own declared name '$declared'"
+  for ip in "$@"; do
+    [[ -n ${name_of[$ip]:-} ]] || die "the peer $ip has no declared name: its --host entry is missing"
+    peer[$ip]=1
+  done
+  for a in "${!name_of[@]}"; do
+    [[ $a == "$own" || -n ${peer[$a]:-} ]] || die "the declared name of $a is no listed peer: the shim would not move its 443"
+  done
+  if [[ ${COMP:-} == op ]]; then
+    [[ -n ${addr_of[${ZONE:-}]:-} ]] || die "--host does not list the zone's declared name '${ZONE:-}'"
+  fi
+  {
+    printf '# hpcop hosts for %s %s on %s, written %s\n' "$COMP" "$declared" "$fqdn" "$(date -u +%FT%TZ)"
+    printf '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n'
+    printf '%s %s %s %s\n' "$own" "$fqdn" "$short" "$declared"   # the cluster's node names stay the node's own
+    for n in $(printf '%s\n' "${!addr_of[@]}" | sort); do
+      [[ $n == "$declared" ]] || printf '%s %s\n' "${addr_of[$n]}" "$n"
+    done
+  } > "$W/hosts"
+  chmod 644 -- "$W/hosts"
+  printf '%s\n' "$declared" > "$W/declared-name"
+  chmod 644 -- "$W/declared-name"
+}
+
 import_binds() {  # <workdir>: the `apptainer exec` arguments that bind each listed tree read-only, one per line; none for none
   [[ -e $1/imports ]] || return 0
   "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/importstorage.py" binds --workdir "$1"
@@ -572,8 +637,13 @@ run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exe
   # bind (`:ro`) of the list's, over the empty mountpoint configure.sh made in the rootfs, which the container cannot
   # write to. A provider's storage on scratch, when its job was given one, is the one writable bind: its own directory
   # there, over the rootfs's empty /volumes/posix. Nothing else of the node's filesystems is seen.
+  # A federation of declared names (O73): the node's /etc/hosts, which the site binds into every cell, is replaced by the
+  # file configure.sh wrote, listing every peer's declared name; --no-mount bind-paths drops the site's binds (and with
+  # them /etc/localtime, which becomes the image's), and our file is bound read-only in the place of /etc/hosts.
+  local -a naming=()
+  if [[ -e $W/hosts ]]; then naming=(--no-mount bind-paths --bind "$W/hosts:/etc/hosts:ro"); fi
   exec "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" run -- apptainer exec --writable --containall --no-home --pwd /root \
-    --workdir "$W/work" "${binds[@]}" "$R" /root/hpcop-start.sh > "$W/run.log" 2>&1 < /dev/null
+    --workdir "$W/work" "${naming[@]}" "${binds[@]}" "$R" /root/hpcop-start.sh > "$W/run.log" 2>&1 < /dev/null
 }
 
 # The Couchbase guard inside the container (hpcop-cb-init.py --watch) prints one of these into run.log: passed

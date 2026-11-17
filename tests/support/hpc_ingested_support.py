@@ -102,7 +102,7 @@ def driver_over(hpc: Any, base: Path, layout: Path, label: str = "fed-a", ca: by
     return SimpleNamespace(driver=driver, fake=fake, root=root, given=given, label=label)
 
 
-def _stand_in_rest(ca_file: Path) -> SimpleNamespace:
+def _stand_in_rest(ca_file: Path, **kwargs: object) -> SimpleNamespace:
     return SimpleNamespace(close=lambda: None)
 
 

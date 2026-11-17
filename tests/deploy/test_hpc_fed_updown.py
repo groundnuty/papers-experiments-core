@@ -113,17 +113,22 @@ def test_the_held_job_is_shaped_by_the_layout_and_read_back_before_anything_runs
 
 def test_every_service_gets_every_peer_address_before_it_starts(hpc, tmp_path, site):
     """O57: the shim reads its peers once, so the zone's step names every provider's address, and each provider's the
-    zone's FQDN and address and every other provider's address."""
+    zone's name (its declared one, O73) and address and every other provider's address; the flags of the names
+    (`--declared`, `--host`) follow the peers (tests/deploy/test_hpc_declared_names.py)."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     zone, *providers = rig.fake.spawned
+
+    def positional(step):
+        return [word for word in step.command if not word.startswith("--")]
+
     assert zone.command[1].endswith("bundle/zone.sbatch")
-    assert zone.command[5:] == [f"10.0.0.{i}" for i in range(2, 7)]
+    assert positional(zone)[5:] == [f"10.0.0.{i}" for i in range(2, 7)]
     for index, step in enumerate(providers):
         assert step.command[1].endswith("bundle/provider.sbatch")
         assert step.command[4] == PROVIDERS[index]
-        assert step.command[5:8] == ["node01.cluster.example.org", "admin@example.org", "10.0.0.1"]
-        assert step.command[8:] == [f"10.0.0.{i}" for i in range(2, 7) if i != index + 2]
+        assert step.command[5:8] == ["zone.expcore-hpc-pilot.test", "admin@example.org", "10.0.0.1"]
+        assert positional(step)[8:] == [f"10.0.0.{i}" for i in range(2, 7) if i != index + 2]
 
 
 def test_service_steps_and_control_steps_are_exact_and_sized_by_the_layout(hpc, tmp_path, site):
@@ -255,18 +260,18 @@ def test_each_provider_is_registered_by_a_token_piped_from_the_zone_before_its_v
     assert all(s.command[s.command.index("--workdir") + 1] == "/tmp/hpcop-oz.abcdef" for s in mints)
 
 
-def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_real_addresses(hpc, tmp_path, site):
+def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_declared_names(hpc, tmp_path, site):
     """O57: the root gets the zone's passphrase (0600, as the Compose root holds it) and its CA; the core's phase
-    runs over https://<node FQDN>:8443, with the job's uid as the storage's owner, this driver's argv prefix and the
-    settle time derived from the layout."""
+    runs over https://<declared name>:8443 (O73: the services' own names, dialled at the root's address map's nodes),
+    with the job's uid as the storage's owner, this driver's argv prefix and the settle time derived from the layout."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     secret = rig.root / "secrets" / "zone.passphrase"
     assert oct(secret.stat().st_mode & 0o777) == "0o600"
     assert (rig.root / "ca" / "federation-ca.pem").read_text(encoding="utf-8").startswith("-----BEGIN CERTIFICATE")
     (layout, owner, values) = rig.core_calls[0]
-    assert layout.spec.zone.url == "https://node01.cluster.example.org:8443"
-    assert layout.spec.provider("hazel").url == "https://node06.cluster.example.org:8443"
+    assert layout.spec.zone.url == "https://zone.expcore-hpc-pilot.test:8443"
+    assert layout.spec.provider("hazel").url == "https://hazel.expcore-hpc-pilot.test:8443"
     assert owner == (5001, 5001)
     assert (values["hpc_step_launch_wait_s"], values["hpc_command_timeout_s"]) == ("240", "300")
     assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("140", "440")
@@ -714,7 +719,7 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
     out = hpc.boot.core_phase(
         layout, (5001, 5001), {**hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, root),
                                **pin_values(tmp_path / "agent")},
-        rest=lambda ca: SimpleNamespace(close=lambda: None),
+        rest=lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
         bootstrap=lambda rest, layout, owner: SimpleNamespace(layout=layout, ids=ids, spec=layout.spec),
         steps=lambda boot: None,
         content=lambda boot: SimpleNamespace(reset=lambda timeout: None),
