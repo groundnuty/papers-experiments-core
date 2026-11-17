@@ -891,3 +891,104 @@ def test_o63_a_bad_label_is_still_the_labels_refusal_not_the_origins(shards, tmp
     with pytest.raises(shards.ShardsError, match="label"):
         shards.step(args, runner=run, core_found=lambda path: True)
     assert not (tmp_path / "escape").exists()
+
+
+# -- a deleted origin does not lift the rule: the shard's archive manifest still says what its step passed -----------
+
+
+def resumed_without_origin(shards, tmp_path, monkeypatch, capsys, line, value=VALUE):
+    """A shard whose first step passed NAME, its `pass-env.json` then deleted, and a `--resume` step whose line
+    declares `line` (names, or None for no option) with the node holding `value`: what that step said when refused."""
+    first_step(shards, tmp_path, monkeypatch)
+    origin_file(tmp_path).unlink()
+    node_holds(monkeypatch, value)
+    monkeypatch.setenv(OTHER, value)
+    return refused_step(shards, tmp_path, capsys, step_args(tmp_path, line, resume=True))
+
+
+def test_o63_a_resume_declaring_nothing_after_the_origin_was_deleted_is_refused_naming_the_variable(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: the rule that a shard's variables keep one value for its whole life is held by its origin file, and by the
+    archive manifest that records what its step passed: with the file deleted, a resume that declares nothing was
+    accepted (and its archive then recorded no variable). It is compared with the manifest instead, and refused,
+    naming the variable and no value; the archive is as it was and no origin was made."""
+    said = resumed_without_origin(shards, tmp_path, monkeypatch, capsys, None)
+    assert NAME in said
+    assert VALUE not in said
+    assert manifest_of(tmp_path)["pass_env"] == {NAME: VALUE}
+    assert not origin_file(tmp_path).exists()
+    assert not (tmp_path / "results" / "fed-a" / "running.json").exists()
+
+
+def test_o63_a_resume_with_another_value_after_the_origin_was_deleted_is_refused_naming_only_the_variable(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: the manifest records the values too, so a deleted origin does not make a changed value acceptable (a
+    names-only comparison would have let the resume write a new origin holding it)."""
+    said = resumed_without_origin(shards, tmp_path, monkeypatch, capsys, [NAME], value=CHANGED)
+    assert NAME in said
+    assert VALUE not in said
+    assert CHANGED not in said
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_resume_adding_a_variable_after_the_origin_was_deleted_is_refused_naming_it(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: a name the first step did not pass is named, and the one it did is not."""
+    said = resumed_without_origin(shards, tmp_path, monkeypatch, capsys, [NAME, OTHER])
+    assert OTHER in said
+    assert NAME not in said
+    assert VALUE not in said
+
+
+def test_o63_a_resume_matching_the_archive_manifest_after_the_origin_was_deleted_continues_and_restores_it(
+    shards, tmp_path, monkeypatch
+):
+    """O63: the same names and values as the manifest records are what the first step passed: the shard continues, and
+    the origin is written again with them (as a first step writes it), so the rule holds from there on."""
+    first_step(shards, tmp_path, monkeypatch)
+    origin_file(tmp_path).unlink()
+    node_holds(monkeypatch)
+    run, seen = dispatcher()
+    assert shards.step(step_args(tmp_path, [NAME], resume=True), runner=run, core_found=lambda path: True) == 0
+    assert seen["env"][NAME] == VALUE
+    assert json.loads(origin_file(tmp_path).read_text())["pass_env"] == {NAME: VALUE}
+
+
+@pytest.mark.parametrize("damage", ["not json", "no shard", "of another shard", "a value that is no value"])
+def test_o63_an_archive_manifest_that_cannot_say_what_was_passed_refuses_a_step_with_no_origin(
+    shards, tmp_path, capsys, monkeypatch, damage
+):
+    """O63: with the origin gone, the manifest is the only record: one that cannot be read as this shard's, or that
+    holds a value a variable may not carry, is never taken for "nothing was passed"."""
+    first_step(shards, tmp_path, monkeypatch)
+    origin_file(tmp_path).unlink()
+    path = tmp_path / "results" / "fed-a.out.json"
+    record = json.loads(path.read_text())
+    if damage == "not json":
+        path.write_text("{")
+    elif damage == "no shard":
+        del record["shard"]
+        path.write_text(json.dumps(record))
+    elif damage == "of another shard":
+        record["shard"] = {"index": 2, "count": 2, "label": "fed-b"}
+        path.write_text(json.dumps(record))
+    else:
+        record["pass_env"] = {NAME: ["x"]}
+        path.write_text(json.dumps(record))
+    node_holds(monkeypatch)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, None, resume=True))
+    assert "out.json" in said
+    assert VALUE not in said
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_shard_that_passed_nothing_resumes_with_nothing_as_before(shards, tmp_path, monkeypatch):
+    """O63: no origin and an archive manifest with no `pass_env` is a first step that passed nothing: a resume that
+    declares nothing continues, as it always did."""
+    first_step_passing_nothing(shards, tmp_path, monkeypatch)
+    run, _ = dispatcher()
+    assert shards.step(step_args(tmp_path, resume=True), runner=run, core_found=lambda path: True) == 0
+    assert not origin_file(tmp_path).exists()

@@ -67,8 +67,10 @@ asks Slurm anything or records its node, and the fleet's `step`. A declared vari
 step did not pass and one it passed that the line no longer carries are refused, naming the variable and never either
 value (status 73 for `step`); a record that cannot be read as the shard's is refused too, never taken for none. With
 no record and no results (an archive or a snapshot) the shard has had no first step: nothing is compared. A shard with
-results and no record had a first step that passed nothing, so a step that now passes a variable adds one mid-shard
-and is refused the same way. `plan` and `lines` print first steps' lines and are not compared.
+results and no record either had a first step that passed nothing or lost the record: its latest archive's manifest says
+which (`archived_pass_env`: names and values, or a refusal when it cannot be read as the shard's), and a step is
+compared with that, so a deleted record lifts no rule; a step that passes a variable the manifest does not hold adds
+one mid-shard and is refused the same way. `plan` and `lines` print first steps' lines and are not compared.
 
 **One campaign across federations (C06).** A space is the same experimental condition across federations only when
 its declared identity and its data identity match, and the campaign fingerprint holds a space's data identity only when
@@ -428,6 +430,7 @@ PASS_ENV_OWN = frozenset({*ALLOWLIST, "HOME", "TMPDIR", *home_env(NO_HOME)})  # 
 # that step once it holds the shard's running mark, and read by every later step, `resume-line` and the fleet's step.
 PASS_ENV_ORIGIN, PASS_ENV_ORIGIN_FORMAT = "pass-env.json", "expcore-hpc-shard-pass-env/1"
 PASS_ENV_ORIGIN_MAX = 1 << 16  # a record is a few names and short words: anything longer is not one
+ARCHIVE_MANIFEST_MAX = 1 << 20  # an archive manifest holds a few records of a step: anything longer is not one
 SNAPSHOT_NAME = re.compile(r"snap-\d{6,}")  # a snapshot's directory (`out_snapshot`'s, which this file loads late)
 
 
@@ -604,24 +607,59 @@ def shard_has_results(results: Path, label: str) -> bool:
         return False
 
 
+def archived_pass_env(results: Path, spec: Mapping[str, Any]) -> dict[str, str] | None:
+    """The name and value of each variable the shard's latest archive says its step passed (the `pass_env` of
+    `<label>.out.json`, which `archive` writes: none in a manifest of a step that passed nothing), or None when the
+    shard has no archive (a snapshot alone, or nothing). The manifest is read as a regular file, never through a link,
+    and up to `ARCHIVE_MANIFEST_MAX` bytes. `ShardsError` naming the manifest, never a value, when there is an archive
+    and its manifest cannot be read as this shard's, or holds a name or a value a variable may not carry: with the
+    shard's own record gone it is the only one, so what it cannot say is never taken for "nothing was passed"."""
+    label = str(spec["label"])
+    manifest = results / f"{label}.out.json"
+    if not any(os.path.lexists(results / f"{label}.out.{kind}") for kind in ("tar", "json")):
+        return None
+    unreadable = ShardsError(
+        f"shard {label}: its archive manifest ({manifest.name}) cannot be read as this shard's, so the variables its "
+        f"first step passed cannot be checked ({PASS_ENV_ORIGIN} is gone)"
+    )
+    try:
+        with _open_plain(manifest, label) as handle:
+            raw = handle.read(ARCHIVE_MANIFEST_MAX + 1)
+        record = json.loads(raw) if len(raw) <= ARCHIVE_MANIFEST_MAX else None
+    except (OSError, ValueError):
+        raise unreadable from None
+    values = record.get("pass_env", {}) if isinstance(record, dict) else None
+    if (
+        not isinstance(record, dict)
+        or record.get("shard") != dict(spec)
+        or not isinstance(values, dict)
+        or any(pass_env_name_problem(name) or pass_env_value_problem(name, value) for name, value in values.items())
+    ):
+        raise unreadable
+    return dict(values)
+
+
 def check_pass_env_origin(results: Path, spec: Mapping[str, Any], given: Mapping[str, str]) -> None:
     """A shard's declared variables keep the values its first step passed, for the shard's whole life: `given` (the
     name and value of each variable a later step would pass: a resume, a plain launch after a first step killed before
     it archived anything, a fleet's step) must be exactly what that step recorded. `ShardsError` naming each variable
     that is not, one that is added or dropped included, and never a value, before anything is launched. A shard with
     no record (`read_pass_env_origin`) and no results (`shard_has_results`) has had no first step: nothing is compared.
-    One with results and no record had a first step that passed nothing, so a variable it now passes is one added
-    mid-shard: refused the same way."""
+    One with results and no record either had a first step that passed nothing, or has lost the record: its latest
+    archive's manifest says which (`archived_pass_env`), and `given` is compared with what that records, values
+    included, so that deleting the record lifts no rule. With a snapshot alone and no archive, the first step passed
+    nothing as far as anything says, so a variable it now passes is one added mid-shard: refused the same way."""
     label = spec["label"]
     recorded = read_pass_env_origin(results, spec)
     if recorded is not None:
-        changed = sorted(name for name in {*recorded, *given} if recorded.get(name) != given.get(name))
         why = f"recorded in {PASS_ENV_ORIGIN}"
-    elif given and shard_has_results(results, str(label)):
-        changed = sorted(given)
-        why = f"the shard has results and no record of any variable ({PASS_ENV_ORIGIN})"
+    elif shard_has_results(results, str(label)):
+        recorded = archived_pass_env(results, spec) or {}
+        why = (f"recorded in the shard's archive manifest, {PASS_ENV_ORIGIN} being gone" if recorded
+               else f"the shard has results and no record of any variable ({PASS_ENV_ORIGIN})")  # fmt: skip
     else:
         return
+    changed = sorted(name for name in {*recorded, *given} if recorded.get(name) != given.get(name))
     if changed:
         many = len(changed) > 1
         raise ShardsError(
