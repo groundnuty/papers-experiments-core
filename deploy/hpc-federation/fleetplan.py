@@ -221,6 +221,18 @@ def load(path: Path) -> shards.Plan:
         raise FleetError(f"the fleet's shard manifest: {error}") from None
 
 
+def require_core(plan: shards.Plan) -> None:
+    """Refuse a plan whose interpreter imports a core that `expcore run` would refuse to start on: its commit unknown
+    or its install stale (C06). The fleet builds its lines with `shards.step_argv` and never goes through
+    `shards.py plan`, which makes this check, so it asks the same: the manifest's `python`, as the steps will run."""
+    try:
+        refusal = shards.core_refusal(shards.identify_core(plan))
+    except shards.ShardsError as error:
+        raise FleetError(str(error)) from None
+    if refusal:
+        raise FleetError(refusal)
+
+
 def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None) -> List[str]:
     """The login node's srun line of one shard (`shards.step_argv`) on the federation the manifest gives it, which must
     be `root` when one is given (the federation the fleet's record gives it, and checked)."""
@@ -301,4 +313,6 @@ def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], re
                     "every reset there takes the full reads, its first included")  # fmt: skip
         argv, fed = target_of(plan, label, again, root_of(directory, holder))
         found.append(Launch(label, holder, argv, again, note, str(fed["job"]), str(fed["name"])))
+    if found:  # a step that launches nothing reads no core; one that would launch asks first, as the plan did
+        require_core(plan)
     return found, said, refused
