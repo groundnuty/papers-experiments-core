@@ -467,6 +467,10 @@ over the same work directory, `exec.sh` beside a running service, and every stop
 stop_seconds` is to be set) are the live slot's. The agent's node's step (M5) is not built here. A layout with a shared
 import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
 
+## An observed read of the services (`hpcobserve.py`)
+
+`python -I -B hpcobserve.py --root <root>` prints one JSON line (`expcore-hpc-observe/1`) for the zone and each provider the state file lists: whether the service's step runs, its start, its end and its exit, as Slurm shows them now, by the step's EXACT id (`hpcslurm.Slurm.step_observed`: `squeue -s` and `sacct`; an id neither listed nor recorded, or the two disagreeing, is unknown with the reason, never running). The state file names the step to start from (`services.<n>.step`, `launch`, `stops`); a service whose step name is listed under another id than the state's is read as the listed one (`state_differs`). It runs where Slurm's client commands answer, the login node, and does nothing but `squeue` and `sacct`: it changes no job, no step and no file, takes no lock, and prints no node, address or path. `expcore_onedata.fedwatch` runs it for a study's post-check and adds each service's own `/configuration` answer and the cross-check against the fault journal and the state's recorded stops (O86; `docs/interfaces.md`, "The platform layer's read of the federation's own services"). The `status` verb is not used: it launches a control step and may record state.
+
 ## The scripts
 
 | Script | Where | Purpose |
