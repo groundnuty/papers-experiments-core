@@ -483,6 +483,14 @@ section 3).
   state file (`study_artifacts_tree_sha256`, beside the site's `study_artifacts`) to the core's phase, so `[hpc] core =
   "step"` has it though a node's environment is an allowlist, and the core never reads the tree again. A layout with no
   platform template writes no record and reads no tree; each federation of a fleet reads the tree itself.
+- **`[placement]` is always in the rendered file, complete** (O79): the platform layer requires it, and a reader that
+  finds none patches in a default of its own. The core has no default for `holder`, so every template declares it
+  (`placement = { holder = "..." }`, a provider the template declares) and `up` refuses one that does not, before
+  anything is submitted, naming the key (`hpcplacement.py`). The render keeps what the template declares and writes
+  every other setting at the core's default beside it, read from `PlacementSettings` (never a copy of the numbers),
+  where the template declares the table: as one `placement = { ... }` line of the root or one `[placement]` table
+  (any other spelling is refused). So every reader, a shard's step and an ingest tool alike, reads the same file, and
+  none patches a default table in on its own.
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
