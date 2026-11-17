@@ -648,9 +648,12 @@ starts.
 **Copy the shards' results back and verify them: required, after `collect` and before `down`.** Nothing durable may live only
 on the cluster's scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all of scratch after 20 days with no job submitted (take your site's own limits; these are the ones this
 step was written against). The cluster cannot push to your host, so you pull. Run `collect` once every step has ended
-(a journal still being written is listed as `collect` read it). It writes `archives.sha256.json` in `<results>` and
-prints that file's SHA-256 on stderr, after the merge line; keep that line. From your own host, pull the whole results
-directory and check it:
+(a journal still being written is listed as `collect` read it) **and while the federation is still up**: `down` removes
+the federation's root, and `collect` archives from it. It writes `archives.sha256.json` in `<results>` last, and prints
+that file's SHA-256 on stderr, after the merge line; keep that line. `collect` is atomic: it unpacks and checks every shard
+in a private directory beside `--into`, and only then moves the trees in, so a refused collect (an archive that holds
+something besides `out/`, a root that is not whole) leaves `--into` exactly as it found it and writes no manifest. From your
+own host, pull the whole results directory and check it:
 
 ```bash
 rsync -a <login node>:<results>/ <local dir>/    # or scp -r: the whole directory, with its subdirectories
@@ -665,7 +668,20 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 | `<label>.out.tar` | the shard's `out/`, which the merge reads | the results |
 | `<label>.out.json` | the archive's manifest (its SHA-256, the exit status, the post-run record) | what the archive is |
 | `<label>/journals/*` (every file) | a spend journal per step (`expcore run --spend-journal`) | what a step killed outright spent, which `--resume` counts as `lost_in_kill`: nowhere else |
+| `<label>.root.tar` | the federation's **root evidence**: the state (`hpc-federation.json`), `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml`, the fault journal's `*.jsonl` and the fault relay's `late-steps.jsonl` and request, taken and answer files (those present). **An allow-list: never `secrets/`, a file holding a token, key or password, the CA, or the live state of the relay and journal** | what `down` removes with the root, and the study's post-check and the facts read: nowhere else once the root is gone |
+| `<label>.root.json` | the root archive's manifest (its SHA-256 and size, and each file's name, size and SHA-256) | what the root archive is |
 | `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one, and `collect --run` refuses |
+
+**`down` refuses a root whose evidence was not collected.** `shards.py step` leaves `shard-steps/<label>.json` in its
+federation's root when a step starts (the shard's spec and a count; a step that cannot write it does not start), and
+`collect` writes `evidence-collected.json` there, naming the root archive's SHA-256 and the digest of those records.
+`hpcfed.py down` reads them first, before it stops or cancels anything: a root with step records and **no current marker**
+is refused, naming the shards, and stays whole so that a `collect` can still read it. A step that started after the
+collect (a resume) makes the marker stale and `down` refuses again until `collect` is run again. A root where no step ever
+ran goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
+down's output then says which shards' evidence was discarded. (`fleet.py down` takes no such flag: it reports the refusal,
+and `hpcfed.py down --discard-evidence` is run for that root by hand.) A `collect` after the root is gone (a down that
+followed an earlier collect) lists the root archive that collect wrote, if it still verifies, and refuses otherwise.
 
 Every other snapshot is resume material and **not part of the required pull.** A snapshot names the archive its step
 started from (`shards.py`, `_run_step`: `facts = {"shard": spec, "base": base}`), and `--resume` restores the newest one
