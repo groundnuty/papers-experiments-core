@@ -20,7 +20,9 @@ from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
 from expcore_onedata.sandbox.settings import MountSettings
 
 KEY = "mount_refused"
-OTHERS = sorted(set(facts.FACTS) - {KEY})
+# a run of the default work disk, the directory, lists none of the image's keys (O71, `facts.WORK_DISK_KEYS`)
+DIRECTORY = sorted(set(facts.FACTS) - ({k for keys in facts.WORK_DISK_KEYS.values() for k in keys} - {"disk_watch"}))
+OTHERS = sorted(set(DIRECTORY) - {KEY})
 
 
 @pytest.fixture
@@ -35,7 +37,7 @@ def recorded(box) -> list[str]:
 def test_o56_the_record_lists_every_departure_and_the_mount_refusal_only_when_asked():
     """O56: the key is stable and its text is looked up in `FACTS`; the list is sorted, with or without the key."""
     refused, accepted = facts.record(mount_refused=True), facts.record(mount_refused=False)
-    assert refused["facts"] == sorted(facts.FACTS)
+    assert refused["facts"] == DIRECTORY
     assert accepted["facts"] == OTHERS
     assert {**refused, "facts": None} == {**accepted, "facts": None}  # the rest of the record does not depend on it
     assert KEY in facts.FACTS
@@ -46,7 +48,7 @@ def test_o56_a_run_whose_sandbox_has_no_mount_helper_records_that_a_mount_is_ref
     """O56: a REST run, or a run with no data path, on a sandbox given no helper: a mount would be refused there."""
     box = start(FakeNode(), settings, make_spec(level))
     try:
-        assert recorded(box) == sorted(facts.FACTS)
+        assert recorded(box) == DIRECTORY
     finally:
         box.stop()
 

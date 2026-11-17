@@ -15,6 +15,10 @@ data on (`tmpfs` or `shared_filesystem`), which the HPC driver declares in `[san
 the list of keys, only for a platform that declares it, so a Compose federation's runs and an older platform's keep
 their record.
 
+The work disk's keys are conditional too (`WORK_DISK_KEYS`, O71): a run of `work_disk = "directory"` lists
+`disk_watch`, one of `"image"` lists `disk_watch_tmp` and `work_disk_unverified` until its start has proved the image,
+`work_disk_image` after; none lists another's.
+
 A cell's processes end with its exec here, its PID namespace ending with it, and on Docker since O72 too (the sandbox
 kills what a cell left once its `docker exec` returns), so the code tool's "State does not carry between calls" holds
 on both: that is no departure, and has no key.
@@ -84,7 +88,36 @@ FACTS: dict[str, str] = {
         "/work, /tmp and /dev/shm are directories on the node's tmpfs, charged to the step's memory: the watch "
         "walks them every disk_poll_s and kills the run's processes when one is past its size or its inode count "
         "(disk_limit), where Docker refuses the write with ENOSPC; a directory the cell makes unreadable to its own "
-        "uid is unknown to the walk and taken as past its size"
+        "uid is unknown to the walk and taken as past its size. The node gives an unprivileged user no file system "
+        'of a size of their own (no loop mount, no root); work_disk = "image" gives /work one (work_disk_image)'
+    ),
+    "disk_watch_tmp": (
+        "/tmp and /dev/shm are directories on the node's tmpfs, charged to the step's memory: the watch walks them "
+        "every disk_poll_s and kills the run's processes when one is past its size or its inode count (disk_limit), "
+        "where Docker refuses the write with ENOSPC; a directory the cell makes unreadable to its own uid is unknown "
+        "to the walk and taken as past its size. /work is the run's work disk image (work_disk_image)"
+    ),
+    "work_disk_image": (
+        "/work is a directory of an ext3 image of work_disk_bytes (rounded down to 2 MiB) that the run makes with "
+        "the node's mkfs.ext3 on its tmpfs and every cell binds (-B <image>:/work:image-src=/work), so a write past "
+        "its size is refused with ENOSPC and nothing is killed, as on Docker. Before the agent's first cell, the "
+        "first start of the driver on that boot of the node with that configuration had a cell write past the size "
+        "of an image made the same way and get ENOSPC (the full fill, work_disk.proof.kind full_fill), and kept that "
+        "proof owner-only on the node where no cell binds it; a later start relied on it (kind invariants, its id) "
+        "after checking the image's superblock, the size and mount type of /work as a cell sees it, and the copy "
+        "out of the image, and a proof missing, unreadable or whose invariants differed made the full fill run "
+        "again. At every start a file was copied out of the image as the outputs are, and the run's own image was "
+        "made afresh and shown a file system of its own of at most that size, or the start failed. How Apptainer "
+        "mounts it (the kernel's driver where the site's apptainer.conf allows setuid-mount extfs, fuse2fs "
+        "otherwise) is the node's. Its pages are charged to the step's memory as they are written, up to its size "
+        "(a full fill fills one whole image once, given back before the agent's first cell); the watch still walks "
+        "the image file's allocated size. It is ext3 where Docker's disk is ext4, and /work holds no lost+found, "
+        "which Docker's disk does. The outputs are copied out by the copy helper in an exec of the image, with "
+        "every refusal of Docker's copy"
+    ),
+    "work_disk_unverified": (
+        'the run asked for the work disk image (work_disk = "image") and its start had not yet shown a write past '
+        "/work's size refused with ENOSPC: a record that holds this key is of a start that did not complete"
     ),
     "cpu_affinity": (
         "cpus is a set of cores and Docker's --cpus a quota: every cell is pinned by taskset to the first ceil(cpus) "
@@ -123,20 +156,28 @@ FACTS: dict[str, str] = {
 
 
 DNS = "none"  # what a cell's name lookups reach (dns_none)
+# the keys of each work disk (O71): a run records its own and none of the others'; the directory's record is the one
+# every run had before the image existed
+WORK_DISK_KEYS = {
+    "directory": ("disk_watch",),
+    "image_unverified": ("disk_watch_tmp", "work_disk_unverified"),
+    "image": ("disk_watch_tmp", "work_disk_image"),
+}
 
 
-def record(*, mount_refused: bool, provider_storage: str | None = None) -> dict[str, Any]:
-    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up, and its name service.
-    `mount_refused` is listed only when the run's sandbox refuses a mount data path (the module's docstring). When the
-    platform declares where the federation's providers keep their data (`[sandbox.apptainer] provider_storage`, O57),
-    the record carries that kind as `provider_storage`: it shapes a run's I/O timing, so a reader of one run knows it,
-    and a run of a platform that declares none has no such key. The sandbox's metadata adds the watch's memory reading
-    (`memory`) once it exists."""
-    keys = sorted(key for key in FACTS if mount_refused or key != "mount_refused")
+def record(work_disk: str = "directory", *, mount_refused: bool, provider_storage: str | None = None) -> dict[str, Any]:
+    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up, and its name service. Of the work
+    disk's keys (`WORK_DISK_KEYS`) only its own are listed, and `mount_refused` only when the run's sandbox refuses a
+    mount data path (the module's docstring). When the platform declares where the federation's providers keep their
+    data (`[sandbox.apptainer] provider_storage`, O57), the record carries that kind as `provider_storage`: it shapes a
+    run's I/O timing, so a reader of one run knows it, and a run of a platform that declares none has no such key. The
+    sandbox's metadata adds the watch's memory reading (`memory`) once it exists."""
+    others = {key for keys in WORK_DISK_KEYS.values() for key in keys} - set(WORK_DISK_KEYS[work_disk])
+    keys = sorted(key for key in FACTS if key not in others and (mount_refused or key != "mount_refused"))
     out: dict[str, Any] = {"backend": "apptainer", "facts": keys, "dns": DNS}
     if provider_storage is not None:
         out["provider_storage"] = provider_storage
     return out
 
 
-__all__ = ["FACTS", "record"]
+__all__ = ["FACTS", "WORK_DISK_KEYS", "record"]

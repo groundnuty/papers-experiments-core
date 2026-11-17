@@ -16,6 +16,7 @@ import contextlib
 import ctypes
 import os
 import platform
+import re
 import signal
 import subprocess
 import threading
@@ -34,6 +35,8 @@ SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434
 PROC = Path("/proc")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 VERSION_S = 20.0
+BOOT_ID = PROC / "sys" / "kernel" / "random" / "boot_id"
+BOOT_ID_FORM = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 @dataclass(frozen=True)
@@ -157,6 +160,11 @@ class NodeOps(Protocol):
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         """Facts of the node for a record: its kernel and the version of `apptainer` (the command words). No name
         and no address."""
+        ...
+
+    def boot_id(self) -> str | None:
+        """This boot of the node: the kernel's random per-boot UUID (`/proc/sys/kernel/random/boot_id`), which names
+        neither the node nor its site; None when it cannot be read. What the work disk's kept proof is for (O71)."""
         ...
 
 
@@ -502,6 +510,13 @@ class LocalNode:
         done = self.apptainer([*apptainer, "--version"], VERSION_S)
         version = done.stdout.strip() if done.returncode == 0 else None
         return {"kernel": platform.release(), "apptainer": version[:80] if version else None}
+
+    def boot_id(self) -> str | None:
+        try:
+            found = _read(BOOT_ID).strip()
+        except OSError:
+            return None
+        return found if BOOT_ID_FORM.fullmatch(found) else None
 
 
 __all__ = ["LocalNode", "NodeOps", "Spawned"]
