@@ -49,7 +49,9 @@ def federation_roles(config: PlatformConfig) -> list[tuple[str, str]]:
     """Each value of the file that is its federation's own, paired with the role that names it in every federation:
     the zone's and each provider's URL and host, each provider's, space's and fixed user's id, the link check's space
     id, the tool server's clone and the platform file's directory. Longest first, so a URL is replaced before its host,
-    and a host that several roles share is the plain role `host`."""
+    and a host that several roles share is the plain role `host`. A host is a role only when it has a dot or a colon
+    (a domain name or an address): a single label (`read`) could be an option's own value, and two lines that differ
+    in that value must never become one, so it is left as written, which can only keep two federations apart."""
     from urllib.parse import urlsplit  # only here: what a word of a command line holds of the federation
 
     roles: dict[str, str] = {}
@@ -59,11 +61,11 @@ def federation_roles(config: PlatformConfig) -> list[tuple[str, str]]:
             roles[value] = role if roles.get(value, role) == role else "host"
 
     add(config.zone.url, "zone")
-    add((urlsplit(config.zone.url).hostname or "").lower(), "zone-host")
+    add(_qualified((urlsplit(config.zone.url).hostname or "").lower()), "zone-host")
     for name, provider in config.providers.items():
         label = config.provider_label(name)
         add(provider.url, label)
-        add(provider.host, f"{label}-host")
+        add(_qualified(provider.host), f"{label}-host")
         add(provider.id, f"{label}-id")
     for entry in config.spaces:
         add(entry.space.id, f"{entry.position}-id")
@@ -76,6 +78,11 @@ def federation_roles(config: PlatformConfig) -> list[tuple[str, str]]:
         add(str(config.toolserver.clone), "clone")
     add(str(config.file.parent), "platform-dir")
     return sorted(roles.items(), key=lambda item: -len(item[0]))
+
+
+def _qualified(host: str) -> str | None:
+    """The host when it is a domain name or an address (a dot or a colon in it); a single label is no role: None."""
+    return host if "." in host or ":" in host else None
 
 
 def neutral_words(words: Any, roles: list[tuple[str, str]]) -> list[str]:

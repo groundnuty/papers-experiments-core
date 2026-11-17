@@ -235,6 +235,20 @@ def test_c06_a_federations_value_inside_a_longer_name_is_never_replaced_so_two_o
     assert whole == ["--relay=<zone-host>", "<zone-host>", "x:<zone-host>:1"]
 
 
+def test_c06_a_single_label_host_is_no_role_so_an_options_value_equal_to_it_stays_as_written(tmp_path, cas):
+    """C06: a zone host of one label (`read`) could be an option's own value, so it is no role: `--mode read` on a
+    federation whose zone is `read` and `--mode write` on one whose zone is `write` stay two lines, never one."""
+    lines = []
+    for host, mode in (("read", "read"), ("write", "write")):
+        values = {**FEDERATIONS[0], "zone_host": host}
+        mode_args = [platform('"--max-rows", "50"', f'"--max-rows", "50", "--mode", "{mode}"')]
+        config = load(edited(DOCKER, mode_args), tmp_path / host / "root", cas[0], values)
+        roles = runsettings.federation_roles(config)
+        assert host not in dict(roles)
+        lines.append(runsettings.neutral_words(config.toolserver.args, roles))
+    assert lines[0] != lines[1]
+
+
 def test_c06_a_new_tool_server_condition_is_refused_at_a_resume_and_is_no_growth(tmp_path, cas):
     """C06, a known limit: a condition added to `[toolserver.conditions]` is a new leaf of the platform's half, which
     the core never counts as growth (only the schema's sections grow), so a campaign that adds a condition needing a
