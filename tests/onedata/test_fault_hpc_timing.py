@@ -236,6 +236,18 @@ def test_o58_a_timing_is_checked_figure_by_figure_and_names_are_dropped():
     assert "secret-name" not in json.dumps(kept)
 
 
+def test_o58_a_timing_figure_beyond_a_floats_range_is_unknown_and_raises_nothing():
+    """O58 (Codex, 17 Nov 2026): a step's figure, or the verb's issue or answer, of 400 digits (a corrupt record) is no
+    number a float holds: it is unknown like a NaN, with its reason, and the rest of the timing is kept."""
+    huge = 10**400
+    steps = [{"word": "stop", "start_after_issue_s": huge, "end_after_answer_s": 1.5}]
+    kept = timing_evidence({"accounting": "read", "steps": steps, "issued_wall": huge, "answered_wall": 3})
+    assert (kept["issued_wall"], kept["answered_wall"]) == (None, 3.0)
+    (step,) = kept["steps"]
+    assert (step["start_after_issue_s"], step["end_after_answer_s"]) == (None, 1.5)
+    assert step["unknown"] == {"start_after_issue_s": "unknown"}
+
+
 # -- the heal's link restart ------------------------------------------------------------------------------------------
 
 
