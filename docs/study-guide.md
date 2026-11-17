@@ -1371,20 +1371,59 @@ Report the primary analysis as it stands and the sensitivity analysis beside it.
 
 If your study's omission scoring rests on which files the agent's scripts read, the scripts run in the agent's own cell, and a log file they write there is the agent's to read, rewrite and delete. The core gives the scripts a channel to a collector outside the cell instead (O91; the contract is in [`interfaces.md`](interfaces.md#the-read-log-the-read_log-instrument-and-its-channel)). Your canonical scripts do three things:
 
-- **Import the client by its fixed path**, `/expcore-readlog-client/expcore_readlog_client.py` (the cell runs `python -I`, so `PYTHONPATH` does nothing; there is no environment variable and no other socket to name).
+- **Import the client by its fixed path**, `/expcore-readlog-client/expcore_readlog_client.py` (the cell runs `python -I`, so `PYTHONPATH` does nothing; there is no environment variable and no other socket to name). A platform that did not declare the channel binds neither the client nor the socket, and both fail closed: the import raises `FileNotFoundError`, and a vendored copy of the client raises `ReadLogError` (no socket, ENOENT). Treat either as unread and return no data, so that a platform template that forgot to declare the channel shows at the first smoke cell and not as runs with silently missing logs.
 - **Log before they return data**, with `log_read(item, range=[start, stop], bytes=n, sha256=...)`: `item` is your own id of what was read, never a host path.
 - **Return no data when `log_read` raises** `ReadLogError`. The read is then "unread": the log is an upper bound on what the scripts handed out.
+- **Run each canonical script as its own process**, `python -I <script> <arguments>`, a program that prints what it returns, and never as a module the agent's code imports into its own process: code in the agent's process could then patch the script's client or `socket` and hide a real read. Patching needs code in the script's process, and only the script's own source runs there. Keep the scripts in a read-only input, never in `/work`, where the agent could change them.
 
 A script looks like this, in your own scripts' words:
 
-    import importlib.util as u
+    import importlib.util
+    import sys
 
-    spec = u.spec_from_file_location("expcore_readlog_client", "/expcore-readlog-client/expcore_readlog_client.py")
-    readlog = u.module_from_spec(spec)
-    spec.loader.exec_module(readlog)
-    data = read_the_bytes(item, start, stop)
-    readlog.log_read(item, range=[start, stop], bytes=len(data), sha256=sha256_of(data))  # raises: no data
-    return data
+    CLIENT = "/expcore-readlog-client/expcore_readlog_client.py"
+
+
+    def load_client():
+        spec = importlib.util.spec_from_file_location("expcore_readlog_client", CLIENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # FileNotFoundError when the platform bound no client
+        return module
+
+
+    def read(item, start, stop):
+        readlog = load_client()  # raises: nothing was read, so nothing is returned
+        data = read_the_bytes(item, start, stop)
+        readlog.log_read(item, range=[start, stop], bytes=len(data), sha256=sha256_of(data))  # raises: no data
+        return data
+
+
+    if __name__ == "__main__":
+        try:
+            sys.stdout.buffer.write(read(item, start, stop))
+        except Exception as error:  # the client is missing, or ReadLogError: unread, nothing is returned
+            sys.exit(f"unread: {error.__class__.__name__}")
+
+On a platform that bound no client (this guide's own run is one), the import is what fails:
+
+```python
+import importlib.util
+
+
+def the_client_is_not_bound_here():
+    spec = importlib.util.spec_from_file_location(
+        "expcore_readlog_client", "/expcore-readlog-client/expcore_readlog_client.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except FileNotFoundError:
+        return True  # the script treats this as unread and returns no data
+    return False
+
+
+assert the_client_is_not_bound_here()
+```
 
 The log reaches your record as a side file you declare: `pattern = "read_log.jsonl"` and `hash_field = "instruments.read_log.side_sha256"` in a `[[study.side_files]]` table ([Side files](#side-files)). Your executor builds `ReadLog(sandbox, nonce, expected_peer_uid)` among the run's instruments, which reads the collector's log once, after the backend has stopped the collector, and puts it beside the record with `stage_harness_side_file` (the log was never in `/work`, so `stage_side_file` does not apply):
 
@@ -1452,7 +1491,7 @@ stage_the_read_log()
 
 **On Docker, ask for the channel.** The Docker sandbox starts the collector only when the run's `SandboxSpec` has `read_log=True` (the Apptainer backend starts it when its settings declare the collector's pin). The sandbox then has `read_log()` (the log's bytes once `collect` has stopped the collector, else None), `readlog_nonce` and `readlog_expected_peer_uid`, the three things `ReadLog(sandbox, sandbox.readlog_nonce, sandbox.readlog_expected_peer_uid)` takes, and `collect` copies the log to `readlog.jsonl` (`readlog_log` in its result). The collector's sender rule on Docker is the declared agent uid, so run the scripts as the agent's user, as the code tool does. Linux hosts only.
 
-**An unknown log is unknown reads.** The log is intact only with a start line of this run, matching end counts, no cap reached, no malformed line, the canary as its first record and every sender the expected uid. A collector that was killed, a log past its cap or a datagram that was no record gives `"log": "unknown"` with the reasons and `counts` None; score the run's reads as unknown, never as fewer. A forged read cannot be prevented (the agent's own code can call the client), only detected, by the read-log scan and, on a REST data path, by the gate's per-file table of what it served. An agent that reads the data some other way than through your scripts leaves no record: decide in the design whether such a read scores as an omission. Code that runs in a script's own process can patch the client or the standard library so that a real read is not logged: the scan reads the text of the agent's code and does not match a patch of the standard library, but on a REST data path the gate's table of served files shows the read.
+**An unknown log is unknown reads.** The log is intact only with a start line of this run, matching end counts, no cap reached, no malformed line, the canary as its first record and every sender the expected uid. A collector that was killed, a log past its cap or a datagram that was no record gives `"log": "unknown"` with the reasons and `counts` None; score the run's reads as unknown, never as fewer. A forged read cannot be prevented (the agent's own code can call the client), only detected, by the read-log scan and, on a REST data path, by the gate's per-file table of what it served. An agent that reads the data some other way than through your scripts leaves no record: decide in the design whether such a read scores as an omission. Code that runs in a script's own process can patch the client or the standard library so that a real read is not logged, which is why each canonical script runs as its own process (above). **The scan is a heuristic** over the text of the agent's code: it matches the channel's names, Unix datagram sockets, ways to find the socket, and patches of the socket or the client (edits of `sys.modules`, mock patches), and code built at run time passes it. On a REST data path the gate's per-file table of served files, which the agent cannot reach, is the backstop: it shows a read the log lacks.
 
 ### The mount on HPC: guarded and reported, not isolated
 

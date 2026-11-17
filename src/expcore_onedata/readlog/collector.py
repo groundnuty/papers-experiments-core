@@ -237,9 +237,8 @@ def open_socket(sock_dir, peer_uid):
     except OSError as error:
         refuse(f"cannot bind the socket ({error})")
     if peer_uid != os.getuid():
-        os.chmod(
-            where, 0o666
-        )  # another uid's sender must be able to connect; the directory is what bounds who can see it
+        # another uid's sender must be able to connect: the directory, empty but for this socket, bounds who sees it
+        os.chmod(where, 0o666)
     return sock, where
 
 
