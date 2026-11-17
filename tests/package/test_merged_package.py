@@ -115,9 +115,10 @@ def test_c29_the_package_of_a_merged_batch_holds_every_snapshot_and_passes_its_o
 
 def test_l08_the_local_log_is_in_no_package_whatever_the_patterns_and_wherever_it_lies(campaign, hashes, tmp_path):
     """L08: the text a withheld start diagnostic leaves in `out/logs/harness-errors.log` is in no package, though the
-    spec names `out` whole and the log lies at `out/logs`, beside a shard's snapshot and where a shard's unpacked
-    `out/` was put. The scan reads every member's name and every member's bytes; the control is a line the package
-    does take, which the same scan finds, and the package still passes its own check."""
+    spec names `out` whole and the log lies at `out/logs`, beside a shard's snapshot and where a shard's unpacked `out/`
+    was put (the ignore file the core writes beside a log holds no text and may ship from the last two). The scan reads
+    every member's name and every member's bytes; the control is a line a file the package does take holds, which the
+    same scan finds, and the package still passes its own check."""
     root = copy_campaign(campaign, tmp_path, "logged").root
     for where in ("out/logs", "out/shards/1/logs", "out/shards/1/out/logs"):
         (root / where).mkdir(parents=True)
@@ -130,7 +131,8 @@ def test_l08_the_local_log_is_in_no_package_whatever_the_patterns_and_wherever_i
     archive = build_package(root, tmp_path / "dist", hashes=hashes)
     with tarfile.open(archive) as members:
         names = members.getnames()
-    assert not [name for name in names if "harness-errors.log" in name or "logs" in name.split("/")]
+    assert not [name for name in names if name.endswith("harness-errors.log")]  # by its name, wherever it lies
+    assert not [name for name in names if name.startswith(f"{NAME}/out/logs")]  # and the campaign's directory whole
     package = unpack(archive, tmp_path / "unpacked")
     files = every_byte(package)
     assert [name for name, data in files.items() if SHIPPED.encode() in data] == ["README.md"]
