@@ -8,6 +8,7 @@
     <python> -I -B deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
     # a step's line may end in: --pre-step REL --pre-step-sha256 HEX --pre-step-timeout S  (`lines` writes them)
     #   and: --expect-render-identity REL --expect-render-identity-sha256 HEX  (the render the plan expects)
+    #   and, for each variable the manifest's pass_env declares: --pass-env NAME, its NAME=VALUE among the env -i words
     <python> -I -B deploy/hpc-federation/shards.py resume-line --manifest M --label L --job J --node N
     <core python> -I -B deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
 
@@ -36,6 +37,19 @@ that file
 declares the Apptainer sandbox, `step` makes its `work_root` (mode 0700) before the dispatcher, which the sandbox will
 not start without; it refuses one that is a link, not this user's, open to others, or not under `--tmpfs` (the node's
 tmpfs: never the shared filesystem).
+
+**The operator's own variables (`pass_env`, O63).** The one addition to that environment is what the manifest
+declares: variables of the operator's the study needs in its dispatcher's environment, such as the operator's half of a
+fault sanction (`pass_env = ["NAME", ...]`, names only). `plan`, `lines` and `resume-line` read each name's value from
+the operator's environment (`pin_pass_env`) before anything is printed or recorded, and refuse, naming the variable and
+never the value, a name that looks like a secret (KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL, AUTH) or is one the
+step sets itself (`PASS_ENV_OWN`, anything of EXPCORE_ or PYTHON), a variable that is unset and a value outside
+`[A-Za-z0-9._:=,+-]` (at most 128). Each line pins the value as an `env -i` word `NAME=VALUE` and declares it as
+`--pass-env NAME`; `step` (`check_pass_env`, its first act) passes the dispatcher exactly those, refusing with
+`PRE_STEP_REFUSED` a declaration its line gives no plain value for, and records each name and value in `step.json` and
+the archive's manifest. The post-run script runs in the dispatcher's environment and sees them; the guard does not.
+`step` never reads the manifest, so `collect` refuses a shard whose manifest lacks a declared name or holds an
+undeclared one (`pass_env_problem`): a line that dropped a declaration with its word.
 
 **One campaign across federations (C06).** A space is the same experimental condition across federations only when
 its declared identity and its data identity match, and the campaign fingerprint holds a space's data identity only when

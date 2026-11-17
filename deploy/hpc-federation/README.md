@@ -743,6 +743,35 @@ that leaves none. A federation whose `up` wrote no record (one brought up before
 template) and a plan that expects none run as they did and write none; `collect` and the core's `merge` take an
 `out/` with the directory as it is (the merge reads `out/runs` alone).
 
+**The operator's own variables: `pass_env` (O63).** A step's environment is an allowlist, so no variable of the
+operator's reaches the dispatcher. A study's fault sanction has two halves, the configuration's (`sanctioned = true` in
+`platform.toml`) and the operator's, a variable in the dispatcher's environment; without it every fault-injecting run
+launched through `shards.py` is refused. The manifest declares such variables by name, and only by name:
+
+    pass_env = ["FAULT_ACK_MODE"]   # an invented name; each once; the value is the operator's, read when `lines` runs
+
+A name matches `^[A-Z][A-Z0-9_]{0,63}$`, contains none of KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL or AUTH
+(any case, anywhere in it) and is none the step sets itself: the allowlist's, `HOME`, `TMPDIR`, the XDG, Apptainer, uv,
+pip and git variables of its own home, anything starting `EXPCORE_` or `PYTHON`. `plan` and `lines` read each value
+from the environment they run in before any line is printed (`resume-line` the same, before it records its node); a
+variable that is unset, or whose value is not `^[A-Za-z0-9._:=,+-]{0,128}$` (so no space, slash, quote or shell
+character), refuses them naming the variable and never the value. Each line then pins the value: an `env -i` word
+`NAME=VALUE` after the step's own, and `--pass-env NAME` at the end of the step's arguments; `plan` prints
+`pass_env: {NAME: VALUE}` beside each line. What the operator's environment holds when the step starts is not read, so
+a step cannot gain or change one. With no `pass_env` the lines and the plan are what they were, word for word.
+
+`step` checks again, as its first act (before the render identity and the guard), what `lines` checked, since a line
+can be edited: each name declared with `--pass-env` must be one it may pass, be given by an `env -i` word with a plain
+value and be declared once, or the step ends with status 73 (`PRE_STEP_REFUSED`), naming the variable, with nothing
+made. The dispatcher's environment is then the allowlist, the step's home and `TMPDIR` and exactly those variables; a
+variable the node holds that the line did not declare never reaches it. The post-run script runs in the dispatcher's
+environment and sees them too; the pre-step guard, which runs before anything is made, does not. `step.json` and the
+archive's manifest hold each passed name and value as `pass_env`. `step` never reads the manifest, so it cannot see a
+line that dropped a declaration together with its word (the same as the render identity's two words, above): `collect`
+refuses a shard whose manifest lacks a name the plan declares, or holds one it does not, naming the shard and the
+variable, as it refuses one whose line dropped the post-run script. A dropped sanction variable also fails closed: the
+study's own refusal stops the run.
+
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into
 `<results>/<label>/snapshots/` every `snapshot_every_s` seconds (a manifest key, 900 by default, at least 60) and after

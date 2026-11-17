@@ -499,6 +499,7 @@ def test_o63_a_run_that_needs_the_operators_sanction_is_refused_without_the_key_
     assert run_line(shards, monkeypatch, old, run) == 3  # the sanction's second half never reached the dispatcher
     assert NAME not in seen["env"]
     assert not list((tmp_path / "old" / "results").glob("*.out.*"))  # no archive: the run never started
+    monkeypatch.setenv(NAME, VALUE)  # the operator's shell, where `lines` runs again (the node's was emulated above)
     lines = printed(shards, tmp_path / "new", capsys, "lines", DECLARED)
     for line in lines:
         run, seen = dispatcher(shards, STUB)
