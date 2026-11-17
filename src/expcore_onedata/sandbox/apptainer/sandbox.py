@@ -128,7 +128,10 @@ class ApptainerSandbox:
             "data_path": spec.mode.value,
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,
             "backend": self.app.record() if self.app is not None else {"backend": "apptainer"},
-            "infrastructure_facts": facts.record(mount_refused=self._mount_refused()),
+            "infrastructure_facts": facts.record(
+                mount_refused=self._mount_refused(),
+                provider_storage=self.app.provider_storage if self.app is not None else None,
+            ),
             "images": {},
             "tls": settings.tls.record(),
             "certifi": None,

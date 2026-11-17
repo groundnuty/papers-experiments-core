@@ -108,6 +108,7 @@ from expcore_onedata.sandbox.containers import (
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr, stderr_digest
 from expcore_onedata.sandbox.observe import Observer
 from expcore_onedata.sandbox.oneclient_args import DIRECT
+from expcore_onedata.sandbox.oneclient_build import sidecar_build
 from expcore_onedata.sandbox.oneclient_log import summarize as summarize_oneclient_log
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -666,6 +667,9 @@ class DockerSandbox:
         self._meta["mount"]["image_config"] = image_config_record(started.stdout if started.returncode == 0 else None)
         self._remove_token_files(self.dir / TOKEN_FILE)  # oneclient read it as it started; its bind outlives this copy
         self.watch_container("sidecar", names.sidecar)
+        build = sidecar_build(self.host, names.sidecar, s.oneclient.id)  # O65: execs in the running sidecar, never a cp
+        with self._meta_lock:  # `metadata()` may be reading it from another thread
+            self._meta["mount"]["oneclient_build"] = build
         return share
 
     def _one_shot_name(self) -> str:
