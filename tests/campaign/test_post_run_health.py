@@ -133,6 +133,17 @@ def test_o90_a_marker_nested_past_the_interpreters_limit_cannot_be_trusted_and_n
         read_marker(tmp_path, "k", 1)
 
 
+def test_o90_the_nesting_and_the_number_of_values_of_a_reading_are_bounded():
+    """O90: a reading nests at most `READING_MAX_DEPTH` deep and holds at most `READING_MAX_NODES` values, counted
+    before anything is serialised, so a cycle, a wide list and a deep one are refused the same way."""
+    assert prerun.reading_of(nested(prerun.READING_MAX_DEPTH - 2)) is not None
+    assert prerun.reading_of(nested(prerun.READING_MAX_DEPTH)) is None
+    assert prerun.reading_of({"wide": list(range(prerun.READING_MAX_NODES))}) is None
+    cycle: dict = {}
+    cycle["self"] = cycle
+    assert prerun.reading_of(cycle) is None
+
+
 def test_o90_the_helper_keeps_a_small_json_object_and_nothing_else():
     """O90: `prerun.reading_of` answers the reading when it is a JSON object within `READING_MAX_BYTES`, else None."""
     assert prerun.reading_of(READING) == READING

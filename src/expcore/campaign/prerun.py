@@ -33,6 +33,8 @@ _NOTE: ContextVar[dict[str, Any] | None] = ContextVar("expcore_prerun_note", def
 UNCHECKED = "unchecked"  # the key of a note whose campaign has no health check: no pre-run check will write to it
 HEALTH_READING = "health_reading"  # the key a platform's check notes its structured reading of the platform under
 READING_MAX_BYTES = 16_384  # the most a reading's JSON text may be for the attempt to keep it
+READING_MAX_DEPTH = 16  # the deepest a reading may nest (a platform's reading is a shallow object)
+READING_MAX_NODES = 4_096  # the most values a reading may hold, walked before anything is serialised
 
 
 @contextlib.contextmanager
@@ -47,14 +49,33 @@ def opened(*, checked: bool = True) -> Iterator[dict[str, Any]]:
         _NOTE.reset(token)
 
 
+def _shallow(value: Any) -> bool:
+    """Whether `value` nests at most `READING_MAX_DEPTH` deep and holds at most `READING_MAX_NODES` values, walked with
+    a stack so that no nesting can exhaust the interpreter's recursion (a cycle ends at the depth bound). Serialising
+    first is no test: one dump of a list thousands deep succeeds where the marker's own, which writes it in pieces,
+    raises RecursionError."""
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    seen = 0
+    while stack:
+        item, depth = stack.pop()
+        seen += 1
+        if seen > READING_MAX_NODES or depth > READING_MAX_DEPTH:
+            return False
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list | tuple):
+            stack.extend((child, depth + 1) for child in item)
+    return True
+
+
 def reading_of(value: Any) -> dict[str, Any] | None:
     """The structured reading `value` is, as a detached copy, or None when it is not one: a JSON object (a dict whose
     contents are plain JSON values) of at most `READING_MAX_BYTES` of text. The attempt keeps the reading its post-run
     check noted under `HEALTH_READING` in its marker and in an event (`expcore.campaign.attempt`); a platform's reading
     is its own, and the core reads nothing in it."""
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or not _shallow(value):
         return None
-    try:  # nesting the interpreter cannot dump or load within its recursion limit is a RecursionError, not a ValueError
+    try:  # a RecursionError is no ValueError: nothing nested is serialised before the walk above has bounded it
         text = json.dumps(value, sort_keys=True, allow_nan=False)
         return json.loads(text) if len(text.encode("utf-8")) <= READING_MAX_BYTES else None
     except (TypeError, ValueError, RecursionError):
