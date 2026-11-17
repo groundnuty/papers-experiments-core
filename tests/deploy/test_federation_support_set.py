@@ -188,6 +188,33 @@ def test_o35_an_extra_supporter_is_refused_by_ensure_support_before_any_support_
     assert made == []
 
 
+def test_o35_ensure_support_makes_no_support_call_for_an_earlier_space_when_a_later_space_is_refused(fed, tmp_path):
+    """O35: alpha-space lacks elm, which up would add, and beta-space lists a provider it does not declare: the refusal
+    comes first and nothing was changed, since a support is never removed again."""
+    boot = compose_boot(fed, tmp_path, **{"alpha-space": ["pid-oak"], "beta-space": ["pid-oak", "pid-ash", "pid-elm"]})
+    boot.provider = lambda service, method, path, label, **options: {"fileId": "root"}
+    made = []
+    boot.support = lambda service, space, sid: made.append((service.name, space.name))
+    with pytest.raises(RuntimeError, match="space beta-space: supported by elm but the platform doesn't declare it"):
+        boot.ensure_support(5)
+    assert made == []
+
+
+def test_o35_ensure_support_names_every_refused_space_in_one_refusal(fed, tmp_path):
+    """O35: an extra supporter on the first space does not hide the one on the second."""
+    boot = compose_boot(
+        fed,
+        tmp_path,
+        **{"alpha-space": ["pid-oak", "pid-elm", "pid-ash"], "beta-space": ["pid-oak", "pid-ash", "pid-elm"]},
+    )
+    with pytest.raises(RuntimeError) as refused:
+        boot.ensure_support(5)
+    message = str(refused.value)
+    assert "space alpha-space: supported by ash but the platform doesn't declare it" in message
+    assert "space beta-space: supported by elm but the platform doesn't declare it" in message
+    assert message.index("space alpha-space") < message.index("space beta-space")
+
+
 class Steps:
     """A bootstrap that only records the steps the core takes, in order."""
 
