@@ -701,6 +701,66 @@ def test_o63_a_resume_with_the_same_values_proceeds_and_keeps_the_origin(shards,
     assert manifest_of(tmp_path)["pass_env"] == {NAME: VALUE}
 
 
+def first_step_passing_nothing(shards, tmp_path, monkeypatch):
+    """The shard's first step, run with a line that declares no variable: its archive, and no origin."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    run, _ = dispatcher()
+    assert shards.step(step_args(tmp_path), runner=run, core_found=lambda path: True) == 0
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_resume_that_adds_a_variable_to_a_shard_whose_first_step_passed_none_is_refused(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: a shard that has results (an archive) and no origin had a first step that passed nothing: a later step
+    that now passes a declared variable adds one mid-shard, a change of value, and is refused (73) naming the
+    variable and never its value, before anything is made; no origin is written and the archive is as it was."""
+    first_step_passing_nothing(shards, tmp_path, monkeypatch)
+    archived = manifest_of(tmp_path)
+    node_holds(monkeypatch)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, [NAME], resume=True))
+    assert NAME in said
+    assert VALUE not in said
+    assert manifest_of(tmp_path) == archived
+    assert not origin_file(tmp_path).exists()
+    assert not list((tmp_path / "tmpfs").iterdir())
+
+
+def test_o63_a_snapshot_alone_is_results_too_for_a_variable_added_mid_shard(shards, tmp_path, capsys, monkeypatch):
+    """O63: a shard killed before it archived anything has a snapshot and no archive: with no origin, a step that
+    passes a declared variable is refused as it is with an archive."""
+    (tmp_path / "results" / "fed-a" / "snapshots" / "snap-000001").mkdir(parents=True)
+    node_holds(monkeypatch)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, [NAME], resume=True))
+    assert NAME in said
+    assert VALUE not in said
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_resume_that_passes_nothing_after_a_first_step_that_passed_nothing_proceeds(
+    shards, tmp_path, monkeypatch
+):
+    """O63: the strict rule is about variables: a shard with results and no origin, resumed with a line that declares
+    none, is what it was, and writes no origin."""
+    first_step_passing_nothing(shards, tmp_path, monkeypatch)
+    run, _ = dispatcher()
+    assert shards.step(step_args(tmp_path, resume=True), runner=run, core_found=lambda path: True) == 0
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_variable_added_mid_shard_is_refused_by_the_writer_too_when_results_appeared_after_the_check(
+    shards, tmp_path
+):
+    """O63: the first step records its values only while the shard has no results: between its first check and its
+    claim of the running mark another step may have archived (passing nothing), and the writer refuses then."""
+    (tmp_path / "results").mkdir()
+    (tmp_path / "results" / "fed-a.out.json").write_text("{}")
+    with pytest.raises(shards.ShardsError, match=NAME) as caught:
+        shards.record_pass_env_origin(tmp_path / "results", SPEC_A, {NAME: VALUE})
+    assert VALUE not in str(caught.value)
+    assert not origin_file(tmp_path).exists()
+
+
 def test_o63_a_plain_relaunch_is_compared_too_when_the_first_step_left_only_its_origin(
     shards, tmp_path, capsys, monkeypatch
 ):

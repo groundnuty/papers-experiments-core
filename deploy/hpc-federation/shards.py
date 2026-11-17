@@ -60,8 +60,9 @@ record before anything is made or launched (`check_pass_env_origin`): `step` as 
 asks Slurm anything or records its node, and the fleet's `step`. A declared variable whose value differs, one the first
 step did not pass and one it passed that the line no longer carries are refused, naming the variable and never either
 value (status 73 for `step`); a record that cannot be read as the shard's is refused too, never taken for none. With
-no record (a first step, or one that passed nothing) nothing is compared. `plan` and `lines` print first steps' lines
-and are not compared.
+no record and no results (an archive or a snapshot) the shard has had no first step: nothing is compared. A shard with
+results and no record had a first step that passed nothing, so a step that now passes a variable adds one mid-shard
+and is refused the same way. `plan` and `lines` print first steps' lines and are not compared.
 
 **One campaign across federations (C06).** A space is the same experimental condition across federations only when
 its declared identity and its data identity match, and the campaign fingerprint holds a space's data identity only when
@@ -349,6 +350,7 @@ PASS_ENV_OWN = frozenset({*ALLOWLIST, "HOME", "TMPDIR", *home_env(NO_HOME)})  # 
 # that step once it holds the shard's running mark, and read by every later step, `resume-line` and the fleet's step.
 PASS_ENV_ORIGIN, PASS_ENV_ORIGIN_FORMAT = "pass-env.json", "expcore-hpc-shard-pass-env/1"
 PASS_ENV_ORIGIN_MAX = 1 << 16  # a record is a few names and short words: anything longer is not one
+SNAPSHOT_NAME = re.compile(r"snap-\d{6,}")  # a snapshot's directory (`out_snapshot`'s, which this file loads late)
 
 
 class ShardsError(Exception):
@@ -496,22 +498,40 @@ def read_pass_env_origin(results: Path, spec: Mapping[str, Any]) -> dict[str, st
     return dict(values)
 
 
+def shard_has_results(results: Path, label: str) -> bool:
+    """Whether the shard has an archive or a snapshot: what a start without `--resume` is refused for (`step`)."""
+    if any(os.path.lexists(results / f"{label}.out.{kind}") for kind in ("tar", "json")):
+        return True
+    try:
+        return any(SNAPSHOT_NAME.fullmatch(entry.name) for entry in (results / label / SNAPSHOTS).iterdir())
+    except OSError:
+        return False
+
+
 def check_pass_env_origin(results: Path, spec: Mapping[str, Any], given: Mapping[str, str]) -> None:
     """A shard's declared variables keep the values its first step passed, for the shard's whole life: `given` (the
     name and value of each variable a later step would pass: a resume, a plain launch after a first step killed before
     it archived anything, a fleet's step) must be exactly what that step recorded. `ShardsError` naming each variable
-    that is not, one that is added or dropped included, and never a value, before anything is launched. Nothing is
-    compared when the shard has no record of a first step (`read_pass_env_origin`)."""
+    that is not, one that is added or dropped included, and never a value, before anything is launched. A shard with
+    no record (`read_pass_env_origin`) and no results (`shard_has_results`) has had no first step: nothing is compared.
+    One with results and no record had a first step that passed nothing, so a variable it now passes is one added
+    mid-shard: refused the same way."""
+    label = spec["label"]
     recorded = read_pass_env_origin(results, spec)
-    if recorded is None:
+    if recorded is not None:
+        changed = sorted(name for name in {*recorded, *given} if recorded.get(name) != given.get(name))
+        why = f"recorded in {PASS_ENV_ORIGIN}"
+    elif given and shard_has_results(results, str(label)):
+        changed = sorted(given)
+        why = f"the shard has results and no record of any variable ({PASS_ENV_ORIGIN})"
+    else:
         return
-    changed = sorted(name for name in {*recorded, *given} if recorded.get(name) != given.get(name))
     if changed:
         many = len(changed) > 1
         raise ShardsError(
-            f"shard {spec['label']}: pass_env variable{'s' if many else ''} {', '.join(changed)} "
-            f"{'are' if many else 'is'} not what its first step passed (recorded in {PASS_ENV_ORIGIN}): a shard's "
-            "declared variables keep one value across its whole life"
+            f"shard {label}: pass_env variable{'s' if many else ''} {', '.join(changed)} "
+            f"{'are' if many else 'is'} not what its first step passed ({why}): a shard's declared variables keep "
+            "one value across its whole life"
         )
 
 
@@ -521,10 +541,11 @@ def record_pass_env_origin(results: Path, spec: Mapping[str, Any], passed: Mappi
     it. Written only when the step passed a variable (with none, the results directory is what it was). A record that
     is already there is compared instead (`check_pass_env_origin`), so two first steps that raced agree or one is
     refused. `ShardsError` when it differs, cannot be read or cannot be written: a step that cannot record its values
-    does not start."""
+    does not start. It compares first, so a step that passes variables is refused when the shard has results and no
+    record (a first step that passed nothing archived meanwhile): a first step records only into a shard with none."""
     label = str(spec["label"])
+    check_pass_env_origin(results, spec, passed)
     if not passed:
-        check_pass_env_origin(results, spec, passed)
         return
     path = results / label / PASS_ENV_ORIGIN
     draft = path.with_name(f".{PASS_ENV_ORIGIN}.{secrets.token_hex(8)}.draft")

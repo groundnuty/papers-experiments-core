@@ -843,9 +843,11 @@ resume or a later fleet step cannot carry a value its shard's first step did not
 A declared variable whose value differs, one the first step did not pass and one it passed that the line no longer
 carries are each refused, naming the variable and never either value. A record that is empty, is not JSON, is another
 shard's, holds a name or a value a variable may not carry, is too long or is a link is refused too, never taken for
-none, so emptying it does not lift the rule. With no record (a shard's first step, or one that passed nothing) nothing
-is compared, and a step that passes variables records them. Nothing here removes the record: a shard that has made
-nothing and must start over with other values has it removed by hand, which is the operator's call.
+none, so emptying it does not lift the rule. A shard with no record and no results (an archive or a snapshot) has had
+no first step: nothing is compared, and a step that passes variables records them. A shard with results and no record
+had a first step that passed nothing, so a step that now passes a declared variable adds one mid-shard, which is a
+change of value, and is refused the same way, naming the variable. Nothing here removes the record: a shard that has
+made nothing and must start over with other values has it removed by hand, which is the operator's call.
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into

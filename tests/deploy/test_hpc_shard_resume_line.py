@@ -235,6 +235,7 @@ def test_resume_line_pins_the_declared_variables_as_every_other_line_does(world,
     word) and `--pass-env NAME`, as `lines` prints them, so a resumed step is passed the same variables."""
     declare_pass_env(world, ["FAULT_ACK_MODE"])
     monkeypatch.setenv("FAULT_ACK_MODE", "go-ahead")
+    lay_origin(world, {"FAULT_ACK_MODE": "go-ahead"})  # the shard's first step passed it, before it snapshotted
     world.snapshot(world.fingerprint())
     line = flagged(world.line())
     assert "FAULT_ACK_MODE=go-ahead" in line
@@ -279,8 +280,8 @@ def test_resume_line_refuses_a_value_that_changed_since_the_first_step_naming_on
     showing neither value."""
     declare_pass_env(world, ["FAULT_ACK_MODE"])
     monkeypatch.setenv("FAULT_ACK_MODE", LATER)
-    world.snapshot(world.fingerprint())
     lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    world.snapshot(world.fingerprint())
     said = refusal_naming_only(world, "FAULT_ACK_MODE")
     assert "no line is printed" in said
 
@@ -290,8 +291,8 @@ def test_resume_line_refuses_a_changed_value_before_it_asks_slurm_anything(world
     does not hide it, so the operator learns the value first."""
     declare_pass_env(world, ["FAULT_ACK_MODE"])
     monkeypatch.setenv("FAULT_ACK_MODE", LATER)
-    world.snapshot(world.fingerprint())
     lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    world.snapshot(world.fingerprint())
     before = world.state()
     with pytest.raises(world.shards.ShardsError, match="FAULT_ACK_MODE") as caught:
         world.line(job="999999")
@@ -304,8 +305,8 @@ def test_resume_line_with_the_values_of_the_first_step_prints_its_line(world, mo
     first step's, untouched."""
     declare_pass_env(world, ["FAULT_ACK_MODE"])
     monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
-    world.snapshot(world.fingerprint())
     lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    world.snapshot(world.fingerprint())
     origin = world.plan.results / "fed-a" / "pass-env.json"
     before = origin.read_bytes()
     line = flagged(world.line())
@@ -318,8 +319,18 @@ def test_resume_line_refuses_a_manifest_that_dropped_a_variable_the_first_step_p
     """O63: the manifest declares nothing now, the first step passed a variable: the resumed shard would lose it,
     so the line is refused, naming the variable."""
     monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
-    world.snapshot(world.fingerprint())
     lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    world.snapshot(world.fingerprint())
+    refusal_naming_only(world, "FAULT_ACK_MODE")
+
+
+def test_resume_line_refuses_a_variable_added_to_a_shard_whose_first_step_passed_none(world, monkeypatch):
+    """O63: the shard has a snapshot (results) and no origin, so its first step passed nothing: the manifest declares a
+    variable now, which is a change of value mid-shard: refused naming the variable, before the job is looked at and
+    with the federation's state untouched."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    world.snapshot(world.fingerprint())
     refusal_naming_only(world, "FAULT_ACK_MODE")
 
 

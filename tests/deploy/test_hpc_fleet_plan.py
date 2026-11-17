@@ -548,6 +548,20 @@ def test_o63_a_first_fleet_step_has_no_origin_to_differ_from(bench):
     assert all(env_words(each.argv)[NAME] == LATER for each in bench.spawned)
 
 
+def test_o63_a_variable_added_to_a_shard_that_has_results_and_no_origin_is_refused_whole(bench):
+    """O63: shard 1 has a snapshot in the results (a first step that passed nothing) and no origin; the settings
+    declare a variable now: `step --resume` refuses the whole command, naming the variable and showing neither value,
+    and launches nothing."""
+    launched_and_ended(bench)
+    (bench.base / "results" / "shard-1" / "snapshots" / "snap-000001").mkdir(parents=True)
+    spawned = len(bench.spawned)
+    code, printed = bench.run("step", "--resume", environ=operator(bench, **{NAME: FIRST}))
+    assert code == 2
+    assert NAME in printed
+    assert FIRST not in printed
+    assert len(bench.spawned) == spawned
+
+
 def test_o63_each_shard_is_compared_with_its_own_first_step(bench, deploy):
     """O63: the origin is the shard's own, in the results directory the shards share (not a federation's): shard 1's
     first step passed the value the operator holds now and shard 2's another, so `step --resume` of shard 1 launches
