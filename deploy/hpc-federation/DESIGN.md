@@ -668,6 +668,22 @@ the root's `platform.toml` beside the study's `study.toml`. The driver holds, re
 facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`: each shard step's directory of this
 federation whose step is gone), then releases it.
 
+**The study's own scripts: a pre-step guard and a post-run script.** A study's own refusals (one worker, every
+planned model's cap 1, a federation root of its own) must hold at every shard's start, and `step` makes the work root and
+its tmpfs directory itself, so they cannot be checked from the study's plugin, which runs later, nor from a wrapper, which
+a line run directly skips. The manifest's `pre_step` (a path relative to the study's root, with its bound
+`pre_step_timeout_s`) is hashed by `plan` and `lines` and rides on every line as `--pre-step`, `--pre-step-sha256` and
+`--pre-step-timeout`. `step` runs it before anything else: it holds the stamped study's root open (a directory of this
+user's, not writable by group or others; the tmpfs copy is not made yet), reads the guard below it, checks the hash,
+and runs those bytes as `<python> -I -B - <label> <campaign.toml>` with the held root as its working directory, under the
+step's allowlist and no-home variables, in a session of its own with a bound. A refusal ends the step with 73 and nothing
+made; a pass is recorded in `step.json` and the archive's manifest. The symmetrical `post_run` (`--post-run*` on the
+line, a bound of 300 s by default) is checked at the same point and run once the dispatcher has exited 0, before the
+archive, while the federation is up: `<python> -I -B - <label> <out/> <status>` in the tmpfs copy of the study, in the
+dispatcher's environment. A pass makes the shard's results final; anything else archives them anyway, with `final: false`
+in the manifest and `NOT-FINAL.json` in `out/`, which `collect` and the core's merge refuse. `--archive-left` runs
+neither script: it starts no work, and it archives from the step's record.
+
 ## 9. Assumptions a live slot verifies first
 
 1. **The login node reaches every service's 8443** on the nodes' FQDNs. The bootstrap, the link check and the core's
