@@ -153,6 +153,7 @@ table `[sandbox.users]` of earlier versions is refused at load, with a message t
 
 import itertools
 import math
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
@@ -163,6 +164,7 @@ from expcore.config.loading import ConfigError, Section
 from expcore_onedata.sandbox import checkprovider as CP
 from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.apptainer.settings import ApptainerSettings, load_apptainer
+from expcore_onedata.sandbox.apptainer.sockets import work_root_problem as socket_work_root_problem
 from expcore_onedata.sandbox.gatelog import DEFAULT_CAPS, Caps
 from expcore_onedata.sandbox.gatepolicy import LISTINGS, PAGED, UPSTREAM_READ_TIMEOUT_BOUNDS_S, UPSTREAM_READ_TIMEOUT_S
 from expcore_onedata.sandbox.hostops import strict_networks
@@ -653,6 +655,10 @@ def _apptainer_sandbox(
     work_root = (base / section.string("work_root")).resolve()
     if any(c in str(work_root) for c in ":,") or any(c.isspace() for c in str(work_root)):
         raise section.fail("work_root", "may hold no ':', ',' or white space: Apptainer's binds are made under it")
+    if app.readlog_collector_sha256 is not None:  # the read-log collector's socket is under it (O91)
+        too_long = socket_work_root_problem(len(os.fsencode(work_root)))  # and a Unix socket's path holds 107 bytes
+        if too_long is not None:
+            raise section.fail("work_root", too_long)
     prefix = section.optional_string("name_prefix") or "sbx"
     if not PREFIX_RE.fullmatch(prefix):
         raise section.fail("name_prefix", "must be lower-case letters, digits and '-', starting with a letter")

@@ -2,14 +2,15 @@
 """The sensitivity reruns a preregistration declares (S19), and the check that an analysis runs exactly those.
 
 An analysis of a batch checked by a guard runs the preregistered analysis again without the runs the guard leaves out:
-`egress` (the egress check), `mount_guard` (the mount guard), `process_visibility` (the hidden-process check) and
-`any_guard` (without every run any guard that checked the batch leaves out, when two or more did). Which of them an
+`egress` (the egress check), `mount_guard` (the mount guard), `process_visibility` (the hidden-process check),
+`read_log` (the read-log scan, S20) and `any_guard` (without every run any guard that checked the batch leaves out,
+when two or more did). Which of them an
 analysis runs depends on which instruments its records carry, so a study that lists a guard on no record, or on the
 wrong runs, would otherwise get a different set of reruns than the one it meant to preregister. The preregistration
 declares the set:
 
     [sensitivity]
-    reruns = ["egress", "mount_guard", "any_guard"]   # in any order; each of the four names at most once
+    reruns = ["egress", "mount_guard", "any_guard"]   # in any order; each of the five names at most once
 
 and `analyze` refuses when the reruns it would run are not exactly these, in either direction, naming the difference: a
 declared rerun that no record supports (no record carries the guard, or fewer than two guards checked the batch for
@@ -28,13 +29,19 @@ from collections.abc import Sequence
 from expcore.config.loading import Section, close_match
 
 EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, ANY_GUARD = "egress", "mount_guard", "process_visibility", "any_guard"
-RERUNS = (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, ANY_GUARD)
-SINGLE = (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY)  # the reruns of one guard; `any_guard` is the one of several
+READ_LOG = "read_log"
+RERUNS = (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, ANY_GUARD)
+SINGLE = (
+    EGRESS,
+    MOUNT_GUARD,
+    PROCESS_VISIBILITY,
+    READ_LOG,
+)  # the reruns of one guard; `any_guard` is the one of several
 KEYS = ("reruns",)
 
 
 def names_problem(names: object) -> str | None:
-    """Why `names` is not a declaration of reruns (a list of the four names, none twice); None when it is one."""
+    """Why `names` is not a declaration of reruns (a list of the five names, none twice); None when it is one."""
     if not isinstance(names, list | tuple) or not all(isinstance(name, str) for name in names):
         return f"must be an array of names from {', '.join(RERUNS)}"
     for name in names:
@@ -72,10 +79,12 @@ def checked(names: Sequence[str] | None) -> tuple[str, ...] | None:
     return tuple(names)
 
 
-def ran_reruns(egress: object, mount_guard: object, visibility: object, guards: object) -> tuple[str, ...]:
+def ran_reruns(
+    egress: object, mount_guard: object, visibility: object, guards: object, read_log: object = None
+) -> tuple[str, ...]:
     """The reruns an analysis would run, in the order of `RERUNS`: each guard's analysis that exists (its guard checked
     the batch, whether or not a run was left out), and the one of every guard together when it exists."""
-    found = (egress, mount_guard, visibility, guards)
+    found = (egress, mount_guard, visibility, read_log, guards)
     return tuple(name for name, analysis in zip(RERUNS, found, strict=True) if analysis is not None)
 
 

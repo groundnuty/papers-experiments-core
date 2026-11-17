@@ -1620,6 +1620,130 @@ Report the primary analysis as it stands and the sensitivity analysis beside it.
 
 **Run nothing else of your account on a sandbox node while runs are live: no interactive login and no other job step.** A process of your user outside the cells is outside every check: the egress shim is loaded only in the cells, and the mount guard proves only the cells, so such a process could connect anywhere, or read oneclient's environment, which holds the token, without a line in either log.
 
+### The read log: what a canonical script read
+
+If your study's omission scoring rests on which files the agent's scripts read, the scripts run in the agent's own cell, and a log file they write there is the agent's to read, rewrite and delete. The core gives the scripts a channel to a collector outside the cell instead (O91; the contract is in [`interfaces.md`](interfaces.md#the-read-log-the-read_log-instrument-and-its-channel)). Your canonical scripts do three things:
+
+- **Import the client by its fixed path**, `/expcore-readlog-client/expcore_readlog_client.py` (the cell runs `python -I`, so `PYTHONPATH` does nothing; there is no environment variable and no other socket to name). A platform that did not declare the channel binds neither the client nor the socket, and both fail closed: the import raises `FileNotFoundError`, and a vendored copy of the client raises `ReadLogError` (no socket, ENOENT). Treat either as unread and return no data, so that a platform template that forgot to declare the channel shows at the first smoke cell and not as runs with silently missing logs.
+- **Log before they return data**, with `log_read(item, range=[start, stop], bytes=n, sha256=...)`: `item` is your own id of what was read, never a host path.
+- **Return no data when `log_read` raises** `ReadLogError`. The read is then "unread": the log is an upper bound on what the scripts handed out.
+- **Run each canonical script as its own process**, `python -I <script> <arguments>`, a program that prints what it returns, and never as a module the agent's code imports into its own process: code in the agent's process could then patch the script's client or `socket` and hide a real read. Patching needs code in the script's process, and only the script's own source runs there. Keep the scripts in a read-only input, never in `/work`, where the agent could change them.
+
+A script looks like this, in your own scripts' words:
+
+    import importlib.util
+    import sys
+
+    CLIENT = "/expcore-readlog-client/expcore_readlog_client.py"
+
+
+    def load_client():
+        spec = importlib.util.spec_from_file_location("expcore_readlog_client", CLIENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # FileNotFoundError when the platform bound no client
+        return module
+
+
+    def read(item, start, stop):
+        readlog = load_client()  # raises: nothing was read, so nothing is returned
+        data = read_the_bytes(item, start, stop)
+        readlog.log_read(item, range=[start, stop], bytes=len(data), sha256=sha256_of(data))  # raises: no data
+        return data
+
+
+    if __name__ == "__main__":
+        try:
+            sys.stdout.buffer.write(read(item, start, stop))
+        except Exception as error:  # the client is missing, or ReadLogError: unread, nothing is returned
+            sys.exit(f"unread: {error.__class__.__name__}")
+
+On a platform that bound no client (this guide's own run is one), the import is what fails:
+
+```python
+import importlib.util
+
+
+def the_client_is_not_bound_here():
+    spec = importlib.util.spec_from_file_location(
+        "expcore_readlog_client", "/expcore-readlog-client/expcore_readlog_client.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except FileNotFoundError:
+        return True  # the script treats this as unread and returns no data
+    return False
+
+
+assert the_client_is_not_bound_here()
+```
+
+The log reaches your record as a side file you declare: `pattern = "read_log.jsonl"` and `hash_field = "instruments.read_log.side_sha256"` in a `[[study.side_files]]` table ([Side files](#side-files)). Your executor builds `ReadLog(sandbox, nonce, expected_peer_uid)` among the run's instruments, which reads the collector's log once, after the backend has stopped the collector, and puts it beside the record with `stage_harness_side_file` (the log was never in `/work`, so `stage_side_file` does not apply):
+
+```python
+import hashlib
+import json
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+from expcore.records.record import record_filename
+from expcore.replay.side_file_placement import stage_harness_side_file
+from expcore.replay.side_files import SideFile
+from expcore_onedata.readlog import paths
+from expcore_onedata.readlog.instrument import ReadLog
+
+
+def stage_the_read_log():
+    NONCE, UID = "ab" * 16, 1000
+    lines = [
+        {
+            "event": "start",
+            "format": paths.FORMAT,
+            "nonce": NONCE,
+            "pid": 7,
+            "uid": UID,
+            "peer_uid": UID,
+            "max_bytes": 1 << 20,
+        },
+        {"event": "record", "peer": {"pid": 9, "uid": UID}, "rec": {"v": 1, "op": "canary", "item": "canary"}},
+        {
+            "event": "record",
+            "peer": {"pid": 9, "uid": UID},
+            "rec": {"v": 1, "op": "read", "item": "file-1", "bytes": 10},
+        },
+        {"event": "end", "records": 2, "malformed": 0, "unwritten": 0, "cap_reached": False},
+    ]
+    for seq, line in enumerate(lines):
+        line.update(seq=seq, wall=1.0 + seq, mono=1.0 + seq)
+    collected = b"".join((json.dumps(line, sort_keys=True) + "\n").encode() for line in lines)  # the collector's log
+
+    class StoppedCollector:
+        def read_log(self):  # what the sandbox kept of the log, once, after it stopped the collector
+            return collected
+
+    snapshot = ReadLog(StoppedCollector(), NONCE, UID).finish()
+    assert snapshot["log"] == "intact" and snapshot["counts"] == {"reads": 1, "canaries": 1}
+    assert snapshot["side_sha256"] == hashlib.sha256(collected).hexdigest()
+
+    declared = [SideFile(paths.SIDE_FILE_NAME, paths.SIDE_HASH_FIELD)]
+    where = Path(tempfile.mkdtemp())
+    (where / "collected").write_bytes(collected)  # where the collection left the log on the harness's disk
+    request = SimpleNamespace(run_dir=where / "try1", identity=SimpleNamespace(run_key="task=read|seed=1", attempt=1))
+    staged = stage_harness_side_file(request, declared, paths.SIDE_FILE_NAME, where / "collected")
+    assert staged is not None and staged.sha256 == snapshot["side_sha256"]
+    (request.run_dir / record_filename("task=read|seed=1", 1)).write_text(
+        json.dumps({"instruments": {"read_log": snapshot}})
+    )
+    staged.commit()  # the rename, once the record names the hash
+    assert (request.run_dir / paths.SIDE_FILE_NAME).read_bytes() == collected
+
+
+stage_the_read_log()
+```
+
+**An unknown log is unknown reads.** The log is intact only with a start line of this run, matching end counts, no cap reached, no malformed line, the canary as its first record and every sender the expected uid. A collector that was killed, a log past its cap or a datagram that was no record gives `"log": "unknown"` with the reasons and `counts` None; score the run's reads as unknown, never as fewer. A forged read cannot be prevented (the agent's own code can call the client), only detected, by the read-log scan and, on a REST data path, by the gate's per-file table of what it served. An agent that reads the data some other way than through your scripts leaves no record: decide in the design whether such a read scores as an omission. Code that runs in a script's own process can patch the client or the standard library so that a real read is not logged, which is why each canonical script runs as its own process (above). **The scan is a heuristic** over the text of the agent's code (`expcore.readlog`, [below](#forged-read-log-records-detected-and-reported-not-prevented)): it matches the channel's names, Unix datagram sockets, a process's environment, ways to find the socket, and patches of the socket or the client (an assignment to or `setattr` on their attributes at any depth, `sys.modules`, a reload or a load from a file, mock and monkeypatch, `builtins`, a script run in the agent's own process by `runpy` or by `exec` of its source), and code built at run time passes it. On a REST data path the gate's per-file table of served files, which the agent cannot reach, is the backstop: it shows a read the log lacks.
+
 ### The mount on HPC: guarded and reported, not isolated
 
 On an HPC batch node your agent's cells and the oneclient that holds the mount's token run as one user, so the token cannot be kept from the agent as the Docker sidecar keeps it. The study's PI ruled (16 Nov 2026) that mount runs stay on HPC with detection and report, as for egress. Declare oneclient's bundle in `[sandbox.apptainer]` (`oneclient_bundle` and `oneclient_bundle_sha256`: the tar `deploy/hpc-federation/oneclient_bundle.py` builds from the Compose sidecar's pinned image, so both backends run one oneclient build; its SHA-256 is in the campaign fingerprint, and each run records oneclient's version and build id), and give the Apptainer backend its mount helper, `host_mount_factory()` from `expcore_onedata.sandbox.apptainer.hostmount`, as `sandbox_options={"mount_helper": ...}`: oneclient then runs on the node outside every cell, from the bundle's own loader and libraries, its token in a private file no cell binds and removed once the mount is up, and a watcher outside the cells logs every access to that file and its directory, watches oneclient for a tracer, and proves from the node's `/proc` that each cell runs in a PID namespace of its own, with no view of the node's processes or of the private files. The helper takes `io_mode = "proxy"` only: a direct mount is refused at the run's start ("Direct I/O: declare the storage, and keep proxy unless placement is shown the same", above), so HPC mounts are proxy-only until the direct-I/O comparison passes. Record it with `expcore.mountguard.mount_guard_for(sandbox)` beside the run's other instruments, **for every run**: it is the guard of a mount run, and, for a REST run or a run with no data path, which have no mount to guard, a statement that the guard does not apply (below). It is built over `MountGuard(sandbox, sandbox.mount_guard_nonce)`:
@@ -1700,9 +1824,31 @@ Once one analysed record carries it, `analyze` judges every analysed run:
 
 The analysis then runs again without every run that is not clean, and with the egress check or the mount guard it also joins the rerun without every run any guard leaves out, `## Egress, mount isolation and process visibility together` for all three (O76). `report.md` gains `## Process visibility (detected, not prevented)`, `analysis.json` gains `process_visibility`, and `analyze` prints a line per contrast. The check detects, it does not prevent. Hidden memory under the margin (`hidden_memory_margin_bytes`, 128 MiB by default) and a hidden process's shared memory are not told apart from the node's own; the step's memory limit bounds them, and every hidden process ends with its cell. What each field means is in [`interfaces.md`](interfaces.md#processes-hidden-from-the-watch-the-process_visibility-instrument).
 
+### Forged read-log records: detected and reported, not prevented
+
+A study's canonical scripts log every read they make to the read-log channel, and the study's omission scoring rests on that log. The channel is a datagram socket bound read-only into every cell, so your agent's code can send a record of its own, and an item it never read then looks read; code that runs a canonical script in its own process can also patch the client or `socket` first, so that a real read is never logged. Nothing prevents either. `expcore.readlog` detects the likely routes from the record alone: a run is flagged when the code of one of its cells names the channel's socket or client, builds a Unix datagram socket, reads a process's environment, searches for the socket, or patches `socket`, the client or the loaded modules.
+
+```python
+from expcore.readlog import scan_cells
+
+ran_a_script = "import subprocess\nsubprocess.run(['python', '-I', '/inputs/scripts/read_item.py', 'fileX'])"
+forged = "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\ns.sendto(b'{}', '/expcore-readlog/sock')"
+patched = "import socket\nsocket.socket = FakeSocket"
+assert scan_cells([ran_a_script])["flagged"] is False  # a script run by its path names none of the channel
+assert [(hit["kind"], hit["what"]) for hit in scan_cells([forged])["hits"]] == [
+    ("channel_path", "/expcore-readlog/sock"),
+    ("unix_datagram", "AF_UNIX+SOCK_DGRAM"),
+]
+assert [hit["kind"] for hit in scan_cells([patched])["hits"]] == ["channel_patch"]
+```
+
+- **Let the agent run a canonical script by its path and never paste its text into a cell.** A cell that holds a script's text names the client and is flagged. Do not name your own scripts or functions `readlog` either: the bare word is a hit.
+- Once one analysed record carries the `read_log` instrument, `analyze` judges every analysed run by its code, and runs the preregistered analysis again without the flagged runs. `report.md` gains `## Read log: runs that touched the channel (detected, not prevented)`, `analysis.json` a `read_log` key, and the terminal `read log:` and `read-log sensitivity` lines. A batch whose records carry no such instrument has none of them. Declare the rerun (`read_log`, below) when you list the instrument.
+- **Report the primary analysis as it stands and the sensitivity analysis beside it.** The scan is a heuristic over text: code that builds a name at run time, decodes it, or edits a copy of a canonical script passes it, and it flags a cell that names `AF_UNIX` and `SOCK_DGRAM` for two unrelated sockets. A run that is not flagged is not shown to have an unforged log; **on a REST data path the gate's per-file served table (O22) is the backstop that does not read code.**
+
 ### The sensitivity reruns a preregistration declares
 
-Which reruns `analyze` runs depends on which guard instruments your records carry: the egress rerun, the mount guard's, the process-visibility check's, and the one without every run any guard that checked the batch leaves out (`any_guard`, when two or more did). A guard listed on the wrong runs, or on none, would silently give a different set than the one you meant to preregister. Declare the set in `preregistration.toml`, in its hash like the rest, as a `[sensitivity]` table whose `reruns` lists any of `egress`, `mount_guard`, `process_visibility` and `any_guard`, in any order, each at most once (the block below appends one to the example's file and loads it).
+Which reruns `analyze` runs depends on which guard instruments your records carry: the egress rerun, the mount guard's, the process-visibility check's, the read-log scan's, and the one without every run any guard that checked the batch leaves out (`any_guard`, when two or more did). A guard listed on the wrong runs, or on none, would silently give a different set than the one you meant to preregister. Declare the set in `preregistration.toml`, in its hash like the rest, as a `[sensitivity]` table whose `reruns` lists any of `egress`, `mount_guard`, `process_visibility`, `read_log` and `any_guard`, in any order, each at most once (the block below appends one to the example's file and loads it).
 
 `analyze` and `report` then refuse unless the reruns they would run are exactly these, in either direction, and name the difference: a declared rerun that no record supports (no analysed record carries that guard's instrument, or fewer than two guards checked the batch for `any_guard`), and a rerun your records would produce that the preregistration does not declare. A rerun counts as run when its guard checked the batch, whether or not it left a run out: a batch whose every run is clean has no second analysis, and is still the rerun you declared. `reruns = []` declares that none is expected, so a batch that would run one is refused. **A preregistration with no `[sensitivity]` table reads as `reruns = []`:** a batch no guard checked runs no rerun, so it passes with no table and its `analysis.json` is as it was; a batch a guard checked is refused, naming the reruns it would run and the table that is missing, so no rerun goes unpreregistered. A study whose plugin lists a guard's instrument declares its reruns; `analysis.json` carries `sensitivity_reruns` for a study that has the table.
 
