@@ -15,6 +15,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
+from fingerprint_support import standin_python
 
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
 NAME, VALUE = "FAULT_ACK_MODE", "go-ahead"
@@ -53,7 +54,7 @@ def make_study(tmp_path: Path) -> Path:
 def manifest_file(tmp_path: Path, extra: str = "") -> Path:
     """A shard plan of two federations; `extra` (top-level keys) goes before the `[[shards]]`."""
     make_study(tmp_path)
-    lines = [f'study = "{tmp_path / "study"}"', f'python = "{tmp_path / "venv" / "python"}"',
+    lines = [f'study = "{tmp_path / "study"}"', f'python = "{standin_python(tmp_path / "venv")}"',
              f'core_src = "{tmp_path / "core" / "src"}"', f'results = "{tmp_path / "results"}"',
              f'tmpfs = "{tmp_path / "tmpfs"}"', 'step_path = "/usr/bin:/bin"', "cpus = 6",
              'memory = "18g"']  # fmt: skip
@@ -65,6 +66,7 @@ def manifest_file(tmp_path: Path, extra: str = "") -> Path:
                  "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         (root / "platform.toml").write_text('[space]\nname = "s"\ndata_manifest = "m.json"\n')
+        (root / "facts.json").write_text("{}")  # what `up` writes beside the state: a collect archives both
     if extra:
         lines.append(extra)
     for label, name in (("fed-a", "a"), ("fed-b", "b")):
@@ -514,6 +516,19 @@ def test_o63_collect_unpacks_shards_whose_steps_were_given_the_plans_names(shard
     """O63: every shard recorded the plan's declared name: collected as ever, with no operator variable set."""
     plan = two_shards(shards, tmp_path, monkeypatch)
     assert [o.parent.name for o in shards.collect(plan, tmp_path / "into")] == ["fed-a", "fed-b"]
+
+
+def test_o63_the_origin_each_first_step_recorded_is_listed_as_evidence_by_collect(shards, tmp_path, monkeypatch):
+    """O63: the `pass-env.json` a shard's first step writes (the values its variables had) is what `collect` lists
+    beside the shard's archive for the copy back (`archives.sha256.json`, with the root evidence of the same collect):
+    the writer and the evidence name the file alike, and the hash is of the bytes the step wrote."""
+    plan = two_shards(shards, tmp_path, monkeypatch)
+    shards.collect(plan, tmp_path / "into")
+    listed = {e["name"]: e for e in json.loads((plan.results / shards.ARCHIVES_MANIFEST).read_text())["evidence"]}
+    assert shards.PASS_ENV == shards.PASS_ENV_ORIGIN
+    for label in ("fed-a", "fed-b"):
+        written = plan.results / label / shards.PASS_ENV_ORIGIN
+        assert listed[f"{label}/{shards.PASS_ENV_ORIGIN}"]["sha256"] == hashlib.sha256(written.read_bytes()).hexdigest()
 
 
 def test_o63_collect_refuses_a_shard_whose_line_lacked_a_declared_name_naming_it(shards, tmp_path, monkeypatch):

@@ -185,6 +185,8 @@ def test_collect_refuses_a_shard_whose_archive_has_a_member_outside_out_and_extr
     manifest = json.loads((results / "fed-a.out.json").read_text())
     manifest["sha256"] = hashlib.sha256((results / "fed-a.out.tar").read_bytes()).hexdigest()
     (results / "fed-a.out.json").write_text(json.dumps(manifest))
+    (tmp_path / "hpc-federation.json").write_text("{}")  # the root's state and facts, which a collect archives
+    (tmp_path / "facts.json").write_text("{}")
     plan = types.SimpleNamespace(
         study=tmp_path / "study",
         results=results,
