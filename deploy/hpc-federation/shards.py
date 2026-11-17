@@ -1111,7 +1111,10 @@ def claim_running(args: argparse.Namespace, spec: Mapping[str, Any]) -> dict[str
         try:
             os.close(os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
         except FileExistsError:
-            raise ShardsError(f"shard {args.label}: another step took its running mark over first") from None
+            raise ShardsError(
+                f"shard {args.label}: another step took its running mark over first (if no step of the shard runs "
+                f"anywhere, a takeover was killed between its claim and its mark: remove {claim.name} by hand)"
+            ) from None
         if _record(path) != found:  # only the claim's maker replaces that mark: never another step's, kept
             raise ShardsError(f"shard {args.label}: its running mark changed while it was taken over")
         os.replace(draft, path)
