@@ -69,6 +69,19 @@ def test_o90_a_missing_provider_in_the_second_space_is_named_with_its_position(t
     assert world.health.space() == Health(False, MISSING)
 
 
+def test_o90_a_missing_provider_and_a_stranger_in_one_space_keep_their_two_part_text(tmp_path, fake):
+    """O90: the parts of a membership difference are joined as they were."""
+    world = four_spaces(tmp_path, fake)
+    fake.add_provider("pr-stranger", "stranger.test", supports=False)
+    fake.space_supports[SECOND_ID]["pr-stranger"] = {"readonly": False}
+    del fake.space_supports[SECOND_ID][BETA_ID]
+    expected = (
+        "spaces[1]: the providers supporting the space differ from the declared set: "
+        "missing providers[1]; 1 reported provider(s) not declared: pr-stranger"
+    )
+    assert world.health.space() == Health(False, expected)
+
+
 def test_o90_one_space_form_keeps_its_text_without_a_position(tmp_path, fake):
     """O90: the one-space form names no position."""
     config = load_platform(write_platform(tmp_path))

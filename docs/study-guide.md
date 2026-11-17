@@ -1186,7 +1186,7 @@ What the wrapper keeps and what it gives up:
 - With `target_only` true, every space was read and passed the name and membership comparison, so what failed the call was the offline set alone; a failure of the fault gate, the baseline or the content type leaves the reading `UNREAD`, and `None` never relaxes anything.
 - While a provider is reported offline the platform's check stops at the space and **does not run its link check**; a wrapper that turns that call into a pass has skipped it for that call. The next run's pre-run check runs it.
 - The reading reaches a run whose restore was verified. A run whose restore failed is answered by the fault gate before any space is read, and its attempt is set aside as `injector_failure` whatever the wrapper does.
-- Record it: the reading is JSON (`reading.to_json()`) beside the run's text detail, and the core's record schema does not carry it. Write it in your own record from the wrapper, or call `platform_health.space()` in your executor after the restore and read `platform_health.reading` there.
+- Record it: the reading is JSON (`reading.to_json()`) beside the run's text detail, and the core's record schema does not carry it. Write it in your own record from the wrapper, or call `platform_health.space()` in your executor after the restore and read `noted_reading()` there: the note belongs to the try, so it is found from a thread the executor started (`asyncio.to_thread` copies the context), where `platform_health.reading` is that thread's own.
 
 ### Tools outside a campaign: hold the federation shared
 

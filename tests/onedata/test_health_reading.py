@@ -10,10 +10,13 @@ import json
 import threading
 
 import pytest
+from campaign_support import planned_store
 from fault_support import FakeServices, injector_for
 from health_support import FOURTH, down, four_spaces, up
 
 from expcore.campaign import liveness, prerun
+from expcore.campaign.healthgate import GO, HealthGate
+from expcore_onedata.admission import run_admission
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.faults import load_faults
@@ -530,3 +533,62 @@ def test_o90_the_json_names_spaces_and_providers_by_label_only(tmp_path, fake):
     text = json.dumps(world.health.reading.to_json())
     for configured in ("beta", "alpha", "gamma", BETA_ID, ALPHA_ID, "ridge", "study-", "lakeside", ".test"):
         assert configured not in text
+
+
+# --- through the gate: the run's own post-run check, under its admission ------------------------------------------
+
+
+def outage_run(tmp_path, world, *, restore_fails):
+    """What the scheduler does around an outage run of providers[1]: a try with its note, the attempt, the run's
+    pre-run check through the gate, the run's exclusive admission, the injector inside it, and the post-run check
+    (`HealthGate.after_run`) in a thread of its own with the context copied, as the gate runs it. Return the post-run
+    answer, the try's reading and the journal entries still open."""
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    store, _, _ = planned_store(campaign)
+    clock = iter(f"2026-01-01T00:{minute:02d}:00Z" for minute in range(1, 60))
+    gate = HealthGate(store, world.health, lambda: next(clock))
+    gate.load()
+    services = FakeServices()
+    injector = injector_for(world.platform, services)
+    admit = run_admission(world.config)
+    outage = ("provider_outage",), {"provider_outage": TARGET}
+    with prerun.opened(), liveness.running("camp-a", 5):
+        assert gate.before_run("run-a", attempt=1).verdict == GO
+        with admit(*outage, threading.Event(), False):
+            injector.start(RUN)
+            if restore_fails:
+                services.knobs["start_fails"] = True
+                assert injector.clear() is False
+            else:
+                assert injector.finish()["ok"] is True
+            down(world.fake, "beta")
+            answer, _ = gate.after_run("run-a", attempt=1, attempt_id=5)
+            reading = noted_reading()
+            open_entries = InjectionJournal(load_faults(world.platform, world.config).journal).open_entries()
+            services.knobs["start_fails"] = False
+            assert injector.finish()["ok"] is True  # whatever the check said, the target is brought back
+    return answer, reading, open_entries
+
+
+def test_o90_the_gates_post_run_check_of_a_restored_outage_run_reads_its_own_target(tmp_path, fake):
+    """O90: a run's post-run check, run by the gate in a thread of its own under the run's exclusive admission, after
+    the restore: no entry is open, so the check reaches the spaces, the text is the unchanged first failing space, the
+    try's note holds the reading, and its targets are the run's own journalled injection: target-only."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, open_entries = outage_run(tmp_path, world, restore_fails=False)
+    assert open_entries == []
+    assert answer.detail == "spaces[1]: declared provider(s) reported offline: providers[1]"
+    assert reading.targets == {TARGET}
+    assert target_only(reading) is True
+
+
+def test_o90_the_gates_post_run_check_of_a_run_whose_restore_failed_reads_nothing(tmp_path, fake):
+    """O90: the restore failed, so its entry is open and the fault gate answers before any space is read: the text is
+    the failed restore's, the reading is unread, and the run is never called target-only."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, open_entries = outage_run(tmp_path, world, restore_fails=True)
+    assert [entry["target"] for entry in open_entries] == [TARGET]
+    assert answer.detail.startswith("the restore of providers[1]")
+    assert reading == UNREAD
+    assert target_only(reading) is None
