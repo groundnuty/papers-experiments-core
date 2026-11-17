@@ -677,7 +677,7 @@ WRITES = [*WRITE_RIGHTS, "space_write_data"]  # every write right a condition ca
 
 
 @pytest.mark.parametrize("right", WRITES)
-def test_o39_a_read_only_planes_user_who_gained_a_write_right_after_the_mint_starts_no_server(
+def test_o88_a_read_only_planes_user_who_gained_a_write_right_after_the_mint_starts_no_server(
     right, world, fake, tmp_path
 ):
     """O88: a read-only condition's token has no data-access caveat, so its user's rights are what keep it from writing;
@@ -692,7 +692,7 @@ def test_o39_a_read_only_planes_user_who_gained_a_write_right_after_the_mint_sta
 
 
 @pytest.mark.parametrize("right", WRITES)
-def test_o39_a_read_only_planes_user_who_gained_a_write_right_during_the_run_is_set_aside(right, world, fake, events):
+def test_o88_a_read_only_planes_user_who_gained_a_write_right_during_the_run_is_set_aside(right, world, fake, events):
     """O88: a write right granted to a read-only condition's user while its server ran is found at teardown: the run is
     set aside as infrastructure of the tool-plane kind, with the rights event, whatever the body did."""
     config, issuer, launcher = world

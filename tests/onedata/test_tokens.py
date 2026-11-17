@@ -129,7 +129,7 @@ def tool_spec(config, condition):
     return tool_server_spec("spmock0001", config.condition(condition))
 
 
-def test_o39_a_read_only_conditions_tool_server_token_carries_no_data_access_caveat(issuer, fake, config):
+def test_o88_a_read_only_conditions_tool_server_token_carries_no_data_access_caveat(issuer, fake, config):
     """O88: a read-only condition's tool-server token is its expiry and the rest interface, as a writing condition's
     is. On Onedata 25.0 a data-access caveat limits a token to data access, and the 12 Nov live run saw the read-only
     token's `data.readonly` and `data.path` refuse its transfer and QoS-requirement views (#181)."""
@@ -183,7 +183,7 @@ WRITES = [*WRITE_RIGHTS, "space_write_data"]  # every write right a condition ca
 
 @pytest.mark.parametrize("right", WRITES)
 @pytest.mark.parametrize("held", ["direct", "effective"])
-def test_o39_a_read_only_conditions_user_who_holds_any_write_right_gets_no_token(right, held, issuer, fake, config):
+def test_o88_a_read_only_conditions_user_who_holds_any_write_right_gets_no_token(right, held, issuer, fake, config):
     """O88: with no data-access caveat, what keeps a read-only condition's token from writing is its user, who must
     hold exactly the condition's rights: one write right more, held directly or only through a group, and nothing is
     minted. `space_write_data` is no right a condition can declare, so no read-only condition admits it either."""
@@ -294,7 +294,7 @@ def test_o05_the_data_path_reads_no_scope_admin_privileges_or_clusters(issuer, f
     assert not [r for r in fake.requests if r.path in (SCOPE, admin_read, CLUSTERS)]
 
 
-def test_o39_a_read_only_condition_reads_its_scope_admin_privileges_and_clusters_as_a_writing_one_does(
+def test_o88_a_read_only_condition_reads_its_scope_admin_privileges_and_clusters_as_a_writing_one_does(
     issuer, fake, config
 ):
     """O88: a read-only condition's token has no data.path caveat to keep it to the plane, so its mint reads what a

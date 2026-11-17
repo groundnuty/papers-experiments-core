@@ -146,9 +146,9 @@ def plane(day0, tmp_path_factory):
         pytest.skip("platform.toml declares no [principals.toolserver] user")
     holder = day0.placement.settings.holder
     receiver = next(p for p in config.support.providers if p != holder)
-    log = tmp_path_factory.mktemp("o39") / "log.jsonl"
+    log = tmp_path_factory.mktemp("o88") / "log.jsonl"
     provisioner = Provisioner(day0.client, config, day0.placement.settings, provider_ids=day0.provider_ids, log=log)
-    directory = f"expcore-live-o39-{int(time.time())}"
+    directory = f"expcore-live-o88-{int(time.time())}"
     files = [provisioner.put_file(f"{directory}/part-{i}.bin", CONTENT) for i in range(2)]
     qid = None
     try:
@@ -248,7 +248,7 @@ def require_unseen(error, what):
     assert 400 <= error.status < 500, f"{what}: a server error ({error.status}, {error.code})"
 
 
-def test_o39_a_read_only_conditions_view_tools_answer_and_its_server_examines_its_token(plane, capfd):
+def test_o88_a_read_only_conditions_view_tools_answer_and_its_server_examines_its_token(plane, capfd):
     """O88: the views the 12 Nov run saw refused now serve, the two under `/data/{id}` still serve, and the server's
     own examination of its token answers, so its log holds no fail-open warning."""
     outputs = call_tools(plane, [(tool, values_of(plane)) for tool in VIEW_TOOLS])
@@ -259,7 +259,7 @@ def test_o39_a_read_only_conditions_view_tools_answer_and_its_server_examines_it
     assert as_token(plane, "POST", "/tokens/examine", zone=True, json={"token": token}) is None
 
 
-def test_o39_a_read_only_conditions_write_tools_answer_an_error_and_change_nothing(plane):
+def test_o88_a_read_only_conditions_write_tools_answer_an_error_and_change_nothing(plane):
     """O88: the replication and the QoS requirement asked for through the tools are refused by Onedata for the
     privilege the user lacks: each tool answers an error, and with the admin credential no transfer of the space and no
     requirement of the file appears."""
@@ -293,7 +293,7 @@ def require_active(state, when):
     )
 
 
-def test_o39_the_read_only_token_is_refused_every_transfer_and_qos_write_straight_at_the_provider(plane):
+def test_o88_the_read_only_token_is_refused_every_transfer_and_qos_write_straight_at_the_provider(plane):
     """O88: sent straight to the provider, without the tool server, the token is refused the cancel of a replication
     that is running (read active with the admin credential just before and just after, so the cancel reached it
     running), a replication, an eviction, a QoS requirement, the removal of the admin's requirement and a rerun of the
@@ -334,14 +334,14 @@ def test_o39_the_read_only_token_is_refused_every_transfer_and_qos_write_straigh
     assert final != "cancelled", f"the replication was cancelled with the read-only condition's token ({final})"
 
 
-def test_o39_the_read_only_token_is_refused_a_file_and_a_write_of_content(plane):
+def test_o88_the_read_only_token_is_refused_a_file_and_a_write_of_content(plane):
     """O88: with no `data.readonly` caveat, the user's lack of `space_write_data` is what refuses a data write, as 400
     posix eperm (the 14 Nov live run; the caveat's refusal was eacces): a file created in the scratch directory and a
     write of a file's content are both refused, the file is not there and the content is what it was."""
     provisioner, file_id = plane["provisioner"], plane["files"][1]
     directory_id = provisioner.resolve(plane["directory"]).file_id
     before = provisioner.read_file(file_id)
-    name = "o39-refused.bin"
+    name = "o88-refused.bin"
     created = as_token(plane, "POST", f"/data/{directory_id}/children", params={"name": name, "type": "REG"})
     written = as_token(
         plane,
@@ -376,7 +376,7 @@ def served_to_the_admin(plane, path, params=None):
 
 
 @OUTSIDE
-def test_o39_a_read_only_condition_sees_nothing_of_a_space_it_does_not_hold(plane):
+def test_o88_a_read_only_condition_sees_nothing_of_a_space_it_does_not_hold(plane):
     """O88: the token's reach is its user's spaces. Another space's root and transfer listing, which the local
     provider serves to the admin credential, are not served to the token through the tool or straight at that
     provider."""
@@ -390,7 +390,7 @@ def test_o39_a_read_only_condition_sees_nothing_of_a_space_it_does_not_hold(plan
 
 
 @OUTSIDE
-def test_o39_a_read_only_condition_cannot_view_a_transfer_of_a_space_it_does_not_hold(plane):
+def test_o88_a_read_only_condition_cannot_view_a_transfer_of_a_space_it_does_not_hold(plane):
     """O88: a transfer of another space, which the local provider lists and serves to the admin credential, is not
     served to the condition, through `get_transfer` or straight. Skipped, saying so, when the space has no ended
     transfer to view: the test cannot make one, since the mutation gate refuses a write outside the declared space

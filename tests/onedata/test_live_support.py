@@ -88,7 +88,7 @@ def test_o05_a_privilege_answer_that_cannot_be_read_is_a_failure_not_a_skip(conf
         mint_for_condition(issuer, config, "read", TOOLS, CEILING_S)
 
 
-def test_o39_a_tools_arguments_come_from_its_own_input_schema_by_what_each_name_says():
+def test_o88_a_tools_arguments_come_from_its_own_input_schema_by_what_each_name_says():
     """O88: the live test of a read-only condition's tools never assumes the server's argument names: it reads each
     property's kind from its name, the more specific word first (a state before a transfer, a transfer or a
     requirement before a file, a provider before replicas), and gives each the value of that kind, as text when the
@@ -136,7 +136,7 @@ def test_o39_a_tools_arguments_come_from_its_own_input_schema_by_what_each_name_
     }
 
 
-def test_o39_a_tool_whose_required_arguments_cannot_be_filled_is_unmeasured_not_guessed():
+def test_o88_a_tool_whose_required_arguments_cannot_be_filled_is_unmeasured_not_guessed():
     """O88: a required property whose name says no known kind, or a kind the test has no value of, leaves the tool
     unmeasured, with the reason naming the properties; an optional one is left out."""
     schema = {"properties": {"file_id": {}, "mode": {}, "limit": {}}, "required": ["mode", "file_id"]}
@@ -171,7 +171,7 @@ TEST_VALUES = {
 
 
 @pytest.mark.parametrize("tool", sorted(PINNED_TOOLS))
-def test_o39_every_required_argument_of_the_pinned_servers_tools_is_filled(tool):
+def test_o88_every_required_argument_of_the_pinned_servers_tools_is_filled(tool):
     """O88: the 14 Nov live run failed `get_qos_requirement` because its `qos_id` named no kind the test knew. Each
     of the seven tools' required arguments, by the names the pinned server gives them, is filled by the kind the
     name says, so none is left unmeasured."""
@@ -182,7 +182,7 @@ def test_o39_every_required_argument_of_the_pinned_servers_tools_is_filled(tool)
     assert set(required) <= set(arguments)
 
 
-def test_o39_a_qos_id_is_the_requirement_and_the_other_qos_names_keep_their_kind():
+def test_o88_a_qos_id_is_the_requirement_and_the_other_qos_names_keep_their_kind():
     """O88: a name holding `qos` is a requirement's id, but the kind a more specific word names wins: the expression and
     the replicas of a QoS requirement, and the file it is on, stay what they are."""
     schema = {
@@ -225,7 +225,7 @@ def test_o39_a_qos_id_is_the_requirement_and_the_other_qos_names_keep_their_kind
         (None, None, None, False),
     ],
 )
-def test_o39_only_a_refusal_counts_as_a_refused_write(status, code, errno, is_refusal):
+def test_o88_only_a_refusal_counts_as_a_refused_write(status, code, errno, is_refusal):
     """O88: a write of a read-only condition passes the live test only when Onedata refused it: 401, 403, or 400 posix
     with errno eacces (a token caveat's refusal) or eperm (a user without the privilege: the 14 Nov live run's answer
     to a data write by the read-only condition's token). A write that failed for another reason, a missing file, a
