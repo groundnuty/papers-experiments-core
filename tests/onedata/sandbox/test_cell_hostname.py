@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from sandbox_support import make_spec, start_options
 
-from expcore_onedata.sandbox import cellhost, infrafacts
+from expcore_onedata.sandbox import cellhost, cellresolv, gatepolicy, infrafacts
 from expcore_onedata.sandbox import containers as C
 from expcore_onedata.sandbox.api import DataPathMode, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
@@ -42,7 +42,8 @@ def test_o73_the_agent_s_docker_arguments_carry_the_declared_host_name(world, mo
     names = C.Names.make(world.s.name_prefix, "k1-0123abcd")
     rest = mode is DataPathMode.REST
     args, _ = C.agent_run_args(
-        world.s, names, LABELS, image_id=world.s.agent.id, mode=mode, work=Path("/w/work"), share=None,
+        world.s, names, LABELS, image_id=world.s.agent.id, mode=mode, work=Path("/w/work"),
+        resolv=Path("/w/resolv.conf"), share=None,
         gate_ip="10.1.0.2" if rest else None, gate_hosts=["zone.test"] if rest else [],
         ca=Path("/w/ca.pem") if rest else None, trust_bundles={}, zone_host="zone.test" if rest else None,
     )  # fmt: skip
@@ -92,7 +93,11 @@ def test_o73_the_run_s_record_carries_the_name_its_container_was_given_beside_th
         box.record_infrastructure_fact("federation_window", {"verdict": "invented"}, owner=infrafacts.WINDOW)
         facts = box.metadata()["infrastructure_facts"]
         assert facts["cell_hostname"] == world.host.containers[box.names.agent].options["--hostname"]
-        assert set(facts) == {"node", "cell_hostname", "federation_window"}
+        # beside the node's readings and the window: what the start records of a REST run, the hash of the resolv.conf
+        # a cell read (O56) and the timeout its gate was given (O85)
+        assert set(facts) == {
+            "node", "cell_hostname", "federation_window", cellresolv.FACT, gatepolicy.UPSTREAM_READ_TIMEOUT_FACT
+        }  # fmt: skip
     finally:
         stopped(world, box)
 

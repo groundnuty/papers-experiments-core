@@ -242,13 +242,13 @@ def test_an_image_changed_after_its_pin_refuses_the_next_exec(node, settings):
 
 def test_a_cell_s_output_is_capped_and_the_cut_recorded(node, settings):
     """O56, O43: the streams are capped as on Docker, and the cut is on the result and the cell's record."""
-    box = start(node, settings, output_cap_bytes=16)
+    box = start(node, settings, output_cap_bytes=80)  # room for the start's own answers (the resolv.conf hash is 71)
     try:
         node.cell_handler = lambda cell: CmdResult(0, "x" * 100, "")
         result = box.exec("print('x' * 100)", 30)
-        assert result.stdout == "x" * 16
-        assert result.output_cut == {"stdout": {"produced": 100, "kept": 16}}
-        assert box.metadata()["cell_output_cuts"] == [{"cell": 1, "stdout": {"produced": 100, "kept": 16}}]
+        assert result.stdout == "x" * 80
+        assert result.output_cut == {"stdout": {"produced": 100, "kept": 80}}
+        assert box.metadata()["cell_output_cuts"] == [{"cell": 1, "stdout": {"produced": 100, "kept": 80}}]
     finally:
         box.stop()
 
