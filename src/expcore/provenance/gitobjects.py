@@ -18,7 +18,7 @@ def git_env(*, isolate_config: bool = False) -> dict[str, str]:
     `git status` refreshes `.git/index` as a side effect, on a fresh copy's first run and again after a tracked file's
     mtime changes; with the flag it completes the same operation, with the same answer, without taking the lock that
     write needs. A check that writes the clone it checks changes every digest of a directory that includes `.git`.
-    The flag does not stop every verb: `git diff` still refreshes the index, so no launch or check may read with it.
+    The flag does not stop every verb: `git diff` still refreshes the index, so a launch or check does not read with it.
 
     With `isolate_config` the user's global and the system configuration are read as empty, so the answer does not
     depend on them (`core.fsmonitor` in the global file runs a program; `diff.ignoreSubmodules` hides a change). A clone

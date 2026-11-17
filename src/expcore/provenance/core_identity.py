@@ -266,6 +266,7 @@ def _disk_blobs(root: Path, files: list[str]) -> dict[str, str] | None:
             capture_output=True,
             text=True,
             timeout=120,
+            env=git_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
