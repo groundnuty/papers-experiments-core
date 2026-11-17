@@ -291,6 +291,7 @@ def unflagged(argv) -> list:
 def flagged(argv) -> list:
     """The argv, once every Python in it runs with `-I -B`; any other fails the test, whatever it tests."""
     assert not unflagged(argv), f"a Python launched without -I -B (B1): {list(argv)}"
+    return list(argv)
 
 
 INTERPRETER = re.compile(r"python[0-9.]*")  # a Python interpreter by its file name: python, python3, python3.11
