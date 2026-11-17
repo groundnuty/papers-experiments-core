@@ -108,8 +108,9 @@ def test_o72_a_memory_kill_is_the_cell_s_own_and_the_next_cell_runs(node, box):
 
 def test_o72_hidden_memory_no_one_cell_can_be_told_to_hold_ends_the_run_as_infrastructure(node, box, tmp_path):
     """O72: hidden memory past the margin while another run's cell shares the cgroup cannot be told this cell's: the
-    cell is killed and the run ended with its reason (`scope: run`), infrastructure the code tool raises as `sandbox`;
-    every later exec and the collection are refused, and the run's memory reading is unknown, never over."""
+    cell is killed and the run ended with its reason (`scope: run`), infrastructure the code tool raises as
+    `cell_not_isolated`; every later exec and the collection are refused, and the run's memory reading is unknown,
+    never over."""
     node._new_proc(node.new_namespace(), "python3", environ=("EXPCORE_SANDBOX=other-run-ffff0000",))
 
     def hiding(cell):
@@ -123,10 +124,10 @@ def test_o72_hidden_memory_no_one_cell_can_be_told_to_hold_ends_the_run_as_infra
         "memory_limit", "run", "infrastructure"
     )  # fmt: skip
     assert "another run's cell is charged to the same cgroup" in result.kill["basis"]
-    assert kinds.kill_error(result.kill).kind == "sandbox"
+    assert kinds.kill_error(result.kill).kind == "cell_not_isolated"
     with pytest.raises(InfraError) as refused:
         box.exec("print('next')", 30)
-    assert refused.value.kind == "sandbox"
+    assert refused.value.kind == "cell_not_isolated"
     with pytest.raises(InfraError):
         box.collect(tmp_path / "out")
     assert box.metadata()["infrastructure_facts"]["memory"]["reading"] == "unknown"
