@@ -40,14 +40,16 @@ def site(tmp_path):
 
 @pytest.fixture
 def tree(tmp_path) -> Path:
-    """A study's artifacts directory under `tmp_path`: a clone, a venv with a link, a manifest."""
+    """A study's artifacts directory under `tmp_path`: a clone, the interpreter installed in it, a venv with a link
+    into it, a manifest."""
     root = tmp_path / "studies" / "a-study" / "artifacts"
     for name, data in {"clone/server.py": b"print('serve')\n", "manifests/space.json": b"{}\n",
+                       "python/bin/python3.12": b"an interpreter\n",
                        "venv/lib/python3.12/site-packages/pkg/__init__.py": b"VALUE = 1\n"}.items():  # fmt: skip
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).write_bytes(data)
     (root / "venv" / "bin").mkdir()
-    (root / "venv" / "bin" / "python").symlink_to("/an/interpreter/bin/python3.12")
+    (root / "venv" / "bin" / "python").symlink_to("../../python/bin/python3.12")
     return root
 
 
@@ -163,6 +165,36 @@ def test_o74_up_refuses_a_tree_holding_a_special_file_naming_its_relative_path(h
     file's path relative to the directory."""
     os.mkfifo(tree / "venv" / "run")
     refuse(Rig(hpc, tmp_path, {**site, "HPC_STUDY_ARTIFACTS": str(tree)}), "venv/run")
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["/an/interpreter/bin/python3.12", "../../../outside/python3.12", "{tmp}/studies/other-study/python3.12"],
+    ids=["absolute", "dot dot", "a sibling study"],
+)
+def test_o74_up_refuses_a_link_that_leaves_the_artifacts_directory_naming_its_relative_path(
+    hpc, tmp_path, site, tree, target
+):
+    """O74: the directory is self-contained (its interpreter is installed in it): a link whose target leaves it is a
+    part of the study that the digest would not pin, so `up` refuses it before any job, naming the variable and the
+    link's path relative to the directory, and neither the target nor an absolute path."""
+    (tree / "venv" / "bin" / "interpreter").symlink_to(target.format(tmp=tmp_path))
+    message = refuse(Rig(hpc, tmp_path, {**site, "HPC_STUDY_ARTIFACTS": str(tree)}), "venv/bin/interpreter")
+    assert "leaves the directory" in message
+    assert "python3.12" not in message
+    assert "outside" not in message
+
+
+def test_o74_up_takes_the_digest_of_a_tree_whose_links_stay_inside_by_relative_or_absolute_targets(
+    hpc, tmp_path, site, tree
+):
+    """O74: `lib64 -> lib` and a link by the directory's own absolute path stay inside: `up` digests the tree, and the
+    digest is the function's own."""
+    (tree / "venv" / "lib64").symlink_to("lib")
+    (tree / "venv" / "interpreter").symlink_to(f"{os.path.realpath(tree)}/python/bin/python3.12")
+    rig = Rig(hpc, tmp_path, {**site, "HPC_STUDY_ARTIFACTS": str(tree)})
+    rig.up()
+    assert rig.state()[ARTIFACTS] == hpc.identity.tree_sha256(tree)
 
 
 @pytest.mark.parametrize("what", ["missing", "a file", "a link"])

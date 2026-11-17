@@ -688,9 +688,13 @@ handed to the core's phase among its values, so a core step on a node, whose env
 never reads the tree. It is the SHA-256 of one canonical listing: `expcore-artifacts-tree/1` and a NUL, then one record
 per entry sorted by its relative path as bytes, none for the directory itself: `F NUL path NUL size NUL sha256 NUL` (a
 regular file), `D NUL path NUL` (a directory), `L NUL path NUL target NUL` (a symbolic link, by its target string, never
-followed: a venv's `bin/python` is a link to an interpreter outside the tree, so refusing links would refuse the venv,
-and the interpreter's own bytes are not in the digest). A special file, or a root that is not a directory of its own, is
-refused, naming `HPC_STUDY_ARTIFACTS` and a path relative to the directory, never an absolute one. No mode, owner, time
+followed, so what it points at must be in the tree to be pinned: the directory is self-contained, its interpreter
+installed in it and its venv built on it, and a link whose resolved target leaves it is refused. A link is resolved as
+the kernel resolves it, against the tree's own entries alone: a component that is a link is replaced by its target, `..`
+goes up one and one at the root is an escape, an absolute target must begin, by whole components, with the root's real
+path or the path it was declared by, and a path may pass through 40 links at most, so a loop is refused; a link that
+dangles inside is allowed and recorded, and a tree whose links stay inside has its earlier digest). A special file, or a
+root that is not a directory of its own, is refused, naming `HPC_STUDY_ARTIFACTS` and a path relative to the directory, never an absolute one. No mode, owner, time
 or path of the directory is in it, so a copy elsewhere has the same digest. The tree is read below one held descriptor
 with no link followed and never written (the pilot makes it read-only first). A manifest's `expect_render_identity`
 (a path of the study; the lines carry it with its hash as `--expect-render-identity*`) makes `step` compare the

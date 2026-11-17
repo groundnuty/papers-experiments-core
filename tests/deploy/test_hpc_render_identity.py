@@ -220,14 +220,16 @@ def test_o74_up_says_the_record_was_written_beside_the_platform_file(hpc, tmp_pa
 
 
 def artifacts_tree(folder: Path, **changes: bytes) -> Path:
-    """A study's artifacts directory made by hand under `folder`: a clone, a venv with its links, a manifest."""
+    """A study's artifacts directory made by hand under `folder`: a clone, the interpreter installed in it, a venv with
+    its links (every link inside the directory), a manifest."""
     files = {"clone/server.py": b"print('serve')\n", "manifests/space.json": b"{}\n",
+             "python/bin/python3.12": b"an interpreter\n",
              "venv/lib/python3.12/site-packages/pkg/__init__.py": b"VALUE = 1\n"}  # fmt: skip
     for name, data in {**files, **changes}.items():
         (folder / name).parent.mkdir(parents=True, exist_ok=True)
         (folder / name).write_bytes(data)
     (folder / "venv" / "bin").mkdir(exist_ok=True)
-    (folder / "venv" / "bin" / "python").symlink_to("/an/interpreter/bin/python3.12")
+    (folder / "venv" / "bin" / "python").symlink_to("../../python/bin/python3.12")
     return folder
 
 
@@ -244,7 +246,7 @@ def test_o74_up_with_a_study_artifacts_directory_records_the_digest_of_its_tree_
     assert HEX.fullmatch(record[ARTIFACTS])
     assert text == json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
     assert stat.S_IMODE((root / FILE).stat().st_mode) == 0o600
-    for part in (str(tree), str(tmp_path), "a-study", "leaf-dir", "/an/interpreter"):
+    for part in (str(tree), str(tmp_path), "a-study", "leaf-dir", "python3.12"):
         assert part not in text
 
 
