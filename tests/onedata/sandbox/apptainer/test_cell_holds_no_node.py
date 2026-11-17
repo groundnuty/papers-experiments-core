@@ -98,7 +98,8 @@ def _everything_a_cell_receives(done) -> dict[str, str]:
 def test_o70_no_cell_input_holds_a_node_name_an_address_or_the_public_port(config, tmp_path, table):
     """O70: the environment, the hosts file, the gate's file, the CA and every other file or argument a cell receives
     hold the declared names alone, with or without `[sandbox.federation]`; the gate's leaf certificates name them alone;
-    and the gate, which the cell cannot read, is the one place the mapped addresses are."""
+    what the run records (its metadata, its egress declaration and its files, but the gate's own directory) holds none
+    either, and the gate, which the cell cannot read, is the one place the mapped addresses are."""
     node = FakeNode()
     node.make_ca = DockerHost().make_ca  # real certificates, whose names are read below
     (tmp_path / "sandbox").mkdir()
@@ -124,6 +125,17 @@ def test_o70_no_cell_input_holds_a_node_name_an_address_or_the_public_port(confi
             assert not [p for p in patterns if p.search(text)], "a certificate names a node or an address"
             assert f"DNS:{leaf.stem}" in text
         assert not [p for p in patterns if p.search(_certificate_names(box.dir / "tls" / "ca.pem"))]
+        record = {
+            "metadata": json.dumps(box.metadata(), default=str),
+            "egress declaration": json.dumps(sorted(box.egress_declaration().hosts)),
+        }
+        for file in sorted(p for p in box.dir.rglob("*") if p.is_file() and "gate" not in p.relative_to(box.dir).parts):
+            if file.suffix not in (".key", ".pem"):  # the certificates' names are read through openssl above
+                record[f"the run's file {file.relative_to(box.dir)}"] = file.read_bytes().decode("utf-8", "replace")
+        for where, text in record.items():  # what the run records and publishes, and its files but the gate's own
+            assert not [p for p in patterns if p.search(text)], (
+                f"the run's record holds a node's name or address: {where}"
+            )
         dialled = node.gates[-1].config["hosts"]  # the gate's own configuration: the one place the addresses are
         assert {h["dial"] for h in dialled.values()} == {NODES[ZONE][0], NODES[LOCAL][0]}
     finally:
