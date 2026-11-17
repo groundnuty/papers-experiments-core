@@ -13,8 +13,11 @@ reported, and the analysis is run again without them. This package is the core's
 - `log`: the watcher's log read and checked, intact or unknown with its reasons, the accesses in the agent's window
   and the isolation proofs;
 - `instrument`: `MountGuard`, the instrument (namespace `mount_guard`) whose snapshot holds the counts and reasons;
-- `flags`: `judge`, one run's verdict, `clean`, `flagged` (an access) or `unknown` (a log or an isolation not shown);
-- `sensitivity`: every run's verdict and the analysis again without the runs that are not clean.
+- `flags`: `judge`, one run's verdict, `clean`, `flagged` (an access), `unknown` (a log or an isolation not shown) or
+  `not_applicable` (a run with no mount: a REST run, a run with no data path, as its record says);
+- `campaign`: the data path of each level of a study's data-path factor, as the campaign's fingerprint records it;
+- `sensitivity`: every run's verdict and the analysis again without the runs that are not clean; a run the guard does
+  not apply to stays in it.
 
 The watcher is `expcore_onedata.sandbox.mountwatch`. **Detection, not a barrier:** inotify names no process, so every
 event in the window is counted as the agent's; it sees an open or a read, never a read of memory the file was mapped
@@ -31,6 +34,7 @@ from expcore.mountguard.flags import (
     FLAGS,
     ISOLATION_UNPROVEN,
     LOG_UNKNOWN,
+    NOT_APPLICABLE,
     PROCESS_ACCESS,
     TOKEN_ACCESS,
     UNKNOWN_VERDICT,
@@ -46,7 +50,11 @@ from expcore.mountguard.instrument import (
     UNKNOWN,
     UNPROVEN,
     MountGuard,
+    MountRunSource,
     MountWatchSource,
+    NoMount,
+    mount_guard_for,
+    not_applicable_snapshot,
     snapshot,
 )
 from expcore.mountguard.log import Reading, read_log
@@ -60,6 +68,7 @@ __all__ = [
     "ISOLATION_UNPROVEN",
     "LOG_UNKNOWN",
     "NAMESPACE",
+    "NOT_APPLICABLE",
     "PROCESS_ACCESS",
     "PROVEN",
     "TOKEN_ACCESS",
@@ -68,10 +77,14 @@ __all__ = [
     "UNPROVEN",
     "VERDICTS",
     "MountGuard",
+    "MountRunSource",
     "MountWatchSource",
+    "NoMount",
     "Reading",
     "RunMountGuard",
     "judge",
+    "mount_guard_for",
+    "not_applicable_snapshot",
     "read_log",
     "snapshot",
     "verdict_of",

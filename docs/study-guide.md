@@ -50,7 +50,7 @@ All configuration is TOML in the study directory, validated when the study is lo
 
 | File | Holds |
 |---|---|
-| `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the side files of its records ([section 4](#side-files)), the factors, the conditions and the tasks |
+| `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the side files of its records ([section 4](#side-files)), the factors, the conditions and the tasks, and, optionally, which factor is the data path (`[study] data_path_factor`, [below](#data-paths-on-the-onedata-platform)) |
 | `models.toml` | the single model table: each model once, with backend, API id, sampling, limits and context window, price (flat or in tiers, [below](#prices-and-the-budget)) and status |
 | `campaign.toml` | the plan (models, seeds, order seed), the loop's caps ([the time cap and the ceiling](#caps-on-a-runs-time) included), the scheduler's caps and the kinds it records its failures as ([below](#the-schedulers-kinds)), and the budget |
 | `preregistration.toml` | the named contrasts, the Holm family (or `exploratory_only = true`, [section 6](#6-what-a-conclusion-may-say)), alpha, the estimators, the bootstrap and the power settings |
@@ -73,6 +73,9 @@ from expcore.study.config import load_study
 
 study = load_study("my-study")
 assert study.name == "tiny-study"
+assert (
+    study.data_path_factor == "data_path"
+)  # the name of the data-path factor, unless `[study] data_path_factor` sets it
 assert sorted(study.config_sha256) == ["campaign.toml", "models.toml", "preregistration.toml", "study.toml"]
 statuses = {key: study.models.resolve(key).status for key in study.models}
 assert statuses == {"alpha-stub": "frozen", "beta-stub": "frozen"}  # only frozen settings may start a study run
@@ -414,7 +417,7 @@ The two keys never go together, and the per-client keys of earlier versions (`in
 
 ### Data paths on the Onedata platform
 
-A study selects each condition's data path through its `data_path` factor: the condition gives the factor a level in the study's own words, and `[sandbox.data_paths]` of `platform.toml` maps each level to a kind, `mount` (a read-only mount of the space), `rest` (the REST interface, through the data gate) or `none`. A REST level can also name how its listings are served, as a table in place of the kind:
+A study selects each condition's data path through its data-path factor, `data_path` unless the study names another with `[study] data_path_factor` in `study.toml` (a study that already calls it `path`, or anything else, sets `data_path_factor = "path"`: a key naming a factor the study declares, else refused at load, so renaming the factor, which would change every run key and the campaign fingerprint, is never needed, and a study that sets no key is exactly as it was; the core and `SandboxPlatform(..., data_path_factor=context.study.data_path_factor)` read the factor from that one name, and the plugin passes the platform's own `StudyPlugin(..., data_path_factor=platform.data_path_factor)`, so that a campaign whose platform was built without the name its study declares, or with another, is refused at its start, naming both, and never left to read the default): the condition gives the factor a level in the study's own words, and `[sandbox.data_paths]` of `platform.toml` maps each level to a kind, `mount` (a read-only mount of the space), `rest` (the REST interface, through the data gate) or `none`. A REST level can also name how its listings are served, as a table in place of the kind:
 
 - `level = "rest"`, or `listing = "paged"`: a listing is the server's page, as it comes. The official client's `ls` reads one page, so a directory of more than 1000 entries shows its first 1000.
 - `level = { kind = "rest", listing = "complete" }`: the gate answers every listing with all of the directory's entries, as one last page. A listing it cannot serve whole (past 64 MiB or 10,000 pages) ends the run as `data_gate_integrity`, so the run is set aside and never scored on a part of the directory; a listing that names where to start (`token`, `index`, `offset`) gets a 400 the agent reads.
@@ -1326,7 +1329,7 @@ Report the primary analysis as it stands and the sensitivity analysis beside it.
 
 ### The mount on HPC: guarded and reported, not isolated
 
-On an HPC batch node your agent's cells and the oneclient that holds the mount's token run as one user, so the token cannot be kept from the agent as the Docker sidecar keeps it. The study's PI ruled (16 Nov 2026) that mount runs stay on HPC with detection and report, as for egress. Declare oneclient's bundle in `[sandbox.apptainer]` (`oneclient_bundle` and `oneclient_bundle_sha256`: the tar `deploy/hpc-federation/oneclient_bundle.py` builds from the Compose sidecar's pinned image, so both backends run one oneclient build; its SHA-256 is in the campaign fingerprint, and each run records oneclient's version and build id), and give the Apptainer backend its mount helper, `host_mount_factory()` from `expcore_onedata.sandbox.apptainer.hostmount`, as `sandbox_options={"mount_helper": ...}`: oneclient then runs on the node outside every cell, from the bundle's own loader and libraries, its token in a private file no cell binds and removed once the mount is up, and a watcher outside the cells logs every access to that file and its directory, watches oneclient for a tracer, and proves from the node's `/proc` that each cell runs in a PID namespace of its own, with no view of the node's processes or of the private files. The helper takes `io_mode = "proxy"` only: a direct mount is refused at the run's start ("Direct I/O: declare the storage, and keep proxy unless placement is shown the same", above), so HPC mounts are proxy-only until the direct-I/O comparison passes. Record it with `expcore.mountguard.MountGuard(sandbox, sandbox.mount_guard_nonce)` beside the run's other instruments:
+On an HPC batch node your agent's cells and the oneclient that holds the mount's token run as one user, so the token cannot be kept from the agent as the Docker sidecar keeps it. The study's PI ruled (16 Nov 2026) that mount runs stay on HPC with detection and report, as for egress. Declare oneclient's bundle in `[sandbox.apptainer]` (`oneclient_bundle` and `oneclient_bundle_sha256`: the tar `deploy/hpc-federation/oneclient_bundle.py` builds from the Compose sidecar's pinned image, so both backends run one oneclient build; its SHA-256 is in the campaign fingerprint, and each run records oneclient's version and build id), and give the Apptainer backend its mount helper, `host_mount_factory()` from `expcore_onedata.sandbox.apptainer.hostmount`, as `sandbox_options={"mount_helper": ...}`: oneclient then runs on the node outside every cell, from the bundle's own loader and libraries, its token in a private file no cell binds and removed once the mount is up, and a watcher outside the cells logs every access to that file and its directory, watches oneclient for a tracer, and proves from the node's `/proc` that each cell runs in a PID namespace of its own, with no view of the node's processes or of the private files. The helper takes `io_mode = "proxy"` only: a direct mount is refused at the run's start ("Direct I/O: declare the storage, and keep proxy unless placement is shown the same", above), so HPC mounts are proxy-only until the direct-I/O comparison passes. Record it with `expcore.mountguard.mount_guard_for(sandbox)` beside the run's other instruments, **for every run**: it is the guard of a mount run, and, for a REST run or a run with no data path, which have no mount to guard, a statement that the guard does not apply (below). It is built over `MountGuard(sandbox, sandbox.mount_guard_nonce)`:
 
 ```python
 from expcore.mountguard import MountGuard
@@ -1343,7 +1346,36 @@ guard = MountGuard(UnguardedMount(), "00112233445566778899aabbccddeeff")
 assert guard.finish()["log"] == "unknown"  # no log: unknown, never a clean run
 ```
 
-What you get, with nothing else to call: once one analysed record carries the `mount_guard` instrument, `analyze` judges every analysed run `clean`, `flagged` (an access to the token's file or directory while cells could run, or a tracer on oneclient) or `unknown` (a missing or damaged log, or a cell isolation that was not proven), and runs the preregistered analysis again without every run that is not clean. `report.md` gains `## Mount isolation (detected, not prevented)` after the egress section, `analysis.json` gains `mount_guard`, and `analyze` prints a line per contrast. A batch checked by both guards also gets `## Egress and mount isolation together`: the analysis again without every run either guard leaves out (flagged or unknown to either, so a run unknown to one and clean to the other is left out), with the runs left out per condition and by which guard, in `analysis.json` (`guards`) and the terminal too. **A run whose guard log is missing or damaged, or whose isolation was not proven, is unknown, never counted clean.** What each field and reason means is in [`interfaces.md`](interfaces.md#the-mount-on-hpc-guarded-the-mount_guard-instrument).
+**A campaign that mixes data paths** (REST runs beside mount runs) lists the guard for every run. A run with no mount had no mount exposure, so the guard does not apply to it: `mount_guard_for` gives it `NoMount`, whose record says so, `analyze` judges it `not_applicable`, and it stays in the mount guard's rerun (and in the combined one, unless another guard leaves it out) instead of being left out as `unknown`. It is counted apart from `clean`, and shown as such in the report, `analysis.json` and the terminal. Only that statement makes a run not applicable, and the sandbox's own data path writes it:
+
+```python
+from expcore.mountguard import NoMount, judge, mount_guard_for
+
+
+class Box:
+    """A sandbox as `mount_guard_for` reads it."""
+
+    data_path_kind = "rest"  # the run's data path, from its spec
+    mount_guard_nonce = None  # no mount, so no watcher
+
+    def mount_watch_log(self):
+        return None
+
+
+class Record:
+    run_key, attempt = "run-1", 1
+    instruments = {"mount_guard": mount_guard_for(Box()).finish()}
+
+
+assert isinstance(mount_guard_for(Box()), NoMount)
+assert judge(Record, "rest-arm").verdict == "not_applicable"  # kept in the rerun, never counted as clean
+Record.instruments = {}  # a record without the snapshot, whatever the run's data path was
+assert judge(Record, "rest-arm").verdict == "unknown"  # unknown is never clean, and the run is left out
+```
+
+A mount run whose record lacks the snapshot is `unknown` and left out as before, and a mount run whose helper keeps no watcher raises `ValueError` at `mount_guard_for` rather than reading as not applicable. A record with no mount-guard snapshot at all, as when the guard was listed on the mount runs alone, is not applicable too when the campaign's own fingerprint maps its level of the data-path factor (the factor `[study] data_path_factor` names, `data_path` unless the study sets it, above) to a REST path or none: the platform records `data_paths` there, so the analysis of such a campaign needs no record rewritten. A mount level, a level the fingerprint does not map and a platform that records no `data_paths` leave the run `unknown`.
+
+What you get, with nothing else to call: once one analysed record carries the `mount_guard` instrument, `analyze` judges every analysed run `clean`, `flagged` (an access to the token's file or directory while cells could run, or a tracer on oneclient), `unknown` (a missing or damaged log, or a cell isolation that was not proven) or `not_applicable` (a run with no mount), and runs the preregistered analysis again without every run that is not clean (a run the guard does not apply to is not left out). `report.md` gains `## Mount isolation (detected, not prevented)` after the egress section, `analysis.json` gains `mount_guard`, and `analyze` prints a line per contrast. A batch checked by two or more guards (egress, the mount guard, the process-visibility check below) also gets a section for them together, `## Egress and mount isolation together` for those two: the analysis again without every run any of them leaves out (flagged or unknown to any, so a run unknown to one and clean to the others is left out; a guard that does not apply to a run, as the mount guard does not to a REST run, leaves it out for nothing), with the runs left out per condition and by which guard, in `analysis.json` (`guards`) and the terminal too. **A run whose guard log is missing or damaged, or whose isolation was not proven, is unknown, never counted clean.** What each field and reason means is in [`interfaces.md`](interfaces.md#the-mount-on-hpc-guarded-the-mount_guard-instrument).
 
 Report the primary analysis as it stands and the sensitivity analysis beside it. The guard detects, it does not prevent: inotify does not say which process touched the file, so every touch while cells can run counts as the agent's; a tracer is sampled, so a short one is missed; oneclient's environment and memory are covered only by the proof that no cell can see its process; and a process of your user outside the cells (an ssh login into the node) is outside every check.
 
@@ -1373,7 +1405,31 @@ Once one analysed record carries it, `analyze` judges every analysed run:
 - `unknown` when its memory reading is unknown (memory not told its own, or a reading that failed), so its limit condition is unknown, never within its limit;
 - otherwise `clean`.
 
-The analysis then runs again without every run that is not clean. `report.md` gains `## Process visibility (detected, not prevented)`, `analysis.json` gains `process_visibility`, and `analyze` prints a line per contrast. The check detects, it does not prevent. Hidden memory under the margin (`hidden_memory_margin_bytes`, 128 MiB by default) and a hidden process's shared memory are not told apart from the node's own; the step's memory limit bounds them, and every hidden process ends with its cell. What each field means is in [`interfaces.md`](interfaces.md#processes-hidden-from-the-watch-the-process_visibility-instrument).
+The analysis then runs again without every run that is not clean, and with the egress check or the mount guard it also joins the rerun without every run any guard leaves out, `## Egress, mount isolation and process visibility together` for all three (O76). `report.md` gains `## Process visibility (detected, not prevented)`, `analysis.json` gains `process_visibility`, and `analyze` prints a line per contrast. The check detects, it does not prevent. Hidden memory under the margin (`hidden_memory_margin_bytes`, 128 MiB by default) and a hidden process's shared memory are not told apart from the node's own; the step's memory limit bounds them, and every hidden process ends with its cell. What each field means is in [`interfaces.md`](interfaces.md#processes-hidden-from-the-watch-the-process_visibility-instrument).
+
+### The sensitivity reruns a preregistration declares
+
+Which reruns `analyze` runs depends on which guard instruments your records carry: the egress rerun, the mount guard's, the process-visibility check's, and the one without every run any guard that checked the batch leaves out (`any_guard`, when two or more did). A guard listed on the wrong runs, or on none, would silently give a different set than the one you meant to preregister. Declare the set in `preregistration.toml`, in its hash like the rest, as a `[sensitivity]` table whose `reruns` lists any of `egress`, `mount_guard`, `process_visibility` and `any_guard`, in any order, each at most once (the block below appends one to the example's file and loads it).
+
+`analyze` and `report` then refuse unless the reruns they would run are exactly these, in either direction, and name the difference: a declared rerun that no record supports (no analysed record carries that guard's instrument, or fewer than two guards checked the batch for `any_guard`), and a rerun your records would produce that the preregistration does not declare. A rerun counts as run when its guard checked the batch, whether or not it left a run out: a batch whose every run is clean has no second analysis, and is still the rerun you declared. `reruns = []` declares that none is expected, so a batch that would run one is refused. **A preregistration with no `[sensitivity]` table reads as `reruns = []`:** a batch no guard checked runs no rerun, so it passes with no table and its `analysis.json` is as it was; a batch a guard checked is refused, naming the reruns it would run and the table that is missing, so no rerun goes unpreregistered. A study whose plugin lists a guard's instrument declares its reruns; `analysis.json` carries `sensitivity_reruns` for a study that has the table.
+
+```python
+import tomllib
+
+from expcore.stats.prereg import parse
+from expcore.stats.reruns import difference
+
+shown = Path("my-study/preregistration.toml").read_text() + '\n[sensitivity]\nreruns = ["egress", "any_guard"]\n'
+declared = parse(tomllib.loads(shown), "my-study/preregistration.toml", "0" * 64, study.schema).sensitivity_reruns
+assert declared == ("egress", "any_guard")
+assert difference(declared, ("any_guard", "egress")) is None  # what the records would run is what is declared
+said = difference(declared, ("egress",))  # only one guard's instrument is listed on the records
+assert (
+    "declared but not run: any_guard (it needs two or more guards to have checked the batch; only egress did)" in said
+)
+said = difference(declared, ("egress", "process_visibility", "any_guard"))  # one the preregistration never declared
+assert "run but not declared: process_visibility" in said
+```
 
 ### The order instruments start and finish in
 
@@ -1684,7 +1740,7 @@ assert "tools-effect-on-rounds" in report.split("## Exploratory contrasts")[1]
 A protocol is frozen when nothing that decides a result can change unnoticed. Before the study's runs:
 
 - Freeze every model: `status = "frozen"` in `models.toml`, with its settings collected. A study run refuses a model that is not frozen.
-- Write `preregistration.toml`: the contrasts, the Holm family, the margins, alpha, the estimators and the bootstrap and power settings. Its hash goes into every analysis and the report.
+- Write `preregistration.toml`: the contrasts, the Holm family, the margins, alpha, the estimators and the bootstrap and power settings, and, when your records carry guard instruments, the sensitivity reruns you expect (`[sensitivity] reruns`, above). Its hash goes into every analysis and the report.
 - Commit the study, and pin the core by tag in its dependencies (`uv add ...@v0.1.0`); every record carries the core version.
 - Then run. The campaign fingerprint holds the hash of every configuration file, the prompts, the tool manifests and the scorers' versions, and a resume under any change is refused.
 
