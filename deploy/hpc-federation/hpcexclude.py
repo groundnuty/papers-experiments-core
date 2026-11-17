@@ -22,10 +22,22 @@ from typing import Dict, Iterable, List, NamedTuple, Sequence, Set, Tuple
 from hpcslurm import JOB_LISTED, Slurm, SlurmError
 
 JOB_PREFIX = "hpcop-"
-# every state in which a job still holds a node (squeue's own default lists pending, running and completing alone, so a
-# suspended job, which keeps its node and its memory, would be missed)
-LIVE_STATES = "PENDING,RUNNING,CONFIGURING,COMPLETING,SUSPENDED,RESIZING"
-LIVE = ["squeue", "--me", "-h", "-t", LIVE_STATES, "-o", "%i %j %T %N"]  # id, name, state, node list: nothing else
+# The read names no state (`-t`): squeue's own default lists every job that holds a node, a suspended one, one staging
+# out, and a running one with a stop or a signal pending among them (Slurm's `_filter_job`, read on master and on 23.02;
+# its manual says only "pending, running, and completing", which is less than the code does). An explicit list of the
+# base state names is narrower than that default, since a base name matches a job's whole state, flags included: it
+# would hide a running job that has been sent a stop or a signal. A login shell's `SQUEUE_STATES` cannot narrow the
+# default either: `hpcslurm.Runner` runs the call with no `SQUEUE_*` variable.
+# `--all`: in every partition, a hidden one included, whatever the environment says (`SQUEUE_ALL` is what a site that
+# hides its partition would otherwise rely on); it only widens what the guard sees
+LIVE = [
+    "squeue",
+    "--me",
+    "-h",
+    "--all",
+    "-o",
+    "%i %j %T %N",
+]  # id, name, state, node list: nothing else of a job is read
 STATE = re.compile(r"[A-Z_]{2,32}")
 LENIENT = ("PENDING", "COMPLETING")  # states whose node list may be none: not yet placed, or all returned to service
 NODE_LIST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._,\[\]-]{0,4095}")  # a compressed host list: `node[01-03],node07`

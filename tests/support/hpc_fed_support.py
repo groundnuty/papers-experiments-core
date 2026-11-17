@@ -374,7 +374,14 @@ def isolated(argv) -> list:
     return list(argv)
 
 
-DEFAULT_STATES = {"PENDING", "RUNNING", "COMPLETING"}  # what `squeue` lists with no `-t` (its documented default)
+# What `squeue` lists with no `-t` (Slurm's `_filter_job`, read on master and on 23.02): a job whose base state is
+# pending, running or suspended, or that is staging out or completing, whatever flag it carries, so a running job with
+# a signal pending (SIGNALING), a stop sent (STOPPED), configuring or resizing is listed too. Its manual says only
+# "pending, running, and completing", which is less than it does. An explicit `-t` matches a base state by equality
+# with the whole state, flags included, so a list of base names hides those flagged jobs: the guard's read therefore
+# names no state.
+DEFAULT_STATES = {"PENDING", "RUNNING", "SUSPENDED", "STAGE_OUT", "COMPLETING", "CONFIGURING", "RESIZING", "STOPPED",
+                  "SIGNALING"}  # fmt: skip
 
 
 @dataclass
@@ -473,11 +480,9 @@ class FakeSlurm:
         self.calls.append(argv)
         tool = argv[0]
         if tool == "squeue" and "--me" in argv:  # the account's live jobs: ids, names, states and node lists only
-            agreed = "PENDING,RUNNING,CONFIGURING,COMPLETING,SUSPENDED,RESIZING"  # every state holding a node
-            assert argv == ["squeue", "--me", "-h", "-t", agreed, "-o", "%i %j %T %N"], f"not read as agreed: {argv}"
+            assert argv == ["squeue", "--me", "-h", "--all", "-o", "%i %j %T %N"], f"the read is not as agreed: {argv}"
             self.me_reads += 1
-            states = set(argv[argv.index("-t") + 1].split(",")) if "-t" in argv else DEFAULT_STATES
-            listed = [row for row in self.me_rows() if row.split()[2] in states]  # squeue lists the states asked for
+            listed = [row for row in self.me_rows() if row.split()[2] in DEFAULT_STATES]  # as squeue lists by default
             answer = self.on_me(self.me_reads, listed) if self.on_me is not None else None
             return answer or Completed(0, "".join(f"{row}\n" for row in listed), "")
         if tool == "sbatch":
