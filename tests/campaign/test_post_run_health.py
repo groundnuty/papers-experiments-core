@@ -18,6 +18,15 @@ from expcore.campaign.healthgate import Health
 from expcore.campaign.markers import MARKER_NAME, AttemptResult, MarkerError, read_marker, write_marker
 from expcore.loop.outcomes import Outcome
 
+
+def nested(depth):
+    """A JSON-looking value nested `depth` lists deep, a few KiB of text, that `json.dumps` cannot dump."""
+    value: list = []
+    for _ in range(depth):
+        value = [value]
+    return {"x": value}
+
+
 READING = {
     "spaces": [{"position": "spaces[0]", "read": True, "offline": ["providers[1]"]}],
     "targets": ["providers[1]"],
@@ -77,8 +86,8 @@ def test_o90_a_reading_from_the_pre_run_check_is_never_the_post_run_checks(tmp_p
 
 @pytest.mark.parametrize(
     "unusable",
-    ["a text", ["a", "list"], {"a": {1, 2}}, {"big": "x" * 70_000}],
-    ids=["text", "list", "not-json", "too-big"],
+    ["a text", ["a", "list"], {"a": {1, 2}}, {"big": "x" * 70_000}, nested(5_000)],
+    ids=["text", "list", "not-json", "too-big", "too-deep"],
 )
 def test_o90_a_reading_that_is_no_small_json_object_is_refused_with_an_event_and_never_kept(tmp_path, unusable):
     """O90: a reading is a JSON object of a bounded size; anything else is not kept, and the store says so."""
@@ -114,5 +123,5 @@ def test_o90_a_marker_whose_reading_is_no_object_cannot_be_trusted(tmp_path):
 def test_o90_the_helper_keeps_a_small_json_object_and_nothing_else():
     """O90: `prerun.reading_of` answers the reading when it is a JSON object within `READING_MAX_BYTES`, else None."""
     assert prerun.reading_of(READING) == READING
-    for value in (None, "x", [1], {"a": {1}}, {"big": "x" * (prerun.READING_MAX_BYTES + 1)}):
+    for value in (None, "x", [1], {"a": {1}}, {"big": "x" * (prerun.READING_MAX_BYTES + 1)}, nested(5_000)):
         assert prerun.reading_of(value) is None
