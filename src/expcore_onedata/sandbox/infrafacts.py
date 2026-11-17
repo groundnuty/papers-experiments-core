@@ -43,6 +43,8 @@ WORK_DISK = "work_disk"  # `apptainer.facts.record`: the departures, the work di
 NODE = "node"  # the readings of the node (O87) and of the tool server's host
 WINDOW = "federation_window"  # the federation's window (O86), which the platform records from the run's preparation on
 METADATA = "metadata"  # the readings made when `metadata()` is read
+GATE = "gate"  # the gate's configuration as it was written (O85): the sandbox records what the file holds
+CELL_RESOLV = "cell_resolv"  # `cellresolv.note`: the hash of the resolv.conf a cell read back at the start (O56)
 HEALTH = "health"  # the platform check's structured reading of the run's post-run state (O90, `healthreading.FACT`)
 
 OWNED: Mapping[str, frozenset[str]] = MappingProxyType(
@@ -50,6 +52,10 @@ OWNED: Mapping[str, frozenset[str]] = MappingProxyType(
         WORK_DISK: frozenset({"backend", "facts", "dns", "provider_storage"}),
         NODE: frozenset({"node", "tool_server_host"}),
         WINDOW: frozenset({"federation_window"}),
+        GATE: frozenset(
+            {"gate_upstream_read_timeout_s"}
+        ),  # `gatepolicy.UPSTREAM_READ_TIMEOUT_FACT`; a test holds them equal
+        CELL_RESOLV: frozenset({"resolv_conf_sha256"}),  # `cellresolv.FACT`; a test holds the two equal
         HEALTH: frozenset({"post_run_health"}),  # a test holds it equal to `healthreading.FACT`
         METADATA: frozenset(
             {
@@ -130,6 +136,8 @@ def refuse_replacement(fields: Mapping[str, Any]) -> None:
 
 
 __all__ = [
+    "CELL_RESOLV",
+    "GATE",
     "HEALTH",
     "METADATA",
     "NODE",
