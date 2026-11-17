@@ -323,9 +323,9 @@ class PlatformConfig:
         mount level's I/O mode (O21, O36), the caps of the tables of the bytes served when `[sandbox.served_bytes]` is
         declared (O22), on the Apptainer backend that backend's pins (`sandbox_backend`, O56), and the sandbox's other
         settings that shape a run (`sandbox`: the backend, the images by id, the limits, the mount, the trust paths,
-        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256, and, when it is a
-        provider other than the local one, the provider the content check reads through, by its `providers[i]`
-        position: O87). With a
+        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256, the gate's upstream
+        read timeout only when it is not the default (`gate`: O85), and, when it is a provider other than the local one,
+        the provider the content check reads through, by its `providers[i]` position: O87). With a
         `[toolserver]`, its pinned commit, its command line (federation-neutral, hashed), its start's bound and each
         condition's allow-list, rights and manifest's SHA-256 (`toolserver`); with a `[placement]`, its data provider by
         label, its range map by digest and the bounds a run's instruments read (`placement`); with `[faults]`, the

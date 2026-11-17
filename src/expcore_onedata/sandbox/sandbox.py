@@ -445,11 +445,16 @@ class DockerSandbox:
             "hosts": hosts,
             "listing": self.spec.listing,  # paged, or every listing answered complete (O21)
             "token_file": GATE_TOKEN_PATH,  # where `gate_run_args` binds the run's file of the token, read-only
+            # how long the gate waits for the upstream's next byte, the default's value when none is declared (O85)
+            "upstream_read_timeout_s": self.s.gate_upstream_read_timeout_s,
         }
         if self._ca_copy is not None:
             config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only
         (self.dir / "gate.json").write_text(json.dumps(config), encoding="utf-8")
         (self.dir / "gate.json").chmod(0o444)  # no secret; the gate, root without DAC_OVERRIDE, reads it as anyone
+        # the fact is what the file holds, read back, never what was meant (O85)
+        given = json.loads((self.dir / "gate.json").read_text(encoding="utf-8"))["upstream_read_timeout_s"]
+        self.record_infrastructure_fact(gatepolicy.UPSTREAM_READ_TIMEOUT_FACT, given)
 
     def _pool_position(self, subnet: str) -> int | None:
         """Which pool of `[sandbox.network] pools`, by position in the file, a subnet was taken from."""

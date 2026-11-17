@@ -77,9 +77,14 @@ def config(
     port: int,
     upstream_ca: Path | None,
     options: Mapping[str, Any],
+    upstream_read_timeout_s: float,
     scan_names: Sequence[str] = (),
 ) -> dict[str, Any]:
     """The gate's configuration: no secret (the token is in its file), the hook's options added to the sandbox's.
+
+    `upstream_read_timeout_s` (O85) is the platform's `[sandbox.gate]` value, the default's included, written whatever
+    it is: it has no default here, so a caller that leaves it out fails instead of leaving this backend's gate on the
+    constant. It is the sandbox's own key, which `gate_options` may not set.
 
     `scan_names` (O73) are the real names and addresses of the federation's nodes, which the gate counts in the answers
     it relays: it is the gate's own configuration, a file of the run's gate directory that no cell binds and no
@@ -102,6 +107,7 @@ def config(
         token_file=str(token_file),
         listen_host=LOOPBACK,
         listen_port=port,
+        upstream_read_timeout_s=upstream_read_timeout_s,
     )
     if upstream_ca is not None:
         out["upstream_ca_file"] = str(upstream_ca)
