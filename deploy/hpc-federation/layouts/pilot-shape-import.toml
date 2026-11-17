@@ -36,6 +36,8 @@ probe_space = "link-probes"
 time = "02:00:00"                        # the held job's --time: bring it down well before
 # stop_seconds: three provider outages on one HPC federation, 17 Nov: largest service-side stop 33.1 s, plus 50 %
 stop_seconds = 50                        # a service's graceful stop bound; settle_timeout_s is derived from it
+# step_launch_wait_s: the same outages, 17 Nov: relay verb steps started 47 to 103 s after they were issued; 103 s plus about 75 %
+step_launch_wait_s = 180                 # what a control step may wait to start, added to every bound that waits on its client
 core = "login"                           # the import check needs the login node's environment (DESIGN.md section 8)
 zone = { cpus = 4, memory = "8g" }       # live peaks: about 4.0 GB of RSS and the 1.9 GB rootfs on tmpfs
 provider = { cpus = 4, memory = "10g" }  # about 4.8 GB of RSS, the 2.5 GB rootfs and the posix storage on tmpfs

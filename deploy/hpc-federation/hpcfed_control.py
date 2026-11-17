@@ -9,11 +9,16 @@ The hook, in `hpcfed.py`'s command dispatch:
 
     if verb in hpcfed_control.VERBS:
         return hpcfed_control.run(verb, service, argv, launcher=launcher, state=state, stop_seconds=stop_seconds,
-                                  mounts=mounts)
+                                  step_launch_wait_s=step_launch_wait_s, mounts=mounts)
 
-`run(verb, service, argv, *, launcher, state, stop_seconds=50, mounts=None, out=None, err=None)` returns the exit
-status. `argv` is what followed `--` for exec, and empty for the other verbs; `out` and `err` are this process's
-standard output and error when None.
+`run(verb, service, argv, *, launcher, state, stop_seconds=50, step_launch_wait_s=180, mounts=None, out=None,
+err=None)` returns the exit status. `argv` is what followed `--` for exec, and empty for the other verbs; `out` and
+`err` are this process's standard output and error when None. **A control step's bound is its launch wait and then its
+work** (`step_launch_wait_s`, the layout's `[hpc]`): a step's client is waited for from its start, so a step Slurm
+starts 103 s late (seen live, 17 Nov) must not be cut off before it has begun. The status step is bounded to the launch
+wait + 60 s, the exec step to it + 300 s, the mount check to it + 30 s, a start waits for the new service step to be
+listed for it + 60 s, and the stop step as below. The launch wait widens timeouts only: it never lengthens a stop, an
+outage or a hold.
 
 **The launcher** (`hpclaunch.Launcher`, DESIGN.md section 3):
 
@@ -65,8 +70,9 @@ start because a start returns once its step is listed, before the restarted serv
 record carries `mounts_proven` with no `mounts` to check it is never ready.
 
 **stop** records `stopping` in the state before anything runs, then runs `bundle/teardown.sh <kind> --workdir W --keep
---keep-until <allocation end> --timeout <stop_seconds>` as a control step (bounded to `stop_seconds` + 60), waits (about
-60 s) for the service step to leave `listed`, and records `stopped` only when teardown exited 0 and the step is gone
+--keep-until <allocation end> --timeout <stop_seconds>` as a control step (bounded to `stop_seconds` + the step's
+launch wait + 60), waits (about 60 s) for the service step to leave `listed`, and records `stopped` only when teardown
+exited 0 and the step is gone
 (and, for a step never seen listed, its srun client has ended too, so no pending step can still be made), and only for
 the launch it stopped. Otherwise it exits 1 and leaves `stopping`. A step still listed at the bound is
 cancelled (by its id, never more) only when teardown exited 0: a step left behind by a stop that did run. After a
@@ -124,13 +130,17 @@ STARTABLE = ("stopped", "stopping", "starting", "running")  # what a start may f
 MUTATING = ("stop", "start")  # one at a time per federation, under VERBS_LOCK
 VERBS_LOCK = "hpc-federation.verbs.lock"  # in the root, beside M1's state lock and lifecycle lock
 
-STATUS_TIMEOUT_S = 60  # the status control step's bound
-EXEC_TIMEOUT_S = 300  # the exec control step's bound
+# Every bound below that waits on a step's client from its start also waits for the step to start: `step_launch_wait_s`
+# (the layout's `[hpc]`, 180 by default) is added to it at the call, so a step that Slurm starts late is not cut off
+# before its own work has begun. The figures here are the work's own.
+DEFAULT_LAUNCH_WAIT_S = 180  # the layout's default (hpcsettings.DEFAULTS), for a caller that passes none
+STATUS_TIMEOUT_S = 60  # the status control step's own bound
+EXEC_TIMEOUT_S = 300  # the exec control step's own bound
 MOUNT_CHECK_TIMEOUT_S = 30  # the read-only proof's control step (it reads the service's mounts, nothing more)
 STOP_MARGIN_S = 60  # the stop's control step lives this long past teardown's own timeout
 STEP_GONE_WAIT_S = 60  # how long a stop waits for the service step to leave the step list
 CANCEL_WAIT_S = 10  # and for a step it cancelled to leave it
-START_LISTED_WAIT_S = 60  # how long a start waits for the new service step to be listed
+START_LISTED_WAIT_S = 60  # how long a start waits, past the step's launch wait, for the new service step to be listed
 POLL_S = 2.0
 
 _SLEEP = time.sleep
@@ -180,7 +190,7 @@ def _site_value(site: Dict[str, Any], key: str) -> str:
 class Target:
     """What the state file says about one service, validated."""
 
-    def __init__(self, doc: Any, service: Any, mounts: Any = None) -> None:
+    def __init__(self, doc: Any, service: Any, mounts: Any = None, launch_wait_s: int = DEFAULT_LAUNCH_WAIT_S) -> None:
         services = doc.get("services") if isinstance(doc, dict) else None
         allocation = doc.get("allocation") if isinstance(doc, dict) else None
         site = doc.get("site") if isinstance(doc, dict) else None
@@ -214,6 +224,7 @@ class Target:
         self.proven = record.get("mounts_proven")
         self.marks_proof = "mounts_proven" in record  # only `up` of a core with the shared import writes it
         self.owned = [str(space) for space in mounts.spaces(service)] if mounts is not None else []
+        self.launch_wait_s = launch_wait_s  # what every control step of this service may wait to start
 
     def script(self, name: str, *args: str) -> List[str]:
         """The argv of one of the bundle's scripts for this service."""
@@ -331,7 +342,7 @@ def _status_reading(target: Target, launcher: Any) -> Optional[Dict[str, Any]]:
             target.node,
             target.script("status.sh"),
             name=target.control_name("status"),
-            timeout_s=STATUS_TIMEOUT_S,
+            timeout_s=target.launch_wait_s + STATUS_TIMEOUT_S,
         )
     except TimeoutError:
         return None
@@ -363,7 +374,8 @@ def _proven(target: Target, launcher: Any, state: Any, mounts: Any, err: Any) ->
         return False
     argv = list(mounts.argv(target.workdir, _site_value(target.site, "node_python")))
     try:
-        done = launcher.control(target.node, argv, name=target.control_name("mounts"), timeout_s=MOUNT_CHECK_TIMEOUT_S)
+        bound = target.launch_wait_s + MOUNT_CHECK_TIMEOUT_S
+        done = launcher.control(target.node, argv, name=target.control_name("mounts"), timeout_s=bound)
     except TimeoutError:
         _say(err, "the read-only check of the service's shared imported trees did not finish in time")
         return False
@@ -448,7 +460,10 @@ def _stop(target: Target, launcher: Any, state: Any, stop_seconds: int, out: Any
     ended, service_seconds, teardown_ok = None, None, False
     try:
         done = launcher.control(
-            target.node, argv, name=target.control_name("stop"), timeout_s=stop_seconds + STOP_MARGIN_S
+            target.node,
+            argv,
+            name=target.control_name("stop"),
+            timeout_s=stop_seconds + target.launch_wait_s + STOP_MARGIN_S,
         )
         teardown_ok = done.returncode == 0  # None (an end not known) or any other status confirms nothing
         ended, service_seconds = _stop_line(_text(done.stdout))
@@ -558,7 +573,7 @@ def _start(target: Target, launcher: Any, state: Any, err: Any) -> int:
         name=name,
         log=log,
     )
-    step_id = _wait_listed(launcher, name, START_LISTED_WAIT_S)
+    step_id = _wait_listed(launcher, name, target.launch_wait_s + START_LISTED_WAIT_S)
     if step_id is None:
         _say(err, "the service step was not listed in time: its state stays 'starting'")
         return 1
@@ -582,7 +597,7 @@ def _exec(target: Target, launcher: Any, argv: Sequence[str], out: Any, err: Any
             target.node,
             target.script("exec.sh", "--", *argv),
             name=target.control_name("exec"),
-            timeout_s=EXEC_TIMEOUT_S,
+            timeout_s=target.launch_wait_s + EXEC_TIMEOUT_S,
         )
     except TimeoutError:
         _say(err, "the command did not finish in time")
@@ -626,6 +641,7 @@ def run(
     launcher: Any,
     state: Any,
     stop_seconds: int = 50,  # the layout's default (hpcsettings.DEFAULTS); `hpcfed.py` passes the layout's own
+    step_launch_wait_s: int = DEFAULT_LAUNCH_WAIT_S,  # likewise
     mounts: Any = None,
     out: Any = None,
     err: Any = None,
@@ -638,12 +654,14 @@ def run(
             raise Refusal("unknown verb '%s'" % (verb,))
         if isinstance(stop_seconds, bool) or not isinstance(stop_seconds, int) or stop_seconds < 1:
             raise Refusal("stop_seconds must be a positive whole number")
+        if isinstance(step_launch_wait_s, bool) or not isinstance(step_launch_wait_s, int) or step_launch_wait_s < 0:
+            raise Refusal("step_launch_wait_s must be a whole number of seconds, 0 or more")
         with _exclusive(state) if verb in MUTATING else contextlib.nullcontext():
             try:
                 doc = state.read()
             except Exception as error:  # an unreadable state names its path: only the error's type is told
                 raise Refusal("the federation's state could not be read (%s)" % type(error).__name__) from None
-            target = Target(doc, service, mounts)
+            target = Target(doc, service, mounts, step_launch_wait_s)
             if verb == "status":
                 return _status(target, launcher, state, mounts, out, err)
             if verb == "stop":

@@ -48,15 +48,27 @@ outcome"). The grace period is in the Compose file, which platform.toml does not
 value below it: whoever raises the grace, or lowers `settle_timeout_s`, keeps this bound. The default is the grace
 period plus `SETTLE_MARGIN_S`.
 
+`step_launch_wait_s` (the HPC backend's, rendered by `up` from the layout's `[hpc]`; 180 s by default) is how long a
+control step may wait to start before its own work begins: three provider outages on one HPC federation (17 Nov)
+showed relay verb steps starting 47 to 103 s after they were issued during a heal, 103 s plus about 75 %. Every bound
+that waits on a step's client from its start adds it: the stop's control step, `down`'s teardown step, the status,
+exec and mount-check steps and a start's wait to see its service step listed (`deploy/hpc-federation`), and here the
+stop verb's `settle_timeout_s` (which must exceed `stop_bound_s` + `step_launch_wait_s`, and by default is that and
+`SETTLE_MARGIN_S`), a link restart's bound (`fault_hpc.link_restart_bound_s`) and the relay verb's
+`command_timeout_s`. **It widens timeouts only**, how long the harness waits before it fails closed: it never
+lengthens an outage or a hold, and a step that starts at once costs nothing. Since the heal's reserves, the restore's
+bound, the token margin and the platform's deferral are counted from those bounds, they carry it too, so a study's
+`max_defer_s` check sees the true figure. It is in the faults fingerprint (`_bounds_record`) after its default.
+
 `command_timeout_s` is the longest one command may take: 120 s on Compose. With `backend = "hpc"` it is the longest one
-relay verb (a status, a start, a ping) may take, and its default is `HPC_COMMAND_TIMEOUT_S`, 240 s: three provider
-outages on one HPC federation (17 Nov) showed relay verb steps starting 47 to 103 s after they were issued, and one
-round trip took 104.6 s against the 120 s a command had. It is the request's `bound_s`, which the relay hands the verb
-to run within; a verb past it is answered `timed_out`, which the driver reads as a command with no answer, never as
-done. A declared value is kept as declared. The bound is in the faults fingerprint after its default
-(`_bounds_record`), so a platform that leaves it out and one that declares 240 are one federation, and one that
-declares 120 is another. A link restart's bound is not this one: it is the RPC's, its margin and the exec's step
-(`link_command_s`).
+relay verb (a status, a start, a ping) may take, and its default is a step's launch wait and the verb's own work
+(`fault_hpc.HPC_VERB_WORK_S`, 120 s): 300 s, where it was 120 s until one round trip took 104.6 s with launch waits of
+up to 103 s, and 240 s once a launch wait of 180 s is counted would not hold the verb's own control step. It is the
+request's `bound_s`, which the relay hands the verb to run within; a verb past it is answered `timed_out`, which the
+driver reads as a command with no answer, never as done. A declared value is kept as declared. The bound is in the
+faults fingerprint after its default (`_bounds_record`), so a platform that leaves it out and one that declares 300
+are one federation, and one that declares 120 is another. A link restart's bound is not this one: it is the launch
+wait, the RPC's bound, its margin and the exec's client's end (`link_command_s`).
 
 `ready_timeout_s` is the longest a restored provider may take to serve before its restore counts as unverified. A
 restore whose identity changed is not yet a provider that serves: in the federation of deploy/compose-federation the
@@ -204,11 +216,12 @@ from expcore.config.platform_loads import record_platform_load
 from expcore_onedata.compose import RESTART_LINK_MARGIN_S, RPC_TIMEOUT_S, CommandRunner, ComposeDriver, run_command
 from expcore_onedata.config import PLATFORM_MODULE, PlatformConfig
 from expcore_onedata.fault_hpc import (
-    HPC_COMMAND_TIMEOUT_S,
-    HPC_EXEC_MARGIN_S,
     HPC_POLL_S,
+    HPC_STEP_LAUNCH_WAIT_S,
     HPC_STOP_BOUND_S,
+    HPC_VERB_WORK_S,
     HpcDriver,
+    link_restart_bound_s,
 )
 from expcore_onedata.fault_relay import RelayClient
 from expcore_onedata.linkrecord import ROOT_FILE, federation_root
@@ -233,7 +246,7 @@ HEAL_MODES = ("off", "all_links", "link_then_container", "link")
 BACKENDS = ("compose", "hpc")
 DEFAULT_RELAY_WAIT_S = 30.0  # what a request through the fault relay may wait beyond its command's own bound
 _COMPOSE_KEYS = ("compose_file", "project", "command", "docker")  # an HPC backend reads none of them
-_HPC_KEYS = ("stop_bound_s", "relay_wait_s")  # a Compose backend reads neither
+_HPC_KEYS = ("stop_bound_s", "relay_wait_s", "step_launch_wait_s")  # a Compose backend reads neither
 _KEYS = (
     "sanctioned",
     "journal",
@@ -289,6 +302,7 @@ class FaultSettings:
     backend: str = "compose"  # "hpc": the providers are Apptainer services on batch nodes (`fault_hpc`)
     stop_bound_s: float = 0.0  # the HPC backend's: the longest a service's stop takes (0 for Compose: not read)
     relay_wait_s: float = 0.0  # the HPC backend's: a relayed request's wait beyond its command's bound (`fault_relay`)
+    step_launch_wait_s: float = 0.0  # the HPC backend's: what a control step may wait to start (every bound adds it)
 
 
 def _number(table: Section, key: str, default: float, minimum: float, *, integer: bool = False) -> float:
@@ -362,6 +376,7 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
             f"<root>/fault-journal), where the link-check record is written; its parent holds no {ROOT_FILE}",
         )
     stop_bound_s = _number(table, "stop_bound_s", HPC_STOP_BOUND_S, 1) if hpc else 0.0
+    launch_wait_s = _number(table, "step_launch_wait_s", HPC_STEP_LAUNCH_WAIT_S, 0) if hpc else 0.0
     settings = FaultSettings(
         file=file,
         sanctioned=sanctioned,
@@ -373,9 +388,12 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         docker=words["docker"],
         poll_s=_number(table, "poll_s", HPC_POLL_S if hpc else 2.0, 0.001),
         settle_timeout_s=_number(
-            table, "settle_timeout_s", stop_bound_s + SETTLE_MARGIN_S if hpc else DEFAULT_SETTLE_TIMEOUT_S, 0
+            table,
+            "settle_timeout_s",
+            stop_bound_s + launch_wait_s + SETTLE_MARGIN_S if hpc else DEFAULT_SETTLE_TIMEOUT_S,
+            0,
         ),
-        command_timeout_s=_number(table, "command_timeout_s", HPC_COMMAND_TIMEOUT_S if hpc else 120.0, 1),
+        command_timeout_s=_number(table, "command_timeout_s", launch_wait_s + HPC_VERB_WORK_S if hpc else 120.0, 1),
         ready_timeout_s=_number(table, "ready_timeout_s", DEFAULT_READY_TIMEOUT_S, 0),
         clear_attempts=_number(table, "clear_attempts", 3, 1, integer=True),
         admission_timeout_s=_number(table, "admission_timeout_s", 3600.0, 0),
@@ -390,14 +408,16 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         backend=backend,
         stop_bound_s=stop_bound_s,
         relay_wait_s=_number(table, "relay_wait_s", DEFAULT_RELAY_WAIT_S, 0) if hpc else 0.0,
+        step_launch_wait_s=launch_wait_s,
     )
-    if hpc and settings.settle_timeout_s <= stop_bound_s:  # a stop's waits must outlast the stop itself
+    if hpc and settings.settle_timeout_s <= stop_bound_s + launch_wait_s:  # a stop's waits must outlast the stop itself
         raise table.fail(
             "settle_timeout_s",
-            f"must exceed stop_bound_s, {stop_bound_s:g} s, the longest a service's stop takes on an HPC federation "
-            f"(by default the layout's stop_seconds 50, supervise.py's kill 30 s and the step's end 60 s), not "
-            f"{settings.settle_timeout_s:g}: a stop waited for less is never seen to end; leave it out for "
-            f"{stop_bound_s + SETTLE_MARGIN_S:g}",
+            f"must exceed stop_bound_s + step_launch_wait_s, {stop_bound_s + launch_wait_s:g} s ({stop_bound_s:g} s, "
+            f"the longest a service's stop takes on an HPC federation, by default the layout's stop_seconds 50, "
+            f"supervise.py's kill 30 s and the step's end 60 s, and {launch_wait_s:g} s a control step may wait to "
+            f"start), not {settings.settle_timeout_s:g}: a stop waited for less is never seen to end; leave it out "
+            f"for {stop_bound_s + launch_wait_s + SETTLE_MARGIN_S:g}",
         )
     declared = "heal_timeout_s" in table.data
     if not declared:  # never a fixed number: one the loader's own check would refuse for some size is wrong
@@ -467,9 +487,10 @@ def stop_command_s(settings: FaultSettings) -> float:
 
 def link_command_s(settings: FaultSettings) -> float:
     """The longest a link restart's command may take: the RPC's bound and its margin, and for the HPC backend the
-    exec's step (`fault_hpc.HPC_EXEC_MARGIN_S`) and the relay's wait."""
+    exec step's launch wait (`step_launch_wait_s`), its client's end (`fault_hpc.HPC_EXEC_MARGIN_S`) and the relay's
+    wait."""
     if settings.backend == "hpc":
-        return RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S + HPC_EXEC_MARGIN_S + settings.relay_wait_s
+        return link_restart_bound_s(settings.step_launch_wait_s) + settings.relay_wait_s
     return RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S
 
 
@@ -699,6 +720,7 @@ def _bounds_record(settings: FaultSettings) -> dict[str, Any]:
         "session_drain_s",
         "stop_bound_s",
         "relay_wait_s",
+        "step_launch_wait_s",
     )
     return {
         "backend": settings.backend,
@@ -735,4 +757,10 @@ def hpc_driver(settings: FaultSettings, *, probe: Callable[[str], bool], transpo
     if settings.backend != "hpc":
         raise ConfigError(f'{settings.file}: [faults]: backend = "{settings.backend}" has no HPC driver')
     sent = transport or RelayClient(federation_root(settings.journal), wait_s=settings.relay_wait_s)
-    return HpcDriver(sent, timeout_s=settings.command_timeout_s, stop_timeout_s=settings.settle_timeout_s, probe=probe)
+    return HpcDriver(
+        sent,
+        timeout_s=settings.command_timeout_s,
+        stop_timeout_s=settings.settle_timeout_s,
+        link_timeout_s=link_restart_bound_s(settings.step_launch_wait_s),
+        probe=probe,
+    )

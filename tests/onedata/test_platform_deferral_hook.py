@@ -38,15 +38,17 @@ SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 # own bounds only (the relay's wait, the exec's step and the stop's own bound).
 SHARED = {
     "heal": "all_links",
-    "settle_timeout_s": 200,
-    "command_timeout_s": 240,
+    "settle_timeout_s": 380,
+    "command_timeout_s": 300,
     "ready_timeout_s": DEFAULT_READY_TIMEOUT_S,
     "poll_s": 10,
     "clear_attempts": 3,
     "session_drain_s": 320,
     "admission_timeout_s": 3600,
 }
-HPC_DEFAULTS = dict.fromkeys(("stop_bound_s", "settle_timeout_s", "relay_wait_s", "poll_s", "clear_attempts"))
+HPC_DEFAULTS = dict.fromkeys(
+    ("stop_bound_s", "settle_timeout_s", "relay_wait_s", "step_launch_wait_s", "poll_s", "clear_attempts")
+)
 
 
 def compose_platform(root: Path, margin_s: int = 100_000, **changes) -> Path:
@@ -116,14 +118,40 @@ def test_o35_each_backend_gets_its_own_figure_from_its_own_file(tmp_path):
         assert declared[name].seconds == settings.session_drain_s + settings.heal_timeout_s + settings.heal_settle_s
 
 
+def test_o58_the_step_launch_wait_is_in_the_deferral_a_study_holds_max_defer_s_to(tmp_path):
+    """O58: the launch wait widens the HPC bounds the heal counts (each command, a stop, a link restart), so the
+    deferral the platform declares, and `max_defer_s` is held to, counts it: with the heal declared, a table whose steps
+    start at once and one that may wait the default 180 s declare deferrals that differ by exactly their
+    `heal_timeout_s`, and each is the platform's own sum of the session drain, the heal and the settle after it. The
+    launch wait widens timeouts only: the drain and the settle are the same."""
+    quick = hpc_platform(tmp_path / "quick", step_launch_wait_s=0)
+    waits = hpc_platform(tmp_path / "waits")
+    settings = {
+        name: load_faults(path, load_platform(path, require_secrets=False))
+        for name, path in (("quick", quick), ("waits", waits))
+    }
+    declared = {name: getattr(kinds, PLATFORM_HOOK)(path) for name, path in (("quick", quick), ("waits", waits))}
+    assert (settings["quick"].step_launch_wait_s, settings["waits"].step_launch_wait_s) == (0.0, 180.0)
+    assert declared["waits"] == bound_of(waits)
+    for name in ("quick", "waits"):
+        s = settings[name]
+        assert declared[name].seconds == s.session_drain_s + s.heal_timeout_s + s.heal_settle_s
+    assert declared["waits"].seconds > declared["quick"].seconds
+    assert declared["waits"].seconds - declared["quick"].seconds == (
+        settings["waits"].heal_timeout_s - settings["quick"].heal_timeout_s
+    )
+    assert settings["waits"].session_drain_s == settings["quick"].session_drain_s
+    assert settings["waits"].heal_settle_s == settings["quick"].heal_settle_s
+
+
 def test_o35_a_backends_own_token_margin_is_held_to_through_the_hook(tmp_path):
-    """O35: the hook loads the file as the platform layer does, so the least `[tokens] margin_s` of its backend (2,950 s
+    """O35: the hook loads the file as the platform layer does, so the least `[tokens] margin_s` of its backend (4,030 s
     on HPC, 2,134 s on Compose) is held to on this path as well: an HPC file with Compose's margin is refused naming the
     margin it needs, and each file with its own backend's margin is read."""
     short = hpc_platform(tmp_path / "short", margin_s=2134)
-    with pytest.raises(ConfigError, match=r"margin_s = 2134 is too small.*set: \[tokens\] margin_s = 2950"):
+    with pytest.raises(ConfigError, match=r"margin_s = 2134 is too small.*set: \[tokens\] margin_s = 4030"):
         getattr(kinds, PLATFORM_HOOK)(short)
-    enough = hpc_platform(tmp_path / "enough", margin_s=2950)
+    enough = hpc_platform(tmp_path / "enough", margin_s=4030)
     assert getattr(kinds, PLATFORM_HOOK)(enough) == bound_of(enough)
     small = compose_platform(tmp_path / "compose", margin_s=2133)
     with pytest.raises(ConfigError, match=r"margin_s = 2133 is too small"):

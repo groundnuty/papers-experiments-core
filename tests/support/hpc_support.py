@@ -254,6 +254,7 @@ def hpc_table(**changes: Any) -> dict[str, Any]:
         "stop_bound_s": 4,
         "settle_timeout_s": 5,
         "relay_wait_s": 1,
+        "step_launch_wait_s": 0,  # the fake clock's steps start at once; the default (180 s) is the settings tests'
         "poll_s": 1,
         "ready_timeout_s": 5,
         "clear_attempts": 2,

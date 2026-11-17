@@ -163,6 +163,7 @@ def control_hook(driver: Driver, verb: str, service: Optional[str], rest: List[s
         launcher=driver.launcher,
         state=driver.store,
         stop_seconds=driver.settings.stop_seconds,
+        step_launch_wait_s=driver.settings.step_launch_wait_s,
         mounts=mount_check(driver),
     )
 

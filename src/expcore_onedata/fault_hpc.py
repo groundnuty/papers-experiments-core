@@ -36,11 +36,12 @@ records it beside `ready_after_s` in the restore. A status without it is no figu
 measurement is.
 
 **The stop's own bound.** A service's stop waits for its graceful end, then the kill, then the step's end: up to
-`stop_seconds` plus about 90 s, 140 s with the layout's default of 50 s (DESIGN.md section 7 (e)). The driver bounds
-`stop` by `stop_timeout_s` (`[faults] settle_timeout_s` for this backend, refused below that figure at load), not by the
-command timeout: a stop that runs past the command timeout would otherwise always be one of unknown outcome. A stop
-that does time out is the Compose case: the injector journals it `stop_unknown` and the restore waits for it to show
-down (`faults.py`, "A stop of unknown outcome").
+`stop_seconds` plus about 90 s, 140 s with the layout's default of 50 s (DESIGN.md section 7 (e)), and the stop's
+control step may wait to start before that (`step_launch_wait_s`, 180 s). The driver bounds `stop` by `stop_timeout_s`
+(`[faults] settle_timeout_s` for this backend, refused below the two together at load), not by the command timeout: a
+stop that runs past the command timeout would otherwise always be one of unknown outcome. A stop that does time out is
+the Compose case: the injector journals it `stop_unknown` and the restore waits for it to show down (`faults.py`, "A
+stop of unknown outcome"). The launch wait widens this timeout only: it never lengthens a stop or an outage.
 
 **The stop's evidence.** The `stop` verb prints whether the stop was confirmed (`stopped`), how it ended (`ended`: the
 service's own exit, the kill at the bound, or none, nothing to stop), how long the verb took from the request to its
@@ -53,8 +54,9 @@ measured `[hpc] stop_seconds` comes from. A stop with no answer has none.
 **The heal (O35).** `ping` runs op-worker's runner (`/usr/sbin/op_worker ping`) inside the provider's service, and
 `restart_link` runs the Compose driver's very command, `compose.RESTART_LINK_SCRIPT` (rtransfer_config's restart_link
 through nodetool's rpcterms), inside it, so env.sh finds the service's own epmd port and cookie and none is on a
-command line. Its bound is the Compose one plus `HPC_EXEC_MARGIN_S` for the step's launch and end, which the heal's
-reserves count (`fault_settings.link_command_s`). Its result is the same word (`compose.link_result`); a failure the
+command line. Its bound is the Compose one plus the step's launch wait (`step_launch_wait_s`) and
+`HPC_EXEC_MARGIN_S` for the client's end (`link_restart_bound_s`), which the heal's reserves count
+(`fault_settings.link_command_s`). Its result is the same word (`compose.link_result`); a failure the
 exec does not describe, a step that could not be made among them, may have reached the node, so it is never `not_run`
 and never retried. **The container fallback** is the heal's restart of a reader through the injector's own stop and
 start (`fault_restore.LinkSettling.restart_container`), which here is the provider's service stopped and started again,
@@ -98,12 +100,29 @@ EXEC_COMMANDS: Mapping[str, tuple[str, ...]] = {
 # The layout's stop_seconds (50: three provider outages on one HPC federation, 17 Nov, ended a service 26.1 to 33.1 s
 # after its SIGTERM, the largest plus 50 %), supervise.py's kill tail (30 s) and the step's end (60 s).
 HPC_STOP_BOUND_S = 140.0
-# What one relay verb (a status, a start, a ping) may take: [faults] command_timeout_s on this backend. The same three
-# outages showed relay verb steps starting 47 to 103 s after they were issued, and one round trip took 104.6 s, against
-# the 120 s a command had until then (Compose's, which keeps it).
-HPC_COMMAND_TIMEOUT_S = 240.0
-HPC_EXEC_MARGIN_S = 60.0  # what an exec's step launch and its client's end add to the command's own bound
+# How long a control step may wait to start before its own work begins (`[faults] step_launch_wait_s`, the layout's
+# `[hpc] step_launch_wait_s`). The same three outages showed relay verb steps starting 47 to 103 s after they were
+# issued during a heal; 180 s is 103 s plus about 75 %. Every bound that waits on a step's client from its start adds
+# it, and it widens timeouts only (how long the harness waits before failing closed), never an outage or a hold.
+HPC_STEP_LAUNCH_WAIT_S = 180.0
+# What a relay verb does besides waiting to start: its control step's own bound (60 s, `STATUS_TIMEOUT_S` of
+# deploy/hpc-federation/hpcfed_control.py; a start waits 60 s for its service step to be listed) and 60 s for the
+# verb's own reads and the client's end.
+HPC_VERB_WORK_S = 120.0
+# What one relay verb (a status, a start, a ping) may take: [faults] command_timeout_s on this backend, a step's
+# launch wait and the verb's work, 300 s. The same outages put one round trip at 104.6 s against the 120 s a command
+# had until then (Compose's, which keeps it); 240 s was too small once a launch wait of 180 s is counted.
+HPC_COMMAND_TIMEOUT_S = HPC_STEP_LAUNCH_WAIT_S + HPC_VERB_WORK_S
+HPC_EXEC_MARGIN_S = 60.0  # what an exec's client's end adds to the command's own bound (the launch wait: apart)
 HPC_POLL_S = 10.0  # every status is a Slurm step on the node's one control core: read every 10 s, not every 2
+
+
+def link_restart_bound_s(step_launch_wait_s: float = HPC_STEP_LAUNCH_WAIT_S) -> float:
+    """A link restart's bound: the exec step's launch wait, the RPC's bound and its margin (the Compose driver's), and
+    the exec's client's end (`HPC_EXEC_MARGIN_S`); 390 s with the defaults."""
+    return step_launch_wait_s + RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S + HPC_EXEC_MARGIN_S
+
+
 IDENTITY = re.compile(r"[A-Za-z0-9@:._+-]{1,200}")  # an identity as a status prints it: one word, never a path
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # a layout's service name, as `[faults.services]` holds it
 STOP_ENDS = ("exit", "kill", "none")
@@ -168,13 +187,16 @@ class HpcDriver:
         *,
         timeout_s: float = HPC_COMMAND_TIMEOUT_S,
         stop_timeout_s: float | None = None,
+        link_timeout_s: float | None = None,
         probe: Callable[[str], bool],
     ) -> None:
         """`probe(service)` says whether the provider behind a service answers its REST API: True when it does, False
         when it does not (yet). It is required: the driver's `serves` is not defined without it. `timeout_s` bounds
-        every request but a stop, which `stop_timeout_s` bounds (`timeout_s` when None)."""
+        every request but a stop and a link restart, which `stop_timeout_s` (`timeout_s` when None) and `link_timeout_s`
+        (`link_restart_bound_s()` when None) bound."""
         self._transport, self._timeout_s, self._probe = transport, timeout_s, probe
         self._stop_timeout_s = timeout_s if stop_timeout_s is None else stop_timeout_s
+        self._link_timeout_s = link_restart_bound_s() if link_timeout_s is None else link_timeout_s
         self.last_stop: dict[str, Any] | None = None  # the latest stop's evidence, once it answered (see the docstring)
         self.last_domain_wait_s: float | None = (
             None  # the latest ready status's `domain_wait_s`, if any (the docstring)
@@ -252,7 +274,7 @@ class HpcDriver:
         of `compose.LINK_RESULTS`; never the command's output, which names the node. Raise DriverError only when the
         request is refused, before anything was sent."""
         try:
-            done = self._exec(service, "restart_link", RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S + HPC_EXEC_MARGIN_S)
+            done = self._exec(service, "restart_link", self._link_timeout_s)
         except subprocess.TimeoutExpired:
             return "command_timeout"  # no answer: the RPC may still be running on the node
         except OSError:

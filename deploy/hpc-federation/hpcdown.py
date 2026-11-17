@@ -17,11 +17,14 @@ import hpcstate
 import hpcstorage
 from fedlayout import ROOT_MARKER
 from hpcremove import SETTLE_S, only_silly, remove_tree, settle_rmdir
-from hpcsettings import Site
+from hpcsettings import KILL_TAIL_S, Site
 from hpcslurm import Client, SlurmError
 
 BUNDLE = Path(__file__).resolve().parent / "bundle"
 SHARDS = BUNDLE.parent / "shards.py"  # its `sweep`, on the agent's node at down
+# A teardown step's bound beyond its launch wait, the graceful stop (`stop_seconds`) and supervise.py's kill tail: what
+# teardown.sh spends on its own steps and the client's end. The launch wait and `stop_seconds` come from the layout.
+TEARDOWN_MARGIN_S = 90
 WORKDIR_LINE = re.compile(r"^hpcop: work directory (/\S+)$", re.M)  # the batch scripts' own line (zone.sbatch)
 
 
@@ -309,8 +312,9 @@ class Down:
         argv = ["bash", str(BUNDLE / "teardown.sh"), record["kind"], "--workdir", record["workdir"]]
         argv += ["--timeout", str(self.settings.stop_seconds)]
         name = f"{prefix}-{service}-teardown-{record['launch']}"
+        bound = self.settings.step_launch_wait_s + self.settings.stop_seconds + KILL_TAIL_S + TEARDOWN_MARGIN_S
         try:
-            done = self.launcher.control(record["node"], argv, name=name, timeout_s=self.settings.stop_seconds + 120.0)
+            done = self.launcher.control(record["node"], argv, name=name, timeout_s=float(bound))
         except TimeoutError:
             return False
         ok = done.returncode == 0

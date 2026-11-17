@@ -68,7 +68,8 @@ holder = "hazel"
 sanctioned = false                           # the configuration's half of the sanction: true only for a study that injects
 backend = "hpc"                              # no compose_file, project, command or docker: the HPC backend refuses them
 journal = "@hpc_root@/fault-journal"
-stop_bound_s = @hpc_stop_bound_s@            # settle_timeout_s defaults to it + 60, poll_s to 10, relay_wait_s 30, command_timeout_s 240
+stop_bound_s = @hpc_stop_bound_s@            # the service's own stop; settle_timeout_s defaults to it + the launch wait + 60
+step_launch_wait_s = @hpc_step_launch_wait_s@  # a control step's wait to start: it widens timeouts only; command_timeout_s defaults to it + 120
 
 [faults.services]
 aspen = "aspen"

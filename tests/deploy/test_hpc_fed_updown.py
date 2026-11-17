@@ -268,7 +268,7 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_r
     assert layout.spec.zone.url == "https://node01.cluster.example.org:8443"
     assert layout.spec.provider("hazel").url == "https://node06.cluster.example.org:8443"
     assert owner == (5001, 5001)
-    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("140", "200")
+    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("140", "380")
     command = json.loads(values["hpc_command"])
     assert command[1:3] == ["-I", "-B"]  # isolated (O58): the relay runs every verb through it
     assert command[3:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
@@ -315,6 +315,26 @@ def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancel
     assert len(rig.fake.ended_clients) == 6
     assert not rig.root.exists()
     assert "is gone" in out
+
+
+def test_a_teardown_step_is_bounded_by_the_launch_wait_the_stop_the_kill_and_a_margin(hpc, tmp_path, site):
+    """O58: down's teardown step is waited for from its start, so its bound holds the step's launch wait (180 s), the
+    graceful stop (50 s), supervise.py's kill tail (30 s) and 90 s: 350 s, past a step that starts 103 s late and ends
+    33 s after its SIGTERM (17 Nov), and past the worst teardown after it (the whole graceful stop, then the kill)."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    asked, inner = {}, rig.driver.launcher.control
+
+    def control(node, argv, *, name, timeout_s, job=None):
+        asked[name] = timeout_s
+        return inner(node, argv, name=name, timeout_s=timeout_s, job=job)
+
+    rig.driver.launcher.control = control
+    rig.driver.down()
+    teardown = {bound for name, bound in asked.items() if "-teardown-" in name}
+    assert teardown == {180 + 50 + 30 + 90}
+    assert 103 + 33 < 350
+    assert 103 + 50 + 30 < 350
 
 
 def test_a_held_job_recorded_otherwise_is_cancelled_and_down_after_it_removes_the_root(hpc, tmp_path, site):
@@ -724,6 +744,7 @@ def test_the_service_verbs_go_through_the_stable_hook_with_the_launcher_and_the_
     assert (verb, service, argv) == ("exec", "aspen", ["op_worker", "ping"])
     assert calls[1][0] == ("status", "aspen", [])
     assert keywords["stop_seconds"] == 50
+    assert keywords["step_launch_wait_s"] == 180
     assert isinstance(keywords["launcher"], hpc.launch.Launcher)
     assert isinstance(keywords["state"], hpc.launch.StateStore)
 

@@ -15,10 +15,12 @@ real addresses (DESIGN.md, sections 5 and 6).
   rendered `platform.toml`, before the link check.
 - **`platform.toml`** is rendered from the layout's own template by the Compose renderer, plus the HPC values a template
   may name: `@hpc_root@` (the root, so every path into it is absolute and a copy of the file beside a study reads the
-  root's files), `@hpc_stop_bound_s@` (a stop's whole bound, `[hpc] stop_seconds` + 90 s), `@hpc_settle_timeout_s@`
-  (above it), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline table of each direct-I/O
-  import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and `@hpc_token_margin_s@`: the
-  least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
+  root's files), `@hpc_stop_bound_s@` (the service's own stop bound, `[hpc] stop_seconds` + 90 s),
+  `@hpc_step_launch_wait_s@` (what a control step may wait to start, `[hpc] step_launch_wait_s`),
+  `@hpc_settle_timeout_s@` (above both), `@hpc_command@` (this driver's argv prefix), `@hpc_direct_storages@` (an inline
+  table of each direct-I/O import's storage id to its tree's directory, for a `[sandbox.mount]`; `{}` with none) and
+  `@hpc_token_margin_s@`: the least `[tokens] margin_s` the platform layer's own loader accepts for the rest of the file
+  (`least_margin_s`).
   The site's values come from `hpcpins` (the agent's sandbox's pins and `@study_artifacts@`, the study's own directory
   on the nodes), and each space's `@data_manifest.<space>@` from `hpcdata` (DESIGN.md, section 6a).
   A template that declares `[sandbox.apptainer]` also names `@hpc_provider_storage@` (`hpcpins.values`: `tmpfs`, or
@@ -59,6 +61,7 @@ from fedlayout import Layout, import_storage_name
 from fedlinks import check_after_up
 from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
+from hpcsettings import DEFAULT_STEP_LAUNCH_WAIT_S
 
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
 from expcore_onedata.importmanifest import Manifest
@@ -218,7 +221,14 @@ def least_margin_s(path: Path, rendered: str, settle_timeout_s: float) -> int:
     return math.ceil(restore_token_margin_s(load_faults(path, load_platform(path))))
 
 
-def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int, root: Path) -> Dict[str, str]:
+def hpc_values(
+    command: Sequence[str],
+    stop_bound_s: int,
+    settle_timeout_s: int,
+    root: Path,
+    *,
+    step_launch_wait_s: int = DEFAULT_STEP_LAUNCH_WAIT_S,
+) -> Dict[str, str]:
     """The HPC values a platform template may name, but the token margin (`write_platform` derives it). `root` is the
     federation's root, as an absolute path in a basic string of TOML: the template's paths into the root are written
     with it (`@hpc_root@/secrets/...`), so a copy of the file elsewhere (beside a study, `shards.py step`) reads the
@@ -229,6 +239,7 @@ def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int,
     return {
         "hpc_command": json.dumps(list(command)),  # a TOML array of basic strings is JSON's
         "hpc_stop_bound_s": str(stop_bound_s),
+        "hpc_step_launch_wait_s": str(step_launch_wait_s),
         "hpc_settle_timeout_s": str(settle_timeout_s),
         "hpc_root": text,
     }

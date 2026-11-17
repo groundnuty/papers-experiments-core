@@ -291,7 +291,7 @@ def test_o58_status_of_a_running_service_prints_one_json_line_with_its_identity(
     [call] = world.launcher.controls
     assert call["node"] == NODE
     assert call["argv"] == ["bash", str(BUNDLE / "status.sh"), "op", "--workdir", WORKDIR]
-    assert call["timeout_s"] == 60
+    assert call["timeout_s"] == 180 + 60  # the step's launch wait, then its own bound
     assert call["name"].startswith(f"{PREFIX}-prov-a-status-")
 
 
@@ -434,7 +434,7 @@ def test_o58_a_stop_runs_teardown_with_keep_the_allocations_end_and_the_stop_bou
         "--timeout",
         "300",
     ]
-    assert call["timeout_s"] == 360
+    assert call["timeout_s"] == 300 + 180 + 60  # stop_seconds, the step's launch wait, teardown's margin
     assert call["name"].startswith(f"{PREFIX}-prov-a-stop-")
 
 
@@ -715,7 +715,7 @@ def test_o58_a_step_that_is_not_listed_in_time_fails_the_start_and_leaves_the_st
     assert out == ""
     assert world.state.service()["state"] == "starting"
     assert world.state.service()["step"]["id"] is None
-    assert clock.slept >= control.START_LISTED_WAIT_S
+    assert clock.slept >= control.DEFAULT_LAUNCH_WAIT_S + control.START_LISTED_WAIT_S  # launch wait, then its own wait
     assert NODE not in err
 
 
@@ -957,7 +957,7 @@ def test_o58_exec_runs_exec_sh_in_a_control_step_with_the_argv_after_the_separat
         "ping",
         "a b",
     ]
-    assert call["timeout_s"] == 300
+    assert call["timeout_s"] == 180 + 300  # the step's launch wait, then its own bound
     assert call["name"].startswith(f"{PREFIX}-prov-a-exec-")
 
 
@@ -1083,7 +1083,7 @@ def test_o59_a_restarted_owner_is_ready_only_once_its_trees_are_proven_read_only
     _status_step, check = world.launcher.controls
     assert check["node"] == NODE
     assert check["argv"] == ["python3.11", "-I", "-B", "/bundle/importstorage.py", "mounts", "--workdir", WORKDIR]
-    assert check["timeout_s"] == control.MOUNT_CHECK_TIMEOUT_S
+    assert check["timeout_s"] == 180 + control.MOUNT_CHECK_TIMEOUT_S
     assert check["name"].startswith(f"{PREFIX}-prov-a-mounts-")
     assert mounts.read == [("proven\n", ["cohort"])]
     assert world.state.service()["mounts_proven"] is True
@@ -1213,3 +1213,100 @@ def test_o58_a_service_whose_longest_step_name_the_launcher_would_refuse_is_refu
     assert status == 2
     assert "no name a step can carry" in err
     assert world.launcher.controls == []
+
+
+# --- a control step's bound is its launch wait, then its work (O58, 17 Nov) -----------------------------------------
+
+
+def late_steps(world, launch_s, work_s):
+    """Slurm starts every control step `launch_s` late and the step then runs `work_s`: its client is waited for from
+    its start, so a bound below their sum times it out (TimeoutError, as the launcher's does). Returns the bounds
+    asked."""
+    bounds, inner = [], world.launcher.control
+
+    def control_step(node, argv, *, name, timeout_s):
+        bounds.append(timeout_s)
+        if launch_s + work_s > timeout_s:
+            raise TimeoutError("the step did not end within its bound")
+        return inner(node, argv, name=name, timeout_s=timeout_s)
+
+    world.launcher.control = control_step
+    return bounds
+
+
+def test_o58_a_stop_whose_step_starts_103_s_late_and_runs_33_s_is_confirmed_inside_its_bound(world, clock):
+    """O58: relay verb steps started 47 to 103 s after they were issued, and a service ended 33.1 s after its SIGTERM
+    (17 Nov). With the launch wait counted the stop's control step is bounded at 50 + 180 + 60 = 290 s and the stop is
+    confirmed; the figures are the layout's defaults."""
+    stopping_launcher(world)
+    bounds = late_steps(world, 103, 33)
+    status, _out, err = verb(world, "stop", stop_seconds=50)
+    assert status == 0, err
+    assert bounds == [50 + 180 + 60]
+    assert world.state.service()["state"] == "stopped"
+
+
+def test_o58_a_stop_with_no_launch_wait_counted_times_out_on_the_same_103_s_late_step_and_is_never_taken_as_done(
+    world, clock
+):
+    """O58: what the launch wait prevents: bounded at 50 + 60 = 110 s alone, the same step (103 s late, 33 s of work)
+    times out, and the stop is unconfirmed, not done: the state stays `stopping` and the verb exits 1."""
+    stopping_launcher(world)
+    bounds = late_steps(world, 103, 33)
+    status, out, err = verb(world, "stop", stop_seconds=50, step_launch_wait_s=0)
+    assert status == 1
+    assert bounds == [50 + 60]
+    assert world.state.service()["state"] == "stopping"
+    assert json.loads(out)["stopped"] is False
+    assert "control step did not finish in time" in err
+
+
+@pytest.mark.parametrize(
+    ("name", "answer", "work_s"),
+    [("status", alive(), control.STATUS_TIMEOUT_S), ("exec", Done(0, "pong\n"), control.EXEC_TIMEOUT_S)],
+)
+def test_o58_a_status_or_exec_step_is_bounded_by_its_launch_wait_and_then_its_own_bound(
+    world, clock, name, answer, work_s
+):
+    """O58: the status step's bound is the layout's launch wait and 60 s, the exec step's the launch wait and 300 s,
+    each held to a step that starts 103 s late and then runs 33 s."""
+    world.launcher.on_control = lambda argv: answer
+    bounds = late_steps(world, 103, 33)
+    argv = ["/usr/sbin/op_worker", "ping"] if name == "exec" else []
+    status, _out, err = verb(world, name, argv=argv, step_launch_wait_s=103)
+    assert status == 0, err
+    assert bounds == [103 + work_s]
+    assert bounds[0] > 103 + 33
+
+
+def test_o58_a_start_waits_for_its_service_step_to_be_listed_for_the_launch_wait_and_then_60_s(world, clock):
+    """O58: a start that finds its new service step not listed gives up after the launch wait and then 60 s, never
+    before: a step Slurm starts 103 s late is listed within that, where a start that gave up at 60 s lost it."""
+    stopped_provider(world)
+    world.launcher.on_service = lambda name: None
+    status, _out, _err = verb(world, "start", step_launch_wait_s=103)
+    assert status == 1
+    assert 103 + control.START_LISTED_WAIT_S <= clock.slept < 103 + control.START_LISTED_WAIT_S + 2 * control.POLL_S
+
+
+@pytest.mark.parametrize("bad", [-1, 2.5, "180", True])
+def test_o58_step_launch_wait_must_be_a_whole_number_of_seconds_of_at_least_zero(world, bad):
+    """O58: a launch wait that is no whole number of seconds, or is negative, is refused with nothing run."""
+    assert verb(world, "stop", step_launch_wait_s=bad)[0] == 2
+    assert world.launcher.controls == []
+
+
+def test_o58_the_launch_wait_and_the_verbs_work_are_one_figure_in_the_core_the_layout_and_the_verbs():
+    """O58: the core's default launch wait (`fault_hpc.HPC_STEP_LAUNCH_WAIT_S`), the layout's (`hpcsettings`) and this
+    module's agree, and the core's allowance for a relay verb's own work (`HPC_VERB_WORK_S`) holds the longest bound
+    a verb waits on its own step for besides the launch wait (a status step, a start's wait to be listed) and 60 s."""
+    from expcore_onedata.fault_hpc import HPC_STEP_LAUNCH_WAIT_S, HPC_VERB_WORK_S
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(str(HPC.parent / "compose-federation"))
+        patch.syspath_prepend(str(HPC))
+        import hpcsettings
+
+        layout_default = hpcsettings.DEFAULTS["step_launch_wait_s"]
+    assert control.DEFAULT_LAUNCH_WAIT_S == layout_default == HPC_STEP_LAUNCH_WAIT_S == 180
+    assert max(control.STATUS_TIMEOUT_S, control.START_LISTED_WAIT_S) + 60 <= HPC_VERB_WORK_S
