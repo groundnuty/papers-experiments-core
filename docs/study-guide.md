@@ -481,7 +481,9 @@ zone = "zone.<layout domain>"
 providers.<local> = "<local>.<layout domain>"
 ```
 
-The gate then serves and certifies those names on the cell's loopback, where the cell dials them on 443, and dials the URLs behind them. The record says `gate.names: declared`. The zone's scope answer still carries each provider's registered domain, which is the layout's name only where the provider registered it.
+The gate then serves and certifies those names on the cell's loopback, where the cell dials them on 443, and dials the URLs behind them. The record says `gate.names: declared`.
+
+**Declare the table only on a federation whose providers registered these names.** The published client finds the provider from the zone's scope answer and dials the domain the provider registered. The cell resolves only the declared names, so a provider still registered under its node's FQDN cannot be reached, and the name lookup's error would print that FQDN. On an HPC federation whose providers register their nodes' FQDNs, leave the table out until they register the layout's names.
 
 Run the campaign's driver on the node that runs the cells, since the gate listens on that node's loopback. The campaign fingerprint holds the backend's pins, so a Docker run and an Apptainer run are never one experiment.
 

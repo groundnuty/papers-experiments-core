@@ -81,7 +81,9 @@ names the gate certifies and serves on port 443, the zone's name in `ONEDATA_ONE
 egress declaration holds, while the gate dials the hosts and ports of the URLs of `[zone]` and the local provider
 behind them and checks their certificates there, as `[tls]` says. So the agent sees the names the layout declares, as
 on Docker, never a node's name or its port. Without the table the cell is given the URLs' hosts, as before; with it,
-`network` is refused, and so is a zone named as the provider is.
+`network` is refused, and so is a zone named as the provider is. The published client dials the provider's registered
+domain, from the zone's scope answer, so declare the table only where the local provider registered its declared name:
+the cell resolves no other.
 
 `io_mode` is declared, never detected (O36). oneclient 25.0 started with neither force option detects each storage's
 access type at the first read of each space, and for a second space on a storage already detected as proxied it takes a
