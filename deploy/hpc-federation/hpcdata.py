@@ -54,6 +54,19 @@ def data_manifests(layout: Layout, environ: Mapping[str, str]) -> Dict[str, Path
     return found
 
 
+def declared(layout: Layout, environ: Mapping[str, str]) -> Dict[str, Manifest]:
+    """Each space's manifest as `data_manifests` will have it, loaded and with nothing written: a shared import's, the
+    layout's own file (its variable, checked as `Layout.load_manifest` does), every other space's from its baseline. For
+    what must know a space's data before the root exists (the inode guard, `hpcquota`)."""
+    plan, imported = baseline_plan(layout.spec), {s.name for s in layout.shared_imports()}
+    return {
+        space.name: layout.load_manifest(space.name, environ)
+        if space.name in imported
+        else baseline_manifest(plan[space.name])
+        for space in layout.spec.spaces
+    }
+
+
 def values(manifests: Mapping[str, Path]) -> Dict[str, str]:
     """The placeholders a platform template names them by: `@data_manifest.<space>@`, an absolute path."""
     return {f"data_manifest.{name}": str(path) for name, path in manifests.items()}

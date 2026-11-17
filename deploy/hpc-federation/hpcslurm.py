@@ -37,6 +37,15 @@ JOB_LISTED = re.compile(r"([0-9]{1,12})(?:\+[0-9]{1,6})?")  # squeue's %i: a job
 STEP_LINE = re.compile(r"([0-9]{1,12}(?:\+[0-9]{1,6})?\.(?:[0-9]{1,9}|batch|extern))\s+(\S+)")
 STEP_ID = re.compile(r"[0-9]{1,12}(?:\+[0-9]{1,6})?\.[0-9]{1,9}")
 OFFSET = re.compile(r"[0-9]{1,6}")
+# A value of srun's --network (HPC_STEP_NETWORK): letters, digits and `_ . , = : + -`, led by a letter or digit, so no
+# shell character, space or option of its own reaches the argv. It names no plugin's words: other sites take others.
+NETWORK = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.,=:+-]{0,127}")
+
+
+def valid_network(value: object) -> bool:
+    """Whether a step's network option can be used: the empty string (no option), or a string `NETWORK` matches. Any
+    other type is no option: a state record is data, and a false or a null must not read as none."""
+    return isinstance(value, str) and (value == "" or NETWORK.fullmatch(value) is not None)
 
 
 class SlurmError(RuntimeError):
@@ -253,7 +262,9 @@ class Step:
     """One job step: where it runs, its size, its name, and its command behind the environment allowlist. A step of a
     heterogeneous job names its component (`het_group`, srun's `--het-group`), 0 included: on the site's Slurm a step
     of one with no `--het-group` is refused. A step of a further component also carries that component's own job id
-    (`component`), by which squeue -s and sacct list its steps. A job of one component takes no `het_group`."""
+    (`component`), by which squeue -s and sacct list its steps. A job of one component takes no `het_group`. A step
+    names `--network=<value>` (`network`, the site's `HPC_STEP_NETWORK`) only when it has a value: with none, its argv
+    is what it was before the setting existed."""
 
     job: str
     node: str
@@ -265,6 +276,7 @@ class Step:
     output: Optional[str] = None
     het_group: Optional[int] = None
     component: Optional[str] = None
+    network: str = ""
 
     @property
     def listed_as(self) -> str:
@@ -274,6 +286,9 @@ class Step:
     def argv(self) -> List[str]:
         out = [f"--output={self.output}"] if self.output else []
         group = [] if self.het_group is None else [f"--het-group={self.het_group}"]
+        if not valid_network(self.network):
+            raise SlurmError("HPC_STEP_NETWORK: the step's network option is not one an srun argv may carry")
+        network = [f"--network={self.network}"] if self.network else []
         return [
             "srun",
             f"--jobid={self.job}",
@@ -289,6 +304,7 @@ class Step:
             "-J",
             self.name,
             "--export=PATH",
+            *network,
             *out,
             ENV,
             "-i",
