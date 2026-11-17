@@ -20,6 +20,7 @@ from faults_shard_support import (
     TARGET_SERVICE,
     Federation,
     attempts_of,
+    injector_readings,
     make_study,
     outage_attempts,
     run_shard,
@@ -29,7 +30,7 @@ from shard_support import json_meta, keys_of_shard, merge_into
 from study_support import Campaign, clean_environment, finish
 
 from expcore.campaign.resume import FINGERPRINT_KEY
-from expcore.campaign.shard import META_ENVIRONMENT
+from expcore.campaign.shard import MERGE_FILE, META_ENVIRONMENT, META_SHARD, RULE_BY_MODEL
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
@@ -38,6 +39,7 @@ SERVES = {1: "alpha-stub", 2: "alpha-stub", 3: "beta-stub"}
 PROJECTS = {0: "stack-a", 1: "stack-b", 2: "stack-c", 3: "stack-d"}  # the whole campaign's federation is 0
 OUTAGE_CONDITION = "relay-down"
 OUTAGE_RUNS = 8  # relay-down's four tasks, for each of the two models
+STRUCK_RUNS = 2  # of them, the run of `lake`, whose fact the down provider holds, for each model
 
 
 @pytest.fixture(scope="module")
@@ -83,7 +85,8 @@ def outage_keys(campaign: Campaign) -> set[str]:
 def test_c32_every_shard_injected_a_real_outage_in_its_own_federation_and_restored_it_verified(shards, federations):
     """C32: each shard's journal holds at least one injection of `providers[1]`, seen down and cleared, and none open;
     its services are running again with a new identity (one start more per injection) and the other provider was never
-    touched. The shard's attempts that held the federation exclusively are exactly the outage runs it holds."""
+    touched. The shard's attempts that held the federation exclusively are exactly the outage runs it holds, and the
+    record of each says the injector verified its restore."""
     for index, shard in shards.items():
         federation = federations[index]
         injections = federation.injections()
@@ -98,6 +101,9 @@ def test_c32_every_shard_injected_a_real_outage_in_its_own_federation_and_restor
         mine = {key for key in keys_of_shard(shard.root, index, 3) if key in outage_keys(shard)}
         assert {row["run_key"] for row in outage_attempts(shard)} == mine
         assert len(injections) == len(outage_attempts(shard))
+        readings = injector_readings(shard)  # the injector's own account, in each outage run's record
+        assert len(readings) == len(injections)
+        assert [reading["restore_verified"] for reading in readings] == [True] * len(injections)
 
 
 def test_c32_each_shards_journal_holds_only_the_owners_of_its_own_attempts(shards, federations, whole):
@@ -123,13 +129,18 @@ def test_c32_the_outage_not_a_script_decides_the_one_run_that_reads_from_the_dow
     """C32: under `relay-down` only the task whose fact the down provider holds fails, as a treatment attempt of kind
     `provider_outage` that is scored; every other `relay-down` run reads from the provider that stayed up and
     finishes."""
-    for campaign in (*shards.values(), whole):
+    struck_in = {}
+    for name, campaign in {**{f"shard {i}": s for i, s in shards.items()}, "whole": whole}.items():
+        struck_in[name] = 0
         for row in attempts_of(campaign):
             factors = json.loads(campaign.sql("SELECT factors FROM runs WHERE run_key = ?", row["run_key"])[0][0])
             struck = factors["task"] == "lake" and row["admission"] == "exclusive"
+            struck_in[name] += struck
             assert (row["treatment"], row["infra_kind"], row["state"]) == (
                 (1, "provider_outage", "done") if struck else (0, None, "done")
             ), (row, factors)
+    assert struck_in["whole"] == STRUCK_RUNS
+    assert sum(struck_in[f"shard {i}"] for i in SERVES) == struck_in["whole"]
 
 
 def test_c32_the_shards_agree_on_one_fingerprint_that_holds_the_faults_and_no_federation(shards, whole, federations):
@@ -143,6 +154,17 @@ def test_c32_the_shards_agree_on_one_fingerprint_that_holds_the_faults_and_no_fe
     assert len({federations[i].project for i in federations}) == len(federations)
     identities = {i: json_meta(shard, META_ENVIRONMENT) for i, shard in shards.items()}
     assert len({json.dumps(value, sort_keys=True) for value in identities.values()}) == 1
+
+
+def test_c32_the_shards_ran_under_the_rule_by_model_and_the_merge_names_it(shards, merged):
+    """C32: each shard's store pins `expcore-shard/3` and holds the runs of the one model it serves, and merge.json
+    names the rule and the three shards."""
+    for index, shard in shards.items():
+        assert json_meta(shard, META_SHARD)["rule"] == RULE_BY_MODEL
+        models = {json.loads(row["factors"])["model"] for row in shard.sql("SELECT factors FROM runs")}
+        assert models == {SERVES[index]}
+    document = json.loads((merged.root / "out" / MERGE_FILE).read_text(encoding="utf-8"))
+    assert (document["rule"], document["count"]) == (RULE_BY_MODEL, len(SERVES))
 
 
 def test_c32_merged_shards_with_real_outages_give_the_scores_and_analysis_of_one_driver(whole, merged):

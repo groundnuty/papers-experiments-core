@@ -21,6 +21,7 @@ from shard_support import make_study as make_example
 from study_support import HEAD, Campaign, cli
 
 from expcore.provenance.codestamp import write_stamp
+from expcore.records.injections import FAULT_NAMESPACE
 from expcore.study.config import load_study
 from expcore_onedata.fault_journal import JOURNAL
 
@@ -137,3 +138,15 @@ def attempts_of(campaign: Campaign) -> list[dict[str, Any]]:
 def outage_attempts(campaign: Campaign) -> list[dict[str, Any]]:
     """The attempts that held the federation exclusively: the outage runs', since no other condition declares it."""
     return [row for row in attempts_of(campaign) if row["admission"] == "exclusive"]
+
+
+def injector_readings(campaign: Campaign) -> list[dict[str, Any]]:
+    """The fault injector's reading in every record of the campaign's batch that holds one: an outage run's record, with
+    the injector's own account of whether its restore was verified."""
+    found = []
+    for path in sorted(campaign.runs.rglob("*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        instruments = data.get("instruments") if isinstance(data, dict) else None
+        if isinstance(instruments, dict) and FAULT_NAMESPACE in instruments:
+            found.append(instruments[FAULT_NAMESPACE])
+    return found
