@@ -9,7 +9,7 @@ import tomllib
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import data_stand_in, hpc_on_path, manifest_values, pin_values
+from hpc_fed_support import address_values, data_stand_in, hpc_on_path, manifest_values, pin_values, put_address_map
 from hpc_import_support import (
     IMPORT_LAYOUT,
     IMPORT_TEMPLATE,
@@ -161,6 +161,7 @@ def core_root(hpc, tmp_path, make_ca, layout_file):
 
     root = tmp_path / "root"
     (root / "secrets" / "users").mkdir(parents=True)
+    put_address_map(root)  # `up` writes it before the core's phase
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(make_ca(tmp_path / "ca").ca.read_bytes())
     spec = fedspec.load_spec(layout_file)
@@ -188,7 +189,7 @@ def boot_of(layout, storages=None):
 def run_core(hpc, layout, environ, events, storages=None, **replaced):
     options = {
         "environ": environ,
-        "rest": lambda ca: SimpleNamespace(close=lambda: None),
+        "rest": lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
         "bootstrap": lambda rest, lay, owner: boot_of(lay, storages),
         "steps": lambda boot: events.append("steps"),
         "content": lambda boot: SimpleNamespace(reset=lambda timeout: None),
@@ -379,6 +380,7 @@ def rendered_import(hpc, root, make_ca):
         ),
         **pin_values(root / "agent"),
         **manifest_values(root, IMPORT_LAYOUT),
+        **address_values(root),
     }
     template = spec.platform_template.read_text(encoding="utf-8")
     hpc.boot.write_platform(root / "platform.toml", template, facts, {**values, "hpc_direct_storages": "{}"})

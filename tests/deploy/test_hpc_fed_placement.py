@@ -21,6 +21,7 @@ from hpc_fed_support import (
     PILOT_TEMPLATE,
     SITE,
     FakeSlurm,
+    address_values,
     agent_site,
     hpc_on_path,
     manifest_values,
@@ -117,6 +118,7 @@ def render(hpc, root: Path, template: str, ca: bytes) -> tuple[Path, str]:
         ),
         **pin_values(root / "agent"),
         **manifest_values(root),
+        **address_values(root),
     }
     text = hpc.boot.write_platform(root / "platform.toml", template, pilot_facts(), values)
     return root / "platform.toml", text

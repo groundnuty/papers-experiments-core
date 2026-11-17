@@ -151,7 +151,7 @@ REFUSED = {
     "no slot": lambda text: text.replace(LINE, ""),
     "the slot in a comment only": lambda text: text.replace(LINE, f"# {LINE}"),
     "the slot as another key": lambda text: text.replace(LINE, "address_map = @hpc_addresses@"),
-    "the slot under a table": lambda text: text.replace(LINE, "").replace("[tokens]\n", f"[tokens]\n{LINE}\n", 1),
+    "the slot under a table": lambda text: text.replace(LINE, "").replace("\n[tokens]\n", f"\n[tokens]\n{LINE}\n", 1),
 }
 
 

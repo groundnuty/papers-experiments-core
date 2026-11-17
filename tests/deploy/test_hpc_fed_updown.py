@@ -21,6 +21,7 @@ from hpc_fed_support import (
     data_stand_in,
     hpc_on_path,
     pin_values,
+    put_address_map,
 )
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
@@ -724,6 +725,7 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
 
     root = tmp_path / "root"
     (root / "secrets" / "users").mkdir(parents=True)
+    put_address_map(root)  # `up` writes it before the core's phase
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(make_ca(tmp_path / "ca").ca.read_bytes())
     spec = fedspec.load_spec(LAYOUT)

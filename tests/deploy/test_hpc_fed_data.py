@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from fingerprint_support import standin_python
-from hpc_fed_support import LAYOUT, data_stand_in, hpc_on_path, pin_values
+from hpc_fed_support import LAYOUT, data_stand_in, hpc_on_path, pin_values, put_address_map
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
 from expcore_onedata.config import load_platform
@@ -46,6 +46,7 @@ def core(hpc, root: Path, label: str, ca: bytes, data=None) -> str:
     import fedspec
 
     (root / "secrets" / "users").mkdir(parents=True)
+    put_address_map(root)  # `up` writes it before the core's phase
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(ca)
     (root / "fault-journal").mkdir()

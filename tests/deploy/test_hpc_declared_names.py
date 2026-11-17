@@ -400,7 +400,7 @@ def test_o73_the_core_s_phase_refuses_a_platform_whose_table_is_not_the_register
     import fedlayout
 
     table = phase.tmp / "table.toml"
-    table.write_text(_table("zone.other.test", DECLARED["aspen"]), encoding="utf-8")
+    table.write_text("addresses = @hpc_addresses@\n" + _table("zone.other.test", DECLARED["aspen"]), encoding="utf-8")
     spec = dataclasses.replace(phase.layout.spec, platform_template=table)
     phase.layout = fedlayout.Layout(phase.root, phase.tmp, spec)
     with pytest.raises(RuntimeError, match="zone") as refused:
