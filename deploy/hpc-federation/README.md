@@ -591,8 +591,8 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   and the scratch inode quota set; with none set, `up` refuses. `up N` past it is refused before anything is made, and
   `add K` counts every federation that may still hold a job (a failed one may, until its `down`). The inode guard is the
   core's own (`hpcquota`, mandatory with `HPC_STORAGE_ROOT`: an override, an unset command or a quota that cannot be read
-  refuses the fleet as it refuses one `up`), asked once for all N: the account's usage against N times one
-  federation's estimate. Without a scratch root nothing is on scratch, and the fleet says it made no check.
+  refuses the fleet as it refuses one `up`), asked once for all N by the fleet: the account's usage against N times one
+  federation's estimate (each federation's own `up` then checks its own estimate again, as it always does). Without a scratch root nothing is on scratch, and the fleet says it made no check.
   `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once. The maximum is one fleet's: two fleets of
   one account share the grant by hand.
 - **What `up` makes.** The fleet's directory (new: never adopted), and federations `fed-1` ... `fed-N`, each its own

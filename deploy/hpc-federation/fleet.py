@@ -98,8 +98,9 @@ def inode_guard(runner: Any, count: int, layout: Layout, site: Any, environ: Map
     """The inode guard for `count` federations at once, the core's own (`hpcquota.guard`, DESIGN.md section 11): N
     concurrent ups would each read the same usage, so the fleet reads it once against N times one federation's estimate.
     It is mandatory as it is for one `up`: a scratch root with `HPC_QUOTA_CHECK=off`, an unset command or pattern or a
-    quota that cannot be read refuses the fleet (`hpcquota.QuotaRefused`). Without a scratch root nothing of the
-    federations is on scratch, and the fleet says that no check was made."""
+    quota that cannot be read refuses the fleet (`hpcquota.QuotaRefused`). The fleet asks once for all N; each member's
+    own `up` then checks its own estimate as it always does (the quota command runs once more for each). Without a
+    scratch root nothing of the federations is on scratch, and the fleet says that no check was made."""
     if not site.storage_root:
         return "inode check: none: HPC_STORAGE_ROOT is not set, so nothing of the federations is on scratch"
     return hpcquota.guard(runner, site, layout, environ, federations=count)
