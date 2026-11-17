@@ -13,7 +13,8 @@ then the agent container.
 in the middle of a teardown leaves its last step on disk):
 
   1. readers: SIGTERM, then SIGKILL, to every process of the agent container except its init and the init's `sleep`
-     (found from the host through the container's cgroup: a `docker exec` fails at the pids limit). Best effort: a reader
+     (found from the host through the container's cgroup: a `docker exec` fails at the pids limit), each only while it is
+     the process listed (its start tick and command line digest, `procsignal`, O72). Best effort: a reader
      whose FUSE request is already with oneclient sleeps uninterruptibly (D) until oneclient answers or the connection
      ends (step 3); the survivors, their states and wait channels are logged, and the next step runs regardless.
   2. unmount, at the host's mount point (the sidecar's mount propagates there): `fusermount -u`, retried until a deadline,

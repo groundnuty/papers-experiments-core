@@ -25,6 +25,10 @@ of the container but its init and the init's `sleep`, as the quiesce kills them)
 that cannot be shown gone, or a listing that fails, ends the run as `survived_kill`, as a process that outlives its
 kill at the cap does (O34): the next cell would find it running.
 
+Every signal goes only to the process that was listed (`procsignal`, `killhelper`, O72): the listing carries each
+process's start tick and the digest of its command line, and a pid that ended and was reused since is never signalled.
+A process no signal reached is not marked done: it is listed again, and while one is alive it is never quiet.
+
 A cell runs under the completion bootstrap (`completion.py`, O55): its program is checked whole in the container before
 it runs, and a record written after the interpreter's exit carries this exec's nonce and the exit status. The record's
 lines are taken out of the streams as they are read, so the output is the program's own; what it showed is the

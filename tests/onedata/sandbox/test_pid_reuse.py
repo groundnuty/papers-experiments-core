@@ -123,7 +123,7 @@ def test_o72_the_kill_at_the_cap_never_signals_a_pid_another_process_took_since_
     assert pids["grandchild"] not in killed_pids(world)
     assert {pids["python"], pids["child"]} <= killed_pids(world)
     assert result.kill["reason"] == "time_limit"
-    assert result.kill["deadline"]["outcome"] == deadline.KILLED
+    assert mounted.metadata()["cell_deadlines"][-1]["outcome"] == deadline.KILLED
 
 
 def test_o72_the_kill_at_the_cap_lists_a_process_that_changed_its_command_line_again_and_kills_it(world, mounted):
@@ -135,7 +135,8 @@ def test_o72_the_kill_at_the_cap_lists_a_process_that_changed_its_command_line_a
     first, *later = plain_kills(world)
     assert pids["child"] not in first
     assert pids["child"] in [pid for kill in later for pid in kill]
-    assert result.kill["deadline"]["outcome"] == deadline.KILLED
+    assert result.kill["reason"] == "time_limit"
+    assert mounted.metadata()["cell_deadlines"][-1]["outcome"] == deadline.KILLED
 
 
 def test_o72_a_cell_process_the_cap_cannot_identify_survives_its_kill_and_the_deadline_escalates(world, mounted):
@@ -166,7 +167,7 @@ class Declining(Processes):
             if p["pid"] in self.always or self.decline.get(p["pid"], 0) > 0:
                 self.decline[p["pid"]] = self.decline.get(p["pid"], 0) - 1
                 continue
-            reached.append(deadline._key(p))
+            reached.append(deadline.key_of(p))
             if p["pid"] not in self.wedged:
                 self.procs.pop(p["pid"], None)
         return reached

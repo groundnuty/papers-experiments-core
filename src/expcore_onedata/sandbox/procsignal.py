@@ -75,7 +75,7 @@ def signal_processes(host: HostOps, procs: Sequence[Mapping[str, Any]], name: st
     has reached none of them."""
     if not procs:
         return Signalled({})
-    targets = [{"pid": p["pid"], "start": p["start"], "cmd_sha256": p.get(KEY)} for p in procs]
+    targets = [{"pid": p["pid"], "start": p.get("start"), "cmd_sha256": p.get(KEY)} for p in procs]
     done = host.run(
         [sys.executable, "-I", "-c", PROGRAM, name], timeout_s, sudo=True, input=json.dumps({"targets": targets})
     )
