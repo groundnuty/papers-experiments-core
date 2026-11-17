@@ -504,7 +504,7 @@ stop. It may read `out/` and the federation, and it may write into `out/`, which
 
 An exit 0 makes the shard's results **final**. A non-zero exit, a signal, a timeout, or a dispatcher that did not exit 0
 (the script is then not run) leaves them **not final**. They are archived all the same, so nothing is lost: the
-manifest says `final: false` and the script's record with its reason, the archived `out/` holds `NOT-FINAL.json`, and
+manifest says `final: false` and the script's record with its reason, the archived `out/` holds `NOT-FINAL.json` (written into the archive itself, so a full tmpfs cannot leave it out), and
 the step ends with exit status 74 (`POST_RUN_FAILED`) when the dispatcher's own status was 0, the dispatcher's otherwise.
 A step's record (`step.json`) and its manifest hold `post_run: {path, sha256, ran, exit_status, final}` (and a `reason`
 when not final); with none declared the record, the manifest and the archive are what they were. `collect` refuses a
