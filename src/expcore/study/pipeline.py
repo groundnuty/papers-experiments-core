@@ -42,9 +42,10 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   The plugin it scores with is the module's `build_analysis` where the study defines one, which needs no platform, and
   its `build` otherwise (`analysis_plugin`, R17); a run never builds with `build_analysis`. An analysis built by it is
   refused, before any record is scored, unless its scorers have the digest every snapshot's campaign fingerprint
-  recorded, so the outputs are the same bytes whichever builder served the analysis. With `allow_rescore` (`analyze
-  --rescore`) a digest that differs is let through, and `analysis.json` (`rescore`) and the report's provenance say
-  so, naming both digests: a scorer corrected after an HPC batch is re-scored on the record, never silently.
+  recorded, so the outputs are the same bytes whichever builder served an analysis that re-scored nothing. With
+  `allow_rescore` (`analyze --rescore`) a digest that differs is let through, and `analysis.json` (`rescore`) and the
+  report's provenance say so, naming both digests: a scorer corrected after an HPC batch is re-scored on the record,
+  never silently.
 - `output_bytes` is the one place the bytes of `export.json`, `scores.json`, `analysis.json` and `report.md` are made;
   `write_analysis` and `write_report` write them and `regenerate` compares them with the files in `out/`, which is
   what a replication package's `make check` runs. Every time in them comes from the records and the store, every
