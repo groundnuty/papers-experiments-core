@@ -303,7 +303,8 @@ def test_o80_a_failed_recovery_judges_every_open_entry_not_only_the_failing_targ
     journal.append({**base, "id": "a", "target": OUTAGE_TARGET, "owner": attempt(campaign, 5)})
     journal.append({**base, "id": "b", "target": LOCAL_TARGET, "owner": attempt(campaign, 6)})
     gate = FaultGate(settings, FakeServices())
-    error = InfraError("injector_failure", "an injection that an earlier run left open was not cleared", OUTAGE_TARGET)
+    detail = "an injection that an earlier run left open was not cleared"
+    error = InfraError("injector_failure", detail, target=OUTAGE_TARGET)
     with liveness.running(campaign, 6):
         assert gate._left_open(error).charge is True
     with liveness.running(campaign, 7):
