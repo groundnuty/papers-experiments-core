@@ -543,9 +543,9 @@ class Snapshots:
     """When a running shard's `out/` is snapshotted (O62; `snapshot` is what a snapshot is).
 
     `take(out)` is called from a thread of its own while the dispatcher runs: every `every_s` seconds, and, given
-    `progress` (a reading that changes when a run ends, None while there is none), within `poll_s` of a change, one
-    snapshot at a time; and once after the dispatcher has exited, before the archive. One that raises is reported
-    and never ends the run: the last good snapshot stands."""
+    `progress` (a count that changes when a run ends, None while there is no reading, which counts as 0), within
+    `poll_s` of a change, one snapshot at a time; and once after the dispatcher has exited, before the archive. One
+    that raises is reported and never ends the run: the last good snapshot stands."""
 
     def __init__(
         self,
@@ -578,7 +578,9 @@ class Snapshots:
             last, seen = self.clock(), self._seen()
             while not self._stop.wait(self.poll_s):
                 now = self._seen()
-                ended = now is not None and now != seen
+                # no reading yet (None: out/ has no runs/ until its first attempt begins) is a count of 0, so that
+                # attempt's beginning is no run's end: the first snapshot comes at the first run's end, or the clock's
+                ended = now is not None and now != (0 if seen is None else seen)
                 if (ended or self.clock() - last >= self.every_s) and out.is_dir():
                     self._once(out)
                     last, seen = self.clock(), now if now is not None else seen
