@@ -28,10 +28,13 @@ decides, and the start's proof below is what is relied on).
   holds), and nothing is copied before they are checked. Each exec mounts the image anew, so the copy's device may
   not be the listing's: the helper is given the listing's device and compares each object with the device the root
   has in its own exec (`WRAPPER`), its inode, kind and size unchanged. Each exec runs after the image's identity is
-  checked (O13), binds no preload and carries the run's tag, so the teardown and a reaper find it.
+  checked (O13) and binds no preload. It carries a tag of its own (`COPY_TAG`), never the run's: the watch, which
+  kills every process carrying the run's tag past a bound, would take the harness's copy for the agent's when the
+  agent's last cell left `/tmp` past its size, and fail the collection.
 * **What holds it** (`end_holders`): at the teardown and in a reaper, every process of the uid whose command line
-  names the image is killed and shown gone, or the step fails: a cell's `apptainer` that was given up on, a FUSE
-  server Apptainer left. Its mount is in the cell's mount namespace, never under the run's directory.
+  names the image, or that carries the run's `COPY_TAG`, is killed and shown gone, or the step fails: a cell's
+  `apptainer` that was given up on, a FUSE server Apptainer left, a copy whose driver died. Its mount is in the cell's
+  mount namespace, never under the run's directory.
 """
 
 from __future__ import annotations
@@ -58,6 +61,7 @@ IMAGE_NAME = "disk.img"  # in the run's `work/`, which the watch walks
 TREE = "/work"  # the image's directory every cell binds at /work
 CELL_WORK = "/work"
 EXPORT = "/expcore-export"  # where a collection's exec binds the run's staging directory
+COPY_TAG = "EXPCORE_WORK_COPY"  # a collection exec's environment: `<COPY_TAG>=<sid>`, which the watch never matches
 ALIGN = 2 << 20  # the image's size is a multiple of this: a huge page of tmpfs, so its allocation stays within it
 MKFS_S = 300.0
 VERSION_S = 20.0
@@ -262,20 +266,27 @@ def collect(
     return copied
 
 
+def copy_env(sid: str) -> dict[str, str]:
+    """A collection exec's environment: its own tag (the module's docstring)."""
+    return {COPY_TAG: sid}
+
+
 def end_holders(
     node: NodeOps,
     image: Path,
+    sid: str,
     *,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> int:
-    """Kill every process of the uid whose command line names `image`, and show each gone: how many there were.
-    `SandboxError` when they cannot be listed or one is not shown gone (unknown is never gone)."""
-    tag = str(image)
-    found = node.processes((tag,))
+    """Kill every process of the uid whose command line names `image` or that carries the run's `COPY_TAG`, and show
+    each gone: how many there were. `SandboxError` when they cannot be listed or one is not shown gone (unknown is never
+    gone)."""
+    tags = (str(image), f"{COPY_TAG}={sid}")
+    found = node.processes(tags)
     if found is None:
         raise SandboxError("the processes that may hold the run's work disk could not be listed")
-    holders = [p for p in found if tag in p.tags]
+    holders = [p for p in found if p.tags & set(tags)]
     for proc in holders:
         node.signal(proc.pid, proc.start, signal.SIGKILL)
     until = clock() + GONE_WAIT_S
@@ -289,6 +300,7 @@ def end_holders(
 __all__ = [
     "CHECK",
     "CHECK_HEAD",
+    "COPY_TAG",
     "EXPORT",
     "IMAGE_NAME",
     "PROBE",
@@ -297,6 +309,7 @@ __all__ = [
     "ImageCopyHost",
     "bind",
     "collect",
+    "copy_env",
     "end_holders",
     "image_path",
     "image_size",

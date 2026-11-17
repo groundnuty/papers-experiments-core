@@ -474,7 +474,20 @@ class FakeNode:
 
     def _copy_helper(self, parsed: Exec) -> CmdResult:
         """The collection's copy helper in an exec of the image: run for real, its /work the image's backing directory
-        and the staging directory where the exec binds it."""
+        and the staging directory where the exec binds it. While it runs, a process of its namespace carries the exec's
+        environment, and the watch is given time to list it; one the watch killed makes the exec's exit 137."""
+        environ = tuple(f"{k}={v}" for k, v in parsed.env.items())
+        proc = self._new_proc(self.new_namespace(), "python3", environ=environ, cmdline=tuple(parsed.command[:3]))
+        try:
+            if self.wait_for_watch:
+                seen, until = self.listed, time.monotonic() + 0.3
+                while self.listed < seen + 10 and time.monotonic() < until:
+                    time.sleep(0.005)
+            return self._copy_helper_run(parsed) if proc.alive else CmdResult(137, "", "")
+        finally:
+            proc.alive = False
+
+    def _copy_helper_run(self, parsed: Exec) -> CmdResult:
         image = self.images[parsed.binds["/work"][0]]
         export = parsed.binds[workdisk.EXPORT][0]
         request = json.loads(parsed.stdin or "{}")

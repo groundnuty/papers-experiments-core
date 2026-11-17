@@ -133,7 +133,7 @@ class Teardown:
     def _work_disk(self) -> None:
         box = self.box
         if os.path.lexists(workdisk.image_path(box.dir)):
-            workdisk.end_holders(box.node, workdisk.image_path(box.dir), sleep=box._sleep, clock=box._clock)
+            workdisk.end_holders(box.node, workdisk.image_path(box.dir), box.sid, sleep=box._sleep, clock=box._clock)
 
     def _directory(self) -> None:
         box = self.box

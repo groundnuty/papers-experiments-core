@@ -183,8 +183,8 @@ def _write(cell, files):
 
 
 def test_o71_a_named_output_is_copied_out_of_the_image_by_execs_of_the_image(node, settings, tmp_path):
-    """O71: the copy helper runs in one-shot execs of the image that bind the run's disk at /work and carry the run's
-    tag; the output lands where Docker's collection puts it, the driver's."""
+    """O71: the copy helper runs in one-shot execs of the image that bind the run's disk at /work and carry a tag of
+    their own; the output lands where Docker's collection puts it, the driver's."""
     box = start(node, settings)
     try:
         node.cell_handler = lambda cell: _write(cell, {"out/result.txt": lambda p: p.write_text("42\n")})
@@ -196,7 +196,8 @@ def test_o71_a_named_output_is_copied_out_of_the_image_by_execs_of_the_image(nod
         assert [e.command[-1] for e in copies] == ["list", "copy"]
         for e in copies:
             assert e.images["/work"] == "/work"
-            assert e.env == {AV.RUN_TAG: box.sid}
+            assert e.env == workdisk.copy_env(box.sid)
+            assert AV.RUN_TAG not in e.env
         assert not (box.dir / "export").exists()
     finally:
         box.stop()
@@ -205,6 +206,21 @@ def test_o71_a_named_output_is_copied_out_of_the_image_by_execs_of_the_image(nod
 def _sparse_past_the_disk(path):
     with open(path, "wb") as handle:
         handle.truncate(LIMITS.work_disk_bytes + 1)
+
+
+def test_o71_the_watch_never_takes_the_collection_s_copy_for_the_agent_s(node, settings, tmp_path):
+    """O71: the agent's last cell left /tmp past its size; the copy execs carry a tag of their own, not the run's, so
+    the watch kills none of them and the output is collected, never set aside."""
+    box = start(node, settings)
+    try:
+        node.cell_handler = lambda cell: _write(cell, {"out/result.txt": lambda p: p.write_text("42\n")})
+        box.exec("write()", 30)
+        (box.dir / "tmp" / "left.bin").write_bytes(b"\0" * (2 * LIMITS.tmp_bytes))
+        done = box.collect(tmp_path / "out", ["out"])
+        assert done["outputs"] == {"out": True}
+        assert [k for k in box.metadata()["watch"]["kills"] if k["cell"] is None] == []
+    finally:
+        box.stop()
 
 
 def _outside_link(path):
@@ -278,6 +294,15 @@ def test_o71_the_teardown_kills_a_process_left_holding_the_image_and_removes_the
     assert not holder.alive
     assert not box.dir.exists()
     assert not runs.record_path(settings.work_root, box.sid).exists()
+
+
+def test_o71_the_teardown_kills_a_copy_of_the_collection_left_running(node, settings):
+    """O71: a process carrying the run's copy tag (an exec of the collection that was given up on) is killed too."""
+    box = start(node, settings)
+    left = node._new_proc(node.new_namespace(), "python3", environ=(f"{workdisk.COPY_TAG}={box.sid}",), role="holder")
+    box.stop()
+    assert not left.alive
+    assert not box.dir.exists()
 
 
 def test_o71_a_holder_that_cannot_be_shown_gone_fails_the_teardown_and_keeps_the_record(node, settings):

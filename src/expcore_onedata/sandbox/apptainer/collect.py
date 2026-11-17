@@ -115,8 +115,9 @@ class Collection:
 
     def _image_outputs(self, dest: Path, outputs: Sequence[str]) -> dict[str, dict[str, int] | None]:
         """The named outputs out of the run's image (`workdisk.collect`): the copy helper in one-shot execs of the image
-        that bind its `/work` and the run's staging directory and carry the run's tag, each after the image is checked
-        (O13); the staging directory is removed whatever happens."""
+        that bind its `/work` and the run's staging directory and carry a tag of their own, never the run's, which the
+        watch would kill them by (`workdisk.COPY_TAG`), each after the image is checked (O13); the staging directory is
+        removed whatever happens."""
         box = self.box
         staging = box.dir / "export"
         runs.remove_tree(staging)
@@ -125,8 +126,8 @@ class Collection:
         host = workdisk.ImageCopyHost(
             box.node, python=box.app.python, before_exec=box.image_unchanged, image=workdisk.image_path(box.dir),
             staging=staging,
-            argv_of=lambda command: AV.exec_argv(box.app.apptainer, box.app.image.path, binds, {AV.RUN_TAG: box.sid},
-                                                 command),
+            argv_of=lambda command: AV.exec_argv(box.app.apptainer, box.app.image.path, binds,
+                                                 workdisk.copy_env(box.sid), command),
         )  # fmt: skip
         try:
             return workdisk.collect(host, staging, dest / "work", outputs, max_bytes=box.s.limits.work_disk_bytes)
