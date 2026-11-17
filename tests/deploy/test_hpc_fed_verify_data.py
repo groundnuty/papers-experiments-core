@@ -12,6 +12,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fingerprint_support import standin_python
@@ -29,8 +30,10 @@ from hpc_ingested_support import (
     up,
     verify_stand_in,
 )
+from hpc_rehearsal_support import link_check_stand_in
 
 from expcore_onedata.importmanifest import Manifest, write_manifest
+from expcore_onedata.linkcheck import LinkReport, PairResult
 
 SCRIPT = LAYOUT.parents[1] / "shards.py"
 
@@ -314,3 +317,114 @@ def test_o57_plan_takes_a_federation_with_no_ingested_space_as_it_always_did(hpc
     fed = brought_up(hpc, tmp_path, ca)
     fed.driver.set(lambda s: s["data"].update(ingested={}))
     assert shards.federation(first_shard(shards, tmp_path, fed))["job"]
+
+
+# -- a rerun of the core's phase on a federation that is linked (C06, O63) --------------------------------------------
+
+
+def failing_links(config: Any, client: Any) -> LinkReport:
+    """`fedlinks.check_links` finding a pair that does not transfer."""
+    pair = PairResult("providers[0]", "providers[1]", False, reason="the fetch failed")
+    return LinkReport(False, "providers[0] <- providers[1]: the fetch failed", (pair,), 1.0, 2.0)
+
+
+def rerun(hpc, fed, links, said=None) -> str:
+    """`hpcfed.py core` on the root of `fed`: the driver's own core's phase again, `links` its link check."""
+    fed.driver.say = (said if said is not None else []).append
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(hpc.fedlinks, "check_links", links)
+        return fed.driver.core_here()
+
+
+def verified(hpc, tmp_path, ca, name="fed"):
+    """A federation brought up and whose ingested space has been verified: plan takes it, and is its only gate left."""
+    fed = brought_up(hpc, tmp_path, ca, name)
+    verify_stand_in(hpc, fed, {"delta-space": ONE})
+    fed.driver.verify_data()
+    return fed
+
+
+def phase(fed) -> str:
+    return fed.driver.store.read()["phase"]
+
+
+def plan(shards, tmp_path, fed) -> int:
+    return shards.main(["plan", "--manifest", str(shard_manifest(tmp_path, [fed, fed]))])
+
+
+def test_c06_a_core_rerun_on_a_linked_federation_whose_link_check_passes_leaves_it_linked_and_plan_takes_it(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63 (live, 17 Nov 2026): `hpcfed.py core` on a finished federation ends in the core's own phase, which set
+    `bootstrapped`, and only `up` set `linked`, so `shards.py plan` refused a federation whose rerun had passed every
+    check. A rerun whose link check passes restores `linked`, and says so."""
+    fed = verified(hpc, tmp_path, ca)
+    assert plan(shards, tmp_path, fed) == 0
+    capsys.readouterr()
+    said: list = []
+    printed = rerun(hpc, fed, link_check_stand_in([]), said)
+    assert "link check: every pair transferred" in printed
+    assert phase(fed) == "linked"
+    assert any("linked again" in line for line in said)
+    assert plan(shards, tmp_path, fed) == 0
+
+
+def test_c06_a_core_rerun_on_a_linked_federation_whose_link_check_fails_leaves_it_bootstrapped_and_plan_refuses(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: a rerun that fails its link check leaves no `linked` it did not earn: the federation is `bootstrapped`,
+    the failure is raised as it was, and `plan` refuses the federation, saying its up has not finished."""
+    fed = verified(hpc, tmp_path, ca)
+    said: list = []
+    with pytest.raises(RuntimeError, match="the link check failed, so the federation is not ready"):
+        rerun(hpc, fed, failing_links, said)
+    assert phase(fed) == "bootstrapped"
+    assert any("bootstrapped" in line for line in said)
+    capsys.readouterr()
+    assert plan(shards, tmp_path, fed) == 2
+    assert "its federation's up has not finished (phase bootstrapped)" in capsys.readouterr().err
+
+
+def test_c06_a_core_rerun_on_a_linked_federation_is_not_linked_while_it_runs(hpc, tmp_path, ca):
+    """C06, O63: the demotion comes before the core's phase, not after its failure: a rerun that dies mid-way (a step
+    killed, a login node's session lost) never raises past a `linked` it has not re-earned."""
+    fed = verified(hpc, tmp_path, ca)
+    seen: list = []
+    real = fed.driver.core
+
+    def watching(*args: Any, **kwargs: Any) -> str:
+        seen.append(phase(fed))
+        return real(*args, **kwargs)
+
+    fed.driver.core = watching
+    rerun(hpc, fed, link_check_stand_in([]))
+    assert seen == ["bootstrapped"]
+
+
+def test_c06_a_core_rerun_does_not_overwrite_a_phase_that_changed_under_it(hpc, tmp_path, ca):
+    """C06, O63: the core's phase takes no lifecycle lock, so a `down` may start while it runs: its `stopping` is not
+    overwritten with `linked` when the rerun ends."""
+    fed = verified(hpc, tmp_path, ca)
+    real = fed.driver.core
+
+    def stopped_meanwhile(*args: Any, **kwargs: Any) -> str:
+        fed.driver.set(lambda s: s.update(phase="stopping"))
+        return real(*args, **kwargs)
+
+    fed.driver.core = stopped_meanwhile
+    rerun(hpc, fed, link_check_stand_in([]))
+    assert phase(fed) == "stopping"
+
+
+@pytest.mark.parametrize("before", ["providers", "bootstrapped"])
+def test_c06_the_core_phase_of_a_federation_that_was_not_linked_ends_bootstrapped_as_up_needs(
+    hpc, tmp_path, ca, before
+):
+    """C06, O63: `up` is unchanged. Brought up, the federation is `linked` (it is `up` that says so); the core's phase
+    (the node's step under `[hpc] core = "step"`) on a state that is not `linked` ends `bootstrapped` and never
+    `linked`, so a rerun cannot link a federation whose up did not finish."""
+    fed = brought_up(hpc, tmp_path, ca)
+    assert phase(fed) == "linked"
+    fed.driver.set(lambda s: s.update(phase=before))
+    rerun(hpc, fed, link_check_stand_in([]))
+    assert phase(fed) == "bootstrapped"
