@@ -464,6 +464,24 @@ def test_c06_a_core_rerun_whose_ingested_manifest_changed_since_up_does_not_link
     stays_bootstrapped(shards, tmp_path, fed, said, "its manifest is not the one up recorded", capsys)
 
 
+def test_c06_the_core_phase_of_a_federation_that_was_not_linked_does_not_overwrite_a_phase_that_changed_under_it(
+    hpc, tmp_path, ca
+):
+    """C06, O63: the same on a state that was not `linked` (a rerun after a failed one, or `up`'s own step): a `down`
+    that wrote `stopping` while the core's phase ran keeps it, instead of having `bootstrapped` written over it."""
+    fed = brought_up(hpc, tmp_path, ca)
+    fed.driver.set(lambda s: s.update(phase="providers"))
+    real = fed.driver.core
+
+    def stopped_meanwhile(*args: Any, **kwargs: Any) -> str:
+        fed.driver.set(lambda s: s.update(phase="stopping"))
+        return real(*args, **kwargs)
+
+    fed.driver.core = stopped_meanwhile
+    rerun(hpc, fed, link_check_stand_in([]))
+    assert phase(fed) == "stopping"
+
+
 @pytest.mark.parametrize("before", ["providers", "bootstrapped"])
 def test_c06_the_core_phase_of_a_federation_that_was_not_linked_ends_bootstrapped_as_up_needs(
     hpc, tmp_path, ca, before

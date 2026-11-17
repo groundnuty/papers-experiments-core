@@ -219,6 +219,58 @@ def test_o63_the_core_phase_rerun_on_a_root_after_a_link_check_passes_its_data_c
     assert (root / "link-check.json").is_file()
 
 
+def test_o63_the_content_reader_does_not_read_the_link_checks_files_and_reads_every_other_file(hpc):
+    """C06, O63, O35: reading a probe through the probe space's owner may replicate it onto the owner, and a retired
+    probe's file is never read again (its fetch may never end): the data check drops the link check's files from the
+    probe space, so the reader neither reads their bytes nor lists them as data. Every other file of that space, one
+    below its directories and a probe-named file of a study space are read, and still refused if undeclared."""
+    import fedcontent
+    import fedspec
+
+    spec = fedspec.load_spec(LAYOUT)
+    assert spec.probe_space == PROBE_SPACE
+    probe, retired, stray = probe_name("pair-one"), retired_name("pair-one", "id"), "stray.txt"
+    listing = {
+        f"root-{PROBE_SPACE}": [(probe, "id-probe"), (retired, "id-marker"), (stray, "id-stray"), ("sub", "dir-sub")],
+        "dir-sub": [(probe, "id-below")],
+        "root-alpha-space": [(probe, "id-study")],
+    }
+    read: list[str] = []
+
+    class Content:
+        def __init__(self, boot: Any) -> None:
+            self.boot = boot
+
+        def root(self, service: Any, space: str) -> str:
+            return f"root-{space}"
+
+        def children(self, service: Any, directory: str) -> list[dict[str, Any]]:
+            return [
+                {"name": name, "type": "DIR" if file_id.startswith("dir-") else "REG", "file_id": file_id, "size": 3}
+                for name, file_id in listing[directory]
+            ]
+
+        def read_back(self, service: Any, file_id: str) -> bytes:
+            read.append(file_id)
+            return b"abc"
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(fedcontent, "Content", Content)
+        reader = hpc.data.content_reader(SimpleNamespace(layout=SimpleNamespace(spec=spec)))
+        files, _ = reader(PROBE_SPACE)
+        study, _ = reader("alpha-space")
+    assert sorted(read) == [
+        "id-below",
+        "id-stray",
+        "id-study",
+    ]  # the probe and the marker of the probe space: never read
+    assert set(files) == {probe, retired, stray, f"sub/{probe}"}
+    (kept, _), left_out = hpc.data.without_link_check_files((files, set()))
+    assert left_out == 2  # `check` still drops and counts the check's files
+    assert set(kept) == {stray, f"sub/{probe}"}
+    assert study == {probe: (3, hashlib.sha256(b"abc").hexdigest())}
+
+
 def test_o63_the_differences_are_counts_of_files_missing_extra_other_and_directories(hpc):
     manifest = hpc.data.baseline_manifest(
         [SimpleNamespace(path="d/a.txt", size=1, content=lambda: b"a"), SimpleNamespace(path="b.txt", size=1,
