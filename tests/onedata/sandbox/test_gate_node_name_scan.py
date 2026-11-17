@@ -193,6 +193,11 @@ def test_o73_the_log_holds_a_count_and_never_a_name_a_body_or_a_context(tmp_path
         (f"::ffff:{ADDRESS}", 1),
         ("::ffff:c633:6415", 1),
         ("::ffff:c633:6416", 0),
+        # the text a parser or a library prints with escapes, and prose that ends in hex digits before an address
+        (f"Bad request syntax ('GET /\\t{NODE} extra HTTP/1.1')", 1),
+        (f"a\\n{SHORT} and b\\r{ADDRESS}", 2),
+        ("node:2001:0db8::2 and de:2001:db8::2", 2),
+        (f"peer={V6}", 1),
     ],
 )
 def test_o73_the_scan_counts_whole_names_with_or_without_a_port_in_any_case(text, hits):
@@ -294,6 +299,65 @@ def test_o73_the_fields_that_echo_the_clients_request_hold_no_known_name(tmp_pat
     for word in NAMES:
         assert word.lower() not in text, word
     assert "<node>" in text
+
+
+@pytest.mark.parametrize(
+    ("body", "hits"),
+    [
+        (rb'"\u0063n-r3c07-n12.cluster.example.org"', 1),  # a JSON string is a document too
+        (rb' "\u0031\u0039\u0038.51.100.21" ', 1),
+        (rb'"fine"', 0),
+        (rb'[ "\u0063n-r3c07-n12" ]', 1),
+    ],
+)
+def test_o73_a_json_string_is_decoded_like_an_object_or_an_array(body, hits):
+    """O73: a body that is a single JSON string is read as its client decodes it."""
+    gate.CFG.clear()
+    gate.CFG["scan_names"] = NAMES
+    try:
+        assert gate._node_name_hits(body) == hits
+    finally:
+        gate.CFG.clear()
+
+
+@pytest.mark.parametrize(
+    ("text", "hits"),
+    [
+        (f"::ffff:{ADDRESS}", 1),  # the dotted tail and the whole address are one occurrence
+        (f"{ADDRESS} and ::ffff:{ADDRESS}", 2),
+        ("::ffff:c633:6415", 1),
+        (f"[::ffff:{ADDRESS}]:8443", 1),
+    ],
+)
+def test_o73_an_address_and_its_ipv4_mapped_form_are_one_occurrence_each(text, hits):
+    """O73: with both the address and its mapped IPv6 form among the names, one occurrence is one hit, however many of
+    the names it matches."""
+    gate.CFG.clear()
+    gate.CFG["scan_names"] = [ADDRESS, f"::ffff:{ADDRESS}", V6]
+    try:
+        assert gate._node_name_hits(text.encode()) == hits
+    finally:
+        gate.CFG.clear()
+
+
+def test_o73_the_redaction_covers_the_spellings_the_scan_finds():
+    """O73: what the scan counts, the log's echoing fields do not keep: escapes before a name, an address after
+    prose and an address in another spelling are replaced by the mark."""
+    gate.CFG.clear()
+    gate.CFG["scan_names"] = NAMES
+    try:
+        for text in (
+            f"GET /\\t{NODE} x",
+            "node:2001:0db8::2",
+            f"GET /{NODE.upper()}:8443/{ADDRESS}",
+            "[2001:DB8:0:0:0:0:0:2]:8443",
+        ):
+            redacted = gate._redact_node_names(text)
+            assert gate.NODE_MARK in redacted
+            assert gate._node_name_hits(redacted.encode()) == 0
+        assert gate._redact_node_names("GET /nothing") == "GET /nothing"
+    finally:
+        gate.CFG.clear()
 
 
 def test_o73_the_gates_own_answers_are_scanned_too(tmp_path, world):
