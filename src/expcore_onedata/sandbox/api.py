@@ -104,7 +104,11 @@ class SandboxSpec:
     no data path has no token and no endpoint. `lease_key` names the leased resource the sandbox's containers, network
     and directories are labelled with, so a probe can prove them gone (C19). `listing` is a REST data path's listing
     mode, `paged` or `complete` (`gatepolicy`, O21); a start refuses another, and any but `paged` on another data path.
-    `inputs` are the run's read-only inputs, in the order they are mounted and recorded (O20).
+    `inputs` are the run's read-only inputs, in the order they are mounted and recorded (O20). `read_log` asks the
+    Docker backend for the read-log channel (`expcore_onedata.readlog`): a collector container the agent's scripts log
+    their reads to, its log kept out of the agent's reach, exposed as `read_log()` once the collection has stopped it.
+    Linux only: a start on another host is refused. The Apptainer backend starts its collector when its settings
+    declare the collector's pin, whatever this field says.
     """
 
     run_key: str
@@ -118,6 +122,7 @@ class SandboxSpec:
     # the real names and addresses of the federation's nodes (O73), which the gate scans the answers it relays for:
     # empty where the names are already the declared ones (Compose). Never shown, never in anything a cell can read.
     node_names: tuple[str, ...] = dataclasses.field(default=(), repr=False)
+    read_log: bool = False
 
 
 RAN = "ran"  # the cell was started: its exit code, timeout and kill say how it ended
