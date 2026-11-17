@@ -481,6 +481,8 @@ Four things differ from Docker, and the record says so (`infrastructure_facts`):
 
 Names resolve as on Docker (`dns: none` in the record): the federation's names resolve from `/etc/hosts` and no other name resolves. A Docker agent's network is `--internal` with `--add-host` entries and no `--dns`, and measured on engine 29.2.1 the engine's embedded resolver answers every outside name with SERVFAIL at once. So the name lookup is no departure; the connect to an outside address is, as the network bullet says (on Docker it fails at once with ENETUNREACH).
 
+The cell's host name is `sandbox` on both backends (O73): `hostname`, `uname -n` and `/etc/hostname` in a cell read it, never the batch node's own name or the engine's container id, and `infrastructure_facts.cell_hostname` records it. It is the core's constant, no setting of a study's.
+
 **Give a REST level on HPC the layout's names (O69).** Without more, a REST cell is given the hosts of the URLs of `[zone]` and the local provider, which on an HPC federation are the nodes' FQDNs on port 8443: site details that would reach the agent's environment, its `/etc/hosts`, the gate's certificates and any error text its client prints, and that differ from what a Compose agent sees. Declare the names in `[sandbox.federation]`, as on Docker but without `network`:
 
     [sandbox.federation]                 # Apptainer: the names the gate serves the agent, on 443; a rest level is required

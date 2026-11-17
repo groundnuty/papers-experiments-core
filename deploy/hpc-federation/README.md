@@ -492,6 +492,33 @@ node the names are reached through the address map `up` writes into the root (`s
 which `platform.toml` names; see `DESIGN.md`, "The registered names". The first sandbox slot on a federation brought up
 this way is owed the checks of `DESIGN.md` section 9, item 7.
 
+## The cell's host name (O73)
+
+An agent's cell on a batch node has no network namespace, and without `--uts` no UTS namespace either: `hostname`,
+`uname -n`, `uname -a` and `/proc/sys/kernel/hostname` in it show the batch node's own name. That is a name the agent
+must not read (the gate's count of node names, above, is for the same reason), and a Compose cell, which reads its own
+container's name, does not show it. The core gives every cell on both backends one fixed, neutral host name, `sandbox`
+(`expcore_onedata/sandbox/cellhost.py`, a constant of the core and no setting): each `apptainer exec` carries
+`--uts --hostname sandbox`, the cell binds a generated read-only `/etc/hostname` of the same name, and the Docker
+agent's container is created with `--hostname sandbox`. A federation with a node of that name is refused at the start.
+
+**Measured (17 Nov 2026, the pilot's site):** its Apptainer runs in setuid mode, and `apptainer exec --uts --hostname
+sandbox <image> hostname` and the same with `uname -n` print `sandbox`, exit 0, with no warning; without `--uts` both
+print the node's own name.
+
+**Not shown offline, owed to the next live slot:**
+
+1. `--uts --hostname sandbox` together with the sandbox's whole argv (`--containall`, `--no-mount
+   hostfs,bind-paths,cwd`, the binds, the preloads and the egress shim). The measurement above was a bare exec of an
+   image.
+2. A cell's `/etc/hostname`, read from inside: the generated file is bound over the image's, as the cell's other
+   generated files are, and the cell reads the name only if the bind holds. This is not shown.
+3. `hostname`, `uname -n`, `uname -a` and `cat /etc/hostname` run in a cell of a live run, and compared with a Compose
+   cell's.
+
+The tests (`tests/onedata/sandbox/apptainer/test_cell_hostname.py`) read the argv and binds a fake node was given; they
+do not run Apptainer.
+
 ## Slots and the tool server (O83)
 
 The tool-server arm needs a slot's users. `layouts/pilot-shape-slots.toml` is the pilot's shape with the four users of two
