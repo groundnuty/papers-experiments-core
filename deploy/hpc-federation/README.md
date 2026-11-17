@@ -1196,9 +1196,11 @@ either had a first step that passed nothing or has lost the record (deleting `pa
 its latest archive's manifest, which holds each name and value its step passed, says which, and a later step is compared
 with what it records (a step that now passes a declared variable the manifest does not hold adds one mid-shard, one that
 drops a recorded variable or gives another value is refused likewise, each naming the variable and never a value). A
-step that matches the manifest continues and writes the record again. A manifest that cannot be read as the shard's
-(not JSON, another shard's, a link, a name or a value a variable may not carry) is refused too, never taken for "nothing
-was passed". A shard with a snapshot alone and no archive has nothing to say what its first step passed. Nothing here removes the record: a shard that has
+step that matches the manifest continues and writes the record again. A manifest that is there and cannot be read as
+the shard's (not JSON, another shard's, a link, a name or a value a variable may not carry) is never taken for "nothing
+was passed": it refuses a step that declares nothing, naming the manifest (a step that declares variables is refused for
+adding them, naming them). A shard with no manifest has nothing to say what its first step passed: a snapshot alone, or
+a first archive killed after its tar was written and before its manifest, which resumes from its snapshots as before. Nothing here removes the record: a shard that has
 made nothing and must start over with other values has it removed by hand, which is the operator's call.
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
