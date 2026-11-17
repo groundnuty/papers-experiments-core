@@ -49,6 +49,26 @@ ENDED_STATES = (
 )  # fmt: skip
 
 
+ACCOUNT_ID = re.compile(
+    r"[0-9]{1,12}(?:\+[0-9]{1,6})?(?:\.[A-Za-z0-9_-]{1,32})?"
+)  # sacct's JobID: job, step or its word
+ACCOUNT_TIME = re.compile(SLURM_TIME.pattern + "|Unknown|None")  # a time sacct prints, or says there is none
+ACCOUNT_STATE = re.compile(r"[A-Z_]+")  # the first word of sacct's State
+
+
+def _accounting_row(parts: List[str]) -> bool:
+    """Whether six fields of `sacct -P -o JobID,JobName,State,Start,End,ExitCode` are a row of accounting: a JobID, a
+    state word, two times (or none) and an exit code. Six empty fields are no row, and count as no evidence."""
+    return (
+        len(parts) == 6
+        and ACCOUNT_ID.fullmatch(parts[0]) is not None
+        and ACCOUNT_STATE.fullmatch(parts[2].split()[0] if parts[2].split() else "") is not None
+        and ACCOUNT_TIME.fullmatch(parts[3]) is not None
+        and ACCOUNT_TIME.fullmatch(parts[4]) is not None
+        and re.fullmatch(r"[0-9]+:[0-9]+", parts[5]) is not None
+    )
+
+
 def _slurm_time(value: str) -> Optional[str]:
     """A time as sacct prints it, or None for `Unknown`, `None`, nothing, or anything that is not one."""
     return value if SLURM_TIME.fullmatch(value) else None
@@ -695,7 +715,7 @@ class Slurm:
             if not line.strip():
                 continue
             parts = line.split("|")
-            if len(parts) != 6:  # a row that is not one is an answer that cannot be read, never accounting's lag
+            if not _accounting_row(parts):  # a row that is not one is an answer that cannot be read, never the lag
                 raise SlurmError("sacct answered something unreadable")
             seen += 1
             if parts[0] != step_id:

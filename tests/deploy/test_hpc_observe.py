@@ -134,9 +134,28 @@ def test_o86_a_read_that_fails_is_unknown_with_its_reason_never_running(hpc, clu
         Cluster(listed=[("4242.7", "svc-run-1")], sacct_text="4242.7|svc-run-1|RUNNING\n"),
         Cluster(listed=[("4242.7", "svc-run-1")], sacct_text="garbage that is not a row\n"),
         Cluster(listed=[("4242.7", "svc-run-1")], sacct_text=""),
+        Cluster(listed=[("4242.7", "svc-run-1")], sacct_text="|||||\n"),
+        Cluster(listed=[("4242.7", "svc-run-1")], sacct_text="x|y|z|u|v|w\n"),
+        Cluster(
+            listed=[("4242.7", "svc-run-1")], sacct_text="4242.7|svc-run-1|running|2026-11-17T02:00:00|Unknown|0:0\n"
+        ),
+        Cluster(listed=[("4242.7", "svc-run-1")], sacct_text="4242.7|svc-run-1|RUNNING|soon|Unknown|0:0\n"),
+        Cluster(
+            listed=[("4242.7", "svc-run-1")], sacct_text="4242.7|svc-run-1|RUNNING|2026-11-17T02:00:00|Unknown|ok\n"
+        ),
         Cluster(listed=[("4242.7", "svc-run-1")], accounting=[row("4242.7")], squeue_text="4242.7\n"),
     ],
-    ids=["truncated row", "not a row", "no row at all", "unreadable squeue row"],
+    ids=[
+        "truncated row",
+        "not a row",
+        "no row at all",
+        "six empty fields",
+        "six words that are not accounting",
+        "a state that is not a word of Slurm's",
+        "a start that is no time",
+        "an exit code that is none",
+        "unreadable squeue row",
+    ],
 )
 def test_o86_an_answer_that_cannot_be_read_is_unknown_never_the_lag_of_accounting(hpc, cluster):
     """O86: a Slurm command that succeeds and prints a row that is not one (cut short, or garbage), or prints nothing
