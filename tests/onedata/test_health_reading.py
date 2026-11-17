@@ -172,7 +172,7 @@ def declared_view(config, *, online=(True,), names=None):
     ids=["online", "offline", "renamed", "stranger", "stranger-and-offline"],
 )
 def test_o90_the_space_reading_is_complete_exactly_when_the_check_found_no_structural_difference(
-    tmp_path, online, name, read, offline
+    tmp_path, fake, online, name, read, offline
 ):
     """O90: `read` is true only when the check's own comparison got past the name and the membership, so a space with
     a difference is never read as clean; its offline set is then the check's `offline` branch, label for label."""
@@ -191,14 +191,14 @@ def test_o90_the_space_reading_is_complete_exactly_when_the_check_found_no_struc
         assert not verdict.detail.startswith("declared provider(s) reported offline")
 
 
-def test_o90_a_provider_whose_online_flag_is_not_a_boolean_leaves_the_space_unread(tmp_path):
+def test_o90_a_provider_whose_online_flag_is_not_a_boolean_leaves_the_space_unread(tmp_path, fake):
     """O90: an online flag that is neither true nor false is no reading; `compare()` counts only `False` as offline."""
     config = load_platform(write_platform(tmp_path))
     view = SpaceView("spmock0001", config.space.name, (ReportedProvider(ALPHA_ID, "a", "alpha.test", None),))
     assert read_space(view, config, config.space_named()).read is False
 
 
-def test_o90_a_host_only_declaration_that_two_reported_providers_fit_is_unread(tmp_path):
+def test_o90_a_host_only_declaration_that_two_reported_providers_fit_is_unread(tmp_path, fake):
     """O90: an ambiguous match is not a read space."""
     config = load_platform(write_platform(tmp_path))
     host_only = dataclasses.replace(config.providers["alpha"], id=None)
