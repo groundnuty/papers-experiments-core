@@ -1,5 +1,8 @@
-"""Shared fixtures: a throwaway git repository that ignores the developer's own git configuration."""
+"""Shared fixtures: the core's identity pinned as committed, a throwaway git repository that ignores the developer's own
+git configuration, and `flock` as NFS grants it."""
 
+import errno
+import fcntl
 import os
 import stat
 import subprocess
@@ -7,8 +10,20 @@ import sys
 from pathlib import Path
 
 import pytest
+from core_pin import pinned  # tests/support, which pytest's `pythonpath` puts on the path before any conftest
 
+from expcore.provenance import core_identity
 from expcore.provenance.study_tokens import render_hash_file
+
+
+@pytest.fixture(scope="session", autouse=True)
+def committed_core():
+    """Every test sees the checkout's core identity as if it were committed (`support/core_pin.py`): the suite's
+    outcome must not depend on uncommitted changes in the checkout it runs from. Tests of the identity read their own
+    repositories, or replace `core_identity.current` themselves."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(core_identity, "current", pinned)
+        yield pinned()
 
 
 class Repo:
@@ -87,3 +102,21 @@ def pushed(repo):
     (repo.path / "src" / "leak.py").unlink()
     third = repo.commit("fix")
     return repo, first, second, third
+
+
+@pytest.fixture
+def nfs_flock_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `fcntl.flock` follow NFS's rule. NFS implements `flock` as a POSIX lock, which needs a descriptor open for
+    writing to be exclusive (and one open for reading to be shared), so an exclusive `flock` on a read-only descriptor
+    fails there with EBADF, where a local filesystem grants it. Any other call takes the real lock."""
+    real = fcntl.flock
+
+    def flock(descriptor: int, operation: int) -> None:
+        access = fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+        needs_write = bool(operation & fcntl.LOCK_EX) and access == os.O_RDONLY
+        needs_read = bool(operation & fcntl.LOCK_SH) and access == os.O_WRONLY
+        if needs_write or needs_read:
+            raise OSError(errno.EBADF, os.strerror(errno.EBADF))
+        real(descriptor, operation)
+
+    monkeypatch.setattr(fcntl, "flock", flock)

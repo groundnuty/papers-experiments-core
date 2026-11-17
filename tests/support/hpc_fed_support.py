@@ -164,9 +164,11 @@ def _import_hpc():
     import hpcdriver
     import hpcfed
     import hpclaunch
+    import hpcquota
     import hpcsettings
     import hpcslurm
     import hpcstate
+    import hpcstorage
 
     return type(
         "Hpc",
@@ -176,9 +178,11 @@ def _import_hpc():
             "driver": hpcdriver,
             "cli": hpcfed,
             "launch": hpclaunch,
+            "quota": hpcquota,
             "settings": hpcsettings,
             "slurm": hpcslurm,
             "state": hpcstate,
+            "storage": hpcstorage,
         },
     )
 
@@ -291,6 +295,9 @@ class FakeSlurm:
     sweep_here: bool = False  # run down's sweep of the agent's node on this host (its tmpfs is here), else answer it
     sweeps: list = field(default_factory=list)  # each sweep step down launched
     leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
+    # A command of the login node beyond Slurm's, by its first word (the site's quota command, invented): a test's
+    # answer, `(argv, timeout) -> Completed`, which may raise what the real Runner does. Every call is in `calls`.
+    tools: dict = field(default_factory=dict)
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -345,6 +352,8 @@ class FakeSlurm:
         if argv[1:4] == ["-B", "-m", "expcore_onedata.fault_relay"]:
             self.relay_calls.append(argv[4])
             return Completed(self.relay_rc.get(argv[4], 0), "", "")
+        if tool in self.tools:
+            return self.tools[tool](argv, timeout)
         raise AssertionError(f"an unexpected command: {argv}")
 
     @staticmethod

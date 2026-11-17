@@ -18,9 +18,12 @@
 # later through a step's stdin.
 # Shared imported trees (O59): a provider that owns imported spaces is given one `--import=SPACE=PATH` per space after
 # the peers; configure.sh checks each tree and the service binds it read-only (importstorage.py).
+# Provider storage on scratch (O57): with HPC_STORAGE_ROOT, hpcfed.py gives the provider its own directory there as one
+# `--storage=PATH` last; configure.sh checks and records it, and the service binds it onto /volumes/posix
+# (posixstorage.py). Without it the posix storage is the rootfs's own, on the node's tmpfs.
 # Usage: sbatch --nodelist=<node-B> --time=<t> --mem=32G [--exclusive] provider.sbatch \
 #          <bundle-dir> <oneprovider.tar> <provider-name> <zone-fqdn> <admin-email> <zone-ip> [<peer-ip> ...] \
-#          [--import=SPACE=PATH ...]
+#          [--import=SPACE=PATH ...] [--storage=PATH]
 set -euo pipefail
 B=${1:?usage: provider.sbatch <bundle-dir> <tar> <name> <zone-fqdn> <admin-email> <zone-ip> [peer-ip ...]}; shift
 [[ -f $B/lib.sh ]] || { echo "hpcop: no lib.sh in '$B'" >&2; exit 1; }
@@ -29,6 +32,7 @@ private_output   # the batch log: 0600 before anything is written to it
 component op
 (( $# >= 5 )) || die "usage: provider.sbatch <bundle-dir> <tar> <name> <zone-fqdn> <admin-email> <zone-ip> [peer-ip ...]"
 TAR=$1 NAME=$2 ZONE=$3 MAIL=$4; shift 4
+split_storage STORAGE REST "$@"   # its own storage on scratch (O57), if given: configure.sh records it, the service binds it
 
 export HPCOP_OWNER_PID=$$   # node-init.sh records this batch script as the owner of the work directory
 W=$(bash "$B/node-init.sh" op "$TAR")
@@ -53,7 +57,7 @@ say "waiting for the registration token (mint-registration-token.sh | deliver-to
 end=$((SECONDS + ${HPCOP_TOKEN_WAIT:-3600}))
 until [[ -s $S/registration-token ]]; do (( SECONDS < end )) || die "no registration token was delivered"; sleep 5; done
 
-bash "$B/run-node.sh" --workdir "$W" &
+bash "$B/run-node.sh" --workdir "$W" ${STORAGE:+"$STORAGE"} &
 # supervise.py, once run_service execs it: our uid, visible in /proc; its start time identifies it for every signal
 svc=$!; svc_start=$(proc_field "$svc" 22 || true)
 if ! bash "$B/finish.sh" --workdir "$W" "$svc"; then
