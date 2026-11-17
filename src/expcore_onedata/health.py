@@ -77,6 +77,11 @@ executor reads with `prerun.current()` to put it in the run's record. Neither ex
 is marked unhealthy, or open by a run that is gone, so no run is admitted until `ProgressiveIngest.recover` verifies it
 whole. A study whose conditions use a preallocated ingest passes every journal they write to.
 
+**Every call makes a structured reading beside its text (O90, `healthreading`).** Per space, the declared providers
+reported offline by label and whether the space was read completely; per run, the targets its own attempt's injections
+took down. `reading` holds the calling thread's latest call's and the try's note holds the same as JSON; the text is
+unchanged, and `healthreading.target_only` tells a study whether an outage was the run's own.
+
 **While `[tls] insecure_tls` is on, every reading warns** that no client of the federation checks its certificate, a
 setting for disposable test federations only (`tls.py`). The warning is appended to the detail, so the campaign's
 health record and day-0's report carry it; it does not change the verdict.
@@ -95,10 +100,12 @@ from expcore_onedata.admission import fault_settings_of
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.fault_gate import FaultGate
+from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.fault_recovery import FaultDriver
 from expcore_onedata.fault_serves import provider_serves, recorded
 from expcore_onedata.fault_settings import FaultSettings, compose_driver, hpc_driver
-from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
+from expcore_onedata.federation import ReportedProvider, SpaceView, parse_scope
+from expcore_onedata.healthreading import READING_NOTE, UNREAD, HealthReading, make_reading, match
 from expcore_onedata.ingesthealth import baseline_health
 from expcore_onedata.linkcheck import LinkReport, check_links
 from expcore_onedata.linkrecord import LINK_RECORD_NOTE, fact, record_path
@@ -139,30 +146,18 @@ def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = 
     space, support = entry.space, entry.support
     if view.name != space.name:
         return Health(False, "the study space is reported under another name than the declared one")
-    matched: dict[str, list[bool]] = {}
-    strangers: list[ReportedProvider] = []
-    ambiguous: set[str] = set()
-    for reported in view.providers:
-        names = declared_names(config, reported)
-        if not names:
-            strangers.append(reported)
-        elif len(names) > 1:
-            ambiguous.update(names)
-        else:
-            matched.setdefault(names[0], []).append(reported.online)
-    ambiguous.update(name for name, online in matched.items() if len(online) > 1)
-    missing = set(support.providers) - set(matched)
-    unexpected = set(matched) - set(support.providers)
-    if missing or strangers or unexpected or ambiguous:
+    found = match(view, config, support.providers)  # the reading's completeness is made from the same match (O90)
+    matched, strangers = found.matched, found.strangers
+    if found.differs:
         parts = []
-        if missing:
-            parts.append(f"missing {config.provider_labels(missing)}")
+        if found.missing:
+            parts.append(f"missing {config.provider_labels(found.missing)}")
         if strangers:
             parts.append(f"{len(strangers)} reported provider(s) not declared: {_reported_ids(strangers)}")
-        if ambiguous:
-            parts.append(f"ambiguous match for {config.provider_labels(ambiguous)}")
-        if unexpected:
-            parts.append(f"declared but not in the support set: {config.provider_labels(unexpected)}")
+        if found.ambiguous:
+            parts.append(f"ambiguous match for {config.provider_labels(found.ambiguous)}")
+        if found.unexpected:
+            parts.append(f"declared but not in the support set: {config.provider_labels(found.unexpected)}")
         return Health(False, "the providers supporting the space differ from the declared set: " + "; ".join(parts))
     offline = [name for name, online in matched.items() if online[0] is False]
     if offline:
@@ -232,6 +227,10 @@ class PlatformHealth:
         # the federation's record (O35): in its root, which `[faults] journal` names; a platform with no `[faults]`
         # declares no root, so its checks write none
         self._record = None if settings is None else record_path(settings.journal)
+        self._journal = None if settings is None else InjectionJournal(settings.journal)  # the run's own targets (O90)
+        self._seen = (
+            threading.local()
+        )  # the reading each thread's latest call made: the check is shared by every worker
         self._ingest_journals = tuple(Path(journal) for journal in ingest_journals)  # read at every call (O44)
         # The link check is not a kept pre-campaign check: a stuck link is remedied while the campaign waits, and the
         # gate's re-checks must see it pass (O35). It runs in `_regular`, after the space, at the first call and later.
@@ -259,6 +258,17 @@ class PlatformHealth:
         """Wait, at most `timeout_s`, for a heal the fault gate runs in the background to end; whether none runs now
         (`FaultGate.wait_for_heal`; True without `[faults]`)."""
         return True if self._faults is None else self._faults.wait_for_heal(timeout_s)
+
+    @property
+    def reading(self) -> HealthReading | None:
+        """What the calling thread's latest call read, in structure beside its text (`healthreading`, O90): None before
+        any call in this thread, `UNREAD` when the call never reached the spaces. Per call, never the call before's."""
+        return getattr(self._seen, "reading", None)
+
+    def _publish(self, reading: HealthReading) -> None:
+        """Make `reading` the calling thread's latest, and the try's note (`healthreading.READING_NOTE`) when there is one."""
+        self._seen.reading = reading
+        prerun.note(READING_NOTE, reading.to_json())
 
     @property
     def content_type(self) -> ContentTypeVerdict | None:
@@ -355,6 +365,7 @@ class PlatformHealth:
 
         While `[tls] insecure_tls` is on, every reading, healthy, failed or deferred, ends with a warning that no client
         of the federation checks its certificate (`tls.WARNING`); the verdict, a deferral included, is unchanged."""
+        self._publish(UNREAD)  # a call that never reaches the spaces reads none
         try:
             verdict = baseline_health(self._ingest_journals)  # first, and asking the federation nothing
             if verdict.ok:
@@ -367,6 +378,7 @@ class PlatformHealth:
         """Each space the data path reaches against its declared support set alone (`_space`), without the content type
         check: what `__call__` answers once that check has passed, and the same warning when TLS is not verified; never
         raise."""
+        self._publish(UNREAD)
         return self._warned(self._space())
 
     def _warned(self, verdict: Health) -> Health:
@@ -381,6 +393,9 @@ class PlatformHealth:
         spaces the first that fails is named by its position (`spaces[i]`), and a pass names how many were checked."""
         try:
             answer = self._client.query("/tokens/infer_access_token_scope", {"token": self._current_token().reveal()})
+            self._publish(
+                make_reading(answer, self._config, self._journal)
+            )  # from this answer; never raises, no verdict
             if len(self._config.spaces) == 1:
                 return compare(parse_scope(answer, self._config.space.id), self._config)
             checked = [entry for entry in self._config.spaces if Plane.DATA_PATH in entry.tokens]

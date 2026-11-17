@@ -10,6 +10,15 @@ import json
 import threading
 
 import pytest
+from fault_support import FakeServices, injector_for
+from health_support import FOURTH, down, four_spaces, up
+
+from expcore.campaign import liveness, prerun
+from expcore_onedata.config import load_platform
+from expcore_onedata.fault_journal import InjectionJournal
+from expcore_onedata.faults import load_faults
+from expcore_onedata.federation import ReportedProvider, SpaceView
+from expcore_onedata.health import compare
 from expcore_onedata.healthreading import (
     READING_NOTE,
     UNREAD,
@@ -20,15 +29,6 @@ from expcore_onedata.healthreading import (
     read_space,
     target_only,
 )
-from fault_support import FakeServices, injector_for
-from health_support import FOURTH, down, four_spaces, up
-
-from expcore.campaign import liveness, prerun
-from expcore_onedata.config import load_platform
-from expcore_onedata.fault_journal import InjectionJournal
-from expcore_onedata.faults import load_faults
-from expcore_onedata.federation import ReportedProvider, SpaceView
-from expcore_onedata.health import compare
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, write_platform
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
