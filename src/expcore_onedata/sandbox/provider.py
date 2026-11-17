@@ -697,9 +697,10 @@ class SandboxPlatform:
         except Exception as error:
             await self._end_with_window(ctx, sandbox, opened, error)
             raise
-        except BaseException:  # a cancellation: the stop waits for a deadline under way, and the run is not classified
+        except BaseException as interrupted:
+            # a cancellation: the stop waits for a deadline under way, and the run is not classified
             if opened is not None:  # no read is awaited under a cancellation, and the window says so
-                sandbox.record_infrastructure_fact(fedwindow.KEY, fedwindow.unread(fedwindow.CANCELLED))
+                sandbox.record_infrastructure_fact(fedwindow.KEY, fedwindow.interrupted(interrupted))
             await self._stop(ctx, sandbox, quiet=True)
             raise
         await self._end_with_window(ctx, sandbox, opened, None)
@@ -724,7 +725,8 @@ class SandboxPlatform:
                 async with ctx.infrastructure_wait(WAIT_KIND):
                     facts = await fedwindow.close_window(self._watch, opened)
                 sandbox.record_infrastructure_fact(fedwindow.KEY, facts)
-            except BaseException:
+            except BaseException as interrupted:  # cancelled during the read: say so, stop, then raise it
+                sandbox.record_infrastructure_fact(fedwindow.KEY, fedwindow.interrupted(interrupted))
                 await self._stop(ctx, sandbox, quiet=True)
                 raise
         await self._end_run(ctx, sandbox, error)

@@ -35,6 +35,7 @@ from typing import Any, Protocol
 KEY = "federation_window"  # the key of the run's `infrastructure_facts`
 VERSION = 1
 CANCELLED = "the run was cancelled before its window was read"
+INTERRUPTED = "the run was interrupted before its window was read"
 TEXT_CAP = 300  # a reason or a finding is a sentence: a longer one is cut, never copied whole
 
 
@@ -74,6 +75,11 @@ def unread(*reasons: str) -> dict[str, Any]:
         "unknown": [_text(reason) for reason in reasons],
         "journal": None,
     }
+
+
+def interrupted(error: BaseException) -> dict[str, Any]:
+    """The facts of a window that a cancellation (or another `BaseException`) cut short: unknown, saying which."""
+    return unread(CANCELLED if isinstance(error, asyncio.CancelledError) else INTERRUPTED)
 
 
 def project(window: Mapping[str, Any]) -> dict[str, Any]:
@@ -131,4 +137,16 @@ async def close_window(watch: Watch, opened: Opened) -> dict[str, Any]:
     return facts
 
 
-__all__ = ["CANCELLED", "KEY", "VERSION", "Opened", "Watch", "close_window", "open_window", "project", "unread"]
+__all__ = [
+    "CANCELLED",
+    "INTERRUPTED",
+    "KEY",
+    "VERSION",
+    "Opened",
+    "Watch",
+    "close_window",
+    "interrupted",
+    "open_window",
+    "project",
+    "unread",
+]

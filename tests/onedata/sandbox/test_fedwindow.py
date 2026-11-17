@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import threading
 import uuid
 
 import pytest
@@ -370,6 +371,42 @@ def test_o86_a_cancelled_run_is_stopped_and_its_window_says_it_was_not_read(conf
     assert federation.events == ["read"]
     assert window_of(seen[0])["verdict"] == "unknown"
     assert "cancelled" in json.dumps(window_of(seen[0]))
+    assert not host.containers
+
+
+def test_o86_a_cancellation_during_the_closing_read_still_records_the_window_and_stops(config, issuer, slots, tmp_path):
+    """O86: the body has ended and the task is cancelled while the window is being read: the window says it was
+    cancelled, the sandbox is stopped, and the cancellation is what is raised."""
+    federation = Federation(config)
+    entered, release = threading.Event(), threading.Event()
+
+    class Slow:
+        def read(self):
+            return {}
+
+        def window(self, start):
+            entered.set()
+            release.wait(10)
+            return {}
+
+    platform, host = build(config, issuer, slots, tmp_path, Slow())
+    seen = []
+
+    async def go():
+        async def body(box):
+            seen.append(box)
+
+        task = asyncio.ensure_future(run_in_loop(platform, federation.settings, body))
+        assert await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+
+    asyncio.run(go())
+    window = window_of(seen[0])
+    assert window["verdict"] == "unknown"
+    assert window["unknown"] == [fedwindow.CANCELLED]
     assert not host.containers
 
 
