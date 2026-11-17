@@ -16,6 +16,7 @@ from fedboot import Bootstrap, Ids
 from feddocker import gib
 from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout, import_storage_name
 from fedspec import Space, Spec
+from fedtools import check_rendered, require_study_artifacts
 
 PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")
 
@@ -107,6 +108,7 @@ def facts_of(boot: Bootstrap) -> dict:
             }
             for p in spec.principals
         },
+        **slot_user_facts(boot),
         "credentials": {
             "admin_access_token_file": "secrets/admin.token",
             "user_password_directory": "secrets/users",
@@ -117,6 +119,14 @@ def facts_of(boot: Bootstrap) -> dict:
         "paths_relative_to": "the directory holding this file",
         "root_parent": root_parent(boot.layout),
     }
+
+
+def slot_user_facts(boot: Bootstrap) -> dict:
+    """What the bootstrap found of each slot user the platform template declares (O83): `created`, or `matched` (it
+    existed, exactly as declared, and nothing was sent for it). Nothing for a layout whose template declares none, so
+    its facts are what they always were. The principals' own entries hold each user's id and privileges."""
+    found = getattr(boot, "slot_status", None)
+    return {"slot_users": dict(sorted(found.items()))} if found else {}
 
 
 def placeholders(facts: dict) -> dict[str, str]:
@@ -140,14 +150,20 @@ def render(template: str, values: dict[str, str]) -> str:
     return PLACEHOLDER.sub(lambda m: values[m.group(1)], template)
 
 
-def write_facts(layout: Layout, boot: Bootstrap) -> str:
-    """Write facts.json, and platform.toml when the layout names a template; say which were written."""
+def write_facts(layout: Layout, boot: Bootstrap, study_artifacts: str | None = None) -> str:
+    """Write facts.json, and platform.toml when the layout names a template; say which were written. A template may name
+    `@study_artifacts@`, the directory of the study's own files that `study_artifacts` gives (O83); the written file's
+    slots are checked against the layout's principals (`fedtools.check_rendered`)."""
     facts = facts_of(boot)
     layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     template = layout.spec.platform_template
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
-    write_private(layout.platform, render(template.read_text(encoding="utf-8"), placeholders(facts)))
+    text = template.read_text(encoding="utf-8")
+    require_study_artifacts(text, study_artifacts)
+    values = {**placeholders(facts), **({"study_artifacts": study_artifacts} if study_artifacts else {})}
+    write_private(layout.platform, render(text, values))
+    check_rendered(layout, facts)
     return "facts.json and platform.toml written"
 
 

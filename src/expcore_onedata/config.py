@@ -53,6 +53,11 @@ user_id = "..."                 # the id Onezone gives the user: its privileges,
 ca_file = "federation-ca.pem"   # a CA bundle the federation's certificate chains to; verification stays on
 insecure_tls = true             # or: verification off, for a disposable test federation only; never both
 
+[addresses]                     # optional: where each declared name is dialled, when the names resolve nowhere (O73)
+file = "secrets/address-map.json"  # a private file (mode 0600, yours, no link), relative to this one (addresses.py)
+resolver = "toolshim/resolve_launch.py"  # optional: the launcher a Python tool server is started through, which
+                                #   resolves exactly those names (the server needs python and -m <module> or a script)
+
 [toolserver]
 command = "path/to/executable"
 args = []
@@ -102,6 +107,7 @@ from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.platform_loads import record_platform_load
+from expcore_onedata.addresses import AddressMap, AddressMapError, launch_argv, load_addresses
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.linksettings import LinkCheckSettings, load_link_check
 from expcore_onedata.rights import declares_qos, declares_write, rights_problem
@@ -226,6 +232,11 @@ class PlatformConfig:
     tls: TlsSettings = field(default_factory=TlsSettings)  # every client's one certificate check (`[tls]`)
     spaces_table: bool = False  # the spaces came from [[spaces]], one entry or several, not from [space]/[support]
     link_check: LinkCheckSettings | None = None  # the pre-campaign link check's probe space and bounds (O35)
+    # where each declared name is dialled (`[addresses]`, O73): None dials every URL's host as written. Never in a
+    # record, the fingerprint or a message, and never shown: it holds the nodes' addresses and names.
+    addresses: AddressMap | None = field(default=None, repr=False, compare=False)
+    addresses_file: Path | None = field(default=None, repr=False, compare=False)  # the map's file (O73): a Python tool
+    addresses_resolver: Path | None = field(default=None, repr=False, compare=False)  # server reads it, by this shim
 
     @property
     def probe_space(self) -> Space | None:
@@ -360,6 +371,14 @@ class PlatformConfig:
         if server is None or name not in server.conditions:
             raise ConfigError(f"{self.file}: [toolserver.conditions]: the condition asked for is not declared")
         return server.conditions[name]
+
+
+def _addresses(root: Section, file: Path) -> dict[str, Any]:
+    """The `[addresses]` table's three fields of the platform (O73), or none of them without the table."""
+    if "addresses" not in root.data:
+        return {}
+    found, path, resolver = load_addresses(Section(root.table("addresses"), file, "[addresses]"), file.parent)
+    return {"addresses": found, "addresses_file": path, "addresses_resolver": resolver}
 
 
 def _url(section: Section, key: str) -> str:
@@ -524,8 +543,9 @@ def _check_fixed_users(
             raise ConfigError(f"{file}: [principals]: {error}") from None
 
 
-def _condition(name: str, section: Section, base: Path) -> Condition:
-    """Read one condition: allow-list, rights, manifest. `section` is known in messages by its position."""
+def _condition(name: str, section: Section, base: Path, *, require_manifest: bool = True) -> Condition:
+    """Read one condition: allow-list, rights, manifest. `section` is known in messages by its position. The manifest
+    must be a file unless `require_manifest` is off, which only the manifest command line uses."""
     _name(section, None, name, "its name")
     section.reject_unknown(("allow", "rights", "manifest"))
     allow, rights = section.strings("allow"), section.strings("rights")
@@ -535,13 +555,13 @@ def _condition(name: str, section: Section, base: Path) -> Condition:
     if problem is not None:
         raise section.fail("rights", problem)
     manifest = (base / section.string("manifest")).resolve()
-    if not manifest.is_file():
+    if require_manifest and not manifest.is_file():
         raise section.fail("manifest", "is not a file; freeze the server's manifest first")
     return Condition(name, allow, tuple(sorted(rights)), manifest)
 
 
-def _toolserver(section: Section, base: Path) -> ToolServer:
-    """Read [toolserver] and its conditions."""
+def _toolserver(section: Section, base: Path, *, require_manifests: bool = True) -> ToolServer:
+    """Read [toolserver] and its conditions, each with a manifest that is a file unless `require_manifests` is off."""
     if "insecure_tls" in section.data:
         raise moved(section, "insecure_tls")
     section.reject_unknown(("command", "args", "start_timeout_s", "clone", "commit", "conditions"))
@@ -558,19 +578,29 @@ def _toolserver(section: Section, base: Path) -> ToolServer:
         (base / clone).resolve() if clone else None,
         commit,
         MappingProxyType(
-            {n: _condition(n, _entry(conditions, index, n), base) for index, n in enumerate(conditions.data)}
+            {
+                n: _condition(n, _entry(conditions, index, n), base, require_manifest=require_manifests)
+                for index, n in enumerate(conditions.data)
+            }
         ),
     )
 
 
 def load_platform(
-    path: str | os.PathLike[str], *, environ: Mapping[str, str] | None = None, require_secrets: bool = True
+    path: str | os.PathLike[str],
+    *,
+    environ: Mapping[str, str] | None = None,
+    require_secrets: bool = True,
+    require_manifests: bool = True,
 ) -> PlatformConfig:
     """Load and validate platform.toml; raise ConfigError naming the file and the key, never a value.
 
     With `require_secrets` (the default, for a run) the admin credential's source must exist and hold something, and
     each fixed principal must have a credential file that others cannot read, so a missing variable or file fails here
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
+
+    Each condition's manifest must be a file (L13), unless `require_manifests` is off, which `python -m
+    expcore_onedata.toolmanifest` uses to read a platform some of whose manifests it is about to write.
 
     While a study's build is open it records that it ran, with `PLATFORM_MODULE` and the file (`platform_loads`).
     """
@@ -600,6 +630,7 @@ def load_platform(
             "slots",  # read by users.load_slots
             "faults",  # read by faults.load_faults
             "link_check",  # read by linksettings.load_link_check, below
+            "addresses",  # read below: where each declared name is dialled (O73)
         )
     )
     zone = root.section("zone")
@@ -613,7 +644,7 @@ def load_platform(
     if require_secrets:
         _check_fixed_users(users, principals, file, environ)
     spaces = load_spaces(root, providers)
-    return PlatformConfig(
+    config = PlatformConfig(
         file=file,
         zone=Zone(_name(zone, "name", zone.string("name"), "the zone name"), _url(zone, "url")),
         providers=MappingProxyType(providers),
@@ -623,7 +654,11 @@ def load_platform(
         users=users,
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),
         principals=principals,
-        toolserver=_toolserver(root.section("toolserver"), file.parent) if "toolserver" in root.data else None,
+        toolserver=(
+            _toolserver(root.section("toolserver"), file.parent, require_manifests=require_manifests)
+            if "toolserver" in root.data
+            else None
+        ),
         sandbox=load_sandbox(
             Section(root.table("sandbox"), file, "[sandbox]"),
             file.parent,
@@ -636,4 +671,13 @@ def load_platform(
         sha256=digest,
         tls=tls,
         link_check=load_link_check(root, providers, spaces),
+        **_addresses(root, file),
     )
+    if config.addresses_resolver is not None and config.toolserver is not None:
+        try:  # the server is started through the launcher: refused at load, where the study can change it (O73)
+            launch_argv(
+                config.toolserver.command, config.toolserver.args, config.addresses_resolver, config.addresses_file
+            )
+        except AddressMapError as error:
+            raise ConfigError(f"{file}: [toolserver]: {error}") from None
+    return config
