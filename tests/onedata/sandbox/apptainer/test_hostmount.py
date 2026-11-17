@@ -305,6 +305,49 @@ def test_a_log_link_that_leaves_the_log_directory_is_not_followed(node, settings
         mount.stop()
 
 
+def test_a_log_that_is_a_regular_file_is_read_as_it_was(node, settings):
+    """O60 (#362): a regular file at oneclient.INFO (no link) is read, from the directory the path is walked to."""
+    mount = helper(node, settings)
+    try:
+        mount.start()
+        text = "I1116 10:00:00.000000  1 logging.cc:1] Forced proxy IO: 1\n"
+        (mount.where.log_dir / "oneclient.INFO").write_text(text)
+        assert mount.oneclient_log() == text.encode()
+    finally:
+        mount.stop()
+
+
+@pytest.mark.parametrize("linked", ["mount-guard", "mount-guard/oneclient-log"])
+def test_a_link_in_a_directory_above_the_log_is_not_followed(node, settings, tmp_path, linked):
+    """O60 (#362): a link in any directory of the path from the run's directory to oneclient's log, `mount-guard` or
+    `oneclient-log` itself, makes the log unreadable, as one at the log's own name already did. The directories are no
+    cell's to reach (`Layout.protected`), so this is defence in depth, not a hole: the path is walked from the run's
+    directory with each directory opened without following a link, and the log is read in the last, so a directory
+    swapped for a link after the run began is never read through."""
+    mount = helper(node, settings)
+    parked = tmp_path / "parked"
+    directory = mount.where.run_dir / linked
+    swapped = False
+    try:
+        mount.start()
+        text = "I1116 10:00:00.000000  1 logging.cc:1] Forced direct IO: 0\n"
+        text += "I1116 10:00:00.000000  1 logging.cc:1] Forced proxy IO: 1\n"
+        (mount.where.log_dir / "oneclient.host.log.INFO.1").write_text(text)
+        (mount.where.log_dir / "oneclient.INFO").symlink_to("oneclient.host.log.INFO.1")
+        assert mount.oneclient_log() == text.encode()  # the control: the same log, with no link above it
+        os.rename(directory, parked)  # the whole directory, log and all, is now reached through a link to it
+        directory.symlink_to(parked)
+        swapped = True
+        assert mount.oneclient_log() is None
+        mount.close_watch()
+        assert mount.metadata()["io_mode"]["effective"] == "unknown"
+    finally:
+        if swapped:
+            directory.unlink()
+            os.rename(parked, directory)
+        mount.stop()
+
+
 def test_a_touch_of_the_token_directory_flags_the_run(node, settings):
     mount = helper(node, settings)
     try:
