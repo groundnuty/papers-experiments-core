@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from campaign_support import STUDY_TOML, write_study
+from locked_work import lock, locked_afterwards, needs_unprivileged, not_the_owner
 from sandbox_support import after_first, around_run, fail_copies, is_copy, is_listing, make_spec, start_options
 
 from expcore.campaign.attempts import classify
@@ -24,7 +25,7 @@ from expcore.campaign.executor import failure_result
 from expcore.campaign.factors import load_factor_schema
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
-from expcore_onedata.sandbox import reap
+from expcore_onedata.sandbox import copyout, reap
 from expcore_onedata.sandbox.hostops import CmdResult, DockerHost
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 
@@ -615,4 +616,69 @@ def test_o19_an_unsafe_object_on_the_way_to_an_output_is_refused_as_the_agents_d
         listed_on_another_device(world.host, "results")
     refuse(world, sbx, tmp_path / "evidence", ["results/report.json"])
     assert refused_paths(sbx) == [("results", what)]
+    sbx.stop()
+
+
+@pytest.fixture
+def unlocked_afterwards(tmp_path):
+    yield from locked_afterwards(lambda: tmp_path)
+
+
+@needs_unprivileged
+def test_o71_a_mode_000_file_and_directory_the_agent_left_are_collected_and_never_set_aside(
+    world, tmp_path, unlocked_afterwards
+):
+    """O71, O19: the helper is shared with the Apptainer backend, where it runs as the agent's own uid. An output the
+    agent locked (a file and a directory with its own `chmod 000`) is collected with what it holds, never an
+    infrastructure failure; on Docker the root helper reads such an entry whatever its mode."""
+    sbx = start(world)
+    results = sbx.dir / "work" / "results"
+    (results / "locked").mkdir(parents=True)
+    (results / "report.json").write_text("{}", encoding="utf-8")
+    (results / "locked" / "inner.txt").write_text("inner\n", encoding="utf-8")
+    lock(results / "report.json")
+    lock(results / "locked")
+    dest = tmp_path / "evidence"
+    got = sbx.collect(dest, outputs=["results"])  # no InfraError
+    assert got["outputs"] == {"results": True}
+    assert "refused_output" not in got
+    assert (dest / "work" / "results" / "report.json").read_text(encoding="utf-8") == "{}"
+    assert (dest / "work" / "results" / "locked" / "inner.txt").read_text(encoding="utf-8") == "inner\n"
+    sbx.stop()
+
+
+@needs_unprivileged
+def test_o71_an_entry_the_helper_cannot_read_is_the_agents_refusal_never_a_set_aside(
+    world, tmp_path, monkeypatch, unlocked_afterwards
+):
+    """O71, O19: where the owner's bits cannot be given back, the collection names the entry for the scorers like any
+    object the agent made that cannot be copied (`refused_output`), copies none of the outputs, and ends normally."""
+    sbx = start(world)
+    results = sbx.dir / "work" / "results"
+    results.mkdir()
+    (results / "report.json").write_text("{}", encoding="utf-8")
+    (results / "hidden.txt").write_text("hidden\n", encoding="utf-8")
+    lock(results / "hidden.txt")
+    source = copyout._helper_source()
+    monkeypatch.setattr(copyout, "_helper_source", lambda: not_the_owner(source))
+    got = refuse(world, sbx, tmp_path / "evidence", ["results"])
+    assert got["refused_output"]["by_what"] == {copyout.UNREADABLE: 1}
+    assert refused_paths(sbx) == [("results/hidden.txt", copyout.UNREADABLE)]
+    sbx.stop()
+
+
+@needs_unprivileged
+def test_o71_a_gate_log_the_helper_cannot_read_is_infrastructure_and_is_never_restored(
+    world, tmp_path, unlocked_afterwards
+):
+    """O71, O19: the gate's own log is the harness's, not the agent's: where it cannot be read the collection is an
+    infrastructure failure of kind output_collection as before, and its mode is not given back (only the copy of
+    the agent's /work asks for that)."""
+    sbx = start(world, "via-gate")
+    log = sbx.dir / "gatelog" / "requests.jsonl"
+    lock(log)
+    with pytest.raises(InfraError) as caught:
+        sbx.collect(tmp_path / "evidence")
+    assert caught.value.kind == KIND
+    assert stat.S_IMODE(log.lstat().st_mode) == 0
     sbx.stop()

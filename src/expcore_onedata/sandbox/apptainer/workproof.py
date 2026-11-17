@@ -83,7 +83,7 @@ def load(work_root: Path, key: str, config: Mapping[str, Any]) -> tuple[dict[str
             if info.st_nlink != 1 or info.st_size > 1 << 16:
                 return None, "unreadable"
             document = json.loads(handle.read().decode("utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError, MemoryError):  # a deep nest within the size cap gives up the parser
         return None, "unreadable"
     if not isinstance(document, dict) or set(document) != {*FIELDS, "sha256"}:
         return None, "unreadable"

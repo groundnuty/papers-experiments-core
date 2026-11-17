@@ -86,7 +86,9 @@ def collect(host: HostOps, x: Path, keep: Path, outputs: Sequence[str], *, max_b
             raise CollectFailed(f"mounting the working disk: {describe_stderr(r.stderr)}")
     if max_bytes is None and image.exists():
         max_bytes = image.stat().st_size  # the disk's own size: what an output on it can hold, unless it is sparse
-    copied = copyout.copy_tree(host, work, [(rel, keep / "work" / rel) for rel in outputs], max_bytes=max_bytes)
+    copied = copyout.copy_tree(
+        host, work, [(rel, keep / "work" / rel) for rel in outputs], max_bytes=max_bytes, restore_locked=True
+    )
     log_copy = copyout.copy_tree(host, x / "gatelog", [(".", keep / "gatelog")], max_bytes=None)  # the gate's own
     return [*(_kept(rel, copied[rel]) for rel in outputs), _kept("gate log", log_copy["."])]
 

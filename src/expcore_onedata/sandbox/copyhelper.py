@@ -9,6 +9,16 @@ ever followed, on the way to an output or in it, and nothing is resolved by path
 `list`: the tree under `root`, pre-order, one record per entry, `kind links device:inode size depth name` ended by
 NUL, as `find -printf '%y %n %D:%i %s %d %f\\0'` writes it; it does not descend into a directory of another file system,
 nor into one whose path from the root is already longer than `max_path_bytes` (everything below it would be refused).
+An entry the agent locked (it owns everything under `/work` and can clear the owner's bits of a file or directory) is
+not left to fail the run's collection, when the request sets `restore_locked` (only the collection of the agent's
+`/work` does: the copy of a file of the harness's own never restores anything). Where the helper's own uid owns a
+file or directory that lacks the owner's read bit (a directory also its search bit) it gives that bit back, nothing
+else, through a descriptor of the entry opened without following a link and checked against what was listed, on the
+listed file system only, and never to a file with another link (a mode belongs to the inode, which another name may
+hold outside the listed tree): such a locked file is listed as kind `x` on every backend, root included, so that Docker
+and Apptainer give the same outcome. An entry the helper cannot read, its root included, is listed as kind `x` and not
+descended into: the caller refuses it as the agent's own unreadable output (O71). The copy then finds every listed
+object readable. As root, the helper otherwise reads whatever the modes say and changes none.
 
 `copy`: one output, from `root` through the names `parts`, to the new path `dest`. Every directory on the way and every
 entry copied must be the object the listing showed: its device, inode, kind and size are compared with `ancestors`
@@ -25,7 +35,10 @@ import stat
 import sys
 
 NO_FOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+O_PATH = getattr(os, "O_PATH", 0o10000000)  # Linux's, for a Python that does not name it
 CHUNK = 1 << 20
+UNREADABLE = "x"  # a record's kind for an entry the helper could not read, listed and never descended into
+OWNER_BITS = {stat.S_IFDIR: 0o500, stat.S_IFREG: 0o400}  # what the owner needs to search a directory, to read a file
 KINDS = {
     stat.S_IFREG: "f",
     stat.S_IFDIR: "d",
@@ -54,32 +67,101 @@ def more_descriptors():
 
 
 def listing(request, out):
-    root = os.open(request["root"], NO_FOLLOW_DIR)
-    info = os.fstat(root)
-    name = os.fsencode(os.path.basename(request["root"].rstrip("/")) or "/")
+    path = request["root"]
+    restoring = bool(request.get("restore_locked"))
+    first = os.stat(path, follow_symlinks=False)
+    name = os.fsencode(os.path.basename(path.rstrip("/")) or "/")
     limit = int(request["max_path_bytes"])
+    if not readable(None, path, first, first.st_dev, restoring):
+        write(out, first, 0, name, UNREADABLE)
+        return
+    try:
+        root = os.open(path, NO_FOLLOW_DIR)
+    except PermissionError:  # not the helper's to restore: the agent's own unreadable /work, alone
+        write(out, first, 0, name, UNREADABLE)
+        return
+    info = os.fstat(root)
     write(out, info, 0, name)
-    walk(root, info.st_dev, 1, 0, limit, out)
+    walk(root, info.st_dev, 1, 0, limit, out, restoring)
 
 
-def write(out, info, depth, name):
-    head = f"{kind_of(info.st_mode)} {info.st_nlink} {info.st_dev}:{info.st_ino} {info.st_size} {depth} "
+def write(out, info, depth, name, kind=None):
+    head = f"{kind or kind_of(info.st_mode)} {info.st_nlink} {info.st_dev}:{info.st_ino} {info.st_size} {depth} "
     out.write(head.encode() + name + b"\0")
 
 
-def walk(directory, device, depth, length, limit, out):
+def readable(directory, name, info, device, restoring):
+    """Whether the helper can read the file or directory `name` of `directory` (the root's path, `directory` None),
+    which `info` describes. With `restoring` (the agent's own `/work`), a file the agent locked (no owner read bit) that
+    has another link is unreadable here whoever runs the helper, root included: a mode change belongs to the inode,
+    which another name may hold outside the tree, so it is never given back, and root's reading it is not a reason to
+    treat it differently from the unprivileged helper (the same outcome on every backend). An entry the helper's own
+    uid owns that lacks the owner's read bit (a directory's search bit too) otherwise first gets it back (`restore`).
+    Anything but a file or a directory, an entry of another file system and every other entry as root are not this
+    function's to judge: True. An entry of another uid is not the helper's to change: a file is tried; a directory is
+    judged by the open that follows (one that opens but cannot be searched is not covered: no agent can make an entry
+    of another uid)."""
+    bits = OWNER_BITS.get(stat.S_IFMT(info.st_mode))
+    if bits is None or info.st_dev != device:
+        return True
+    if restoring and stat.S_ISREG(info.st_mode) and info.st_nlink > 1 and not info.st_mode & 0o400:
+        return False
+    if os.geteuid() == 0:
+        return True
+    if info.st_uid != os.geteuid():
+        return stat.S_ISDIR(info.st_mode) or opens(directory, name)
+    return info.st_mode & bits == bits or (restoring and restore(directory, name, info, bits))
+
+
+def opens(directory, name):
+    try:
+        os.close(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory))
+    except PermissionError:
+        return False
+    return True
+
+
+def restore(directory, name, info, bits):
+    """Give the owner `bits` of the file or directory `name` that `info` described when it was listed. The entry is
+    pinned by a descriptor opened without following a link, shown to be the object listed (device, inode and kind),
+    and changed through that descriptor, never by its name: a name swapped for a link since the listing is not
+    followed, and the link's target is not touched. Whether the bits were given; any error is a refusal."""
+    try:
+        held = os.open(name, O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+    except OSError:
+        return False
+    try:
+        now = os.fstat(held)
+        if (now.st_dev, now.st_ino, stat.S_IFMT(now.st_mode)) != (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)):
+            return False
+        os.chmod(f"/proc/self/fd/{held}", stat.S_IMODE(now.st_mode) | bits)
+    except OSError:
+        return False
+    finally:
+        os.close(held)
+    return True
+
+
+def walk(directory, device, depth, length, limit, out, restoring=False):
     """List a directory's entries, sorted by name, descending into each directory of the same device."""
     for name in sorted(os.listdir(directory), key=os.fsencode):
         raw = os.fsencode(name)
         info = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        write(out, info, depth, raw)
         path = length + bool(length) + len(raw)
-        if stat.S_ISDIR(info.st_mode) and info.st_dev == device and path <= limit:
-            child = os.open(name, NO_FOLLOW_DIR, dir_fd=directory)
+        descend = stat.S_ISDIR(info.st_mode) and info.st_dev == device and path <= limit
+        refused = (descend or stat.S_ISREG(info.st_mode)) and not readable(directory, name, info, device, restoring)
+        child = None
+        if descend and not refused:
+            try:
+                child = os.open(name, NO_FOLLOW_DIR, dir_fd=directory)
+            except PermissionError:
+                refused = True
+        write(out, info, depth, raw, UNREADABLE if refused else None)
+        if child is not None:
             try:
                 if (os.fstat(child).st_dev, os.fstat(child).st_ino) != (info.st_dev, info.st_ino):
                     raise Mismatch("a directory changed while it was listed")
-                walk(child, device, depth + 1, path, limit, out)
+                walk(child, device, depth + 1, path, limit, out, restoring)
             finally:
                 os.close(child)
 

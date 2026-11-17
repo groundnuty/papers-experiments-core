@@ -2,14 +2,17 @@
 and the evidence scanned for the token; the run's start marked at the gate."""
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
 from apptainer_support import TOKEN, make_settings, make_spec, start
 from fake_node import FakeNode
+from locked_work import lock, locked_afterwards, needs_unprivileged, not_the_owner
 
 from expcore.egress import EgressLog
 from expcore.errors import InfraError
+from expcore_onedata.sandbox import copyout
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.hostops import CmdResult
 
@@ -99,6 +102,86 @@ def test_the_collection_copies_the_outputs_and_the_gate_log_and_counts_the_bytes
         assert box.metadata()["gate_stop"]["signalled"] is True
         assert "served_bytes" in json.loads((tmp_path / "out" / "metadata.json").read_text())
     finally:
+        box.stop()
+
+
+@pytest.fixture
+def unlocked_afterwards(tmp_path):
+    yield from locked_afterwards(lambda: tmp_path)
+
+
+def _locked_work(box, *, root: bool = False) -> None:
+    """What an agent can do in /work (a directory of the node's here): leave a file and a directory (with a file in it)
+    with every bit cleared, and, with `root`, clear the bits of /work itself."""
+    work = box.dir / "work"
+    (work / "out" / "locked").mkdir(parents=True)
+    (work / "out" / "ok.txt").write_text("ok\n")
+    (work / "out" / "secret.txt").write_text("secret\n")
+    (work / "out" / "locked" / "inner.txt").write_text("inner\n")
+    lock(work / "out" / "secret.txt")
+    lock(work / "out" / "locked")
+    if root:
+        lock(work)
+
+
+@needs_unprivileged
+@pytest.mark.parametrize("root", [False, True])
+def test_o71_a_mode_000_file_and_directory_the_agent_locked_are_collected_never_set_aside(
+    node, settings, tmp_path, unlocked_afterwards, root
+):
+    """O71: with `work_disk = "directory"` the copy helper runs as the agent's own uid too: an entry the agent locked
+    (`chmod 000` of a file, of a directory, of /work itself) is collected with what it holds, never an infrastructure
+    failure set aside instead of scored."""
+    box = start(node, settings)
+    try:
+        _locked_work(box, root=root)
+        done = box.collect(tmp_path / "out", ["out"])  # no InfraError
+        assert done["outputs"] == {"out": True}
+        assert "refused_output" not in done
+        got = tmp_path / "out" / "work" / "out"
+        assert (got / "secret.txt").read_text() == "secret\n"
+        assert (got / "locked" / "inner.txt").read_text() == "inner\n"
+        assert (got / "ok.txt").read_text() == "ok\n"
+    finally:
+        box.stop()
+
+
+@needs_unprivileged
+def test_o71_an_entry_the_helper_cannot_read_is_the_agents_refusal_never_a_set_aside_in_directory_mode(
+    node, settings, tmp_path, monkeypatch, unlocked_afterwards
+):
+    """O71, O19: where the owner's bits cannot be given back, the entry is named for the scorers (`refused_output`),
+    none of the outputs is copied, and the collection ends normally."""
+    box = start(node, settings)
+    try:
+        _locked_work(box)
+        source = copyout._helper_source()
+        monkeypatch.setattr(copyout, "_helper_source", lambda: not_the_owner(source))
+        done = box.collect(tmp_path / "out", ["out"])  # no InfraError
+        assert done["outputs"] == {"out": False}
+        assert done["refused_output"]["by_what"] == {copyout.UNREADABLE: 2}
+        assert not (tmp_path / "out" / "work").exists()
+    finally:
+        box.stop()
+
+
+@needs_unprivileged
+def test_o71_a_gate_log_the_helper_cannot_read_is_infrastructure_and_is_never_restored(
+    node, settings, tmp_path, unlocked_afterwards
+):
+    """O71: the gate's own log is the harness's, not the agent's: where it cannot be read the collection is an
+    infrastructure failure, set aside as before, and its mode is not given back (the helper's restore is only for
+    the agent's /work)."""
+    box = start(node, settings)
+    try:
+        log = box.dir / "gate" / "requests.jsonl"
+        lock(log)
+        with pytest.raises(InfraError) as failed:
+            box.collect(tmp_path / "out")
+        assert failed.value.kind == "output_collection"
+        assert stat.S_IMODE(log.lstat().st_mode) == 0
+    finally:
+        log.chmod(0o600)  # the teardown reads the gate's log
         box.stop()
 
 

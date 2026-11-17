@@ -8,7 +8,7 @@ from apptainer_support import make_settings, make_spec, start
 from fake_node import FakeNode
 
 from expcore_onedata.sandbox.api import SandboxError
-from expcore_onedata.sandbox.apptainer import runs
+from expcore_onedata.sandbox.apptainer import runs, workdisk
 from expcore_onedata.sandbox.apptainer.node import Spawned
 
 
@@ -54,6 +54,25 @@ def test_the_next_start_reaps_a_dead_driver_s_run_whole(node, settings):
         assert not cell.alive
         assert not old.dir.exists()
         assert not runs.record_path(settings.work_root, old.sid).exists()
+    finally:
+        fresh.stop()
+
+
+def test_o71_the_reaper_counts_the_processes_that_held_a_dead_run_s_image(node, tmp_path):
+    """O71: a FUSE server of the dead run's work disk is killed before its directory goes, and counted with the rest:
+    `end_holders` returned the number it found and killed, which the reaper dropped: `reaped_orphans` undercounted."""
+    settings = make_settings(tmp_path, work_disk="image")
+    old, cell = _abandoned(node, settings)
+    image = workdisk.image_path(old.dir)
+    holder = node._new_proc("pid:[4026531836]", "fuse2fs", cmdline=("fuse2fs", str(image), "/mnt"), role="holder")
+    node.owner = Spawned(1001, "5151")
+    node.procs[1001] = type(node.procs[999])(1001, "5151", "pid:[4026531836]", "driver", role="driver")
+    fresh = start(node, settings)
+    try:
+        # two helpers, a cell's process and the image's holder
+        assert fresh.metadata()["reaped_orphans"] == {"runs": 1, "processes": 4, "left": 0}
+        assert not holder.alive
+        assert not cell.alive
     finally:
         fresh.stop()
 
