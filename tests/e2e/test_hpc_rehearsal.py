@@ -453,7 +453,7 @@ def test_o63_every_file_a_real_root_holds_is_archived_a_secret_or_named_as_not_e
         and not name.startswith("secrets/")
         and not any(name == path or name.startswith(path) for path, _ in NOT_EVIDENCE)
     ]
-    assert not unclassified, unclassified
+    assert not unclassified, "unclassified: " + ", ".join(unclassified)
 
 
 @pytest.mark.parametrize("label", LABELS)
