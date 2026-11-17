@@ -69,7 +69,8 @@ step did not pass and one it passed that the line no longer carries are refused,
 value (status 73 for `step`); a record that cannot be read as the shard's is refused too, never taken for none. With
 no record and no results (an archive or a snapshot) the shard has had no first step: nothing is compared. A shard with
 results and no record either had a first step that passed nothing or lost the record: its latest archive's manifest says
-which (`archived_pass_env`: names and values, or a refusal when it cannot be read as the shard's), and a step is
+which (`archived_pass_env`: names and values; none when there is no manifest, as with a snapshot alone or a first
+archive killed before its manifest; a refusal when it is there and cannot be read as the shard's), and a step is
 compared with that, so a deleted record lifts no rule; a step that passes a variable the manifest does not hold adds
 one mid-shard and is refused the same way. `plan` and `lines` print first steps' lines and are not compared.
 
