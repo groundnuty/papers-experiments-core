@@ -1138,6 +1138,56 @@ assert set(fingerprint["caps"]) and fingerprint["environment"]["distributions"] 
 snapshot.close()
 ```
 
+### Judging an outage run: was the outage the run's own?
+
+The platform's post-run check compares every space with its declared providers, and a provider Onezone still reports offline after the run's restore fails it, with a text that names the first failing space only (`spaces[1]: declared provider(s) reported offline: providers[1]`). A study with several spaces cannot tell from that text whether the one provider its run took down is all that is offline, or another provider is too. The check makes the answer beside the text (O90, `expcore_onedata.healthreading`): `PlatformHealth.reading` holds, for every declared space, whether it was read completely and which providers it reports offline, by label, and the targets the run's own attempt took down, from its own journal lines. `target_only(reading)` asks the question:
+
+- `True`: every space was read, and everything offline is a target of this run (nothing offline is `True` too);
+- `False`: a provider the run did not take down is offline in a space that was read;
+- `None`: the reading cannot say. A space was not read (the answer lacks it, its providers are not exactly its declared set, or only the tool server's token reaches it, so **a platform with such a space always answers `None`**), the call never reached the spaces, or something is offline and the journal could not be read. Treat it as the run's reading being unusable, never as `True`.
+
+The core's own judgment is unchanged: a failing post-run check sets an attempt that would have been scored aside as infrastructure of `[scheduler] health_kind`, and leaves a run that already ended as the condition's treatment scored, with an event. A study that wants a run whose only offline provider is its own target to stand as a clean run wraps the check; the reading is read in the thread the gate gave the check, so a wrapper has it as soon as the platform's check has answered:
+
+```python
+from expcore.campaign.health_context import POST_RUN, CheckContext
+from expcore.campaign.healthgate import Health
+from expcore_onedata.healthreading import target_only
+
+
+class OutageAwareHealth:
+    """The platform's check, but a post-run reading that shows only the run's own target offline is a pass."""
+
+    def __init__(self, platform_health):
+        self.platform_health = platform_health
+
+    def max_deferral_s(self):
+        return self.platform_health.max_deferral_s()  # the campaign holds its max_defer_s to the platform's bound
+
+    def __call__(self, context: CheckContext | None = None) -> Health:
+        verdict = self.platform_health()
+        reading = self.platform_health.reading
+        own_outage = (
+            context is not None
+            and context.phase == POST_RUN
+            and not verdict.ok
+            and not verdict.deferred
+            and reading is not None
+            and bool(reading.offline)
+            and target_only(reading) is True
+        )
+        if own_outage:
+            return Health(True, f"post-run: only the run's own target is reported offline: {sorted(reading.offline)}")
+        return verdict
+```
+
+What the wrapper keeps and what it gives up:
+
+- It relaxes a post-run check only: before a run, a target still reported offline means the federation is not back to its baseline, and the run waits as it does.
+- With `target_only` true, every space was read and passed the name and membership comparison, so what failed the call was the offline set alone; a failure of the fault gate, the baseline or the content type leaves the reading `UNREAD`, and `None` never relaxes anything.
+- While a provider is reported offline the platform's check stops at the space and **does not run its link check**; a wrapper that turns that call into a pass has skipped it for that call. The next run's pre-run check runs it.
+- The reading reaches a run whose restore was verified. A run whose restore failed is answered by the fault gate before any space is read, and its attempt is set aside as `injector_failure` whatever the wrapper does.
+- Record it: the reading is JSON (`reading.to_json()`) beside the run's text detail, and the core's record schema does not carry it. Write it in your own record from the wrapper, or call `platform_health.space()` in your executor after the restore and read `platform_health.reading` there.
+
 ### Tools outside a campaign: hold the federation shared
 
 A smoke driver, a warm-up or a `verify` is no campaign attempt, so it holds no run admission, and on a platform with `[faults]` nothing keeps an outage from taking a provider down or bringing it back while the tool reads and writes through it. Take the federation's shared admission around everything such a tool does on it, the same one a campaign attempt takes, so an outage run waits for the tool and the tool waits for an outage run. Give the reason, in your own words: it goes into the record of who held the federation, `shared-holds.jsonl` beside the fault journal, with the process (boot id, pid and start time) and the start and end, and nowhere else.
