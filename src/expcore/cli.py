@@ -16,8 +16,10 @@ A thin shell; the logic is in the packages.
     check BATCH     the replay check over a batch of records (the study is found above the batch), with a copy of
                     the campaign store that the analysis reads instead of the live one
     analyze STUDY   refuse without a current replay check; then export, scores (derived from the records anew each time,
-                    so this is also how a changed scorer is applied) and the preregistered analysis
-    report STUDY    the same refusal; then write out/report.md
+                    so this is also how a changed scorer is applied) and the preregistered analysis; with `--rescore`,
+                    a study whose `build_analysis` gives scorers corrected since the run is analysed too, and
+                    analysis.json and the report record both scorer digests (R17)
+    report STUDY    the same refusal; then write out/report.md; takes `--rescore` as `analyze` does
     package STUDY --out DIR
                     build the replication package the study's package.toml lists, as DIR/<name>.tar.gz
     package-check PACKAGE
@@ -166,6 +168,14 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="accept a campaign with attempts still running, and leave out attempts no replayed record covers",
             )
+        if name in ("analyze", "report"):
+            command.add_argument(
+                "--rescore",
+                action="store_true",
+                help="score with a scorer corrected since the run, where the study's build_analysis gives scorers "
+                "other than the campaign's: allowed on purpose, and recorded in analysis.json and the report with "
+                "both digests (without it such a study is refused)",
+            )
         if name == "check":
             command.add_argument("--study", type=Path, help="the study directory (default: the one above the batch)")
     merge = commands.add_parser("merge", help="merge OUT SHARD_OUT...: merge the outputs of a campaign's shards")
@@ -284,7 +294,13 @@ def _check(args: argparse.Namespace) -> int:
 
 
 def _analysis(args: argparse.Namespace) -> StudyAnalysis:
-    return analyse_study(args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, partial=args.partial)
+    return analyse_study(
+        args.study,
+        allow_dirty=args.allow_dirty,
+        code_root=args.code_root,
+        partial=args.partial,
+        allow_rescore=args.rescore,
+    )
 
 
 def _analyze(args: argparse.Namespace) -> int:

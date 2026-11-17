@@ -19,6 +19,15 @@ the refusal names them, never a digest or a version. An analysis built by `build
 own builder, and re-scoring with a scorer that has changed since (R13) is what it is for. A snapshot that records no
 valid digest is refused as well: every fingerprint the core writes holds one (`build_fingerprint` requires it), so
 such a store was changed or is damaged, and a pass would let the analysis score with scorers the run never had.
+
+A scorer corrected after an HPC batch is re-scored on purpose with `rescore=True` (`analyze --rescore`, which
+sets `allow_rescore` of `analyse_study`): a digest that
+differs is then let through, and the guard returns what the analysis records of it (`RUN_DIGESTS`, the distinct
+digests the snapshots hold, and `ANALYSIS_DIGEST`), which `analysis.json` holds under `rescore` and the report's
+provenance shows. R13 records the corrected scorers' versions (`scorers`, every score's `version`); the digests are
+what the flag adds, so a re-score is never silent. A store holds one hash of all the run's scorers, so which scorer
+changed is not recorded and cannot be said. Nothing else is relaxed: no snapshot and a snapshot with no valid digest
+are refused with the flag as without it, and nothing is recorded when the digests are the analysis plugin's own.
 """
 
 import re
@@ -31,6 +40,8 @@ from expcore.study.plugin import BUILD, StudyContext, StudyPlugin, call_builder,
 
 BUILD_ANALYSIS = "build_analysis"
 SCORER_DIGEST = "scorer_digest"  # the key of the campaign fingerprint that holds the run plugin's scorers' digest
+RUN_DIGESTS = "run_scorer_digests"  # what a re-score records: the digests the snapshots hold of the run's scorers
+ANALYSIS_DIGEST = "analysis_scorer_digest"  # and the digest of the scorers the analysis scored with
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
@@ -59,14 +70,25 @@ def load_analysis_plugin(context: StudyContext) -> AnalysisPlugin:
     return AnalysisPlugin(call_builder(context, module, BUILD_ANALYSIS, scorers_only=True), True)
 
 
-def require_run_scorers(scorers: Sequence[Any], plugin_file: str, recorded: Sequence[Mapping[str, Any] | None]) -> None:
+def require_run_scorers(
+    scorers: Sequence[Any],
+    plugin_file: str,
+    recorded: Sequence[Mapping[str, Any] | None],
+    *,
+    rescore: bool = False,
+) -> dict[str, Any] | None:
     """Refuse unless the analysis plugin's scorers have the digest every snapshot of the store recorded of the run's;
-    raise `ScorersDiffer`, naming the scorers and never a digest or a version.
+    raise `ScorersDiffer`, naming the scorers and never a digest or a version. Return None when they have it.
 
     `recorded` holds the campaign fingerprint of each snapshot the analysis reads (one for a campaign, one per shard of
     a merged batch). A snapshot whose fingerprint is missing, has no `scorer_digest` or holds one that is not a SHA-256
     digest is refused too: every fingerprint the core writes holds one, so such a store was changed or is damaged, and
     the scorers cannot be shown to be the run's. A snapshot that differs is named before one that records none.
+
+    With `rescore` a digest that differs is let through, and the return value is what the analysis records of it:
+    `{RUN_DIGESTS: the distinct digests the snapshots hold, sorted, ANALYSIS_DIGEST: the analysis plugin's}`. The flag
+    relaxes nothing else: with it a snapshot that records no valid digest, or no snapshot at all, is still refused,
+    including beside a snapshot that differs.
     """
     if not recorded:
         raise ScorersDiffer(
@@ -75,12 +97,15 @@ def require_run_scorers(scorers: Sequence[Any], plugin_file: str, recorded: Sequ
         )
     held = [fingerprint.get(SCORER_DIGEST) if isinstance(fingerprint, Mapping) else None for fingerprint in recorded]
     digests = [d for d in held if isinstance(d, str) and _DIGEST.fullmatch(d)]
-    if any(d != scorers_digest(scorers) for d in digests):
+    mine = scorers_digest(scorers)
+    differs = any(d != mine for d in digests)
+    if differs and not rescore:
         names = ", ".join(repr(scorer_name(s)) for s in scorers)
         raise ScorersDiffer(
             f"{plugin_file}: {BUILD_ANALYSIS} gives the scorers {names}, but the campaign was run with other scorers "
             f"(the scorer digest its fingerprint records is not theirs): give {BUILD_ANALYSIS} the scorers `build` "
-            "gives, with the same names and versions"
+            "gives, with the same names and versions; to analyse with a scorer corrected since the run, on purpose "
+            "and on the record, run `analyze --rescore` and `report --rescore`"
         )
     missing = len(held) - len(digests)
     if missing:
@@ -90,3 +115,6 @@ def require_run_scorers(scorers: Sequence[Any], plugin_file: str, recorded: Sequ
             f"{noun} of the store {verb} no valid scorer digest (every campaign fingerprint the core writes holds one, "
             "so this store was changed or is damaged)"
         )
+    if differs:
+        return {RUN_DIGESTS: sorted(set(digests)), ANALYSIS_DIGEST: mine}
+    return None

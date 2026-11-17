@@ -42,7 +42,9 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   The plugin it scores with is the module's `build_analysis` where the study defines one, which needs no platform, and
   its `build` otherwise (`analysis_plugin`, R17); a run never builds with `build_analysis`. An analysis built by it is
   refused, before any record is scored, unless its scorers have the digest every snapshot's campaign fingerprint
-  recorded, so the outputs are the same bytes whichever builder served the analysis.
+  recorded, so the outputs are the same bytes whichever builder served the analysis. With `allow_rescore` (`analyze
+  --rescore`) a digest that differs is let through, and `analysis.json` (`rescore`) and the report's provenance say
+  so, naming both digests: a scorer corrected after an HPC batch is re-scored on the record, never silently.
 - `output_bytes` is the one place the bytes of `export.json`, `scores.json`, `analysis.json` and `report.md` are made;
   `write_analysis` and `write_report` write them and `regenerate` compares them with the files in `out/`, which is
   what a replication package's `make check` runs. Every time in them comes from the records and the store, every
@@ -184,6 +186,7 @@ class StudyAnalysis:
         None  # a batch checked by two or more guards: the rerun without the runs any leaves out
     )
     visibility: VisibilityAnalysis | None = None  # a batch watched for hidden processes: the same, of those (O56)
+    rescore: Mapping[str, Any] | None = None  # `--rescore` let through scorers other than the run's: the digests (R17)
 
 
 def out_dir(study: StudyConfig | StudyIdentity) -> Path:
@@ -842,6 +845,7 @@ def analyse_study(
     code_root: str | os.PathLike[str] | None = None,
     partial: bool = False,
     stamped: bool = False,
+    allow_rescore: bool = False,
 ) -> StudyAnalysis:
     """Export the campaign, score its records and run the preregistered analysis; refuse without a current check.
 
@@ -849,11 +853,13 @@ def analyse_study(
     compared with the check's hash (`study.verified`). Nothing is written, into the batch or anywhere else. With
     `partial`, attempts still running at the check are tolerated and a final attempt that no replayed record covers is
     left out of the analysis and named in the result. With `stamped`, the code identity comes from the stamp beside
-    the study and never from a repository around it, as in a replication package.
+    the study and never from a repository around it, as in a replication package. With `allow_rescore`, an analysis
+    built by a plugin module's `build_analysis` may score with scorers other than the campaign's (R17): the result then
+    holds `rescore`, the digests of both, and every output says so; a module without `build_analysis` is unaffected.
     """
     study = load_study(path)
     with study_kinds(study.kinds):  # the snapshot's attempts and the records may end in one of the study's own kinds
-        return _analyse_loaded(study, allow_dirty, code_root, partial, stamped)
+        return _analyse_loaded(study, allow_dirty, code_root, partial, stamped, allow_rescore)
 
 
 def _analyse_loaded(
@@ -862,6 +868,7 @@ def _analyse_loaded(
     code_root: str | os.PathLike[str] | None,
     partial: bool,
     stamped: bool,
+    allow_rescore: bool = False,
 ) -> StudyAnalysis:
     """Analyse the records of a loaded study, with its own infrastructure kinds in scope."""
     out = out_dir(study)
@@ -914,9 +921,10 @@ def _analyse_loaded(
     data_paths = recorded_paths[0] if recorded_paths and all(p == recorded_paths[0] for p in recorded_paths) else None
     loaded = load_analysis_plugin(StudyContext(study, code))  # the one place a `build_analysis` is built (R17)
     plugin = loaded.plugin
+    rescored = None
     if loaded.from_build_analysis:  # the run's own `build` is not compared: re-scoring after a scorer change is R13
         try:
-            require_run_scorers(plugin.scorers, study.plugin_file.name, fingerprints)
+            rescored = require_run_scorers(plugin.scorers, study.plugin_file.name, fingerprints, rescore=allow_rescore)
         except ScorersDiffer as error:
             verified.close()
             raise Refused(str(error)) from None
@@ -948,7 +956,9 @@ def _analyse_loaded(
     _require_declared_reruns(study, ran_reruns(egress, guard, seen, both))
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
-    return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen)
+    return StudyAnalysis(
+        study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both, seen, rescored
+    )
 
 
 def _require_declared_reruns(study: StudyConfig, ran: tuple[str, ...]) -> None:
@@ -1027,7 +1037,8 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     Holm decision, with each named family's steps (S17) and each declared equivalence family's (S18). `exploratory_only`
     is true when the preregistration makes no confirmatory claim (S12): there is then no Holm decision, and every
     contrast is exploratory. A preregistration that declares its sensitivity reruns (S19) has them under
-    `sensitivity_reruns`."""
+    `sensitivity_reruns`. An analysis that `--rescore` let score with other scorers than the run's has the digests of
+    both under `rescore` (R17), and no other analysis has the key."""
     return (
         {
             "preregistration": dict(analysis.result.manifest),
@@ -1048,6 +1059,7 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         | ({} if analysis.guards is None else {"guards": _guards_summary(analysis.guards)})
         | ({} if analysis.visibility is None else {"process_visibility": _visibility_summary(analysis.visibility)})
         | _declared_reruns_entry(analysis.study.prereg.sensitivity_reruns)
+        | ({} if analysis.rescore is None else {"rescore": dict(analysis.rescore)})
     )
 
 
@@ -1167,6 +1179,7 @@ def report_text(analysis: StudyAnalysis) -> str:
         code=analysis.code,
         core_version=analysis.core_version,
         scorers=analysis.scorers,
+        rescore=analysis.rescore,
         interval_level=analysis.study.prereg.bootstrap.ci_level,
         egress=analysis.egress,
         mount_guard=analysis.mount_guard,
@@ -1203,14 +1216,22 @@ def write_report(analysis: StudyAnalysis) -> Path:
 
 
 def regenerate(
-    path: str | os.PathLike[str], *, allow_dirty: bool = False, partial: bool = False, stamped: bool = False
+    path: str | os.PathLike[str],
+    *,
+    allow_dirty: bool = False,
+    partial: bool = False,
+    stamped: bool = False,
+    allow_rescore: bool = False,
 ) -> list[str]:
     """Derive every output anew from the records and compare it byte for byte with the file in out/; write nothing.
 
     Returns one line per output that is missing or differs, empty when all four match. The refusals of
-    `analyse_study` (no current check, records changed since) are raised as they are.
+    `analyse_study` (no current check, records changed since) are raised as they are. `allow_rescore` is as for
+    `analyse_study`: outputs written by a re-score derive only with it.
     """
-    analysis = analyse_study(path, allow_dirty=allow_dirty, partial=partial, stamped=stamped)
+    analysis = analyse_study(
+        path, allow_dirty=allow_dirty, partial=partial, stamped=stamped, allow_rescore=allow_rescore
+    )
     out, problems = out_dir(analysis.study), []
     for name, made in output_bytes(analysis).items():
         target = out / name

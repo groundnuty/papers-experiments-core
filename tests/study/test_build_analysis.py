@@ -4,7 +4,9 @@
 batch is analysed after copy-back. A plugin module may also define `build_analysis(context)`: the analysis paths
 (`analyse_study`, so `analyze`, `report`, `regenerate` and a package's check) call it, and fall back to `build` without
 it. It is never called for a run. The campaign fingerprint records the run plugin's `scorer_digest`, and an analysis
-built by `build_analysis` is refused when its scorers' digest is another one, or when a snapshot records none.
+built by `build_analysis` is refused when its scorers' digest is another one, or when a snapshot records none. With
+`--rescore` a digest that is another one is let through and recorded, as the last section tests; a snapshot that
+records none is refused with it too.
 
 The example is copied, and its plugin gains both builders: each notes its call in a file the test names, `build` fails
 when the test says the federation is gone, and `build_analysis` gives the scorers the test asks for.
@@ -21,6 +23,7 @@ import pytest
 from study_support import HEAD, Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
 from expcore.campaign.shard import ShardSpec
+from expcore.cli import build_parser
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
 from expcore.study import analysis_plugin, pipeline
@@ -409,3 +412,161 @@ def test_r17_several_scorers_are_named_in_the_order_the_plugin_gives_them():
         require_run_scorers(scorers, "plugin.py", [{"scorer_digest": "0" * 64}])
     assert "'second', 'first'" in str(refused.value)
     assert "build_analysis" in str(refused.value)
+
+
+# --- --rescore: a scorer corrected since the run is allowed on purpose, and recorded ---------------------------------
+
+OUTPUTS = ("export.json", "scores.json", "analysis.json", "report.md")  # what `analyze` and `report` write under out/
+
+
+def recorded_digest(campaign: Campaign) -> str:
+    """The run plugin's scorer digest, as the store's fingerprint records it."""
+    return json.loads(campaign.sql("SELECT value FROM meta WHERE key='fingerprint'")[0]["value"])["scorer_digest"]
+
+
+def written(campaign: Campaign) -> dict[str, bytes]:
+    return {name: (campaign.root / "out" / name).read_bytes() for name in OUTPUTS}
+
+
+def rescored(campaign: Campaign, env: dict[str, str]) -> tuple[str, str]:
+    """Analyse and report a campaign whose `build_analysis` gives the corrected scorer, with `--rescore`; return the
+    digest the run recorded and the one of the corrected scorers."""
+    assert [cli(env, name, str(campaign.root), "--rescore")[0] for name in ("analyze", "report")] == [0, 0]
+    return recorded_digest(campaign), digest_of(Scorer("tiny", "2"))
+
+
+def test_r17_rescore_lets_a_corrected_scorer_through_and_records_both_digests_beside_r13s_scorer_versions(
+    copy, monkeypatch, clean_environment
+):
+    """R17: with `--rescore` a `build_analysis` whose scorer changed since the run analyses; `scores.json` and
+    `analysis.json["scorers"]` hold the corrected version, as R13's re-score does, and `analysis.json["rescore"]` says
+    that the run recorded another digest and what it was."""
+    monkeypatch.setenv(SCORERS, "other")
+    old, new = rescored(copy, clean_environment)
+    assert old == digest_of(Scorer("tiny", "1")) != new
+    analysis = json.loads((copy.root / "out" / "analysis.json").read_text(encoding="utf-8"))
+    assert analysis["scorers"] == {"tiny": "2"}
+    assert analysis["rescore"] == {"run_scorer_digests": [old], "analysis_scorer_digest": new}
+    scores = json.loads((copy.root / "out" / "scores.json").read_text(encoding="utf-8"))
+    assert scores
+    assert {held["tiny"]["version"] for held in scores.values()} == {"2"}
+
+
+def test_r17_rescore_is_shown_in_the_reports_provenance_beside_the_scorers_line(copy, monkeypatch, clean_environment):
+    """R17: the report's Provenance names the re-score, with both digests, right after R13's `- Scorers:` line, which
+    holds the corrected version; the rest of the report is the report without it."""
+    monkeypatch.setenv(SCORERS, "other")
+    old, new = rescored(copy, clean_environment)
+    lines = (copy.root / "out" / "report.md").read_text(encoding="utf-8").splitlines()
+    at = lines.index("- Scorers: tiny `2`")
+    assert lines[at + 1].startswith("- Re-scored (`--rescore`):")
+    assert f"`{old}`" in lines[at + 1]
+    assert f"`{new}`" in lines[at + 1]
+    assert lines[at + 2].startswith("- Runs:")
+    assert sum(line.startswith("- Re-scored") for line in lines) == 1
+
+
+def test_r17_without_rescore_a_corrected_scorer_is_still_refused_and_the_refusal_names_the_flag(
+    copy, monkeypatch, clean_environment
+):
+    """R17: no flag, no change: the refusal comes before any record is scored, writes nothing and shows no digest; it
+    now says that `--rescore` is how to analyse with the corrected scorer on purpose."""
+    monkeypatch.setenv(SCORERS, "other")
+    for name in OUTPUTS:
+        (copy.root / "out" / name).unlink()
+    for command in ("analyze", "report"):
+        status, errors = cli(clean_environment, command, str(copy.root))
+        assert status == 1
+        assert errors.startswith(f"{command} refused: ")
+        assert "--rescore" in errors
+        assert not DIGEST.search(errors)
+    assert not any((copy.root / "out" / name).exists() for name in OUTPUTS)
+
+
+def test_r17_rescore_with_no_recorded_digest_is_refused_whatever_the_scorers(copy, monkeypatch, clean_environment):
+    """R17: the flag relaxes only a digest that differs: a store that records none cannot show the scorers to be
+    corrected ones, so it is refused with the flag, for the same scorers and for others, writing nothing."""
+    forget_scorer_digest(copy)
+    assert cli(clean_environment, "check", str(copy.runs))[0] == 0
+    for name in OUTPUTS:
+        (copy.root / "out" / name).unlink()
+    for which in ("same", "other"):
+        monkeypatch.setenv(SCORERS, which)
+        status, errors = cli(clean_environment, "analyze", str(copy.root), "--rescore")
+        assert status == 1
+        assert "1 of 1 snapshot of the store records no valid scorer digest" in errors
+        assert not DIGEST.search(errors)
+        assert not (copy.root / "out" / "scores.json").exists()
+        with pytest.raises(Refused):
+            analyse_study(copy.root, allow_rescore=True)
+
+
+def test_r17_rescore_refuses_a_snapshot_with_no_digest_beside_one_that_differs_and_one_with_no_snapshot():
+    """R17: with the flag, a merged batch whose snapshots differ and one records none is refused for the one that
+    records none; a batch of no snapshot is refused; a blank, malformed or upper-case digest is no digest."""
+    mine = [Scorer("tiny", "2")]
+    other = {"scorer_digest": digest_of(Scorer("tiny", "1"))}
+    with pytest.raises(ScorersDiffer, match=r"1 of 2 snapshots of the store record no valid scorer digest"):
+        require_run_scorers(mine, "plugin.py", [None, other], rescore=True)
+    with pytest.raises(ScorersDiffer, match="no snapshot of the store was read"):
+        require_run_scorers(mine, "plugin.py", [], rescore=True)
+    for blank in ({}, {"scorer_digest": "not a digest"}, {"scorer_digest": other["scorer_digest"].upper()}):
+        with pytest.raises(ScorersDiffer, match="record no valid scorer digest"):
+            require_run_scorers(mine, "plugin.py", [other, blank], rescore=True)
+
+
+def test_r17_rescore_over_a_merged_batch_records_every_digest_the_snapshots_hold_once_and_in_order():
+    """R17: each shard's snapshot is compared; the record lists the distinct digests the snapshots hold, sorted, one
+    entry each, and the analysis plugin's own. Without the flag the same snapshots are refused."""
+    mine = [Scorer("tiny", "3")]
+    older, oldest = digest_of(Scorer("tiny", "2")), digest_of(Scorer("tiny", "1"))
+    snapshots = [{"scorer_digest": older}, {"scorer_digest": oldest}, {"scorer_digest": older}]
+    record = require_run_scorers(mine, "plugin.py", snapshots, rescore=True)
+    assert record == {"run_scorer_digests": sorted({older, oldest}), "analysis_scorer_digest": digest_of(*mine)}
+    with pytest.raises(ScorersDiffer):
+        require_run_scorers(mine, "plugin.py", snapshots)
+
+
+def test_r17_rescore_with_the_scorers_the_run_had_changes_no_byte_and_records_nothing(copy):
+    """R17: nothing was re-scored, so nothing is recorded: with the same scorers the flag gives the bytes it gives
+    without it, with no `rescore` entry and no report line, and the check against the run's digest returns none."""
+    plain = output_bytes(analyse_study(copy.root))
+    flagged = output_bytes(analyse_study(copy.root, allow_rescore=True))
+    assert flagged == plain
+    assert "rescore" not in json.loads(plain["analysis.json"])
+    assert b"Re-scored" not in plain["report.md"]
+    mine = [Scorer("tiny", "1")]
+    assert require_run_scorers(mine, "plugin.py", [{"scorer_digest": digest_of(*mine)}], rescore=True) is None
+
+
+def test_r17_rescore_with_a_module_without_build_analysis_is_as_it_was(copy, monkeypatch):
+    """R17: a module that defines no `build_analysis` is built by `build` and never compared, so the flag changes
+    nothing in what it analyses, however the environment asks for other scorers."""
+    monkeypatch.setattr(analysis_plugin, "BUILD_ANALYSIS", "no_such_builder")
+    monkeypatch.setenv(SCORERS, "other")
+    plain = output_bytes(analyse_study(copy.root))
+    assert output_bytes(analyse_study(copy.root, allow_rescore=True)) == plain
+    assert "rescore" not in json.loads(plain["analysis.json"])
+
+
+def test_r17_regenerate_with_rescore_derives_what_a_rescored_analysis_wrote_and_without_it_is_refused(
+    copy, monkeypatch, clean_environment
+):
+    """R17: `regenerate` takes the flag as `analyze` does and compares byte for byte; without it a re-scored batch is
+    refused as an analysis of it is."""
+    monkeypatch.setenv(SCORERS, "other")
+    rescored(copy, clean_environment)
+    assert regenerate(copy.root, allow_rescore=True) == []
+    with pytest.raises(Refused, match="--rescore"):
+        regenerate(copy.root)
+
+
+def test_r17_rescore_is_an_option_of_analyze_and_report_only():
+    """R17: `analyze` and `report` take it (off by default); `run`, `check` and `merge` do not."""
+    parser = build_parser()
+    for command in ("analyze", "report"):
+        assert parser.parse_args([command, "study"]).rescore is False
+        assert parser.parse_args([command, "study", "--rescore"]).rescore is True
+    for argv in (["run", "study", "--rescore"], ["check", "batch", "--rescore"], ["merge", "out", "s", "--rescore"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(argv)
