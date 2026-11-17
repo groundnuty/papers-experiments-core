@@ -60,6 +60,22 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
+def registered_name(workdir: str) -> str:
+    """The name the service is registered under, which its certificate holds: the work directory's `declared-name`
+    when configure.sh wrote one (O73), else the node's own FQDN, as before."""
+    path = os.path.join(workdir, "declared-name")
+    if not os.path.lexists(path):
+        return subprocess.run(["hostname", "-f"], capture_output=True, text=True, check=True).stdout.strip()
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        die(f"{path} is not a regular file of yours")
+    with open(path, encoding="ascii") as handle:
+        value = handle.readline().strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+", value):
+        die(f"{path} holds no fully qualified name")
+    return value
+
+
 def say(msg: str) -> None:
     print(f"fed-zone: {msg}", file=sys.stderr, flush=True)
 
@@ -105,7 +121,7 @@ class LocalHTTPS(http.client.HTTPSConnection):
 class Zone:
     def __init__(self, workdir: str) -> None:
         rootfs = os.path.join(workdir, "rootfs")
-        self.fqdn = subprocess.run(["hostname", "-f"], capture_output=True, text=True, check=True).stdout.strip()
+        self.fqdn = registered_name(workdir)
         ca = os.path.join(rootfs, "volumes/persistence_backup/etc/oz_panel/OnedataTestWebServerCa.pem")
         self.ctx = ssl.create_default_context(cafile=ca)
         password = read_secret(os.path.join(rootfs, "root/.hpcop/passphrase"))

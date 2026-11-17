@@ -16,5 +16,5 @@ cluster:
     nodes: ["n0"]
 onezone:
   name: "@ZONE_NAME@"
-  domainName: "@NODE_FQDN@"
+  domainName: "@DECLARED_NAME@"
   letsEncryptEnabled: false

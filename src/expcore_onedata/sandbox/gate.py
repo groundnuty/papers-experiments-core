@@ -17,7 +17,7 @@ in argv[1]:
    "upstream_ca_file": "/etc/gate/federation-ca.pem", "tls_dir": "/etc/gate/tls",
    "listing": "paged|complete", "peer_uid_check": false,
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
-                        "port": 443, "tls": true}},
+                        "port": 443, "tls": true, "dial": "<address to connect to>"}},
    "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
 
 `peer_uid_check` (true or false, false when absent; anything else refuses the start) is for a node whose loopback other
@@ -87,7 +87,10 @@ Errors and retries, identical on every path: an upstream attempt that fails befo
 an answer arrives (connect, handshake, send, or the peer closing first) is retried once, on a new connection, before
 anything reaches the client; nothing is retried after an answer began, and a read timeout is never retried. Every
 failure is logged with its origin, `upstream` (the platform) or `gate` (the gate itself), and with what the client saw
-(`5xx` or `reset`), so a run can tell an error the gate made from one the platform made.
+(`5xx` or `reset`), so a run can tell an error the gate made from one the platform made. The 502 of a failed upstream
+call carries the failure's text, with the host the gate dialled (`addr`, and `addr:port`, as a certificate's name
+mismatch quotes them) named by the name it serves and port 443 (`_as_served`, O69): a gate whose names are not the
+hosts behind them never gives its client those hosts. The log's line keeps the text as it was.
 """
 
 from __future__ import annotations
@@ -100,6 +103,7 @@ import io
 import itertools
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -276,6 +280,9 @@ def _upstream_ctx(verify: bool) -> ssl.SSLContext:
 
 
 def _upstream_conn(h: dict) -> http.client.HTTPConnection:
+    """A connection to the host's upstream: `addr` is the name the handshake asks for, the certificate is checked
+    against and the request's `Host` names; `dial`, when the host has one, is the address the TCP connection goes to
+    (O73: `addr` is then a declared name that resolves nowhere)."""
     if h.get("tls", True):
         conn = http.client.HTTPSConnection(
             h["addr"],
@@ -286,6 +293,11 @@ def _upstream_conn(h: dict) -> http.client.HTTPConnection:
     else:
         conn = http.client.HTTPConnection(
             h["addr"], h.get("port", 80), timeout=CFG.get("upstream_connect_timeout_s", CONNECT_TIMEOUT)
+        )
+    dial = h.get("dial")
+    if dial:  # the connection's own hook for making its socket: the name stays the host, the address is where it goes
+        conn._create_connection = lambda address, timeout, source: socket.create_connection(
+            (dial, address[1]), timeout, source
         )
     conn.connect()
     conn.sock.settimeout(READ_TIMEOUT)  # short connect, then a read timeout that outlasts the client's
@@ -390,6 +402,31 @@ class _Upstream(Exception):
         super().__init__(repr(cause))
         self.cause = cause
         self.origin = origin_of(cause)
+
+
+SERVED_PORT = 443  # where a client of the gate dials every name it serves: the gate's own port, or the 443 mapped to it
+
+
+def _as_served(text: str, name: str, hcfg: dict) -> str:
+    """The text of a failure as the gate's answer gives it to its client: the host it dialled upstream (`addr`, and
+    `addr:port`), which a certificate's name mismatch quotes, named as the client knows it, by the name the gate
+    serves on 443 (O69), and the address it connected to (`dial`, O73) by that name too. A gate whose name is the host it
+    dials (Docker's) gives the text unchanged; the log's line keeps the text as it was.
+
+    A host that is the served name itself but is dialled at a mapped address (O73: the URL's host is the declared name)
+    needs no replacement, yet its port is the nodes' public one, so `name:port` still becomes `name:443`."""
+    port = hcfg.get("port", 443 if hcfg.get("tls", True) else 80)
+    named = name.lower()
+    hosts = [h for h in dict.fromkeys(str(hcfg.get(key) or "") for key in ("addr", "dial")) if h]  # O73: `dial` too
+    bare = [h for h in hosts if h.lower() != named]  # the name itself is not replaced by itself
+    ported = bare + ([name] if hcfg.get("dial") and any(h.lower() == named for h in hosts) else [])  # O73: its port is
+    if not ported:
+        return text
+    with_port = tuple(form for h in ported for form in (f"[{h}]:{port}", f"{h}:{port}"))
+    forms = sorted((*with_port, *bare), key=len, reverse=True)  # the longest first: a host's own port goes with it
+    dialled = re.compile("|".join(re.escape(form) for form in forms), re.IGNORECASE)  # one pass
+    held = {f.lower() for f in with_port}
+    return dialled.sub(lambda m: f"{name}:{SERVED_PORT}" if m.group(0).lower() in held else name, text)
 
 
 _LOST = (
@@ -944,7 +981,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._abort_client()
                 return
             rec["client_saw"] = "5xx"
-            details = str(e)
+            details = _as_served(str(e), host, hcfg)  # the line's `error` keeps the host dialled; the answer, the name
             if gateboundary.holds_token(details.encode(errors="replace"), CFG.get("token")):  # an upstream's echo
                 details = gateboundary.CREDENTIAL_DETAILS
             with contextlib.suppress(OSError):

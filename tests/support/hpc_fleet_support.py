@@ -113,7 +113,7 @@ class Bench:
         made.poll_s = made.slurm.poll_s = 0.0
         made.core = functools.partial(
             self.deploy.hpc.boot.core_phase,
-            rest=lambda ca: SimpleNamespace(close=lambda: None),
+            rest=lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
             bootstrap=BootStandIn(label),
             steps=lambda b: None,
             content=lambda b: SimpleNamespace(reset=lambda timeout: None),
@@ -121,7 +121,7 @@ class Bench:
         )
         made.verify = functools.partial(  # `verify-data`: each ingested space read back as the same stand-in holds it
             self.deploy.hpc.boot.verify_ingested,
-            rest=lambda ca: SimpleNamespace(close=lambda: None),
+            rest=lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
             bootstrap=BootStandIn(label),
             data=self.data.get(label) or data_stand_in(),
         )
