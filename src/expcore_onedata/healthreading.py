@@ -52,6 +52,7 @@ from expcore_onedata.federation import ReportedProvider, SpaceView, declared_nam
 from expcore_onedata.tokens import Plane
 
 READING_NOTE = "health_reading"  # the key of the try's note (`expcore.campaign.prerun`) the latest reading is put under
+FACT = "post_run_health"  # the key a reading has among a run's facts, owned by `sandbox.infrafacts.HEALTH`
 _POSITION = re.compile(r"spaces\[(0|[1-9][0-9]*)\]")
 _ASKED = ("stopping", "injected", "stop_unknown")  # a journal line that says the stop of the target was asked for
 log = logging.getLogger(__name__)
@@ -270,6 +271,12 @@ def make_reading(answer: Any, config: PlatformConfig, journal: InjectionJournal 
     except Exception as error:
         log.warning("the health reading failed (%s): no space is read", type(error).__name__)
         return UNREAD
+
+
+def reading_in(facts: Mapping[str, Any] | None) -> HealthReading | None:
+    """The reading a run's facts hold under `FACT` (the table a record carries, read back from JSON), or None when
+    they hold none or one that is malformed: `target_only(reading_in(facts))` is then None, never True."""
+    return None if not isinstance(facts, Mapping) else HealthReading.from_json(facts.get(FACT))
 
 
 def noted_reading() -> HealthReading | None:

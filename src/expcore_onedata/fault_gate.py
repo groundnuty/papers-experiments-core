@@ -25,6 +25,13 @@ stuck: the check recovers, verified, whatever the journal holds open, marks the 
 verdict's time) and fails, saying the lock is stuck. The record is never deleted for it, so every later timeout is stuck
 too; only an acquisition of the lock, which proves it usable, clears it.
 
+**A run's own open injection is no unsettled one under its own admission (O90).** A check that runs under the judged
+attempt's admission (`_held_check`) while that attempt holds a target down, an executor that reads health inside its
+injection and restores after, does not answer "unsettled" for the entry that attempt journalled itself
+(`fault_owner.in_progress_of`: owner exactly the attempt, seen down, no failed restore, no heal's mark): the space is
+compared as usual, and the structured reading (`healthreading`) names the target as held. Every other open entry still
+fails the check: another attempt's, one that names no attempt, a failed restore, a heal's restart.
+
 **It heals stuck pairs its own link check found (O35, `fault_gate_heal`).** Given the link report the rest of the check
 made in the calling thread (`links`), a way to make it check the links again (`relink`) and the providers' services
 (`labels`), as `PlatformHealth` gives them, a check that holds no run's admission and whose own all-pairs link check, in

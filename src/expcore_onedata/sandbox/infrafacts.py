@@ -43,12 +43,14 @@ WORK_DISK = "work_disk"  # `apptainer.facts.record`: the departures, the work di
 NODE = "node"  # the readings of the node (O87) and of the tool server's host
 WINDOW = "federation_window"  # the federation's window (O86), which the platform records from the run's preparation on
 METADATA = "metadata"  # the readings made when `metadata()` is read
+HEALTH = "health"  # the platform check's structured reading of the run's post-run state (O90, `healthreading.FACT`)
 
 OWNED: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         WORK_DISK: frozenset({"backend", "facts", "dns", "provider_storage"}),
         NODE: frozenset({"node", "tool_server_host"}),
         WINDOW: frozenset({"federation_window"}),
+        HEALTH: frozenset({"post_run_health"}),  # a test holds it equal to `healthreading.FACT`
         METADATA: frozenset(
             {
                 "run_ended",
@@ -128,6 +130,7 @@ def refuse_replacement(fields: Mapping[str, Any]) -> None:
 
 
 __all__ = [
+    "HEALTH",
     "METADATA",
     "NODE",
     "OWNED",

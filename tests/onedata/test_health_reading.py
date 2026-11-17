@@ -24,6 +24,7 @@ from expcore_onedata.faults import load_faults
 from expcore_onedata.federation import ReportedProvider, SpaceView
 from expcore_onedata.health import compare
 from expcore_onedata.healthreading import (
+    FACT,
     READING_NOTE,
     UNREAD,
     HealthReading,
@@ -32,8 +33,10 @@ from expcore_onedata.healthreading import (
     own_injections,
     own_targets,
     read_space,
+    reading_in,
     target_only,
 )
+from expcore_onedata.sandbox import infrafacts
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, write_platform
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
@@ -777,3 +780,29 @@ def test_o90_a_held_target_that_is_no_target_of_the_run_is_refused():
         HealthReading(targets=frozenset({TARGET}), held=frozenset({OTHER}))
     with pytest.raises(ValueError, match="held"):
         HealthReading(targets=None, held=frozenset({TARGET}))
+
+
+# --- the reading among a run's facts -------------------------------------------------------------------------------
+
+
+def test_o90_the_reading_is_a_fact_of_the_run_with_its_own_owner_and_target_only_reads_it_back_alone():
+    """O90: the reading goes into a run's facts through the one writer, under the owner `health` and the key
+    `post_run_health`; read back from the facts as a record carries them (JSON), `target_only` answers as it did, and
+    the key is nobody else's to write."""
+    assert infrafacts.OWNED[infrafacts.HEALTH] == {FACT}
+    meta: dict = {}
+    facts = infrafacts.InfrastructureFacts(meta, threading.RLock())
+    reading = four((), (TARGET,), (), (TARGET,))
+    facts.write(infrafacts.HEALTH, {FACT: reading.to_json()})
+    carried = json.loads(json.dumps(meta))["infrastructure_facts"]  # what a record written to out/runs holds
+    assert reading_in(carried) == reading
+    assert target_only(reading_in(carried)) is True
+    with pytest.raises(infrafacts.FactsConflict):
+        facts.write("another", {FACT: {}})
+
+
+@pytest.mark.parametrize("carried", [None, {}, {FACT: None}, {FACT: {"spaces": []}}, {FACT: "providers[1]"}])
+def test_o90_a_run_whose_facts_hold_no_whole_reading_is_unknown(carried):
+    """O90: absent or malformed, the reading is None and `target_only` of it is None, never True."""
+    assert reading_in(carried) is None
+    assert target_only(reading_in(carried)) is None
