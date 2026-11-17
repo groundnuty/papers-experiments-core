@@ -2,10 +2,11 @@
 """The collection of a run of the Apptainer backend: its outputs, the gate's log and count, the egress log (O56).
 
 In order: every process of the run is killed and shown gone (none should be: each cell's end showed its own gone), so
-nothing changes `/work` while it is copied (there is no freezer here, `facts.py`); the helpers' state is read while they
-run, so a gate or a collector that ended during the run is a death of infrastructure; the named outputs are copied as on
-Docker (`copyout.copy_tree`: never a link, a special file, a hard link out of the tree, another file system or more
-than the work disk holds; what the agent made so is refused for the scorers, the harness's own failure raises
+nothing changes `/work` while it is copied (there is no freezer here, `facts.py`); the state of the run's other
+infrastructure is read while it runs (`infra_check`, `apptainer.infra`), so a gate, a collector, a mount's oneclient or
+its mount, or the guard's watcher that ended during the run is a death of infrastructure; the named outputs are copied
+as on Docker (`copyout.copy_tree`: never a link, a special file, a hard link out of the tree, another file system or
+more than the work disk holds; what the agent made so is refused for the scorers, the harness's own failure raises
 `InfraError` of kind `output_collection`); the read-only inputs are hashed again; the gate is stopped (SIGTERM, so it
 writes its close lines) and the bytes it served counted once (O22), its log copied; the collector is stopped (it writes
 its end line) and its log read once, kept for the egress instrument and copied. Every file of evidence the collection
@@ -23,7 +24,6 @@ from typing import TYPE_CHECKING, Any
 
 from expcore_onedata.fault_drain import GATE
 from expcore_onedata.sandbox import copyout, gatelog, inputs, kinds
-from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox.api import DataPathMode, SandboxError
 from expcore_onedata.sandbox.apptainer import helpers
 from expcore_onedata.sandbox.sandbox import TEARDOWN_TROUBLE
@@ -76,25 +76,14 @@ class Collection:
         return result
 
     def deaths(self) -> list[dict[str, Any]]:
-        """Each helper that ended during the run, or whose state cannot be read: infrastructure, never the agent's."""
-        box, found = self.box, []
-        for role, helper in box._helpers.items():
-            if role == "gate" and "gate_stop" in box._meta:
-                continue  # stopped by an earlier collection: no death
-            alive = box.node.alive(helper.process.pid, helper.process.start)
-            if alive is True:
-                continue
-            status = box.node.exit_status(helper.process)
-            basis = (
-                f"the {role}'s process ended during the run (exit status {status})"
-                if alive is False
-                else f"the {role}'s state could not be read"
-            )
-            death = {"role": role, "condition": box.spec.mode.value, "cause": ID.UNDETERMINED}
-            death.update(category="infrastructure", basis=basis, problems=[f"the {role} is not running"])
-            found.append(death)
-        box._meta["container_deaths"] = found
-        return found
+        """Each of the run's other processes that ended during the run, or whose state cannot be read (the gate, the
+        collector, a mount's oneclient, its mount and the guard's watcher): infrastructure, never the agent's. The check
+        is kept in the metadata as Docker's collection keeps it (`infra_check`, `container_deaths`, `infra_death`); one
+        the harness stopped itself, in an earlier collection say, is judged by its state just before."""
+        box = self.box
+        check = box.infra_check()
+        box.record(infra_check=check, container_deaths=check["deaths"], infra_death=check["death"])
+        return check["deaths"]
 
     def _outputs(self, dest: Path, outputs: Sequence[str]) -> dict[str, bool]:
         box = self.box
@@ -128,6 +117,7 @@ class Collection:
         note: dict[str, Any] = {"signalled": False}
         gate = box._helpers.get("gate")
         try:
+            box.infra.stopping("gate")  # the harness's own stop: its state now stands as its last of the run
             stopped = helpers.stop(box.node, gate, sleep=box._sleep, clock=box._clock)
             note["signalled"] = stopped["term"] is True
             if stopped["ended_on_term"] is True:
@@ -164,6 +154,7 @@ class Collection:
         box = self.box
         collector = box._helpers.get("collector")
         if "collector_stop" not in box._meta and collector is not None:
+            box.infra.stopping("collector")  # the harness's own stop, as the gate's
             try:
                 box._meta["collector_stop"] = helpers.stop(box.node, collector, sleep=box._sleep, clock=box._clock)
             except SandboxError as error:

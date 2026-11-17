@@ -685,6 +685,30 @@ def test_o06_the_tool_server_is_checked_against_the_ceiling_its_token_was_minted
     assert len(refused) == 2
 
 
+def test_o56_a_docker_runs_tool_server_is_launched_with_the_keywords_it_always_had_and_no_process(stage, tmp_path):
+    """O56: only a sandbox that names where its tool server runs (the Apptainer backend's) passes the launcher a
+    `process`; a Docker run's launcher gets the keywords it always got, so its server's process is unchanged."""
+    launcher, seen = with_tools(stage), []
+
+    @contextlib.asynccontextmanager
+    async def launch(ctx, condition, token, **keywords):
+        seen.append(sorted(keywords))
+        yield "the run's tools"
+
+    launcher.launch = launch
+    lease = lease_pool(stage, tmp_path).acquire(
+        stage.platform.lease_group({"data_path": "via-gate", "tools": "read"}), run_key="run-1"
+    )
+
+    async def body(sandbox):
+        assert not hasattr(sandbox, "tool_server_process")
+        async with stage.platform.tool_server(RecordingContext(), sandbox):
+            pass
+
+    run_launch(stage, "via-gate", lease, body, condition="read")
+    assert seen == [["ceiling_s", "extra_env", "principal"]]
+
+
 def test_c19_a_run_with_a_tool_server_and_no_data_path_leases_a_slot_and_mints_only_the_tool_servers_token(
     stage, tmp_path
 ):

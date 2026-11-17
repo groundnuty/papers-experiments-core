@@ -168,7 +168,7 @@ class Completion:
     def argv(self, python: str) -> list[str]:
         """The command `timeout` runs in the agent's container: the bootstrap, isolated, by `python`, which also runs
         the program."""
-        return [python, "-I", "-c", BOOTSTRAP, self.nonce, str(self.size), self.sha256, python]
+        return [python, "-I", "-B", "-c", BOOTSTRAP, self.nonce, str(self.size), self.sha256, python]
 
     def check(self, done: CmdResult) -> Check:
         """Read a finished exec against this exec's completion record (see the module docstring)."""

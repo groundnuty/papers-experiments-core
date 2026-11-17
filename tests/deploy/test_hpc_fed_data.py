@@ -58,7 +58,7 @@ def core(hpc, root: Path, label: str, ca: bytes, data=None) -> str:
         patch.setattr(hpc.fedlinks, "check_links", link_check_stand_in([]))
         return hpc.boot.core_phase(
             layout, (5001, 5001), values, environ={},
-            rest=lambda ca_file: SimpleNamespace(close=lambda: None), bootstrap=BootStandIn(label),
+            rest=lambda ca_file, **kwargs: SimpleNamespace(close=lambda: None), bootstrap=BootStandIn(label),
             steps=lambda boot: None, content=lambda boot: SimpleNamespace(reset=lambda timeout: None),
             data=data or data_stand_in(),
         )  # fmt: skip
@@ -70,7 +70,7 @@ def test_o63_up_renders_each_spaces_manifest_and_two_federations_with_the_same_d
     fingerprint, holding each space's data identity."""
     printed = core(hpc, tmp_path / "a" / "root", "fed-a", ca)
     core(hpc, tmp_path / "b" / "root", "fed-b", ca)
-    assert "data: every space holds the data its manifest declares" in printed
+    assert "data: every space that is not ingested holds the data its manifest declares" in printed
     one, two = (load_platform(tmp_path / name / "root" / "platform.toml") for name in ("a", "b"))
     assert [entry.space.id for entry in one.spaces] != [entry.space.id for entry in two.spaces]
     assert one.fingerprint() == two.fingerprint()
@@ -134,7 +134,8 @@ def manifest(tmp_path, platforms, *, phase="linked", same_root=False) -> Path:
     for root, text in zip(roots, platforms, strict=True):
         root.mkdir(parents=True, exist_ok=True)
         state = {"format": "expcore-hpc-federation/1", "allocation": {"job": "101", "name": "hpcop-x"},
-                 "sandbox": {"placement": "het", "node": "node-s1", "het_group": 1}, "phase": phase}  # fmt: skip
+                 "sandbox": {"placement": "het", "node": "node-s1", "het_group": 1}, "phase": phase,
+                 "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         (root / "platform.toml").write_text(text)
     lines = [f'{k} = "{tmp_path / k}"' for k in ("study", "python", "core_src", "results", "tmpfs")]

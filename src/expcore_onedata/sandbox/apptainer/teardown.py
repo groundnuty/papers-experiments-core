@@ -6,9 +6,9 @@ raised: the run's file of the token (first: a secret is never evidence, and a la
 every process of the run's cells, killed and shown gone; the watch; the mount's helper (hook c); the gate and the
 collector, each shown gone (`helpers.stop`); then the run's directory, removed and shown gone, or, when the run is kept
 as evidence (a failed collection, a deadline that ended the run), moved to `work_root/_kept_evidence` once its token
-file and its copy of the CA bundle are gone. The run's record (`runs.py`) is dropped last, and only when all of it is
-shown gone: a teardown that is not complete raises `SandboxError` naming each step that failed, and leaves the record
-for a next try, the reaper and the probe.
+file, its copy of the CA bundle and the tool server's home (O56) are gone. The run's record (`runs.py`) is dropped
+last, and only when all of it is shown gone: a teardown that is not complete raises `SandboxError` naming each step
+that failed, and leaves the record for a next try, the reaper and the probe.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import helpers, runs
+from expcore_onedata.sandbox.apptainer.layout import TOOL_SERVER_DIR
 from expcore_onedata.sandbox.hostops import describe_error
 
 if TYPE_CHECKING:
@@ -120,6 +121,7 @@ class Teardown:
         def stop() -> None:
             box = self.box
             helper = box._helpers[role]
+            box.infra.stopping(role)  # the harness's own stop: a check read after it is no death (`infra_check`)
             if box.node.alive(helper.process.pid, helper.process.start) is False:
                 return  # stopped by the collection, or ended by itself: shown gone
             helpers.stop(box.node, helper, sleep=box._sleep, clock=box._clock)
@@ -137,6 +139,10 @@ class Teardown:
             return
         if box.token_files_left():  # a secret is never evidence: the run stays where it is
             raise SandboxError("the run directory is left where it is: a copy of the data-path token is in it")
+        server = box.dir / TOOL_SERVER_DIR  # the tool server's home: its files are no evidence, and may hold its token
+        runs.remove_tree(server)
+        if os.path.lexists(server):
+            raise SandboxError("the run directory is left where it is: the tool server's home could not be removed")
         if box._ca_copy is not None:
             box._ca_copy.unlink(missing_ok=True)  # configuration, not evidence
         removed = scrub(box.dir, box.spec.token.reveal().encode() if box.spec.token is not None else b"")

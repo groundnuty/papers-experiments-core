@@ -42,7 +42,7 @@ from expcore_onedata.tool_admission import shared_admission, shared_admission_as
 WAIT_S = 10.0  # the bound of every wait of a test that holds the lock between threads
 GRACE_S = 0.3  # how long a party that must be held back is given to get in anyway (a secondary check)
 PROBE_S = 0.2  # how long the test thread's own try for the lock is given before it counts as refused
-REASON = "smoke: warm-up of the first space"
+REASON = "smoke_warmup"
 
 
 def federation(tmp_path):
@@ -149,7 +149,7 @@ def test_o48_two_tools_hold_the_federation_together(tmp_path):
     entered, leave = threading.Event(), threading.Event()
 
     def other_tool():
-        with shared_admission(config, reason="another tool"):
+        with shared_admission(config, reason="another_tool"):
             entered.set()
             leave.wait(WAIT_S)
 
@@ -157,7 +157,7 @@ def test_o48_two_tools_hold_the_federation_together(tmp_path):
     try:
         assert entered.wait(WAIT_S)
         with shared_admission(config, reason=REASON, timeout_s=PROBE_S):
-            assert {hold["reason"] for hold in SharedHolds(settings.journal).open_holds()} == {"another tool", REASON}
+            assert {hold["reason"] for hold in SharedHolds(settings.journal).open_holds()} == {"another_tool", REASON}
     finally:
         leave.set()
         thread.join(WAIT_S)
@@ -179,7 +179,7 @@ def test_o48_the_tools_admission_admits_the_sandbox_and_the_tool_server(tmp_path
 def test_o48_a_tool_inside_a_shared_admission_reuses_it_and_records_nothing_more(tmp_path):
     """O48: a warm-up called by a smoke driver that holds the federation already does not take it twice."""
     config, settings, _ = federation(tmp_path)
-    with shared_admission(config, reason=REASON) as outer, shared_admission(config, reason="a warm-up") as inner:
+    with shared_admission(config, reason=REASON) as outer, shared_admission(config, reason="warmup") as inner:
         assert inner is outer
     assert [hold["reason"] for hold in holds_of(settings)] == [REASON]
 
@@ -281,14 +281,60 @@ def test_o48_a_platform_without_faults_has_no_federation_to_hold(tmp_path):
         raise AssertionError("a tool was admitted onto a baseline that is not whole")
 
 
-@pytest.mark.parametrize("reason", ["", "   ", "x" * 201, "two\nlines", 5, None])
-def test_o48_a_reason_that_is_not_one_short_line_of_text_is_refused_before_anything_is_taken(tmp_path, reason):
-    """O48: the reason goes into a journal that people read: one printable line of 1 to 200 characters."""
+NOT_CODES = ["", "   ", "x" * 65, "two\nlines", 5, None, "smoke: warm-up of the first run", "smoke/warmup", "Smoke"]
+
+
+@pytest.mark.parametrize("reason", NOT_CODES)
+def test_o48_a_reason_that_is_not_a_short_code_is_refused_before_anything_is_taken(tmp_path, reason):
+    """O48 with O12: the reason goes into the published record of the holds, so it is a short code (a lower-case
+    letter, then up to 63 lower-case letters, digits or underscores; `shortcode.checked_code`), never a sentence, a
+    path or an empty text: anything else is refused, naming `reason`, before anything is taken or recorded."""
     config, settings, lock = federation(tmp_path)
-    with pytest.raises(ValueError, match="reason"), shared_admission(config, reason=reason):
-        raise AssertionError("a tool was admitted with no reason")
+    with pytest.raises(ValueError, match=r"^reason is a short code"), shared_admission(config, reason=reason):
+        raise AssertionError("a tool was admitted with a reason that is no short code")
     assert holds_of(settings) == []
     assert not refused(lock, exclusive=True)
+
+
+@pytest.mark.parametrize("reason", ["warmup_beta", "warmup_alpha_test", "reset_studyadata", "warmup_z_o_n_e"])
+def test_o48_a_reason_that_holds_a_configured_name_is_refused_before_anything_is_taken(tmp_path, reason):
+    """O48 with O12: a reason that holds a name the configuration gives (a provider's name, a host with its dots made
+    underscores, a space's name, the zone's name spelled out), whatever its separators, is refused before anything is
+    taken or recorded, and the refusal does not repeat it."""
+    config, settings, lock = federation(tmp_path)
+    with pytest.raises(ValueError, match="configuration gives") as caught, shared_admission(config, reason=reason):
+        raise AssertionError("a tool was admitted with a reason that names the federation")
+    assert reason not in str(caught.value)
+    assert holds_of(settings) == []
+    assert not refused(lock, exclusive=True)
+
+
+def test_o48_the_async_form_and_a_platform_without_faults_check_the_reason_too(tmp_path):
+    """O48 with O12: `shared_admission_async` refuses a reason that is no short code as the synchronous form does, and
+    so does a platform without `[faults]`, which takes no lock: the rule is the reason's, not the lock's."""
+    config, settings, _ = federation(tmp_path)
+
+    async def enter():
+        async with shared_admission_async(config, reason="a warm-up"):
+            raise AssertionError("a tool was admitted with a reason that is no short code")
+
+    with pytest.raises(ValueError, match=r"^reason is a short code"):
+        asyncio.run(enter())
+    assert holds_of(settings) == []
+    (tmp_path / "plain").mkdir()
+    plain = load_platform(write_platform(tmp_path / "plain"), require_secrets=False)
+    with pytest.raises(ValueError, match="configuration gives"), shared_admission(plain, reason="warmup_alpha"):
+        raise AssertionError("a tool was admitted with a reason that names the federation")
+    with shared_admission(plain, reason=REASON) as admission:
+        assert admission is None
+
+
+def test_o48_a_valid_reason_is_recorded_exactly_as_given(tmp_path):
+    """O48: a short code that holds no configured name is recorded as it was given, up to 64 characters."""
+    config, settings, _ = federation(tmp_path)
+    with shared_admission(config, reason="r" * 64):
+        pass
+    assert [hold["reason"] for hold in holds_of(settings)] == ["r" * 64]
 
 
 @pytest.mark.parametrize("timeout_s", [-1, math.nan, math.inf, True])
@@ -362,9 +408,9 @@ def test_o48_a_torn_last_line_of_the_record_is_ignored_and_cut_by_the_next_hold(
     with open(settings.journal / HOLDS, "a", encoding="utf-8") as handle:
         handle.write('{"event": "shared_held", "id": "torn')
     assert [hold["reason"] for hold in holds_of(settings)] == [REASON]
-    with shared_admission(config, reason="after the tear"):
+    with shared_admission(config, reason="after_the_tear"):
         pass
-    assert [hold["reason"] for hold in holds_of(settings)] == [REASON, "after the tear"]
+    assert [hold["reason"] for hold in holds_of(settings)] == [REASON, "after_the_tear"]
 
 
 def test_o48_an_end_that_names_no_time_makes_the_record_unreadable(tmp_path):
@@ -383,7 +429,7 @@ def test_o48_an_end_that_names_no_time_makes_the_record_unreadable(tmp_path):
 def killed_tool(tmp_path):
     """A tool process that took the hold and died inside it: its lock went with it, its record has no end."""
     platform = write_faults(tmp_path)
-    child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(platform), "a killed tool"))
+    child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(platform), "killed_tool"))
     child.start()
     child.join(120)
     assert child.exitcode == 0
@@ -396,7 +442,7 @@ def test_o48_a_dead_tools_hold_reads_as_gone_and_never_blocks_an_outage_run(tmp_
     is gone, and the exclusive admission, which proves no tool holds the federation, ends it as `holder_gone`."""
     _config, settings = killed_tool(tmp_path)
     (hold,) = SharedHolds(settings.journal).open_holds()
-    assert hold["reason"] == "a killed tool"
+    assert hold["reason"] == "killed_tool"
     assert hold["live"] is False
     outage = FederationLock(settings).try_acquire(exclusive=True, target=OUTAGE_TARGET)
     assert outage is not None
@@ -411,7 +457,7 @@ def test_o48_the_next_tool_ends_a_dead_tools_record_without_an_exclusive_admissi
     config, settings = killed_tool(tmp_path)
     with shared_admission(config, reason=REASON):
         (dead, live) = holds_of(settings)
-        assert (dead["reason"], dead["how"]) == ("a killed tool", "holder_gone")
+        assert (dead["reason"], dead["how"]) == ("killed_tool", "holder_gone")
         assert live["reason"] == REASON
         assert live["until_utc"] is None
 
@@ -433,12 +479,12 @@ def test_o48_an_outage_run_that_waits_in_vain_names_the_tools_that_hold_the_fede
     reason is the tool's own text and stays in the record (O12)."""
     config, _settings, lock = federation(tmp_path)
     with (
-        shared_admission(config, reason="a reason that names the first space"),
+        shared_admission(config, reason="warmup_first_run"),
         pytest.raises(FederationBusy) as caught,
     ):
         lock.acquire(exclusive=True, timeout_s=PROBE_S, target=OUTAGE_TARGET)
     assert "1 tool outside a campaign holds it shared since " in caught.value.detail
-    assert "first space" not in caught.value.detail
+    assert "warmup_first_run" not in caught.value.detail
 
 
 def test_o48_a_task_that_reuses_the_hold_keeps_the_federation_held_when_the_owner_leaves(tmp_path):
@@ -450,7 +496,7 @@ def test_o48_a_task_that_reuses_the_hold_keeps_the_federation_held_when_the_owne
         inside, leave = asyncio.Event(), asyncio.Event()
 
         async def child():
-            async with shared_admission_async(config, reason="the child") as admission:
+            async with shared_admission_async(config, reason="child_task") as admission:
                 assert admission is not None
                 inside.set()
                 await leave.wait()
@@ -531,7 +577,7 @@ def test_o48_a_forked_child_that_gives_up_its_copy_of_the_hold_ends_nothing_of_i
     child.start()
     child.join(120)
     assert child.exitcode == 0
-    assert json.loads(result.read_text(encoding="utf-8")) == {"refused": True, "open": ["a tool that forks"]}
+    assert json.loads(result.read_text(encoding="utf-8")) == {"refused": True, "open": ["forking_tool"]}
 
 
 # --- the async form ------------------------------------------------------------------------------------------------

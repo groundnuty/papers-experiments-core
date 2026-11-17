@@ -22,6 +22,7 @@ from expcore.study.config import load_study
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = ROOT / "examples" / "tiny_study"
 HEAD = "a" * 40  # the stamped commit: one value for every copy, so every campaign has the same code identity
+PINNED = str(Path(__file__).resolve().parent / "pinned_expcore.py")  # `python -m expcore` with the core pinned
 
 
 @dataclass
@@ -90,9 +91,10 @@ def table(report: str, heading: str) -> dict[str, list[str]]:
 
 
 def cli(env: dict[str, str], *argv: str, process: bool = False) -> tuple[int, str]:
-    """Run a command and return its exit status and stderr, in this process or as `python -m expcore`."""
+    """Run a command and return its exit status and stderr, in this process or as `python -m expcore` would (with the
+    core's identity the suite pins, `core_pin`)."""
     if process:
-        done = subprocess.run([sys.executable, "-m", "expcore", *argv], capture_output=True, text=True, env=env)
+        done = subprocess.run([sys.executable, PINNED, *argv], capture_output=True, text=True, env=env)
         return done.returncode, done.stderr
     errors = io.StringIO()
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
