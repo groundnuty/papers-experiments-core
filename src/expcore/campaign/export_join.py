@@ -25,6 +25,8 @@ snapshot and this module joins the results:
   order, each with `"shard"` added, since each shard counted its own journals against its own share;
 - `interrupted_spend` (C05), when any shard's interrupted attempts kept a call log: every shard's own entries in shard
   order, each with `"shard"` added, since each was charged against its own shard's share;
+- `attempt_diagnostics` (C40), when any shard's attempts kept a diagnostic snapshot: every shard's own entries in shard
+  order, each with `"shard"` added;
 - `shard_retries_by_kind` keeps what the sum of `retries_by_kind` loses: every row of every shard's own table, in shard
   order, with `"shard"` added, so a report can say which host met which kind. A shard with no row has none here, and
   the key is there all the same: it says the set-asides were recorded;
@@ -54,6 +56,7 @@ from expcore.campaign.interrupted_spend import EXPORT_KEY as INTERRUPTED_KEY
 from expcore.campaign.lost_ledger import KEY as LOST_KEY
 from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
 from expcore.campaign.shard import EXPORT_KEY
+from expcore.campaign.start_diagnostic import EXPORT_KEY as DIAGNOSTICS_KEY
 from expcore.errors import CORE_KINDS
 
 SHARD_KEY = "shard"  # the key of each run entry in a merged export: the index of the shard that ran it
@@ -73,9 +76,9 @@ HOLDS = "operator_holds"  # the holds an operator ends (C11): a shard's export h
 _MODEL_SUMS = ("analysed_runs", "runs_without_mix", "mixed_runs", "turns")
 _FINGERPRINT_SUMS = ("turns", "runs")
 # each shard's own entries, joined in shard order with the shard named (C11, O62, C05)
-_ENTRIES = (HOLDS, LOST_KEY, INTERRUPTED_KEY)
+_ENTRIES = (HOLDS, LOST_KEY, INTERRUPTED_KEY, DIAGNOSTICS_KEY)
 # keys that one shard's export may have and another's lack
-_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY)
+_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY, DIAGNOSTICS_KEY)
 
 
 def join_exports(

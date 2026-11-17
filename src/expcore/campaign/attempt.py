@@ -70,6 +70,7 @@ from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import Lease, LeaseCancelled, LeasePool, LeaseRefused
 from expcore.campaign.markers import AttemptResult, write_marker
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.start_diagnostic import snapshot_of
 from expcore.campaign.store import Store
 from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.campaign.units import UnitHealth
@@ -364,6 +365,7 @@ class AttemptRunner:
                     treatment_targets=targets,
                     sent_nothing=sent_no_request(error, backend),
                 )
+                result = self._with_diagnostic(result, error, backend)
                 if guard is not None and guard.loop_ended:  # past the loop its call log is all it spent (C05)
                     result = settle_usage(result, *self._call_log(begun.id))
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
@@ -379,6 +381,12 @@ class AttemptRunner:
             status = self._finish(begun, run_dir, key, result, bookkeeping)
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
+
+    def _with_diagnostic(self, result: AttemptResult, error: BaseException, backend: Any) -> AttemptResult:
+        """Keep on the result the snapshot an infrastructure error carries (a failed instrument start's), redacted
+        with this attempt's secrets as a record is (C40). One that cannot be kept is recorded as failed, not raised."""
+        kept = snapshot_of(error, lambda: redactor_for(backend, models=self.p.models))
+        return result if kept is None else dataclasses.replace(result, diagnostic=kept)
 
     def _call_log(self, attempt_id: int) -> tuple[Any, Any]:
         """The attempt's call log as its row keeps it: the requests sent and how each closed one ended."""

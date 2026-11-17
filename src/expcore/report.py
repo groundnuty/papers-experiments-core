@@ -50,6 +50,10 @@ are the same text: no clock, no path and no random number enters it.
 - A campaign whose interrupted attempts kept a call log (its export has `interrupted_spend`, C05) gets a section
   "Interrupted attempts' spend" after that (`expcore.report_interrupted`): per model, how many were charged measured,
   measured plus a request in flight, or at their bound. A report of an export without it is the text it was before.
+- A campaign whose attempts kept a diagnostic snapshot (its export has `attempt_diagnostics`, C40) gets a section
+  "Instrument start failures" after that (`expcore.report_diagnostics`): per condition, instrument, kind and state, the
+  attempts, how many were charged and how many snapshots could not be kept, with a row of zeros for a condition that
+  had none. A report of an export without it is the text it was.
 - A batch merged from shards (its export has `shards`, and each run entry its `shard`) gets one more section after the
   conditions (`expcore.report_shards`): per shard, with its label and start, the runs of each condition by how they
   ended with their rates, the infrastructure attempts by kind, and the wall time, turn latency and reset time, each
@@ -91,6 +95,7 @@ from expcore.accounting import condition_accounting
 from expcore.egress.sensitivity import EgressAnalysis
 from expcore.guards import GuardsAnalysis
 from expcore.mountguard.sensitivity import MountGuardAnalysis
+from expcore.report_diagnostics import section as start_failures
 from expcore.report_egress import egress_lines
 from expcore.report_families import (
     check_equivalence_families,
@@ -670,6 +675,7 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
         *operator_holds(export, _table),  # only an export with such a hold has it (C11)
         *lost_in_kill(export, _table),  # only an export whose store a kill took spend out of has it (O62)
         *interrupted_spend(export, _table),  # only an export whose interrupted attempts kept a call log has it (C05)
+        *start_failures(export, _table),  # only an export whose attempts kept a diagnostic snapshot has it (C40)
     ]
 
 

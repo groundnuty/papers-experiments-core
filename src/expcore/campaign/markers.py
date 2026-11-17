@@ -23,6 +23,9 @@ declares no target, and is read without the target rule.
 A schema-3 marker may also carry `spend_basis`, optional: how an attempt that raised after its model loop was charged
 (`measured` or `bound`, `campaign.after_loop`). It is written only when there is one, so every other marker is as it
 was, and a marker without it reads with none.
+
+It may carry `diagnostic` too, optional in the same way: the redacted snapshot a failed instrument start left on the
+attempt (`campaign.start_diagnostic`, C40), so a kill after the marker loses no evidence of why it was set aside.
 """
 
 import json
@@ -59,6 +62,7 @@ _RESULT_FIELDS = (
     "treatment_targets",
     "injected_targets",
     "spend_basis",
+    "diagnostic",
 )
 # What a schema-2 marker holds of a result; the target fields take their version-2 values.
 _SCHEMA_2_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("target_rule")]
@@ -67,7 +71,7 @@ _LEGACY_FIELDS = _RESULT_FIELDS[: _RESULT_FIELDS.index("model_turns")]
 # Fields added to schema 2 after its first markers were written: a schema-2 marker without one reads with its default.
 _ADDED_FIELDS = ("first_turn_rule", "turn_usage", "replies_checked")
 # A schema-3 marker written before `spend_basis` existed holds none: it reads as None, the attempt's usage as it says.
-_ADDED_SCHEMA_3 = ("spend_basis",)
+_ADDED_SCHEMA_3 = ("spend_basis", "diagnostic")
 
 
 class MarkerError(RuntimeError):
@@ -116,6 +120,8 @@ class AttemptResult:
       reported, or `bound` when the log was unreadable or incomplete, so its usage is unknown and it is charged its
       bound. None for every other attempt: one with a record, whose counts are the record's, and one that raised
       during its loop or before it, or that kept no call log (an interrupted attempt's basis is set by recovery).
+    - `diagnostic`: the redacted snapshot of a failed instrument start, or of another infrastructure failure that
+      carried a diagnostic (`campaign.start_diagnostic`, C40): a JSON object, None for every other attempt.
     """
 
     outcome: Outcome
@@ -138,6 +144,7 @@ class AttemptResult:
     treatment_targets: Mapping[str, str] = field(default_factory=dict)
     injected_targets: tuple[str, ...] = ()
     spend_basis: str | None = None
+    diagnostic: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         """Refuse a kind or target outside the vocabulary, so a typo never reaches the store; keep each list sorted;
@@ -153,6 +160,10 @@ class AttemptResult:
             raise ValueError("first_turn_rule, legacy_marker, replies_checked and target_rule must be True or False")
         if self.spend_basis is not None and self.spend_basis not in SPEND_BASES:
             raise ValueError(f"spend_basis is one of {', '.join(SPEND_BASES)} or None, not {self.spend_basis!r}")
+        if self.diagnostic is not None:
+            if not isinstance(self.diagnostic, Mapping):
+                raise ValueError("a diagnostic is a JSON object, or None")
+            object.__setattr__(self, "diagnostic", dict(self.diagnostic))
         for kind in (*(() if self.outage_kind is None else (self.outage_kind,)), *self.treatment_kinds):
             if kind not in infra_kinds():
                 raise ValueError(f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(infra_kinds())}")
@@ -217,8 +228,9 @@ def write_marker(run_dir: Path, run_key: str, attempt_id: int, result: AttemptRe
         "attempt_id": attempt_id,
         "result": {
             "outcome": _outcome_json(result.outcome),
-            **{f: getattr(result, f) for f in _RESULT_FIELDS if f != "spend_basis"},
+            **{f: getattr(result, f) for f in _RESULT_FIELDS if f not in ("spend_basis", "diagnostic")},
             **({} if result.spend_basis is None else {"spend_basis": result.spend_basis}),  # only when there is one
+            **({} if result.diagnostic is None else {"diagnostic": dict(result.diagnostic)}),  # likewise (C40)
             "treatment_kinds": list(result.treatment_kinds),
             "treatment_targets": dict(result.treatment_targets),
             "injected_targets": list(result.injected_targets),
