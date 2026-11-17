@@ -125,6 +125,20 @@ def test_c06_the_backends_of_the_sandbox_and_the_fault_injector_are_in_the_finge
     assert (docker["faults"]["settings"]["backend"], hpc["faults"]["settings"]["backend"]) == ("compose", "hpc")
 
 
+def test_o87_the_check_provider_is_in_the_fingerprint_by_position_only_when_it_is_not_the_local_one(tmp_path, cas):
+    """O87: no key, or the local provider named, leaves the fingerprint as it was before the key (a store started
+    before it resumes); another provider adds `content_check_provider` to `sandbox` as its `providers[i]`, a position,
+    never its name, so two federations rendered from one template still give one fingerprint."""
+    edits = [platform(CHECK_FILE_LINE, CHECK_FILE_LINE + CHECK_PROVIDER_LINE)]
+    base = load(DOCKER, tmp_path / "base", cas[0]).fingerprint()
+    assert "content_check_provider" not in base["sandbox"]
+    prints = [load(edited(DOCKER, edits), tmp_path / f"fed-{i}", cas[0], values).fingerprint()
+              for i, values in enumerate(FEDERATIONS)]  # fmt: skip
+    assert prints[0]["sandbox"]["content_check_provider"] == "providers[1]"
+    assert prints[0] == prints[1]
+    assert "birch" not in json.dumps(prints[0])
+
+
 @pytest.mark.parametrize(
     ("template", "edits"),
     [
@@ -149,20 +163,6 @@ def test_c06_the_backends_of_the_sandbox_and_the_fault_injector_are_in_the_finge
     ids=["tokens", "fault-numbers", "fault-heal", "limits", "grace-placeholder", "agent", "trust-order",
          "allow-order", "support-order", "listing", "check-provider-local", "apptainer"],
 )  # fmt: skip
-def test_o87_the_check_provider_is_in_the_fingerprint_by_position_only_when_it_is_not_the_local_one(tmp_path, cas):
-    """O87: no key, or the local provider named, leaves the fingerprint as it was before the key (a store started
-    before it resumes); another provider adds `content_check_provider` to `sandbox` as its `providers[i]`, a position,
-    never its name, so two federations rendered from one template still give one fingerprint."""
-    edits = [platform(CHECK_FILE_LINE, CHECK_FILE_LINE + CHECK_PROVIDER_LINE)]
-    base = load(DOCKER, tmp_path / "base", cas[0]).fingerprint()
-    assert "content_check_provider" not in base["sandbox"]
-    prints = [load(edited(DOCKER, edits), tmp_path / f"fed-{i}", cas[0], values).fingerprint()
-              for i, values in enumerate(FEDERATIONS)]  # fmt: skip
-    assert prints[0]["sandbox"]["content_check_provider"] == "providers[1]"
-    assert prints[0] == prints[1]
-    assert "birch" not in json.dumps(prints[0])
-
-
 def test_c06_a_setting_at_its_default_and_one_left_out_or_written_otherwise_give_one_fingerprint(
     tmp_path, cas, template, edits
 ):
