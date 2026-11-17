@@ -41,8 +41,8 @@ def settings_of(platform):
 
 
 def test_o58_a_table_without_backend_is_the_compose_one_loaded_as_before(tmp_path):
-    """O58: no `backend` key is `"compose"`: its file, project and defaults as before, no HPC bound read, and its
-    fingerprint still hashes each target's project and service."""
+    """O58, C06: no `backend` key is `"compose"`: its file, project and defaults as before, no HPC bound read, and its
+    fingerprint hashes each target's backend and service, never its project (each deployment's own name)."""
     platform = write_faults(tmp_path)
     settings = settings_of(platform)
     assert (settings.backend, settings.stop_bound_s, settings.relay_wait_s) == ("compose", 0.0, 0.0)
@@ -50,7 +50,7 @@ def test_o58_a_table_without_backend_is_the_compose_one_loaded_as_before(tmp_pat
     assert (settings.project, settings.poll_s) == ("stack-a", 1)
     assert DEFAULT_SETTLE_TIMEOUT_S == 180.0
     targets = faults_fingerprint(load_platform(platform, require_secrets=False))["targets"]
-    assert targets["providers[1]"] == hashlib.sha256(f"stack-a/{SERVICES['beta']}".encode()).hexdigest()
+    assert targets["providers[1]"] == hashlib.sha256(f"compose:{SERVICES['beta']}".encode()).hexdigest()
 
 
 def test_o58_an_hpc_table_has_no_compose_file_and_its_own_defaults(tmp_path):
