@@ -338,8 +338,9 @@ def test_o79_a_placement_the_render_cannot_complete_is_refused_naming_the_key_an
 
 def test_o79_the_preflight_reads_every_placeholder_as_a_value_of_its_own(pl):
     """O79: a template whose placeholders stand in keys (`x."@a@"`, `x."@b@"`) is a document with two keys, not one
-    that is "no TOML": filled in alike they would collide, the preflight would skip the template as unreadable and take
-    one with no `[placement]`, which the render then refuses with the federation up. Each placeholder is its own value."""
+    that is "no TOML": filled in alike they would collide, the preflight would skip the template as unreadable and
+    take one with no `[placement]`, which the render then refuses with the federation up. Each placeholder is its own
+    value."""
     template = BASE + 'x."@provider_id.pine@" = 1\nx."@provider_id.birch@" = 2\n'
     with pytest.raises(RuntimeError, match=r"declares no \[placement\]"):
         pl.check_template(template)

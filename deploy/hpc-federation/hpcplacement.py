@@ -4,8 +4,9 @@ The platform layer requires the table (`rangemap.load_placement`), and a reader 
 patched in a default of its own: defaults supplied separately by each tool are how a setting drifts unseen. So:
 
 - **The template declares `holder`**, the one setting the core has no default for (`PlacementSettings.holder`): a
-  provider the file declares. `check_template` is the preflight (`up` refuses a template without it before anything is
-  submitted), and `complete` refuses the same at the render.
+  provider the file declares. `check_template` is the preflight: it runs `complete` over the template as the render
+  does, so `up` refuses a template without it, or in a spelling the render cannot complete, before anything is
+  submitted.
 - **The render writes every other setting at the core's default** beside what the template declared: the fields of
   `PlacementSettings` are the one source of the numbers (`defaults`), none is held here, so a field added there is in
   the next render. A setting the template declares keeps its value; a table that declares every setting is returned
@@ -88,18 +89,30 @@ def declared_placement(document: Mapping[str, Any]) -> Dict[str, Any]:
     return table
 
 
+def filled_in(template: str) -> str:
+    """A template with each distinct placeholder as a number of its own: a value of every position the renderer's
+    templates put one in (an integer where it stands bare, characters in a string where it stands in one), and no two
+    alike, so placeholders that stand in keys cannot collide."""
+    numbers: Dict[str, int] = {}
+    return hpcpins.ANY_PLACEHOLDER.sub(
+        lambda found: str(1_000_001 + numbers.setdefault(found.group(0), len(numbers))), template
+    )
+
+
 def check_template(template: Optional[str]) -> None:
-    """The refusal before anything is submitted: the template, read as TOML with its placeholders filled in as
-    `hpcpins` fills them for its own check, declares a `[placement]` holder (`declared_placement`). A layout with no
-    template renders no platform file and is not asked; a template that is no TOML once filled in is left to the
-    renderer, which reads the file it writes."""
+    """The refusal before anything is submitted: the template, filled in (`filled_in`) and read as TOML, completes as
+    the render completes it (`complete`): it declares a `[placement]` with a `holder` that names a provider, in a
+    spelling the missing settings can be added to. The holder is a name written in the template, since a placeholder
+    is no provider here. A layout with no template renders no platform file and is not asked; a template that is no
+    TOML once filled in is left to the renderer, which reads the file it writes."""
     if template is None:
         return
+    text = filled_in(template)
     try:
-        document = tomllib.loads(hpcpins.ANY_PLACEHOLDER.sub("0", template))
+        tomllib.loads(text)
     except tomllib.TOMLDecodeError:
         return
-    declared_placement(document)
+    complete(text)
 
 
 def insertion(lines: List[str], pairs: List[str]) -> List[str]:
