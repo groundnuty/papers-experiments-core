@@ -29,6 +29,7 @@ A feature that adds a fact: write it with its own `owner`, and, if it is the san
 
 from __future__ import annotations
 
+import copy
 import threading
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -90,16 +91,19 @@ class InfrastructureFacts:
     def write(self, owner: str, update: Mapping[str, Any]) -> None:
         """Add `update`'s keys to the run's table, under the lock, for `owner`. Raises `FactsConflict`, and writes
         nothing, when a key belongs to another owner. The table is made by the first write: a run that has none has no
-        empty one."""
+        empty one. The table keeps a copy of each value (`copy.deepcopy`), so the dict a writer still holds is no handle
+        on a recorded fact: editing or clearing it afterwards changes nothing here."""
         with self._lock:
             table = self._meta.get(_TABLE, {})
             self._claim(owner, update, table)
-            self._meta.setdefault(_TABLE, {}).update(update)
+            self._meta.setdefault(_TABLE, {}).update(copy.deepcopy(dict(update)))
 
     def get(self, key: str, default: Any = None) -> Any:
-        """The value the run's table holds for `key`, or `default`."""
+        """A copy of the value the run's table holds for `key`, or `default` as given: editing what it returns changes
+        no recorded fact."""
         with self._lock:
-            return self._meta.get(_TABLE, {}).get(key, default)
+            table = self._meta.get(_TABLE, {})
+            return copy.deepcopy(table[key]) if key in table else default
 
     def annotate(self, snapshot: dict[str, Any], owner: str, update: Mapping[str, Any]) -> None:
         """Add `update`'s keys to the table of `snapshot`, a copy of the run's metadata that `metadata()` returns, for

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from expcore_onedata import fault_relay_group
 from expcore_onedata.compose import CommandResult
 from expcore_onedata.fault_relay import run_clean
 
@@ -184,3 +185,61 @@ def test_o58_a_child_that_left_the_group_on_purpose_is_not_a_straggler(tmp_path,
     assert done == CommandResult(0, "", "")
     assert alive(pid)
     assert calls == []
+
+
+def leader_states_at_each_signal(monkeypatch) -> list[str]:
+    """Patch the group's signal so that, at each one, the leader's state is noted: `zombie` (ended, unreaped: it holds
+    the group id), `running`, or `reaped` (its pid and so the group id are free to be given to another process)."""
+    seen: list[str] = []
+    real = fault_relay_group._signal_group
+
+    def watching(group: int, signum: signal.Signals) -> None:
+        try:
+            info = os.waitid(os.P_PID, group, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            seen.append("running" if info is None else "zombie")
+        except ChildProcessError:
+            seen.append("reaped")
+        real(group, signum)
+
+    monkeypatch.setattr(fault_relay_group, "_signal_group", watching)
+    return seen
+
+
+def test_o58_a_verb_that_returned_has_its_group_signalled_while_its_leader_is_still_unreaped(
+    tmp_path, children, monkeypatch
+):
+    """O58 (Codex, 17 Nov 2026): `communicate()` reaped the leader before the stragglers were signalled, so between the
+    look at the group's members and `killpg` the group id could have been given to another process (a pid wrap), which
+    the signal would then have reached. The leader is reaped only after the last signal, as the bound's path does."""
+    seen = leader_states_at_each_signal(monkeypatch)
+    done, pid, calls = run_leaver(tmp_path, children, status=1)
+    assert done == CommandResult(1, "", "")
+    assert calls == [True]
+    assert seen, "the straggler was never signalled"
+    assert set(seen) == {"zombie"}, seen
+    assert gone_within(pid, 3.0)
+
+
+def test_o58_a_verb_ended_at_its_bound_has_its_group_signalled_while_its_leader_is_unreaped(
+    tmp_path, children, monkeypatch
+):
+    """O58: the bound's path, which already ended the group before the leader was reaped, is unchanged."""
+    seen = leader_states_at_each_signal(monkeypatch)
+    run_verb(tmp_path, children, SLEEPER)
+    assert seen
+    assert "reaped" not in seen
+
+
+def test_o58_the_output_of_a_verb_that_returned_is_read_whole_as_text_with_its_newlines_translated(tmp_path):
+    """O58: reading the pipes without `communicate` changes no answer: output and errors in the locale's text, CRLF and
+    CR read as the newlines they stand for, and a byte that is no character replaced, not raised."""
+    code = (
+        "import sys; sys.stdout.buffer.write(b'a\\r\\nb\\rc\\n' + b'\\xff' + b'x' * 200000); "
+        "sys.stderr.buffer.write(b'e\\r\\n'); sys.exit(2)"
+    )
+    done = run_clean(ENVIRONMENT)([sys.executable, "-I", "-c", code], timeout_s=30)
+    assert done.returncode == 2
+    assert done.stdout.startswith("a\nb\nc\n")
+    assert done.stdout.endswith("x" * 200000)
+    assert len(done.stdout) == 200007
+    assert done.stderr == "e\n"

@@ -111,11 +111,18 @@ def ingested_manifests(layout: Layout, values: Mapping[str, str]) -> Dict[str, M
 
 def ingested_record(layout: Layout, values: Mapping[str, str]) -> Dict[str, Dict[str, Any]]:
     """What the state file records of each ingested space at `up` (`data.ingested`): the digest of the manifest it is
-    to be verified against, whether the layout declares it, and no verdict yet."""
+    to be verified against, whether the layout declares it, no verdict yet, and no Onezone ID yet (`space_id`: `up`
+    records the one the zone gave the space once its core's phase has written the facts, and a marker `verify-data`
+    leaves is bound to it, so a space made again by name under another ID is no space that was verified)."""
     declared = ingested(layout)
     manifests = ingested_manifests(layout, values)
     return {
-        name: {"manifest": manifests[name].digest(), "declared": declared[name] is not None, "verified": None}
+        name: {
+            "manifest": manifests[name].digest(),
+            "declared": declared[name] is not None,
+            "space_id": None,
+            "verified": None,
+        }
         for name in declared
     }
 

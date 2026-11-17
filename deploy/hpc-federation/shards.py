@@ -863,6 +863,19 @@ def federation(shard: Shard) -> dict[str, Any]:
     return {"job": job, "name": name, "node": node, "placement": placement, "het_group": group, "listed": listed}
 
 
+def platform_ids(root: Path) -> dict[str, str]:
+    """For each space of the federation's `platform.toml` that names its Onezone ID (`id`), that ID: the one the
+    study's runs would read and write, which the core's phase rewrote from the zone it last found (a space made again
+    by name is under a new one)."""
+    data = tomllib.loads((root / PLATFORM).read_text(encoding="utf-8"))
+    entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
+    return {
+        entry["name"]: entry["id"]
+        for entry in entries
+        if isinstance(entry, Mapping) and isinstance(entry.get("name"), str) and isinstance(entry.get("id"), str)
+    }
+
+
 def platform_data(root: Path) -> dict[str, str | None]:
     """For each space of the federation's `platform.toml` that declares its data (`data_manifest`), the content hash of
     the manifest it names, as the dispatcher's fingerprint will take it (`Manifest.digest()`), None for a file that
@@ -888,8 +901,11 @@ def check_ingested(shard: Shard, state: Mapping[str, Any]) -> None:
     verified marker (O57): data nothing has shown to be the declared data is data a shard would spend on under a
     fingerprint that says otherwise. A marker is `hpcfed.py verify-data`'s pass, bound to the digest of the manifest it
     compared with; it counts only while that is the manifest `up` recorded and the one the platform file names now (a
-    manifest edited after the verification changes the fingerprint and leaves the pass for another experiment). A state
-    with no record at all, from an `up` that predates it, cannot be shown verified."""
+    manifest edited after the verification changes the fingerprint and leaves the pass for another experiment). It is
+    bound to the space it read as well, by its Onezone ID: the ID in the marker, in the record `up` made and in the
+    platform file must be one, so a space deleted and made again by name (empty, under a new ID) after the pass is
+    refused, naming it, whatever the marker still says. A state with no record at all, from an `up` that predates it,
+    cannot be shown verified, and nor can a marker or a record with no ID."""
     data = state.get("data")
     ingested = data.get("ingested") if isinstance(data, Mapping) else None
     if not isinstance(ingested, Mapping):
@@ -900,22 +916,33 @@ def check_ingested(shard: Shard, state: Mapping[str, Any]) -> None:
     if not ingested:
         return
     try:
-        declared = platform_data(shard.root)
+        declared, current = platform_data(shard.root), platform_ids(shard.root)
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         raise ShardsError(f"shard {shard.label}: its federation's {PLATFORM} could not be read") from None
-    unverified = []
+    unverified, moved = [], []
     for space, record in ingested.items():
         record = record if isinstance(record, Mapping) else {}
         verified = record.get("verified")
         marker = verified.get("manifest") if isinstance(verified, Mapping) else None
         recorded = record.get("manifest")
+        read = verified.get("space_id") if isinstance(verified, Mapping) else None
         if not (isinstance(marker, str) and marker == recorded and declared.get(space, recorded) == recorded):
             unverified.append(str(space))
+        elif not (isinstance(read, str) and isinstance(record.get("space_id"), str)):
+            unverified.append(str(space))  # no ID to bind the pass to: an older `up`'s, or a driver that records none
+        elif not read == record["space_id"] == current.get(space):
+            moved.append(str(space))
     if unverified:
         spaces = ", ".join(sorted(unverified))
         raise ShardsError(
             f"shard {shard.label}: its federation's ingested space(s) have no verified data: {spaces} "
             "(run `hpcfed.py verify-data` once the ingest is done)"
+        )
+    if moved:
+        spaces = ", ".join(sorted(moved))
+        raise ShardsError(
+            f"shard {shard.label}: its federation's ingested space(s) are not the ones verified: {spaces} "
+            "(a space made again since the pass holds none of its data: down, then up)"
         )
 
 

@@ -83,25 +83,34 @@ def brought_up(hpc, tmp_path, ca, name="fed", art=None):
 
 def test_o57_up_records_each_ingested_space_unverified_with_its_manifests_digest(hpc, tmp_path):
     """O57: the state file names the spaces awaiting verification, from the layout alone, each with the digest of the
-    manifest it will be verified against and no verdict yet; an undeclared one with the empty manifest's."""
+    manifest it will be verified against and no verdict yet; an undeclared one with the empty manifest's. Each has no
+    Onezone ID here (`space_id`): a core's phase that writes no facts file, as this stand-in, gives `up` none to record
+    (test_hpc_fed_space_identity.py runs `up` over a core's phase that does)."""
     declared = driver_over(hpc, tmp_path / "a", study_layout(tmp_path / "la"))
     declared.driver.up(hpc.settings.site_from_environment(site_env(tmp_path / "a", artifacts(tmp_path / "art"))))
-    assert ingested_state(declared) == {"delta-space": {"manifest": ONE.digest(), "declared": True, "verified": None}}
+    assert ingested_state(declared) == {
+        "delta-space": {"manifest": ONE.digest(), "declared": True, "space_id": None, "verified": None}
+    }
     plain = driver_over(hpc, tmp_path / "b", LAYOUT)
     plain.driver.up(hpc.settings.site_from_environment(site_env(tmp_path / "b", None)))
     empty = Manifest((), ()).digest()
-    assert ingested_state(plain) == {"delta-space": {"manifest": empty, "declared": False, "verified": None}}
+    assert ingested_state(plain) == {
+        "delta-space": {"manifest": empty, "declared": False, "space_id": None, "verified": None}
+    }
 
 
 def test_o57_verify_data_passes_on_matching_data_and_records_the_marker_bound_to_the_manifest(hpc, tmp_path, ca):
     """O57: after the ingest, each ingested space read through its owner holds exactly the declared manifest: the
-    state file gets a marker holding the manifest's digest and the counts, and the phase is unchanged."""
+    state file gets a marker holding the manifest's digest, the counts and the ID of the space that was read, and the
+    phase is unchanged."""
     fed = brought_up(hpc, tmp_path, ca)
     verify_stand_in(hpc, fed, {"delta-space": ONE})
     printed = fed.driver.verify_data()
     assert "every ingested space holds the data its manifest declares (1 space(s), 3 file(s))" in printed
     assert fed.driver.store.read()["phase"] == "linked"
-    assert ingested_state(fed)["delta-space"]["verified"] == {"manifest": ONE.digest(), "files": 3, "bytes": 14}
+    space_id = json.loads((fed.root / "facts.json").read_text(encoding="utf-8"))["spaces"]["delta-space"]["id"]
+    marker = {"manifest": ONE.digest(), "files": 3, "bytes": 14, "space_id": space_id}
+    assert ingested_state(fed)["delta-space"]["verified"] == marker
 
 
 @pytest.mark.parametrize(

@@ -68,6 +68,7 @@ from typing import Any
 
 from expcore.config.loading import ConfigError, Section
 from expcore_onedata.sandbox.apptainer.hidden import DEFAULT_MARGIN_BYTES
+from expcore_onedata.sandbox.cellpath import normal
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
@@ -176,6 +177,9 @@ class ApptainerSettings:
 
 
 def _own_target(target: str) -> bool:
+    """Whether `target` is, holds or lies under one of the sandbox's own, by the path it names (`cellpath.normal`):
+    `/etc/./hostname` and `//work` are as refused as the plain spellings."""
+    target = normal(target)
     return any(target == own or target.startswith(own + "/") for own in OWN_TARGETS) or target == "/"
 
 

@@ -11,6 +11,10 @@ So each verb runs in a session and process group of its own (`start_new_session`
 ended: SIGTERM, a short grace, then SIGKILL, so no `srun` client of the verb survives it. The group is signalled while
 its leader is still unreaped (a zombie holds the group id), so the id cannot belong to another process by then.
 
+The leader is kept unreaped on the way out as well: the verb's output is read from its pipes and its end awaited without
+reaping it (`subprocess`'s own `communicate` reaps), the stragglers are signalled while it is a zombie, and it is
+reaped last.
+
 The same goes for a verb that exits before its bound with a child still in its group (hpcfed failing while it ends
 its own step, say): the child is ended and the relay is told (`on_stragglers`), so that it opens the watch for the
 steps that child may already have asked for.
@@ -21,6 +25,7 @@ recorded in the federation's state file by the verb (`hpcslurm.Runner.spawn`); i
 
 import contextlib
 import os
+import selectors
 import signal
 import subprocess
 import time
@@ -108,6 +113,39 @@ def _release(process: "subprocess.Popen[str]") -> None:
                 pipe.close()
 
 
+def _read_to_the_end(process: "subprocess.Popen[str]", timeout_s: float) -> tuple[str, str]:
+    """What `process.communicate(timeout_s)` answers (output and errors as text, newlines translated, a byte that is no
+    character replaced), with one difference: the leader is not reaped. Both pipes are read to their end, then the
+    leader's end is awaited with `_exited` (no reaping), all within `timeout_s`; `subprocess.TimeoutExpired` at the
+    bound."""
+    assert process.stdout is not None
+    assert process.stderr is not None
+    deadline = time.monotonic() + timeout_s
+    chunks: dict[int, list[bytes]] = {process.stdout.fileno(): [], process.stderr.fileno(): []}
+    with selectors.DefaultSelector() as selector:
+        for pipe in (process.stdout, process.stderr):
+            selector.register(pipe, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout_s)
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fd, 1 << 16)
+                if chunk:
+                    chunks[key.fd].append(chunk)
+                else:
+                    selector.unregister(key.fileobj)  # its end: every holder of its write end has closed it
+    while not _exited(process.pid):
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(process.args, timeout_s)
+        time.sleep(_POLL_S)
+    texts = [
+        b"".join(chunks[pipe.fileno()]).decode(pipe.encoding, "replace").replace("\r\n", "\n").replace("\r", "\n")
+        for pipe in (process.stdout, process.stderr)
+    ]
+    return texts[0], texts[1]
+
+
 def run_in_group(
     argv: Sequence[str],
     *,
@@ -131,11 +169,15 @@ def run_in_group(
         start_new_session=True,
     )
     try:
-        out, err = process.communicate(timeout=timeout_s)
+        out, err = _read_to_the_end(process, timeout_s)
     except BaseException:  # the bound, or anything that interrupts the wait: nothing of the verb is left running
         end_group(process, grace_s)
         _release(process)
         raise
-    if end_stragglers(process.pid, grace_s) and on_stragglers is not None:
-        on_stragglers()
+    _release(process)  # both pipes are at their end: ours are closed
+    try:
+        if end_stragglers(process.pid, grace_s) and on_stragglers is not None:
+            on_stragglers()
+    finally:
+        process.wait()  # the leader, a zombie until now, is reaped after the last signal
     return CommandResult(process.returncode, out, err)

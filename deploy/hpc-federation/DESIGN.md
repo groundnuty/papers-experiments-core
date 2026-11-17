@@ -68,12 +68,16 @@ a port per federation would patch the shim, the guard and the images, for a plac
 answer. Asking the site for whole nodes (`--exclusive`) was the other option: it would change the held job's shape and
 what it bills (above), which this problem does not need.
 
-- **Which jobs.** Every live job of the account (`squeue --me`, read-only, ids, names, states and node lists) whose
+- **Which jobs.** Every live job of the account (`squeue --me -t <every state a job holds a node in>`, read-only, ids,
+  names, states and node lists; the states are named because squeue's default lists pending, running and completing
+  alone, which would miss a suspended job, and the call runs with no `SQUEUE_*` variable and none of Slurm's
+  output-format variables in its environment, so a login shell's own cannot hide a job) whose
   name starts with `hpcop-` (`hpcexclude.JOB_PREFIX`, the one prefix `up` names its jobs by, and the bundle's batch
   scripts carry): the held job, the agent's own job (`-sandbox`), the older scripts' `hpcop-zone` and `hpcop-provider`. A
   job is read whole, a heterogeneous job's components together, so another federation's agent's node is one of its nodes:
-  the agent's sandbox never runs on a node that hosts an Onedata service. A pending job holds none, a completing one still
-  does.
+  the agent's sandbox never runs on a node that hosts an Onedata service. A pending job holds none unless
+  it names its nodes (a list that cannot be expanded refuses, naming the job's own name, as one of any other state
+  does), a completing one still does.
 - **Before the submit** (section 5, step 2): the nodes of those jobs go to every component of every held job `up`
   submits as `--exclude`, named on every component so that nothing depends on Slurm passing it on, and only when there
   are some, so
@@ -443,10 +447,16 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 - **`data.ingested`** (O57, C06) names each space whose data is the study's own, put there after `up` (section 6a),
   written by `up` from the layout alone: `manifest` is the SHA-256 of the manifest it is to be verified against
   (`Manifest.digest()`: the declared file's, or the empty manifest's for a space that declares none), `declared` whether
-  the layout declares it, and `verified` is `null` until `hpcfed.py verify-data` has read the space back and found
-  exactly that manifest, then `{"manifest": <the digest it compared with>, "files": n, "bytes": n}`. **A state without
-  `data`** (an `up` of an earlier driver) cannot be shown verified, and `shards.py plan` refuses it. Every run of
-  `verify-data` sets `verified` back to `null` first, and a pass sets it again.
+  the layout declares it, `space_id` the space's Onezone ID (`null` until `up` has recorded it from the facts its core's
+  phase wrote, just before it says `linked`), and `verified` is `null` until `hpcfed.py verify-data` has read the space
+  back and found exactly that manifest, then `{"manifest": <the digest it compared with>, "files": n, "bytes": n,
+  "space_id": <the ID of the space it read>}`. **A state without `data`**, or a space with no `space_id` (an `up` of an
+  earlier driver), cannot be shown verified, and `shards.py plan` refuses it. Every run of `verify-data` sets `verified`
+  back to `null` first, and a pass sets it again. A rerun of the core's phase that finds another ID than the recorded
+  one (the space was deleted and made again by name, empty) clears the marker and leaves the phase `bootstrapped`.
+- **`core_unfinished`** (C06, O63) is `true` while a core phase runs and after one that failed or died, `false` after
+  one that returned: set before the phase runs, cleared only when it returns, under the core-phase lock. `up`'s own last
+  write reads it (below, "The core's phase holds the root's core-phase lock").
 - **`storage`** is `null` without a scratch root (`HPC_STORAGE_ROOT`, section 11), else the provider storage `up` makes
   on scratch, recorded before the first `mkdir`; `down` reads its paths here and nowhere else.
 - **Read and changed through one store** (`hpclaunch.StateStore`): `read()` the whole file; `update(fn)` a
@@ -659,7 +669,7 @@ site's shared filesystem (NFS) a file held open while it is removed becomes a si
 last close: the first live `down` held the lock inside the root it removed, which was then not empty. A lock file
 removed while held would let the next `up` or `down` lock another file of the same name, so it stays.
 
-**The core's phase holds the root's core-phase lock** (`<root>/core-phase.lock`, `flock`, never waited for) from its first read of the state to its last write of the phase: `up`'s own (in its process, or in the node's step under `[hpc] core = "step"`) and a rerun of it by hand (`hpcfed.py core`); `up`'s own write of `linked`, after its core phase, takes it too, so a rerun by hand that started in the step's teardown makes `up` fail with the federation `bootstrapped`, never `linked` over a check that has not ended. A second core phase on the root is refused at once, naming the state, and changes nothing. It is not the lifecycle lock, which `up` holds around the step. A rerun on a `linked` federation sets `bootstrapped` before the phase runs and `linked` again only if it returns (its link check passed, and the facts file, the layout's digest, the platform template's hash (`render-identity.json`) and the ingested spaces' manifests are what `up` recorded, so the rerun can vouch for the federation: otherwise it ends `bootstrapped` and says why); an overlapping second one would have read that `bootstrapped` as no rerun of a linked federation, and the first could have linked it over the second's failed check. The lock file is in the root and is closed when the phase ends, so `down` removes it with the root; it is no evidence.
+**The core's phase holds the root's core-phase lock** (`<root>/core-phase.lock`, `flock`, never waited for) from its first read of the state to its last write of the phase: `up`'s own (in its process, or in the node's step under `[hpc] core = "step"`) and a rerun of it by hand (`hpcfed.py core`); `up`'s own write of `linked`, after its core phase, takes it too, so a rerun by hand that started in the step's teardown makes `up` fail with the federation `bootstrapped`, never `linked` over a check that has not ended; the write is a compare-and-set (`bootstrapped` to `linked`: a `down`'s `stopping` is never overwritten), and `up` also fails when the state's `core_unfinished` is set, which a rerun that began after `up`'s own core phase and failed (or died) leaves, since that rerun leaves the phase `bootstrapped` as `up`'s own did. A second core phase on the root is refused at once, naming the state, and changes nothing. It is not the lifecycle lock, which `up` holds around the step. A rerun on a `linked` federation sets `bootstrapped` before the phase runs and `linked` again only if it returns (its link check passed, and the facts file, the layout's digest, the platform template's hash (`render-identity.json`) and the ingested spaces' manifests are what `up` recorded, so the rerun can vouch for the federation: otherwise it ends `bootstrapped` and says why); an overlapping second one would have read that `bootstrapped` as no rerun of a linked federation, and the first could have linked it over the second's failed check. The lock file is in the root and is closed when the phase ends, so `down` removes it with the root; it is no evidence.
 
 **`down`** (login node), whatever `up` reached:
 
@@ -856,7 +866,8 @@ read that dies half way, leaves none. On a pass it records the marker in
 **`shards.py plan` and `lines`** (`federation()`, so a shard is never planned past it) refuse a federation whose
 ingested spaces lack a marker bound to the manifest `up` recorded, and to the manifest the platform file names now (a
 file edited after the verification changes the hash the fingerprint carries, which the pass was not for), naming the
-shard and the spaces. A later ingest needs another `verify-data`: nothing watches the space after the pass. Reading
+shard and the spaces, and refuse a marker whose space ID is not the one `up` recorded and the platform file names now
+(a space made again since the pass holds none of its data), naming the shard and the spaces. A later ingest needs another `verify-data`: nothing watches the space after the pass. Reading
 every file's bytes through the owner holds each whole in memory (16 workers): a very large ingested file is the limit. `verify-data` runs on the login node, as `[hpc] core = "login"`
 runs the core's phase: it reaches the services' 8443 from there, and has no `core = "step"` form yet.
 

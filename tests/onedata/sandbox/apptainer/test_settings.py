@@ -1,11 +1,14 @@
 """O56: `[sandbox] backend = "apptainer"` and `[sandbox.apptainer]`: every file pinned, the Docker backend's tables
 refused, the hooks' entries checked, and a message that names the key, never a value or a path."""
 
+from pathlib import Path
+
 import pytest
 from sandbox_support import add_sandbox
 
 from expcore.config.loading import ConfigError, Section
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.sandbox.apptainer.settings import ApptainerSettings, Pinned, PinnedBind
 from expcore_onedata.sandbox.settings import FederationNetwork, load_sandbox
 
 SHA = "a" * 64
@@ -210,6 +213,42 @@ def test_o73_a_hook_bind_may_not_replace_the_cell_s_host_name(tmp_path):
     refused, as one onto the name server files is."""
     with pytest.raises(ConfigError, match="entry 0"):
         _load(tmp_path, _document(binds=[{"path": "f", "sha256": SHA, "target": "/etc/hostname"}]))
+
+
+# every spelling of a target that is, holds or lies under one of the sandbox's own once its `.` and empty parts are gone
+SPELLED_OWN = [
+    "/etc/./hostname", "/etc//hostname", "//work", "/./tmp", "///work", "/work/./x", "/etc/hosts/.",
+    "/dev/./shm", "/dev//shm/x", "/etc/./sandbox/ca.pem", "/etc/expcore//x", "/.", "//", "/./",
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("target", SPELLED_OWN)
+def test_o73_a_hook_bind_onto_one_of_the_sandboxs_own_targets_is_refused_however_it_is_spelled(tmp_path, target):
+    """O73 (Codex, 17 Nov 2026): the own-target check compared the text, so `/etc/./hostname` or `/etc//hostname`, which
+    name the protected file, went through to Apptainer; `//work` and `/./tmp` too, and `/.` and `//` (the root). The
+    path is normalised first, so each is refused as its plain spelling is."""
+    with pytest.raises(ConfigError, match="entry 0: target is one of the sandbox's own"):
+        _load(tmp_path, _document(binds=[{"path": "f", "sha256": SHA, "target": target}]))
+
+
+@pytest.mark.parametrize(
+    "target", ["/data/x", "/etc/other.conf", "/worker", "/tmpfiles", "/opt//extra", "/opt/./extra"]
+)
+def test_o73_a_hook_bind_elsewhere_is_taken_as_before_whatever_its_spelling(tmp_path, target):
+    """O73: normalising refuses nothing that is not the sandbox's own: a name that only starts like one (`/worker`,
+    `/tmpfiles`) is taken, and a harmless extra slash or `.` is kept as written, as it always was."""
+    loaded = _load(tmp_path, _document(binds=[{"path": "f", "sha256": SHA, "target": target}]))
+    assert [bind.target for bind in loaded.apptainer.binds] == [target]
+
+
+@pytest.mark.parametrize("target", ["/data/../etc/hostname", "/etc/./../work", "/a/b/../../tmp/x"])
+def test_o73_settings_built_in_code_refuse_a_target_that_leads_to_an_own_one_by_dots(target):
+    """O73: the dataclass checks its binds itself (a platform loaded from a file is checked as it is read, and an
+    `ApptainerSettings` made in code is checked here): a `..` that leads to an own target is refused as the plain
+    spelling is, though a file's `..` was already refused by the loader."""
+    pin = Pinned(Path("/x/f"), SHA)
+    with pytest.raises(ValueError, match="a bind's target is one of the sandbox's own"):
+        ApptainerSettings(pin, pin, pin, binds=(PinnedBind(pin, target),))
 
 
 def test_the_campaign_fingerprint_holds_the_backend_s_pins_and_docker_s_is_unchanged(tmp_path, fake):

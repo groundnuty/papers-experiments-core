@@ -50,6 +50,19 @@ def assignments(text):
     return found
 
 
+def cut_line(head):
+    """`head`, the first READ_BYTES of a file that is longer, without the line the bound cut, and that line's text."""
+    end = head.rfind(b"\n") + 1
+    return head[:end], head[end:].decode("utf-8", "replace").strip()
+
+
+def may_be(fragment, key):
+    """Whether the line the bound cut (`fragment`) may have been an assignment of `key`: it names the key before an `=`,
+    or ends inside the key's name, so the value that followed, or the one that was to, is not known."""
+    name, sign, _ = fragment.partition("=")
+    return bool(fragment) and (name.strip() == key if sign else key.startswith(name.strip()))
+
+
 def plain(value):
     """The value without one pair of quotes, or None when it is no plain value."""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -62,7 +75,11 @@ def read_os(path, unknown):
     out = {"id": UNKNOWN, "version_id": UNKNOWN}
     try:
         with open(path, "rb") as stream:
-            raw = stream.read(READ_BYTES)
+            # one byte more than the bound tells a longer file from one that ends at it
+            raw = stream.read(READ_BYTES + 1)
+        cut = ""
+        if len(raw) > READ_BYTES:
+            raw, cut = cut_line(raw[:READ_BYTES])
         text = raw.decode("utf-8")
         if "\x00" in text:
             raise UnicodeDecodeError("utf-8", raw, 0, 1, "a NUL byte")
@@ -74,7 +91,9 @@ def read_os(path, unknown):
         return out
     assigned = assignments(text)
     for field, key in (("id", "ID"), ("version_id", "VERSION_ID")):
-        if key not in assigned:
+        if may_be(cut, key):
+            unknown["os." + field] = "too long"
+        elif key not in assigned:
             unknown["os." + field] = "no " + key + " line"
         elif not assigned[key].strip("\"'"):
             unknown["os." + field] = "empty"

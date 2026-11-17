@@ -219,13 +219,31 @@ def clients_of(job: str, proc: str = "/proc") -> List[Client]:
     return found
 
 
+# squeue takes its defaults (the states, names, accounts and partitions it lists) from SQUEUE_* variables, and the
+# form of what Slurm's commands print from a few SLURM_* ones: a login shell that exported one (`SQUEUE_NAMES=x` hides
+# every federation job) would change what a read of the driver answers, and the guards that read the account's jobs
+# would fail open without a word. The commands `Runner.run` runs get an environment without them; every other variable,
+# the site's own SLURM_CONF and SBATCH_* among them, reaches them as it was.
+OUTPUT_FORMAT_VARIABLES = ("SLURM_TIME_FORMAT", "SLURM_BITSTR_LEN")
+
+
+def read_environment(environ: Mapping[str, str]) -> Dict[str, str]:
+    """`environ` without every SQUEUE_* variable and without Slurm's output-format variables."""
+    return {k: v for k, v in environ.items() if not k.startswith("SQUEUE_") and k not in OUTPUT_FORMAT_VARIABLES}
+
+
 class Runner:
     """Runs the commands on the login node. The tests replace it with a fake Slurm."""
 
     def run(self, argv: Sequence[str], timeout: float) -> Completed:
         try:
             done = subprocess.run(
-                list(argv), capture_output=True, timeout=timeout, check=False, stdin=subprocess.DEVNULL
+                list(argv),
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                env=read_environment(os.environ),
             )
         except subprocess.TimeoutExpired:
             raise SlurmError(f"{argv[0]} did not answer in {timeout:.0f} s") from None

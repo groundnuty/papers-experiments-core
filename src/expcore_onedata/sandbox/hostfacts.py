@@ -19,7 +19,9 @@ key is there only when something is unknown.
 
 The os-release file is read as text and never executed: it is a shell fragment, and sourcing one would run what a
 hostile line holds. Only its first 64 KiB are read, a line `KEY=value` is split by hand, a value loses one pair of
-quotes and must then be plain characters, and the last assignment of a key wins, as it would in a shell.
+quotes and must then be plain characters, and the last assignment of a key wins, as it would in a shell. A file longer
+than that is read to its last whole line: the line the bound cut is no line that was read, so a value cut inside is
+`unknown` ("too long") and never a prefix of itself, while the lines before it count as they would in a short file.
 
 `deploy/hpc-federation/bundle/nodefacts.py` makes the same readings on each node of an HPC federation for the driver's
 state, in a file of its own because it runs on a node's own Python with nothing of the core imported (3.9, standard
@@ -63,6 +65,19 @@ def _assignments(text: str) -> dict[str, str]:
     return found
 
 
+def _cut_line(head: bytes) -> tuple[bytes, str]:
+    """`head`, the first `READ_BYTES` of a file that is longer, without the line the bound cut, and that line's text."""
+    end = head.rfind(b"\n") + 1
+    return head[:end], head[end:].decode("utf-8", "replace").strip()
+
+
+def _may_be(fragment: str, key: str) -> bool:
+    """Whether the line the bound cut (`fragment`) may have been an assignment of `key`: it names the key before an `=`,
+    or ends inside the key's name, so the value that followed, or the one that was to, is not known."""
+    name, sign, _ = fragment.partition("=")
+    return bool(fragment) and (name.strip() == key if sign else key.startswith(name.strip()))
+
+
 def _plain(value: str) -> str | None:
     """The value without one pair of quotes, or None when it is no plain value."""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -75,7 +90,11 @@ def _os(path: str | os.PathLike[str], unknown: dict[str, str]) -> dict[str, str]
     out = {"id": UNKNOWN, "version_id": UNKNOWN}
     try:
         with open(path, "rb") as stream:
-            raw = stream.read(READ_BYTES)
+            # one byte more than the bound tells a longer file from one that ends at it
+            raw = stream.read(READ_BYTES + 1)
+        cut = ""
+        if len(raw) > READ_BYTES:
+            raw, cut = _cut_line(raw[:READ_BYTES])
         text = raw.decode("utf-8")
         if "\x00" in text:
             raise UnicodeDecodeError("utf-8", raw, 0, 1, "a NUL byte")
@@ -87,7 +106,9 @@ def _os(path: str | os.PathLike[str], unknown: dict[str, str]) -> dict[str, str]
         return out
     assigned = _assignments(text)
     for field, key in (("id", "ID"), ("version_id", "VERSION_ID")):
-        if key not in assigned:
+        if _may_be(cut, key):
+            unknown[f"os.{field}"] = "too long"
+        elif key not in assigned:
             unknown[f"os.{field}"] = f"no {key} line"
         elif not assigned[key].strip("\"'"):
             unknown[f"os.{field}"] = "empty"
