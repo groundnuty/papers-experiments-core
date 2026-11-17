@@ -7,10 +7,11 @@ start time) and the run's token files by their place in its directory. Its stop 
 everything it names is shown gone. So a driver killed outright leaves a record, and:
 
 * the next start on the same work root **reaps** every record whose owner is shown gone (`reap`): it SIGKILLs the
-  helpers it names and every process that carries the run's tag (a mount's oneclient included), removes the token
-  files first, unmounts whatever is still mounted in the run's directory (`fusermount3 -u`, then `-uz`), then removes
-  the directory, and drops the record once all of it is gone. A record whose owner lives, or whose owner cannot be
-  told gone, is never touched;
+  helpers it names and every process that carries the run's tag (a mount's oneclient included), removes the token files
+  first, kills every process that names the run's work disk image or carries its copy's tag (O71,
+  `workdisk.end_holders`), unmounts whatever is still mounted in the run's directory (`fusermount3 -u`, then `-uz`),
+  then removes the directory, and drops the record once all of it is gone. A record whose owner lives, or whose owner
+  cannot be told gone, is never touched;
 * the lease's **probe** (`ApptainerProbe.resource_gone`) says a key's sandbox is gone only when no record names the
   key, no run directory of the key is under the work root and no process carries a run tag of the key; anything it
   cannot read is not gone.
@@ -33,6 +34,7 @@ from expcore.campaign.lease import process_gone
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer.argv import RUN_TAG
 from expcore_onedata.sandbox.apptainer.node import NodeOps
+from expcore_onedata.sandbox.apptainer.workdisk import end_holders, image_path
 
 log = logging.getLogger(__name__)
 
@@ -198,6 +200,8 @@ def _reap_one(node: NodeOps, work_root: Path, document: Mapping[str, Any]) -> in
     left = _tagged(node, sid)
     if any(state is not False for state in states) or left is None or left:  # unknown is never gone
         raise SandboxError("a dead driver's helper or cell is not shown gone")
+    if os.path.lexists(image_path(run_dir)):  # a FUSE server of its work disk, say (O71): never left holding it
+        end_holders(node, image_path(run_dir), sid)
     _unmount_all(node, run_dir)  # a dead oneclient's FUSE mount, say (hook c): never removed from under a mount
     remove_tree(run_dir)
     drop(work_root, sid)

@@ -6,8 +6,8 @@
 backend = "apptainer"            # the Docker backend when absent
 work_root = "/node/tmpfs/dir"    # an existing 0700 directory of the driver's uid, not a link, on the node's tmpfs
 [sandbox.limits]                 # as for Docker; on this backend memory_bytes, tmp_bytes, shm_bytes and
-                                 # work_disk_bytes are the harness's watch's bounds, and cpus, pids, nofile and
-                                 # gate_memory_bytes are recorded, not enforced (facts.py)
+                                 # work_disk_bytes are the harness's watch's bounds, pids and gate_memory_bytes its
+                                 # polls', nofile a prlimit and cpus a taskset pin before each cell (limits.py, O70)
 [sandbox.data_paths]             # as for Docker; a mount level needs oneclient_bundle below
 
 [sandbox.apptainer]
@@ -25,6 +25,10 @@ memory_poll_s = 0.1              # optional, 0.02 to 1: the memory watch's perio
 disk_poll_s = 1.0                # optional, 0.1 to 10: the period of its walk of /work, /tmp and /dev/shm
 hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: anonymous memory nothing visible explains that
                                  # a cell may add before it is taken as past its limit (hidden.py)
+work_disk = "directory"          # optional (O71): "directory", /work a directory the watch bounds, or "image", /work an
+                                 # ext3 image of work_disk_bytes, a write past it refused with ENOSPC (workdisk.py)
+work_disk_mkfs = ["mkfs.ext3"]   # optional: the node's mkfs.ext3 (e2fsprogs 1.43 or later, for -d), for "image": ONE
+                                 # program word, a name or an absolute path, never an option (it is no experiment)
 preload =[{ path = "x.so", sha256 = "<64 hex>" }]   # optional (hook b): libraries the cell preloads BEFORE the egress
                                  # shim, so a connect hook's rewrite reaches the shim through RTLD_NEXT
 binds = [{ path = "f", sha256 = "<64 hex>", target = "/etc/x" }]   # optional (hook b): files bound read-only
@@ -55,7 +59,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -66,6 +70,10 @@ from expcore_onedata.sandbox.apptainer.hidden import DEFAULT_MARGIN_BYTES
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
+# a command word that is no option: none starts with "-"
+MKFS_PROGRAM = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]{0,127}")
+DEFAULT_MKFS = ("mkfs.ext3",)
+MKFS_ONE_PROGRAM = "must be exactly one program word (a name or an absolute path), never an option or a second word"
 PROVIDER_STORAGE_KINDS = ("tmpfs", "shared_filesystem")  # where the providers keep their data (O57)
 CELL_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,1023}")
 # the targets the sandbox binds itself, and those under which it binds: an extra bind may be none of them
@@ -73,6 +81,7 @@ OWN_TARGETS = ("/work", "/tmp", "/dev/shm", "/etc/hosts", "/etc/resolv.conf", "/
                "/etc/ld.so.preload", "/etc/sandbox", "/etc/expcore", "/hpcop-egress", "/hpcop-shim",
                "/expcore-preload")  # fmt: skip
 MARGIN_BOUNDS = (1 << 20, 64 << 30)  # hidden_memory_margin_bytes, in bytes
+WORK_DISKS = ("directory", "image")  # work_disk: the first is the default (O71)
 # the keys of the gate's configuration the sandbox writes itself (`gaterun.config`): gate_options may set none of them
 GATE_OWN_KEYS = frozenset(
     {"run_key", "verify_ssl", "log", "tls_dir", "hosts", "listing", "token_file", "token", "upstream_ca_file",
@@ -114,6 +123,8 @@ class ApptainerSettings:
     hidden_memory_margin_bytes: int = DEFAULT_MARGIN_BYTES
     oneclient_bundle: Pinned | None = None  # the host mount's oneclient (`hostmount`), a tar pinned by its SHA-256
     provider_storage: str | None = None  # one of PROVIDER_STORAGE_KINDS, or None: the platform does not say
+    work_disk: str = WORK_DISKS[0]  # O71: "directory" (the watch alone) or "image" (`workdisk.py`)
+    work_disk_mkfs: tuple[str, ...] = DEFAULT_MKFS
 
     def __post_init__(self) -> None:
         low, high = MARGIN_BOUNDS
@@ -122,6 +133,10 @@ class ApptainerSettings:
             raise ValueError(f"hidden_memory_margin_bytes must be a whole number of bytes from {low} to {high}")
         if self.provider_storage is not None and self.provider_storage not in PROVIDER_STORAGE_KINDS:
             raise ValueError(f"provider_storage must be one of {', '.join(PROVIDER_STORAGE_KINDS)}")
+        if self.work_disk not in WORK_DISKS:
+            raise ValueError(f"work_disk must be one of {', '.join(WORK_DISKS)}")
+        if not _is_mkfs_program(self.work_disk_mkfs):
+            raise ValueError(f"work_disk_mkfs {MKFS_ONE_PROGRAM}")
         clash = sorted(set(self.gate_options) & GATE_OWN_KEYS)
         if clash:
             raise ValueError(f"gate_options may not set {clash[0]!r}: the sandbox writes it itself")
@@ -150,6 +165,9 @@ class ApptainerSettings:
             **({"oneclient_bundle_sha256": self.oneclient_bundle.sha256} if self.oneclient_bundle is not None else {}),
             # the storage kind of the federation's providers, when declared (O57): tmpfs and scratch are two experiments
             **({"provider_storage": self.provider_storage} if self.provider_storage is not None else {}),
+            # the image is another experiment; the directory, the default, keeps the record it had (O71); the tool
+            # that makes the image is none
+            **({} if self.work_disk == WORK_DISKS[0] else {"work_disk": self.work_disk}),
         }  # fmt: skip
 
 
@@ -200,6 +218,25 @@ def _margin(section: Section) -> int:
     return value
 
 
+def _is_mkfs_program(words: Sequence[str]) -> bool:
+    """Whether `work_disk_mkfs` is the tool alone: exactly one word, a program's name or an absolute path, that is no
+    option. The file system's type and options shape the image, so no word may carry them (C06: the setting is out of
+    the fingerprint because it can name only where the node's mkfs is)."""
+    return len(words) == 1 and isinstance(words[0], str) and MKFS_PROGRAM.fullmatch(words[0]) is not None
+
+
+def _work_disk(section: Section) -> tuple[str, tuple[str, ...]]:
+    mode = section.data.get("work_disk", WORK_DISKS[0])
+    if mode not in WORK_DISKS:
+        raise section.fail("work_disk", f"must be one of {', '.join(WORK_DISKS)}")
+    if "work_disk_mkfs" in section.data and not isinstance(section.data["work_disk_mkfs"], list):
+        raise section.fail("work_disk_mkfs", "must be an array holding one program word")
+    words = section.strings("work_disk_mkfs") if "work_disk_mkfs" in section.data else DEFAULT_MKFS
+    if not _is_mkfs_program(words):
+        raise section.fail("work_disk_mkfs", MKFS_ONE_PROGRAM)
+    return mode, words
+
+
 def _gate_options(section: Section) -> Mapping[str, Any]:
     options = section.table("gate_options")
     clash = sorted(set(options) & GATE_OWN_KEYS)
@@ -222,7 +259,7 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
         ("apptainer", "image", "image_sha256", "python", "host_python", "egress_shim", "egress_shim_sha256",
          "egress_collector", "egress_collector_sha256", "memory_poll_s", "disk_poll_s", "preload", "binds",
          "gate_options", "hidden_memory_margin_bytes", "oneclient_bundle", "oneclient_bundle_sha256",
-         "provider_storage")
+         "provider_storage", "work_disk", "work_disk_mkfs")
     )  # fmt: skip
     words = section.strings("apptainer") or ("apptainer",)
     if any(not COMMAND_WORD.fullmatch(word) for word in words):
@@ -239,6 +276,7 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
         lists[key] = [_entry_pin(section, key, n, e, base, target=key == "binds") for n, e in enumerate(value)]
     declared = "oneclient_bundle" in section.data or "oneclient_bundle_sha256" in section.data
     bundle = _pinned(section, base, "oneclient_bundle") if declared else None
+    work_disk, mkfs = _work_disk(section)
     targets = [b.target for b in lists["binds"]]
     if len(set(targets)) != len(targets):
         raise section.fail("binds", "names a target twice")
@@ -258,6 +296,8 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
             hidden_memory_margin_bytes=_margin(section),
             oneclient_bundle=bundle,
             provider_storage=_provider_storage(section),
+            work_disk=work_disk,
+            work_disk_mkfs=mkfs,
         )
     except ValueError as error:  # the dataclass's own checks, which the loader already made: never a value
         raise ConfigError(f"{section.file}: {section.where}: {error}") from None

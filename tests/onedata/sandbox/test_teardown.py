@@ -2,6 +2,7 @@
 
 import pytest
 from fake_host import FakeHost
+from sandbox_support import before_first_signal
 
 from expcore_onedata.sandbox import netpool, teardown
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -76,6 +77,33 @@ def test_o15_the_readers_are_signalled_without_the_init_and_its_sleep(world):
     run_teardown(world)
     signalled = {pid for call in world.calls if call[0] == "run" and call[1][0] == "kill" for pid in call[1][3:]}
     assert signalled == {"22", "23"}
+
+
+def test_o72_a_reader_whose_pid_another_process_took_since_the_listing_is_never_signalled(world):
+    """O72: the teardown lists the agent's readers and signals them (TERM, then KILL for what is left) by pid; a pid
+    given to another process in between is spared by both."""
+
+    def give_pid_23_away() -> None:
+        agent = world.containers[AGENT]
+        world.add_stat(23, "gate", 1, start=999_999)  # another process holds the pid, outside the container
+        world.add_cgroup(agent, [agent.pid, 21, 22])
+
+    before_first_signal(world, give_pid_23_away)
+    run_teardown(world)
+    signalled = {pid for call in world.calls if call[0] == "run" and call[1][0] == "kill" for pid in call[1][3:]}
+    assert signalled == {"22"}
+
+
+def test_o72_a_reader_whose_identity_cannot_be_read_is_not_signalled_and_stays_on_the_record(world):
+    """O72: no identity, no signal: the reader is left running, and the teardown's own log says so, so the survivors it
+    reports are the ones it could not signal as well as the ones that outlived the signal."""
+    world.denied.add("/proc/23/cmdline")
+    result = run_teardown(world)
+    signalled = {pid for call in world.calls if call[0] == "run" and call[1][0] == "kill" for pid in call[1][3:]}
+    assert signalled == {"22"}
+    term = next(r for r in result.log if r["step"] == "readers" and r.get("signal") == "TERM")
+    assert term["declined"] == 1
+    assert 23 in [p["pid"] for p in term["left_procs"]]
 
 
 def test_o15_every_step_is_verified_by_reading_the_state_again(world):

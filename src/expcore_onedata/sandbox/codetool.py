@@ -18,8 +18,12 @@ attribute to the agent (its own memory limit, its own time limit) is the agent's
 such. A kill the counters attribute to the host or a component, or that nothing attributes, is infrastructure: it
 raises `InfraError` of kind `sandbox` or `unattributed_kill` and ends the attempt (O17). A cell during which the data
 gate refused an answer for its own integrity raises `InfraError` of kind `data_gate_integrity`, which no condition can
-treat (O05, C01). A cell a process of which outlived its kill at the cell's deadline raises `InfraError` of kind
-`cell_unkillable`, before anything else, which no condition can treat either (O34).
+treat (O05, C01). A cell a process of which outlived its kill at the cell's own deadline ended the run (O34), and the
+run's ending is the run's, never the cell's: the cell ran, and hit its deadline, so the call returns what a cell that
+hit its deadline returns, a timeout with the output it kept and the exec's check, and a record never says a call was
+skipped when it ran (O72). The refusal of every later call, and `launch` or the collection when the body is over,
+raise `InfraError` of kind `cell_unkillable`, which no condition can treat (O34); nothing read from the run after an
+abort or a stop is the cell's evidence, so no refusal of the gate is read into that cell's call.
 
 What is kept of a cell's output is capped per stream by the sandbox (`cells.OUTPUT_CAP_BYTES`, O43). When it cut
 one, the text this tool returns ends with a notice that says how much of each cut stream was written and how much kept,
@@ -75,13 +79,15 @@ class CodeExecutionProvider:
                 "the argument 'code' must be a non-empty string", is_error=True, error_class="bad_arguments"
             )
         result = await asyncio.to_thread(self._sandbox.exec, code, max(float(timeout_s), MIN_TIMEOUT_S))
-        # a cell that outlived its kill first (O34): its mount or its sandbox is gone, and nothing read after that, the
-        # gate's log included, is the cell's evidence; then the gate's refusal: its read was cut by the gate
-        failure = (
-            kinds.deadline_error(result.kill) or kinds.gate_error(result.gate_refusals) or kinds.kill_error(result.kill)
-        )
-        if failure is not None:
-            raise failure
+        # a cell that outlived its kill at its deadline ended the run (O34), and the run's ending is said by the next
+        # call, `launch` and the collection (`run_ended_error`): this call keeps its own result, a timeout (O72). Its
+        # mount or its sandbox is gone, and nothing read after that, the gate's log included, is the cell's evidence.
+        # Any other cell: the gate's refusal first, since its read was cut by the gate, then a kill nothing but the
+        # harness explains
+        if kinds.deadline_error(result.kill) is None:
+            failure = kinds.gate_error(result.gate_refusals) or kinds.kill_error(result.kill)
+            if failure is not None:
+                raise failure
         return self._output(result)
 
     @classmethod

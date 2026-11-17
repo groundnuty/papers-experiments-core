@@ -46,7 +46,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import Any, Protocol
 
 KILLED = "killed"  # every process of the cell ended within the grace of its kill
@@ -59,6 +59,7 @@ ESCALATED = (SURVIVED, MOUNT_ABORTED, SANDBOX_STOPPED)  # each makes the attempt
 # order the same stop, so their order never changes what is done; `survived_kill`, where nothing shows the cell gone, is
 # above them all
 SEVERITY = (KILLED, MOUNT_ABORTED, SANDBOX_STOPPED, SURVIVED)
+SWEEP = "end_of_cell_sweep"  # what ended a run that no deadline ended: the sweep after a cell found a survivor (O72)
 STOPS = (SURVIVED, SANDBOX_STOPPED)  # each orders the sandbox's stop: the caller runs it once the outcome is recorded
 KILL_ROUNDS = 5  # a forking worker can start a child between a listing and the kill: listed again until none is new
 POLL_S = 0.25
@@ -76,11 +77,14 @@ def margin_s(grace_s: float) -> float:
 
 class Tracker(Protocol):
     """The cell's processes: `processes` lists them now (None when they cannot be listed in `timeout_s`), `kill`
-    SIGKILLs these within `timeout_s`."""
+    SIGKILLs these within `timeout_s` and answers with the `key_of` of each that the signal reached (a signal sent, or
+    its process found gone); None says every one was reached. A process whose signal did not reach it (the privileged
+    half signals a pid only while it is still the process listed, O72) is not marked done: it is listed and tried
+    again, never counted as signalled."""
 
     def processes(self, timeout_s: float) -> list[dict[str, Any]] | None: ...
 
-    def kill(self, procs: list[dict[str, Any]], timeout_s: float) -> None: ...
+    def kill(self, procs: list[dict[str, Any]], timeout_s: float) -> Collection[tuple[Any, ...]] | None: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,8 +103,11 @@ class Escalation:
         return margin_s(self.grace_s)
 
 
-def _key(proc: dict[str, Any]) -> tuple[Any, Any]:
-    return proc["pid"], proc.get("start")
+def key_of(proc: dict[str, Any]) -> tuple[Any, Any, Any]:
+    """What identifies a listed process: its pid, its start tick and, where the listing reads it, the digest of its
+    command line. A process that execs between two listings has another key, so it is signalled again as what it is
+    now (O72)."""
+    return proc["pid"], proc.get("start"), proc.get("cmd_sha256")
 
 
 class _Run:
@@ -108,7 +115,8 @@ class _Run:
 
     def __init__(self, tracker: Tracker, esc: Escalation) -> None:
         self.tracker, self.esc = tracker, esc
-        self.seen: set[tuple[Any, Any]] = set()
+        self.seen: set[tuple[Any, Any, Any]] = set()  # the processes a signal reached
+        self.unreached: set[tuple[Any, Any]] = set()  # the (pid, start) of what was asked for and is not reached yet
         self.doing: str | None = None  # the command under way, named when it raises
         self.reached = KILLED  # the most severe step taken: no outcome is less (`reach`, `done`)
         self.t0 = esc.clock()
@@ -142,13 +150,19 @@ class _Run:
         return result
 
     def kill_new(self, procs: list[dict[str, Any]], until: float) -> int:
-        """SIGKILL what was not signalled yet, within the time left until `until`; how many that was."""
-        fresh = [p for p in procs if _key(p) not in self.seen]
+        """SIGKILL what was not reached yet, within the time left until `until`; how many were reached. A process the
+        tracker says it did not reach is kept in `unreached`, not marked done, and asked for again by the next call."""
+        fresh = [p for p in procs if key_of(p) not in self.seen]
         budget = self.left(until)
         if fresh and budget > 0:
-            self.command("kill", self.tracker.kill, fresh, budget)
-            self.seen.update(_key(p) for p in fresh)
-            return len(fresh)
+            answer = self.command("kill", self.tracker.kill, fresh, budget)
+            asked = {key_of(p) for p in fresh}
+            done = asked if answer is None else asked & set(answer)
+            self.seen.update(done)
+            # by pid and start, not by key: a process declined as it execed and reached under its new command line is
+            # one process, and is no longer unreached
+            self.unreached = (self.unreached | {key[:2] for key in asked}) - {key[:2] for key in self.seen}
+            return len(done)
         return 0
 
     def kill(self) -> list[dict[str, Any]] | None:
@@ -164,7 +178,11 @@ class _Run:
                 break
         else:
             procs = self.listing(self.end)
-        self.step("kill", signalled=signalled if self.seen or procs is not None else None)
+        self.step(
+            "kill",
+            signalled=signalled if self.seen or procs is not None else None,
+            **({"unreached": len(self.unreached)} if self.unreached else {}),
+        )
         return procs
 
     def wait(self, left: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:

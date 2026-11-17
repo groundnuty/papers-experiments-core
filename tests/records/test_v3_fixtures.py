@@ -424,3 +424,57 @@ def test_o56_the_ninth_fixture_pins_a_process_visibility_snapshot_and_the_eight_
     assert replay_record(record).dumps().encode("utf-8") == ninth[0].read_bytes()
     for earlier in FIXTURES[:8]:
         assert NAMESPACE not in load_record(earlier).instruments
+
+
+def test_o72_the_tenth_fixture_pins_a_cell_that_ran_and_a_run_the_end_of_cell_sweep_ended():
+    """O72 and R03: the tenth merge point adds no field. Its fixture, written by the code of that merge through the real
+    agent loop over the code tool and a Docker sandbox on the fake host, is the case a study's post-check reads: a cell
+    whose exec returned normally (its exit status, its output and its completion record on the call), then a sweep that
+    could not end a worker the cell left. The cell's call is that result, whole; the attempt's outcome is the run's
+    ending, infrastructure of kind `cell_unkillable` whose detail names the end-of-cell sweep and the cell it followed,
+    and the agent's next call is the one the run refused. It validates and replays to its own bytes (the parametrized
+    tests above)."""
+    tenth = [p for p in FIXTURES if p.name.startswith("10-")]
+    assert [p.name for p in tenth] == ["10-sweep-survivor.json"]
+    record = load_record(tenth[0])
+    cell, refused = record.tool_calls
+    assert (cell["name"], cell["status"], cell["text"], cell["error_class"]) == (
+        "python",
+        "ok",
+        "worker started\n",
+        None,
+    )
+    assert cell["exec_check"] == {"source_whole": True, "exit_status": 0, "nonce_matched": True}
+    assert (refused["status"], refused["detail"]) == ("failed", "infrastructure: cell_unkillable")
+    assert "exec_check" not in refused
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "cell_unkillable")
+    assert "end-of-cell sweep after cell 1" in record.outcome["detail"]
+    assert "deadline" not in record.outcome["detail"]
+    assert replay_record(record).dumps().encode("utf-8") == tenth[0].read_bytes()
+
+
+def test_o72_the_eleventh_fixture_pins_a_cell_that_hit_its_deadline_and_a_run_that_deadline_ended():
+    """O72 and R03: the eleventh merge point adds no field. Its fixture, written by the code of that merge through the
+    real agent loop over the code tool and a Docker sandbox on the fake host, is the other case a study's post-check
+    reads: a cell that hit its own deadline, whose kill could not end a process of it. The cell's call is what it did,
+    a timeout of a call that ran (its kept output, the killed exec's check), never one the loop skipped; the run's
+    ending is the outcome's, infrastructure of kind `cell_unkillable` whose detail names that cell's deadline, with the
+    agent's next call the one the run refused, as in the tenth. It validates and replays to its own bytes (the
+    parametrized tests above)."""
+    eleventh = [p for p in FIXTURES if p.name.startswith("11-")]
+    assert [p.name for p in eleventh] == ["11-deadline-unkillable.json"]
+    record = load_record(eleventh[0])
+    cell, refused = record.tool_calls
+    assert (cell["name"], cell["status"], cell["error_class"], cell["detail"]) == ("python", "error", "timeout", "")
+    assert cell["text"] == "timeout: partial output\nthe code did not finish within the time limit and was stopped"
+    assert cell["exec_check"] == {"source_whole": None, "exit_status": None, "nonce_matched": False}
+    assert (refused["status"], refused["error_class"], refused["detail"]) == (
+        "failed",
+        "skipped",
+        "infrastructure: cell_unkillable",
+    )
+    assert "exec_check" not in refused
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "cell_unkillable")
+    assert "cell 1's deadline (survived_kill)" in record.outcome["detail"]
+    assert "sweep" not in record.outcome["detail"]
+    assert replay_record(record).dumps().encode("utf-8") == eleventh[0].read_bytes()
