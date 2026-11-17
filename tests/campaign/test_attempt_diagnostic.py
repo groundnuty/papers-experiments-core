@@ -137,7 +137,8 @@ def test_c40_a_redaction_that_raises_is_recorded_as_failed_and_costs_nothing():
         raise RuntimeError("no redactor")
 
     kept = snapshot_of(failed_start(), broken)
-    assert kept == {"phase": "start", "instrument": "state_inducer", "ok": False, "error": "RuntimeError"}
+    # the instrument's name is the study's own word and cannot be redacted here, so it is not kept; the phase is not
+    assert kept == {"phase": "start", "ok": False, "error": "RuntimeError"}
 
 
 def test_c40_an_infra_error_subclass_that_skips_the_base_initialiser_is_still_named_and_kept():

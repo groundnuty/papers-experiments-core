@@ -84,12 +84,14 @@ def snapshot_of(
 
 def _head(origin: Any, redactor: Callable[[], Redactor]) -> dict[str, Any]:
     """The phase and the instrument a snapshot that holds no evidence keeps, redacted like the rest (an instrument's
-    name can be any word, a secret's value among them); empty when they cannot be redacted: none is kept unredacted."""
+    name can be any word, a secret's value among them). When they cannot be redacted only the phase is kept: it is the
+    literal `start_instruments` sets, never a name the study chose."""
+    held = dict(origin or {})
     try:
-        redacted, _ = redactor().structure(dict(origin or {}))
+        redacted, _ = redactor().structure(held)
         return dict(redacted)
     except Exception:
-        return {}
+        return {"phase": held["phase"]} if held.get("phase") == "start" else {}
 
 
 def exported(store: Any, conditions: Mapping[str, str], models: Mapping[str, str]) -> list[dict[str, Any]] | None:
