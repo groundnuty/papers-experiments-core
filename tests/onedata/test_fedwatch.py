@@ -291,6 +291,34 @@ def test_o86_a_service_not_running_at_the_end_is_down_and_a_finding_unless_an_op
     assert result["services"]["providers[0]"]["end"]["exit_code"] == 137
 
 
+def test_o86_a_container_inspection_that_lacks_a_field_is_unknown_never_stable(tmp_path):
+    """O86: an inspection without RestartCount or StartedAt cannot show a restart; the parser's defaults are not
+    readings, so the service is unknown at both ends and the window is not stable."""
+    containers = steady()
+    containers.by_service[ALPHA] = {"Id": "ctr-a", "State": {"Status": "running", "Running": True}}
+    watch = compose_watch(containers, tmp_path)
+    result = watch.window(watch.read())
+    seen = result["services"]["providers[0]"]
+    assert seen["status"] == "unknown"
+    assert any("lacks a field" in reason for reason in seen["unknown"])
+    assert result["verdict"] == "unknown"
+
+
+def test_o86_a_service_with_no_container_is_unknown_not_down(tmp_path):
+    """O86: a service `docker compose ps` lists no container for was removed or never made: unknown with the reason,
+    and an open injection of it explains nothing (an injection's stop leaves its container)."""
+    containers = steady()
+    watch = compose_watch(containers, tmp_path)
+    start = watch.read()
+    containers.by_service[ALPHA] = None
+    injection(journal_of(tmp_path), ALPHA, clears=None)
+    result = watch.window(start)
+    seen = result["services"]["providers[0]"]
+    assert seen["status"] == "unknown"
+    assert any("no container" in reason for reason in seen["unknown"])
+    assert result["verdict"] == "unknown"
+
+
 def test_o86_an_unreadable_container_is_unknown_with_a_reason_never_stable(tmp_path):
     """O86: the daemon cannot be reached for one service at the end: that service is unknown with the reason, the
     window is unknown, and no other verdict hides it."""
@@ -538,6 +566,38 @@ def test_o86_a_restart_outside_the_driver_behind_an_injection_is_a_second_restar
     injection(journal_of(tmp_path), ALPHA)
     seen = watch.window(start)["services"]["providers[0]"]
     assert [(r["label"], r["explained"]) for r in seen["restarts"]] == [("outage", True), ("finding", False)]
+
+
+def test_o86_an_outside_restart_is_counted_though_the_state_already_named_another_step_at_the_start(tmp_path):
+    """O86: the state already named another step than the one listed at the start. In the window one injection launched
+    a step and a restart outside the driver replaced it: the end still differs from the state, so the injection
+    explains one restart and the other is a finding."""
+    cluster = hpc_steady()
+    cluster.services[ALPHA] = hpc_record("4242.8", launch=1, state_differs=True)
+    watch = hpc_watch(cluster, tmp_path)
+    start = watch.read()
+    cluster.services[ALPHA] = hpc_record(
+        "4242.10", launch=2, started="2026-11-17T03:40:00", stops=1, state_differs=True
+    )
+    injection(journal_of(tmp_path), ALPHA)
+    seen = watch.window(start)["services"]["providers[0]"]
+    assert [(r["label"], r["explained"]) for r in seen["restarts"]] == [("outage", True), ("finding", False)]
+
+
+def test_o86_a_launch_counter_that_went_backwards_explains_nothing(tmp_path):
+    """O86: the state's launch fell between the readings while the step changed: the restarts cannot be counted, so
+    even a journalled injection with a recorded stop leaves it a finding, and the service is unknown."""
+    cluster = hpc_steady()
+    cluster.services[ALPHA] = hpc_record("4242.8", launch=3)
+    watch = hpc_watch(cluster, tmp_path)
+    start = watch.read()
+    cluster.services[ALPHA] = hpc_record("4242.9", launch=2, started="2026-11-17T03:00:00", stops=1)
+    injection(journal_of(tmp_path), ALPHA)
+    result = watch.window(start)
+    seen = result["services"]["providers[0]"]
+    assert [(r["label"], r["explained"]) for r in seen["restarts"]] == [("finding", False)]
+    assert seen["status"] == "unknown"
+    assert result["verdict"] == "finding"
 
 
 def test_o86_an_hpc_step_that_slurm_cannot_read_is_unknown_with_its_reason(tmp_path):

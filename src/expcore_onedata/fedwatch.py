@@ -126,8 +126,8 @@ class ComposeSource:
             seen = self._driver.inspect_state(service)
         except Exception as error:  # a read that cannot be made is unknown, whatever stopped it
             return {"unknown": [_reason(error)]}
-        if seen is None:
-            return {"running": False, "notes": ["the service has no container"]}
+        if seen is None:  # removed or never made: not a state to read, and nothing an injection's stop leaves
+            return {"unknown": ["the service has no container"]}
         running = seen["running"] and not seen["restarting"] and not seen["paused"]
         never = "0001-01-01T00:00:00Z"
         return {
@@ -349,6 +349,7 @@ class _Change:
     exact: bool
     policy: int
     odd: list[str]
+    cannot: str
 
 
 def _change(before: Mapping[str, Any], after: Mapping[str, Any]) -> _Change:
@@ -363,21 +364,28 @@ def _change(before: Mapping[str, Any], after: Mapping[str, Any]) -> _Change:
     policy = 0
     if isinstance(before["restart_count"], int) and isinstance(after["restart_count"], int):
         policy = max(0, after["restart_count"] - before["restart_count"])
-    launches = None
+    launches, backwards = None, False
     if isinstance(before["launch"], int) and isinstance(after["launch"], int):
         launches = after["launch"] - before["launch"]
         if launches < 0:
             odd.append("the launch counter went backwards between the readings")
-            launches = None
+            launches, backwards = None, True
     if launches and not (moved or started):
         odd.append("the launch counter rose while the step did not change: a start may be in flight")
-    if launches is None:  # Compose, or no counter: one change seen, at least one restart
-        outside = int(after["unrecorded"] and not before["unrecorded"])  # a step the state does not name
+    # a step squeue lists that the state does not name at the end, and which is not the one listed at the start (or that
+    # moved since): a restart the driver did not make, whatever the driver launched
+    outside = int(bool(after["unrecorded"]) and bool(moved or started or not before["unrecorded"]))
+    named = "the state file names another step than the one squeue lists: a restart the driver did not make"
+    if launches is None:  # Compose, or no usable counter: one change seen, at least one restart
         count = max(int(bool(moved or started or policy)), policy, outside)
-        return _Change(count, count - outside, False, policy, odd)
-    # HPC: the driver's launches are the restarts it made; a step listed that its state does not name is one it did not
-    unrecorded = int(((moved or started) and launches == 0) or (after["unrecorded"] and not before["unrecorded"]))
-    return _Change(launches + unrecorded, launches, True, 0, odd)
+        if backwards:
+            return _Change(
+                count, 0, False, policy, odd, "the launch counter went backwards: restarts cannot be counted"
+            )
+        return _Change(count, count - outside, False, policy, odd, named)
+    # HPC: the driver's launches are the restarts it made; a step it does not name is one it did not make
+    unrecorded = int(bool(outside) or (bool(moved or started) and launches == 0))
+    return _Change(launches + unrecorded, launches, True, 0, odd, named)
 
 
 def _restarts(
@@ -400,7 +408,7 @@ def _restarts(
     held = window.held(member.service, bool(before["running"]))
     capacity, short = min(len(held), change.eligible), "no journalled injection of it is left"
     if change.eligible < change.count:
-        short = "the state file names another step than the one squeue lists: a restart the driver did not make"
+        short = change.cannot
     if isinstance(before["stops"], int) and isinstance(after["stops"], int):  # HPC: a running service owes a stop
         allowed = max(after["stops"] - before["stops"], 0) + (0 if before["running"] else 1)
         if allowed < capacity:

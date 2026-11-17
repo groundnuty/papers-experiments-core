@@ -23,7 +23,18 @@ def hpc():
 class Cluster:
     """The login node's `squeue -s` and `sacct` for one job; every command is kept, and only these two are answered."""
 
-    def __init__(self, listed=(), accounting=(), squeue_rc=0, sacct_rc=0, squeue_err="", sacct_err=""):
+    def __init__(
+        self,
+        listed=(),
+        accounting=(),
+        squeue_rc=0,
+        sacct_rc=0,
+        squeue_err="",
+        sacct_err="",
+        squeue_text=None,
+        sacct_text=None,
+    ):
+        self.squeue_text, self.sacct_text = squeue_text, sacct_text  # an answer as it is printed, when a test gives one
         self.listed = list(listed)  # (step id, name) squeue -s lists
         self.accounting = list(accounting)  # (id, name, state, start, end, exit code) sacct holds
         self.squeue_rc, self.sacct_rc, self.squeue_err, self.sacct_err = squeue_rc, sacct_rc, squeue_err, sacct_err
@@ -36,11 +47,15 @@ class Cluster:
         if argv[0] == "squeue" and "-s" in argv:
             if self.squeue_rc:
                 return Completed(self.squeue_rc, "", self.squeue_err)
+            if self.squeue_text is not None:
+                return Completed(0, self.squeue_text, "")
             lines = ["4242.batch batch", "4242.extern extern", *(f"{i} {n}" for i, n in self.listed)]
             return Completed(0, "".join(f"{line}\n" for line in lines), "")
         if argv[0] == "sacct":
             if self.sacct_rc:
                 return Completed(self.sacct_rc, "", self.sacct_err)
+            if self.sacct_text is not None:
+                return Completed(0, self.sacct_text, "")
             rows = [("4242.batch", "batch", "RUNNING", "2026-11-17T01:00:00", "Unknown", "0:0"), *self.accounting]
             return Completed(0, "".join("|".join(row) + "\n" for row in rows), "")
         raise AssertionError(f"a command that is not a read: {argv}")
@@ -111,6 +126,24 @@ def test_o86_a_read_that_fails_is_unknown_with_its_reason_never_running(hpc, clu
     assert seen["state"] is None
     assert seen["unknown"]
     assert "squeue" in seen["unknown"] or "sacct" in seen["unknown"]
+
+
+@pytest.mark.parametrize(
+    "cluster",
+    [
+        Cluster(listed=[("4242.7", "svc-run-1")], sacct_text="4242.7|svc-run-1|RUNNING\n"),
+        Cluster(listed=[("4242.7", "svc-run-1")], sacct_text="garbage that is not a row\n"),
+        Cluster(listed=[("4242.7", "svc-run-1")], sacct_text=""),
+        Cluster(listed=[("4242.7", "svc-run-1")], accounting=[row("4242.7")], squeue_text="4242.7\n"),
+    ],
+    ids=["truncated row", "not a row", "no row at all", "unreadable squeue row"],
+)
+def test_o86_an_answer_that_cannot_be_read_is_unknown_never_the_lag_of_accounting(hpc, cluster):
+    """O86: a Slurm command that succeeds and prints a row that is not one (cut short, or garbage), or prints nothing
+    for a job that has rows, is no answer: the step is unknown, not running with accounting a little behind."""
+    seen = slurm_of(hpc, cluster).step_observed("4242.7", "svc-run-1")
+    assert seen["running"] is None
+    assert seen["unknown"]
 
 
 def test_o86_a_command_that_times_out_is_unknown(hpc):

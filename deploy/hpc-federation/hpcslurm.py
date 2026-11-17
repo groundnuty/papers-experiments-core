@@ -672,8 +672,12 @@ class Slurm:
             raise SlurmError("squeue -s failed with status %s" % done.returncode)
         found = {}
         for line in done.stdout.splitlines():
+            if not line.strip():
+                continue
             match = STEP_LINE.fullmatch(line.strip())
-            if match and not match.group(1).endswith((".batch", ".extern")):
+            if match is None:  # a row that is not one is an answer that cannot be read, never an absent step
+                raise SlurmError("squeue -s answered something unreadable")
+            if not match.group(1).endswith((".batch", ".extern")):
                 found[match.group(1)] = match.group(2)
         return found
 
@@ -686,9 +690,15 @@ class Slurm:
         if done.returncode != 0:
             raise SlurmError("sacct failed with status %s" % done.returncode)
         rows = []
+        seen = 0
         for line in done.stdout.splitlines():
+            if not line.strip():
+                continue
             parts = line.split("|")
-            if len(parts) != 6 or parts[0] != step_id:
+            if len(parts) != 6:  # a row that is not one is an answer that cannot be read, never accounting's lag
+                raise SlurmError("sacct answered something unreadable")
+            seen += 1
+            if parts[0] != step_id:
                 continue
             words = parts[2].split()
             state = words[0] if words else ""
@@ -697,6 +707,8 @@ class Slurm:
                 status, killed = (int(part) for part in parts[5].split(":"))
                 code = 128 + killed if killed else status
             rows.append((state, _slurm_time(parts[3]), _slurm_time(parts[4]), code))
+        if not seen:  # the job itself has rows (its batch step at least): none at all is no record of it
+            raise SlurmError("accounting holds no record of the job")
         return rows
 
     def _finish(self, process: Process, step: Step, timeout_s: float) -> Completed:

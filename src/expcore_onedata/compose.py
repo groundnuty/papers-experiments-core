@@ -180,7 +180,21 @@ class ComposeDriver:
         state = parse_inspect(shown.stdout)
         if state is None:
             raise DriverError("the container's inspection could not be read")
-        health = json.loads(shown.stdout)[0]["State"].get("Health")
+        document = json.loads(shown.stdout)[0]
+        running = document["State"]
+        # `parse_inspect` supplies a default for a field Docker did not give; a reading of restarts has none to give
+        complete = (
+            isinstance(document.get("RestartCount"), int)
+            and not isinstance(document.get("RestartCount"), bool)
+            and isinstance(running.get("Running"), bool)
+            and isinstance(running.get("StartedAt"), str)
+            and bool(running["StartedAt"])
+            and isinstance(running.get("FinishedAt"), str)
+            and isinstance(running.get("ExitCode"), int)
+        )
+        if not complete:
+            raise DriverError("the container's inspection lacks a field a restart is read from")
+        health = running.get("Health")
         status = health.get("Status") if isinstance(health, dict) else None
         if status is not None and not (isinstance(status, str) and HEALTH_STATUS.fullmatch(status)):
             raise DriverError("the container's inspection could not be read")
