@@ -27,7 +27,7 @@ from typing import Any
 from expcore.campaign.attempt import RunAdmission
 from expcore.campaign.defect_log import write_failure
 from expcore.campaign.executor import BackendFactory, RunExecutor
-from expcore.campaign.healthgate import HealthCheck
+from expcore.campaign.healthgate import ContextHealthCheck, HealthCheck
 from expcore.campaign.lease import ResourceProbe
 from expcore.campaign.reset_settings import checked as checked_settings
 from expcore.config.loading import ConfigError, Section
@@ -122,7 +122,7 @@ class StudyPlugin:
     scorers: Sequence[Scorer | SideFileScorer]
     prompts: Mapping[str, str]
     tools: Mapping[str, str]
-    health: HealthCheck | None = None
+    health: HealthCheck | ContextHealthCheck | None = None
     probe: ResourceProbe | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()
