@@ -16,10 +16,16 @@
 # The work directory is never removed unless a stop without --keep asks for it (teardown.sh, hpcfed.py down). A failed
 # restart stops the service and writes `keep` into stop-requested, so the directory stays and the start may be tried
 # again; a service that ends by itself after a good restart leaves it kept the same way.
-# Usage: restart.sh <op|oz> --workdir W
+# --storage=PATH (O57): a provider's own directory on scratch, which `hpcfed.py start` reads from the federation's state
+# and the work directory must record (configure.sh wrote it at the first start); the service binds it again. Without
+# one, a work directory that records a storage is refused. Never for the zone.
+# Usage: restart.sh <op|oz> --workdir W [--storage=PATH]
 source "$(dirname "$0")/lib.sh"
 component "${1:-}"; shift
-[[ ${1:-} == --workdir && -n ${2:-} && $# == 2 ]] || die "usage: restart.sh <op|oz> --workdir W"
+[[ ${1:-} == --workdir && -n ${2:-} ]] && { (( $# == 2 )) || [[ $# == 3 && $3 == --storage=* ]]; } \
+  || die "usage: restart.sh <op|oz> --workdir W [--storage=PATH]"
+STORAGE=${3:-}
+[[ -z $STORAGE || $COMP == op ]] || die "the zone has no posix storage: only a provider binds one"
 W=$(find_workdir "$COMP" "$2")
 
 # Every refusal comes before anything is changed.
@@ -29,6 +35,7 @@ kept_stop "$W" || die "$W has no kept stop (stop-requested does not begin with '
   || die "$W has no identity.json: the first start never finished, so there is nothing to restart"
 if recorded_service_runs "$W"; then die "the recorded service of $W still runs (pid $REC_PID): stop it first"; fi
 if owner_runs "$W"; then die "the process that owns $W still runs: the stop has not finished"; fi
+storage_binds "$W" "$STORAGE" > /dev/null || die "the posix storage of $W on scratch cannot be bound: nothing was changed"
 
 case $COMP in op) RUN=run-node.sh FINISH=finish.sh ;; oz) RUN=run-zone.sh FINISH=finish-zone.sh ;; esac
 export HPCOP_OWNER_PID=$$
@@ -52,7 +59,7 @@ trap 'exit 143' TERM INT
 
 rm -f -- "$W/stop-requested" "$W/service-verified" "$W/rootfs/root/service-ready.lock"
 say "restarting the $COMP service in $W"
-bash "$HPCOP_BUNDLE/$RUN" --workdir "$W" &
+bash "$HPCOP_BUNDLE/$RUN" --workdir "$W" ${STORAGE:+"$STORAGE"} &
 # supervise.py, once run_service execs it: our uid, visible in /proc; its start time identifies it for every signal
 svc=$!; svc_start=$(proc_field "$svc" 22 || true)
 if ! bash "$HPCOP_BUNDLE/$FINISH" --restart --workdir "$W" "$svc"; then

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
 
 import tomllib
+from hpcslurm import valid_network
 
 SIZE = re.compile(r"([1-9][0-9]{0,6})([mg])")
 TIME = re.compile(r"(?:([0-9]{1,2})-)?([0-9]{1,2}):([0-9]{2}):([0-9]{2})")
@@ -47,6 +48,9 @@ AGENT_PINS = {
     "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
 }
 AGENT_VARIABLES = {**AGENT_PATHS, **AGENT_PINS}
+# HPC_QUOTA_CHECK's one value. It never applies to a federation bound onto scratch (a site that sets it with
+# HPC_STORAGE_ROOT is refused), and without a scratch root there is no check to skip (README, "Provider storage").
+QUOTA_CHECK_OFF = "off"
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
     # 2.5 GB rootfs, plus its posix storage on the same tmpfs; the largest control step (a token's delivery) about
@@ -327,6 +331,23 @@ class Site:
     oneclient_bundle: str = ""
     oneclient_bundle_sha256: str = ""
     agent_work_root: str = ""
+    # The providers' storage on the cluster's shared scratch filesystem and the guard of its inode quota (hpcstorage,
+    # hpcquota; README, "Provider storage on scratch"). `storage_root` is the directory below which `up` makes the
+    # federation's own storage; with none, nothing is made on scratch and no check runs. `quota_cmd` is the site's
+    # command that prints the account's inode usage and quota (split as a shell would, run without one),
+    # `quota_pattern` the regular expression with the named groups `used` and `quota` that reads its output. With a
+    # scratch root the providers' storage is bound onto scratch and the check is mandatory: `quota_check` "off" is
+    # refused with it, and changes nothing without it. Only `storage_root` is recorded in the state file: `down` needs
+    # it.
+    storage_root: str = ""
+    quota_cmd: str = ""
+    quota_pattern: str = ""
+    quota_check: str = ""
+    # srun's `--network=<value>` on every step the driver launches, when not empty (HPC_STEP_NETWORK). On a site whose
+    # switch plugin gives each job a virtual network identifier, a heterogeneous job's steps on component 0 were refused
+    # ("Error configuring interconnect") from a point on while the same steps with `no_vni` ran; the services talk over
+    # TCP and need none. Empty: no option, as before.
+    step_network: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -340,7 +361,9 @@ class Site:
             "core_python": self.core_python,
             "admin_mail": self.admin_mail,
             "billing_weight": self.billing_weight,
+            "step_network": self.step_network,
             **{attribute: getattr(self, attribute) for attribute in AGENT_VARIABLES.values()},
+            "storage_root": self.storage_root,
         }
 
     @classmethod
@@ -379,12 +402,27 @@ def checked_site(site: Site) -> Site:
     weight = site.billing_weight
     if weight is not None and (isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0):
         raise SettingsError("HPC_BILLING_MEM_WEIGHT: must be a positive number")
+    if not valid_network(site.step_network):
+        raise SettingsError(
+            "HPC_STEP_NETWORK: must be an option of srun's --network (for example 'no_vni'): up to 128 letters, "
+            "digits and _ . , = : + -, with no space"
+        )
     for variable, attribute in AGENT_PATHS.items():
         if getattr(site, attribute):
             _absolute(getattr(site, attribute), variable)
     for variable, attribute in AGENT_PINS.items():
         if getattr(site, attribute) and not SHA256.fullmatch(getattr(site, attribute)):
             raise SettingsError(f"{variable}: must be 64 lower-case hexadecimal digits")
+    if site.storage_root:
+        _absolute(site.storage_root, "HPC_STORAGE_ROOT")
+    if site.quota_check not in ("", QUOTA_CHECK_OFF):
+        raise SettingsError(f"HPC_QUOTA_CHECK: must be '{QUOTA_CHECK_OFF}' or unset (unset is not off)")
+    if site.storage_root and site.quota_check == QUOTA_CHECK_OFF:
+        raise SettingsError(
+            f"HPC_QUOTA_CHECK={QUOTA_CHECK_OFF} with HPC_STORAGE_ROOT: a federation whose provider storage is bound "
+            "onto scratch always runs the inode check, which cannot be turned off there; unset HPC_QUOTA_CHECK, or "
+            "unset HPC_STORAGE_ROOT for storage on the nodes' tmpfs"
+        )
     return site
 
 
@@ -413,6 +451,11 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             core_python=environ.get("HPC_CORE_PYTHON") or "",
             admin_mail=environ.get("HPC_ADMIN_MAIL") or defaults.admin_mail,
             billing_weight=billing,
+            step_network=environ.get("HPC_STEP_NETWORK") or "",
             **{attribute: environ.get(variable) or "" for variable, attribute in AGENT_VARIABLES.items()},
+            storage_root=environ.get("HPC_STORAGE_ROOT") or "",
+            quota_cmd=environ.get("HPC_QUOTA_CMD") or "",
+            quota_pattern=environ.get("HPC_QUOTA_PATTERN") or "",
+            quota_check=environ.get("HPC_QUOTA_CHECK") or "",
         )
     )

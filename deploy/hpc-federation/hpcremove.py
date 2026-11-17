@@ -94,6 +94,8 @@ def remove_tree(
     rmdir: Callable[[Any], None] = os.rmdir,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    keep_root: bool = False,
+    marker_name: str = ROOT_MARKER,
 ) -> None:
     """Remove a federation's root, which may hold read-only directories and lie on a shared filesystem (NFS).
 
@@ -102,14 +104,17 @@ def remove_tree(
     whose removal is cut short still reads as this federation's and a second `down` finishes it. A file another process
     holds open becomes a silly-rename file (`.nfsXXXX`) that goes at its last close: the removal waits for those, up to
     `SETTLE_S` in all, and then raises RuntimeError with the marker kept. Anything else that cannot be removed raises
-    OSError, as before."""
+    OSError, as before. With `keep_root` the directory and its marker (`marker_name`) are left, for the caller to
+    remove: the provider storage's removal (`hpcstorage`) passes `/proc/self/fd/<n>` of a directory it holds open and
+    has proved, so what is removed is that directory's contents whatever its path now names, and retires the
+    directory itself by its parent's descriptor."""
     for directory, subdirectories, _ in os.walk(root, followlinks=False):
         for name in subdirectories:
             path = Path(directory) / name
             if not path.is_symlink():
                 os.chmod(path, stat.S_IMODE(path.lstat().st_mode) | stat.S_IRWXU)
     os.chmod(root, stat.S_IRWXU)
-    marker, until = root / ROOT_MARKER, clock() + SETTLE_S
+    marker, until = root / marker_name, clock() + SETTLE_S
     while True:
         left = _remove_below(root, marker, unlink, rmdir)
         if not left:
@@ -120,6 +125,8 @@ def remove_tree(
                 "process holds open; its marker is kept, so run down again once they are closed"
             )
         sleep(POLL_S)
+    if keep_root:
+        return
     if marker.exists() or marker.is_symlink():
         unlink(marker)
     settle_rmdir(root, rmdir, sleep, until, clock)

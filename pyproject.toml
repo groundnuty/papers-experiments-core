@@ -37,10 +37,19 @@ dev = [
     "sparql-platform",
 ]
 
+# hatch_build.py writes the core's identity (commit, git tree, dirty, digest of its Python source) into the wheel and
+# the sdist as expcore/_build_identity.json (expcore.provenance.core_identity). A copy an sdist carries reaches a wheel
+# through the hook alone, never as an ordinary file.
+[tool.hatch.build.hooks.custom]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["src/expcore/_build_identity.json"]
+
 [tool.hatch.build.targets.wheel]
 # The two packages and the example study, which a study that installs the core writes out with
 # `python -m expcore example DEST`. Ignored files, such as the example's out/, are left out.
 only-include = ["src/expcore", "src/expcore_onedata", "examples/tiny_study"]
+exclude = ["src/expcore/_build_identity.json"]
 # An editable install puts src/ on the path and reads the example and the hashes from the checkout.
 dev-mode-dirs = ["src"]
 

@@ -30,6 +30,8 @@ preload =[{ path = "x.so", sha256 = "<64 hex>" }]   # optional (hook b): librari
 binds = [{ path = "f", sha256 = "<64 hex>", target = "/etc/x" }]   # optional (hook b): files bound read-only
 oneclient_bundle = "oneclient-bundle.tar"  # the host mount's oneclient (hostmount), required by a mount level: the tar
 oneclient_bundle_sha256 = "<64 hex>"      # deploy/hpc-federation/oneclient_bundle.py builds from the sidecar's image
+provider_storage = "tmpfs"       # optional: where the federation's providers keep their data, "tmpfs" or
+                                 # "shared_filesystem" (the cluster's scratch): the driver renders it (O57)
 [sandbox.apptainer.gate_options] # optional (hook a): further keys of the gate's configuration, never one it sets
 ```
 
@@ -39,6 +41,12 @@ checked again before every exec (`sandbox.py`); oneclient's bundle is unpacked f
 are hashed (`oneclient_bundle.unpack`). A path is a configured value: a message names the key, never the path, and a
 record holds the hashes alone (`record`), the bundle's only when it is declared, so a platform without one keeps its
 fingerprint while two bundles are two experiments.
+
+The storage kind (`provider_storage`) is one word the HPC driver renders from `site.env` (`HPC_STORAGE_ROOT` set:
+`shared_filesystem`, else `tmpfs`), never the root's path: where a provider stores its data shapes a run's I/O
+timing, so shards on tmpfs and on scratch are two experiments. It is in the record (so in the campaign
+fingerprint, `sandbox_backend`, and in every run's `backend`) only when declared: a Compose federation, which
+has no such table, and a platform written before the key keep the record they had.
 """
 
 from __future__ import annotations
@@ -58,6 +66,7 @@ from expcore_onedata.sandbox.apptainer.hidden import DEFAULT_MARGIN_BYTES
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
+PROVIDER_STORAGE_KINDS = ("tmpfs", "shared_filesystem")  # where the providers keep their data (O57)
 CELL_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,1023}")
 # the targets the sandbox binds itself, and those under which it binds: an extra bind may be none of them
 OWN_TARGETS = ("/work", "/tmp", "/dev/shm", "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
@@ -104,12 +113,15 @@ class ApptainerSettings:
     gate_options: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     hidden_memory_margin_bytes: int = DEFAULT_MARGIN_BYTES
     oneclient_bundle: Pinned | None = None  # the host mount's oneclient (`hostmount`), a tar pinned by its SHA-256
+    provider_storage: str | None = None  # one of PROVIDER_STORAGE_KINDS, or None: the platform does not say
 
     def __post_init__(self) -> None:
         low, high = MARGIN_BOUNDS
         margin = self.hidden_memory_margin_bytes
         if isinstance(margin, bool) or not isinstance(margin, int) or not low <= margin <= high:
             raise ValueError(f"hidden_memory_margin_bytes must be a whole number of bytes from {low} to {high}")
+        if self.provider_storage is not None and self.provider_storage not in PROVIDER_STORAGE_KINDS:
+            raise ValueError(f"provider_storage must be one of {', '.join(PROVIDER_STORAGE_KINDS)}")
         clash = sorted(set(self.gate_options) & GATE_OWN_KEYS)
         if clash:
             raise ValueError(f"gate_options may not set {clash[0]!r}: the sandbox writes it itself")
@@ -136,6 +148,8 @@ class ApptainerSettings:
                {"hidden_memory_margin_bytes": self.hidden_memory_margin_bytes}),
             # another oneclient is another experiment; a platform that declares none keeps the record it had
             **({"oneclient_bundle_sha256": self.oneclient_bundle.sha256} if self.oneclient_bundle is not None else {}),
+            # the storage kind of the federation's providers, when declared (O57): tmpfs and scratch are two experiments
+            **({"provider_storage": self.provider_storage} if self.provider_storage is not None else {}),
         }  # fmt: skip
 
 
@@ -194,12 +208,21 @@ def _gate_options(section: Section) -> Mapping[str, Any]:
     return MappingProxyType(options)
 
 
+def _provider_storage(section: Section) -> str | None:
+    """`provider_storage`: one of the kinds, or absent; the message names the key and the choices, never the value."""
+    value = section.optional_string("provider_storage")
+    if value is not None and value not in PROVIDER_STORAGE_KINDS:
+        raise section.fail("provider_storage", f"must be one of {', '.join(PROVIDER_STORAGE_KINDS)}")
+    return value
+
+
 def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
     """Validate `[sandbox.apptainer]`; raise ConfigError naming the file and key, never a value or a path."""
     section.reject_unknown(
         ("apptainer", "image", "image_sha256", "python", "host_python", "egress_shim", "egress_shim_sha256",
          "egress_collector", "egress_collector_sha256", "memory_poll_s", "disk_poll_s", "preload", "binds",
-         "gate_options", "hidden_memory_margin_bytes", "oneclient_bundle", "oneclient_bundle_sha256")
+         "gate_options", "hidden_memory_margin_bytes", "oneclient_bundle", "oneclient_bundle_sha256",
+         "provider_storage")
     )  # fmt: skip
     words = section.strings("apptainer") or ("apptainer",)
     if any(not COMMAND_WORD.fullmatch(word) for word in words):
@@ -234,9 +257,10 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
             gate_options=_gate_options(section),
             hidden_memory_margin_bytes=_margin(section),
             oneclient_bundle=bundle,
+            provider_storage=_provider_storage(section),
         )
     except ValueError as error:  # the dataclass's own checks, which the loader already made: never a value
         raise ConfigError(f"{section.file}: {section.where}: {error}") from None
 
 
-__all__ = ["ApptainerSettings", "Pinned", "PinnedBind", "load_apptainer"]
+__all__ = ["PROVIDER_STORAGE_KINDS", "ApptainerSettings", "Pinned", "PinnedBind", "load_apptainer"]
