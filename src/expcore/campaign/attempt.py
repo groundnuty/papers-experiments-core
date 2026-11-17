@@ -379,6 +379,11 @@ class AttemptRunner:
                     p.store.event(p.stamp(), ZERO_EVENT, model, f"{key}: {ZERO_REASON}; charged 0, basis measured")
                 if mix is not None:
                     p.store.record_deployments(begun.id, mix)
+                if (
+                    result.post_run_health is not None
+                ):  # the reading, with the result: both stand, or neither does (O90)
+                    text = json.dumps(result.post_run_health, sort_keys=True)
+                    p.store.event(p.stamp(), "post_run_health", model, f"{key}: {text}")
 
             status = self._finish(begun, run_dir, key, result, bookkeeping)
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
@@ -413,7 +418,14 @@ class AttemptRunner:
         is told the attempt it judges (`CheckContext`): the run, the number and the id of the row `begun` made."""
         p = self.p
         if p.health is not None:
+            note = prerun.current()
+            if note is not None:
+                note.pop(prerun.HEALTH_READING, None)  # only a check made from here on leaves the post-run reading
+                note[prerun.EXECUTOR_RETURNED] = (
+                    True  # nothing of the run is in progress now: no leftover is its own work
+                )
             health, outage = p.health.after_run(key, attempt=begun.number, attempt_id=begun.id)
+            result = self._keep_reading(result, note, model, key)
             if health.deferred:  # it verified nothing: no result is scored on it, treatment included (C11)
                 result = unverified(result, health.detail)
                 text = f"{key}: {health.detail}; nothing is scored on it ({result.outcome.infra_kind or 'set aside'})"
@@ -444,6 +456,23 @@ class AttemptRunner:
         text = "the endpoint's served identity changed during the run"
         outcome = Outcome("infrastructure", text, infra_kind=p.settings.identity_kind)
         return dataclasses.replace(result, outcome=outcome), True
+
+    def _keep_reading(self, result: AttemptResult, note: Any, model: str, key: str) -> AttemptResult:
+        """The structured reading the post-run check noted for this try (`prerun.HEALTH_READING`), kept in the result
+        (its marker, and an event in the result's transaction); one that is no small JSON object is not kept, and an
+        event says so. A check that noted none leaves the result as it was."""
+        raw = None if note is None else note.get(prerun.HEALTH_READING)
+        if raw is None:
+            return result
+        reading = prerun.reading_of(raw)
+        if reading is None:
+            limit = prerun.READING_MAX_BYTES
+            reason = f"is not a JSON object of at most {limit} bytes of text"
+            self.p.store.event(
+                self.p.stamp(), "post_run_health_refused", model, f"{key}: the post-run reading {reason}"
+            )
+            return result
+        return dataclasses.replace(result, post_run_health=reading)
 
     def _judge_instruments(self, result: AttemptResult, record: Any, model: str, key: str) -> AttemptResult:
         """Apply the refusal an instrument's post-run check put in the record (C31): the third way a finished attempt is

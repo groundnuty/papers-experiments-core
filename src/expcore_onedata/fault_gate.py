@@ -25,6 +25,17 @@ stuck: the check recovers, verified, whatever the journal holds open, marks the 
 verdict's time) and fails, saying the lock is stuck. The record is never deleted for it, so every later timeout is stuck
 too; only an acquisition of the lock, which proves it usable, clears it.
 
+**A run's own open injection is no unsettled one under its own admission (O90).** A check that runs under the judged
+attempt's admission (`_held_check`) while that attempt holds a target down, an executor that reads health inside its
+injection and restores after, does not answer "unsettled" for the entry that attempt journalled itself
+(`fault_owner.in_progress_of`: owner exactly the attempt, seen down, no failed restore, no heal's mark, and a live
+injector still holding the target's lock, `_held_down`): the space is
+compared as usual, and the structured reading (`healthreading`) names the target as held. Every other open entry still
+fails the check: another attempt's, one that names no attempt, a failed restore, a heal's restart. Only a check made
+while the executor is still inside its injection explains it: the scheduler's post-run check, which the runner marks
+(`prerun.EXECUTOR_RETURNED`) once the executor has returned, explains nothing, so a pending restore whose journal line
+was lost, or a reused injector, is still an unsettled injection there.
+
 **It heals stuck pairs its own link check found (O35, `fault_gate_heal`).** Given the link report the rest of the check
 made in the calling thread (`links`), a way to make it check the links again (`relink`) and the providers' services
 (`labels`), as `PlatformHealth` gives them, a check that holds no run's admission and whose own all-pairs link check, in
@@ -86,7 +97,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from expcore.campaign import prerun
+from expcore.campaign import liveness, prerun
 from expcore.campaign.healthgate import DeferralBound, Health, HealthCheck, read_health
 from expcore.errors import TARGET_LABEL, InfraError
 from expcore_onedata.admission import (
@@ -106,7 +117,7 @@ from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch, Rais
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals, failed_heal_reason
 from expcore_onedata.fault_journal import HeldLock, holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
-from expcore_onedata.fault_owner import charge_of, with_note
+from expcore_onedata.fault_owner import charge_of, in_progress_of, with_note
 from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling, failure
 from expcore_onedata.fault_relay import RELAY_NOTE, beat
 from expcore_onedata.fault_settings import (
@@ -414,17 +425,41 @@ class FaultGate:
                 deferred=True,
                 charge=False,
             )
+        note = prerun.current()
+        returned = note is not None and note.get(prerun.EXECUTOR_RETURNED) is True  # the scheduler's post-run check
         try:
-            return self._judged()[0]
+            return self._judged(own=not returned)[0]
         finally:
             give_up()
 
-    def _checked(self) -> Health:
-        """With the federation held: the journal, then the rest of the check."""
+    def _checked(self, *, own: bool = False) -> Health:
+        """With the federation held: the journal, then the rest of the check. With `own` (under the judged attempt's
+        admission) the injection that attempt is itself holding down, journalled by it and seen down, is no unsettled
+        injection: the run's own health reading inside its injection compares every space as usual, and its reading
+        says that target is held (`healthreading`, O90). Every other open entry, another attempt's, one with no owner,
+        a failed restore of the run's own, a heal's restart, still fails the check as unsettled."""
         entries = self._recovery.entries()
+        if own:
+            here = liveness.current()
+            entries = [entry for entry in entries if not (in_progress_of(entry, here) and self._held_down(entry))]
         if entries:
             return self._operator(_unsettled(entries))
         return read_health(self._inner) if self._inner is not None else Health(True, "no injection is unsettled")
+
+    def _held_down(self, entry: Mapping[str, Any]) -> bool:
+        """Whether a live injector still holds the entry's target down: the target's lock is held, as an injector holds
+        it for as long as it may have the target down and the kernel drops it with its holder. An entry whose lock is
+        free was left by an injector that is gone (an executor that returned without restoring, a dead process): it is
+        no injection in progress, whoever journalled it, and the check fails it as unsettled. A lock that cannot be
+        tried is no proof: not held."""
+        try:
+            lock = self._journal.try_lock(entry["target"])
+        except OSError:
+            return False
+        if lock is None:
+            return True
+        lock.close()
+        return False
 
     def _taken(self) -> Any:
         return None if self._links is None else self._links()
@@ -451,7 +486,7 @@ class FaultGate:
             prerun.note(RELAY_NOTE, {"alive": live is not None, "nonce": None if live is None else live["nonce"]})
         return noted
 
-    def _judged(self, noted: dict[str, Any] | None = None) -> tuple[Health, LinkMatrix | None]:
+    def _judged(self, noted: dict[str, Any] | None = None, *, own: bool = False) -> tuple[Health, LinkMatrix | None]:
         """With the federation held: the check (`_checked`), and the matrix of the link check it made in this call, in
         this thread (None when it made none: a report another call made is never this call's). A link check of this
         call that passed lets a later stuck pair be healed again (`GateHeals.passed`), while the federation is held;
@@ -460,7 +495,7 @@ class FaultGate:
         answers for that epoch."""
         with self._epoch.checking():
             self._taken()  # whatever this thread's earlier calls left untaken is not this call's
-            verdict = self._checked()
+            verdict = self._checked(own=own)
             report = self._taken()
             if report is None:
                 return verdict, None

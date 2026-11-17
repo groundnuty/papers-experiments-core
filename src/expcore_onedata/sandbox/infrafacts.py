@@ -45,6 +45,7 @@ WINDOW = "federation_window"  # the federation's window (O86), which the platfor
 METADATA = "metadata"  # the readings made when `metadata()` is read
 GATE = "gate"  # the gate's configuration as it was written (O85): the sandbox records what the file holds
 CELL_RESOLV = "cell_resolv"  # `cellresolv.note`: the hash of the resolv.conf a cell read back at the start (O56)
+HEALTH = "health"  # the platform check's structured reading of the run's post-run state (O90, `healthreading.FACT`)
 
 OWNED: Mapping[str, frozenset[str]] = MappingProxyType(
     {
@@ -55,6 +56,7 @@ OWNED: Mapping[str, frozenset[str]] = MappingProxyType(
             {"gate_upstream_read_timeout_s"}
         ),  # `gatepolicy.UPSTREAM_READ_TIMEOUT_FACT`; a test holds them equal
         CELL_RESOLV: frozenset({"resolv_conf_sha256"}),  # `cellresolv.FACT`; a test holds the two equal
+        HEALTH: frozenset({"post_run_health"}),  # a test holds it equal to `healthreading.FACT`
         METADATA: frozenset(
             {
                 "run_ended",
@@ -136,6 +138,7 @@ def refuse_replacement(fields: Mapping[str, Any]) -> None:
 __all__ = [
     "CELL_RESOLV",
     "GATE",
+    "HEALTH",
     "METADATA",
     "NODE",
     "OWNED",
