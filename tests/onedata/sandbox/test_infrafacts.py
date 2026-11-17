@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from expcore_onedata.sandbox import fedwindow, hostfacts, infrafacts
+from expcore_onedata.sandbox import cellhost, fedwindow, hostfacts, infrafacts
 from expcore_onedata.sandbox.apptainer import facts as apptainer_facts
 from expcore_onedata.sandbox.infrafacts import FactsConflict, InfrastructureFacts
 
@@ -131,15 +131,15 @@ def test_o89_a_snapshot_never_overwrites_a_stored_key_of_another_writer():
 def test_o89_a_snapshot_of_a_run_with_no_table_makes_it_for_the_facts_it_adds():
     facts, _ = handle()
     snapshot: dict = {}
-    facts.annotate(snapshot, "cell_hostname", {"cell_hostname": "sandbox"})
-    assert snapshot == {LITERAL: {"cell_hostname": "sandbox"}}
+    facts.annotate(snapshot, "a_feature", {"a_fact_made_at_the_read": "kept"})  # an undeclared key: its writer's own
+    assert snapshot == {LITERAL: {"a_fact_made_at_the_read": "kept"}}
 
 
 def test_o89_a_fact_made_at_the_read_cannot_later_be_stored_by_another_writer():
     facts, _ = handle()
-    facts.annotate({}, "cell_hostname", {"cell_hostname": "sandbox"})
-    with pytest.raises(FactsConflict, match="cell_hostname"):
-        facts.write("another_feature", {"cell_hostname": "other"})
+    facts.annotate({}, "a_feature", {"a_fact_made_at_the_read": "kept"})  # an undeclared key: its writer's own
+    with pytest.raises(FactsConflict, match="a_fact_made_at_the_read"):
+        facts.write("another_feature", {"a_fact_made_at_the_read": "other"})
 
 
 def test_o89_a_fact_read_back_is_the_stored_one_or_the_default():
@@ -189,6 +189,10 @@ def test_o89_the_declared_owners_hold_disjoint_keys_that_the_features_actually_w
     assert {fedwindow.KEY} == infrafacts.OWNED[infrafacts.WINDOW]
     assert {"node", "tool_server_host"} == infrafacts.OWNED[infrafacts.NODE]
     assert hostfacts.of_node(lambda: hostfacts.readings()) is not None  # the readings the node's key carries
+    # the two facts the cell host name feature adds when the metadata is read (O73): declared, so a stray write of
+    # either key is the one refused, and the helper's literal for the first is the feature's own constant
+    assert {cellhost.FACT, "own_node_scan"} <= infrafacts.OWNED[infrafacts.METADATA]
+    assert cellhost.FACT == "cell_hostname"
 
 
 # ---------------------------------------------------------------------------------------------- the scanner

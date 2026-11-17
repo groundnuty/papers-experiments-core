@@ -171,6 +171,8 @@ def test_o89_an_apptainer_run_keeps_every_fact_every_writer_made_from_its_prepar
             assert mid[OTHER_KEY] == {"kept": True}
             assert mid["memory"]["reading"] == "within"
             assert mid["limits"]["nofile"]["reading"] == "set"
+            assert mid[cellhost.FACT] == cellhost.CELL_HOSTNAME  # the facts the cell host name adds at the read (O73)
+            assert mid["own_node_scan"]["version"] == 1
             assert mid["rest_node_name_hits"]["unknown"] == [gatelog_not_collected()]
             assert mid["rest_request_durations"]["unknown"] == [gatelog_not_collected()]
 

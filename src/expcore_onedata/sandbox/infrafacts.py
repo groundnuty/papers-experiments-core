@@ -3,7 +3,8 @@
 
 Several features put a fact there: the work disk's record and its proof (`apptainer.facts`), the node's readings
 (`hostfacts`, O87), the federation's window (`fedwindow`, O86), the readings `metadata()` makes when it is read (the
-watch's memory, the limits, the gate's scans), and a fact a platform adds (`record_infrastructure_fact`). On 16 Nov 2026
+watch's memory, the limits, the gate's scans, the cells' host name and the scan of the agent node's own names,
+`cellhost`, O73), and a fact a platform adds (`record_infrastructure_fact`). On 16 Nov 2026
 one of them replaced the dict three times and dropped what another had put there. This module closes that class: every
 write goes through an `InfrastructureFacts`, which is made of a sandbox's metadata and its lock, and which
 
@@ -48,7 +49,17 @@ OWNED: Mapping[str, frozenset[str]] = MappingProxyType(
         WORK_DISK: frozenset({"backend", "facts", "dns", "provider_storage"}),
         NODE: frozenset({"node", "tool_server_host"}),
         WINDOW: frozenset({"federation_window"}),
-        METADATA: frozenset({"run_ended", "memory", "limits", "rest_node_name_hits", "rest_request_durations"}),
+        METADATA: frozenset(
+            {
+                "run_ended",
+                "memory",
+                "limits",
+                "rest_node_name_hits",
+                "rest_request_durations",
+                "cell_hostname",  # `cellhost.FACT` (O73); a test holds the two equal: this module imports no feature
+                "own_node_scan",  # the facts of the agent node's names in the gate's scan (O73)
+            }
+        ),
     }
 )
 _DECLARED: Mapping[str, str] = MappingProxyType({key: owner for owner, keys in OWNED.items() for key in keys})

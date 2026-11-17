@@ -1116,7 +1116,7 @@ class ApptainerSandbox:
         cellhost.note(self._facts, meta)  # O73: added at the read, so a record of the facts made again cannot drop it
         if self._own_scan is not None:  # a copy, by reason alone (the module's `_scan_names`)
             scan = {**self._own_scan, "unread": list(self._own_scan["unread"])}
-            self._facts.annotate(meta, "own_node_scan", {"own_node_scan": scan})  # an undeclared key: its writer's own
+            self._facts.annotate(meta, infrafacts.METADATA, {"own_node_scan": scan})  # declared for the read's facts
         counted, timed = meta.pop("rest_node_name_hits", None), meta.pop("rest_request_durations", None)
         if self.spec.node_names and self.spec.mode is DataPathMode.REST:  # O73: scanned, so never silently absent
             read["rest_node_name_hits"] = counted or gatelog.node_name_hits_unknown(gatelog.GATE_NOT_COLLECTED)

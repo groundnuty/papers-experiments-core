@@ -31,7 +31,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from expcore_onedata.sandbox.infrafacts import InfrastructureFacts
+from expcore_onedata.sandbox.infrafacts import METADATA, InfrastructureFacts
 
 CELL_HOSTNAME = "sandbox"
 FACT = "cell_hostname"  # the key of the run's `infrastructure_facts`
@@ -130,8 +130,9 @@ def _first_label(name: str) -> tuple[str, ...]:
 
 def note(facts: InfrastructureFacts, meta: dict[str, Any], name: str = CELL_HOSTNAME) -> None:
     """Put the name the run's cells were given in the infrastructure facts of `meta`, the copy `metadata()` returns,
-    beside what that holds, through the run's one writer (`infrafacts`, O89): the key is this module's own."""
-    facts.annotate(meta, FACT, {FACT: name})
+    beside what that holds, through the run's one writer (`infrafacts`, O89): a fact made when the metadata is read,
+    which the helper declares for `METADATA`, so no other writer may take the key."""
+    facts.annotate(meta, METADATA, {FACT: name})
 
 
 __all__ = [
