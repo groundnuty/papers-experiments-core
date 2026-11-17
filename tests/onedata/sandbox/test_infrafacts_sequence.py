@@ -19,7 +19,7 @@ from fake_node import READINGS as NODE_READINGS
 from fake_node import FakeNode
 from sandbox_support import make_spec, start_options
 
-from expcore_onedata.sandbox import cellhost, cellresolv, fedwindow, infrafacts
+from expcore_onedata.sandbox import cellhost, cellresolv, fedwindow, gatepolicy, infrafacts
 from expcore_onedata.sandbox.api import DataPathMode, SandboxSpec
 from expcore_onedata.sandbox.apptainer import facts as apptainer_facts
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
@@ -30,6 +30,8 @@ from expcore_onedata.tokens import Secret
 LITERAL = "infrastructure_facts"
 NAME = {cellhost.FACT: cellhost.CELL_HOSTNAME}  # every read of a Docker run's metadata adds the cells' name (O73)
 RESOLV = {cellresolv.FACT: cellresolv.RESOLV_SHA256}  # the start records the hash of the resolv.conf a cell read (O56)
+# a REST run's start records the timeout its gate was given, the default's when the platform declares none (O85)
+GATE = {gatepolicy.UPSTREAM_READ_TIMEOUT_FACT: float(gatepolicy.UPSTREAM_READ_TIMEOUT_S)}
 OTHER = "another_feature"
 OTHER_KEY = "recorded_before_the_start_by_another_feature"
 CLOSED = {**fedwindow.unread("the window closed after the run"), "verdict": "stable"}
@@ -70,7 +72,14 @@ def test_o89_a_docker_run_keeps_every_fact_every_writer_made_from_its_preparatio
     assert table(box) == {fedwindow.KEY: fedwindow.pending(), OTHER_KEY: {"kept": True}, **NAME}  # before the start
 
     box.begin()
-    started = {fedwindow.KEY: fedwindow.pending(), OTHER_KEY: {"kept": True}, "node": HOST_READINGS, **NAME, **RESOLV}
+    started = {
+        fedwindow.KEY: fedwindow.pending(),
+        OTHER_KEY: {"kept": True},
+        "node": HOST_READINGS,
+        **NAME,
+        **RESOLV,
+        **GATE,
+    }
     assert table(box) == started
 
     (box.dir / "gatelog" / "requests.jsonl").write_text("\n".join(GATE_LINES) + "\n", encoding="utf-8")
@@ -91,7 +100,7 @@ def test_o89_a_docker_run_without_a_window_or_another_fact_holds_the_node_alone(
     """O89: a record that no feature added to keeps what it had (O87's test of the host's readings says the same)."""
     box = DockerSandbox.start(world.host, world.s, make_spec(world, "via-gate"), **start_options(world))
     try:
-        assert table(box) == {"node": HOST_READINGS, **NAME, **RESOLV}
+        assert table(box) == {"node": HOST_READINGS, **NAME, **RESOLV, **GATE}
     finally:
         box.stop()
 
@@ -106,7 +115,7 @@ def test_o89_a_docker_writer_overwriting_another_s_key_is_refused_and_its_own_is
         with pytest.raises(FactsConflict, match="node"):
             box.record_infrastructure_fact("node", {"kernel": "mine"}, owner=OTHER)
         box.record_infrastructure_fact(fedwindow.KEY, CLOSED, owner=infrafacts.WINDOW)  # its own, again
-        assert table(box) == {fedwindow.KEY: CLOSED, "node": HOST_READINGS, **NAME, **RESOLV}
+        assert table(box) == {fedwindow.KEY: CLOSED, "node": HOST_READINGS, **NAME, **RESOLV, **GATE}
     finally:
         box.stop()
 

@@ -454,7 +454,7 @@ class DockerSandbox:
         (self.dir / "gate.json").chmod(0o444)  # no secret; the gate, root without DAC_OVERRIDE, reads it as anyone
         # the fact is what the file holds, read back, never what was meant (O85)
         given = json.loads((self.dir / "gate.json").read_text(encoding="utf-8"))["upstream_read_timeout_s"]
-        self.record_infrastructure_fact(gatepolicy.UPSTREAM_READ_TIMEOUT_FACT, given)
+        self.record_infrastructure_fact(gatepolicy.UPSTREAM_READ_TIMEOUT_FACT, given, owner=infrafacts.GATE)
 
     def _pool_position(self, subnet: str) -> int | None:
         """Which pool of `[sandbox.network] pools`, by position in the file, a subnet was taken from."""

@@ -486,7 +486,7 @@ class ApptainerSandbox:
         written = json.loads(config.read_text(encoding="utf-8"))  # what this gate was given, not what was meant
         asked = written.get(gaterun.PEER_CHECK_KEY) is True
         given = written["upstream_read_timeout_s"]  # the fact is what the file holds, never what was meant (O85)
-        self.record_infrastructure_fact(gatepolicy.UPSTREAM_READ_TIMEOUT_FACT, given)
+        self.record_infrastructure_fact(gatepolicy.UPSTREAM_READ_TIMEOUT_FACT, given, owner=infrafacts.GATE)
         # in effect only when asked of a gate that has it, which refuses to start when it cannot make it (#317)
         self._meta["gate"] = {"port": self._gate_port, "hosts": len(served),
                               "names": "declared" if self.s.federation is not None else "urls",  # whose, not which
