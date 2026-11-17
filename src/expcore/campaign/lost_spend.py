@@ -49,7 +49,7 @@ from typing import Any
 
 from expcore.campaign import reply_cap
 from expcore.campaign.attempt_bounds import LOST_STATE, AttemptCost, journaled_cost, row_cost
-from expcore.campaign.interrupted_spend import BOUND, CallLog, basis_of, log_of, merged, read_log
+from expcore.campaign.interrupted_spend import BOUND, MEASURED, CallLog, basis_of, log_of, merged, read_log
 from expcore.campaign.lost_ledger import ATTEMPT_KEYS, CALL_KEYS, KEY, Ledger, LostSpendError, dollars, parse, read
 from expcore.campaign.spend_journal import Journal, SpendJournal, SpendJournalError, journals_in, read_journal
 from expcore.campaign.store import Store
@@ -119,7 +119,7 @@ def reconcile(store: Store, journal: SpendJournal, now: str, pricing: Pricing) -
         lost = _lost(store, journaled, own=journaled.name == ledger.journal, now=now)
         confirmed += lost.pop("confirmed")
         for attempt in lost["attempts"]:
-            usd, _, basis = _attempt_cost(attempt, pricing.models, pricing.limits, (), taken_off)
+            usd, _, basis, _ = _attempt_cost(attempt, pricing.models, pricing.limits, (), taken_off)
             attempt["usd"] = usd
             if basis is not None:
                 attempt["basis"] = basis
@@ -274,12 +274,15 @@ def costs(
     for name in sorted(ledger.counted):
         lost = ledger.counted[name]
         for attempt in lost["attempts"]:
-            usd, bounded, basis = _attempt_cost(attempt, models, limits, reply_capped, taken_off)
-            cost = AttemptCost(attempt["id"], attempt["run_key"], attempt["model"], LOST_STATE, usd, bounded, basis)
+            usd, bounded, basis, charged_on = _attempt_cost(attempt, models, limits, reply_capped, taken_off)
+            topped = float(attempt["topup_usd"])
+            cost = AttemptCost(
+                attempt["id"], attempt["run_key"], attempt["model"], LOST_STATE, usd, bounded, basis, topped, charged_on
+            )
             out.append(cost)
         for charge in lost["charges"]:
-            run_key = str(charge.get("run_key", ""))
-            out.append(AttemptCost(0, run_key, charge["model"], LOST_STATE, float(charge["usd"]), True))
+            run_key, usd = str(charge.get("run_key", "")), float(charge["usd"])
+            out.append(AttemptCost(0, run_key, charge["model"], LOST_STATE, usd, True, topup_usd=usd))
     return out
 
 
@@ -289,15 +292,18 @@ def _attempt_cost(
     limits: Limits,
     reply_capped: Collection[str],
     taken_off: Collection[str],
-) -> tuple[float | None, bool, str | None]:
+) -> tuple[float | None, bool, str | None, str | None]:
     """A lost attempt's cost, its top-ups included, as its row would be charged, and whether it holds a bound: one
     the journal never saw end by its journaled call log, else its bound (C05), with the basis; one that ended measured
-    or at its bound, with no basis. None for an unpriced model."""
+    or at its bound, with no basis. None for an unpriced model. The fourth value is the basis its cost without the
+    top-ups was charged on (`AttemptCost.charged_on`)."""
     row = {**attempt, "complete": 1 if attempt["usage_complete"] is None else attempt["usage_complete"]}
     spec, basis = models.get(attempt["model"]), None
     if attempt["state"] == "running":
         usd, bounded, basis = journaled_cost(spec, row, limits, reply_capped=reply_capped, taken_off=taken_off)
+        charged_on = None if usd is None else basis
     else:
         usd, bounded = row_cost(spec, row, limits, running=False, reply_capped=reply_capped, taken_off=taken_off)
+        charged_on = None if usd is None else (BOUND if bounded else MEASURED)
     topped = float(attempt["topup_usd"])
-    return (None if usd is None else usd + topped), bounded or topped > 0, basis
+    return (None if usd is None else usd + topped), bounded or topped > 0, basis, charged_on

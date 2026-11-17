@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from expcore.campaign import lost_spend, probe_spend, reply_cap
-from expcore.campaign.attempt_bounds import attempt_costs, spent_usd
+from expcore.campaign.attempt_bounds import AttemptCost, attempt_costs, spent_usd
 from expcore.campaign.gate import RELEASED_KEY
 from expcore.campaign.shard import META_STARTED
 from expcore.config.models import Limits, ModelSpec
@@ -76,22 +76,43 @@ class _View:
         return rows[0][0] if rows else None
 
 
-def spend_of(query: Query, pricing: Pricing) -> Spend:
-    """What the store spent, as the budget gate counts it at its next assessment with nothing in flight."""
+@dataclass(frozen=True)
+class Charges:
+    """Every charge the budget gate counts for a store: `costs` (each attempt's, and each lost attempt's and charge),
+    `probes` (what admission's probes were charged, per model) and `ledger` (what a kill took out of the store)."""
+
+    costs: list[AttemptCost]
+    probes: Mapping[str, float]
+    ledger: lost_spend.Ledger
+
+
+def charges_of(query: Query, pricing: Pricing) -> Charges | None:
+    """The charges of the store as the budget gate counts them at its next assessment with nothing in flight; None
+    when the probes' record or the ledger of what a kill lost cannot be read, so what was spent is unknown. The one
+    place these are gathered: `spend_of` totals them and the model-usage report (`campaign.model_usage`) breaks them
+    down, so the two cannot disagree."""
     view = _View(query)
     marks = reply_cap.unheld(view)
     taken_off = frozenset(m for m in pricing.models if reply_cap.is_unheld(marks, m))
     costs = attempt_costs(view, pricing.models, pricing.limits, taken_off=taken_off)
     probes, ledger = probe_spend.charged(view), lost_spend.read(view)
     if probes is None or ledger is None:
-        return Spend(None, dict.fromkeys(pricing.models))
+        return None
     costs += lost_spend.costs(ledger, pricing.models, pricing.limits, taken_off=taken_off)
-    total = spent_usd(costs)
+    return Charges(costs, probes, ledger)
+
+
+def spend_of(query: Query, pricing: Pricing) -> Spend:
+    """What the store spent, as the budget gate counts it at its next assessment with nothing in flight."""
+    found = charges_of(query, pricing)
+    if found is None:
+        return Spend(None, dict.fromkeys(pricing.models))
+    total = spent_usd(found.costs)
     per_model = {}
     for model in sorted(pricing.models):
-        spent = spent_usd(costs, model)
-        per_model[model] = None if spent is None else spent + probes.get(model, 0.0)
-    return Spend(None if total is None else total + sum(probes.values()), per_model)
+        spent = spent_usd(found.costs, model)
+        per_model[model] = None if spent is None else spent + found.probes.get(model, 0.0)
+    return Spend(None if total is None else total + sum(found.probes.values()), per_model)
 
 
 def _moment(text: Any) -> dt.datetime | None:
