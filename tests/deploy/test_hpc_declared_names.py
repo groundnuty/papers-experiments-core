@@ -8,6 +8,8 @@ Against the fake Slurm of hpc_fed_support, with invented names (`.test` for the 
 
 import json
 import re
+import tomllib
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +25,7 @@ DECLARED = {"zone": ZONE_NAME, **{p: f"{p}.{DOMAIN}" for p in PROVIDERS}}
 NODES = ["zone", *PROVIDERS]  # the services' roles, on node01 to node06 in order
 FQDN = {role: f"node{i + 1:02d}.cluster.example.org" for i, role in enumerate(NODES)}
 ADDRESS = {role: f"10.0.0.{i + 1}" for i, role in enumerate(NODES)}
+SLOT = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")  # the renderer's own pattern, written out here
 
 
 @pytest.fixture(scope="module")
@@ -220,7 +223,15 @@ def phase(hpc, tmp_path):
     return SimpleNamespace(root=root, layout=layout, spec=spec, tmp=tmp_path)
 
 
-def _run(hpc, phase, *, with_map, **more):
+def without_slot(phase):
+    """The phase's layout with a template that has no `addresses` line: a template a root without a map can render."""
+    text = phase.layout.spec.platform_template.read_text(encoding="utf-8")
+    path = phase.tmp / "no-addresses.platform.toml.template"
+    path.write_text("".join(x for x in text.splitlines(keepends=True) if not x.startswith("addresses = ")), "utf-8")
+    return replace(phase.layout, spec=replace(phase.layout.spec, platform_template=path))
+
+
+def _run(hpc, phase, *, with_map, layout=None, **more):
     """`core_phase` with every collaborator stood in; returns the arguments the REST client was built with."""
     from hpc_fed_support import data_stand_in, pin_values
 
@@ -252,7 +263,7 @@ def _run(hpc, phase, *, with_map, **more):
     values = {**hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, phase.root),
               **pin_values(phase.tmp / "agent")}  # fmt: skip
     out = hpc.boot.core_phase(
-        phase.layout, (5001, 5001), values, rest=rest, bootstrap=boot, steps=lambda b: None,
+        layout or phase.layout, (5001, 5001), values, rest=rest, bootstrap=boot, steps=lambda b: None,
         content=lambda b: SimpleNamespace(reset=lambda t: None), data=data_stand_in(),
         links=lambda layout, spaces: "link check: stood in", verify=lambda *a, **k: None, **more,
     )  # fmt: skip
@@ -267,21 +278,29 @@ def test_o73_the_core_s_rest_client_is_given_the_map_when_the_root_holds_one(hpc
     assert isinstance(kwargs["addresses"], AddressMap)
     assert kwargs["addresses"].address_of(ZONE_NAME) == ADDRESS["zone"]
     phase.layout.address_map.unlink()
-    built, _ = _run(hpc, phase, with_map=False)
+    built, _ = _run(hpc, phase, with_map=False, layout=without_slot(phase))
     assert built == [{}]
 
 
 def test_o73_the_platform_file_names_the_map_and_loads_with_declared_urls(hpc, phase, monkeypatch):
-    """O73: the rendered platform.toml carries `addresses` (the root's own file, by its absolute path) first, its URLs
-    are the declared names, and the platform layer loads it with the map; none of its text holds a node's name or
-    address."""
+    """O73: the rendered platform.toml is its template with the slots filled (the `addresses` line is the template's
+    own, and `[placement]` is completed as always), its `addresses` is the root's own map and launcher by their absolute
+    paths, its URLs are the declared names, and the platform layer loads it with the map; none of its text holds a
+    node's name or address."""
     from expcore_onedata.testing import ADMIN_ENV
 
     monkeypatch.setenv(ADMIN_ENV, "admin-token-0123456789")
     _run(hpc, phase, with_map=True)
     text = (phase.root / "platform.toml").read_text(encoding="utf-8")
-    assert text.startswith('addresses = { file = "')
-    assert f', resolver = "{phase.root}/toolshim/resolve_launch.py" }}\n' in text.split("\n", 1)[0] + "\n"
+    template = phase.layout.spec.platform_template.read_text(encoding="utf-8")
+    pieces = SLOT.split(template)  # the template's text and its slots' names, alternating
+    pattern = "".join(re.escape(piece) if n % 2 == 0 else "[^\n]*" for n, piece in enumerate(pieces))
+    declared = re.sub(r"(?m)^placement = \{[^}]*\}", 'placement = { holder = "aspen" }', text)
+    assert re.fullmatch(pattern, declared), "the render is the template with its slots filled and nothing else"
+    assert tomllib.loads(text)["addresses"] == {
+        "file": str(phase.layout.address_map),
+        "resolver": str(phase.root / "toolshim" / "resolve_launch.py"),
+    }
     assert f'url = "https://{ZONE_NAME}:8443"' in text
     assert not re.search(r"cluster\.example\.org|10\.0\.0\.", text)
     config = load_platform(phase.root / "platform.toml", require_secrets=False)
@@ -290,10 +309,18 @@ def test_o73_the_platform_file_names_the_map_and_loads_with_declared_urls(hpc, p
     assert config.zone.url == f"https://{ZONE_NAME}:8443"
 
 
-def test_o73_a_root_without_a_map_renders_the_platform_file_as_before(hpc, phase):
-    """O73: no `addresses` line without a map."""
-    _run(hpc, phase, with_map=False)
+def test_o73_a_root_without_a_map_renders_a_template_without_the_slot_as_before(hpc, phase):
+    """O73: no `addresses` line without a map, for a template that has no slot."""
+    _run(hpc, phase, with_map=False, layout=without_slot(phase))
     assert "addresses" not in (phase.root / "platform.toml").read_text(encoding="utf-8")
+
+
+def test_o73_a_root_without_a_map_refuses_a_template_that_names_the_slot(hpc, phase):
+    """O73: the core's phase finds no map where the template's slot needs one: refused, naming the slot, with no
+    platform.toml written."""
+    with pytest.raises(RuntimeError, match=r"@hpc_addresses@"):
+        _run(hpc, phase, with_map=False)
+    assert not (phase.root / "platform.toml").exists()
 
 
 def test_o73_the_facts_hold_what_each_service_registered_and_that_the_dns_check_is_advisory(hpc, phase):

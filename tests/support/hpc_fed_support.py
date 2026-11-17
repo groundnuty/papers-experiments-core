@@ -146,6 +146,27 @@ def manifest_values(root: Path, layout: Path = LAYOUT) -> dict:
     return hpcdata.values(found)
 
 
+def address_values(root: Path, resolver: bool = True) -> dict:
+    """`@hpc_addresses@` as `up` fills it (O73): an inline table of TOML naming the root's address map, a real 0600
+    file in its secrets the platform layer reads as it loads the platform file, and, with `resolver`, the resolve
+    launcher, a regular file of the root's toolshim. Written here from the slot's contract, not by the driver's own
+    function."""
+
+    from expcore_onedata.addresses import build
+
+    secrets = root / "secrets"
+    secrets.mkdir(parents=True, exist_ok=True)
+    map_file = secrets / "address-map.json"
+    build({"zone.invented.test": ("192.0.2.1", ["node01.example.org"])}).write(map_file)
+    parts = [f"file = {json.dumps(str(map_file))}"]
+    if resolver:
+        launcher = root / "toolshim" / "resolve_launch.py"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.write_text("# an invented launcher\n", encoding="utf-8")
+        parts.append(f"resolver = {json.dumps(str(launcher))}")
+    return {"hpc_addresses": "{ " + ", ".join(parts) + " }"}
+
+
 def pin_values(directory: Path) -> dict:
     """The agent's sandbox's placeholders as `up` fills them (`hpcpins.values`), over `agent_site(directory)`."""
     import hpcpins
