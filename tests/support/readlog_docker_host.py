@@ -3,9 +3,10 @@ collector process (`expcore_onedata/readlog/collector.py`) with the container's 
 
 `Collector(host)` installs itself on a `FakeHost` instance (the fake's own methods keep working for every other
 container). Stand-in mode writes, at SIGTERM, a log in the collector's format (`readlog_logs`) of the records a test
-put in `records`; real mode starts the collector as `python -I collector.py <socket dir> <log> <nonce> <uid>` on the
-bound host directories, and the test's own process is the agent (the canary through the real client, at the agent's
-bound socket directory), so the real socket, the real client and the real reader are in play.
+put in `records`; real mode starts the collector as `python -I -B collector.py <socket dir> <log> <nonce> <uid>` (the
+options the sandbox's own command carries) on the bound host directories, and the test's own process is the agent (the
+canary through the real client, at the agent's bound socket directory), so the real socket, the real client and the
+real reader are in play.
 
 Knobs a test sets before the start: `ready` (the container says it is ready), `exits_before_ready`, `canary` (the
 canary cell's answer, stand-in mode), `ignores_term`, `complete` (a TERM writes an end line), `writes_log` (the
