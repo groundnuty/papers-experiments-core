@@ -175,7 +175,7 @@ def pilot_layout(tmp_path, command_form="python"):
     from slots_support import pilot_form
 
     folder = tmp_path / "pilot-layout"
-    folder.mkdir(exist_ok=True)
+    folder.mkdir(parents=True, exist_ok=True)
     (folder / LAYOUT.name).write_text(LAYOUT.read_text(encoding="utf-8"), encoding="utf-8")
     template = pilot_form((HPC / "layouts" / "pilot-shape-slots.platform.toml.template").read_text(encoding="utf-8"))
     if command_form == "env":
@@ -522,7 +522,7 @@ def test_o83_a_tool_server_run_through_env_is_refused_naming_the_form_to_use_at_
     )
     with pytest.raises(ConfigError, match=FORM):
         load_platform(path)
-    rig = Rig(hpc, tmp_path / "rig", pilot_layout(tmp_path / "env", "env"))
+    rig = Rig(hpc, tmp_path, pilot_layout(tmp_path / "env", "env"))
     with pytest.raises(RuntimeError, match=FORM):
         rig.up({**site, "HPC_STUDY_ARTIFACTS": str(study)})
     assert not rig.submitted()
