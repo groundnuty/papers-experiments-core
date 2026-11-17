@@ -278,6 +278,27 @@ def test_c40_an_induction_that_failed_before_any_request_keeps_its_diagnostic_an
     assert (failed["bounded_attempts"], m1["usd"]["total"]) == (0, 0.0)
 
 
+def test_c40_the_runner_redacts_with_the_secrets_the_executor_gave_the_recording(tmp_path):
+    """C40: the snapshot is redacted with the same redactor the attempt's harness-defect log uses, which the recording
+    replaces with the whole context of the attempt (secrets and secret variables passed to `record_run`): a secret the
+    executor named for the record is gone from the diagnostic too."""
+    run_secret = "run-scoped-secret-9876543210"
+
+    async def executor(request):
+        request.defect_log.redact_with(lambda: Redactor([run_secret]))  # what `record_run` does with its `secrets=`
+        start_instruments([Inducer({"seen": f"rejected {run_secret}"})], {"run_key": request.run_key})
+
+    with build(
+        tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+    ) as sched:
+        sched.run()
+        row = dict(sched.store.q("SELECT * FROM attempts ORDER BY id")[0])
+        marker = read_marker(Path(row["run_dir"]), row["run_key"], row["id"])
+    assert run_secret not in row["diagnostic"]
+    assert run_secret not in json.dumps(marker.diagnostic)
+    assert "[redacted]" in row["diagnostic"]
+
+
 # --- the export -------------------------------------------------------------------------------------------------------
 
 

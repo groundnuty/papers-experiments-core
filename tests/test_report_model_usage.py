@@ -108,7 +108,9 @@ def test_c39_the_report_has_a_section_with_each_models_spend_on_each_basis(tmp_p
     assert rows(spend, "| m1 |") == [
         "| m1 | 34.500000 | 4.500000 | 30.000000 | 4.500000 | 0.000000 | 30.000000 | 0.000000 | 0.000000 |"
     ]
-    assert rows(spend, "| m2 |") == ["| m2 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | 0.000000 |"]
+    assert rows(spend, "| m2 |") == [
+        "| m2 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
+    ]  # no price: nothing is known
     assert rows(spend, "| m3 |") == [
         "| m3 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |"
     ]
@@ -252,3 +254,33 @@ def test_c39_the_section_names_no_shard_so_a_merged_report_is_an_unsharded_ones_
     """C39: an unsharded report mentions no shard (a pinned property of it), and the section is the same text for a
     merged batch, whose figures are its shards' added: the merged-batch test compares the two reports line by line."""
     assert "shard" not in render(export(), usage_of_two_models(tmp_path)).lower()
+
+
+def test_c39_an_attempt_still_running_is_n_a_but_for_its_topups_and_the_provenance_says_it_is_not_counted(tmp_path):
+    """C39: a partial analysis's attempt mid-run has no known spend of its own: its row says n/a except its top-ups,
+    the model's Spent is the gate's (which has only its top-ups of it), and the provenance line says how many are
+    still running."""
+    store, _, manifest = planned_store(tmp_path)
+    keys = [row.key.text for row in manifest.rows]
+    run_one(store, keys[0], finished(**TOKENS))
+    running = store.begin_attempt(keys[1], NOW, 1, "", calls_logged=True)
+    store.add_topup(running.id, 0.25, NOW, ("topup", "m1", "a send the cap could not account for"))
+    usage = usage_of(store.q, Pricing({"m1": PRICED}, LIMITS))
+    text = render(export(), usage)
+    classes = section_of(text).split("### Attempts, tokens and spend", 1)[1].split("\n### ", 1)[0]
+    assert rows(classes, "| m1 | attempts still running") == [
+        line("m1", "attempts still running", 1, 0, 0, 0, 0, 1, 1, "n/a", "n/a", "n/a", "0.250000", "n/a")
+    ]
+    [spend] = rows(section_of(text).split("### Spend by model", 1)[1].split("\n### ", 1)[0], "| m1 |")
+    assert spend.startswith("| m1 | 4.750000 | 4.500000 | 0.250000 |")
+    [provenance] = [x for x in text.split("## ", 2)[1].splitlines() if x.startswith("- Spend")]
+    assert "1 attempt(s) still running" in provenance
+
+
+def test_c39_the_notes_say_a_top_up_and_a_probe_are_what_the_gate_charged_so_a_campaign_with_no_budget_has_none():
+    """C39: a campaign without a budget has no gate: its top-ups and probes are 0 there, which the notes say is what
+    the gate charged and not what the endpoints billed."""
+    notes = section_of(
+        render(export(), {"format": "model-usage-1", "dollars": {"known": True, "reason": None}, "models": []})
+    )
+    assert "without a budget" in notes.split("###", 1)[0]

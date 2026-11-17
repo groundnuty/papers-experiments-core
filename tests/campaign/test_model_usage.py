@@ -8,6 +8,7 @@ apart. A dollar that cannot be known is `None`, never 0.
 
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from campaign_support import LATER, NOW, defect, finished, infra, planned_store, run_one
@@ -15,7 +16,7 @@ from campaign_support import LATER, NOW, defect, finished, infra, planned_store,
 from expcore.campaign import probe_spend
 from expcore.campaign.interrupted_spend import INFLIGHT, MEASURED
 from expcore.campaign.lost_ledger import KEY as LOST_KEY
-from expcore.campaign.model_usage import CLASSES, usage_of
+from expcore.campaign.model_usage import CLASSES, attach_observed, merge_usage, observed_by_model, usage_of
 from expcore.campaign.recovery import recover
 from expcore.campaign.selection_ledger import Pricing, spend_of
 from expcore.config.models import Limits, ModelSpec
@@ -257,9 +258,10 @@ def test_c39_what_a_kill_lost_is_its_own_class_with_the_attempts_the_journal_cou
     store.put_meta(LOST_KEY, json.dumps(ledger), NOW)
     m1 = model_of(usage_of(store.q, PRICING))
     cell = klass(m1, "lost_in_kill")
-    assert cell["attempts"] == 1
+    assert (cell["attempts"], cell["bounded_attempts"]) == (1, 1)  # the two charges are no attempts
     assert cell["usd"]["bound"] == pytest.approx(BOUND_USD)  # the journal never saw it end: its bound
-    assert cell["usd"]["charges"] == pytest.approx(0.5 + 0.2 + 0.1)
+    assert cell["usd"]["charges"] == pytest.approx(0.5 + 0.2)  # its top-ups, and the top-up the kill lost
+    assert m1["probes_usd"] == pytest.approx(0.1)  # the probe send the kill lost is a probe, not a top-up
     assert (cell["input_tokens"], cell["usage_incomplete_attempts"]) == (0, 1)  # no log: tokens unknown
     assert m1["usd"]["total"] == pytest.approx(spend_of(store.q, PRICING).per_model["m1"])
 
@@ -343,3 +345,134 @@ def test_c39_a_lost_attempt_the_journal_saw_every_reply_of_shows_those_replies_t
     cell = klass(model_of(usage_of(store.q, PRICING)), "lost_in_kill")
     assert (cell["input_tokens"], cell["output_tokens"], cell["usage_incomplete_attempts"]) == (10_000, 500, 0)
     assert cell["usd"]["measured"] == pytest.approx(FIRST_USD)
+
+
+def lost_ledger_of(store, keys, *, attempts=(), charges=()):
+    """Put a ledger of what a kill lost into the store: the given attempts (as `lost_attempt`) and charges."""
+    ledger = {
+        "campaign": "c" * 64,
+        "journal": "j2.jsonl",
+        "counted": {"j1.jsonl": {"attempts": list(attempts), "charges": list(charges)}},
+    }
+    store.put_meta(LOST_KEY, json.dumps(ledger), NOW)
+
+
+def test_c39_charges_a_kill_lost_with_no_attempt_are_a_class_of_no_attempts_and_a_probe_is_a_probe(tmp_path):
+    """C39: a lost top-up is a top-up and a lost probe send a probe: neither is an attempt charged at a bound, and the
+    class that holds only them says 0 attempts."""
+    store, _, _ = planned_store(tmp_path)
+    lost_ledger_of(
+        store, [], charges=[{"kind": "topup", "model": "m1", "usd": 0.2}, {"kind": "probe", "model": "m1", "usd": 0.1}]
+    )
+    m1 = model_of(usage_of(store.q, PRICING))
+    cell = klass(m1, "lost_in_kill")
+    assert (cell["attempts"], cell["bounded_attempts"], cell["usage_incomplete_attempts"]) == (0, 0, 0)
+    assert cell["usd"]["charges"] == pytest.approx(0.2)
+    assert m1["probes_usd"] == pytest.approx(0.1)
+    assert m1["usd"]["total"] == pytest.approx(spend_of(store.q, PRICING).per_model["m1"])
+
+
+def test_c39_an_attempt_still_running_has_no_known_spend_of_its_own_and_only_its_topups_are_charged(tmp_path):
+    """C39: a partial analysis can hold an attempt mid-run: the gate charges it its top-ups alone, so its dollars are
+    n/a (None) except those, and the model's total is the gate's, which leaves its own spend out."""
+    store, _, manifest = planned_store(tmp_path)
+    keys = keys_of(manifest)
+    run_one(store, keys[0], finished(**TOKENS))
+    running = store.begin_attempt(keys[1], NOW, 1, "", calls_logged=True)
+    store.add_topup(running.id, 0.25, NOW, ("topup", "m1", "a send the cap could not account for"))
+    m1 = model_of(usage_of(store.q, PRICING))
+    cell = klass(m1, "running")
+    assert (cell["attempts"], cell["usage_incomplete_attempts"]) == (1, 1)
+    assert cell["usd"] == {
+        "measured": None, "measured_plus_inflight": None, "bound": None, "charges": pytest.approx(0.25), "total": None,
+    }  # fmt: skip
+    assert m1["usd"]["total"] == pytest.approx(4.5 + 0.25) == pytest.approx(spend_of(store.q, PRICING).per_model["m1"])
+    assert m1["usd"]["not_analysed"] == pytest.approx(0.25)
+
+
+def test_c39_a_model_with_no_price_has_no_known_dollar_even_with_no_attempt_and_no_probe_figure(tmp_path):
+    """C39: an unpriced model's dollars are n/a whatever it did, its probes included: nothing priced them."""
+    store, _, _ = planned_store(tmp_path)
+    unpriced = ModelSpec(key="m2", backend="stub", api_id="m2", status="frozen")
+    usage = usage_of(store.q, Pricing({"m1": SPEC, "m2": unpriced}, LIMITS))
+    m2 = model_of(usage, "m2")
+    assert (m2["price"], m2["classes"], m2["probes_usd"], m2["usd"]) == ("unpriced", [], None, None)
+    assert model_of(usage)["usd"]["total"] == 0.0  # a priced model with no attempt has a known zero
+
+
+def test_c39_a_merged_batch_with_a_shard_whose_dollars_are_unknown_shows_no_known_dollar_at_all(tmp_path):
+    """C39: a dollar is known only where every shard's is: with one shard's prices not shown to be the campaign's, no
+    class, probe or total dollar of the merged figures is known, and a price the shards disagree on is not shown."""
+    first, _, manifest = planned_store(tmp_path / "one")
+    second, _, _ = planned_store(tmp_path / "two")
+    run_one(first, keys_of(manifest)[0], finished(**TOKENS))
+    run_one(second, keys_of(manifest)[1], finished(**HALF))
+    known = usage_of(first.q, PRICING)
+    unknown = usage_of(second.q, None, why="not the campaign's prices", models=["m1"])
+    merged = merge_usage([known, unknown])
+    m1 = model_of(merged)
+    assert merged["dollars"] == {"known": False, "reason": "not the campaign's prices"}
+    assert (m1["usd"], m1["probes_usd"], m1["price"]) == (None, None, None)
+    assert klass(m1, "analysed")["usd"] is None
+    assert klass(m1, "analysed")["attempts"] == 2  # the tokens are both shards'
+    assert klass(m1, "analysed")["input_tokens"] == 1_500_000
+
+
+def test_c39_an_attempt_known_to_have_had_no_turn_has_no_unreported_count(tmp_path):
+    """C39: an attempt whose per-turn usage is known to hold no turn (the loop ended before any reply, and the usage
+    was judged with the check that a billed reply left no turn) costs 0 measured: it is not incomplete, which is what
+    the gate says of it; one whose per-turn usage is unknown is."""
+    store, _, manifest = planned_store(tmp_path)
+    keys = keys_of(manifest)
+    run_one(store, keys[0], infra("endpoint", "refused before a reply", model_turns=0, turn_usage=()))
+    run_one(store, keys[1], infra("endpoint", "refused, usage unknown", model_turns=0, turn_usage=None))
+    cell = klass(model_of(usage_of(store.q, PRICING)), "infra_fail")
+    assert cell["attempts"] == 2
+    assert cell["usage_incomplete_attempts"] == 1  # only the one whose turns are unknown
+    assert cell["usd"]["measured"] == 0.0
+    assert cell["usd"]["bound"] == pytest.approx(BOUND_USD)
+
+
+def test_c39_a_store_whose_dollars_are_unknown_still_has_its_lost_attempts_tokens(tmp_path):
+    """C39: the tokens are the store's whatever the dollars are: a lost attempt the journal saw end is in its class with
+    its tokens when no prices apply, and a model only the ledger names is listed."""
+    store, _, manifest = planned_store(tmp_path)
+    lost = {
+        "id": 98, "run_key": keys_of(manifest)[1], "model": "m9", "started_utc": NOW, "state": "infra_fail",
+        "reserved_capped": None, "input_tokens": 700, "output_tokens": 30, "cache_creation_tokens": 0,
+        "cache_read_tokens": 0, "turn_usage": "[[700, 30, 0, 0]]", "usage_complete": 1, "replies_checked": 1,
+        "topups": 0, "topup_usd": 0.0,
+    }  # fmt: skip
+    lost_ledger_of(store, [], attempts=[lost])
+    usage = usage_of(store.q, None, why="no prices")
+    cell = klass(model_of(usage, "m9"), "lost_in_kill")
+    assert (cell["attempts"], cell["input_tokens"], cell["output_tokens"], cell["usd"]) == (1, 700, 30, None)
+
+
+def test_c39_a_malformed_row_whatever_it_raises_is_unknown_dollars_and_never_an_error(tmp_path):
+    """C39: a per-turn usage the cost code cannot read raises a TypeError or a ValueError from inside it: the analysis
+    still runs, its dollars unknown with the reason."""
+    tiers = TieredPrice((PriceTier(200_000, Price(1.25, 10.0)), PriceTier(None, Price(2.5, 15.0))))
+    tiered = ModelSpec(key="m1", backend="stub", api_id="m1", status="frozen", price=tiers, context_tokens=100_000)
+    store, _, manifest = planned_store(tmp_path)
+    run_one(store, keys_of(manifest)[0], finished(**TOKENS))
+    store.db.execute("UPDATE attempts SET turn_usage='5'")  # not a list of turns
+    usage = usage_of(store.q, Pricing({"m1": tiered}, LIMITS))
+    assert usage["dollars"]["known"] is False
+    assert klass(model_of(usage), "analysed")["attempts"] == 1
+
+
+def test_c39_what_the_records_say_has_no_float_noise_and_a_retry_without_a_kind_is_unknown(tmp_path):
+    """C39: waits are summed to a millisecond, so no addition artefact reaches the bytes of an output, and a retry
+    event that names no kind is `unknown`, not the word None."""
+    events = [{"kind": "rate_limit", "wait_s": 0.1}, {"kind": "rate_limit", "wait_s": 0.2}, {"wait_s": 0.0}]
+    turn = {"served_model": "m1-x", "system_fingerprint": None, "retries": events}
+    record = SimpleNamespace(factors={"model": "m1"}, transcript=[turn])
+    store, _, _ = planned_store(tmp_path)
+    usage = attach_observed(usage_of(store.q, PRICING), observed_by_model([record]))
+    retries = model_of(usage)["retries"]
+    assert retries["wait_s"] == 0.3
+    assert [(k["kind"], k["events"], k["wait_s"]) for k in retries["by_kind"]] == [
+        ("rate_limit", 2, 0.3),
+        ("unknown", 1, 0.0),
+    ]
