@@ -85,6 +85,8 @@ def spawn(node: FakeNode, argv: list[str], stdout: Path, stderr: Path, environ: 
         if node.real_node is None:
             node.real_node = LocalNode()
         env = dict(item.split("=", 1) for item in environ)
+        stdout.unlink()  # the fake node made both files for its own emulation: the real spawn makes them itself
+        stderr.unlink()
         started = node.real_node.spawn(argv, stdout=stdout, stderr=stderr, env=env)
         node.real_helpers.add((started.pid, started.start))
         return started

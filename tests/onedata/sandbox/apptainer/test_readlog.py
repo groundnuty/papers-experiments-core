@@ -13,12 +13,15 @@ import json
 import os
 import signal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from apptainer_support import TOKEN, make_settings, make_spec, start
 from fake_node import FakeNode
 
 from expcore.errors import InfraError
+from expcore.replay.side_file_placement import stage_harness_side_file
+from expcore.replay.side_files import SideFile
 from expcore_onedata.readlog import facts, files, paths
 from expcore_onedata.readlog.instrument import ReadLog
 from expcore_onedata.sandbox.api import ReadOnlyInput, SandboxError, StartRefused
@@ -132,7 +135,7 @@ def test_o91_the_canary_is_the_first_record_of_the_log(node, settings, tmp_path)
         snapshot = instrument(box).finish()
         assert snapshot["log"] == "intact"
         assert snapshot["canary"] is True
-        assert snapshot["counts"] == {"reads": 0, "malformed": 0, "unwritten": 0}
+        assert snapshot["counts"] == {"reads": 0, "canaries": 1}
     finally:
         box.stop()
 
@@ -177,6 +180,33 @@ def test_o91_the_log_is_read_once_after_the_collector_stopped_and_copied_into_th
         assert snapshot["log"] == "intact"
         assert snapshot["counts"]["reads"] == 1
         assert snapshot["side_sha256"] is not None
+    finally:
+        box.stop()
+
+
+@pytest.mark.parametrize("killed", [False, True], ids=["intact", "killed"])
+def test_o91_the_evidence_copy_is_what_the_executor_stages_and_its_hash_is_the_snapshots(
+    node, settings, tmp_path, killed
+):
+    """O91: the executor hands `stage_harness_side_file` the copy `collect` wrote (`result["read_log"]`): the bytes
+    the instrument hashed are the staged file's, whether the log is intact or unknown (a killed collector's log is
+    staged too, so what was read before the kill can be looked at)."""
+    box = start(node, settings)
+    try:
+        node.readlog_collector().record({"v": 1, "op": "read", "item": "file-1", "bytes": 9})
+        if killed:
+            proc = node.readlog_collector().proc
+            assert node.signal(proc.pid, proc.start, signal.SIGKILL) is True
+        done = box.collect(tmp_path / "out")
+        snapshot = instrument(box).finish()
+        assert snapshot["log"] == ("unknown" if killed else "intact")
+        request = SimpleNamespace(
+            run_dir=tmp_path / "runs" / "aaaa" / "try1", identity=SimpleNamespace(run_key="run-1", attempt=1)
+        )
+        declared = [SideFile(paths.SIDE_FILE_NAME, paths.SIDE_HASH_FIELD)]
+        staged = stage_harness_side_file(request, declared, paths.SIDE_FILE_NAME, tmp_path / "out" / done["read_log"])
+        assert staged is not None
+        assert staged.sha256 == snapshot["side_sha256"]
     finally:
         box.stop()
 

@@ -18,7 +18,8 @@ import time
 from pathlib import Path
 
 import pytest
-from apptainer_support import make_settings, start
+from apptainer_support import make_settings
+from apptainer_support import start as start_with
 from fake_node import FakeNode
 
 from expcore_onedata.readlog import files, paths
@@ -42,6 +43,13 @@ def settings():
     short = Path(tempfile.mkdtemp(prefix="rl"))
     yield make_settings(short, readlog_collector_sha256=files.sha256_of(files.collector_file()))
     shutil.rmtree(short, ignore_errors=True)
+
+
+def start(node, settings):
+    """A start on the real clock: the helpers' waits (`helpers.stop` gives a collector a few seconds to drain and write
+    its end line) are in real time here, since the collector is a real process; the default's clock moves only when the
+    sandbox sleeps, so a stop would give up at once and kill the collector before its end line."""
+    return start_with(node, settings, sleep=time.sleep, clock=time.monotonic)
 
 
 def instrument(box) -> ReadLog:
@@ -82,7 +90,7 @@ def test_o91_a_client_in_a_cell_sends_and_the_record_appears_with_the_expected_p
         snapshot = instrument(box).finish()
         assert snapshot["log"] == "intact"
         assert snapshot["canary"] is True
-        assert snapshot["counts"] == {"reads": 1, "malformed": 0, "unwritten": 0}
+        assert snapshot["counts"] == {"reads": 1, "canaries": 1}
     finally:
         box.stop()
 
