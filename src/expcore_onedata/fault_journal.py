@@ -61,6 +61,7 @@ from typing import Any
 
 from expcore.campaign.healthgate import Health, HealthCheck
 from expcore.errors import TARGET_LABEL
+from expcore_onedata.fault_owner import charge_of, with_note
 
 JOURNAL = "injections.jsonl"
 JOURNAL_LOCK = "journal.lock"
@@ -428,5 +429,7 @@ class SettledInjections:
             return Health(False, f"the injection journal cannot be read ({type(error).__name__})")
         if entries:
             targets = ", ".join(sorted({entry["target"] for entry in entries}))
-            return Health(False, f"an injection of {targets} is unsettled: the federation is not in its baseline state")
+            charge, note = charge_of(entries)  # only the attempt that made it is charged for it (O80)
+            detail = f"an injection of {targets} is unsettled: the federation is not in its baseline state"
+            return Health(False, with_note(detail, note), charge=charge)
         return self._inner() if self._inner is not None else Health(True, "no injection is unsettled")

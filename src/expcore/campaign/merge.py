@@ -18,12 +18,18 @@ side file in that copy (R15), never in the shard, and the batch is laid out from
 replay check (`study.merge`) last:
 
 1. every shard is sharded, under the same rule and count, with indices exactly 1..N and distinct labels;
-2. every shard has the same campaign fingerprint, which a start pins whole, so the same experiment;
+2. every shard has the same campaign fingerprint, which a start pins whole, so the same experiment; first of all the
+   same core (`check_core`): a shard that ran the core at another commit is refused naming both commits, and so is
+   one whose environment records the core in the other form (an earlier core recorded it by how it was installed);
 3. the shards' run sets are disjoint, and every run belongs to its shard under their rule's assignment of the whole
    plan (`assign()`, or by model with the `[shards]` layout of their fingerprint, C32);
 4. the union of the run sets is exactly the plan, so no run is missing and none is extra;
 5. each shard passes the replay check `python -m expcore check` performs on a batch;
 6. every shard records the same environment identity.
+
+A shard whose `out/` holds `NOT-FINAL.json` (`shard.NOT_FINAL_FILE`) is refused first of all, naming it and the reason
+the file gives: a driver that checks a shard's results before archiving them, as the HPC shard driver's post-run script
+does (O63), marks them so when the check did not pass.
 
 A campaign run in **selections** (`expcore-shard/4`, C38) is merged by the same command, with the checks of
 `campaign.merge_selection` in place of 1, 3 and 4: the selections are disjoint and cover the plan, sequential ones ran
@@ -65,6 +71,7 @@ from expcore.campaign.shard import (
     META_SHARD,
     META_SHARES,
     META_STARTED,
+    NOT_FINAL_FILE,
     ShardError,
     check_identity,
     in_shard,
@@ -73,6 +80,7 @@ from expcore.campaign.shard import (
     partition,
 )
 from expcore.campaign.snapshot import SNAPSHOT_FILE, AttemptsRunning, SnapshotError, take_snapshot
+from expcore.provenance.environment import core_entry, is_earlier_form
 
 SHARDS_DIR = "shards"
 RUNS_DIR = "runs"
@@ -163,7 +171,19 @@ def read_shard(out: Path, scratch: Path, pricing: Pricing | None = None) -> Shar
         raise MergeRefused(f"{out}: {error}; a shard is merged when it has finished") from None
     except SnapshotError as error:
         raise MergeRefused(str(error)) from None
-    return facts_of_bytes(scratch.read_bytes(), out, out=out, snapshot=scratch, pricing=pricing)
+    facts = facts_of_bytes(scratch.read_bytes(), out, out=out, snapshot=scratch, pricing=pricing)
+    if os.path.lexists(out / NOT_FINAL_FILE):  # a driver's check of the shard's results did not pass (it says why)
+        raise MergeRefused(f"{facts.name}: its results are marked not final ({_not_final_reason(out)})")
+    return facts
+
+
+def _not_final_reason(out: Path) -> str:
+    """The reason the shard's `NOT-FINAL.json` gives, for a message; a fixed phrase when it cannot be read."""
+    try:
+        reason = json.loads((out / NOT_FINAL_FILE).read_text(encoding="utf-8")).get("reason")
+    except (OSError, ValueError, AttributeError):
+        reason = None
+    return reason if isinstance(reason, str) and reason else f"{NOT_FINAL_FILE} says so"
 
 
 def facts_of_bytes(
@@ -281,8 +301,35 @@ def _check_specs(shards: Sequence[ShardFacts]) -> None:
         labels[shard.spec.label] = shard
 
 
+def check_core(shards: Sequence[ShardFacts]) -> None:
+    """2, for the core first: every shard ran the core the first did, by the identity its environment records.
+
+    A shard at another commit is refused naming both commits. A shard whose environment records the core in the earlier
+    form, by how it was installed, beside one that records its identity, is refused too: what the earlier form says
+    cannot be compared with a commit (`study.core_legacy`). Shards that all record the earlier form, or an environment
+    without sources (an anonymised package's), have no commit to compare, and the whole fingerprint decides.
+    """
+    first = shards[0]
+    was = first.fingerprint.get("environment")
+    for shard in shards[1:]:
+        now = shard.fingerprint.get("environment")
+        if is_earlier_form(now) != is_earlier_form(was):
+            older, newer = (shard, first) if is_earlier_form(now) else (first, shard)
+            raise MergeRefused(
+                f"{older.name}: its environment records the core by how it was installed, as an earlier core recorded "
+                f"it, and {newer.name}'s by its commit: shards of the two forms are not one campaign"
+            )
+        before, after = core_entry(was), core_entry(now)
+        if before is not None and after is not None and before.get("commit") != after.get("commit"):
+            raise MergeRefused(
+                f"{shard.name}: ran the core at commit {after.get('commit')}, {first.name} at commit "
+                f"{before.get('commit')}: shards merge only when they ran one core"
+            )
+
+
 def check_fingerprints(shards: Sequence[ShardFacts]) -> None:
-    """2: every shard has the campaign fingerprint of the first."""
+    """2: every shard has the campaign fingerprint of the first, the core first of all (`check_core`)."""
+    check_core(shards)
     first = shards[0]
     for shard in shards[1:]:
         if shard.fingerprint != first.fingerprint:

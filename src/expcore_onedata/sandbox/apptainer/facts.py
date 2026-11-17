@@ -9,6 +9,11 @@ key, `dns_none`, records what a cell resolves and is no departure: a Docker cell
 One key is conditional, `mount_refused`: it is listed only for a run whose sandbox refuses a mount data path at its
 start (`ApptainerSandbox._mount_refused`: no mount helper is given, or the platform declares no `[sandbox.mount]`), so a
 mount run, which was not refused, never carries it, nor does any run of a sandbox that would accept one.
+
+One more entry is no departure either: `provider_storage`, the kind of storage the federation's providers keep their
+data on (`tmpfs` or `shared_filesystem`), which the HPC driver declares in `[sandbox.apptainer]` (O57). It sits beside
+the list of keys, only for a platform that declares it, so a Compose federation's runs and an older platform's keep
+their record.
 """
 
 from __future__ import annotations
@@ -96,12 +101,18 @@ FACTS: dict[str, str] = {
 DNS = "none"  # what a cell's name lookups reach (dns_none)
 
 
-def record(*, mount_refused: bool) -> dict[str, Any]:
+def record(*, mount_refused: bool, provider_storage: str | None = None) -> dict[str, Any]:
     """The run's `infrastructure_facts`: every key, sorted, for a reader to look up, and its name service.
-    `mount_refused` is listed only when the run's sandbox refuses a mount data path (the module's docstring). The
-    sandbox's metadata adds the watch's memory reading (`memory`) once it exists."""
+    `mount_refused` is listed only when the run's sandbox refuses a mount data path (the module's docstring). When the
+    platform declares where the federation's providers keep their data (`[sandbox.apptainer] provider_storage`, O57),
+    the record carries that kind as `provider_storage`: it shapes a run's I/O timing, so a reader of one run knows it,
+    and a run of a platform that declares none has no such key. The sandbox's metadata adds the watch's memory reading
+    (`memory`) once it exists."""
     keys = sorted(key for key in FACTS if mount_refused or key != "mount_refused")
-    return {"backend": "apptainer", "facts": keys, "dns": DNS}
+    out: dict[str, Any] = {"backend": "apptainer", "facts": keys, "dns": DNS}
+    if provider_storage is not None:
+        out["provider_storage"] = provider_storage
+    return out
 
 
 __all__ = ["FACTS", "record"]

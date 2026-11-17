@@ -14,14 +14,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+import hpcdata
+import hpcidentity
 import hpcimport
 import hpcpins
+import hpcplacement
+import hpcquota
 import hpcrelay
 import hpcstate
+import hpcstorage
 from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
-from hpcboot import core_phase, hpc_spec, hpc_values, load_owner
+from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, verify_ingested
 from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
 from hpclaunch import Launcher, StateStore
@@ -78,6 +83,7 @@ class Driver(Down):
     command: List[str]  # this driver's argv prefix for this federation: what the fault relay runs a verb through
     say: Callable[[str], None] = _say
     core: Callable[..., str] = core_phase
+    verify: Callable[..., Dict[str, str]] = verify_ingested  # verify-data's read of each ingested space (O57)
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     poll_s: float = 5.0
@@ -159,6 +165,10 @@ class Driver(Down):
             self.layout.import_manifest(space.name, self.environ)
         hpcimport.check_support(self.layout, self.environ)
         places = {"the federation's root": self.root, "the log directory (L)": Path(site.logs)}
+        if (
+            site.storage_root
+        ):  # the provider storage's scratch root: `down` removes below it, and nothing may reach a tree
+            places["the provider storage root (HPC_STORAGE_ROOT)"] = Path(site.storage_root)
         hpcimport.check_separate(self.layout, self.environ, places)
 
     def preflight(self, site: Site) -> None:
@@ -166,6 +176,11 @@ class Driver(Down):
         self.check_imports(site)
         if self.layout.outer_roots or self.layout.inner_roots:
             raise RuntimeError("the root lies inside another federation's root, or holds one; refused")
+        if self.relay_available() and hpcrelay.linked(self.root):  # refused now, not once the federation is up
+            raise RuntimeError(
+                "the root is reached through a symbolic link, where the fault relay does not start: name it by its "
+                "resolved path"
+            )
         if self.root.exists() and not self.layout.owned and any(self.root.iterdir()):
             raise RuntimeError(f"the root holds files and is not marked as this federation's ({ROOT_MARKER}); refused")
         if self.store.exists():
@@ -178,13 +193,37 @@ class Driver(Down):
             raise RuntimeError("L is not a directory")
         if self.settings.core == "step" and not site.core_python:
             raise RuntimeError('[hpc] core = "step" needs HPC_CORE_PYTHON, the core\'s Python on the nodes')
+        if self.settings.sandbox is not None and not site.core_python:  # the reaper of the sandbox's runs is the core's
+            raise RuntimeError(
+                "the agent's node needs HPC_CORE_PYTHON, the core's Python on the nodes: down's sweep of a node a "
+                "shard step ran on reaps the sandbox's killed runs with the core's reaper"
+            )
         template = self.spec.platform_template
-        hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None)
+        text = template.read_text(encoding="utf-8") if template is not None else None
+        declared = [space.data_manifest for space in self.spec.spaces if space.data_manifest]
+        hpcpins.check(site, text, declared)
+        hpcplacement.check_template(
+            text
+        )  # a template declares [placement] holder (O79), which the core has no default for
+        # every declared manifest loads now, so a mistake in one fails before a job is held
+        hpcdata.ingested_manifests(self.layout, hpcdata.study_values(site.study_artifacts))
+        self.check_scratch(site)
         if self.settings.sandbox is not None:
             self.say(
                 f"the layout declares the agent's node ({self.settings.sandbox_placement}): it is held and placed, and "
                 "only its node facts step runs on it here (M5's shard step runs the agent)"
             )
+
+    def check_scratch(self, site: Site) -> None:
+        """The provider storage's scratch root, and the inode guard (hpcquota; DESIGN.md section 11): with a scratch
+        root, the account's inode usage and quota are read through the site's command and the federation refused when
+        its estimate would pass 95% of the quota, or when the quota cannot be read, before anything is submitted. The
+        check is mandatory there: the providers' storage is bound onto scratch, and no override skips it. Nothing
+        without a scratch root: nothing of the federation lands on scratch."""
+        if not site.storage_root:
+            return
+        hpcstorage.check_root(site, self.root)
+        self.say(hpcquota.guard(self.slurm.runner, site, self.layout, self.environ))
 
     def prepare_root(self) -> None:
         private_directory(self.root)
@@ -195,11 +234,15 @@ class Driver(Down):
         self.layout.ca_pem.parent.mkdir(exist_ok=True)
         self.layout.journal.mkdir(exist_ok=True)
 
-    def initial_state(self, site: Site) -> Dict[str, Any]:
+    def initial_state(self, site: Site, tree: Optional[str] = None) -> Dict[str, Any]:
+        """The state file as `up` first writes it. `tree` is the digest of the study's artifacts directory
+        (`study_artifacts_tree`), kept under `hpcidentity.ARTIFACTS` so the core's phase, here or in a step on a node
+        whose environment is an allowlist, is handed the digest `up` took and never reads the directory again; the
+        key is left out when there is none."""
         roles = self.settings.roles(tuple(p.name for p in self.spec.providers))
         node = self.settings.node()
         name = f"hpcop-{self.spec.project[:40]}-{secrets.token_hex(4)}"
-        return {
+        state = {
             "format": hpcstate.FORMAT,
             "project": self.spec.project,
             "layout": {"source": self.spec.source, "digest": self.spec.digest, "path": str(self.layout_path)},
@@ -218,12 +261,18 @@ class Driver(Down):
                 "ends": None,
             },
             "sandbox": self.sandbox_record(name),
+            "storage": hpcstorage.plan(site, name, [p.name for p in self.spec.providers]),
             "roles": [role.name for role in roles],
             "services": {role.name: hpcstate.new_service(role.kind) for role in roles},
             "clients": {},
             "owner": None,
+            # the spaces the study ingests into, each to be verified after its ingest (`verify_data`); plan reads it
+            "data": {"ingested": hpcdata.ingested_record(self.layout, hpcdata.study_values(site.study_artifacts))},
             "phase": "preflight",
         }
+        if tree is not None:
+            state[hpcidentity.ARTIFACTS] = tree
+        return state
 
     def sandbox_record(self, name: str) -> Optional[Dict[str, Any]]:
         """Where the agent's node is held (DESIGN.md, section 4), None without one: M5's shard driver reads `node`, and
@@ -284,12 +333,35 @@ class Driver(Down):
 
     def up(self, site: Site) -> str:
         self.preflight(site)
+        tree = self.study_artifacts_tree(site)
         self.prepare_root()
         with self.store.lifecycle("up"):  # a down cannot run between the state and the sbatch
-            return self.bring_up(site)
+            return self.bring_up(site, tree)
 
-    def bring_up(self, site: Site) -> str:
-        state = self.store.create(self.initial_state(site))
+    def study_artifacts_tree(self, site: Site) -> Optional[str]:
+        """The digest of the study's artifacts directory (`HPC_STUDY_ARTIFACTS`, O74), taken here, on the login node
+        and before anything is made or submitted, so a tree that cannot be digested (a special file, a directory that
+        is not one, a link whose target leaves the directory: it must be self-contained) fails `up` at once, naming
+        the variable and a path relative to the directory, never an absolute one. None when the site declares no
+        directory, or the layout names no platform template, which writes no render identity to hold it. The tree is
+        only read: it may be read-only."""
+        if not site.study_artifacts:
+            return None
+        if self.spec.platform_template is None:
+            self.say(
+                "HPC_STUDY_ARTIFACTS is set and the layout names no platform template: it writes no render identity"
+            )
+            return None
+        try:
+            digest = hpcidentity.tree_sha256(Path(site.study_artifacts))
+        except hpcidentity.TreeError as error:
+            raise RuntimeError(f"HPC_STUDY_ARTIFACTS: {error}") from None
+        self.say("the study's artifacts directory (HPC_STUDY_ARTIFACTS) is digested for the render identity")
+        return digest
+
+    def bring_up(self, site: Site, tree: Optional[str] = None) -> str:
+        state = self.store.create(self.initial_state(site, tree))
+        self.make_storage(state)  # recorded above, made before any job exists to bill for it
         asked, alone = self.allocation(state, site), self.sandbox_allocation(state, site)
         held = [(self.submit(asked, "allocation"), asked)]
         if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
@@ -308,6 +380,16 @@ class Driver(Down):
         out = self.run_core()
         self.set(lambda s: s.update(phase="linked"))
         return f"{out}\n{self.start_relay()}"
+
+    def make_storage(self, state: Mapping[str, Any]) -> None:
+        """The providers' storage directories on scratch, as the state records them (hpcstorage.create); none without a
+        scratch root. `down` removes exactly these, and only these."""
+        record = state.get("storage")
+        if record is None:
+            return
+        hpcstorage.create(record)
+        made = len(record["providers"])
+        self.say(f"provider storage: {made} director(ies) made on scratch and recorded; down removes them")
 
     def start_relay(self) -> str:
         """The login node's fault relay, for a campaign on a compute node (M4); none in a core without it."""
@@ -483,7 +565,9 @@ class Driver(Down):
             argv = ["bash", str(BUNDLE / "provider.sbatch"), str(BUNDLE), tar, name, zone["fqdn"], site.admin_mail]
             # --import=SPACE=PATH for each tree it owns, none for a mirror
             imports = hpcimport.provider_import_args(self.layout, name, self.environ)
-            self.launch(name, [*argv, zone["address"], *peers, *imports])
+            # --storage=PATH, its own directory on scratch, bound onto /volumes/posix; none without a scratch root
+            storage = hpcstorage.provider_args(state, name)
+            self.launch(name, [*argv, zone["address"], *peers, *imports, *storage])
         self.say(f"{len(names)} provider(s) launched; registering each")
         for name in names:
             self.register(name, self.record_workdir(name, self.wait_log(name, TOKEN_WAIT)))
@@ -587,9 +671,58 @@ class Driver(Down):
         s, site = self.settings, Site.from_json(state["site"])
         # the agent's sandbox's values, as up recorded the site (its files' pins checked in the preflight)
         values = {**hpc_values(state["command"], s.stop_bound_s, s.settle_timeout_s, self.root), **hpcpins.values(site)}
+        # the study's artifacts digest, as up took it: a step on a node has no site variable and never reads the tree
+        if state.get(hpcidentity.ARTIFACTS) is not None:
+            values[hpcidentity.ARTIFACTS] = state[hpcidentity.ARTIFACTS]
         out = self.core(self.placed_layout(state), owner, values, environ=self.environ)
         self.set(lambda s: s.update(phase="bootstrapped"))
         return out
+
+    def verify_data(self) -> str:
+        """After the study's ingest, show that each ingested space holds exactly the data its manifest declares (O57,
+        C06): every file's path, size and SHA-256, and every directory, read through the space's owner and compared with
+        the manifest `up` recorded. A pass is recorded in the state file as a marker bound to the manifest's digest,
+        which `shards.py plan` requires; a space that differs fails loudly, naming it and the counts, and has no marker
+        (one an earlier pass left is cleared). A federation whose `up` has not finished is refused."""
+        state = self.store.read()
+        if state.get("phase") != "linked":
+            raise RuntimeError(f"the federation's up has not finished (phase {state.get('phase')}): nothing to verify")
+        recorded = (state.get("data") or {}).get("ingested")
+        if recorded is None:
+            raise RuntimeError("the state holds no record of the ingested spaces (its up predates it): down, then up")
+        # a verification that fails, or dies mid-read, leaves no marker an earlier pass gave
+        self.set(lambda s: [record.update(verified=None) for record in s["data"]["ingested"].values()])
+        values = hpcdata.study_values(Site.from_json(state["site"]).study_artifacts)
+        now = hpcdata.ingested(self.layout)
+        if set(now) != set(recorded):
+            raise RuntimeError("the layout's ingested spaces are not the ones this up recorded: it changed since up")
+        manifests = hpcdata.ingested_manifests(self.layout, values)
+        for space, manifest in manifests.items():
+            if manifest.digest() != recorded[space]["manifest"]:
+                raise RuntimeError(f"{space}: its manifest is not the one up recorded (its file changed since up)")
+        if not manifests:
+            return "data: no ingested space: nothing to verify"
+        owner = tuple(state["owner"] or ())
+        if len(owner) != 2:
+            raise RuntimeError("the state names no owner of the providers' storage: the node facts did not run")
+        found = self.verify(self.placed_layout(state), owner, manifests)
+        passed = {space: manifests[space] for space, said in found.items() if not said}
+
+        def mark(state: Dict[str, Any]) -> None:
+            for space, record in state["data"]["ingested"].items():
+                manifest = passed.get(space)
+                record["verified"] = None if manifest is None else {
+                    "manifest": manifest.digest(), "files": len(manifest.files), "bytes": manifest.bytes}  # fmt: skip
+
+        self.set(mark)
+        failed = [hpcdata.failure(space, said, recorded[space]["declared"]) for space, said in found.items() if said]
+        if failed:
+            raise RuntimeError("; ".join(failed) + ": not verified")
+        files = sum(len(m.files) for m in manifests.values())
+        return (
+            f"data: every ingested space holds the data its manifest declares ({len(manifests)} space(s), "
+            f"{files} file(s))"
+        )
 
     def run_core(self) -> str:
         """The core's phase where `[hpc] core` says: here, or in a control step on the zone's node."""

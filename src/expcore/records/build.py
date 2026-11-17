@@ -28,6 +28,7 @@ from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import LoopResult, TurnRecord
 from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
+from expcore.models import spend
 from expcore.models.adapters import ModelBackend, ModelTurn
 from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
@@ -595,6 +596,7 @@ async def _record_attempt(
         sleep=sleep,
         on_defect=defect_log,
     )
+    spend.after_loop()  # every request is closed: an exception from here on is not one during the loop (C05)
     unheld = None if reply_cap_unheld is None else await asyncio.to_thread(reply_cap_unheld)
     record = _build_record(
         result,

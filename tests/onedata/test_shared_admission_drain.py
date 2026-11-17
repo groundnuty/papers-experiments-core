@@ -27,7 +27,7 @@ from expcore_onedata.tool_admission import shared_admission, shared_admission_as
 WAIT_S = 10.0  # a bound no test should reach
 PROBE_S = 0.2  # a bound that runs out
 DRAIN_S = 3.0  # the session drain an outage run's release leaves in these tests: long enough to outlast a slow fsync
-REASON = "smoke: warm-up of the first space"
+REASON = "smoke_warmup"
 
 
 def federation(tmp_path, drain_s=DRAIN_S):
