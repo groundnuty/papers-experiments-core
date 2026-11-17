@@ -4,7 +4,9 @@ It implements `NodeOps` (expcore_onedata.sandbox.apptainer.node). Every `apptain
 its environment, its image and its command, and kept in `execs`, so a test reads exactly what a cell was given. A cell
 runs under the completion bootstrap (O55) as on the fake docker host (`fake_host`): the program is checked against the
 size and hash its argv names, handed to `cell_handler`, and the record added to both streams; `exec_delivers` stands
-for a stdin that loses bytes and a handler that returns `Unrecorded` for an exec whose record never came.
+for a stdin that loses bytes and a handler that returns `Unrecorded` for an exec whose record never came. An exec with
+no `--uts --hostname <name>` after `--pwd` fails to parse, as every exec path of the backend must carry them; what a
+cell reads as its host name (`Cell.hostname`, `Exec.hostname`) is that name.
 
 While a cell runs, its processes are in the process table in a PID namespace of their own, carrying the run's tag in
 their environment and the nonce in their command line, as `apptainer exec --containall` would make them; the cell waits
@@ -96,6 +98,7 @@ class Exec:
     image: str
     command: list[str]
     stdin: str | None
+    hostname: str | None = None  # the name `--uts --hostname` set in the exec's UTS namespace
 
 
 @dataclass
@@ -112,6 +115,11 @@ class Cell:
     def source(self, target: str) -> Path | None:
         found = self.exec.binds.get(target)
         return None if found is None else Path(found[0])
+
+    def hostname(self) -> str:
+        """What `hostname` and `uname -n` print in the cell: the name set in its UTS namespace."""
+        assert self.exec.hostname is not None
+        return self.exec.hostname
 
 
 @dataclass
@@ -474,6 +482,8 @@ def parse_exec(argv: list[str], stdin: str | None) -> Exec:
     expected = ["--containall", "--cleanenv", "--no-home", "--no-mount", AV.NO_MOUNT, "--pwd", "/work"]
     assert rest[: len(expected)] == expected, f"the exec's flags: {rest[: len(expected)]}"
     rest = rest[len(expected) :]
+    assert rest[:2] == ["--uts", "--hostname"] and len(rest) > 2, f"the exec's UTS flags: {rest[:3]}"
+    hostname, rest = rest[2], rest[3:]
     binds: dict[str, tuple[str, bool]] = {}
     env: dict[str, str] = {}
     while rest and rest[0] in ("-B", "--env"):
@@ -487,7 +497,7 @@ def parse_exec(argv: list[str], stdin: str | None) -> Exec:
         else:
             name, _, text = value.partition("=")
             env[name] = text
-    return Exec(argv, flags, binds, env, rest[0], rest[1:], stdin)
+    return Exec(argv, flags, binds, env, rest[0], rest[1:], stdin, hostname=hostname)
 
 
 __all__ = ["CANARY_MARK", "CGROUP", "Cell", "Exec", "FakeNode", "FakeProc", "Unrecorded", "parse_exec"]

@@ -205,6 +205,13 @@ def test_o56_a_hook_bind_may_not_give_the_cell_a_name_server(tmp_path):
             _load(tmp_path, _document(binds=[{"path": "f", "sha256": SHA, "target": target}]))
 
 
+def test_o73_a_hook_bind_may_not_replace_the_cell_s_host_name(tmp_path):
+    """O73: the cell's `/etc/hostname` is the sandbox's own file of the declared name: a hook (b) bind onto it is
+    refused, as one onto the name server files is."""
+    with pytest.raises(ConfigError, match="entry 0"):
+        _load(tmp_path, _document(binds=[{"path": "f", "sha256": SHA, "target": "/etc/hostname"}]))
+
+
 def test_the_campaign_fingerprint_holds_the_backend_s_pins_and_docker_s_is_unchanged(tmp_path, fake):
     """O56: a Docker and an Apptainer run are never one experiment; a Docker platform's fingerprint keeps its shape."""
     from expcore_onedata.config import load_platform
