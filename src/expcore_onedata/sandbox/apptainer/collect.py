@@ -92,6 +92,17 @@ class Collection:
             )
             death = {"role": role, "condition": box.spec.mode.value, "cause": ID.UNDETERMINED}
             death.update(category="infrastructure", basis=basis, problems=[f"the {role} is not running"])
+            # a gate the watch killed for its memory hit its own limit, as on Docker: a defect of the component (O70)
+            killed = box._watch.gate_kill() if role == "gate" and alive is False and box._watch is not None else None
+            if killed is not None:
+                death["cause"] = ID.COMPONENT_DEFECT
+                death["basis"] = (
+                    f"the harness's watch killed the gate: its resident memory was {killed['amount']} bytes, over its "
+                    f"limit of {killed['limit']}, a defect of the component whatever the agent asked of it"
+                )
+                death["problems"] = [
+                    f"the gate is not running: killed by the watch for its memory (exit status {status})"
+                ]
             found.append(death)
         box._meta["container_deaths"] = found
         return found

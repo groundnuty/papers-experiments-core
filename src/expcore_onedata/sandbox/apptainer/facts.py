@@ -77,7 +77,28 @@ FACTS: dict[str, str] = {
         "(disk_limit), where Docker refuses the write with ENOSPC; a directory the cell makes unreadable to its own "
         "uid is unknown to the walk and taken as past its size"
     ),
-    "cpu_pids_nofile": "cpus, pids, nofile and the gate's memory limit are recorded and not enforced per container",
+    "cpu_affinity": (
+        "cpus is a set of cores and Docker's --cpus a quota: every cell is pinned by taskset to the first ceil(cpus) "
+        "cores of the driver's own affinity (the step's cores) and may use all of them fully, where a quota (CFS) "
+        "bounds the time across any cores, so a fractional cpus is a whole core here; the canary reads the cell's "
+        "affinity from inside it (the run's effective set), and the watch reads the cores of every task of every "
+        "process of the run at every poll, recording a process outside that set (widened) and never killing it: "
+        "the agent's own code can widen its affinity within the step's cores, and a process /proc hides is unseen "
+        "(hidden_process leaves the reading unknown)"
+    ),
+    "pids_watch": (
+        "no pids cgroup: the harness's watch counts the tasks (Threads) of the run's processes at every poll and, "
+        "over pids, kills the running cell's processes as pids_limit (the agent's own; scope cell), where Docker "
+        "refuses the fork with EAGAIN and the agent's code sees the error with no kill; a burst of forks between two "
+        "polls is not bounded, and the tasks of a process /proc hides are not counted (hidden_process leaves the "
+        "reading unknown)"
+    ),
+    "gate_memory_watch": (
+        "no cgroup for the gate either: the watch reads its RssAnon and RssShmem at every poll and over "
+        "gate_memory_bytes SIGKILLs it through its pidfd, which the collection records as the gate's death with the "
+        "cause component_defect (a gate past its own limit, as on Docker); a spike shorter than a poll is missed, "
+        "and the gate's file-backed pages, which a cgroup counts, are not"
+    ),
     "no_freezer": (
         "the outputs are copied with no cgroup freezer: no process of the run is left between cells (each cell's "
         "end shows them gone), and the copy and the removals run as the one uid there is, with no privilege"

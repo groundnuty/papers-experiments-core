@@ -119,8 +119,9 @@ class LimitsCheck:
     docstring). `begin` gives it the step's cores and the gate once the run has them; until then every reading is
     unknown."""
 
-    def __init__(self, *, cpus: float, pids: int, nofile: int, gate_memory_bytes: int) -> None:
+    def __init__(self, *, cpus: float, pids: int, nofile: int, gate_memory_bytes: int, has_gate: bool = True) -> None:
         self.cpus, self.pids, self.nofile, self.gate_limit = cpus, pids, nofile, gate_memory_bytes
+        self.has_gate = has_gate  # a REST data path: there is a gate to bound
         self.step_set: list[int] | None = None
         self.pin: list[int] | None = None
         self.gate: Spawned | None = None
@@ -132,7 +133,7 @@ class LimitsCheck:
         self.gate_ended = False
 
     def begin(self, step_set: Sequence[int] | None, gate: Spawned | None) -> None:
-        """The step's own cores (None: they could not be read) and the gate helper, if the run has one."""
+        """The step's own cores (None: they could not be read) and the gate helper, which a run with a gate has."""
         self.step_set = sorted(step_set) if step_set else None
         self.pin = pin_for(self.step_set, self.cpus)
         self.gate = gate
@@ -188,16 +189,13 @@ class LimitsCheck:
 
     def note_gate(self, found: P.Proc | None, ended: bool | None) -> int | None:
         """The gate's resident bytes at one poll: `found` is its row of a listing, `ended` what the node says of it when
-        no row shows it (False: it is gone, which stops the watching). The bytes when they are over the limit."""
+        no row shows its memory (False: it is gone, which stops the watching). The bytes when over the limit."""
         if self.gate is None or self.gate_ended:
             return None
-        if found is None:
-            if ended is False:
-                self.gate_ended = True
-            else:
-                self._reasons["gate_memory"].add(GATE_UNREADABLE)
+        if ended is False:  # gone, whatever the row of a zombie not yet reaped shows (it has no memory to read)
+            self.gate_ended = True
             return None
-        if found.rss is None:
+        if found is None or found.rss is None:
             self._reasons["gate_memory"].add(GATE_UNREADABLE)
             return None
         self.gate_peak = max(self.gate_peak or 0, found.rss)
@@ -272,7 +270,7 @@ class LimitsCheck:
 
     def _gate(self, gate_kills: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         declared = int(self.gate_limit)
-        if self.gate is None:
+        if not self.has_gate:
             return {"declared": declared, "reading": NOT_APPLICABLE, "unknown": [], "peak_bytes": None}
         reached = [k for k in gate_kills if k["signalled"] is True]
         reasons = set(self._reasons["gate_memory"])

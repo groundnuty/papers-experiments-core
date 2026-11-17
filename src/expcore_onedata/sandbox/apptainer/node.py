@@ -143,6 +143,17 @@ class NodeOps(Protocol):
         children cannot be read while it lives."""
         ...
 
+    def own_affinity(self) -> list[int] | None:
+        """The cores this process may run on (its CPU affinity, sorted): the step's cores, from which a cell's pin is
+        taken (O70); None when they cannot be read."""
+        ...
+
+    def task_affinity(self, pid: int, start: str) -> frozenset[int] | None:
+        """The union of the cores every task of the process that started at `start` may run on (`Cpus_allowed_list`
+        of each task's status: a thread may set its own); the empty set when the process is gone or another holds its
+        pid; None when a living task's cores cannot be read."""
+        ...
+
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         """Facts of the node for a record: its kernel and the version of `apptainer` (the command words). No name
         and no address."""
@@ -351,7 +362,7 @@ class LocalNode:
             found.append(
                 P.Proc(
                     int(name), start, ppid, state, comm, pidns, P.parse_rss(status), P.tags_in(cmdline, environ, tags),
-                    P.parse_anon(status), cgroup,
+                    P.parse_anon(status), cgroup, P.parse_threads(status),
                 )
             )  # fmt: skip
         return found
@@ -457,6 +468,35 @@ class LocalNode:
         if _start_of(pid) != start:  # gone, hidden itself (its parent's children name it), or another process now
             return []
         return P.hidden_children(lambda: _children(pid), _shown_ours, _exists)
+
+    def own_affinity(self) -> list[int] | None:
+        try:
+            return sorted(os.sched_getaffinity(0)) or None
+        except (AttributeError, OSError):
+            return None
+
+    def task_affinity(self, pid: int, start: str) -> frozenset[int] | None:
+        if _start_of(pid) != start:  # gone, hidden, or another process now
+            return frozenset()
+        tasks = PROC / str(pid) / "task"
+        try:
+            tids = os.listdir(tasks)
+        except FileNotFoundError:
+            return frozenset()
+        except OSError:
+            return None
+        found: set[int] = set()
+        for tid in tids:
+            try:
+                cores = P.parse_cpus_allowed(_read(tasks / tid / "status"))
+            except FileNotFoundError:
+                continue  # the thread ended between the listing and the read
+            except OSError:
+                return None
+            if cores is None:
+                return None
+            found |= cores
+        return frozenset(found)
 
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         done = self.apptainer([*apptainer, "--version"], VERSION_S)

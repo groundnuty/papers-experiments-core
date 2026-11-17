@@ -25,6 +25,9 @@ Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded fir
   (`facts.py`, `dns_none`);
 * every cell one `apptainer exec --containall` (`cells.py`, `argv.py`), the root of the image and every bind but
   `/work`, `/tmp` and `/dev/shm` read-only, proved at the start as on Docker, with the read-only inputs (O20).
+* every cell's command under `prlimit --nofile=N:N` and `taskset -c <cores>` (`limits.py`, O70): the open-file limit
+  and the pin the canary reads back from inside a cell, with the watch's polls of `pids`, the cores of the run's
+  tasks and the gate's memory; each run's `infrastructure_facts.limits` says which readings were shown.
 
 What departs from the Docker sandbox is recorded in every run's metadata (`facts.py`).
 """
@@ -57,6 +60,7 @@ from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs
+from expcore_onedata.sandbox.apptainer import limits as LM
 from expcore_onedata.sandbox.apptainer.cells import AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
@@ -85,15 +89,6 @@ log = logging.getLogger(__name__)
 COLLECTOR_READY = "egress collector ready"
 GATE_ATTEMPTS = 3  # a free port another process took before the gate bound it: tried again with another
 PROBE_S = 60.0
-CANARY = (
-    "import socket, time\n"
-    "try:\n"
-    "    socket.create_connection(('127.0.0.1', {port}), 10).close()\n"
-    "    print('canary open')\n"
-    "except OSError as e:\n"
-    "    print('canary ' + type(e).__name__)\n"
-    "time.sleep({hold:.3f})\n"
-)
 
 
 class ApptainerSandbox:
@@ -142,6 +137,10 @@ class ApptainerSandbox:
         self._created, self._created_lock = 0, threading.Lock()
         self._cells: AppCellRunner | None = None
         self._watch: Watch | None = None
+        self._limits = LM.LimitsCheck(
+            cpus=settings.limits.cpus, pids=settings.limits.pids, nofile=settings.limits.nofile,
+            gate_memory_bytes=settings.limits.gate_memory_bytes, has_gate=spec.mode is DataPathMode.REST,
+        )  # fmt: skip
         self._helpers: dict[str, helpers.Helper] = {}
         self._mount: MountHelper | None = None
         self._token_files: list[Path] = []
@@ -445,14 +444,18 @@ class ApptainerSandbox:
         self._binds, self._env = binds, env
 
     def cell_argv(self, command: Sequence[str]) -> list[str]:
-        return AV.exec_argv(self.app.apptainer, self.app.image.path, self._binds, self._env, command)
+        """A cell's command line: `apptainer exec` under the file limit and the pin (`limits.prefix`, O70)."""
+        return [*self._limits.command_prefix(),
+                *AV.exec_argv(self.app.apptainer, self.app.image.path, self._binds, self._env, command)]  # fmt: skip
 
     def _start_cells(self) -> None:
         limits, own = self.s.limits, self.node.own_pidns()
         if own is None:  # the driver's and the helpers' namespace could not be told from a cell's
             raise SandboxError("the driver's own PID namespace could not be read")
+        gate = self._helpers.get("gate")
+        self._limits.begin(self.node.own_affinity(), None if gate is None else gate.process)
         self._watch = Watch(
-            self.node, run_tag=self.run_tag, own_pidns=own, memory_bytes=limits.memory_bytes,
+            self.node, run_tag=self.run_tag, own_pidns=own, memory_bytes=limits.memory_bytes, limits=self._limits,
             spaces=spaces_of(self.dir, {"work": limits.work_disk_bytes, "tmp": limits.tmp_bytes,
                                         "shm": limits.shm_bytes}),
             memory_poll_s=self.app.memory_poll_s, disk_poll_s=self.app.disk_poll_s,
@@ -471,18 +474,37 @@ class ApptainerSandbox:
         """The egress canary (`expcore.egress`): a connect from inside a cell to a listener of the harness's, the
         first record of the collector's log, so a shim that never loaded leaves a log that reads as unknown. The cell
         holds on long enough for the watch to find its namespace: a cell whose processes the harness cannot see could
-        not be bounded, and the start fails."""
+        not be bounded, and the start fails. It also reads, inside the cell, the open-file limit and the cores the cell
+        was given (`limits.CANARY`, O70): a hard limit that is not the declared one fails the start, and the cores are
+        the run's effective set."""
         with loopback.listener() as port:
             self._canary_port = port
             hold = max(1.0, 5 * self.app.memory_poll_s)
-            done = self._cells.run(CANARY.format(port=self._canary_port, hold=hold), PROBE_S, record=False)
-        said = done.stdout.strip()
+            try:
+                done = self._cells.run(LM.CANARY.format(port=self._canary_port, hold=hold), PROBE_S, record=False)
+            except ExecIncomplete as incomplete:
+                tool = LM.wrapper_failed(incomplete.result.exit_code, incomplete.result.stderr)
+                if tool is None:
+                    raise
+                log.error("%s did not start the egress canary: %s", tool, describe_stderr(incomplete.result.stderr))
+                raise SandboxError(
+                    f"{tool} could not set the cell's limits: a node without it, or a limit it may not raise"
+                ) from None
+        lines = done.stdout.strip().splitlines()
+        said = lines[0] if lines else ""
+        probe = LM.parse_probe(done.stdout)
+        self._watch.note_probe(probe)
         seen = self._cells.last_watch.get("seen") is True
         self._meta["egress"] = {"nonce": self.egress_nonce, "declaration": self.egress_declaration().to_json(),
                                 "canary": said == "canary open", "supervised": seen}  # fmt: skip
         if done.exit_code != 0 or said != "canary open":
             log.error("the egress canary said %r (%s)", said, describe_stderr(done.stderr))
             raise SandboxError("the egress canary could not connect from inside a cell")
+        if probe is not None and probe.nofile_hard != self.s.limits.nofile:
+            log.error(
+                "a cell's hard open-file limit is %d, not the declared %d", probe.nofile_hard, self.s.limits.nofile
+            )
+            raise SandboxError("a cell's open-file limit is not the declared one: the starter changed it")
         if not seen:
             raise SandboxError(
                 "the harness cannot see a cell's processes: its time and memory bounds could not be kept"
@@ -749,6 +771,7 @@ class ApptainerSandbox:
         if self._watch is not None:
             meta["watch"] = self._watch.summary()
             meta["infrastructure_facts"]["memory"] = meta["watch"]["memory"]  # never `within` unless the check held
+        meta["infrastructure_facts"]["limits"] = self._limits_record()  # every key; a reading shown or unknown (O70)
         if self.spec.mode is DataPathMode.REST:
             lines = self.gate_log_lines()
             meta["gate_log"] = gatelog.unknown("the gate log could not be read") if lines is None else (
@@ -758,6 +781,12 @@ class ApptainerSandbox:
             meta["mount"] = self._mount.metadata()
         meta["served_bytes"] = self.served_bytes()
         return meta
+
+    def _limits_record(self) -> dict[str, Any]:
+        """`infrastructure_facts.limits` (`limits.LimitsCheck.record`): the watch's, or before it exists every reading
+        unknown with its reason."""
+        found = None if self._watch is None else self._watch.limits_record()
+        return found if found is not None else self._limits.record(kills=[], gate_kills=[], memory={})
 
     # ------------------------------------------------------------------------------------------------ stop
     def stop(self, *, force: bool = False) -> None:
