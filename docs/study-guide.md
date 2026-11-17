@@ -1367,6 +1367,91 @@ Report the primary analysis as it stands and the sensitivity analysis beside it.
 
 **Run nothing else of your account on a sandbox node while runs are live: no interactive login and no other job step.** A process of your user outside the cells is outside every check: the egress shim is loaded only in the cells, and the mount guard proves only the cells, so such a process could connect anywhere, or read oneclient's environment, which holds the token, without a line in either log.
 
+### The read log: what a canonical script read
+
+If your study's omission scoring rests on which files the agent's scripts read, the scripts run in the agent's own cell, and a log file they write there is the agent's to read, rewrite and delete. The core gives the scripts a channel to a collector outside the cell instead (O91; the contract is in [`interfaces.md`](interfaces.md#the-read-log-the-read_log-instrument-and-its-channel)). Your canonical scripts do three things:
+
+- **Import the client by its fixed path**, `/expcore-readlog-client/expcore_readlog_client.py` (the cell runs `python -I`, so `PYTHONPATH` does nothing; there is no environment variable and no other socket to name).
+- **Log before they return data**, with `log_read(item, range=[start, stop], bytes=n, sha256=...)`: `item` is your own id of what was read, never a host path.
+- **Return no data when `log_read` raises** `ReadLogError`. The read is then "unread": the log is an upper bound on what the scripts handed out.
+
+A script looks like this, in your own scripts' words:
+
+    import importlib.util as u
+
+    spec = u.spec_from_file_location("expcore_readlog_client", "/expcore-readlog-client/expcore_readlog_client.py")
+    readlog = u.module_from_spec(spec)
+    spec.loader.exec_module(readlog)
+    data = read_the_bytes(item, start, stop)
+    readlog.log_read(item, range=[start, stop], bytes=len(data), sha256=sha256_of(data))  # raises: no data
+    return data
+
+The log reaches your record as a side file you declare: `pattern = "read_log.jsonl"` and `hash_field = "instruments.read_log.side_sha256"` in a `[[study.side_files]]` table ([Side files](#side-files)). Your executor builds `ReadLog(sandbox, nonce, expected_peer_uid)` among the run's instruments, which reads the collector's log once, after the backend has stopped the collector, and puts it beside the record with `stage_harness_side_file` (the log was never in `/work`, so `stage_side_file` does not apply):
+
+```python
+import hashlib
+import json
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+from expcore.records.record import record_filename
+from expcore.replay.side_file_placement import stage_harness_side_file
+from expcore.replay.side_files import SideFile
+from expcore_onedata.readlog import paths
+from expcore_onedata.readlog.instrument import ReadLog
+
+
+def stage_the_read_log():
+    NONCE, UID = "ab" * 16, 1000
+    lines = [
+        {
+            "event": "start",
+            "format": paths.FORMAT,
+            "nonce": NONCE,
+            "pid": 7,
+            "uid": UID,
+            "peer_uid": UID,
+            "max_bytes": 1 << 20,
+        },
+        {"event": "record", "peer": {"pid": 9, "uid": UID}, "rec": {"v": 1, "op": "canary", "item": "canary"}},
+        {
+            "event": "record",
+            "peer": {"pid": 9, "uid": UID},
+            "rec": {"v": 1, "op": "read", "item": "file-1", "bytes": 10},
+        },
+        {"event": "end", "records": 2, "malformed": 0, "unwritten": 0, "cap_reached": False},
+    ]
+    for seq, line in enumerate(lines):
+        line.update(seq=seq, wall=1.0 + seq, mono=1.0 + seq)
+    collected = b"".join((json.dumps(line, sort_keys=True) + "\n").encode() for line in lines)  # the collector's log
+
+    class StoppedCollector:
+        def read_log(self):  # what the sandbox kept of the log, once, after it stopped the collector
+            return collected
+
+    snapshot = ReadLog(StoppedCollector(), NONCE, UID).finish()
+    assert snapshot["log"] == "intact" and snapshot["counts"] == {"reads": 1, "canaries": 1}
+    assert snapshot["side_sha256"] == hashlib.sha256(collected).hexdigest()
+
+    declared = [SideFile(paths.SIDE_FILE_NAME, paths.SIDE_HASH_FIELD)]
+    where = Path(tempfile.mkdtemp())
+    (where / "collected").write_bytes(collected)  # where the collection left the log on the harness's disk
+    request = SimpleNamespace(run_dir=where / "try1", identity=SimpleNamespace(run_key="task=read|seed=1", attempt=1))
+    staged = stage_harness_side_file(request, declared, paths.SIDE_FILE_NAME, where / "collected")
+    assert staged is not None and staged.sha256 == snapshot["side_sha256"]
+    (request.run_dir / record_filename("task=read|seed=1", 1)).write_text(
+        json.dumps({"instruments": {"read_log": snapshot}})
+    )
+    staged.commit()  # the rename, once the record names the hash
+    assert (request.run_dir / paths.SIDE_FILE_NAME).read_bytes() == collected
+
+
+stage_the_read_log()
+```
+
+**An unknown log is unknown reads.** The log is intact only with a start line of this run, matching end counts, no cap reached, no malformed line, the canary as its first record and every sender the expected uid. A collector that was killed, a log past its cap or a datagram that was no record gives `"log": "unknown"` with the reasons and `counts` None; score the run's reads as unknown, never as fewer. A forged read cannot be prevented (the agent's own code can call the client), only detected, by the read-log scan and, on a REST data path, by the gate's per-file table of what it served. An agent that reads the data some other way than through your scripts leaves no record: decide in the design whether such a read scores as an omission. Code that runs in a script's own process can patch the client or the standard library so that a real read is not logged: the scan reads the text of the agent's code and does not match a patch of the standard library, but on a REST data path the gate's table of served files shows the read.
+
 ### The mount on HPC: guarded and reported, not isolated
 
 On an HPC batch node your agent's cells and the oneclient that holds the mount's token run as one user, so the token cannot be kept from the agent as the Docker sidecar keeps it. The study's PI ruled (16 Nov 2026) that mount runs stay on HPC with detection and report, as for egress. Declare oneclient's bundle in `[sandbox.apptainer]` (`oneclient_bundle` and `oneclient_bundle_sha256`: the tar `deploy/hpc-federation/oneclient_bundle.py` builds from the Compose sidecar's pinned image, so both backends run one oneclient build; its SHA-256 is in the campaign fingerprint, and each run records oneclient's version and build id), and give the Apptainer backend its mount helper, `host_mount_factory()` from `expcore_onedata.sandbox.apptainer.hostmount`, as `sandbox_options={"mount_helper": ...}`: oneclient then runs on the node outside every cell, from the bundle's own loader and libraries, its token in a private file no cell binds and removed once the mount is up, and a watcher outside the cells logs every access to that file and its directory, watches oneclient for a tracer, and proves from the node's `/proc` that each cell runs in a PID namespace of its own, with no view of the node's processes or of the private files. The helper takes `io_mode = "proxy"` only: a direct mount is refused at the run's start ("Direct I/O: declare the storage, and keep proxy unless placement is shown the same", above), so HPC mounts are proxy-only until the direct-I/O comparison passes. Record it with `expcore.mountguard.mount_guard_for(sandbox)` beside the run's other instruments, **for every run**: it is the guard of a mount run, and, for a REST run or a run with no data path, which have no mount to guard, a statement that the guard does not apply (below). It is built over `MountGuard(sandbox, sandbox.mount_guard_nonce)`:
