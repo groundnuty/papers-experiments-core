@@ -23,6 +23,10 @@ real addresses (DESIGN.md, sections 5 and 6).
   `shared_filesystem` with a scratch root), which the platform layer records in the campaign fingerprint, and the
   rendered file is read back for it (`check_provider_storage`): a federation on scratch and one on tmpfs are two
   experiments.
+- **The render identity** (O74, `hpcidentity`) is written beside it, once the platform file is rendered: the hashes of
+  the template, of the rendered platform's fingerprint and of each pin it holds, and the digest of the study's artifacts
+  tree when the site declares one (`up` took it in its preflight and the state file carries it here), as
+  `render-identity.json` in the root, which a shard's step compares with the one its plan expects.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -35,6 +39,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
+import hpcidentity
 import hpcimport
 import hpcpins
 import tomllib
@@ -244,14 +249,17 @@ def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, 
 
 
 def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> str:
-    """facts.json, and platform.toml from the layout's template with the HPC values."""
+    """facts.json, and platform.toml from the layout's template with the HPC values, and the render identity of that
+    platform (O74): the template is read once, and what is hashed is the text that was rendered."""
     facts = facts_of(boot)
     layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     template = layout.spec.platform_template
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
-    write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values)
-    return "facts.json and platform.toml written"
+    text = template.read_text(encoding="utf-8")
+    write_platform(layout.platform, text, facts, values)
+    hpcidentity.write(layout.root, hpcidentity.build(text, values, layout.platform))
+    return f"facts.json and platform.toml written; {hpcidentity.FILE} written"
 
 
 def direct_storages_value(layout: Layout, boot: Bootstrap, environ: Mapping[str, str]) -> str:
