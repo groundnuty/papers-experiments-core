@@ -27,7 +27,7 @@ def hold_fork_and_unwind(platform: str, result: str) -> None:
     path = Path(platform)
     config = load_platform(path, require_secrets=False)
     settings = load_faults(path, config)
-    with shared_admission(config, reason="a tool that forks") as admission:
+    with shared_admission(config, reason="forking_tool") as admission:
         pid = os.fork()
         if pid == 0:
             try:

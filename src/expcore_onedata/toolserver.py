@@ -73,6 +73,17 @@ so nothing of a run acts on the federation after its admission ends.
 
 `ctx` is anything with `infrastructure_wait(kind)`: the `CallContext` of a tool call, or the attempt's timer, which an
 executor has before the loop starts.
+
+The server's process. The MCP client spawns it as a child of the driver, in a session of its own, with the client's
+inherited variables of the driver's environment (`HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER`) beside the settings
+here, in the launch's own empty directory (O84, above): on Docker that child is a process on the host, outside every
+container. A backend may name where it runs instead (`process`, an `api.ServerProcess`; the Apptainer backend's
+`tool_server_process`, O56): then its `HOME` and working directory are the backend's directory (a new one, mode 0700,
+which holds only the server's `TMPDIR`, so the working directory is as private and as free of a `.env` as the launch's
+own), its settings include
+the backend's (the run's tag), and its environment is named whole: the client's inherited variables that the settings do
+not set are unset by `env -u ... --` before the command, so nothing of the driver's reaches it but `PATH`, and no value,
+the token least of all, is ever an argument (`env -i` would need every value as one).
 """
 
 import asyncio
@@ -84,6 +95,8 @@ import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Protocol
+
+from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS
 
 from expcore.config.loading import ConfigError
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
@@ -104,6 +117,7 @@ from expcore_onedata.client import PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, ToolServer
 from expcore_onedata.credentials import Principal
 from expcore_onedata.pin import verify_configured
+from expcore_onedata.sandbox.api import ServerProcess
 from expcore_onedata.tls import CA_BUNDLE_ENV, write_private_copy
 from expcore_onedata.tokencheck import ExaminationFailed, PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, token_window, tool_server_spec
@@ -224,6 +238,36 @@ def server_environment(
     return env
 
 
+def inherited_by_the_client() -> tuple[str, ...]:
+    """The variables of the driver's environment the MCP client gives every server it spawns, beside the ones it is
+    given (`mcp.client.stdio.get_default_environment`)."""
+    return tuple(DEFAULT_INHERITED_ENV_VARS)
+
+
+def _placed(extra: Mapping[str, str] | None, process: ServerProcess | None) -> Mapping[str, str] | None:
+    """The caller's settings with a backend's placement added: its `HOME` and its own settings, which a caller cannot
+    set, as it cannot set the managed ones."""
+    if process is None:
+        return extra
+    ours = {**process.env, "HOME": str(process.home)}
+    clash = sorted(set(extra or {}) & set(ours))
+    if clash:
+        raise ValueError(f"the tool server's {', '.join(clash)} is the backend's, not the caller's to set")
+    return {**(extra or {}), **ours}
+
+
+def _spawned(
+    command: str, args: list[str], env: Mapping[str, str], process: ServerProcess | None
+) -> tuple[str, list[str]]:
+    """The command and arguments the client spawns: `command` and `args` (the server's own, or through the resolve
+    launcher, `server_argv`), or, with a backend's placement, the same behind `env -u <each inherited variable the
+    settings do not set> --`, so that the server's environment is `env` alone."""
+    if process is None:
+        return command, list(args)
+    unset = [word for name in inherited_by_the_client() if name not in env for word in ("-u", name)]
+    return "env", [*unset, "--", command, *args]
+
+
 @contextlib.contextmanager
 def _private_bundle(config: PlatformConfig) -> Iterator[Path | None]:
     """With the platform's `ca_file`: the verified bytes, read once and written to a read-only copy in a directory of
@@ -249,17 +293,25 @@ class ServerStart:
 
 @contextlib.contextmanager
 def server_start(
-    config: PlatformConfig, condition: Condition, token: Revealable, extra: Mapping[str, str] | None = None
+    config: PlatformConfig,
+    condition: Condition,
+    token: Revealable,
+    extra: Mapping[str, str] | None = None,
+    process: ServerProcess | None = None,
 ) -> Iterator[ServerStart]:
     """Build what the server of a condition is started with, and keep what it needs until the server has stopped: the
     run's private copy of the CA bundle, when the platform has one (`_private_bundle`), and a new, empty, private
     working directory (`private_workdir`, O84). The launch and the manifest tool both start the server from this, so
     the server's environment (`server_environment`, a caller's `extra` refused where it clashes with the managed
-    settings), its command (`server_argv`) and its directory are one definition, not two that can drift."""
+    settings), its command (`server_argv`) and its directory are one definition, not two that can drift.
+
+    `process` is where a backend runs the server (O56): its settings are added to the caller's (which may not set them,
+    `ValueError`), the server's environment is named whole (`_spawned`), and its working directory is the backend's own
+    new home (0700, holding only the server's `TMPDIR`) instead of the launch's empty one."""
     with _private_bundle(config) as ca_copy, private_workdir() as workdir:
-        env = server_environment(config, condition, token, extra, ca_copy=ca_copy)
-        command, args = server_argv(config)
-        yield ServerStart(command, args, env, workdir)
+        env = server_environment(config, condition, token, _placed(extra, process), ca_copy=ca_copy)
+        command, args = _spawned(*server_argv(config), env, process)
+        yield ServerStart(command, args, env, workdir if process is None else process.home)
 
 
 def _server(config: PlatformConfig) -> ToolServer:
@@ -404,11 +456,17 @@ class ToolServerLauncher:
         ceiling_s: float,
         extra_env: Mapping[str, str] | None = None,
         principal: Principal | None = None,
+        process: ServerProcess | None = None,
     ) -> AsyncIterator[McpToolProvider]:
         """Start the server for a condition and yield its tool provider; stop it on leaving.
 
         `principal` is the leased slot's tool-server user (`SandboxPlatform.tool_server` passes it): a token minted for
         any other user is refused before anything starts, so the plane's principal is the run's own slot's (C19).
+
+        `process` is where a backend runs the server (`SandboxPlatform.tool_server` passes the sandbox's
+        `tool_server_process()` when it has one, O56): its home and working directory, and its settings, which
+        `extra_env` may not set (`ValueError`); the server's environment is then named whole (the module's
+        docstring). Without it the server's process is as it always was.
 
         The start and the stop are each inside `ctx.infrastructure_wait("toolserver_lifecycle")`. A token that fails its
         examination, a principal whose privileges differ from the condition's rights, and a read of either that fails
@@ -434,7 +492,9 @@ class ToolServerLauncher:
         server, chosen = _server(self._config), self._config.condition(condition)
         with (
             token_step(TOOL_SERVER_STEP),  # ended only once the re-verification at teardown has ended
-            server_start(self._config, chosen, token, extra_env) as begun,  # its CA copy and directory, gone with it
+            server_start(
+                self._config, chosen, token, extra_env, process
+            ) as begun,  # its CA copy and directory, gone with it
         ):
             provider = McpToolProvider(
                 begun.command,

@@ -599,13 +599,15 @@ def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_th
     the requirement is gone, no job is waiting or ongoing, the receiver holds nothing of the directory, and the ended
     history is recorded with its count, never removed. Each stage has its seconds."""
     from expcore_onedata.reset import STAGES, SpaceReset
+    from expcore_onedata.tool_admission import shared_admission
 
     provisioner, receiver, directory, ids = scratch
     holder = provisioner.settings.holder
     body = {"fileId": ids[1], "expression": "anyStorage", "replicasNum": 1}
     provisioner.client.mutate("POST", "/qos_requirements", provider=holder, json=body)
     provisioner.schedule_transfer("replication", ids[0], receiver)
-    record = SpaceReset(provisioner).run({receiver: [directory]})
+    with shared_admission(provisioner.config, reason="live_reset_contract"):  # a reset holds the reset lock
+        record = SpaceReset(provisioner).run({receiver: [directory]})
     assert record["ok"] is True
     assert list(record["stages"]) == list(STAGES)
     assert record["stages"]["qos"]["removed"] >= 1

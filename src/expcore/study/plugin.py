@@ -27,7 +27,7 @@ from typing import Any
 from expcore.campaign.attempt import RunAdmission
 from expcore.campaign.defect_log import write_failure
 from expcore.campaign.executor import BackendFactory, RunExecutor
-from expcore.campaign.healthgate import HealthCheck
+from expcore.campaign.healthgate import ContextHealthCheck, HealthCheck
 from expcore.campaign.lease import ResourceProbe
 from expcore.campaign.reset_settings import checked as checked_settings
 from expcore.config.loading import ConfigError, Section
@@ -89,9 +89,11 @@ class StudyPlugin:
       platform's loader for a module `[study] platforms` does not list (`config.platform_loads`), so hiding both
       declarations and listing nothing hides nothing either.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
-      Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, each level's data path and
-      listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign
-      fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
+      Onedata layer's `PlatformConfig.fingerprint()`: every declared setting that shapes a run, such as the TLS mode
+      and CA bundle hash, the spaces, the token lifetime, the sandbox's images, limits and data paths, the tool
+      server's commit and conditions, placement and the fault injector's targets and bounds, and nothing that is one
+      federation's own, so two federations of one template give one). They go into the campaign fingerprint, so a
+      resume under another is refused. Leave it empty for a study without a platform.
     - `platform_legacy`: an earlier form of `platform` that a store may have recorded for these same settings, or None
       (the Onedata layer's `PlatformConfig.legacy_fingerprint()`: each space by its Onezone id, as before a space could
       declare its data). A store whose recorded fingerprint is this campaign's with `platform` in that form resumes
@@ -122,7 +124,7 @@ class StudyPlugin:
     scorers: Sequence[Scorer | SideFileScorer]
     prompts: Mapping[str, str]
     tools: Mapping[str, str]
-    health: HealthCheck | None = None
+    health: HealthCheck | ContextHealthCheck | None = None
     probe: ResourceProbe | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
     lease_keys: Callable[[str], Sequence[str]] = lambda group: ()

@@ -39,6 +39,7 @@ __all__ = [
     "BudgetHold",
     "SpendGuard",
     "after_failed_send",
+    "after_loop",
     "after_reply",
     "before_request",
     "before_resend",
@@ -90,6 +91,16 @@ def watching(guard: SpendGuard) -> Iterator[None]:
         yield
     finally:
         _guard.reset(token)
+
+
+def after_loop() -> None:
+    """Tell the attempt's guard, if it has one that wants to know, that the loop has ended: every request the attempt
+    made is closed, so what its call log holds is all it spent (the recording calls it as `run_agent` returns). A guard
+    without `after_loop` is not asked."""
+    guard = _guard.get()
+    notify = getattr(guard, "after_loop", None)
+    if notify is not None:
+        notify()
 
 
 async def before_request() -> None:

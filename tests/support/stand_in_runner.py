@@ -3,8 +3,8 @@
 The core is installed editable where the tests run, and packing the real environment's wheels on every run costs
 minutes, so the fresh-repository test runs its study steps through this file: `<python> stand_in_runner.py -m expcore
 ARGS` runs the command line with every vendored wheel a stand-in (`package_support.stand_in_vendor`), and
-`<python> stand_in_runner.py -c CODE ARGS` runs the code as `python -c` would. The fresh-repo workflow runs the real
-thing.
+`<python> stand_in_runner.py -c CODE ARGS` runs the code as `python -c` would. Either sees the core's identity the suite
+pins (`core_pin`). The fresh-repo workflow runs the real thing.
 """
 
 import sys
@@ -12,12 +12,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import core_pin
 from package_support import stand_in_vendor
 
 from expcore.package import build
 
 
 def main(argv: list[str]) -> int:
+    core_pin.apply()  # the core's identity the suite pins (`core_pin`), so a dirty checkout runs as the tests do
     if argv[:2] == ["-m", "expcore"]:
         from expcore.cli import main as expcore_main
 

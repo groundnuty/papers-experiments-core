@@ -48,12 +48,12 @@ its settle. Whatever the heal did, the next check makes the link
 check afresh (`relink`), so no pass from before the heal's end opens the gate: a heal that left a pair failing leaves it
 to the next check, which finds it stuck and fails closed, and none runs again until the gate's link check passes. A
 check under a run's admission keeps a share of it until it ends, so one that outlives its caller's wait still holds the
-federation and no shortcut section of the run begins while it reads; while the run's own shortcut reset holds the
+federation and no reset section of the run begins while it reads; while the run's own reset holds the
 federation's reset lock (`federation.reset`) the check is deferred, uncharged.
 
 **The heal takes no reset lock.** Its exclusive admission of `federation.lock` waits for the turnstile holding nothing
 and for the main lock holding the turnstile, as every exclusive admission does (`admission`, the lock order), and so it
-already excludes every shared holder, each with its share of `federation.reset`, and every shortcut reset, whose run
+already excludes every shared holder, each with its share of `federation.reset`, and every reset, whose run
 keeps its share of `federation.lock` for the whole section. No section runs while the heal restarts links and reads the
 links again, and no holder of `federation.reset` waits for what the heal holds, so the heal never deadlocks with one:
 a section under way keeps the heal out until `health_wait_s` runs out, and the gate stays closed, uncharged.
@@ -91,6 +91,7 @@ from expcore.campaign.healthgate import DeferralBound, Health, HealthCheck, read
 from expcore.errors import TARGET_LABEL, InfraError
 from expcore_onedata.admission import (
     EXCLUSIVE_RUN,
+    INGEST,
     INJECTOR,
     OUTAGE_RUN,
     RECOVERY,
@@ -105,6 +106,7 @@ from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch, Rais
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals, failed_heal_reason
 from expcore_onedata.fault_journal import HeldLock, holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
+from expcore_onedata.fault_owner import charge_of, with_note
 from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling, failure
 from expcore_onedata.fault_relay import RELAY_NOTE, beat
 from expcore_onedata.fault_settings import (
@@ -120,6 +122,7 @@ _PURPOSES = {
     EXCLUSIVE_RUN: "an exclusive run",
     INJECTOR: "an injector",
     RECOVERY: "the recovery of the health check",
+    INGEST: "an ingest",
 }
 log = logging.getLogger(__name__)
 _STAMP = re.compile(r"[0-9T:+.-]{10,40}")
@@ -160,7 +163,8 @@ def _held_for(record: Mapping[str, Any]) -> float | None:
 def _unsettled(entries: list[dict[str, Any]]) -> Health:
     """The failure of a journal with open injections: a failed restore by its target's label and how it failed. A
     journal whose only open injections are heals' container restarts that a recovery brought back and that settle before
-    their gate and pairs are read (`settling`) is a wait that charges no run, never a pass."""
+    their gate and pairs are read (`settling`) is a wait that charges no run, never a pass. Otherwise the failure
+    charges the attempt that made the injection and no other (`fault_owner.charge_of`, O80)."""
     if entries and all(entry.get("clear_failed") == "settling" for entry in entries):
         settling = ", ".join(sorted({entry["target"] for entry in entries}))
         detail = (
@@ -171,9 +175,13 @@ def _unsettled(entries: list[dict[str, Any]]) -> Health:
     failed = sorted({(entry["target"], entry["clear_failed"]) for entry in entries if "clear_failed" in entry})
     if failed:
         hows = ", ".join(f"{target} ({how if _WORD.fullmatch(how) else 'failed'})" for target, how in failed)
-        return Health(False, f"the restore of {hows} failed: the federation is not in its baseline state")
+        detail = f"the restore of {hows} failed: the federation is not in its baseline state"
+        charge, note = charge_of(entries)  # every open entry: the judged attempt's own is never spared (O80)
+        return Health(False, with_note(detail, note), charge=charge)
     targets = ", ".join(sorted({entry["target"] for entry in entries}))
-    return Health(False, f"an injection of {targets} is unsettled: the federation is not in its baseline state")
+    detail = f"an injection of {targets} is unsettled: the federation is not in its baseline state"
+    charge, note = charge_of(entries)
+    return Health(False, with_note(detail, note), charge=charge)
 
 
 class FaultGate:
@@ -327,7 +335,12 @@ class FaultGate:
                             # before anything is restored: a provider it brings back went down in a run it knows nothing
                             # of, and the release below publishes the drain whatever interrupts the recovery
                             exclusive.drain.owe(self._clock(), clock=self._clock, sleep=self._sleep)
-                        self._recovery.recover(defer=True)  # a held settle is a wait, never slept here
+                        try:
+                            self._recovery.recover(defer=True)  # a held settle is a wait, never slept here
+                        except RestoreSettling:
+                            raise
+                        except InfraError as error:  # what an earlier run left open could not be settled
+                            return self._operator(self._left_open(error))
                         if self._relink is not None:  # the pairs of what it restored: the link check made afresh next
                             self._relink()
                     finally:
@@ -346,6 +359,20 @@ class FaultGate:
             return self._operator(Health(False, settling.detail, deferred=True, charge=False))
         except InfraError as error:
             return self._operator(Health(False, error.detail))
+
+    def _left_open(self, error: InfraError) -> Health:
+        """The failure of a recovery of what earlier runs left open, charged to the attempt that made an injection
+        that is open and to no other (O80). Every open entry is judged, not only the one the recovery failed on: the
+        judged attempt's own is never spared, and an entry that names no attempt keeps the charge. An unreadable
+        journal, or none open any more, says nothing of whose it is: charged as it was."""
+        try:
+            entries = self._recovery.entries()
+        except (OSError, ValueError):
+            return Health(False, error.detail)
+        if not entries:
+            return Health(False, error.detail)
+        charge, note = charge_of(entries)
+        return Health(False, with_note(error.detail, note), charge=charge)
 
     def _operator(self, health: Health) -> Health:
         """`health` led by the reason a failed heal needs an operator (`failed_heal_reason`), when the current stuck
@@ -383,7 +410,7 @@ class FaultGate:
                 give_up()
             return Health(
                 False,
-                "the run's own shortcut reset holds the federation's reset lock: the check waits for it",
+                "the run's own reset holds the federation's reset lock: the check waits for it",
                 deferred=True,
                 charge=False,
             )
@@ -507,7 +534,7 @@ class FaultGate:
         heal never runs past the core's wait for this check (`health_timeout_s`) and no run is charged for it; fail
         closed whenever it cannot begin. The admission takes no reset lock (see the module docstring): the check's own
         shared hold, with its share of `federation.reset`, is let go before it, and the exclusive hold of
-        `federation.lock` already keeps every shortcut reset out."""
+        `federation.lock` already keeps every reset out."""
         if self._healer is None or self._relink is None:  # no heal declared, or no sanction, services or reports
             return verdict
         refused = self._refused(verdict)  # read first, so a latched gate waits for nobody
@@ -659,9 +686,9 @@ class FaultGate:
         done = "its record stays until an acquisition of the lock proves it usable"
         if entries:  # it left something open: bring it back, verified, before anything else
             if not self._may_recover:
-                return Health(
-                    False, f"the federation's lock is stuck{at}: {_named(record)} is gone and left an injection open"
-                )
+                charge, note = charge_of(entries)  # only the attempt that made the injection is charged (O80)
+                detail = f"the federation's lock is stuck{at}: {_named(record)} is gone and left an injection open"
+                return Health(False, with_note(detail, note), charge=charge)
             # the holder may have gone, and the lock with it, since the wait ran out: then the recovery runs under it
             exclusive = self._lock.try_acquire(exclusive=True, purpose=RECOVERY)
             try:
@@ -671,7 +698,12 @@ class FaultGate:
                     # still held, by a holder that is gone: nobody else is admitted while it is, and the record is
                     # written first, so an admission that finds the journal settled after it finds the record
                     self._lock.hold_for(self._drain_s)
-                self._recovery.recover(defer=True)  # raises InfraError naming the target when one cannot be settled
+                try:
+                    self._recovery.recover(defer=True)
+                except RestoreSettling:
+                    raise
+                except InfraError as error:  # naming the target when one cannot be settled
+                    return self._operator(self._left_open(error))
             finally:
                 if exclusive is not None:
                     exclusive.close()

@@ -104,7 +104,8 @@ _ADDED_COLUMNS = (
     ("attempts", "calls_sent", "INTEGER"),
     # JSON: each answered request's [input, output, cache writes, cache reads], null for a reply that was not read
     ("attempts", "calls_usage", "TEXT"),
-    # how an interrupted attempt is charged: measured | measured_plus_inflight | bound; NULL: no log was kept
+    # how an interrupted attempt is charged: measured | measured_plus_inflight | bound; NULL: no log was kept. A
+    # finished attempt that raised after its model loop has measured | bound too (`after_loop`); NULL for any other
     ("attempts", "spend_basis", "TEXT"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
@@ -687,7 +688,7 @@ class Store:
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"
                 " detail=?, termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?,"
-                " cache_read_tokens=?, usage_complete=?, turn_usage=?, replies_checked=? WHERE id=?",
+                " cache_read_tokens=?, usage_complete=?, turn_usage=?, replies_checked=?, spend_basis=? WHERE id=?",
                 (
                     state,
                     int(charged),
@@ -705,6 +706,7 @@ class Store:
                     int(result.usage_complete),
                     None if result.turn_usage is None else json.dumps(result.turn_usage),
                     int(result.replies_checked),
+                    result.spend_basis,
                     attempt_id,
                 ),
             )
