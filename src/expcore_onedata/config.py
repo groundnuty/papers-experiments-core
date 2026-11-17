@@ -543,8 +543,9 @@ def _check_fixed_users(
             raise ConfigError(f"{file}: [principals]: {error}") from None
 
 
-def _condition(name: str, section: Section, base: Path) -> Condition:
-    """Read one condition: allow-list, rights, manifest. `section` is known in messages by its position."""
+def _condition(name: str, section: Section, base: Path, *, require_manifest: bool = True) -> Condition:
+    """Read one condition: allow-list, rights, manifest. `section` is known in messages by its position. The manifest
+    must be a file unless `require_manifest` is off, which only the manifest command line uses."""
     _name(section, None, name, "its name")
     section.reject_unknown(("allow", "rights", "manifest"))
     allow, rights = section.strings("allow"), section.strings("rights")
@@ -554,13 +555,13 @@ def _condition(name: str, section: Section, base: Path) -> Condition:
     if problem is not None:
         raise section.fail("rights", problem)
     manifest = (base / section.string("manifest")).resolve()
-    if not manifest.is_file():
+    if require_manifest and not manifest.is_file():
         raise section.fail("manifest", "is not a file; freeze the server's manifest first")
     return Condition(name, allow, tuple(sorted(rights)), manifest)
 
 
-def _toolserver(section: Section, base: Path) -> ToolServer:
-    """Read [toolserver] and its conditions."""
+def _toolserver(section: Section, base: Path, *, require_manifests: bool = True) -> ToolServer:
+    """Read [toolserver] and its conditions, each with a manifest that is a file unless `require_manifests` is off."""
     if "insecure_tls" in section.data:
         raise moved(section, "insecure_tls")
     section.reject_unknown(("command", "args", "start_timeout_s", "clone", "commit", "conditions"))
@@ -577,19 +578,29 @@ def _toolserver(section: Section, base: Path) -> ToolServer:
         (base / clone).resolve() if clone else None,
         commit,
         MappingProxyType(
-            {n: _condition(n, _entry(conditions, index, n), base) for index, n in enumerate(conditions.data)}
+            {
+                n: _condition(n, _entry(conditions, index, n), base, require_manifest=require_manifests)
+                for index, n in enumerate(conditions.data)
+            }
         ),
     )
 
 
 def load_platform(
-    path: str | os.PathLike[str], *, environ: Mapping[str, str] | None = None, require_secrets: bool = True
+    path: str | os.PathLike[str],
+    *,
+    environ: Mapping[str, str] | None = None,
+    require_secrets: bool = True,
+    require_manifests: bool = True,
 ) -> PlatformConfig:
     """Load and validate platform.toml; raise ConfigError naming the file and the key, never a value.
 
     With `require_secrets` (the default, for a run) the admin credential's source must exist and hold something, and
     each fixed principal must have a credential file that others cannot read, so a missing variable or file fails here
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
+
+    Each condition's manifest must be a file (L13), unless `require_manifests` is off, which `python -m
+    expcore_onedata.toolmanifest` uses to read a platform some of whose manifests it is about to write.
 
     While a study's build is open it records that it ran, with `PLATFORM_MODULE` and the file (`platform_loads`).
     """
@@ -643,7 +654,11 @@ def load_platform(
         users=users,
         tokens=_tokens(Section(root.table("tokens"), file, "[tokens]")),
         principals=principals,
-        toolserver=_toolserver(root.section("toolserver"), file.parent) if "toolserver" in root.data else None,
+        toolserver=(
+            _toolserver(root.section("toolserver"), file.parent, require_manifests=require_manifests)
+            if "toolserver" in root.data
+            else None
+        ),
         sandbox=load_sandbox(
             Section(root.table("sandbox"), file, "[sandbox]"),
             file.parent,

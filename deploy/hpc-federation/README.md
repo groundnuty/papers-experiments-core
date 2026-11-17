@@ -225,7 +225,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `B` | the bundle on a filesystem the nodes see (`<shared_root>/hpc-federation/bundle`), `chmod -R go-w` |
 | `SH` | a 0700 directory for the two rootfs tarballs, each with its `.provenance` (SHA-256): single files only (`<scratch_root>/hpcop-images`) |
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
-| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's venv, clone and data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it. `up` also digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
+| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's interpreter and venv, the pinned clone, the frozen manifests and its data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it. `up` also digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository. The optional keys of the driver, the agent's sandbox and the study's artifacts are in `site.env.example`; the four of the next
@@ -411,6 +411,32 @@ alone and reports the declared names `unresolvable`; it is advisory, and `facts.
 node the names are reached through the address map `up` writes into the root (`secrets/address-map.json`, 0600),
 which `platform.toml` names; see `DESIGN.md`, "The registered names". The first sandbox slot on a federation brought up
 this way is owed the checks of `DESIGN.md` section 9, item 7.
+
+## Slots and the tool server (O83)
+
+The tool-server arm needs a slot's users. `layouts/pilot-shape-slots.toml` is the pilot's shape with the four users of two
+slots as ordinary principals, and its template, `pilot-shape-slots.platform.toml.template`, is the pilot's with the
+slots and a `[toolserver]` after it (the Compose federation's own form, `deploy/compose-federation/README.md`, "Slots
+and a tool server"). `up` provisions the users with the Compose bootstrap's own steps: the zone user, its password in a
+0600 file of `secrets/users/` (in no cell, `gate.json`, fact, record, log or message), its membership of each declared
+space with exactly the declared privileges, and the storage mapping to the job's uid that every principal gets. **A slot
+user that already exists is verified and never changed**: exactly as declared, it is recorded `matched` in `facts.json`
+with nothing sent; any difference is refused naming the user and the attribute. The template's `[slots]` takes each id as
+`@user_id.<username>@` from the facts, and the written file is checked against the layout (a slot user that is no
+principal, `rights` that are not exactly the privileges the layout gave the user, a data-path user with more than the
+baseline are refused) and loaded as a campaign loads it, so `up` fails there, not at the first run.
+
+The tool server runs from the study's artifacts directory, `HPC_STUDY_ARTIFACTS` in `site.env`, which the pilot fills
+with its interpreter and venv, the pinned onedata-mcp clone and one frozen manifest per condition
+(`python -m expcore.tools.manifest freeze`, run with the condition's allow-list). Before any job is held `up` refuses a
+site without the variable when the template names it, a command that is no executable file, a clone that is not at the
+pinned commit with no change to a tracked file, and a manifest that is not its condition's (edited, or showing other
+tools than the allow-list); each message names the condition by its position and no path. The server is started through
+the resolve launcher (`<interpreter> -I -B resolve_launch.py <map> -- -m <module>`, "Registered names"), so `command` is a
+Python interpreter and `args` start with `-m <module>`: a console script behind `/usr/bin/env` is refused by `up`'s
+preflight, before any job is held, and when the file is loaded, saying to use `<venv>/bin/python` with `args = ['-m',
+'<module>', ...]`. Owed to the next HPC slot: a B2 run whose tool calls succeed, whose rights refusals match Compose's for the same
+layout, and whose visible-names counts are zero.
 
 ## The driver: `hpcfed.py`
 
@@ -896,7 +922,10 @@ allowed). `tests/deploy/test_hpc_fed_plan.py`, `test_hpc_fed_updown.py` and `tes
 against a fake Slurm (O57): the layout's sizes and the held job's shape, the submit read-back, every step's form and
 allowlist, a hung client and a step past its bound, the state file, `up`'s placement, peers and token pipes, `down`
 after a whole or a partial `up`, the core's phase writing `platform.toml` and the ten-pair link-check record, and
-`zone-export.sh` on a stand-in work directory. `tests/deploy/test_hpc_inode_guard.py` and `test_hpc_fed_storage.py` run
+`zone-export.sh` on a stand-in work directory. `tests/deploy/test_hpc_fed_slots.py` and `test_hpc_fed_slots_provision.py` (O83) provision a layout's slots with
+the Compose bootstrap and the HPC one over a fake zone each (an existing slot user matched or refused, never changed),
+render the pilot's slot layout through the core's phase and load the file with its map, slots and tool server, and run the
+driver's preflight over the site's study directory. `tests/deploy/test_hpc_inode_guard.py` and `test_hpc_fed_storage.py` run
 the provider storage on scratch (O57) against the same fake Slurm, with an invented quota command and a temporary
 directory for scratch: usage under, at and one past the 95% line, every way a quota can fail to be read, the override
 refused on scratch, the estimate against the manifests `up` writes, the directories `up` makes and records first, and
