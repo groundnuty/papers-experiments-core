@@ -4,10 +4,10 @@ sensitivity analysis."""
 
 import pytest
 from egress_logs import record
-from expcore.readlog import sensitivity
-from expcore.readlog.sensitivity import LEFT_OUT_AS, checked, read_log_analysis
 from readlog_support import FORGER, preregistration, rows_of_pairs, runs_for
 
+from expcore.readlog import sensitivity
+from expcore.readlog.sensitivity import LEFT_OUT_AS, checked, read_log_analysis
 from expcore.stats.analysis import ContrastRefused, analyse
 
 

@@ -4,11 +4,11 @@ run's record carrying the code cells it ran and, unless a test says otherwise, t
 import tomllib
 
 from egress_logs import record
-from expcore.readlog.scan import NAMESPACE
 from readlog_cells import FORGING
 from stats_support import both_arms
 
 from expcore.campaign.factors import FactorSchema
+from expcore.readlog.scan import NAMESPACE
 from expcore.stats.prereg import parse
 
 SCHEMA = FactorSchema({"arm": ["a", "b"]}, ["task", "arm", "model", "seed"], {f"cond-{a}": {"arm": a} for a in "ab"})

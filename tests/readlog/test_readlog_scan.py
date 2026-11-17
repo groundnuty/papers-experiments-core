@@ -10,14 +10,14 @@ from pathlib import Path
 
 import pytest
 from egress_logs import CODE_TOOL, record
-from expcore.readlog import scan
-from expcore.readlog.flags import judge
-from expcore.readlog.scan import NAMESPACE, scan_cells
 from readlog_cells import FORGING, ORDINARY, SPLIT
 
 from expcore.egress import declaration
 from expcore.egress import scan as egress_scan
 from expcore.egress import scan_cells as egress_scan_cells
+from expcore.readlog import scan
+from expcore.readlog.flags import judge
+from expcore.readlog.scan import NAMESPACE, scan_cells
 
 GOLDEN = Path(__file__).resolve().parents[1] / "data" / "readlog_egress_scan_golden.json"
 FORGER = FORGING["socket path and datagram socket"][0]
