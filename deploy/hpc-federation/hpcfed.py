@@ -20,7 +20,9 @@ them in the state file in the root, so `down` and the service verbs need no envi
   (`hpcboot.core_phase`). The layout's `[hpc] core` says where that phase runs: "login" (in this process) or "step"
   (a control step on the zone's node, the core's Python).
 - down: every service torn down (the providers, then the zone), every step gone, each node checked, the held job
-  (and the agent's own job, when it has one) cancelled by its id, then the root removed; on whatever up reached.
+  (and the agent's own job, when it has one) cancelled by its id, then the root removed; on whatever up reached. A
+  root that a shard step ran against and whose evidence `shards.py collect` did not collect (no current marker) is
+  refused first, with nothing stopped; `down --discard-evidence` removes it all the same and its output says so (O63).
 - describe: the plan: the nodes and their shape, every step's size, and what the job bills per hour.
 - verify-data: after the study's ingest, read each ingested space (a space that is neither a baseline space nor a
   shared import, whose data is the study's own) back through its owner and compare every file's path, size and SHA-256
@@ -253,7 +255,22 @@ def main(
     parser.add_argument(
         "--since", type=float, help=argparse.SUPPRESS
     )  # late-steps: the epoch second the verb was answered
+    parser.add_argument(
+        "--discard-evidence",
+        action="store_true",
+        help="down only: remove a root whose shard evidence was not collected (shards.py collect), and say so",
+    )
+    parser.add_argument(
+        "--discard-reason",
+        help="with --discard-evidence: why, recorded in the state file and in down's output (at most 500 characters)",
+    )
     args = parser.parse_args(words)
+    if args.discard_evidence and args.command != "down":
+        print(f"error: {args.command}: --discard-evidence belongs to down", file=sys.stderr)
+        return 2
+    if args.discard_reason is not None and (not args.discard_evidence or len(args.discard_reason) > 500):
+        print("error: --discard-reason goes with --discard-evidence and is at most 500 characters", file=sys.stderr)
+        return 2
     environ = os.environ if environ is None else environ
     try:
         root = args.root or environ.get("EXPCORE_FED_ROOT")
@@ -290,7 +307,7 @@ def main(
             self_check()
             print(driver.up(site_from_environment(environ)))
         elif args.command == "down":  # never an `else`: a command added without a branch would tear the federation down
-            print(driver.down())
+            print(driver.down(discard_evidence=args.discard_evidence, discard_reason=args.discard_reason))
         else:
             raise AssertionError(f"{args.command}: no branch")  # pragma: no cover
     except CoreMismatch as error:

@@ -191,12 +191,22 @@ of scratch after 20 days with no job submitted. The cluster cannot push to the o
 manifest `<label>.out.json`; every file under `<label>/journals/` (a spend journal per step, which holds what a step
 killed outright spent and `--resume` counts as `lost_in_kill`); and the newest snapshot that verifies, when it is NEWER
 than the archive (`newer_snapshot`: a step resumed from the archive was killed before it archived, so its snapshot names
-that archive and holds runs the archive lacks, which the merge does not see). Every other snapshot is resume material,
+that archive and holds runs the archive lacks, which the merge does not see); and, per federation, its **root
+evidence**: `<label>.root.tar` and `<label>.root.json` (the state, `platform.toml`, `facts.json`, the link check, the
+render identity, the whole fault journal, the relay's journal: an allow-list, never a secret, `hpcevidence.py`), which
+`down` would remove with the root; and the shard's `<label>/pass-env.json` when there is one (private, like the root
+archive). Every other snapshot is resume material,
 superseded by the verified archive (a snapshot of the step that wrote an archive names an earlier one or none, and was
 taken before it), and is not required. The manifest has the plan's `plan_id` (the SHA-256 of the plan's study and
 results directories and each shard's index, count, label and root), then the archives and the other files, each with
 its name relative to `<results>`, size and SHA-256 from the bytes `collect` read, sorted, with no path and no timestamp;
-`collect` prints the file's own SHA-256 on stderr. `verify-copy` takes the pulled manifest, the local directory and that
+`collect` prints the file's own SHA-256 on stderr. `collect` is atomic (G9): it stages every shard in a private
+directory beside `--into`, checks it all, and only then moves the trees in, publishes the root archives and writes the
+manifest last; a refusal leaves `--into` as it was and writes no manifest. Then it writes `evidence-collected.json`
+into each root, which `hpcfed.py down` requires of a root a step ran against (`shard-steps/<label>.json`, which `step`
+leaves there): `down` refuses one without it, or whose evidence is no longer what the marked archive holds, unless
+`--discard-evidence`.
+`verify-copy` takes the pulled manifest, the local directory and that
 hash (`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1
 naming each file that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only,
 never a path), 2 for a manifest it cannot use (one without the list of files beside the archives is an earlier tip's,
@@ -332,6 +342,15 @@ ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not b
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
 ARCHIVES_FORMAT = "expcore-hpc-archives/1"  # the copy back's manifest: what `collect` read, for `verify-copy`
 ARCHIVES_MANIFEST = "archives.sha256.json"  # in <results>, beside the archives
+PASS_ENV = "pass-env.json"  # <results>/<label>/: the shard's first-step pass_env names and values; PRIVATE evidence
+ROOT_SUFFIXES = (".root.tar", ".root.json")
+ASIDE_NAME = re.compile(
+    r"(?P<label>[A-Za-z0-9][A-Za-z0-9-]*)\.[0-9a-f]{12}\.root\.json"
+)  # <results>/<label>: a federation's root evidence and its manifest
+# The step's record in its federation's root that `down` reads (`hpcevidence`, the source: this file runs alone on a
+# node and keeps its own copy of the two names; a test compares them).
+STEP_RECORDS = "shard-steps"
+STEP_RECORD_FORMAT = "expcore-hpc-shard-step-record/1"
 RUNNING_MARK, RUNNING_FORMAT = "running.json", "expcore-hpc-shard-running/1"  # <results>/<label>/: a step runs it
 # The federation's render identity (O74): the record `hpcfed.py up` writes in its root (hpcidentity.py: hashes and a
 # version, no address, id, path or secret). This file runs alone on a node, so it keeps its own copy of the names; a
@@ -1178,6 +1197,18 @@ def _files_under(root: Path, results: Path, label: str) -> list[str]:
     return sorted(found)
 
 
+def _file_when_present(results: Path, name: str, label: str) -> list[str]:
+    """`[name]` (relative to `results`) when it is there as a regular file, `[]` when it is not there; `ShardsError`
+    naming the shard for a link or anything else, which is never followed."""
+    try:
+        mode = (results / name).lstat().st_mode
+    except FileNotFoundError:
+        return []
+    if not stat.S_ISREG(mode):
+        raise ShardsError(f"shard {label}: {name.rsplit('/', 1)[-1]} is not a regular file: a link is never followed")
+    return [name]
+
+
 def newer_snapshot(plan: Plan, shard: Shard, archive_sha: str, scratch: Path) -> Path | None:
     """The snapshot of `shard` that is newer than its archive (`archive_sha`: what the verified archive's manifest
     names) and that `--resume` would restore, or None. A snapshot names the archive its step started from (`base`), so
@@ -1209,7 +1240,8 @@ def evidence_entries(
     spent), and the snapshot newer than the archive when there is one (`newer_snapshot`), each as name (relative to the
     results directory), size and SHA-256 of the bytes read, sorted by name. The archive manifest is shown to name the
     archive that was verified, so the two listed are a pair. A link among them refuses the collect; so does a file that
-    cannot be read. Snapshots older than the archive are resume material and not listed (README). Returns the entries
+    cannot be read. `<label>/pass-env.json`, the shard's first-step `pass_env` (private), is listed when it is there.
+    Snapshots older than the archive are resume material and not listed (README). Returns the entries
     and, for each shard that has a snapshot newer than its archive, its (label, snapshot name)."""
     entries: list[dict[str, Any]] = []
     ahead: list[tuple[str, str]] = []
@@ -1225,6 +1257,7 @@ def evidence_entries(
             entries.append({"name": f"{shard.label}.out.json", "bytes": len(own),
                             "sha256": hashlib.sha256(own).hexdigest()})  # fmt: skip
             names = _files_under(plan.results / shard.label / JOURNALS, plan.results, shard.label)
+            names += _file_when_present(plan.results, f"{shard.label}/{PASS_ENV}", shard.label)
             snapshot = newer_snapshot(plan, shard, manifest["sha256"], scratch)
             if snapshot is not None:
                 names += _files_under(snapshot, plan.results, shard.label)
@@ -1237,21 +1270,37 @@ def evidence_entries(
     return sorted(entries, key=lambda entry: entry["name"]), ahead
 
 
+def archive_entries(plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]]) -> list[dict[str, Any]]:
+    """Each verified archive's name, size and SHA-256 (`found`, in the plan's order). The size is the private copy's,
+    whose
+    bytes were hashed, never a step's claim; `verified` raised unless the SHA-256 of those bytes is the manifest's, so
+    that value is theirs. Taken before the copies are unpacked and removed."""
+    return [
+        {"name": f"{shard.label}.out.tar", "bytes": copy.stat().st_size, "sha256": manifest["sha256"]}
+        for shard, (copy, manifest) in zip(plan.shards, found, strict=True)
+    ]
+
+
+def archives_payload(plan: Plan, entries: Sequence[Mapping[str, Any]], evidence: Sequence[Mapping[str, Any]]) -> bytes:
+    """The bytes of `archives.sha256.json`: the plan's id, each archive's entry and the `evidence` beside them
+    (`evidence_entries`, and each federation's root archive). Names are relative and there is no timestamp:
+    collecting one plan twice, with nothing changed in its results, writes the same bytes."""
+    document = {
+        "format": ARCHIVES_FORMAT,
+        "plan_id": plan_id(plan),
+        "archives": list(entries),
+        "evidence": list(evidence),
+    }
+    return (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
+
+
 def write_archives_manifest(
     plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]], evidence: Sequence[Mapping[str, Any]]
 ) -> Path:
     """`<results>/archives.sha256.json`, written whole beside the archives `verified` read (`found`, in the plan's
-    order): the plan's id, each archive's name, size and SHA-256, and the `evidence` beside them
-    (`evidence_entries`). The size is the private copy's, whose bytes were hashed, never a step's claim; `verified`
-    raised unless the SHA-256 of those bytes is the manifest's, so that value is theirs. Names are relative and there
-    is no timestamp: collecting one plan twice, with nothing changed in its results, writes the same bytes."""
-    entries = [
-        {"name": f"{shard.label}.out.tar", "bytes": copy.stat().st_size, "sha256": manifest["sha256"]}
-        for shard, (copy, manifest) in zip(plan.shards, found, strict=True)
-    ]
-    document = {"format": ARCHIVES_FORMAT, "plan_id": plan_id(plan), "archives": entries, "evidence": list(evidence)}
-    payload = (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
+    order): `archives_payload` of `archive_entries` and `evidence`. `collect` writes it itself, last."""
     path = plan.results / ARCHIVES_MANIFEST
+    payload = archives_payload(plan, archive_entries(plan, found), evidence)
     try:
         _write_whole(path, lambda draft: draft.write_bytes(payload))
     except OSError as error:
@@ -1295,69 +1344,325 @@ def pass_env_problem(shard: Shard, manifest: Mapping[str, Any], declared: Sequen
     return None
 
 
-def collect(plan: Plan, into: Path, refuse_newer: bool = False) -> list[Path]:
-    """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails, when
-    any is not final (`final_problem`) and when any step was not given the plan's `pass_env` (`pass_env_problem`),
-    naming it. Once every archive has verified and is final, and before anything is unpacked, `archives.sha256.json` is
-    written beside them for the copy back (`verify-copy`): the archives and what lies beside them (`evidence_entries`).
-    A refused collect writes none. Run it once every step has ended: a journal still being written is listed as it was
-    read, and a pull of it later would differ. A shard with a snapshot newer than its archive (a step resumed from the
-    archive was killed before it archived) holds runs the merge would omit: `collect` warns, naming the shard and the
-    snapshot, and lists the snapshot for the copy back; with `refuse_newer` (the merge follows at once: `--run`) it
-    refuses instead, since the merge has no flag to leave a shard short and would analyse an incomplete campaign."""
-    if into.exists() and any(into.iterdir()):
-        raise ShardsError("the directory to collect into must be new or empty")
+def _evidence() -> Any:
+    """`hpcevidence`, loaded by its path (the root's allow-list, its archive and its marker)."""
+    return _sibling("hpcevidence")
+
+
+def root_archives(plan: Plan) -> list[Any]:
+    """Each federation's root evidence as bytes (`hpcevidence.archive_root`), in the plan's order; nothing is written. A
+    root that is gone is shown by the root archive an earlier collect wrote (`earlier_archive`), or refused.
+    `ShardsError`
+    naming the shard and the file when a required file is missing, one is a link or holds a secret, or the root
+    cannot be read."""
+    module, found = _evidence(), []
+    for shard in plan.shards:
+        if (plan.results / shard.label / RUNNING_MARK).is_file():  # a step runs, or was killed: its end is not in
+            print(f"shards: WARNING: shard {shard.label}: a step of it is marked running ({RUNNING_MARK}): its "
+                  "root's evidence is archived as it is now, and a step that starts after the collect makes `down` "
+                  "refuse again", file=sys.stderr)  # fmt: skip
+        try:
+            try:
+                found.append(module.archive_root(shard.root, shard.label, root_id_of(shard)))
+            except module.RootGone:
+                found.append(module.earlier_archive(plan.results, shard.label, root_id_of(shard)))
+                print(
+                    f"shards: WARNING: shard {shard.label}: its root is gone: the root archive of an earlier collect "
+                    "is listed as it is",
+                    file=sys.stderr,
+                )
+        except module.EvidenceError as error:
+            raise ShardsError(f"shard {shard.label}: {error}") from None
+        except OSError as error:
+            raise ShardsError(
+                f"shard {shard.label}: its root's evidence could not be read ({type(error).__name__})"
+            ) from None
+    return found
+
+
+def root_id_of(shard: Shard) -> str:
+    """A hash of the shard's federation's root path, which the root archive's manifest records (no path): the root
+    archives of one shard label that were made of two federations (a shard that moved) are told apart by it."""
+    return hashlib.sha256(f"expcore-root-id:{shard.root}".encode()).hexdigest()
+
+
+def root_entries(plan: Plan, archives: Sequence[Any]) -> list[dict[str, Any]]:
+    """Each root archive and its manifest as name, size and SHA-256 of the bytes that are written (or, kept, were)."""
+    entries = []
+    for shard, held in zip(plan.shards, archives, strict=True):
+        for suffix, payload in ((".root.tar", held.tar), (".root.json", held.manifest)):
+            entries.append({"name": f"{shard.label}{suffix}", "bytes": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest()})  # fmt: skip
+    return entries
+
+
+def _fsync_dir(path: Path) -> None:
+    """The directory's entries made durable, where the filesystem lets a directory be synced."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _make_parents(directory: Path) -> list[Path]:
+    """The directories above `into` that did not exist, made (outermost first) and returned, so that a refused collect
+    can remove them."""
+    made = []
+    for missing in reversed([p for p in (directory, *directory.parents) if not p.exists()]):
+        missing.mkdir()
+        made.append(missing)
+    return made
+
+
+def _put_back(into: Path, existed: bool) -> None:
+    """`into` as `collect` found it, after its trees were moved in: gone, or an empty private directory if it was."""
+    with contextlib.suppress(OSError):
+        remove_tree(into)
+        if existed:
+            into.mkdir(mode=0o700)
+
+
+def _verify_shards(plan: Plan, stage: Path, refuse_newer: bool) -> tuple[list[tuple[Path, Mapping[str, Any]]], list]:
+    """Every shard's archive verified into a private copy in `stage`, its results final, and the files beside it listed
+    (`evidence_entries`); `ShardsError` naming the shard otherwise, and for a snapshot newer than its archive when the
+    merge follows (`refuse_newer`)."""
     wanted = None
     if plan.post_run is not None:  # the script the plan declares, as the study holds it now
         wanted = pinned(replace(plan, pre_step=None, expect_render_identity=None)).post_run_sha256
-    created = not into.exists()
-    into.mkdir(mode=0o700, parents=True, exist_ok=True)
-    seen = into.lstat()  # the merge runs in it (`--run`): a private directory of ours, never one others may enter
-    if not stat.S_ISDIR(seen.st_mode) or seen.st_uid != os.getuid() or seen.st_mode & 0o077:
-        if created:
-            into.rmdir()
-        raise ShardsError("the directory to collect into must be a private directory of this user (0700)")
-    try:
-        found = []
-        for shard in plan.shards:
-            found.append(verified(plan.results, shard, into))
-            if problem := final_problem(shard, found[-1][1], wanted) or pass_env_problem(
-                shard, found[-1][1], plan.pass_env
-            ):
-                raise ShardsError(problem)
-        evidence, ahead = evidence_entries(plan, found, into)
-        if ahead and refuse_newer:
-            who = "; ".join(f"shard {label}: snapshot {name}" for label, name in ahead)
-            raise ShardsError(
-                f"a snapshot is newer than its archive ({who}), so the merge would leave out the runs it holds: resume "
-                "the shard so that they reach a new archive, or run collect without --run and merge the line it prints "
-                "yourself, knowing they are left out"
-            )
-        for label, name in ahead:
-            print(
-                f"shards: WARNING: shard {label}: snapshot {name} is newer than its archive (a step resumed from the "
-                "archive was killed before it archived): it holds runs the merge leaves out; it is in the "
-                f"{ARCHIVES_MANIFEST} to pull and check, and `--resume` continues from it",
-                file=sys.stderr,
-            )
-        write_archives_manifest(plan, found, evidence)
-    except ShardsError:  # refused whole: nothing of it is left behind
-        for leftover in into.glob(".*.out.tar"):
-            leftover.unlink()
-        if created:
-            into.rmdir()
-        raise
-    outs = []
+    found = []
+    for shard in plan.shards:
+        found.append(verified(plan.results, shard, stage))
+        if problem := final_problem(shard, found[-1][1], wanted) or pass_env_problem(
+            shard, found[-1][1], plan.pass_env
+        ):
+            raise ShardsError(problem)
+    evidence, ahead = evidence_entries(plan, found, stage)
+    if ahead and refuse_newer:
+        who = "; ".join(f"shard {label}: snapshot {name}" for label, name in ahead)
+        raise ShardsError(
+            f"a snapshot is newer than its archive ({who}), so the merge would leave out the runs it holds: resume "
+            "the shard so that they reach a new archive, or run collect without --run and merge the line it prints "
+            "yourself, knowing they are left out"
+        )
+    for label, name in ahead:
+        print(
+            f"shards: WARNING: shard {label}: snapshot {name} is newer than its archive (a step resumed from the "
+            "archive was killed before it archived): it holds runs the merge leaves out; it is in the "
+            f"{ARCHIVES_MANIFEST} to pull and check, and `--resume` continues from it",
+            file=sys.stderr,
+        )
+    return found, evidence
+
+
+def _unpack_shards(plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]], stage: Path) -> None:
+    """Each verified private copy unpacked into `stage/<label>/out`, checked and made read-only; the copy removed."""
     for shard, (tar_path, _) in zip(plan.shards, found, strict=True):
-        out = unpack(tar_path, into / shard.label, label=shard.label)
+        try:
+            out = unpack(tar_path, stage / shard.label, label=shard.label)  # its own refusal names the shard
+        except (tarfile.TarError, OSError) as error:  # a refusal of the tar module
+            raise ShardsError(
+                f"shard {shard.label}: its archive could not be unpacked ({type(error).__name__})"
+            ) from None
         tar_path.unlink()
         if not (out / LOCK_NAME).is_file():
             raise ShardsError(f"shard {shard.label}: its unpacked out/ has no {LOCK_NAME}")
         if os.path.lexists(out / NOT_FINAL):
             raise ShardsError(f"shard {shard.label}: its out/ is marked not final ({NOT_FINAL})")
         _read_only(out)
-        outs.append(out)
-    return outs
+
+
+def _private_bytes(payload: bytes) -> Callable[[Path], None]:
+    """What `_write_whole` calls with its draft: `payload` written there, mode 0600 (the evidence is private)."""
+
+    def write(draft: Path) -> None:
+        descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+
+    return write
+
+
+def _set_aside(plan: Plan, shard: Shard, up_id: str) -> None:
+    """The root archive of another federation under this shard's label (the shard moved) put aside, not overwritten:
+    both files renamed to `<label>.<12 hex digits of the archive's SHA-256>.root.*`, which `aside_entries` lists."""
+    stem = _evidence().stem_of(plan.results, shard.label, root_id_of(shard), up_id)
+    if stem is None:
+        return
+    for suffix in ROOT_SUFFIXES:
+        if os.path.lexists(plan.results / f"{shard.label}{suffix}"):
+            os.replace(plan.results / f"{shard.label}{suffix}", plan.results / f"{shard.label}.{stem}{suffix}")
+
+
+def aside_entries(plan: Plan) -> list[dict[str, Any]]:
+    """The root archives an earlier collect put aside (`_set_aside`: `<label>.<12 hex digits>.root.tar` and its
+    manifest), each pair shown to be one another's, as name, size and SHA-256, so that `verify-copy` checks what a moved
+    shard's first federation left: `ShardsError` for a pair that is not."""
+    module, entries = _evidence(), []
+    for path in sorted(plan.results.glob("*.root.json")):
+        found = ASIDE_NAME.fullmatch(path.name)
+        if found is None:
+            continue
+        try:
+            held = module.verified_pair(plan.results, path.name.removesuffix(".root.json"), found["label"])
+        except module.EvidenceError as error:
+            raise ShardsError(f"{error}: the root archive put aside for a shard that moved cannot be used") from None
+        stem = path.name.removesuffix(".root.json")
+        for suffix, payload in ((".root.tar", held.tar), (".root.json", held.manifest)):
+            entries.append(
+                {"name": f"{stem}{suffix}", "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+            )
+    return entries
+
+
+def _publish(plan: Plan, archives: Sequence[Any]) -> None:
+    """Each root archive and its manifest written whole into the results directory, mode 0600 (an earlier one, kept
+    because its root is gone, is not); the archive of another federation under the same label put aside first."""
+    try:
+        for shard, held in zip(plan.shards, archives, strict=True):
+            if held.reused:
+                continue
+            _set_aside(plan, shard, held.up_id)
+            _write_whole(plan.results / f"{shard.label}.root.tar", _private_bytes(held.tar))
+            _write_whole(plan.results / f"{shard.label}.root.json", _private_bytes(held.manifest))
+    except OSError as error:
+        raise ShardsError(
+            f"a root evidence archive or the archives manifest could not be written ({type(error).__name__})"
+        ) from None
+
+
+def _mark_roots(plan: Plan, archives: Sequence[Any]) -> None:
+    """The collected-evidence marker into each archived root (`hpcevidence.write_marker`): what `down` reads. The
+    collect is done by now (the trees are in place and the manifest is written), so a marker that cannot be written
+    is a warning naming the shard, never a refusal: that root stays locked against `down` until a collect writes it."""
+    module = _evidence()
+    for shard, held in zip(plan.shards, archives, strict=True):
+        if held.reused:  # its root is gone: there is nothing to mark
+            continue
+        try:
+            module.write_marker(shard.root, shard.label, held.sha256, held.steps_sha256)
+        except (OSError, module.EvidenceError) as error:
+            print(
+                f"shards: WARNING: shard {shard.label}: the collected-evidence marker could not be written in its root "
+                f"({type(error).__name__}); the results are collected and the manifest is written, but `down` refuses "
+                "that root until a collect writes it (or --discard-evidence)",
+                file=sys.stderr,
+            )
+
+
+def _install(
+    plan: Plan,
+    stage: Path,
+    into: Path,
+    existed: bool,
+    entries: Sequence[Mapping[str, Any]],
+    listed: Sequence[Mapping[str, Any]],
+) -> bytes:
+    """The trees into `into` (one rename of `stage` onto it, which may exist only if empty), then
+    `archives.sha256.json` as the last write (a draft, fsynced, renamed); its bytes. Anything that goes wrong after the
+    trees are in, whatever it is, puts `into` back as it was found."""
+    try:
+        os.rename(stage, into)  # onto nothing, or onto the empty directory: one step, never a partial one
+    except OSError as error:
+        raise ShardsError(f"the unpacked trees could not be moved into place ({type(error).__name__})") from None
+    try:
+        payload = archives_payload(plan, entries, listed)
+        _write_whole(plan.results / ARCHIVES_MANIFEST, lambda draft: draft.write_bytes(payload))
+    except BaseException as error:
+        _put_back(into, existed)
+        if isinstance(error, OSError):
+            raise ShardsError(f"the archives manifest could not be written ({type(error).__name__})") from None
+        raise
+    _fsync_dir(plan.results)
+    return payload
+
+
+def collect_hashed(plan: Plan, into: Path, refuse_newer: bool = False) -> tuple[list[Path], str]:
+    """`collect`'s outs and the SHA-256 of the archives manifest it wrote (the bytes written, not a file read again).
+
+    Atomic (G9). Everything is made in a private directory beside `into` (0700, in its parent): every archive verified
+    into a private copy, every shard unpacked and checked there, every root's evidence read. Only when all of it holds
+    is anything published, in this order: each root archive and its manifest into the results directory, the trees into
+    `into`, and `archives.sha256.json` last. Then the collected-evidence marker in each root, which unlocks `down` and
+    so comes after the manifest. A refusal before the manifest leaves `into` as it was found (new, or an empty private
+    directory) and no marker, and the results directory as it was apart from the root archives (a refusal at the rename
+    leaves them, which the next collect overwrites); a manifest that cannot be written puts `into` back. A marker that
+    cannot be written is a warning naming the shard, not a refusal: the collect is done and `down` stays
+    locked for that root."""
+    if into.exists() and any(into.iterdir()):
+        raise ShardsError("the directory to collect into must be new or empty")
+    existed = into.exists()
+    if existed:
+        seen = into.lstat()
+        if not stat.S_ISDIR(seen.st_mode) or seen.st_uid != os.getuid() or seen.st_mode & 0o077:
+            raise ShardsError("the directory to collect into must be a private directory of this user (0700)")
+    made: list[Path] = []
+    stage: Path | None = None
+    done = False
+    try:
+        made += _make_parents(into.parent)
+        try:
+            stage = Path(tempfile.mkdtemp(prefix=".collect-", dir=into.parent))  # 0700, ours, beside `into`
+        except OSError as error:
+            raise ShardsError(
+                f"a private directory beside the one to collect into could not be made ({type(error).__name__})"
+            ) from None
+        found, evidence = _verify_shards(plan, stage, refuse_newer)
+        entries = archive_entries(plan, found)
+        archives = root_archives(plan)
+        _unpack_shards(plan, found, stage)
+        _publish(plan, archives)
+        listed = sorted([*evidence, *root_entries(plan, archives), *aside_entries(plan)], key=lambda e: e["name"])
+        payload = _install(plan, stage, into, existed, entries, listed)
+        done = True
+        _mark_roots(plan, archives)
+    finally:
+        if stage is not None and stage.exists():
+            remove_tree(stage)
+        if not done:  # the directories this collect made above `into`, once empty (rmdir refuses the others)
+            for directory in reversed(made):
+                with contextlib.suppress(OSError):
+                    directory.rmdir()
+    return [into / shard.label / "out" for shard in plan.shards], hashlib.sha256(payload).hexdigest()
+
+
+def collect(plan: Plan, into: Path, refuse_newer: bool = False) -> list[Path]:
+    """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails, when
+    any is not final (`final_problem`) and when any step was not given the plan's `pass_env` (`pass_env_problem`),
+    naming it. Atomic: see `collect_hashed`, which also gives the hash of the
+    archives manifest. Beside each shard's archive it writes the federation's root evidence for the copy back
+    (`<label>.root.tar`: an allow-list of what `down` removes with the root, never a secret) and a marker in the
+    root, and
+    lists them, the journals and the archive manifests in `archives.sha256.json` for `verify-copy`. Run it once every
+    step has ended and while the federation is up: a journal still being written is listed as it was read, and a pull
+    of it later would differ. A shard with a snapshot newer than its archive (a step resumed from the archive was killed
+    before it archived) holds runs the merge would omit: `collect` warns, naming the shard and the snapshot, and lists
+    the snapshot for the copy back; with `refuse_newer` (the merge follows at once: `--run`) it refuses instead, since
+    the merge has no flag to leave a shard short and would analyse an incomplete campaign."""
+    return collect_hashed(plan, into, refuse_newer)[0]
+
+
+def collect_roots(plan: Plan, label: str | None = None) -> list[tuple[str, str]]:
+    """Only the roots' evidence, of every shard or of `label`'s: each archived (`root_archives`) and published, and
+    marked collected, as `collect` does, without verifying any shard's archive, unpacking or writing
+    `archives.sha256.json`. For a shard about to move to another federation (`fleet.py down --member`), whose first
+    federation's root `down` would otherwise refuse, when the other shards are not final and a full `collect` is
+    refused.
+    Each shard's (label, root archive SHA-256). The next full collect lists the archive (and an archive of a root since
+    set aside) for `verify-copy`."""
+    chosen = tuple(shard for shard in plan.shards if label in (None, shard.label))
+    if not chosen:
+        raise ShardsError(f"the plan has no shard {label}")
+    only = replace(plan, shards=chosen)
+    archives = root_archives(only)
+    _publish(only, archives)
+    _mark_roots(only, archives)
+    return [(shard.label, held.sha256) for shard, held in zip(chosen, archives, strict=True)]
 
 
 def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
@@ -1451,7 +1756,11 @@ def _extras(local: Path, named: set[str]) -> tuple[str, ...]:
     """What `local` holds that looks like what the manifest names and it does not: an archive or an archive manifest
     (`*.out.tar`, `*.out.json`) in the directory, and a file in a shard's `journals/` (a step that ran after `collect`).
     Only a warning: another campaign's files, or a later step's, are not this pull's to fail."""
-    found = [f.name for f in local.iterdir() if f.name.endswith((".out.tar", ".out.json")) and f.name not in named]
+    found = [
+        f.name
+        for f in local.iterdir()
+        if f.name.endswith((".out.tar", ".out.json", *ROOT_SUFFIXES)) and f.name not in named
+    ]
     journal_dirs = {"/".join(parts[:2]) for parts in (name.split("/") for name in named) if parts[1:2] == [JOURNALS]}
     for directory in sorted(journal_dirs):  # `<label>/journals`, once, whatever lies under it
         base = local / directory
@@ -2610,6 +2919,38 @@ def check_pass_env_stable(args: argparse.Namespace, passed: Mapping[str, str]) -
         raise StepRefused(str(error)) from None
 
 
+def note_step_started(root: str | None, spec: Mapping[str, Any]) -> None:
+    """Leave `<root>/shard-steps/<label>.json` in the federation's root: a step of this shard started against it, and
+    how many have (`starts`, up by one each time, a resume included). `down` cannot see the results directory, so
+    this is
+    how it learns that a step ran, and a collect's marker names the digest of these records, so a step that starts after
+    the collect makes it stale (`hpcevidence`). The record holds the shard's spec and the count: no path, host or
+    secret.
+    Written whole (a draft, fsynced, renamed), the directory 0700. Nothing is done without a federation root that is a
+    directory (a study with no federation). `ShardsError` when it cannot be written, or an earlier record cannot be
+    read: a step that cannot say it ran does not start, since `down` would then remove evidence it cannot know of."""
+    if not root or not Path(root).is_dir():
+        return
+    path = Path(root) / STEP_RECORDS / f"{spec['label']}.json"
+    try:
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        if path.parent.is_symlink() or not path.parent.is_dir():
+            raise OSError(errno.ENOTDIR, "not a directory")
+        starts = 1
+        if os.path.lexists(path):
+            earlier = json.loads(path.read_text(encoding="utf-8"))["starts"]
+            if isinstance(earlier, bool) or not isinstance(earlier, int) or earlier < 0:
+                raise ValueError("starts")
+            starts = earlier + 1
+        record = {"format": STEP_RECORD_FORMAT, "shard": dict(spec), "starts": starts}
+        _write_whole(path, lambda draft: draft.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8"))
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ShardsError(
+            f"the step's record in its federation's root ({STEP_RECORDS}/{spec['label']}.json) could not be written or "
+            f"read ({type(error).__name__}): a step that cannot say it ran does not start"
+        ) from None
+
+
 def step(
     args: argparse.Namespace,
     *,
@@ -2755,6 +3096,7 @@ def _run_step(
                 getattr(args, "snapshot_every", SNAPSHOT_EVERY_S),
                 progress=lambda: out_snapshot.ended_attempts(out),
             )
+        note_step_started(os.environ.get("EXPCORE_FED_ROOT"), spec)  # `down` learns that a step ran from this
         snapshots.start(out)
         try:
             status = runner(argv, env, work)
@@ -2820,8 +3162,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         command = sub.add_parser(name)
         command.add_argument("--manifest", type=Path, required=True)
         if name == "collect":
-            command.add_argument("--into", type=Path, required=True)
+            command.add_argument("--into", type=Path, help="the new or empty directory to unpack into")
             command.add_argument("--run", action="store_true")
+            command.add_argument("--roots-only", dest="roots_only", action="store_true",
+                                 help="only each root's evidence (no --into): for a shard about to move")  # fmt: skip
+            command.add_argument("--shard", help="with --roots-only: the one shard's root")
     one = sub.add_parser("step")
     for key in ("study", "tmpfs", "results", "core_src"):
         one.add_argument(f"--{key.replace('_', '-')}", dest=key, type=Path, required=True)
@@ -2871,12 +3216,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "step":
             return archive_left(args) if args.archive_left else step(args)
         plan = load_plan(args.manifest)
+        if args.command == "collect" and args.roots_only:
+            if args.into is not None or args.run:
+                raise ShardsError("--roots-only takes neither --into nor --run")
+            for done, digest in collect_roots(plan, args.shard):
+                print(
+                    f"shards: shard {done}: root evidence archived ({done}.root.tar sha256 {digest}) and marked",
+                    file=sys.stderr,
+                )
+            print("shards: archives.sha256.json is not rewritten: a full collect lists these archives; pull the "
+                  "results directory and check each <label>.root.json before down", file=sys.stderr)  # fmt: skip
+            return 0
         if args.command == "collect":
-            outs = collect(plan, args.into, refuse_newer=args.run)
+            if args.into is None or args.shard is not None:
+                raise ShardsError("collect takes --into (and --shard only with --roots-only)")
+            outs, manifest_hash = collect_hashed(plan, args.into, refuse_newer=args.run)
             line = merge_argv(plan, outs)
             print(shlex.join(line))  # first, and alone on stdout: callers read it as the merge line
-            manifest_hash = _sha256(plan.results / ARCHIVES_MANIFEST)
             print(f"shards: archives manifest {ARCHIVES_MANIFEST} sha256 {manifest_hash}", file=sys.stderr)
+            print("shards: each root's evidence is archived (<label>.root.tar) and marked collected; down refuses a "
+                  "root that ran a step and has no current mark, unless --discard-evidence",
+                  file=sys.stderr)  # fmt: skip
             print("shards: pull the results directory and run verify-copy with that hash before down (README)",
                   file=sys.stderr)  # fmt: skip
             return subprocess.run(line, check=False, cwd=args.into).returncode if args.run else 0

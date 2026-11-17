@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+import hpcevidence
 import hpcrelay
 import hpcstate
 import hpcstorage
@@ -31,7 +32,10 @@ WORKDIR_LINE = re.compile(r"^hpcop: work directory (/\S+)$", re.M)  # the batch 
 class Down:
     """down, and what it is made of; `hpcdriver.Driver` provides the rest."""
 
-    def down(self) -> str:
+    def down(self, discard_evidence: bool = False, discard_reason: Optional[str] = None) -> str:
+        """The federation taken down and its root removed. A root that a shard step ran against and whose evidence was
+        not collected (`evidence_gate`) is refused before anything is stopped, unless `discard_evidence`, which the
+        output records."""
         if not self.root.exists():
             return "down: the root is gone already"
         if not self.layout.owned:
@@ -45,7 +49,59 @@ class Down:
                 settle_rmdir(self.root, ops["rmdir"], ops["sleep"], ops["clock"]() + SETTLE_S, ops["clock"])
             return "down: the root an earlier down's removal left (cut short by files held open) is removed"
         with self.store.lifecycle("down"):  # never beside an up that may be between its state and its sbatch
-            return self.take_down()
+            discarded = self.evidence_gate(discard_evidence, discard_reason)
+            done = self.take_down()
+        return f"{discarded}\n{done}" if discarded else done
+
+    def evidence_gate(self, discard: bool, reason: Optional[str] = None) -> str:
+        """O63: down removes the root, which holds the evidence the study's post-check and the facts read (the state,
+        `platform.toml`, `facts.json`, the link check, the render identity, the fault journals), so it refuses, before
+        it stops or cancels anything, a root that has shard results recorded against it (a step of a shard started
+        there, `shards.py step`) unless `shards.py collect` marked it and its evidence is still exactly what the marked
+        archive holds (`hpcevidence.uncollected`): a step that started or wrote since, or a changed file, makes it
+        stale. A root where no step ever ran goes as before, and so does one whose down already began (its phase
+        `stopping` or `down`: a down that failed halfway and is run again passed this gate before, and its own changes
+        to the state are no change of the evidence). `discard` (`--discard-evidence`) goes on, and the line it
+        returns, which the output and `say` carry, records what was discarded. Empty when there was nothing to
+        refuse or discard."""
+        if self.store.exists() and self.store.read().get("phase") in ("stopping", "down"):
+            return ""
+        found = hpcevidence.uncollected(self.root)
+        if found is None:
+            return ""
+        labels, stale = found
+        shown = ", ".join(labels)
+        if not discard:
+            if stale:
+                why = (
+                    f"the evidence of {shown} changed after it was collected (a step started or wrote since, or a file "
+                    "was changed), so what was collected lacks it"
+                )
+                remedy = (
+                    "end the shard's step, run `shards.py collect` (or `collect --roots-only`) again while it is up"
+                )
+            else:
+                why = f"shard results are recorded in this root ({shown}) and its evidence was not collected"
+                remedy = (
+                    "run `shards.py collect` (or `collect --roots-only`, which needs no final shard) while it is up"
+                )
+            raise RuntimeError(
+                f"{why}: down would remove the state, facts, link check, render identity and fault journals the "
+                f"post-check needs. Nothing was stopped or removed: {remedy}, pull the results and `verify-copy` them; "
+                "or give --discard-evidence to remove the root without it"
+            )
+        line = (
+            f"down: --discard-evidence: the root's evidence of {shown} "
+            f"{'changed after it was collected' if stale else 'was not collected'} and is removed with it"
+            + (f" (reason given: {reason})" if reason else "")
+        )
+        if self.store.exists():  # the state goes with the root: this line, in down's output, is what outlives it
+            entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "shards": labels,
+                     "changed_since_collect": stale, "reason": reason}  # fmt: skip
+            self.set(lambda state: state.setdefault("evidence_discarded", []).append(entry))
+            line += "; recorded in the state file"
+        self.say(line)
+        return line
 
     def removal_remains(self) -> bool:
         """Whether the root is what a removal cut short after its marker leaves: empty, or holding nothing but NFS

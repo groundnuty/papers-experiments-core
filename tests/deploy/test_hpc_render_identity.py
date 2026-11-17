@@ -854,6 +854,7 @@ def manifest(tmp_path: Path, extra: str = "", expected: dict | str | None = None
                  "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         (root / "platform.toml").write_text('[space]\nname = "s"\ndata_manifest = "m.json"\n')
+        (root / "facts.json").write_text("{}")  # what `up` writes beside the state: a collect archives both
     if extra:
         lines.append(extra)
     for label, name in (("fed-a", "a"), ("fed-b", "b")):
