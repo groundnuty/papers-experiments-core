@@ -47,7 +47,7 @@ class FailsAtStart(FakeExecutor):
 
 
 def induction_failure():
-    return InfraError("injector_failure", "the fault could not be induced")
+    return InfraError("sandbox", "the fault could not be induced")
 
 
 def run_once(root, executor, *, budget=True):
