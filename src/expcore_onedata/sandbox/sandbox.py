@@ -356,8 +356,11 @@ class DockerSandbox:
         self._input_copies = self._snapshot_inputs()  # copied and hashed before any container exists
         self._started = time.time()
         self._meta.update(host=self.host.host_facts(), started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        # O87: the host's OS release, glibc and kernel where an Apptainer run keeps its node's; recorded, never refused
-        self._meta["infrastructure_facts"] = {"node": hostfacts.of_node(lambda: self.host.host_readings())}
+        # O87: the host's OS release, glibc and kernel where an Apptainer run keeps its node's; recorded, never refused.
+        # Set in place: the platform may have recorded a fact before the start (the federation's window, O86)
+        node = hostfacts.of_node(lambda: self.host.host_readings())
+        with self._meta_lock:
+            self._meta.setdefault("infrastructure_facts", {})["node"] = node
         work = self.dir / "work"
         self._note_mount(work)  # registered before the mount (unmounting what never got mounted is harmless)
         self.host.make_quota_dir(self.dir / "work.img", work, s.limits.work_disk_bytes, s.agent_uid)
