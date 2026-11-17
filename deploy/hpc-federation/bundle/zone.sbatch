@@ -62,7 +62,7 @@ fi
 # The ready marker, once finish-zone.sh has passed every check: service-verified holds service.pid as it is now
 # (status.sh reads "ready" from it; a later launch has another service.pid, so a stale marker never matches).
 mark_verified "$W"
-say "zone up at https://$(node_fqdn):8443; holding until teardown or the end of the job"
+say "zone up at https://$(service_name "$W"):8443; holding until teardown or the end of the job"
 status=0; wait "$svc" || status=$?
 # The job's state says how the service ended: a stop teardown.sh asked for is a success, any other end a
 # failure, with the service's own status (1 if it exited 0 by itself).

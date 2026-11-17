@@ -3,8 +3,8 @@ is given a hosts file that resolves every peer's declared name (the node's own /
 unresolved peer crashes a provider's lookup of it); no onepanel or Onedata setting of the service holds the node's name
 as the domain it registers or its certificate is made for.
 
-Run in plain bash on this host, over the stand-ins of tests/deploy/hpcnode.py (hostname, apptainer, curl, ss). Every name
-is invented: `.test` for the layout's, `example.invalid` for a node's, and the documentation range for addresses.
+Run in plain bash on this host, over the stand-ins of tests/deploy/hpcnode.py (hostname, apptainer, curl, ss). Every
+name is invented: `.test` for the layout's, `example.invalid` for a node's, and the documentation range for addresses.
 """
 
 import importlib.util
@@ -90,7 +90,7 @@ def test_o70_a_provider_registers_its_declared_name_and_the_zones_and_certifies_
 
 def test_o70_the_zone_registers_its_declared_name_and_certifies_for_it(env):
     """O70: `onezone.domainName` and the generated certificate's domain are the zone's declared name."""
-    work, secrets, done = configure(env, "oz", *zone_args())
+    _, secrets, done = configure(env, "oz", *zone_args())
     assert done.returncode == 0, done.stderr
     config = (secrets / "config.yaml").read_text(encoding="utf-8")
     assert re.search(rf'^  domainName: "{ZONE_NAME}"$', config, re.M)
@@ -225,7 +225,7 @@ class Kept:
                     "domain": self.own,
                     "adminUserId": "a-1",
                 }
-            ),  # fmt: skip
+            ),
             encoding="utf-8",
         )
         self.env = {**env, "HPCOP_STOP_SECONDS": "30"}
