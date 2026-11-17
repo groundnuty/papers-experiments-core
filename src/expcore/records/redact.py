@@ -259,7 +259,12 @@ class Redactor:
         return key
 
     def text(self, value: str) -> str:
-        """Return the string with every secret replaced, and every fragment of one that a cut left at either end."""
+        """Return the string with every secret replaced, and every fragment of one that a cut left at either end.
+
+        The cut is looked for first, in the text as it came: a shorter secret replaced inside the cut tail of a longer
+        one would stop the tail matching it, and leave its start in the text. After the replacement it is looked for
+        again, as it always was."""
+        value = self._fragments(value) if self._inside else value
         for form in self._inside:
             if form in value:
                 value = value.replace(form, REDACTED)
@@ -318,6 +323,9 @@ class Redactor:
                 if self._keys and not schema:  # first, while the string is still the JSON it was
                     new = in_json_text(new, path)
                 new = self.text(new)
+                # again, once a replaced secret has made it the JSON it was not (one that held a quote)
+                if self._keys and not schema and new != value:
+                    new = in_json_text(new, path)
                 if new != value:
                     paths.append(path)
                 return new
