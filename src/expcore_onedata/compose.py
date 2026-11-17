@@ -35,8 +35,8 @@ could not run. nodetool prints the node's name in its failure line, so its outpu
 import json
 import re
 import subprocess
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -70,6 +70,9 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str = ""
+    # where the command's time went, when the fault relay read it (`fault_relay_timing`); never part of what the command
+    # was, so never compared, and None for every command that is no relayed verb
+    timing: Mapping[str, Any] | None = field(default=None, compare=False, repr=False)
 
 
 class CommandRunner(Protocol):

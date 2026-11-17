@@ -67,7 +67,8 @@ commit = "..."
 
 [toolserver.conditions.<name>]
 allow = ["tool", ...]           # the server-side allow-list of this condition
-rights = ["space_view", ...]    # the platform privileges of its principal and the caveats of its token
+rights = ["space_view", ...]    # the platform privileges of its principal and the caveats of its token; it and allow
+                                #   must agree (O31): a write tool's right, no write right without a tool that uses it
 manifest = "path.json"          # the frozen manifest the client checks the server against (L13)
 
 [sandbox]                       # optional: images, network pool, limits, mount, data paths (see sandbox/settings.py)
@@ -111,9 +112,11 @@ from expcore_onedata.addresses import AddressMap, AddressMapError, launch_argv, 
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.linksettings import LinkCheckSettings, load_link_check
 from expcore_onedata.rights import declares_qos, declares_write, rights_problem
+from expcore_onedata.sandbox.checkprovider import check as check_content_provider
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
+from expcore_onedata.toolrights import agreement_problem
 
 PLATFORM_MODULE = "expcore_onedata.sandbox.kinds"  # the module a study lists in `[study] platforms` for this platform
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
@@ -281,6 +284,14 @@ class PlatformConfig:
         """The agent's own provider, the same in every declared space."""
         return self.providers[self.spaces[0].support.local]
 
+    @property
+    def content_check_reader(self) -> Provider:
+        """The provider the pre-campaign content check reads through (`precampaign.py`): `[sandbox]
+        content_check_provider`, a provider that supports the check file's space and holds it whole, or, with none
+        declared, the agent's local provider (O87)."""
+        name = None if self.sandbox is None else self.sandbox.content_check_provider
+        return self.local_provider if name is None else self.providers[name]
+
     def provider_label(self, name: str) -> str:
         """Name a declared provider for a message by its position in the file, `providers[i]`, never by its name."""
         return f"providers[{list(self.providers).index(name)}]"
@@ -312,7 +323,9 @@ class PlatformConfig:
         mount level's I/O mode (O21, O36), the caps of the tables of the bytes served when `[sandbox.served_bytes]` is
         declared (O22), on the Apptainer backend that backend's pins (`sandbox_backend`, O56), and the sandbox's other
         settings that shape a run (`sandbox`: the backend, the images by id, the limits, the mount, the trust paths,
-        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256). With a
+        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256, and, when it is a
+        provider other than the local one, the provider the content check reads through, by its `providers[i]`
+        position: O87). With a
         `[toolserver]`, its pinned commit, its command line (federation-neutral, hashed), its start's bound and each
         condition's allow-list, rights and manifest's SHA-256 (`toolserver`); with a `[placement]`, its data provider by
         label, its range map by digest and the bounds a run's instruments read (`placement`); with `[faults]`, the
@@ -341,6 +354,9 @@ class PlatformConfig:
             if self.sandbox.apptainer is not None:  # O56: a Docker and an Apptainer run are never one experiment
                 out["sandbox_backend"] = self.sandbox.apptainer.record()
             out["sandbox"] = runsettings.sandbox_record(self.sandbox, runsettings.federation_roles(self))
+            reader = runsettings.check_provider_record(self)
+            if reader is not None:  # only a reader other than the local provider: a store older than the key resumes
+                out["sandbox"]["content_check_provider"] = reader
         if self.toolserver is not None:
             roles = runsettings.federation_roles(self)
             out["toolserver"] = runsettings.toolserver_record(self.toolserver, self.file, roles)
@@ -554,6 +570,9 @@ def _condition(name: str, section: Section, base: Path, *, require_manifest: boo
     problem = rights_problem(rights)
     if problem is not None:
         raise section.fail("rights", problem)
+    disagreement = agreement_problem(allow, rights)  # O31: the agent would see a tool that fails, or a wider token
+    if disagreement is not None:
+        raise section.fail(*disagreement)
     manifest = (base / section.string("manifest")).resolve()
     if require_manifest and not manifest.is_file():
         raise section.fail("manifest", "is not a file; freeze the server's manifest first")
@@ -680,4 +699,7 @@ def load_platform(
             )
         except AddressMapError as error:
             raise ConfigError(f"{file}: [toolserver]: {error}") from None
+    if config.sandbox is not None:  # the key names a provider of the spaces just read: checked once the file is
+        section = Section(root.table("sandbox"), file, "[sandbox]")
+        check_content_provider(section, config.sandbox.content_check_provider, providers, spaces)  # O87
     return config

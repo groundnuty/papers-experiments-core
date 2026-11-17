@@ -206,7 +206,7 @@ tls = {{ ca_file = "@root@/ca/federation-ca.pem" }}
 addresses = {{ file = "address-map.json", resolver = "toolshim/resolve_launch.py" }}
 
 [tokens]
-margin_s = 6000
+margin_s = 9000
 
 [[spaces]]
 label = "alpha"
@@ -245,6 +245,7 @@ backend = "hpc"
 journal = "@root@/fault-journal"
 stop_bound_s = 690
 relay_wait_s = 30
+step_launch_wait_s = 240
 
 [faults.services]
 aspen = "aspen"
@@ -299,11 +300,15 @@ binds = [{{ path = "@root@/pins/extra.conf", sha256 = "{SHA["bind"]}", target = 
 oneclient_bundle = "@root@/pins/oneclient.tar"
 oneclient_bundle_sha256 = "{SHA["bundle"]}"
 provider_storage = "tmpfs"
+work_disk = "directory"
+work_disk_mkfs = ["@mkfs@"]
 
 [sandbox.apptainer.gate_options]
 read_timeout_s = 30
 """
 
+CHECK_FILE_LINE = 'content_check_file = "dir/check-@space_suffix@.bin"'
+CHECK_PROVIDER_LINE = '\ncontent_check_provider = "birch"'  # supports the space; not the local provider (O87)
 DOCKER = {
     "platform.toml": DOCKER_PLATFORM,
     "ranges.toml": RANGES,
@@ -336,7 +341,7 @@ FEDERATIONS = (
         "slot_reader_id": "4" * 32, "slot_tools_id": "5" * 32, "space_suffix": "nordic", "prefix": "sbx",
         "registry": "registry-a.example.org", "pool": "10.10.0.0/16", "pool_prefix": "28", "attempts": "64",
         "network": "fed-a_default", "project": "fed-a", "admin_env": "FED_A_ADMIN", "users_env": "FED_A_USERS",
-        "apptainer": "/usr/bin/apptainer", "host_python": "python3.11",
+        "apptainer": "/usr/bin/apptainer", "host_python": "python3.11", "mkfs": "mkfs.ext3",
     },
     {
         "zone_host": "zone.fed-b.example.net", "pine_host": "n1.fed-b.example.net",
@@ -347,7 +352,7 @@ FEDERATIONS = (
         "slot_reader_id": "34" * 16, "slot_tools_id": "56" * 16, "space_suffix": "austral", "prefix": "box",
         "registry": "registry-b.example.net", "pool": "172.20.0.0/14", "pool_prefix": "29", "attempts": "32",
         "network": "fed-b_net", "project": "fed-b", "admin_env": "FED_B_ADMIN", "users_env": "FED_B_USERS",
-        "apptainer": "/opt/site/bin/apptainer", "host_python": "/usr/bin/python3",
+        "apptainer": "/opt/site/bin/apptainer", "host_python": "/usr/bin/python3", "mkfs": "/usr/sbin/mkfs.ext3",
     },
 )  # fmt: skip
 
@@ -444,6 +449,7 @@ IN = {
     "sandbox.placeholder_token": edit("docker", platform('placeholder_token = "placeholder"',
                                                          'placeholder_token = "nothing"')),
     "sandbox.kill_grace_s": edit("docker", platform("kill_grace_s = 5", "kill_grace_s = 6")),
+    "sandbox.content_check_provider": edit("docker", platform(CHECK_FILE_LINE, CHECK_FILE_LINE + CHECK_PROVIDER_LINE)),
     "sandbox.images.agent.id": edit("docker", platform(SHA["agent"], SHA["sif"])),
     "sandbox.images.gate.id": edit("docker", platform(SHA["gate"], SHA["sif"])),
     "sandbox.images.oneclient.id": edit("docker", platform(SHA["oneclient"], SHA["sif"])),
@@ -491,6 +497,7 @@ IN = {
     "sandbox.apptainer.oneclient_bundle_sha256": edit("apptainer", platform(SHA["bundle"], SHA["gate"])),
     "sandbox.apptainer.provider_storage": edit("apptainer", platform('provider_storage = "tmpfs"',
                                                                      'provider_storage = "shared_filesystem"')),
+    "sandbox.apptainer.work_disk": edit("apptainer", platform('work_disk = "directory"', 'work_disk = "image"')),
     "placement.holder": edit("docker", platform('holder = "birch"', 'holder = "pine"')),
     "placement.map": edit("docker", platform('map = "ranges.toml"\n', "")),
     "placement.map.*.file": edit("docker", ("ranges.toml", 'file = "dir/file.bin"', 'file = "dir/other.bin"')),
@@ -520,6 +527,7 @@ IN = {
                                                               "heal_container_fallback = false")),
     "faults.stop_bound_s": edit("apptainer", platform("stop_bound_s = 690", "stop_bound_s = 691")),
     "faults.relay_wait_s": edit("apptainer", platform("relay_wait_s = 30", "relay_wait_s = 31")),
+    "faults.step_launch_wait_s": edit("apptainer", platform("step_launch_wait_s = 240", "step_launch_wait_s = 241")),
     "space.name": edit("docker", platform('name = "alpha-space"', 'name = "alpha-other"')),
     "placement.clock_skew_allowance_s": edit("docker", platform("clock_skew_allowance_s = 5.0",
                                                                 "clock_skew_allowance_s = 6.0")),
@@ -603,6 +611,9 @@ OUT = {
     "addresses.file": ADDRESSES,
     "addresses.resolver": ADDRESSES,
     "sandbox.apptainer.apptainer": HOST,
+    "sandbox.apptainer.work_disk_mkfs": HOST + " (the node's mkfs, one program word with no option, refused at load "
+    "otherwise, so it names only where the tool is; the run records its version, `work_disk.mkfs`; the mode that uses "
+    "it, `work_disk`, is in)",
     "sandbox.apptainer.image": PATH,
     "sandbox.apptainer.host_python": HOST + " (the node's interpreter for the gate, as the driver's own is)",
     "sandbox.apptainer.egress_shim": PATH,

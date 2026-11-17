@@ -20,14 +20,18 @@ marks, as Docker's check does: so the check reads the same before the collection
 harness notes that state before it stops anything, and the check reads a component's live state first and looks for
 the note after, so a stop that lands while the check reads is found by its note, never taken for a death.
 
-No per-process limit, OOM counter or kernel line is kept for a process of the driver's, so every death's cause is
+No per-process limit, OOM counter or kernel line is kept for a process of the driver's, so a death's cause is
 `undetermined` and its category `infrastructure`, as the collection always recorded it (`kinds.death_error` then makes
-the run `unattributed_kill`). The guard's watcher is the guard's own evidence too: its death also leaves the guard's log
-without its end line, which the mount guard reads as unknown, never clean (O60).
+the run `unattributed_kill`). One death is known: the gate the run's watch killed for its memory over its own limit
+(O70) is a `component_defect`, as on Docker, with a basis naming the watch; only a gate that SIGKILL ended is the
+watch's, since a signal sent to a gate that had already exited (a zombie until reaped) succeeds all the same.
+The guard's watcher is the guard's own evidence too: its death also leaves the guard's log without its end line,
+which the mount guard reads as unknown, never clean (O60).
 """
 
 from __future__ import annotations
 
+import signal
 import threading
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
@@ -113,6 +117,28 @@ class InfraCheck:
             found.update(read() if read is not None else {"mount": {"start": None, "end": None}})
         return found
 
+    def _by_watch(self, death: dict[str, Any], end: Mapping[str, Any]) -> dict[str, Any]:
+        """The death, or its form when the run's watch killed the gate for its memory (O70): a defect of the
+        component, as on Docker. `end` is the state the check read, so the watch's kill is asked for after it was
+        read, and the death is the watch's only when SIGKILL ended the gate (a signal sent to a gate that had exited
+        by itself succeeds, since a dead process is a zombie until reaped)."""
+        watch = self.box._watch
+        if death["role"] != "gate" or watch is None or end.get("running") is not False:
+            return death
+        killed = watch.gate_kill()
+        if killed is None or end.get("exit_status") != 128 + signal.SIGKILL:
+            return death
+        who = f"{death['role']} (condition {death['condition']})"
+        return {
+            **death,
+            "cause": ID.COMPONENT_DEFECT,
+            "basis": (
+                f"the harness's watch killed the gate: its resident memory was {killed['amount']} bytes, over its "
+                f"limit of {killed['limit']}, a defect of the component whatever the agent asked of it"
+            ),
+            "problems": [f"{who}: killed by the watch for its memory (exit status {end['exit_status']})"],
+        }
+
     def check(self) -> dict[str, Any]:
         """`infra_check()`'s answer: each role's state with its problems, the deaths, and the infrastructure's
         problems (`api.InfraReadings`)."""
@@ -122,8 +148,9 @@ class InfraCheck:
             found = problems(role, condition, entry["end"])
             containers[role] = {**entry, "problems": found}
             if found:
-                deaths.append({"role": role, "condition": condition, "cause": ID.UNDETERMINED,
-                               "category": "infrastructure", "basis": BASIS, "problems": found})  # fmt: skip
+                death = {"role": role, "condition": condition, "cause": ID.UNDETERMINED,
+                         "category": "infrastructure", "basis": BASIS, "problems": found}  # fmt: skip
+                deaths.append(self._by_watch(death, entry["end"]))
         infra = [death for death in deaths if death["category"] == "infrastructure"]
         return {"containers": containers, "deaths": deaths, "death": [p for d in infra for p in d["problems"]]}
 

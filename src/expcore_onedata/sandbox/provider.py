@@ -74,6 +74,7 @@ import weakref
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from expcore.campaign.factors import DATA_PATH_FACTOR
 from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
@@ -123,7 +124,7 @@ log = logging.getLogger(__name__)
 WAIT_KIND = "sandbox_lifecycle"
 TEARDOWN_DEADLINE_S = 600.0  # how long the platform waits for a sandbox's stop, whatever it is doing (O42)
 CANCEL_WAIT_S = 120.0  # how long a cancelled launch waits for its start thread to notice and clean up, before it stops
-DATA_PATH_FACTOR = "data_path"  # the study's factor whose levels [sandbox.data_paths] maps
+# the study's factor whose levels [sandbox.data_paths] maps, unless the study names another (`[study] data_path_factor`)
 
 
 def _well_formed(document: Any) -> bool:
@@ -336,8 +337,14 @@ class SandboxPlatform:
         clock: Callable[[], float] = time.time,
         read_only_inputs: Mapping[str, Sequence[ReadOnlyInput]] | None = None,
         teardown_deadline_s: float = TEARDOWN_DEADLINE_S,
+        data_path_factor: str = DATA_PATH_FACTOR,
         federation_watch: fedwindow.Watch | None = None,
     ) -> None:
+        if not isinstance(data_path_factor, str) or not data_path_factor.strip():
+            raise ValueError(
+                "data_path_factor is the name of the study's data-path factor (`[study] data_path_factor`)"
+            )
+        self._data_path_factor = data_path_factor
         if isinstance(teardown_deadline_s, bool) or not isinstance(teardown_deadline_s, int | float):
             raise ValueError("teardown_deadline_s must be a number of seconds")
         if not 0 < teardown_deadline_s < float("inf"):
@@ -379,9 +386,15 @@ class SandboxPlatform:
         return self._slots
 
     # ------------------------------------------------------------------------------------------------ the plugin's hooks
+    @property
+    def data_path_factor(self) -> str:
+        """The name of the study's data-path factor, which `mode` reads: `data_path` unless the study names another
+        (`[study] data_path_factor`, `StudyConfig.data_path_factor`, O75)."""
+        return self._data_path_factor
+
     def mode(self, factors: Mapping[str, Any]) -> DataPathMode:
-        """The data path of a run, from its `data_path` factor."""
-        return self._s.mode_of(str(factors[DATA_PATH_FACTOR]))
+        """The data path of a run, from the level of its data-path factor (`data_path_factor`)."""
+        return self._s.mode_of(str(factors[self._data_path_factor]))
 
     def lease_group(self, factors: Mapping[str, Any]) -> str | None:
         """The lease group of a run (O31): with a tool server, its condition's (`condition_group`), the slots whose

@@ -23,6 +23,8 @@ JOB_ID = re.compile(r"[0-9]{1,12}")
 STEP_ID = re.compile(r"[0-9]{1,12}\.[0-9]{1,9}")
 PLACEMENTS = ("het", "separate")  # where the agent's node is held (hpcsettings.SANDBOX_PLACEMENTS)
 SHA256 = re.compile(r"[0-9a-f]{64}")
+RELAYS = ("serving", "none")  # the login node's fault relay as `up` ended: its heartbeat seen, or this core has none
+UNRECORDED = "unrecorded"  # `relay_of`'s word for a state that says neither: an older up, or one that never got there
 
 
 class StateError(RuntimeError):
@@ -31,6 +33,15 @@ class StateError(RuntimeError):
 
 def path(root: Path) -> Path:
     return Path(root) / STATE
+
+
+def relay_of(state: Dict[str, Any]) -> str:
+    """The fault relay's state as `up` recorded it once the relay beat (`serving`) or found none in its core (`none`);
+    `unrecorded` when the state has neither, as one written by an older up, or by an up that failed before the relay's
+    heartbeat, has none. The `relay` record (the client's pid, kept so `down` can end it) is no answer: it is written at
+    the relay's spawn, before its heartbeat."""
+    found = state.get("fault_relay")
+    return found if found in RELAYS else UNRECORDED
 
 
 def checked_workdir(value: str, node_tmp: str, kind: str) -> str:
@@ -63,6 +74,7 @@ def new_service(kind: str) -> Dict[str, Any]:
         "workdir": None,
         "rootfs": None,
         "launch": 0,
+        "launch_retries": [],  # each launch `up` repeated, with the proofs that nothing of it ran (hpclaunchproof)
         "step": None,
         "client": None,
         "log": None,
@@ -89,6 +101,11 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
     job = state["allocation"].get("job")
     if job is not None and not (isinstance(job, str) and JOB_ID.fullmatch(job)):
         raise StateError(f"{STATE}: allocation.job is not a Slurm job id")
+    excluded = state["allocation"].get("excluded_nodes")  # a count (O57): none in a state an older up wrote
+    if excluded is not None and not (isinstance(excluded, int) and not isinstance(excluded, bool) and excluded >= 0):
+        raise StateError(f"{STATE}: allocation.excluded_nodes is not a count")
+    if "fault_relay" in state and state["fault_relay"] not in RELAYS:
+        raise StateError(f"{STATE}: fault_relay is not one of {', '.join(RELAYS)}")
     sandbox = state.get("sandbox")
     if sandbox is not None:
         checked_sandbox(sandbox)

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from hpc_fed_support import (
     LAYOUT,
+    NODE_READINGS,
     PEM,
     SITE,
     FakeProcess,
@@ -20,6 +21,7 @@ from hpc_fed_support import (
     data_stand_in,
     hpc_on_path,
     pin_values,
+    write_address_map,
 )
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
@@ -273,7 +275,8 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_d
     assert layout.spec.zone.url == "https://zone.expcore-hpc-pilot.test:8443"
     assert layout.spec.provider("hazel").url == "https://hazel.expcore-hpc-pilot.test:8443"
     assert owner == (5001, 5001)
-    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("690", "750")
+    assert (values["hpc_step_launch_wait_s"], values["hpc_command_timeout_s"]) == ("240", "300")
+    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("140", "450")
     command = json.loads(values["hpc_command"])
     assert command[1:3] == ["-I", "-B"]  # isolated (O58): the relay runs every verb through it
     assert command[3:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
@@ -312,7 +315,7 @@ def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancel
     teardowns = [s for s in rig.fake.sruns if s.command[1:2] and s.command[1].endswith("teardown.sh")]
     assert [s.command[s.command.index("--workdir") + 1].split(".")[0] for s in teardowns][-1] == "/tmp/hpcop-oz"
     assert [s.node for s in teardowns] == [f"node{i:02d}" for i in (2, 3, 4, 5, 6, 1)]
-    assert all(s.command[-2:] == ["--timeout", "600"] for s in teardowns)
+    assert all(s.command[-2:] == ["--timeout", "50"] for s in teardowns)
     checks = [s for s in rig.fake.sruns if s.command[0] == "test"]
     assert len(checks) == 6
     assert all(s.command[1:3] == ["!", "-e"] for s in checks)
@@ -320,6 +323,27 @@ def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancel
     assert len(rig.fake.ended_clients) == 6
     assert not rig.root.exists()
     assert "is gone" in out
+
+
+def test_a_teardown_step_is_bounded_by_the_launch_wait_the_stop_the_kill_and_a_margin(hpc, tmp_path, site):
+    """O58: down's teardown step is waited for from its start, so its bound holds the step's launch wait (240 s), the
+    graceful stop (50 s), supervise.py's kill tail (30 s) and 90 s: 410 s, past a step that starts 200 s late (the
+    controller's message timeout) and ends 33 s after its SIGTERM, and past the worst teardown after it (the whole
+    graceful stop, then the kill)."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    asked, inner = {}, rig.driver.launcher.control
+
+    def control(node, argv, *, name, timeout_s, job=None):
+        asked[name] = timeout_s
+        return inner(node, argv, name=name, timeout_s=timeout_s, job=job)
+
+    rig.driver.launcher.control = control
+    rig.driver.down()
+    teardown = {bound for name, bound in asked.items() if "-teardown-" in name}
+    assert teardown == {240 + 50 + 30 + 90}
+    assert 200 + 33 < 410
+    assert 200 + 50 + 30 < 410
 
 
 def test_a_held_job_recorded_otherwise_is_cancelled_and_down_after_it_removes_the_root(hpc, tmp_path, site):
@@ -568,6 +592,63 @@ def test_a_node_facts_step_that_says_nothing_is_named_so(hpc, tmp_path, site):
         rig.up()
 
 
+def test_o87_up_records_each_nodes_os_glibc_and_kernel_in_the_state_beside_its_name_and_address(hpc, tmp_path, site):
+    """O87: the node facts step also prints the node's OS release (ID, VERSION_ID), glibc version and kernel release;
+    the state keeps them for every node that runs a service and for the agent's, beside its FQDN and address."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    services = rig.state()["services"]
+    assert set(services) == {"zone", *PROVIDERS, "sandbox"}
+    for name, record in services.items():
+        assert record["readings"] == NODE_READINGS, name
+    assert "unknown" not in services["zone"]["readings"]
+
+
+@pytest.mark.parametrize(
+    "printed",
+    [
+        None,  # a step that gives none (an older bundle's)
+        "garbage",
+        5,
+        ["os"],
+        {"os": "rocky"},
+        {"os": {"id": "x" * 500, "version_id": "1"}, "glibc": "glibc 2.34", "kernel": "5.14"},
+        {"os": {"id": "a", "version_id": "1"}, "glibc": ["glibc 2.34"], "kernel": "5.14"},
+        {"os": {"id": "a", "version_id": "1"}, "glibc": "glibc 2.34", "kernel": "5.14\nsecond"},
+    ],
+)
+def test_o87_readings_a_node_does_not_give_in_the_shape_are_unknown_with_a_reason_and_up_still_succeeds(
+    hpc, tmp_path, site, printed
+):
+    """O87: recorded only, never refused: a step that prints no readings or a malformed value is `unknown` with the
+    reason, for each reading, and the federation comes up all the same."""
+    fake = FakeSlurm()
+    fake.node_readings = printed
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    assert rig.up().startswith("core: the link check passed")
+    for name, record in rig.state()["services"].items():
+        found = record["readings"]
+        assert found["kernel"] == found["glibc"] == "unknown", name
+        assert found["os"] == {"id": "unknown", "version_id": "unknown"}
+        assert set(found["unknown"]) == {"os.id", "os.version_id", "glibc", "kernel"}
+        assert all(reason for reason in found["unknown"].values())
+
+
+def test_o87_a_node_that_marks_some_of_its_readings_unknown_keeps_what_it_read(hpc, tmp_path, site):
+    """O87: the step's own `unknown` (a glibc it could not read, with the reason) reaches the state as printed."""
+    printed = {
+        "os": {"id": "invented", "version_id": "9.9"},
+        "glibc": "unknown",
+        "kernel": "9.99.0-invented",
+        "unknown": {"glibc": "ValueError"},
+    }
+    fake = FakeSlurm()
+    fake.node_readings = printed
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    rig.up()
+    assert rig.state()["services"]["zone"]["readings"] == printed
+
+
 def test_a_step_on_a_node_outside_the_held_job_is_refused(hpc, tmp_path, site):
     """O57: the launcher runs steps of the held job, on its own nodes only."""
     rig = Rig(hpc, tmp_path, site)
@@ -676,6 +757,7 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
         os.chmod(root / name, 0o600)
     hosts = {s.name: f"{s.name}.cluster.example.org" for s in spec.services}
     layout = fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
+    write_address_map(layout)  # `up` leaves one in a root of declared names
     ids = SimpleNamespace(
         admin="uid-admin",
         providers={p.name: f"pid-{p.name}" for p in spec.providers},
@@ -728,7 +810,8 @@ def test_the_service_verbs_go_through_the_stable_hook_with_the_launcher_and_the_
     (verb, service, argv), keywords = calls[0]
     assert (verb, service, argv) == ("exec", "aspen", ["op_worker", "ping"])
     assert calls[1][0] == ("status", "aspen", [])
-    assert keywords["stop_seconds"] == 600
+    assert keywords["stop_seconds"] == 50
+    assert keywords["step_launch_wait_s"] == 240
     assert isinstance(keywords["launcher"], hpc.launch.Launcher)
     assert isinstance(keywords["state"], hpc.launch.StateStore)
 

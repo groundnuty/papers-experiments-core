@@ -239,9 +239,10 @@ def test_o34_without_a_mount_a_cell_that_outlives_its_kill_stops_the_sandbox(wor
         sandbox.stop()
 
 
-def test_o34_the_code_tool_ends_the_attempt_as_cell_unkillable(world, mounted):
-    """O34: the code tool raises the cell's kind for a cell that outlived its kill, never a timeout told to the
-    model."""
+def test_o34_the_code_tool_tells_a_cell_that_outlived_its_kill_what_it_did_and_the_run_is_ended(world, mounted):
+    """O34, O72: the code tool returns the cell's own result for a cell that outlived its kill: it ran and hit its
+    deadline, a timeout, never a raise in its place (the loop would record a call that ran as skipped). The run's
+    ending, the kind `cell_unkillable`, is said at run level: the next call raises it, naming the cell's deadline."""
     import asyncio
 
     pids = cell_processes(world, mounted, wedged=True)
@@ -255,9 +256,15 @@ def test_o34_the_code_tool_ends_the_attempt_as_cell_unkillable(world, mounted):
     tool = CodeExecutionProvider(mounted)
     result, _ = run_to_the_cap(mounted, world)  # the cell itself, as the tool would have run it
     mounted.exec = lambda code, timeout_s: result  # the tool's next call returns that cell's result
+    told = asyncio.run(tool.execute("python", {"code": "x"}, timeout_s=CELL_S, ctx=None))
+    assert (told.is_error, told.error_class) == (True, "timeout")
+    assert told.exec_check == result.exec_check
+    del mounted.exec  # the next call is the sandbox's own: the run is over
     with pytest.raises(InfraError) as ended:
         asyncio.run(tool.execute("python", {"code": "x"}, timeout_s=CELL_S, ctx=None))
     assert ended.value.kind == "cell_unkillable"
+    assert "cell 1's deadline" in ended.value.detail
+    assert "mount_aborted" in ended.value.detail
 
 
 def test_o34_the_grace_period_is_a_setting_and_is_recorded(world, mounted):

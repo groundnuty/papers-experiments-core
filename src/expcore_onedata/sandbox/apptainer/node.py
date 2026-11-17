@@ -16,6 +16,7 @@ import contextlib
 import ctypes
 import os
 import platform
+import re
 import signal
 import subprocess
 import threading
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from expcore_onedata.sandbox import hostfacts
 from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import loopback
@@ -34,6 +36,8 @@ SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434
 PROC = Path("/proc")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 VERSION_S = 20.0
+BOOT_ID = PROC / "sys" / "kernel" / "random" / "boot_id"
+BOOT_ID_FORM = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 @dataclass(frozen=True)
@@ -143,9 +147,35 @@ class NodeOps(Protocol):
         children cannot be read while it lives."""
         ...
 
+    def own_affinity(self) -> list[int] | None:
+        """The cores this process may run on (its CPU affinity, sorted): the step's cores, from which a cell's pin is
+        taken (O70); None when they cannot be read."""
+        ...
+
+    def task_affinity(self, pid: int, start: str) -> frozenset[int] | None:
+        """The union of the cores every task of the process that started at `start` may run on (`Cpus_allowed_list`
+        of each task's status: a thread may set its own); the empty set when the process is gone or another holds its
+        pid; None when a living task's cores cannot be read."""
+        ...
+
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         """Facts of the node for a record: its kernel and the version of `apptainer` (the command words). No name
         and no address."""
+        ...
+
+    def boot_id(self) -> str | None:
+        """This boot of the node: the kernel's random per-boot UUID (`/proc/sys/kernel/random/boot_id`), which names
+        neither the node nor its site; None when it cannot be read. What the work disk's kept proof is for (O71)."""
+        ...
+
+    def node_readings(self) -> dict[str, Any]:
+        """The node's OS release (ID, VERSION_ID), glibc version and kernel release (`hostfacts.readings`, O87): files
+        read as text and system values asked, nothing executed; a reading that fails is `unknown` with its reason."""
+        ...
+
+    def tool_server_readings(self) -> dict[str, Any]:
+        """The same readings of the host the run's tool server runs on. The server is the driver's own child, so on
+        the node it is the node's own; a node that places it elsewhere answers for that host."""
         ...
 
 
@@ -351,7 +381,7 @@ class LocalNode:
             found.append(
                 P.Proc(
                     int(name), start, ppid, state, comm, pidns, P.parse_rss(status), P.tags_in(cmdline, environ, tags),
-                    P.parse_anon(status), cgroup,
+                    P.parse_anon(status), cgroup, P.parse_threads(status),
                 )
             )  # fmt: skip
         return found
@@ -458,10 +488,52 @@ class LocalNode:
             return []
         return P.hidden_children(lambda: _children(pid), _shown_ours, _exists)
 
+    def own_affinity(self) -> list[int] | None:
+        try:
+            return sorted(os.sched_getaffinity(0)) or None
+        except (AttributeError, OSError):
+            return None
+
+    def task_affinity(self, pid: int, start: str) -> frozenset[int] | None:
+        if _start_of(pid) != start:  # gone, hidden, or another process now
+            return frozenset()
+        tasks = PROC / str(pid) / "task"
+        try:
+            tids = os.listdir(tasks)
+        except FileNotFoundError:
+            return frozenset()
+        except OSError:
+            return None
+        found: set[int] = set()
+        for tid in tids:
+            try:
+                cores = P.parse_cpus_allowed(_read(tasks / tid / "status"))
+            except FileNotFoundError:
+                continue  # the thread ended between the listing and the read
+            except OSError:
+                return None
+            if cores is None:
+                return None
+            found |= cores
+        return frozenset(found)
+
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         done = self.apptainer([*apptainer, "--version"], VERSION_S)
         version = done.stdout.strip() if done.returncode == 0 else None
         return {"kernel": platform.release(), "apptainer": version[:80] if version else None}
+
+    def boot_id(self) -> str | None:
+        try:
+            found = _read(BOOT_ID).strip()
+        except OSError:
+            return None
+        return found if BOOT_ID_FORM.fullmatch(found) else None
+
+    def node_readings(self) -> dict[str, Any]:
+        return hostfacts.readings()
+
+    def tool_server_readings(self) -> dict[str, Any]:
+        return self.node_readings()  # the tool server is a process of this driver's, on this node
 
 
 __all__ = ["LocalNode", "NodeOps", "Spawned"]

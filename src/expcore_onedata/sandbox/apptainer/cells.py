@@ -37,7 +37,14 @@ from expcore_onedata.sandbox.api import RAN, ExecResult
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer.node import NodeOps
 from expcore_onedata.sandbox.apptainer.watch import Watch
-from expcore_onedata.sandbox.cells import CAP_MARGIN_S, HOST_CALL_MARGIN_S, QUIESCE_ROUNDS, CellRunner, CellTimer
+from expcore_onedata.sandbox.cells import (
+    CAP_MARGIN_S,
+    HOST_CALL_MARGIN_S,
+    QUIESCE_ROUNDS,
+    CellRunner,
+    CellTimer,
+    _left_record,
+)
 from expcore_onedata.sandbox.cells import _output_cut as output_cut
 from expcore_onedata.sandbox.completion import Completion, ExecIncomplete
 from expcore_onedata.sandbox.hostops import TIMED_OUT, describe_error
@@ -51,6 +58,10 @@ APPTAINER_FAILED = (
     "apptainer could not run the cell's container (exit {rc}, its own FATAL line on stderr): its program did not run"
 )
 EXEC = "apptainer exec"  # the exec a completion cause names on this backend (`completion.Completion.runner`)
+RUN_ENDED = "watch_ended_run"  # the outcome of the `ended` record the watch makes when a cell cannot be isolated
+# what the run's infrastructure facts keep of that end (`infrastructure_facts.run_ended`): a run-level fact, so a
+# campaign can count the runs the watch ended for a cell it could not isolate
+RUN_ENDED_FACT = ("scope", "attributed", "reason", "what", "why")
 HIDDEN_BASIS = (
     "the harness's watch killed the run's processes: the cgroup charged {amount} bytes more anonymous memory during "
     "the cell than any process /proc shows explains, past the margin of {limit}, and memory the watch cannot see is "
@@ -105,6 +116,15 @@ class AppCellRunner(CellRunner):
         self.node, self.watch, self._argv_of, self._python = node, watch, argv_of, python
         self._before_exec, self._sleep, self._clock = before_exec, sleep, clock
         self.last_watch: dict[str, Any] = {}  # what the watch saw of the last exec: `seen`, `peak_bytes`, `kills`
+        watch.on_run_end = self.run_ended_by_watch
+
+    def run_ended_by_watch(self, event: dict[str, Any]) -> None:
+        """The watch ended the run (`scope: run`, O72): every later exec and the collection are refused (`ended`)."""
+        with self.meta_lock:
+            self.ended = self.ended or {
+                "outcome": RUN_ENDED, "scope": "run", "attributed": event.get("attributed", True),
+                "reason": event.get("reason"), "what": event.get("what"), "why": event.get("why"),
+            }  # fmt: skip
 
     # ------------------------------------------------------------------------------------------------ no earlyoom here
     def sample_pids(self) -> None:
@@ -150,7 +170,7 @@ class AppCellRunner(CellRunner):
         """`quiesce` without its record."""
         state: dict[str, Any] = {"reason": reason, "killed": None, "left": None}
         try:
-            killed, seen, left = 0, set(), []
+            killed, seen, left, unsent = 0, set(), [], False
             for _ in range(QUIESCE_ROUNDS):
                 procs = self.agent_processes()
                 if procs is None:
@@ -160,14 +180,18 @@ class AppCellRunner(CellRunner):
                 left = procs
                 if not fresh:
                     break
-                killed += self.kill(fresh)
+                sent = self.kill(fresh)
+                killed += sent
+                unsent = unsent or sent < len(fresh)  # one signal not known to have been sent
                 seen.update((p["pid"], p["start"]) for p in fresh)
                 left = self._wait_gone(fresh, GONE_WAIT_S)
                 if left is None:
                     killed = None
                     break
             if killed is not None:
-                state.update(killed=killed, left=[{k: p[k] for k in ("pid", "comm", "state")} for p in left[:16]])
+                state.update(killed=killed, **_left_record(left))
+                if unsent and state["left_alive"]:
+                    state.update(killed=None, error="a signal was not sent and a process is left")
         except Exception as error:
             state.update(killed=None, left=None, error=describe_error(error))
         return state
@@ -273,7 +297,7 @@ class AppCellRunner(CellRunner):
             return {"reason": "host_oom", "category": KC.CATEGORY["host_oom"], "basis": basis, "timer_fired": fired,
                     "watch_kills": kills}  # fmt: skip
         if kills:
-            first = kills[0]
+            first = next((k for k in kills if k.get("scope") == "run"), kills[0])  # one that ended the run first
             reason = first["reason"]
             basis = (
                 HIDDEN_BASIS.format(amount=first["amount"], limit=first["limit"])
@@ -281,8 +305,11 @@ class AppCellRunner(CellRunner):
                 else f"the harness's watch killed the run's processes: {first['what']} at {first['amount']}, over its "
                 f"limit of {first['limit']}"
             )
-            return {"reason": reason, "category": KC.CATEGORY[reason], "basis": basis, "watch_kills": kills,
-                    "timer_fired": fired}  # fmt: skip
+            if first["scope"] == "run":  # the cell could not be isolated: the run cannot go on as on Docker
+                basis = f"{basis}; the watch ended the run: {first['why']}"
+            category = "infrastructure" if first["scope"] == "run" else KC.CATEGORY[reason]
+            return {"reason": reason, "category": category, "basis": basis, "scope": first["scope"],
+                    "watch_kills": kills, "timer_fired": fired}  # fmt: skip
         if fired:
             basis = f"the harness's timer fired at the cell's limit of {timeout_s:g} s"
             return {"reason": "time_limit", "category": KC.CATEGORY["time_limit"], "basis": basis, "timer_fired": True}

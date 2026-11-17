@@ -1,11 +1,12 @@
 """O34: a cell's deadline through the agent loop, as a study runs it. The loop gives each cell the agent's remaining
 time as its cap, so the cell's deadline falls with the agent's own, at the same moment of the real clock: either the
 loop's watch cuts the call and cancels its wait for it while the deadline's escalation is still under way, which alone
-would make the attempt the agent's `time_cap`, or the escalation decides first and the code tool raises the cell's
-`cell_unkillable` to the loop. A cell a process of which outlived its kill must end the run as `cell_unkillable` either
-way: `launch` settles the deadline of a cell still running, and decides from it before anything else, on every way out
-of its body. Which of the two comes first is a race of a few milliseconds (#226), so each test holds one order with
-events and the fake docker, never the real clock."""
+would make the attempt the agent's `time_cap`, or the escalation decides first and the code tool gives the loop the
+cell's own result (O72: it ran, and hit its deadline, a timeout; the run's ending is never said in its place). A cell a
+process of which outlived its kill must end the run as `cell_unkillable` either way: `launch` settles the deadline of a
+cell still running, and decides from it before anything else, on every way out of its body. Which of the two comes
+first is a race of a few milliseconds (#226), so each test holds one order with events and the fake docker, never the
+real clock."""
 
 import asyncio
 import contextlib
@@ -168,13 +169,14 @@ def test_o34_a_cell_that_outlives_its_kill_in_the_agent_loop_ends_the_run_as_cel
     assert_ended_as_cell_unkillable(ended, kept[0])
 
 
-def test_o34_a_cell_whose_deadline_decides_before_the_loop_cuts_ends_the_run_as_cell_unkillable(platform):
-    """O34: the other order of the same race (#226): the loop's watch wakes late, so the cell's own timer fires at its
-    cap, the escalation aborts the mount, and the code tool raises the cell's `cell_unkillable` to the loop before the
-    loop cuts the call. The loop's outcome is then that infrastructure kind, never `time_cap`, and `launch` ends the run
-    as `cell_unkillable` from the same deadline, with the sandbox stopped."""
+def test_o34_a_cell_whose_deadline_decides_before_the_loop_cuts_is_its_own_timeout_and_launch_ends_the_run(platform):
+    """O34, O72: the other order of the same race (#226): the loop's watch wakes late, so the cell's own timer fires at
+    its cap, the escalation aborts the mount, and the code tool returns before the loop cuts the call. The call is what
+    the cell did, a timeout of a call that ran (an error with its class `timeout`, never a call the loop skipped), and
+    the run's ending is said where it is decided: the agent's time is used up by then, so the loop's own outcome is not
+    infrastructure, and `launch` ends the run as `cell_unkillable` from the same deadline, with the sandbox stopped."""
     lease = platform.pool.acquire(GROUP, run_key="run-1")
-    outcomes, kept, cut = [], [], threading.Event()
+    results, kept, cut = [], [], threading.Event()
 
     async def go():
         async with platform.platform.launch(
@@ -182,13 +184,19 @@ def test_o34_a_cell_whose_deadline_decides_before_the_loop_cuts_ends_the_run_as_
         ) as sandbox:
             kept.append(sandbox)
             wedge_the_cell(sandbox, platform.host)
-            outcomes.append((await run_the_agent(sandbox, cut=cut, late_s=LATE_S)).outcome)
+            results.append(await run_the_agent(sandbox, cut=cut, late_s=LATE_S))
 
     with pytest.raises(InfraError) as ended:
         asyncio.run(go())
-    assert [(o.name, o.infra_kind) for o in outcomes] == [("infrastructure", "cell_unkillable")]
+    (result,) = results
+    assert result.outcome.name == "time_cap"  # the agent's time is used up at its cell's cap: the loop's own ending
+    (call,) = result.tool_calls
+    assert (call.status, call.error_class, call.detail) == ("error", "timeout", "")
+    assert "did not finish within the time limit" in call.text
+    assert call.exec_check is not None
     assert not cut.is_set()  # the loop never cut the call: the cell's own deadline decided it
     assert_ended_as_cell_unkillable(ended, kept[0])
+    assert "cell 1's deadline" in ended.value.detail
 
 
 def test_o34_collect_settles_a_cell_still_running_before_it_decides(world, mounted):
@@ -232,12 +240,14 @@ def test_o34_collect_settles_a_cell_still_running_before_it_decides(world, mount
 REFUSAL = {"status": 502, "upstream_status": 200, "gate_refusal": "credential_in_header", "client_saw": "5xx"}
 
 
-@pytest.mark.parametrize("by_the_code_tool", [False, True], ids=["the body returns", "the code tool raises the cell's"])
+@pytest.mark.parametrize(
+    "by_the_code_tool", [False, True], ids=["the body returns", "the code tool returns the cell's timeout"]
+)
 def test_o34_a_cell_that_outlives_its_kill_ends_a_rest_run_before_the_gates_refusals_do(platform, by_the_code_tool):
     """O34: in a REST run whose gate has refused an answer, a cell that outlives its kill (with no FUSE mount there is
     nothing to abort: the sandbox is stopped) ends the run as `cell_unkillable`, not `data_gate_integrity`: after a
     stop the gate's log is not the run's evidence, so its refusals do not end the run in place of the cell, whether the
-    body returns or raises the code tool's own error for the cell."""
+    body returns or has had the code tool's own result for the cell (its timeout, O72)."""
     kept = []
 
     async def body(sandbox):

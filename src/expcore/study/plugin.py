@@ -9,6 +9,9 @@ study.toml names one Python file (`[study] plugin`). The core loads it and calls
 The module is the study's own code and lives in the study directory, so the code identity covers it. It may import
 modules beside it relatively (`from .scoring import Scorer`), each a file `[study] code` lists. Nothing in the core
 imports a study by name.
+
+A study whose `build` needs its platform may also define `build_analysis(context) -> StudyPlugin`, which gives the
+analysis the scorers alone (`study.analysis_plugin`). `load_plugin`, the run's loader, never looks for it.
 """
 
 import datetime as dt
@@ -27,6 +30,7 @@ from typing import Any
 from expcore.campaign.attempt import RunAdmission
 from expcore.campaign.defect_log import write_failure
 from expcore.campaign.executor import BackendFactory, RunExecutor
+from expcore.campaign.factors import DATA_PATH_FACTOR
 from expcore.campaign.healthgate import ContextHealthCheck, HealthCheck
 from expcore.campaign.lease import ResourceProbe
 from expcore.campaign.reset_settings import checked as checked_settings
@@ -37,7 +41,7 @@ from expcore.provenance.codestamp import covered_files
 from expcore.provenance.environment import EnvironmentUnknown, closure
 from expcore.records.build import redactor_for
 from expcore.records.rescore import Scorer, SideFileScorer, scorer_name, scorer_version
-from expcore.study.config import OUT_DIR, STUDY_FILE, StudyConfig, StudyIdentity
+from expcore.study.config import DATA_PATH_FACTOR_KEY, OUT_DIR, STUDY_FILE, StudyConfig, StudyIdentity
 from expcore.study.plugin_import import (
     PLUGIN_MODULE_PREFIX,
     Locator,
@@ -99,6 +103,11 @@ class StudyPlugin:
       declare its data). A store whose recorded fingerprint is this campaign's with `platform` in that form resumes
       under the fingerprint it recorded, unchanged; nothing else accepts it, and a merge compares the shards'
       recorded fingerprints as they are, so a store of the earlier form never merges with one of the later (C06).
+    - `data_path_factor`: the name of the factor the platform reads a run's data path by (the Onedata layer's
+      `SandboxPlatform.data_path_factor`, which a study passes from `StudyConfig.data_path_factor` when it builds the
+      platform); None for a platform that says nothing, read as the default `data_path`. The campaign refuses to start
+      when it is not the name `[study] data_path_factor` gives the study (`check_data_path_factor`, O75), so a platform
+      built without the name its study declares is never left to read the default.
     - `reset_settings`: the platform's settings that change how it does its work and not what an agent sees, and so are
       in no fingerprint, after its defaults (the Onedata layer's `Placement.reset_settings()`): a flat mapping
       of names to text, numbers, booleans or None, without a secret or a name that identifies a machine, since it
@@ -134,11 +143,11 @@ class StudyPlugin:
     environment_identity: Callable[[], Mapping[str, str]] | None = None
     reset_settings: Mapping[str, Any] = field(default_factory=dict)  # last, so positional callers keep their order
     platform_legacy: Mapping[str, Any] | None = None  # after it, for the same reason
+    data_path_factor: str | None = None  # after it, for the same reason
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
-        entries = sorted([scorer_name(s), scorer_version(s)] for s in self.scorers)
-        return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return scorers_digest(self.scorers)
 
     def backend_factory_identity(self) -> dict[str, str] | None:
         """The factory's name and version for the campaign fingerprint; None when the plugin supplies no factory.
@@ -157,6 +166,12 @@ class StudyPlugin:
         else:
             name = f"{module}.{qualname}"
         return {"name": name, "version": factory.version}
+
+
+def scorers_digest(scorers: Iterable[Any]) -> str:
+    """The SHA-256 of scorers' names and versions: what the campaign fingerprint records as `scorer_digest`."""
+    entries = sorted([scorer_name(s), scorer_version(s)] for s in scorers)
+    return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def factory_name(factory: Any) -> tuple[str, str]:
@@ -316,27 +331,52 @@ def _relative_import(study: StudyConfig | StudyIdentity, path: str) -> str:
 
 
 def load_plugin(context: StudyContext) -> StudyPlugin:
-    """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve."""
+    """Import the study's plugin module from its file and call its `build`; raise ConfigError when it cannot serve.
+
+    This is the run's loader: every start, resume and shard of a campaign builds its plugin here, and nothing here ever
+    looks for `build_analysis` (`analysis_plugin`, which only the analysis calls).
+    """
+    return call_builder(context, import_for_build(context), BUILD)
+
+
+def import_for_build(context: StudyContext) -> ModuleType:
+    """Import the study's plugin module as a build imports it: the study's models redact a failure's text, and the
+    traceback of one goes to the study's `out/`."""
+    return import_plugin_module(context.study, models=context.study.models, log_root=context.study.root / OUT_DIR)
+
+
+def call_builder(context: StudyContext, module: ModuleType, name: str, *, scorers_only: bool = False) -> StudyPlugin:
+    """Call the function `name` of the imported plugin module with the context and return the `StudyPlugin` it gives,
+    after the same refusals for each builder: not a function, a file of the study run outside its covered code, and not
+    a `StudyPlugin`. The plugin is then checked against the study (`_check`), or, with `scorers_only`, for its
+    scorers alone (`check_scorers`), as an analysis, which reads nothing else of it, needs."""
     file = context.study.plugin_file
-    module = import_plugin_module(context.study, models=context.study.models, log_root=context.study.root / OUT_DIR)
-    build = getattr(module, BUILD, None)
-    if not callable(build):
-        raise ConfigError(f"{file}: must define a function {BUILD}(context) that returns a StudyPlugin")
+    builder = getattr(module, name, None)
+    if not callable(builder):
+        raise ConfigError(f"{file}: must define a function {name}(context) that returns a StudyPlugin")
     with watching() as ran:
-        plugin = build(context)
-    check_plugin_modules(context.study, module, ran)  # again: `build` may import or run a file of the study too
+        plugin = builder(context)
+    check_plugin_modules(context.study, module, ran)  # again: the builder may import or run a file of the study too
     if not isinstance(plugin, StudyPlugin):
-        raise ConfigError(f"{file}: {BUILD}(context) returned {type(plugin).__name__}, not a StudyPlugin")
-    _check(file, context.study, plugin)
+        raise ConfigError(f"{file}: {name}(context) returned {type(plugin).__name__}, not a StudyPlugin")
+    if scorers_only:
+        check_scorers(file, plugin)
+    else:
+        _check(file, context.study, plugin)
     return plugin
 
 
-def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
-    """Refuse a plugin that does not cover the study: a scorer twice, a condition without a prompt or tool hash, a
-    model whose backend nothing can build."""
+def check_scorers(file: Any, plugin: StudyPlugin) -> None:
+    """Refuse a plugin with no scorer, or with two of one name: the one thing every use of a plugin needs of it."""
     names = [scorer_name(s) for s in plugin.scorers]
     if not names or len(set(names)) != len(names):
         raise ConfigError(f"{file}: the plugin needs at least one scorer, and their names must differ: {names}")
+
+
+def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
+    """Refuse a plugin that does not cover the study: no scorer or one twice (`check_scorers`), a condition without a
+    prompt or tool hash, a model whose backend nothing can build."""
+    check_scorers(file, plugin)
     for label, hashes in (("prompts", plugin.prompts), ("tools", plugin.tools)):
         missing = [c for c in study.schema.conditions if c not in hashes]
         if missing:
@@ -344,6 +384,11 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
     if not isinstance(plugin.platform, Mapping):
         kind = type(plugin.platform).__name__
         raise ConfigError(f"{file}: the plugin's platform must be a mapping of plain data, not a {kind}")
+    factor = plugin.data_path_factor
+    if factor is not None and (not isinstance(factor, str) or not factor.strip()):
+        raise ConfigError(
+            f"{file}: the plugin's data_path_factor must be the name of a factor, or None, not {factor!r}"
+        )
     if plugin.platform_legacy is not None and not isinstance(plugin.platform_legacy, Mapping):
         kind = type(plugin.platform_legacy).__name__
         raise ConfigError(f"{file}: the plugin's platform_legacy must be a mapping of plain data or None, not a {kind}")
@@ -368,6 +413,30 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
                 f"{file}: the plugin's backend_factory needs a 'version' attribute, a non-empty string, for the "
                 "campaign fingerprint; change it whenever the factory's behaviour changes"
             )
+
+
+def check_data_path_factor(study: StudyConfig, plugin: StudyPlugin) -> None:
+    """Refuse a campaign whose platform reads a run's data path by another factor than the study names, naming both.
+
+    The study names its data-path factor in `[study] data_path_factor` (`data_path` unset), and the plugin says which
+    one its platform reads (`StudyPlugin.data_path_factor`, None: the default). The platform maps the level of that
+    factor to a mount, a REST path or none, so one built without the name its study declares would read the default,
+    or a factor that is not the study's data path, and give a run the wrong sandbox; this refuses it before any run.
+    It holds at a campaign's start only: analysis builds no platform (O75).
+    """
+    study_name = study.data_path_factor
+    platform_name = DATA_PATH_FACTOR if plugin.data_path_factor is None else plugin.data_path_factor
+    if platform_name != study_name:
+        where = Section({}, study.root / STUDY_FILE, "[study]")
+        how = "set" if study_name != DATA_PATH_FACTOR else "the default"
+        build = f"data_path_factor={study_name!r}"
+        raise where.fail(
+            DATA_PATH_FACTOR_KEY,
+            f"names {study_name!r} as the study's data-path factor ({how}), and the plugin's platform reads a run's "
+            f"data path by {platform_name!r}: build the platform with `{build}` "
+            "(`SandboxPlatform(..., data_path_factor=context.study.data_path_factor)`) and pass "
+            "`StudyPlugin(..., data_path_factor=platform.data_path_factor)`, or make the two names one",
+        )
 
 
 def _check_backends(study: StudyConfig) -> None:

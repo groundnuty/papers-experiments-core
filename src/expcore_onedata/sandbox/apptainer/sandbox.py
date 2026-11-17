@@ -14,6 +14,8 @@ Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded fir
 (`runs.py`), so a driver killed outright is reaped by the next start and its key held by the probe:
 
 * `work/`, `tmp/` and `shm/`: the cell's `/work`, `/tmp` and `/dev/shm`, kept across cells, bounded by the watch;
+  with `work_disk = "image"`, `work/` holds the run's ext3 image instead, a directory of which is the cell's `/work`,
+  a write past its size refused with ENOSPC as on Docker, proven before the agent's first cell (`workdisk.py`, O71);
 * the egress collector (`egress-collector.py`, a pinned copy), started first, on a fresh 0700 socket directory that
   every cell binds read-only at `/hpcop-egress`; the pinned egress shim, preloaded in every cell through a bound
   `/etc/ld.so.preload`; a canary connect from inside a cell opens the collector's log before anything else runs, and
@@ -28,6 +30,9 @@ Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded fir
   (`facts.py`, `dns_none`);
 * every cell one `apptainer exec --containall` (`cells.py`, `argv.py`), the root of the image and every bind but
   `/work`, `/tmp` and `/dev/shm` read-only, proved at the start as on Docker, with the read-only inputs (O20).
+* every cell's command under `prlimit --nofile=N:N` and `taskset -c <cores>` (`limits.py`, O70): the open-file limit
+  and the pin the canary reads back from inside a cell, with the watch's polls of `pids`, the cores of the run's
+  tasks and the gate's memory; each run's `infrastructure_facts.limits` says which readings were shown.
 
 What departs from the Docker sandbox is recorded in every run's metadata (`facts.py`).
 """
@@ -57,7 +62,7 @@ from expcore.egress import Declaration, declaration
 from expcore_onedata import tls as TLS
 from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import deadline as DL
-from expcore_onedata.sandbox import gatelog, gatepolicy, inputs, kinds, tokenfiles
+from expcore_onedata.sandbox import gatelog, gatepolicy, hostfacts, inputs, kinds, tokenfiles
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
     DataPathMode,
@@ -69,8 +74,9 @@ from expcore_onedata.sandbox.api import (
     StartRefused,
 )
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs
-from expcore_onedata.sandbox.apptainer.cells import AppCellRunner
+from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs, workdisk, workproof
+from expcore_onedata.sandbox.apptainer import limits as LM
+from expcore_onedata.sandbox.apptainer.cells import RUN_ENDED_FACT, AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.infra import InfraCheck
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
@@ -101,15 +107,6 @@ COLLECTOR_READY = "egress collector ready"
 LOG_UNREAD = "the oneclient log could not be read"
 GATE_ATTEMPTS = 3  # a free port another process took before the gate bound it: tried again with another
 PROBE_S = 60.0
-CANARY = (
-    "import socket, time\n"
-    "try:\n"
-    "    socket.create_connection(('127.0.0.1', {port}), 10).close()\n"
-    "    print('canary open')\n"
-    "except OSError as e:\n"
-    "    print('canary ' + type(e).__name__)\n"
-    "time.sleep({hold:.3f})\n"
-)
 
 
 class ApptainerSandbox:
@@ -131,6 +128,7 @@ class ApptainerSandbox:
     ) -> None:
         self.node, self.s, self.spec, self.registry = node, settings, spec, registry
         self.app = settings.apptainer
+        self.work_image = self.app is not None and self.app.work_disk == "image"  # O71: /work an ext3 image
         self._sleep, self._clock, self._output_cap, self._mount_factory = sleep, clock, output_cap_bytes, mount_helper
         key = re.sub(r"[^A-Za-z0-9_.-]", "_", spec.lease_key or spec.run_key)[:48]
         self.sid = f"{key}-{uuid.uuid4().hex[:8]}"
@@ -142,10 +140,7 @@ class ApptainerSandbox:
             "data_path": spec.mode.value,
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,
             "backend": self.app.record() if self.app is not None else {"backend": "apptainer"},
-            "infrastructure_facts": facts.record(
-                mount_refused=self._mount_refused(),
-                provider_storage=self.app.provider_storage if self.app is not None else None,
-            ),
+            "infrastructure_facts": self._facts_record("image_unverified" if self.work_image else "directory"),
             "images": {},
             "tls": settings.tls.record(),
             "certifi": None,
@@ -162,6 +157,10 @@ class ApptainerSandbox:
         self._created, self._created_lock = 0, threading.Lock()
         self._cells: AppCellRunner | None = None
         self._watch: Watch | None = None
+        self._limits = LM.LimitsCheck(
+            cpus=settings.limits.cpus, pids=settings.limits.pids, nofile=settings.limits.nofile,
+            gate_memory_bytes=settings.limits.gate_memory_bytes, has_gate=spec.mode is DataPathMode.REST,
+        )  # fmt: skip
         self._helpers: dict[str, helpers.Helper] = {}
         self._mount: MountHelper | None = None
         self._token_files: list[Path] = []
@@ -229,6 +228,24 @@ class ApptainerSandbox:
         without a token) come after it, at the helper's start."""
         return self._mount_factory is None or self.s.mount is None
 
+    def _facts_record(self, work_disk: str) -> dict[str, Any]:
+        """The keys `facts.record` makes for the work disk's state. Every record of a run, the one the work disk's proof
+        sets again included, is made here, so each carries the platform's `provider_storage` (O57)."""
+        return facts.record(
+            work_disk,
+            mount_refused=self._mount_refused(),
+            provider_storage=self.app.provider_storage if self.app is not None else None,
+        )
+
+    def _set_facts_record(self, work_disk: str) -> None:
+        """Set the keys `facts.record` makes for the work disk's state in the run's `infrastructure_facts`, in place and
+        under the meta lock, and leave every other key as it is: the node's readings (`node`, O87), the federation's
+        window (`federation_window`, which the platform records from the run's preparation on, O86) and whatever else
+        was recorded since the run was made. Replacing the dict would drop them."""
+        fresh = self._facts_record(work_disk)
+        with self._meta_lock:
+            self._meta.setdefault("infrastructure_facts", {}).update(fresh)
+
     def _validate(self) -> None:
         sp, s = self.spec, self.s
         if self.app is None:
@@ -258,6 +275,8 @@ class ApptainerSandbox:
                 raise StartRefused(str(error)) from None
         if self.app.gate_options.get(gaterun.PEER_CHECK_KEY) is True and not gaterun.PEER_CHECK.is_file():
             raise StartRefused("gate_options asks for the gate's peer-uid check, and this core's gate does not have it")
+        if self.work_image and workdisk.image_size(s.limits.work_disk_bytes) < workdisk.ALIGN:
+            raise StartRefused('work_disk = "image" needs [sandbox.limits] work_disk_bytes of at least 2 MiB')
         self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s), storages=inputs.storage_paths(s))
         layout.check_work_root(s.work_root, os.getuid())
         self._image_identity = layout.pin_image(self.app.image)  # O13, before anything exists
@@ -295,6 +314,8 @@ class ApptainerSandbox:
         self.dir.mkdir(mode=0o700)
         for name in ("work", "tmp", "shm", "cell", "egress", "egress-sock"):
             (self.dir / name).mkdir(mode=0o700)
+        if self.work_image:
+            self._make_work_disk()
         cell = self.dir / "cell"
         layout.copy_pinned(self.app.egress_shim, cell / "egresslog.so", "the egress shim")
         layout.copy_pinned(self.app.egress_collector, self.dir / "egress" / "egress-collector.py",
@@ -309,6 +330,7 @@ class ApptainerSandbox:
         self._started = time.time()
         self._meta.update(host=self.node.node_facts(self.app.apptainer),
                           started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))  # fmt: skip
+        self._meta["infrastructure_facts"]["node"] = hostfacts.of_node(lambda: self.node.node_readings())  # O87
         self._checkpoint()
         self._start_collector()
         self._checkpoint()
@@ -321,11 +343,23 @@ class ApptainerSandbox:
         self._start_cells()
         self._canary()
         self._verify_read_only()
+        self._verify_work_disk()
         self._verify_inputs()
         self._new_refusals()  # whatever the start's own steps met is not the agent's first cell's
 
     def _host_python(self) -> str:
         return self.app.host_python or sys.executable
+
+    def _make_work_disk(self) -> None:
+        """The run's ext3 image (`workdisk.make`), recorded unverified until its probe holds (`_verify_work_disk`)."""
+        size = workdisk.image_size(self.s.limits.work_disk_bytes)
+        self._meta["work_disk"] = {"mode": "image", "size_bytes": size, "enospc_verified": False,
+                                   "mkfs": workdisk.mkfs_version(self.node, self.app.work_disk_mkfs)}  # fmt: skip
+        workdisk.make(self.node, self.dir, size, self.app.work_disk_mkfs)
+
+    def work_bind(self) -> AV.Bind:
+        """The cell's `/work`: the run's directory, or a directory of its image (O71)."""
+        return workdisk.bind(self.dir) if self.work_image else AV.Bind(self.dir / "work", "/work", True)
 
     def _start_collector(self) -> None:
         egress = self.dir / "egress"
@@ -436,8 +470,7 @@ class ApptainerSandbox:
 
     def _probe_argv(self, command: Sequence[str]) -> list[str]:
         """A one-shot exec of the image for the harness's own reads: `/work` alone bound, no shim, no egress."""
-        return AV.exec_argv(self.app.apptainer, self.app.image.path, [AV.Bind(self.dir / "work", "/work", True)], {},
-                            command)  # fmt: skip
+        return AV.exec_argv(self.app.apptainer, self.app.image.path, [self.work_bind()], {}, command)
 
     def _trust_bundles(self) -> dict[str, Path]:
         """Each declared trust path and the image's certifi bundle (O23), with the run's CA appended."""
@@ -474,7 +507,7 @@ class ApptainerSandbox:
         layout.write_text(cell / "nsswitch.conf", AV.NSSWITCH_TEXT)
         layout.write_text(cell / "ld.so.preload", AV.preload_text([*preloads, AV.SHIM_TARGET]))
         binds = [
-            AV.Bind(self.dir / "work", "/work", True), AV.Bind(self.dir / "tmp", "/tmp", True),
+            self.work_bind(), AV.Bind(self.dir / "tmp", "/tmp", True),
             AV.Bind(self.dir / "shm", "/dev/shm", True), AV.Bind(cell / "hosts", "/etc/hosts"),
             AV.Bind(cell / "resolv.conf", AV.RESOLV_CONF), AV.Bind(cell / "nsswitch.conf", AV.NSSWITCH_CONF),
             AV.Bind(self.dir / "egress-sock", AV.EGRESS_DIR), AV.Bind(cell / "egresslog.so", AV.SHIM_TARGET),
@@ -498,14 +531,18 @@ class ApptainerSandbox:
         self._binds, self._env = binds, env
 
     def cell_argv(self, command: Sequence[str]) -> list[str]:
-        return AV.exec_argv(self.app.apptainer, self.app.image.path, self._binds, self._env, command)
+        """A cell's command line: `apptainer exec` under the file limit and the pin (`limits.prefix`, O70)."""
+        return [*self._limits.command_prefix(),
+                *AV.exec_argv(self.app.apptainer, self.app.image.path, self._binds, self._env, command)]  # fmt: skip
 
     def _start_cells(self) -> None:
         limits, own = self.s.limits, self.node.own_pidns()
         if own is None:  # the driver's and the helpers' namespace could not be told from a cell's
             raise SandboxError("the driver's own PID namespace could not be read")
+        gate = self._helpers.get("gate")
+        self._limits.begin(self.node.own_affinity(), None if gate is None else gate.process)
         self._watch = Watch(
-            self.node, run_tag=self.run_tag, own_pidns=own, memory_bytes=limits.memory_bytes,
+            self.node, run_tag=self.run_tag, own_pidns=own, memory_bytes=limits.memory_bytes, limits=self._limits,
             spaces=spaces_of(self.dir, {"work": limits.work_disk_bytes, "tmp": limits.tmp_bytes,
                                         "shm": limits.shm_bytes}),
             memory_poll_s=self.app.memory_poll_s, disk_poll_s=self.app.disk_poll_s,
@@ -524,18 +561,37 @@ class ApptainerSandbox:
         """The egress canary (`expcore.egress`): a connect from inside a cell to a listener of the harness's, the
         first record of the collector's log, so a shim that never loaded leaves a log that reads as unknown. The cell
         holds on long enough for the watch to find its namespace: a cell whose processes the harness cannot see could
-        not be bounded, and the start fails."""
+        not be bounded, and the start fails. It also reads, inside the cell, the open-file limit and the cores the cell
+        was given (`limits.CANARY`, O70): a hard limit that is not the declared one fails the start, and the cores are
+        the run's effective set."""
         with loopback.listener() as port:
             self._canary_port = port
             hold = max(1.0, 5 * self.app.memory_poll_s)
-            done = self._cells.run(CANARY.format(port=self._canary_port, hold=hold), PROBE_S, record=False)
-        said = done.stdout.strip()
+            try:
+                done = self._cells.run(LM.CANARY.format(port=self._canary_port, hold=hold), PROBE_S, record=False)
+            except ExecIncomplete as incomplete:
+                tool = LM.wrapper_failed(incomplete.result.exit_code, incomplete.result.stderr)
+                if tool is None:
+                    raise
+                log.error("%s did not start the egress canary: %s", tool, describe_stderr(incomplete.result.stderr))
+                raise SandboxError(
+                    f"{tool} could not set the cell's limits: a node without it, or a limit it may not raise"
+                ) from None
+        lines = done.stdout.strip().splitlines()
+        said = lines[0] if lines else ""
+        probe = LM.parse_probe(done.stdout)
+        self._watch.note_probe(probe)
         seen = self._cells.last_watch.get("seen") is True
         self._meta["egress"] = {"nonce": self.egress_nonce, "declaration": self.egress_declaration().to_json(),
                                 "canary": said == "canary open", "supervised": seen}  # fmt: skip
         if done.exit_code != 0 or said != "canary open":
             log.error("the egress canary said %r (%s)", said, describe_stderr(done.stderr))
             raise SandboxError("the egress canary could not connect from inside a cell")
+        if probe is not None and probe.nofile_hard != self.s.limits.nofile:
+            log.error(
+                "a cell's hard open-file limit is %d, not the declared %d", probe.nofile_hard, self.s.limits.nofile
+            )
+            raise SandboxError("a cell's open-file limit is not the declared one: the starter changed it")
         if not seen:
             raise SandboxError(
                 "the harness cannot see a cell's processes: its time and memory bounds could not be kept"
@@ -547,6 +603,108 @@ class ApptainerSandbox:
             log.error("read-only probe of the root said %r (%s)", r.stdout.strip(), describe_stderr(r.stderr))
             raise SandboxError("the root is not read-only for the agent")
         self._meta["read_only_verified"] = {"root": True}
+
+    def _verify_work_disk(self) -> None:
+        """O71: the work disk proved before the agent's first cell, or the start fails. The first start of this driver
+        on this boot of the node with this configuration runs the full fill (`_full_fill`) and keeps its proof on the
+        node (`workproof.py`); a later one checks the invariants against that proof (`_invariants`), and a proof that is
+        missing, unreadable or whose invariants differ makes the full fill run again. Either way the file a cell leaves
+        must come out through the collection's path, the image the agent uses is made afresh, and only then does the
+        record say `/work` is closed, naming the proof it relied on (`work_disk.proof`)."""
+        if not self.work_image:
+            return
+        size = workdisk.image_size(self.s.limits.work_disk_bytes)
+        config = self._proof_config(size)
+        key = workproof.key_of(config)
+        kept, why = (
+            workproof.load(self.s.work_root, key, config) if key is not None else (None, "unknown_configuration")
+        )
+        if kept is not None:
+            found = self._invariants(size, kept)
+            if found is not None:
+                total, fstype = found
+                proof = {"kind": "invariants", **workproof.reference(kept)}
+                with self._meta_lock:
+                    self._meta["work_disk"].update(filesystem_bytes=total, fstype=fstype, remade=True, proof=proof)
+                    self._set_facts_record("image")
+                return
+            why = "invariants_differ"
+        held, total, fstype, block = self._full_fill(size)
+        document = workproof.make(key or "", config, held=held, size=size, total=total, fstype=fstype or "",
+                                  superblock=block)  # fmt: skip
+        kept_now = key is not None and fstype is not None and workproof.keep(self.s.work_root, document)
+        with self._meta_lock:
+            self._meta["work_disk"].update(
+                enospc_verified=True, held_bytes=held, filesystem_bytes=total, fstype=fstype, remade=True,
+                proof={"kind": "full_fill", "full_fill_because": why, "kept": kept_now,
+                       **workproof.reference(document)},
+            )  # fmt: skip
+            self._set_facts_record("image")
+
+    def _proof_config(self, size: int) -> dict[str, Any]:
+        """What a kept proof is for (`workproof.key_of`): this boot of the node, this driver, the image, the size, the
+        mkfs and Apptainer commands and their versions. A part that cannot be read is None, which keys nothing."""
+        try:
+            owner = self.node.identity()
+            driver = f"{owner.pid}:{owner.start}"
+        except OSError:
+            driver = None
+        return {
+            "boot": self.node.boot_id(), "driver": driver, "image_sha256": self.app.image.sha256, "size_bytes": size,
+            "mkfs": " ".join(self.app.work_disk_mkfs), "mkfs_version": self._meta["work_disk"].get("mkfs"),
+            "apptainer": " ".join(self.app.apptainer),
+            "apptainer_version": (self._meta.get("host") or {}).get("apptainer"),
+        }  # fmt: skip
+
+    def _full_fill(self, size: int) -> tuple[int, int, str | None, dict[str, Any]]:
+        """A cell writes past `/work`'s size and must be refused with ENOSPC at most at it (`workdisk.judge`), and the
+        file it leaves must come out through the collection's path; the image, which it filled, is made again, and
+        must be an ext file system of at most its size (`workdisk.superblock`) that a cell sees as one of its own
+        (`workdisk.judge_check`). What `/work` held, the file system's size, its mount type and its superblock; the
+        start fails otherwise."""
+        r = self._cells.run(workdisk.probe_source(size), workdisk.probe_timeout_s(size), record=False)
+        held = workdisk.judge(r.stdout, r.exit_code, size)
+        if held is None:
+            log.error("the work disk's probe said %r (%s)", r.stdout.strip()[:80], describe_stderr(r.stderr))
+            raise SandboxError("a write past /work's size is not refused with ENOSPC for the agent")
+        self.collection.prove_image_copy()  # the collection's path, on the file the probe left
+        workdisk.make(self.node, self.dir, size, self.app.work_disk_mkfs)  # the probed image's pages given back
+        block = self._superblock(size)
+        total, fstype = self._check(size)
+        return held, total, fstype, block
+
+    def _invariants(self, size: int, kept: dict[str, Any]) -> tuple[int, str | None] | None:
+        """A start that relies on a kept proof: a cell leaves the copy probe's file and it must come out through the
+        collection's path (else the start fails, as after a fill); the image is made again; its superblock and the
+        file system a cell sees must be the proof's (size and mount type). The file system's size and type, or None
+        when an invariant differs (then the full fill runs)."""
+        r = self._cells.run(workdisk.mark_source(), PROBE_S, record=False)
+        if r.exit_code != 0 or r.stdout.strip() != "marked":
+            log.error("the work disk's mark said %r (%s)", r.stdout.strip()[:80], describe_stderr(r.stderr))
+            raise SandboxError("a cell could not write the copy probe's file into /work")
+        self.collection.prove_image_copy()
+        workdisk.make(self.node, self.dir, size, self.app.work_disk_mkfs)
+        if workdisk.superblock(workdisk.image_path(self.dir)) != kept["superblock"]:
+            return None
+        r = self._cells.run(workdisk.CHECK, PROBE_S, record=False)
+        found = workdisk.judge_check(r.stdout, r.exit_code, size)
+        if found is None or found != (kept["filesystem_bytes"], kept["fstype"]):
+            return None
+        return found
+
+    def _superblock(self, size: int) -> dict[str, Any]:
+        block = workdisk.superblock(workdisk.image_path(self.dir))
+        if block is None or not size // 2 < block["bytes"] <= size:
+            raise SandboxError("the work disk's image has no ext superblock of at most its size")
+        return block
+
+    def _check(self, size: int) -> tuple[int, str | None]:
+        r = self._cells.run(workdisk.CHECK, PROBE_S, record=False)
+        found = workdisk.judge_check(r.stdout, r.exit_code, size)
+        if found is None:
+            log.error("the work disk's check said %r (%s)", r.stdout.strip()[:80], describe_stderr(r.stderr))
+            raise SandboxError("the run's /work is not a file system of its own of at most its size")
+        return found
 
     def _snapshot_inputs(self) -> list[tuple[Path, str]]:
         """Copy each read-only input into the run's directory, hash it, and take every write bit away (O20)."""
@@ -758,6 +916,13 @@ class ApptainerSandbox:
         """The nonce of the mount guard's watcher (`expcore.mountguard.MountGuard`), once the helper exists."""
         return getattr(self._mount, "nonce", None)
 
+    @property
+    def data_path_kind(self) -> str:
+        """The run's data path, `mount`, `rest` or `none`, from the spec it was started with: what
+        `expcore.mountguard.mount_guard_for` decides on. It is the spec's and never read from the helper, so a mount run
+        whose helper keeps no watcher is still a mount run (O60)."""
+        return self.spec.mode.value
+
     def mount_io_mode(self) -> dict[str, Any]:
         if self.spec.mode is not DataPathMode.MOUNT or self._mount is None:
             return {"mount": False}
@@ -833,6 +998,7 @@ class ApptainerSandbox:
         self.record(tool_server_process={"on": "node", "home": "run_directory", "tmpdir": "home", "run_tag": True,
                                          "inherited": ["PATH"]})  # fmt: skip
         try:
+            self._note_tool_server_host()
             yield ServerProcess(home=home, env={AV.RUN_TAG: self.sid, "TMPDIR": str(home / "tmp")})
         finally:
             try:
@@ -841,6 +1007,15 @@ class ApptainerSandbox:
                     runs.remove_tree(self.dir)  # making its home again after the teardown, which no reaper would take
             except OSError as error:  # the teardown removes the run's directory, this one with it
                 log.error("the tool server's directory could not be removed: %s", describe_error(error))
+
+    def _note_tool_server_host(self) -> None:
+        """O87: the tool server's host's OS release, glibc and kernel, beside the node's, when they differ from it: on
+        the node's own host (the driver's child) they are the node's and nothing is added. Recorded, never refused."""
+        theirs = hostfacts.of_node(lambda: self.node.tool_server_readings())  # the lookup is guarded too
+        with self._meta_lock:
+            facts = self._meta["infrastructure_facts"]
+            if theirs != facts.get("node"):
+                facts["tool_server_host"] = theirs
 
     def record(self, **fields: Any) -> None:
         with self._meta_lock:
@@ -891,11 +1066,15 @@ class ApptainerSandbox:
         """The facts of the run for its record. Never a secret: the token is in none of them."""
         with self._meta_lock:
             meta = json.loads(json.dumps(self._meta, default=str))
+            ended = None if self._cells is None else self._cells.ended
         if self._cells is not None:
             meta["cells"] = len(self._cells.cells)
+        if ended is not None and ended.get("scope") == "run":  # the watch ended the run: a fact of the run (O72)
+            meta["infrastructure_facts"]["run_ended"] = {key: ended.get(key) for key in RUN_ENDED_FACT}
         if self._watch is not None:
             meta["watch"] = self._watch.summary()
             meta["infrastructure_facts"]["memory"] = meta["watch"]["memory"]  # never `within` unless the check held
+        meta["infrastructure_facts"]["limits"] = self._limits_record()  # every key; a reading shown or unknown (O70)
         if self.spec.mode is DataPathMode.REST:
             lines = self.gate_log_lines()
             meta["gate_log"] = gatelog.unknown("the gate log could not be read") if lines is None else (
@@ -917,6 +1096,12 @@ class ApptainerSandbox:
                 gatelog.GATE_NOT_COLLECTED
             )
         return meta
+
+    def _limits_record(self) -> dict[str, Any]:
+        """`infrastructure_facts.limits` (`limits.LimitsCheck.record`): the watch's, or before it exists every reading
+        unknown with its reason."""
+        found = None if self._watch is None else self._watch.limits_record()
+        return found if found is not None else self._limits.record(kills=[], gate_kills=[], memory={})
 
     # ------------------------------------------------------------------------------------------------ stop
     def stop(self, *, force: bool = False) -> None:

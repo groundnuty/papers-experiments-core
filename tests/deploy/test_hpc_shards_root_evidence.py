@@ -563,6 +563,7 @@ def test_a_step_records_in_its_federation_s_root_that_it_ran_before_its_dispatch
     secret): the shard's spec and how many times a step of it started. It is there when the dispatcher starts, and a
     resume counts again."""
     root = make_root(tmp_path / "fed" / "fed-a")
+    shutil.rmtree(root / "shard-steps")  # the fixture's own (made at the process's umask): the step makes this one
     monkeypatch.setenv("EXPCORE_FED_ROOT", str(root))
     seen: list = []
     assert shards.step(_step_args(tmp_path), runner=_dispatcher(seen), core_found=lambda path: True) == 0

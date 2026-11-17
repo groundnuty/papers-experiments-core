@@ -71,7 +71,9 @@ are the same text: no clock, no path and no random number enters it.
   decision with the signed estimate. A report with none has neither, so it keeps its bytes.
 - The fixed prose beside the tables is in `expcore.report_notes`.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
-  the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13).
+  the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13). An
+  analysis that `--rescore` let score with scorers other than the run's (R17) has one more line after the scorers',
+  naming the digest the campaign recorded and the digest of the scorers used; no other report has it.
 """
 
 import json
@@ -93,8 +95,8 @@ from expcore.report_families import (
     one_line,
     steps_lines,
 )
-from expcore.report_guards import LEFT_OUT as EITHER_GUARD
-from expcore.report_guards import guards_lines
+from expcore.report_guards import guards_lines, left_out_label
+from expcore.report_guards import summary_lines as guards_summary_lines
 from expcore.report_holds import section as operator_holds
 from expcore.report_interrupted import section as interrupted_spend
 from expcore.report_lost import section as lost_in_kill
@@ -832,31 +834,21 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> list[str]:
         f"{n['token_access']} token access, {n['process_access']} process access; {n['unknown']} unknown: "
         f"{n['log_unknown']} log unknown, {n['isolation_unproven']} isolation unproven)"
     ]
+    if n["not_applicable"]:  # runs with no mount (a REST run), kept in the rerun and never counted as clean
+        lines[0] += f"; {n['not_applicable']} not applicable (no mount)"
     if guard.refused is not None:
         return [*lines, f"mount sensitivity: not computed ({guard.refused})"]
+    if guard.sensitivity is None and n["not_applicable"]:
+        return [*lines, "mount sensitivity: no run left out, the same as the analysis above"]
     if guard.sensitivity is None:
         return [*lines, "mount sensitivity: every run clean, the same as the analysis above"]
     return lines + _rerun_lines(guard.sensitivity, "mount sensitivity")
 
 
 def _guards_summary(guards: GuardsAnalysis) -> list[str]:
-    """The terminal's lines of both guards together (O60): the runs either leaves out, then each confirmatory contrast
+    """The terminal's lines of the guards together (O60, O76): the runs any leaves out, then each confirmatory contrast
     without them."""
-    n = guards.counts()
-    lines = [
-        f"both guards: {n['left_out']} of {n['analysed']} analysed run(s) left out ({n['egress_only']} by egress "
-        f"alone, {n['mount_only']} by the mount guard alone, {n['both']} by both)"
-    ]
-    for condition, c in guards.by_condition().items():
-        lines.append(
-            f"both guards, {condition}: {c['left_out']} of {c['analysed']} left out ({c['egress_only']} by egress "
-            f"alone, {c['mount_only']} by the mount guard alone, {c['both']} by both)"
-        )
-    if guards.refused is not None:
-        return [*lines, f"both-guards sensitivity: not computed ({guards.refused})"]
-    if guards.sensitivity is None:
-        return [*lines, "both-guards sensitivity: every run clean to both, the same as the analysis above"]
-    return lines + _rerun_lines(guards.sensitivity, "both-guards sensitivity")
+    return guards_summary_lines(guards, _rerun_lines)
 
 
 def _visibility_summary(seen: VisibilityAnalysis) -> list[str]:
@@ -911,8 +903,8 @@ def summary_lines(
         lines.append(f"{d.name} (descriptive, {kind} of {d.outcome} in {arm}): {_num(d.estimate)} {interval}")
     lines += _egress_summary(egress) if egress is not None else []
     lines += _mount_guard_summary(mount_guard) if mount_guard is not None else []
-    lines += _guards_summary(guards) if guards is not None else []
-    return lines + (_visibility_summary(visibility) if visibility is not None else [])
+    lines += _visibility_summary(visibility) if visibility is not None else []
+    return lines + (_guards_summary(guards) if guards is not None else [])
 
 
 def _partial_line(export: Mapping[str, Any]) -> str:
@@ -975,6 +967,16 @@ def _scorers(scorers: Mapping[str, str] | None) -> str:
     return ", ".join(f"{name} `{version}`" for name, version in sorted((scorers or {}).items())) or UNKNOWN
 
 
+def _rescored(rescore: Mapping[str, Any]) -> str:
+    """The provenance line of a re-score (R17): the digests the campaign's snapshots recorded of its scorers (the keys
+    `expcore.study.analysis_plugin` builds the mapping with) and the digest of the scorers this analysis used."""
+    ran = ", ".join(f"`{digest}`" for digest in rescore["run_scorer_digests"])
+    return (
+        f"- Re-scored (`--rescore`): the campaign ran with scorers of digest {ran}; this analysis scored with "
+        f"`{rescore['analysis_scorer_digest']}` (the scorers above)"
+    )
+
+
 def render_report(
     result: AnalysisResult,
     export: Mapping[str, Any],
@@ -983,6 +985,7 @@ def render_report(
     code: Mapping[str, Any],
     core_version: str | None,
     scorers: Mapping[str, str] | None = None,
+    rescore: Mapping[str, Any] | None = None,
     interval_level: float | None = None,
     egress: EgressAnalysis | None = None,
     mount_guard: MountGuardAnalysis | None = None,
@@ -992,11 +995,12 @@ def render_report(
     """Render the report as Markdown.
 
     `code` is the code identity (`provenance.codestamp.version`), `scorers` the version of each scorer by name (the
-    report says n/a without them), `interval_level` the level of the contrasts' intervals when the preregistration
+    report says n/a without them), `rescore` the digests of a re-scored analysis (R17; a line of its own in the
+    provenance, none without it), `interval_level` the level of the contrasts' intervals when the preregistration
     states one, `egress` the egress verdicts and the sensitivity analysis of a batch checked for egress (no section
     without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60),
-    `guards` the rerun without the runs either guard leaves out (a batch checked by both, O60), `visibility` the
-    process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
+    `guards` the rerun without the runs any guard leaves out (a batch checked by two or more, O60, O76), `visibility`
+    the process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
     it, O56). A partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`).
     What each number counts is stated in the report beside it. The text ends with a newline.
     """
@@ -1016,6 +1020,10 @@ def render_report(
         f"- Code: commit `{code.get('commit')}`, tree `{code.get('tree_sha256')}` ({state})",
         f"- Core version: {core_version or UNKNOWN}",
         f"- Scorers: {_scorers(scorers)}",
+    ]
+    if rescore is not None:
+        lines.append(_rescored(rescore))
+    lines += [
         f"- Runs: {planned} planned, {len(export['analysed_attempts'])} analysed, "
         f"{len(export['exhausted_runs'])} exhausted (charged infrastructure attempts reached the limit; no scored "
         "attempt), "
@@ -1028,7 +1036,7 @@ def render_report(
     shards = shard_lines(export, _table)  # only a batch merged from shards has any (#154)
     checked = egress_lines(egress, _table, lambda r: _sensitivity(r, interval_level))  # only a checked batch (#179)
     guarded = mount_guard_lines(mount_guard, _table, lambda r: _sensitivity(r, interval_level, NOT_CLEAN))  # O60
-    both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, EITHER_GUARD))  # O60
+    both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, left_out_label(guards)))  # O60
     seen = visibility_lines(visibility, _table, lambda r: _sensitivity(r, interval_level, HID_OR_UNKNOWN))  # O56
     sections = (
         _contrasts(result, interval_level)
@@ -1036,8 +1044,8 @@ def render_report(
         + shards
         + checked
         + guarded
-        + both
         + seen
+        + both
         + _deployments(export)
         + _left_out(left_out)
     )

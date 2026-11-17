@@ -240,6 +240,36 @@ def test_the_platform_builds_the_apptainer_sandbox_and_its_probe(tmp_path, fake)
     assert isinstance(platform._prepare("run-key-1", "isolated", None, None, None, 600.0), ApptainerSandbox)
 
 
+def test_o75_the_platform_reads_a_runs_data_path_from_the_factor_the_study_names(tmp_path, fake):
+    """O75: `SandboxPlatform` maps the level of the study's data-path factor, `data_path` unless it is given the name
+    of another (`[study] data_path_factor`), and refuses a name that is not one."""
+    from fake_node import FakeNode
+
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.sandbox.api import DataPathMode
+    from expcore_onedata.sandbox.provider import DATA_PATH_FACTOR, SandboxPlatform
+    from expcore_onedata.testing import write_platform
+
+    def apptainer(data):
+        data["sandbox"] = _document()
+
+    config = load_platform(write_platform(tmp_path, apptainer))
+
+    def built(**more):
+        return SandboxPlatform(config, issuer=None, host=FakeNode(), events=lambda *a, **k: None, **more)
+
+    default, named = built(), built(data_path_factor="path")
+    assert DATA_PATH_FACTOR == "data_path"
+    assert (default.data_path_factor, named.data_path_factor) == ("data_path", "path")
+    assert default.mode({"data_path": "isolated"}) is DataPathMode.NONE
+    assert named.mode({"path": "isolated"}) is DataPathMode.NONE
+    with pytest.raises(KeyError):
+        named.mode({"data_path": "isolated"})  # the name it was given is the only one it reads
+    for bad in ("", " ", None, 3):
+        with pytest.raises(ValueError, match="data_path_factor"):
+            built(data_path_factor=bad)
+
+
 def _mounting(**apptainer_changes):
     document = _document(**apptainer_changes)
     document["data_paths"]["mounted"] = "mount"
@@ -358,3 +388,65 @@ def test_o57_a_platform_that_declares_no_storage_kind_keeps_the_fingerprint_it_h
     assert {"tls", "data_paths"} <= set(docker)  # what the Docker backend's fingerprint held before the key existed
     assert "sandbox_backend" not in docker
     assert "provider_storage" not in json.dumps(docker)  # nothing the key adds reaches a Compose federation's
+
+
+def test_o71_work_disk_defaults_to_the_directory_and_is_recorded_only_when_it_is_the_image(tmp_path):
+    """O71: `work_disk` is "directory" (the watch alone) unless set; the record names it only when it is "image", so
+    a fingerprint made before the key existed is unchanged, while an image run is another experiment."""
+    loaded = _load(tmp_path, _document())
+    assert loaded.apptainer.work_disk == "directory"
+    assert loaded.apptainer.work_disk_mkfs == ("mkfs.ext3",)
+    assert "work_disk" not in loaded.apptainer.record()
+    assert _load(tmp_path, _document(work_disk="directory")).apptainer.record() == loaded.apptainer.record()
+    image = _load(tmp_path, _document(work_disk="image", work_disk_mkfs=["/usr/sbin/mkfs.ext3"])).apptainer
+    assert image.work_disk == "image"
+    assert image.work_disk_mkfs == ("/usr/sbin/mkfs.ext3",)
+    assert image.record() == {**loaded.apptainer.record(), "work_disk": "image"}  # the tool is no experiment
+
+
+@pytest.mark.parametrize(("key", "bad"), [("work_disk", "loop"), ("work_disk", 1), ("work_disk_mkfs", ["mkfs ext3"]),
+                                          ("work_disk_mkfs", "mkfs.ext3")])  # fmt: skip
+def test_o71_a_work_disk_setting_that_is_not_one_is_refused_naming_its_key(tmp_path, key, bad):
+    """O71: the mode is one of the two, and mkfs plain command words."""
+    with pytest.raises(ConfigError, match=key):
+        _load(tmp_path, _document(**{key: bad}))
+
+
+@pytest.mark.parametrize("bad", [["mke2fs", "-t", "ext4"], ["mkfs.ext3", "-m0"], ["-t"], ["--help"], [], [""]])
+def test_o71_work_disk_mkfs_is_one_program_and_never_an_option(tmp_path, bad):
+    """O71: the file system's type and options shape the image, so the setting is the tool alone, one program word, and
+    never what a study could use to change them: an option-bearing value, a second word or none is refused at load,
+    naming the key. It is out of the fingerprint (C06) because it can name nothing but where the node's mkfs is."""
+    with pytest.raises(ConfigError, match="work_disk_mkfs"):
+        _load(tmp_path, _document(work_disk="image", work_disk_mkfs=bad))
+
+
+@pytest.mark.parametrize(
+    "program", ["mkfs.ext3", "mke2fs", "/usr/sbin/mkfs.ext3", "/opt/site/e2fsprogs-1.47/sbin/mkfs.ext3"]
+)
+def test_o71_work_disk_mkfs_takes_a_program_by_name_or_by_absolute_path(tmp_path, program):
+    """O71: a bare program name or an absolute path loads, and is kept as the one word."""
+    loaded = _load(tmp_path, _document(work_disk="image", work_disk_mkfs=[program])).apptainer
+    assert loaded.work_disk_mkfs == (program,)
+
+
+@pytest.mark.parametrize("words", [("mke2fs", "-t", "ext4"), ("-t",), (), ("a b",)])
+def test_o71_the_settings_refuse_a_work_disk_mkfs_that_is_not_one_program_word(tmp_path, words):
+    """O71: the check is the settings' own, so a platform built in code cannot pass an option either."""
+    from apptainer_support import make_settings
+
+    with pytest.raises(ValueError, match="work_disk_mkfs"):
+        make_settings(tmp_path, work_disk_mkfs=words)
+
+
+def test_o87_the_apptainer_backend_reads_the_check_provider_as_the_docker_backend_does(tmp_path):
+    """O87: `content_check_provider` is a `[sandbox]` key of both backends: a layout name, kept for the platform's
+    load to check against its providers and the space; unset it is None, the agent's local provider."""
+    assert _load(tmp_path, _document()).content_check_provider is None
+    assert _load(tmp_path, {**_document(), "content_check_provider": "owner"}).content_check_provider == "owner"
+
+
+@pytest.mark.parametrize("value", [5, "", "with space", ["a"]])
+def test_o87_a_check_provider_that_is_no_name_is_refused_naming_the_key(tmp_path, value):
+    with pytest.raises(ConfigError, match="content_check_provider"):
+        _load(tmp_path, {**_document(), "content_check_provider": value})

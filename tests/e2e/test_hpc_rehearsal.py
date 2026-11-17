@@ -554,21 +554,28 @@ def other_build(deploy, plan, shards, merged, federations, shared, tmp_path_fact
         shutil.copyfile(plan.results / f"{KILLED}.out.{kind}", base / "results" / f"{KILLED}.out.{kind}")
     feds = {KILLED: federations[KILLED], fed.label: fed}
     manifest = write_manifest(base / "shards.toml", study, base / "results", shared.node_tmp, feds)
-    code, printed = printing(deploy.shards.main, ["plan", "--manifest", str(manifest)])
-    assert code == 0, printed
-    entry = json.loads(printed.splitlines()[1])
-    step = StepLine.parse(entry["shard"], entry["argv"]).start(plan.logs / "fed-c.log")
+    refused = printing(deploy.shards.main, ["plan", "--manifest", str(manifest)])  # O63: before any line is printed
+    loaded = deploy.shards.load_plan(manifest)  # the line `plan` printed before it compared the fingerprints
+    shard = loaded.shards[1]
+    argv = deploy.shards.step_argv(loaded, shard, deploy.shards.federation(shard), Path(deploy.shards.__file__))
+    step = StepLine.parse(shard.label, argv).start(plan.logs / "fed-c.log")
     stepped = wait_step(step)
     collected = printing(deploy.shards.main, ["collect", "--manifest", str(manifest), "--into", str(base / "in")])
     line = shlex.split(collected[1].splitlines()[0])
     merge = subprocess.run(line, capture_output=True, text=True, env=clean_environment, check=False)
     hpcfed(deploy, fed, "down", {})
-    return SimpleNamespace(fed=fed, stepped=stepped, collected=collected[0], merge=merge, study=study)
+    return SimpleNamespace(fed=fed, refused=refused, stepped=stepped, collected=collected[0], merge=merge, study=study)
 
 
 def test_c06_a_shard_on_another_build_of_the_agents_image_is_another_campaign_and_the_merge_refuses(other_build):
-    """C06, O63: the same layout and the same data, another SIF declared (and checked) at up: the step runs, its archive
-    is collected, and the merge refuses it beside fed-a's shard, by the image's pin alone, writing nothing."""
+    """C06, O63: the same layout and the same data, another SIF declared (and checked) at up: `plan` refuses the two
+    federations before it prints a line (the study's fingerprint beside fed-c's platform file is not fed-a's); the line
+    it would have printed, run by hand, runs, its archive is collected, and the merge refuses it beside fed-a's
+    shard, by the image's pin alone, writing nothing."""
+    code, printed = other_build.refused
+    assert code == 2
+    assert "fed-c differs from fed-a (first differing key: platform); no line is printed" in printed
+    assert not printed.lstrip().startswith("{")
     assert other_build.stepped == 0
     assert other_build.collected == 0
     assert other_build.merge.returncode == 1, other_build.merge.stdout + other_build.merge.stderr

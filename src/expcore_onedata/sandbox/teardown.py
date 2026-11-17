@@ -13,7 +13,8 @@ then the agent container.
 in the middle of a teardown leaves its last step on disk):
 
   1. readers: SIGTERM, then SIGKILL, to every process of the agent container except its init and the init's `sleep`
-     (found from the host through the container's cgroup: a `docker exec` fails at the pids limit). Best effort: a reader
+     (found from the host through the container's cgroup: a `docker exec` fails at the pids limit), each only while it is
+     the process listed (its start tick and command line digest, `procsignal`, O72). Best effort: a reader
      whose FUSE request is already with oneclient sleeps uninterruptibly (D) until oneclient answers or the connection
      ends (step 3); the survivors, their states and wait channels are logged, and the next step runs regardless.
   2. unmount, at the host's mount point (the sidecar's mount propagates there): `fusermount -u`, retried until a deadline,
@@ -54,6 +55,7 @@ import time
 from pathlib import Path
 
 from expcore_onedata.sandbox import hostops
+from expcore_onedata.sandbox import procsignal as PS
 from expcore_onedata.sandbox.hostops import HostOps
 
 log = logging.getLogger(__name__)
@@ -279,7 +281,8 @@ def _readers(host: HostOps, agent: dict) -> list[dict] | None:
     """The agent container's processes except its init and the init's `sleep infinity` (`_the_init_sleep`; keeping those
     keeps the container, and with it its mount namespace, alive until step 4). None when the container's cgroup cannot
     be read, or the state of one of its processes cannot: it could be a reader as well as the init's `sleep`, so the
-    list is unknown (O15)."""
+    list is unknown (O15). Each carries the digest of its command line (`procsignal.KEY`, None when it cannot be read), so
+    that a signal sent later goes only to the process listed here (O72)."""
     procs = _cgroup_procs(host, agent["id"])
     if procs is None:
         return None
@@ -291,7 +294,7 @@ def _readers(host: HostOps, agent: dict) -> list[dict] | None:
         if st == UNKNOWN:
             return None
         if isinstance(st, dict):
-            found.append(st)
+            found.append({**st, PS.KEY: PS.cmd_digest(host, pid)})
     spared = _the_init_sleep(found, agent)
     return [st for st in found if st is not spared]
 
@@ -307,6 +310,13 @@ def _alive(host: HostOps, procs: list[dict]) -> list[dict]:
         elif isinstance(st, dict) and st["start"] == p["start"]:
             out.append(st)
     return out
+
+
+def _identified(host: HostOps, procs: list[dict]) -> list[dict]:
+    """The processes as they are now, each with the digest of its command line read again: for a signal that follows a
+    wait, which a process may have answered by changing its command line (O72). `_alive` has shown each to be the process
+    listed, by its start tick."""
+    return [{**p, PS.KEY: PS.cmd_digest(host, p["pid"])} for p in procs]
 
 
 def _brief(host: HostOps, procs: list[dict], waits: Waits) -> list[dict]:
@@ -342,24 +352,26 @@ def _stop_readers(host: HostOps, agent: dict | None, waits: Waits, L: _StepLog) 
     if not procs:
         L("readers", outcome="none", detail="no process besides init and its sleep")
         return []
-    pids = [str(p["pid"]) for p in procs]
-    r = _sudo(host, "kill", "-s", "TERM", *pids, timeout_s=waits.command_s)
+    r = PS.signal_processes(host, procs, "TERM", waits.command_s)
     left = _wait_gone(host, procs, waits.reader_term_s, waits.poll_s)
     L(
         "readers",
         signal="TERM",
-        signalled=len(procs),
-        rc=r.returncode,
+        signalled=len(procs) - len(r.declined(procs)),
+        declined=len(r.declined(procs)),
+        rc=0 if r.failed is None else 1,
         left=len(left),
         left_procs=_brief(host, left, waits),
     )
     if left:
-        r = _sudo(host, "kill", "-s", "KILL", *[str(p["pid"]) for p in left], timeout_s=waits.command_s)
+        left = _identified(host, left)
+        r = PS.signal_processes(host, left, "KILL", waits.command_s)
         left = _wait_gone(host, left, waits.reader_kill_s, waits.poll_s)
         L(
             "readers",
             signal="KILL",
-            rc=r.returncode,
+            declined=len(r.declined(left)),
+            rc=0 if r.failed is None else 1,
             left=len(left),
             d_state=sum(p["state"] == "D" for p in left),
             left_procs=_brief(host, left, waits),

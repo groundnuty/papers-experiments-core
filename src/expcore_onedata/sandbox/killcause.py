@@ -29,7 +29,8 @@ counters say, since after an abort or a stop they describe the harness's doing, 
 
 One cause per run, in this order (kills can correlate with the condition, since a download may be charged to memory twice, so a cause must not depend on which
 was looked at first): `kill_survived`, `earlyoom` (its journal, whatever the counters and the exit code), `container_dead`, `host_oom`, `memory_limit`, `disk_limit`
-(the Apptainer backend's watch, O56: a cell's directory past its size, the agent's own as a memory limit is), `time_limit`, `killed_other`, `unknown`. An infrastructure cause ends the run and retries it; the agent's own cause, or an exception in its code, is its outcome and is kept. `run_cause`
+(the Apptainer backend's watch, O56: a cell's directory past its size, the agent's own as a memory limit is), `pids_limit`
+(its watch too, O70: the run's tasks past `pids`, the agent's own), `time_limit`, `killed_other`, `unknown`. An infrastructure cause ends the run and retries it; the agent's own cause, or an exception in its code, is its outcome and is kept. `run_cause`
 applies the order to a run's cells.
 """
 
@@ -39,13 +40,15 @@ import re
 
 KILL_SURVIVED = "kill_survived"
 DISK_LIMIT = "disk_limit"  # the Apptainer backend's watch: a cell's directory past its size (O56)
+PIDS_LIMIT = "pids_limit"  # the Apptainer backend's watch: the run's tasks past `pids` (O70); Docker refuses the fork
 REASONS = (
     "memory_limit", "host_oom", "earlyoom", "container_dead", "time_limit", "killed_other", "unknown", KILL_SURVIVED,
-    DISK_LIMIT,
+    DISK_LIMIT, PIDS_LIMIT,
 )  # fmt: skip
 CATEGORY = {
     "memory_limit": "agent",
     DISK_LIMIT: "agent",
+    PIDS_LIMIT: "agent",
     "time_limit": "agent",
     "host_oom": "infrastructure",
     "earlyoom": "infrastructure",
@@ -57,8 +60,8 @@ CATEGORY = {
 
 
 PRECEDENCE = (
-    KILL_SURVIVED, "earlyoom", "container_dead", "host_oom", "memory_limit", DISK_LIMIT, "time_limit", "killed_other",
-    "unknown",
+    KILL_SURVIVED, "earlyoom", "container_dead", "host_oom", "memory_limit", DISK_LIMIT, PIDS_LIMIT, "time_limit",
+    "killed_other", "unknown",
 )  # fmt: skip
 
 

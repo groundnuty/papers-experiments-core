@@ -9,10 +9,12 @@ import importlib.util
 import json
 import sqlite3
 import sys
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 from campaign_support import make_manifest, make_schema
+from fingerprint_support import seen_environments, standin_python
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, flagged, hpc_on_path
 from shard_support import make_study
 
@@ -124,7 +126,8 @@ class World:
 
         scratch = self.tmp / "fp-scratch"
         scratch.mkdir(mode=0o700)
-        return self.resume.study_fingerprint(self.shards, self.plan, self.plan.shards[0], scratch, refuse)
+        plan = self.shards.pin_pass_env(self.plan)  # the declared variables, valued as the operator holds them
+        return self.resume.study_fingerprint(self.shards, plan, plan.shards[0], scratch, refuse)
 
     def snapshot(self, fingerprint, *, label="fed-a", index=1):
         """A snapshot of the shard's out/, its store pinning `fingerprint`, as the step's snapshot thread takes one."""
@@ -220,6 +223,233 @@ def test_resume_line_refuses_a_mark_that_names_no_step(world):
     mark = world.plan.results / "fed-a" / "running.json"
     mark.write_text(json.dumps({"format": "expcore-hpc-shard-running/1", "shard": SPEC, "nonce": "a" * 32}))
     refused(world, "names no step")
+
+
+def declare_pass_env(world, names):
+    """The manifest, with `pass_env` declared (a top-level key: before the `[[shards]]`)."""
+    text = world.manifest.read_text(encoding="utf-8")
+    world.manifest.write_text(text.replace('memory = "17g"\n', f'memory = "17g"\npass_env = {json.dumps(names)}\n'),
+                              encoding="utf-8")  # fmt: skip
+
+
+def test_resume_line_pins_the_declared_variables_as_every_other_line_does(world, monkeypatch):
+    """O63: a manifest declaring `pass_env` has its resume line carry each name with the operator's value (an `env -i`
+    word) and `--pass-env NAME`, as `lines` prints them, so a resumed step is passed the same variables."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", "go-ahead")
+    lay_origin(world, {"FAULT_ACK_MODE": "go-ahead"})  # the shard's first step passed it, before it snapshotted
+    world.snapshot(world.fingerprint())
+    line = flagged(world.line())
+    assert "FAULT_ACK_MODE=go-ahead" in line
+    assert line.count("--pass-env") == 1
+    assert line[line.index("--pass-env") + 1] == "FAULT_ACK_MODE"
+    assert "--resume" in line
+
+
+def test_resume_line_refuses_an_unset_declared_variable_before_it_records_anything(world, monkeypatch):
+    """O63: the operator's value is read before the job and node are recorded in the federation's state: a declared
+    variable that is unset refuses the line, naming it, and the state is as it was."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.delenv("FAULT_ACK_MODE", raising=False)
+    world.snapshot(world.fingerprint())
+    refused(world, "FAULT_ACK_MODE is not set")
+
+
+FIRST, LATER = "go-ahead", "changed-mode"  # the value the shard's first step passed, and one the operator holds later
+
+
+def lay_origin(world, values):
+    """The shard's first step's record of the values it passed, as the step's own writer makes it."""
+    world.shards.record_pass_env_origin(world.plan.results, SPEC, values)
+
+
+def refusal_naming_only(world, name):
+    """`resume-line` refuses, with the federation's state untouched, naming `name` and showing neither value."""
+    before = world.state()
+    with pytest.raises(world.shards.ShardsError) as caught:
+        world.line()
+    said = str(caught.value)
+    assert name in said
+    assert FIRST not in said
+    assert LATER not in said
+    assert world.state() == before  # nothing recorded
+    return said
+
+
+def test_resume_line_refuses_a_value_that_changed_since_the_first_step_naming_only_the_variable(world, monkeypatch):
+    """O63: the operator now holds another value of a declared variable than the shard's first step passed: the
+    resume's line is refused, before the job is looked at and before its node is recorded, naming the variable and
+    showing neither value."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", LATER)
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    world.snapshot(world.fingerprint())
+    said = refusal_naming_only(world, "FAULT_ACK_MODE")
+    assert "no line is printed" in said
+
+
+def test_resume_line_refuses_a_changed_value_before_it_asks_slurm_anything(world, monkeypatch):
+    """O63: the check is the first of the line's: a job that is not the operator's (here, one Slurm does not know)
+    does not hide it, so the operator learns the value first."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", LATER)
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    world.snapshot(world.fingerprint())
+    before = world.state()
+    with pytest.raises(world.shards.ShardsError, match="FAULT_ACK_MODE") as caught:
+        world.line(job="999999")
+    assert "not known to Slurm" not in str(caught.value)
+    assert world.state() == before
+
+
+def test_resume_line_with_the_values_of_the_first_step_prints_its_line(world, monkeypatch):
+    """O63: the same value again: the line is printed and the job and node recorded, as ever, and the origin is the
+    first step's, untouched."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    world.snapshot(world.fingerprint())
+    origin = world.plan.results / "fed-a" / "pass-env.json"
+    before = origin.read_bytes()
+    line = flagged(world.line())
+    assert f"FAULT_ACK_MODE={FIRST}" in line
+    assert world.state()["shard_nodes"] == [{"job": JOB, "node": NODE, "label": "fed-a", "name": "expcore-resume"}]
+    assert origin.read_bytes() == before
+
+
+TREE_NAME, TREE = "HPC_STUDY_ARTIFACTS", "/srv/example/artifacts/tree"  # another invented variable, with a path
+NEEDED = ["FAULT_ACK_MODE", TREE_NAME]
+
+
+def with_needing_plugin(world, monkeypatch):
+    """The manifest's python is a stand-in whose study plugin refuses to be built without the two variables the
+    manifest declares and the operator holds (the operator holds a third it does not declare), and the shard's first
+    step passed both. Returns the directory the stand-in records the environment of each of its calls in."""
+    python = standin_python(world.tmp / "venv", needs=tuple(NEEDED))
+    text = world.manifest.read_text(encoding="utf-8")
+    assert f'python = "{sys.executable}"' in text
+    world.manifest.write_text(text.replace(f'python = "{sys.executable}"', f'python = "{python}"'), encoding="utf-8")
+    declare_pass_env(world, NEEDED)
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    monkeypatch.setenv(TREE_NAME, TREE)
+    monkeypatch.setenv("NOT_DECLARED_VAR", "x")
+    world.plan = world.shards.load_plan(world.manifest)
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST, TREE_NAME: TREE})
+    return world.tmp / "venv"
+
+
+def test_resume_line_builds_a_plugin_that_needs_a_declared_variable_with_the_values_its_line_carries(
+    world, monkeypatch
+):
+    """O63: a study's plugin may refuse to be built without a variable the manifest declares in `pass_env`; the campaign
+    fingerprint `resume-line` takes before it records a node is taken by a program given the declared variables, with
+    the values its line carries, so the line is printed."""
+    venv = with_needing_plugin(world, monkeypatch)
+    world.snapshot(world.fingerprint())
+    line = flagged(world.line())
+    assert "--resume" in line
+    assert f"FAULT_ACK_MODE={FIRST}" in line
+    assert f"{TREE_NAME}={TREE}" in line
+    taken = seen_environments(venv)  # the test's own fingerprint of the snapshot, then resume-line's
+    assert [(env["FAULT_ACK_MODE"], env[TREE_NAME]) for env in taken] == [(FIRST, TREE)] * 2
+
+
+def test_resume_line_gives_the_plugin_no_variable_the_manifest_does_not_declare(world, monkeypatch):
+    """O63: nothing else of the operator's environment reaches the program that builds the plugin."""
+    venv = with_needing_plugin(world, monkeypatch)
+    world.snapshot(world.fingerprint())
+    world.line()
+    taken = seen_environments(venv)
+    assert len(taken) == 2
+    for env in taken:
+        assert "NOT_DECLARED_VAR" not in env
+
+
+def test_resume_line_refuses_an_unset_declared_variable_before_it_builds_the_plugin_naming_only_the_variable(
+    world, monkeypatch
+):
+    """O63: a declared variable the operator no longer holds refuses the line before the plugin is built for it (the
+    program is not run again), naming the variable and showing no value, with the federation's state untouched."""
+    venv = with_needing_plugin(world, monkeypatch)
+    world.snapshot(world.fingerprint())
+    monkeypatch.delenv(TREE_NAME)
+    built = len(seen_environments(venv))
+    said = refusal_naming_only(world, TREE_NAME)
+    assert TREE not in said
+    assert len(seen_environments(venv)) == built
+
+
+def test_resume_line_refuses_a_manifest_that_dropped_a_variable_the_first_step_passed(world, monkeypatch):
+    """O63: the manifest declares nothing now, the first step passed a variable: the resumed shard would lose it,
+    so the line is refused, naming the variable."""
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    lay_origin(world, {"FAULT_ACK_MODE": FIRST})
+    world.snapshot(world.fingerprint())
+    refusal_naming_only(world, "FAULT_ACK_MODE")
+
+
+def test_resume_line_refuses_a_variable_added_to_a_shard_whose_first_step_passed_none(world, monkeypatch):
+    """O63: the shard has a snapshot (results) and no origin, so its first step passed nothing: the manifest declares a
+    variable now, which is a change of value mid-shard: refused naming the variable, before the job is looked at and
+    with the federation's state untouched."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    world.snapshot(world.fingerprint())
+    refusal_naming_only(world, "FAULT_ACK_MODE")
+
+
+def test_resume_line_refuses_an_origin_it_cannot_read_as_the_shards(world, monkeypatch):
+    """O63: an origin that is not a record of this shard refuses the line, as no record at all would not."""
+    declare_pass_env(world, ["FAULT_ACK_MODE"])
+    monkeypatch.setenv("FAULT_ACK_MODE", FIRST)
+    world.snapshot(world.fingerprint())
+    origin = world.plan.results / "fed-a" / "pass-env.json"
+    origin.write_text("{")
+    before = world.state()
+    with pytest.raises(world.shards.ShardsError, match=r"pass-env\.json"):
+        world.line()
+    assert world.state() == before
+
+
+GUARD, POST = "raise SystemExit(0)  # guard\n", "raise SystemExit(0)  # post-run\n"
+
+
+def declare_scripts(world, *, write=True):
+    """The manifest, with the study's guard and post-run script declared (and, `write`, in the study)."""
+    if write:
+        guards = world.plan.study / "guards"
+        guards.mkdir()
+        (guards / "pre_step.py").write_text(GUARD)
+        (guards / "post_run.py").write_text(POST)
+    text = world.manifest.read_text(encoding="utf-8")
+    world.manifest.write_text(
+        text.replace(
+            'memory = "17g"\n', 'memory = "17g"\npre_step = "guards/pre_step.py"\npost_run = "guards/post_run.py"\n'
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_resume_line_pins_the_studys_guard_and_post_run_script_as_lines_does(world):
+    """O63: A manifest declaring `pre_step` and `post_run` gives a resume line carrying each script's path and its
+    SHA-256 as the study holds it, as `lines` does: the resumed step runs the study's guard first and its post-run
+    script last. The line was refused as unpinned (`step_argv`), so such a shard could not be resumed at all."""
+    declare_scripts(world)
+    world.snapshot(world.fingerprint())
+    line = flagged(world.line())
+    options = ("--pre-step", "--pre-step-sha256", "--post-run", "--post-run-sha256")
+    wanted = {"--pre-step": "guards/pre_step.py", "--pre-step-sha256": sha256(GUARD.encode()).hexdigest(),
+              "--post-run": "guards/post_run.py", "--post-run-sha256": sha256(POST.encode()).hexdigest()}  # fmt: skip
+    assert {option: line[line.index(option) + 1] for option in options} == wanted
+    assert "--resume" in line
+
+
+def test_resume_line_refuses_a_declared_script_the_study_does_not_hold_before_it_records_anything(world):
+    """O63: The scripts are read before the job and node are recorded in the federation's state: a declared guard that
+    is not in the study refuses the line, naming it, and the state is as it was."""
+    declare_scripts(world, write=False)
+    world.snapshot(world.fingerprint())
+    refused(world, "guards/pre_step.py")
 
 
 @pytest.mark.parametrize(

@@ -161,7 +161,11 @@ def _helper_source() -> str:
 
 
 def _helper(host: HostOps, operation: str, request: Mapping[str, Any], timeout_s: float) -> Any:
-    """Run the copy helper as root with `request` on stdin; never a path of the agent's tree as an argument."""
+    """Run the copy helper as root with `request` on stdin; never a path of the agent's tree as an argument. A host
+    with a `copy_helper` of its own runs it where the tree is (the Apptainer backend's work disk image, O71)."""
+    own = getattr(host, "copy_helper", None)
+    if own is not None:
+        return own(operation, dict(request), timeout_s)
     argv = [sys.executable, "-I", "-B", "-c", _helper_source(), operation]
     return host.run(argv, timeout_s, sudo=True, input=json.dumps(dict(request)))
 

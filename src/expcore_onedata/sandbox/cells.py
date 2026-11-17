@@ -17,6 +17,18 @@ that outcome, the cell's own included, lasts at most the margin and `SETTLE_SLAC
 like an escalation that raised and whose quiesce did not show the cell gone, is `survived_kill`, never a clean kill.
 The first end published stands: an outcome decided later is kept among the cell's deadlines, never made the run's end.
 
+**A cell's processes end with it** (O56): the code tool tells the agent that state does not carry between calls
+(`codetool.DEFAULT_DESCRIPTION`), so whatever of the agent's is left in the container once a cell's `docker exec` has
+returned, a worker it detached into a session of its own included, is killed and shown gone (`_sweep`: every process
+of the container but its init and the init's `sleep`, as the quiesce kills them), and counted on the cell's record
+(`left_after_exec`). The Apptainer backend's cells end so too, since each is an exec of its own PID namespace. One
+that cannot be shown gone, or a listing that fails, ends the run as `survived_kill`, as a process that outlives its
+kill at the cap does (O34): the next cell would find it running.
+
+Every signal goes only to the process that was listed (`procsignal`, `killhelper`, O72): the listing carries each
+process's start tick and the digest of its command line, and a pid that ended and was reused since is never signalled.
+A process no signal reached is not marked done: it is listed again, and while one is alive it is never quiet.
+
 A cell runs under the completion bootstrap (`completion.py`, O55): its program is checked whole in the container before
 it runs, and a record written after the interpreter's exit carries this exec's nonce and the exit status. The record's
 lines are taken out of the streams as they are read, so the output is the program's own; what it showed is the
@@ -38,6 +50,7 @@ from expcore_onedata.sandbox import bounds as BD
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import earlyoom as EO
 from expcore_onedata.sandbox import killcause as KC
+from expcore_onedata.sandbox import procsignal as PS
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox.api import NOT_STARTED, RAN, ExecResult
 from expcore_onedata.sandbox.completion import Completion, ExecIncomplete
@@ -69,6 +82,21 @@ def docker_failed(rc: int, err: str) -> bool:
     if rc == 0 or not any(m in err for m in ("Error response from daemon", "OCI runtime", "docker: ", "timeout: ")):
         return False
     return rc in (125, 126) or "is not running" in err or "No such container" in err
+
+
+def _running(procs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The processes that can still run code: neither in D (a pending SIGKILL ends it on its return) nor a zombie."""
+    return [p for p in procs if p["state"] not in ("D", "Z")]
+
+
+def _left_record(left: list[dict[str, Any]]) -> dict[str, Any]:
+    """What a quiesce's record keeps of the processes left: the first 16 by pid, comm and state, and how many of all
+    of them can still run (`left_running`) or are not dead (`left_alive`), which decide what follows."""
+    return {
+        "left": [{k: p[k] for k in ("pid", "comm", "state")} for p in left[:16]],
+        "left_running": len(_running(left)),
+        "left_alive": sum(1 for p in left if p["state"] != "Z"),
+    }
 
 
 def _output_cut(done: Any, gave_up: bool) -> dict[str, dict[str, int]] | None:
@@ -166,9 +194,12 @@ class _CellProcesses:
             log.error("the processes of a cell could not be listed at its deadline: %s", describe_error(e))
             return None
 
-    def kill(self, procs: list[dict], timeout_s: float) -> None:
-        pids = [str(p["pid"]) for p in procs]
-        TD._sudo(self._runner._host, "kill", "-s", "KILL", *pids, timeout_s=min(KILL_S, timeout_s))
+    def kill(self, procs: list[dict], timeout_s: float) -> list[tuple]:
+        """SIGKILL each process, only while it is the one listed (`procsignal`, O72). The deadline's keys of the ones
+        reached; one that was not (its command line changed, its identity could not be read, the command failed) is not
+        among them, so the deadline lists it again and tries once more, and never counts it as signalled."""
+        sent = PS.signal_processes(self._runner._host, procs, "KILL", min(KILL_S, timeout_s))
+        return [DL.key_of(p) for p in procs if sent.reached(p)]
 
     def fallback(self) -> list[dict] | None:
         """After a step of the deadline raised: the sandbox's quiesce kills what is left; what it left, None when the
@@ -277,37 +308,76 @@ class CellRunner:
         is outside `timeout`'s group, and could go on changing outputs after the cap. The container stays up, since its
         cgroup's counters classify the kills and a mount has its own teardown; only its init and `sleep` remain.
         `killed` None means the processes could not be listed, so nothing is known. It never raises."""
+        state = self._kill_all(reason)
+        self._meta.setdefault("quiesced", []).append(state)
+        return state
+
+    def _sweep(self, cell: int) -> int | None:
+        """After a cell's exec: kill whatever of the agent's is left and show it gone (the module's docstring). How many
+        were left, None when that is unknown; the state is on the record when anything was left or nothing is known, and
+        a process that is not shown gone ends the run (O34). It never raises."""
+        state = self._kill_all("end of cell")
+        if state["killed"] != 0:
+            with self.meta_lock:
+                self._meta.setdefault("quiesced", []).append({"cell": cell, **state})
+        if not self.quiet(state):
+            log.error("a process of a cell outlived its exec and its kill: the run is ended as %s", DL.SURVIVED)
+            why = "a process of the cell outlived its exec and its kill"
+            with self.meta_lock:
+                if self.ended is None:  # the run's ending is the sweep's, said apart from the cell's own result (O72)
+                    self.ended = self._unknown(why, by=DL.SWEEP, cell=cell)
+                    self._meta["run_ended"] = {"by": DL.SWEEP, "cell": cell, "outcome": DL.SURVIVED, "why": why}
+            return None
+        return state["killed"]
+
+    def _kill_all(self, reason: str) -> dict[str, Any]:
+        """`quiesce` without its record. A process is signalled only while it is the one listed (`procsignal`, O72): one
+        the signal did not reach (its command line changed, its identity could not be read, the command failed) is
+        listed again, with what it is then, in the next round, and is never marked done; one still alive at the end
+        that no signal reached is not quiet, however the signals went for the rest."""
         state: dict[str, Any] = {"reason": reason, "killed": None, "left": None}
         try:
-            killed, left, seen = 0, [], set()
+            listed, seen, reached, left = set(), set(), set(), []
             for _ in range(QUIESCE_ROUNDS):
                 procs = self.agent_processes()
                 if procs is None:
-                    killed = None
+                    listed = None
                     break
                 left = procs
-                fresh = [p for p in procs if (p["pid"], p["start"]) not in seen]
+                fresh = [p for p in procs if DL.key_of(p) not in seen]
                 if not fresh:
                     break
-                TD._sudo(self._host, "kill", "-s", "KILL", *[str(p["pid"]) for p in fresh], timeout_s=20.0)
-                seen.update((p["pid"], p["start"]) for p in fresh)
-                killed += len(fresh)
-                left = TD._wait_gone(self._host, fresh, 10.0, 0.2)
+                sent = PS.signal_processes(self._host, fresh, "KILL", 20.0)
+                done = [p for p in fresh if sent.reached(p)]
+                listed.update((p["pid"], p["start"]) for p in fresh)
+                reached.update((p["pid"], p["start"]) for p in done)
+                seen.update(DL.key_of(p) for p in done)
+                if sent.failed is not None:  # it failed as a whole, perhaps after signalling: asking again won't help
+                    left = self.agent_processes()  # so what is left is listed anew, never taken from before the signals
+                    listed = None if left is None else listed
+                    break
+                if done:  # what no signal reached is not waited for: it is listed again at once
+                    TD._wait_gone(self._host, done, 10.0, 0.2)
             else:
                 left = self.agent_processes()
-                killed = None if left is None else killed
-            if killed is not None:
-                state.update(killed=killed, left=[{k: p[k] for k in ("pid", "comm", "state")} for p in left[:16]])
+                listed = None if left is None else listed
+            if listed is not None:
+                state.update(killed=len(listed), **_left_record(left))
+                if any((p["pid"], p["start"]) not in reached for p in left):
+                    state.update(killed=None, error="a signal did not reach a process that is left")
         except Exception as e:
             state.update(killed=None, left=None, error=describe_error(e))
-        self._meta.setdefault("quiesced", []).append(state)
         return state
 
     @staticmethod
     def quiet(state: dict[str, Any]) -> bool:
         """Nothing of the agent's can run any more. A process in D (a read of a slow mount) or a zombie has
-        SIGKILL pending or is dead: it returns to no user code, so it changes nothing."""
-        return state["killed"] is not None and not [p for p in state["left"] if p["state"] not in ("D", "Z")]
+        SIGKILL pending or is dead: it returns to no user code, so it changes nothing. Judged on every process left,
+        never only the ones the record keeps (`left_running`)."""
+        if state["killed"] is None:
+            return False
+        running = state.get("left_running")
+        return (running if running is not None else len(_running(state["left"]))) == 0
 
     def _kill_at_the_cap(self, cell: int) -> Callable[[], None] | None:
         """In the timer's thread, when a cell's time runs out: its deadline (deadline.py). Every process of the agent's
@@ -333,6 +403,8 @@ class CellRunner:
         the outcome is decided."""
         outcome = record["outcome"]
         with self.meta_lock:
+            if outcome in DL.ESCALATED:
+                record["cell"] = cell  # the run's end says whose deadline it was: the cell ran, its result stands (O72)
             self._deadline = record
             self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})  # shares the record's steps
             # the run is over from now, whatever the cell's record makes of it after. An end already published stands:
@@ -344,11 +416,14 @@ class CellRunner:
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
         return (lambda: self._stop_after(record)) if outcome in DL.STOPS else None
 
-    def _unknown(self, why: str) -> dict[str, Any]:
+    def _unknown(self, why: str, **facts: Any) -> dict[str, Any]:
         """The record of a deadline whose outcome is not known: `survived_kill`, since unknown is never a clean kill. It
-        is the most severe outcome (`deadline.SEVERITY`), so never below a step the escalation took."""
+        is the most severe outcome (`deadline.SEVERITY`), so never below a step the escalation took. `facts` say what
+        else ended the run, when it was not a deadline (`by`), and the `cell` it followed or whose deadline it was."""
         esc = self._escalation
-        return {"grace_s": esc.grace_s, "margin_s": esc.margin_s, "outcome": DL.SURVIVED, "why": why, "steps": []}
+        return {
+            "grace_s": esc.grace_s, "margin_s": esc.margin_s, "outcome": DL.SURVIVED, "why": why, "steps": [], **facts,
+        }  # fmt: skip
 
     @property
     def decide_s(self) -> float:
@@ -367,7 +442,7 @@ class CellRunner:
             if record is not None:
                 return True, record
             why = "not decided within its margin" if fired is None else "decided with no record"
-            record = self._unknown(why)
+            record = self._unknown(why, cell=cell)
             self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})
             self.ended = self.ended or record
         log.error("a cell's deadline was %s: the run is ended as %s", why, DL.SURVIVED)
@@ -483,8 +558,15 @@ class CellRunner:
             bound = BD.named(fired=fired, gave_up=gave_up, exit_code=rc, ran_s=res.duration_s, limit_s=limit_s)
             # incomplete, and no bound or kill of the harness's own to say how it ended: never a result (O55)
             incomplete = check.cause if not gave_up and not fired else None
+            # state does not carry between calls: nothing of the cell outlives it, its time measured before (the sweep
+            # is the harness's). At the cap the deadline has killed every process already and said what outlived it,
+            # and a run already ended is the stop's to end
+            with self.meta_lock:
+                ended = self.ended is not None
+            left = self._sweep(cell) if not fired and not ended else None
             if record:
                 self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, deadline, wall0, incomplete)
+                self.cells[-1]["left_after_exec"] = left
                 res.bound = bound if res.timed_out else None
             else:  # no timer ran: only the container's own bound, or the host's giving up, can have ended it (O39)
                 res.timed_out, res.bound = bound is not None, bound
