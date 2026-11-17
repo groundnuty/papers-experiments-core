@@ -36,7 +36,8 @@ Compose (`up`, `reset --replicas` and `down`; see "An imported space").
   `platform.toml`, refusing a file whose support set for a space is not the one Onezone listed (the link check and a
   campaign read the file's own sets, which its template declares: `space <name>: supported by <provider> but
   platform.toml doesn't declare it`, `space <name>: platform.toml declares <provider> but it doesn't support the
-  space`). Last, it runs the platform layer's link check through that `platform.toml` (`fedlinks.py`, #221):
+  space`; the probe space's `[link_check]` list may leave a provider out but may not name one that does not support
+  it, and a space of the file that is no space of the federation is refused). Last, it runs the platform layer's link check through that `platform.toml` (`fedlinks.py`, #221):
   each ordered (reading provider, source) pair of providers sharing a space must fetch a probe, a file of its own, from
   the layout's `probe_space` within the bound, or up fails naming the pair and the remedy; the report is written as `link-check.json` in the root, beside `facts.json`, atomically, by the platform layer's own writer (`expcore_onedata.linkrecord`): a fault injector's restore, a heal and the health gate's routine check write the same file after each of their all-pairs checks, whichever platform file they ran through (the root is the parent of the `[faults] journal` the file names), so it is always the latest check's whole report (one check at a time makes it, under a lock file `link-check.lock` beside it). Run on a federation that is up,
   it starts what is stopped and checks every step again, the links and the support sets included, and writes no
@@ -46,7 +47,8 @@ Compose (`up`, `reset --replicas` and `down`; see "An imported space").
   them; a space declared `baseline = false` is left empty. The providers, spaces and users keep their ids, so
   `platform.toml` stays valid. A fault-injection journal left behind is emptied. A layout with an imported space is
   refused before anything is touched: run `down`, then `up` (see "An imported space").
-- **reset --replicas** is the reset between runs: it starts what is stopped and checks every step again, then keeps
+- **reset --replicas** is the reset between runs: it starts what is stopped and checks every step again (the support
+  sets included, and the rendered `platform.toml` against them, which a refused `up` leaves in the root), then keeps
   every owner's data and evicts only what the mirrors hold (`fedreplicas.py`). A space is supported by exactly its
   owner and its mirrors, so every non-owner that can hold a replica, the agent's local provider included, is a
   declared mirror, and its replicas go. It refuses, evicting nothing in any

@@ -60,7 +60,7 @@ from feddocker import (
     require_own,
     require_ports_free,
 )
-from fedfacts import baseline_left_behind, describe, root_parent, write_facts
+from fedfacts import baseline_left_behind, describe, facts_of, root_parent, write_facts
 from fedimport import copy_imports, pending_copies, require_resettable
 from fedlayout import NODE, ROOT_MARKER, Layout
 from fedlinks import check_after_up
@@ -76,6 +76,7 @@ from fedpki import (
 from fedreplicas import evict_replicas
 from fedrest import Rest
 from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, load_spec
+from fedsupport import check_rendered_support
 from fedtools import check_artifacts, study_artifacts_from
 
 ZONE_TIMEOUT_S = 1500.0
@@ -294,6 +295,10 @@ def reset_replicas(layout: Layout) -> str:
     try:
         boot = Bootstrap(rest, layout)
         bring_up(layout, boot, timer)
+        if layout.spec.platform_template is not None:
+            # a refused up leaves its file in the root, which require_up accepts: held to the zone again, before any
+            # eviction (O35)
+            check_rendered_support(layout, facts_of(boot))
         evicted = evict_replicas(boot, TRANSFER_TIMEOUT_S)
         timer.mark("replicas")
     finally:

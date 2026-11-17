@@ -86,16 +86,23 @@ def refusal(problems: Sequence[str]) -> str:
     )
 
 
-def rendered_differences(space: str, declared: Sequence[str], measured: Sequence[str], undeclared: int) -> list[str]:
+def rendered_differences(
+    space: str, declared: Sequence[str], measured: Sequence[str], undeclared: int, *, subset: bool = False
+) -> list[str]:
     """How a rendered file's support set for a space differs from the zone's (`measured`), one message each.
 
     `declared` is the file's, as layout labels, and `undeclared` counts its providers whose id is no provider of the
     federation. What the zone lists and the file leaves out comes first, then what the file declares and the space
-    does not have."""
-    problems = [
-        f"space {space}: supported by {label} but platform.toml doesn't declare it"
-        for label in sorted(set(measured) - set(declared))
-    ]
+    does not have. With `subset` the file may leave a supporter out (a probe space's `[link_check]` list may omit a
+    provider that is in no pair), so only what it declares and the space does not have is a difference."""
+    problems = (
+        []
+        if subset
+        else [
+            f"space {space}: supported by {label} but platform.toml doesn't declare it"
+            for label in sorted(set(measured) - set(declared))
+        ]
+    )
     problems += [
         f"space {space}: platform.toml declares {label} but it doesn't support the space"
         for label in sorted(set(declared) - set(measured))
@@ -117,8 +124,9 @@ def check_rendered_support(layout: Layout, facts: Mapping[str, Any]) -> None:
     credentials or manifests (which are no concern of this check); a refusal of the load is passed on with the root's
     path written `<root>`. Its spaces are matched to the layout's by id and its providers to the federation's by id,
     whatever the template calls them, and the refusal names them by layout label, one message per difference, never an
-    id. A space of the file that is no space of the federation, or a facts record with no measured set (a bootstrap
-    that never read one), is not checked here."""
+    id. The probe space's `[link_check]` list is held to the zone's as a subset, since the platform layer lets it leave
+    out a provider that is in no pair. A space of the file that is no space of the federation is refused, counted; a
+    facts record with no measured set (a bootstrap that never read one) is not checked here."""
     measured = {n: s["supported_by_measured"] for n, s in facts["spaces"].items() if "supported_by_measured" in s}
     if not measured:
         return
@@ -134,13 +142,25 @@ def check_rendered_support(layout: Layout, facts: Mapping[str, Any]) -> None:
     space_of = {space["id"]: name for name, space in facts["spaces"].items()}
     label_of = {provider["id"]: name for name, provider in facts["providers"].items()}
     problems: list[str] = []
-    for entry in config.spaces:
-        name = space_of.get(entry.space.id)
+    strangers = 0  # the file's spaces that are no space of the federation
+    declared = [(entry.space.id, entry.support.providers, False) for entry in config.spaces]
+    if config.link_check is not None:  # the probe space's providers, which the link check reads from the file
+        declared.append((config.link_check.space.id, config.link_check.providers, True))
+    for space_id, listed_providers, subset in declared:
+        name = space_of.get(space_id)
+        if name is None:
+            strangers += 1
+            continue
         if name not in measured:
             continue
-        ids = [config.providers[provider].id for provider in entry.support.providers]
+        ids = [config.providers[provider].id for provider in listed_providers]
         known = [label_of[found] for found in ids if found in label_of]
-        problems += rendered_differences(name, known, measured[name], sum(1 for found in ids if found not in label_of))
+        unknown = sum(1 for found in ids if found not in label_of)
+        problems += rendered_differences(name, known, measured[name], unknown, subset=subset)
+    if strangers == 1:
+        problems.append("platform.toml declares a space that is no space of this federation")
+    elif strangers:
+        problems.append(f"platform.toml declares {strangers} spaces that are no space of this federation")
     if problems:
         raise RuntimeError(
             "the rendered platform.toml's support sets differ from what the zone listed: "
