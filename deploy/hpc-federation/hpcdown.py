@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+import hpcevidence
 import hpcrelay
 import hpcstate
 import hpcstorage
@@ -28,7 +29,10 @@ WORKDIR_LINE = re.compile(r"^hpcop: work directory (/\S+)$", re.M)  # the batch 
 class Down:
     """down, and what it is made of; `hpcdriver.Driver` provides the rest."""
 
-    def down(self) -> str:
+    def down(self, discard_evidence: bool = False) -> str:
+        """The federation taken down and its root removed. A root that a shard step ran against and whose evidence was
+        not collected (`evidence_gate`) is refused before anything is stopped, unless `discard_evidence`, which the
+        output records."""
         if not self.root.exists():
             return "down: the root is gone already"
         if not self.layout.owned:
@@ -42,7 +46,41 @@ class Down:
                 settle_rmdir(self.root, ops["rmdir"], ops["sleep"], ops["clock"]() + SETTLE_S, ops["clock"])
             return "down: the root an earlier down's removal left (cut short by files held open) is removed"
         with self.store.lifecycle("down"):  # never beside an up that may be between its state and its sbatch
-            return self.take_down()
+            discarded = self.evidence_gate(discard_evidence)
+            done = self.take_down()
+        return f"{discarded}\n{done}" if discarded else done
+
+    def evidence_gate(self, discard: bool) -> str:
+        """O63: down removes the root, which holds the evidence the study's post-check and the facts read (the state,
+        `platform.toml`, `facts.json`, the link check, the render identity, the fault journals): so it refuses,
+        before it
+        stops or cancels anything, a root that has shard results recorded against it (a step of a shard started there,
+        `shards.py step`) and no current marker that `shards.py collect` wrote (`hpcevidence.uncollected`), a root where
+        no step ever ran as before. `discard` (`--discard-evidence`) goes on, and the line it returns, which the output
+        and `say` carry, records what was discarded. Empty when there was nothing to refuse or discard."""
+        found = hpcevidence.uncollected(self.root)
+        if found is None:
+            return ""
+        labels, stale = found
+        shown = ", ".join(labels)
+        if not discard:
+            if stale:
+                why = f"a step of {shown} started after the evidence was collected, so it lacks their journals"
+                remedy = "run `shards.py collect` again while the federation is up"
+            else:
+                why = f"shard results are recorded in this root ({shown}) and its evidence was not collected"
+                remedy = "run `shards.py collect` while the federation is up"
+            raise RuntimeError(
+                f"{why}: down would remove the state, facts, link check, render identity and fault journals the "
+                f"post-check needs. Nothing was stopped or removed: {remedy}, pull the results and `verify-copy` them; "
+                "or give --discard-evidence to remove the root without it"
+            )
+        line = (
+            f"down: --discard-evidence: the root's evidence of {shown} "
+            f"{'was collected before a later step' if stale else 'was not collected'} and is removed with it"
+        )
+        self.say(line)
+        return line
 
     def removal_remains(self) -> bool:
         """Whether the root is what a removal cut short after its marker leaves: empty, or holding nothing but NFS

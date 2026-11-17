@@ -182,7 +182,15 @@ def main(
     parser.add_argument("--root", help="the federation's root (default: EXPCORE_FED_ROOT)")
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("service", nargs="?", help="the service a verb acts on, by its layout name")
+    parser.add_argument(
+        "--discard-evidence",
+        action="store_true",
+        help="down only: remove a root whose shard evidence was not collected (shards.py collect), and say so",
+    )
     args = parser.parse_args(words)
+    if args.discard_evidence and args.command != "down":
+        print(f"error: {args.command}: --discard-evidence belongs to down", file=sys.stderr)
+        return 2
     environ = os.environ if environ is None else environ
     try:
         root = args.root or environ.get("EXPCORE_FED_ROOT")
@@ -206,7 +214,7 @@ def main(
             self_check()
             print(driver.up(site_from_environment(environ)))
         elif args.command == "down":  # never an `else`: a command added without a branch would tear the federation down
-            print(driver.down())
+            print(driver.down(discard_evidence=args.discard_evidence))
         else:
             raise AssertionError(f"{args.command}: no branch")  # pragma: no cover
     except CoreMismatch as error:
