@@ -4,9 +4,12 @@
 A cell that shares its node's UTS namespace reads the node's own name from `hostname`, `uname -n`, `uname -a` and
 `/proc/sys/kernel/hostname`: a private detail of the site, and not what a Compose federation's cell reads. The Apptainer
 backend's cells have no UTS namespace of their own unless asked for (`apptainer exec --uts`), so each exec is given
-`--uts --hostname <name>` (`argv.exec_argv`) and a generated, read-only `/etc/hostname` of the same name; the Docker
-sandbox gives the agent's container `--hostname <name>` (`containers.agent_run_args`), where the engine writes the file
-itself.
+`--uts --hostname <name>` (`argv.exec_argv`); the Docker sandbox gives the agent's container `--hostname <name>`
+(`containers.agent_run_args`). `/etc/hostname` is left to each: the sandbox binds no file of its own onto it.
+Apptainer's source (its `addHostnameMount`, read on `main`, not on the site's release) writes the file itself with the
+name when a UTS namespace and a host name are given, and never binds the node's own `/etc/hostname` (not by default,
+and not at all under `--containall`); Docker's engine writes one for `--hostname`. A study's bind onto it is refused,
+since it would replace the name (`apptainer.settings.OWN_TARGETS`).
 
 The name is a constant of the core, not a setting: a study does not choose it, so it is in no campaign fingerprint, and
 a change of it is a change of the core's version. Each run records the name its cells were given
@@ -24,7 +27,6 @@ from collections.abc import Iterable, MutableMapping
 from typing import Any
 
 CELL_HOSTNAME = "sandbox"
-ETC_HOSTNAME = "/etc/hostname"
 FACT = "cell_hostname"  # the key of the run's `infrastructure_facts`
 LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")  # one DNS label: what a host name without a domain is
 REFUSAL = (
@@ -38,11 +40,6 @@ def valid(name: str) -> bool:
     return LABEL.fullmatch(name) is not None
 
 
-def etc_hostname_text(name: str = CELL_HOSTNAME) -> str:
-    """The cell's `/etc/hostname`: the name and a newline."""
-    return f"{name}\n"
-
-
 def is_node_name(node_names: Iterable[str], name: str = CELL_HOSTNAME) -> bool:
     """Whether one of the federation's real node names or addresses is `name`, or has it as its first label (a fully
     qualified name), in any case: the clash the start refuses."""
@@ -54,4 +51,4 @@ def note(meta: MutableMapping[str, Any], name: str = CELL_HOSTNAME) -> None:
     meta.setdefault("infrastructure_facts", {})[FACT] = name
 
 
-__all__ = ["CELL_HOSTNAME", "ETC_HOSTNAME", "FACT", "REFUSAL", "etc_hostname_text", "is_node_name", "note", "valid"]
+__all__ = ["CELL_HOSTNAME", "FACT", "REFUSAL", "is_node_name", "note", "valid"]

@@ -9,8 +9,8 @@ A cell is one `apptainer exec`:
         timeout -s KILL <limit> <python> -I -B -c <completion bootstrap> <nonce> <size> <sha256> <python>
 
 `--uts --hostname <name>` gives the cell a UTS namespace of its own with the declared host name (`cellhost.py`, O73),
-so `hostname`, `uname -n` and `/proc/sys/kernel/hostname` show that name, the same as Docker's, and not the node's. A
-generated `/etc/hostname` of the name is bound read-only beside it (`sandbox.py`), so the file is no image's or node's.
+so `hostname`, `uname -n` and `/proc/sys/kernel/hostname` show that name, the same as Docker's, and not the node's.
+`/etc/hostname` is not bound by the sandbox: with a UTS namespace and a name, Apptainer writes its own (`cellhost.py`).
 Every exec carries the flags, the harness's one-shot reads of the image included.
 
 `--containall` gives the cell its own PID, IPC and mount namespaces, a minimal `/dev` and an environment of the image's

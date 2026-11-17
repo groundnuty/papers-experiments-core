@@ -476,14 +476,12 @@ class ApptainerSandbox:
         layout.write_text(cell / "resolv.conf", AV.RESOLV_TEXT)
         layout.write_text(cell / "nsswitch.conf", AV.NSSWITCH_TEXT)
         layout.write_text(cell / "ld.so.preload", AV.preload_text([*preloads, AV.SHIM_TARGET]))
-        layout.write_text(cell / "hostname", cellhost.etc_hostname_text())  # O73: the name the exec's --hostname sets
         binds = [
             AV.Bind(self.dir / "work", "/work", True), AV.Bind(self.dir / "tmp", "/tmp", True),
             AV.Bind(self.dir / "shm", "/dev/shm", True), AV.Bind(cell / "hosts", "/etc/hosts"),
             AV.Bind(cell / "resolv.conf", AV.RESOLV_CONF), AV.Bind(cell / "nsswitch.conf", AV.NSSWITCH_CONF),
             AV.Bind(self.dir / "egress-sock", AV.EGRESS_DIR), AV.Bind(cell / "egresslog.so", AV.SHIM_TARGET),
             AV.Bind(cell / "ld.so.preload", "/etc/ld.so.preload"),
-            AV.Bind(cell / "hostname", cellhost.ETC_HOSTNAME),
             *(AV.Bind(cell / f"preload-{n}.so", target) for n, target in enumerate(preloads)),
             *(AV.Bind(cell / f"bind-{n}", b.target) for n, b in enumerate(self.app.binds)),
         ]  # fmt: skip

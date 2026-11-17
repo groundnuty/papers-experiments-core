@@ -496,11 +496,20 @@ this way is owed the checks of `DESIGN.md` section 9, item 7.
 
 An agent's cell on a batch node has no network namespace, and without `--uts` no UTS namespace either: `hostname`,
 `uname -n`, `uname -a` and `/proc/sys/kernel/hostname` in it show the batch node's own name. That is a name the agent
-must not read (the gate's count of node names, above, is for the same reason), and a Compose cell, which reads its own
-container's name, does not show it. The core gives every cell on both backends one fixed, neutral host name, `sandbox`
-(`expcore_onedata/sandbox/cellhost.py`, a constant of the core and no setting): each `apptainer exec` carries
-`--uts --hostname sandbox`, the cell binds a generated read-only `/etc/hostname` of the same name, and the Docker
-agent's container is created with `--hostname sandbox`. A federation with a node of that name is refused at the start.
+must not read (the gate's count of node names, `rest_node_name_hits` in `docs/interfaces.md`, is for the same reason),
+and a Compose cell, which reads its own container's name, does not show it. The core gives every cell on both backends
+one fixed, neutral host name, `sandbox` (`expcore_onedata/sandbox/cellhost.py`, a constant of the core and no setting):
+each `apptainer exec` carries `--uts --hostname sandbox`, and the Docker agent's container is created with
+`--hostname sandbox`. A federation with a node of that name is refused at the start.
+
+**`/etc/hostname`:** the sandbox binds none of its own. From Apptainer's source (read on its `main` branch, not on this
+site's release), `--uts` with a `--hostname` makes Apptainer write an `/etc/hostname` of the name and bind it, and it
+never binds the node's own: `/etc/hosts` and `/etc/localtime` are the only default bind paths, and `--containall` binds
+no others of the site's. A bind of ours onto it would, by the same reading (not run), be a second mount on the same
+path: Apptainer mounts its own first and a user bind after it, so ours would win, and for an image with no
+`/etc/hostname` the source makes a user bind fatal where Apptainer's own is skipped (unless an overlay or underlay makes
+the mount point, which was not read). So the sandbox adds none, and a hook (b) bind onto it is refused (it would replace
+the name).
 
 **Measured (17 Nov 2026, the pilot's site):** its Apptainer runs in setuid mode, and `apptainer exec --uts --hostname
 sandbox <image> hostname` and the same with `uname -n` print `sandbox`, exit 0, with no warning; without `--uts` both
@@ -511,10 +520,10 @@ print the node's own name.
 1. `--uts --hostname sandbox` together with the sandbox's whole argv (`--containall`, `--no-mount
    hostfs,bind-paths,cwd`, the binds, the preloads and the egress shim). The measurement above was a bare exec of an
    image.
-2. A cell's `/etc/hostname`, read from inside: the generated file is bound over the image's, as the cell's other
-   generated files are, and the cell reads the name only if the bind holds. This is not shown.
-3. `hostname`, `uname -n`, `uname -a` and `cat /etc/hostname` run in a cell of a live run, and compared with a Compose
-   cell's.
+2. `cat /etc/hostname` in a cell of a live run, with no bind of ours, which is what ships: it must read `sandbox`
+   (record `apptainer --version`, since the source above is `main`'s). If it reads anything else, a generated file bound
+   at `/etc/hostname` is the fallback, and its start must then be shown not to fail on an image with no such file.
+3. `hostname`, `uname -n`, `uname -a` and `cat /etc/hostname` in a cell of a live run, compared with a Compose cell's.
 
 The tests (`tests/onedata/sandbox/apptainer/test_cell_hostname.py`) read the argv and binds a fake node was given; they
 do not run Apptainer.

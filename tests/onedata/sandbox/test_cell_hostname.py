@@ -1,5 +1,5 @@
-"""O73: every agent cell has one fixed, neutral host name, the same string on both backends, so `hostname`, `uname -n`
-and `/etc/hostname` show a node's name nowhere. These are the Docker sandbox's and the name's own; the Apptainer
+"""O73: every agent cell has one fixed, neutral host name, the same string on both backends, so `hostname` and
+`uname -n` show a node's name nowhere. These are the Docker sandbox's and the name's own; the Apptainer
 backend's are in `apptainer/test_cell_hostname.py`."""
 
 import dataclasses
@@ -34,12 +34,6 @@ def test_o73_the_declared_host_name_is_sandbox_and_a_valid_one():
     assert cellhost.CELL_HOSTNAME == "sandbox"
     assert cellhost.valid(cellhost.CELL_HOSTNAME)
     assert not any(cellhost.valid(name) for name in ("", "a b", "-x", "x-", "x" * 64, "a.b", "not_ok"))
-
-
-def test_o73_the_etc_hostname_text_is_the_name_and_a_newline():
-    """O73: `/etc/hostname` is one line, the name."""
-    assert cellhost.etc_hostname_text() == "sandbox\n"
-    assert cellhost.ETC_HOSTNAME == "/etc/hostname"
 
 
 @pytest.mark.parametrize("mode", [DataPathMode.REST, DataPathMode.NONE])
@@ -80,7 +74,7 @@ def test_o73_only_the_agent_s_container_is_renamed(world):
 
 def test_o73_a_cell_on_docker_reads_the_declared_name_as_its_host_name(world):
     """O73: what `hostname` prints in the fake host's cell is the name its container was given, not the engine's short
-    container id, which would differ on every run."""
+    container id, which would differ on every run. One data path: the argument is the same for each."""
     box = started(world, "isolated")
     try:
         world.host.exec_handler = lambda container, argv, stdin: CmdResult(0, container.hostname() + "\n")

@@ -1,8 +1,7 @@
 """O73: every Apptainer cell has the declared host name, the same string as Docker's. A cell of this backend has no
-network namespace and, without `--uts`, no UTS namespace either: `hostname`, `uname -n` and `/etc/hostname` would show
-the node's own name, a private detail of the site. `--uts --hostname <name>` is in every exec's argv, and
-`/etc/hostname` is a generated file of the name, bound read-only. The Docker sandbox's are in
-`../test_cell_hostname.py`."""
+network namespace and, without `--uts`, no UTS namespace either: `hostname` and `uname -n` would show
+the node's own name, a private detail of the site. `--uts --hostname <name>` is in every exec's argv. The Docker
+sandbox's are in `../test_cell_hostname.py`."""
 
 import dataclasses
 from pathlib import Path
@@ -67,8 +66,8 @@ def test_o73_every_exec_a_run_makes_carries_the_declared_name(node, settings):
 
 @pytest.mark.parametrize("level", ["via-gate", "isolated"])
 def test_o73_a_cell_reads_the_declared_name_as_its_host_name(node, settings, level):
-    """O73: what `hostname` and `uname -n` print in the fake node's cell is the name set in its UTS namespace, whatever
-    the data path; with the flags missing the exec would not parse, and the node's own name would show."""
+    """O73: what `hostname` and `uname -n` print in the fake node's cell is the name set in its UTS namespace, with and
+    without a gate; an exec without the flags would not parse."""
     box = start(node, settings, make_spec(level))
     try:
         node.cell_handler = lambda cell: CmdResult(0, cell.hostname() + "\n")  # after the start's canary
@@ -78,31 +77,14 @@ def test_o73_a_cell_reads_the_declared_name_as_its_host_name(node, settings, lev
         box.stop()
 
 
-@pytest.mark.parametrize("level", ["via-gate", "isolated"])
-def test_o73_every_cell_binds_a_generated_etc_hostname_read_only(node, settings, level):
-    """O73: the cell's `/etc/hostname` is a file the sandbox wrote, one line, the name: the image's own, or one the
-    node might bind, is never what the cell reads. Read-only, in every cell the node ran."""
-    box = start(node, settings, make_spec(level))
-    try:
-        box.exec("print('x')", 30)
-        cells = [done for done in node.execs if done.command[0] == "timeout"]
-        assert cells
-        for done in cells:
-            source, writable = done.binds[cellhost.ETC_HOSTNAME]
-            assert writable is False
-            assert Path(source).parent == box.dir / "cell"
-            assert Path(source).read_text(encoding="utf-8") == cellhost.CELL_HOSTNAME + "\n"
-    finally:
-        box.stop()
-
-
-def test_o73_the_probes_of_the_image_bind_no_hostname_file(node, settings):
-    """O73: a one-shot read of the image binds `/work` alone, as it did; it has the name by its UTS flags."""
+def test_o73_no_exec_binds_a_file_of_the_sandbox_s_own_onto_etc_hostname(node, settings):
+    """O73: `/etc/hostname` is left to Apptainer, which writes its own from `--uts --hostname` and never binds the
+    node's: a bind of ours would be a second mount on the same path, and fatal where the image had none to bind over."""
     box = start(node, settings)
     try:
-        probes = [done for done in node.execs if done.command[0] != "timeout"]
-        assert probes
-        assert all(cellhost.ETC_HOSTNAME not in done.binds for done in probes)
+        box.exec("print('x')", 30)
+        assert node.execs
+        assert all("/etc/hostname" not in done.binds for done in node.execs)
     finally:
         box.stop()
 
