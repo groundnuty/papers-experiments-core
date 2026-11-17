@@ -500,11 +500,9 @@ class Driver(Down):
             argv = ["bash", str(BUNDLE / "provider.sbatch"), str(BUNDLE), tar, name, zone["declared"], site.admin_mail]
             # --import=SPACE=PATH for each tree it owns, none for a mirror
             imports = hpcimport.provider_import_args(self.layout, name, self.environ)
-            names = [
-                f"--declared={services[name]['declared']}",
-                *self.host_args(state),
-            ]  # O70: its own name, every peer's
-            self.launch(name, [*argv, zone["address"], *peers, *imports, *names])
+            # O70: the name it registers under, and every service's name with its address, for its hosts file
+            naming = [f"--declared={services[name]['declared']}", *self.host_args(state)]
+            self.launch(name, [*argv, zone["address"], *peers, *imports, *naming])
         self.say(f"{len(names)} provider(s) launched; registering each")
         for name in names:
             self.register(name, self.record_workdir(name, self.wait_log(name, TOKEN_WAIT)))

@@ -180,6 +180,10 @@ def phase(hpc, tmp_path):
     import fedlayout
     import fedspec
 
+    tls = pytest.importorskip("tls_support")
+    if not tls.HAS_OPENSSL:
+        pytest.skip("no openssl on this host")
+
     root = tmp_path / "root"
     (root / "secrets" / "users").mkdir(parents=True)
     (root / "ca").mkdir()
@@ -187,7 +191,7 @@ def phase(hpc, tmp_path):
     hosts = {s.name: DECLARED[s.name] for s in spec.services}
     layout = fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
     (root / "secrets" / "zone.passphrase").write_text("A1b2C3d4E5f6G7h8", encoding="utf-8")
-    (root / "ca" / "federation-ca.pem").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+    (root / "ca" / "federation-ca.pem").write_text(tls.make_federation_ca(tmp_path / "pki").ca.read_text("ascii"))
     return SimpleNamespace(root=root, layout=layout, spec=spec, tmp=tmp_path)
 
 
