@@ -10,17 +10,19 @@ files the stage before it wrote.
    allowlist alone): the step makes the sandbox's work root and copies the root's `platform.toml` beside the study's
    `study.toml`; its dispatcher `python -I -m expcore run` runs every run in the Apptainer sandbox with `[sandbox]` as
    that file has it, on a fake node (`fake_mount_node`), with a spend journal and snapshots.
-3. Shard fed-a killed outright after its first snapshot, with an attempt that began after it ended and one in flight,
-   then `step --resume`: the killed step's directory on the node removed, the snapshot restored, what the journal holds
-   that it lacks counted once as `lost_in_kill`.
+3. Shard fed-a killed outright after a snapshot of its first two attempts ended and its third in flight, with an
+   attempt that began after it ended and one in flight, then `step --resume`: the killed step's directory on the node
+   removed, the snapshot restored, what the journal holds that it lacks counted once as `lost_in_kill`.
 4. `shards.py collect --run` (which runs `expcore merge`), then `check`, `analyze` and `report` on the merge.
 5. `hpcfed.py down` on each: the relay stopped, the agent's node swept, the held job cancelled, the root gone.
 
 Nothing here reaches a cluster, a container or a model. The kill is timed by holds the study's plugin reads
 (`hpc_rehearsal_plugin`), never by sleeping: the step's own snapshot thread looks for a run's end every 30 s
-(`shards.POLL_S`), and the manifest's `snapshot_every_s` is past the rehearsal, so the first snapshot is the one taken
-at its first look, and the next could come no sooner than 30 s after it; the kill comes within seconds of it, and the
-module checks that no second snapshot was taken. That look is why the module takes about a minute.
+(`shards.POLL_S`), and the manifest's `snapshot_every_s` is past the rehearsal, so a snapshot is taken at a look that
+finds a run ended since the last one. The second attempt is held over the first look, on every run of the module, so
+that look takes a snapshot with that attempt in flight, which the kill must not follow; the fixture accepts the snapshot
+of the next look, which holds the first two attempts ended and the held third in flight. The kill comes within seconds
+of it, and the module checks that it is still the newest. Those two looks are why the module takes about two minutes.
 """
 
 import contextlib
@@ -41,9 +43,11 @@ from hpc_rehearsal_support import (
     Control,
     Federation,
     StepLine,
+    attempt_starts_in,
     attempts_in,
     deploy_modules,
     hpcfed,
+    journaled_starts,
     kill_outright,
     link_check_stand_in,
     make_ca,
@@ -63,7 +67,7 @@ from expcore_onedata.config import load_platform
 __all__ = ["clean_environment"]  # a fixture the stages below use, imported from the support module
 
 pytestmark = [
-    pytest.mark.benchmark,  # a minute of wall time: the step's own snapshot thread looks every 30 s
+    pytest.mark.benchmark,  # two minutes of wall time: the step's own snapshot thread looks every 30 s
     pytest.mark.skipif(not HAS_OPENSSL, reason="the zone's CA is made with openssl"),
 ]
 
@@ -208,9 +212,12 @@ class Shards:
 
     codes: dict[str, int] = field(default_factory=dict)
     logs: dict[str, Path] = field(default_factory=dict)
+    accepted: str = ""  # the snapshot the fixture waited for: the first two attempts ended, the held third in flight
     snapshot_at_kill: list[Path] = field(default_factory=list)
     snapshot_attempts: list[tuple[str, str]] = field(default_factory=list)
+    snapshot_starts: set[tuple[str, str]] = field(default_factory=set)  # (run_key, started_utc) of the newest one's
     journals_at_kill: list[str] = field(default_factory=list)
+    journaled: set[tuple[str, str]] = field(default_factory=set)  # the same, of every attempt the killed life journaled
     archive_at_kill: bool = False
     left_at_kill: list[str] = field(default_factory=list)  # the killed step's directory on the agent's node
     left_after_resume: list[str] = field(default_factory=list)
@@ -221,9 +228,11 @@ class Shards:
 
 @pytest.fixture(scope="module")
 def shards(plan, federations, shared) -> Shards:
-    """fed-b's step runs to its end while fed-a's first life is held at its third attempt until the step's first
-    snapshot holds that attempt in flight, released, held again at its fifth, and killed outright; then fed-a's step is
-    run again with `--resume`."""
+    """fed-b's step runs to its end while fed-a's first life is held at its second attempt over the step's first look,
+    which takes a snapshot with that attempt in flight, then released and held at its third until the next look takes
+    a snapshot holding the third in flight with the two before it ended; that one accepted, the third is released, the
+    fifth held, and the step killed outright; then fed-a's step is run again with `--resume`. What the kill left is
+    read before the resume, which prunes the older snapshots."""
     found, control = Shards(), shared.control
     snapdir = plan.results / KILLED / "snapshots"
     for n in (PINNED_AT, SNAPSHOT_AT, KILL_AT):
@@ -232,16 +241,25 @@ def shards(plan, federations, shared) -> Shards:
     killed = plan.lines[KILLED].start(found.logs[f"{KILLED}-1"])
     whole = plan.lines[WHOLE].start(found.logs[WHOLE])
     try:
-        control.wait_held(KILLED, PINNED_AT, killed)  # the first look comes with this attempt in flight: pinned, so
-        wait_for(lambda: any(snapdir.glob("snap-*")), killed, 150.0, "the snapshot of the first look")  # every run
-        control.release(KILLED, PINNED_AT)  # of the module takes that early snapshot, not only a slow host's
+        # the first look comes with the second attempt in flight on every run of the module, not only on a slow host's
+        control.wait_held(KILLED, PINNED_AT, killed)
+        wait_for(lambda: any(snapdir.glob("snap-*")), killed, 150.0, "the snapshot of the first look")
+        control.release(KILLED, PINNED_AT)
         control.wait_held(KILLED, SNAPSHOT_AT, killed)
 
-        def snapshot_with_the_held_attempt() -> bool:
+        def snapshot_of_the_held_third() -> bool:
+            """The newest snapshot holds the first two attempts ended and the held third in flight (and no other);
+            an earlier one does not, and the next look takes the one that does."""
             taken = sorted(snapdir.glob("snap-*"))
-            return bool(taken) and any(state == "running" for _, state in attempts_in(taken[-1]))
+            if not taken:
+                return False
+            states = [state for _, state in attempts_in(taken[-1])]
+            if not (len(states) == SNAPSHOT_AT and states.count("running") == 1 and states[-1] == "running"):
+                return False
+            found.accepted = taken[-1].name
+            return True
 
-        wait_for(snapshot_with_the_held_attempt, killed, 150.0, "a snapshot holding the held attempt")
+        wait_for(snapshot_of_the_held_third, killed, 150.0, "a snapshot of the two ended attempts and the held third")
         control.release(KILLED, SNAPSHOT_AT)
         control.wait_held(KILLED, KILL_AT, killed)
         found.snapshot_at_kill = sorted(snapdir.glob("snap-*"))
@@ -250,6 +268,8 @@ def shards(plan, federations, shared) -> Shards:
         found.codes[f"{KILLED}-1"] = killed.returncode
         found.archive_at_kill = (plan.results / f"{KILLED}.out.tar").exists()
         found.snapshot_attempts = attempts_in(found.snapshot_at_kill[-1])
+        found.snapshot_starts = attempt_starts_in(found.snapshot_at_kill[-1])
+        found.journaled = journaled_starts(plan.results / KILLED / "journals" / found.journals_at_kill[0])
         found.left_at_kill = sorted(p.name for p in shared.node_tmp.glob(f"expcore-shard-{KILLED}.*"))
         control.clear()  # the second life holds nothing
         again = plan.lines[KILLED].start(found.logs[f"{KILLED}-2"], "--resume")
@@ -263,15 +283,16 @@ def shards(plan, federations, shared) -> Shards:
     return found
 
 
-def test_every_step_ends_and_fed_a_was_killed_outright_after_exactly_one_snapshot(shards):
-    """The kill left the snapshot taken while attempt 3 was in flight and nothing newer (the rehearsal's timing: a
-    second snapshot here would make what follows another case, so it fails the module rather than pass another way),
-    one journal, and no archive."""
+def test_every_step_ends_and_fed_a_was_killed_outright_with_the_held_thirds_snapshot_the_newest(shards):
+    """The kill left the snapshot the fixture accepted, taken while attempt 3 was in flight and the two before it
+    ended, as the newest (the rehearsal's timing: a snapshot taken after it, at attempt 3's end, would make what
+    follows another case, so it fails the module rather than pass another way), one journal, and no archive."""
     assert shards.codes[f"{KILLED}-1"] < 0, shards.printed(f"{KILLED}-1")
-    assert [p.name for p in shards.snapshot_at_kill] == ["snap-000001"]
+    assert shards.snapshot_at_kill[-1].name == shards.accepted, [p.name for p in shards.snapshot_at_kill]
     assert len(shards.journals_at_kill) == 1
     assert not shards.archive_at_kill
     states = [state for _, state in shards.snapshot_attempts]
+    assert len(states) == SNAPSHOT_AT, states
     assert states.count("running") == 1, states
     assert states[-1] == "running"
     assert shards.codes[f"{KILLED}-2"] == 0, shards.printed(f"{KILLED}-2")
@@ -294,7 +315,7 @@ def test_the_resume_removed_the_killed_steps_directory_on_the_agents_node(shards
 
 def test_the_resume_restores_the_snapshot_and_counts_what_the_journal_holds_beyond_it_once(shards):
     printed = shards.printed(f"{KILLED}-2")
-    assert f"shards: shard {KILLED} resumes from snapshot snap-000001" in printed
+    assert f"shards: shard {KILLED} resumes from snapshot {shards.accepted}" in printed
     assert "counted as lost_in_kill" in printed
 
 
@@ -321,9 +342,17 @@ def test_collect_merges_both_shards_and_every_command_on_the_merge_succeeds(merg
     assert [(s["index"], s["label"]) for s in batch["shards"]] == [(1, KILLED), (2, WHOLE)]
 
 
-def test_the_merged_export_carries_the_kills_lost_spend_with_its_basis_and_the_interrupted_attempt(merged):
+def test_the_merged_export_carries_the_kills_lost_spend_with_its_basis_and_the_interrupted_attempt(merged, shards):
+    """O63: the attempts begun after the restored snapshot are the lost spend, each counted once: the snapshot holds
+    none of them, and with them it holds every attempt the killed life journaled, no more. That holds whichever
+    snapshot the resume found; the shape checked after it is the case this module sets up (attempt 4 ended, 5 in
+    flight)."""
     export = merged.read("export.json")
     lost = export[LOST_KEY]
+    starts = [(entry["run_key"], entry["started_utc"]) for entry in lost if entry["kind"] == "attempt"]
+    assert len(set(starts)) == len(starts), starts
+    assert not set(starts) & shards.snapshot_starts
+    assert set(starts) | shards.snapshot_starts == shards.journaled
     assert [(entry["kind"], entry["ended"]) for entry in lost] == [("attempt", True), ("attempt", False)]
     assert {entry["shard"] for entry in lost} == {1}
     assert lost[1]["basis"] == "measured"
