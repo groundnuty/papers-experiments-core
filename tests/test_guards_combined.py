@@ -201,8 +201,8 @@ def test_a_rerun_the_kernel_refuses_keeps_the_primary_and_says_why(prereg, monke
 # --- a campaign that mixes mount and REST runs: the combined rerun leaves a run out only for a guard that applies ----
 
 
-def test_o69_a_run_the_mount_guard_does_not_apply_to_is_left_out_only_for_egress(prereg):
-    """O69: not applicable to the mount guard and clean to egress: kept. Not applicable and flagged or unknown to
+def test_o72_a_run_the_mount_guard_does_not_apply_to_is_left_out_only_for_egress(prereg):
+    """O72: not applicable to the mount guard and clean to egress: kept. Not applicable and flagged or unknown to
     egress: left out, by egress alone. A mount run unknown to the mount guard is left out, by the mount guard."""
     rows = rows_of_pairs(8)
     cases = {
@@ -228,8 +228,8 @@ def test_o69_a_run_the_mount_guard_does_not_apply_to_is_left_out_only_for_egress
     assert {run.run_key for run in mount.left_out} == {rows[3].run_key, rows[4].run_key}  # not the REST runs
 
 
-def test_o69_a_run_not_applicable_to_the_mount_guard_and_clean_to_egress_stays_in_the_combined_rerun(prereg):
-    """O69: nothing is left out, so there is no combined rerun."""
+def test_o72_a_run_not_applicable_to_the_mount_guard_and_clean_to_egress_stays_in_the_combined_rerun(prereg):
+    """O72: nothing is left out, so there is no combined rerun."""
     rows = rows_of_pairs(4)
     _, mount, both = analysed(rows, prereg, dict.fromkeys(range(8), ("clean", "not_applicable")))
     assert both.left_out == ()
@@ -238,7 +238,7 @@ def test_o69_a_run_not_applicable_to_the_mount_guard_and_clean_to_egress_stays_i
 
 
 def test_a_guard_state_this_code_does_not_know_leaves_the_run_out():
-    """O69: only `clean` and `not_applicable` keep a run: an unknown word is never read as a pass."""
+    """O72: only `clean` and `not_applicable` keep a run: an unknown word is never read as a pass."""
     from expcore.guards import GuardedRun
 
     assert GuardedRun("k", 1, "c", "clean", "not_applicable").by is None
@@ -246,7 +246,7 @@ def test_a_guard_state_this_code_does_not_know_leaves_the_run_out():
     assert GuardedRun("k", 1, "c", "", "clean").by == "egress"
 
 
-# --- every guard: the process-visibility check joins the combined rerun (O70) ----------------------------------------
+# --- every guard: the process-visibility check joins the combined rerun (O73) ----------------------------------------
 
 FIGURES = {"margin_bytes": 1, "start_unexplained_bytes": 0, "unexplained_peak_bytes": 0, "cgroup_anon_bytes": 5,
            "visible_anon_bytes": 5}  # fmt: skip
@@ -303,8 +303,8 @@ THREE = {
 }
 
 
-def test_o70_the_combined_rerun_leaves_out_a_run_any_of_the_three_guards_leaves_out(prereg):
-    """O70: process visibility flagged or unknown, alone or with the others, leaves a run out of the combined rerun,
+def test_o73_the_combined_rerun_leaves_out_a_run_any_of_the_three_guards_leaves_out(prereg):
+    """O73: process visibility flagged or unknown, alone or with the others, leaves a run out of the combined rerun,
     beside the runs egress and the mount guard leave out; a run not applicable to the mount guard stays in."""
     rows = rows_of_pairs(8)
     _, mount, seen, both = analysed_all(rows, prereg, THREE)
@@ -326,7 +326,7 @@ def test_o70_the_combined_rerun_leaves_out_a_run_any_of_the_three_guards_leaves_
     assert {run.run_key for run in mount.left_out} == {rows[i].run_key for i in (5, 8)}
 
 
-def test_o70_the_counts_of_three_guards_name_each_guard_and_those_left_out_by_several(prereg):
+def test_o73_the_counts_of_three_guards_name_each_guard_and_those_left_out_by_several(prereg):
     rows = rows_of_pairs(8)
     _, _, _, both = analysed_all(rows, prereg, THREE)
     assert both.counts() == {
@@ -340,7 +340,7 @@ def test_o70_the_counts_of_three_guards_name_each_guard_and_those_left_out_by_se
     assert both.by_condition()["cond-a"]["visibility_only"] == 1  # row 0, in cond-a
 
 
-def test_o70_a_batch_of_egress_and_the_visibility_check_alone_is_combined_with_the_word_both(prereg):
+def test_o73_a_batch_of_egress_and_the_visibility_check_alone_is_combined_with_the_word_both(prereg):
     rows = rows_of_pairs(8)
     cases = {0: ("flagged", "clean", "clean"), 1: ("clean", "clean", "unknown"), 2: ("flagged", "clean", "flagged")}
     _, mount, _, both = analysed_all(rows, prereg, cases, guards=("egress", "visibility"))
@@ -351,7 +351,7 @@ def test_o70_a_batch_of_egress_and_the_visibility_check_alone_is_combined_with_t
     assert not both.legacy
 
 
-def test_o70_a_batch_of_egress_and_the_mount_guard_alone_keeps_its_vocabulary(prereg):
+def test_o73_a_batch_of_egress_and_the_mount_guard_alone_keeps_its_vocabulary(prereg):
     rows = rows_of_pairs(8)
     _, _, _, both = analysed_all(rows, prereg, {0: ("flagged", "flagged", "clean")}, guards=("egress", "mount"))
     assert both.legacy
@@ -359,21 +359,21 @@ def test_o70_a_batch_of_egress_and_the_mount_guard_alone_keeps_its_vocabulary(pr
     assert both.runs[0].by == "both"
 
 
-def test_o70_a_run_unknown_to_the_visibility_check_and_clean_to_the_others_is_left_out(prereg):
+def test_o73_a_run_unknown_to_the_visibility_check_and_clean_to_the_others_is_left_out(prereg):
     rows = rows_of_pairs(4)
     _, _, _, both = analysed_all(rows, prereg, {0: ("clean", "clean", "unknown")})
     assert [run.run_key for run in both.left_out] == [rows[0].run_key]
     assert both.runs[0].visibility == "unknown"
 
 
-def test_o70_one_guard_alone_has_no_combined_rerun_whichever_it_is(prereg):
+def test_o73_one_guard_alone_has_no_combined_rerun_whichever_it_is(prereg):
     rows = rows_of_pairs(4)
     for guard in ("egress", "mount", "visibility"):
         *_, both = analysed_all(rows, prereg, {0: ("flagged", "flagged", "flagged")}, guards=(guard,))
         assert both is None
 
 
-def test_o70_verdicts_of_different_runs_are_refused_for_any_guard(prereg):
+def test_o73_verdicts_of_different_runs_are_refused_for_any_guard(prereg):
     rows = rows_of_pairs(2)
     egress, mount, seen, _ = analysed_all(rows, prereg, {})
     reordered = type(seen)(tuple(reversed(seen.runs)), seen.sensitivity, seen.refused)

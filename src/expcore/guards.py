@@ -1,5 +1,5 @@
 # Provenance: new
-"""Every guard together: the preregistered analysis again without every run that any guard leaves out (#179, O60, O70).
+"""Every guard together: the preregistered analysis again without every run that any guard leaves out (#179, O60, O73).
 It is the rerun a reader asks for of a batch checked by two or more guards, beside each guard's own.
 
 `guards_analysis(rows, absent, prereg, egress, mount, visibility=None)` takes the analysis rows in the export's order,

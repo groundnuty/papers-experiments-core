@@ -273,10 +273,10 @@ def test_a_study_checked_by_both_guards_reruns_without_the_runs_either_leaves_ou
     assert "#### Preregistered contrasts without the runs either guard leaves out" in report
 
 
-def test_o69_a_campaign_that_mixes_data_paths_keeps_its_rest_runs_in_the_mount_guards_rerun(
+def test_o72_a_campaign_that_mixes_data_paths_keeps_its_rest_runs_in_the_mount_guards_rerun(
     tmp_path, clean_environment
 ):
-    """O69: `river`'s runs are REST runs whose record says they had no mount, `lake`'s mount runs touched the token's
+    """O72: `river`'s runs are REST runs whose record says they had no mount, `lake`'s mount runs touched the token's
     directory, `hill`'s logs were never closed and the rest are clean: the REST runs are not applicable, are kept in the
     rerun and are shown so."""
     analysis = checked_study(tmp_path, clean_environment, guard=True, rest_task="river")
@@ -295,10 +295,10 @@ def test_o69_a_campaign_that_mixes_data_paths_keeps_its_rest_runs_in_the_mount_g
     assert "Not applicable" in made[REPORT_FILE].decode()
 
 
-def test_o70_a_study_checked_by_all_three_guards_reruns_without_the_runs_any_of_them_leaves_out(
+def test_o73_a_study_checked_by_all_three_guards_reruns_without_the_runs_any_of_them_leaves_out(
     tmp_path, clean_environment
 ):
-    """O70: the process-visibility check joins the combined rerun: `river`'s runs, whose memory reading is unknown, are
+    """O73: the process-visibility check joins the combined rerun: `river`'s runs, whose memory reading is unknown, are
     left out of it beside the runs the mount guard and egress leave out, and analysis.json, the report and the
     terminal carry it."""
     analysis = checked_study(tmp_path, clean_environment, guard=True, egress=True, visibility=True)
@@ -322,10 +322,10 @@ def test_o70_a_study_checked_by_all_three_guards_reruns_without_the_runs_any_of_
     assert "#### Preregistered contrasts without the runs any guard leaves out" in report
 
 
-def test_o69_a_rest_arm_that_lists_no_mount_guard_is_not_applicable_by_the_campaigns_recorded_data_paths(
+def test_o72_a_rest_arm_that_lists_no_mount_guard_is_not_applicable_by_the_campaigns_recorded_data_paths(
     tmp_path, clean_environment
 ):
-    """O69: the REST level's runs (`relay-down`) hold no mount-guard snapshot at all, as when the guard was listed on
+    """O72: the REST level's runs (`relay-down`) hold no mount-guard snapshot at all, as when the guard was listed on
     the mount runs alone; the campaign fingerprint maps the level to `rest`, so they are not applicable and stay in the
     rerun, and the mount runs of `lake` (token touched) and `hill` (log never closed) are left out."""
     analysis = checked_study(tmp_path, clean_environment, guard=True, data_paths=True)
