@@ -244,3 +244,33 @@ def test_o83_a_template_that_spells_its_slots_another_way_still_protects_its_slo
             provision(boot, spec)
         assert zone.snapshot() == before
         assert zone.writes == []
+
+
+def test_o83_a_rerun_after_a_partial_up_finishes_the_slot_users_that_up_made_and_matches_the_rest(hpc, tmp_path):
+    """O83: an up that stopped after it made the users (a provider's panel answering 500, as the day-0 reports saw) is
+    rerun: the slot users this bootstrap made and did not finish are finished, as any principal is, while a slot user
+    that was there before stays read-only. Afterwards each is exactly as declared and the record of the unfinished is
+    gone, so a third up finds all of them `matched`."""
+    for _, zone, boot, layout in boots(hpc, tmp_path):
+        spec = boot.spec
+        made_by_hand(zone, layout, spec, only={"slot1-data", "alpha-reader"})
+        boot.ensure_users()  # up stopped here: the other three slot users exist, with no membership yet
+        assert "uid-slot1-tools" not in zone.members["sid-alpha-space"]
+        second = type(boot)(zone, layout, *((5001, 5001),) if type(boot).__name__ == "HpcBootstrap" else ())
+        second.zone = zone.zone
+        second.ids.spaces = dict(boot.ids.spaces)
+        assert provision(second, spec) == {
+            "slot1-data": "matched",
+            "slot1-tools": "created",
+            "slot2-data": "created",
+            "slot2-tools": "created",
+        }
+        assert zone.members["sid-alpha-space"]["uid-slot1-tools"] == READ_SET
+        assert zone.members["sid-alpha-space"]["uid-slot2-tools"] == WRITE_SET
+        assert not list(layout.secrets.glob("*.pending"))
+        third = type(boot)(zone, layout, *((5001, 5001),) if type(boot).__name__ == "HpcBootstrap" else ())
+        third.zone = zone.zone
+        third.ids.spaces = dict(boot.ids.spaces)
+        sent = len(zone.writes)
+        assert provision(third, spec) == dict.fromkeys(SLOT_USERS, "matched")
+        assert len(zone.writes) == sent
