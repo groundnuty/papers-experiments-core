@@ -82,10 +82,12 @@ def build_analysis(context):
 
 def with_builders(base: Path, name: str, extra: str = BOTH_BUILDERS, *, held: bool = False) -> Path:
     """A stamped copy of the example whose plugin gains `extra`; the scorer is code, so the stamp is made after. With
-    `held`, a budget too small for any run, so a start opens the store, pins its fingerprint and returns."""
+    `held`, a budget too small for any run, so a start opens the store, pins its fingerprint and returns, and room for
+    two shards (a model's cap is at least the number of shards)."""
     copy = make_copy(base, name)
     if held:
         text = (copy / "campaign.toml").read_text(encoding="utf-8").replace("max_usd = 5.0", "max_usd = 0.00001")
+        text = text.replace("alpha-stub = 1", "alpha-stub = 2").replace("beta-stub = 1", "beta-stub = 2")
         (copy / "campaign.toml").write_text(text, encoding="utf-8")
     plugin = copy / "plugin.py"
     plugin.write_text(plugin.read_text(encoding="utf-8") + extra, encoding="utf-8")
