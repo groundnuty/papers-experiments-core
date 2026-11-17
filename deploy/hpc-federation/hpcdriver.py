@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import hpcimport
+import hpcnames
 import hpcpins
 import hpcrelay
 import hpcstate
@@ -386,9 +387,11 @@ class Driver(Down):
         state["phase"] = "placed"
 
     def node_facts(self) -> None:
-        """Each node's FQDN, its IPv4 address and the job's uid and gid, from a control step on it."""
+        """Each node's FQDN, its IPv4 address and the job's uid and gid, from a control step on it; then each service's
+        declared name, and the address map the login node's clients dial them through (`write_address_map`)."""
         state = self.store.read()
         site, prefix = Site.from_json(state["site"]), state["allocation"]["name"]
+        declared = hpcnames.declared_names(self.spec)
         for role in state["roles"]:
             argv = [site.node_python, "-I", "-B", str(BUNDLE / "nodefacts.py")]
             node = state["services"][role]["node"]
@@ -405,10 +408,24 @@ class Driver(Down):
                 )
             self.set(
                 lambda s, r=role, f=facts, o=owner: (
-                    s["services"][r].update(fqdn=f["fqdn"], address=f["address"]),
+                    s["services"][r].update(fqdn=f["fqdn"], address=f["address"], declared=declared.get(r)),
                     s.update(owner=list(o)),
                 )
             )
+        self.write_address_map()
+
+    def write_address_map(self) -> None:
+        """The map from each declared name to its node's address and the node's own names, into the root's secrets
+        (0600), before any service is launched or any client of the login node dials one (O70). It is the root's own
+        file, never in a cell, the gate's file or the facts. A service without an address stops up here."""
+        state = self.store.read()
+        found = hpcnames.address_map(hpcnames.declared_names(self.spec), state["services"])
+        found.write(self.layout.address_map)
+
+    def host_args(self, state: Mapping[str, Any]) -> List[str]:
+        """The `--host` arguments every service is launched with: each service's declared name and its node's address,
+        so its hosts file resolves every peer. A service the state has no address for stops up."""
+        return hpcnames.host_args(hpcnames.address_map(hpcnames.declared_names(self.spec), state["services"]))
 
     def launch(self, service: str, argv: Sequence[str]) -> None:
         """Launch a service step; its name, its log and its launch count are recorded first."""
@@ -467,7 +484,7 @@ class Driver(Down):
         tar = str(Path(site.images) / "onezone.tar")
         peers = [services[p.name]["address"] for p in self.spec.providers]
         argv = ["bash", str(BUNDLE / "zone.sbatch"), str(BUNDLE), tar, self.spec.project[:40], *peers]
-        self.launch("zone", argv)
+        self.launch("zone", [*argv, f"--declared={services['zone']['declared']}", *self.host_args(state)])
         self.say("zone launched; waiting for its verdict")
         self.record_workdir("zone", self.wait_log("zone", VERDICT["oz"]))
         self.set(lambda s: (s["services"]["zone"].update(state="running"), s.update(phase="zone")))
@@ -480,10 +497,14 @@ class Driver(Down):
         names = [p.name for p in self.spec.providers]
         for name in names:
             peers = [services[p]["address"] for p in names if p != name]
-            argv = ["bash", str(BUNDLE / "provider.sbatch"), str(BUNDLE), tar, name, zone["fqdn"], site.admin_mail]
+            argv = ["bash", str(BUNDLE / "provider.sbatch"), str(BUNDLE), tar, name, zone["declared"], site.admin_mail]
             # --import=SPACE=PATH for each tree it owns, none for a mirror
             imports = hpcimport.provider_import_args(self.layout, name, self.environ)
-            self.launch(name, [*argv, zone["address"], *peers, *imports])
+            names = [
+                f"--declared={services[name]['declared']}",
+                *self.host_args(state),
+            ]  # O70: its own name, every peer's
+            self.launch(name, [*argv, zone["address"], *peers, *imports, *names])
         self.say(f"{len(names)} provider(s) launched; registering each")
         for name in names:
             self.register(name, self.record_workdir(name, self.wait_log(name, TOKEN_WAIT)))
@@ -574,7 +595,12 @@ class Driver(Down):
         self.layout.ca_pem.write_text(ca_certificates(export("ca")), encoding="utf-8")
 
     def placed_layout(self, state: Mapping[str, Any]) -> Layout:
-        hosts = {name: record["fqdn"] for name, record in state["services"].items() if record["kind"] in ("oz", "op")}
+        """The layout with every service at its declared name (O70): its URLs, and the facts and the platform file built
+        from them, hold the name the service registered under, never its node's. The root's address map says where each
+        is dialled."""
+        hosts = {
+            name: record["declared"] for name, record in state["services"].items() if record["kind"] in ("oz", "op")
+        }
         return Layout(self.root, self.layout.parent, hpc_spec(self.spec, hosts))
 
     def core_here(self) -> str:

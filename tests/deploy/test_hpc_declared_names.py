@@ -307,16 +307,22 @@ def test_o70_a_federation_table_of_the_registered_names_is_accepted_and_none_is_
         (_table(ZONE_NAME, "aspen.other.test"), "aspen"),
     ],
 )
-def test_o70_a_federation_table_whose_names_are_not_the_registered_ones_is_refused_by_declared_names_only(
-    hpc, table, why
-):
-    """O70: a table that names what no service registered under is refused, the message naming the table's own names
-    and the roles, never the name a service did register (which, from an older registration, is a node's)."""
-    registered = {**DECLARED, "zone": FQDN["zone"], "aspen": FQDN["aspen"]}
+def test_o70_a_federation_table_of_other_names_is_refused_naming_the_table_s_own(hpc, table, why):
+    """O70: a table that names what no service registered under is refused, the message naming the table's own name
+    and the role."""
     with pytest.raises(RuntimeError, match=why) as refused:
-        hpc.names.check_federation_table(table, registered)
+        hpc.names.check_federation_table(table, dict(DECLARED))
+    assert "ordering" in str(refused.value)
+
+
+def test_o70_a_federation_table_over_an_older_registration_is_refused_without_naming_the_nodes(hpc):
+    """O70: services that registered their node's names (an `up` before the declared names) refuse the table of the
+    declared names, and the message names the table's own names alone, never the name that was registered."""
+    registered = {role: FQDN[role] for role in NODES}
+    with pytest.raises(RuntimeError, match="zone") as refused:
+        hpc.names.check_federation_table(_table(ZONE_NAME, DECLARED["aspen"]), registered)
     assert not re.search(r"cluster\.example\.org|10\.0\.0", str(refused.value))
-    assert "ordering" in str(refused.value) or "registered" in str(refused.value)
+    assert ZONE_NAME in str(refused.value)
 
 
 def test_o70_a_federation_table_with_no_record_of_what_was_registered_is_refused(hpc):

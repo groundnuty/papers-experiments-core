@@ -1,9 +1,10 @@
 """The HPC federation's bootstrap, `platform.toml` and link check: the Compose federation's own code, over the services'
 real addresses (DESIGN.md, sections 5 and 6).
 
-- **The services' URLs** are `https://<node FQDN>:8443` (the shim moves the worker's 443 there), so `HpcService` is the
-  Compose `Service` with the node's name in place of the loopback port; the Compose bootstrap (`fedboot.Bootstrap`), the
-  baseline (`fedcontent.Content`) and the facts (`fedfacts`) then run unchanged.
+- **The services' URLs** are `https://<declared name>:8443` (the shim moves the worker's 443 there), so `HpcService` is
+  the Compose `Service` with the layout's declared name in place of the loopback port (O70: the services register
+  under it, and the root's address map says where it is dialled); the Compose bootstrap (`fedboot.Bootstrap`), the
+  baseline (`fedcontent.Content`) and the facts (`fedfacts`) then run unchanged, the client given the map.
 - **The storage** is the one posix storage the bundle's `finish.sh` adds to each provider, owned by the job's uid on
   the node's tmpfs, with Onedata's LUMA local feed: each support also maps the space's default credentials, and every
   user of the federation, to that uid (as `bundle/onboard.py` does), or the users could reach none of its files. The
@@ -30,6 +31,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
 import hpcimport
+import hpcnames
 import tomllib
 from fedboot import Bootstrap
 from fedcontent import Content
@@ -40,6 +42,7 @@ from fedlinks import check_after_up
 from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
 
+from expcore_onedata.addresses import AddressMap
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
 
 HTTPS_PORT = 8443  # every service's public port: its 443, moved by the port shim
@@ -69,7 +72,7 @@ PROVISIONAL_MARGIN_S = 10**9  # the margin the platform file is first written wi
 
 @dataclass(frozen=True)
 class HpcService(Service):
-    """A service of the layout, at its node's FQDN on the public port."""
+    """A service of the layout, at its declared name on the public port (the name it registers under)."""
 
     host: str = ""
 
@@ -79,10 +82,13 @@ class HpcService(Service):
 
 
 def hpc_spec(spec: Spec, hosts: Mapping[str, str]) -> Spec:
-    """The layout with every service at its node's FQDN (`hosts`, by service name); every other value as declared."""
+    """The layout with every service at its declared name (`hosts`, by service name, from `hpcnames.declared_names`);
+    every other value as declared. The service keeps the layout's own domain, so its `domain` is the declared name."""
 
     def placed(service: Service) -> HpcService:
-        return HpcService(service.name, service.port, service.domain, service.memory_limit, hosts[service.name])
+        return HpcService(
+            service.name, service.port, service.federation_domain, service.memory_limit, hosts[service.name]
+        )
 
     return replace(spec, zone=placed(spec.zone), providers=tuple(placed(p) for p in spec.providers))
 
@@ -95,6 +101,7 @@ class HpcBootstrap(Bootstrap):
         super().__init__(rest, layout)
         self.owner = owner  # the uid and gid the storage belongs to (finish.sh adds it as the job user)
         self._mapped: set = set()  # the (provider, storage) pairs whose users are mapped already
+        self.registered: Optional[Dict[str, str]] = None  # what each service reported as its domain (O70), once read
 
     def import_storage_extra(self, service: Service) -> Dict[str, Any]:
         """What an imported storage is made with beyond what the layout declares: the job user's ids, the local LUMA
@@ -155,6 +162,9 @@ def bring_up(boot: Bootstrap) -> None:
         if boot.spec.members(space.name):
             boot.ensure_members(space.name)
     boot.wait_import(IMPORT_TIMEOUT_S)  # each import's one scan complete (no-op with no import)
+    boot.registered = hpcnames.registered_domains(
+        boot
+    )  # O70: what each service registered, for the facts and the checks
 
 
 def rule_margin_s(rendered: str, settle_timeout_s: float) -> int:
@@ -216,23 +226,56 @@ def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, 
     """Write the platform file: the Compose placeholders from the facts, the HPC ones, and the token margin last, the
     least the platform layer accepts for the rest of the file. Returns the text written."""
     filled = {**placeholders(facts), **values, "hpc_token_margin_s": str(PROVISIONAL_MARGIN_S)}
-    text = render(template, filled)
+    text = rendered(template, filled)
+    # O70: a `[sandbox.federation]` table is usable only once the providers registered the declared names, which the
+    # facts record: refused here, before the file is written or loaded
+    hpcnames.check_federation_table(text, registered_of(facts))
     write_private(path, text)
     if "@hpc_token_margin_s@" not in template:
         return text
     filled["hpc_token_margin_s"] = str(least_margin_s(path, text, float(values["hpc_settle_timeout_s"])))
-    text = render(template, filled)
+    text = rendered(template, filled)
     write_private(path, text)
     return text
+
+
+def rendered(template: str, filled: Mapping[str, str]) -> str:
+    """The template filled in, and, once the root holds an address map (`hpc_addresses`, its path), `addresses` first:
+    the file where the platform layer's clients find the address each declared name is dialled at (O70). A top-level key
+    of its own, so it may precede every table."""
+    text = render(template, dict(filled))
+    if "hpc_addresses" not in filled:
+        return text
+    return f"addresses = {{ file = {json.dumps(filled['hpc_addresses'])} }}\n" + text
+
+
+def registered_of(facts: Mapping[str, Any]) -> Dict[str, str]:
+    """The domains the services registered under, by service name, as facts.json records them (`write_facts`)."""
+    found: Dict[str, str] = {}
+    zone = facts.get("zone", {}).get("registered_domain")
+    if zone:
+        found["zone"] = zone
+    for name, provider in facts.get("providers", {}).items():
+        if provider.get("registered_domain"):
+            found[name] = provider["registered_domain"]
+    return found
 
 
 def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> str:
     """facts.json, and platform.toml from the layout's template with the HPC values."""
     facts = facts_of(boot)
+    registered = getattr(boot, "registered", None)
+    if registered:  # O70: what each service reported as its domain; with the DNS check, which is advisory
+        facts["zone"]["registered_domain"] = registered.get("zone")
+        for name, provider in facts["providers"].items():
+            provider["registered_domain"] = registered.get(name)
+        facts["dns_check"] = dict(hpcnames.DNS_CHECK)
     layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     template = layout.spec.platform_template
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
+    if layout.address_map.is_file():  # the platform layer's clients dial each declared name at its mapped address
+        values = {**values, "hpc_addresses": str(layout.address_map)}
     write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values)
     return "facts.json and platform.toml written"
 
@@ -271,10 +314,14 @@ def core_phase(
     if not passphrase.is_file() or not layout.ca_pem.is_file():
         raise RuntimeError("the root holds no zone passphrase or no CA: the zone's export did not run")
     env = os.environ if environ is None else environ
-    client = rest(layout.ca_pem)
+    addresses = AddressMap.load(layout.address_map) if layout.address_map.is_file() else None
+    client = rest(layout.ca_pem) if addresses is None else rest(layout.ca_pem, addresses=addresses)
     try:
         boot = bootstrap(client, layout, owner)
         steps(boot)
+        registered = getattr(boot, "registered", None)
+        if registered is not None:  # O70: every service registered under its declared name, or nothing reaches it
+            hpcnames.check_registered(hpcnames.declared_names(layout.spec), registered)
         if not layout.facts.exists():
             content(boot).reset(TRANSFER_TIMEOUT_S)
         manifests = hpcdata.data_manifests(layout, env)
