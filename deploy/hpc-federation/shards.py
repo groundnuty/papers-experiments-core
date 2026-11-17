@@ -1198,6 +1198,7 @@ def _run_step(
             (work / name).mkdir(mode=0o700)
         env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
         env |= {**home_env(str(work / "home")), "TMPDIR": str(work / "tmp")}  # never the account's ~
+        env["PYTHONDONTWRITEBYTECODE"] = "1"  # B1: for a Python the dispatcher's children start without -I -B
         journals = args.results / args.label / JOURNALS
         journals.mkdir(parents=True, exist_ok=True)
         journal = journals / f"{_stamp()}-{os.getpid()}-{secrets.token_hex(4)}.jsonl"

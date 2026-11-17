@@ -121,12 +121,13 @@ def test_b1_the_steps_expcore_run_takes_both_flags(shards, tmp_path):
     seen = {}
 
     def runner(argv, env, cwd):
-        seen["argv"] = list(argv)
+        seen["argv"], seen["env"] = list(argv), dict(env)
         return 0
 
     nothing = SimpleNamespace(start=lambda out: None, stop=lambda out: None)
     shards.step(args, runner=runner, core_found=lambda src: True, snapshots=nothing)
     assert seen["argv"][:5] == [sys.executable, "-I", "-B", "-m", "expcore"]
+    assert seen["env"]["PYTHONDONTWRITEBYTECODE"] == "1"  # what a child the dispatcher starts without -I honours
 
 
 def test_b1_the_sandboxs_helpers_on_the_node_take_both_flags(tmp_path):

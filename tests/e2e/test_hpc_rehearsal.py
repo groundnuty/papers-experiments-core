@@ -214,13 +214,31 @@ class Shards:
     archive_at_kill: bool = False
     left_at_kill: list[str] = field(default_factory=list)  # the killed step's directory on the agent's node
     left_after_resume: list[str] = field(default_factory=list)
+    campaign_check: str | None = "not run"  # what resume-line's campaign check said of the killed shard (None: passed)
 
     def printed(self, life: str) -> str:
         return self.logs[life].read_text(encoding="utf-8", errors="replace")
 
 
+def campaign_check(deploy, plan) -> str | None:
+    """resume-line's check of the killed shard's newest snapshot against the study beside its federation's platform
+    file (`shardresume.check_campaign`); None when it passes, else its refusal."""
+    resume = deploy.shards._sibling("shardresume")
+    loaded = deploy.shards.load_plan(plan.manifest)
+    shard = next(s for s in loaded.shards if s.label == KILLED)
+
+    def refuse(why):
+        raise deploy.shards.ShardsError(why)
+
+    try:
+        resume.check_campaign(deploy.shards, loaded, shard, refuse)
+    except deploy.shards.ShardsError as error:
+        return str(error)
+    return None
+
+
 @pytest.fixture(scope="module")
-def shards(plan, federations, shared) -> Shards:
+def shards(deploy, plan, federations, shared) -> Shards:
     """fed-b's step runs to its end while fed-a's first life is held at its third attempt until the step's first
     snapshot holds that attempt in flight, released, held again at its fifth, and killed outright; then fed-a's step is
     run again with `--resume`."""
@@ -248,6 +266,7 @@ def shards(plan, federations, shared) -> Shards:
         found.archive_at_kill = (plan.results / f"{KILLED}.out.tar").exists()
         found.snapshot_attempts = attempts_in(found.snapshot_at_kill[-1])
         found.left_at_kill = sorted(p.name for p in shared.node_tmp.glob(f"expcore-shard-{KILLED}.*"))
+        found.campaign_check = campaign_check(deploy, plan)
         control.clear()  # the second life holds nothing
         again = plan.lines[KILLED].start(found.logs[f"{KILLED}-2"], "--resume")
         found.codes[f"{KILLED}-2"] = wait_step(again)
@@ -287,6 +306,13 @@ def test_the_resume_removed_the_killed_steps_directory_on_the_agents_node(shards
     assert len(shards.left_at_kill) == 1
     assert shards.left_after_resume == []
     assert "an earlier step's directory on this node is removed" in shards.printed(f"{KILLED}-2")
+
+
+def test_o63_resume_lines_campaign_check_passes_on_the_store_a_real_dispatcher_pinned(shards):
+    """O63: the killed shard's newest snapshot holds the store its real dispatcher wrote; resume-line's check finds it
+    pins exactly the fingerprint the study pins beside its federation's rendered platform file (computed by the
+    manifest's Python on a copy, the restored store in its out/), so a valid resume is never refused for it."""
+    assert shards.campaign_check is None, shards.campaign_check
 
 
 def test_the_resume_restores_the_snapshot_and_counts_what_the_journal_holds_beyond_it_once(shards):

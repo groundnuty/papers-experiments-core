@@ -5,10 +5,19 @@ node's check, so it finishes in one pass; a cancel whose own exit status says it
 the step leaving the list. The fake Slurm of hpc_fed_support stands for the cluster; each node's directories are a set
 here. Nothing reaches a cluster."""
 
+import importlib.util
+import sys
 from itertools import count
+from pathlib import Path
 
 import pytest
 from hpc_fed_support import LAYOUT, SITE, FakeProcess, FakeSlurm, agent_site, hpc_on_path
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("hpcop_node_tests", HERE / "hpcnode.py")
+node = sys.modules.get("hpcop_node_tests") or importlib.util.module_from_spec(spec)
+sys.modules["hpcop_node_tests"] = node
+spec.loader.exec_module(node)
 
 PROVIDERS = ["aspen", "larch", "rowan", "alder", "hazel"]
 
@@ -120,3 +129,47 @@ def test_k1_down_removes_nothing_its_state_did_not_record_as_the_bundles(hpc, tm
     removed = [command[command.index("--workdir") + 1] for _, command in nodes.removals]
     assert "/tmp/not-the-bundles" not in removed
     assert len(removed) == 5
+
+
+# -- what down runs on the node: teardown.sh with no wait, in plain bash (tests/deploy/hpcnode.py) -----------------
+
+
+@pytest.fixture
+def processes():
+    started = []
+    yield started
+    node.kill_all(started)
+
+
+def test_k1_teardown_with_no_wait_removes_the_work_directory_a_killed_service_left(tmp_path, processes):
+    """O57 (K1): the removal down runs once a cancelled step has left the list, `teardown.sh <kind> --workdir W
+    --timeout 0`, on a service killed outright (its recorded process gone, no batch-script cleanup to wait for):
+    nothing is signalled, and the work directory, its secrets and its data with it, is removed."""
+    holder = tmp_path / "tmpfs"
+    holder.mkdir(mode=0o700)
+    env = node.node_env(holder)
+    work = node.make_work(holder)
+    (work / "rootfs" / "data").write_text("bucket", encoding="utf-8")
+    pid, tick = node.dead_record(processes)
+    node.put(work / "service.pid", f"{pid} {tick}\n")
+    result = node.script("teardown.sh", "op", "--workdir", str(work), "--timeout", "0", env=env)
+    assert result.returncode == 0, result.stderr
+    assert "not signalled" in result.stderr
+    assert not work.exists()
+
+
+def test_k1_teardown_never_removes_a_directory_that_is_not_a_private_hpcop_work_directory(tmp_path):
+    """O57 (K1): what teardown.sh is given must be a private hpcop work directory of ours: a link to one, or one open
+    to others, is refused and left as it is (down's own check of the recorded path comes first)."""
+    holder = tmp_path / "tmpfs"
+    holder.mkdir(mode=0o700)
+    env = node.node_env(holder)
+    work = node.make_work(holder)
+    link = holder / "hpcop-op.Zz99Zz"
+    link.symlink_to(work)
+    assert node.script("teardown.sh", "op", "--workdir", str(link), "--timeout", "0", env=env).returncode != 0
+    assert work.is_dir()
+    assert link.is_symlink()
+    work.chmod(0o755)
+    assert node.script("teardown.sh", "op", "--workdir", str(work), "--timeout", "0", env=env).returncode != 0
+    assert work.is_dir()

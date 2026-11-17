@@ -174,15 +174,19 @@ def check_no_live_step(
     return nonce
 
 
-def study_fingerprint(shards: Any, plan: Any, shard: Any, scratch: Path, refuse: Any) -> dict[str, Any]:
+def study_fingerprint(
+    shards: Any, plan: Any, shard: Any, scratch: Path, refuse: Any, out: Path | None = None
+) -> dict[str, Any]:
     """The campaign fingerprint the study pins beside this federation's `platform.toml`, by the manifest's Python on a
-    private copy, with the step's own environment (the allowlist, a home of its own): what the step's dispatcher would
-    pin."""
+    private copy, with the step's own environment (the allowlist, a home of its own), and with `out` (a restored
+    snapshot's) moved in as the copy's `out/`, as the step places it: what the step's dispatcher would pin."""
     copy = scratch / "study"
     shutil.copytree(plan.study, copy, symlinks=True)
     platform = shard.root / shards.PLATFORM
     if platform.is_file():
         shutil.copyfile(platform, copy / shards.PLATFORM)
+    if out is not None:
+        shutil.move(out, copy / "out")
     for name in ("home", "tmp", *(f"home/{sub}" for sub in shards.HOME_DIRS)):
         (scratch / name).mkdir(mode=0o700)
     env = {"PATH": plan.step_path, "LC_ALL": "C", "EXPCORE_FED_ROOT_PARENT": str(shard.root.parent),
@@ -247,7 +251,7 @@ def check_campaign(shards: Any, plan: Any, shard: Any, refuse: Any) -> None:
         if pinned is None:
             refuse(f"snapshot {snapshot.name}'s store pins no campaign fingerprint")
         want = fingerprint_sha256(pinned)
-        if fingerprint_sha256(study_fingerprint(shards, plan, shard, scratch, refuse)) != want:
+        if fingerprint_sha256(study_fingerprint(shards, plan, shard, scratch, refuse, scratch / "out")) != want:
             refuse(f"snapshot {snapshot.name} pins another campaign than the study with its federation's "
                    f"{shards.PLATFORM} (another federation, image or data)")  # fmt: skip
         for other in plan.shards:
