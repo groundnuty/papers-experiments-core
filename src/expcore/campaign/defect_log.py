@@ -111,12 +111,17 @@ class DefectLog:
     ):
         self.root, self.run_key, self.attempt, self._stamp = Path(root), run_key, attempt, stamp
         self._redactor = redactor
+        # whether the executor said the redaction context is the attempt's whole one (`redact_with`); until then it is
+        # the environment's, the models' and the registry's secrets, and a secret only the executor knows is not in it
+        self.context_given = False
         self.failure: Exception | None = None  # the first entry that could not be written, if any
         self._where = f"the harness-error log {log_path(self.root)}"
 
     def redact_with(self, redactor: Callable[[], Redactor]) -> None:
-        """Use this redactor for the attempt's entries from now on."""
+        """Use this redactor for the attempt's entries from now on. It is the executor's word that the context is the
+        attempt's whole one: `RunRequest.declare_secrets` and `record_attempt` both say it so."""
         self._redactor = redactor
+        self.context_given = True
 
     def build_redactor(self) -> Redactor:
         """The redactor of the attempt's redaction context as it stands now: the one it started with, the one the

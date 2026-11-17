@@ -16,9 +16,10 @@ no phase or instrument. An error with neither has no snapshot, and the attempt i
 The snapshot goes through the attempt's redactor, as an instrument's snapshot goes through the record's (R12): every
 string, a key among them, loses the secrets of the environment, the models and the registry, and those the executor
 declared (`RunRequest.declare_secrets`: an executor starts its instruments before `record_run`, so a secret it names
-only to `record_run` is not known when a start fails, and it declares it first). A secret an executor neither declares
-nor registers (`records.redact.register_secret`, as a platform that mints a token does) and that is not in the
-environment is not redacted from a failed start's diagnostic. It is kept on the
+only to `record_run` is not known when a start fails, and it declares it first, or declares none to say there is
+nothing more). **Never a diagnostic redacted against a partial list of the run's secrets**: until the executor has
+declared (or `record_attempt` has given the attempt's whole context) a diagnostic is withheld: the snapshot keeps the
+phase and the instrument and is `{"ok": false, "error": "Withheld", "why": ...}`. It is kept on the
 attempt's row (`attempts.diagnostic`, canonical JSON), in its outcome marker (so recovery commits it after a kill) and
 in the export (`attempt_diagnostics`, only when an attempt kept one). A snapshot that cannot be kept (not a JSON
 object, a number JSON cannot hold, more than `LIMIT_BYTES`, a redaction that raised) is `{"ok": false, "error":
@@ -35,6 +36,10 @@ from expcore.records.redact import Redactor
 
 EXPORT_KEY = "attempt_diagnostics"
 LIMIT_BYTES = 16 * 1024  # the canonical JSON of a snapshot, before redaction
+WITHHELD = (
+    "the executor did not tell the core its secrets (RunRequest.declare_secrets) before it started its instruments, so "
+    "the diagnostic cannot be shown redacted with all of them; declare them, or declare none, and it is kept"
+)
 
 
 class DiagnosticTooLarge(ValueError):
@@ -45,15 +50,25 @@ class DiagnosticUnreadable(ValueError):
     """A stored diagnostic is not the JSON object the core writes; the message names the attempt."""
 
 
-def snapshot_of(error: BaseException, redactor: Callable[[], Redactor]) -> dict[str, Any] | None:
+def snapshot_of(
+    error: BaseException, redactor: Callable[[], Redactor], *, complete: bool = True
+) -> dict[str, Any] | None:
     """The snapshot an attempt keeps of an error, redacted with `redactor()`; None when the error has nothing to keep
-    (it is no infrastructure error, or it names no instrument and carries no diagnostic). Never raises."""
+    (it is no infrastructure error, or it names no instrument and carries no diagnostic). Never raises.
+
+    `complete` says the redaction context is known to be whole: the executor declared its secrets, or `record_attempt`
+    gave the attempt's whole context. Never a diagnostic redacted against a partial list of the run's secrets: without
+    it, a diagnostic is withheld (`{"ok": false, "error": "Withheld", "why": WITHHELD}`, with the phase and the
+    instrument), since a secret that only the executor knows would be kept on the row, in the marker and the export.
+    A failed start that gave no diagnostic has nothing to redact and is kept either way."""
     given, origin = getattr(error, "diagnostic", None), getattr(error, "origin", None)  # a subclass may skip the base
     if not isinstance(error, InfraError) or (given is None and origin is None):
         return None
     head: dict[str, Any] = {}
     try:
         head = dict(origin or {})
+        if given is not None and not complete:
+            return {**head, "ok": False, "error": "Withheld", "why": WITHHELD}
         if given is not None and not isinstance(given, Mapping):
             raise TypeError("a diagnostic is a JSON object")
         text = json.dumps(head if given is None else {**head, "diagnostic": given}, sort_keys=True, allow_nan=False)

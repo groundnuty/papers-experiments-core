@@ -148,7 +148,10 @@ class RunRequest:
         of the failed start (which goes to the row, the marker and the export) would keep it. Declared here, the secret
         is in the attempt's redaction context from now on: the diagnostic and the harness-defect log are redacted with
         it, and `record_run` merges it with its own `secrets`, so the record is too. Call it first, in the executor's
-        own task, once or more; a secret already declared is not declared again.
+        own task, once or more; a secret already declared is not declared again. **Without a call, a failed start's
+        diagnostic is withheld** (never a diagnostic redacted against a partial list of the run's secrets); a call with
+        no argument says there is nothing beyond the environment's, the models' keys and the registry, and the
+        diagnostic is kept.
 
         `secrets` are values; `secret_env` are names of variables whose values are secrets whatever the names, read
         from `environ` (the process's by default) **now** and kept as values. A given `environ` is the mapping the

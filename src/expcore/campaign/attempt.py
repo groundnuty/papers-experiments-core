@@ -84,7 +84,6 @@ from expcore.loop.outcomes import Outcome
 from expcore.models import spend
 from expcore.records.build import RunIdentity, redactor_for
 from expcore.records.injections import restore_refusal
-from expcore.records.redact import Redactor
 
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
 # A platform's run admission: given the run's treatment kinds, its treatment targets, the campaign's end and whether its
@@ -369,7 +368,7 @@ class AttemptRunner:
                     treatment_targets=targets,
                     sent_nothing=sent_no_request(error, backend),
                 )
-                result = self._with_diagnostic(result, error, defects.build_redactor)
+                result = self._with_diagnostic(result, error, defects)
                 result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
@@ -387,15 +386,14 @@ class AttemptRunner:
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
 
-    def _with_diagnostic(
-        self, result: AttemptResult, error: BaseException, redactor: Callable[[], Redactor]
-    ) -> AttemptResult:
+    def _with_diagnostic(self, result: AttemptResult, error: BaseException, defects: DefectLog) -> AttemptResult:
         """Keep on the result the snapshot an infrastructure error carries (a failed instrument start's), redacted
         with the attempt's redaction context as it stands (C40): the environment's secrets, the models' keys, the
         registered secrets and the secrets the executor declared (`RunRequest.declare_secrets`, which it calls before
-        it starts its instruments, since `record_run` comes after). One that cannot be kept is recorded as failed, not
-        raised."""
-        kept = snapshot_of(error, redactor)
+        it starts its instruments, since `record_run` comes after). Never a diagnostic redacted against a partial list:
+        until the executor has declared its secrets (or `record_attempt` has given the whole context) the diagnostic is
+        withheld, and the snapshot says so. One that cannot be kept is recorded as failed, not raised."""
+        kept = snapshot_of(error, defects.build_redactor, complete=defects.context_given)
         return result if kept is None else dataclasses.replace(result, diagnostic=kept)
 
     def _settle_failure(
