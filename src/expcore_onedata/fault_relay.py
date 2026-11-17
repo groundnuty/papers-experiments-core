@@ -307,14 +307,17 @@ def clean_environment(environ: Mapping[str, str]) -> dict[str, str]:
     return {name: environ[name] for name in ENVIRONMENT if name in environ and not SECRET_NAME.search(name)}
 
 
-def run_clean(environ: Mapping[str, str], *, grace_s: float = GRACE_S) -> Callable[..., CommandResult]:
+def run_clean(
+    environ: Mapping[str, str], *, grace_s: float = GRACE_S, on_stragglers: Callable[[], None] | None = None
+) -> Callable[..., CommandResult]:
     """A command runner whose commands get `clean_environment(environ)` and no stdin, each in a process group of its own
     that is ended whole at the bound (SIGTERM, `grace_s`, SIGKILL: `fault_relay_group`), so nothing a verb launched, its
-    `srun` client above all, outlives it."""
+    `srun` client above all, outlives it; what a verb that returned left in its group is ended too, and `on_stragglers`
+    called."""
     env = clean_environment(environ)
 
     def run(argv: Sequence[str], *, timeout_s: float) -> CommandResult:
-        return run_in_group(argv, env=env, timeout_s=timeout_s, grace_s=grace_s)
+        return run_in_group(argv, env=env, timeout_s=timeout_s, grace_s=grace_s, on_stragglers=on_stragglers)
 
     return run
 
@@ -342,7 +345,8 @@ class Relay:
             raise PermissionError(f"the relay refuses to run with a secret-like name in its environment: {named}")
         self.root, self.nonce = Path(root), uuid.uuid4().hex
         self._prefix = list(prefix)
-        self._verbs = VerbCommand(prefix, runner or run_clean(environ))
+        self._left_behind = False  # the verb now running left a child in its group, which the runner ended
+        self._verbs = VerbCommand(prefix, runner or run_clean(environ, on_stragglers=self._note_stragglers))
         self._clock, self._wall = clock, wall
         self._env = clean_environment(environ)  # what the verbs, and the watch, are run with
         self._watcher = watcher or spawn_watch  # (argv, env) -> a process handle with `poll()`
@@ -452,30 +456,33 @@ class Relay:
             return {"refused": "expired"}
         bound = min(float(record["bound_s"]), left)
         assert key is not None  # `_refusal` holds it
-        tag = step_tag(self.nonce, key)
+        tag, self._left_behind = step_tag(self.nonce, key), False
         try:
             done = self._verbs(request, timeout_s=bound, step_tag=tag)
         except subprocess.TimeoutExpired:
-            self._watch(request, key, tag)  # before the answer: the guard is in place when the client reads `timed_out`
+            self._watch(request, key, tag, "timed_out")  # before the answer: the guard is in place when it is read
             return {"timed_out": True}
         except OSError:  # the verb's process could not be started
             return {"refused": "not_run"}
         except Exception:  # anything else once the verb may have run: its outcome is unknown, never "not run"
-            self._watch(request, key, tag)
+            self._watch(request, key, tag, "unknown")
             return {"timed_out": True}
+        if self._left_behind:  # it ended with an srun still in its group, now ended: its steps may yet be made
+            self._watch(request, key, tag, "left_behind")
         return {"returncode": done.returncode, "stdout": done.stdout[:OUTPUT_CAP], "stderr": done.stderr[:OUTPUT_CAP]}
 
-    def _watch(self, request: Request, key: str, tag: str) -> None:
-        """Journal that a watch is owed for the verb's steps, then start it. It never raises: a journal that cannot be
-        written never keeps the watch from starting (the watch is the guard), and a watch that cannot be started is
-        journalled."""
+    def _note_stragglers(self) -> None:
+        self._left_behind = True
+
+    def _watch(self, request: Request, key: str, tag: str, why: str) -> None:
+        """Journal that a watch is owed for the verb's steps (`why`: it timed out, ended unknown, or left an srun in
+        its group), then start it. It never raises: a journal that cannot be written never keeps the watch from starting
+        (the watch is the guard), and a watch that cannot be started is journalled."""
         journal = journal_path(self.root)
-        event = {"request": key, "verb": request.verb, "service": request.service, "tag": tag}
+        event = {"request": key, "verb": request.verb, "service": request.service, "tag": tag, "why": why}
         with contextlib.suppress(OSError):
             record(journal, {"event": "watch_opened", **event, "window_s": self._late_window_s, "wall": self._wall()})
-        argv = watch_argv(
-            self._prefix, tag, request.verb, request.service, key, journal, self._late_window_s, self._late_poll_s
-        )
+        argv = watch_argv(self._prefix, tag, request.verb, request.service, key, self._late_window_s, self._late_poll_s)
         try:
             handle = self._watcher(argv, self._env)
         except Exception as error:  # no process to start it with, say: said in the journal, the answer unchanged

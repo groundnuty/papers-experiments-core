@@ -730,15 +730,18 @@ message timeout after the request. The relay now does three things (`fault_relay
 
 - **Each verb runs in a session and process group of its own, and at the bound the whole group is ended:** SIGTERM, a
   grace of 5 s, then SIGKILL, with the leader reaped only afterwards so the group id is its own. No `srun` client of the
-  verb survives it. The pipes are closed on our side, so a descendant that left the group cannot hold the relay.
+  verb survives it. The pipes are closed on our side, so a descendant that left the group cannot hold the relay. **A
+  verb that exits before its bound with a child still in its group** (hpcfed failing while it ends its own step, say)
+  has that child ended the same way (only while a live member holds the group), and the relay treats it as a timed-out
+  verb for the watch below; its answer is the verb's own exit status.
 - **The relay stamps the verb's steps.** It derives a tag of 12 hex digits from its own nonce and the request's id and
   runs `hpcfed.py ... --step-tag <tag> <verb> <service>`; every control step the verb launches is then named
   `<allocation>-<service>-<word>-<tag>` (`word` of `hpcfed_control.CONTROL_WORDS`: `status` and `mounts` for a status,
   `stop`, `status` for a start, `exec`), in place of the clock's millisecond. The name is the request's alone: no other
   request, and no verb run by hand, can share it.
 - **After a timed-out verb the relay starts a watch** (`hpcfed.py late-steps <service> --for-verb <verb> --request <id>
-  --journal <path> --window-s 400 --poll-s 5`; a command of its own, outside `fault_hpc.VERBS`, which no request can
-  name, and which refuses a journal other than this root's). The watch is a detached process, so it outlives a relay
+  --window-s 400 --poll-s 5`; a command of its own, outside `fault_hpc.VERBS`, which no request can name; it writes
+  the relay's journal in the root it was given, and nowhere else). The watch is a detached process, so it outlives a relay
   that stops or dies. For 400 s (twice the controller's message timeout, from the bound) it lists the steps of the
   federation's own job (`hpclaunch.listings`) every 5 s and cancels any whose name is one of the verb's exact names,
   by its exact `<job>.<step>` id through `Launcher.cancel`, which refuses an id of another job of the federation's;
@@ -748,7 +751,7 @@ message timeout after the request. The relay now does three things (`fault_relay
 The answer is still `timed_out` and the injector still reads the verb's outcome as unknown: a stop is waited out and a
 start verified by a changed identity, as before. **The record** is `<root>/fault-relay/late-steps.jsonl` (0600, one JSON
 line per event, fsynced): `watch_opened` (written before the watch starts, so a relay that dies in the window still
-leaves the record that a watch was owed), `watch_failed`, `late_step` (the step's name, its id, whether the cancel
+leaves the record that a watch was owed, with `why`: `timed_out`, `unknown` or `left_behind`), `watch_failed`, `late_step` (the step's name, its id, whether the cancel
 worked and, if not, the error's type; a failed cancel is tried again at the next look), `accounted_late`, `watch_ended`
 (a watch that exited nonzero) and `watch_closed` with an outcome: `late_steps`, `none_seen` (only when at least one look
 and the accounting were read), `unreadable` (a controller that never answered in the window says nothing about
@@ -757,8 +760,7 @@ watched to its end.** The cancel is best-effort (a step may have run before it w
 step its KillWait, 182 s here, to end); the record is the guarantee. **Not covered, on purpose:** a start's service step
 (`<allocation>-<service>-run-<n>`) is launched detached, in a session of its own, and recorded in the state file by the
 verb; it is the start arriving, which a restore wants, and is never cancelled by name (a later stop or `down` ends
-it). **Not covered either:** a verb that crashes before its bound with an `srun` still waiting; it is answered with
-its exit status, not as timed out.
+it). A look that fails half way (the job check, or the agent's job's listing) keeps the step it found and cancels it.
 
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
 `hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` (and

@@ -5,7 +5,7 @@ file (DESIGN.md is the process model; README.md says what has run).
     uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH stop | start | status SERVICE
     uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH exec SERVICE -- ARGV...
     (the fault relay's own: `--step-tag TAG` before a verb, and `late-steps SERVICE --for-verb VERB --request ID
-    --journal PATH --window-s N --poll-s N`; see hpclate.py)
+    --window-s N --poll-s N`; see hpclate.py)
 
 Run on the login node. `up` reads the site's values from the environment (`set -a; . site.env; set +a`) and records
 them in the state file in the root, so `down` and the service verbs need no environment: the login node's fault relay
@@ -185,8 +185,8 @@ def control_hook(
 
 def late_steps(driver: Driver, args: argparse.Namespace) -> int:
     """`late-steps`: the fault relay's watch for a timed-out verb's steps (`hpclate.py`). Every argument is checked
-    before Slurm is looked at: the tag, the request id, the verb (one of the four), the service, the numbers, and a
-    journal that is the relay's own, in this federation's root and nowhere else."""
+    before Slurm is looked at: the tag, the request id, the verb (one of the four), the service and the numbers. It
+    journals to the relay's own file in this federation's root, which it derives from the root, and nowhere else."""
     import hpcfed_control
     import hpclate
 
@@ -204,7 +204,6 @@ def late_steps(driver: Driver, args: argparse.Namespace) -> int:
             (args.service, "name the service"),
             (args.for_verb in hpcfed_control.VERBS, "--for-verb is one of %s" % ", ".join(hpcfed_control.VERBS)),
             (args.request is not None and REQUEST_ID.fullmatch(args.request), "--request is a request id"),
-            (args.journal == str(journal), "--journal is the relay's own, in this root"),
             (numbers, "--window-s and --poll-s are positive numbers within bounds"),
         )
         if not ok
@@ -241,7 +240,7 @@ def main(
     parser.add_argument("--step-tag", help=argparse.SUPPRESS)  # the fault relay's tag for a verb's control steps
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("service", nargs="?", help="the service a verb acts on, by its layout name")
-    for late in ("--for-verb", "--request", "--journal"):  # late-steps only: the fault relay's own watch
+    for late in ("--for-verb", "--request"):  # late-steps only: the fault relay's own watch
         parser.add_argument(late, help=argparse.SUPPRESS)
     parser.add_argument("--window-s", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--poll-s", type=float, help=argparse.SUPPRESS)
@@ -260,7 +259,7 @@ def main(
         print("error: %s: --step-tag belongs to a verb or to late-steps" % args.command, file=sys.stderr)
         return 2
     if args.command != "late-steps" and any(
-        value is not None for value in (args.for_verb, args.request, args.journal, args.window_s, args.poll_s)
+        value is not None for value in (args.for_verb, args.request, args.window_s, args.poll_s)
     ):
         print("error: %s: the late-steps options belong to late-steps" % args.command, file=sys.stderr)
         return 2

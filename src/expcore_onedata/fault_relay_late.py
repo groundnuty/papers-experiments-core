@@ -56,10 +56,10 @@ def journal_path(root: Path) -> Path:
 
 
 def watch_argv(
-    prefix: Sequence[str], tag: str, verb: str, service: str, key: str, journal: Path, window_s: float, poll_s: float
+    prefix: Sequence[str], tag: str, verb: str, service: str, key: str, window_s: float, poll_s: float
 ) -> list[str]:
     """The watch as `hpcfed.py` is given it: the relay's prefix, the tag, then `late-steps <service>` and what it
-    needs."""
+    needs. No journal path: `hpcfed.py` knows the relay's journal from the root it was given."""
     return [
         *prefix,
         STEP_TAG_OPTION,
@@ -70,8 +70,6 @@ def watch_argv(
         verb,
         "--request",
         key,
-        "--journal",
-        str(journal),
         "--window-s",
         str(float(window_s)),
         "--poll-s",

@@ -566,7 +566,8 @@ driver's launcher and state file; DESIGN.md section 7), which also repeat the mo
 `status` that finds a restarted owner otherwise ready runs it); `up` starts the core's fault relay
 (`expcore_onedata.fault_relay`) and `down` stops it. **The relay ends a verb that outlives its bound with its whole
 process group, and watches for its late steps (O58):** each verb runs in a group of its own, so no `srun` client of a
-timed-out verb survives to make its step after the relay has answered (the controller can stall for about 200 s first);
+timed-out verb, nor of one that exited early with its `srun` still waiting, survives to make its step after the relay has
+answered (the controller can stall for about 200 s first);
 the relay names the verb's control steps with a tag of its own (`hpcfed.py --step-tag`), and `hpcfed.py late-steps`, a
 detached watch of 400 s, cancels a step of those exact names that appears in the federation's job, by its exact
 `<job>.<step>` id and no other, and writes what it saw to `<root>/fault-relay/late-steps.jsonl`. A `watch_opened` there

@@ -79,20 +79,23 @@ def watch(
     outcome: Optional[str] = None
     deadline = clock() + window_s
     while True:
-        found: Dict[str, List[str]] = {}
+        found: Dict[str, List[str]] = {}  # kept whatever fails later in this look: a step found is cancelled
         try:
             doc = store.read()
             for each in listings(doc):
                 for name, step_id in slurm.steps(each).items():
                     if name in wanted:
                         found.setdefault(name, []).append(step_id)
-            gone = slurm.gone(job)
             read += 1
         except StateError:  # the federation was taken down: nothing is left to start a step in
             outcome = "state_gone"
             break
         except (SlurmError, OSError, KeyError, TypeError, ValueError):
-            unread, found, gone = unread + 1, {}, False
+            unread += 1
+        try:
+            gone = slurm.gone(job)
+        except (SlurmError, OSError):  # not known to be gone (nor known to be there): the window runs on
+            gone = False
         for name, ids in found.items():
             for step_id in ids:
                 if handled.get(step_id) is True:
