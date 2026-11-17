@@ -698,6 +698,68 @@ def test_down_stops_the_fault_relay_before_anything_else(hpc, tmp_path, site):
     assert rig.fake.cancelled == ["4242"]
 
 
+class RelayWhoseStopFails(FakeSlurm):
+    """A relay whose own stop fails (as on a login node whose kernel has no pidfd_open: the stop's signal could not be
+    sent), and which only the end of its recorded client brings down: its stop fails, by exit status 1 or by an error
+    (`raises`), until that client is ended, and shows no heartbeat after."""
+
+    raises = False
+
+    def run(self, argv, timeout):
+        argv = list(argv)
+        if argv[1:5] == ["-B", "-m", "expcore_onedata.fault_relay", "stop"]:
+            ended = any(client.pid == 9999 for client in self.ended_clients)
+            if not ended and self.raises:
+                self.relay_calls.append("stop")
+                raise OSError("the stop could not be started")
+            self.relay_rc["stop"] = 0 if ended else 1
+        return super().run(argv, timeout)
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_o58_down_checks_the_fault_relay_again_once_its_client_is_ended(hpc, tmp_path, site, raises):
+    """O58: a relay whose own stop failed (it exited 1 or could not be run) is ended by `down` as a recorded client, and
+    `down` then checks it again: with no heartbeat beating it is clean, and `down` finishes and removes the root in
+    the one run, where it concluded the relay was not verified before it had ended it and failed every time."""
+    fake = RelayWhoseStopFails()
+    fake.raises = raises
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    rig.driver.relay_available = lambda: True
+    rig.up()
+    rig.fake.relay_calls.clear()
+    assert "the held job 4242 is gone, and so is the root" in rig.driver.down()
+    assert not rig.root.exists()
+    assert rig.fake.relay_calls == ["stop", "stop"]
+    assert [c.pid for c in rig.fake.ended_clients if c.pid == 9999] == [9999]
+    assert rig.fake.cancelled == ["4242"]
+
+
+def test_o58_down_still_reports_a_fault_relay_that_beats_after_its_client_was_ended(hpc, tmp_path, site):
+    """O58: the second check is not a way round the first: a relay whose stop fails again after its client was ended is
+    unverified, the job is cancelled all the same, and the root and its state are kept for the next `down`."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver.relay_available = lambda: True
+    rig.up()
+    rig.fake.relay_calls.clear()
+    rig.fake.relay_rc["stop"] = 1
+    with pytest.raises(RuntimeError, match="the fault relay could not be verified clean"):
+        rig.driver.down()
+    assert rig.fake.relay_calls == ["stop", "stop"]
+    assert rig.fake.cancelled == ["4242"]
+    assert rig.root.exists()
+    assert rig.state()["phase"] == "down"
+
+
+def test_o58_down_checks_the_fault_relay_once_when_its_stop_succeeded(hpc, tmp_path, site):
+    """O58: a relay that stopped at the first call is verified by it: no second stop is made."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver.relay_available = lambda: True
+    rig.up()
+    rig.fake.relay_calls.clear()
+    rig.driver.down()
+    assert rig.fake.relay_calls == ["stop"]
+
+
 def test_a_core_without_the_relay_starts_and_stops_none(hpc, tmp_path, site):
     """O57: a core without M4's relay module says so at up, and down does not call it."""
     rig = Rig(hpc, tmp_path, site)
