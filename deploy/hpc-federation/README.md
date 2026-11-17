@@ -387,23 +387,27 @@ sbatch --account="$HPC_ACCOUNT" --partition="$HPC_PARTITION" --no-requeue --time
   --mem=24G --output="$L/build-oz-%j.log" --wrap "bash $B/build-rootfs.sh oz $SH/onezone.tar"
 # 1. The zone on node A, listing every provider's address as a peer.
 ZJ=$(sbatch --parsable --account="$HPC_ACCOUNT" --partition="$HPC_PARTITION" --nodelist=<node-A> --time=03:30:00 \
-  --mem=32G --output="$L/hpcop-zone-%j.log" "$B/zone.sbatch" "$B" "$SH/onezone.tar" <zone-name> <provider-address>)
+  --mem=32G --chdir=/ --output="$L/hpcop-zone-%j.log" "$B/zone.sbatch" "$B" "$SH/onezone.tar" <zone-name> \
+  <provider-address>)
 # 2. A provider on node B, registered to the zone with a single-use token that travels only through the pipe.
 PJ=$(sbatch --parsable --account="$HPC_ACCOUNT" --partition="$HPC_PARTITION" --nodelist=<node-B> --time=03:00:00 \
-  --mem=32G --output="$L/hpcop-provider-%j.log" "$B/provider.sbatch" "$B" "$SH/oneprovider.tar" <provider-name> \
-  <zone-fqdn> <admin-email> <zone-address>)
-srun --jobid="$ZJ" --overlap --export=PATH -n1 -c1 --mem=200M bash "$B/mint-registration-token.sh" <provider-name> \
-  </dev/null | srun --jobid="$PJ" --overlap --export=PATH -n1 -c1 --mem=1G bash "$B/deliver-token.sh"
+  --mem=32G --chdir=/ --output="$L/hpcop-provider-%j.log" "$B/provider.sbatch" "$B" "$SH/oneprovider.tar" \
+  <provider-name> <zone-fqdn> <admin-email> <zone-address>)
+srun --jobid="$ZJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=200M bash "$B/mint-registration-token.sh" \
+  <provider-name> </dev/null | srun --jobid="$PJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=1G \
+  bash "$B/deliver-token.sh"
 # 3. Teardown: providers first, then the zone.
-srun --jobid="$PJ" --overlap --export=PATH -n1 -c1 --mem=100M bash "$B/teardown.sh" op </dev/null
-srun --jobid="$ZJ" --overlap --export=PATH -n1 -c1 --mem=100M bash "$B/teardown.sh" oz </dev/null
+srun --jobid="$PJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=100M bash "$B/teardown.sh" op </dev/null
+srun --jobid="$ZJ" --overlap --export=PATH --chdir=/ -n1 -c1 --mem=100M bash "$B/teardown.sh" oz </dev/null
 scancel "$PJ" "$ZJ"
 ```
 
 The token delivery step needs about 1 GB: the seventh live run's step was killed for memory under `--mem=100M`.
 Each batch job runs its service from the batch step itself (`node-init.sh`, `configure.sh`, `run-*.sh`,
 `finish*.sh`), so polling costs no job steps; read a work directory's `run.log` with
-`srun --jobid=<job> --overlap --export=PATH -n1 cat <workdir>/run.log </dev/null`. On a failed start the batch
+`srun --jobid=<job> --overlap --export=PATH --chdir=/ -n1 cat <workdir>/run.log </dev/null`. Give every `srun` and
+`sbatch` a `--chdir=/`: a step or job otherwise starts in the directory it was called from, or, where that does not
+exist on the node, in the node's shared `/tmp`. On a failed start the batch
 script stops the service, deletes and redacts every secret (`scrub.py`) and keeps the logs for
 `HPCOP_INSPECT_SECONDS`. A job whose service stopped at `teardown.sh`'s request ends with status 0; a service that
 ends any other way fails the job, with its own status. `--exclusive` keeps other users off a node, at the price of
@@ -418,12 +422,18 @@ fake Slurm; not run live.**
 
 ```bash
 set -a; . deploy/hpc-federation/site.env; set +a
-uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
   --root <a directory on a filesystem the login node and the nodes see> describe   # the plan and what it bills
-uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> up
-uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> verify-data   # after the study's ingest
-uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> down
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> up
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> verify-data   # after the study's ingest
+uv run python -I -B deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> down
 ```
+
+Run them as shown, `python -I -B`, from the checkout or another directory of ours, never a shared one such as the
+login node's `/tmp`: `uv run` takes the project of the working directory when it has a `pyproject.toml`, and builds it.
+Every Python the driver itself launches runs with `-I -B` (the fault relay among them, in the federation's root), so
+the working directory never reaches its `sys.path` and no bytecode is written beside what it imports (`DESIGN.md`,
+section 3).
 
 - **The layout** is a `deploy/compose-federation` layout (its providers, spaces, principals, probe space and platform
   template) with an `[hpc]` table of sizes, which Compose ignores: the held job's `--time`, each service step's cores
@@ -502,6 +512,14 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   state file (`study_artifacts_tree_sha256`, beside the site's `study_artifacts`) to the core's phase, so `[hpc] core =
   "step"` has it though a node's environment is an allowlist, and the core never reads the tree again. A layout with no
   platform template writes no record and reads no tree; each federation of a fleet reads the tree itself.
+- **`[placement]` is always in the rendered file, complete** (O79): the platform layer requires it, and a reader that
+  finds none patches in a default of its own. The core has no default for `holder`, so every template declares it
+  (`placement = { holder = "..." }`, a provider the template declares) and `up` refuses one that does not, before
+  anything is submitted, naming the key (`hpcplacement.py`). The render keeps what the template declares and writes
+  every other setting at the core's default beside it, read from `PlacementSettings` (never a copy of the numbers),
+  where the template declares the table: as one `placement = { ... }` line of the root or one `[placement]` table
+  (any other spelling is refused). So every reader, a shard's step and an ingest tool alike, reads the same file, and
+  none patches a default table in on its own.
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
@@ -512,21 +530,29 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   `platform.toml` and its render identity (`render-identity.json`), and runs the platform layer's link check, which
   writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
-- **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, checks each node
-  for the recorded work directory, sweeps the agent's node (`shards.py sweep`, a control step there: every shard step's
+- **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, removes the
+  recorded work directory of a service whose step it had to cancel (a cancel was an outright kill on the site, which
+  left 2 to 2.6 GB per service), checks each node
+  for the recorded work directory, sweeps the agent's node and every node a shard was resumed on (`shards.py sweep`, a
+  control step there by `HPC_CORE_PYTHON`: every shard step's
   directory of this federation on its tmpfs whose step is gone is removed, and one holding an `out/` that could not be
-  archived is kept and named in what `down` prints), cancels the held job (and the agent's own job, under `"separate"`) by its id (never by user or name), ends the srun clients (run it on the login node that ran
+  archived is kept and named in what `down` prints; the sandbox's killed runs are reaped, a dead FUSE mount unmounted
+  first, and the work root removed once empty), cancels the held job (and the agent's own job, under `"separate"`) by its id (never by user or name), ends the srun clients (run it on the login node that ran
   `up`: it finds them there), then removes the provider storage on scratch that `up` recorded, when there is one, and
   shows by a count that none of it remains (the previous section), and removes the root. After a partial `up` it finds the
   job by its recorded id, or by its allocation's exact name.
-- **Every step** is `srun --jobid --exact` with a name, its size and `/usr/bin/env -i PATH=... LC_ALL=C TMPDIR=<node
-  tmpfs>` (and `--network=<value>` when `site.env` sets `HPC_STEP_NETWORK`, on every step `up`, `down` and the service
-  verbs launch; the line `shards.py lines` prints for a shard step is the manifest's own and does not carry it); no
-  step uses `--overlap`; a control step's srun client is ended only once its step is gone from `squeue
-  -s`, and one still listed at its bound is cancelled by its own id.
+- **Every step** is `srun --jobid --exact` with a name, its size, `--chdir=/` and `/usr/bin/env -i PATH=... LC_ALL=C
+  TMPDIR=<node tmpfs>` (and `--network=<value>` when `site.env` sets `HPC_STEP_NETWORK`, on every step `up`, `down` and
+  the service verbs launch; the line `shards.py lines` prints for a shard step is the manifest's own and does not carry
+  it), and every Python in it runs with `-I -B`; no step uses `--overlap`; a control step's srun client is ended only
+  once its step is gone from `squeue -s`, and one still listed at its bound is cancelled by its own id.
 - **The site** comes from `site.env` (`HPC_ACCOUNT`, `HPC_PARTITION`, `SH`, `L`, and optionally `HPC_STEP_PATH`,
   `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, `HPC_STUDY_ARTIFACTS`, and the four keys of the
-  provider storage on scratch), recorded in the state file at `up` (of the storage keys, only `HPC_STORAGE_ROOT`), so `down` and the service verbs need no environment. The bundle is this checkout's own, which must lie on a
+  provider storage on scratch), recorded in the state file at `up` (of the storage keys, only `HPC_STORAGE_ROOT`), so `down` and the service verbs need no environment. `HPC_CORE_PYTHON` (a venv of this checkout on the
+  shared filesystem) is required with an agent's node: `down`'s sweep reaps the sandbox's runs with the core's reaper.
+  **Install that venv's interpreter under the site directory** (`UV_PYTHON_INSTALL_DIR=<site dir>/python uv sync`),
+  never in the account's home: every Python the driver and `shards.py` launch takes `-I -B` and writes no bytecode,
+  but the home is every job's and agent's of the account (live slot 5 found a node step's `.pyc` there). The bundle is this checkout's own, which must lie on a
   filesystem the nodes see. The first `python3.11` on `HPC_STEP_PATH` must be the node's own, not a uv-installed one:
   the bundle's `supervise.py` needs `os.pidfd_open`.
 
@@ -583,9 +609,10 @@ line, whose environment is an allowlist (`PATH`, `LC_ALL` and the federation's r
 the stamped study to the node's tmpfs (the store's lock refuses a network filesystem), checks the interpreter imports
 the core it was given, runs `python -m expcore run STUDY --shard i/N --shard-label L`, and once the dispatcher has
 exited writes the copy's `out/` whole to `<results>/<label>.out.tar` with a manifest. `shards.py collect --manifest
-shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only and prints the `python -m expcore merge`
-line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's docstring
-has its form). Outage runs (`[faults]`) go through the login node's fault relay (M4), which `up`
+shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only into DIR (a new or empty 0700 directory of
+ours) and prints the `<python> -I -B -m expcore merge` line (`--run` runs it in DIR). Run `shards.py` itself as `<python> -I -B`, from a private directory. The manifest names the site's
+paths and stays out of the repository (the script's docstring has its form). Outage runs (`[faults]`) go through the
+login node's fault relay (M4), which `up`
 starts.
 
 > **A bare copy of the core without `.git` is refused as `core_src`.** The core names itself by its commit in every
@@ -608,6 +635,40 @@ shard's, of its own campaign; it refuses while one still runs) and by `down`'s s
 dispatcher ended and whose `out/` was not archived (exit 75, or killed before the archive) is kept and named:
 `--resume` refuses while it is there, and `shards.py step ... --archive-left` archives it with the same manifest and that
 step's exit status, then removes it, unless an archive was published after that step started.
+
+**A killed run's sandbox, and the work root (W1, W2: live slot 5).** A step killed outright takes its sandbox's
+processes with it, and leaves the run's directory and its `_runs` record under the work root, and a dead
+`fuse.oneclient` mount in it ("Transport endpoint is not connected"). The next shard step on that node, before it uses
+its work root, and `down`'s sweep run the Apptainer run reaper over the work root: a run whose driver is shown gone has
+its token files removed, its processes ended, each mount in its directory unmounted (`fusermount3 -u`, then `-uz`)
+and shown gone by the mount table, then its directory and record removed. A dead run whose leftovers cannot all go
+refuses the step and fails the sweep (so `down` keeps the root for a second pass). The sweep then removes the work
+root, by `rmdir` alone, once it is empty and no step directory is on the node.
+
+**A resume on another node (`resume-line`).** When the agent's node is lost, or a shard is better continued elsewhere,
+hold a job of your own (one node, the manifest's cores and memory, `--no-requeue`) and ask for its line:
+
+    <python> -I -B shards.py resume-line --manifest shards.toml --label L --job J --node N
+
+It prints the shard's step line with `--resume` in job J on node N (in `/`, named as every step of the shard) only
+after these checks, each refusing with the shard's label and printing nothing: J is RUNNING, yours, of one component
+and the one node N, not a federation's services' job, with the manifest's cores and memory free on it (its own less
+its running steps', from `sacct`); no step of the shard is listed under any job of yours (`squeue -s -u`), and its
+running mark names no step still listed; the newest snapshot that verifies (restored into a private copy on the login
+node: every file against its hash, the store's integrity, every ended attempt's marker) names the shard and the archive
+its results hold, and pins the campaign fingerprint the study pins with this federation's `platform.toml` (computed by
+the manifest's Python), as every other shard's newest snapshot or archive does. It then records J and N in the
+federation's state file (`shard_nodes`), so `down` sweeps N in J (it never cancels J; one that ended is said, and the
+next shard step there reaps what it left). Hand-edited lines are not supported: nothing checks them.
+
+**The running mark.** Every step keeps `<results>/<label>/running.json` (its node, process, job, step name and a
+nonce) from its start to its own end, written exclusively; a step killed outright leaves it. A start is refused while
+one is there; a `--resume` takes one over only on the node it names once its process is gone (a resume of `lines` on
+the same node), or with the nonce `resume-line` showed gone (`--over`). The mark is never absent while a step holds
+it: a takeover first makes that mark's one claim (`.running.json.<nonce>.taken`, exclusively, never removed), then
+renames its own mark over it, so of any number of launches of one line one alone runs. `down` cancels a step of this
+federation's shards still running in a resume's job, by its id, before it sweeps that node, and a step still there
+after it fails that sweep (the root is kept).
 
 **The study's own refusals: a pre-step guard.** A study that refuses a campaign it must not run (one worker, each
 planned model's cap exactly 1, a federation root of its own) can have every shard step assert that again, from its

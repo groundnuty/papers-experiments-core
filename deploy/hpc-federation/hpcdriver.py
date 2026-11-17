@@ -18,6 +18,7 @@ import hpcdata
 import hpcidentity
 import hpcimport
 import hpcpins
+import hpcplacement
 import hpcquota
 import hpcrelay
 import hpcstate
@@ -175,6 +176,11 @@ class Driver(Down):
         self.check_imports(site)
         if self.layout.outer_roots or self.layout.inner_roots:
             raise RuntimeError("the root lies inside another federation's root, or holds one; refused")
+        if self.relay_available() and hpcrelay.linked(self.root):  # refused now, not once the federation is up
+            raise RuntimeError(
+                "the root is reached through a symbolic link, where the fault relay does not start: name it by its "
+                "resolved path"
+            )
         if self.root.exists() and not self.layout.owned and any(self.root.iterdir()):
             raise RuntimeError(f"the root holds files and is not marked as this federation's ({ROOT_MARKER}); refused")
         if self.store.exists():
@@ -187,9 +193,18 @@ class Driver(Down):
             raise RuntimeError("L is not a directory")
         if self.settings.core == "step" and not site.core_python:
             raise RuntimeError('[hpc] core = "step" needs HPC_CORE_PYTHON, the core\'s Python on the nodes')
+        if self.settings.sandbox is not None and not site.core_python:  # the reaper of the sandbox's runs is the core's
+            raise RuntimeError(
+                "the agent's node needs HPC_CORE_PYTHON, the core's Python on the nodes: down's sweep of a node a "
+                "shard step ran on reaps the sandbox's killed runs with the core's reaper"
+            )
         template = self.spec.platform_template
+        text = template.read_text(encoding="utf-8") if template is not None else None
         declared = [space.data_manifest for space in self.spec.spaces if space.data_manifest]
-        hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None, declared)
+        hpcpins.check(site, text, declared)
+        hpcplacement.check_template(
+            text
+        )  # a template declares [placement] holder (O79), which the core has no default for
         # every declared manifest loads now, so a mistake in one fails before a job is held
         hpcdata.ingested_manifests(self.layout, hpcdata.study_values(site.study_artifacts))
         self.check_home(site)

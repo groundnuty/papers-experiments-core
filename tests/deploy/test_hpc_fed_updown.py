@@ -270,8 +270,8 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_r
     assert owner == (5001, 5001)
     assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("690", "750")
     command = json.loads(values["hpc_command"])
-    assert command[1] == "-B"
-    assert command[2:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
+    assert command[1:3] == ["-I", "-B"]  # isolated (O58): the relay runs every verb through it
+    assert command[3:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
 
 
 KEY_BLOCK = "-----BEGIN RSA " + "PRIVATE KEY-----\nTUlJQg==\n-----END RSA " + "PRIVATE KEY-----\n"  # a stand-in
@@ -744,11 +744,27 @@ def test_up_starts_the_fault_relay_last_with_no_environment_but_its_own_and_wait
     (argv,) = rig.fake.relays
     cut = argv.index("-m")
     environment = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "HOME=/home/someone", "LC_ALL=C"]
-    assert argv[:cut] == [*environment, sys.executable, "-B"]
+    assert argv[:cut] == [*environment, sys.executable, "-I", "-B"]
     command = rig.state()["command"]
     assert argv[cut:] == ["-m", "expcore_onedata.fault_relay", "serve", "--root", str(rig.root), "--", *command]
     assert rig.fake.relay_calls[:2] == ["serve", "alive"]
+    assert rig.fake.relay_cwds == [str(rig.root)]  # it works in the root, never where up was launched (O58)
     assert rig.state()["relay"]["pid"] == 9999
+
+
+def test_o58_an_up_whose_root_a_link_reaches_is_refused_before_anything_is_submitted(hpc, tmp_path, site):
+    """O58: the relay works in the root and never starts in one a symbolic link reaches (the root's own name or a
+    directory above it), so up refuses such a root in its preflight, before any job is submitted, rather than once
+    the federation is up."""
+    (tmp_path / "real" / "fed").mkdir(parents=True)  # the root's parent is no link: one above it is
+    (tmp_path / "linked").symlink_to(tmp_path / "real")
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver = hpc.cli.make_driver(LAYOUT, str(tmp_path / "linked" / "fed" / "root"), runner=rig.fake)
+    rig.driver.relay_available = lambda: True
+    with pytest.raises(RuntimeError, match="reached through a symbolic link"):
+        rig.up()
+    assert rig.fake.submitted == {}
+    assert not (tmp_path / "real" / "fed" / "root").exists()
 
 
 def test_an_up_whose_relay_never_beats_fails_and_ends_the_relay(hpc, tmp_path, site):
@@ -775,7 +791,7 @@ def test_down_stops_the_fault_relay_before_anything_else(hpc, tmp_path, site):
     with pytest.raises(RuntimeError, match="the fault relay"):
         rig.driver.down()
     first = rig.fake.calls[0]
-    assert first[1:5] == ["-B", "-m", "expcore_onedata.fault_relay", "stop"]
+    assert first[1:6] == ["-I", "-B", "-m", "expcore_onedata.fault_relay", "stop"]
     assert rig.fake.cancelled == ["4242"]
 
 
@@ -788,7 +804,7 @@ class RelayWhoseStopFails(FakeSlurm):
 
     def run(self, argv, timeout):
         argv = list(argv)
-        if argv[1:5] == ["-B", "-m", "expcore_onedata.fault_relay", "stop"]:
+        if argv[1:6] == ["-I", "-B", "-m", "expcore_onedata.fault_relay", "stop"]:
             ended = any(client.pid == 9999 for client in self.ended_clients)
             if not ended and self.raises:
                 self.relay_calls.append("stop")

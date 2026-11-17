@@ -211,9 +211,18 @@ sandbox_placement = "het"                # S as component 1 of a heterogeneous j
 ## 3. How every step is launched
 
 ```
-srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name> --export=PATH \
+srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name> --export=PATH --chdir=/ \
      [--network=<HPC_STEP_NETWORK>] [--output=<log>] /usr/bin/env -i <allowlist> <argv>  # stdin </dev/null unless the payload
 ```
+
+- **Every step starts in `/`** (`--chdir=/`), never in the directory srun was called from: where that directory does not
+  exist on the node, slurmstepd starts the step in the node's `/tmp` instead, which other users share (another study's
+  audit, 16 Nov 2026). `/` exists on every node and nobody but root writes it; a service step's own work directory does
+  not exist yet when it starts, and a control step names its work directory by `--workdir`, never by where it starts.
+  Every script then works by absolute paths: the bundle's from `$(dirname "$0")`, its work directory from `--workdir`; a
+  shard manifest's paths and the run harness's `B`, `SH`, `L` and `GATE_DIR` must be absolute. The shards' steps
+  (`shards.py lines`), the test runner's (`deploy/hpc-tests`) and the run harness's (`run/common.sh`) are launched the
+  same way, and the held job's `sbatch` takes `--chdir=/` too.
 
 - **`--network=<value>` is on every step the driver launches when the site sets `HPC_STEP_NETWORK`** (empty by default:
   no option, and the line is what it was). A control step, a service step, a teardown and a step in either component
@@ -243,7 +252,8 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   and curl among them (`status.sh`, which writes nothing, points them there without making it: `home_at`); a shard step's dispatcher gets them in the step's own directory (`shards.py step`). Nothing else, and never a secret. The bundle's helpers
   then run on the first `python3.11` on that `PATH` (`lib.sh`'s default `HPCOP_PY`), which must be the node's own:
   `supervise.py`, which holds every service, needs `os.pidfd_open`, which uv's standalone Python lacks. Only the core's
-  step (`HPC_CORE_PYTHON`) runs a venv's Python.
+  step and `down`'s sweep of a node a shard step ran on (`HPC_CORE_PYTHON`), and the shard step itself (its
+  manifest's `python`), run a venv's Python.
 - **Every write on a node is under the node's tmpfs**, never Slurm's per-job `$TMPDIR`: on the site that is a link
   into a shared filesystem with a file quota. The allowlist sets `TMPDIR` itself, and the bundle refuses a `TMPDIR`
   that is a link (`lib.sh`). Work directories are the bundle's `mktemp -d <tmpfs>/hpcop-<oz|op>.XXXXXX` (0700); the
@@ -260,8 +270,24 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   pipe are finished whatever the first does. Ending a client is verified (SIGTERM, then SIGKILL, each only while the
   pid still has its recorded start tick), and `down` also ends any `srun --jobid=<job>` of ours on the same login node (run `down` where `up` ran) that
   no record names (one spawned just before a crash).
-- **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python a
-  step runs takes `-I -B`.
+- **Every Python the driver launches runs isolated and writes no bytecode** (`-I -B`, O58): on a node, on the login node
+  (the fault relay's `serve`, `alive` and `stop`, and the verbs' argv prefix, section 7), in a container and in
+  `shards.py` (its step, its dispatcher, the merge `collect --run` runs), and so does the test runner's pytest
+  (`deploy/hpc-tests`). Without it `python -m` and `python -c` put the directory they were launched from first on
+  `sys.path`, and every `PYTHON*` variable is read: on 16 Nov 2026 (F2) a `down` launched from the login node's `/tmp`,
+  which held 49 `.py` files of other users, had the relay's `stop` import another user's `/tmp/inspect.py` in place of
+  the standard library's. Launch `up`, `down` and the verbs as `python -I -B deploy/hpc-federation/hpcfed.py ...` from a
+  directory of ours (the checkout) all the same, never a shared one: `uv run` takes the project of the working directory
+  when it has a `pyproject.toml`, and builds it.
+- **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python the
+  driver and the shard driver launch, on a node or on the login node, takes `-I -B` (the bundle's `"$HPCOP_PY"`, the
+  fault relay, the shard step, its dispatcher and its `expcore run`, the merge, and the sandbox's gate, collector,
+  mount watcher and copy helper on the node). `-I` alone ignores `PYTHONDONTWRITEBYTECODE`, so only the flag stops
+  it: live slot 5 found a shard step's first import of a stdlib module writing its `.pyc` into the core's interpreter,
+  which uv had installed under the account's home, shared by every job and agent of the account. **Install the venv's
+  interpreter under the site directory** (`UV_PYTHON_INSTALL_DIR=<site dir>/python` before `uv sync`), never in the
+  shared home, so a node step that writes there by any other path still writes into the site's own tree. The fake Slurm
+  of the tests fails any command that runs a Python without both flags.
 - **The core the driver imports is recorded**: `up` writes the resolved paths of `expcore_onedata`, `fedlayout` and
   `hpcfed` into the state file, and refuses to run when `expcore_onedata` is not imported from this checkout's `src`.
   The core's step (`[hpc] core = "step"`) makes the same check on the node and exits 97 on a mismatch, which fails
@@ -282,7 +308,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "project": "<the layout's project>",
   "layout": {"source": "<file name>", "digest": "<sha256>", "path": "<absolute path>"},
   "core": {"expcore_onedata": "<path>", "fedlayout": "<path>", "hpcfed": "<path>"},
-  "command": ["<python>", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
+  "command": ["<python>", "-I", "-B", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
            "billing_weight": null, "step_network": "", "study_artifacts": "<directory, or empty>",
@@ -325,6 +351,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "relay": {"pid": 0, "start": 0, "log": "<log dir>/<allocation name>-fault-relay.log"},
   "data": {"ingested": {"<space>": {"manifest": "<sha256>", "declared": true,
                                     "verified": null}}},
+  "shard_nodes": [{"job": "<the operator's job id>", "node": "<node>", "label": "<shard>", "name": "<its job name>"}],
   "phase": "preflight | submitted | placed | zone | providers | bootstrapped | linked | stopping | down"
 }
 ```
@@ -334,6 +361,11 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   its step with `--jobid=<sandbox.job>`, plus `--het-group=<sandbox.het_group>` when that is not `null`; S's facts
   (FQDN, address) are in `services.sandbox`, the role's record. `down` cancels `sandbox.job` itself only under
   `separate`; under `het` the leader's cancel ends S's component.
+- **`shard_nodes`** (absent until one is recorded) are the nodes a shard of this federation was resumed on outside its
+  own jobs, each in the operator's held job it was resumed in: `shards.py resume-line` records one, under the root's
+  lifecycle lock, before it prints the line that starts the step there. `down` sweeps each such node in that job, only
+  while the job runs and still carries the recorded name (Slurm reuses ids), and never cancels it; the launcher runs a
+  step in such a job on its recorded node alone.
 - **`site`** is what `up` read from `site.env` (no secret): every later command reads it here, so `down` and the
   service verbs need no environment. **`command`** is this driver's argv prefix, which `platform.toml`'s `[faults]
   command` holds. **`clients`** are the detached srun clients of the service steps, by step name, which `down` ends
@@ -425,10 +457,13 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    layer's own check through the rendered `platform.toml`, which writes `link-check.json` in the root through
    `expcore_onedata.linkrecord`. `up` fails unless every pair passes.
 10. **The fault relay** (M4's `expcore_onedata.fault_relay`), when the core has it: started detached on the login node
-    (`env -i PATH HOME LC_ALL [SLURM_CONF] <python> -m expcore_onedata.fault_relay serve --root <root> -- <this
-    driver's argv prefix>`, its output appended to `<L>/<allocation name>-fault-relay.log`), then `fault_relay alive`
-    polled until it beats (30 s at most; a relay that never beats fails `up` and is ended). It is recorded in the
-    state file as `relay`. One relay per root: it takes a lock.
+    (`env -i PATH HOME LC_ALL [SLURM_CONF] <python> -I -B -m expcore_onedata.fault_relay serve --root <root> --
+    <this driver's argv prefix>`, its output appended to `<L>/<allocation name>-fault-relay.log`), in the root as its
+    working directory (a 0700 directory of ours that no symbolic link reaches, or the relay is not started: `up`'s
+    preflight refuses such a root before anything is submitted), never the directory `up` was launched from, since
+    every verb it runs inherits it; then `fault_relay alive` (`-I -B` too) polled until it beats (30 s at
+    most; a relay that never beats fails `up` and is ended). It is recorded in the state file as `relay`. One relay
+    per root: it takes a lock.
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
@@ -445,7 +480,8 @@ removed while held would let the next `up` or `down` lock another file of the sa
 
 **`down`** (login node), whatever `up` reached:
 
-0. **Stop the fault relay first** (`fault_relay stop --root <root>`, when the core has it), so no service verb launches
+0. **Stop the fault relay first** (`<python> -I -B -m expcore_onedata.fault_relay stop --root <root>`, when the core
+   has it), so no service verb launches
    a step while the federation goes down; a relay that will not stop is reported, and `down` goes on. Its directory
    `<root>/fault-relay/` goes with the root. The stop signals the relay by the pid and start tick of its heartbeat,
    through a pidfd where the kernel has `pidfd_open` and, on a login node whose kernel has none (Linux before 5.3, which
@@ -465,7 +501,14 @@ removed while held would let the next `up` or `down` lock another file of the sa
    the zone), each bounded by `stop_seconds`; then wait until no step but `batch` and `extern` is listed in `squeue -s`
    under the held job's id and, under `het`, its component 1's own id (S's steps, a shard step's among them, are listed
    there alone), one deadline for both (ending each service step's srun client only then); a step still listed at the
-   bound is cancelled by its own id.
+   bound is cancelled by its own id. **A cancel's own exit status is no verdict:** on a heterogeneous job `scancel
+   <leader>.<n>` printed "Invalid job id specified" and exited 225 while it did end the step (live slot 5); whether the
+   step left the list decides. **A cancel on that site was an outright kill** (the step's processes ended within a
+   second, no trap ran), which left each such service's work directory (2 to 2.6 GB of the node's tmpfs) on its node:
+   once a cancelled step has left the list, `down` removes the work directory the state recorded for that service, and
+   only one the bundle makes (`hpcstate.checked_workdir`), by `teardown.sh <kind> --workdir W --timeout 0` in a
+   control step on its node, and step 3 shows it gone. Nothing the state did not record is removed: a service whose
+   log never named a work directory is left to `leftovers.py`, which only counts.
 3. One read-only control step per node checks that no recorded work directory is left on it. A service whose step
    was launched but whose log never named a work directory (seen live: a zone that failed in node-init before making
    one) is clean only when both are shown: its step has ended (listed no more, once seen listed, or cancelled by its
@@ -524,7 +567,22 @@ serves both:
   reads it with `load_faults` as a campaign would, and writes it again with the least that loader's rule gives (5,340 s
   with M4's defaults), so a measured `stop_seconds`, or a term the loader adds, moves it. A core whose loader cannot
   read the HPC `[faults]` (one without M4's backend) gets the restore's rule over the keys it knows, with the HPC
-  settle time and poll.
+  settle time and poll;
+- **`[placement]`, always and complete** (O79; `hpcplacement.py`): the platform layer requires the table
+  (`rangemap.load_placement`), and a reader that found the render without one patched in a default of its own;
+  defaults supplied separately by each tool are how a setting drifts unseen. The core has no default for `holder`
+  (the file-wide data provider; every `[[spaces]]` entry names its own, which the provisioner uses), so the template
+  declares it, a provider the file declares, with a comment saying why, and `up` refuses a template that declares no
+  holder (or a holder that is no provider of the file), or declares the table in a spelling the render cannot add to,
+  naming the key and never a value, in its preflight (which runs the render's own completion over the template), before
+  anything is submitted. The render, in both of its passes, keeps what the template declares and writes every other
+  setting at the core's default, read from the fields of `PlacementSettings` (the one place the numbers are, so a field
+  added there is in the next render with no change here), each with its own TOML type. The missing settings are added
+  where the template declares the table (inside one `placement = { ... }` line of the root, or after one
+  `[placement]` header: TOML cannot add to an inline table from elsewhere, nor reopen a table, so any other spelling is
+  refused) and the result is read back as TOML, which must be the declared document plus exactly the added settings or
+  the render fails and writes nothing. No tool adds a table to the render or reads it with a default of its own:
+  `shards.py step` copies the file as it is, and `load_placement` still refuses a file without the table.
 
 The core's platform layer (gate, health, link check, faults) points at `<root>/platform.toml` wherever it runs,
 provided it reaches the services' 8443 and reads the root. A layout's link check covers the pairs its
@@ -588,10 +646,20 @@ runs the core's phase: it reaches the services' 8443 from there, and has no `cor
 ## 7. Service verbs for faults and the heal (M4)
 
 Per service, by its layout name. **Each verb is one argv**, run on the login node (only there can a step be
-launched): `<python> deploy/hpc-federation/hpcfed.py --layout PATH --root PATH <verb> <service> [-- argv...]`; the
+launched): `<python> -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH <verb> <service> [-- argv...]`; the
 site's values come from the state file, so the verb needs no environment. A campaign that runs on a compute node
 cannot launch a step: its fault injector asks the login node's **fault relay** (M4's, which `up` starts with this
 argv prefix and `down` stops first; section 5), which runs the verb and answers.
+
+**How the answer is awaited.** The request and the answer are files under `<root>/fault-relay/` on the shared
+file system, and a compute node's NFS client keeps a negative entry for a name it looked up while the file was
+missing, failing every later lookup of it until the directory's attributes expire (30 s by default). The client
+therefore never looks the answer's path up while waiting: on every poll (0.5 s) it lists `answers/` with
+`os.scandir`, whose `opendir` revalidates the directory, and reads `<id>.json` only once the listing shows that
+exact name. The file system then adds at most one poll to a relayed verb's time, which is the verb's own plus
+the wait for any request issued before it (the relay runs one at a time, in order); polling the path had cost
+about 30 s on every verb, measured live. The relay lists `requests/` the same way; a login-node wait (`up`'s for the
+heartbeat, `stop`'s for it to go) runs on the host that writes the file and is no such poll.
 
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
 `hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` for a verb in
@@ -642,13 +710,20 @@ claims its launch, and is `ready` only once a status has run `hpcimport.mount_ch
 report against the spaces it owns: the start returns once its step is listed, before the service holds its mounts, so
 the proof is taken by the first status that finds it otherwise ready, and recorded for that launch alone.
 
+**A restart's identity check waits for the domain (O58).** `finish.sh --restart` compares the provider id and the domain that op_worker's `/configuration` reports with `identity.json`, before anything is rotated. op_worker answers `domain` from the provider record it reads over its Onezone connection, so for a moment after its REST listener answers it says null (live: a restart's check ran 1.9 s before the connection came up, and compared the word null with the recorded domain of a service that had not changed). `finish.sh` therefore polls `/configuration` first (`wait_domain` in `lib.sh`, every `HPCOP_POLL_S`, 1 s) until `domain` is neither null nor empty, under **one deadline with `wait_ready`: 1800 s from `finish.sh`'s start**, `wait_ready`'s own bound (`HPCOP_READY_SECONDS`, validated, for a test to shorten), so the wait takes what `wait_ready` left; there is always one read, and the deadline is checked between requests, so the wait can end one request (`http`'s 120 s bound) past it. The first non-empty answer ends the wait whatever it holds and the check runs unchanged: another non-null domain fails as `the service's identity changed across the restart`; a domain still null at the deadline fails as `stayed null`, so a start that lacks Onezone is not read as a changed deployment; an answer with no `domain` field, or one that is not JSON, fails at once, and so does a service that exited meanwhile. A first start waits the same way and records the identity only from a real domain. How long a start waited is kept in `domain-wait` and reported as `domain_wait_s` (section (c)). `jsonget` never prints a JSON null as a word: with no `--default` it prints nothing and exits 3 (2 is a field that is not there), so no script compares or records "null" as an id, a domain, a user id or a token.
+
 **(c) STATUS** `hpcfed.py status <service>`: one JSON line, no secret: `{"service", "state", "running", "ready",
-"identity", "launch", "node", "step"}`. `running` is true only when the service step is listed in `squeue -s` **and**
+"identity", "launch", "node", "step"[, "domain_wait_s"]}`. `running` is true only when the service step is listed in `squeue -s` **and**
 a control step on the node (`status.sh`) finds the recorded service process alive with its recorded start tick.
 **`ready`** is true only once the service's own checks passed for this launch: a marker whose content is the current
 `service.pid` line, written by `zone.sbatch` and `provider.sbatch` after `finish*.sh` and by `restart.sh` after its
 checks; running but not ready is a Compose container not yet healthy, so a restore is never verified before a
-restart's guard, rotation and live checks pass. **`identity` is `"<launch>:<pid>:<start tick>"`**, from
+restart's guard, rotation and live checks pass. **A ready launch's status also carries `domain_wait_s` (O58)**: the seconds its start waited for op_worker's
+domain (`finish.sh` writes `domain-wait` in the work directory, 0.000 when the first read held it, and `restart.sh`
+removes an earlier launch's first; `status.sh` prints it only for a ready launch and only in the form `finish.sh` writes;
+the status verb passes it on only for a ready launch and only as a finite number of at least 0). The injector records it
+as `domain_wait_s` beside `ready_after_s` in the restore: the part of the provider's down time spent waiting for its
+Onezone connection, which a live slot measures. Absent when nothing reported it, never 0. **`identity` is `"<launch>:<pid>:<start tick>"`**, from
 `service.pid`, which `run_service` rewrites on every start: stable while the service is untouched, different after
 every start.
 
@@ -681,7 +756,7 @@ service steps through `zone.sbatch` and `provider.sbatch` unchanged):
   in `stop-requested` it must remove neither, and end with status 0.
 - `wait_ready` demands a fresh deployment (`Congratulations! New`) and the guard's first-start flow. A restart over an
   existing deployment prints neither: `restart.sh` needs its own readiness (`service-ready.lock`, `/configuration`
-  answering, the guard's verdict for a restart) and the live default and port checks again. The guard's behaviour on a
+  answering with a domain, the guard's verdict for a restart) and the live default and port checks again. The guard's behaviour on a
   restart is untested.
 - **`sweep_leftovers` removes a work directory whose `owner.pid` process has ended**, and a stop ends it. A stopped
   service's directory would then be removed by the next `node-init.sh` of ours on that node (another federation's,
@@ -741,8 +816,13 @@ against its declared SHA-256 before the cluster is touched, the work root, and t
 into the root is rendered absolute. M5 launches its shard's step on `sandbox.node` with `--jobid=<sandbox.job>`, plus
 `--het-group=<sandbox.het_group>` when that is not `null`; the step makes the sandbox's work root on S's tmpfs and copies
 the root's `platform.toml` beside the study's `study.toml`. The driver holds, reads back and places S, runs its node
-facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`: each shard step's directory of this
-federation whose step is gone), then releases it.
+facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`, by `HPC_CORE_PYTHON`, which `up` asks for
+with an agent's node: each shard step's directory of this federation whose step is gone; then the Apptainer run reaper
+over the sandbox's work root, each dead run's mounts unmounted, `fusermount3 -u` then `-uz`, shown gone by the mount
+table, before its directory and record go, and the work root removed once empty and no step directory is on the node),
+on S and on every node `shard_nodes` records, then releases it. A sweep that cannot reap (its leftovers, or a Python
+without the core) fails, and `down` keeps the root. The next shard step on a node reaps the same way before it uses its
+work root, and refuses when it cannot.
 
 **The render identity (O74).** What `up` rendered is recorded as hashes alone in `<root>/render-identity.json` (mode 0600,
 canonical JSON with sorted keys; `hpcidentity.py`, written by `hpcboot.write_facts` beside `platform.toml`, so for
