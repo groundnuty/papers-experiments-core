@@ -63,6 +63,7 @@ def records(sbx) -> list[dict]:
 def test_o91_a_send_from_the_declared_agent_uid_appears_with_that_uid_and_the_log_is_intact(
     short_world, real, tmp_path
 ):
+    """O91: a send from the declared agent uid appears with that uid and the log is intact."""
     sbx = start(short_world, agent_uid=os.getuid())  # this process is the agent: the declared uid is its own
     client = load_client(real.socket_path)
     client.log_read("file-1", range=[0, 5], bytes=5, sha256="ab" * 32)
@@ -85,6 +86,7 @@ def test_o91_a_send_from_the_declared_agent_uid_appears_with_that_uid_and_the_lo
 
 
 def test_o91_a_send_from_another_uid_than_the_declared_one_makes_the_log_unknown(short_world, real, tmp_path):
+    """O91: a send from another uid than the declared one makes the log unknown."""
     if os.getuid() == 10001:
         pytest.skip("this process runs as the declared agent uid: nothing is foreign")
     sbx = start(short_world)  # the declared agent uid is 10001; the sender here is not
@@ -116,6 +118,7 @@ def test_o91_the_socket_is_world_writable_in_a_directory_others_can_search_and_t
 
 
 def test_o91_the_collector_that_runs_is_the_pinned_copy_the_run_recorded(short_world, real):
+    """O91: the collector that runs is the pinned copy the run recorded."""
     sbx = start(short_world)
     ran = real.proc.args
     assert ran[1] == "-I"
@@ -130,6 +133,7 @@ def test_o91_the_collector_that_runs_is_the_pinned_copy_the_run_recorded(short_w
 def test_o91_a_collector_killed_during_the_run_gives_an_unknown_log_and_the_client_fails_closed(
     short_world, real, tmp_path
 ):
+    """O91: a collector killed during the run gives an unknown log and the client fails closed."""
     sbx = start(short_world, agent_uid=os.getuid())
     client = load_client(real.socket_path)
     client.log_read("file-1")
@@ -146,6 +150,7 @@ def test_o91_a_collector_killed_during_the_run_gives_an_unknown_log_and_the_clie
 
 
 def test_o91_after_the_collection_the_socket_is_gone_and_a_late_send_raises(short_world, real, tmp_path):
+    """O91: after the collection the socket is gone and a late send raises."""
     sbx = start(short_world, agent_uid=os.getuid())
     client = load_client(real.socket_path)
     sbx.collect(tmp_path / "out")

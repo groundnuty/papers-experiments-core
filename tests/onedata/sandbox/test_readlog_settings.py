@@ -2,6 +2,7 @@
 the channel on for every run of the Docker backend. Without it a run has no channel and the record is what it was."""
 
 import json
+import os
 
 import pytest
 from sandbox_support import add_sandbox
@@ -33,6 +34,15 @@ def test_a_platform_that_does_not_declare_the_pin_has_no_channel(tmp_path):
 
 def test_a_declared_pin_is_loaded_whole(tmp_path):
     assert load(tmp_path, readlog_collector_sha256=PIN).readlog_collector_sha256 == PIN
+
+
+def test_o91_a_docker_platform_that_pins_the_collector_loads_with_a_work_root_of_any_length(tmp_path):
+    """O91: the Apptainer backend bounds the work root where it pins the collector, because that collector binds a Unix
+    socket under it (107 bytes). Docker's collector binds a path inside its container, so the work root is only the
+    source of a bind and no length of it is refused."""
+    settings = load(tmp_path, readlog_collector_sha256=PIN, work_root="w" * 200)
+    assert len(os.fsencode(settings.work_root)) > 107
+    assert settings.readlog_collector_sha256 == PIN
 
 
 @pytest.mark.parametrize("bad", ["A" * 64, "a" * 63, "a" * 65, "", "sha256:" + "a" * 64, 7, ["a" * 64]])
