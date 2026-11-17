@@ -5,6 +5,7 @@ import pytest
 from sandbox_support import add_sandbox
 
 from expcore.config.loading import ConfigError, Section
+from expcore_onedata.readlog import paths
 from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.settings import FederationNetwork, load_sandbox
 
@@ -152,6 +153,34 @@ def test_a_bind_onto_one_of_the_sandbox_s_own_paths_is_refused(tmp_path):
     for target in ("/work/x", "/etc/ld.so.preload", "/hpcop-egress/sock"):
         with pytest.raises(ConfigError, match="entry 0"):
             _load(tmp_path, _document(binds=[{"path": "f", "sha256": SHA, "target": target}]))
+
+
+@pytest.mark.parametrize("target", [*paths.TARGETS, paths.SOCKET, paths.CLIENT, f"{paths.SOCKET_DIR}/x"])
+def test_o91_a_bind_onto_a_read_log_target_is_refused(tmp_path, target):
+    """O91: the read-log channel's socket directory and client module are the sandbox's own targets in every cell: an
+    extra bind may not be, hold or lie under either."""
+    with pytest.raises(ConfigError, match="entry 0"):
+        _load(tmp_path, _document(binds=[{"path": "f", "sha256": SHA, "target": target}]))
+
+
+def test_o91_the_read_log_collector_is_pinned_and_recorded_only_when_declared(tmp_path):
+    """O91: `readlog_collector_sha256` turns the channel on and is in the record (another collector is another
+    experiment); a platform that declares none keeps the record it had, and no channel."""
+    plain = _load(tmp_path, _document())
+    assert plain.apptainer.readlog_collector_sha256 is None
+    assert "readlog_collector_sha256" not in plain.apptainer.record()
+    declared = _load(tmp_path, _document(readlog_collector_sha256="e" * 64))
+    assert declared.apptainer.readlog_collector_sha256 == "e" * 64
+    assert declared.apptainer.record() == {**plain.apptainer.record(), "readlog_collector_sha256": "e" * 64}
+
+
+@pytest.mark.parametrize("bad", ["E" * 64, "e" * 63, "e" * 65, "", 5, True, ["e" * 64]])
+def test_o91_the_read_log_collector_pin_must_be_64_lower_case_hex_digits(tmp_path, bad):
+    """O91: the pin is a SHA-256; the message names the key, never the value."""
+    message = "key 'readlog_collector_sha256' must be 64 lower-case hexadecimal digits"
+    with pytest.raises(ConfigError, match=message) as caught:
+        _load(tmp_path, _document(readlog_collector_sha256=bad))
+    assert "eeee" not in str(caught.value).lower()  # never the value
 
 
 def test_a_preload_entry_is_pinned_and_kept_in_order(tmp_path):

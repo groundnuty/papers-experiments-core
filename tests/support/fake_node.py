@@ -14,7 +14,8 @@ until the watch has listed the table twice (`wait_for_watch`), so a watch's thre
 
 The helpers are emulated by what they do: the gate reads its token file when it starts (`gate_tokens`), says it is
 ready, writes its run-start mark on SIGUSR1 and its teardown line on SIGTERM; the collector writes its start line, a
-record for each connect a cell makes through `connect`, and its end line on SIGTERM. Everything else a test needs to
+record for each connect a cell makes through `connect`, and its end line on SIGTERM. The read-log collector
+(O91) is emulated the same way, or run for real (`real_readlog`): see `fake_readlog`. Everything else a test needs to
 break (a gate that never gets ready, a helper that ignores its signals, an unreadable /proc) is a flag here. Every
 name and address is invented.
 
@@ -47,6 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import fake_readlog
 from fake_host import Unrecorded, bootstrap_of, recorded
 
 from expcore_onedata.sandbox import completion
@@ -175,6 +177,10 @@ class Cell:
         (self.work_dir() / rel).write_bytes(b"\0" * size)
         return 0
 
+    def readlog_client(self):
+        """The read-log client module a script in this cell imports (`fake_readlog.client_of`)."""
+        return fake_readlog.client_of(self)
+
     def hostname(self) -> str:
         """What `hostname` and `uname -n` print in the cell: the name set in its UTS namespace."""
         assert self.exec.hostname is not None
@@ -233,6 +239,11 @@ class FakeNode:
         self.gate_tokens: list[str] = []
         self.gates: list[Gate] = []
         self.collectors: list[Collector] = []
+        self.readlogs: list[fake_readlog.FakeReadLog] = []  # the read-log collectors the node emulated (O91)
+        self.real_readlog = False  # True: the REAL read-log collector program runs (`fake_readlog`)
+        self.readlog_lingers = False  # True: the emulated one writes its end line on SIGTERM and stays until SIGKILL
+        self.real_node: LocalNode | None = None  # the host that runs it
+        self.real_helpers: set[tuple[int, str]] = set()  # the real helpers' pid and start time
         self.gate_busy = 0  # this many gate starts fail as if their port were taken
         self.gate_never_ready = False
         self.helpers_ignore: frozenset[int] = frozenset()
@@ -330,6 +341,9 @@ class FakeNode:
         return proc if proc is not None and proc.start == start else None
 
     def signal(self, pid: int, start: str, sig: int) -> bool | None:
+        if (pid, start) in self.real_helpers:
+            self.signals.append((pid, sig))
+            return self.real_node.signal(pid, start, sig)
         with self.lock:
             proc = self._find(pid, start)
             if proc is None or not proc.alive:
@@ -339,6 +353,8 @@ class FakeNode:
             self._gate_signal(proc, sig)
         elif proc.role == "collector":
             self._collector_signal(proc, sig)
+        elif proc.role == "readlog":
+            fake_readlog.signalled(self, proc, sig)
         elif not proc.unkillable and (sig == signal.SIGKILL or sig not in proc.ignores):
             proc.alive, proc.exit_status = False, 128 + sig
             self._end_namespace_if_empty(proc.pidns)
@@ -354,6 +370,8 @@ class FakeNode:
                     p.alive = False
 
     def alive(self, pid: int, start: str) -> bool | None:
+        if (pid, start) in self.real_helpers:
+            return self.real_node.alive(pid, start)
         with self.lock:
             if self.host is not None and pid not in self.procs:
                 return self.host.alive(pid, start)
@@ -361,6 +379,8 @@ class FakeNode:
             return proc is not None and proc.alive
 
     def exit_status(self, process: Spawned) -> int | None:
+        if (process.pid, process.start) in self.real_helpers:
+            return self.real_node.exit_status(process)
         proc = self._find(process.pid, process.start)
         return None if proc is None or proc.alive else proc.exit_status
 
@@ -469,6 +489,8 @@ class FakeNode:
             return self._spawn_gate(list(argv), stdout, stderr, environ)
         if any(a.endswith("egress-collector.py") for a in argv):
             return self._spawn_collector(list(argv), stdout, environ)
+        if fake_readlog.is_collector(list(argv)):
+            return fake_readlog.spawn(self, list(argv), stdout, stderr, environ)
         raise AssertionError(f"the fake node spawns only the gate and the collector, not {argv[:3]}")
 
     def _spawn_gate(self, argv: list[str], stdout: Path, stderr: Path, environ: tuple[str, ...]) -> Spawned:
@@ -523,6 +545,9 @@ class FakeNode:
 
     def collector(self) -> Collector:
         return self.collectors[-1]
+
+    def readlog_collector(self) -> fake_readlog.FakeReadLog:
+        return self.readlogs[-1]
 
     # ------------------------------------------------------------------------------------------------ apptainer
     def apptainer(
@@ -623,6 +648,8 @@ class FakeNode:
 
     def default_cell(self, cell: Cell) -> CmdResult:
         """The harness's own programs, as a cell would answer them; any other program prints nothing and exits 0."""
+        if cell.program.startswith("import importlib.util") and "log_canary" in cell.program:  # the read-log canary
+            return fake_readlog.canary(self, cell)
         if cell.program.startswith("import os, resource, socket, time"):  # the egress canary
             port = int(cell.program.split("'127.0.0.1', ")[1].split(")")[0])
             self.collector().connect("127.0.0.1", port)
