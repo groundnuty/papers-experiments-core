@@ -194,7 +194,8 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
 The root is the Compose federation's (`fedlayout.Layout`: `EXPCORE_FED_ROOT_PARENT`, `EXPCORE_FED_ROOT`, the same
 checks, the same mark): a 0700 directory, here **on a filesystem the login node and the nodes see** (named in
 `site.env`; never node tmpfs). It holds what `up` lays out for Compose (`platform.toml`, `fault-journal/`,
-`link-check.json`, `facts.json`, `ca/`, `secrets/`) and the state file, **`hpc-federation.json`**:
+`link-check.json`, `facts.json`, `ca/`, `secrets/`), the federation's render identity, **`render-identity.json`**
+(section 8, O74: hashes and a version, mode 0600), and the state file, **`hpc-federation.json`**:
 
 ```json
 {
@@ -318,7 +319,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    user to that uid, as `onboard.py` does), the members, the baseline content (`fedcontent.Content`). An owner of a
    shared imported space also has its `import-<space>` storage made before any support, and the scan awaited after
    the members (section 8).
-9. **`facts.json` and `platform.toml`** (section 6), then each shared import verified against its manifest (section 8),
+9. **`facts.json` and `platform.toml`** (section 6) and the render identity of that platform (`render-identity.json`,
+   section 8), then each shared import verified against its manifest (section 8),
    then **the link check**: `fedlinks.check_after_up`, the platform
    layer's own check through the rendered `platform.toml`, which writes `link-check.json` in the root through
    `expcore_onedata.linkrecord`. `up` fails unless every pair passes.
@@ -574,6 +576,20 @@ into the root is rendered absolute. M5 launches its shard's step on `sandbox.nod
 the root's `platform.toml` beside the study's `study.toml`. The driver holds, reads back and places S, runs its node
 facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`: each shard step's directory of this
 federation whose step is gone), then releases it.
+
+**The render identity (O74).** What `up` rendered is recorded as hashes alone in `<root>/render-identity.json` (mode 0600,
+canonical JSON with sorted keys; `hpcidentity.py`, written by `hpcboot.write_facts` beside `platform.toml`, so for
+`[hpc] core = "login"` and `"step"` alike): `version` (`expcore-render-identity/1`); `template_sha256`, the template as
+the renderer read it, before it was rendered; `platform_fingerprint_sha256`, the canonical JSON of the rendered file's
+`PlatformConfig.fingerprint()` hashed as the core hashes a fingerprint (`expcore.campaign.manifest.fingerprint_sha256`);
+and the SHA-256 of each pin the platform holds (`sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256`,
+`oneclient_bundle_sha256`), the very values the preflight checked (`hpcpins`), never read again. It holds no address,
+id, job, node, path, user or secret, so it can travel with a shard's results and be committed beside a study. A pin the
+template does not name is left out; a layout with no template writes no record. A manifest's `expect_render_identity`
+(a path of the study; the lines carry it with its hash as `--expect-render-identity*`) makes `step` compare the
+federation's record with the expected one before it makes anything, beside the pre-step guard and before it, refusing
+with 73 and naming the keys that differ; and every step copies the record it read into `out/study-state/` so the archive
+carries it. `shards.py` keeps its own copy of the record's names, since it runs alone with `-I`; a test compares them.
 
 **The study's own scripts: a pre-step guard and a post-run script.** A study's own refusals (one worker, every
 planned model's cap 1, a federation root of its own) must hold at every shard's start, and `step` makes the work root and

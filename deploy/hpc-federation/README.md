@@ -358,6 +358,17 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   (`sandbox_backend`), no path is. Every path `up` renders into the root is absolute (`@hpc_root@`), so a copy of the
   file (the one a shard step places beside a study) reads the root's secrets, CA and journal.
 - **The data each space holds** (C06, O63): every template's `[[spaces]]` entry names its `data_manifest`. A shared import's is the manifest its layout names; every other space's is written by `up` into `<root>/data-manifests/` from its baseline, the same for every federation of a layout. Before the link check `up` reads every space back through its owner (directories, sizes, bytes; a shared import by `verify_imports`) and fails, naming the space, when it is not exactly its manifest. So shards on two federations of one layout record one campaign fingerprint (each space by its declared identity and its data, never its Onezone id), and `shards.py plan` refuses federations whose platform files leave a space's data undeclared.
+- **The render identity** (O74, `hpcidentity.py`): once `platform.toml` is rendered, `up` writes
+  `<root>/render-identity.json` (mode 0600, canonical JSON, sorted keys), which holds hashes and a version and nothing
+  else: `version` (`expcore-render-identity/1`), `template_sha256` (the template as the renderer read it, before it was
+  rendered), `platform_fingerprint_sha256` (the canonical JSON of the rendered file's `PlatformConfig.fingerprint()`,
+  hashed as the core hashes a fingerprint) and, for each pin the rendered platform holds, the SHA-256 `up` filled in and
+  checked: `sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256` and `oneclient_bundle_sha256`. A pin
+  the template does not name is not in the record, and no entry is ever empty. It holds no address, id, job, node, path,
+  user or secret. Two federations rendered from one template, with the same pins and the same data (every space
+  declaring its `data_manifest`, as above), have byte-equal records; a changed pin changes its own entry and the
+  fingerprint, which holds the Apptainer backend's pins, and an edited template changes the template's. A layout with no
+  platform template writes none. `shards.py step` compares it with the record a plan expects (below).
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
@@ -365,7 +376,8 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   passphrase (0600) and the Onedata test CA's certificates, never its key, into the root (`bundle/zone-export.sh`,
   `hpcca.py`); then bootstraps the federation
   through the Compose bootstrap over `https://<node FQDN>:8443`, writes its baseline, `facts.json` and
-  `platform.toml`, and runs the platform layer's link check, which writes `link-check.json` in the root; last, when
+  `platform.toml` and its render identity (`render-identity.json`), and runs the platform layer's link check, which
+  writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, checks each node
   for the recorded work directory, sweeps the agent's node (`shards.py sweep`, a control step there: every shard step's
@@ -514,6 +526,38 @@ core's `python -m expcore merge` refuses an `out/` holding `NOT-FINAL.json`, nam
 not-final archive as from any other, without the mark, and decides afresh; `step --archive-left` of an `out/` kept on the
 node archives it final only when the step's record says its script passed, and not final (with the mark) otherwise, so a
 step killed before its script passed is never archived as final.
+
+**Which render a shard runs against: the render identity (O74).** A shard is one experimental condition across
+federations only when every federation was rendered alike, and nothing but the merge, after the spend, said otherwise.
+`up` records what it rendered (see `up` above), so a plan can say which render it expects. Copy a federation's record
+into the study as the expected one, commit it with the study, and declare it in the manifest:
+
+    cp <root>/render-identity.json <study>/render-identity.expected.json
+    expect_render_identity = "render-identity.expected.json"   # a path relative to the study's root, the guard's rules
+
+`plan` and `lines` read the file (the guard's path rules; a file that is not a well-formed record refuses them, printing
+nothing), record its SHA-256 (`plan` prints `expect_render_identity: {path, sha256}` beside each line), and each line
+then ends in `--expect-render-identity REL --expect-render-identity-sha256 HEX`, after the post-run words. With none
+declared the lines and the plan are what they were, word for word. `collect` never reads it.
+
+`step` compares first, before the pre-step guard (a script of the study) and before the core check, a resume's
+removals, the work root, its own directory, the journals or an archive. It reads the expected file below the study's
+root with no link followed, refuses one that is not the bytes the plan hashed, takes the federation's own record from
+`$EXPCORE_FED_ROOT/render-identity.json` (read once below that root, no link followed, a root that is this user's and
+that no group or other can write to) and requires both to be well formed and equal, key by key. Any difference refuses
+the step with exit status 73 (`PRE_STEP_REFUSED`), naming the keys that differ (`sandbox_sif_sha256` and
+`platform_fingerprint_sha256` for a changed SIF: the fingerprint holds the pins) and never a value, a hash or a path;
+so does a federation with no record in its root, an unreadable or malformed one, or no `EXPCORE_FED_ROOT`. Nothing is
+made. A record is only the file `up` wrote: a `platform.toml` edited by hand afterwards is not seen, and a line edited
+to drop the two words runs unchecked.
+
+Whether or not one is expected, a step that has the federation's record copies the bytes it read at its start into
+`out/study-state/render-identity.json` once the dispatcher has ended, before the post-run script and the archive, so the
+archive, an `out/` kept for `--archive-left`, and a post-run script all see which render the shard ran against. A
+failure to write it is said on stderr and never stops the archive. A federation whose `up` wrote no record (one brought
+up before O74, or a layout with no platform template) and a plan that expects none run as they did and archive none;
+`collect` and the core's `merge` take an `out/` with the directory as it is (the merge reads `out/runs` alone). A resume
+writes the record of the federation it ran against, in place of an earlier step's.
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into

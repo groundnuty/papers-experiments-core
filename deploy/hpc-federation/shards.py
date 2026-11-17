@@ -7,6 +7,7 @@
     uv run python deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
     <python> -I deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
     # a step's line may end in: --pre-step REL --pre-step-sha256 HEX --pre-step-timeout S  (`lines` writes them)
+    #   and: --expect-render-identity REL --expect-render-identity-sha256 HEX  (the render the plan expects)
     <node python> -I deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
 
 **Where the dispatcher runs.** One shard runs per federation, as one job step on that federation's sandbox node: the
@@ -80,6 +81,24 @@ true (a line that dropped the words); the core's `merge` refuses an `out/` holdi
 from such an archive as from any and decides afresh; `--archive-left` archives a kept `out/` as final only when the
 step's record says its script passed.
 
+**Which render a shard runs against: the render identity (O74).** `hpcfed.py up` writes `render-identity.json` in the
+federation's root (`hpcidentity.py`): mode 0600, canonical JSON, nothing but SHA-256s and a version: the template as it
+was read before it was rendered, the rendered platform's fingerprint, and each pin the platform holds (the agent's SIF,
+the egress shim, the egress collector, oneclient's bundle). A manifest that declares `expect_render_identity`, a path
+of the study (`render-identity.expected.json` at its root, say: a federation's record copied there), makes every line
+carry `--expect-render-identity REL --expect-render-identity-sha256 HEX` (`plan` and `lines` read the file by the
+guard's path rules, refuse one that is not a well-formed record, and record its hash; with none declared the line and
+the plan are what they were). `step` compares first, before the pre-step guard and before anything else is made: it
+reads the expected file below the held study root, shows it is the file the plan hashed, reads the federation's own
+record once from `$EXPCORE_FED_ROOT` (below that root, no link followed, a root of this user's that no group or other
+can write to), and refuses with `PRE_STEP_REFUSED` (73), naming the keys that differ and never a value, when they are
+not equal key by key, when either is not well formed, or when the federation has no record, an unreadable one, or no
+root named. Whether or not one is expected, a step that has the federation's record copies those bytes into
+`out/study-state/render-identity.json` once the dispatcher has ended, before the post-run script and the archive, so
+the archive carries them; a federation whose `up` wrote none (before O74, or a layout with no platform template) and a
+plan with no expectation run as they did, and archive none. The record is what `up` wrote: a `platform.toml` edited
+by hand afterwards is not seen, and a line edited to drop the two words runs unchecked.
+
 **The node's tmpfs is the node's, not the job's.** Each step's directory there (`expcore-shard-<label>.<random>`)
 records its step (`step.json`: its pid and start time, its shard, its federation's root, its results directory, the
 archive it started from, and its phase): `running` while its dispatcher runs, `archiving` from the moment it ends
@@ -144,6 +163,7 @@ The manifest (`shards.toml`, operator-local, never committed, since it names the
     pre_step_timeout_s = 60           # optional, with pre_step: its bound in seconds (above 0, at most 600)
     post_run = "guards/post_run.py"   # optional: a script of the study that each step runs after its dispatcher exits 0
     post_run_timeout_s = 300          # optional, with post_run: its bound in seconds (above 0, at most 1800)
+    expect_render_identity = "render-identity.expected.json"  # optional: the render a federation must have (see above)
     [[shards]]                        # in order: shard i is the i-th entry
     label = "fed-a"                   # the shard's label (no host name: it travels with the export)
     root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml
