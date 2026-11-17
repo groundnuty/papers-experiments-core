@@ -405,6 +405,7 @@ def test_o74_up_wrote_each_federations_render_identity_0600_and_each_shards_out_
 NOT_EVIDENCE: tuple[tuple[str, str], ...] = (
     (".expcore-fed-root", "the mark that makes the root this federation's own"),
     ("ca/", "the federation's CA certificate: public, and meaningless once the federation is gone"),
+    ("core-phase.lock", "the core phase's lock, held while a core phase runs and holding nothing (C06)"),
     ("evidence-collected.json", "collect's own marker, which says the evidence was collected"),
     ("hpc-federation.lock", "the lifecycle lock, held only while an up or a down runs"),
     ("link-check.lock", "the link check's lock"),

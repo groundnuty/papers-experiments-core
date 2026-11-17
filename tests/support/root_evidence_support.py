@@ -81,3 +81,35 @@ def record_step(root: Path, label: str, starts: int = 1) -> Path:
 
 def mode_of(path: Path) -> int:
     return os.stat(path).st_mode & 0o777
+
+
+def leave_what_up_leaves(root: Path) -> Path:
+    """What `up` alone leaves in a root, on top of what the down rig's `up` already made (the state, `secrets/`, the
+    empty `fault-journal/`: `hpcdriver.prepare_root`, line 240): each file with the code that writes it, so a root of
+    this is the one a plain up-then-down meets, and nothing here is evidence a run left. The link check's record and its
+    lock are written by the real writer, the way `fedlinks.check_after_up` writes them (lines 53 to 55).
+
+    - `platform.toml`: `hpcboot.write_platform` (lines 270, 275);
+    - `render-identity.json`: `hpcidentity.write` (line 326), beside the platform file;
+    - `data-manifests/<space>.json`: `hpcdata.data_manifests` (line 140);
+    - `link-check.json` and `link-check.lock`: `linkrecord.recording` and `write_record` through `check_after_up`;
+    - `fault-relay/requests`, `taken`, `answers` (empty), `relay.lock` and `heartbeat.json`: `fault_relay.holding`
+      (lines 345 to 347) and `beat` (line 366), which `up` starts at its end (`hpcdriver.start_relay`)."""
+    from expcore_onedata.linkcheck import LinkReport, PairResult
+    from expcore_onedata.linkrecord import recording, write_record
+
+    for name in ("platform.toml", "render-identity.json", "data-manifests/alpha-space.json"):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(EVIDENCE[name])
+        path.chmod(0o600)
+    record = root / "link-check.json"
+    passed = PairResult("providers[0]", "providers[1]", True, 0.25, 65536)
+    with recording(record):
+        write_record(LinkReport(True, "ok", (passed,), 1.0, 2.0), record)
+    relay = root / "fault-relay"
+    for name in ("", "requests", "taken", "answers"):
+        (relay / name).mkdir(mode=0o700, exist_ok=True)
+    (relay / "relay.lock").write_bytes(b"")
+    (relay / "heartbeat.json").write_bytes(NOT_EVIDENCE["fault-relay/heartbeat.json"])
+    return root

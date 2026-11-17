@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from apptainer_support import make_settings, make_spec, start
-from fake_node import FakeNode
+from fake_node import OWN_FQDN, OWN_HOST, FakeNode
 
 from expcore_onedata.addresses import build
 from expcore_onedata.sandbox import gatelog
@@ -136,19 +136,20 @@ def test_o73_the_platform_gives_a_run_the_names_of_its_map_and_a_platform_withou
 
 
 def test_o73_the_gate_is_given_the_names_and_a_cell_is_given_none_of_them(node, tmp_path):
-    """O73: the gate's own configuration holds the list; no exec's argument, environment or bound file of a cell holds a
-    name, an address or the port."""
+    """O73: the gate's own configuration holds the list, the federation's nodes' names and addresses and then the agent
+    node's own names (`own_names`); no exec's argument, environment or bound file of a cell holds a name, an address or
+    the port."""
     box = start(node, make_settings(tmp_path), _spec())
     try:
         box.exec("print(1)", 30)
-        assert node.gates[-1].config["scan_names"] == list(NAMES)
+        assert node.gates[-1].config["scan_names"] == [*NAMES, OWN_HOST, OWN_FQDN]
         for done in node.execs:
             seen = [" ".join(done.argv), json.dumps(done.env)]
             for source, _ in done.binds.values():
                 path = Path(source)
                 files = [path] if path.is_file() else [p for p in path.rglob("*") if p.is_file()]
                 seen += [p.read_bytes().decode("utf-8", "replace") for p in files]
-            for word in NAMES:
+            for word in (*NAMES, OWN_HOST, OWN_FQDN):
                 assert not [text for text in seen if word in text], word
     finally:
         box.stop()

@@ -45,7 +45,7 @@ from expcore_onedata.sandbox.oneclient_build import SLICE, SLICE_NAME
 VALUED = {
     "--name", "--network", "--label", "-l", "--user", "-u", "--cpus", "--memory", "--memory-swap", "--pids-limit",
     "--ulimit", "--tmpfs", "--shm-size", "-v", "--volume", "--mount", "-e", "--env", "--add-host", "--cap-add",
-    "--cap-drop", "--security-opt", "--entrypoint", "--oom-score-adj", "--device", "-w", "--workdir",
+    "--cap-drop", "--security-opt", "--entrypoint", "--oom-score-adj", "--device", "-w", "--workdir", "--hostname",
 }  # fmt: skip
 REPEATED = {"--label", "-l", "-v", "--volume", "--mount", "-e", "--env", "--add-host", "--cap-add", "--cap-drop"}
 BOOT_ID = "0f0f0f0f-1111-2222-3333-444455556666"
@@ -101,6 +101,10 @@ class FakeContainer:
 
     def mount_specs(self) -> list[str]:
         return [*self.options.get("-v", []), *self.options.get("--mount", [])]
+
+    def hostname(self) -> str:
+        """What `hostname` prints in the container: `--hostname`, else the engine's own choice, its short id."""
+        return self.options.get("--hostname") or self.id[:12]
 
 
 def _mounts_json(c: FakeContainer) -> list[dict[str, str]]:

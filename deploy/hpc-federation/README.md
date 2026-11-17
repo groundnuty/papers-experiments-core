@@ -495,6 +495,52 @@ and the line stands before the template's first table; `up` refuses a template w
 and the render refuses the slot where the root holds no map); see `DESIGN.md`, "The registered names". Every login-side client of the services is built by `hpcboot.service_client`, which refuses a root with no usable map rather than build a client that could reach no name, and `tests/deploy/test_rest_constructors.py` fails on any other construction that is not listed with its reason. The first sandbox slot on a federation brought up
 this way is owed the checks of `DESIGN.md` section 9, item 7.
 
+## The cell's host name (O73)
+
+An agent's cell on a batch node has no network namespace, and without `--uts` no UTS namespace either: `hostname`,
+`uname -n`, `uname -a` and `/proc/sys/kernel/hostname` in it show the batch node's own name. That is a name the agent
+must not read (the gate's count of node names, `rest_node_name_hits` in `docs/interfaces.md`, is for the same reason),
+and a Compose cell, which reads its own container's name, does not show it. The core gives every cell on both backends
+one fixed, neutral host name, `sandbox` (`expcore_onedata/sandbox/cellhost.py`, a constant of the core and no setting):
+each `apptainer exec` carries `--uts --hostname sandbox`, and the Docker agent's container is created with
+`--hostname sandbox`. A federation with a node of that name, or, for a run that scans for node names, an agent node whose own host name is that, is
+refused at the start. The gate's scan for node names
+(`rest_node_name_hits`) holds the agent node's own host name instead, in its fully qualified and one-label forms, read
+from the node at the start (`NodeOps.own_names`), after the federation's nodes' names, so a leak of the name the cell
+no longer shows is still counted; never `sandbox`, which is the allowed name and would count false hits. The fully
+qualified names are a resolver lookup (`gethostbyaddr` of the host name: the primary name and every alias, each
+scanned whole and by its first label), so it is bounded: 5 s in a thread of its own, after which the host name is
+scanned alone, and a start waits no longer for a resolver that hangs. The run's facts (`own_node_scan`) say how many
+forms were scanned and, by reason alone (`fqdn_timeout`, `fqdn_failed`, `host_name_failed`, and `fqdn_unqualified` when
+no name the scan keeps has a domain, which a loopback alias or a declared name does not give, so a leak of the node's
+name followed by its domain would not be counted), what was not read, never a name. A live slot should show `own_node_scan.unread` empty.
+
+**`/etc/hostname`:** the sandbox binds none of its own. From Apptainer's source (read on its `main` branch, not on this
+site's release), `--uts` with a `--hostname` makes Apptainer write an `/etc/hostname` of the name and bind it, and it
+never binds the node's own: `/etc/hosts` and `/etc/localtime` are the only default bind paths, and `--containall` binds
+no others of the site's. A bind of ours onto it would, by the same reading (not run), be a second mount on the same
+path: Apptainer mounts its own first and a user bind after it, so ours would win, and for an image with no
+`/etc/hostname` the source makes a user bind fatal where Apptainer's own is skipped (unless an overlay or underlay makes
+the mount point, which was not read). So the sandbox adds none, and a hook (b) bind onto it is refused (it would replace
+the name).
+
+**Measured (17 Nov 2026, the pilot's site):** its Apptainer runs in setuid mode, and `apptainer exec --uts --hostname
+sandbox <image> hostname` and the same with `uname -n` print `sandbox`, exit 0, with no warning; without `--uts` both
+print the node's own name.
+
+**Not shown offline, owed to the next live slot:**
+
+1. `--uts --hostname sandbox` together with the sandbox's whole argv (`--containall`, `--no-mount
+   hostfs,bind-paths,cwd`, the binds, the preloads and the egress shim). The measurement above was a bare exec of an
+   image.
+2. `cat /etc/hostname` in a cell of a live run, with no bind of ours, which is what ships: it must read `sandbox`
+   (record `apptainer --version`, since the source above is `main`'s). If it reads anything else, a generated file bound
+   at `/etc/hostname` is the fallback, and its start must then be shown not to fail on an image with no such file.
+3. `hostname`, `uname -n`, `uname -a` and `cat /etc/hostname` in a cell of a live run, compared with a Compose cell's.
+
+The tests (`tests/onedata/sandbox/apptainer/test_cell_hostname.py`) read the argv and binds a fake node was given; they
+do not run Apptainer.
+
 ## Slots and the tool server (O83)
 
 The tool-server arm needs a slot's users. `layouts/pilot-shape-slots.toml` is the pilot's shape with the four users of two
@@ -819,11 +865,28 @@ directory they were pulled into and whatever the patterns say (tests: `tests/pac
 alternative, an anonymisation that covers node names, addresses and site paths, was not chosen, since no list of terms
 can name a site's details before they are known.
 
-**`down` refuses a root whose evidence was not collected.** `shards.py step` leaves `shard-steps/<label>.json` in its
-federation's root when a step starts (the shard's spec and a count; a step that cannot write it does not start), and
+**`down` refuses a root that holds evidence a run left, whose evidence was not collected.** The gate keys on the
+evidence **present** in the root, not on a shard step having run. `shards.py step` leaves `shard-steps/<label>.json` in
+its federation's root when a step starts (the shard's spec and a count; a step that cannot write it does not start), and
 `collect` writes `evidence-collected.json` there, naming the root archive's SHA-256, the digest of those records and the
-SHA-256 of each archived file. `hpcfed.py down` reads them first, before it stops or cancels anything: a root with step
-records and **no current marker** is refused, naming the shards, and stays whole so that a `collect` can still read it.
+SHA-256 of each archived file. `hpcfed.py down` reads the root first, before it stops or cancels anything. What counts as
+evidence is what a run, a step or the operator leaves: **any step record, a file of `fault-journal/` with a line in it
+(at any depth), a file of the relay's journals (`late-steps.jsonl`, a request, a taken request, an answer) that is not
+empty, `shard-claim.json` (or its lock) that is not empty, and the pilot's `day0-wiring.toml`**; so a root that only ran
+Day-0 measurements, with no shard step, is refused too. An empty file (the injector's lock files, say) is no evidence, and
+a link or a special file where the journal is counts, since it proves no absence, and so does a file with a line in it at any depth (a tree nested past the archive's bound, or with an odd name, counts for what it holds). **What `up` alone
+writes does not count:** the state, `platform.toml`, `facts.json`, `render-identity.json`, the data manifests and the link
+check's record and lock (`up` takes no admission and writes no line of the fault journal; the relay it starts makes only
+empty directories, a lock and a heartbeat). A root after `up` alone, or a failed `up`'s, holds none, and `down` removes it
+as it always did, so an emergency teardown is never blocked. A root with evidence and **no current marker** is refused,
+naming its shards (or, with no step record, the kinds of evidence it holds: the fault journal, the relay's journals, a
+shard claim, the day-0 wiring; never a file), and stays whole so that a `collect` can still read it; **`shards.py collect
+--roots-only --shard L` marks a root with no step record** (it works from the shard plan, which must name the root; a
+plan has at least two shards, so a single federation's Day-0 root needs a manifest that names another shard too), and a
+root no plan names, or one the collect refuses (a link, a special file, a file holding a secret), is removed with
+`--discard-evidence`. A Day-0 run leaves evidence in the root only through the injector's journal and the relay's files,
+which need a platform with `[faults]`: its own report, and the checks that only read, are written under its `--out`
+directory, never in the root, so `down` does not see them.
 The runbook order stays **collect, pull and verify, then `down`.** `down` reads the root's evidence again and compares it
 with the marker file by file, **strictly only for the evidence a step or the study writes:** the fault journal
 (`fault-journal/`), the relay's journals (`fault-relay/`, `late-steps.jsonl` among them), the shard claims
@@ -838,11 +901,13 @@ rewritten while the federation runs (by state updates, and by each link check), 
 it in the state (`evidence_rewritten_after_collect`: the time in UTC, the shards, the names); the copy `collect` took
 stays what the post-check reads, so no second archive is made. A link check a step makes also appends to the fault
 journal's holds, so a step still running after the collect is refused through the journal all the same.
-`pass-env.json` is in the results, not in the root: `verify-copy` checks it. A root where no step ever
-ran goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
-down's output then says which shards' evidence was discarded, and **every use is recorded in the federation's state file**
-(`evidence_discarded`: the time in UTC, the shards, whether their evidence had been collected and changed since, and
-the reason given with `--discard-reason TEXT`, at most 500 characters, if any). The state file goes with the root when
+`pass-env.json` is in the results, not in the root: `verify-copy` checks it. A root that holds no evidence a run left
+(an NFS silly-rename file, a removed file still held open, is none: a `down` run again after a removal cut short finds only
+these) goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
+down's output then says which shards' evidence (or which kinds, for a root with no step record) was discarded, and **every
+use is recorded in the federation's state file** (`evidence_discarded`: the time in UTC, the shards, the kinds of
+evidence, whether their evidence had been collected and changed since, and the reason given with `--discard-reason TEXT`,
+at most 500 characters, if any). The state file goes with the root when
 `down` ends, so that line in down's output is what outlives it: keep it. (`fleet.py down` takes no such flag: it reports the refusal,
 and `hpcfed.py down --discard-evidence` is run for that root by hand.) A `collect` after the root is gone (a down that
 followed an earlier collect) lists the root archive that collect wrote, if it still verifies, and refuses otherwise.
@@ -1240,8 +1305,8 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   first, so a refused plan shows a failed federation that still bills. `status` runs nothing and then adds each
   federation's phase and jobs, and each shard's place.
 - **Moving a shard.** End its step, then collect the federation's root evidence: `shards.py collect --manifest M --roots-only --shard L`
-  (no archive, no `--into`: the other shards need not be final; a step still writing makes `down` refuse the collect as stale), since `down --member fed-k` refuses a root a step ran
-  against whose evidence is not collected (or `hpcfed.py down --discard-evidence --discard-reason ...` by hand: recorded).
+  (no archive, no `--into`: the other shards need not be final; a step still writing makes `down` refuse the collect as stale), since `down --member fed-k` refuses a root that holds
+  evidence a run left (a step ran against it, say) which is not collected (or `hpcfed.py down --discard-evidence --discard-reason ...` by hand: recorded).
   The shard's archive under its label is named by the shard, so the root archive the move leaves (`<label>.root.*`, made of
   the first federation) is put aside by the next collect as `<label>.<12 hex digits>.root.*` and listed in
   `archives.sha256.json`, never overwritten. `down --member fed-k` takes one federation down and frees its shard (its step ends with the
