@@ -10,6 +10,7 @@ from sandbox_support import make_spec, start_options
 from expcore.errors import InfraError
 from expcore_onedata.sandbox import deadline
 from expcore_onedata.sandbox.codetool import DEFAULT_DESCRIPTION
+from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 
 
@@ -70,3 +71,31 @@ def test_o69_the_sweep_s_wait_is_the_harness_s_never_the_cell_s_time(world, sbx)
     assert time.monotonic() - began >= 5  # the sweep waited for the survivor
     assert result.duration_s < 5
     assert sbx._cells.cells[-1]["duration_s"] < 5
+
+
+def test_o69_a_leftover_in_d_whose_kill_failed_ends_the_run(world, sbx):
+    """O69: a process in D takes a pending SIGKILL on its next return, but only one the kill reached: when the kill
+    command failed, a leftover in D is not known to be signalled, so the run ends as `survived_kill`."""
+    agent = world.host.containers[sbx.names.agent]
+    world.host.add_stat(7010, "reader", agent.pid, state="D")
+    world.host.add_cgroup(agent, [agent.pid, agent.init_child, 7010])
+    world.host.run_handlers["kill"] = lambda argv: CmdResult(1, "", "sudo: a password is required")
+    sbx.exec("start_a_reader()", 30)
+    del world.host.run_handlers["kill"]
+    assert sbx._cells.ended["outcome"] == deadline.SURVIVED
+
+
+def test_o69_every_leftover_counts_not_only_the_first_sixteen_recorded(world, sbx):
+    """O69: the quiesce's record keeps 16 leftovers, but whether the run goes on is judged on all of them: sixteen in
+    D and a seventeenth still running end the run."""
+    agent = world.host.containers[sbx.names.agent]
+    pids = list(range(7100, 7117))
+    for pid in pids[:16]:
+        world.host.add_stat(pid, "reader", agent.pid, state="D")
+    world.host.add_stat(pids[16], "worker", agent.pid)
+    world.host.add_cgroup(agent, [agent.pid, agent.init_child, *pids])
+    world.host.unkillable.update(pids)
+    sbx.exec("start_readers()", 30)
+    assert sbx._cells.ended["outcome"] == deadline.SURVIVED
+    swept = [q for q in sbx.metadata()["quiesced"] if q.get("cell") == 1]
+    assert (len(swept[0]["left"]), swept[0]["left_running"]) == (16, 1)
