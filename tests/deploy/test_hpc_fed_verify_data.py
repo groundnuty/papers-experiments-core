@@ -214,7 +214,7 @@ def test_o57_verify_reads_every_space_through_the_ids_up_wrote_into_facts_json(h
         return lambda space: tree_of(ONE)
 
     result = hpc.boot.verify_ingested(
-        layout, (5001, 5001), {"delta-space": ONE}, rest=lambda f: SimpleNamespace(close=lambda: None),
+        layout, (5001, 5001), {"delta-space": ONE}, rest=lambda f, **kwargs: SimpleNamespace(close=lambda: None),
         bootstrap=bootstrap, data=reader,
     )  # fmt: skip
     facts = json.loads((fed.root / "facts.json").read_text(encoding="utf-8"))["spaces"]

@@ -18,12 +18,15 @@
 # later through a step's stdin.
 # Shared imported trees (O59): a provider that owns imported spaces is given one `--import=SPACE=PATH` per space after
 # the peers; configure.sh checks each tree and the service binds it read-only (importstorage.py).
+# A federation reached by the names its layout declares (O73) gives <zone-fqdn> the zone's declared name and adds
+# `--declared=NAME` (the provider's own) and one `--host=NAME=ADDRESS` per service of the federation, itself included
+# (see configure.sh): the provider registers under NAME and its cell is given a hosts file that resolves every peer.
 # Provider storage on scratch (O57): with HPC_STORAGE_ROOT, hpcfed.py gives the provider its own directory there as one
 # `--storage=PATH` last; configure.sh checks and records it, and the service binds it onto /volumes/posix
 # (posixstorage.py). Without it the posix storage is the rootfs's own, on the node's tmpfs.
 # Usage: sbatch --nodelist=<node-B> --time=<t> --mem=32G [--exclusive] provider.sbatch \
 #          <bundle-dir> <oneprovider.tar> <provider-name> <zone-fqdn> <admin-email> <zone-ip> [<peer-ip> ...] \
-#          [--import=SPACE=PATH ...] [--storage=PATH]
+#          [--declared=NAME --host=NAME=ADDRESS ...] [--import=SPACE=PATH ...] [--storage=PATH]
 set -euo pipefail
 B=${1:?usage: provider.sbatch <bundle-dir> <tar> <name> <zone-fqdn> <admin-email> <zone-ip> [peer-ip ...]}; shift
 [[ -f $B/lib.sh ]] || { echo "hpcop: no lib.sh in '$B'" >&2; exit 1; }

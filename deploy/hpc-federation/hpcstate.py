@@ -57,6 +57,7 @@ def new_service(kind: str) -> Dict[str, Any]:
         "kind": kind,
         "node": None,
         "fqdn": None,
+        "declared": None,  # the name the service registers under and is reached by (O73); fqdn is the node's own
         "address": None,
         "ports": ports,
         "workdir": None,

@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -37,13 +37,32 @@ TOKEN_DIR = "gate-secret"
 TOKEN_FILE = Path(TOKEN_DIR, "gate-token")
 
 
-def hosts(zone: Endpoint, provider: Endpoint) -> dict[str, dict[str, Any]]:
-    """The names the gate serves and dials: the zone's and the agent's pinned local provider's, as their URLs give
-    them (O03, O05). On the node the cell resolves both to the loopback (`argv.hosts_text`)."""
+def hosts(zone: Endpoint, provider: Endpoint, names: tuple[str, str] | None = None) -> dict[str, dict[str, Any]]:
+    """The names the gate serves, each with the host and port it dials: the zone's and the agent's pinned local
+    provider's (O03, O05). The cell resolves every name to the loopback (`argv.hosts_text`) and dials it on 443.
+
+    `names` are `[sandbox.federation]`'s, the zone's and the provider's (O69): the gate then serves and certifies those
+    and dials the URLs' hosts and ports behind them, so the agent sees the names the layout declares and never a
+    node's name or port. Without them it serves the URLs' hosts themselves, as it always has. An endpoint with an
+    address (O73) is dialled at it, the name it is served under unchanged."""
+    zone_name, provider_name = names if names is not None else (zone.host, provider.host)
+    if names is not None and zone_name.lower() == provider_name.lower():
+        raise SandboxError("[sandbox.federation] serves the zone and the provider by one name: a name is one host's")
     return {
-        zone.host: {"role": "onezone", "addr": zone.host, "port": zone.port, "tls": zone.tls},
-        provider.host: {"role": "oneprovider", "addr": provider.host, "port": provider.port, "tls": provider.tls},
+        zone_name: _upstream("onezone", zone),
+        provider_name: _upstream("oneprovider", provider),
     }
+
+
+def _upstream(role: str, endpoint: Endpoint) -> dict[str, Any]:
+    """One served name's upstream: the URL's host (`addr`, the name its handshake asks for and its certificate is
+    checked against), its port and TLS, and `dial`, the address to connect to, when the platform's `[addresses]` map
+    holds the host (O73): the host is then a declared name that resolves nowhere. Without a map entry there is no `dial`
+    key, and the gate dials `addr`, as it always has."""
+    out: dict[str, Any] = {"role": role, "addr": endpoint.host, "port": endpoint.port, "tls": endpoint.tls}
+    if endpoint.address is not None:
+        out["dial"] = endpoint.address
+    return out
 
 
 def config(
@@ -58,8 +77,13 @@ def config(
     port: int,
     upstream_ca: Path | None,
     options: Mapping[str, Any],
+    scan_names: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """The gate's configuration: no secret (the token is in its file), the hook's options added to the sandbox's."""
+    """The gate's configuration: no secret (the token is in its file), the hook's options added to the sandbox's.
+
+    `scan_names` (O73) are the real names and addresses of the federation's nodes, which the gate counts in the answers
+    it relays: it is the gate's own configuration, a file of the run's gate directory that no cell binds and no
+    collection copies, and is set only when there are names to scan."""
     clash = sorted(set(options) & GATE_OWN_KEYS)
     if clash:
         raise SandboxError(f"the gate's options may not set {clash[0]!r}: the sandbox writes it itself")
@@ -81,6 +105,8 @@ def config(
     )
     if upstream_ca is not None:
         out["upstream_ca_file"] = str(upstream_ca)
+    if scan_names:
+        out["scan_names"] = list(scan_names)
     return out
 
 
