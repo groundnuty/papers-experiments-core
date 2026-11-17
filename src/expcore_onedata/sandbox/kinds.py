@@ -167,8 +167,10 @@ def kind_of(category: str | None) -> str | None:
 
 def deadline_error(kill: Mapping[str, Any] | None) -> InfraError | None:
     """The error of a cell that outlived its kill at its deadline (`killcause.KILL_SURVIVED`), or None for any other
-    cell: kind `cell_unkillable`, with how the deadline ended. It comes before every other error of the cell, the
-    gate's refusals included: after an abort or a stop, nothing read from the run is the cell's own evidence."""
+    cell: kind `cell_unkillable`, with how the deadline ended. The run's ending is never raised in place of that cell's
+    own result (O72): the code tool returns the cell's timeout and uses this only to tell such a cell, whose gate
+    refusals and kill it then reads no further: after an abort or a stop, nothing read from the run is the cell's own
+    evidence. The run's end is `run_ended_error`'s, raised at the next call, by `launch` and by the collection."""
     if not kill or kill.get("reason") != killcause.KILL_SURVIVED:
         return None
     outcome = (kill.get("deadline") or {}).get("outcome", "unknown")
@@ -177,7 +179,9 @@ def deadline_error(kill: Mapping[str, Any] | None) -> InfraError | None:
 
 def run_ended_error(record: Mapping[str, Any]) -> InfraError:
     """The error of every later cell of a run a cell's deadline ended (O34), and of its collection once the sandbox was
-    stopped: kind `cell_unkillable`, with how that deadline ended. A run the Apptainer backend's watch ended, because
+    stopped: kind `cell_unkillable`, with how that deadline ended, and the cell it was when the record knows it (the
+    detail then says that cell ran, and hit its deadline: its own result stands, O72). A run the Apptainer backend's
+    watch ended, because
     what passed a limit could not be told one cell's (`scope: run`, O72), is kind `cell_not_isolated` instead: set
     aside, and counted apart from every other sandbox failure."""
     if record.get("scope") == "run":
@@ -190,6 +194,13 @@ def run_ended_error(record: Mapping[str, Any]) -> InfraError:
             CELL_UNKILLABLE,
             f"the run was ended by the end-of-cell sweep after cell {record.get('cell')} ({outcome}): "
             f"{record.get('why')}; the cell's own result stands: nothing more runs",
+        )
+    if record.get("cell") is not None:  # the cell ran and hit its deadline: its own result stands, a timeout (O72)
+        why = record.get("why") or "a process of the cell outlived its kill"
+        return InfraError(
+            CELL_UNKILLABLE,
+            f"the run was ended at cell {record['cell']}'s deadline ({outcome}): {why}; "
+            "the cell's own result stands: nothing more runs",
         )
     return InfraError(CELL_UNKILLABLE, f"the run was ended at a cell's deadline ({outcome}): nothing more runs")
 
