@@ -17,6 +17,12 @@ from hpc_import_support import IMPORT_LAYOUT, make_environ
 
 PROVIDERS = ["aspen", "larch", "rowan", "alder", "hazel"]
 PATTERN = r"inodes used (?P<used>[0-9,]+) of (?P<quota>[0-9,]+)"
+TOOL = "fake-quota"  # an invented command name
+
+
+def quota_answer(hpc):
+    """The invented quota command's answer, well under any line."""
+    return lambda argv, timeout: hpc.slurm.Completed(0, "inodes used 1,000 of 1,000,000\n", "")
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +46,10 @@ def site(tmp_path):
         "SH": str(images),
         "L": str(logs),
         "HPC_STORAGE_ROOT": str(scratch),
-        "HPC_QUOTA_CHECK": "off",  # the guard has its own tests (test_hpc_inode_guard.py)
+        # the guard is mandatory on scratch (it has its own tests, test_hpc_inode_guard.py): an invented command that
+        # answers well under any line
+        "HPC_QUOTA_CMD": f"{TOOL} --inodes",
+        "HPC_QUOTA_PATTERN": PATTERN,
     }
 
 
@@ -48,7 +57,7 @@ class Rig:
     """A driver over the fake Slurm with the core's phase recorded instead of run."""
 
     def __init__(self, hpc, tmp_path, site, layout=LAYOUT, environ=None):
-        self.hpc, self.site, self.fake = hpc, site, FakeSlurm()
+        self.hpc, self.site, self.fake = hpc, site, FakeSlurm(tools={TOOL: quota_answer(hpc)})
         self.root, self.scratch = tmp_path / "fed" / "root", Path(site.get("HPC_STORAGE_ROOT", tmp_path / "scratch"))
         given = {} if environ is None else {"environ": environ}
         self.driver = hpc.cli.make_driver(layout, str(self.root), runner=self.fake, **given)
@@ -148,7 +157,7 @@ def test_up_makes_one_directory_of_its_own_and_one_per_provider_below_the_scratc
     marker = json.loads((rig.parent() / ".hpcop-storage-owner").read_text(encoding="utf-8"))
     assert marker == {"allocation": name, "token": record["token"]}
     for provider, directory in rig.provider_dirs().items():  # each provider's directory proves itself, too
-        assert listing(directory) == {".hpcop-storage-owner"}
+        assert listing(directory) == {".hpcop-storage-owner", "posix"}  # and holds the directory its service binds
         held = json.loads((directory / ".hpcop-storage-owner").read_text(encoding="utf-8"))
         assert held == {**marker, "provider": provider}
     assert rig.state()["site"]["storage_root"] == site["HPC_STORAGE_ROOT"]

@@ -47,9 +47,9 @@ AGENT_PINS = {
     "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
 }
 AGENT_VARIABLES = {**AGENT_PATHS, **AGENT_PINS}
-QUOTA_CHECK_OFF = (
-    "off"  # HPC_QUOTA_CHECK's one value: the inode check is skipped, and up says so (README, "Provider storage")
-)
+# HPC_QUOTA_CHECK's one value. It never applies to a federation bound onto scratch (a site that sets it with
+# HPC_STORAGE_ROOT is refused), and without a scratch root there is no check to skip (README, "Provider storage").
+QUOTA_CHECK_OFF = "off"
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
     # 2.5 GB rootfs, plus its posix storage on the same tmpfs; the largest control step (a token's delivery) about
@@ -334,8 +334,10 @@ class Site:
     # hpcquota; README, "Provider storage on scratch"). `storage_root` is the directory below which `up` makes the
     # federation's own storage; with none, nothing is made on scratch and no check runs. `quota_cmd` is the site's
     # command that prints the account's inode usage and quota (split as a shell would, run without one),
-    # `quota_pattern` the regular expression with the named groups `used` and `quota` that reads its output, and
-    # `quota_check` is "off" to skip the check. Only `storage_root` is recorded in the state file: `down` needs it.
+    # `quota_pattern` the regular expression with the named groups `used` and `quota` that reads its output. With a
+    # scratch root the providers' storage is bound onto scratch and the check is mandatory: `quota_check` "off" is
+    # refused with it, and changes nothing without it. Only `storage_root` is recorded in the state file: `down` needs
+    # it.
     storage_root: str = ""
     quota_cmd: str = ""
     quota_pattern: str = ""
@@ -403,6 +405,12 @@ def checked_site(site: Site) -> Site:
         _absolute(site.storage_root, "HPC_STORAGE_ROOT")
     if site.quota_check not in ("", QUOTA_CHECK_OFF):
         raise SettingsError(f"HPC_QUOTA_CHECK: must be '{QUOTA_CHECK_OFF}' or unset (unset is not off)")
+    if site.storage_root and site.quota_check == QUOTA_CHECK_OFF:
+        raise SettingsError(
+            f"HPC_QUOTA_CHECK={QUOTA_CHECK_OFF} with HPC_STORAGE_ROOT: a federation whose provider storage is bound "
+            "onto scratch always runs the inode check, which cannot be turned off there; unset HPC_QUOTA_CHECK, or "
+            "unset HPC_STORAGE_ROOT for storage on the nodes' tmpfs"
+        )
     return site
 
 

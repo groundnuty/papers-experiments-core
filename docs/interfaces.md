@@ -1186,6 +1186,7 @@ egress_shim_sha256 = "<64 hex>"
 egress_collector = "egress-collector.py"
 egress_collector_sha256 = "<64 hex>"
 hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: the default
+provider_storage = "tmpfs"          # optional (O57): where the federation's providers keep their data, "tmpfs" or "shared_filesystem"
 ```
 
 - **Its egress:** `EgressLog(sandbox, sandbox.egress_declaration(), sandbox.egress_nonce)`. The declaration names the gate at `127.0.0.1:<its port>`, the canary's listener, and the gate's names. `egress_log()` returns the collector's log once `collect` has stopped the collector, and None before that.
@@ -1215,6 +1216,8 @@ hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: the defaul
   - a cell's processes end with its exec;
   - no freezer;
   - a mount is refused, `mount_refused`, listed only for a run whose sandbox refuses one (no mount helper, or no `[sandbox.mount]`): a mount run never carries it.
+
+- **The providers' storage kind** (O57; `provider_storage`). Where a provider stores its data shapes a run's I/O timing, so `[sandbox.apptainer] provider_storage` declares it, `"tmpfs"` or `"shared_filesystem"` (any other word is refused at load, naming the key). The HPC driver renders it from `site.env` (`HPC_STORAGE_ROOT` set: `shared_filesystem`), the word and never the root's path. Declared, it is in `PlatformConfig.fingerprint()` (`sandbox_backend`), so shards on the two kinds never merge and a campaign never resumes from one onto the other, in each run's `metadata()["backend"]` and as `metadata()["infrastructure_facts"]["provider_storage"]`. A platform that declares none (the Docker backend, so a Compose federation, or an Apptainer platform written before the key) has no such key anywhere and keeps its fingerprint.
 
 ## The platform layer's files in and out
 
