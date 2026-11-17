@@ -431,7 +431,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    --declared=<its declared name> --host=<name>=<address> ...` (one `--host` per service of the federation, itself
    included), run as a step (it holds the service for the step's life, as the standing run did). `up` waits for its log's verdict
    (`hpcop: OK zone`, or `FINISH FAILED` or `hpcop: ERROR`, which fail `up`).
-6. **The providers**: one detached service step each, `provider.sbatch <bundle> <provider tar> <name> <zone's declared
+6. **The providers**: one detached service step each, launched `launch_stagger_s` (1 s) apart (below), `provider.sbatch <bundle> <provider tar> <name> <zone's declared
    name> <admin mail> <zone address> <every other provider's address> --declared=<its declared name> --host=...`; for each, a registration token minted in a control
    step on the zone's node piped into a delivery step on the provider's (`mint-registration-token.sh |
    deliver-token.sh`, the bundle's, with `--workdir`); then each log's verdict (`hpcop: OK provider`). A provider that
@@ -467,6 +467,52 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
     every verb it runs inherits it; then `fault_relay alive` (`-I -B` too) polled until it beats (30 s at
     most; a relay that never beats fails `up` and is ended). It is recorded in the state file as `relay`. One relay
     per root: it takes a lock.
+
+**A launch that failed at launch (O57; live 17 Nov 2026, twice).** Five provider steps launched in the same second
+failed together: srun's fan-out on the login node could not find the nodes' addresses, each step was accounted
+`CANCELLED` with exit `0:116` after about 12 s, and the services' run logs were empty (the bundle's first write never
+happened). `up` could only fail and be torn down, although a minute later every node resolved. Two changes:
+
+- **The providers are launched `launch_stagger_s` apart**: a declared bound of the driver (`hpcdriver.LAUNCH_STAGGER_S`,
+  1 s), a pause between two launches, never before the first provider's or after the last. It is recorded in the state
+  file as `launch.stagger_s`.
+- **A service is launched once more, only when both proofs hold** (`hpclaunchproof.py`; the zone's launch and each
+  provider's). The one failure considered is the one `up` always raised: the step ended before its log said what `up`
+  waited for. `up` then reads, at that moment, three sources. **(a)** sacct's rows of the step's job (`sacct -j <job> -n
+  -P -o JobID,JobName,State,ExitCode`) for the step id that srun's own client log names (`<run log>.client`: `srun:
+  error: Task launch for StepId=<id> failed on node <node>: Can't find an address, check slurm.conf`): exactly one row
+  of that id, under the step's name, State exactly `CANCELLED` and ExitCode `0:116`, both as the site printed them twice
+  (a step a user cancels reads `CANCELLED by <uid>`, exit `0:9`; a job's batch step cancelled with the job reads plain
+  `CANCELLED`, exit `0:15`: the state alone is not the proof). The client's log must name that one step and its failure
+  must be the missing address, which srun's message reads as a request that was never sent (its message, not something
+  seen on the node); a task launch that failed otherwise (a socket that timed out) may have reached the node, and is no
+  proof. **(b)** The run log is a
+  regular file of zero bytes, by a fresh `lstat` read last, and again immediately before the retry is written. A
+  missing log proves nothing. The step's id comes from the client's log, not from the state: `up` waits for the
+  providers one after the other, so the steps of the later ones were never listed while it waited; an id the state does
+  hold must be the same. A step sacct cannot show (the command fails, times out, prints nothing, or no row is the
+  step's) is no proof, and `up` fails with its own error, never sacct's.
+
+  The retry is **one**, counted in the state file (`services.<name>.launch_retries`), never in the process. A second
+  failure of the same service, a step still listed when its bound runs out (it may be running), a run log holding a
+  single byte, and a log that says it failed all stop `up` exactly as before. A retry is written to the state **before**
+  the launch, with its proofs: `launch` (the launch that failed), `step`, `step_id`, `sacct_state`, `sacct_exit`,
+  `run_log_bytes`, and `failure`, a class (`task-launch-no-address`) and never the client's line, which names a node. It
+  is said while `up` runs and printed in `up`'s output (`launch retried: ...`). The new launch has the next launch
+  number, so its step, run log and client log are new files (`...-run-2`); the first launch's client stays recorded and
+  `down` ends it. **The retry waits first**: `launch_retry_backoff_s`
+  (`hpcdriver.LAUNCH_RETRY_BACKOFF_S`, 60 s; recorded as `launch.retry_backoff_s`), since live the nodes resolved
+  again a minute after the failure, and a retry 15 to 30 s after it (three polls with the step gone) would have failed
+  for the same reason. **Each service's backoff counts from its own step's End**, read from the same sacct row as the
+  proofs (`End` is one of its fields; the row's `step_end` is recorded), and `up` sleeps only until End + the backoff,
+  which is nothing when that is already past: the services are awaited one after another, and five providers that
+  failed in the same second wait about one backoff in all (58 s of 60, the three polls having used some), not five. A
+  service that failed later waits what is left of its own. sacct prints End in the local time of the node that prints
+  it, so it is read in this node's local time and **believed only between this process's launch of the step (less
+  10 s) and now (plus 10 s)**: an End that is "Unknown", empty, not a time, in another zone or on another clock takes
+  the whole backoff from now, never zero. The seconds waited are recorded (`waited_s`). Proof (b) is read again after
+  the wait, or when there is none, and immediately before the retry is written and the service launched: a run log
+  that gained a byte meanwhile cancels the retry (said, nothing recorded, `up` fails as before).
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
