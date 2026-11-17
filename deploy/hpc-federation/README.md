@@ -887,7 +887,12 @@ with a warning: the shards' own archives are not part of this form.
 
 `DIR` must be new, or empty and private (0700), and may never be the root, inside it (`down` removes the root with whatever
 is in it) or above it; a link is refused. **A copy is never replaced.** The same command run again while the evidence is
-unchanged and `DIR` holds its copy says so, exits 0 and rewrites nothing. If a journal line was written after the collect (a
+unchanged and `DIR` holds its copy says so, exits 0 and rewrites nothing; it says so only for a copy that is whole: the
+archive is the one the root's marker names, and the archive and its manifest are one another's (the check `collect`'s
+root archives get, `hpcevidence.verified_pair`), so a manifest swapped for another with its line in `archives.sha256.json`
+updated to match is refused, naming it, and no hash is printed. The directory syncs that come before the marker
+(`DIR`'s entries and its parent's) fail the collect on an I/O error too, as for a marker that cannot be written: exit 2, no
+marker, the copy kept. If a journal line was written after the collect (a
 relay verb's late-step watch, or another verb), `down` refuses the root as changed, and the evidence is collected again into
 a **new** directory, which is then the copy to pull; the first directory stays as it was. A root that is not there, is a link
 (never followed), is not a directory or holds no `hpc-federation.json` as a plain file is refused with nothing made.
