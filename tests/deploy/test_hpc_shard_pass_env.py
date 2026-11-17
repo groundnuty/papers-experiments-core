@@ -247,6 +247,42 @@ def test_o63_a_name_the_step_sets_itself_refuses_the_plan_naming_it(shards, tmp_
     assert "sets itself" in err
 
 
+LOADER_AND_SHELL = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+                    "BASH_ENV", "ENV", "IFS", "GCONV_PATH", "LOCPATH", "NLSPATH"]  # fmt: skip
+
+
+@pytest.mark.parametrize("name", LOADER_AND_SHELL)
+def test_o63_a_loader_or_shell_variable_refuses_the_plan_naming_only_it(shards, tmp_path, capsys, name):
+    """O63: the dynamic loader's variables (a library named by `LD_PRELOAD` runs before Python starts, so before the
+    environment, identity and guard checks), the shell's start-up file and field separator, and the locale and
+    conversion paths change how a program is started: none can be declared, whatever the operator's environment holds
+    (it is not read: the name is refused first). The message names the variable and nothing else."""
+    err = refused_plan(shards, tmp_path, capsys, f'pass_env = ["{name}"]')
+    assert name in err
+    assert "loaded or started" in err
+    assert str(tmp_path) not in err
+
+
+@pytest.mark.parametrize("name", LOADER_AND_SHELL)
+def test_o63_a_step_refuses_a_loader_or_shell_variable_its_line_declares_with_nothing_made(
+    shards, tmp_path, capsys, name
+):
+    """O63: a line typed or edited by hand to pass one is refused by the step as the plan would have, before anything
+    of the study runs; nothing is made."""
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, [name]))
+    assert name in said
+    assert "loaded or started" in said
+    nothing_made(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["LDAP_MODE", "LDFLAGS", "ENVIRONMENT_NAME", "IFS_MODE", "BASH_ENVIRONMENT",
+                                  "LOCPATHS", "DYLD", "LD"])  # fmt: skip
+def test_o63_a_name_that_only_starts_like_a_loader_or_shell_variable_is_still_accepted(shards, name):
+    """O63: the refusal is of the names, `LD_` and `DYLD_` as prefixes and the exact shell and locale names: no other
+    variable that begins alike is refused."""
+    assert shards.pass_env_name_problem(name) is None
+
+
 @pytest.mark.parametrize(
     "name", ["lower_case", "1STARTS_WITH_DIGIT", "HAS-DASH", "WITH SPACE", "A" * 65, "", "NAME\\n"]
 )

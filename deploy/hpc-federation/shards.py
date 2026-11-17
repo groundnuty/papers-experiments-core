@@ -45,8 +45,9 @@ declares: variables of the operator's the study needs in its dispatcher's enviro
 fault sanction (`pass_env = ["NAME", ...]`, names only). `plan`, `lines` and `resume-line` read each name's value from
 the operator's environment (`pin_pass_env`) before anything is printed or recorded, and refuse, naming the variable and
 never the value, a name that looks like a secret (KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL, AUTH) or is one the
-step sets itself (`PASS_ENV_OWN`, anything of EXPCORE_ or PYTHON), a variable that is unset and a value that is
-neither a plain word (`[A-Za-z0-9._:=,+-]`, at most 128) nor an absolute path of `[A-Za-z0-9._/-]` with no `..` or
+step sets itself (`PASS_ENV_OWN`, anything of EXPCORE_ or PYTHON) or changes how a program is loaded or started
+(anything of LD_ or DYLD_, BASH_ENV, ENV, IFS, GCONV_PATH, LOCPATH, NLSPATH), a variable that is unset and a value that
+is neither a plain word (`[A-Za-z0-9._:=,+-]`, at most 128) nor an absolute path of `[A-Za-z0-9._/-]` with no `..` or
 `.` part and no `//` (`pass_env_path_ok`). Each line pins the value as an `env -i` word `NAME=VALUE` and declares it as
 `--pass-env NAME`; `step` (`check_pass_env`, its first act) passes the dispatcher exactly those, refusing with
 `PRE_STEP_REFUSED` a declaration its line gives no plain value for, and records each name and value in `step.json` and
@@ -417,6 +418,11 @@ PASS_ENV_VALUE = re.compile(r"[A-Za-z0-9._:=,+-]{0,128}")
 PASS_ENV_PATH = re.compile(r"/[A-Za-z0-9._/-]{1,1024}")
 PASS_ENV_SECRET = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH", re.IGNORECASE)
 PASS_ENV_OWN_PREFIXES = ("EXPCORE_", "PYTHON")
+# Variables that change how a program is loaded or started: the dynamic loader's (`LD_PRELOAD` names a library whose
+# constructor runs before Python starts, so before the environment, identity and guard checks), the shell's start-up
+# file and field separator, and the locale and character-conversion search paths. Never declared, whatever their value.
+PASS_ENV_LOADER_PREFIXES = ("LD_", "DYLD_")
+PASS_ENV_LOADER_NAMES = frozenset({"BASH_ENV", "ENV", "IFS", "GCONV_PATH", "LOCPATH", "NLSPATH"})
 PASS_ENV_OWN = frozenset({*ALLOWLIST, "HOME", "TMPDIR", *home_env(NO_HOME)})  # the step's own: never a declared one
 # The values a shard's first step passed, kept for its whole life (O63): `<results>/<label>/pass-env.json`, written by
 # that step once it holds the shard's running mark, and read by every later step, `resume-line` and the fleet's step.
@@ -475,7 +481,9 @@ def _label_ok(index: int, count: int, label: str) -> None:
 def pass_env_name_problem(name: Any) -> str | None:
     """Why `name` cannot be a variable the step passes to its dispatcher (the message names it), or None: a plain
     upper-case name, none that looks like a secret (KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL, AUTH, anywhere in
-    it), and none the step sets itself (its allowlist, its home and TMPDIR, anything of EXPCORE_ or PYTHON)."""
+    it), none the step sets itself (its allowlist, its home and TMPDIR, anything of EXPCORE_ or PYTHON) and none that
+    changes how a program is loaded or started (anything of LD_ or DYLD_, BASH_ENV, ENV, IFS, GCONV_PATH, LOCPATH,
+    NLSPATH)."""
     if not isinstance(name, str) or PASS_ENV_NAME.fullmatch(name) is None:
         shown = repr(name[:70] if isinstance(name, str) else name)
         return f"pass_env name {shown} must match ^[A-Z][A-Z0-9_]{{0,63}}$"
@@ -484,6 +492,8 @@ def pass_env_name_problem(name: Any) -> str | None:
                 "CREDENTIAL or AUTH): a secret never rides on a line")  # fmt: skip
     if name in PASS_ENV_OWN or name.startswith(PASS_ENV_OWN_PREFIXES):
         return f"pass_env name {name} is one the step sets itself"
+    if name in PASS_ENV_LOADER_NAMES or name.startswith(PASS_ENV_LOADER_PREFIXES):
+        return f"pass_env name {name} changes how a program is loaded or started (a loader or shell variable)"
     return None
 
 
