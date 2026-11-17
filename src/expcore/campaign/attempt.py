@@ -32,7 +32,7 @@ The order is fixed, and each step is decided by what a kill at that point must l
 
 An exception in the executor is the study's: `InfraError` is infrastructure, anything else is a harness defect, whose
 redacted traceback goes to the campaign's local log (`defect_log`) and nowhere else; the request carries that log, so a
-crash the loop catches inside `record_run` is logged too, redacted with the secrets the executor passed it. An
+crash the loop catches inside `record_run` is logged too, redacted with the secrets the executor declared or passed it. An
 exception in the steps around it is our own bookkeeping failing, and propagates: the scheduler stops dispatch loudly
 and leaves the 'running' row for recovery (C17).
 """
