@@ -154,6 +154,7 @@ class ApptainerSandbox:
         if config_sha256:
             self._meta["platform_config_sha256"] = config_sha256
         self._meta_lock = threading.RLock()
+        self._evidence: list[Path] = []  # where `collect` wrote its evidence: a host path, never in the metadata
         self._phase = threading.Lock()
         self._agent_began, self._steps_running, self._refusals_seen = False, 0, 0
         self._stopped, self._stop_lock = True, threading.Lock()
@@ -862,6 +863,21 @@ class ApptainerSandbox:
     def record(self, **fields: Any) -> None:
         with self._meta_lock:
             self._meta.update(fields)
+
+    def note_evidence(self, dest: Path) -> None:
+        """Remember a directory `collect` wrote the run's evidence into (as Docker's, for the federation's window)."""
+        with self._meta_lock:
+            if dest not in self._evidence:
+                self._evidence.append(dest)
+
+    def evidence_dirs(self) -> tuple[Path, ...]:
+        with self._meta_lock:
+            return tuple(self._evidence)
+
+    def record_infrastructure_fact(self, key: str, value: Any) -> None:
+        """Add one fact beside the departures in `infrastructure_facts` (as Docker's: the federation's window, O86)."""
+        with self._meta_lock:
+            self._meta.setdefault("infrastructure_facts", {})[key] = value
 
     def note_end(self, kind: str) -> None:
         with self._meta_lock:

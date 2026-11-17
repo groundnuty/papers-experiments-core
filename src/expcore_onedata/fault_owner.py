@@ -30,8 +30,9 @@ LEFT_BY_ANOTHER = "left by another attempt, so no run is charged for it"
 NO_ATTEMPT = "it records no attempt as its owner: charged as before"  # short: the gate keeps 200 characters of a detail
 
 
-def _attempt_of(owner: Any) -> tuple[Any, Any, Any] | None:
-    """The (process, campaign, attempt id) an owner token names, or None when it names no attempt."""
+def attempt_of(owner: Any) -> tuple[Any, Any, Any] | None:
+    """The (process, campaign, attempt id) an owner token names, or None when it names no attempt. A token that names
+    only a process names none, and an owner is never guessed: two tokens are one attempt's only when both name it."""
     if not isinstance(owner, Mapping):
         return None
     attempt_id = owner.get("attempt_id")
@@ -50,7 +51,7 @@ def charge_of(entries: Iterable[Mapping[str, Any]]) -> tuple[bool, str | None]:
     judged = None if here is None else (here.get("process"), here.get("campaign"), here.get("attempt_id"))
     unattributed = False
     for entry in entries:
-        owner = _attempt_of(entry.get("owner"))
+        owner = attempt_of(entry.get("owner"))
         if owner is None:
             unattributed = True
         elif owner == judged:

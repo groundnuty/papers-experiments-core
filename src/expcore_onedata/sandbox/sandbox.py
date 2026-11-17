@@ -193,6 +193,7 @@ class DockerSandbox:
             "cell_deadline": {"grace_s": settings.kill_grace_s, "margin_s": DL.margin_s(settings.kill_grace_s)},
         }
         self._meta_lock = threading.RLock()  # a cell's deadline writes here from its timer's thread (cells.py)
+        self._evidence: list[Path] = []  # where `collect` wrote its evidence: never in the metadata, a host path
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
         self._stopped, self._stop_lock = True, threading.Lock()
@@ -1229,6 +1230,25 @@ class DockerSandbox:
         """Add facts to the metadata (the lease, the token records: never a value)."""
         self._meta.update(fields)
 
+    def note_evidence(self, dest: Path) -> None:
+        """Remember a directory `collect` wrote the run's evidence into, so a fact that exists only after the
+        collection (the federation's window, O86) can be written beside `metadata.json` there."""
+        with self._meta_lock:
+            if dest not in self._evidence:
+                self._evidence.append(dest)
+
+    def evidence_dirs(self) -> tuple[Path, ...]:
+        """The directories `collect` wrote into, in order."""
+        with self._meta_lock:
+            return tuple(self._evidence)
+
+    def record_infrastructure_fact(self, key: str, value: Any) -> None:
+        """Add one fact to the run's `infrastructure_facts` (the platform's own observation: the federation's window,
+        O86), the table the Apptainer backend always has and a Docker run has once it holds one. Plain JSON, never a
+        secret."""
+        with self._meta_lock:
+            self._meta.setdefault("infrastructure_facts", {})[key] = value
+
     def collect(self, dest_dir: str | Path, outputs: Sequence[str] = ()) -> dict[str, Any]:
         """Stop whatever of the agent's still runs, then copy out the run's evidence and the named files of /work.
 
@@ -1263,6 +1283,7 @@ class DockerSandbox:
             if rel.startswith("/") or ".." in Path(rel).parts:
                 raise SandboxError("an output to collect must be a relative path inside the working directory")
         dest.mkdir(parents=True, exist_ok=True)
+        self.note_evidence(dest)
         got = dict.fromkeys(outputs, False)
         refused: dict[str, Any] | None = None
         try:
