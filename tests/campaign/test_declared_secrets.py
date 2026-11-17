@@ -308,3 +308,58 @@ def test_c40_the_environment_an_executor_declares_is_kept_as_it_is_redacted_from
     run_failing_start(tmp_path / "again", refused)
     assert seen
     assert "zq" not in seen[0]
+
+
+def test_c40_a_withheld_diagnostic_keeps_no_instrument_name_that_is_a_secret(tmp_path, monkeypatch):
+    """C40: withholding keeps the phase and the instrument, and those go through the redactor too: an instrument whose
+    name is the value of a secret of the environment is `[redacted]` in the row, the marker and the export, as it was
+    before diagnostics were withheld."""
+    monkeypatch.setenv("EXAMPLE_API_KEY", "probe_credential_1234")
+
+    class Named(Inducer):
+        namespace = "probe_credential_1234"
+
+    async def executor(request):
+        start_instruments([Named()], {"run_key": request.run_key})  # never declares: the diagnostic is withheld
+
+    with build(
+        tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+    ) as scheduler:
+        scheduler.run()
+        row = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
+        marker = read_marker(Path(row["run_dir"]), row["run_key"], row["id"])
+        export = export_run_state(scheduler.store)
+    assert json.loads(row["diagnostic"])["error"] == "Withheld"
+    assert "probe_credential_1234" not in json.dumps(where_it_is_kept(row, marker, export))
+    assert json.loads(row["diagnostic"])["instrument"] == "[redacted]"
+
+
+def test_c40_the_processs_secrets_stay_redacted_when_record_run_is_given_an_environment_of_its_own(
+    tmp_path, monkeypatch
+):
+    """C40: `declare_secrets()` keeps the process's own secrets as values too, so a `record_run` that is given another
+    environment (which replaces the redactor `record_attempt` installs, built from that environment alone) still
+    redacts them: from the record, and from the diagnostic of an error raised after it."""
+    credential = "process_credential_1234"
+    monkeypatch.setenv("EXAMPLE_API_KEY", credential)
+    seen = {}
+
+    async def executor(request):
+        request.declare_secrets()
+        script = [ModelTurn("", [ToolCall("call_one", "look", {})], 10, 5, "tool_calls", 0.0)]
+        request.backend.use([*script, ModelTurn("done", [], 10, 5, "stop", 0.0)])
+        providers = [FakeProvider({"look": lambda arguments: f"the answer carried {credential}"})]
+        record = await record_run(
+            request, providers, "s", "u", FakeExecutor().config, code=dict(CODE), environ={"UNRELATED": "nothing"}
+        )
+        seen["record"] = record.dumps(environ={})  # the record as built: no environment applied at the write
+        raise InfraError("sandbox", "post-run check refused", diagnostic={"seen": f"it quoted {credential}"})
+
+    with build(
+        tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+    ) as scheduler:
+        scheduler.run()
+        row = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
+    assert credential not in seen["record"]
+    assert credential not in row["diagnostic"]
+    assert "[redacted]" in row["diagnostic"]
