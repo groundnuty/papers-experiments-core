@@ -319,9 +319,10 @@ class Driver(Down):
     def study_artifacts_tree(self, site: Site) -> Optional[str]:
         """The digest of the study's artifacts directory (`HPC_STUDY_ARTIFACTS`, O74), taken here, on the login node
         and before anything is made or submitted, so a tree that cannot be digested (a special file, a directory that
-        is not one) fails `up` at once, naming the variable and a path relative to the directory, never an absolute
-        one. None when the site declares no directory, or the layout names no platform template, which writes no
-        render identity to hold it. The tree is only read: it may be read-only."""
+        is not one, a link whose target leaves the directory: it must be self-contained) fails `up` at once, naming
+        the variable and a path relative to the directory, never an absolute one. None when the site declares no
+        directory, or the layout names no platform template, which writes no render identity to hold it. The tree is
+        only read: it may be read-only."""
         if not site.study_artifacts:
             return None
         if self.spec.platform_template is None:

@@ -33,12 +33,33 @@ and hashes are ASCII, so no field holds a NUL and the listing reads back one way
 directory's own path are not in it, so a copy of the tree elsewhere has the digest of the original, as long as its
 files hold no path of their own (a venv's scripts name the venv, and are then another tree).
 
-A link is recorded by its target string and never followed: a venv's `bin/python` is a link to an interpreter outside
-the tree, which `up` can neither hash nor refuse, so the digest holds where the link points and not what is there. A
-special file (a FIFO, a socket, a device) is refused, as is a root that is not a directory of its own. The tree is read
-below one held descriptor with no link followed (`O_NOFOLLOW`, entries classified by `lstat` before any is opened, the
-opened one checked to be the one classified) and written never: it may be read-only. Every refusal is a `TreeError`
-that names the path relative to the directory, escaped, and never an absolute path.
+A link is recorded by its target string and never followed, so the digest holds where a link points and not what is
+there: what a link points at must therefore be in the tree, where its own entry pins it. **The directory is
+self-contained** (the study's interpreter is installed in it and its venv is built on it), and a link whose resolved
+target leaves it is refused, because a change of what it points at would pass the shard check. A link is inside when
+it resolves, as the kernel resolves it, to a place in the tree:
+
+- the link's own path is walked from the root one component at a time; a component that is a link of the tree (the
+  walk found them all) is replaced by its target, a relative one read from the directory the link is in, an absolute
+  one from the root once the root's own path is stripped; `..` goes up one directory (through whatever the walk has
+  reached, a link to a parent included: the dots are never collapsed as text), and one at the root is an escape;
+- an absolute target is inside only when it begins, component by component and never as a string prefix (`/a/bc` is
+  not inside `/a/b`), with the root's real path or with the path the root was given by (a parent of the root may be a
+  link, and a venv built on the directory holds the path it was built by); `..` before that path is reached is no
+  match, since a parent there may be a link too;
+- the walk never reads or opens what is outside the root: it works on the tree's own entries alone, so a target that
+  does not exist outside, or a FIFO, is refused all the same and never touched;
+- a path may pass through at most `MAX_LINK_HOPS` (40, Linux's own limit) links, the link itself the first: a longer
+  chain, and a loop, are refused;
+- a link that dangles inside the tree (its target resolves to a name the tree does not hold) is allowed and recorded as
+  any other: a file that appears where it points is a change of the tree, so the digest moves; a link to the root
+  itself, or to a directory above it inside the tree, is inside.
+
+A special file (a FIFO, a socket, a device) is refused, as is a root that is not a directory of its own. The tree is
+read below one held descriptor with no link followed (`O_NOFOLLOW`, entries classified by `lstat` before any is
+opened, the opened one checked to be the one classified) and written never: it may be read-only. Every refusal is a
+`TreeError` that names the path relative to the directory, escaped, and never an absolute path (nor a link's target,
+which may be one).
 """
 
 import errno
@@ -47,7 +68,7 @@ import json
 import os
 import stat
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fedfacts import write_private
 
@@ -66,6 +87,7 @@ KEYS = ("version", "template_sha256", "platform_fingerprint_sha256", *PINS, ARTI
 HEX_DIGITS = frozenset("0123456789abcdef")
 TREE_VERSION = "expcore-artifacts-tree/1"  # the tree digest's own format: the listing's first bytes
 MAX_DEPTH = 128  # directories one below another; a walk holds one descriptor for each
+MAX_LINK_HOPS = 40  # the links one path may pass through, the link itself the first: Linux's own limit (MAXSYMLINKS)
 CHUNK = 1 << 20
 
 
@@ -160,9 +182,12 @@ def hash_file(descriptor: int, path: bytes) -> Tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def walk(directory_fd: int, prefix: bytes, depth: int, entries: List[Tuple[bytes, bytes]]) -> None:
+def walk(
+    directory_fd: int, prefix: bytes, depth: int, entries: List[Tuple[bytes, bytes]], links: Dict[bytes, bytes]
+) -> None:
     """Add a record to `entries` for every entry below the held directory (`prefix`, its path from the root, empty for
-    the root), as (path, record), descending into each directory it holds."""
+    the root), as (path, record), descending into each directory it holds, and each link to `links` (its path and its
+    target). Both are filled in place: they are the walk's result."""
     if depth > MAX_DEPTH:
         raise TreeError(f"{shown(prefix)} is nested deeper than {MAX_DEPTH} directories")
     try:
@@ -179,7 +204,7 @@ def walk(directory_fd: int, prefix: bytes, depth: int, entries: List[Tuple[bytes
             entries.append((path, b"D\0" + path + b"\0"))
             child = open_below(directory_fd, name, os.O_DIRECTORY, seen, path)
             try:
-                walk(child, path, depth + 1, entries)
+                walk(child, path, depth + 1, entries, links)
             finally:
                 os.close(child)
         elif stat.S_ISREG(seen.st_mode):
@@ -191,14 +216,84 @@ def walk(directory_fd: int, prefix: bytes, depth: int, entries: List[Tuple[bytes
             except OSError as error:
                 raise TreeError(f"{shown(path)} cannot be read ({why(error)})") from None
             entries.append((path, b"L\0" + path + b"\0" + target + b"\0"))
+            links[path] = target
         else:
             raise TreeError(f"{shown(path)} is a special file: the tree may hold files, directories and links only")
 
 
+def components(path: bytes) -> List[bytes]:
+    """The parts of `path` that name something: no empty one (a doubled or a trailing `/`), no `.`; a `..` stays."""
+    return [part for part in path.split(b"/") if part not in (b"", b".")]
+
+
+def root_spellings(root: Path) -> List[Tuple[bytes, ...]]:
+    """The ways an absolute link may write the root's own path, as components: its real path and, when that differs,
+    the path `root` was given by (plain, absolute: a parent of the root may be a link on a shared filesystem, and a
+    venv built on the directory holds the path it was built by)."""
+    spellings = [tuple(components(os.fsencode(os.path.realpath(root))))]
+    given = os.fsencode(root)
+    if given.startswith(b"/"):
+        parts = tuple(components(given))
+        if b".." not in parts and parts not in spellings:
+            spellings.append(parts)
+    return spellings
+
+
+def below_root(target: bytes, spellings: Sequence[Tuple[bytes, ...]]) -> Optional[List[bytes]]:
+    """The components of the absolute `target` after the root's own path, or None when it does not begin with one of
+    its spellings. The comparison is by whole components: `/a/bc` does not begin with `/a/b`; and a `..` before the
+    root's path is reached matches nothing (a parent there might be a link)."""
+    parts = components(target)
+    for spelling in spellings:
+        if tuple(parts[: len(spelling)]) == spelling:
+            return parts[len(spelling) :]
+    return None
+
+
+def check_link(path: bytes, links: Mapping[bytes, bytes], spellings: Sequence[Tuple[bytes, ...]]) -> None:
+    """Raise `TreeError` unless the link at `path` (a key of `links`: path to target, every link the walk found)
+    resolves to a place in the tree. `path` is walked from the root as the kernel walks it: a component that is a link
+    is replaced by its target (a relative one is read from the directory the link is in, an absolute one from the
+    root, `below_root`), `..` goes up one and an escape is one that goes above the root; the dots are never collapsed
+    as text first, since `d/..` is not where it started when `d` is a link to somewhere else. Nothing outside the root
+    is read: the tree's own entries are all it consults. A path that passes through more than `MAX_LINK_HOPS` links is
+    refused (a loop is a chain with no end)."""
+    leaves = f"{shown(path)} is a link that leaves the directory: the tree must hold what its links point at"
+    here: List[bytes] = []  # the directory reached so far, from the root
+    ahead = components(path)[::-1]  # still to walk, the next one last: a stack, spliced in place when a link is met
+    hops = 0
+    while ahead:
+        part = ahead.pop()
+        if part == b"..":
+            if not here:
+                raise TreeError(leaves)
+            here.pop()
+            continue
+        target = links.get(b"/".join([*here, part]))
+        if target is None:  # a directory, a file, or a name the tree does not hold
+            here.append(part)
+            continue
+        hops += 1
+        if hops > MAX_LINK_HOPS:
+            raise TreeError(
+                f"{shown(path)} is a link that takes more than {MAX_LINK_HOPS} links to follow: a loop or a chain"
+            )
+        if target.startswith(b"/"):
+            inside = below_root(target, spellings)
+            if inside is None:
+                raise TreeError(leaves)
+            here = []
+            ahead.extend(inside[::-1])
+        else:
+            ahead.extend(components(target)[::-1])
+
+
 def tree_sha256(root: Path) -> str:
     """The digest of the tree below `root` (the module's docstring: the canonical listing): 64 lower-case hex digits.
-    `TreeError` when `root` is not a directory of its own (a link is refused, never followed), or on a special file, a
-    directory or file that cannot be read, one that changed while it was read, or nesting past `MAX_DEPTH`."""
+    `TreeError` when `root` is not a directory of its own (a link is refused, never followed), on a special file, a
+    directory or file that cannot be read, one that changed while it was read, nesting past `MAX_DEPTH`, or a link
+    whose target leaves the tree or that takes more than `MAX_LINK_HOPS` links to follow (`check_link`; the first by
+    path is named)."""
     try:
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as error:
@@ -206,10 +301,14 @@ def tree_sha256(root: Path) -> str:
             f"the directory cannot be opened ({why(error)}): it must exist and be a directory of its own, not a link"
         ) from None
     entries: List[Tuple[bytes, bytes]] = []
+    links: Dict[bytes, bytes] = {}
+    spellings = root_spellings(root)
     try:
-        walk(root_fd, b"", 0, entries)
+        walk(root_fd, b"", 0, entries, links)
     finally:
         os.close(root_fd)
+    for path in sorted(links):
+        check_link(path, links, spellings)
     digest = hashlib.sha256(TREE_VERSION.encode("ascii") + b"\0")
     for _, record in sorted(entries):
         digest.update(record)
