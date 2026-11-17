@@ -69,16 +69,16 @@ def output(proc):
     return proc.stdout.read() if proc.stdout else ""
 
 
-def first_start(session, processes, script="finish.sh"):
+def first_start(session, processes, script="finish.sh", service_pid=None):
     """finish.sh (or finish-zone.sh) as a first start runs it: a fresh deployment, no identity recorded yet."""
     work = session.work
     for name in ("stop-requested", "keep-until", "identity.json", "service-verified"):
         (work / name).unlink(missing_ok=True)
     (work / "rootfs" / "root" / "service-ready.lock").touch()
     (work / "run.log").write_text("Congratulations! New deployment\nhpcop: Couchbase guard passed\n", encoding="utf-8")
-    service = node.spawn(processes)
+    pid = service_pid if service_pid is not None else node.spawn(processes).pid
     return subprocess.run(
-        ["bash", str(session.bundle / script), "--workdir", str(work), str(service.pid)],
+        ["bash", str(session.bundle / script), "--workdir", str(work), str(pid)],
         capture_output=True,
         text=True,
         env=session.env,
@@ -205,6 +205,21 @@ def test_o58_a_first_start_whose_domain_stays_null_fails_and_records_no_identity
     assert "stayed null" in done.stderr
     assert not (op.work / "identity.json").exists()
     assert "check-defaults" not in " ".join(op.lines())
+
+
+def test_o58_a_service_that_exits_while_its_domain_is_null_ends_the_wait_at_once(op, processes):
+    """O58: the wait is not run out when nothing is left to connect: the service's pid is gone, the budget is 300 s,
+    and the start fails naming that, long before the budget and without recording an identity."""
+    op.env["HPCOP_READY_SECONDS"] = "300"
+    op.set_state(domain_early={"reads": FOREVER, "value": None})
+    pid, _tick = node.dead_record(processes)
+    began = time.monotonic()
+    done = first_start(op, processes, service_pid=pid)
+    assert done.returncode != 0
+    assert time.monotonic() - began < 60
+    assert "exited before it reported its domain" in done.stderr
+    assert "stayed null" not in done.stderr
+    assert not (op.work / "identity.json").exists()
 
 
 def test_o58_a_first_start_whose_provider_id_is_null_records_nothing(op, processes):
