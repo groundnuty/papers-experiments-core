@@ -94,7 +94,7 @@ from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.fault_drain import SessionTicket
-from expcore_onedata.sandbox import fedwindow, gatelog, kinds
+from expcore_onedata.sandbox import fedwindow, gatelog, infrafacts, kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.apptainer.runs import ApptainerProbe
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
@@ -543,7 +543,9 @@ class SandboxPlatform:
         )
         # the window is a fact of every run from its preparation on: unknown until a watch closes it, never absent (O86)
         sandbox.record_infrastructure_fact(
-            fedwindow.KEY, fedwindow.unwatched() if self._watch is None else fedwindow.pending()
+            fedwindow.KEY,
+            fedwindow.unwatched() if self._watch is None else fedwindow.pending(),
+            owner=infrafacts.WINDOW,
         )
         # never a value, and the slot by its place in the file, never by its name (O12)
         slot = self._slots.keys_of(GROUP).index(lease.key) if lease is not None else "principals.data_path"
@@ -743,7 +745,7 @@ class SandboxPlatform:
         """Put the closed window in the sandbox's metadata and, beside each `metadata.json` its `collect` wrote (which
         came before the window existed), in `federation-window.json`. Never raises: a file that cannot be written is
         logged (O86)."""
-        sandbox.record_infrastructure_fact(fedwindow.KEY, facts)
+        sandbox.record_infrastructure_fact(fedwindow.KEY, facts, owner=infrafacts.WINDOW)
         fedwindow.persist(sandbox, facts)
 
     async def _end_with_window(

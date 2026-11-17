@@ -7,11 +7,13 @@ with that manifest, fails loudly on any difference and records a marker bound to
 `shards.py plan` and `lines` refuse a federation whose ingested spaces have no marker. Slurm is the fake of
 hpc_fed_support, the bootstrap and the space reads are stand-ins, and nothing reaches a cluster."""
 
+import contextlib
 import importlib.util
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fingerprint_support import standin_python
@@ -29,8 +31,10 @@ from hpc_ingested_support import (
     up,
     verify_stand_in,
 )
+from hpc_rehearsal_support import link_check_stand_in
 
 from expcore_onedata.importmanifest import Manifest, write_manifest
+from expcore_onedata.linkcheck import LinkReport, PairResult
 
 SCRIPT = LAYOUT.parents[1] / "shards.py"
 
@@ -314,3 +318,344 @@ def test_o57_plan_takes_a_federation_with_no_ingested_space_as_it_always_did(hpc
     fed = brought_up(hpc, tmp_path, ca)
     fed.driver.set(lambda s: s["data"].update(ingested={}))
     assert shards.federation(first_shard(shards, tmp_path, fed))["job"]
+
+
+# -- a rerun of the core's phase on a federation that is linked (C06, O63) --------------------------------------------
+
+
+def failing_links(config: Any, client: Any) -> LinkReport:
+    """`fedlinks.check_links` finding a pair that does not transfer."""
+    pair = PairResult("providers[0]", "providers[1]", False, reason="the fetch failed")
+    return LinkReport(False, "providers[0] <- providers[1]: the fetch failed", (pair,), 1.0, 2.0)
+
+
+def rerun(hpc, fed, links, said=None) -> str:
+    """`hpcfed.py core` on the root of `fed`: the driver's own core's phase again, `links` its link check."""
+    fed.driver.say = (said if said is not None else []).append
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(hpc.fedlinks, "check_links", links)
+        return fed.driver.core_here()
+
+
+def verified(hpc, tmp_path, ca, name="fed", art=None):
+    """A federation brought up and whose ingested space has been verified: plan takes it, and is its only gate left."""
+    fed = brought_up(hpc, tmp_path, ca, name, art)
+    verify_stand_in(hpc, fed, {"delta-space": ONE})
+    fed.driver.verify_data()
+    return fed
+
+
+def phase(fed) -> str:
+    return fed.driver.store.read()["phase"]
+
+
+def plan(shards, tmp_path, fed) -> int:
+    return shards.main(["plan", "--manifest", str(shard_manifest(tmp_path, [fed, fed]))])
+
+
+def test_c06_a_core_rerun_on_a_linked_federation_whose_link_check_passes_leaves_it_linked_and_plan_takes_it(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63 (live, 17 Nov 2026): `hpcfed.py core` on a finished federation ends in the core's own phase, which set
+    `bootstrapped`, and only `up` set `linked`, so `shards.py plan` refused a federation whose rerun had passed every
+    check. A rerun whose link check passes restores `linked`, and says so."""
+    fed = verified(hpc, tmp_path, ca)
+    assert plan(shards, tmp_path, fed) == 0
+    capsys.readouterr()
+    said: list = []
+    printed = rerun(hpc, fed, link_check_stand_in([]), said)
+    assert "link check: every pair transferred" in printed
+    assert phase(fed) == "linked"
+    assert any("linked again" in line for line in said)
+    assert plan(shards, tmp_path, fed) == 0
+
+
+def test_c06_a_core_rerun_on_a_linked_federation_whose_link_check_fails_leaves_it_bootstrapped_and_plan_refuses(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: a rerun that fails its link check leaves no `linked` it did not earn: the federation is `bootstrapped`,
+    the failure is raised as it was, and `plan` refuses the federation, saying its up has not finished."""
+    fed = verified(hpc, tmp_path, ca)
+    said: list = []
+    with pytest.raises(RuntimeError, match="the link check failed, so the federation is not ready"):
+        rerun(hpc, fed, failing_links, said)
+    assert phase(fed) == "bootstrapped"
+    assert any("bootstrapped" in line for line in said)
+    capsys.readouterr()
+    assert plan(shards, tmp_path, fed) == 2
+    assert "its federation's up has not finished (phase bootstrapped)" in capsys.readouterr().err
+
+
+def test_c06_a_core_rerun_on_a_linked_federation_is_not_linked_while_it_runs(hpc, tmp_path, ca):
+    """C06, O63: the demotion comes before the core's phase, not after its failure: a rerun that dies mid-way (a step
+    killed, a login node's session lost) never raises past a `linked` it has not re-earned."""
+    fed = verified(hpc, tmp_path, ca)
+    seen: list = []
+    real = fed.driver.core
+
+    def watching(*args: Any, **kwargs: Any) -> str:
+        seen.append(phase(fed))
+        return real(*args, **kwargs)
+
+    fed.driver.core = watching
+    rerun(hpc, fed, link_check_stand_in([]))
+    assert seen == ["bootstrapped"]
+
+
+def test_c06_a_core_rerun_does_not_overwrite_a_phase_that_changed_under_it(hpc, tmp_path, ca):
+    """C06, O63: the core's phase takes no lifecycle lock, so a `down` may start while it runs: its `stopping` is not
+    overwritten with `linked` when the rerun ends."""
+    fed = verified(hpc, tmp_path, ca)
+    real = fed.driver.core
+
+    def stopped_meanwhile(*args: Any, **kwargs: Any) -> str:
+        fed.driver.set(lambda s: s.update(phase="stopping"))
+        return real(*args, **kwargs)
+
+    fed.driver.core = stopped_meanwhile
+    rerun(hpc, fed, link_check_stand_in([]))
+    assert phase(fed) == "stopping"
+
+
+def stays_bootstrapped(shards, tmp_path, fed, said: list, why: str, capsys) -> None:
+    """The rerun passed its own checks and the federation is not `linked`: `why` was said, and `plan` refuses it."""
+    assert phase(fed) == "bootstrapped"
+    assert any(why in line for line in said)
+    capsys.readouterr()
+    assert plan(shards, tmp_path, fed) == 2
+    assert "its federation's up has not finished (phase bootstrapped)" in capsys.readouterr().err
+
+
+def test_c06_a_core_rerun_after_the_facts_file_was_removed_does_not_link_the_federation_again(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: with no facts file the core's phase resets every space to its baseline, which empties an ingested space
+    whose `verified` marker the state still holds: the rerun passes its own checks and cannot vouch for that data, so
+    the federation stays `bootstrapped` and the rerun says why."""
+    fed = verified(hpc, tmp_path, ca)
+    fed.driver.layout.facts.unlink()
+    said: list = []
+    assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its facts file was missing", capsys)
+
+
+def test_c06_a_core_rerun_whose_layout_has_other_ingested_spaces_than_up_recorded_does_not_link_it_again(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: `up` recorded the ingested spaces the layout declared, and `plan` checks only those: a rerun over a
+    layout that declares others (here the state records none) would leave a study space neither read nor verified, so
+    the federation stays `bootstrapped` and the rerun says why."""
+    fed = verified(hpc, tmp_path, ca)
+    fed.driver.set(lambda s: s["data"].update(ingested={}))
+    said: list = []
+    assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "ingested spaces are not the ones this up recorded", capsys)
+
+
+def test_c06_a_core_rerun_over_another_layout_than_up_recorded_does_not_link_it_again(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: the rerun renders the platform file from the layout it is given, and `up` built the federation from
+    its own: a rerun over another layout (a wrong `--layout`, a layout edited since, one with no platform template and
+    so no link check to run) passes its own checks and cannot vouch for the federation, so it stays `bootstrapped`
+    and says why."""
+    fed = verified(hpc, tmp_path, ca)
+    fed.driver.set(lambda s: s["layout"].update(digest="ab" * 32))  # the digest `up` recorded of its layout's bytes
+    said: list = []
+    assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its layout is not the one up recorded", capsys)
+
+
+def test_c06_a_core_rerun_that_cannot_compare_the_ingested_spaces_does_not_link_it_again_and_names_no_path(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: whatever goes wrong while the rerun compares the layout's ingested spaces with the recorded ones (here
+    the template cannot be read) is a refusal to link again, in fixed words that name no path: the rerun still runs, and
+    never ends in a traceback before it does."""
+    fed = verified(hpc, tmp_path, ca)
+    real, asked = hpc.data.ingested, []
+
+    def unreadable_once(layout: Any) -> Any:
+        if not asked:
+            asked.append(True)
+            raise OSError("/no/such/place/template.toml: unreadable")
+        return real(layout)
+
+    said: list = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(hpc.data, "ingested", unreadable_once)
+        assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its ingested spaces could not be compared with the layout", capsys)
+    assert not any("/no/such/place" in line for line in said)
+
+
+def test_c06_a_core_rerun_with_another_platform_template_than_up_rendered_does_not_link_it_again(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: the layout's digest covers the layout file and not the platform template beside it. A template edited
+    since `up` (here by a comment; in the worst case so that no provider pair is left and no link check runs) is
+    rendered again by the rerun, which would then vouch for a render `up` never made: it stays `bootstrapped` and says
+    why, comparing the template with the hash `up` recorded in `render-identity.json`."""
+    fed = verified(hpc, tmp_path, ca)
+    template = fed.driver.spec.platform_template
+    template.write_text(template.read_text(encoding="utf-8") + "\n# edited since up\n", encoding="utf-8")
+    said: list = []
+    assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its platform template is not the one up rendered", capsys)
+
+
+def test_c06_a_core_rerun_with_no_render_identity_to_compare_does_not_link_it_again(hpc, shards, tmp_path, ca, capsys):
+    """C06, O63: a root whose render identity record is gone (or not a record) gives the rerun nothing to compare the
+    template with: it stays `bootstrapped`, in fixed words that name no path."""
+    fed = verified(hpc, tmp_path, ca)
+    (fed.root / "render-identity.json").write_text("[]", encoding="utf-8")
+    said: list = []
+    assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its platform template could not be compared", capsys)
+    assert not any(str(tmp_path) in line for line in said)
+
+
+def test_c06_up_does_not_say_linked_while_a_rerun_by_hand_holds_the_core_phase_lock(hpc, tmp_path):
+    """C06, O63: `up` says `linked` after its core phase has ended (under `[hpc] core = "step"` the node's step has
+    released the lock by then). A rerun by hand that started in that window reads the `bootstrapped` the step left and
+    is no relink, so `up`'s own write takes the lock too: refused while that rerun runs, `up` fails and the federation
+    stays `bootstrapped`, never `linked` over a rerun whose link check has not ended."""
+    art = artifacts(tmp_path / "art")
+    fed = driver_over(hpc, tmp_path / "fed", study_layout(tmp_path / "layout"))
+    fed.site = site_env(tmp_path / "fed", art)
+    held, real = contextlib.ExitStack(), fed.driver.run_core
+
+    def core_then_a_rerun_starts() -> str:
+        out = real()
+        held.enter_context(fed.driver.store.core_phase())  # the rerun by hand, started once the step released the lock
+        return out
+
+    fed.driver.run_core = core_then_a_rerun_starts
+    with held, pytest.raises(RuntimeError, match=REFUSED):
+        fed.driver.up(hpc.settings.site_from_environment(fed.site))
+    assert phase(fed) == "bootstrapped"
+
+
+def test_c06_a_core_rerun_whose_ingested_manifest_changed_since_up_does_not_link_it_again(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: the manifest an ingested space declares was edited after `up` recorded its digest: what `verify-data`
+    read is no longer what the layout declares, so the federation stays `bootstrapped` and the rerun says why."""
+    art = artifacts(tmp_path / "art")
+    fed = verified(hpc, tmp_path, ca, art=art)
+    write_manifest(OTHER, art / "manifests" / "delta.json")
+    said: list = []
+    assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its manifest is not the one up recorded", capsys)
+
+
+def test_c06_the_core_phase_of_a_federation_that_was_not_linked_does_not_overwrite_a_phase_that_changed_under_it(
+    hpc, tmp_path, ca
+):
+    """C06, O63: the same on a state that was not `linked` (a rerun after a failed one, or `up`'s own step): a `down`
+    that wrote `stopping` while the core's phase ran keeps it, instead of having `bootstrapped` written over it."""
+    fed = brought_up(hpc, tmp_path, ca)
+    fed.driver.set(lambda s: s.update(phase="providers"))
+    real = fed.driver.core
+
+    def stopped_meanwhile(*args: Any, **kwargs: Any) -> str:
+        fed.driver.set(lambda s: s.update(phase="stopping"))
+        return real(*args, **kwargs)
+
+    fed.driver.core = stopped_meanwhile
+    rerun(hpc, fed, link_check_stand_in([]))
+    assert phase(fed) == "stopping"
+
+
+REFUSED = "a core phase is already running on this federation"
+
+
+def attempt_meanwhile(fed, found: list):
+    """The driver's core wrapped so that, once, a second `core_here` is attempted from inside it: `found` gets what that
+    attempt raised (None if it ran) and the state before and after it."""
+    real, attempted = fed.driver.core, []
+
+    def with_a_second(*args: Any, **kwargs: Any) -> str:
+        if not attempted:
+            attempted.append(True)
+            before = fed.driver.store.read()
+            try:
+                fed.driver.core_here()
+                raised = None
+            except RuntimeError as error:
+                raised = str(error)
+            found.append((raised, before, fed.driver.store.read()))
+        return real(*args, **kwargs)
+
+    fed.driver.core = with_a_second
+
+
+def test_c06_a_core_rerun_is_refused_while_another_core_phase_runs_and_changes_nothing(hpc, tmp_path, ca):
+    """C06, O63: `hpcfed.py core` takes no lifecycle lock, so two reruns could overlap: the second would read the
+    `bootstrapped` the first left, not be a rerun of a `linked` federation, and the first would then link it over the
+    second's failed check. The core's phase holds an exclusive lock on the root, never waited for: a second one is
+    refused at once, naming the state, and writes nothing; the first goes on and ends `linked`."""
+    fed = verified(hpc, tmp_path, ca)
+    found: list = []
+    attempt_meanwhile(fed, found)
+    rerun(hpc, fed, link_check_stand_in([]))
+    ((raised, before, after),) = found
+    assert raised is not None
+    assert REFUSED in raised
+    assert "phase bootstrapped" in raised  # the state the first run left while it works
+    assert after == before
+    assert phase(fed) == "linked"
+
+
+def test_c06_the_core_phase_lock_is_held_by_a_rerun_that_fails_and_released_when_it_ends(hpc, tmp_path, ca):
+    """C06, O63: a rerun whose link check fails holds the lock to its end, so a second one is refused meanwhile; it
+    releases it however it ends, so a rerun after it is not refused (and, the state not being `linked`, ends
+    `bootstrapped`)."""
+    fed = verified(hpc, tmp_path, ca)
+    found: list = []
+    attempt_meanwhile(fed, found)  # once: a second `core_here` from inside the first rerun
+    with pytest.raises(RuntimeError, match="the link check failed"):
+        rerun(hpc, fed, failing_links)
+    assert found[0][0] is not None
+    assert REFUSED in found[0][0]
+    assert phase(fed) == "bootstrapped"
+    rerun(hpc, fed, link_check_stand_in([]))  # raises if the lock were still held
+    assert phase(fed) == "bootstrapped"
+
+
+def test_c06_a_core_rerun_by_hand_is_refused_while_ups_own_core_phase_runs(hpc, tmp_path):
+    """C06, O63: `up`'s core phase (here, or the node's step under `[hpc] core = "step"`) takes the same lock: a rerun
+    started by hand meanwhile is refused, and `up` ends `linked` all the same."""
+    art = artifacts(tmp_path / "art")
+    fed = driver_over(hpc, tmp_path / "fed", study_layout(tmp_path / "layout"))
+    fed.site = site_env(tmp_path / "fed", art)
+    seen: list = []
+
+    def core_while_up_runs(layout: Any, owner: Any, values: Any, environ: Any = None) -> str:
+        if not seen:
+            seen.append(None)
+            try:
+                fed.driver.core_here()
+            except RuntimeError as error:
+                seen[0] = str(error)
+        return "core: linked"
+
+    fed.driver.core = core_while_up_runs
+    fed.driver.up(hpc.settings.site_from_environment(fed.site))
+    assert seen[0] is not None
+    assert REFUSED in seen[0]
+    assert phase(fed) == "linked"
+
+
+@pytest.mark.parametrize("before", ["providers", "bootstrapped"])
+def test_c06_the_core_phase_of_a_federation_that_was_not_linked_ends_bootstrapped_as_up_needs(
+    hpc, tmp_path, ca, before
+):
+    """C06, O63: `up` is unchanged. Brought up, the federation is `linked` (it is `up` that says so); the core's phase
+    (the node's step under `[hpc] core = "step"`) on a state that is not `linked` ends `bootstrapped` and never
+    `linked`, so a rerun cannot link a federation whose up did not finish."""
+    fed = brought_up(hpc, tmp_path, ca)
+    assert phase(fed) == "linked"
+    fed.driver.set(lambda s: s.update(phase=before))
+    rerun(hpc, fed, link_check_stand_in([]))
+    assert phase(fed) == "bootstrapped"

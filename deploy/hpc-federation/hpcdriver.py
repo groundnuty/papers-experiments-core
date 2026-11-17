@@ -427,7 +427,8 @@ class Driver(Down):
         self.providers_up()
         self.export_zone()
         out = self.run_core()
-        self.set(lambda s: s.update(phase="linked"))
+        with self.store.core_phase("the end of this up"):  # no rerun by hand is in flight: its check has not ended
+            self.set(lambda s: s.update(phase="linked"))
         retried = self.retried()
         return f"{out}\n{retried}\n{self.start_relay()}" if retried else f"{out}\n{self.start_relay()}"
 
@@ -881,8 +882,83 @@ class Driver(Down):
         }
         return Layout(self.root, self.layout.parent, hpc_spec(self.spec, hosts))
 
+    def move_phase(self, was: str, to: str) -> bool:
+        """Set the state's phase to `to` only if it is still `was`, under the state's lock; whether it was. A `down`
+        that wrote `stopping` meanwhile is never overwritten."""
+        moved: List[bool] = []
+
+        def change(state: Dict[str, Any]) -> None:
+            if state.get("phase") == was:
+                state["phase"] = to
+                moved.append(True)
+
+        self.set(change)
+        return bool(moved)
+
+    def recorded_manifests(self, state: Mapping[str, Any], recorded: Mapping[str, Any]) -> Dict[str, Any]:
+        """The manifests of the layout's ingested spaces, once they are the ones `up` recorded (`recorded`, the state's
+        `data.ingested`): the same spaces, each manifest the digest `up` took; RuntimeError naming the space if not."""
+        values = hpcdata.study_values(Site.from_json(state["site"]).study_artifacts)
+        now = hpcdata.ingested(self.layout)
+        if set(now) != set(recorded):
+            raise RuntimeError("the layout's ingested spaces are not the ones this up recorded: it changed since up")
+        manifests = hpcdata.ingested_manifests(self.layout, values)
+        for space, manifest in manifests.items():
+            if manifest.digest() != recorded[space]["manifest"]:
+                raise RuntimeError(f"{space}: its manifest is not the one up recorded (its file changed since up)")
+        return manifests
+
+    def relink_refusal(self, state: Mapping[str, Any]) -> Optional[str]:
+        """Why a rerun on a `linked` federation cannot say `linked` again, whatever its own checks find, or None. The
+        rerun never reads an ingested space, and `shards.py plan` takes the markers `verify-data` left as read. So a
+        rerun that found no facts file (the core's phase then resets every space's content, an ingested one's too),
+        one over another layout than the one `up` recorded or another platform template than the one it rendered (it
+        renders the platform file from what it is given, and one with no provider pair runs no link check), or one
+        whose ingested spaces or manifests are not what `up` recorded, does not vouch for them. Whatever goes wrong
+        while comparing is a refusal too, in fixed words: the rerun still runs, and no error here names a path or
+        ends in a traceback."""
+        if not self.layout.facts.exists():
+            return "its facts file was missing, so the core's phase reset every space's content"
+        if self.spec.digest != (state.get("layout") or {}).get("digest"):
+            return "its layout is not the one up recorded"
+        if self.spec.platform_template is not None:  # the layout's digest covers the layout file, not the template
+            try:
+                recorded_hash = json.loads((self.root / hpcidentity.FILE).read_text(encoding="utf-8"))[
+                    "template_sha256"
+                ]
+                current_hash = hpcidentity.sha256_text(self.spec.platform_template.read_text(encoding="utf-8"))
+            except (OSError, ValueError, KeyError, TypeError):
+                return "its platform template could not be compared with the one up rendered"
+            if recorded_hash != current_hash:
+                return "its platform template is not the one up rendered"
+        recorded = (state.get("data") or {}).get("ingested")
+        if recorded is None:
+            return "its state holds no record of the ingested spaces (its up predates it)"
+        try:
+            self.recorded_manifests(state, recorded)
+        except RuntimeError as error:  # the comparison's own words: they name a space and never a path
+            return str(error)
+        except (OSError, ValueError, KeyError, TypeError):
+            return "its ingested spaces could not be compared with the layout"
+        return None
+
     def core_here(self) -> str:
-        """The core's phase in this process: the bootstrap, the baseline, the facts, platform.toml, the link check."""
+        """The core's phase in this process: the bootstrap, the baseline, the facts, platform.toml, the link check.
+        It holds the root's core-phase lock (`StateStore.core_phase`) from its first read of the state to its last write
+        of the phase: a second one is refused while it runs.
+
+        On a federation that is `linked` (`hpcfed.py core` run again on a finished root) the phase is `bootstrapped`
+        from before the core's phase runs, and `linked` again only if it returns, which it does only when its link
+        check passed: `up`'s own condition for `linked`, and `relink_refusal` finds nothing against it. A rerun that
+        starts and fails, or dies, leaves `bootstrapped`, which `shards.py plan` refuses, and no `linked` it did not
+        earn; one refused before it starts (no owner, a mount not proved read-only) changes nothing, the phase
+        included. On any other state the phase ends `bootstrapped` and only `up` says `linked`. Either way a phase
+        another command wrote meanwhile (a `down`'s `stopping`) is never overwritten."""
+        with self.store.core_phase():
+            return self.core_phase_locked()
+
+    def core_phase_locked(self) -> str:
+        """`core_here` with the core-phase lock held."""
         state = self.store.read()
         owner = tuple(state["owner"] or ())
         if len(owner) != 2:
@@ -902,8 +978,25 @@ class Driver(Down):
         # the study's artifacts digest, as up took it: a step on a node has no site variable and never reads the tree
         if state.get(hpcidentity.ARTIFACTS) is not None:
             values[hpcidentity.ARTIFACTS] = state[hpcidentity.ARTIFACTS]
-        out = self.core(self.placed_layout(state), owner, values, environ=self.environ)
-        self.set(lambda s: s.update(phase="bootstrapped"))
+        placed = self.placed_layout(state)
+        before = state["phase"]
+        was_linked = before == "linked"
+        why = self.relink_refusal(state) if was_linked else None  # before the core's phase changes what it reads
+        relink = was_linked and self.move_phase("linked", "bootstrapped")
+        if relink:
+            self.say("the federation was linked: it is bootstrapped unless this core phase's link check passes")
+        try:
+            out = self.core(placed, owner, values, environ=self.environ)
+        except Exception:
+            if relink:
+                self.say("the core's phase failed: the federation stays bootstrapped, which shards plan refuses")
+            raise
+        if not was_linked:
+            self.move_phase(before, "bootstrapped")  # a `down`'s `stopping`, written meanwhile, is kept
+        elif relink and why is not None:
+            self.say(f"the core's phase passed, but the federation stays bootstrapped: {why}")
+        elif relink and self.move_phase("bootstrapped", "linked"):
+            self.say("the core's phase and its link check passed: the federation is linked again")
         return out
 
     def verify_data(self) -> str:
@@ -920,14 +1013,7 @@ class Driver(Down):
             raise RuntimeError("the state holds no record of the ingested spaces (its up predates it): down, then up")
         # a verification that fails, or dies mid-read, leaves no marker an earlier pass gave
         self.set(lambda s: [record.update(verified=None) for record in s["data"]["ingested"].values()])
-        values = hpcdata.study_values(Site.from_json(state["site"]).study_artifacts)
-        now = hpcdata.ingested(self.layout)
-        if set(now) != set(recorded):
-            raise RuntimeError("the layout's ingested spaces are not the ones this up recorded: it changed since up")
-        manifests = hpcdata.ingested_manifests(self.layout, values)
-        for space, manifest in manifests.items():
-            if manifest.digest() != recorded[space]["manifest"]:
-                raise RuntimeError(f"{space}: its manifest is not the one up recorded (its file changed since up)")
+        manifests = self.recorded_manifests(state, recorded)
         if not manifests:
             return "data: no ingested space: nothing to verify"
         owner = tuple(state["owner"] or ())

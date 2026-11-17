@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint
+from expcore_onedata.sandbox.cellhost import CELL_HOSTNAME
 from expcore_onedata.sandbox.oneclient_args import (
     CONFIG_NULL,
     CONFIG_OPTION,
@@ -476,12 +477,14 @@ def agent_run_args(
     the sidecar owns the mount's (O05). Its `ONEDATA_TOKEN` is the configured placeholder, which only lets the published
     client start (O23); the gate drops it. In mount mode the read-only mount is bound in with `readonly`. With no data
     path it has neither. Each read-only input, the run's own copy and the path the agent sees it at, is bound in with
-    `readonly` too, in every data path (O20).
+    `readonly` too, in every data path (O20). Its host name is the declared one (`cellhost`, O73), as every Apptainer
+    cell's, so `hostname` reads the same string on both backends and not the engine's container id.
     """
     lim, uid = s.limits, s.agent_uid
     args = [
         *("run", "-d", "--init", "--oom-score-adj", str(AGENT_OOM_SCORE_ADJ), "--name", names.agent),
         *("--network", names.net, *labels, "--user", f"{uid}:{uid}", "--read-only"),
+        *("--hostname", CELL_HOSTNAME),  # O73: the same neutral name as the Apptainer backend's cells (`cellhost`)
         *("--cap-drop", "ALL", "--security-opt", "no-new-privileges"),
         *("--cpus", str(lim.cpus), "--memory", str(lim.memory_bytes), "--memory-swap", str(lim.memory_bytes)),
         *("--pids-limit", str(lim.pids), "--ulimit", f"nofile={lim.nofile}:{lim.nofile}"),
