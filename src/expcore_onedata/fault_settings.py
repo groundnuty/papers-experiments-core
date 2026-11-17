@@ -52,26 +52,32 @@ period plus `SETTLE_MARGIN_S`.
 control step may wait to start before its own work begins: a step's creation can wait on the scheduler's controller up
 to its message timeout (200 s on a site that sets it so, with no error), and three provider outages on one HPC
 federation (17 Nov) showed relay verb steps starting 47 to 103 s after they were issued during a heal. 240 s is the
-200 s plus 20 %. Every bound
-that waits on a step's client from its start adds it: the stop's control step, `down`'s teardown step, the status,
-exec and mount-check steps and a start's wait to see its service step listed (`deploy/hpc-federation`), and here the
-stop verb's `settle_timeout_s` (which must exceed `stop_bound_s` + `step_launch_wait_s`, and by default is that and
-`SETTLE_MARGIN_S`), a link restart's bound (`fault_hpc.link_restart_bound_s`) and the relay verb's
-`command_timeout_s`. **It widens timeouts only**, how long the harness waits before it fails closed: it never
-lengthens an outage or a hold, and a step that starts at once costs nothing. Since the heal's reserves, the restore's
-bound, the token margin and the platform's deferral are counted from those bounds, they carry it too, so a study's
-`max_defer_s` check sees the true figure. It is in the faults fingerprint (`_bounds_record`) after its default.
+200 s plus 20 %. Every bound that waits on a step's client from its start adds it: the stop's control step, `down`'s
+teardown step, the status, exec and mount-check steps and a start's wait to see its service step listed
+(`deploy/hpc-federation`), and here each relay verb's bound (below). **It widens timeouts only**, how long the harness
+waits before it fails closed: it never lengthens an outage or a hold, and a step that starts at once costs nothing.
+Since the heal's reserves, the restore's bound, the token margin and the platform's deferral are counted from those
+bounds, they carry it too, so a study's `max_defer_s` check sees the true figure. It is in the faults fingerprint
+(`_bounds_record`) after its default.
 
-`command_timeout_s` is the longest one command may take: 120 s on Compose. With `backend = "hpc"` it is the longest one
-relay verb (a status, a start, a ping) may take, and its default is a step's launch wait and the verb's own work
-(`fault_hpc.HPC_VERB_WORK_S`, 60 s): 300 s. It was 120 s until one round trip took 104.6 s with launch waits of up to
-103 s. `up` declares it in the platform file, derived the same way from the layout's launch wait, so the federation's
-fingerprint holds both figures. It is the request's `bound_s`, which the relay hands the verb to run within; a verb
-past it is answered `timed_out`, which the driver reads as a command with no answer, never as done. A declared value
-is kept as declared. The bound is in the faults fingerprint after its default (`_bounds_record`), so a platform that
-leaves it out and one that declares 300 are one federation, and one that declares 120 is another. A link restart's
-bound is not this one: it is the launch wait, the RPC's bound, its margin and the exec's client's end
-(`link_command_s`).
+`command_timeout_s` is the longest one command may take: 120 s on Compose. With `backend = "hpc"` it is the floor of
+every relay verb's bound (a status, a start, a ping and a link restart), and its default is a step's launch wait and
+the verb's own work (`fault_hpc.HPC_VERB_WORK_S`, 60 s): 300 s. It was 120 s until one round trip took 104.6 s with
+launch waits of up to 103 s. **Each verb's own bound is derived** (`fault_hpc.verb_bounds`, `hpc_verb_bounds`): its
+inner worst case, with every step at its whole bound and the launch wait counted in each, and 30 s, and never below
+the floor: a status 600 s (the status step, then a restarted shared-import owner's mount check), a start 630 s (a
+status step, then the wait to see its new service step listed, which a start after an unrecorded stop makes), a ping
+and a link restart 570 s (the exec step, bounded alike for every command), a stop 450 s (its control step, the wait
+for the service step to leave the list and after a cancel), with the defaults: a single bound of 300 s was below the
+first, second and fourth, and a relay that cuts a verb short times out one about to complete, which on the restore
+path after a stop of unknown outcome fails the restore when it matters. `settle_timeout_s` is the stop's floor, and by
+default that inner worst case and the margin. `up` declares the floor and the launch wait in the platform file; the
+verb bounds are recorded in the faults fingerprint (`_bounds_record`) with them, so a platform that leaves a key out
+and one that declares its default are one federation, and one that declares 120 is another. A bound is the request's
+`bound_s`, which the relay hands the verb to run within; a verb past it is answered `timed_out`, which the driver
+reads as a command with no answer, never as done. A declared floor above a verb's own bound is every verb's bound. The
+restore's and the heal's reserves count the slowest command verb (`command_bound_s`), the stop's (`stop_command_s`)
+and the link restart's (`link_command_s`).
 
 `ready_timeout_s` is the longest a restored provider may take to serve before its restore counts as unverified. A
 restore whose identity changed is not yet a provider that serves: in the federation of deploy/compose-federation the
@@ -748,14 +754,18 @@ def _bounds_record(settings: FaultSettings) -> dict[str, Any]:
         "relay_wait_s",
         "step_launch_wait_s",
     )
-    verbs = {"verb_bounds": {v: float(s) for v, s in sorted(hpc_verb_bounds(settings).items())}}
+    verbs = (
+        {"verb_bounds": {verb: float(bound) for verb, bound in sorted(hpc_verb_bounds(settings).items())}}
+        if settings.backend == "hpc"
+        else {}
+    )
     return {
         "backend": settings.backend,
         "heal": settings.heal,
         "heal_container_fallback": settings.heal_container_fallback,
         "clear_attempts": int(settings.clear_attempts),
         **{key: float(getattr(settings, key)) for key in seconds},
-        **(verbs if settings.backend == "hpc" else {}),
+        **verbs,
     }
 
 

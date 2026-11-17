@@ -206,7 +206,7 @@ tls = {{ ca_file = "@root@/ca/federation-ca.pem" }}
 addresses = {{ file = "address-map.json", resolver = "toolshim/resolve_launch.py" }}
 
 [tokens]
-margin_s = 8000
+margin_s = 9000
 
 [[spaces]]
 label = "alpha"

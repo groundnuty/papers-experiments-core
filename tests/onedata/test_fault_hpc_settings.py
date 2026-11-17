@@ -224,7 +224,7 @@ def test_o58_the_relay_verb_bound_and_the_launch_wait_are_in_the_faults_fingerpr
     assert former != left_out
     assert (quick["step_launch_wait_s"], quick["command_timeout_s"], quick["settle_timeout_s"]) == (0.0, 60.0, 210.0)
     assert (slow["step_launch_wait_s"], slow["command_timeout_s"], slow["settle_timeout_s"]) == (200.0, 260.0, 410.0)
-    assert len({tuple(sorted(record.items())) for record in (left_out, quick, slow)}) == 3
+    assert len({json.dumps(record, sort_keys=True) for record in (left_out, quick, slow)}) == 3
 
 
 def test_o58_the_hpc_driver_hands_the_relay_each_verb_its_own_bound(tmp_path):
@@ -287,6 +287,8 @@ def test_o58_a_declared_floor_or_settle_above_a_verbs_inner_worst_case_is_kept_a
     """O58: a declared `command_timeout_s` above every verb's own worst case is every verb's bound (a study that wants
     more room has it), and one below them (60 s, with a launch wait of 240 s) gives each verb its own worst case and
     margin instead: a relay never cuts a verb short of what it may legitimately take."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
     roomy = hpc_verb_bounds(settings_of(write_hpc_platform(tmp_path / "a", **{**DEFAULTS, "command_timeout_s": 900})))
     assert (roomy["status"], roomy["start"], roomy["ping"], roomy["restart_link"]) == (900.0,) * 4
     tight = hpc_verb_bounds(settings_of(write_hpc_platform(tmp_path / "b", **{**DEFAULTS, "command_timeout_s": 60})))
