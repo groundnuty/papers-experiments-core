@@ -923,7 +923,8 @@ class Driver(Down):
         from before the core's phase runs, and `linked` again only if it returns, which it does only when its link
         check passed: `up`'s own condition for `linked`, and `relink_refusal` finds nothing against it. A rerun that
         fails, or dies, leaves `bootstrapped`, which `shards.py plan` refuses, and no `linked` it did not earn. On any
-        other state the phase ends `bootstrapped` and only `up` says `linked`."""
+        other state the phase ends `bootstrapped` and only `up` says `linked`. Either way a phase another command
+        wrote meanwhile (a `down`'s `stopping`) is never overwritten."""
         state = self.store.read()
         owner = tuple(state["owner"] or ())
         if len(owner) != 2:
@@ -936,7 +937,8 @@ class Driver(Down):
         if state.get(hpcidentity.ARTIFACTS) is not None:
             values[hpcidentity.ARTIFACTS] = state[hpcidentity.ARTIFACTS]
         placed = self.placed_layout(state)
-        was_linked = state.get("phase") == "linked"
+        before = state["phase"]
+        was_linked = before == "linked"
         why = self.relink_refusal(state) if was_linked else None  # before the core's phase changes what it reads
         relink = was_linked and self.move_phase("linked", "bootstrapped")
         if relink:
@@ -948,7 +950,7 @@ class Driver(Down):
                 self.say("the core's phase failed: the federation stays bootstrapped, which shards plan refuses")
             raise
         if not was_linked:
-            self.set(lambda s: s.update(phase="bootstrapped"))
+            self.move_phase(before, "bootstrapped")  # a `down`'s `stopping`, written meanwhile, is kept
         elif relink and why is not None:
             self.say(f"the core's phase passed, but the federation stays bootstrapped: {why}")
         elif relink and self.move_phase("bootstrapped", "linked"):
