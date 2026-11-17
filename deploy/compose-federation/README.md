@@ -141,6 +141,19 @@ review, and a test keeps it, and the example's, equal to what the generator make
 A layout with no `platform_template` gets `facts.json` alone. A layout's template names its providers, spaces and users
 by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`, `@zone_url@`, `@space_name@`).
 
+**The root, as a placeholder (`@hpc_root@`).** A template's paths into the root (`ca_file`, the credentials, the faults
+journal, `compose_file`) are relative by default, which is right in the root and wrong in a copy beside a study's
+`study.toml`: the core refuses a relative `[faults] journal` there (O35), and the other paths would resolve into the
+study. A template that writes them `@hpc_root@/ca/federation-ca.pem`, `@hpc_root@/secrets/admin.token`,
+`@hpc_root@/secrets/users`, `@hpc_root@/fault-journal` and `@hpc_root@/outage.compose.yaml` gets the root's absolute
+path (the name is the HPC render's, `hpcboot.hpc_values`, so one template text names the root on either platform).
+`up` and `reset --clean` refuse it, before writing `facts.json` or `platform.toml`, unless the root is an absolute path
+of an existing directory that carries this federation's mark, with no symbolic link on any component of its path and
+no `"` or `\` or non-printable character (it lands inside a TOML string as it is); a link is refused rather than
+resolved, so set `EXPCORE_FED_ROOT` and its parent to the real path. `facts.json` records the filled value as
+`root`, and only then: a template that never names it renders, and records, exactly as before. A tool server's files
+stay under `@study_artifacts@`; `@hpc_root@` is for the root's own.
+
 ## What it touches
 
 - **Docker:** only the layout's Compose project (default `expcore-fed`): its services, its network `<project>_fed`,
@@ -180,9 +193,9 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
   | `<service>/persistence` | each service's state; up seeds the certificates and the CA into it before the first start |
   | `<provider>/storage` | each provider's POSIX storage |
   | `<owner>/import/<space>` | a writable import's copy of its dataset, made by up once (see "An imported space") |
-  | `facts.json` | what an integrator needs to write `platform.toml`: addresses, ids, names, where the credentials are; no secret |
+  | `facts.json` | what an integrator needs to write `platform.toml`: addresses, ids, names, where the credentials are, and the `root` a template's `@hpc_root@` was filled with; no secret |
   | `link-check.json`, `link-check.lock` | the latest all-pairs link check's report (up's, and a restore's, a heal's and the health gate's routine check's, which write it too, through any platform file that names this root's `fault-journal`), and the lock that orders the checks that write it; no secret |
-  | `platform.toml` (0600) | rendered from the layout's template, next to the CA and the secrets it names by relative path |
+  | `platform.toml` (0600) | rendered from the layout's template, next to the CA and the secrets it names by relative path, or by absolute path where the template writes `@hpc_root@` |
   | `fault-journal/` | the fault injector's journal, when the fault test runs; every platform file of this federation names it in `[faults] journal`, and its parent, this root, is where the link-check record is written (`platform.toml` must be in that parent, or the table is refused at load) |
 
   Nothing is kept between a down and the next up: up makes a new CA and new secrets every time.
