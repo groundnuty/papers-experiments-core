@@ -315,7 +315,7 @@ def test_r17_the_analysis_plugin_is_checked_for_its_scorers_alone(tmp_path):
 
 
 def forget_scorer_digest(campaign: Campaign) -> None:
-    """Make the store one from before the fingerprint held the scorers' digest."""
+    """Make the store one whose fingerprint was edited or damaged: the core never writes one without the digest."""
     connection = sqlite3.connect(campaign.root / "out" / "state.sqlite")
     try:
         (text,) = connection.execute("SELECT value FROM meta WHERE key='fingerprint'").fetchone()
