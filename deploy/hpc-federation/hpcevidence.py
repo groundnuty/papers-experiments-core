@@ -28,14 +28,15 @@ something in it counts: a file of the fault journal at any depth, a relay reques
 which `shards.py step` leaves in the root when a step of that shard starts: the shard's spec and how many steps of
 it started; no path, host or secret). An empty file does not (the injector's lock files, the claim's lock), nor does
 an NFS silly-rename file (a removed file still held open, which a `down` run again after a removal cut short finds),
-and a thing that cannot be looked at (a link, a special file, a tree nested past `MAX_DEPTH`) does, since it proves
-no absence. `up` writes no line of the fault journal and takes no admission (a test pins that no module on its path
-imports what does, directly), and the relay it starts makes only empty directories, `relay.lock` and a heartbeat,
-which are in no set: so a root after `up` alone, or a failed `up`'s, holds none, and `down` removes it as it always
-did. The marker names the archive's SHA-256, the digest of the step records (`steps_digest`) and the SHA-256 of each
-archived file (`files`), all as they were when the evidence was read; `collect --roots-only` writes one from the
-plan, whatever the root holds, so a Day-0-only root can be marked. `down` reads the root's evidence again
-(`check_collected`) and compares it with the marker file by file.
+and a thing that cannot be looked at (a link or a special file) does, as does a file with a line in it at any depth
+(a tree no collect could archive, nested past `MAX_DEPTH` or with a name that is not plain, counts only for what it
+holds), since it proves no absence. `up` writes no line of the fault journal and takes no admission (a test pins
+that no module on its path imports what does, directly), and the relay it starts makes only empty directories,
+`relay.lock` and a heartbeat, which are in no set: so a root after `up` alone, or a failed `up`'s, holds none, and
+`down` removes it as it always did. The marker names the archive's SHA-256, the digest of the step records
+(`steps_digest`) and the SHA-256 of each archived file (`files`), all as they were when the evidence was read;
+`collect --roots-only` writes one from the plan, whatever the root holds, so a Day-0-only root can be marked. `down`
+reads the root's evidence again (`check_collected`) and compares it with the marker file by file.
 
 **Two sets, compared differently.** `STRICT_FILES` and the trees (`STRICT_TREES`) hold what a
 step, the study or `up` writes: the fault journal, the relay's journals (`late-steps.jsonl` and its request, taken and
@@ -135,6 +136,7 @@ _PLAIN_NAME = re.compile(r"[A-Za-z0-9._-]{1,200}")
 # standard library alone: `collect` loads it by its path); a test compares the two.
 SILLY = re.compile(r"\.nfs[0-9A-Fa-f]+")
 MAX_DEPTH = 4
+SCAN_DEPTH = 32  # how deep `down`'s look for evidence goes (a tree below it counts): never the archive's bound
 SECRETS = "secrets"  # never archived; its files' contents are what no archived file may hold
 MIN_SECRET = 8  # the shortest value taken for a secret when scanning (a shorter one would match by chance)
 MAX_SECRET_FILE = 1 << 20
@@ -422,19 +424,24 @@ def steps_digest(root: Path) -> str:
 # ------------------------------------------------------------------------------------------------ evidence present
 def _journal_has(directory: int, depth: int) -> bool:
     """Whether the fault journal below `directory` (a descriptor; `depth` 0 at its top) holds a file with something in
-    it, or a thing no collect could archive (a link or another special file, a name that is not plain, a tree nested
-    past `MAX_DEPTH`): the last proves no absence, so it counts. OSError and EvidenceError are for the caller."""
-    if depth > MAX_DEPTH:
+    it, at any depth up to the scan's own bound (`SCAN_DEPTH`, which a deeper tree exceeds: it counts, so no tree can
+    exhaust the stack), or a thing that cannot be looked at as a file (a link or another special file): that proves no
+    absence, so it counts. Names and depth do not matter to what a file holds: a tree no collect could archive (nested
+    past `MAX_DEPTH`, a name that is not plain) with nothing in it holds no evidence, and one with a line in it does.
+    An NFS silly-rename file counts for nothing, but only a regular one: a directory, a link or a special file named
+    like one is looked at as what it is. OSError and EvidenceError are for the caller."""
+    if depth > SCAN_DEPTH:
         return True
+    entries = []
     with os.scandir(directory) as listing:
-        entries = [(entry.name, entry.stat(follow_symlinks=False)) for entry in listing]
+        for entry in listing:
+            try:
+                entries.append((entry.name, entry.stat(follow_symlinks=False)))
+            except FileNotFoundError:  # removed since the listing: nothing of it is left to count
+                continue
     for name, info in entries:
-        if SILLY.fullmatch(name):  # a removed file still held open: the file is gone
-            continue
-        if not _PLAIN_NAME.fullmatch(name):
-            return True
         if stat.S_ISREG(info.st_mode):
-            if info.st_size > 0:  # a lock file the injector took and wrote nothing to is empty: no evidence
+            if info.st_size > 0 and not SILLY.fullmatch(name):  # a lock file with no line in it is empty: no evidence
                 return True
         elif stat.S_ISDIR(info.st_mode):
             below = _open_dir(directory, name, name)
@@ -480,7 +487,7 @@ def _present(root_fd: int, steps: list[tuple[str, bytes | None]] | None) -> tupl
     admission, so a root after `up` alone holds none. Every read is below the root's descriptor with no link followed,
     and only sizes are read: a thing that cannot be looked at counts, never passes for nothing."""
     found: set[str] = set()
-    if steps is None or any(not SILLY.fullmatch(name) for name, _ in steps):
+    if steps is None or any(data is None or not SILLY.fullmatch(name) for name, data in steps):
         found.add(STEPS_KIND)
     for name, kind in RUN_FILES.items():
         try:
@@ -802,8 +809,8 @@ def check_collected(root: Path) -> Check | None:
             if entries is None
             else [
                 name[: -len(".json")] if name.endswith(".json") else name
-                for name, _ in entries
-                if not SILLY.fullmatch(name)
+                for name, data in entries
+                if data is None or not SILLY.fullmatch(name)
             ]
         )
         marker = _marker(fd)

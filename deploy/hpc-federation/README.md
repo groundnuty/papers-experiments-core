@@ -695,7 +695,7 @@ evidence is what a run, a step or the operator leaves: **any step record, a file
 (at any depth), a file of the relay's journals (`late-steps.jsonl`, a request, a taken request, an answer) that is not
 empty, `shard-claim.json` (or its lock) that is not empty, and the pilot's `day0-wiring.toml`**; so a root that only ran
 Day-0 measurements, with no shard step, is refused too. An empty file (the injector's lock files, say) is no evidence, and
-a link, a special file or a tree nested too deep where the journal is counts, since it proves no absence. **What `up` alone
+a link or a special file where the journal is counts, since it proves no absence, and so does a file with a line in it at any depth (a tree nested past the archive's bound, or with an odd name, counts for what it holds). **What `up` alone
 writes does not count:** the state, `platform.toml`, `facts.json`, `render-identity.json`, the data manifests and the link
 check's record and lock (`up` takes no admission and writes no line of the fault journal; the relay it starts makes only
 empty directories, a lock and a heartbeat). A root after `up` alone, or a failed `up`'s, holds none, and `down` removes it

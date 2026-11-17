@@ -217,24 +217,47 @@ def test_what_up_writes_and_a_link_check_the_federation_rewrites_are_no_evidence
     assert hpc.evidence.present_evidence(rig.root) == ()
 
 
-@pytest.mark.parametrize("what", ["a link", "a directory nested too deep", "a fifo"])
+@pytest.mark.parametrize(
+    "what", ["a link", "a fifo", "a link named like a silly file", "a fifo named like a silly file"]
+)
 def test_a_thing_in_the_evidence_trees_that_cannot_be_read_as_a_file_counts_as_evidence(hpc, tmp_path, site, what):
-    """O63: a link, a fifo, or a tree nested past the bound, where the fault journal is, is no proof that nothing ran
-    (and no collect could archive it): it counts, so down refuses and the operator decides with `--discard-evidence`."""
+    """O63: a link or a fifo where the fault journal is, whatever its name (one named like an NFS silly-rename file
+    too: only a regular file is taken for one), is no proof that nothing ran (and no collect could archive it): it
+    counts, so down refuses and the operator decides with `--discard-evidence`."""
     rig = Rig(hpc, tmp_path, site)
     leave_what_up_leaves(rig.root)
     journal = rig.root / "fault-journal"
-    if what == "a link":
-        (journal / "x.jsonl").symlink_to(rig.root / "facts.json")
-    elif what == "a fifo":
-        os.mkfifo(journal / "x.jsonl")
+    name = ".nfs00000000deadbeef0009" if "silly" in what else "x.jsonl"
+    if "link" in what:
+        (journal / name).symlink_to(rig.root / "facts.json")
     else:
-        deep = journal.joinpath(*["a"] * 7)
-        deep.mkdir(parents=True)
+        os.mkfifo(journal / name)
     assert hpc.evidence.present_evidence(rig.root) == ("the fault journal",)
     with pytest.raises(RuntimeError, match=r"holds evidence.*the fault journal"):
         rig.driver.down()
     assert rig.fake.cancelled == []
+
+
+def test_a_tree_counts_for_what_it_holds_whatever_its_depth_or_its_names(hpc, tmp_path, site):
+    """O63: a tree no collect could archive (nested past the archive's bound, a name that is not plain) with nothing in
+    it holds no evidence, so a `down` run again after a removal cut short, whose discarded tree is left as empty
+    directories, is not refused; with a line in it, at any depth the scan goes to, it is evidence."""
+    rig = Rig(hpc, tmp_path, site)
+    leave_what_up_leaves(rig.root)
+    journal = rig.root / "fault-journal"
+    tree = journal.joinpath("bad name", "one", "two", "three", "four", "five", "six")
+    tree.mkdir(parents=True)
+    (journal / "bad name" / "one" / "empty.lock").write_bytes(b"")
+    assert hpc.evidence.present_evidence(rig.root) == ()
+    assert rig.driver.evidence_gate(False) == ""
+    (tree / "open.log").write_bytes(JOURNAL_LINE)
+    assert hpc.evidence.present_evidence(rig.root) == ("the fault journal",)
+    with pytest.raises(RuntimeError, match=r"holds evidence.*the fault journal"):
+        rig.driver.down()
+    (tree / "open.log").unlink()
+    assert hpc.evidence.present_evidence(rig.root) == ()
+    journal.joinpath(*["a"] * (hpc.evidence.SCAN_DEPTH + 2)).mkdir(parents=True)
+    assert hpc.evidence.present_evidence(rig.root) == ("the fault journal",)  # past the scan's bound: it counts
 
 
 def test_an_nfs_silly_rename_file_is_no_evidence_and_is_not_named_as_a_shard(hpc, tmp_path, site):
@@ -255,6 +278,25 @@ def test_an_nfs_silly_rename_file_is_no_evidence_and_is_not_named_as_a_shard(hpc
     assert hpc.evidence.present_evidence(rig.root) == ("the fault journal",)
     _write(rig.root, "shard-steps/shard-1.json", b"{}\n")
     assert hpc.evidence.uncollected(rig.root) == (["shard-1"], False)  # the silly file is no shard
+
+
+def test_a_directory_named_like_a_silly_file_is_looked_into_and_a_step_record_that_is_not_a_file_counts(
+    hpc, tmp_path, site
+):
+    """O63: only a regular file is an NFS silly-rename file. A directory named like one holds what it holds (a collect
+    archives what is below it), and a thing in `shard-steps/` that is no regular file counts whatever its name."""
+    rig = Rig(hpc, tmp_path, site)
+    leave_what_up_leaves(rig.root)
+    _write(rig.root, "fault-journal/.nfs00000000deadbeef0004/injections.jsonl", JOURNAL_LINE)
+    assert hpc.evidence.present_evidence(rig.root) == ("the fault journal",)
+    with pytest.raises(RuntimeError, match=r"holds evidence.*the fault journal"):
+        rig.driver.down()
+    (rig.root / "fault-journal" / ".nfs00000000deadbeef0004" / "injections.jsonl").unlink()
+    assert hpc.evidence.present_evidence(rig.root) == ()
+    steps = rig.root / "shard-steps"
+    steps.mkdir()
+    (steps / ".nfs00000000deadbeef0005").mkdir()
+    assert hpc.evidence.present_evidence(rig.root) == ("step records",)
 
 
 def test_the_relays_directory_being_a_link_counts_as_evidence(hpc, tmp_path, site):
@@ -323,6 +365,7 @@ def test_the_stale_refusal_of_a_day0_only_root_does_not_say_a_step_started(hpc, 
         rig.driver.down()
     assert "something wrote since" in str(late.value)
     assert "a step started" not in str(late.value)
+    assert "verify-copy" not in str(late.value)
     rig.root.joinpath("evidence-collected.json").unlink()
     with pytest.raises(
         RuntimeError, match=r"collect --roots-only --shard L.*a shard plan that names this root"

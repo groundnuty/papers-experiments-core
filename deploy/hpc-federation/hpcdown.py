@@ -101,19 +101,28 @@ class Down:
                 if found.labels
                 else "end whatever still writes the journals, run `shards.py collect --roots-only` again while up"
             )
+            after = (
+                "pull the results and `verify-copy` them"
+                if found.labels
+                else "pull the results and check each `<label>.root.json`"
+            )
         elif found.labels:
             shards = ", ".join(found.labels)
             why = f"shard results are recorded in this root ({shards}) and its evidence was not collected"
             remedy = "run `shards.py collect` (or `collect --roots-only`, which needs no final shard) while it is up"
+            after = "pull the results and `verify-copy` them"
         else:
             why = f"this root holds evidence a run left in it ({', '.join(found.present)}) and it was not collected"
             remedy = (
                 "run `shards.py collect --roots-only --shard L` (it needs a shard plan that names this root) while it "
                 "is up (a collect that refuses a file, a link or one holding a secret, leaves only --discard-evidence)"
             )
+            after = (
+                "pull the results and check each `<label>.root.json` (`--roots-only` writes no manifest of the copy)"
+            )
         return (
             f"{why}: down would remove the state, facts, link check, render identity and fault journals the "
-            f"post-check needs. Nothing was stopped or removed: {remedy}, pull the results and `verify-copy` them; "
+            f"post-check needs. Nothing was stopped or removed: {remedy}, {after}; "
             "or give --discard-evidence to remove the root without it"
         )
 
