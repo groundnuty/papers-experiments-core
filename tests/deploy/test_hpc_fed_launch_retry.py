@@ -225,6 +225,64 @@ def test_o57_down_after_a_retried_up_tears_down_the_second_launch_and_ends_both_
     assert not rig.root.exists()
 
 
+# -- the backoff before the retry ------------------------------------------------------------------------------------
+
+
+def test_o57_the_retry_waits_the_declared_backoff_before_it_launches_again_and_it_is_recorded(hpc, tmp_path, site):
+    """O57: the nodes resolved again a minute after the live failure, so the retry waits `launch_retry_backoff_s`
+    (60 s unless changed) after the failure was proved and before the relaunch: exactly one pause between the two
+    launches of the service, none before its first, nothing recorded as retried until the pause is over; the bound is
+    recorded in the state file."""
+    rig = Rig(hpc, tmp_path, site, FakeSlurm(launch_failures={"larch": [{}]}))
+    assert rig.driver.launch_retry_backoff_s == 60.0
+    rig.driver.launch_retry_backoff_s = 7.5
+    events, held = [], []
+    real_launch = rig.driver.launch
+    rig.driver.launch = lambda service, argv: (events.append(("launch", service)), real_launch(service, argv))[1]
+    real_sleep = rig.driver.sleep
+
+    def sleep(seconds):
+        events.append(("sleep", seconds))
+        if seconds == 7.5:
+            held.append(retries(rig, "larch"))
+        real_sleep(seconds)
+
+    rig.driver.sleep = sleep
+    rig.up()
+    mine = [e for e in events if e in (("launch", "larch"), ("sleep", 7.5))]
+    assert mine == [("launch", "larch"), ("sleep", 7.5), ("launch", "larch")]
+    assert held == [[]]  # the retry is written once the pause is over, with the run log seen empty again
+    assert len(retries(rig, "larch")) == 1
+    assert rig.state()["launch"]["retry_backoff_s"] == 7.5
+
+
+def test_o57_a_run_log_that_gains_a_byte_during_the_backoff_cancels_the_retry(hpc, tmp_path, site):
+    """O57: proof (b) is read again after the backoff, immediately before the relaunch: a log that holds a single byte
+    by then means the service may have started, so it is never launched again, nothing is recorded as retried, and
+    up fails as it always did."""
+    rig = Rig(hpc, tmp_path, site, FakeSlurm(launch_failures={"larch": [{}]}))
+    real_sleep = rig.driver.sleep
+
+    def sleep(seconds):
+        if seconds == rig.driver.launch_retry_backoff_s:
+            Path(rig.state()["services"]["larch"]["log"]).write_text("x", encoding="utf-8")
+        real_sleep(seconds)
+
+    rig.driver.sleep = sleep
+    with pytest.raises(RuntimeError, match="larch's step ended before its log said"):
+        rig.up()
+    assert len(rig.launches("larch")) == 1
+    assert retries(rig, "larch") == []
+
+
+def test_o57_a_failure_that_is_no_proof_waits_no_backoff(hpc, tmp_path, site):
+    """O57: the backoff is for a launch proved failed: one that is not (a log with content) fails up at once."""
+    rig = Rig(hpc, tmp_path, site, FakeSlurm(launch_failures={"larch": [{"log": "x"}]}))
+    with pytest.raises(RuntimeError, match="larch's step ended before its log said"):
+        rig.up()
+    assert rig.driver.launch_retry_backoff_s not in rig.slept
+
+
 # -- what is never retried -------------------------------------------------------------------------------------------
 
 
@@ -415,7 +473,7 @@ def test_o57_the_provider_launches_are_staggered_by_the_declared_bound_and_it_is
     rig.driver.launch_stagger_s = 0.25
     rig.up()
     assert rig.slept.count(0.25) == len(PROVIDERS) - 1
-    assert rig.state()["launch"] == {"stagger_s": 0.25, "retry_limit": 1}
+    assert rig.state()["launch"] == {"stagger_s": 0.25, "retry_backoff_s": 60.0, "retry_limit": 1}
 
 
 def test_o57_the_stagger_pauses_come_between_the_provider_launches_not_before_the_first(hpc, tmp_path, site):

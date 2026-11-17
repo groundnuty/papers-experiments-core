@@ -501,9 +501,10 @@ section 3).
   `platform.toml` and its render identity (`render-identity.json`), and runs the platform layer's link check, which
   writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat. The providers are launched
-  1 s apart, and a service whose step ended before its log said anything is launched **once more**, only when sacct shows
+  1 s apart, and a service whose step ended before its log said anything is launched **once more**, after a 60 s wait
+  (`launch_retry_backoff_s`) and only when sacct shows
   that exact step as `CANCELLED` with exit `0:116`, srun's client log shows its task launch failing for want of an
-  address, and its run log is empty (zero bytes): the live failure of 17 Nov, where srun could not find the nodes'
+  address, and its run log is empty (zero bytes, read again after the wait): the live failure of 17 Nov, where srun could not find the nodes'
   addresses. The retry and its proofs are recorded in the state file and printed; a second failure fails `up` as before
   (`DESIGN.md`, section 5, "A launch that failed at launch").
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, removes the

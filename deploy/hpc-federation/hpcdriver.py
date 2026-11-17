@@ -52,6 +52,8 @@ PASSPHRASE = re.compile(r"[A-Za-z0-9]{16,128}")
 GONE_POLLS = 3
 STDERR_TAIL = 300  # the most of a step's stderr a message repeats
 LAUNCH_STAGGER_S = 1.0  # declared bound: the pause between two provider launches, so five do not start in one second
+LAUNCH_RETRY_BACKOFF_S = 60.0  # declared bound: the wait between a launch proved failed and its one retry (the live
+# nodes resolved again "a minute later")
 
 
 class CoreMismatch(RuntimeError):
@@ -95,6 +97,7 @@ class Driver(Down):
     clock: Callable[[], float] = time.monotonic
     poll_s: float = 5.0
     launch_stagger_s: float = LAUNCH_STAGGER_S  # recorded in the state file by `initial_state`
+    launch_retry_backoff_s: float = LAUNCH_RETRY_BACKOFF_S  # recorded there too
     core_paths: Dict[str, str] = field(default_factory=dict)
     relay_available: Callable[[], bool] = hpcrelay.available
     environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
@@ -273,7 +276,11 @@ class Driver(Down):
             "roles": [role.name for role in roles],
             "services": {role.name: hpcstate.new_service(role.kind) for role in roles},
             "clients": {},
-            "launch": {"stagger_s": self.launch_stagger_s, "retry_limit": hpclaunchproof.RETRY_LIMIT},
+            "launch": {
+                "stagger_s": self.launch_stagger_s,
+                "retry_backoff_s": self.launch_retry_backoff_s,
+                "retry_limit": hpclaunchproof.RETRY_LIMIT,
+            },
             "owner": None,
             # the spaces the study ingests into, each to be verified after its ingest (`verify_data`); plan reads it
             "data": {"ingested": hpcdata.ingested_record(self.layout, hpcdata.study_values(site.study_artifacts))},
@@ -547,14 +554,19 @@ class Driver(Down):
 
         The only failure considered is `StepGone`: the step ended before its log said anything it waited for. It is
         launched again only when `launch_proof` shows, from three sources read now, that nothing of it ran (both
-        proofs, `hpclaunchproof`); the retry is written to the state, with its proofs, before the launch. Every other
-        failure, a second failure of the same service, and a deadline that ran out (the step may be running) are
-        raised as they always were."""
+        proofs, `hpclaunchproof`). Then `launch_retry_backoff_s` passes (the cause was transient: live, the nodes
+        resolved again a minute later), the run log is read once more, and only if it is still empty is the retry
+        written to the state, with its proofs, and the service launched. Every other failure, a second failure of the
+        same service, and a deadline that ran out (the step may be running) are raised as they always were."""
         try:
             return self.wait_log(service, wanted)
         except StepGone:
             retry = self.launch_proof(service)
-            if retry is None or not self.record_retry(service, retry):
+            if retry is None:
+                raise
+            self.say(f"{service}: its launch failed before anything ran; waiting {self.launch_retry_backoff_s:g} s")
+            self.sleep(self.launch_retry_backoff_s)
+            if not self.record_retry(service, retry):
                 raise
         self.launch(service, argv)
         return self.wait_log(service, wanted)
@@ -577,10 +589,11 @@ class Driver(Down):
         return None if found is None else {"launch": record["launch"], **found}
 
     def record_retry(self, service: str, retry: Dict[str, Any]) -> bool:
-        """Write the retry and its proofs to the state, once the run log is seen empty again, immediately before the
-        launch; False (nothing written) when it holds a byte now."""
+        """Write the retry and its proofs to the state, once the run log is seen empty again (proof (b), after the
+        backoff and immediately before the launch); False (nothing written) when it holds a byte now, or is gone."""
         log = Path(self.store.read()["services"][service]["log"])
         if hpclaunchproof.run_log_size(log) != 0:
+            self.say(f"{service}: its run log is not empty now; not launched again")
             return False
         self.set(lambda s: s["services"][service].setdefault("launch_retries", []).append(retry))
         self.say(hpclaunchproof.evidence(service, retry) + "; launching it once more")

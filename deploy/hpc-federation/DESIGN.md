@@ -494,8 +494,12 @@ happened). `up` could only fail and be torn down, although a minute later every 
   `run_log_bytes`, and `failure`, a class (`task-launch-no-address`) and never the client's line, which names a node. It
   is said while `up` runs and printed in `up`'s output (`launch retried: ...`). The new launch has the next launch
   number, so its step, run log and client log are new files (`...-run-2`); the first launch's client stays recorded and
-  `down` ends it. The retry fires about 15 to 30 s after the failed launch (three polls with the step gone), which a
-  node that resolves only a minute later may outlast: its second failure then stops `up`.
+  `down` ends it. **The retry waits first**: `launch_retry_backoff_s`
+  (`hpcdriver.LAUNCH_RETRY_BACKOFF_S`, 60 s; recorded as `launch.retry_backoff_s`), since live the nodes resolved
+  again a minute after the failure, and a retry 15 to 30 s after it (three polls with the step gone) would have failed
+  for the same reason. Proof (b) is read again after the wait and immediately before the retry is written and the
+  service launched: a run log that gained a byte meanwhile cancels the retry (said, nothing recorded, `up` fails as
+  before). The services are awaited one after another, so providers that failed together are retried a backoff apart.
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
