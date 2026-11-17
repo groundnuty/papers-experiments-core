@@ -50,8 +50,8 @@ def test_the_configuration_names_the_checkout_and_the_commit(tmp_path, fake, clo
     assert verify_configured(config.toolserver) == commit
 
 
-def test_o80_the_launch_check_does_not_write_the_checkout_it_checks(clone, tmp_path):
-    """O80: a tracked file's mtime changes (a fresh copy, a restore); the check still leaves `.git/index` as it was."""
+def test_o81_the_launch_check_does_not_write_the_checkout_it_checks(clone, tmp_path):
+    """O81: a tracked file's mtime changes (a fresh copy, a restore); the check still leaves `.git/index` as it was."""
     commit = clone.git("rev-parse", "HEAD")
     copy = aged_copy(clone.path, tmp_path / "copy")
     before = index_state(copy)
@@ -59,8 +59,8 @@ def test_o80_the_launch_check_does_not_write_the_checkout_it_checks(clone, tmp_p
     assert index_state(copy) == before
 
 
-def test_o80_a_changed_tracked_file_is_still_refused_and_the_refusal_writes_nothing(clone, tmp_path):
-    """O80: the answer does not change with the flag: dirty stays dirty, and the check still does not write."""
+def test_o81_a_changed_tracked_file_is_still_refused_and_the_refusal_writes_nothing(clone, tmp_path):
+    """O81: the answer does not change with the flag: dirty stays dirty, and the check still does not write."""
     commit = clone.git("rev-parse", "HEAD")
     copy = aged_copy(clone.path, tmp_path / "copy")
     (copy / "server.py").write_text("print(2)\n", encoding="utf-8")
@@ -74,8 +74,8 @@ def test_o80_a_changed_tracked_file_is_still_refused_and_the_refusal_writes_noth
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes through a read-only directory")
-def test_o80_a_checkout_with_a_read_only_git_directory_verifies_and_refuses_as_before(clone, tmp_path):
-    """O80: a read-only `.git` (a copy shipped read-only) answers as a writable one does. This also passes without the
+def test_o81_a_checkout_with_a_read_only_git_directory_verifies_and_refuses_as_before(clone, tmp_path):
+    """O81: a read-only `.git` (a copy shipped read-only) answers as a writable one does. This also passes without the
     flag, since git's refresh is opportunistic; it guards the read-only copy a study ships."""
     commit = clone.git("rev-parse", "HEAD")
     copy = aged_copy(clone.path, tmp_path / "copy")
@@ -88,8 +88,8 @@ def test_o80_a_checkout_with_a_read_only_git_directory_verifies_and_refuses_as_b
     assert stat.S_IMODE((copy / ".git" / "index").stat().st_mode) & stat.S_IWUSR  # restored for the cleanup
 
 
-def test_o80_the_users_global_git_configuration_is_not_read_by_the_launch_check(clone, tmp_path, monkeypatch):
-    """O80: a global `core.fsmonitor` hook runs on a plain `git status` and must not run on the check."""
+def test_o81_the_users_global_git_configuration_is_not_read_by_the_launch_check(clone, tmp_path, monkeypatch):
+    """O81: a global `core.fsmonitor` hook runs on a plain `git status` and must not run on the check."""
     marker = tmp_path / "hook-ran"
     hook = tmp_path / "hook.sh"
     hook.write_text(f"#!/bin/sh\necho ran >> '{marker}'\nprintf '\\0'\n", encoding="utf-8")

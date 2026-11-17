@@ -28,7 +28,7 @@ def _git(clone: Path, *args: str) -> str:
     """Run git in the checkout and return its stdout; raise PinError, without the output, when it fails.
 
     The launch check must not write what it checks: git runs with no optional locks, so its `status` does not refresh
-    `.git/index`, and with the user's global and the system git configuration read as empty (O80).
+    `.git/index`, and with the user's global and the system git configuration read as empty (O81).
     """
     try:
         done = subprocess.run(

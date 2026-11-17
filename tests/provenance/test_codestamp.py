@@ -362,8 +362,8 @@ def test_p01_a_tracked_file_whose_name_starts_with_a_space_is_clean(repo):
     assert require_known("study run", repo.path, scope)["dirty"] is False
 
 
-def test_o80_reading_the_code_identity_does_not_write_the_checkout_it_reads(checkout, tmp_path):
-    """O80: a tracked file's mtime changes (a copy, a restore); the identity still leaves `.git/index` as it was."""
+def test_o81_reading_the_code_identity_does_not_write_the_checkout_it_reads(checkout, tmp_path):
+    """O81: a tracked file's mtime changes (a copy, a restore); the identity still leaves `.git/index` as it was."""
     copy = aged_copy(checkout.path, tmp_path / "copy")
     before = index_state(copy)
     found = version(copy, SCOPE)
@@ -371,8 +371,8 @@ def test_o80_reading_the_code_identity_does_not_write_the_checkout_it_reads(chec
     assert index_state(copy) == before
 
 
-def test_o80_a_changed_tracked_file_is_still_dirty_and_reading_it_writes_nothing(checkout, tmp_path):
-    """O80: the answer does not change with the flag: dirty stays dirty, and the read still does not write."""
+def test_o81_a_changed_tracked_file_is_still_dirty_and_reading_it_writes_nothing(checkout, tmp_path):
+    """O81: the answer does not change with the flag: dirty stays dirty, and the read still does not write."""
     copy = aged_copy(checkout.path, tmp_path / "copy")
     (copy / "pkg" / "run.py").write_text("print('changed')\n", encoding="utf-8")
     before = index_state(copy)

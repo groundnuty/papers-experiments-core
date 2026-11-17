@@ -13,7 +13,7 @@ class GitError(RuntimeError):
 
 
 def git_env(*, isolate_config: bool = False) -> dict[str, str]:
-    """The environment for a git command that only reads a clone: the process's own, plus `GIT_OPTIONAL_LOCKS=0` (O80).
+    """The environment for a git command that only reads a clone: the process's own, plus `GIT_OPTIONAL_LOCKS=0` (O81).
 
     `git status` refreshes `.git/index` as a side effect, on a fresh copy's first run and again after a tracked file's
     mtime changes; with the flag it completes the same operation, with the same answer, without taking the lock that
