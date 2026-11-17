@@ -430,6 +430,15 @@ site's values come from the state file, so the verb needs no environment. A camp
 cannot launch a step: its fault injector asks the login node's **fault relay** (M4's, which `up` starts with this
 argv prefix and `down` stops first; section 5), which runs the verb and answers.
 
+**How the answer is awaited.** The request and the answer are files under `<root>/fault-relay/` on the shared
+file system, and a compute node's NFS client keeps a negative entry for a name it looked up while the file was
+missing, failing every later lookup of it until the directory's attributes expire (30 s by default). The client
+therefore never looks the answer's path up while waiting: on every poll (0.5 s) it lists `answers/` with
+`os.scandir`, whose `opendir` revalidates the directory, and reads `<id>.json` only once the listing shows that
+exact name. A relayed verb then costs its own time and at most one poll; polling the path had cost about 30 s
+on every verb, measured live. The relay lists `requests/` the same way; a login-node wait (`up`'s for the
+heartbeat, `stop`'s for it to go) runs on the host that writes the file and is no such poll.
+
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
 `hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` for a verb in
 `hpcfed_control.VERBS = ("stop", "start", "status", "exec")` and exits with its status; `argv` is what follows `--`
