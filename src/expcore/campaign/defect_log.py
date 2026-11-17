@@ -119,10 +119,10 @@ class DefectLog:
         self._redactor = redactor
 
     def build_redactor(self) -> Redactor:
-        """The redactor of the attempt's redaction context as it stands now: the one it started with, or, once the
-        executor has called `record_attempt`, the whole context it gave it (the secrets and secret variables it
-        passed). What else of the attempt is kept redacted (the diagnostic of a failed instrument start, C40) uses
-        it too, so it knows no more than the log does at that moment."""
+        """The redactor of the attempt's redaction context as it stands now: the one it started with, the one the
+        executor's `declare_secrets` gave it, or, once the executor has called `record_attempt`, the whole context
+        that gave it. What else of the attempt is kept redacted (the diagnostic of a failed instrument start, C40)
+        uses it too, so it knows what the log does at that moment."""
         return self._redactor()
 
     def __call__(self, error: BaseException, defect: HarnessDefect) -> Path | None:

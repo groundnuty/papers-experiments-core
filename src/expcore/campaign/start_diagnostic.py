@@ -15,9 +15,10 @@ no phase or instrument. An error with neither has no snapshot, and the attempt i
 
 The snapshot goes through the attempt's redactor, as an instrument's snapshot goes through the record's (R12): every
 string, a key among them, loses the secrets of the environment, the models and the registry, and those the executor
-passed to `record_run` once it has. An executor starts its instruments before `record_run`, so a diagnostic of a failed
-start that could quote a secret known only to `record_run(secrets=...)` needs it registered first
-(`records.redact.register_secret`, as a platform that mints a token does). It is kept on the
+declared (`RunRequest.declare_secrets`: an executor starts its instruments before `record_run`, so a secret it names
+only to `record_run` is not known when a start fails, and it declares it first). A secret an executor neither declares
+nor registers (`records.redact.register_secret`, as a platform that mints a token does) and that is not in the
+environment is not redacted from a failed start's diagnostic. It is kept on the
 attempt's row (`attempts.diagnostic`, canonical JSON), in its outcome marker (so recovery commits it after a kill) and
 in the export (`attempt_diagnostics`, only when an attempt kept one). A snapshot that cannot be kept (not a JSON
 object, a number JSON cannot hold, more than `LIMIT_BYTES`, a redaction that raised) is `{"ok": false, "error":
