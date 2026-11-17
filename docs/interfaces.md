@@ -989,6 +989,16 @@ class RenderedPrompt:
 class HealthCheck(Protocol):
     def __call__(self) -> Health
 
+class ContextHealthCheck(Protocol):      # a check with a parameter named `context` is told the attempt it judges (O82)
+    def __call__(self, *, context: CheckContext | None) -> Health
+
+@dataclass(frozen=True)
+class CheckContext:                      # `expcore.campaign.healthgate.CheckContext`, defined in `campaign/health_context.py`
+    run_key: str
+    attempt: int                         # the number the store gives the attempt (`RunIdentity.attempt`); a pre-run check's is the number its try will have
+    phase: str                           # "pre_run" (`PRE_RUN`) or "post_run" (`POST_RUN`)
+    attempt_id: int | None = None        # the store's id of the attempt's row, which `liveness.owner()` names; None before the row exists, so in a pre-run check
+
 class DeferralBound(NamedTuple):   # what an optional `max_deferral_s()` of a check answers
     seconds: float                 # the platform's own time of the longest the check may stay deferred, with no pass in between
     detail: str                    # what defers it that long and how to shorten it, in the platform's words
@@ -1008,6 +1018,41 @@ Core guarantees: it is asked before an attempt starts and after it ends, and aga
 The attempt's liveness (`expcore.campaign.liveness`, C33). An attempt is live from its 'running' row until the store holds its result, finished or set aside: the scheduler registers its store when it opens (`liveness.register`) and takes it back as it closes, and the attempt runner enters `liveness.running(campaign, attempt_id)` around the executor, the post-run check and the store's record. A platform that takes a hold for a run writes `liveness.owner()`: `{"process", "campaign", "attempt_id"}` inside an attempt, `{"process"}` outside one, the process named as the lease pool names a holder (`lease.process_owner`: boot id, pid and start time); no run key, path or name. `liveness.state(token)` answers `ended` when the process is gone, or when it is this process and the store says the attempt is not running (or this process runs that campaign no more); `live` when the store says it runs, or the token names another process that still runs, whose store this process cannot read, or names no attempt and its process runs; None when the process's liveness cannot be read. Since this process cannot read another's store, a hold any process must be able to judge also takes a lock of its own and asks `liveness.on_end(callback)` inside the attempt: the callback runs as the attempt ends, last given first, one that raises logged and the others still run; outside an attempt `on_end` keeps nothing and returns False.
 
 **A failure an earlier attempt left charges no run that meets it** (`Health.charge`, O45, O80). `Health(False, detail, charge=False)` closes the gate and holds every run without charging any, the one that found it included; the default is `True`, and the core does not change it. A check that reads a marker an attempt leaves behind must therefore answer `charge=False` for a marker an earlier attempt left, and `True` only for the one the judged attempt left itself: compare the marker's owner (`liveness.owner()`, written when the marker was) with `liveness.current()`, the attempt this context runs, which is None in a pre-run check and the dispatcher's own, so those never charge for a marker (`ingesthealth._owned_here`, `fault_owner.charge_of`). A marker that records no owner cannot be told apart, so the marker should record one: the core's own checks charge such a marker as before, and say so, rather than guess. The core's own checks do this: the baseline marks charge only their owner, and the fault journal's `injecting` line carries `owner` (an optional field of the journal line, absent from lines written before it, which are charged as before) with the verdicts of `SettledInjections` and the fault gate charging by it.
+
+**A check can be told which attempt it judges** (O82; `expcore.campaign.health_context`). The gate runs the pre-run checks of some runs, the post-run checks of others and its own in the one shared check at the same moment, so a check that decides whom a failure is charged to cannot tell whose check it is in from where it is called. The gate hands it the attempt as an argument, a frozen `CheckContext(run_key, attempt, phase, attempt_id)`, passed down each call and never kept on the gate:
+
+- **One rule decides whether a check receives it:** its call signature has a parameter named `context` (positional-or-keyword or keyword-only, with a default or not), and the gate calls it `check(context=ctx)`. Every other check is called with no argument, exactly as before: a check with `*args` or `**kwargs`, one with a parameter of another name even when it has a default (`timeout=30`), a mock, and a callable whose signature cannot be read. Only the name opts in, so no check that works today is handed something it does not expect. The signature is the callable's own, read once when the gate is built, and not that of a function a `functools.wraps` wrapper wraps: **a decorated check opts in through its wrapper's signature**, and a wrapper that takes no argument is called with none, whatever the function it wraps declares (a `__signature__` attribute is honoured, as `inspect.signature` does, and `functools.wraps` copies one).
+- **An ambiguous signature is refused when the scheduler is built** (`ConfigError`, before the lock and the store, naming the parameter; `healthgate.takes_context` is the same rule for a study's own wrapper to ask): a `context` that cannot be passed by keyword (positional-only, `*context`, `**context`), and a required parameter the gate would never fill (`def check(ctx)`, `def check(context, other)`). Such a check used to read as a failed check at every call (`health check raised TypeError`) and is now refused at the start; a check with no required parameter is unaffected.
+- **The fields.** `attempt` is the number the store gives the attempt (`BegunAttempt.number`, the `RunIdentity`'s `attempt`): one more than the run's charged attempts when it starts, so a pre-run check is given the number its try will have if it goes, and the attempt that follows is the same number. An attempt set aside uncharged, or interrupted, is run again under the number it had, so **two attempts of one run can share a number**: `attempt_id`, the store's id of the attempt's row (the `attempt_id` of `liveness.owner()`), tells them apart. It is set in a post-run check, which judges a stored attempt, and None in a pre-run check, which runs before the row exists. `phase` is `PRE_RUN` (`"pre_run"`) or `POST_RUN` (`"post_run"`).
+- **None is the context of a check that judges no attempt**: the dispatcher's own check (the gate re-checking while it is closed), and a call of `HealthGate.before_run` or `after_run` that names no attempt (a caller outside the scheduler; the scheduler always names it). A check that takes the context takes the None, and answers for no attempt.
+- **A wrapper passes it on.** A study's check around another that takes the context declares `context` too and calls `inner(context=context)`. The core's own wrappers of the platform's checks (`PreCampaignHealth`, `FaultGate`, `SettledInjections`) call their inner check with no argument, so a check that takes the context goes outermost, as the study's check around the platform's does.
+
+An owner-based check, a marker that charges only the attempt that left it, then needs no stack inspection. The executor (or the platform tool that leaves the marker) writes `liveness.owner()` into it, and the check compares the owner with the context:
+
+```python
+from expcore.campaign.healthgate import POST_RUN, CheckContext, Health, HealthCheck
+
+
+class MarkedHealth:
+    """The platform's health, and a marker an attempt may leave; charges the attempt that left it, and no other."""
+
+    def __init__(self, platform: HealthCheck, read_marker) -> None:
+        self.platform, self.read_marker = platform, read_marker
+
+    def __call__(self, context: CheckContext | None) -> Health:
+        health = self.platform()
+        left = self.read_marker()  # None, or what the attempt wrote: {"owner": liveness.owner(), ...}
+        if not health.ok or left is None:
+            return health
+        mine = (
+            context is not None and context.phase == POST_RUN and left["owner"].get("attempt_id") == context.attempt_id
+        )
+        # only the post-run check of the attempt that left it is charged; a pre-run check or the dispatcher's own
+        # (context None) that meets the marker holds every run without charging the one that found it
+        return Health(False, "a marker the study leaves is open", charge=mine)
+```
+
+A pre-run check knows the run and the number of the attempt it precedes (`run_key`, `attempt`), never an id; the attempt's own post-run check is told apart from every other by `attempt_id`, not by the number, which a retried run reuses.
 
 Implementer must guarantee: it is quick (bounded by `health_timeout_s`), side-effect free, and `detail` holds no secret. `health_kind` must not be a kind any condition declares as its treatment, and, like `identity_kind` (the kind of a run whose endpoint changed its served identity, C16, `endpoint` by default), it must be a kind known when the study is loaded, or the load is refused. Each infrastructure kind is treatable or not: the core's `tool_plane_integrity`, `budget_hold` and `post_check_unverified`, any kind a platform registers with `treatable=False` (the Onedata layer's `data_gate_integrity`, `output_collection`, `injector_failure`, `ingest_failure` and `ingest_held`) and any kind a study declares with `treatable = false` cannot be declared in `infrastructure_is_treatment`, and the factor schema refuses to load a condition that does, naming the file and the key; the scheduler refuses, at its start, a campaign whose health or identity kind a condition declares.
 

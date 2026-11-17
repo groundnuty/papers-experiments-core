@@ -51,7 +51,7 @@ from typing import Any
 
 from expcore.campaign import liveness, prerun
 from expcore.campaign.after_loop import settle_usage
-from expcore.campaign.attempts import classify, is_charged, unverified
+from expcore.campaign.attempts import BegunAttempt, classify, is_charged, unverified
 from expcore.campaign.defect_log import DefectLog
 from expcore.campaign.executor import (
     BackendFactory,
@@ -151,7 +151,8 @@ class AttemptRunner:
         p = self.p
         key, factors = row["run_key"], json.loads(row["factors"])
         if p.health is not None:
-            pre = p.health.before_run(key)
+            # the number this try will have, as `Store.begin_attempt` numbers it: the check is told its attempt
+            pre = p.health.before_run(key, attempt=p.store.charged_attempts(key) + 1)
             if pre.verdict == HOLD:
                 return 0.0  # nothing is tried, charged or recorded; the gate holds dispatch
             if pre.verdict == DEFER:  # the platform is held on purpose: a wait, so nothing is tried or charged
@@ -367,7 +368,7 @@ class AttemptRunner:
                     result = settle_usage(result, *self._call_log(begun.id))
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
-            result, moved = self._judge(result, record, model, key)
+            result, moved = self._judge(result, record, model, key, begun)
             mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
 
             def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
@@ -384,11 +385,14 @@ class AttemptRunner:
         [row] = self.p.store.q("SELECT calls_sent, calls_usage FROM attempts WHERE id=?", (attempt_id,))
         return row["calls_sent"], row["calls_usage"]
 
-    def _judge(self, result: AttemptResult, record: Any, model: str, key: str) -> tuple[AttemptResult, bool]:
-        """Apply the post-run health check (C11) and the served-identity check (C16) to a result."""
+    def _judge(
+        self, result: AttemptResult, record: Any, model: str, key: str, begun: BegunAttempt
+    ) -> tuple[AttemptResult, bool]:
+        """Apply the post-run health check (C11) and the served-identity check (C16) to a result. The post-run check
+        is told the attempt it judges (`CheckContext`): the run, the number and the id of the row `begun` made."""
         p = self.p
         if p.health is not None:
-            health, outage = p.health.after_run()
+            health, outage = p.health.after_run(key, attempt=begun.number, attempt_id=begun.id)
             if health.deferred:  # it verified nothing: no result is scored on it, treatment included (C11)
                 result = unverified(result, health.detail)
                 text = f"{key}: {health.detail}; nothing is scored on it ({result.outcome.infra_kind or 'set aside'})"
