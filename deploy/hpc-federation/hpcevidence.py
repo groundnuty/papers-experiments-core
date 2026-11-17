@@ -1,7 +1,8 @@
 """The evidence a federation's root holds, and what `down` may not remove (O63; README, "The copy back").
 
 `hpcfed.py down` removes the federation's root, and with it files the study's post-check and the facts read: the state,
-`platform.toml`, `facts.json`, the link check, the render identity, the fault journal and the fault relay's journal.
+`platform.toml`, `facts.json`, the link check, the render identity, the manifests the spaces' data identities are
+hashes of, the step records, the fault journal and the fault relay's journal.
 `shards.py collect`, run while the federation is up, archives exactly those files (`archive_root`) to
 `<results>/<label>.root.tar` with a manifest of its own, and writes a marker into the root (`write_marker`); `down`
 refuses a root that has shard results recorded against it and no current marker (`uncollected`).
@@ -51,6 +52,7 @@ EVIDENCE_FILES = (
 )
 REQUIRED = (STATE, "facts.json")  # what `up` always writes: a root without one is not the evidence the post-check needs
 _REQUEST_FILE = re.compile(r"[0-9a-f]{32}\.json")  # the relay's requests, the ones it took and its answers
+_JSON_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.json")
 # A directory of the root and the names of the files directly in it that are evidence; every other name is left out.
 EVIDENCE_TREES = (
     ("fault-journal", re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\.jsonl")),  # injections.jsonl, shared-holds.jsonl
@@ -58,6 +60,9 @@ EVIDENCE_TREES = (
     ("fault-relay/requests", _REQUEST_FILE),
     ("fault-relay/taken", _REQUEST_FILE),
     ("fault-relay/answers", _REQUEST_FILE),
+    # what `up` made each non-imported space's data identity from (`hpcdata.MANIFESTS`): `platform.toml` has its hash
+    ("data-manifests", _JSON_FILE),
+    ("shard-steps", _JSON_FILE),  # `STEPS_DIR`: which shards' steps ran against this root, and how many times
 )
 SECRETS = "secrets"  # never archived; its files' contents are what no archived file may hold
 MIN_SECRET = 8  # the shortest value taken for a secret when scanning (a shorter one would match by chance)

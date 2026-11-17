@@ -402,7 +402,14 @@ def test_o74_up_wrote_each_federations_render_identity_0600_and_each_shards_out_
 # What a root `up` and a campaign made holds that its archive leaves out, and why (O63): every file of a real root is
 # archived, under `secrets/`, or named here. A file `up` writes later that is none of them fails the test below, so that
 # someone decides whether the post-check needs it.
-NOT_EVIDENCE: tuple[tuple[str, str], ...] = ()
+NOT_EVIDENCE: tuple[tuple[str, str], ...] = (
+    (".expcore-fed-root", "the mark that makes the root this federation's own"),
+    ("ca/", "the federation's CA certificate: public, and meaningless once the federation is gone"),
+    ("evidence-collected.json", "collect's own marker, which says the evidence was collected"),
+    ("hpc-federation.lock", "the lifecycle lock, held only while an up or a down runs"),
+    ("link-check.lock", "the link check's lock"),
+    ("toolshim/", "a copy of the launcher script of the checkout, not data a run made"),
+)
 
 
 def _root_files(root: Path) -> list[str]:

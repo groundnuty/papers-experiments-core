@@ -26,6 +26,8 @@ EVIDENCE = {
     f"fault-relay/taken/{REQUEST_ID}.json": b'{"verb": "status", "service": "aspen"}\n',
     f"fault-relay/answers/{REQUEST_ID}.json": b'{"status": "ok", "stdout": "up"}\n',
     f"fault-relay/answers/{TAKEN_ID}.json": b'{"status": "timed_out"}\n',
+    "data-manifests/alpha-space.json": b'{"version": 1, "files": [], "directories": []}\n',
+    "shard-steps/shard.json": b'{"format": "expcore-hpc-shard-step-record/1", "shard": {"label": "s"}, "starts": 1}\n',
 }
 
 # What a root holds that is not evidence: secrets, live state and what no read of the study needs. None is archived.
