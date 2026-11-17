@@ -840,8 +840,11 @@ run is open.
    test pins the two together). A shared import's owner adds nothing on scratch (its storage is the tree, read-only), but
    the copy a mirror fetches does, so it counts once like every other space; a replica on every mirror is **not**
    multiplied in (no multiplier is invented), and the 5% below the line is the room for what the estimate leaves out. For
-   the ingest layout (`pilot-shape.toml`) the estimate is a handful of files (its spaces declare no data: `baseline =
-   false`, or one small file), because the study's own ingest is in no manifest `up` knows; for the import layout
+   the ingest layout (`pilot-shape.toml`) the estimate is a handful of files while its ingested space declares no
+   manifest (`baseline = false`, nothing the study will put there is known to `up`); a study that declares it
+   (`data_manifest = "@study_artifacts@/..."`, which `up` loads and records, section 6a) has that manifest counted too,
+   from the site's `HPC_STUDY_ARTIFACTS`: the pilot's largest space is 15,340 files (`hpcdata.declared` takes it through
+   `ingested_manifests`, so the estimate and the manifest `up` verifies the space against are one count); for the import layout
    (`pilot-shape-import.toml`) it is the four imported manifests, about the pilot's 17,500.
 3. **Refuse** when `used + estimate > quota * 95 // 100`, in integers, so a total exactly at the line passes. The message
    names the used count, the estimate, the quota and the 95% line.

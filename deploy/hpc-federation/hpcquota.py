@@ -19,8 +19,9 @@ manifest being the layout's own file and every other space's the baseline `up` w
 the core's phase writes the data manifests from). A shared import's owner holds the tree where it already is and adds
 nothing on scratch, but the copy a mirror fetches does, so it counts once like the rest; a replica on every mirror is
 not multiplied in, and the 5% below the line is the room for what the estimate leaves out. A layout whose spaces
-declare no data (the ingest layout's, `baseline = false`) estimates what its baseline writes, a handful: the study's own
-ingest is outside every manifest `up` knows.
+declare no data (`baseline = false`, no manifest) estimates what its baseline writes, a handful. An ingested space that
+declares its manifest (`data_manifest = "@study_artifacts@/..."`, which `up` loads and records) counts it, as the study
+will fill the space with what it declares: the pilot's largest space is 15,340 files.
 """
 
 import re
@@ -47,9 +48,13 @@ class QuotaRefused(RuntimeError):
     """The federation is refused: the quota cannot be read, or the federation would pass the line. Names why."""
 
 
-def estimate_inodes(layout: Any, environ: Mapping[str, str]) -> Dict[str, int]:
-    """Each space's inodes: its manifest's files and directories, nothing written (`hpcdata.declared`)."""
-    return {name: len(m.files) + len(m.directories) for name, m in hpcdata.declared(layout, environ).items()}
+def estimate_inodes(
+    layout: Any, environ: Mapping[str, str], values: Optional[Mapping[str, str]] = None
+) -> Dict[str, int]:
+    """Each space's inodes: its manifest's files and directories, nothing written (`hpcdata.declared`). An ingested
+    space counts the manifest its layout declares for it (`values` fills `@study_artifacts@`: the site's
+    `HPC_STUDY_ARTIFACTS`), as `up` loads it; one that declares none counts nothing."""
+    return {name: len(m.files) + len(m.directories) for name, m in hpcdata.declared(layout, environ, values).items()}
 
 
 def pattern_of(site: Site) -> "re.Pattern[str]":
@@ -158,4 +163,5 @@ def guard(runner: Any, site: Site, layout: Any, environ: Mapping[str, str], fede
             f"HPC_QUOTA_CHECK={QUOTA_CHECK_OFF} with HPC_STORAGE_ROOT: the inode check of a federation bound onto "
             "scratch cannot be turned off; nothing was submitted"
         )
-    return check_inodes(runner, site, federations * sum(estimate_inodes(layout, environ).values()))
+    values = hpcdata.study_values(site.study_artifacts)
+    return check_inodes(runner, site, federations * sum(estimate_inodes(layout, environ, values).values()))

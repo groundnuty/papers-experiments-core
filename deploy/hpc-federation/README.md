@@ -254,8 +254,10 @@ contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   lacks a group, a command that cannot run, fails or does not answer in 120 s, an output the pattern does not match exactly
   once, a figure that is no count (`unlimited` is none) or that the pattern cut out of a longer one (`1000.5`, `2G`: the
   pattern must capture the whole figure) and a quota of 0 all refuse `up`, naming why; nothing turns the check off.
-  For the ingest layout the estimate is a handful (its spaces declare no data);
-  for `layouts/pilot-shape-import.toml` it is the four imported manifests.
+  For the ingest layout the estimate is a handful until its ingested space declares the manifest of the study's data
+  (`data_manifest`): that manifest is counted too (the pilot's largest space is 15,340 files), through the site's
+  `HPC_STUDY_ARTIFACTS`, and a fleet counts it once for each of its federations; for `layouts/pilot-shape-import.toml`
+  it is the four imported manifests.
 - **`up` then makes the federation's storage:** below `HPC_STORAGE_ROOT`, one directory of its own named for its allocation
   (0700) and one per provider, each by an exclusive `mkdir` that never adopts what is already there and each holding an
   owner marker, recorded in the state file before the first is made, and in each provider's, beside its marker, the
