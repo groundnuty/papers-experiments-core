@@ -158,8 +158,9 @@ killed outright spent and `--resume` counts as `lost_in_kill`); and the newest s
 than the archive (`newer_snapshot`: a step resumed from the archive was killed before it archived, so its snapshot names
 that archive and holds runs the archive lacks, which the merge does not see); and, per federation, its **root
 evidence**: `<label>.root.tar` and `<label>.root.json` (the state, `platform.toml`, `facts.json`, the link check, the
-render identity, the fault journal's and the relay's journals: an allow-list, never a secret, `hpcevidence.py`), which
-`down` would remove with the root. Every other snapshot is resume material,
+render identity, the whole fault journal, the relay's journal: an allow-list, never a secret, `hpcevidence.py`), which
+`down` would remove with the root; and the shard's `<label>/pass-env.json` when there is one (private, like the root
+archive). Every other snapshot is resume material,
 superseded by the verified archive (a snapshot of the step that wrote an archive names an earlier one or none, and was
 taken before it), and is not required. The manifest has the plan's `plan_id` (the SHA-256 of the plan's study and
 results directories and each shard's index, count, label and root), then the archives and the other files, each with
@@ -293,6 +294,7 @@ ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not b
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
 ARCHIVES_FORMAT = "expcore-hpc-archives/1"  # the copy back's manifest: what `collect` read, for `verify-copy`
 ARCHIVES_MANIFEST = "archives.sha256.json"  # in <results>, beside the archives
+PASS_ENV = "pass-env.json"  # <results>/<label>/: the shard's first-step pass_env names and values; PRIVATE evidence
 ROOT_SUFFIXES = (".root.tar", ".root.json")  # <results>/<label>: a federation's root evidence and its manifest
 # The step's record in its federation's root that `down` reads (`hpcevidence`, the source: this file runs alone on a
 # node and keeps its own copy of the two names; a test compares them).
@@ -888,6 +890,18 @@ def _files_under(root: Path, results: Path, label: str) -> list[str]:
     return sorted(found)
 
 
+def _file_when_present(results: Path, name: str, label: str) -> list[str]:
+    """`[name]` (relative to `results`) when it is there as a regular file, `[]` when it is not there; `ShardsError`
+    naming the shard for a link or anything else, which is never followed."""
+    try:
+        mode = (results / name).lstat().st_mode
+    except FileNotFoundError:
+        return []
+    if not stat.S_ISREG(mode):
+        raise ShardsError(f"shard {label}: {name.rsplit('/', 1)[-1]} is not a regular file: a link is never followed")
+    return [name]
+
+
 def newer_snapshot(plan: Plan, shard: Shard, archive_sha: str, scratch: Path) -> Path | None:
     """The snapshot of `shard` that is newer than its archive (`archive_sha`: what the verified archive's manifest
     names) and that `--resume` would restore, or None. A snapshot names the archive its step started from (`base`), so
@@ -919,7 +933,8 @@ def evidence_entries(
     spent), and the snapshot newer than the archive when there is one (`newer_snapshot`), each as name (relative to the
     results directory), size and SHA-256 of the bytes read, sorted by name. The archive manifest is shown to name the
     archive that was verified, so the two listed are a pair. A link among them refuses the collect; so does a file that
-    cannot be read. Snapshots older than the archive are resume material and not listed (README). Returns the entries
+    cannot be read. `<label>/pass-env.json`, the shard's first-step `pass_env` (private), is listed when it is there.
+    Snapshots older than the archive are resume material and not listed (README). Returns the entries
     and, for each shard that has a snapshot newer than its archive, its (label, snapshot name)."""
     entries: list[dict[str, Any]] = []
     ahead: list[tuple[str, str]] = []
@@ -935,6 +950,7 @@ def evidence_entries(
             entries.append({"name": f"{shard.label}.out.json", "bytes": len(own),
                             "sha256": hashlib.sha256(own).hexdigest()})  # fmt: skip
             names = _files_under(plan.results / shard.label / JOURNALS, plan.results, shard.label)
+            names += _file_when_present(plan.results, f"{shard.label}/{PASS_ENV}", shard.label)
             snapshot = newer_snapshot(plan, shard, manifest["sha256"], scratch)
             if snapshot is not None:
                 names += _files_under(snapshot, plan.results, shard.label)

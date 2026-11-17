@@ -95,6 +95,7 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
     if "data" in state:
         checked_data(state["data"])
     checked_shard_nodes(state.get("shard_nodes", []))
+    checked_discards(state.get("evidence_discarded", []))
     return state
 
 
@@ -143,6 +144,20 @@ def checked_shard_nodes(entries: Any) -> None:
             raise StateError(f"{STATE}: a shard_nodes entry's node is not a node name")
         if not all(isinstance(entry[key], str) and entry[key] for key in ("label", "name")):
             raise StateError(f"{STATE}: a shard_nodes entry has no label or job name")
+
+
+def checked_discards(entries: Any) -> None:
+    """Each use of `down --discard-evidence` (O63): when it was, the shards whose evidence was not collected and so went
+    with the root, and the reason given on the command line (None when none was)."""
+    if not isinstance(entries, list):
+        raise StateError(f"{STATE}: evidence_discarded is not a list")
+    for entry in entries:
+        ok = isinstance(entry, dict) and set(entry) == {"at", "shards", "after_a_later_step", "reason"}
+        ok = ok and isinstance(entry["at"], str) and isinstance(entry["after_a_later_step"], bool)
+        ok = ok and isinstance(entry["shards"], list) and all(isinstance(label, str) for label in entry["shards"])
+        ok = ok and (entry["reason"] is None or isinstance(entry["reason"], str))
+        if not ok:
+            raise StateError(f"{STATE}: an evidence_discarded entry is not {{at, shards, after_a_later_step, reason}}")
 
 
 def checked_sandbox(sandbox: Any) -> None:

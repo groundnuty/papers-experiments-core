@@ -12,8 +12,13 @@ that names nothing would pass for any package (K01), and so is a pattern that is
 
 Never selected, whatever the patterns say: version-control and cache directories, compiled Python, the live
 campaign under out/ (the store, its lock and its leases), since the package's analysis reads the snapshot of the store
-that the replay check keeps in the batch, and the campaign's local logs (`out/logs`, the harness defects' tracebacks),
-which stay on the author's machine. A selected symbolic link is refused, since it could point out of the study.
+that the replay check keeps in the batch, the campaign's local logs (`out/logs`, the harness defects' tracebacks),
+which stay on the author's machine, and the private evidence of an HPC campaign (`PRIVATE_EVIDENCE_SUFFIXES`,
+`PRIVATE_EVIDENCE_NAMES`): a federation's root archive `<label>.root.tar` and its manifest, which hold node names,
+site paths and the account's details, and the shard's `pass-env.json`, which holds a site path. They are private to the
+operator, whatever directory they were pulled into, and no anonymisation list covers a site's details.
+
+A selected symbolic link is refused, since it could point out of the study.
 The names the build writes at the package root (`GENERATED`) cannot be selected, nor can the other names GNU Make
 reads there (`GNUmakefile`, `makefile`), which would take the place of the generated Makefile; the generated
 instructions run `make -f Makefile check` as well. Nor can anything under `wheels/`, where the build puts the wheels
@@ -48,6 +53,10 @@ SKIPPED_PARTS = frozenset({".git", "__pycache__", ".venv", "venv", ".pytest_cach
 SKIPPED_SUFFIXES = frozenset({".pyc", ".pyo"})
 LIVE_CAMPAIGN = ("out/state.sqlite", "out/campaign.lock", "out/leases")
 LOCAL_ONLY = ("out/logs",)  # the campaign's local logs (`campaign.defect_log`): never committed, never packaged
+# An HPC campaign's private evidence (`deploy/hpc-federation/shards.py collect`): by what a file is called, wherever it
+# lies. The root archive's files are not named here, since they are `facts.json` and the like: the archive is.
+PRIVATE_EVIDENCE_SUFFIXES = (".root.tar", ".root.json")
+PRIVATE_EVIDENCE_NAMES = ("pass-env.json",)
 WHEELS_DIR = "wheels"  # the build fills it with the wheels of the environment (`package.wheels`)
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 
@@ -162,11 +171,13 @@ def pattern_regex(pattern: str) -> re.Pattern[str]:
 
 def never_selected(rel: str) -> bool:
     """Tell whether a path is left out whatever the patterns say: caches, version control, the live campaign, the
-    local logs."""
+    local logs, an HPC campaign's private evidence."""
     parts = rel.split("/")
     if SKIPPED_PARTS.intersection(parts) or os.path.splitext(rel)[1] in SKIPPED_SUFFIXES:
         return True
     if any(rel == local or rel.startswith(local + "/") for local in LOCAL_ONLY):
+        return True
+    if parts[-1].endswith(PRIVATE_EVIDENCE_SUFFIXES) or parts[-1] in PRIVATE_EVIDENCE_NAMES:
         return True
     return any(rel == live or rel.startswith(live + "-") or rel.startswith(live + "/") for live in LIVE_CAMPAIGN)
 

@@ -29,7 +29,7 @@ WORKDIR_LINE = re.compile(r"^hpcop: work directory (/\S+)$", re.M)  # the batch 
 class Down:
     """down, and what it is made of; `hpcdriver.Driver` provides the rest."""
 
-    def down(self, discard_evidence: bool = False) -> str:
+    def down(self, discard_evidence: bool = False, discard_reason: Optional[str] = None) -> str:
         """The federation taken down and its root removed. A root that a shard step ran against and whose evidence was
         not collected (`evidence_gate`) is refused before anything is stopped, unless `discard_evidence`, which the
         output records."""
@@ -46,11 +46,11 @@ class Down:
                 settle_rmdir(self.root, ops["rmdir"], ops["sleep"], ops["clock"]() + SETTLE_S, ops["clock"])
             return "down: the root an earlier down's removal left (cut short by files held open) is removed"
         with self.store.lifecycle("down"):  # never beside an up that may be between its state and its sbatch
-            discarded = self.evidence_gate(discard_evidence)
+            discarded = self.evidence_gate(discard_evidence, discard_reason)
             done = self.take_down()
         return f"{discarded}\n{done}" if discarded else done
 
-    def evidence_gate(self, discard: bool) -> str:
+    def evidence_gate(self, discard: bool, reason: Optional[str] = None) -> str:
         """O63: down removes the root, which holds the evidence the study's post-check and the facts read (the state,
         `platform.toml`, `facts.json`, the link check, the render identity, the fault journals): so it refuses,
         before it
@@ -78,7 +78,13 @@ class Down:
         line = (
             f"down: --discard-evidence: the root's evidence of {shown} "
             f"{'was collected before a later step' if stale else 'was not collected'} and is removed with it"
+            + (f" (reason given: {reason})" if reason else "")
         )
+        if self.store.exists():  # the state goes with the root: this line, in down's output, is what outlives it
+            entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "shards": labels,
+                     "after_a_later_step": stale, "reason": reason}  # fmt: skip
+            self.set(lambda state: state.setdefault("evidence_discarded", []).append(entry))
+            line += "; recorded in the state file"
         self.say(line)
         return line
 

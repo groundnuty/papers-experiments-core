@@ -668,9 +668,18 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 | `<label>.out.tar` | the shard's `out/`, which the merge reads | the results |
 | `<label>.out.json` | the archive's manifest (its SHA-256, the exit status, the post-run record) | what the archive is |
 | `<label>/journals/*` (every file) | a spend journal per step (`expcore run --spend-journal`) | what a step killed outright spent, which `--resume` counts as `lost_in_kill`: nowhere else |
-| `<label>.root.tar` | the federation's **root evidence**: the state (`hpc-federation.json`), `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml`, `data-manifests/*.json` (what each space's data identity was made from), `shard-steps/*.json` (which steps ran), the fault journal's `*.jsonl` and the fault relay's `late-steps.jsonl` and request, taken and answer files (those present). **An allow-list: never `secrets/`, a file holding a token, key or password, the CA, or the live state of the relay and journal** | what `down` removes with the root, and the study's post-check and the facts read: nowhere else once the root is gone |
+| `<label>.root.tar` | the federation's **root evidence**: the state (`hpc-federation.json`), `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml`, `shard-claim.json` and `shard-claim.lock` (the study's pre-step guard: who held the root), `data-manifests/*.json` (what each space's data identity was made from), `shard-steps/*.json` (which steps ran), the **whole `fault-journal/` directory** (its journals, the holder and drain records, the lock files, read as they are and never locked) and the fault relay's `late-steps.jsonl` and request, taken and answer files (those present). **An allow-list: never `secrets/`, a file holding a token, key or password, the CA, or the relay's heartbeat and lock** | what `down` removes with the root, and the study's post-check and the facts read: nowhere else once the root is gone |
 | `<label>.root.json` | the root archive's manifest (its SHA-256 and size, and each file's name, size and SHA-256) | what the root archive is |
+| `<label>/pass-env.json`, **when there is one** | the shard's first-step `pass_env` names and values (a site path of the study's artifacts) | what the first step was given, which the archive's `out/` does not hold |
 | `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one, and `collect --run` refuses |
+
+**The root archive and `pass-env.json` are private evidence.** The state file and the facts name nodes and site paths, the
+state file also the account and the administrator's address (no secret, but the site's own), and `pass-env.json` a site
+path. They are for the operator: keep the pulled copies like the journals, and never publish them. `expcore package` can
+never take them: `package.spec.never_selected` leaves out any `*.root.tar`, `*.root.json` and `pass-env.json`, whatever
+directory they were pulled into and whatever the patterns say (tests: `tests/package/test_spec.py`, `test_build.py`); the
+alternative, an anonymisation that covers node names, addresses and site paths, was not chosen, since no list of terms
+can name a site's details before they are known.
 
 **`down` refuses a root whose evidence was not collected.** `shards.py step` leaves `shard-steps/<label>.json` in its
 federation's root when a step starts (the shard's spec and a count; a step that cannot write it does not start), and
@@ -679,7 +688,10 @@ federation's root when a step starts (the shard's spec and a count; a step that 
 is refused, naming the shards, and stays whole so that a `collect` can still read it. A step that started after the
 collect (a resume) makes the marker stale and `down` refuses again until `collect` is run again. A root where no step ever
 ran goes down as it always did. To remove a root whose evidence you do not want, give `hpcfed.py down --discard-evidence`:
-down's output then says which shards' evidence was discarded. (`fleet.py down` takes no such flag: it reports the refusal,
+down's output then says which shards' evidence was discarded, and **every use is recorded in the federation's state file**
+(`evidence_discarded`: the time in UTC, the shards, whether their evidence had been collected before a later step, and
+the reason given with `--discard-reason TEXT`, at most 500 characters, if any). The state file goes with the root when
+`down` ends, so that line in down's output is what outlives it: keep it. (`fleet.py down` takes no such flag: it reports the refusal,
 and `hpcfed.py down --discard-evidence` is run for that root by hand.) A `collect` after the root is gone (a down that
 followed an earlier collect) lists the root archive that collect wrote, if it still verifies, and refuses otherwise.
 

@@ -9,7 +9,7 @@ refuses a root that has shard results recorded against it and no current marker 
 
 **An allow-list, never a deny-list.** The archive holds the files named in `EVIDENCE_FILES` and the files of
 `EVIDENCE_TREES` whose names match, and nothing else: not `secrets/`, not any file that holds a token, key or password
-by whatever name, not the live state of the relay or the journal (heartbeat, locks, holder, drain), not the CA, the
+by whatever name, not the relay's heartbeat and lock, not the CA, the
 shim or a provider's data. Every file is opened below a descriptor of the root with `O_NOFOLLOW` and read once, as
 bytes; the archive is built from those bytes, so a link anywhere among the evidence is refused and never followed, and
 what was checked is what is archived. As a last check no archived file may hold the content of a file of `secrets/`
@@ -39,9 +39,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 STATE = "hpc-federation.json"
-# A file of the root, by its name: the allow-list. Present-only except `REQUIRED`: a federation that ran no faults or
-# has
-# no platform template lacks some. `day0-wiring.toml` is named by the brief; no code of this repository writes it.
+# A file of the root, by its name: the allow-list. Present-only except `REQUIRED`: a federation that ran no faults, or
+# has no platform template, lacks some. `day0-wiring.toml` is the pilot's, hand-copied into the root; `shard-claim.json`
+# and `shard-claim.lock` are written by its pre-step guard (who held the root, which a resume dispute needs). One line
+# each: a file the post-check reads is added here.
 EVIDENCE_FILES = (
     STATE,
     "platform.toml",
@@ -49,13 +50,14 @@ EVIDENCE_FILES = (
     "link-check.json",
     "render-identity.json",
     "day0-wiring.toml",
+    "shard-claim.json",
+    "shard-claim.lock",
 )
 REQUIRED = (STATE, "facts.json")  # what `up` always writes: a root without one is not the evidence the post-check needs
 _REQUEST_FILE = re.compile(r"[0-9a-f]{32}\.json")  # the relay's requests, the ones it took and its answers
 _JSON_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.json")
 # A directory of the root and the names of the files directly in it that are evidence; every other name is left out.
 EVIDENCE_TREES = (
-    ("fault-journal", re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\.jsonl")),  # injections.jsonl, shared-holds.jsonl
     ("fault-relay", re.compile(r"late-steps\.jsonl")),  # not heartbeat.json, relay.lock
     ("fault-relay/requests", _REQUEST_FILE),
     ("fault-relay/taken", _REQUEST_FILE),
@@ -64,6 +66,12 @@ EVIDENCE_TREES = (
     ("data-manifests", _JSON_FILE),
     ("shard-steps", _JSON_FILE),  # `STEPS_DIR`: which shards' steps ran against this root, and how many times
 )
+# A directory archived whole, every file at any depth: the fault journal (`injections.jsonl`, `shared-holds.jsonl`,
+# `reset-holds.jsonl`, `link-epoch.json`, the holder and drain records and the lock files the pilot's heal flocks). The
+# files are read as they are, never locked; a link or a name that is not a plain file name refuses the collect.
+WHOLE_TREES = ("fault-journal",)
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9._-]{1,200}")
+MAX_DEPTH = 4
 SECRETS = "secrets"  # never archived; its files' contents are what no archived file may hold
 MIN_SECRET = 8  # the shortest value taken for a secret when scanning (a shorter one would match by chance)
 MAX_SECRET_FILE = 1 << 20
@@ -180,7 +188,38 @@ def _candidates(root_fd: int) -> list[str]:
                         found.append(f"{relative}/{entry.name}")
         finally:
             os.close(directory)
+    for relative in WHOLE_TREES:
+        directory = _tree(root_fd, relative)
+        if directory is not None:
+            try:
+                _whole(directory, relative, 0, found)
+            finally:
+                os.close(directory)
     return sorted(found)
+
+
+def _whole(directory: int, relative: str, depth: int, found: list[str]) -> None:
+    """Every file below the directory `directory` (the descriptor of `relative`), at any depth up to `MAX_DEPTH`, added
+    to `found`; EvidenceError for a link or another thing that is no file or directory, a name that is not plain, or a
+    tree nested deeper."""
+    if depth > MAX_DEPTH:
+        raise EvidenceError(f"{relative} is nested more than {MAX_DEPTH} directories deep")
+    with os.scandir(directory) as listing:
+        entries = sorted((entry.name, entry.stat(follow_symlinks=False).st_mode) for entry in listing)
+    for name, mode in entries:
+        shown = f"{relative}/{name}"
+        if not _PLAIN_NAME.fullmatch(name):
+            raise EvidenceError(f"{relative}/ holds a name that is not a plain file name")
+        if stat.S_ISREG(mode):
+            found.append(shown)
+        elif stat.S_ISDIR(mode):
+            below = _open_dir(directory, name, shown)
+            try:
+                _whole(below, shown, depth + 1, found)
+            finally:
+                os.close(below)
+        else:
+            raise EvidenceError(f"{shown} is a link or not a regular file, never followed")
 
 
 def _read_named(root_fd: int, relative: str) -> bytes:

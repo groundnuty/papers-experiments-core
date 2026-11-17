@@ -5,6 +5,8 @@ anything is stopped, unless `--discard-evidence` is given, which down's output r
 goes as before. Against the fake Slurm of hpc_fed_support; nothing reaches a cluster."""
 
 import json
+import os
+import re
 
 import pytest
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
@@ -154,6 +156,105 @@ def test_discard_evidence_lets_down_remove_an_uncollected_root_and_the_output_re
     assert any("--discard-evidence" in line and "shard-1" in line for line in said)
     assert rig.fake.cancelled == ["4242"]
     assert not rig.root.exists()
+
+
+def _discarded(rig):
+    """What a `down --discard-evidence` left in the state file: down is stopped right after its gate, so the state,
+    which goes with the root at the end of a whole down, is still there to read."""
+
+    def stopped():
+        raise RuntimeError("stopped for the test, after the gate")
+
+    rig.driver.take_down = stopped
+    with pytest.raises(RuntimeError, match="stopped for the test"):
+        rig.driver.down(discard_evidence=True, discard_reason=rig.reason)
+    return rig.driver.store.read().get("evidence_discarded")
+
+
+def test_every_use_of_discard_evidence_is_recorded_in_the_state_with_its_time_and_reason(hpc, tmp_path, site):
+    """O63: the shards whose evidence was not collected, when (UTC), and the reason given on the command line; a second
+    use adds a second entry. The output says it was recorded, with the reason."""
+    rig = Rig(hpc, tmp_path, site)
+    record_step(rig.root, "shard-1")
+    said = []
+    rig.driver.say = said.append
+    rig.reason = "the pilot's batch was abandoned"
+    (entry,) = _discarded(rig)
+    assert entry["shards"] == ["shard-1"]
+    assert entry["after_a_later_step"] is False
+    assert entry["reason"] == "the pilot's batch was abandoned"
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", entry["at"])
+    assert any(
+        "reason given: the pilot's batch was abandoned" in line and "recorded in the state file" in line
+        for line in said
+    )
+    rig.reason = None
+    entries = _discarded(rig)
+    assert [e["reason"] for e in entries] == ["the pilot's batch was abandoned", None]
+
+
+def test_a_discard_of_a_marker_made_stale_by_a_later_step_says_so_in_the_state(hpc, tmp_path, site):
+    """O63: the evidence was collected, and a step started since: recorded as such, not as never collected."""
+    rig = Rig(hpc, tmp_path, site)
+    record_step(rig.root, "shard-1")
+    rig.collected()
+    record_step(rig.root, "shard-1", starts=2)
+    rig.reason = None
+    (entry,) = _discarded(rig)
+    assert entry["after_a_later_step"] is True
+
+
+def test_nothing_is_recorded_when_there_was_nothing_to_discard(hpc, tmp_path, site):
+    """O63: the flag on a root with no step record, or whose evidence is collected, records nothing."""
+    rig = Rig(hpc, tmp_path, site)
+
+    def stopped():
+        raise RuntimeError("stopped for the test")
+
+    rig.driver.take_down = stopped
+    with pytest.raises(RuntimeError, match="stopped for the test"):
+        rig.driver.down(discard_evidence=True, discard_reason="not needed")
+    assert "evidence_discarded" not in rig.driver.store.read()
+
+
+def test_the_state_loader_refuses_a_discard_record_that_is_not_of_the_form(hpc, tmp_path, site):
+    """O63: the record is part of the state file's checked form."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver.store.update(lambda state: {**state, "evidence_discarded": [{"at": 1}]})
+    with pytest.raises(hpc.state.StateError, match="evidence_discarded"):
+        rig.driver.store.read()
+
+
+def test_the_discard_reason_goes_with_the_flag_and_is_bounded(hpc, tmp_path, site, capsys):
+    """O63: `--discard-reason` without `--discard-evidence`, or one over 500 characters, is an error (exit 2) before
+    anything is touched; with the flag it is accepted and recorded."""
+    rig = Rig(hpc, tmp_path, site)
+    record_step(rig.root, "shard-1")
+    words = ["--layout", str(LAYOUT), "--root", str(rig.root), "down"]
+    assert hpc.cli.main([*words, "--discard-reason", "why"], {}, runner=rig.fake) == 2
+    assert hpc.cli.main([*words, "--discard-evidence", "--discard-reason", "x" * 501], {}, runner=rig.fake) == 2
+    assert rig.root.exists()
+    capsys.readouterr()
+    assert hpc.cli.main([*words, "--discard-evidence", "--discard-reason", "why"], {}, runner=rig.fake) == 0
+    assert "reason given: why" in capsys.readouterr().out
+
+
+def test_the_state_file_holds_no_secret_of_the_root(hpc, tmp_path, site):
+    """O63: the archive of the root takes the state file, so it must hold none: no content of any file of `secrets/`
+    (the zone's passphrase and CA key `up` wrote, and a planted token and password) is in it."""
+    rig = Rig(hpc, tmp_path, site)
+    (rig.root / "secrets").mkdir(exist_ok=True)
+    (rig.root / "secrets" / "planted.token").write_text("tok-7c1e93b2a5d84f60e3a1b9c2")
+    (rig.root / "secrets" / "users").mkdir(exist_ok=True)
+    (rig.root / "secrets" / "users" / "planted.pass").write_text("pass-1f0e4d8a73b65c92")
+    state = (rig.root / "hpc-federation.json").read_bytes()
+    descriptor = os.open(rig.root, os.O_RDONLY)
+    try:
+        values = hpc.evidence.secret_values(descriptor)
+    finally:
+        os.close(descriptor)
+    assert len(values) >= 3  # the planted ones, and what up wrote
+    assert not [value for value in values if value in state]
 
 
 def test_a_root_where_no_step_ever_ran_goes_down_as_it_always_did(hpc, tmp_path, site):

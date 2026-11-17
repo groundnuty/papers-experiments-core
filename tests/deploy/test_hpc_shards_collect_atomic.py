@@ -29,13 +29,19 @@ def shards():
         sys.modules.pop("hpc_shards_collect_atomic", None)
 
 
-def _replace_archive(results: Path, label: str, members: dict[str, bytes]) -> None:
+def _replace_archive(results: Path, label: str, members: dict[str, bytes | tuple[bytes, str]]) -> None:
     """The shard's archive as a step could have left it: whole, matching its manifest, holding `members` (a name and the
-    bytes of a file, written as the tar gives it, so that a name may lead out of the tree)."""
+    bytes of a file, written as the tar gives it, so that a name may lead out of the tree; or a name and the pair
+    (kind, target) of a link, `kind` being `b"sym"` or `b"hard"`)."""
     tar_path, json_path = results / f"{label}.out.tar", results / f"{label}.out.json"
     with tarfile.open(tar_path, "w", format=tarfile.PAX_FORMAT) as tar:
         for name, content in members.items():
             info = tarfile.TarInfo(name)
+            if isinstance(content, tuple):
+                kind, info.linkname = content
+                info.type = tarfile.SYMTYPE if kind == b"sym" else tarfile.LNKTYPE
+                tar.addfile(info)
+                continue
             info.size = len(content)
             tar.addfile(info, io.BytesIO(content))
     manifest = json.loads(json_path.read_text())
@@ -56,6 +62,10 @@ def _untouched(plan, tmp_path, results_before, parent_before):
 REFUSED = {
     "a member that is not under out/": {"etc/passwd": b"x", "out/campaign.lock": b""},
     "a member that leads out of the tree": {"out/campaign.lock": b"", "out/../../escape": b"x"},
+    "an absolute member": {"out/campaign.lock": b"", "/tmp/escape": b"x"},
+    "a link that leaves out/": {"out/campaign.lock": b"", "out/link": (b"sym", "../../../../escape")},
+    "a link to an absolute path": {"out/campaign.lock": b"", "out/link": (b"sym", "/etc")},
+    "a hard link to a file outside": {"out/campaign.lock": b"", "out/link": (b"hard", "../../escape")},
 }
 
 

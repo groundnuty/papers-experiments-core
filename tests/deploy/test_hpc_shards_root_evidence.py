@@ -6,6 +6,7 @@ archive is an allow-list of evidence files: nothing from `secrets/`, no file hol
 path, name and token here is invented."""
 
 import argparse
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -47,8 +48,7 @@ def _collect(shards, tmp_path, into="merge"):
 # ------------------------------------------------------------------------------------------------ the allow-list
 def test_the_root_archive_holds_exactly_the_evidence_allow_list(shards, tmp_path):
     """O63: every file of the allow-list that the root holds, by its name relative to the root, and nothing else: the
-    live state of the relay and the journal (heartbeat, locks, holder, drain), the CA, the shim and the providers'
-    data are not evidence."""
+    relay's heartbeat and lock, the CA, the shim and the providers' data are not evidence."""
     plan = _collect(shards, tmp_path)
     for shard in plan.shards:
         assert _members(plan.results / f"{shard.label}.root.tar") == EVIDENCE
@@ -93,7 +93,13 @@ def test_a_token_inside_an_evidence_file_refuses_the_collect_naming_the_file_and
 
 
 @pytest.mark.parametrize(
-    "name", ["fault-relay/answers/" + "1" * 32 + ".json", "fault-journal/injections.jsonl", "facts.json"]
+    "name",
+    [
+        "fault-relay/answers/" + "1" * 32 + ".json",
+        "fault-journal/injections.jsonl",
+        "fault-journal/federation.lock",
+        "facts.json",
+    ],
 )
 def test_a_link_among_the_evidence_refuses_the_collect_and_is_never_followed(shards, tmp_path, name):
     """O63: a link where an evidence file is (here into `secrets/`) is refused, naming it; its target is never read into
@@ -107,6 +113,53 @@ def test_a_link_among_the_evidence_refuses_the_collect_and_is_never_followed(sha
         shards.collect(plan, tmp_path / "merge")
     assert not list(plan.results.glob("*.root.*"))
     assert not (plan.results / MANIFEST).exists()
+
+
+def test_the_fault_journal_is_archived_whole_and_a_lock_in_it_is_read_never_taken(shards, tmp_path):
+    """O63: every file of `fault-journal/` at any depth, the lock files the pilot's heal flocks included, as they are;
+    one held under an exclusive lock by another process of the operator's (here this one, on a lock file) does not stop
+    the collect, which only reads."""
+    plan = make_plan(shards, tmp_path)
+    lock = plan.shards[0].root / "fault-journal" / "federation.lock"
+    with open(lock, "wb") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        shards.collect(plan, tmp_path / "merge")
+        fcntl.flock(held, fcntl.LOCK_UN)
+    members = _members(plan.results / "fed-a.root.tar")
+    assert {name for name in members if name.startswith("fault-journal/")} == {
+        name for name in EVIDENCE if name.startswith("fault-journal/")
+    }
+    assert members["fault-journal/old/one.jsonl"] == EVIDENCE["fault-journal/old/one.jsonl"]
+    assert members["fault-journal/federation.lock"] == b""
+
+
+@pytest.mark.parametrize("what", ["a link in a nested directory", "a name that is not plain", "a tree nested too deep"])
+def test_a_fault_journal_with_a_link_an_odd_name_or_a_deep_tree_refuses_the_collect(shards, tmp_path, what):
+    """O63: the journal is archived whole or not at all: nothing in it is skipped silently or followed."""
+    plan = make_plan(shards, tmp_path)
+    journal = plan.shards[0].root / "fault-journal"
+    if what == "a link in a nested directory":
+        (journal / "old" / "link.jsonl").symlink_to(plan.shards[0].root / "secrets" / "admin.token")
+    elif what == "a name that is not plain":
+        (journal / "a b.jsonl").write_text("{}\n")
+    else:
+        deep = journal.joinpath(*"abcdef")
+        deep.mkdir(parents=True)
+        (deep / "x.jsonl").write_text("{}\n")
+    with pytest.raises(shards.ShardsError, match=r"fed-a.*fault-journal"):
+        shards.collect(plan, tmp_path / "merge")
+    assert not list(plan.results.glob("*.root.*"))
+
+
+def test_the_pre_step_guards_claim_files_are_evidence_when_present(shards, tmp_path):
+    """O63: `shard-claim.json` and `shard-claim.lock` (who held the root: a resume dispute needs it) are archived
+    beside the state, and a root without them is as it was."""
+    plan = make_plan(shards, tmp_path)
+    for name in ("shard-claim.json", "shard-claim.lock"):
+        (plan.shards[1].root / name).unlink()
+    shards.collect(plan, tmp_path / "merge")
+    assert {"shard-claim.json", "shard-claim.lock"} <= set(_members(plan.results / "fed-a.root.tar"))
+    assert not {"shard-claim.json", "shard-claim.lock"} & set(_members(plan.results / "fed-b.root.tar"))
 
 
 def test_a_link_in_place_of_a_directory_of_the_allow_list_is_refused(shards, tmp_path):

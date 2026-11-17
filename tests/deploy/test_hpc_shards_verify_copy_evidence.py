@@ -55,6 +55,24 @@ def test_verify_copy_passes_on_an_exact_copy_with_the_newer_snapshot(shards, tmp
     assert f"fed-a/snapshots/{snapshot.name}/state.sqlite: missing" in seen
 
 
+@pytest.mark.parametrize("change", ["missing", "changed"])
+def test_verify_copy_fails_naming_a_pass_env_file_that_is_missing_or_changed(shards, tmp_path, capsys, change):
+    """O63: `<label>/pass-env.json` (private evidence: a site path) is checked like a journal once collect listed it."""
+    plan = make_plan(shards, tmp_path)
+    planted = plan.results / "fed-a" / "pass-env.json"
+    planted.write_text('{"STUDY_ARTIFACTS": "/scratch/invented/artifacts"}\n')
+    shards.collect(plan, tmp_path / "merge")
+    manifest, local, given = pull(plan, tmp_path)
+    assert verify(shards, manifest, local, given) == 0
+    capsys.readouterr()
+    if change == "missing":
+        (local / "fed-a" / "pass-env.json").unlink()
+    else:
+        (local / "fed-a" / "pass-env.json").write_text('{"STUDY_ARTIFACTS": "/scratch/other/artifacts"}\n')
+    assert verify(shards, manifest, local, given) == 1
+    assert "fed-a/pass-env.json: " in capsys.readouterr().err
+
+
 def test_verify_copy_fails_naming_a_missing_journal_and_no_other(shards, tmp_path, capsys):
     """O63: the spend journal of a killed step, which `--resume` counts as lost, is not in the pull: exit 1, named."""
     manifest, local, given = pulled(shards, tmp_path)
