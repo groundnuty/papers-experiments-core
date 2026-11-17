@@ -1460,7 +1460,7 @@ class DockerSandbox:
                 meta["gate"] = gatelog.unknown("the gate log could not be parsed")
         meta["served_bytes"] = self.served_bytes()
         meta["sidecar_log"] = self.mount_errors() if not self._stopped else None
-        cellhost.note(meta)  # O73: the name the agent's container was created with, beside the node's readings
+        cellhost.note(self._facts, meta)  # O73: the name the agent's container was created with, beside the node's
         return meta
 
     # ------------------------------------------------------------------------------------------------ stop

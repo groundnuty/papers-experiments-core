@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from collections.abc import Iterable, MutableMapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
+
+from expcore_onedata.sandbox.infrafacts import InfrastructureFacts
 
 CELL_HOSTNAME = "sandbox"
 FACT = "cell_hostname"  # the key of the run's `infrastructure_facts`
@@ -126,9 +128,10 @@ def _first_label(name: str) -> tuple[str, ...]:
     return (name.split(".", 1)[0],) if qualified(name) else ()
 
 
-def note(meta: MutableMapping[str, Any], name: str = CELL_HOSTNAME) -> None:
-    """Put the name the run's cells were given in `meta`'s `infrastructure_facts`, beside what that holds."""
-    meta.setdefault("infrastructure_facts", {})[FACT] = name
+def note(facts: InfrastructureFacts, meta: dict[str, Any], name: str = CELL_HOSTNAME) -> None:
+    """Put the name the run's cells were given in the infrastructure facts of `meta`, the copy `metadata()` returns,
+    beside what that holds, through the run's one writer (`infrafacts`, O89): the key is this module's own."""
+    facts.annotate(meta, FACT, {FACT: name})
 
 
 __all__ = [

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from sandbox_support import make_spec, start_options
 
-from expcore_onedata.sandbox import cellhost
+from expcore_onedata.sandbox import cellhost, infrafacts
 from expcore_onedata.sandbox import containers as C
 from expcore_onedata.sandbox.api import DataPathMode, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
@@ -89,7 +89,7 @@ def test_o73_the_run_s_record_carries_the_name_its_container_was_given_beside_th
     what was in it: the node's readings, and a fact the platform recorded before or after."""
     box = started(world, "via-gate")
     try:
-        box.record_infrastructure_fact("federation_window", {"verdict": "invented"})
+        box.record_infrastructure_fact("federation_window", {"verdict": "invented"}, owner=infrafacts.WINDOW)
         facts = box.metadata()["infrastructure_facts"]
         assert facts["cell_hostname"] == world.host.containers[box.names.agent].options["--hostname"]
         assert set(facts) == {"node", "cell_hostname", "federation_window"}

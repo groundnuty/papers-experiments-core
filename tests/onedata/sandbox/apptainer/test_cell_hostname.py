@@ -10,7 +10,7 @@ import pytest
 from apptainer_support import make_settings, make_spec, start
 from fake_node import FakeNode, parse_exec
 
-from expcore_onedata.sandbox import cellhost
+from expcore_onedata.sandbox import cellhost, infrafacts
 from expcore_onedata.sandbox.api import StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -95,7 +95,7 @@ def test_o73_the_run_s_record_carries_the_name_its_execs_were_given(node, settin
     box = start(node, settings)
     try:
         box.exec("print('x')", 30)
-        box.record_infrastructure_fact("federation_window", {"verdict": "invented"})
+        box.record_infrastructure_fact("federation_window", {"verdict": "invented"}, owner=infrafacts.WINDOW)
         facts = box.metadata()["infrastructure_facts"]
         assert facts["cell_hostname"] == cellhost.CELL_HOSTNAME
         assert {done.hostname for done in node.execs} == {facts["cell_hostname"]}
