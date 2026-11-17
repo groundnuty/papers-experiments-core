@@ -23,7 +23,8 @@ phase and the instrument and is `{"ok": false, "error": "Withheld", "why": ...}`
 attempt's row (`attempts.diagnostic`, canonical JSON), in its outcome marker (so recovery commits it after a kill) and
 in the export (`attempt_diagnostics`, only when an attempt kept one). A snapshot that cannot be kept (not a JSON
 object, a number JSON cannot hold, more than `LIMIT_BYTES`, a redaction that raised) is `{"ok": false, "error":
-<class>}` with the phase and the instrument when known, as an instrument whose `finish` failed is (O08): it is never
+<class>}` with the phase and the instrument's name, redacted like the rest (only the phase, when the redactor cannot
+be built), as an instrument whose `finish` failed is (O08): it is never
 dropped, never guessed, and never an exception, since one that escaped the attempt runner would stop dispatch (C17).
 """
 

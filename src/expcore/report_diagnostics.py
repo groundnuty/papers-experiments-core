@@ -24,7 +24,8 @@ NOTES = textwrap.wrap(
     "aside and run again: the instrument that failed, and what it checked and saw as the instrument gave it, redacted "
     "as an instrument's snapshot is. An infrastructure failure from anywhere else that carried a diagnostic is listed "
     "with no instrument (-). Charged counts the attempts that used one of the run's attempts; Not kept counts the "
-    "snapshots that could not be kept (not a JSON object, too large, or a redaction that failed), which the export "
+    "snapshots that could not be kept (not a JSON object, too large, a redaction that failed, or withheld because the "
+    "executor did not declare its secrets before it started its instruments), which the export "
     f"records as failed. The snapshots are in export.json under {EXPORT_KEY}, one entry per attempt.",
     width=118,
 )
