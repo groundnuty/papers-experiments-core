@@ -369,3 +369,46 @@ def test_o83_compose_up_gives_the_facts_the_study_artifacts_only_when_it_was_giv
     monkeypatch.delenv(fed.tools.ENVIRONMENT, raising=False)
     fed.cli.up(plain)
     assert ("facts", ()) in calls
+
+
+RELATIVE = (
+    TEMPLATE
+    + f"""
+[toolserver]
+command = "/bin/sh"
+args = ["-m", "onedata_mcp"]
+clone = "clone"
+commit = "{COMMIT}"
+
+[toolserver.conditions.knowledge]
+allow = {json.dumps(READ_TOOLS)}
+rights = [{READ}]
+manifest = "manifests/knowledge.json"
+"""
+)
+
+
+def test_o83_a_relative_clone_and_manifest_are_read_from_the_root_where_the_platform_file_lies(
+    fed, tmp_path, monkeypatch
+):
+    """O83: the platform layer reads a relative clone and manifest from the platform file's directory, which is the
+    root, so the preflight reads them there, whatever directory `up` is run from; a root without them is refused."""
+    spec = fed.spec.load_spec(layout_with_template(RELATIVE, tmp_path))
+    root = tmp_path / "root"
+    (root / "clone").mkdir(parents=True)
+    (root / "manifests").mkdir()
+    (root / "manifests" / "knowledge.json").write_text(frozen(READ_TOOLS), encoding="utf-8")
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+
+    def pinned(clone, commit):
+        assert clone == root / "clone"
+        return commit
+
+    fed.tools.check_artifacts(spec, None, root, verify=pinned)
+    (root / "manifests" / "knowledge.json").unlink()
+    with pytest.raises(RuntimeError, match=r"conditions\[0\]"):
+        fed.tools.check_artifacts(spec, None, root, verify=pinned)
+    (root / "clone").rmdir()
+    with pytest.raises(RuntimeError, match="clone"):
+        fed.tools.check_artifacts(spec, None, root, verify=pinned)

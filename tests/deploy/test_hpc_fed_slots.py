@@ -32,6 +32,7 @@ from slots_support import (
     ids_of,
     layout_with_template,
     make_root,
+    pilot_artifacts,
     principal_of,
     secret_of,
 )
@@ -167,14 +168,38 @@ def test_o83_a_layout_without_slots_renders_the_hpc_platform_file_it_always_did(
 # -- the pilot's template, through the core's phase --------------------------------------------------------------------
 
 
+def pilot_layout(tmp_path, command_form="python"):
+    """A copy of the slot layout and its template in the pilot's shape (the tool server's paths under `toolserver/`),
+    with the command as the pilot first wrote it (`env`: `/usr/bin/env` and the console script) or as the launcher needs
+    it."""
+    from slots_support import pilot_form
+
+    folder = tmp_path / "pilot-layout"
+    folder.mkdir(exist_ok=True)
+    (folder / LAYOUT.name).write_text(LAYOUT.read_text(encoding="utf-8"), encoding="utf-8")
+    template = pilot_form((HPC / "layouts" / "pilot-shape-slots.platform.toml.template").read_text(encoding="utf-8"))
+    if command_form == "env":
+        old = 'command = "@study_artifacts@/toolserver/venv/bin/python"\nargs = ["-m", "onedata_mcp"]'
+        script = "@study_artifacts@/toolserver/venv/bin/onedata-mcp"
+        new = f'command = "/usr/bin/env"\nargs = ["PYTHONDONTWRITEBYTECODE=1", "{script}"]'
+        assert old in template
+        template = template.replace(old, new)
+    (folder / "pilot-shape-slots.platform.toml.template").write_text(template, encoding="utf-8")
+    return folder / LAYOUT.name
+
+
 @pytest.fixture
 def phase(hpc, tmp_path):
     """The core's phase over the pilot-shape slot layout: a root with a map and every principal's credential file, the
     study's artifacts, and the bootstrap and the REST client stood in."""
+    return build_phase(hpc, tmp_path, LAYOUT, artifacts(tmp_path / "artifacts"))
+
+
+def build_phase(hpc, tmp_path, layout_path, study):
     tls = pytest.importorskip("tls_support")
     if not tls.HAS_OPENSSL:
         pytest.skip("no openssl on this host")
-    spec = hpc.fedspec.load_spec(LAYOUT)
+    spec = hpc.fedspec.load_spec(layout_path)
     root = tmp_path / "root"
     layout = hpc.fedlayout.Layout(
         root, tmp_path, hpc.boot.hpc_spec(spec, {s.name: DECLARED[s.name] for s in spec.services})
@@ -193,9 +218,7 @@ def phase(hpc, tmp_path):
             "hosts": {DECLARED[r]: {"address": a, "nodes": n} for r, (a, n) in nodes.items()},
         }
     ).write(layout.address_map)
-    return SimpleNamespace(
-        root=root, layout=layout, spec=spec, tmp=tmp_path, secrets=secrets, study=artifacts(tmp_path / "artifacts")
-    )
+    return SimpleNamespace(root=root, layout=layout, spec=spec, tmp=tmp_path, secrets=secrets, study=study)
 
 
 def run_core(hpc, phase):
@@ -371,9 +394,9 @@ def site(tmp_path):
 class Rig:
     """A driver over the fake Slurm and the slot layout, the core's phase recorded with the values it is handed."""
 
-    def __init__(self, hpc, tmp_path):
+    def __init__(self, hpc, tmp_path, layout=LAYOUT):
         self.hpc, self.fake, self.root = hpc, FakeSlurm(), tmp_path / "fed" / "root"
-        self.driver = hpc.cli.make_driver(LAYOUT, str(self.root), runner=self.fake)
+        self.driver = hpc.cli.make_driver(layout, str(self.root), runner=self.fake)
         self.driver.sleep = self.driver.slurm.sleep = lambda s: None
         self.driver.poll_s = self.driver.slurm.poll_s = 0.0
         self.driver.relay_available = lambda: False
@@ -455,3 +478,51 @@ def test_o83_the_slot_layouts_template_is_the_pilots_template_with_the_slots_and
 
     assert body(slots).startswith(body(pilot).rstrip("\n"))
     assert "[slots.slot-1.data_path]" in body(slots)[len(body(pilot).rstrip("\n")) :]
+
+
+def test_o83_the_pilots_form_of_the_hpc_tool_server_loads_and_is_started_through_the_launcher(hpc, tmp_path):
+    """O83: the pilot's tool server (its interpreter `toolserver/venv/bin/python`, its clone `toolserver/clone`, its
+    frozen manifests beside them) as `command = <venv>/bin/python` and `args = ["-m", <module>]`, the launcher's form,
+    loads with its slots and is started as `<interpreter> -I -B <launcher> <map> -- -m <module>`."""
+    study = pilot_artifacts(tmp_path / "pilot-artifacts")
+    phase = build_phase(hpc, tmp_path, pilot_layout(tmp_path), study)
+    run_core(hpc, phase)
+    config = load_platform(phase.root / "platform.toml")
+    slots = load_slots(phase.root / "platform.toml", config)
+    assert [slot.name for slot in slots.slots] == ["slot-1", "slot-2"]
+    command, args = server_argv(config)
+    assert command == f"{study}/toolserver/venv/bin/python"
+    assert args[-3:] == ["--", "-m", "onedata_mcp"]
+    assert config.toolserver.clone == (study / "toolserver" / "clone").resolve()
+    assert config.toolserver.conditions["writing"].manifest == (study / "toolserver" / "K1.json").resolve()
+
+
+FORM = r"use <venv>/bin/python with args \['-m', '<module>', \.\.\.\]"
+
+
+def test_o83_a_tool_server_run_through_env_is_refused_naming_the_form_to_use_at_load_and_before_a_job_is_held(
+    hpc, tmp_path, site
+):
+    """O83: the launcher starts a Python server by `-m <module>` or a script, so `/usr/bin/env` with a console script is
+    refused when the platform file is loaded, and by `up`'s preflight before any job is held, each saying to use
+    `<venv>/bin/python` with `args = ['-m', '<module>', ...]`."""
+    study = pilot_artifacts(tmp_path / "pilot-artifacts")
+    phase = build_phase(hpc, tmp_path, pilot_layout(tmp_path, "python"), study)
+    run_core(hpc, phase)
+    path = phase.root / "platform.toml"
+    text = path.read_text(encoding="utf-8")
+    old = f'command = "{study}/toolserver/venv/bin/python"\nargs = ["-m", "onedata_mcp"]'
+    assert old in text
+    path.write_text(
+        text.replace(
+            old,
+            f'command = "/usr/bin/env"\nargs = ["PYTHONDONTWRITEBYTECODE=1", "{study}/toolserver/venv/bin/mcp"]',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match=FORM):
+        load_platform(path)
+    rig = Rig(hpc, tmp_path / "rig", pilot_layout(tmp_path / "env", "env"))
+    with pytest.raises(RuntimeError, match=FORM):
+        rig.up({**site, "HPC_STUDY_ARTIFACTS": str(study)})
+    assert not rig.submitted()

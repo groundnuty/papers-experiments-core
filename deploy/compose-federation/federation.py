@@ -230,7 +230,7 @@ def up(layout: Layout) -> str:
             "them: run reset --clean, which empties a baseline-off space, then up again"
         )
     study_artifacts = study_artifacts_from(os.environ)  # where a layout's tool server finds its files (O83)
-    check_artifacts(layout.spec, study_artifacts)  # before anything is brought up: the server can run from them
+    check_artifacts(layout.spec, study_artifacts, layout.root)  # before anything is brought up: it can run from them
     given = (study_artifacts,) if study_artifacts else ()  # without a directory the facts are written as they were
     fresh = not containers
     if fresh:
@@ -268,7 +268,7 @@ def reset_clean(layout: Layout) -> str:
     timer = Timer()
     require_up(layout)
     study_artifacts = study_artifacts_from(os.environ)
-    check_artifacts(layout.spec, study_artifacts)
+    check_artifacts(layout.spec, study_artifacts, layout.root)
     given = (study_artifacts,) if study_artifacts else ()
     rest = Rest(layout.ca_pem)
     try:

@@ -13,10 +13,12 @@ from slots_boot import boots, made_by_hand, modules, provision
 from slots_support import (
     BASE_SET,
     LAYOUT,
+    READ,
     READ_SET,
     SLOT_USERS,
     TEMPLATE,
     WITH_SLOTS,
+    WRITE,
     WRITE_SET,
     layout_with_template,
     secret_of,
@@ -206,3 +208,39 @@ def test_o83_the_facts_record_each_slot_user_as_created_or_matched(hpc, tmp_path
     for _, _, boot, _ in boots(hpc, tmp_path / "plain", TEMPLATE):
         provision(boot, boot.spec)
         assert "slot_users" not in hpc.fedfacts.facts_of(boot)
+
+
+def inline_slots() -> str:
+    """The template's slots as inline tables, which TOML keeps to one line each."""
+    rows = []
+    for slot, data, tools, rights in (
+        ("slot-1", "slot1-data", "slot1-tools", READ),
+        ("slot-2", "slot2-data", "slot2-tools", WRITE),
+    ):
+        rows.append(f"[slots.{slot}]")
+        rows.append(f'data_path = {{ username = "{data}", user_id = "@user_id.{data}@" }}')
+        rows.append(f'toolserver = {{ username = "{tools}", user_id = "@user_id.{tools}@", rights = [{rights}] }}')
+    return "\n" + "\n".join(rows) + "\n"
+
+
+SPELLINGS = {
+    "a quoted table name": WITH_SLOTS.replace("[slots.", '["slots".'),
+    "inline tables": TEMPLATE + inline_slots(),
+}
+
+
+@pytest.mark.parametrize("what", ["a quoted table name", "inline tables"])
+def test_o83_a_template_that_spells_its_slots_another_way_still_protects_its_slot_users(hpc, tmp_path, what):
+    """O83: TOML has many spellings of one table (a quoted name, inline tables); the slot users are read as the platform
+    layer's loader reads them, so an existing slot user short of a privilege is refused, never set, whichever the
+    template uses."""
+    for _, zone, boot, layout in boots(hpc, tmp_path / "p", SPELLINGS[what]):
+        spec = boot.spec
+        assert set(hpc.fedtools.slot_users(spec)) == set(SLOT_USERS)
+        made_by_hand(zone, layout, spec)
+        deviate_missing(zone, spec)
+        before = zone.snapshot()
+        with pytest.raises(RuntimeError, match="slot user slot2-tools: direct privileges in alpha-space"):
+            provision(boot, spec)
+        assert zone.snapshot() == before
+        assert zone.writes == []

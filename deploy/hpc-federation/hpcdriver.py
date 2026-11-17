@@ -22,7 +22,7 @@ import hpcstate
 from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
-from fedtools import check_artifacts
+from fedtools import check_artifacts, check_launchable
 from hpcboot import core_phase, hpc_spec, hpc_values, load_owner
 from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
@@ -183,7 +183,8 @@ class Driver(Down):
         template = self.spec.platform_template
         hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None)
         # O83: a template that names @study_artifacts@ has its tool server's files checked, and the frozen manifests
-        check_artifacts(self.spec, site.study_artifacts)
+        check_launchable(self.spec, site.study_artifacts)  # the names resolve through the launcher here (O73)
+        check_artifacts(self.spec, site.study_artifacts, self.root)
         if self.settings.sandbox is not None:
             self.say(
                 f"the layout declares the agent's node ({self.settings.sandbox_placement}): it is held and placed, and "

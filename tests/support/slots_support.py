@@ -135,6 +135,32 @@ def principal_of(spec, name: str):
     return next(p for p in spec.principals if p.name == name)
 
 
+def pilot_artifacts(directory: Path) -> Path:
+    """The pilot's shape of the study's artifacts: everything of the tool server under `toolserver/`, its interpreter
+    `toolserver/venv/bin/python`, its clone `toolserver/clone` and the two frozen manifests `K0.json` and `K1.json`."""
+    artifacts(directory)
+    (directory / "toolserver").mkdir()
+    for old, new in (("venv", "toolserver/venv"), ("onedata-mcp", "toolserver/clone")):
+        (directory / old).rename(directory / new)
+    (directory / "manifests" / "knowledge.json").rename(directory / "toolserver" / "K0.json")
+    (directory / "manifests" / "writing.json").rename(directory / "toolserver" / "K1.json")
+    (directory / "manifests").rmdir()
+    return directory
+
+
+def pilot_form(template: str) -> str:
+    """The same template with the tool server's paths in the pilot's shape (`pilot_artifacts`)."""
+    for old, new in (
+        ("@study_artifacts@/venv/bin/python", "@study_artifacts@/toolserver/venv/bin/python"),
+        ("@study_artifacts@/onedata-mcp", "@study_artifacts@/toolserver/clone"),
+        ("@study_artifacts@/manifests/knowledge.json", "@study_artifacts@/toolserver/K0.json"),
+        ("@study_artifacts@/manifests/writing.json", "@study_artifacts@/toolserver/K1.json"),
+    ):
+        assert old in template, old
+        template = template.replace(old, new)
+    return template
+
+
 def secret_of(user: str) -> str:
     """The password a test gives a user: one nothing else in the root may hold."""
     return f"pw-{user}-" + hashlib.sha256(user.encode()).hexdigest()[:20]

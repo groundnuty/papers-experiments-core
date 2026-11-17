@@ -31,7 +31,7 @@ from fedspec import Spec
 ENVIRONMENT = "EXPCORE_FED_STUDY_ARTIFACTS"  # where a Compose federation finds the study's artifacts (HPC: site.env)
 STUDY_ARTIFACTS = "@study_artifacts@"
 ANY_PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")
-SLOTS_TABLE = re.compile(r"^\s*\[+\s*slots[\].\s]", re.M)
+SLOTS_WORD = re.compile(r"^[^#\n]*slots", re.M)  # `slots` anywhere in the code of a line, whatever its quoting
 
 
 def study_artifacts_from(environ: Mapping[str, str]) -> str | None:
@@ -83,14 +83,14 @@ def slot_users(spec: Spec) -> dict[str, str]:
     `toolserver`); none for a template without `[slots]`. A template that declares `[slots]` and cannot be read as it
     stands is refused: provisioning would otherwise not know which users it must never change."""
     text = _template(spec)
-    if not SLOTS_TABLE.search(text):
-        return {}
     document = stand_in(text, None)
-    if document is None:
-        raise RuntimeError(
-            "the platform template declares [slots] and is no TOML before it is rendered: a placeholder may stand in a "
-            "value, never in a key or a table's name"
-        )
+    if document is None:  # no TOML as it stands: one that may declare slots (in any spelling TOML has) is refused
+        if SLOTS_WORD.search(text):
+            raise RuntimeError(
+                "the platform template may declare [slots] and is no TOML before it is rendered: a placeholder may "
+                "stand in a value, never in a key or a table's name"
+            )
+        return {}
     found = {}
     for slot in (document.get("slots") or {}).values():
         for plane in ("data_path", "toolserver"):
@@ -101,14 +101,19 @@ def slot_users(spec: Spec) -> dict[str, str]:
 
 
 def check_artifacts(
-    spec: Spec, study_artifacts: str | None, *, verify: Callable[[Path, str], str] | None = None
+    spec: Spec,
+    study_artifacts: str | None,
+    root: Path | None = None,
+    *,
+    verify: Callable[[Path, str], str] | None = None,
 ) -> None:
     """Refuse a federation whose tool server cannot run from the study's artifacts, before anything is brought up: the
     command, when a path, is an executable file; each argument that names a file of the study exists; the clone is a
     directory at the pinned commit with no change to a tracked file (the check the launcher makes at every start,
     `expcore_onedata.pin`); each condition's frozen manifest is one, unedited, showing exactly its allow-list (the
-    server shows exactly those, and the client fails the start on any other). Nothing for a template without
-    `[toolserver]`."""
+    server shows exactly those, and the client fails the start on any other). The platform layer reads a relative
+    clone or manifest from the platform file's directory, which is the federation's `root`, so they are read from
+    there here. Nothing for a template without `[toolserver]`."""
     from expcore.tools.manifest import FrozenManifest, ManifestError
     from expcore_onedata.pin import PinError, verify_pin
 
@@ -124,22 +129,23 @@ def check_artifacts(
         and not (os.path.isfile(command) and os.access(command, os.X_OK))
     ):
         raise RuntimeError("the tool server's command is not an executable file")
+    here = root if root is not None else Path()  # where the rendered platform.toml lies
     base = (study_artifacts or "").rstrip("/") + "/"
     for argument in tool.get("args") or []:
         if study_artifacts and isinstance(argument, str) and argument.startswith(base) and not Path(argument).exists():
             raise RuntimeError("an argument of the tool server names a file of the study's artifacts that is missing")
     clone, commit = tool.get("clone"), tool.get("commit")
     if isinstance(clone, str) and isinstance(commit, str):
-        if not Path(clone).is_dir():
+        if not (here / clone).is_dir():
             raise RuntimeError("the tool server's clone is not a directory")
         try:
-            (verify or verify_pin)(Path(clone), commit)
+            (verify or verify_pin)(here / clone, commit)
         except PinError as error:
             raise RuntimeError(str(error)) from None
     for index, condition in enumerate((tool.get("conditions") or {}).values()):
         where = f"conditions[{index}]"
         try:
-            frozen = FrozenManifest.load(Path(condition["manifest"]))
+            frozen = FrozenManifest.load(here / condition["manifest"])
         except (ManifestError, KeyError, TypeError):
             raise RuntimeError(
                 f"{where}: its frozen manifest is missing, is not one, or its hash is not its tools'"
@@ -151,6 +157,22 @@ def check_artifacts(
                 f"{len(allowed - shown)} that the allow-list names: freeze it again from the pinned server with the "
                 "condition's allow-list"
             )
+
+
+def check_launchable(spec: Spec, study_artifacts: str | None) -> None:
+    """Refuse, before anything is brought up, a `[toolserver]` the resolve launcher cannot start (O73, `launch_argv`):
+    on a platform whose names resolve through it (HPC) the command must be a Python interpreter and the arguments start
+    with `-m <module>` or name a script; the platform layer refuses the same at load, naming the key. Nothing for a
+    template without `[toolserver]`."""
+    from expcore_onedata.addresses import AddressMapError, launch_argv
+
+    tool = (stand_in(_template(spec), study_artifacts) or {}).get("toolserver")
+    if not isinstance(tool, dict) or not isinstance(tool.get("command"), str):
+        return
+    try:
+        launch_argv(tool["command"], list(tool.get("args") or []), Path("resolve_launch.py"), Path("address-map.json"))
+    except AddressMapError as error:
+        raise RuntimeError(str(error)) from None
 
 
 def check_rendered(layout: Layout, facts: Mapping[str, Any], *, environ: Mapping[str, str] | None = None) -> None:
