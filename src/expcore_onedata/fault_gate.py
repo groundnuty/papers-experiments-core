@@ -359,14 +359,14 @@ class FaultGate:
             return self._operator(Health(False, error.detail))
 
     def _left_open(self, error: InfraError) -> Health:
-        """The failure of a recovery of what an earlier run left open, charged to the attempt that made the injection
-        that could not be settled (its target's entry, else every open one) and to no other (O80). An unreadable
+        """The failure of a recovery of what earlier runs left open, charged to the attempt that made an injection
+        that is open and to no other (O80). Every open entry is judged, not only the one the recovery failed on: the
+        judged attempt's own is never spared, and an entry that names no attempt keeps the charge. An unreadable
         journal, or none open any more, says nothing of whose it is: charged as it was."""
         try:
-            open_entries = self._recovery.entries()
+            entries = self._recovery.entries()
         except (OSError, ValueError):
             return Health(False, error.detail)
-        entries = [entry for entry in open_entries if entry.get("target") == error.target] or open_entries
         if not entries:
             return Health(False, error.detail)
         charge, note = charge_of(entries)
