@@ -59,6 +59,22 @@ def charge_of(entries: Iterable[Mapping[str, Any]]) -> tuple[bool, str | None]:
     return (True, NO_ATTEMPT) if unattributed else (False, LEFT_BY_ANOTHER)
 
 
+def in_progress_of(entry: Mapping[str, Any], attempt: Mapping[str, Any] | None) -> bool:
+    """Whether an open journal entry is an injection `attempt` (`liveness.current()`) is holding down right now, which
+    its own health reading under its own admission may explain (O90): it names exactly this attempt as its owner, was
+    seen down (`injected`), has no failed restore (`clear_failed`) and is no heal's restart (`heal`). Nothing else is
+    explained: another attempt's, an entry with no owner or a process alone, one not seen down yet, one whose restore
+    failed. None of those is guessed to be this attempt's."""
+    judged = attempt_of(attempt)
+    return (
+        judged is not None
+        and entry.get("heal") is not True
+        and entry.get("injected") is True
+        and "clear_failed" not in entry
+        and attempt_of(entry.get("owner")) == judged
+    )
+
+
 def with_note(detail: str, note: str | None) -> str:
     """A verdict's detail followed by what `charge_of` says of its charge."""
     return detail if note is None else f"{detail}; {note}"

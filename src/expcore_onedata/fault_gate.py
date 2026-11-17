@@ -86,7 +86,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from expcore.campaign import prerun
+from expcore.campaign import liveness, prerun
 from expcore.campaign.healthgate import DeferralBound, Health, HealthCheck, read_health
 from expcore.errors import TARGET_LABEL, InfraError
 from expcore_onedata.admission import (
@@ -106,7 +106,7 @@ from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch, Rais
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals, failed_heal_reason
 from expcore_onedata.fault_journal import HeldLock, holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
-from expcore_onedata.fault_owner import charge_of, with_note
+from expcore_onedata.fault_owner import charge_of, in_progress_of, with_note
 from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling, failure
 from expcore_onedata.fault_relay import RELAY_NOTE, beat
 from expcore_onedata.fault_settings import (
@@ -415,13 +415,20 @@ class FaultGate:
                 charge=False,
             )
         try:
-            return self._judged()[0]
+            return self._judged(own=True)[0]
         finally:
             give_up()
 
-    def _checked(self) -> Health:
-        """With the federation held: the journal, then the rest of the check."""
+    def _checked(self, *, own: bool = False) -> Health:
+        """With the federation held: the journal, then the rest of the check. With `own` (under the judged attempt's
+        admission) the injection that attempt is itself holding down, journalled by it and seen down, is no unsettled
+        injection: the run's own health reading inside its injection compares every space as usual, and its reading
+        says that target is held (`healthreading`, O90). Every other open entry, another attempt's, one with no owner,
+        a failed restore of the run's own, a heal's restart, still fails the check as unsettled."""
         entries = self._recovery.entries()
+        if own:
+            here = liveness.current()
+            entries = [entry for entry in entries if not in_progress_of(entry, here)]
         if entries:
             return self._operator(_unsettled(entries))
         return read_health(self._inner) if self._inner is not None else Health(True, "no injection is unsettled")
@@ -451,7 +458,7 @@ class FaultGate:
             prerun.note(RELAY_NOTE, {"alive": live is not None, "nonce": None if live is None else live["nonce"]})
         return noted
 
-    def _judged(self, noted: dict[str, Any] | None = None) -> tuple[Health, LinkMatrix | None]:
+    def _judged(self, noted: dict[str, Any] | None = None, *, own: bool = False) -> tuple[Health, LinkMatrix | None]:
         """With the federation held: the check (`_checked`), and the matrix of the link check it made in this call, in
         this thread (None when it made none: a report another call made is never this call's). A link check of this
         call that passed lets a later stuck pair be healed again (`GateHeals.passed`), while the federation is held;
@@ -460,7 +467,7 @@ class FaultGate:
         answers for that epoch."""
         with self._epoch.checking():
             self._taken()  # whatever this thread's earlier calls left untaken is not this call's
-            verdict = self._checked()
+            verdict = self._checked(own=own)
             report = self._taken()
             if report is None:
                 return verdict, None

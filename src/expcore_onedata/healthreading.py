@@ -112,6 +112,13 @@ class HealthReading:
 
     spaces: tuple[SpaceReading, ...] = ()
     targets: frozenset[str] | None = None
+    held: frozenset[str] = (
+        frozenset()
+    )  # the targets whose injection is still open: held down by the run's own injection
+
+    def __post_init__(self) -> None:
+        if not self.held <= (self.targets or frozenset()):
+            raise ValueError("a target held by the run's own injection is one of the run's targets")
 
     @property
     def offline(self) -> frozenset[str]:
@@ -126,15 +133,18 @@ class HealthReading:
                 for space in self.spaces
             ],
             "targets": None if self.targets is None else sorted(self.targets),
+            "held": sorted(self.held),
         }
 
     @classmethod
     def from_json(cls, value: Any) -> "HealthReading | None":
         """The reading `to_json` made, or None for anything else: a malformed value is no reading, never a guess."""
-        if not isinstance(value, Mapping) or set(value) != {"spaces", "targets"}:
+        if not isinstance(value, Mapping) or set(value) != {"spaces", "targets", "held"}:
             return None
-        spaces, targets = value["spaces"], value["targets"]
-        if not isinstance(spaces, list) or not (targets is None or _labels(targets) is not None):
+        spaces, targets, held = value["spaces"], value["targets"], _labels(value["held"])
+        if not isinstance(spaces, list) or held is None or not (targets is None or _labels(targets) is not None):
+            return None
+        if not held <= (_labels(targets) if targets is not None else frozenset()):
             return None
         parsed: list[SpaceReading] = []
         for item in spaces:
@@ -146,7 +156,7 @@ class HealthReading:
             if offline is None or (offline and not read):
                 return None
             parsed.append(SpaceReading(position, read, offline))
-        return cls(tuple(parsed), None if targets is None else _labels(targets))
+        return cls(tuple(parsed), None if targets is None else _labels(targets), held)
 
 
 def _labels(value: Any) -> frozenset[str] | None:
@@ -189,20 +199,29 @@ def read_space(view: SpaceView, config: PlatformConfig, entry: StudySpace) -> Sp
     return SpaceReading(entry.position, True, offline)
 
 
-def own_targets(journal: InjectionJournal | None, attempt: Mapping[str, Any] | None) -> frozenset[str] | None:
-    """The labels of the providers the attempt `attempt` (`liveness.current()`) took down, from the append-only journal,
-    whether their restore is done or not. The empty set for no attempt (nothing is read), or no journal (a platform
-    with no `[faults]`); None when the journal cannot be read. Only an `injecting` line whose owner is exactly this
-    attempt, which is no heal's, and whose stop was asked for, counts: no other attempt's, no line that names none."""
+class Injections(NamedTuple):
+    """What the run's own attempt took down, by label: every target whose stop was asked for, and those among them
+    whose injection is still open (no `cleared` line): held down by the run's own injection."""
+
+    targets: frozenset[str]
+    held: frozenset[str]
+
+
+def own_injections(journal: InjectionJournal | None, attempt: Mapping[str, Any] | None) -> Injections | None:
+    """The injections the attempt `attempt` (`liveness.current()`) made, from the append-only journal, whether their
+    restore is done or not. Nothing for no attempt (nothing is read), or no journal (a platform with no `[faults]`);
+    None when the journal cannot be read. Only an `injecting` line whose owner is exactly this attempt, which is no
+    heal's, and whose stop was asked for, counts: no other attempt's, no line that names none."""
     judged = attempt_of(attempt)
     if journal is None or judged is None:
-        return frozenset()
+        return Injections(frozenset(), frozenset())
     try:
         text = journal.complete_text()
     except OSError:
         return None
     owned: dict[str, str] = {}  # injection id -> its target, for the judged attempt's own
     asked: set[str] = set()
+    cleared: set[str] = set()
     for number, text_line in enumerate(text.splitlines(), 1):
         try:
             line = json.loads(text_line)
@@ -214,10 +233,19 @@ def own_targets(journal: InjectionJournal | None, attempt: Mapping[str, Any] | N
                 owned[key] = line["target"]
         elif event in _ASKED and isinstance(key, str):
             asked.add(key)
-        elif event not in ("cleared", "clear_failed"):  # a line that is no injection event: nothing can be said
+        elif event == "cleared" and isinstance(key, str):
+            cleared.add(key)
+        elif event != "clear_failed":  # a line that is no injection event: nothing can be said
             log.warning("the injection journal's line %d is no injection event: the run's targets are unknown", number)
             return None
-    return frozenset(target for key, target in owned.items() if key in asked)
+    own = {key: target for key, target in owned.items() if key in asked}
+    return Injections(frozenset(own.values()), frozenset(target for key, target in own.items() if key not in cleared))
+
+
+def own_targets(journal: InjectionJournal | None, attempt: Mapping[str, Any] | None) -> frozenset[str] | None:
+    """The labels of the providers the attempt took down (`own_injections`), None when the journal cannot be read."""
+    found = own_injections(journal, attempt)
+    return None if found is None else found.targets
 
 
 def make_reading(answer: Any, config: PlatformConfig, journal: InjectionJournal | None) -> HealthReading:
@@ -235,7 +263,10 @@ def make_reading(answer: Any, config: PlatformConfig, journal: InjectionJournal 
                 spaces.append(read_space(parse_scope(answer, entry.space.id), config, entry))
             except PlatformError:  # the answer does not describe this space
                 spaces.append(SpaceReading(entry.position, False))
-        return HealthReading(tuple(spaces), own_targets(journal, liveness.current()))
+        own = own_injections(journal, liveness.current())
+        return HealthReading(
+            tuple(spaces), None if own is None else own.targets, frozenset() if own is None else own.held
+        )
     except Exception as error:
         log.warning("the health reading failed (%s): no space is read", type(error).__name__)
         return UNREAD
