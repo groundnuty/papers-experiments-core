@@ -38,11 +38,12 @@ A reading is per call: `PlatformHealth` resets it at the start of every call, so
 import json
 import logging
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from expcore.campaign import liveness, prerun
+from expcore.campaign.healthgate import Health
 from expcore.errors import TARGET_LABEL
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
@@ -53,6 +54,7 @@ from expcore_onedata.tokens import Plane
 
 READING_NOTE = prerun.HEALTH_READING  # the key of the try's note the latest reading is put under: the core keeps it
 FACT = "post_run_health"  # the key a reading has among a run's facts, owned by `sandbox.infrafacts.HEALTH`
+NAMESPACE = "post_run_health"  # the namespace of `PostRunHealth`'s snapshot, `RunRecord.instruments[NAMESPACE]`
 _POSITION = re.compile(r"spaces\[(0|[1-9][0-9]*)\]")
 _ASKED = ("stopping", "injected", "stop_unknown")  # a journal line that says the stop of the target was asked for
 log = logging.getLogger(__name__)
@@ -278,6 +280,57 @@ def reading_in(facts: Mapping[str, Any] | None) -> HealthReading | None:
 
 
 def noted_reading() -> HealthReading | None:
-    """The latest reading in the try this context is in (`prerun`), or None outside a try or when it holds none."""
+    """The latest reading in the try this context is in (`prerun`), or None outside a try or when it holds none. After
+    a call of another check than the platform's, or one that may not have asked it, this can still be an earlier
+    check's: take a call's own reading with `checked`."""
     note = prerun.current()
     return None if note is None else HealthReading.from_json(note.get(READING_NOTE))
+
+
+def checked(check: Callable[[], Health]) -> tuple[Health, HealthReading | None]:
+    """Make ONE call of `check`, the platform's whole chain (`PlatformHealth`, which runs the fault gate under the run's
+    admission), and return its answer with the reading THAT call noted. The try's note is cleared first and read back
+    after, in the calling context, so a reading the pre-run check noted is never taken for this call's, a wrapper that
+    never asked the platform leaves None, and it holds through a thread that copied the context
+    (`asyncio.to_thread`). Outside a try there is no note: the call is made and the reading is None."""
+    note = prerun.current()
+    if note is not None:
+        note.pop(READING_NOTE, None)
+    return check(), noted_reading()
+
+
+class PostRunHealth:
+    """An instrument (`expcore.plugin.Instrument`) whose snapshot is the platform check's reading of the platform when
+    it finishes, so the reading is in the run's RECORD (`RunRecord.instruments["post_run_health"]`), which the merge
+    carries and the replay and the package hash, where a collected `metadata.json` is neither (a run directory holds
+    nothing that is not a record or a declared side file).
+
+    List it AFTER the fault injector: instruments finish in the reverse of their list order, so it finishes inside the
+    run's own open injection, before the injector's restore, with the one full-chain call under the run's admission
+    (the fault gate explains the run's own injection there, and answers every other open one, which leaves the reading
+    unread). `check` is the platform's `PlatformHealth`; the snapshot is `{"ok", "deferred", "reading"}`, the reading
+    as `HealthReading.to_json()` or None, and `reading_in_instruments(record.instruments)` reads it back. A call that
+    raises is recorded by `finish_instruments` as `{"ok": False, "error": ...}`, which reads as no reading."""
+
+    namespace = NAMESPACE
+
+    def __init__(self, check: Callable[[], Health]) -> None:
+        self._check = check
+
+    def start(self, identity: Mapping[str, Any]) -> None:
+        """Nothing is read before the run."""
+
+    def finish(self) -> Mapping[str, Any]:
+        verdict, reading = checked(self._check)
+        return {
+            "ok": verdict.ok,
+            "deferred": verdict.deferred,
+            "reading": None if reading is None else reading.to_json(),
+        }
+
+
+def reading_in_instruments(instruments: Mapping[str, Any] | None) -> HealthReading | None:
+    """The reading a record's instruments hold under `NAMESPACE` (`record.instruments`, read back from JSON), or None
+    when they hold none, the finish failed, or it is malformed: `target_only` of it is then None, never True."""
+    snapshot = instruments.get(NAMESPACE) if isinstance(instruments, Mapping) else None
+    return HealthReading.from_json(snapshot.get("reading")) if isinstance(snapshot, Mapping) else None
