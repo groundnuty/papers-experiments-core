@@ -144,7 +144,9 @@ def test_o58_a_verb_that_times_out_is_answered_timed_out_and_a_watch_is_opened_b
     assert TAG.fullmatch(tag)
     assert re.fullmatch(r"[0-9a-f]{32}", key)
     assert opened["why"] == "timed_out"
-    assert started["argv"] == watch_argv(PREFIX, tag, "stop", SERVICE, key, LATE_WINDOW_S, LATE_POLL_S)
+    since = float(started["argv"][started["argv"].index("--since") + 1])  # the moment the relay answered
+    assert since > 0
+    assert started["argv"] == watch_argv(PREFIX, tag, "stop", SERVICE, key, LATE_WINDOW_S, LATE_POLL_S, since)
     assert "--journal" not in started["argv"]  # hpcfed knows the relay's journal from the root: no path to mis-spell
     assert started["env"] == ENVIRONMENT
     assert stat.S_IMODE(journal_path(root).stat().st_mode) == 0o600
@@ -389,3 +391,25 @@ def test_o58_a_verb_that_fails_with_its_srun_still_waiting_is_answered_with_its_
     (started,) = watchers.started
     (opened,) = started["journal"]
     assert (opened["event"], opened["verb"], opened["why"]) == ("watch_opened", "stop", "left_behind")
+
+
+@pytest.mark.parametrize(
+    ("words", "ok"),
+    [
+        (["--late-window-s", "30", "--late-poll-s", "0.5"], True),
+        (["--late-poll-s", "60"], True),
+        (["--late-poll-s", "61"], False),  # hpcfed's own bound for the watch's poll
+        (["--late-window-s", "3601"], False),
+        (["--late-window-s", "0"], False),
+        (["--late-window-s", "nan"], False),
+        (["--late-window-s", "5", "--late-window-s", "6"], False),
+        (["--late-nothing", "5"], False),
+        (["--late-window-s"], False),
+    ],
+)
+def test_o58_serve_takes_only_the_watchs_two_numbers_within_what_hpcfed_accepts(words, ok):
+    """O58: `serve`'s optional watch settings are refused rather than defaulted when they are not numbers within the
+    bounds `hpcfed.py late-steps` itself accepts, so a watch is never started that exits 2 and is lost."""
+    from expcore_onedata.fault_relay import _serve_options
+
+    assert (_serve_options(words) is not None) is ok

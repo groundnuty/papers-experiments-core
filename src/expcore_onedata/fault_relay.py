@@ -105,6 +105,7 @@ RELAY_STALE_S = 30.0  # a heartbeat older than this, by the reader's wall clock,
 RELAY_MODULE = "expcore_onedata.fault_relay"  # the relay runs as `-m RELAY_MODULE serve --root <root>`: how it is told
 RELAY_NOTE = "fault_relay"  # the try's note key: what the fault gate's pre-run check saw of the relay
 POLL_S = 0.5  # between two listings that look for an answer
+SACCT_GRACE_S = 1.0  # the accounting call's own grace before its kill: counted out of what is left of the client's wait
 OUTPUT_CAP = 65536  # the most of a command's output an answer carries, per stream
 MIN_RUN_S = 1.0  # a request with less than this left before its deadline is refused, never started
 ENVIRONMENT = ("PATH", "HOME", "LANG", "LC_ALL", "USER", "LOGNAME", "SLURM_CONF")
@@ -499,7 +500,7 @@ class Relay:
         if why is None and elapsed >= LATE_ELAPSED_S:  # hpcfed may have ended an srun whose step the controller holds
             why = "own_bound"
         if why is not None:
-            self._watch(request, key, tag, why)  # before the answer: the guard is in place when it is read
+            self._watch(request, key, tag, why, answered)  # before the answer: the guard is in place when it is read
         timing = self._timing(record, request, tag, issued, answered, launched)
         return answer if timing is None else {**answer, "timing": timing}
 
@@ -516,7 +517,7 @@ class Relay:
         return entry.get("launch"), name
 
     def _run_sacct(self, argv: Sequence[str], bound_s: float) -> CommandResult:
-        return run_in_group(argv, env=self._env, timeout_s=bound_s, grace_s=1.0)
+        return run_in_group(argv, env=self._env, timeout_s=bound_s, grace_s=SACCT_GRACE_S)
 
     def _timing(
         self,
@@ -536,7 +537,7 @@ class Relay:
             now = self._launch_of(request.service) if request.verb == "start" else None
             service_step = now[1] if now is not None and launched is not None and now[0] != launched[0] else None
             names = step_names(prefix or "", request.service, request.verb, tag, service_step)
-            budget = min(SACCT_TIMEOUT_S, float(record["deadline"]) - self._wall() - POLL_S)
+            budget = min(SACCT_TIMEOUT_S, float(record["deadline"]) - self._wall() - POLL_S - SACCT_GRACE_S)
             return read_timing(
                 self._sacct,
                 job=job if isinstance(job, str) else None,
@@ -551,7 +552,7 @@ class Relay:
     def _note_stragglers(self) -> None:
         self._left_behind = True
 
-    def _watch(self, request: Request, key: str, tag: str, why: str) -> None:
+    def _watch(self, request: Request, key: str, tag: str, why: str, since: float | None = None) -> None:
         """Journal that a watch is owed for the verb's steps (`why`: it timed out, ended unknown, or left an srun in
         its group), then start it. It never raises: a journal that cannot be written never keeps the watch from starting
         (the watch is the guard), and a watch that cannot be started is journalled."""
@@ -559,7 +560,9 @@ class Relay:
         event = {"request": key, "verb": request.verb, "service": request.service, "tag": tag, "why": why}
         with contextlib.suppress(OSError):
             record(journal, {"event": "watch_opened", **event, "window_s": self._late_window_s, "wall": self._wall()})
-        argv = watch_argv(self._prefix, tag, request.verb, request.service, key, self._late_window_s, self._late_poll_s)
+        argv = watch_argv(
+            self._prefix, tag, request.verb, request.service, key, self._late_window_s, self._late_poll_s, since
+        )
         try:
             handle = self._watcher(argv, self._env)
         except Exception as error:  # no process to start it with, say: said in the journal, the answer unchanged
@@ -620,7 +623,8 @@ def _serve_options(words: Sequence[str]) -> dict[str, float] | None:
             number = float(value)
         except ValueError:
             return None
-        if flag not in names or names[flag] in found or not math.isfinite(number) or not 0 < number <= 3600:
+        top = 60 if flag == "--late-poll-s" else 3600  # hpcfed's own bounds for the watch
+        if flag not in names or names[flag] in found or not math.isfinite(number) or not 0 < number <= top:
             return None
         found[names[flag]] = number
     return found

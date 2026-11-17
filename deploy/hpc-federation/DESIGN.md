@@ -750,13 +750,16 @@ message timeout after the request. The relay now does three things (`fault_relay
   federation's own job (`hpclaunch.listings`) every 5 s and cancels any whose name is one of the verb's exact names,
   by its exact `<job>.<step>` id through `Launcher.cancel`, which refuses an id of another job of the federation's;
   never by user, name or pattern. At the window's end it reads the accounting (`sacct`) for the same names, to record a
-  step that was made and ended between two looks (`accounted_late`); nothing is cancelled that is over.
+  step that was made and ended between two looks (`accounted_late`) when its accounted Start is not before the moment
+  the relay answered (`--since`; a step with no accounted Start is counted, since it may have run late), and a step that
+  began before it as `accounted_in_time`, which is no late step: a verb watched for having run long (a stop of a minute)
+  has its own steps in the accounting. Nothing is cancelled that is over.
 
 The answer is still `timed_out` and the injector still reads the verb's outcome as unknown: a stop is waited out and a
 start verified by a changed identity, as before. **The record** is `<root>/fault-relay/late-steps.jsonl` (0600, one JSON
 line per event, fsynced): `watch_opened` (written before the watch starts, so a relay that dies in the window still
 leaves the record that a watch was owed, with `why`: `timed_out`, `unknown`, `left_behind` or `own_bound`), `watch_failed`, `late_step` (the step's name, its id, whether the cancel
-worked and, if not, the error's type; a failed cancel is tried again at the next look), `accounted_late`, `watch_ended`
+worked and, if not, the error's type; a failed cancel is tried again at the next look), `accounted_late`, `accounted_in_time`, `watch_ended`
 (a watch that exited nonzero) and `watch_closed` with an outcome: `late_steps`, `none_seen` (only when at least one look
 and the accounting were read), `unreadable` (a controller that never answered in the window says nothing about
 whether a step came), `job_gone` or `state_gone`. **A `watch_opened` with no `watch_closed` is a window nobody
@@ -787,7 +790,11 @@ be given is null, with the reason (`not_recorded`, `no_such_step`, `unparsable`)
 request, checked and with no names, and the injector journals it where the verb's own evidence goes: a stop's with the
 stop's (`stop.timing`, in `injected` and in `stop_unknown`, where there is no other evidence of the stop), a start's in
 the restore (`start_timing`, in the `verified` step and the injection, served or not), a link restart's in the heal's
-action (`timing`). A status's and a ping's are kept by the driver and journalled by no line.
+action (`timing`). A status's and a ping's are kept by the driver and journalled by no line. **Reading a figure:** `start_after_issue_s`
+counts from the verb's issue, so for a verb's later step (a status's read-only check, a start's service step after its
+status read) it includes what the verb did before it launched that step; the journalled timing keeps `issued_wall` and
+`answered_wall`, which let a reader take that out. The login node's clock and Slurm's are read as the same, and sacct's
+local time is ambiguous in the hour a clock goes back.
 
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
 `hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` (and

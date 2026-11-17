@@ -102,7 +102,7 @@ class Cluster:
         self.listed = {name: step for name, step in self.listed.items() if step != step_id}
 
 
-def run_watch(hpc, tmp_path, cluster, verb="stop", window_s=60.0, poll_s=5.0, store=None):
+def run_watch(hpc, tmp_path, cluster, verb="stop", window_s=60.0, poll_s=5.0, store=None, since=None):
     """The watch, to its end on a fake clock; the journal's lines."""
     launcher = hpc.launch.Launcher(cluster, store or Store(), None)
     journal, clock = tmp_path / JOURNAL, Clock()
@@ -118,6 +118,7 @@ def run_watch(hpc, tmp_path, cluster, verb="stop", window_s=60.0, poll_s=5.0, st
         poll_s=poll_s,
         clock=clock.monotonic,
         sleep=clock.sleep,
+        since=since,
     )
     lines = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()] if journal.exists() else []
     return status, lines, clock
@@ -205,12 +206,68 @@ def test_o58_a_step_that_ran_and_ended_between_two_looks_is_found_in_the_account
     reads the accounting for the verb's exact names and records a step that was made, with how it ended. Nothing is
     cancelled: it is over."""
     cluster = Cluster(hpc.slurm)
-    cluster.accounting = {name("exec"): {"id": f"{JOB}.8", "exit": 0, "state": "COMPLETED"}}
-    _, lines, _ = run_watch(hpc, tmp_path, cluster, verb="exec")
+    cluster.accounting = {name("exec"): {"id": f"{JOB}.8", "exit": 0, "state": "COMPLETED", "start": 1_500.0}}
+    _, lines, _ = run_watch(hpc, tmp_path, cluster, verb="exec", since=1_000.0)  # it began after the answer
     assert cluster.cancelled == []
     (late,) = events(lines, "accounted_late")
     assert (late["step"], late["id"], late["exit"], late["state"]) == (name("exec"), f"{JOB}.8", 0, "COMPLETED")
+    assert late["start_known"] is True
     assert events(lines, "watch_closed")[-1]["outcome"] == "late_steps"
+
+
+def test_o58_a_step_the_accounting_shows_that_began_before_the_answer_ran_inside_the_verb_and_is_no_late_step(
+    hpc, tmp_path
+):
+    """O58: a verb that ran 25 s or more is watched though its steps all ran in time (a stop that took a minute, say):
+    its own steps are in the accounting under the exact names, and are no late steps. A step that began before the
+    moment the relay answered is recorded as `accounted_in_time` and does not make the window a `late_steps` one."""
+    cluster = Cluster(hpc.slurm)
+    cluster.accounting = {name("stop"): {"id": f"{JOB}.7", "exit": 0, "state": "COMPLETED", "start": 900.0}}
+    _, lines, _ = run_watch(hpc, tmp_path, cluster, since=1_000.0)
+    assert events(lines, "accounted_late") == []
+    (inside,) = events(lines, "accounted_in_time")
+    assert (inside["step"], inside["id"], inside["state"]) == (name("stop"), f"{JOB}.7", "COMPLETED")
+    closed = events(lines, "watch_closed")[-1]
+    assert (closed["outcome"], closed["late_steps"]) == ("none_seen", 0)
+
+
+@pytest.mark.parametrize(("start", "known"), [(None, False), (1_000.4, True)])
+def test_o58_a_step_with_no_accounted_start_or_one_in_the_answers_own_second_is_counted_as_late(
+    hpc, tmp_path, start, known
+):
+    """O58: sacct's Start is whole seconds: a step that began in the second of the answer, or that the accounting gives
+    no Start at all, may have run late, so it is counted (fail closed), with `start_known` saying which."""
+    cluster = Cluster(hpc.slurm)
+    cluster.accounting = {name("stop"): {"id": f"{JOB}.7", "exit": 0, "state": "COMPLETED", "start": start}}
+    _, lines, _ = run_watch(hpc, tmp_path, cluster, since=1_000.7)
+    (late,) = events(lines, "accounted_late")
+    assert late["start_known"] is known
+    assert events(lines, "watch_closed")[-1]["outcome"] == "late_steps"
+
+
+def test_o58_the_accounting_read_gives_each_steps_start_as_epoch_seconds_and_none_for_unknown(hpc):
+    """O58: `Slurm.accounted` reads sacct once for the job's steps: id, exit status, state, and Start as epoch seconds
+    (the login node's local time, as sacct prints it) or None."""
+    from datetime import datetime
+
+    rows = (
+        f"{JOB}.batch|batch|0:0|COMPLETED|2026-11-17T09:00:00\n"
+        f"{JOB}.7|a-step|0:0|COMPLETED|2026-11-17T09:00:05\n"
+        f"{JOB}.8|b-step|0:9|CANCELLED by 1000|Unknown\n"
+    )
+    seen = []
+
+    class Runner:
+        def run(self, argv, timeout):
+            seen.append(argv)
+            return hpc.slurm.Completed(0, rows, "")
+
+    found = hpc.slurm.Slurm(Runner()).accounted(JOB)
+    assert set(found) == {"a-step", "b-step"}
+    assert found["a-step"]["start"] == datetime(2026, 11, 17, 9, 0, 5).timestamp()
+    assert (found["b-step"]["start"], found["b-step"]["exit"], found["b-step"]["state"]) == (None, 137, "CANCELLED")
+    assert len(seen) == 1
+    assert "Start" in seen[0][-1]
 
 
 def test_o58_a_step_the_watch_cancelled_is_not_reported_again_from_the_accounting(hpc, tmp_path):
@@ -544,7 +601,7 @@ def federation(hpc, tmp_path, site):
 
 
 def late_argv(federation, tag=TAG, verb="stop", window_s=0.2, poll_s=0.05):
-    argv = watch_argv(federation.prefix, tag, verb, federation.service, REQUEST, window_s, poll_s)
+    argv = watch_argv(federation.prefix, tag, verb, federation.service, REQUEST, window_s, poll_s, 1_000.0)
     return argv[argv.index("hpcfed.py") + 1 :]  # hpcfed's own arguments: what follows the script
 
 
@@ -577,8 +634,9 @@ def test_o58_the_relays_own_watch_command_cancels_the_late_step_by_its_exact_id_
         lambda argv: [*argv[: argv.index("--request") + 1], "x", *argv[argv.index("--request") + 2 :]],
         lambda argv: [*argv[: argv.index("--window-s") + 1], "-1", *argv[argv.index("--window-s") + 2 :]],
         lambda argv: [*argv[: argv.index("--for-verb") + 1], "down", *argv[argv.index("--for-verb") + 2 :]],
+        lambda argv: [*argv[: argv.index("--since") + 1], "-5", *argv[argv.index("--since") + 2 :]],
     ],
-    ids=["tag", "request", "window", "verb"],
+    ids=["tag", "request", "window", "verb", "since"],
 )
 def test_o58_the_watch_command_refuses_a_tag_a_request_a_window_or_a_verb_it_was_not_built_for(hpc, federation, change):
     """O58: the command watches only the four verbs' names, for a tag and a request id of the relay's making and a

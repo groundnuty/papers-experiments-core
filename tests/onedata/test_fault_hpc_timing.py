@@ -225,6 +225,7 @@ def test_o58_a_timing_is_checked_figure_by_figure_and_names_are_dropped():
     ]
     kept = timing_evidence({"accounting": "unreadable", "reason": "sacct_timeout", "steps": steps})
     assert (kept["accounting"], kept["reason"]) == ("unreadable", "sacct_timeout")
+    assert (kept["issued_wall"], kept["answered_wall"]) == (None, None)  # none given: none invented
     first, second = kept["steps"][0], kept["steps"][1]
     assert first["start_after_issue_s"] is None
     assert first["end_after_answer_s"] is None

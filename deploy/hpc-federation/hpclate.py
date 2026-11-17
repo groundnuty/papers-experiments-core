@@ -11,7 +11,10 @@ relay alone (never by a request: it is no verb of `fault_hpc.VERBS`), with the t
 - Each such step is cancelled by its exact `<job>.<step>` id, through the launcher, which refuses an id of any other job
   of the federation's, never by user, name or pattern. A cancel that fails is tried again at the next look.
 - At the window's end it reads the accounting for the same names: a step that was made and ended between two looks is
-  recorded as `accounted_late` (with how it ended); nothing is cancelled that is over.
+  recorded as `accounted_late` (with how it ended) when its accounted Start is not before the moment the relay
+  answered (`--since`; a Start the accounting does not hold is counted, since the step may have run late), and as
+  `accounted_in_time` when it started before: a step that ran inside the verb is no late step. Nothing is cancelled
+  that is over.
 - What it saw goes to the relay's journal (`late-steps.jsonl`, `expcore_onedata.fault_relay_late`). It closes with
   `none_seen` only when at least one look and the accounting were read: a window the controller never answered in is
   `unreadable`, never "nothing came".
@@ -52,9 +55,12 @@ def watch(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     wall: Callable[[], float] = time.time,
+    since: Optional[float] = None,
 ) -> int:
     """Watch for the late steps of one verb for `window_s`, cancel each by its exact id, journal what was seen; 0 once
-    the window has been watched, 1 when the federation's state cannot be read at the start."""
+    the window has been watched, 1 when the federation's state cannot be read at the start. `since`: the wall-clock
+    moment (epoch seconds) the relay answered the verb; a step the accounting shows started before it ran inside the
+    verb, and is no late step (None: every step the accounting shows is counted)."""
 
     def emit(event: str, **fields: Any) -> None:
         try:
@@ -120,13 +126,27 @@ def watch(
         sleep(min(poll_s, max(0.0, deadline - clock())))
     accounting, accounted = "unreadable", {}
     if outcome != "state_gone":
-        with contextlib.suppress(SlurmError, OSError):  # the accounting stays "unreadable": never read as an empty one
+        # the accounting stays "unreadable" (never read as an empty one) when it cannot be read
+        with contextlib.suppress(SlurmError, OSError, TypeError):
             accounted, accounting = slurm.accounted(job), "read"
     for name in wanted:
         row = accounted.get(name)
-        if row is not None and str(row["id"]) not in handled:
-            late += 1
-            emit("accounted_late", step=name, id=row["id"], exit=row["exit"], state=row["state"])
+        if row is None or str(row["id"]) in handled:
+            continue
+        began = row.get("start")
+        # a Start before the answer is a step that ran inside the verb; a Start the accounting lacks may be a late one
+        if since is not None and isinstance(began, (int, float)) and int(began) < int(since):
+            emit("accounted_in_time", step=name, id=row["id"], exit=row["exit"], state=row["state"])
+            continue
+        late += 1
+        emit(
+            "accounted_late",
+            step=name,
+            id=row["id"],
+            exit=row["exit"],
+            state=row["state"],
+            start_known=began is not None,
+        )
     if outcome is None:
         outcome = "late_steps" if late else ("none_seen" if read and accounting == "read" else "unreadable")
     elif late and outcome == "job_gone":

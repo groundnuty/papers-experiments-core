@@ -58,12 +58,12 @@ STUBS = {
         done
         exit 0
         """,
-    # sacct: the accounting as files hold it (the times form when asked for Start and End)
+    # sacct: the accounting as files hold it (the times form when asked for End, the steps form otherwise)
     "sacct": """\
         #!/bin/sh
         d=$(dirname "$0")
         case "$*" in
-          *Start*) cat "$d/sacct-times.txt" 2>/dev/null;;
+          *End*) cat "$d/sacct-times.txt" 2>/dev/null;;
           *) cat "$d/sacct.txt" 2>/dev/null;;
         esac
         exit 0

@@ -57,7 +57,7 @@ def _moment(text: str) -> float | None:
         return None
     try:
         return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S").timestamp()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         return None
 
 

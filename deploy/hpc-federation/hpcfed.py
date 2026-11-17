@@ -5,7 +5,7 @@ file (DESIGN.md is the process model; README.md says what has run).
     uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH stop | start | status SERVICE
     uv run python -I -B deploy/hpc-federation/hpcfed.py --layout PATH --root PATH exec SERVICE -- ARGV...
     (the fault relay's own: `--step-tag TAG` before a verb, and `late-steps SERVICE --for-verb VERB --request ID
-    --window-s N --poll-s N`; see hpclate.py)
+    --window-s N --poll-s N --since T`; see hpclate.py)
 
 Run on the login node. `up` reads the site's values from the environment (`set -a; . site.env; set +a`) and records
 them in the state file in the root, so `down` and the service verbs need no environment: the login node's fault relay
@@ -205,6 +205,10 @@ def late_steps(driver: Driver, args: argparse.Namespace) -> int:
             (args.for_verb in hpcfed_control.VERBS, "--for-verb is one of %s" % ", ".join(hpcfed_control.VERBS)),
             (args.request is not None and REQUEST_ID.fullmatch(args.request), "--request is a request id"),
             (numbers, "--window-s and --poll-s are positive numbers within bounds"),
+            (
+                args.since is None or (math.isfinite(args.since) and args.since > 0),
+                "--since is a time in epoch seconds",
+            ),
         )
         if not ok
     ]
@@ -221,6 +225,7 @@ def late_steps(driver: Driver, args: argparse.Namespace) -> int:
         journal=journal,
         window_s=window,
         poll_s=poll,
+        since=args.since,
     )
 
 
@@ -244,6 +249,9 @@ def main(
         parser.add_argument(late, help=argparse.SUPPRESS)
     parser.add_argument("--window-s", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--poll-s", type=float, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--since", type=float, help=argparse.SUPPRESS
+    )  # late-steps: the epoch second the verb was answered
     args = parser.parse_args(words)
     environ = os.environ if environ is None else environ
     try:
@@ -259,7 +267,7 @@ def main(
         print("error: %s: --step-tag belongs to a verb or to late-steps" % args.command, file=sys.stderr)
         return 2
     if args.command != "late-steps" and any(
-        value is not None for value in (args.for_verb, args.request, args.window_s, args.poll_s)
+        value is not None for value in (args.for_verb, args.request, args.window_s, args.poll_s, args.since)
     ):
         print("error: %s: the late-steps options belong to late-steps" % args.command, file=sys.stderr)
         return 2

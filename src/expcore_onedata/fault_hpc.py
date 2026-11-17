@@ -394,6 +394,10 @@ def timing_evidence(timing: Any) -> dict[str, Any] | None:
         "accounting": timing["accounting"],
         "reason": reason if isinstance(reason, str) and _TIMING_REASON.fullmatch(reason) else None,
         "resolution_s": 1,
+        # the verb's issue and its answer (epoch seconds): a later step's first figure counts from the issue, so it
+        # includes what the verb did before launching it, which these two let a reader take out
+        "issued_wall": _seconds_figure(timing.get("issued_wall")),
+        "answered_wall": _seconds_figure(timing.get("answered_wall")),
         "steps": steps,
     }
 
