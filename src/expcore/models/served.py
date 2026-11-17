@@ -285,17 +285,13 @@ def judge(
     `accepted_ids` are other ids the server reports for the same model (the model table's aliases).
     `accepted_fingerprints` is the set the model's entry declares (B18; `ModelSpec.accepted_fingerprints`), judged as
     the campaign judges it (`outside_accepted`): a reply from any member is the model, a reply from another
-    fingerprint is a mismatch, and the set replaces the baseline, so `expected_fingerprint` is refused with it. An
-    empty set judges as if none were given.
+    fingerprint is a mismatch. The set replaces the baseline, as it does in the campaign, which never consults a
+    model's baseline fingerprint once the model declares a set (a baseline taken before it was declared stays in the
+    store, unused): `expected_fingerprint` is ignored when a set is given. An empty set judges as if none were given.
     """
     if isinstance(accepted_fingerprints, str):
         raise TypeError("accepted_fingerprints is a collection of fingerprints, not one string")
     declared = tuple(accepted_fingerprints)  # read once: any iterable will do
-    if declared and expected_fingerprint is not None:
-        raise ValueError(
-            "accepted_fingerprints replaces the fingerprint baseline, as the campaign's check does: "
-            "give it or expected_fingerprint, not both"
-        )
     ids = sorted({str(x) for x in served_ids if x})
     ok_ids = {expected_id, *accepted_ids}
     reported_by = served_settings or {}

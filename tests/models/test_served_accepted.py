@@ -112,10 +112,25 @@ def test_b18_the_served_model_id_is_judged_whatever_the_set_says():
     assert "plover-large" in result["reasons"][0]
 
 
-def test_b18_a_declared_set_and_a_baseline_fingerprint_together_are_refused():
-    """B18: the campaign lets the set replace the baseline, so a call that gives both says two things; it is refused."""
-    with pytest.raises(ValueError, match=r"accepted_fingerprints.*expected_fingerprint"):
-        judged([KESTREL], expected_fingerprint=KESTREL, accepted_fingerprints=DECLARED)
+def test_b18_a_declared_set_replaces_a_baseline_fingerprint():
+    """B18: the campaign never consults the baseline fingerprint of a model that declares a set, so `judge` does not."""
+    result = judged([PLOVER], expected_fingerprint=KESTREL, accepted_fingerprints=DECLARED)
+    assert result["state"] == "match"
+    assert judged([OSPREY], expected_fingerprint=KESTREL, accepted_fingerprints=DECLARED)["state"] == "mismatch"
+
+
+def test_b18_a_baseline_taken_before_the_set_was_declared_changes_neither_check(tmp_path):
+    """B18: a model first served with no set keeps its baseline once the set is declared, and neither the campaign's
+    check nor `judge` holds a reply to it: the second deployment is the model to both."""
+    store, _, _ = planned_store(tmp_path)
+    before = [{"served_model": MODEL, "system_fingerprint": KESTREL}]
+    assert ServedIdentities(store, lambda: NOW).check(MODEL, before, NOW) is None
+    declared = ServedIdentities(store, lambda: NOW, {MODEL: model_spec(DECLARED)})
+    baseline = declared.baseline(MODEL)["system_fingerprint"]
+    assert baseline == KESTREL
+    later = [{"served_model": MODEL, "system_fingerprint": PLOVER}]
+    assert declared.check(MODEL, later, NOW) is None
+    assert judged([PLOVER], expected_fingerprint=baseline, accepted_fingerprints=DECLARED)["state"] == "match"
 
 
 def test_b18_the_set_is_a_collection_of_fingerprints_not_one_string():
@@ -137,13 +152,17 @@ def test_b18_the_split_of_a_mixed_reply_is_the_one_the_campaign_uses():
     assert served_module.fingerprint_parts(KESTREL) == [KESTREL]
 
 
+def model_spec(declared):
+    """The model's entry, declaring `declared` (none when empty)."""
+    return ModelSpec(
+        key=MODEL, backend="stub", api_id=MODEL, status="frozen", price=Price(3.0, 15.0), accepted_fingerprints=declared
+    )
+
+
 def campaign_change(tmp_path, fingerprints, declared):
     """What the campaign's check says of the same run: the change it finds, or None."""
     store, _, _ = planned_store(tmp_path)
-    spec = ModelSpec(
-        key=MODEL, backend="stub", api_id=MODEL, status="frozen", price=Price(3.0, 15.0), accepted_fingerprints=declared
-    )
-    identities = ServedIdentities(store, lambda: NOW, {MODEL: spec})
+    identities = ServedIdentities(store, lambda: NOW, {MODEL: model_spec(declared)})
     transcript = [{"served_model": MODEL, "system_fingerprint": fingerprint} for fingerprint in fingerprints]
     return identities.check(MODEL, transcript, NOW)
 
