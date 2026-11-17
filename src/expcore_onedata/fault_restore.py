@@ -100,7 +100,11 @@ def stop_record(driver: Any) -> dict[str, Any]:
     ended and its seconds), as the `stop` key of the injection's `injected` or `stop_unknown` line and step; nothing
     for a driver that keeps none (Compose), or for a stop that did not answer."""
     found = getattr(driver, "last_stop", None)
-    return {"stop": dict(found)} if isinstance(found, Mapping) else {}
+    timing = (getattr(driver, "last_timing", None) or {}).get("stop")  # where the stop's time went (O58), else nothing
+    if not isinstance(found, Mapping) and not isinstance(timing, Mapping):
+        return {}
+    evidence = dict(found) if isinstance(found, Mapping) else {}
+    return {"stop": {**evidence, **({"timing": dict(timing)} if isinstance(timing, Mapping) else {})}}
 
 
 def unhealed_detail(record: Mapping[str, Any], latest: LinkMatrix, before: str | None) -> str:

@@ -43,6 +43,19 @@ so the injector journals a stop of unknown outcome (`stop_unknown`, `faults.py`)
 to show down, a start is verified only by a changed identity read afterwards, and a link restart is `command_timeout`,
 never retried. A relay that is not answering (no heartbeat, or one older than `RELAY_STALE_S`) gets no request at all.
 
+**A timed-out verb's late steps.** A verb runs as a process that launches an `srun` step. It runs in a process group of
+its own, and at its bound the whole group is ended (`fault_relay_group`), so no `srun` client survives it to create
+the step after the relay has answered. The relay also stamps each verb's steps with a tag of its own, and after a
+timed-out verb starts a watch that cancels, by exact id and in the federation's own job alone, any step of that verb's
+exact names that is made late, and journals it (`fault_relay_late`). The answer stays `timed_out`. A verb that ran at
+least `LATE_ELAPSED_S` is watched too: hpcfed ends its own `srun` only after its own bound, and the controller may
+still hold that step.
+
+**Where the time went.** After each verb the relay reads the accounting once (`fault_relay_timing`) and puts in the
+answer's `timing` the time from the verb's issue to each of its steps' accounted Start, and from the answer to each End,
+so that a controller stall is the site's in the record; a figure it cannot give is unknown with the reason, and it never
+fails or delays a verb past the client's wait.
+
 **Liveness.** The relay writes `heartbeat.json` every `BEAT_S` (its nonce, the federation, a count and the wall clock),
 removes it when it stops, and holds `relay.lock` while it runs, so a second relay for the same root refuses to start.
 The fault gate's pre-run check reads it and notes what it saw in the try's note (`RELAY_NOTE`), and the run admission
@@ -71,6 +84,18 @@ from typing import Any
 
 from expcore_onedata.compose import CommandResult, DriverError
 from expcore_onedata.fault_hpc import EXEC_COMMANDS, VERBS, Request, VerbCommand
+from expcore_onedata.fault_relay_group import GRACE_S, run_in_group
+from expcore_onedata.fault_relay_late import (
+    LATE_ELAPSED_S,
+    LATE_POLL_S,
+    LATE_WINDOW_S,
+    journal_path,
+    record,
+    spawn_watch,
+    step_tag,
+    watch_argv,
+)
+from expcore_onedata.fault_relay_timing import SACCT_TIMEOUT_S, Sacct, is_timing, read_timing, step_names
 
 FORMAT = "expcore-fault-relay/1"
 RELAY_DIR = "fault-relay"
@@ -80,6 +105,7 @@ RELAY_STALE_S = 30.0  # a heartbeat older than this, by the reader's wall clock,
 RELAY_MODULE = "expcore_onedata.fault_relay"  # the relay runs as `-m RELAY_MODULE serve --root <root>`: how it is told
 RELAY_NOTE = "fault_relay"  # the try's note key: what the fault gate's pre-run check saw of the relay
 POLL_S = 0.5  # between two listings that look for an answer
+SACCT_GRACE_S = 1.0  # the accounting call's own grace before its kill: counted out of what is left of the client's wait
 OUTPUT_CAP = 65536  # the most of a command's output an answer carries, per stream
 MIN_RUN_S = 1.0  # a request with less than this left before its deadline is refused, never started
 ENVIRONMENT = ("PATH", "HOME", "LANG", "LC_ALL", "USER", "LOGNAME", "SLURM_CONF")
@@ -256,6 +282,13 @@ class RelayClient:
         raise RelayDown("the fault relay took no request in time: withdrawn, nothing ran")
 
 
+class RelayTimeout(subprocess.TimeoutExpired):
+    """A command the relay ran and answered `timed_out`: its outcome unknown. `timing` is where its time went, when the
+    relay read it (`fault_relay_timing`), else None."""
+
+    timing: Mapping[str, Any] | None = None
+
+
 def _answered(answer: Mapping[str, Any], key: str, nonce: str, timeout_s: float) -> CommandResult:
     """An answer as a command's end; raise DriverError for a refusal (nothing ran) and `subprocess.TimeoutExpired` for
     a command the relay ran past its bound (its outcome unknown). An answer not for this request is no answer."""
@@ -265,12 +298,15 @@ def _answered(answer: Mapping[str, Any], key: str, nonce: str, timeout_s: float)
     if refused is not None:
         word = refused if isinstance(refused, str) and re.fullmatch(r"[a-z_]{1,40}", refused) else "refused"
         raise DriverError(f"the fault relay refused the request ({word}): nothing ran")
+    timing = answer.get("timing") if is_timing(answer.get("timing")) else None  # a file of the relay's: checked
     if answer.get("timed_out") is True:
-        raise subprocess.TimeoutExpired(["fault-relay"], timeout_s)
+        error = RelayTimeout(["fault-relay"], timeout_s)
+        error.timing = timing
+        raise error
     code, out, err = answer.get("returncode"), answer.get("stdout"), answer.get("stderr")
     if isinstance(code, bool) or not isinstance(code, int) or not isinstance(out, str) or not isinstance(err, str):
         raise subprocess.TimeoutExpired(["fault-relay"], timeout_s)
-    return CommandResult(code, out, err)
+    return CommandResult(code, out, err, timing)
 
 
 def _issued(paths: Iterator[Path]) -> list[Path]:
@@ -291,22 +327,17 @@ def clean_environment(environ: Mapping[str, str]) -> dict[str, str]:
     return {name: environ[name] for name in ENVIRONMENT if name in environ and not SECRET_NAME.search(name)}
 
 
-def run_clean(environ: Mapping[str, str]) -> Callable[..., CommandResult]:
-    """A command runner whose commands get `clean_environment(environ)` and no stdin."""
+def run_clean(
+    environ: Mapping[str, str], *, grace_s: float = GRACE_S, on_stragglers: Callable[[], None] | None = None
+) -> Callable[..., CommandResult]:
+    """A command runner whose commands get `clean_environment(environ)` and no stdin, each in a process group of its own
+    that is ended whole at the bound (SIGTERM, `grace_s`, SIGKILL: `fault_relay_group`), so nothing a verb launched, its
+    `srun` client above all, outlives it; what a verb that returned left in its group is ended too, and `on_stragglers`
+    called."""
     env = clean_environment(environ)
 
     def run(argv: Sequence[str], *, timeout_s: float) -> CommandResult:
-        done = subprocess.run(
-            list(argv),
-            capture_output=True,
-            text=True,
-            errors="replace",  # output that is not UTF-8 is still an answer, never an error after the verb ran
-            timeout=timeout_s,
-            check=False,
-            env=env,
-            stdin=subprocess.DEVNULL,
-        )
-        return CommandResult(done.returncode, done.stdout, done.stderr)
+        return run_in_group(argv, env=env, timeout_s=timeout_s, grace_s=grace_s, on_stragglers=on_stragglers)
 
     return run
 
@@ -324,14 +355,25 @@ class Relay:
         environ: Mapping[str, str] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
+        watcher: Callable[[Sequence[str], Mapping[str, str]], Any] | None = None,
+        late_window_s: float = LATE_WINDOW_S,
+        late_poll_s: float = LATE_POLL_S,
+        sacct: Sacct | None = None,
     ) -> None:
         environ = dict(os.environ if environ is None else environ)
         named = sorted(name for name in environ if SECRET_NAME.search(name))
         if named:  # names only: never a value
             raise PermissionError(f"the relay refuses to run with a secret-like name in its environment: {named}")
         self.root, self.nonce = Path(root), uuid.uuid4().hex
-        self._verbs = VerbCommand(prefix, runner or run_clean(environ))
+        self._prefix = list(prefix)
+        self._left_behind = False  # the verb now running left a child in its group, which the runner ended
+        self._verbs = VerbCommand(prefix, runner or run_clean(environ, on_stragglers=self._note_stragglers))
         self._clock, self._wall = clock, wall
+        self._env = clean_environment(environ)  # what the verbs, and the watch, are run with
+        self._watcher = watcher or spawn_watch  # (argv, env) -> a process handle with `poll()`
+        self._late_window_s, self._late_poll_s = late_window_s, late_poll_s
+        self._sacct: Sacct = sacct or self._run_sacct  # (argv, bound) -> the accounting call's end
+        self._watches: list[tuple[str, Any]] = []  # each watch started: its request id and handle, until it ends
         self._beats = 0
         self._taken: set[str] = set()  # every request id this relay has claimed: one never runs twice
         self._stop = threading.Event()
@@ -392,6 +434,7 @@ class Relay:
                     )
             with contextlib.suppress(OSError):
                 claimed.unlink()
+        self._reap_watches()
         return taken
 
     def _refusal(self, record: dict[str, Any] | None, key: str | None) -> str | None:
@@ -434,15 +477,115 @@ class Relay:
         if left < MIN_RUN_S:  # too late to run and answer: refused, so nothing is started and killed at once
             return {"refused": "expired"}
         bound = min(float(record["bound_s"]), left)
+        assert key is not None  # `_refusal` holds it
+        tag, self._left_behind = step_tag(self.nonce, key), False
+        launched = self._launch_of(request.service) if request.verb == "start" else None
+        issued, began, why = self._wall(), self._clock(), None
         try:
-            done = self._verbs(request, timeout_s=bound)
+            done = self._verbs(request, timeout_s=bound, step_tag=tag)
+            answer: dict[str, Any] = {
+                "returncode": done.returncode,
+                "stdout": done.stdout[:OUTPUT_CAP],
+                "stderr": done.stderr[:OUTPUT_CAP],
+            }
         except subprocess.TimeoutExpired:
-            return {"timed_out": True}
+            why, answer = "timed_out", {"timed_out": True}
         except OSError:  # the verb's process could not be started
             return {"refused": "not_run"}
         except Exception:  # anything else once the verb may have run: its outcome is unknown, never "not run"
-            return {"timed_out": True}
-        return {"returncode": done.returncode, "stdout": done.stdout[:OUTPUT_CAP], "stderr": done.stderr[:OUTPUT_CAP]}
+            why, answer = "unknown", {"timed_out": True}
+        answered, elapsed = self._wall(), self._clock() - began
+        if why is None and self._left_behind:  # it ended with an srun still in its group, now ended
+            why = "left_behind"
+        if why is None and elapsed >= LATE_ELAPSED_S:  # hpcfed may have ended an srun whose step the controller holds
+            why = "own_bound"
+        if why is not None:
+            self._watch(request, key, tag, why, answered)  # before the answer: the guard is in place when it is read
+        timing = self._timing(record, request, tag, issued, answered, launched)
+        return answer if timing is None else {**answer, "timing": timing}
+
+    def _state(self) -> dict[str, Any]:
+        return _read(self.root / STATE_FILE) or {}
+
+    def _launch_of(self, service: str) -> tuple[Any, str] | None:
+        """The service's launch count and the name of the service step the state records for it, or None."""
+        entry = (self._state().get("services") or {}).get(service)
+        step = entry.get("step") if isinstance(entry, dict) else None
+        name = step.get("name") if isinstance(step, dict) else None
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", name):
+            return None
+        return entry.get("launch"), name
+
+    def _run_sacct(self, argv: Sequence[str], bound_s: float) -> CommandResult:
+        return run_in_group(argv, env=self._env, timeout_s=bound_s, grace_s=SACCT_GRACE_S)
+
+    def _timing(
+        self,
+        record: dict[str, Any],
+        request: Request,
+        tag: str,
+        issued: float,
+        answered: float,
+        launched: tuple[Any, str] | None,
+    ) -> dict[str, Any] | None:
+        """The answer's `timing` (`fault_relay_timing`): one accounting call, within what is left of the client's wait.
+        Never raises: a timing that could not be made is None, and the answer is the verb's own."""
+        try:
+            state = self._state()
+            allocation = state.get("allocation") if isinstance(state.get("allocation"), dict) else {}
+            prefix, job = federation_of(self.root), allocation.get("job")
+            now = self._launch_of(request.service) if request.verb == "start" else None
+            service_step = now[1] if now is not None and launched is not None and now[0] != launched[0] else None
+            names = step_names(prefix or "", request.service, request.verb, tag, service_step)
+            budget = min(SACCT_TIMEOUT_S, float(record["deadline"]) - self._wall() - POLL_S - SACCT_GRACE_S)
+            return read_timing(
+                self._sacct,
+                job=job if isinstance(job, str) else None,
+                names=names if prefix else [],
+                issued=issued,
+                answered=answered,
+                budget_s=budget,
+            )
+        except Exception:  # a timing never fails a verb
+            return None
+
+    def _note_stragglers(self) -> None:
+        self._left_behind = True
+
+    def _watch(self, request: Request, key: str, tag: str, why: str, since: float | None = None) -> None:
+        """Journal that a watch is owed for the verb's steps (`why`: it timed out, ended unknown, or left an srun in
+        its group), then start it. It never raises: a journal that cannot be written never keeps the watch from starting
+        (the watch is the guard), and a watch that cannot be started is journalled."""
+        journal = journal_path(self.root)
+        event = {"request": key, "verb": request.verb, "service": request.service, "tag": tag, "why": why}
+        with contextlib.suppress(OSError):
+            record(journal, {"event": "watch_opened", **event, "window_s": self._late_window_s, "wall": self._wall()})
+        argv = watch_argv(
+            self._prefix, tag, request.verb, request.service, key, self._late_window_s, self._late_poll_s, since
+        )
+        try:
+            handle = self._watcher(argv, self._env)
+        except Exception as error:  # no process to start it with, say: said in the journal, the answer unchanged
+            with contextlib.suppress(OSError):
+                record(journal, {"event": "watch_failed", **event, "error": type(error).__name__, "wall": self._wall()})
+            return
+        self._watches.append((key, handle))
+
+    def _reap_watches(self) -> None:
+        """Collect the watches that ended; one that failed (a nonzero status) is journalled, since it may have ended
+        with no closing line of its own. A running watch is never waited for."""
+        running = []
+        for key, handle in self._watches:
+            status = handle.poll()
+            if status is None:
+                running.append((key, handle))
+            elif status != 0:
+                with contextlib.suppress(OSError):
+                    record(
+                        journal_path(self.root),
+                        {"event": "watch_ended", "request": key, "returncode": status, "wall": self._wall()},
+                    )
+        self._watches = running
 
     def stop(self) -> None:
         self._stop.set()
@@ -468,25 +611,52 @@ class Relay:
             beater.join(timeout=BEAT_S + 1)
 
 
+def _serve_options(words: Sequence[str]) -> dict[str, float] | None:
+    """The optional `--late-window-s N` and `--late-poll-s N` of `serve` (tests and slots that shorten the watch), as
+    `Relay`'s keywords; None for anything else, so a typo is a usage error and never a default silently."""
+    names = {"--late-window-s": "late_window_s", "--late-poll-s": "late_poll_s"}
+    found: dict[str, float] = {}
+    if len(words) % 2:
+        return None
+    for flag, value in zip(words[::2], words[1::2], strict=True):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        top = 60 if flag == "--late-poll-s" else 3600  # hpcfed's own bounds for the watch
+        if flag not in names or names[flag] in found or not math.isfinite(number) or not 0 < number <= top:
+            return None
+        found[names[flag]] = number
+    return found
+
+
 def main(argv: Sequence[str]) -> int:
-    """`serve --root R -- <prefix...>`: run the relay; `alive --root R`: exit 0 when a live relay beats (its record on
-    stdout), 1 otherwise; `stop --root R`: SIGTERM to the relay that beats, then wait for its heartbeat to go."""
+    """`serve --root R [--late-window-s N] [--late-poll-s N] -- <prefix...>`: run the relay; `alive --root R`: exit 0
+    when a live relay beats (its record on stdout), 1 otherwise; `stop --root R`: SIGTERM to the relay that beats,
+    then wait for its heartbeat to go."""
     args = list(argv)
     if len(args) >= 3 and args[1] == "--root":
         verb, root = args[0], Path(args[2])
-        if verb == "serve" and len(args) > 4 and args[3] == "--":
-            relay = Relay(root, args[4:])
-            for signum in (signal.SIGTERM, signal.SIGINT):
-                signal.signal(signum, lambda *_: relay.stop())
-            relay.serve()
-            return 0
+        if verb == "serve" and "--" in args[3:] and len(args) > args.index("--", 3) + 1:
+            cut = args.index("--", 3)
+            options = _serve_options(args[3:cut])
+            if options is not None:
+                relay = Relay(root, args[cut + 1 :], **options)
+                for signum in (signal.SIGTERM, signal.SIGINT):
+                    signal.signal(signum, lambda *_: relay.stop())
+                relay.serve()
+                return 0
         if verb == "alive" and len(args) == 3:
             live = beat(root)
             print(json.dumps({"alive": live is not None, "nonce": None if live is None else live["nonce"]}))
             return 0 if live is not None else 1
         if verb == "stop" and len(args) == 3:
             return _stop(root)
-    print("usage: fault_relay serve --root R -- <prefix...> | alive --root R | stop --root R", file=sys.stderr)
+    print(
+        "usage: fault_relay serve --root R [--late-window-s N] [--late-poll-s N] -- <prefix...> | alive --root R | "
+        "stop --root R",
+        file=sys.stderr,
+    )
     return 2
 
 

@@ -35,6 +35,15 @@ status that is not ready, one that carries none, a status that cannot be read, a
 records it beside `ready_after_s` in the restore. A status without it is no figure, never 0: only the node's own
 measurement is.
 
+**Where the time went (O58).** The relay reads the accounting after each verb and puts, in its answer, the time from
+the verb's issue to each of its steps' accounted Start and from the answer to each End (`fault_relay_timing`), so a
+controller stall during a scored batch is the site's in the record. The driver keeps the checked reading of each kind
+of request (`last_timing`: `stop`, `start`, `status`, `ping`, `restart_link`; the latest, and none for a request that
+was refused or never sent), from an answer and from a request that timed out too, and the injector journals it where
+the verb's own evidence goes: a stop's with the stop's evidence (`stop.timing`), a start's in the restore
+(`start_timing`), a link restart's in the heal's action (`timing`). A figure the relay could not read is None with its
+reason, never a 0, and no timing fails or changes a verb.
+
 **The stop's own bound.** A service's stop waits for its graceful end, then the kill, then the step's end: up to
 `stop_seconds` plus about 90 s, 140 s with the layout's default of 50 s (DESIGN.md section 7 (e)), and the stop's
 control step may wait to start before that (`step_launch_wait_s`, 240 s). The driver bounds `stop` by `stop_timeout_s`
@@ -85,6 +94,7 @@ from expcore_onedata.compose import (
     link_result,
     run_command,
 )
+from expcore_onedata.fault_relay_late import STEP_TAG_OPTION
 
 if TYPE_CHECKING:  # the heal's module imports the Compose driver's, which this one shares
     from expcore_onedata.fault_matrix import LinkMatrix
@@ -204,14 +214,17 @@ class VerbCommand:
             raise ValueError("the verbs' command is a non-empty argv")
         self._prefix, self._runner = list(prefix), runner
 
-    def argv(self, request: Request) -> list[str]:
+    def argv(self, request: Request, step_tag: str | None = None) -> list[str]:
+        """The verb's argv; with `step_tag` (the relay's), `--step-tag <tag>` follows the prefix, so the verb names the
+        control steps it launches by it (`fault_relay_late`)."""
+        head = self._prefix if step_tag is None else [*self._prefix, STEP_TAG_OPTION, step_tag]
         if request.verb == "exec":
             assert request.command is not None  # `Request` holds it for an exec
-            return [*self._prefix, "exec", request.service, "--", *EXEC_COMMANDS[request.command]]
-        return [*self._prefix, request.verb, request.service]
+            return [*head, "exec", request.service, "--", *EXEC_COMMANDS[request.command]]
+        return [*head, request.verb, request.service]
 
-    def __call__(self, request: Request, *, timeout_s: float) -> CommandResult:
-        return self._runner(self.argv(request), timeout_s=timeout_s)
+    def __call__(self, request: Request, *, timeout_s: float, step_tag: str | None = None) -> CommandResult:
+        return self._runner(self.argv(request, step_tag), timeout_s=timeout_s)
 
 
 class HpcDriver:
@@ -243,12 +256,31 @@ class HpcDriver:
         self.last_domain_wait_s: float | None = (
             None  # the latest ready status's `domain_wait_s`, if any (the docstring)
         )
+        self.last_timing: dict[str, dict[str, Any]] = {}  # the latest checked timing of each kind of request
+
+    def _send(self, request: Request, timeout_s: float) -> CommandResult:
+        """Send a request through the transport and keep the relay's timing of it (`last_timing`), from its answer or
+        from the timeout that was its answer; every exception goes on as it came."""
+        kind = request.command if request.verb == "exec" and request.command else request.verb
+        self.last_timing.pop(kind, None)  # a request that never ran leaves no earlier request's figures
+        try:
+            done = self._transport(request, timeout_s=timeout_s)
+        except subprocess.TimeoutExpired as error:
+            self._keep_timing(kind, getattr(error, "timing", None))
+            raise
+        self._keep_timing(kind, getattr(done, "timing", None))
+        return done
+
+    def _keep_timing(self, kind: str, timing: Any) -> None:
+        kept = timing_evidence(timing)
+        if kept is not None:
+            self.last_timing[kind] = kept
 
     def _ask(self, request: Request, step: str, timeout_s: float) -> CommandResult:
         """Send a request; raise DriverError, naming only the step, when it is refused, cannot be sent, has no answer in
         its bound, or its command failed."""
         try:
-            done = self._transport(request, timeout_s=timeout_s)
+            done = self._send(request, timeout_s)
         except subprocess.TimeoutExpired:
             raise DriverError(f"the command to {step} did not finish within {timeout_s:g} s") from None
         except OSError as error:
@@ -264,7 +296,7 @@ class HpcDriver:
         self.last_stop = None
         step, request = "stop the service", Request("stop", service)
         try:
-            done = self._transport(request, timeout_s=self._stop_timeout_s)
+            done = self._send(request, self._stop_timeout_s)
         except subprocess.TimeoutExpired:
             raise DriverError(f"the command to {step} did not finish within {self._stop_timeout_s:g} s") from None
         except OSError as error:
@@ -300,7 +332,7 @@ class HpcDriver:
     def _exec(self, service: str, command: str, timeout_s: float) -> CommandResult:
         """Run one allowed command inside the service; raise `subprocess.TimeoutExpired` or OSError as the transport
         does, and DriverError when the request is refused before anything was sent."""
-        return self._transport(Request("exec", service, command), timeout_s=timeout_s)
+        return self._send(Request("exec", service, command), timeout_s)
 
     def ping(self, service: str) -> bool:
         """Whether the op-worker node in the service answers `pong` to its runner's `ping`. A command that fails,
@@ -384,6 +416,60 @@ def parse_status(stdout: str) -> Observation:
         raise unreadable
     health = None if ready is None else ("healthy" if ready else "starting")
     return Observation(record["running"], identity, health)
+
+
+_TIMING_WORDS = ("status", "mounts", "stop", "exec", "run")
+_TIMING_ID = re.compile(r"[0-9]{1,12}(?:\+[0-9]{1,6})?\.[0-9]{1,9}")
+_TIMING_REASON = re.compile(r"[A-Za-z0-9_]{1,60}")
+_TIMING_FIGURES = ("start_after_issue_s", "end_after_answer_s")
+
+
+def _seconds_figure(value: Any) -> float | None:
+    """A finite number (it may be negative: a step ended before the answer), rounded to the millisecond, else None."""
+    ok = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    return round(float(value), 3) if ok else None
+
+
+def timing_evidence(timing: Any) -> dict[str, Any] | None:
+    """The relay's `timing` of a request (`fault_relay_timing`), checked, as the injector journals it: how the
+    accounting was read (`accounting`, and `reason` when it was not), and for each of up to eight steps its word, id
+    and state and the two figures (`start_after_issue_s`, `end_after_answer_s`: finite numbers or None) with, for each
+    that is None, why. Names are left out (they carry the allocation's). None when there is nothing of the sort."""
+    if not isinstance(timing, Mapping) or timing.get("accounting") not in ("read", "unreadable", "skipped"):
+        return None
+    if not isinstance(timing.get("steps"), list):
+        return None
+    reason = timing.get("reason")
+    steps = []
+    for raw in (timing.get("steps") if isinstance(timing.get("steps"), list) else [])[:8]:
+        if not isinstance(raw, Mapping) or raw.get("word") not in _TIMING_WORDS:
+            continue
+        unknown = raw.get("unknown") if isinstance(raw.get("unknown"), Mapping) else {}
+        step: dict[str, Any] = {
+            "word": raw["word"],
+            "id": raw["id"] if isinstance(raw.get("id"), str) and _TIMING_ID.fullmatch(raw["id"]) else None,
+            "state": raw["state"]
+            if isinstance(raw.get("state"), str) and re.fullmatch(r"[A-Z_]{1,32}", raw["state"])
+            else None,
+        }
+        for figure in _TIMING_FIGURES:
+            step[figure] = _seconds_figure(raw.get(figure))
+            why = unknown.get(figure)
+            if step[figure] is None:
+                step.setdefault("unknown", {})[figure] = (
+                    why if isinstance(why, str) and _TIMING_REASON.fullmatch(why) else "unknown"
+                )
+        steps.append(step)
+    return {
+        "accounting": timing["accounting"],
+        "reason": reason if isinstance(reason, str) and _TIMING_REASON.fullmatch(reason) else None,
+        "resolution_s": 1,
+        # the verb's issue and its answer (epoch seconds): a later step's first figure counts from the issue, so it
+        # includes what the verb did before launching it, which these two let a reader take out
+        "issued_wall": _seconds_figure(timing.get("issued_wall")),
+        "answered_wall": _seconds_figure(timing.get("answered_wall")),
+        "steps": steps,
+    }
 
 
 def _duration(value: Any) -> float | None:
