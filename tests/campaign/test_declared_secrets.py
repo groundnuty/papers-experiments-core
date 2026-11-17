@@ -363,3 +363,30 @@ def test_c40_the_processs_secrets_stay_redacted_when_record_run_is_given_an_envi
     assert credential not in seen["record"]
     assert credential not in row["diagnostic"]
     assert "[redacted]" in row["diagnostic"]
+
+
+def test_c40_an_undeclared_executor_whose_record_run_has_an_environment_of_its_own_still_redacts_the_processs_secrets(
+    tmp_path, monkeypatch
+):
+    """C40: `record_attempt` installs on the log a redactor built from the environment `record_run` is given, and says the
+    context is whole; the diagnostic of an error raised after it is redacted with the runner's own base too (the
+    process, the models, the registry), so it is never redacted against a partial list, declared or not."""
+    credential = "process_credential_5678"
+    monkeypatch.setenv("EXAMPLE_API_KEY", credential)
+
+    async def executor(request):
+        script = [ModelTurn("done", [], 10, 5, "stop", 0.0)]
+        request.backend.use(script)
+        config = FakeExecutor().config
+        await record_run(request, [], "s", "u", config, code=dict(CODE), environ={"UNRELATED": "nothing"})
+        raise InfraError("sandbox", "post-run check refused", diagnostic={"seen": f"it quoted {credential}"})
+
+    with build(
+        tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings_for(max_attempts=1)
+    ) as scheduler:
+        scheduler.run()
+        row = dict(scheduler.store.q("SELECT * FROM attempts ORDER BY id")[0])
+        marker = read_marker(Path(row["run_dir"]), row["run_key"], row["id"])
+        export = export_run_state(scheduler.store)
+    assert json.loads(row["diagnostic"])["diagnostic"] == {"seen": "it quoted [redacted]"}
+    assert credential not in json.dumps(where_it_is_kept(row, marker, export))
