@@ -329,8 +329,9 @@ class PostRunHealth:
     not cost the run its record: its type is logged, the take is kept as failed, and `finish` raises it again, which
     `finish_instruments` records as `{"ok": False, "error": ...}` (unknown), never a fresh reading after the restore.
     `take` called once the executor has returned is within the same contract as any check: the fault gate explains
-    nothing then, and the reading is unread. The state is per run: `start` clears a take whose `finish` never ran, so
-    an instance that serves run after run never hands one run another's reading; give each concurrent run its own."""
+    nothing then, and the reading is unread. The state is per run: `start` clears a take whose `finish` never ran, and a
+    take still reading when the next run begins drops its answer, so an instance that serves run after run never hands
+    one run another's reading; give each concurrent run its own."""
 
     namespace = NAMESPACE
 
@@ -341,11 +342,14 @@ class PostRunHealth:
         self._called = False  # `take` was called for this run: `finish` never makes a call of its own
         self._kept: Mapping[str, Any] | None = None  # the snapshot the take made
         self._failure: Exception | None = None  # what the check raised inside the take
+        self._run = 0  # which run `start` began last: a take publishes its result only into the run it began in
 
     def start(self, identity: Mapping[str, Any]) -> None:
-        """Nothing is read before the run; a take an earlier run made and never finished is dropped."""
+        """Nothing is read before the run; a take an earlier run made and never finished is dropped, and one still
+        reading is left to drop its own answer when it comes."""
         with self._lock:
             self._called, self._kept, self._failure = False, None, None
+            self._run += 1
 
     def take(self) -> None:
         """Make the run's one call now, inside its own open injection, and keep its snapshot for `finish` to return.
@@ -359,11 +363,19 @@ class PostRunHealth:
                     "inside the run's own injection"
                 )
             self._called = True
+            run = self._run
+        kept: Mapping[str, Any] | None = None
+        failure: Exception | None = None
         try:
-            self._kept = self._snapshot()
+            kept = self._snapshot()
         except Exception as error:  # `finish` raises it again, where the record keeps it as a failed finish
             log.warning("the %s take failed (%s): finish records it as failed", self.namespace, type(error).__name__)
-            self._failure = error
+            failure = error
+        with self._lock:
+            if run != self._run:  # the run was over (`start` began another) while the check was reading: not its own
+                log.warning("the %s take of an earlier run finished after its run: dropped", self.namespace)
+                return
+            self._kept, self._failure = kept, failure
 
     def finish(self) -> Mapping[str, Any]:
         """The snapshot `take` kept (and forgets it), or, when `take` was never called, one call of the check now."""

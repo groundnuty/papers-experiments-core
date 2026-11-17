@@ -1172,3 +1172,30 @@ def test_o90_start_clears_a_take_whose_finish_never_ran_so_it_is_never_the_next_
     instrument.take()
     assert instrument.finish()["ok"] is False
     assert check.calls == 3
+
+
+def test_o90_a_take_that_outlives_its_run_never_overwrites_the_next_runs_snapshot():
+    """O90: run A's take is still inside its check when `start` begins run B on the same instance and B takes: when A's
+    check answers, late, A's snapshot is dropped, and B's `finish` returns B's own (a failed verdict), never A's."""
+    released, entered, calls = threading.Event(), threading.Event(), []
+
+    def check():
+        calls.append(1)
+        if len(calls) == 1:
+            entered.set()
+            assert released.wait(30)
+            return Health(True, "the first run's, late")
+        return Health(False, "the second run's")
+
+    instrument = PostRunHealth(check)
+    instrument.start(RUN)
+    first = threading.Thread(target=instrument.take, name="first-take")
+    first.start()
+    assert entered.wait(30)
+    instrument.start(RUN)  # the next run, while the first run's take is still reading
+    instrument.take()
+    released.set()
+    first.join(30)
+    assert not first.is_alive()
+    assert instrument.finish()["ok"] is False
+    assert len(calls) == 2
