@@ -76,6 +76,7 @@ from fedpki import (
 from fedreplicas import evict_replicas
 from fedrest import Rest
 from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, load_spec
+from fedtools import check_artifacts, study_artifacts_from
 
 ZONE_TIMEOUT_S = 1500.0
 PROVIDER_TIMEOUT_S = 1800.0
@@ -210,6 +211,7 @@ def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
     for space in spec.spaces:
         if spec.members(space.name):
             boot.ensure_members(space.name)
+    boot.audit_slot_users()  # an existing slot user is verified and recorded matched, never changed (O83)
     timer.mark("spaces")
     boot.wait_import(IMPORT_TIMEOUT_S)
     timer.mark("import")
@@ -227,6 +229,9 @@ def up(layout: Layout) -> str:
             "federation that is up writes and removes no baseline file, so they would stay where an agent can read "
             "them: run reset --clean, which empties a baseline-off space, then up again"
         )
+    study_artifacts = study_artifacts_from(os.environ)  # where a layout's tool server finds its files (O83)
+    check_artifacts(layout.spec, study_artifacts, layout.root)  # before anything is brought up: it can run from them
+    given = (study_artifacts,) if study_artifacts else ()  # without a directory the facts are written as they were
     fresh = not containers
     if fresh:
         require_ports_free(layout.spec)
@@ -240,7 +245,7 @@ def up(layout: Layout) -> str:
         if not layout.facts.exists():
             Content(boot).reset(TRANSFER_TIMEOUT_S)
             timer.mark("baseline")
-        written = write_facts(layout, boot)
+        written = write_facts(layout, boot, *given)
         links = check_after_up(layout, dict(boot.ids.spaces))  # last: not ready until every pair transfers (#221)
         timer.mark("links")
     finally:
@@ -262,6 +267,9 @@ def reset_clean(layout: Layout) -> str:
     require_resettable(layout)
     timer = Timer()
     require_up(layout)
+    study_artifacts = study_artifacts_from(os.environ)
+    check_artifacts(layout.spec, study_artifacts, layout.root)
+    given = (study_artifacts,) if study_artifacts else ()
     rest = Rest(layout.ca_pem)
     try:
         boot = Bootstrap(rest, layout)
@@ -270,7 +278,7 @@ def reset_clean(layout: Layout) -> str:
         timer.mark(f"baseline (removed {sum(removed.values())} entries)")
         for leftover in layout.journal.iterdir():
             leftover.unlink()
-        write_facts(layout, boot)
+        write_facts(layout, boot, *given)
     finally:
         rest.close()
     return timer.summary("reset --clean")
