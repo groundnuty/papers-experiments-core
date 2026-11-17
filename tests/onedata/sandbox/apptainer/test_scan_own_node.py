@@ -128,13 +128,12 @@ def test_o73_a_resolver_that_fails_is_unread_by_its_reason_and_the_host_name_sta
         (("198.51.100.9", [], []), ("cn-own-n01", "198.51.100.9")),
     ],
 )
-def test_o73_an_answer_with_no_qualified_name_says_so_in_unread(monkeypatch, answer, names):
-    """O73: a resolver that gives the host name no dotted name (a hosts file with the short name alone) leaves the one
-    label form scanned, which never matches the node's name followed by a domain. `getfqdn` returned the bare host
-    name then without an error, so the facts said nothing was missed; the reason is `fqdn_unqualified`. An address is
-    no qualified name."""
+def test_o73_the_names_of_an_answer_with_no_domain_are_read_as_they_are(monkeypatch, answer, names):
+    """O73: a resolver that gives the host name no dotted name (a hosts file with the short name alone) answers what it
+    has, without an error, as `getfqdn` did; that the scan then holds a one-label name is said by the run's facts
+    (`fqdn_unqualified`, below), where the names the scan keeps are known."""
     _system(monkeypatch, "cn-own-n01", answer)
-    assert LocalNode().own_names() == OwnNames(names, ("fqdn_unqualified",))
+    assert LocalNode().own_names() == OwnNames(names)
 
 
 def test_o73_a_host_name_that_is_already_qualified_leaves_nothing_unread(monkeypatch):
@@ -201,6 +200,12 @@ def test_o73_a_lookup_that_answers_in_time_is_read_whole_and_a_thread_that_ends_
 def test_o73_a_qualified_name_holds_a_domain_and_is_no_address(name, qualified):
     """O73: what makes a node's name read as a fully qualified one."""
     assert cellhost.qualified(name) is qualified
+
+
+@pytest.mark.parametrize("name", ["localhost4", "localhost4.localdomain4", "localhost6.localdomain6", "ip6-localhost"])
+def test_o73_the_loopback_aliases_of_a_hosts_file_are_nobody_s_name(name):
+    """O73: the aliases a stock hosts file gives the loopback addresses would count false hits, as `localhost` would."""
+    assert cellhost.scan_names((), (name,)) == ()
 
 
 def test_o73_the_gate_scans_for_the_agent_node_after_the_federation_s_nodes(node, tmp_path):
@@ -284,6 +289,41 @@ def test_o73_the_node_is_asked_once_for_its_names_however_the_start_goes(node, t
     """O73: one lookup serves the refusal check and the gate's list (a lookup is bounded, never repeated)."""
     _scanned(node, tmp_path)
     assert node.own_asked == 1
+
+
+@pytest.mark.parametrize(
+    ("own", "unread"),
+    [
+        ((OWN_HOST,), ["fqdn_unqualified"]),
+        ((OWN_HOST, "198.51.100.9"), ["fqdn_unqualified"]),
+        (("localhost", "localhost.localdomain", "localhost4.localdomain4", OWN_HOST), ["fqdn_unqualified"]),
+        ((OWN_HOST, "ip6-localhost", "localhost6.localdomain6"), ["fqdn_unqualified"]),
+        ((OWN_HOST, make_spec("via-gate").provider.host), ["fqdn_unqualified"]),
+        ((OWN_HOST, OWN_FQDN), []),
+        ((OWN_FQDN,), []),
+        ((OWN_HOST, "localhost.localdomain", OWN_FQDN), []),
+    ],
+)
+def test_o73_the_facts_say_when_no_name_the_scan_keeps_has_a_domain(node, tmp_path, own, unread):
+    """O73: `fqdn_unqualified` is decided over the names the scan keeps: a loopback alias with a domain, a name the
+    federation declares or an address is no qualified name of the node, so a run whose only dotted name is one of those
+    scans a one-label form that never matches the node's name followed by its domain, and the facts say so."""
+    node.own_hosts = own
+    box = start(node, make_settings(tmp_path), _spec())
+    try:
+        assert box.metadata()["infrastructure_facts"]["own_node_scan"]["unread"] == unread
+    finally:
+        box.stop()
+
+
+def test_o73_a_reason_the_node_gave_is_not_joined_by_another(node, tmp_path):
+    """O73: a lookup that timed out says `fqdn_timeout` alone: the host name's missing domain is that reason's."""
+    node.own_hosts, node.own_unread = (OWN_HOST,), ("fqdn_timeout",)
+    box = start(node, make_settings(tmp_path), _spec())
+    try:
+        assert box.metadata()["infrastructure_facts"]["own_node_scan"]["unread"] == ["fqdn_timeout"]
+    finally:
+        box.stop()
 
 
 def test_o73_a_node_whose_resolver_gives_no_qualified_name_says_so_in_the_run_s_facts(node, tmp_path, monkeypatch):
