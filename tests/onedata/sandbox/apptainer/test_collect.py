@@ -2,6 +2,7 @@
 and the evidence scanned for the token; the run's start marked at the gate."""
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -160,6 +161,25 @@ def test_o71_an_entry_the_helper_cannot_read_is_the_agents_refusal_never_a_set_a
         assert done["outputs"] == {"out": False}
         assert done["refused_output"]["by_what"] == {copyout.UNREADABLE: 2}
         assert not (tmp_path / "out" / "work").exists()
+    finally:
+        box.stop()
+
+
+@needs_unprivileged
+def test_o71_a_gate_log_the_helper_cannot_read_is_infrastructure_and_is_never_restored(
+    node, settings, tmp_path, unlocked_afterwards
+):
+    """O71: the gate's own log is the harness's, not the agent's: where it cannot be read the collection is an
+    infrastructure failure, set aside as before, and its mode is not given back (the helper's restore is only for
+    the agent's /work)."""
+    box = start(node, settings)
+    try:
+        log = box.dir / "gate" / "requests.jsonl"
+        lock(log)
+        with pytest.raises(InfraError) as failed:
+            box.collect(tmp_path / "out")
+        assert failed.value.kind == "output_collection"
+        assert stat.S_IMODE(log.lstat().st_mode) == 0
     finally:
         box.stop()
 

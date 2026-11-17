@@ -10,12 +10,14 @@ ever followed, on the way to an output or in it, and nothing is resolved by path
 NUL, as `find -printf '%y %n %D:%i %s %d %f\\0'` writes it; it does not descend into a directory of another file system,
 nor into one whose path from the root is already longer than `max_path_bytes` (everything below it would be refused).
 An entry the agent locked (it owns everything under `/work` and can clear the owner's bits of a file or directory) is
-not left to fail the run's collection: where the helper's own uid owns a file or directory that lacks the owner's read
-bit (a directory also its search bit) it gives that bit back, nothing else, through a descriptor of the entry opened
-without following a link and checked against what was listed, on the listed file system only. An entry the helper still
-cannot read, its root included, is listed as kind `x` and not descended into: the caller refuses it as the agent's own
-unreadable output (O71). The copy then finds every listed object readable. As root, the helper reads whatever the modes
-say and changes none.
+not left to fail the run's collection, when the request sets `restore_locked` (only the collection of the agent's
+`/work` does: the copy of a file of the harness's own never restores anything). Where the helper's own uid owns a
+file or directory that lacks the owner's read bit (a directory also its search bit) it gives that bit back, nothing
+else, through a descriptor of the entry opened without following a link and checked against what was listed, on the
+listed file system only, and never to a file with another link (a mode belongs to the inode, which another name may
+hold outside the listed tree). An entry the helper cannot read, its root included, is listed as kind `x` and not
+descended into: the caller refuses it as the agent's own unreadable output (O71). The copy then finds every listed
+object readable. As root, the helper reads whatever the modes say and changes none.
 
 `copy`: one output, from `root` through the names `parts`, to the new path `dest`. Every directory on the way and every
 entry copied must be the object the listing showed: its device, inode, kind and size are compared with `ancestors`
@@ -65,10 +67,11 @@ def more_descriptors():
 
 def listing(request, out):
     path = request["root"]
+    restoring = bool(request.get("restore_locked"))
     first = os.stat(path, follow_symlinks=False)
     name = os.fsencode(os.path.basename(path.rstrip("/")) or "/")
     limit = int(request["max_path_bytes"])
-    if not readable(None, path, first, first.st_dev):
+    if not readable(None, path, first, first.st_dev, restoring):
         write(out, first, 0, name, UNREADABLE)
         return
     try:
@@ -78,7 +81,7 @@ def listing(request, out):
         return
     info = os.fstat(root)
     write(out, info, 0, name)
-    walk(root, info.st_dev, 1, 0, limit, out)
+    walk(root, info.st_dev, 1, 0, limit, out, restoring)
 
 
 def write(out, info, depth, name, kind=None):
@@ -86,18 +89,21 @@ def write(out, info, depth, name, kind=None):
     out.write(head.encode() + name + b"\0")
 
 
-def readable(directory, name, info, device):
+def readable(directory, name, info, device, restoring):
     """Whether the helper can read the file or directory `name` of `directory` (the root's path, `directory` None),
-    which `info` describes, after giving back what the agent cleared of an entry the helper's own uid owns: its owner's
-    read bit, a directory's search bit too (`restore`). Anything but a file or a directory, an entry of another file
-    system and every entry as root are not this function's to judge: True. An entry of another uid is not the helper's
-    to change: a file is tried, and a directory's open says."""
+    which `info` describes. With `restoring`, an entry the helper's own uid owns and that lacks the owner's read bit
+    (a directory's search bit too) first gets it back (`restore`): unless it is a file with another link. Anything but
+    a file or a directory, an entry of another file system and every entry as root are not this function's to judge:
+    True. An entry of another uid is not the helper's to change: a file is tried; a directory is judged by the open
+    that follows (one that opens but cannot be searched is not covered: no agent can make an entry of another uid)."""
     bits = OWNER_BITS.get(stat.S_IFMT(info.st_mode))
     if bits is None or info.st_dev != device or os.geteuid() == 0:
         return True
     if info.st_uid != os.geteuid():
         return stat.S_ISDIR(info.st_mode) or opens(directory, name)
-    return info.st_mode & bits == bits or restore(directory, name, info, bits)
+    if info.st_mode & bits == bits:
+        return True
+    return restoring and (stat.S_ISDIR(info.st_mode) or info.st_nlink == 1) and restore(directory, name, info, bits)
 
 
 def opens(directory, name):
@@ -129,14 +135,14 @@ def restore(directory, name, info, bits):
     return True
 
 
-def walk(directory, device, depth, length, limit, out):
+def walk(directory, device, depth, length, limit, out, restoring=False):
     """List a directory's entries, sorted by name, descending into each directory of the same device."""
     for name in sorted(os.listdir(directory), key=os.fsencode):
         raw = os.fsencode(name)
         info = os.stat(name, dir_fd=directory, follow_symlinks=False)
         path = length + bool(length) + len(raw)
         descend = stat.S_ISDIR(info.st_mode) and info.st_dev == device and path <= limit
-        refused = (descend or stat.S_ISREG(info.st_mode)) and not readable(directory, name, info, device)
+        refused = (descend or stat.S_ISREG(info.st_mode)) and not readable(directory, name, info, device, restoring)
         child = None
         if descend and not refused:
             try:
@@ -148,7 +154,7 @@ def walk(directory, device, depth, length, limit, out):
             try:
                 if (os.fstat(child).st_dev, os.fstat(child).st_ino) != (info.st_dev, info.st_ino):
                     raise Mismatch("a directory changed while it was listed")
-                walk(child, device, depth + 1, path, limit, out)
+                walk(child, device, depth + 1, path, limit, out, restoring)
             finally:
                 os.close(child)
 

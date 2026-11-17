@@ -12,7 +12,8 @@ sure nothing of the agent's runs meanwhile: the sandbox freezes the agent's cont
    root's file system: each entry's type, link count, device and inode, size, depth and name, the records ended by
    NUL, so a name may hold any byte but NUL and '/'. Names are matched as the listing spells them. A file or
    directory the agent locked (its owner's bits cleared, `/work` itself too) gets the owner's read bit back from the
-   helper (O71), so it is listed and copied; an entry the helper still cannot read is listed as kind `x`.
+   helper (O71) when the caller asks (`restore_locked`, for the agent's `/work` only), so it is listed and copied; an
+   entry the helper cannot read, or a locked file with another link, is listed as kind `x`.
 2. Each output, with the directories on its way to it, is checked against the listing before anything is copied. A
    symbolic link, a FIFO, socket, device or door, or a directory of another file system, on the way or in it (a
    dangling link too), a regular file with more links than the output holds (a hard link to a file outside it), a
@@ -176,9 +177,11 @@ def _helper(host: HostOps, operation: str, request: Mapping[str, Any], timeout_s
     return host.run(argv, timeout_s, sudo=True, input=json.dumps(dict(request)))
 
 
-def list_tree(host: HostOps, root: Path) -> list[Entry]:
-    """List `root` as root, never following a link or leaving its file system."""
-    done = _helper(host, "list", {"root": str(root), "max_path_bytes": MAX_PATH_BYTES}, LIST_TIMEOUT_S)
+def list_tree(host: HostOps, root: Path, *, restore_locked: bool = False) -> list[Entry]:
+    """List `root` as root, never following a link or leaving its file system. `restore_locked` asks the helper to give
+    the owner's read bit back to what the agent locked (`copyhelper.py`, O71): only for the agent's own `/work`."""
+    request = {"root": str(root), "max_path_bytes": MAX_PATH_BYTES, "restore_locked": restore_locked}
+    done = _helper(host, "list", request, LIST_TIMEOUT_S)
     if done.returncode != 0:
         log.error("listing the sandbox's output failed (%s): %s", done.returncode, describe_stderr(done.stderr))
         raise SandboxError(f"listing the sandbox's output failed ({done.returncode})")
@@ -224,7 +227,7 @@ def check(
             out.present = out.present or entry.depth == k
             problem = _problem(entry, device, lengths[-1])
             if problem:
-                refused.append(Refusal(_shown(names), problem))
+                refused.append(Refusal(_shown(names) or ".", problem))
                 continue
             out.expect[(*entry.key, entry.kind, entry.size)] += 1
             if entry.kind == "d":
@@ -324,7 +327,12 @@ def verify(dst: Path, out: _Output) -> str | None:
 
 
 def copy_tree(
-    host: HostOps, root: Path, copies: Sequence[tuple[str, Path]], *, max_bytes: int | None
+    host: HostOps,
+    root: Path,
+    copies: Sequence[tuple[str, Path]],
+    *,
+    max_bytes: int | None,
+    restore_locked: bool = False,
 ) -> dict[str, dict[str, int] | None]:
     """Copy each output `rel` of `root` to its destination, as root, under the rule of this module.
 
@@ -333,11 +341,12 @@ def copy_tree(
     destination must lie at the same place under the other's. Returns, per output, its files and bytes, or None when it
     is absent; raises `UnsafeOutput` when anything in or on the way to an output cannot be copied safely, before any
     copy is made, `CopyMismatch` when a copy is not what the listing showed (that copy is removed), and `SandboxError`
-    when a command fails."""
+    when a command fails. `restore_locked` is for the agent's own `/work` alone (`list_tree`): the copy of a file of
+    the harness's own never changes a mode."""
     rels = [rel for rel, _ in copies]
     if not host.exists(root):
         return dict.fromkeys(rels)
-    outputs, refused = check(list_tree(host, root), rels, max_bytes=max_bytes)
+    outputs, refused = check(list_tree(host, root, restore_locked=restore_locked), rels, max_bytes=max_bytes)
     if refused:
         raise UnsafeOutput(refused)
     got: dict[str, dict[str, int] | None] = {}

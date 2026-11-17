@@ -665,3 +665,20 @@ def test_o71_an_entry_the_helper_cannot_read_is_the_agents_refusal_never_a_set_a
     assert got["refused_output"]["by_what"] == {copyout.UNREADABLE: 1}
     assert refused_paths(sbx) == [("results/hidden.txt", copyout.UNREADABLE)]
     sbx.stop()
+
+
+@needs_unprivileged
+def test_o71_a_gate_log_the_helper_cannot_read_is_infrastructure_and_is_never_restored(
+    world, tmp_path, unlocked_afterwards
+):
+    """O71, O19: the gate's own log is the harness's, not the agent's: where it cannot be read the collection is an
+    infrastructure failure of kind output_collection as before, and its mode is not given back (only the copy of
+    the agent's /work asks for that)."""
+    sbx = start(world, "via-gate")
+    log = sbx.dir / "gatelog" / "requests.jsonl"
+    lock(log)
+    with pytest.raises(InfraError) as caught:
+        sbx.collect(tmp_path / "evidence")
+    assert caught.value.kind == KIND
+    assert stat.S_IMODE(log.lstat().st_mode) == 0
+    sbx.stop()

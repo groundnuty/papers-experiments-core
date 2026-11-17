@@ -38,10 +38,10 @@ def _helper_module():
     return module
 
 
-def _list(root: Path, source: str | None = None):
+def _list(root: Path, source: str | None = None, *, restore: bool = True):
     done = run_bounded(
         [sys.executable, "-I", "-B", "-c", source or copyout.HELPER.read_text(encoding="utf-8"), "list"], 60,
-        input=json.dumps({"root": str(root), "max_path_bytes": copyout.MAX_PATH_BYTES}),
+        input=json.dumps({"root": str(root), "max_path_bytes": copyout.MAX_PATH_BYTES, "restore_locked": restore}),
     )  # fmt: skip
     return done, (copyout.parse_listing(done.stdout) if done.returncode == 0 else [])
 
@@ -90,7 +90,7 @@ def test_o71_the_locked_outputs_are_copied_with_their_content_and_the_copy_is_th
     """O71: the whole collection through the copy helper: a mode-000 file and directory come out with what they hold."""
     _tree(tmp_path, halves=True)
     dest = tmp_path / "dest"
-    got = copyout.copy_tree(LocalHost(), tmp_path, [("out", dest / "out")], max_bytes=None)
+    got = copyout.copy_tree(LocalHost(), tmp_path, [("out", dest / "out")], max_bytes=None, restore_locked=True)
     assert got["out"] == {"files": len(TEXTS), "bytes": sum(len(t) for t in TEXTS.values())}
     for rel, text in TEXTS.items():
         assert (dest / "out" / rel).read_text(encoding="utf-8") == text
@@ -136,7 +136,7 @@ def test_o71_an_entry_whose_restore_failed_is_listed_unreadable_and_the_run_is_n
     module = _helper_module()
     monkeypatch.setattr(module, "restore", lambda *args: False)
     out = io.BytesIO()
-    module.listing({"root": str(tmp_path), "max_path_bytes": copyout.MAX_PATH_BYTES}, out)
+    module.listing({"root": str(tmp_path), "max_path_bytes": copyout.MAX_PATH_BYTES, "restore_locked": True}, out)
     kinds = {e.name: e.kind for e in copyout.parse_listing(out.getvalue().decode())}
     assert (kinds["a.txt"], kinds["locked"], kinds["nosearch"], kinds["noread"], kinds["ok.txt"]) == (
         "x", "x", "x", "x", "f",
@@ -154,6 +154,8 @@ def test_o71_a_locked_root_that_cannot_be_restored_is_listed_alone_as_unreadable
     assert done.returncode == 0, done.stderr
     assert [(e.name, e.kind) for e in entries] == [("work", "x")]
     _, refused = copyout.check(entries, ["out"], max_bytes=None)
+    assert [(r.path, r.what) for r in refused] == [(".", copyout.UNREADABLE)]
+    _, refused = copyout.check(entries, ["."], max_bytes=None)  # the root itself as the output
     assert [(r.path, r.what) for r in refused] == [(".", copyout.UNREADABLE)]
 
 
@@ -207,7 +209,37 @@ def test_o71_nothing_on_another_file_system_is_restored(tmp_path):
     lock(tmp_path / "f")
     directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        module.walk(directory, -1, 1, 0, copyout.MAX_PATH_BYTES, io.BytesIO())  # the root's device is another
+        module.walk(directory, -1, 1, 0, copyout.MAX_PATH_BYTES, io.BytesIO(), True)  # the root's device is another
     finally:
         os.close(directory)
     assert [stat.S_IMODE(p.lstat().st_mode) for p in (tmp_path / "d", tmp_path / "f")] == [0, 0]
+
+
+def test_o71_nothing_is_restored_unless_the_caller_asks_for_it(tmp_path):
+    """O71: only the collection of the agent's /work asks (`restore_locked`); the copy of the harness's own file, a gate
+    log, never does, so nothing outside /work is ever changed and an unreadable log of the harness's is not papered
+    over. Without the request the entries stay as they are and are listed unreadable."""
+    _tree(tmp_path)
+    done, entries = _list(tmp_path, restore=False)
+    assert done.returncode == 0, done.stderr
+    kinds = {e.name: e.kind for e in entries}
+    assert (kinds["a.txt"], kinds["locked"], kinds["ok.txt"]) == ("x", "x", "f")
+    assert [stat.S_IMODE((tmp_path / "out" / n).lstat().st_mode) for n in ("a.txt", "locked")] == [0, 0]
+    with pytest.raises(copyout.UnsafeOutput) as refused:
+        copyout.copy_tree(LocalHost(), tmp_path, [("out", tmp_path / "dest" / "out")], max_bytes=None)
+    assert sorted(r.what for r in refused.value.refused) == [copyout.UNREADABLE] * 2
+    assert not (tmp_path / "dest").exists()
+
+
+def test_o71_a_locked_file_with_another_link_is_refused_never_restored(tmp_path):
+    """O71: a mode change goes to the inode, so it would reach every name of a file that has another link, which may
+    lie outside /work. The agent cannot make such a link across the /work mount, and a listing refuses the one it can
+    (a hard link to a file outside the output); the helper changes no such inode and lists both names unreadable."""
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "a").write_text("a\n", encoding="utf-8")
+    os.link(tmp_path / "out" / "a", tmp_path / "out" / "b")
+    lock(tmp_path / "out" / "a")
+    done, entries = _list(tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert {e.name: e.kind for e in entries if e.name in ("a", "b")} == {"a": "x", "b": "x"}
+    assert stat.S_IMODE((tmp_path / "out" / "b").lstat().st_mode) == 0

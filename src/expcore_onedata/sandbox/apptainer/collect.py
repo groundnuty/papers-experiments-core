@@ -97,7 +97,9 @@ class Collection:
                 copied = self._image_outputs(dest, outputs)
             else:
                 copies = [(rel, dest / "work" / rel) for rel in outputs]
-                copied = copyout.copy_tree(box.node, box.dir / "work", copies, max_bytes=box.s.limits.work_disk_bytes)
+                copied = copyout.copy_tree(
+                    box.node, box.dir / "work", copies, max_bytes=box.s.limits.work_disk_bytes, restore_locked=True
+                )
         except copyout.UnsafeOutput as unsafe:  # the agent's own doing: for the scorers, never a set-aside
             box._meta["refused_output"] = copyout.record(unsafe.refused)
             return dict.fromkeys(outputs, False)
