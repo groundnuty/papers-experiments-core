@@ -982,6 +982,22 @@ assert exposed == plugin.tools["relay-down"] == plugin.tools["baseline"] != plug
 assert record.prompt["tools_sha256"] != exposed  # what the model was sent: the cap sentence in each description
 ```
 
+### Analysing without the platform
+
+`build` often needs what the run needed: the rendered federation, the site's variables. A batch run on an HPC allocation is analysed after copy-back, where neither exists, and the analysis needs only the scorers. Define `build_analysis(context)` beside `build` in the plugin, with the same context, returning a `StudyPlugin` whose `scorers` are the ones `build` gives (make both from one function, so the two cannot drift). `analyze`, `report`, `regenerate` and the package's check call it when it is there and `build` when it is not; nothing else of what it returns is read, so give it no prompts, tools, executor or backend factory that would need the platform. A run never calls it. Define it when `build` needs the platform and leave it out when `build` runs wherever the analysis does, as the example's does:
+
+```python
+from expcore.study.analysis_plugin import load_analysis_plugin
+
+analysis = load_analysis_plugin(StudyContext(study, {}))
+assert not analysis.from_build_analysis  # the example defines `build` alone, so its analysis is built by `build`
+assert analysis.plugin.scorer_digest() == plugin.scorer_digest()
+```
+
+The campaign records the digest of the run's scorers (their names and versions) in its fingerprint, and `analyze` refuses a `build_analysis` whose scorers have another, naming them: change a scorer's `version` when its behaviour changes, as for any scorer, so that this can see it. A store whose snapshot records no valid digest is refused too, since every fingerprint the core writes holds one. Scorers must come out the same in both builders: build them from values both can read (a file of the study, not the platform's settings), and declare `version` on each, since a scorer without one is versioned by the hash of its file and adding `build_analysis` to that file would change it. With `build_analysis` defined the campaign's scorers are the reference, so a scorer changed since the run is refused unless you ask for the re-score with `--rescore`, below. See [what the plugin may define](interfaces.md#the-study-plugin).
+
+**Correcting a scorer after an HPC batch.** A scorer is found wrong after the batch is copied back, where `build` cannot run. Fix it and change its `version`, in the one function both builders call. The scorer is code, so the replay check is stale: run `check` again on the batch (it builds nothing, so it needs no federation). Then run `analyze my-study --rescore` and `report my-study --rescore`. Without the flag both refuse, naming the scorers. With it the analysis scores every record anew with the corrected scorer, and says so: `scores.json`, the `scorers` of `analysis.json` and the report's `Scorers` line hold the new version, as any re-score does (R13), and `analysis.json` (`rescore`) and one line of the report's Provenance hold the digest the campaign recorded and the digest of the scorers used. They cannot name the scorer that changed, because the campaign records one digest of all its scorers: keep the old version in your own notes or in git. The flag changes nothing when the scorers are the campaign's own, and nothing for a module without `build_analysis`. A store that records no digest is refused with the flag too. Then build the replication package as for any study, with no flag: the decision was recorded at `analyze`, so the package's build, its `make check` and `package-check` honour it, and an anonymised package does too. A differing scorer digest is accepted exactly when the `analysis.json` that ships holds a `rescore` entry equal to what the check works out now, the digests the store recorded and the digest of the scorers in the package's plugin; with no entry, with an entry for other scorers or another store, or with a store that records no digest, the build and the check refuse as `analyze` does, and they never re-ask. The package's outputs are still compared byte for byte with what the records give, so an entry on a batch that re-scored nothing fails as differing, and the package carries the `rescore` entry and the Provenance line, so a reader of it sees the re-score.
+
 ### How pairs become a contrast's input
 
 What a contrast estimates is decided by how its pairs are combined, in stages of plain means:
