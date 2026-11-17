@@ -42,7 +42,16 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from expcore.provenance.gitobjects import git_env
+
+def git_env() -> dict[str, str]:
+    """The process's environment plus `GIT_OPTIONAL_LOCKS=0`, so a read does not rewrite the clone's index (O81).
+
+    The same as `expcore.provenance.gitobjects.git_env()`, written out here because this module must stay standard
+    library only: `hatch_build.py` loads it standalone from the tree being built, in an isolated build environment
+    where the `expcore` package is not importable (`tests/provenance/test_core_identity_standalone.py`).
+    """
+    return {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+
 
 CORE_PROJECT = "papers-experiments-core"
 BUILD_FILE = "_build_identity.json"
