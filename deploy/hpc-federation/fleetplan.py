@@ -42,7 +42,6 @@ SETTINGS = {
 }  # shards.py's keys: no argv
 OPTIONAL = ("snapshot_every_s",)
 SCRIPT = Path(__file__).resolve().parent / "shards.py"
-STUDY = "study.toml"  # in the study's root: its conditions are what `injection` reads
 
 
 def read_settings(path: Path) -> Dict[str, Any]:
@@ -110,6 +109,9 @@ def shortcut_on(root: Path) -> bool:
         return True
     placement = data.get("placement")
     return isinstance(placement, Mapping) and placement.get("reset_shortcut", False) is not False
+
+
+STUDY = "study.toml"  # in the study's root: its conditions are what `injection` reads
 
 
 def declares(condition: Mapping[str, Any], kind: str) -> bool:
