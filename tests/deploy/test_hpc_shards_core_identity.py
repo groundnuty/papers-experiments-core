@@ -137,7 +137,8 @@ def write_manifest(tmp_path: Path, python: Path | str, core_src: Path) -> Path:
     for n, root in enumerate(roots, 1):
         root.mkdir(parents=True)
         state = {"format": "expcore-hpc-federation/1", "allocation": {"job": str(100 + n), "name": f"hpcop-x-{n}"},
-                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked"}  # fmt: skip
+                 "sandbox": {"placement": "het", "node": f"node-s{n}", "het_group": 1}, "phase": "linked",
+                 "data": {"ingested": {}}}  # fmt: skip
         (root / "hpc-federation.json").write_text(json.dumps(state))
         (root / "platform.toml").write_text('[space]\nname = "s"\ndata_manifest = "m.json"\n')
     lines = [
