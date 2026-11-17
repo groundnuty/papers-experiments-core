@@ -11,7 +11,8 @@ reported. `settle_usage` gives such an attempt that measured usage, and the basi
 (`spend.after_loop`) as `run_agent` returns, and the guard keeps `AttemptSpend.loop_ended`. Nothing else tells an
 exception after the loop from one during it: a tool that raises between two requests also leaves every request closed.
 An executor that runs the loop another way never says so, a raise before the loop or during it never does, and the
-attempt keeps today's usage: unknown, so charged its bound, with no basis recorded.
+attempt keeps today's usage: unknown, so charged its bound, with no basis recorded, unless its log shows that no request
+was sent (`campaign.no_request`, which decides that for an attempt whose loop did not end).
 
 **The log is complete** (basis `measured`) when it holds at least one request and every request in it is closed with
 its counts: each reply's input and output counts known, or the request closed by a failed last send, whose top-up is
