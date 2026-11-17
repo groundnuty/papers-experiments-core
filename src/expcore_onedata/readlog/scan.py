@@ -10,19 +10,24 @@ never read then looks read. This scan is one detection. It reads the code cells 
 not) and finds:
 
 - `channel_path`: the socket directory or the socket (`/expcore-readlog`, `/expcore-readlog/sock`), with or without the
-  leading slash;
+  leading slash, or the prefix of their name (`/expcore-*`, `startswith('expcore')`);
 - `client`: the client's directory (`/expcore-readlog-client`), its module name (`expcore_readlog_client`, and the
   earlier `expcore_readlog`) or its bound path;
-- `unix_datagram`: a Unix-family name (`AF_UNIX`, `AF_LOCAL`, `PF_UNIX`, `PF_LOCAL`) together with `SOCK_DGRAM` or
-  `SOCK_SEQPACKET`, in one cell or in two cells of the run (the hit is at the cell where the run first holds both), or
-  the numbers in a `socket(...)` call (`socket(1, 2)`, `socket(AF_UNIX, 5)`, `socket(family=1, type=2)`);
+- `unix_datagram`: a Unix-family name (`AF_UNIX`, `AF_LOCAL`, `PF_UNIX`, `PF_LOCAL`, `sockaddr_un`,
+  `IO::Socket::UNIX`) together with `SOCK_DGRAM`, `SOCK_SEQPACKET` or `create_datagram_endpoint`, in one cell or in
+  two cells of the run (the hit is at the cell where the run first holds both); the numbers in a `socket(...)` call,
+  by position or by keyword in either order (`socket(1, 2)`, `socket(AF_UNIX, 5)`, `socket(type=2, family=1)`); a name
+  that is a Unix datagram socket alone (`UnixDatagram`, `"unixgram"`, `"unixpacket"`); and a shell tool that sends to
+  a Unix socket (`socat` with `UNIX-SENDTO`, `UNIX-CLIENT`, `UNIX-CONNECT` or `UNIX-DATAGRAM`, `nc -U`, `logger -u`);
 - `proc_environ`: a path `/environ`, which is `/proc/<pid>/environ` however the process is named;
 - `channel_discovery`: finding the socket without naming it, which a canonical script never does: the table of Unix
-  sockets (`/proc/net/unix`), the mount table (`/proc/<pid>/mountinfo`, `/proc/mounts`), a test for a socket file
-  (`S_ISSOCK`, `is_socket()`), a search for one (`find -type s`, `-name` with `sock`, a glob `*/sock`) and a tool that
-  lists Unix sockets (`ss -x`, `netstat -x`, `lsof -U`);
-- `channel_name`: the bare word `readlog`, in any case, where nothing above names the channel in the cell (a directory
-  listing filtered by it, say).
+  sockets (`/proc/net/unix`), a test for a socket file (`S_ISSOCK`, `is_socket()`), a search for one (`find -type s`,
+  `-name` with `sock`, a glob `*/sock`) and a tool that lists Unix sockets (`ss -x`, `netstat -x`, `lsof -U`). The
+  mount table is no hit: it sends nothing, the socket's path is fixed and public, and an agent that looks for its data
+  mount reads it for its own reasons, in some conditions more than in others;
+- `channel_name`: the bare word `readlog`, in any case and set off from letters and digits (`readLogFile` is not it),
+  where nothing above names the channel in the cell (a directory listing filtered by it, say). A study should not name
+  its own scripts or functions `readlog`.
 
 A canonical script is run by its path, so a cell that runs one names none of these and is not flagged; the script's own
 text is not part of the cell. Each hit names its cell and a fixed name for what was found, never the cell's own text
@@ -70,18 +75,22 @@ PROC_ENVIRON, CHANNEL_DISCOVERY, CHANNEL_NAME = "proc_environ", "channel_discove
 KINDS = (CHANNEL_PATH, CLIENT, UNIX_DATAGRAM, PROC_ENVIRON, CHANNEL_DISCOVERY, CHANNEL_NAME)
 
 PROC_ENVIRON_WHAT = "/proc/*/environ"
+PREFIX = "/expcore-* prefix"
 # Every (kind, what) a hit can have, in the fixed order a cell's hits are listed in
 NAMES = (
     (CHANNEL_PATH, SOCKET_DIR),
     (CHANNEL_PATH, SOCKET_PATH),
+    (CHANNEL_PATH, PREFIX),
     (CLIENT, CLIENT_DIR),
     (CLIENT, CLIENT_MODULE),
     (UNIX_DATAGRAM, "AF_UNIX+SOCK_DGRAM"),
     (UNIX_DATAGRAM, "AF_UNIX+SOCK_SEQPACKET"),
+    (UNIX_DATAGRAM, "AF_UNIX+datagram API"),
     (UNIX_DATAGRAM, "socket(AF_UNIX, datagram)"),
+    (UNIX_DATAGRAM, "unix datagram API"),
+    (UNIX_DATAGRAM, "unix datagram tool"),
     (PROC_ENVIRON, PROC_ENVIRON_WHAT),
     (CHANNEL_DISCOVERY, "/proc/net/unix"),
-    (CHANNEL_DISCOVERY, "/proc/mounts"),
     (CHANNEL_DISCOVERY, "socket file test"),
     (CHANNEL_DISCOVERY, "socket file search"),
     (CHANNEL_DISCOVERY, "socket listing tool"),
@@ -91,17 +100,23 @@ NAMES = (
 # The channel's names, with or without the leading slash: group 1 is the separator after `expcore`, group 2 the one
 # before `client`, group 3 a `/sock` after the directory
 _NAMED = re.compile(r"expcore([-_])readlog(?:([-_])client)?(/sock\b)?")
-_BARE = re.compile(r"readlog", re.IGNORECASE)
-_FAMILY = re.compile(r"\b(?:AF|PF)_(?:UNIX|LOCAL)\b")
-_DATAGRAM = re.compile(r"\bSOCK_(DGRAM|SEQPACKET)\b")
-_NUMBERED = re.compile(
-    r"\bsocket\s*\(\s*(?:family\s*=\s*)?(?:(?:\w+\.)*(?:AF|PF)_(?:UNIX|LOCAL)|1)\s*,"
-    r"\s*(?:type\s*=\s*)?(?:(?:\w+\.)*SOCK_(?:DGRAM|SEQPACKET)|[25])\b"
+_PREFIX = re.compile(r"\bexpcore[-_]\*|\bstartswith\(\s*['\"]/?expcore")
+_BARE = re.compile(r"(?<![A-Za-z0-9])readlog(?![A-Za-z0-9])", re.IGNORECASE)
+_FAMILY = re.compile(r"\b(?:AF|PF)_(?:UNIX|LOCAL)\b|\bsockaddr_un\b|\bIO::Socket::UNIX\b")
+_DATAGRAM = re.compile(r"\bSOCK_(DGRAM|SEQPACKET)\b|\bcreate_datagram_endpoint\b")
+_TYPES = ("SOCK_DGRAM", "SOCK_SEQPACKET", "datagram API")  # what a cell's datagram type is called, in this order
+# a Unix datagram socket that no family name is needed to say, and a shell tool that sends to a Unix socket
+_UNIX_API = re.compile(r"\bUnixDatagram\b|['\"](?:unixgram|unixpacket)['\"]")
+_UNIX_TOOL = re.compile(
+    r"\bUNIX-(?:SENDTO|CLIENT|CONNECT|DATAGRAM)\b|\b(?:nc|ncat|netcat)\b[^\n;|&]*\s-\w*U\b"
+    r"|\blogger\b[^\n;|&]*\s-u\b"
 )
+_SOCKET_CALL = re.compile(r"\bsocket\s*\(([^()]*)\)")
+_FAMILY_ARG = re.compile(r"(?:\w+\.)*(?:AF|PF)_(?:UNIX|LOCAL)|1")
+_TYPE_ARG = re.compile(r"(?:(?:\w+\.)*SOCK_(?:DGRAM|SEQPACKET)|[25])\b")
 _ENVIRON = re.compile(r"/environ\b")
 _DISCOVERY = {
     "/proc/net/unix": re.compile(r"/proc/net/unix\b"),
-    "/proc/mounts": re.compile(r"/proc/(?:[\w./$*{}-]*/)?(?:mountinfo|mounts)\b"),
     "socket file test": re.compile(r"\bS_ISSOCK\b|\bis_socket\s*\("),
     "socket file search": re.compile(r"-type\s+s\b|-name\s+\S*sock\b|\*+/sock\b"),
     "socket listing tool": re.compile(r"\b(?:ss|netstat|lsof)\s+-\w*[xU]"),
@@ -123,22 +138,47 @@ def _named(code: str) -> set[tuple[str, str]]:
 
 
 def _datagram_type(code: str) -> str | None:
-    """The first datagram type a cell names (`SOCK_DGRAM` before `SOCK_SEQPACKET`), None when it names neither."""
-    types = {match.group(1) for match in _DATAGRAM.finditer(code)}
-    return next((t for t in ("DGRAM", "SEQPACKET") if t in types), None)
+    """The first datagram type a cell names (`SOCK_DGRAM`, `SOCK_SEQPACKET`, then a datagram API), None when none."""
+    held = {f"SOCK_{m.group(1)}" if m.group(1) else "datagram API" for m in _DATAGRAM.finditer(code)}
+    return next((t for t in _TYPES if t in held), None)
+
+
+def _numbered(code: str) -> bool:
+    """Whether a `socket(...)` call of the cell has a Unix family and a datagram type, each by name or number, by
+    position or by keyword in either order."""
+    for call in _SOCKET_CALL.finditer(code):
+        arguments = [argument.strip() for argument in call.group(1).split(",")]
+        keywords = dict(a.split("=", 1) for a in arguments if "=" in a)
+        keywords = {name.strip(): value.strip() for name, value in keywords.items()}
+        positional = [a for a in arguments if "=" not in a]
+        family = keywords["family"] if "family" in keywords else (positional.pop(0) if positional else "")
+        kind = keywords["type"] if "type" in keywords else (positional.pop(0) if positional else "")
+        if _FAMILY_ARG.fullmatch(family) and _TYPE_ARG.match(kind):
+            return True
+    return False
 
 
 def _unix_datagram(code: str) -> set[tuple[str, str]]:
-    """A Unix-family socket of a datagram type, by names in the cell or by numbers in a `socket(...)` call; one hit."""
+    """A Unix-family socket of a datagram type, by names in the cell or by numbers in a `socket(...)` call, a name
+    that is one alone, or a shell tool that sends to one."""
+    found = set()
     kind = _datagram_type(code)
     if kind is not None and _FAMILY.search(code):
-        return {(UNIX_DATAGRAM, f"AF_UNIX+SOCK_{kind}")}
-    return {(UNIX_DATAGRAM, "socket(AF_UNIX, datagram)")} if _NUMBERED.search(code) else set()
+        found.add((UNIX_DATAGRAM, f"AF_UNIX+{kind}"))
+    elif _numbered(code):
+        found.add((UNIX_DATAGRAM, "socket(AF_UNIX, datagram)"))
+    if _UNIX_API.search(code):
+        found.add((UNIX_DATAGRAM, "unix datagram API"))
+    if _UNIX_TOOL.search(code):
+        found.add((UNIX_DATAGRAM, "unix datagram tool"))
+    return found
 
 
 def _names_of(code: str) -> list[tuple[str, str]]:
     """Every hit of one cell as (kind, fixed name), once each, in the order of `NAMES`."""
     found = _named(code) | _unix_datagram(code)
+    if _PREFIX.search(code):
+        found.add((CHANNEL_PATH, PREFIX))
     if _ENVIRON.search(code):
         found.add((PROC_ENVIRON, PROC_ENVIRON_WHAT))
     found |= {(CHANNEL_DISCOVERY, what) for what, pattern in _DISCOVERY.items() if pattern.search(code)}
@@ -155,7 +195,7 @@ def _split(cells: Sequence[str]) -> tuple[int, str] | None:
         own = _datagram_type(code)
         family, kind = family or bool(_FAMILY.search(code)), kind or own
         if family and kind is not None:
-            return None if own is not None and _FAMILY.search(code) else (index, f"AF_UNIX+SOCK_{kind}")
+            return None if own is not None and _FAMILY.search(code) else (index, f"AF_UNIX+{kind}")
     return None
 
 

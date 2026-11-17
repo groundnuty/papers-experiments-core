@@ -1463,7 +1463,7 @@ assert [(hit["kind"], hit["what"]) for hit in scan_cells([forged])["hits"]] == [
 ]
 ```
 
-- **Let the agent run a canonical script by its path and never paste its text into a cell.** A cell that holds a script's text names the client and is flagged.
+- **Let the agent run a canonical script by its path and never paste its text into a cell.** A cell that holds a script's text names the client and is flagged. Do not name your own scripts or functions `readlog` either: the bare word is a hit.
 - `read_log_analysis(runs, rows, absent, prereg)` judges every analysed run once a record carries the `read_log` instrument, and runs the preregistered analysis again without the flagged runs; `read_log_lines` renders the `## Read log` section of the report. They are not called by `analyze` yet (the core does not import the platform layer), so a study that wants the section calls them from its own analysis step.
 - **Report the primary analysis as it stands and the sensitivity analysis beside it.** The scan reads text: code that builds a name at run time, decodes it, or edits a copy of a canonical script passes it, and it flags a cell that names `AF_UNIX` and `SOCK_DGRAM` for two unrelated sockets. A run that is not flagged is not shown to have an unforged log; on a REST data path the gate's per-file served table (O22) is the check that does not read code.
 

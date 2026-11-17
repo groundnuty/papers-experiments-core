@@ -58,6 +58,39 @@ FORGING = {
         "import socket\ns = socket.socket(family=1, type=2)",
         [("unix_datagram", "socket(AF_UNIX, datagram)")],
     ),
+    "keywords in the other order": (
+        "import socket\ns = socket.socket(type=2, family=1)",
+        [("unix_datagram", "socket(AF_UNIX, datagram)")],
+    ),
+    "type with a flag by number": (
+        "import socket\ns = socket.socket(1, 2 | 0x80000)",
+        [("unix_datagram", "socket(AF_UNIX, datagram)")],
+    ),
+    "a datagram endpoint of the Unix family": (
+        "await loop.create_datagram_endpoint(Proto, remote_addr=p, family=socket.AF_UNIX)",
+        [("unix_datagram", "AF_UNIX+datagram API")],
+    ),
+    "a Unix datagram socket of Go": ('conn, _ := net.Dial("unixgram", p)', [("unix_datagram", "unix datagram API")]),
+    "a Unix datagram socket of Rust": ("let s = UnixDatagram::unbound()?;", [("unix_datagram", "unix datagram API")]),
+    "a Unix socket of Perl with a datagram type": (
+        "IO::Socket::UNIX->new(Type => SOCK_DGRAM, Peer => $p)",
+        [("unix_datagram", "AF_UNIX+SOCK_DGRAM")],
+    ),
+    "a Unix socket address of C with a datagram type": (
+        "struct sockaddr_un a; int s = socket(PF_UNIX, SOCK_DGRAM, 0);",
+        [("unix_datagram", "AF_UNIX+SOCK_DGRAM")],
+    ),
+    "a shell send by socat": (
+        "os.system('echo hi | socat - UNIX-SENDTO:$p')",
+        [("unix_datagram", "unix datagram tool")],
+    ),
+    "a shell send by netcat": ("os.system('echo hi | nc -uU $p')", [("unix_datagram", "unix datagram tool")]),
+    "a shell send by logger": ("os.system('logger -u $p hi')", [("unix_datagram", "unix datagram tool")]),
+    "a glob on the name's prefix": ("import glob\nglob.glob('/expcore-*')", [("channel_path", "/expcore-* prefix")]),
+    "a listing filtered by the name's prefix": (
+        "import os\nd = [x for x in os.listdir('/') if x.startswith('expcore')]",
+        [("channel_path", "/expcore-* prefix")],
+    ),
     "environment of any process": (
         "print(open('/proc/self/environ', 'rb').read())",
         [("proc_environ", "/proc/*/environ")],
@@ -75,11 +108,6 @@ FORGING = {
         [("proc_environ", "/proc/*/environ")],
     ),
     "table of Unix sockets": ("print(open('/proc/net/unix').read())", [("channel_discovery", "/proc/net/unix")]),
-    "mount table of the process": (
-        "print(open('/proc/self/mountinfo').read())",
-        [("channel_discovery", "/proc/mounts")],
-    ),
-    "mount table, short form": ("print(open('/proc/mounts').read())", [("channel_discovery", "/proc/mounts")]),
     "test for a socket file": (
         "import stat, os\nsockets = [p for p in paths if stat.S_ISSOCK(os.stat(p).st_mode)]",
         [("channel_discovery", "socket file test")],
@@ -107,6 +135,11 @@ ORDINARY = {
     ),
     "the process's own environment": "import os\nhome = os.environ.get('HOME')\nname = os.environ['USER']",
     "other proc files": "print(open('/proc/meminfo').read(), open('/proc/self/status').read())",
+    "a process's mount table": "print(open('/proc/self/mountinfo').read(), open('/proc/mounts').read())",
+    "an identifier that holds the letters but not the word": "def readLogFile(p):\n    return open(p).read()",
+    "a listing of the root": "import os\nprint(os.listdir('/'), list(os.scandir('/')))",
+    "a network datagram socket by keywords": "socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)",
+    "a shell send over the network": "os.system('echo hi | nc -u 127.0.0.1 9')",
     "a network socket": "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)",
     "a datagram socket of the network family": "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)",
     "a stream socket of the Unix family": "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
