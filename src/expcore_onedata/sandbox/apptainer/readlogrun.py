@@ -14,14 +14,20 @@ the harness runs outside it (`expcore_onedata.readlog`). On this backend, when `
 * in EVERY cell (`binds`, so in each `apptainer exec` of `cell_argv`, the start's canaries and probes included), the
   socket directory bound read-only at `paths.SOCKET_DIR` and the client module's directory bound read-only at
   `paths.CLIENT_DIR`. A Unix datagram socket takes `sendto` on a read-only bind (the egress shim depends on the same),
-  and nothing else of the run's directories is bound: the log, the collector and its copy are out of every cell's reach;
+  and nothing else of the run's directories is bound: the log, the collector and its copy are out of every cell's reach.
+  `cell_argv` is the one builder of the execs that run the agent's code, and of the harness's own cell programs; the
+  harness's one-shot execs of the image (the certifi probe, the trust-bundle reads, the collection's copy helper) run
+  programs of the harness alone, never the agent's code, and carry no channel binds, as they carry no egress shim;
 * a canary, sent through the real client from inside a cell before the agent's first cell (`CANARY_PROGRAM`), so the
   log's first record is the harness's own: a start whose cell cannot send it fails;
 * at the collection, the collector stopped on SIGTERM (it drains what is queued and writes its end line), its log read
   once, copied into the evidence and scanned for the data-path token like every file of evidence (`collect.py`), and
   exposed as `read_log()`: bytes, or None when it could not be read, which the instrument reads as an UNKNOWN log.
   A collector that was killed wrote no end line, so its log is unknown as well, and its death is infrastructure
-  (`infra.HELPERS`);
+  (`infra.HELPERS`). A collector that ended BEFORE the harness stopped it (told to end by something else, so it wrote a
+  clean end line), or whose stop was not clean (it needed the kill, or could not be shown gone), has a log that may
+  read intact with the reads it took and none after: that log is withheld (`read_log()` None, no copy), so the run's
+  log is unknown, never a clean one (`Channel.read`; `readlog_stop` says how the stop went);
 * the collector's and the client's hashes, the placement and the sender uid, once, in `infrastructure_facts` as the
   readlog's own (`readlog.facts`, through the one writer, O89).
 
@@ -38,7 +44,7 @@ import stat
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from expcore_onedata.readlog import facts, files, paths
+from expcore_onedata.readlog import facts, files, paths, reader
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import helpers, layout
@@ -78,6 +84,7 @@ class Channel:
         self.nonce = secrets.token_hex(16)
         self.uid = os.getuid()  # every cell runs as the driver's own uid
         self._client_sha256: str | None = None
+        self._stopped_cleanly = False  # the collector ran until the harness's own stop, which ended it on SIGTERM
 
     @property
     def enabled(self) -> bool:
@@ -148,19 +155,39 @@ class Channel:
     # ------------------------------------------------------------------------------------------------ collection
     def stop(self) -> None:
         """Stop the collector on SIGTERM so it drains and writes its end line (the harness's own stop: its state now
-        stands as its last of the run, so the stop is no death). A stop that failed is recorded, and the log it left
-        has no end line, which reads as unknown."""
+        stands as its last of the run, so the stop is no death). What the stop was is recorded: whether the collector
+        still ran when the harness came to stop it (`ran_until_stop`), and how it ended; a stop that failed holds the
+        error. Only a collector that ran until this stop and ended on SIGTERM is a clean one (`read`)."""
         box = self.box
         helper = box._helpers.get(ROLE)
         if helper is None or STOP_KEY in box._meta:
             return
         box.infra.stopping(ROLE)
+        ran = box.node.alive(helper.process.pid, helper.process.start)  # True only while it ran until this stop
         try:
-            box._meta[STOP_KEY] = helpers.stop(box.node, helper, sleep=box._sleep, clock=box._clock)
+            note = helpers.stop(box.node, helper, sleep=box._sleep, clock=box._clock)
         except SandboxError as error:
-            box._meta[STOP_KEY] = {"error": str(error)}
+            box._meta[STOP_KEY] = {"error": str(error), "ran_until_stop": ran}
+            return
+        box._meta[STOP_KEY] = {**note, "ran_until_stop": ran}
+        self._stopped_cleanly = ran is True and note["ended_on_term"] is True
 
     def read(self) -> bytes | None:
+        """The collector's log as the instrument is to read it, or None: the log is withheld, so it reads as missing
+        and so unknown, when it would read INTACT although its collector did not run until the harness's own stop or
+        that stop was not clean (the collector was told to end by something else and wrote a clean end line, needed
+        the kill, or could not be shown gone): a lost collector is never a clean log, however complete its bytes
+        look. A log that already reads unknown (a killed collector's has no end line) is handed on as it is, with
+        its own reasons, so what was read before the loss can be looked at."""
+        data = self._read_file()
+        if data is None or self._stopped_cleanly:
+            return data
+        if reader.read_log(data, self.nonce, expected_peer_uid=self.uid).intact:
+            log.error("the read-log collector did not end cleanly under the harness's stop: its log is withheld")
+            return None
+        return data
+
+    def _read_file(self) -> bytes | None:
         """The collector's log, read once from the file the stopped collector left; None when it cannot be read as a
         regular file. At most one byte past the size the reader accepts is read, so a log that is too large reads as
         too large and never fills the driver's memory."""
