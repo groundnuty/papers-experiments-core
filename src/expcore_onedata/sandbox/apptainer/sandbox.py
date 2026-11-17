@@ -7,8 +7,10 @@ code tool call of a sandbox beyond that protocol: `start`/`begin`/`abandon`, `ex
 `stop`, `metadata`, `record`, `read_only_inputs`, `settle_deadline`, `gate_refusals`, `served_bytes`,
 `mount_io_mode`, `session_kinds`, `session_ends`, `teardown_left`, `keep_evidence`, `stopped`, `tool_server_process`;
 for the egress instrument (`expcore.egress.EgressLog`) `egress_log`, `egress_declaration` and `egress_nonce`; for the
-process visibility instrument (`expcore.visibility.ProcessVisibility`) `process_visibility`; and for a study's reading
-after the run, with Docker's names and shapes (`api.InfraReadings`), `infra_check`, `mount_log` and `mount_errors`.
+read-log instrument (`expcore_onedata.readlog.ReadLog`) `read_log`, `readlog_nonce` and `readlog_expected_peer_uid`; for
+the process visibility instrument (`expcore.visibility.ProcessVisibility`) `process_visibility`; and for a study's
+reading after the run, with Docker's names and shapes (`api.InfraReadings`), `infra_check`, `mount_log` and
+`mount_errors`.
 
 Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded first in `work_root/_runs/<sid>.json`
 (`runs.py`), so a driver killed outright is reaped by the next start and its key held by the probe:
@@ -20,6 +22,11 @@ Per run, under `work_root/<sid>` (owner-only, on the node's tmpfs), recorded fir
   every cell binds read-only at `/hpcop-egress`; the pinned egress shim, preloaded in every cell through a bound
   `/etc/ld.so.preload`; a canary connect from inside a cell opens the collector's log before anything else runs, and
   proves the watch sees a cell's processes, or the start fails;
+* with `readlog_collector_sha256` declared (O91), the read-log channel (`readlogrun.py`): its collector, a second
+  helper, started before any cell; its socket directory and the client module bound read-only in every cell at fixed
+  targets; a canary sent through the real client from inside a cell; at the collection the collector stopped and its
+  log read once
+  (`read_log()`), a log that is missing or has no end line reading as unknown, never as no reads;
 * REST: the core's gate on 127.0.0.1 (`gaterun.py`), with the token in its memory alone; the cell resolves the zone's
   and the provider's names to the loopback and trusts the run's CA; its `ONEDATA_TOKEN` is the placeholder (O23);
 * a mount: oneclient on the node, outside every cell, by the helper of hook (c) (`mounthook.py`, `hostmount.py`); a
@@ -74,7 +81,17 @@ from expcore_onedata.sandbox.api import (
     StartRefused,
 )
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs, workdisk, workproof
+from expcore_onedata.sandbox.apptainer import (
+    facts,
+    gaterun,
+    helpers,
+    layout,
+    loopback,
+    readlogrun,
+    runs,
+    workdisk,
+    workproof,
+)
 from expcore_onedata.sandbox.apptainer import limits as LM
 from expcore_onedata.sandbox.apptainer.cells import RUN_ENDED_FACT, AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
@@ -139,6 +156,7 @@ class ApptainerSandbox:
         self.dir = settings.work_root / self.sid
         self.run_tag = f"{AV.RUN_TAG}={self.sid}"
         self.egress_nonce = secrets.token_hex(16)
+        self._readlog = readlogrun.Channel(self)  # O91: on only when the platform pins the collector
         self._meta: dict[str, Any] = {
             "run_key": spec.run_key,
             "data_path": spec.mode.value,
@@ -286,6 +304,7 @@ class ApptainerSandbox:
                 raise StartRefused(str(error)) from None
         if self.app.gate_options.get(gaterun.PEER_CHECK_KEY) is True and not gaterun.PEER_CHECK.is_file():
             raise StartRefused("gate_options asks for the gate's peer-uid check, and this core's gate does not have it")
+        self._readlog.check_pin()  # O91: this core's collector is the pinned one, before anything exists
         if self.work_image and workdisk.image_size(s.limits.work_disk_bytes) < workdisk.ALIGN:
             raise StartRefused('work_disk = "image" needs [sandbox.limits] work_disk_bytes of at least 2 MiB')
         self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s), storages=inputs.storage_paths(s))
@@ -331,6 +350,7 @@ class ApptainerSandbox:
         layout.copy_pinned(self.app.egress_shim, cell / "egresslog.so", "the egress shim")
         layout.copy_pinned(self.app.egress_collector, self.dir / "egress" / "egress-collector.py",
                            "the egress collector")  # fmt: skip
+        self._readlog.prepare()  # O91: its directories and its two copies, when the platform pins the collector
         for n, pin in enumerate(self.app.preload):
             layout.copy_pinned(pin, cell / f"preload-{n}.so", f"preload library {n}")
         for n, bind in enumerate(self.app.binds):
@@ -345,6 +365,8 @@ class ApptainerSandbox:
         self._checkpoint()
         self._start_collector()
         self._checkpoint()
+        self._readlog.start()  # O91: before any cell, as the egress collector is
+        self._checkpoint()
         share = self._start_mount() if self.spec.mode is DataPathMode.MOUNT else None
         self._checkpoint()
         if self.spec.mode is DataPathMode.REST:
@@ -353,6 +375,7 @@ class ApptainerSandbox:
         self._lay_out_cell(share)
         self._start_cells()
         self._canary()
+        self._readlog.canary()  # O91: the log's first record, sent through the real client from inside a cell
         self._verify_read_only()
         self._verify_work_disk()
         self._verify_inputs()
@@ -542,6 +565,7 @@ class ApptainerSandbox:
             *(AV.Bind(cell / f"preload-{n}.so", target) for n, target in enumerate(preloads)),
             *(AV.Bind(cell / f"bind-{n}", b.target) for n, b in enumerate(self.app.binds)),
         ]  # fmt: skip
+        binds += self._readlog.binds()  # O91: read-only, at the channel's fixed targets, in every cell
         env = {AV.RUN_TAG: self.sid}
         if rest:
             layout.write_text(cell / "ca.pem", (self.dir / "tls" / "ca.pem").read_text(encoding="utf-8"))
@@ -925,6 +949,22 @@ class ApptainerSandbox:
         """The collector's log as the collection read it once the collector had stopped; None before, or when it
         could not be read (`expcore.egress.EgressSource`)."""
         return self.collection.egress_bytes
+
+    @property
+    def readlog_nonce(self) -> str:
+        """The value the run's read-log collector was given, which its start line carries (`ReadLog`'s `nonce`)."""
+        return self._readlog.nonce
+
+    @property
+    def readlog_expected_peer_uid(self) -> int:
+        """The uid the collector was told to accept: the driver's own, which every cell runs as (`ReadLog`'s
+        `expected_peer_uid`)."""
+        return self._readlog.uid
+
+    def read_log(self) -> bytes | None:
+        """The read-log collector's log as the collection read it once the collector had stopped; None before, when the
+        platform has no channel, or when it could not be read (`expcore_onedata.readlog.instrument.ReadLogSource`)."""
+        return self.collection.readlog_bytes
 
     def process_visibility(self) -> dict[str, Any] | None:
         """What the watch saw of the processes `/proc` hides (`expcore.visibility.ProcessVisibility`'s source): read

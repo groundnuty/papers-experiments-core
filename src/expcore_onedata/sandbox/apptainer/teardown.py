@@ -4,13 +4,13 @@
 On every path that ends a sandbox, a failed start's included, in this order, each step run whatever an earlier one
 raised: the run's file of the token (first: a secret is never evidence, and a later step that hangs must find none);
 every process of the run's cells, killed and shown gone; the watch; the mount's helper (hook c); the gate and the
-collector, each shown gone (`helpers.stop`); with a work disk image (O71), every process whose command line names the
-image, killed and shown gone (`workdisk.end_holders`); then the run's directory, removed and shown gone, or, when the
-run is kept as evidence (a failed collection, a deadline that ended the run), moved to `work_root/_kept_evidence` once
-its token file, its copy of the CA bundle and the tool server's home (O56) are gone, and its image too, which cannot be
-shown free of the token. The run's record (`runs.py`) is dropped last, and only when all of it is shown gone: a teardown
-that is not complete raises `SandboxError` naming each step that failed, and leaves the record for a next try, the
-reaper and the probe.
+collectors (the egress collector, and the read-log collector of a platform that has one), each shown gone
+(`helpers.stop`); with a work disk image (O71), every process whose command line names the image, killed and shown
+gone (`workdisk.end_holders`); then the run's directory, removed and shown gone, or, when the run is kept as evidence
+(a failed collection, a deadline that ended the run), moved to `work_root/_kept_evidence` once its token file, its copy
+of the CA bundle and the tool server's home (O56) are gone, and its image too, which cannot be shown free of the token.
+The run's record (`runs.py`) is dropped last, and only when all of it is shown gone: a teardown that is not complete
+raises `SandboxError` naming each step that failed, and leaves the record for a next try, the reaper and the probe.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ class Teardown:
                 if self._do(errors, self.step, box._mount.stop):
                     box.note_end(MOUNT)
             self.step = "helpers"
-            for role in ("gate", "collector"):
+            for role in ("gate", "collector", "readlog"):
                 if role in box._helpers and role not in self.gone and self._do(errors, role, self._helper(role)):
                     self.gone.add(role)
                     if role == "gate":

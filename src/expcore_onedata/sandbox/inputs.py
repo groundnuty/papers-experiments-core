@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore_onedata.readlog import paths as readlog_paths
 from expcore_onedata.sandbox.api import ReadOnlyInput, StartRefused
 from expcore_onedata.sandbox.containers import CA_PATH
 from expcore_onedata.sandbox.hostops import describe_error
@@ -53,7 +54,9 @@ from expcore_onedata.sandbox.settings import SandboxSettings
 PART = re.compile(r"[A-Za-z0-9._-]{1,255}")  # a name of a path in the agent: nothing docker's mount syntax splits on
 MAX_TARGET = 1024
 # what the agent's other mounts, and docker itself, already take: no input may be, hold or lie under one of them
-TAKEN = ("/work", "/tmp", "/dev", "/proc", "/sys", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf")
+# (the read-log channel's two targets are the harness's own in every cell, on either backend, O91)
+TAKEN = ("/work", "/tmp", "/dev", "/proc", "/sys", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf",
+         *readlog_paths.TARGETS)  # fmt: skip
 FILE_MODE, RUNNABLE_MODE, DIR_MODE = 0o644, 0o755, 0o755
 PROBE_MARK = "# read-only input probe (O20)"
 CHANGES = ("write", "beside", "mkdir", "rename", "chmod", "delete")  # each must fail with EROFS

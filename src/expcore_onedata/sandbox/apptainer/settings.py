@@ -21,6 +21,8 @@ egress_shim = "egresslog.so"     # the bundle's egress shim (egresslog.c), built
 egress_shim_sha256 = "<64 hex>"
 egress_collector = "egress-collector.py"   # the bundle's collector
 egress_collector_sha256 = "<64 hex>"
+readlog_collector_sha256 = "<64 hex>"   # optional (O91): the read-log channel's collector, the core's own file
+                                 # (`expcore_onedata.readlog`) by its SHA-256; declared, the channel is on
 memory_poll_s = 0.1              # optional, 0.02 to 1: the memory watch's period
 disk_poll_s = 1.0                # optional, 0.1 to 10: the period of its walk of /work, /tmp and /dev/shm
 hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: anonymous memory nothing visible explains that
@@ -40,7 +42,9 @@ provider_storage = "tmpfs"       # optional: where the federation's providers ke
 ```
 
 Every file is copied into the run's directory at the start, its copy hashed and compared with the pin, and only the
-copy is used; the SIF, too large to copy, is hashed once per identity (device, inode, size, times) and its identity
+copy is used (the read-log collector is the core's own file, so only its hash is declared: a core whose collector has
+another hash refuses the start, and the key is in the record only when declared, so a platform without a channel keeps
+its fingerprint); the SIF, too large to copy, is hashed once per identity (device, inode, size, times) and its identity
 checked again before every exec (`sandbox.py`); oneclient's bundle is unpacked for each mount run from the bytes that
 are hashed (`oneclient_bundle.unpack`). A path is a configured value: a message names the key, never the path, and a
 record holds the hashes alone (`record`), the bundle's only when it is declared, so a platform without one keeps its
@@ -66,6 +70,7 @@ from types import MappingProxyType
 from typing import Any
 
 from expcore.config.loading import ConfigError, Section
+from expcore_onedata.readlog import paths as readlog_paths
 from expcore_onedata.sandbox.apptainer.hidden import DEFAULT_MARGIN_BYTES
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -79,7 +84,7 @@ CELL_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,1023}")
 # the targets the sandbox binds itself, and those under which it binds: an extra bind may be none of them
 OWN_TARGETS = ("/work", "/tmp", "/dev/shm", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/etc/nsswitch.conf",
                "/etc/ld.so.preload", "/etc/sandbox", "/etc/expcore", "/hpcop-egress", "/hpcop-shim",
-               "/expcore-preload")  # fmt: skip
+               "/expcore-preload", *readlog_paths.TARGETS)  # fmt: skip
 MARGIN_BOUNDS = (1 << 20, 64 << 30)  # hidden_memory_margin_bytes, in bytes
 WORK_DISKS = ("directory", "image")  # work_disk: the first is the default (O71)
 # the keys of the gate's configuration the sandbox writes itself (`gaterun.config`): gate_options may set none of them
@@ -125,6 +130,7 @@ class ApptainerSettings:
     provider_storage: str | None = None  # one of PROVIDER_STORAGE_KINDS, or None: the platform does not say
     work_disk: str = WORK_DISKS[0]  # O71: "directory" (the watch alone) or "image" (`workdisk.py`)
     work_disk_mkfs: tuple[str, ...] = DEFAULT_MKFS
+    readlog_collector_sha256: str | None = None  # O91: the read-log channel's collector's pin; None: no channel
 
     def __post_init__(self) -> None:
         low, high = MARGIN_BOUNDS
@@ -135,6 +141,9 @@ class ApptainerSettings:
             raise ValueError(f"provider_storage must be one of {', '.join(PROVIDER_STORAGE_KINDS)}")
         if self.work_disk not in WORK_DISKS:
             raise ValueError(f"work_disk must be one of {', '.join(WORK_DISKS)}")
+        pin = self.readlog_collector_sha256
+        if pin is not None and not (isinstance(pin, str) and SHA256.fullmatch(pin)):
+            raise ValueError("readlog_collector_sha256 must be 64 lower-case hexadecimal digits")
         if not _is_mkfs_program(self.work_disk_mkfs):
             raise ValueError(f"work_disk_mkfs {MKFS_ONE_PROGRAM}")
         clash = sorted(set(self.gate_options) & GATE_OWN_KEYS)
@@ -168,6 +177,8 @@ class ApptainerSettings:
             # the image is another experiment; the directory, the default, keeps the record it had (O71); the tool
             # that makes the image is none
             **({} if self.work_disk == WORK_DISKS[0] else {"work_disk": self.work_disk}),
+            # another collector is another experiment; a platform without the channel keeps the record it had (O91)
+            **({"readlog_collector_sha256": self.readlog_collector_sha256} if self.readlog_collector_sha256 else {}),
         }  # fmt: skip
 
 
@@ -253,13 +264,23 @@ def _provider_storage(section: Section) -> str | None:
     return value
 
 
+def _readlog_pin(section: Section) -> str | None:
+    """`readlog_collector_sha256` (O91): 64 lower-case hex digits, or absent (no channel); the message names the key."""
+    if "readlog_collector_sha256" not in section.data:
+        return None
+    value = section.data["readlog_collector_sha256"]
+    if not isinstance(value, str) or not SHA256.fullmatch(value):
+        raise section.fail("readlog_collector_sha256", "must be 64 lower-case hexadecimal digits")
+    return value
+
+
 def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
     """Validate `[sandbox.apptainer]`; raise ConfigError naming the file and key, never a value or a path."""
     section.reject_unknown(
         ("apptainer", "image", "image_sha256", "python", "host_python", "egress_shim", "egress_shim_sha256",
          "egress_collector", "egress_collector_sha256", "memory_poll_s", "disk_poll_s", "preload", "binds",
          "gate_options", "hidden_memory_margin_bytes", "oneclient_bundle", "oneclient_bundle_sha256",
-         "provider_storage", "work_disk", "work_disk_mkfs")
+         "provider_storage", "work_disk", "work_disk_mkfs", "readlog_collector_sha256")
     )  # fmt: skip
     words = section.strings("apptainer") or ("apptainer",)
     if any(not COMMAND_WORD.fullmatch(word) for word in words):
@@ -277,6 +298,7 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
     declared = "oneclient_bundle" in section.data or "oneclient_bundle_sha256" in section.data
     bundle = _pinned(section, base, "oneclient_bundle") if declared else None
     work_disk, mkfs = _work_disk(section)
+    readlog_pin = _readlog_pin(section)
     targets = [b.target for b in lists["binds"]]
     if len(set(targets)) != len(targets):
         raise section.fail("binds", "names a target twice")
@@ -298,6 +320,7 @@ def load_apptainer(section: Section, base: Path) -> ApptainerSettings:
             provider_storage=_provider_storage(section),
             work_disk=work_disk,
             work_disk_mkfs=mkfs,
+            readlog_collector_sha256=readlog_pin,
         )
     except ValueError as error:  # the dataclass's own checks, which the loader already made: never a value
         raise ConfigError(f"{section.file}: {section.where}: {error}") from None
