@@ -287,22 +287,27 @@ def end_holders(
 ) -> int:
     """Kill every process of the uid whose command line names `image` or that carries the run's `COPY_TAG`, listing
     again until a fresh listing shows none (one may start another while it is killed), within `GONE_WAIT_S`: how many
-    were killed. A zombie holds nothing and is left to its parent. `SandboxError` when they cannot be listed or one is
-    still listed at the deadline (unknown is never gone)."""
+    were found. A process once found is waited for until it is shown gone, whatever a later listing can read of its
+    command line; a zombie holds nothing and is left to its parent. `SandboxError` when they cannot be listed or one is
+    not shown gone at the deadline (unknown is never gone)."""
     tags = {str(image), f"{COPY_TAG}={sid}"}
-    until, killed = clock() + GONE_WAIT_S, set()
+    until, found = clock() + GONE_WAIT_S, {}
     while True:
-        found = node.processes(tuple(tags))
-        if found is None:
+        listing = node.processes(tuple(tags))
+        if listing is None:
             raise SandboxError("the processes that may hold the run's work disk could not be listed")
-        holders = [p for p in found if p.tags & tags and p.state != "Z"]
-        if not holders:
-            return len(killed)
+        listed = {(p.pid, p.start): p for p in listing}
+        found |= {(p.pid, p.start): p for p in listing if p.tags & tags and p.state != "Z"}
+        left = [
+            proc for key, proc in found.items()
+            if (key in listed and listed[key].state != "Z") or (key not in listed and node.alive(*key) is not False)
+        ]  # fmt: skip
+        if not left:
+            return len(found)
         if clock() >= until:
             raise SandboxError("a process that holds the run's work disk could not be shown gone")
-        for proc in holders:
-            if node.signal(proc.pid, proc.start, signal.SIGKILL) is True:
-                killed.add((proc.pid, proc.start))
+        for proc in left:
+            node.signal(proc.pid, proc.start, signal.SIGKILL)
         sleep(GONE_POLL_S)
 
 

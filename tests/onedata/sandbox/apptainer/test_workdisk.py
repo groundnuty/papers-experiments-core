@@ -341,6 +341,23 @@ def test_o71_a_holder_started_while_the_sweep_kills_is_found_by_a_fresh_listing(
     assert zombie.state == "Z"
 
 
+def test_o71_a_holder_once_found_is_waited_for_even_when_its_command_line_cannot_be_read_again(node, tmp_path):
+    """O71: a holder whose kill could not be told sent, and whose command line the next listing cannot read, is still
+    the one found: the sweep waits for it to be shown gone and fails at its deadline, never passing over it."""
+    image = tmp_path / "work" / workdisk.IMAGE_NAME
+    holder = _holder(node, image)
+
+    def unreadable(pid, start, sig):
+        holder.cmdline = ()  # its tags cannot be read any more
+        return None
+
+    node.signal = unreadable
+    clock = SleptClock()
+    with pytest.raises(SandboxError, match="holds the run's work disk"):
+        workdisk.end_holders(node, image, "sid-00000000", sleep=clock.sleep, clock=clock)
+    assert holder.alive
+
+
 def test_o71_a_holder_that_cannot_be_shown_gone_fails_the_teardown_and_keeps_the_record(node, settings):
     """O71: one that no kill ends is never passed over: the directory and the record stay for a next try."""
     box = start(node, settings)
