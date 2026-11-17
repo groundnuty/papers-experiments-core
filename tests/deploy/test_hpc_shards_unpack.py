@@ -86,6 +86,10 @@ HOSTILE = {
     # and `out/s/leak` is written through it beside out/: every name and target is inside out/ taken by itself
     "through-a-link": [OUT, ("out/d", SYMLINK, "."), ("out/d/s", SYMLINK, ".."), ("out/s/leak", FILE, None)],
     "through-a-directory-link": [OUT, ("out/d", SYMLINK, "."), ("out/d/file", FILE, None)],
+    # `tarfile` keeps the trailing `/` of a link's name and drops it when it makes the link: the link is at out/d
+    "symlink-named-with-a-slash": [OUT, ("out/d/", SYMLINK, "..")],
+    "symlink-named-out": [("out/", SYMLINK, "x")],
+    "file-named-out": [("out", FILE, None)],
     "empty": [],
 }
 
@@ -95,7 +99,7 @@ def test_an_archive_with_a_member_that_leaves_out_is_refused_before_anything_is_
     """O63: the whole archive is refused and nothing is made, not the directory it was to be unpacked into."""
     archive = tmp_path / "shard.tar"
     names = _write(archive, HOSTILE[case])
-    assert len(names) == len(HOSTILE[case])  # the hostile member is really in it
+    assert names == [name for name, _, _ in HOSTILE[case]]  # the hostile names are really in it, slashes and all
     before = _tree(tmp_path)
     with pytest.raises(shards.ShardsError):
         shards.unpack(archive, tmp_path / "into")

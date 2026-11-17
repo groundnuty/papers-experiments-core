@@ -795,16 +795,18 @@ def _link_stays_in_out(member: tarfile.TarInfo) -> bool:
     ascent = next((n for n, part in enumerate(names) if part != ".."), len(names))  # the leading `..` parts
     if not target or target.startswith("/") or ".." in names[ascent:]:
         return False
-    base = "" if member.islnk() else posixpath.dirname(member.name)
+    base = (
+        "" if member.islnk() else posixpath.dirname(posixpath.normpath(member.name))
+    )  # `tarfile` drops a trailing `/`
     return _in_out(posixpath.normpath(posixpath.join(base, target)))
 
 
 def archive_problem(members: Sequence[tarfile.TarInfo]) -> str | None:
     """Why an archive is not an `out/` and nothing else, as a short class that carries nothing the archive wrote, or
     None. `tarfile`'s data filter judges a member against the directory unpacked into, so it lets `out/../x` and a link
-    to `../x` land beside `out/`; here `out/` is the boundary. A member's name has no `..` and is `out` or under
-    `out/`, a link stays in `out/` (`_link_stays_in_out`), and no member's path (a hard link's target too) passes
-    through a link of the archive, in whatever order, so that every link sits in a real directory."""
+    to `../x` land beside `out/`; here `out/` is the boundary. A member's name has no `..` and is `out` (a directory)
+    or under `out/`, a link stays in `out/` (`_link_stays_in_out`), and no member's path (a hard link's target too)
+    passes through a link of the archive, in whatever order, so that every link sits in a real directory."""
     if not members:
         return "holds something besides out/"
     links = {posixpath.normpath(m.name) for m in members if m.issym() or m.islnk()}
@@ -818,7 +820,7 @@ def archive_problem(members: Sequence[tarfile.TarInfo]) -> str | None:
     for member in members:
         if ".." in member.name.split("/"):
             return "has a member name with a '..' component"
-        if not _in_out(member.name):
+        if not _in_out(member.name) or (posixpath.normpath(member.name) == "out" and not member.isdir()):
             return "holds something besides out/"
         if (member.issym() or member.islnk()) and not _link_stays_in_out(member):
             return "has a link that leaves out/"
