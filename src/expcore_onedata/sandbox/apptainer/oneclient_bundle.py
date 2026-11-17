@@ -24,7 +24,8 @@ node on 16 Nov 2026: nothing outside the bundle was tried or opened.
 
 **`version_of`** reads `oneclient --version` (`Oneclient: <version>`, and `FUSE library: <version>`), and **`build_id`**
 the binary's GNU build-id note, since oneclient prints no build id. With the pin they are what a run records of the
-oneclient that served it.
+oneclient that served it. Both are `sandbox.oneclient_build`'s, which the Docker sandbox's sidecar record uses too
+(re-exported here).
 """
 
 from __future__ import annotations
@@ -34,7 +35,6 @@ import io
 import os
 import re
 import shutil
-import struct
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +43,7 @@ from typing import Any, BinaryIO
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer.settings import Pinned
 from expcore_onedata.sandbox.hostops import describe_error
+from expcore_onedata.sandbox.oneclient_build import build_id, version_of
 
 LOADER = "ld-linux-x86-64.so.2"
 BINARY = "bin/oneclient"
@@ -53,8 +54,6 @@ MAX_FILE_BYTES = 256 << 20
 MAX_TOTAL_BYTES = 1 << 30
 MAX_MEMBERS = 4096
 CHUNK = 1 << 20
-VERSION = re.compile(r"Oneclient: ([0-9A-Za-z.+~_-]{1,64})")
-FUSE = re.compile(r"FUSE library: ([0-9A-Za-z.+~_-]{1,64})")
 MISMATCH = "oneclient's bundle is not the file it is pinned to (its SHA-256 differs)"
 UNREAD = "oneclient's bundle could not be read on this node"
 
@@ -199,51 +198,6 @@ def _empty(root: Path) -> None:
             shutil.rmtree(path)
         else:
             path.unlink()
-
-
-def version_of(returncode: int, stdout: str) -> dict[str, str]:
-    """oneclient's own words for its version, from `--version`; `SandboxError` when they are not there."""
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    found = VERSION.fullmatch(lines[0]) if returncode == 0 and lines else None
-    if found is None:
-        raise SandboxError(f"oneclient's --version on this node did not name its version (exit {returncode})")
-    fuse = next((m.group(1) for m in map(FUSE.fullmatch, lines[1:]) if m), None)
-    return {"version": found.group(1), **({"fuse": fuse} if fuse is not None else {})}
-
-
-def build_id(path: Path) -> str | None:
-    """The GNU build id of a 64-bit little-endian ELF file, from its notes; None when it has none or is no such file."""
-    try:
-        with open(path, "rb") as handle:
-            head = handle.read(64)
-            if head[:6] != b"\x7fELF\x02\x01":
-                return None
-            phoff = struct.unpack_from("<Q", head, 32)[0]
-            phentsize, phnum = struct.unpack_from("<HH", head, 54)
-            handle.seek(phoff)
-            table = handle.read(phentsize * phnum)
-            for n in range(phnum):
-                kind, _, offset, _, _, filesz, _, align = struct.unpack_from("<IIQQQQQQ", table, n * phentsize)
-                if kind == 4:  # PT_NOTE
-                    handle.seek(offset)
-                    found = _note(handle.read(filesz), 8 if align == 8 else 4)
-                    if found is not None:
-                        return found
-    except (OSError, struct.error):
-        return None
-    return None
-
-
-def _note(notes: bytes, align: int) -> str | None:
-    at = 0
-    while at + 12 <= len(notes):
-        namesz, descsz, kind = struct.unpack_from("<III", notes, at)
-        name_at = at + 12
-        desc_at = name_at + (namesz + align - 1) // align * align
-        if kind == 3 and notes[name_at : name_at + namesz] == b"GNU\0":  # NT_GNU_BUILD_ID
-            return notes[desc_at : desc_at + descsz].hex() or None
-        at = desc_at + (descsz + align - 1) // align * align
-    return None
 
 
 __all__ = ["Bundle", "build_id", "unpack", "version_of"]
