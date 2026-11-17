@@ -114,10 +114,11 @@ def check_rendered_support(layout: Layout, facts: Mapping[str, Any]) -> None:
 
     `facts` are the ones the file was rendered from: each space's id and measured set (`supported_by_measured`, from
     `Bootstrap.verify_support`) and each provider's id. The file is loaded as the platform layer reads it, without its
-    credentials or manifests (which are no concern of this check); its spaces are matched to the layout's by id and its
-    providers to the federation's by id, whatever the template calls them, and the refusal names them by layout label,
-    one message per difference, never an id. A space of the file that is no space of the federation, or a facts record
-    with no measured set (a bootstrap that never read one), is not checked here."""
+    credentials or manifests (which are no concern of this check); a refusal of the load is passed on with the root's
+    path written `<root>`. Its spaces are matched to the layout's by id and its providers to the federation's by id,
+    whatever the template calls them, and the refusal names them by layout label, one message per difference, never an
+    id. A space of the file that is no space of the federation, or a facts record with no measured set (a bootstrap
+    that never read one), is not checked here."""
     measured = {n: s["supported_by_measured"] for n, s in facts["spaces"].items() if "supported_by_measured" in s}
     if not measured:
         return
@@ -127,7 +128,9 @@ def check_rendered_support(layout: Layout, facts: Mapping[str, Any]) -> None:
     try:
         config = load_platform(layout.platform, require_secrets=False, require_manifests=False)
     except ConfigError as error:
-        raise RuntimeError(f"the rendered platform file is refused: {error}") from None
+        raise RuntimeError(
+            f"the rendered platform file is refused: {str(error).replace(str(layout.root), '<root>')}"
+        ) from None
     space_of = {space["id"]: name for name, space in facts["spaces"].items()}
     label_of = {provider["id"]: name for name, provider in facts["providers"].items()}
     problems: list[str] = []
