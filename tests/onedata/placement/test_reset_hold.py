@@ -27,7 +27,17 @@ from reset_lock_support import hold_until_told
 from shared_support import hold_and_die
 
 from expcore.errors import uncharged_kinds
-from expcore_onedata.admission import AdmissionRefused, FederationBusy, FederationLock, run_admission
+from expcore_onedata.admission import (
+    SANDBOX_STEP,
+    TOOL_SERVER_STEP,
+    AdmissionRefused,
+    FederationBusy,
+    FederationLock,
+    require_admission,
+    retain_to_act,
+    run_admission,
+    token_step,
+)
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import load_faults
@@ -564,6 +574,104 @@ def test_o66_a_reset_in_a_thread_pool_that_did_not_inherit_the_run_is_refused_an
         with pytest.raises(AdmissionRefused, match="run_in_executor"):
             asyncio.run(executor())
         assert len(fake.sent) == before
+
+
+# --- nothing of the agent's runs while its run resets --------------------------------------------------------------
+
+
+def agent_entries(config):
+    """Try every way the run's agent can come to act on the federation, as the run's own code would: the first call of
+    a sandbox launch and of a tool-server launch (`require_admission`; the agent's cells run in the sandbox, its tool
+    calls go to the tool server, and every read it sees goes through one of them), a sandbox start's share
+    (`retain_to_act`) and a tool reusing the run's admission (`shared_admission`). Return which were let through,
+    giving back at once whatever one took."""
+    entries = {
+        "launch": lambda stack: require_admission(config),
+        "start": lambda stack: stack.callback(retain_to_act()),
+        "tool": lambda stack: stack.enter_context(shared_admission(config, reason="smoke_warmup")),
+    }
+    allowed = []
+    for name, entry in entries.items():
+        with contextlib.ExitStack() as stack:
+            try:
+                entry(stack)
+            except AdmissionRefused:
+                continue
+            allowed.append(name)
+    return allowed
+
+
+def test_o66_no_agent_entry_is_let_through_until_the_runs_reset_has_completed(
+    client, config, platform_file, ticker, tmp_path, fake, monkeypatch
+):
+    """O66: in a campaign run (`run_admission`), its reset first, then its agent: at the reset's first stage and at its
+    last, every way the run's agent can come to act (a sandbox or tool-server launch, a sandbox start's share, a tool
+    reusing the admission) is refused, so a share the run keeps during its reset can only be a harness step's; once
+    the reset has completed, each is let through."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path)
+    seen: dict[str, list[str]] = {}
+    qos, history = SpaceReset._qos, SpaceReset._history
+
+    def probed(stage, method):
+        def run(self, *args, **kwargs):
+            seen[stage] = agent_entries(config)
+            return method(self, *args, **kwargs)
+
+        return run
+
+    monkeypatch.setattr(SpaceReset, "_qos", probed("qos", qos))
+    monkeypatch.setattr(SpaceReset, "_history", probed("history", history))
+    admit = run_admission(config)
+    assert admit is not None
+    with admit((), {}, threading.Event(), False):
+        record = SpaceReset(p, now=ticker.clock).run(allowed=ALLOWED, qos_rights=True)
+        with contextlib.ExitStack() as after:
+            require_admission(config)
+            after.callback(retain_to_act())
+            after.enter_context(shared_admission(config, reason="smoke_warmup"))
+    assert record["ok"] is True
+    assert seen == {"qos": [], "history": []}
+
+
+@pytest.mark.parametrize("step", [SANDBOX_STEP, TOOL_SERVER_STEP])
+def test_o66_a_reset_after_the_runs_sandbox_or_tool_server_started_is_refused_and_sends_nothing(
+    client, config, platform_file, ticker, tmp_path, fake, lock, step
+):
+    """O66: the broken order. The run's sandbox (or tool server) is up, counted as a step that uses the run's tokens
+    from its launch to the end of its stop (`token_step`, as `SandboxPlatform.launch` and the tool-server launch hold
+    it), so the agent may be running cells, calling tools or reading: a reset then could run beside the agent, so it
+    is refused before anything is sent, naming the step, the run's share left held."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path)
+    with lock.held(exclusive=False, timeout_s=1.0) as admission, token_step(step):
+        before = len(fake.sent)
+        with pytest.raises(AdmissionRefused, match=f"run's {step}") as refused:
+            SpaceReset(p, now=ticker.clock).run(allowed=ALLOWED, qos_rights=True)
+        assert len(fake.sent) == before
+        assert admission.reset.shared
+        assert "before the run's sandbox and tool server start" in str(refused.value)
+    with lock.held(exclusive=False, timeout_s=1.0):  # the same reset once the step has ended passes
+        assert SpaceReset(p, now=ticker.clock).run(allowed=ALLOWED, qos_rights=True)["ok"] is True
+
+
+def test_o66_an_agent_step_that_begins_during_the_reset_fails_that_stage(
+    client, config, platform_file, ticker, tmp_path, fake, lock, monkeypatch
+):
+    """O66: a step that uses the run's tokens begun while the reset runs (a launch that passed its admission check just
+    before the reset began) may let the agent act during it: the stage it began in fails, naming it, and no later stage
+    begins."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path)
+    settle = SpaceReset._qos_settle
+
+    def and_a_launch(self, *args, **kwargs):
+        facts = settle(self, *args, **kwargs)
+        admission.begin_step(SANDBOX_STEP)  # counted, as a launch already past its check counts it
+        return facts
+
+    monkeypatch.setattr(SpaceReset, "_qos_settle", and_a_launch)
+    with lock.held(exclusive=False, timeout_s=1.0) as admission, pytest.raises(ResetFailed, match="sandbox") as failed:
+        SpaceReset(p, now=ticker.clock).run(allowed=ALLOWED, qos_rights=True)
+    assert failed.value.stage == "qos_settle"
+    assert "transfers" not in failed.value.record["stages"]
 
 
 # --- no reset without the federation's admission --------------------------------------------------------------------
