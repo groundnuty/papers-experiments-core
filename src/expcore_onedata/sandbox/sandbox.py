@@ -67,6 +67,7 @@ from expcore_onedata.sandbox import (
     gatepolicy,
     hostfacts,
     hostops,
+    infrafacts,
     inputs,
     iomode,
     kinds,
@@ -193,6 +194,7 @@ class DockerSandbox:
             "cell_deadline": {"grace_s": settings.kill_grace_s, "margin_s": DL.margin_s(settings.kill_grace_s)},
         }
         self._meta_lock = threading.RLock()  # a cell's deadline writes here from its timer's thread (cells.py)
+        self._facts = infrafacts.InfrastructureFacts(self._meta, self._meta_lock)  # the one writer of its facts (O89)
         self._evidence: list[Path] = []  # where `collect` wrote its evidence: never in the metadata, a host path
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
@@ -357,10 +359,8 @@ class DockerSandbox:
         self._started = time.time()
         self._meta.update(host=self.host.host_facts(), started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         # O87: the host's OS release, glibc and kernel where an Apptainer run keeps its node's; recorded, never refused.
-        # Set in place: the platform may have recorded a fact before the start (the federation's window, O86)
-        node = hostfacts.of_node(lambda: self.host.host_readings())
-        with self._meta_lock:
-            self._meta.setdefault("infrastructure_facts", {})["node"] = node
+        # Merged in: the platform may have recorded a fact before the start (the federation's window, O86)
+        self._facts.write(infrafacts.NODE, {"node": hostfacts.of_node(lambda: self.host.host_readings())})
         work = self.dir / "work"
         self._note_mount(work)  # registered before the mount (unmounting what never got mounted is harmless)
         self.host.make_quota_dir(self.dir / "work.img", work, s.limits.work_disk_bytes, s.agent_uid)
@@ -1230,7 +1230,9 @@ class DockerSandbox:
         return self._stopped
 
     def record(self, **fields: Any) -> None:
-        """Add facts to the metadata (the lease, the token records: never a value)."""
+        """Add facts to the metadata (the lease, the token records: never a value). Not the run's infrastructure facts as
+        a whole, which `record_infrastructure_fact` adds to one at a time (O89)."""
+        infrafacts.refuse_replacement(fields)
         self._meta.update(fields)
 
     def note_evidence(self, dest: Path) -> None:
@@ -1245,12 +1247,12 @@ class DockerSandbox:
         with self._meta_lock:
             return tuple(self._evidence)
 
-    def record_infrastructure_fact(self, key: str, value: Any) -> None:
+    def record_infrastructure_fact(self, key: str, value: Any, *, owner: str) -> None:
         """Add one fact to the run's `infrastructure_facts` (the platform's own observation: the federation's window,
         O86), the table the Apptainer backend always has and a Docker run has once it holds one. Plain JSON, never a
-        secret."""
-        with self._meta_lock:
-            self._meta.setdefault("infrastructure_facts", {})[key] = value
+        secret. Merged beside the others, and `owner` names who writes it (`infrafacts`, O89): the key is its own, to
+        record again, and no other owner's key may be overwritten."""
+        self._facts.write(owner, {key: value})
 
     def collect(self, dest_dir: str | Path, outputs: Sequence[str] = ()) -> dict[str, Any]:
         """Stop whatever of the agent's still runs, then copy out the run's evidence and the named files of /work.

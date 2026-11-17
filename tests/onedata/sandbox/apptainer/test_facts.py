@@ -12,7 +12,7 @@ from apptainer_support import make_settings, make_spec, options, pinned_bundle, 
 from fake_mount_node import FakeMountNode
 from fake_node import READINGS, FakeNode
 
-from expcore_onedata.sandbox import fedwindow
+from expcore_onedata.sandbox import fedwindow, infrafacts
 from expcore_onedata.sandbox.api import StartRefused
 from expcore_onedata.sandbox.apptainer import facts
 from expcore_onedata.sandbox.apptainer import hostmount as HM
@@ -171,8 +171,8 @@ def test_o71_o86_o87_the_work_disk_s_proof_keeps_every_fact_another_feature_reco
     window = fedwindow.pending()
     for proof in proofs:
         box = ApptainerSandbox(node, settings, make_spec("via-gate"), **options())
-        box.record_infrastructure_fact(fedwindow.KEY, window)  # as `SandboxPlatform` does before the start
-        box.record_infrastructure_fact("recorded_before_the_start_by_another_feature", {"kept": True})
+        box.record_infrastructure_fact(fedwindow.KEY, window, owner=infrafacts.WINDOW)  # as `SandboxPlatform` does
+        box.record_infrastructure_fact("recorded_before_the_start_by_another_feature", {"kept": True}, owner="another")
         box.begin()
         try:
             kept = box.metadata()["infrastructure_facts"]
