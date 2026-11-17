@@ -140,11 +140,7 @@ class ApptainerSandbox:
             "data_path": spec.mode.value,
             "listing": spec.listing if spec.mode is DataPathMode.REST else None,
             "backend": self.app.record() if self.app is not None else {"backend": "apptainer"},
-            "infrastructure_facts": facts.record(
-                "image_unverified" if self.work_image else "directory",
-                mount_refused=self._mount_refused(),
-                provider_storage=self.app.provider_storage if self.app is not None else None,
-            ),
+            "infrastructure_facts": self._facts_record("image_unverified" if self.work_image else "directory"),
             "images": {},
             "tls": settings.tls.record(),
             "certifi": None,
@@ -230,6 +226,16 @@ class ApptainerSandbox:
         The run's facts list `mount_refused` exactly when this holds; the helper's own refusals (a direct mount, a run
         without a token) come after it, at the helper's start."""
         return self._mount_factory is None or self.s.mount is None
+
+    def _facts_record(self, work_disk: str) -> dict[str, Any]:
+        """The run's `infrastructure_facts` for the work disk's state (`facts.record`). Every record of a run, the one
+        the work disk's proof replaces included, is made here, so each carries the platform's `provider_storage`
+        (O57)."""
+        return facts.record(
+            work_disk,
+            mount_refused=self._mount_refused(),
+            provider_storage=self.app.provider_storage if self.app is not None else None,
+        )
 
     def _validate(self) -> None:
         sp, s = self.spec, self.s
@@ -610,7 +616,7 @@ class ApptainerSandbox:
                 proof = {"kind": "invariants", **workproof.reference(kept)}
                 with self._meta_lock:
                     self._meta["work_disk"].update(filesystem_bytes=total, fstype=fstype, remade=True, proof=proof)
-                    self._meta["infrastructure_facts"] = facts.record("image", mount_refused=self._mount_refused())
+                    self._meta["infrastructure_facts"] = self._facts_record("image")
                 return
             why = "invariants_differ"
         held, total, fstype, block = self._full_fill(size)
@@ -623,7 +629,7 @@ class ApptainerSandbox:
                 proof={"kind": "full_fill", "full_fill_because": why, "kept": kept_now,
                        **workproof.reference(document)},
             )  # fmt: skip
-            self._meta["infrastructure_facts"] = facts.record("image", mount_refused=self._mount_refused())
+            self._meta["infrastructure_facts"] = self._facts_record("image")
 
     def _proof_config(self, size: int) -> dict[str, Any]:
         """What a kept proof is for (`workproof.key_of`): this boot of the node, this driver, the image, the size, the

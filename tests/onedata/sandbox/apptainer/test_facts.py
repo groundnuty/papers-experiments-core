@@ -134,3 +134,22 @@ def test_o57_the_facts_record_echoes_the_kind_only_when_given():
     given = facts.record(mount_refused=False, provider_storage="shared_filesystem")
     assert given["provider_storage"] == "shared_filesystem"
     assert {k: v for k, v in given.items() if k != "provider_storage"} == facts.record(mount_refused=False)
+
+
+@pytest.mark.parametrize("kind", ["tmpfs", "shared_filesystem"])
+def test_o57_an_image_run_keeps_the_provider_storage_kind_after_its_work_disk_is_proved(tmp_path, kind):
+    """O57, O71: a run whose `/work` is an image replaces its facts once the work disk is proved, on the first start of
+    the node's driver (the full fill) and on a later one (the invariants against the kept proof), and either record
+    carries the kind the platform declares, as a directory run's does."""
+    settings = make_settings(tmp_path, work_disk="image", provider_storage=kind)
+    node = FakeNode()
+    for proof in ("full_fill", "invariants"):
+        box = start(node, settings, make_spec("via-gate"))
+        try:
+            meta = box.metadata()
+            assert meta["work_disk"]["proof"]["kind"] == proof
+            assert "work_disk_image" in meta["infrastructure_facts"]["facts"]  # the record of the proved disk
+            assert meta["infrastructure_facts"]["provider_storage"] == kind
+            assert meta["backend"]["provider_storage"] == kind
+        finally:
+            box.stop()
