@@ -31,7 +31,7 @@ from expcore.prompt.templates import RenderedPrompt
 from expcore.records.build import DefectSink, PromptText, RunIdentity, model_secrets, record_attempt, redactor_for
 from expcore.records.injections import injected_targets
 from expcore.records.record import RunRecord
-from expcore.records.redact import Redactor, secret_env_names
+from expcore.records.redact import MIN_SECRET_LEN, Redactor, secret_env_names
 from expcore.records.schema import first_turn_rule, outcome_from_entry, target_rule, unread_replies
 
 
@@ -157,8 +157,9 @@ class RunRequest:
         from `environ` (the process's by default) **now** and kept as values. A given `environ` is the mapping the
         executor gives `record_run`: what that redacts from it (the variables named like a secret, the models' keys)
         is kept here too. It never replaces the process: the secrets of the process (a variable named like one, a
-        model's key) stay redacted, and a later declaration with another `environ` takes nothing away. A name with no
-        value is ignored. A string is one secret or one name, not its characters.
+        model's key) are kept as values as well, so they stay redacted when `record_run` is given another environment,
+        and a later declaration with another `environ` takes nothing away. A name with no value is ignored. A string is
+        one secret or one name, not its characters.
 
         A secret too short to redact (a value, or the value of a variable) is refused here with a `ConfigError` that
         names the variable and never shows the value, as `record_attempt` refuses it: nothing of this call is kept, and
@@ -176,11 +177,18 @@ class RunRequest:
             # leaves the log one that cannot be built, which withholds the traceback of the ConfigError
             self.defect_log.redact_with(checked)
         checked()  # refuses a secret too short to redact, naming the variable
-        if environ is None:  # the process's own secrets are read by the redactor itself: only the names declared
-            read = tuple(shown[name] for name in names if shown.get(name, "").strip())
-        else:  # the mapping the executor gives `record_run`: what that redacts from it is kept here too, as values
-            keys = model_secrets(self.backend, self.models, shown)[1]
-            read = (*(shown[name] for name in secret_env_names(shown, names)), *keys)
+        # The values the redactor reads from the environments are kept as values: the declared names' and, with a given
+        # environment, what `record_run` redacts from it (variables named like a secret, the models' keys); and the
+        # process's own, which `record_attempt` stops reading when `record_run` is given an environment of its own. A
+        # process secret too short to redact is left out: `record_attempt` would not have looked at it either.
+        read = [shown[name] for name in secret_env_names(shown, names)]
+        read += model_secrets(self.backend, self.models, shown)[1]
+        if environ is not None:
+            process = dict(os.environ)
+            kept = [process[name] for name in secret_env_names(process)] + model_secrets(
+                self.backend, self.models, process
+            )[1]
+            read += [value for value in kept if len(value) >= MIN_SECRET_LEN]
         held = tuple(dict.fromkeys([*self.declared.secrets, *given, *read]))
         self.declared.secrets = held
         if self.defect_log is not None:

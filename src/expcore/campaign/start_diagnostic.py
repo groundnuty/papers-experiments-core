@@ -64,20 +64,32 @@ def snapshot_of(
     given, origin = getattr(error, "diagnostic", None), getattr(error, "origin", None)  # a subclass may skip the base
     if not isinstance(error, InfraError) or (given is None and origin is None):
         return None
-    head: dict[str, Any] = {}
     try:
-        head = dict(origin or {})
         if given is not None and not complete:
-            return {**head, "ok": False, "error": "Withheld", "why": WITHHELD}
+            return {**_head(origin, redactor), "ok": False, "error": "Withheld", "why": WITHHELD}
         if given is not None and not isinstance(given, Mapping):
             raise TypeError("a diagnostic is a JSON object")
-        text = json.dumps(head if given is None else {**head, "diagnostic": given}, sort_keys=True, allow_nan=False)
+        text = json.dumps(
+            dict(origin or {}) if given is None else {**dict(origin or {}), "diagnostic": given},
+            sort_keys=True,
+            allow_nan=False,
+        )
         if len(text.encode("utf-8")) > LIMIT_BYTES:
             raise DiagnosticTooLarge(f"a diagnostic is at most {LIMIT_BYTES} bytes")
         redacted, _ = redactor().structure(json.loads(text))
         return dict(redacted)
     except Exception as problem:  # whatever is wrong with it, the attempt keeps its result and says the snapshot failed
-        return {**head, "ok": False, "error": type(problem).__name__}
+        return {**_head(origin, redactor), "ok": False, "error": type(problem).__name__}
+
+
+def _head(origin: Any, redactor: Callable[[], Redactor]) -> dict[str, Any]:
+    """The phase and the instrument a snapshot that holds no evidence keeps, redacted like the rest (an instrument's
+    name can be any word, a secret's value among them); empty when they cannot be redacted: none is kept unredacted."""
+    try:
+        redacted, _ = redactor().structure(dict(origin or {}))
+        return dict(redacted)
+    except Exception:
+        return {}
 
 
 def exported(store: Any, conditions: Mapping[str, str], models: Mapping[str, str]) -> list[dict[str, Any]] | None:
