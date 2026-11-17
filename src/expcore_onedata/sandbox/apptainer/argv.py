@@ -29,6 +29,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from expcore_onedata.sandbox.cellresolv import RESOLV_CONF, RESOLV_TEXT
+
 NO_MOUNT = "hostfs,bind-paths,cwd"
 RUN_TAG = "EXPCORE_SANDBOX"  # in every cell's environment: the run's sandbox id, how the watch finds its processes
 GATE_PORT_ENV = "EXPCORE_GATE_PORT"  # a REST cell's: the port of the gate on 127.0.0.1
@@ -39,10 +41,10 @@ PRELOAD_DIR = "/expcore-preload"  # hook (b)'s libraries, each `<n>.so`
 LOOPBACK = "127.0.0.1"
 FATAL = "FATAL:"  # how apptainer itself says it could not run a container, on its stderr
 APPTAINER_FAILED_EXIT = 255
-RESOLV_CONF, NSSWITCH_CONF = "/etc/resolv.conf", "/etc/nsswitch.conf"
-# No name server (facts.py, dns_none). A resolv.conf without one alone would not do: the C library then asks the name
-# server on 127.0.0.1, the node's loopback that every user shares; so the hosts database is the files alone.
-RESOLV_TEXT = "# no name server: a cell resolves the names of /etc/hosts alone\noptions attempts:1 timeout:1\n"
+NSSWITCH_CONF = "/etc/nsswitch.conf"
+# No name server (facts.py, dns_none). The resolv.conf is the one both backends' cells read (`cellresolv`, O56). A
+# resolv.conf without a name server alone would not do: the C library then asks the name server on 127.0.0.1, the node's
+# loopback that every user shares; so the hosts database is the files alone. A Docker agent has a loopback of its own.
 NSSWITCH_TEXT = "".join(
     f"{db}: files\n" for db in ("passwd", "group", "shadow", "hosts", "networks", "protocols", "services", "ethers")
 )

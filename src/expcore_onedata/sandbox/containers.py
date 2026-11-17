@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint
+from expcore_onedata.sandbox.cellresolv import RESOLV_CONF
 from expcore_onedata.sandbox.oneclient_args import (
     CONFIG_NULL,
     CONFIG_OPTION,
@@ -461,6 +462,7 @@ def agent_run_args(
     image_id: str,
     mode: DataPathMode,
     work: Path,
+    resolv: Path,
     share: Path | None,
     gate_ip: str | None,
     gate_hosts: Sequence[str],
@@ -477,6 +479,11 @@ def agent_run_args(
     client start (O23); the gate drops it. In mount mode the read-only mount is bound in with `readonly`. With no data
     path it has neither. Each read-only input, the run's own copy and the path the agent sees it at, is bound in with
     `readonly` too, in every data path (O20).
+
+    `resolv` is the run's own copy of the neutral `/etc/resolv.conf` (`cellresolv`, O56), bound read-only over the
+    engine's own file in every data path, so the agent reads no name server, search or domain line, the same file as an
+    Apptainer cell's. It is one `--mount` and changes nothing else of the container: the names the agent resolves are
+    `--add-host`'s, and nothing of it resolves through the engine's embedded resolver.
     """
     lim, uid = s.limits, s.agent_uid
     args = [
@@ -487,6 +494,7 @@ def agent_run_args(
         *("--pids-limit", str(lim.pids), "--ulimit", f"nofile={lim.nofile}:{lim.nofile}"),
         *("--tmpfs", f"/tmp:size={lim.tmp_bytes},mode=1777", "--shm-size", str(lim.shm_bytes)),
         *("-v", f"{work}:/work"),
+        *bind(resolv, RESOLV_CONF),
     ]
     env: dict[str, str] = {}
     if mode is DataPathMode.REST:
