@@ -9,12 +9,21 @@ launches are also staggered. Over the fake Slurm of hpc_fed_support: every node 
 import importlib
 import json
 import re
+import time
 from pathlib import Path
 
 import pytest
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
 
 PROVIDERS = ["aspen", "larch", "rowan", "alder", "hazel"]
+STAMP = "%Y-%m-%dT%H:%M:%S"  # a time as sacct prints it, in the local time of the node that prints it
+T0 = time.mktime(time.strptime("2027-01-15T12:00:00", STAMP))  # where the fake wall clock starts
+
+
+def stamp(epoch):
+    return time.strftime(STAMP, time.localtime(epoch))
+
+
 NODE = re.compile(r"node[0-9]{2}")  # the fake's node names: never in a retry's record or in what `up` says
 LIVE_CLIENT = (
     "srun: error: _fwd_tree_get_addr: can't find address for host node01, check slurm.conf\n"
@@ -58,13 +67,23 @@ class Rig:
         self.driver = hpc.cli.make_driver(LAYOUT, str(self.root), runner=self.fake)
         self.said = []
         self.slept = []
+        self.now = T0  # the driver's wall clock: it moves only when the driver sleeps
         self.driver.say = self.said.append
-        self.driver.sleep = self.slept.append
+        self.driver.sleep = self.sleep
+        self.driver.wall = lambda: self.now
         self.driver.poll_s = 0.0
         self.driver.slurm.sleep = lambda s: None
         self.driver.slurm.poll_s = 0.0
         self.driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
         self.driver.relay_available = lambda: False
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def waits(self):
+        """The pauses that were backoffs: not a stagger, not a poll."""
+        return [s for s in self.slept if s not in (self.driver.launch_stagger_s, self.driver.poll_s)]
 
     def up(self):
         return self.driver.up(self.hpc.settings.site_from_environment(self.site))
@@ -86,7 +105,7 @@ def rows_of(rig):
     found = {}
     for rows in rig.fake.step_rows.values():
         for row in rows:
-            ident, name, state, code = row.split("|")
+            ident, name, state, code, _end = row.split("|")
             found[name] = (ident, state, code)
     return found
 
@@ -123,6 +142,8 @@ def test_o57_a_provider_that_failed_at_launch_with_an_empty_log_is_launched_agai
             "sacct_exit": "0:116",
             "run_log_bytes": 0,
             "failure": "task-launch-no-address",
+            "step_end": "Unknown",
+            "waited_s": 60.0,
         }
     ]
     assert (accounted, code) == ("CANCELLED", "0:116")
@@ -273,6 +294,87 @@ def test_o57_a_run_log_that_gains_a_byte_during_the_backoff_cancels_the_retry(hp
         rig.up()
     assert len(rig.launches("larch")) == 1
     assert retries(rig, "larch") == []
+
+
+def test_o57_five_failures_that_ended_together_wait_one_backoff_in_all_not_five(hpc, tmp_path, site):
+    """O57 (the live pattern): all five providers failed in the same second. The backoff counts from each step's End,
+    read from the sacct row the proofs read: the first waits what is left of 60 s after that End, the other four find
+    it already over, so the five wait about one backoff in all (58 s here), not five (300 s)."""
+    end = stamp(T0 + 12)
+    rig = Rig(hpc, tmp_path, site, FakeSlurm(launch_failures={p: [{"end": end}] for p in PROVIDERS}))
+    rig.driver.poll_s = 5.0  # three polls with the step gone (10 s) before up knows: the wall clock moves
+    rig.up()
+    assert rig.waits() == [58.0]
+    entries = [retries(rig, p)[0] for p in PROVIDERS]
+    assert [e["waited_s"] for e in entries] == [58.0, 0.0, 0.0, 0.0, 0.0]
+    assert {e["step_end"] for e in entries} == {end}
+    assert rig.state()["phase"] == "linked"
+
+
+def test_o57_a_later_failure_waits_the_remainder_of_its_own_backoff(hpc, tmp_path, site):
+    """O57: a service whose step ended later counts its backoff from its own End: here larch's step ended 28 s after
+    aspen's, and by the time up looks at it (82 s after the launches) 18 s of its 60 are left."""
+    fake = FakeSlurm(launch_failures={"aspen": [{"end": stamp(T0 + 12)}], "larch": [{"end": stamp(T0 + 40)}]})
+    rig = Rig(hpc, tmp_path, site, fake)
+    rig.driver.poll_s = 5.0
+    rig.up()
+    assert rig.waits() == [58.0, 18.0]
+    assert [retries(rig, p)[0]["waited_s"] for p in ("aspen", "larch")] == [58.0, 18.0]
+
+
+@pytest.mark.parametrize(
+    "end",
+    [
+        "Unknown",
+        "",
+        "garbage",
+        "2027-13-45T99:99:99",
+        stamp(T0 - 3600),  # before the launch: another time zone, or another clock
+        stamp(T0 + 3600),  # in the future
+    ],
+    ids=["unknown", "empty", "garbage", "impossible", "before-the-launch", "in-the-future"],
+)
+def test_o57_an_end_that_cannot_be_read_or_believed_takes_the_whole_backoff_from_now(hpc, tmp_path, site, end):
+    """O57: where the End is not a time sacct printed in the node's own clock between the launch and now, the backoff
+    is the whole 60 s from now, never zero: a step can only be proved to have ended when its End says so."""
+    rig = Rig(hpc, tmp_path, site, FakeSlurm(launch_failures={"larch": [{"end": end}]}))
+    rig.driver.poll_s = 5.0
+    rig.up()
+    assert rig.waits() == [60.0]
+    assert retries(rig, "larch")[0]["waited_s"] == 60.0
+
+
+def test_o57_a_byte_in_the_log_during_a_wait_counted_from_the_end_cancels_the_retry_too(hpc, tmp_path, site):
+    """O57: the run log is read again after a shortened wait as after a whole one."""
+    rig = Rig(hpc, tmp_path, site, FakeSlurm(launch_failures={"aspen": [{"end": stamp(T0 + 12)}]}))
+    rig.driver.poll_s = 5.0
+    real_sleep = rig.driver.sleep
+
+    def sleep(seconds):
+        if seconds == 58.0:
+            Path(rig.state()["services"]["aspen"]["log"]).write_text("x", encoding="utf-8")
+        real_sleep(seconds)
+
+    rig.driver.sleep = sleep
+    with pytest.raises(RuntimeError, match="aspen's step ended before its log said"):
+        rig.up()
+    assert len(rig.launches("aspen")) == 1
+    assert retries(rig, "aspen") == []
+
+
+def test_o57_the_end_is_read_only_between_the_launch_and_now_and_the_wait_is_never_negative(proof):
+    """O57: `failure_time` believes an End only inside the window from the launch (less the clocks' skew) to now (plus
+    it); `backoff_wait` is what is left of the backoff after that time, never below zero, and the whole backoff
+    when there is no time."""
+    assert proof.failure_time(stamp(T0 + 12), T0, T0 + 14) == T0 + 12
+    assert proof.failure_time(stamp(T0 - 5), T0, T0 + 14) == T0 - 5  # inside the skew
+    assert proof.failure_time(stamp(T0 + 20), T0, T0 + 14) == T0 + 20  # inside the skew
+    for end in ("Unknown", "", "x", stamp(T0 - 3600), stamp(T0 + 3600)):
+        assert proof.failure_time(end, T0, T0 + 14) is None
+    assert proof.failure_time(stamp(T0 + 12), None, T0 + 14) is None  # launched by no process of this one
+    assert proof.backoff_wait(60.0, T0 + 12, T0 + 14) == 58.0
+    assert proof.backoff_wait(60.0, T0 + 12, T0 + 500) == 0.0
+    assert proof.backoff_wait(60.0, None, T0 + 500) == 60.0
 
 
 def test_o57_a_failure_that_is_no_proof_waits_no_backoff(hpc, tmp_path, site):
@@ -509,15 +611,16 @@ def test_o57_the_client_logs_failure_is_read_as_a_step_id_and_a_class_never_a_ho
 def test_o57_an_accounting_row_is_found_by_its_exact_id_and_name_and_read_raw(proof):
     """O57: the row of the one step id, whose name is the step's; its state and exit code as sacct prints them."""
     rows = (
-        "4242.6|a-zone-run-1|RUNNING|0:0\n"
-        "4242.7|a-larch-run-1|CANCELLED|0:116\n"
-        "4242.8|a-rowan-run-1|CANCELLED by 5|0:9\n"
+        "4242.6|a-zone-run-1|RUNNING|0:0|Unknown\n"
+        "4242.7|a-larch-run-1|CANCELLED|0:116|2027-01-15T12:00:12\n"
+        "4242.8|a-rowan-run-1|CANCELLED by 5|0:9|2027-01-15T12:00:13\n"
     )
-    assert proof.accounted(rows, "4242.7", "a-larch-run-1") == ("CANCELLED", "0:116")
-    assert proof.accounted(rows, "4242.8", "a-rowan-run-1") == ("CANCELLED by 5", "0:9")
+    assert proof.accounted(rows, "4242.7", "a-larch-run-1") == ("CANCELLED", "0:116", "2027-01-15T12:00:12")
+    assert proof.accounted(rows, "4242.8", "a-rowan-run-1") == ("CANCELLED by 5", "0:9", "2027-01-15T12:00:13")
+    assert proof.accounted("4242.7|a-larch-run-1|CANCELLED|0:116\n", "4242.7", "a-larch-run-1") is None  # no End
     assert proof.accounted(rows, "4242.7", "a-rowan-run-1") is None  # the name is not that id's
     assert proof.accounted(rows, "4242.9", "a-larch-run-1") is None  # no such id
     assert proof.accounted(rows, "4242", "a-larch-run-1") is None
-    twice = rows + "4242.7|a-larch-run-1|CANCELLED|0:116\n"
+    twice = rows + "4242.7|a-larch-run-1|CANCELLED|0:116|Unknown\n"
     assert proof.accounted(twice, "4242.7", "a-larch-run-1") is None  # two rows of the id: which is it?
     assert proof.accounted("", "4242.7", "a-larch-run-1") is None

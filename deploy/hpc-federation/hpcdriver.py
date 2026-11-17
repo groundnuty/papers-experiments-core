@@ -98,6 +98,8 @@ class Driver(Down):
     poll_s: float = 5.0
     launch_stagger_s: float = LAUNCH_STAGGER_S  # recorded in the state file by `initial_state`
     launch_retry_backoff_s: float = LAUNCH_RETRY_BACKOFF_S  # recorded there too
+    wall: Callable[[], float] = time.time  # the login node's wall clock, to read a step's End against (a stand-in's)
+    launched_wall: Dict[str, float] = field(default_factory=dict)  # service -> the wall time of its last launch here
     core_paths: Dict[str, str] = field(default_factory=dict)
     relay_available: Callable[[], bool] = hpcrelay.available
     environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
@@ -516,6 +518,7 @@ class Driver(Down):
         name = f"{state['allocation']['name']}-{service}-run-{launch}"
         log = str(Path(state["site"]["logs"]) / f"{name}.log")
         step = {"name": name, "id": None}
+        self.launched_wall[service] = self.wall()
         self.set(lambda s: s["services"][service].update(launch=launch, step=step, log=log, state="starting"))
         record = state["services"][service]
         self.launcher.service(record["node"], argv, kind=record["kind"], name=name, log=log)
@@ -554,9 +557,10 @@ class Driver(Down):
 
         The only failure considered is `StepGone`: the step ended before its log said anything it waited for. It is
         launched again only when `launch_proof` shows, from three sources read now, that nothing of it ran (both
-        proofs, `hpclaunchproof`). Then `launch_retry_backoff_s` passes (the cause was transient: live, the nodes
-        resolved again a minute later), the run log is read once more, and only if it is still empty is the retry
-        written to the state, with its proofs, and the service launched. Every other failure, a second failure of the
+        proofs, `hpclaunchproof`). Then what is left of `launch_retry_backoff_s` passes, counted from the step's own End
+        (the cause was transient: live, the nodes resolved again a minute later; `backoff`), the run log is read once
+        more, and only if it is still empty is the retry written to the state, with its proofs, and the service
+        launched. Every other failure, a second failure of the
         same service, and a deadline that ran out (the step may be running) are raised as they always were."""
         try:
             return self.wait_log(service, wanted)
@@ -564,12 +568,24 @@ class Driver(Down):
             retry = self.launch_proof(service)
             if retry is None:
                 raise
-            self.say(f"{service}: its launch failed before anything ran; waiting {self.launch_retry_backoff_s:g} s")
-            self.sleep(self.launch_retry_backoff_s)
+            retry["waited_s"] = self.backoff(service, retry)
             if not self.record_retry(service, retry):
                 raise
         self.launch(service, argv)
         return self.wait_log(service, wanted)
+
+    def backoff(self, service: str, retry: Dict[str, Any]) -> float:
+        """Wait out what is left of `launch_retry_backoff_s` counted from the step's own End, read from the sacct row
+        of the proofs; the whole of it from now when that End is unreadable or not to be believed (`failure_time`).
+        Providers that failed together then wait one backoff in all, not one each. Returns the seconds waited."""
+        now = self.wall()
+        failed_at = hpclaunchproof.failure_time(retry["step_end"], self.launched_wall.get(service), now)
+        wait = hpclaunchproof.backoff_wait(self.launch_retry_backoff_s, failed_at, now)
+        how = "from its End" if failed_at is not None else "from now: its End is not to be read"
+        self.say(f"{service}: its launch failed before anything ran; waiting {wait:g} s ({how})")
+        if wait > 0:
+            self.sleep(wait)
+        return wait
 
     def launch_proof(self, service: str) -> Optional[Dict[str, Any]]:
         """The proofs that this service's last launch failed before anything of it ran, or None. Never a second

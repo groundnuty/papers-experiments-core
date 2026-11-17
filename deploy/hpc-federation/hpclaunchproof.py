@@ -16,12 +16,17 @@ exit code `0:116`, the exact id and the client's own line are. A launch is prove
 - (b) the run log is a file of zero bytes. The bundle's batch script writes to it first, so a single byte means the
   service may have started.
 
+The same row's End says when the step ended, which the retry's backoff counts from (`failure_time`, `backoff_wait`):
+providers that failed together then wait one backoff in all. An End that cannot be read, or lies outside the time
+between the launch and now, is no time: the whole backoff is waited from now, never none.
+
 Nothing here names a node: a failure is recorded as a class (`NO_ADDRESS`), never as the client's line.
 """
 
 import os
 import re
 import stat
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -33,6 +38,8 @@ STEP_ID = r"[0-9]{1,12}(?:\+[0-9]{1,6})?\.[0-9]{1,9}"  # `<job>.<n>`, or a heter
 TASK_LAUNCH = re.compile(rf"srun: error: Task launch for StepId=({STEP_ID}) failed on node \S+: (.*)")
 ADDRESS_REASON = "Can't find an address"
 CLIENT_LIMIT = 65536  # the most of a client's log read: a larger one is no proof
+END_FORMAT = "%Y-%m-%dT%H:%M:%S"  # sacct's End, in the local time of the node that prints it ("Unknown" until it ends)
+SKEW_S = 10.0  # what an End may lie outside the time between the launch and now, for the clocks' skew
 
 
 def client_failure(text: str) -> Optional[Tuple[str, str]]:
@@ -49,17 +56,38 @@ def client_failure(text: str) -> Optional[Tuple[str, str]]:
     return (ident, failure) if failure == NO_ADDRESS else None
 
 
-def accounted(rows: str, step_id: str, name: str) -> Optional[Tuple[str, str]]:
-    """(State, ExitCode), raw, of the one `JobID|JobName|State|ExitCode` row of this exact step id, when that row is
-    of the step's own name; None when no row, two rows or another name."""
+def accounted(rows: str, step_id: str, name: str) -> Optional[Tuple[str, str, str]]:
+    """(State, ExitCode, End), raw, of the one `JobID|JobName|State|ExitCode|End` row of this exact step id, when that
+    row is of the step's own name; None when no row, two rows, another name or a row of another shape."""
     found = []
     for line in rows.splitlines():
         parts = line.split("|")
-        if len(parts) == 4 and parts[0] == step_id:
+        if len(parts) == 5 and parts[0] == step_id:
             found.append(parts)
     if len(found) != 1 or found[0][1] != name:
         return None
-    return found[0][2], found[0][3]
+    return found[0][2], found[0][3], found[0][4]
+
+
+def failure_time(end: str, launched_at: Optional[float], now: float) -> Optional[float]:
+    """When the step ended, as epoch seconds, from the End sacct printed for it; None when that is not to be believed.
+    sacct prints End in the local time of the node that prints it, so it is read as the local time of this node, and
+    believed only when it falls between this process's launch of the step (less `SKEW_S`) and now (plus it): a time in
+    another zone, another clock or a field that is not a time ("Unknown", empty) lies outside that and is no time.
+    `launched_at` and `now` are this process's wall clock; None when the step was launched by no process of this one."""
+    if launched_at is None:
+        return None
+    try:
+        ended = time.mktime(time.strptime(end, END_FORMAT))
+    except (ValueError, OverflowError):
+        return None
+    return ended if launched_at - SKEW_S <= ended <= now + SKEW_S else None
+
+
+def backoff_wait(backoff_s: float, failed_at: Optional[float], now: float) -> float:
+    """What is left of the backoff, counted from the failure's own time: the whole of it from now when that time is
+    unknown (never zero then), never below zero when it is known."""
+    return backoff_s if failed_at is None else max(0.0, failed_at + backoff_s - now)
 
 
 def run_log_size(path: Path) -> Optional[int]:
@@ -95,7 +123,8 @@ def prove(
     failure = client_failure(client)
     if failure is None or (known_id is not None and known_id != failure[0]):
         return None
-    if accounted(rows, failure[0], name) != (STATE, EXIT):
+    row = accounted(rows, failure[0], name)
+    if row is None or row[:2] != (STATE, EXIT):
         return None
     return {
         "step": name,
@@ -104,6 +133,7 @@ def prove(
         "sacct_exit": EXIT,
         "run_log_bytes": 0,
         "failure": failure[1],
+        "step_end": row[2],
     }
 
 
@@ -111,6 +141,6 @@ def evidence(service: str, entry: Dict[str, Any]) -> str:
     """One line of `up`'s output for a retry: the service, which launch, and each proof as it was read."""
     return (
         f"launch retried: {service} launch {entry['launch']} ({entry['step']}, step {entry['step_id']}): sacct "
-        f"{entry['sacct_state']} {entry['sacct_exit']}, run log {entry['run_log_bytes']} bytes, client log "
-        f"{entry['failure']}"
+        f"{entry['sacct_state']} {entry['sacct_exit']}, ended {entry['step_end']}, run log "
+        f"{entry['run_log_bytes']} bytes, client log {entry['failure']}, waited {entry['waited_s']:g} s"
     )

@@ -497,9 +497,16 @@ happened). `up` could only fail and be torn down, although a minute later every 
   `down` ends it. **The retry waits first**: `launch_retry_backoff_s`
   (`hpcdriver.LAUNCH_RETRY_BACKOFF_S`, 60 s; recorded as `launch.retry_backoff_s`), since live the nodes resolved
   again a minute after the failure, and a retry 15 to 30 s after it (three polls with the step gone) would have failed
-  for the same reason. Proof (b) is read again after the wait and immediately before the retry is written and the
-  service launched: a run log that gained a byte meanwhile cancels the retry (said, nothing recorded, `up` fails as
-  before). The services are awaited one after another, so providers that failed together are retried a backoff apart.
+  for the same reason. **Each service's backoff counts from its own step's End**, read from the same sacct row as the
+  proofs (`End` is one of its fields; the row's `step_end` is recorded), and `up` sleeps only until End + the backoff,
+  which is nothing when that is already past: the services are awaited one after another, and five providers that
+  failed in the same second wait about one backoff in all (58 s of 60, the three polls having used some), not five. A
+  service that failed later waits what is left of its own. sacct prints End in the local time of the node that prints
+  it, so it is read in this node's local time and **believed only between this process's launch of the step (less
+  10 s) and now (plus 10 s)**: an End that is "Unknown", empty, not a time, in another zone or on another clock takes
+  the whole backoff from now, never zero. The seconds waited are recorded (`waited_s`). Proof (b) is read again after
+  the wait, or when there is none, and immediately before the retry is written and the service launched: a run log
+  that gained a byte meanwhile cancels the retry (said, nothing recorded, `up` fails as before).
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 

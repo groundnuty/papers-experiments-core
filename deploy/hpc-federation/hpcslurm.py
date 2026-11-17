@@ -595,13 +595,14 @@ class Slurm:
         return None
 
     def step_rows(self, job: str) -> Optional[str]:
-        """sacct's rows of a job's steps, `JobID|JobName|State|ExitCode` one per line, as sacct prints them: the state
-        (`CANCELLED by <uid>` is a step a user cancelled) and the exit code (`exit:signal`) raw, where `step_status`
-        folds the code. None when sacct fails, does not answer or cannot run: no row is no proof, and the caller keeps
-        its own failure (`up`'s launch retry, `hpclaunchproof`)."""
+        """sacct's rows of a job's steps, `JobID|JobName|State|ExitCode|End` one per line, as sacct prints them: the
+        state (`CANCELLED by <uid>` is a step a user cancelled), the exit code (`exit:signal`) and the end (local
+        time of the node that prints it) raw, where `step_status` folds the code. None when sacct fails, does not
+        answer or cannot run: no row is no proof, and the caller keeps its own failure (`up`'s launch retry,
+        `hpclaunchproof`)."""
         try:
             done = self.runner.run(
-                ["sacct", "-j", job, "-n", "-P", "-o", "JobID,JobName,State,ExitCode"], self.command_timeout_s
+                ["sacct", "-j", job, "-n", "-P", "-o", "JobID,JobName,State,ExitCode,End"], self.command_timeout_s
             )
         except (SlurmError, OSError):
             return None

@@ -379,9 +379,10 @@ class FakeSlurm:
     # all), `state` and `exit` (the accounted step's, "CANCELLED" and "0:116"), `no_row` (accounting holds no row),
     # `row_id` (the id accounting shows, when not the step's), `client` (the client log's text instead), `reason` (the
     # failure's reason in the client log), `client_id` (the StepId the client log names, when not the step's), `listed`
-    # (squeue lists the step, as it did for about 12 s live, until a test makes it vanish).
+    # (squeue lists the step, as it did for about 12 s live, until a test makes it vanish) and `end` (the End the
+    # row shows, as sacct prints one, `2027-01-15T12:00:12`; "Unknown" by default).
     launch_failures: dict = field(default_factory=dict)
-    step_rows: dict = field(default_factory=dict)  # job id -> the `JobID|JobName|State|ExitCode` rows sacct prints
+    step_rows: dict = field(default_factory=dict)  # job id -> the `JobID|JobName|State|ExitCode|End` rows sacct prints
     sacct_steps: Callable | None = None  # a test's own answer to that sacct query, `(argv) -> Completed`, or raises
 
     # -- the Runner interface ------------------------------------------------------------------------------------
@@ -445,9 +446,7 @@ class FakeSlurm:
         if tool == "sacct":
             ident = argv[argv.index("-j") + 1]
             fields = argv[argv.index("-o") + 1]
-            if (
-                fields == "JobID,JobName,State,ExitCode"
-            ):  # the rows of a job's steps, with their raw state and exit code
+            if fields == "JobID,JobName,State,ExitCode,End":  # a job's steps: raw state, exit code and end
                 if self.sacct_steps is not None:
                     return self.sacct_steps(argv)
                 return Completed(0, "".join(f"{row}\n" for row in self.step_rows.get(ident, [])), "")
@@ -690,6 +689,7 @@ class FakeSlurm:
         )
         if not how.get("no_row"):
             row = f"{how.get('row_id', step)}|{srun.name}|{how.get('state', 'CANCELLED')}|{how.get('exit', '0:116')}"
+            row += f"|{how.get('end', 'Unknown')}"
             self.step_rows.setdefault(self.listing_of(srun), []).append(row)
         self.dead_clients.append(Client(30000 + self.next_step, 77))
         return self.dead_clients[-1]
