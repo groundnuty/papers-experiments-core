@@ -356,14 +356,15 @@ def _helper(path):
 
 
 @pytest.mark.parametrize("path", HELPERS)
-def test_o70_a_helper_dials_the_declared_name_a_service_registered_under(tmp_path, path):
+def test_o70_a_helper_dials_the_declared_name_a_service_registered_under(tmp_path, monkeypatch, path):
     """O70: onboard.py and the first run's zone and provider helpers verify the service's certificate for the name in
     the work directory's `declared-name` when the service registered under a declared name, and for the node's own
     (`hostname -f`) as before when it did not: the certificate holds the registered name alone."""
     helper = _helper(path)
     work = tmp_path / "hpcop-op.Ab12Cd"
     work.mkdir(mode=0o700)
-    helper.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=NODE_FQDN + "\n", stderr="")
+    fixed = lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=NODE_FQDN + "\n", stderr="")  # noqa: E731
+    monkeypatch.setattr(helper.subprocess, "run", fixed)  # the module's own `subprocess` is the process's: undone after
     assert helper.registered_name(str(work)) == NODE_FQDN
     (work / "declared-name").write_text(ALPHA + "\n", encoding="ascii")
     assert helper.registered_name(str(work)) == ALPHA
