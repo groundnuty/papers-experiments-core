@@ -36,6 +36,7 @@ OS_RELEASE = "/etc/os-release"
 READ_BYTES = 64 * 1024
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}")  # an ID, a version or a release: short, plain characters
 _GLIBC = re.compile(r"glibc [0-9][A-Za-z0-9._+~-]{0,31}")  # what `confstr("CS_GNU_LIBC_VERSION")` answers on glibc
+_REASON = re.compile(r"[A-Za-z0-9._ -]{1,80}")  # a reason: an exception's type or a short phrase of ours, nothing else
 _KEYS = ("os.id", "os.version_id", "glibc", "kernel")
 
 
@@ -142,7 +143,7 @@ def checked(found: object, *, reason: str = "not the expected shape") -> dict[st
         isinstance(v, str) and (v == UNKNOWN or shape.fullmatch(v)) for v, shape in zip(values, shapes, strict=True)
     ):
         return unreadable(reason)
-    why = {k: v for k, v in reasons.items() if k in _KEYS and isinstance(v, str) and 0 < len(v) <= 80}
+    why = {k: v for k, v in reasons.items() if k in _KEYS and isinstance(v, str) and _REASON.fullmatch(v)}
     if len(why) != len(reasons) or {k for k, v in zip(_KEYS, values, strict=True) if v == UNKNOWN} != set(why):
         return unreadable(reason)
     out = {"os": {"id": values[0], "version_id": values[1]}, "glibc": values[2], "kernel": values[3]}

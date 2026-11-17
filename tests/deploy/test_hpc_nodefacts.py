@@ -106,6 +106,8 @@ GIVEN = [
     {"os": {"id": "a", "version_id": "1"}, "glibc": "musl 1.2", "kernel": KERNEL},
     {"os": {"id": "a", "version_id": "1"}, "glibc": GLIBC, "kernel": KERNEL, "unknown": {"kernel": "x"}},
     {"os": {"id": "a", "version_id": "1"}, "glibc": GLIBC, "kernel": KERNEL, "unknown": {"other": "x"}},
+    {"os": {"id": "a", "version_id": "1"}, "glibc": "unknown", "kernel": KERNEL, "unknown": {"glibc": "line\nbreak"}},
+    {"os": {"id": "a", "version_id": "1"}, "glibc": "unknown", "kernel": KERNEL, "unknown": {"glibc": "a/path"}},
     {"os": "rocky"},
     {},
     "text",

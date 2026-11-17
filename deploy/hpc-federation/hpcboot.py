@@ -311,6 +311,7 @@ def core_phase(
 READINGS_KEYS = ("os.id", "os.version_id", "glibc", "kernel")
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}")
 _GLIBC = re.compile(r"glibc [0-9][A-Za-z0-9._+~-]{0,31}")
+_REASON = re.compile(r"[A-Za-z0-9._ -]{1,80}")
 
 
 def _unknown_readings(reason: str) -> Dict[str, Any]:
@@ -336,7 +337,7 @@ def load_readings(found: Any) -> Dict[str, Any]:
     shapes = (_WORD, _WORD, _GLIBC, _WORD)
     if not all(isinstance(v, str) and (v == "unknown" or shape.fullmatch(v)) for v, shape in zip(values, shapes)):
         return _unknown_readings("not the expected shape")
-    why = {k: v for k, v in reasons.items() if k in READINGS_KEYS and isinstance(v, str) and 0 < len(v) <= 80}
+    why = {k: v for k, v in reasons.items() if k in READINGS_KEYS and isinstance(v, str) and _REASON.fullmatch(v)}
     if len(why) != len(reasons) or {k for k, v in zip(READINGS_KEYS, values) if v == "unknown"} != set(why):
         return _unknown_readings("not the expected shape")
     out: Dict[str, Any] = {"os": {"id": values[0], "version_id": values[1]}, "glibc": values[2], "kernel": values[3]}
