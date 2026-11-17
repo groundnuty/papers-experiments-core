@@ -281,22 +281,27 @@ def reading_in(facts: Mapping[str, Any] | None) -> HealthReading | None:
 
 def noted_reading() -> HealthReading | None:
     """The latest reading in the try this context is in (`prerun`), or None outside a try or when it holds none. After
-    a call of another check than the platform's, or one that may not have asked it, this can still be an earlier
-    check's: take a call's own reading with `checked`."""
+    a call of another check than the platform's, or one that may not have asked it, or with calls at once in the same
+    try, this can be another call's: take a call's own reading with `checked`."""
     note = prerun.current()
     return None if note is None else HealthReading.from_json(note.get(READING_NOTE))
 
 
-def checked(check: Callable[[], Health]) -> tuple[Health, HealthReading | None]:
+def checked(check: Callable[[], Health], source: Any = None) -> tuple[Health, HealthReading | None]:
     """Make ONE call of `check`, the platform's whole chain (`PlatformHealth`, which runs the fault gate under the run's
-    admission), and return its answer with the reading THAT call noted. The try's note is cleared first and read back
-    after, in the calling context, so a reading the pre-run check noted is never taken for this call's, a wrapper that
-    never asked the platform leaves None, and it holds through a thread that copied the context
-    (`asyncio.to_thread`). Outside a try there is no note: the call is made and the reading is None."""
-    note = prerun.current()
-    if note is not None:
-        note.pop(READING_NOTE, None)
-    return check(), noted_reading()
+    admission), and return its answer with the reading THAT call made, taken from `source` (by default `check`: the
+    `PlatformHealth` itself; pass it when `check` is a wrapper of it, which exposes no reading of its own).
+
+    The reading is the calling thread's own (`PlatformHealth.reading`, a thread-local reset at every call), forgotten
+    before the call and read right after it, in the same thread: two calls at once in one try, each in a thread of its
+    own (`asyncio.to_thread`), never see each other's, and a check that answers without asking the platform (a guard
+    that refuses early) leaves None, not an earlier call's. A `source` with no reading to give is None, unknown."""
+    forget = getattr(source if source is not None else check, "forget_reading", None)
+    if callable(forget):
+        forget()
+    verdict = check()
+    reading = getattr(source if source is not None else check, "reading", None)
+    return verdict, reading if isinstance(reading, HealthReading) else None
 
 
 class PostRunHealth:
@@ -314,14 +319,15 @@ class PostRunHealth:
 
     namespace = NAMESPACE
 
-    def __init__(self, check: Callable[[], Health]) -> None:
-        self._check = check
+    def __init__(self, check: Callable[[], Health], source: Any = None) -> None:
+        """`check` is the platform's whole check or a wrapper of it; `source` the `PlatformHealth` a wrapper calls."""
+        self._check, self._source = check, source
 
     def start(self, identity: Mapping[str, Any]) -> None:
         """Nothing is read before the run."""
 
     def finish(self) -> Mapping[str, Any]:
-        verdict, reading = checked(self._check)
+        verdict, reading = checked(self._check, self._source)
         return {
             "ok": verdict.ok,
             "deferred": verdict.deferred,

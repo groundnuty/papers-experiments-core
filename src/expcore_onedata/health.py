@@ -265,6 +265,11 @@ class PlatformHealth:
         any call in this thread, `UNREAD` when the call never reached the spaces. Per call, never the call before's."""
         return getattr(self._seen, "reading", None)
 
+    def forget_reading(self) -> None:
+        """Forget the calling thread's latest reading (`reading` is None again), so that a call that never asks this check
+        leaves none behind it (`healthreading.checked`)."""
+        self._seen.reading = None
+
     def _publish(self, reading: HealthReading) -> None:
         """Make `reading` the calling thread's latest, and the try's note (`healthreading.READING_NOTE`) when there is one."""
         self._seen.reading = reading

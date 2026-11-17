@@ -910,9 +910,9 @@ def test_o90_a_run_whose_facts_hold_no_whole_reading_is_unknown(carried):
 
 
 def test_o90_checked_returns_the_reading_of_its_own_call_and_never_the_pre_run_checks(tmp_path, fake):
-    """O90: `checked` clears the try's note before its one call and reads it back after: a wrapper that never asked the
-    platform leaves no reading, a reading the pre-run check noted is not taken for the call's, the full chain's call
-    returns its own, and outside a try there is none."""
+    """O90: `checked` takes the reading of its one call from the check's own, never from the try's note: a wrapper that
+    never asked the platform leaves no reading, a reading the pre-run check noted is not taken for the call's, the full
+    chain's call returns its own, and outside a try it does as well."""
     world = four_spaces(tmp_path, fake)
     with prerun.opened() as note:
         note[READING_NOTE] = four((), (TARGET,)).to_json()  # what the pre-run check noted
@@ -922,7 +922,9 @@ def test_o90_checked_returns_the_reading_of_its_own_call_and_never_the_pre_run_c
         assert verdict.ok is True
         assert reading == world.health.reading
         assert reading.spaces
-    assert checked(world.health)[1] is None  # outside a try: the call is made, and there is no note to read it from
+    outside = checked(world.health)[1]  # outside a try there is no note; the call's own reading is there
+    assert outside is not None
+    assert outside.spaces
 
 
 def test_o90_overlapping_calls_in_one_try_each_get_their_own_reading(tmp_path, fake):
