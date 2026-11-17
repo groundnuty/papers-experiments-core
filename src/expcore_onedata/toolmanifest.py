@@ -26,8 +26,10 @@ token (only the stand-in server has been shown to behave so), so without `--toke
 placeholder that is no token of any run; a server that checks its token when it starts takes the value of a variable
 named by `--token-env` (never a value on the command line).
 
-Each exits 0 on success, 1 on a mismatch (`check`, listed on standard error) and 2 on an error. It starts the server
-and reads its tools; it contacts no federation, and it does not verify the pinned checkout that a launch verifies.
+Each exits 0 on success, 1 on a mismatch (`check`, listed on standard error) and 2 on an error. It verifies the
+pinned checkout first, as a launch does (when `[toolserver]` pins one), and refuses a clone at another commit or with a
+local change, naming which, before anything is started or written. It starts the server and reads its tools; it
+contacts no federation.
 """
 
 import argparse
@@ -41,6 +43,7 @@ from mcp import StdioServerParameters
 from expcore.config.loading import ConfigError
 from expcore.tools.manifest import ManifestError, check_server, freeze_server
 from expcore_onedata.config import load_platform
+from expcore_onedata.pin import PinError, verify_configured
 from expcore_onedata.toolserver import MANAGED_ENV, OVERRIDDEN_ENV, server_start
 
 FREEZE_TOKEN = "expcore-manifest-freeze-placeholder"  # not a credential of any run: the tools do not depend on it
@@ -78,6 +81,7 @@ def _run(args: argparse.Namespace) -> int:
     if server is None:
         raise ValueError(f"{config.file}: has no [toolserver] section")
     timeout_s = server.start_timeout_s if args.timeout is None else args.timeout
+    verify_configured(server)  # as a launch does first: never a manifest from a clone that is not the pinned one
     with server_start(config, condition, token, extra) as begun:
         params = StdioServerParameters(command=begun.command, args=begun.args, env=begun.env, cwd=begun.cwd)
         run = freeze_server if args.action == "freeze" else check_server
@@ -101,7 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return _run(args)
-    except (ConfigError, ManifestError, ValueError, OSError, TimeoutError) as error:
+    except (ConfigError, ManifestError, PinError, ValueError, OSError, TimeoutError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
