@@ -189,6 +189,26 @@ def stage_side_file(
         return _stage_copy(copy, run_dir, declaration, identity.attempt, record)
 
 
+def stage_harness_side_file(
+    request: SideFileRequest,
+    side_files: Sequence[SideFile],
+    name: str,
+    path: str | os.PathLike[str],
+) -> StagedSideFile | None:
+    """Stage a side file the HARNESS wrote, from `path` on the harness's own disk, beside the record (the read log).
+
+    The counterpart of `stage_side_file` for a file that never was in the sandbox's /work: the collector's log, which
+    the agent could neither read nor change, is copied from where the sandbox's collection left it. `name` is a
+    declared `pattern`; `path` a regular file (a link is refused: `PlacementError`). Everything after the lookup is
+    `stage_side_file`'s: the copy goes into the attempt directory under its temporary name, hashed as it is copied
+    and fsynced; the record that names `staged.sha256` is written; then `staged.commit()` renames it, and refuses
+    before that. Returns None when nothing lies at `path` (no log: the run's record holds no hash for it). Raises
+    `UndeclaredSideFile` for a name no declaration holds and `SideFileTooLarge` for a file over `MAX_SIDE_FILE_BYTES`,
+    before anything is written into the attempt directory.
+    """
+    raise NotImplementedError
+
+
 def _declared(side_files: Sequence[SideFile], name: str) -> SideFile:
     for declaration in side_files:
         if declaration.pattern == name:
