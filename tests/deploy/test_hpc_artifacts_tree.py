@@ -321,6 +321,28 @@ def test_o74_a_tree_deeper_than_the_cap_is_refused_naming_where(identity, tmp_pa
     assert str(tmp_path) not in str(refused.value)
 
 
+def test_o74_a_file_that_changes_while_it_is_read_is_refused_naming_it(identity, tmp_path, monkeypatch):
+    """O74: a file appended to between the first and the last of its reads is no file the digest can name: it is
+    refused with its relative path, as is one whose mtime moved, never hashed in two states."""
+    root = put(tmp_path / "artifacts", {"clone/f": b"x" * 20})
+    monkeypatch.setattr(identity, "CHUNK", 7)
+    real, grown = os.read, []
+
+    def appending(descriptor, length):
+        if not grown:
+            grown.append(True)
+            with open(root / "clone" / "f", "ab") as handle:
+                handle.write(b"more")
+        return real(descriptor, length)
+
+    monkeypatch.setattr(identity.os, "read", appending)
+    with pytest.raises(identity.TreeError) as refused:
+        identity.tree_sha256(root)
+    assert "clone/f" in str(refused.value)
+    assert "changed while it was read" in str(refused.value)
+    assert str(tmp_path) not in str(refused.value)
+
+
 # -- read, never written ---------------------------------------------------------------------------------------------
 
 

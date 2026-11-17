@@ -186,6 +186,11 @@ def test_o74_a_layout_with_no_platform_template_writes_no_record_so_up_takes_no_
     (folder / LAYOUT.name).write_text("\n".join(kept) + "\n", encoding="utf-8")
     site = {k: v for k, v in site.items() if not k.startswith(("HPC_AGENT", "HPC_EGRESS", "HPC_ONECLIENT"))}
     rig = Rig(hpc, tmp_path, {**site, "HPC_STUDY_ARTIFACTS": str(tmp_path / "missing")}, layout=folder / LAYOUT.name)
+    said = []
+    rig.driver.say = said.append
     rig.up()
     assert ARTIFACTS not in rig.values[0]
     assert ARTIFACTS not in rig.state()
+    assert rig.state()["site"]["study_artifacts"] == str(tmp_path / "missing")  # the site's key was read, and kept
+    assert any("HPC_STUDY_ARTIFACTS" in line and "no platform template" in line for line in said)  # and it says so
+    assert not any(str(tmp_path) in line for line in said)
