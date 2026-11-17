@@ -469,3 +469,113 @@ def test_o35_a_platform_file_the_check_cannot_load_is_refused_without_the_roots_
         fed.facts.write_facts(boot.layout, boot)
     assert str(boot.layout.root) not in str(refused.value)
     assert "<root>" in str(refused.value)
+
+
+# -- the probe space, an unknown space, and the reset that does not render ---------------------------------------------
+
+# alpha-space is oak's and elm's; ash supports only beta-space, which no agent may reach; the probe space is oak's and
+# elm's, so it is supported by every provider of the one space the agent reaches
+PROBE = (
+    THREE.replace('[spaces.beta-space]\nowner = "oak"\nmirrors = ["ash"]', "")
+    .replace('study_space = "alpha-space"', 'study_space = "alpha-space"\nprobe_space = "link-probes"')
+    .rstrip()
+    + """
+
+[spaces.beta-space]
+owner = "ash"
+agent_visible = false
+
+[spaces.link-probes]
+owner = "oak"
+mirrors = ["elm"]
+agent_visible = false
+"""
+)
+
+
+def link_check(*providers: str) -> str:
+    """The template's `[link_check]` line, listing `providers` for the probe space."""
+    return (
+        'link_check = { name = "link-probes", id = "@space_id.link-probes@", prefixes = ["link-"], '
+        f"providers = {json.dumps(list(providers))} }}"
+    )
+
+
+def probed(*providers: str) -> str:
+    """A template whose `[link_check]` lists `providers` for the probe space, over a study space of oak and elm."""
+    return template("oak", "elm", extra=link_check(*providers))
+
+
+def test_o35_a_link_check_provider_that_does_not_support_the_probe_space_is_refused_by_label(fed, tmp_path):
+    """O35: the file lists ash for the probe space, which only oak and elm support: a provider no probe can reach."""
+    boot = compose_staged(fed, tmp_path, PROBE, probed("oak", "elm", "ash"))
+    with pytest.raises(RuntimeError, match=re.escape("space link-probes: platform.toml declares ash but it doesn't")):
+        fed.facts.write_facts(boot.layout, boot)
+
+
+def test_o35_a_link_check_provider_with_an_id_of_no_provider_is_an_undeclared_provider(fed, tmp_path):
+    """O35: a hand-typed provider id in the probe space's list is only counted, never named."""
+    extra = 'providers.stray = { url = "https://stray.test", id = "typed-by-hand-9" }'
+    probe = link_check("oak", "elm", "stray")
+    boot = compose_staged(fed, tmp_path, PROBE, template("oak", "elm", extra=f"{extra}\n{probe}"))
+    with pytest.raises(
+        RuntimeError, match=re.escape("space link-probes: platform.toml declares an undeclared provider")
+    ) as bad:
+        fed.facts.write_facts(boot.layout, boot)
+    assert "typed-by-hand" not in str(bad.value)
+
+
+def test_o35_a_link_check_that_lists_fewer_providers_than_the_probe_space_has_is_written(fed, tmp_path):
+    """O35: the platform layer allows a provider in no pair to be left out of `[link_check]`, so the probe space's list
+    is held to the zone's as a subset, never as an equality."""
+    layout = PROBE.replace(
+        'mirrors = ["elm"]\nagent_visible = false\n', 'mirrors = ["elm", "ash"]\nagent_visible = false\n'
+    )
+    boot = compose_staged(fed, tmp_path, layout, probed("oak", "elm"))
+    assert fed.facts.write_facts(boot.layout, boot) == "facts.json and platform.toml written"
+
+
+def test_o35_a_space_of_the_file_that_is_no_space_of_the_federation_is_refused_and_counted(fed, tmp_path):
+    """O35: a mistyped or stale space id would leave the space the file means unchecked."""
+    stale = template("oak", "elm", "ash").replace("@space_id.alpha-space@", "typed-by-hand-space")
+    boot = compose_staged(fed, tmp_path, WIDE, stale)
+    with pytest.raises(
+        RuntimeError, match=re.escape("platform.toml declares a space that is no space of this federation")
+    ) as bad:
+        fed.facts.write_facts(boot.layout, boot)
+    assert "typed-by-hand" not in str(bad.value)
+
+
+def reset_stand_ins(fed, monkeypatch, boot, ran):
+    """What `reset --replicas` would touch, stood in: the root's checks, the REST client, the bootstrap (the measured
+    one a test built) and the eviction, which records that it ran."""
+    monkeypatch.setattr(fed.cli, "require_up", lambda layout: None)
+    monkeypatch.setattr(fed.cli, "Rest", lambda ca: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(fed.cli, "Bootstrap", lambda rest, layout: boot)
+    monkeypatch.setattr(fed.cli, "bring_up", lambda layout, boot, timer: None)
+    monkeypatch.setattr(fed.cli, "evict_replicas", lambda boot, timeout: ran.append("evict") or {})
+
+
+def test_o35_reset_replicas_holds_the_rendered_file_to_the_zone_and_evicts_nothing_when_it_differs(
+    fed, tmp_path, monkeypatch
+):
+    """O35: a refused up leaves its facts and file in the root, which `require_up` accepts: the next reset checks the
+    file again, before it evicts anything."""
+    boot = compose_staged(fed, tmp_path, WIDE, template("oak", "elm"))
+    with pytest.raises(RuntimeError):
+        fed.facts.write_facts(boot.layout, boot)  # refused, and the files stay where they were written
+    ran = []
+    reset_stand_ins(fed, monkeypatch, boot, ran)
+    with pytest.raises(RuntimeError, match=re.escape("space alpha-space: supported by ash but platform.toml doesn't")):
+        fed.cli.reset_replicas(boot.layout)
+    assert ran == []
+
+
+def test_o35_reset_replicas_goes_on_when_the_rendered_file_declares_what_the_zone_lists(fed, tmp_path, monkeypatch):
+    """O35: the same reset over a file that agrees evicts as it always did."""
+    boot = compose_staged(fed, tmp_path, WIDE, template("oak", "elm", "ash"))
+    fed.facts.write_facts(boot.layout, boot)
+    ran = []
+    reset_stand_ins(fed, monkeypatch, boot, ran)
+    assert fed.cli.reset_replicas(boot.layout).startswith("reset --replicas")
+    assert ran == ["evict"]
