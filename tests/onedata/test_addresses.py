@@ -17,7 +17,7 @@ from expcore_onedata import addresses
 from expcore_onedata.addresses import AddressMap, AddressMapError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import load_platform
-from expcore_onedata.testing import write_platform
+from expcore_onedata.testing import ADMIN_ENV, write_platform
 
 ZONE, ALPHA, BETA = "zone.layout.test", "alpha.layout.test", "beta.layout.test"
 NODE_A, NODE_B = "node-a.cluster.example.org", "node-b.cluster.example.org"
@@ -30,6 +30,11 @@ DOCUMENT = {
         BETA: {"address": V6},
     },
 }
+
+
+@pytest.fixture(autouse=True)
+def _admin_credential(monkeypatch):
+    monkeypatch.setenv(ADMIN_ENV, "admin-token-0123456789")
 
 
 def _write(path, document, mode=0o600):
