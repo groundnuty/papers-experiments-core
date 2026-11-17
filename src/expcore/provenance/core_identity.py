@@ -42,6 +42,17 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+
+def git_env() -> dict[str, str]:
+    """The process's environment plus `GIT_OPTIONAL_LOCKS=0`, so a read does not rewrite the clone's index (O81).
+
+    The same as `expcore.provenance.gitobjects.git_env()`, written out here because this module must stay standard
+    library only: `hatch_build.py` loads it standalone from the tree being built, in an isolated build environment
+    where the `expcore` package is not importable (`tests/provenance/test_core_identity_standalone.py`).
+    """
+    return {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+
+
 CORE_PROJECT = "papers-experiments-core"
 BUILD_FILE = "_build_identity.json"
 BUILD_FORMAT = "expcore-core-identity/1"
@@ -107,7 +118,9 @@ def is_sha(value: object) -> bool:
 def _git(root: Path, *args: str, raw: bool = False) -> str | None:
     """Run git in `root`; None when git cannot run or fails. Stripped unless `raw` (NUL-separated listings)."""
     try:
-        done = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=60)
+        done = subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=60, env=git_env()
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:
@@ -262,6 +275,7 @@ def _disk_blobs(root: Path, files: list[str]) -> dict[str, str] | None:
             capture_output=True,
             text=True,
             timeout=120,
+            env=git_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
