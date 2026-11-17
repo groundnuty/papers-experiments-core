@@ -1,5 +1,5 @@
 # Provenance: new
-"""The address map of a federation reached by the names its layout declares (O77).
+"""The address map of a federation reached by the names its layout declares (O73).
 
 A federation on a batch cluster registers each service under a name the layout declares (a zone's domain, a provider's
 domain), which resolves nowhere: the cluster's nodes have names and addresses of their own, and an unprivileged user
@@ -21,7 +21,7 @@ file = "secrets/address-map.json"   # relative to this file; a private file of y
 ```
 
 `address` is where the declared name is dialled; `nodes` are the node's own names, which nothing agent-visible may
-carry (`node_names` turns them into the tool server's `ONEDATA_MCP_NODE_NAMES`). A real host, an address or a node name,
+carry (the gate's scan for them reads them). A real host, an address or a node name,
 belongs to one declared name only. The file is read once, when `platform.toml` is loaded: it is no part of the campaign
 fingerprint (the addresses change at every `up`), of any record, or of any message, and nothing the agent can read ever
 holds it. A refusal names the file's key, never a name or an address.
@@ -145,19 +145,6 @@ class AddressMap:
         found = self.address_of(host)
         return host if found is None else found
 
-    def node_names(self, ports: Sequence[int] = ()) -> dict[str, str]:
-        """Every real name and address the federation is reachable by, each bare and with each of `ports`, mapped to
-        the declared name it belongs to: onedata-mcp's `ONEDATA_MCP_NODE_NAMES` (a key is `host`, `host:port` or
-        `[ipv6]:port`, a value the declared name, one host under one name only). A declared name maps to itself, bare
-        and with each port, so a port printed after it goes with it as it does after a real name."""
-        out: dict[str, str] = {}
-        for declared, node in sorted(self.hosts.items()):
-            for host in (declared, node.address, *node.names):
-                bracketed = f"[{host}]" if ":" in host else host
-                out[host] = declared
-                out.update({f"{bracketed}:{port}": declared for port in ports})
-        return out
-
     def to_document(self) -> dict[str, Any]:
         """The file's content: what `from_document` reads."""
         return {
@@ -226,13 +213,23 @@ class AddressMap:
             raise
 
 
-def load_addresses(section: Section, base: Path) -> AddressMap:
-    """Read `[addresses]` of platform.toml: `file`, the map's file, relative to the platform file. A ConfigError names
-    the table's key and never a name, an address or the path."""
-    section.reject_unknown(("file",))
+def load_addresses(section: Section, base: Path) -> tuple[AddressMap, Path, Path | None]:
+    """Read `[addresses]` of platform.toml: `file`, the map's file, and optionally `resolver`, the directory that holds
+    the resolver shim a Python tool server imports (`sitecustomize.py`, O73); both relative to the platform file.
+    Returns the map, its file's path and the resolver's. A ConfigError names the table's key and never a name, an
+    address or a path."""
+    section.reject_unknown(("file", "resolver"))
     path = Path(os.path.abspath(base / section.string("file")))  # not resolved: a link as the file itself is refused
+    resolver = None
+    if "resolver" in section.data:
+        resolver = Path(os.path.abspath(base / section.string("resolver")))
+        shim = resolver / "sitecustomize.py"
+        if not resolver.is_dir() or not shim.is_file() or shim.is_symlink():
+            raise section.fail(
+                "resolver", "must be a directory that holds the shim, sitecustomize.py, as a regular file"
+            )
     try:
-        return AddressMap.load(path)
+        return AddressMap.load(path), path, resolver
     except AddressMapError as error:
         raise section.fail("file", str(error)) from None
 

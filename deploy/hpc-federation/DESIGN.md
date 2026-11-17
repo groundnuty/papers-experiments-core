@@ -332,7 +332,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
-### The registered names (O77)
+### The registered names (O73)
 
 A layout declares a name for the zone and for each provider, `<service>.<domain>`. On a cluster those names resolve
 nowhere, and the nodes have names and addresses of their own that nothing the agent can read may carry (the zone's
@@ -369,9 +369,22 @@ map. Four parts land together, in this order, since only then does every step ha
    `facts.json` records it per service (`registered_domain`). A `[sandbox.federation]` table whose names are not those,
    or declared with no such record, is refused as `platform.toml` is rendered (`hpcnames.check_federation_table`),
    naming the table's own names alone: the cell resolves only the declared names, and the published client dials the
-   domain a provider registered, so the table is usable only once the providers register them. The tool server's
-   environment gets `ONEDATA_MCP_NODE_NAMES`, built from the same map (every node name and address, with and without
-   the URLs' ports, under the declared name); how a third-party tool server connects to a declared name is open.
+   domain a provider registered, so the table is usable only once the providers register them.
+5. **The tool server.** It is given **no `ONEDATA_MCP_NODE_NAMES`**: once the services register the declared names
+   there is nothing to map, so onedata-mcp runs unset on both platforms and its text is a Compose federation's (the
+   registration is the fix, since raw REST answers reach the agent without passing through it). It still has to reach
+   the declared names, which resolve nowhere on a node. It runs as a process of the driver's, from a venv and a
+   checkout the driver cannot name, so a cell with the agent's hosts file (a bind of those paths) is no option; a
+   Python server resolves them through the **resolver shim** (`toolshim/sitecustomize.py`): `up` copies it into the
+   root, `platform.toml` names its directory (`[addresses] resolver`), and `toolserver.resolver_environment` puts the
+   directory first on the server's `PYTHONPATH` and the map in `EXPCORE_ADDRESS_MAP`. The shim wraps
+   `socket.getaddrinfo` so that exactly the names of the private map resolve, to their addresses, and every other host
+   as before; the URL, the handshake, the certificate check and `Host` stay the declared name. A map the shim may not
+   use (readable by others, a link, garbled) maps nothing, so the failure is the name not resolving. It serves a Python
+   server that does not run isolated (`-I`), and replaces another `sitecustomize` on the path; a C preload would
+   cover any process but is a built file pinned in `site.env`. **Fallback, not built:** the same
+   `ONEDATA_MCP_NODE_NAMES` mapping set on both platforms, only if the registration cannot land before the pilot's
+   freeze.
 
 What stays as it was: the certificate is the image's generated test certificate for the declared name, signed by the
 image's test CA (section 7 of `up`); the cluster's Erlang names are the node's and use no TLS; the port shim moves
@@ -429,7 +442,7 @@ nodes it could not check.
 
 **Rendered by `up` into the root from the layout's own `platform_template`, by the Compose renderer
 (`fedfacts.write_facts`), with the HPC facts:** `@zone_url@` and `@provider_url.<name>@` are `https://<declared
-name>:8443` (O77; the address map's file is named by an `addresses` line the driver puts first); the ids are this
+name>:8443` (O73; the address map's file is named by an `addresses` line the driver puts first); the ids are this
 `up`'s. Every path in the template stays relative to the root, so the same template
 serves both:
 
@@ -651,7 +664,7 @@ federation whose step is gone), then releases it.
    `<leader>+0.<n>`), `scancel <component id>.<n>`, and `sacct -j <component id>` for a step's status. **The fallback
    is a setting:** `sandbox_placement = "separate"`.
 
-7. **The registered names** (O77), not yet run live: the service cells' own hosts file in a `--writable` sandbox
+7. **The registered names** (O73), not yet run live: the service cells' own hosts file in a `--writable` sandbox
    (`--no-mount bind-paths` and a file bind onto `/etc/hosts`, which the site's Apptainer accepted for the agent's SIF
    only); a registered domain unrelated to `cluster.domainName`; the zone's `/configuration` and each provider's
    answering their declared names; a provider's check of a peer and an rtransfer replication between two providers by
@@ -659,8 +672,9 @@ federation whose step is gone), then releases it.
    `s3.<name>` on a provider), verified by `curl --resolve` with the exported CA; and **a sandbox slot that records the
    cell's environment, `/etc/hosts`, `gate.json` and the gate's certificates' names, the agent's typical REST answers,
    one forced no-connection error, the K1 tools' answers and the transcript, and asserts none holds a node's name or
-   address or `8443`.** The tool server's connection to a declared name is undecided (section 5, "The registered
-   names").
+   address or `8443`.** The tool server's connection to a declared name through the resolver shim (section 5,
+   "The registered names", item 5) is tested offline in a real child process only: on a node, with onedata-mcp's own
+   venv and interpreter, it is owed too.
 
 ## 10. Who builds what
 

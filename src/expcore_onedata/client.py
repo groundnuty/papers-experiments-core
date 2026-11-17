@@ -453,7 +453,7 @@ _REQUEST_COUNT = re.compile(r"Request Count: (\d+)$")  # the end of httpcore's `
 
 
 class MappedTransport(httpx.HTTPTransport):
-    """An HTTP transport that dials a declared name at the address the map holds for it (O77).
+    """An HTTP transport that dials a declared name at the address the map holds for it (O73).
 
     The request keeps its URL, so its `Host` is the declared name; the connection is made to the mapped address, and the
     TLS handshake asks for the declared name and checks the certificate against it (httpcore's `sni_hostname`
@@ -484,7 +484,7 @@ def _build_http(config: PlatformConfig, timeout_s: float) -> httpx.Client:
     """The HTTP client the layer sends through when none is injected, checking certificates as `[tls]` says. A retried
     read is sent through one more of them, made for that read alone, so it has a connection of its own
     (`readretry.py`). Its pool keeps every idle connection it may open alive (`POOL_CONNECTIONS`), for httpx's own
-    5 s, so a reading with many requests in flight reuses its connections. With `[addresses]` (O77) it dials each
+    5 s, so a reading with many requests in flight reuses its connections. With `[addresses]` (O73) it dials each
     declared name at its mapped address (`MappedTransport`), and trusts no proxy of the environment, which could not
     resolve the names."""
     limits = httpx.Limits(max_connections=POOL_CONNECTIONS, max_keepalive_connections=POOL_CONNECTIONS)

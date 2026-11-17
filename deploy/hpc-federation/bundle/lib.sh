@@ -510,7 +510,7 @@ split_imports() {  # <imports-array> <other-array> args...: the --import=SPACE=P
   done
 }
 
-# The names a service registers under (O77). A federation reached by the names its layout declares gives each service
+# The names a service registers under (O73). A federation reached by the names its layout declares gives each service
 # `--declared=NAME` (the zone's or the provider's own domain) and one `--host=NAME=ADDRESS` per service of the federation,
 # itself included: configure.sh registers the service under NAME, makes its certificate for NAME, and writes the hosts file
 # the service's cell is given in place of the node's own, so every peer's declared name resolves in it (an unresolved
@@ -538,7 +538,7 @@ service_name() {  # <workdir>: the name this service is registered under: its de
   printf '%s\n' "$f"
 }
 
-write_names() {  # <workdir> <node fqdn> <node short name> <declared name> <peer-ip ...>: W/declared-name and W/hosts (O77)
+write_names() {  # <workdir> <node fqdn> <node short name> <declared name> <peer-ip ...>: W/declared-name and W/hosts (O73)
   local W=$1 fqdn=$2 short=$3 declared=$4 entry n a own ip
   local -A addr_of=() name_of=() peer=()
   shift 4
@@ -601,7 +601,7 @@ run_service() {  # <workdir>: become the service (apptainer exec) in the foregro
   # --workdir keeps the container's /tmp and /var/tmp inside the private work directory. A shared tree is a read-only
   # bind (`:ro`) of the list's, over the empty mountpoint configure.sh made in the rootfs: the one thing of the node's
   # filesystems the container sees, and one it cannot write to.
-  # A federation of declared names (O77): the node's /etc/hosts, which the site binds into every cell, is replaced by the
+  # A federation of declared names (O73): the node's /etc/hosts, which the site binds into every cell, is replaced by the
   # file configure.sh wrote, listing every peer's declared name; --no-mount bind-paths drops the site's binds (and with
   # them /etc/localtime, which becomes the image's), and our file is bound read-only in the place of /etc/hosts.
   local -a naming=()

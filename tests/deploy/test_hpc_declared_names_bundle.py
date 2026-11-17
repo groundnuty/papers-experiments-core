@@ -1,4 +1,4 @@
-"""O77: a service of the HPC bundle registers under the name its layout declares, not its node's hostname, and its cell
+"""O73: a service of the HPC bundle registers under the name its layout declares, not its node's hostname, and its cell
 is given a hosts file that resolves every peer's declared name (the node's own /etc/hosts is replaced, since an
 unresolved peer crashes a provider's lookup of it); no onepanel or Onedata setting of the service holds the node's name
 as the domain it registers or its certificate is made for.
@@ -73,8 +73,8 @@ def zone_args():
     return ["zone", *peers_of(ZONE_NAME), f"--declared={ZONE_NAME}", *HOSTS]
 
 
-def test_o77_a_provider_registers_its_declared_name_and_the_zones_and_certifies_for_its_own(env):
-    """O77: `oneprovider.domain` and the generated certificate's domain are the provider's declared name, the zone it
+def test_o73_a_provider_registers_its_declared_name_and_the_zones_and_certifies_for_its_own(env):
+    """O73: `oneprovider.domain` and the generated certificate's domain are the provider's declared name, the zone it
     registers with is the zone's declared name, and the node's own FQDN is the cluster's node name only."""
     work, secrets, done = configure(env, "op", *provider_args())
     assert done.returncode == 0, done.stderr
@@ -88,8 +88,8 @@ def test_o77_a_provider_registers_its_declared_name_and_the_zones_and_certifies_
     assert f"registered as {ALPHA}" in done.stderr
 
 
-def test_o77_the_zone_registers_its_declared_name_and_certifies_for_it(env):
-    """O77: `onezone.domainName` and the generated certificate's domain are the zone's declared name."""
+def test_o73_the_zone_registers_its_declared_name_and_certifies_for_it(env):
+    """O73: `onezone.domainName` and the generated certificate's domain are the zone's declared name."""
     _, secrets, done = configure(env, "oz", *zone_args())
     assert done.returncode == 0, done.stderr
     config = (secrets / "config.yaml").read_text(encoding="utf-8")
@@ -99,8 +99,8 @@ def test_o77_the_zone_registers_its_declared_name_and_certifies_for_it(env):
 
 
 @pytest.mark.parametrize("kind", ["op", "oz"])
-def test_o77_the_hosts_file_lists_the_node_and_every_peers_declared_name_with_its_address(env, kind):
-    """O77: the cell's hosts file has the loopback, the node's own names on its own address (the cluster keeps them),
+def test_o73_the_hosts_file_lists_the_node_and_every_peers_declared_name_with_its_address(env, kind):
+    """O73: the cell's hosts file has the loopback, the node's own names on its own address (the cluster keeps them),
     and every service's declared name, the service's own and each peer's, with its address."""
     own = ALPHA if kind == "op" else ZONE_NAME
     args = provider_args() if kind == "op" else zone_args()
@@ -119,8 +119,8 @@ def test_o77_the_hosts_file_lists_the_node_and_every_peers_declared_name_with_it
     assert sorted(peers) == sorted(peers_of(own))  # the shim moves the same peers' 443 as the hosts file names
 
 
-def test_o77_without_a_declared_name_a_service_registers_the_nodes_own_as_before(env):
-    """O77: no `--declared` means the node's FQDN registers and certifies, and no hosts file is made."""
+def test_o73_without_a_declared_name_a_service_registers_the_nodes_own_as_before(env):
+    """O73: no `--declared` means the node's FQDN registers and certifies, and no hosts file is made."""
     work, secrets, done = configure(env, "op", "alpha", ZONE_NAME, ADMIN, "192.0.2.10")
     assert done.returncode == 0, done.stderr
     assert re.search(rf'^  domain: "{re.escape(NODE_FQDN)}"$', (secrets / "config.yaml").read_text(), re.M)
@@ -170,8 +170,8 @@ def test_o77_without_a_declared_name_a_service_registers_the_nodes_own_as_before
         ),
     ],
 )
-def test_o77_a_service_whose_peers_names_are_not_all_listed_is_refused_before_anything_is_written(env, args, why):
-    """O77: a peer with no declared name, a declared name that is no peer, a repeated name or address, a malformed
+def test_o73_a_service_whose_peers_names_are_not_all_listed_is_refused_before_anything_is_written(env, args, why):
+    """O73: a peer with no declared name, a declared name that is no peer, a repeated name or address, a malformed
     entry or a zone name nothing lists stops the script before it writes a configuration, a hosts file or a name."""
     work, secrets, done = configure(env, "op", *args)
     assert done.returncode != 0
@@ -268,10 +268,10 @@ def processes():
 
 @node.needs_pidfd
 @pytest.mark.parametrize("kind", ["op", "oz"])
-def test_o77_the_service_starts_with_our_hosts_file_in_place_of_the_nodes_and_dials_itself_by_its_declared_name(
+def test_o73_the_service_starts_with_our_hosts_file_in_place_of_the_nodes_and_dials_itself_by_its_declared_name(
     tmp_path, env, processes, kind
 ):
-    """O77: a service whose work directory holds a hosts file is started with the site's bind paths off and that file
+    """O73: a service whose work directory holds a hosts file is started with the site's bind paths off and that file
     bound read-only over /etc/hosts (a restart reads it from the work directory, not from configure.sh's arguments), and
     its own readiness calls name its declared name and pin it to the loopback, never the node's FQDN."""
     kept = Kept(tmp_path, env, processes, kind)
@@ -291,8 +291,8 @@ def test_o77_the_service_starts_with_our_hosts_file_in_place_of_the_nodes_and_di
 
 
 @node.needs_pidfd
-def test_o77_a_service_without_a_hosts_file_keeps_the_sites_binds_as_before(tmp_path, env, processes):
-    """O77: no hosts file in the work directory, no `--no-mount`, and the node's own name is what it dials."""
+def test_o73_a_service_without_a_hosts_file_keeps_the_sites_binds_as_before(tmp_path, env, processes):
+    """O73: no hosts file in the work directory, no `--no-mount`, and the node's own name is what it dials."""
     kept = Kept(tmp_path, env, processes, "oz")
     (kept.work / "hosts").unlink()
     (kept.work / "declared-name").unlink()
@@ -311,8 +311,8 @@ def test_o77_a_service_without_a_hosts_file_keeps_the_sites_binds_as_before(tmp_
         kept.stop()
 
 
-def test_o77_the_registration_token_is_minted_from_the_zone_by_its_declared_name(tmp_path, env):
-    """O77: the zone's own call for a provider's token names the zone's declared name, pinned to the loopback of the
+def test_o73_the_registration_token_is_minted_from_the_zone_by_its_declared_name(tmp_path, env):
+    """O73: the zone's own call for a provider's token names the zone's declared name, pinned to the loopback of the
     zone's node, and the node's FQDN is nowhere in it."""
     work = node.make_work(Path(env["TMPDIR"]), kind="oz")
     (work / "rootfs" / "root" / "service-ready.lock").touch()
@@ -332,8 +332,8 @@ def test_o77_the_registration_token_is_minted_from_the_zone_by_its_declared_name
     assert NODE_FQDN not in calls
 
 
-def test_o77_no_script_that_dials_the_service_takes_the_name_from_the_node_alone():
-    """O77: the scripts that call the service they run beside take the name from `service_name`, which reads the work
+def test_o73_no_script_that_dials_the_service_takes_the_name_from_the_node_alone():
+    """O73: the scripts that call the service they run beside take the name from `service_name`, which reads the work
     directory's declared name and falls back to the node's, never from `node_fqdn` directly."""
     for name in ("finish.sh", "finish-zone.sh", "mint-registration-token.sh", "zone.sbatch"):
         text = (node.BUNDLE / name).read_text(encoding="utf-8")
@@ -356,8 +356,8 @@ def _helper(path):
 
 
 @pytest.mark.parametrize("path", HELPERS)
-def test_o77_a_helper_dials_the_declared_name_a_service_registered_under(tmp_path, monkeypatch, path):
-    """O77: onboard.py and the first run's zone and provider helpers verify the service's certificate for the name in
+def test_o73_a_helper_dials_the_declared_name_a_service_registered_under(tmp_path, monkeypatch, path):
+    """O73: onboard.py and the first run's zone and provider helpers verify the service's certificate for the name in
     the work directory's `declared-name` when the service registered under a declared name, and for the node's own
     (`hostname -f`) as before when it did not: the certificate holds the registered name alone."""
     helper = _helper(path)

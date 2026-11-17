@@ -1,4 +1,4 @@
-"""O77: nothing a REST cell receives holds a node's name, a node's address or the nodes' public port, for a federation
+"""O73: nothing a REST cell receives holds a node's name, a node's address or the nodes' public port, for a federation
 whose services register and are reached by the names their layout declares.
 
 The layout is a fake of the HPC pilot's shape with node-shaped names (a rack, a chassis and a blade in each node's name)
@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import rest_answers
 from apptainer_support import LEVELS, TOKEN, make_settings, start
 from fake_node import FakeNode
 
@@ -95,8 +96,8 @@ def _everything_a_cell_receives(done) -> dict[str, str]:
 
 
 @pytest.mark.parametrize("table", [False, True], ids=["urls-are-the-names", "federation-table"])
-def test_o77_no_cell_input_holds_a_node_name_an_address_or_the_public_port(config, tmp_path, table):
-    """O77: the environment, the hosts file, the gate's file, the CA and every other file or argument a cell receives
+def test_o73_no_cell_input_holds_a_node_name_an_address_or_the_public_port(config, tmp_path, table):
+    """O73: the environment, the hosts file, the gate's file, the CA and every other file or argument a cell receives
     hold the declared names alone, with or without `[sandbox.federation]`; the gate's leaf certificates name them alone;
     what the run records (its metadata, its egress declaration and its files, but the gate's own directory) holds none
     either, and the gate, which the cell cannot read, is the one place the mapped addresses are."""
@@ -142,8 +143,8 @@ def test_o77_no_cell_input_holds_a_node_name_an_address_or_the_public_port(confi
         box.stop()
 
 
-def test_o77_the_levels_of_the_fake_are_the_apptainer_support_s(config):
-    """O77: the scan above ran a REST level, which `apptainer_support` names `via-gate`."""
+def test_o73_the_levels_of_the_fake_are_the_apptainer_support_s(config):
+    """O73: the scan above ran a REST level, which `apptainer_support` names `via-gate`."""
     assert LEVELS["via-gate"] is DataPathMode.REST
     assert _spec(config).zone.address == NODES[ZONE][0]
 
@@ -158,9 +159,33 @@ def test_o77_the_levels_of_the_fake_are_the_apptainer_support_s(config):
         '"port": 8443}',
     ],
 )
-def test_o77_the_search_finds_a_node_name_an_address_or_the_port_where_one_is(leak):
-    """O77: the patterns the scan uses match each of the forms a leak takes, in any case, and not a declared name or a
+def test_o73_the_search_finds_a_node_name_an_address_or_the_port_where_one_is(leak):
+    """O73: the patterns the scan uses match each of the forms a leak takes, in any case, and not a declared name or a
     hash that holds the digits."""
     assert any(pattern.search(leak) for pattern in forbidden())
     clean = f"{ZONE} {LOCAL} 127.0.0.1 sha256:ab18443cd and port 40443"
     assert not [pattern for pattern in forbidden() if pattern.search(clean)]
+
+
+ZONE_NODE, LOCAL_NODE = NODES[ZONE][1][0], NODES[LOCAL][1][0]  # the nodes' own names: what an older registration holds
+NODE_WORDS = [w for address, names in NODES.values() for w in (address, *names)]
+
+
+def test_o73_rest_answers_that_carry_the_registered_domains_hold_only_declared_names_after_registration():
+    """O73: the raw answers that reach the agent (the scope answer, `ctx.serviceDomain`, a URL in a description,
+    `details.providerDomain`, `details.zoneDomain`) carry the domain each service registered under, never passing
+    through onedata-mcp: registered under the declared names they hold those and no node's name, address or 8443."""
+    bodies = rest_answers.answers(ZONE, LOCAL)
+    assert set(bodies) == set(rest_answers.CHANNELS)
+    assert not rest_answers.leaks(bodies, rest_answers.node_patterns(NODE_WORDS))
+    assert all(LOCAL in body or ZONE in body for _, body in bodies.values())
+
+
+def test_o73_the_search_finds_a_node_name_in_each_channel_of_an_older_registration():
+    """O73: registered under their nodes' own names (an `up` before this change), the same answers hold them in every
+    channel, and the same search names each: so the clean result above is the registration's, not the search's."""
+    bodies = rest_answers.answers(ZONE_NODE, LOCAL_NODE)
+    found = rest_answers.leaks(bodies, rest_answers.node_patterns(NODE_WORDS))
+    assert set(found) == set(rest_answers.CHANNELS)
+    assert "8443" in bodies["description URL"][1]
+    assert found["description URL"] >= 2  # the node's name and the port

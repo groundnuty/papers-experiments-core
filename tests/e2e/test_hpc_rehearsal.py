@@ -141,7 +141,7 @@ def test_up_renders_platform_toml_with_the_apptainer_sandbox_and_writes_the_ten_
     assert config.sandbox.work_root == fed.work_root
     assert config.sandbox.apptainer.image.sha256 == fed.agent["HPC_AGENT_SIF_SHA256"]
     assert not fed.work_root.exists()  # the shard step makes it, on the agent's node
-    assert config.zone.url == "https://zone.expcore-hpc-pilot.test:8443"  # the declared name (O77), never a node's
+    assert config.zone.url == "https://zone.expcore-hpc-pilot.test:8443"  # the declared name (O73), never a node's
     record = json.loads((fed.root / "link-check.json").read_text(encoding="utf-8"))
     assert record["ok"] is True
     assert len(record["pairs"]) == 10

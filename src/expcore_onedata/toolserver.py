@@ -57,13 +57,11 @@ executor has before the loop starts.
 import asyncio
 import contextlib
 import dataclasses
-import json
 import os
 import sys
 import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
@@ -103,7 +101,10 @@ ENV_PROVIDER_HOST = "ONEDATA_ONEPROVIDER_HOST"
 ENV_PROVIDER_TOKEN = "ONEDATA_ONEPROVIDER_TOKEN"
 ENV_TOOLS = "ONEDATA_MCP_TOOLS"
 ENV_INSECURE_TLS = "ONEDATA_ALLOW_INSECURE_TLS"
-ENV_NODE_NAMES = "ONEDATA_MCP_NODE_NAMES"  # O77: the server's map from every real node name to its declared name
+ENV_ADDRESS_MAP = (
+    "EXPCORE_ADDRESS_MAP"  # O73: the private map file the resolver shim reads (a federation of declared names)
+)
+ENV_PYTHONPATH = "PYTHONPATH"
 MANAGED_ENV = (
     ENV_ZONE_HOST,
     ENV_ZONE_TOKEN,
@@ -111,29 +112,24 @@ MANAGED_ENV = (
     ENV_PROVIDER_TOKEN,
     ENV_TOOLS,
     ENV_INSECURE_TLS,
-    ENV_NODE_NAMES,
+    ENV_ADDRESS_MAP,
     *CA_BUNDLE_ENV,
 )
-STANDARD_HTTPS_PORT = 443  # a port printed after a name, beside the ones the URLs hold, is the name's own too
 
 
-def node_names(config: PlatformConfig) -> str | None:
-    """The value of `ONEDATA_MCP_NODE_NAMES` for this platform, or None where the names are already the declared ones
-    (a Compose federation: no `[addresses]`).
+def resolver_environment(config: PlatformConfig, caller_path: str | None) -> dict[str, str]:
+    """What lets a Python tool server reach a declared name that resolves nowhere (O73): the settings of the resolver
+    shim, or nothing for a platform with no `[addresses] resolver`.
 
-    It is built from the platform's address map: every real name and address the federation is reachable by (each
-    node's own names and its address), bare and with each port the URLs hold and 443, mapped to the declared name it
-    belongs to, and each declared name to itself, so a port printed after it goes with it. The server replaces each in
-    the text of an Onedata error before the agent sees it (onedata-mcp's `get_node_names`); a host is under one name
-    only, and the value names no secret. JSON, keys in sorted order."""
-    if config.addresses is None:
-        return None
-    ports = {
-        urlsplit(url).port or STANDARD_HTTPS_PORT
-        for url in (config.zone.url, *(p.url for p in config.providers.values()))
-    }
-    ports.add(STANDARD_HTTPS_PORT)
-    return json.dumps(config.addresses.node_names(sorted(ports)), sort_keys=True)
+    The shim is a `sitecustomize.py` the federation's `up` placed in its root; the server's `PYTHONPATH` starts with its
+    directory (before any the caller gave), so Python imports it at start, and `EXPCORE_ADDRESS_MAP` names the private
+    map it reads. It resolves exactly the names of that map, to their addresses, and every other host as before; the
+    URL, the handshake, the certificate check and `Host` stay the declared name. It serves a Python server that does not
+    run isolated (`-I`), which is onedata-mcp: any other needs a mechanism of its own."""
+    if config.addresses_file is None or config.addresses_resolver is None:
+        return {}
+    path = os.pathsep.join(p for p in (str(config.addresses_resolver), caller_path) if p)
+    return {ENV_PYTHONPATH: path, ENV_ADDRESS_MAP: str(config.addresses_file)}
 
 
 def server_environment(
@@ -149,9 +145,10 @@ def server_environment(
     The one token serves the server's Onezone and Oneprovider settings. The provider is the agent's pinned local one.
     The allow-list is the condition's, and a caller cannot set it or any other managed setting.
 
-    With the platform's `[addresses]` (O77, a federation reached by the names its layout declares) it is also given
-    `ONEDATA_MCP_NODE_NAMES` (`node_names`): the server then names a node by its declared name in the text of an error,
-    never by its own name or address or its port. A Compose federation sets none.
+    With the platform's `[addresses] resolver` (O73, a federation reached by the names its layout declares) it also gets
+    the resolver's settings (`resolver_environment`), so that it resolves those names, and never `ONEDATA_MCP_NODE_NAMES`:
+    once the services register the declared names there is no node name to map, and the server's text is the one a
+    Compose federation's is.
 
     Its certificate check is the platform's `[tls]`: by default the server's own (it verifies with httpx's CAs); with
     `ca_file`, `ca_copy`, the run's own read-only copy of the verified bundle (`tls.write_private_copy`), never the
@@ -174,9 +171,7 @@ def server_environment(
             ENV_TOOLS: ",".join(condition.allow),
         }
     )
-    names = node_names(config)
-    if names is not None:
-        env[ENV_NODE_NAMES] = names
+    env.update(resolver_environment(config, (extra or {}).get(ENV_PYTHONPATH)))
     if config.tls.insecure:
         env[ENV_INSECURE_TLS] = "true"
     elif ca_copy is not None:

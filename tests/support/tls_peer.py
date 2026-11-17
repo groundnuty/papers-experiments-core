@@ -1,9 +1,10 @@
-"""A real TLS service on the loopback, for the tests of a client that reaches a service by name (O77).
+"""A real TLS service on the loopback, for the tests of a client that reaches a service by name (O73).
 
 `TlsPeer(directory, name)` listens on 127.0.0.1 at a free port with a certificate that names `name` alone, signed by a
-CA of its own (`ca`), answers every request with an empty JSON object, and records what it was sent: the server name the
-client's handshake asked for (`sni`), and each request's method, path and `Host` header (`requests`). The names are
-invented (`.test` resolves nowhere), so a client that connects at all has been given the address another way.
+CA of its own (`ca`). It answers every request with an empty JSON object, or with the `answer` a test sets, and records
+what it was sent: the server name the client's handshake asked for (`sni`), and each request's method, path and `Host`
+header (`requests`). The names are invented (`.test` resolves nowhere), so a client that connects at all has been given
+the address another way.
 """
 
 import ssl
@@ -28,8 +29,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.peer.requests.append(  # type: ignore[attr-defined]
             {"method": self.command, "path": self.path, "host": self.headers.get("Host")}
         )
-        body = b"{}"
-        self.send_response(200)
+        status, body = self.server.peer.answer  # type: ignore[attr-defined]
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -54,6 +55,7 @@ class TlsPeer:
         self.ca = directory / "ca.pem"
         self.sni: list[str | None] = []
         self.requests: list[dict[str, Any]] = []
+        self.answer: tuple[int, bytes] = (200, b"{}")  # what every request is answered with: a test sets it
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(directory / f"{name}.pem", directory / f"{name}.key")
         context.sni_callback = self._remember

@@ -2,7 +2,7 @@
 real addresses (DESIGN.md, sections 5 and 6).
 
 - **The services' URLs** are `https://<declared name>:8443` (the shim moves the worker's 443 there), so `HpcService` is
-  the Compose `Service` with the layout's declared name in place of the loopback port (O77: the services register
+  the Compose `Service` with the layout's declared name in place of the loopback port (O73: the services register
   under it, and the root's address map says where it is dialled); the Compose bootstrap (`fedboot.Bootstrap`), the
   baseline (`fedcontent.Content`) and the facts (`fedfacts`) then run unchanged, the client given the map.
 - **The storage** is the one posix storage the bundle's `finish.sh` adds to each provider, owned by the job's uid on
@@ -101,10 +101,10 @@ class HpcBootstrap(Bootstrap):
         super().__init__(rest, layout)
         self.owner = owner  # the uid and gid the storage belongs to (finish.sh adds it as the job user)
         self._mapped: set = set()  # the (provider, storage) pairs whose users are mapped already
-        self.registered: Optional[Dict[str, str]] = None  # what each service reported as its domain (O77), once read
+        self.registered: Optional[Dict[str, str]] = None  # what each service reported as its domain (O73), once read
 
     def read_registered(self) -> Dict[str, str]:
-        """What each service reports as its domain (O77), kept for the facts and the checks of `core_phase`."""
+        """What each service reports as its domain (O73), kept for the facts and the checks of `core_phase`."""
         self.registered = hpcnames.registered_domains(self)
         return self.registered
 
@@ -229,7 +229,7 @@ def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, 
     least the platform layer accepts for the rest of the file. Returns the text written."""
     filled = {**placeholders(facts), **values, "hpc_token_margin_s": str(PROVISIONAL_MARGIN_S)}
     text = rendered(template, filled)
-    # O77: a `[sandbox.federation]` table is usable only once the providers registered the declared names, which the
+    # O73: a `[sandbox.federation]` table is usable only once the providers registered the declared names, which the
     # facts record: refused here, before the file is written or loaded
     hpcnames.check_federation_table(text, registered_of(facts))
     write_private(path, text)
@@ -243,12 +243,13 @@ def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, 
 
 def rendered(template: str, filled: Mapping[str, str]) -> str:
     """The template filled in, and, once the root holds an address map (`hpc_addresses`, its path), `addresses` first:
-    the file where the platform layer's clients find the address each declared name is dialled at (O77). A top-level key
+    the file where the platform layer's clients find the address each declared name is dialled at (O73). A top-level key
     of its own, so it may precede every table."""
     text = render(template, dict(filled))
     if "hpc_addresses" not in filled:
         return text
-    return f"addresses = {{ file = {json.dumps(filled['hpc_addresses'])} }}\n" + text
+    resolver = f", resolver = {json.dumps(filled['hpc_resolver'])}" if "hpc_resolver" in filled else ""
+    return f"addresses = {{ file = {json.dumps(filled['hpc_addresses'])}{resolver} }}\n" + text
 
 
 def registered_of(facts: Mapping[str, Any]) -> Dict[str, str]:
@@ -267,7 +268,7 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
     """facts.json, and platform.toml from the layout's template with the HPC values."""
     facts = facts_of(boot)
     registered = getattr(boot, "registered", None)
-    if registered:  # O77: what each service reported as its domain; with the DNS check, which is advisory
+    if registered:  # O73: what each service reported as its domain; with the DNS check, which is advisory
         facts["zone"]["registered_domain"] = registered.get("zone")
         for name, provider in facts["providers"].items():
             provider["registered_domain"] = registered.get(name)
@@ -278,6 +279,8 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
         return "facts.json written; the layout names no platform_template, so no platform.toml"
     if layout.address_map.is_file():  # the platform layer's clients dial each declared name at its mapped address
         values = {**values, "hpc_addresses": str(layout.address_map)}
+        if layout.toolshim.is_dir():  # the resolver shim `up` copied into the root, for a Python tool server
+            values["hpc_resolver"] = str(layout.toolshim)
     write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values)
     return "facts.json and platform.toml written"
 
@@ -323,11 +326,11 @@ def core_phase(
         steps(boot)
         read = getattr(
             boot, "read_registered", None
-        )  # the HPC bootstrap reads what each service registered under (O77)
+        )  # the HPC bootstrap reads what each service registered under (O73)
         if read is not None:
             read()
         registered = getattr(boot, "registered", None)
-        if registered is not None:  # O77: every service registered under its declared name, or nothing reaches it
+        if registered is not None:  # O73: every service registered under its declared name, or nothing reaches it
             hpcnames.check_registered(hpcnames.declared_names(layout.spec), registered)
         if not layout.facts.exists():
             content(boot).reset(TRANSFER_TIMEOUT_S)

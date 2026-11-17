@@ -1,4 +1,4 @@
-"""The names an HPC federation registers its services under and is reached by (O77, DESIGN.md section 5.8).
+"""The names an HPC federation registers its services under and is reached by (O73, DESIGN.md section 5.8).
 
 A layout declares a name for the zone and for each provider (`<service>.<domain>`, under the layout's `domain`). On a
 cluster those names resolve nowhere, and the nodes have names and addresses of their own, which nothing the agent can
@@ -17,6 +17,9 @@ read may carry. So:
 Nothing here prints or records a node's name or address but the map file and the state, which are the root's own.
 """
 
+import os
+import shutil
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 import tomllib
@@ -57,6 +60,25 @@ def address_map(declared: Mapping[str, str], services: Mapping[str, Mapping[str,
         raise RuntimeError(
             "two services share one node's name or address: a name belongs to one service only"
         ) from None
+
+
+SHIM = Path(__file__).resolve().parent / "toolshim" / "sitecustomize.py"  # the resolver of a Python tool server
+
+
+def install_toolshim(directory: Path) -> Path:
+    """Copy the resolver shim into the root (`directory`, 0700; the file 0644 and never a link), and return the
+    directory: `platform.toml` names it (`[addresses] resolver`), and the tool server's `PYTHONPATH` starts with it
+    (O73). A copy an earlier `up` left is replaced: it is the driver's own file."""
+    directory.mkdir(mode=0o700, exist_ok=True)
+    directory.chmod(0o700)
+    target = directory / "sitecustomize.py"
+    if target.is_symlink():
+        raise RuntimeError("the root's resolver shim is a link: refused")
+    scratch = directory / f".sitecustomize.{os.getpid()}.part"
+    shutil.copyfile(SHIM, scratch)
+    scratch.chmod(0o644)
+    os.replace(scratch, target)
+    return directory
 
 
 def host_args(found: AddressMap) -> List[str]:
@@ -113,12 +135,12 @@ def check_federation_table(platform_text: str, registered: Mapping[str, str]) ->
     if not registered:
         raise RuntimeError(
             "[sandbox.federation] is declared, and the facts hold no record of the names the services registered: the "
-            "table is usable only once they register the layout's declared names (the ordering of O77)"
+            "table is usable only once they register the layout's declared names (the ordering of O73)"
         )
     for role, name in declared.items():
         if not isinstance(name, str) or registered.get(role) != name.lower():
             raise RuntimeError(
                 f"[sandbox.federation]'s name for the {role} ({name!r}) is not the name the federation registered: the "
-                "table is usable only once the providers register the layout's declared names (the ordering of O77)"
+                "table is usable only once the providers register the layout's declared names (the ordering of O73)"
             )
     return True

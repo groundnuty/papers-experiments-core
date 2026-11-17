@@ -320,7 +320,7 @@ script stops the service, deletes and redacts every secret (`scrub.py`) and keep
 ends any other way fails the job, with its own status. `--exclusive` keeps other users off a node, at the price of
 the whole node for the job.
 
-## Registered names (O77)
+## Registered names (O73)
 
 By default a service registers under its node's own FQDN, and its certificate is made for it. A federation reached by
 the names its layout declares registers each service under its declared name instead, so that no node's name, address

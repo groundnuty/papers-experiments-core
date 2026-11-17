@@ -282,7 +282,7 @@ def _upstream_ctx(verify: bool) -> ssl.SSLContext:
 def _upstream_conn(h: dict) -> http.client.HTTPConnection:
     """A connection to the host's upstream: `addr` is the name the handshake asks for, the certificate is checked
     against and the request's `Host` names; `dial`, when the host has one, is the address the TCP connection goes to
-    (O77: `addr` is then a declared name that resolves nowhere)."""
+    (O73: `addr` is then a declared name that resolves nowhere)."""
     if h.get("tls", True):
         conn = http.client.HTTPSConnection(
             h["addr"],
@@ -410,16 +410,16 @@ SERVED_PORT = 443  # where a client of the gate dials every name it serves: the 
 def _as_served(text: str, name: str, hcfg: dict) -> str:
     """The text of a failure as the gate's answer gives it to its client: the host it dialled upstream (`addr`, and
     `addr:port`), which a certificate's name mismatch quotes, named as the client knows it, by the name the gate
-    serves on 443 (O69), and the address it connected to (`dial`, O77) by that name too. A gate whose name is the host it
+    serves on 443 (O69), and the address it connected to (`dial`, O73) by that name too. A gate whose name is the host it
     dials (Docker's) gives the text unchanged; the log's line keeps the text as it was.
 
-    A host that is the served name itself but is dialled at a mapped address (O77: the URL's host is the declared name)
+    A host that is the served name itself but is dialled at a mapped address (O73: the URL's host is the declared name)
     needs no replacement, yet its port is the nodes' public one, so `name:port` still becomes `name:443`."""
     port = hcfg.get("port", 443 if hcfg.get("tls", True) else 80)
     named = name.lower()
-    hosts = [h for h in dict.fromkeys(str(hcfg.get(key) or "") for key in ("addr", "dial")) if h]  # O77: `dial` too
+    hosts = [h for h in dict.fromkeys(str(hcfg.get(key) or "") for key in ("addr", "dial")) if h]  # O73: `dial` too
     bare = [h for h in hosts if h.lower() != named]  # the name itself is not replaced by itself
-    ported = bare + ([name] if hcfg.get("dial") and any(h.lower() == named for h in hosts) else [])  # O77: its port is
+    ported = bare + ([name] if hcfg.get("dial") and any(h.lower() == named for h in hosts) else [])  # O73: its port is
     if not ported:
         return text
     with_port = tuple(form for h in ported for form in (f"[{h}]:{port}", f"{h}:{port}"))
