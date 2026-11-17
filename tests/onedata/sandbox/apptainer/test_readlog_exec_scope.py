@@ -224,8 +224,9 @@ def node() -> FakeNode:
 
 
 @pytest.fixture
-def settings(tmp_path):
-    return make_settings(tmp_path, work_disk="image", readlog_collector_sha256=files.sha256_of(files.collector_file()))
+def settings(short_tmp):
+    """The work root is short: the collector's socket path must fit a Unix socket's address (the start refuses it)."""
+    return make_settings(short_tmp, work_disk="image", readlog_collector_sha256=files.sha256_of(files.collector_file()))
 
 
 def _answer(node: FakeNode):

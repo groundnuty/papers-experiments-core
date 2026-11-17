@@ -7,7 +7,9 @@ the harness runs outside it (`expcore_onedata.readlog`). On this backend, when `
 
 * three directories of the run's, each 0700: `readlog/` (the collector's copy, its log and its two streams, never bound
   into a cell), `readlog-sock/` (empty, the collector's socket directory) and `readlog-client/` (the client module's
-  copy alone). The collector's and the client's copies are hashed against their sources, and only the copies are used;
+  copy alone). The collector's and the client's copies are hashed against their sources, and only the copies are used.
+  The socket's path (`<work_root>/<run id>/readlog-sock/sock`) must fit a Unix socket's 107 bytes: a longer one refuses
+  the start before anything exists (`check_socket_path`), as a collector that cannot bind it would only end unready;
 * the collector, a helper of the driver's uid (role `readlog`, `helpers.start`), started before any cell, told the run's
   nonce and the expected sender uid: every cell runs as the driver's own uid (`facts.py`, `same_uid`), so that is
   `os.getuid()`;
@@ -105,6 +107,12 @@ class Channel:
                 "[sandbox.apptainer] readlog_collector_sha256 is not the read-log collector of this core: "
                 "its SHA-256 differs"
             )
+
+    def check_socket_path(self) -> None:
+        """Before anything exists: the collector's socket path fits a Unix socket's address, or `StartRefused`
+        (`layout.check_socket_path`)."""
+        if self.enabled:
+            layout.check_socket_path(self.box.dir / SOCK_DIR / paths.SOCKET_NAME, "read-log")
 
     def prepare(self) -> None:
         """The three directories and the two copies, each shown to have its hash (`layout.copy_pinned`)."""

@@ -16,7 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from apptainer_support import TOKEN, make_settings, make_spec, start
+from apptainer_support import TOKEN, make_settings, make_spec, settings_with_socket_bytes, start
 from fake_node import FakeNode
 
 from expcore.errors import InfraError
@@ -38,8 +38,9 @@ def node() -> FakeNode:
 
 
 @pytest.fixture
-def settings(tmp_path):
-    return make_settings(tmp_path, readlog_collector_sha256=files.sha256_of(files.collector_file()))
+def settings(short_tmp):
+    """The work root is short: the collector's socket path must fit a Unix socket's address (the start refuses it)."""
+    return make_settings(short_tmp, readlog_collector_sha256=files.sha256_of(files.collector_file()))
 
 
 def instrument(box) -> ReadLog:
@@ -373,6 +374,27 @@ def test_o91_a_platform_that_pins_another_collector_than_the_core_s_refuses_the_
     assert not node.readlogs
     assert not node.spawned
     assert not any(p.name.startswith("run-key") for p in wrong.work_root.iterdir())
+
+
+@pytest.mark.parametrize("size", [108, 200])
+def test_o91_a_work_root_that_puts_the_collector_s_socket_over_a_unix_socket_s_limit_refuses_the_start(
+    node, short_tmp, size
+):
+    """O91: the collector binds `<work_root>/<run id>/readlog-sock/sock`, and a Unix socket's address holds at most 107
+    bytes of path. A longer one would end the collector before it said it was ready, with nothing said of why (seen on
+    the HPC nodes, whose test paths are long): the start is refused before anything exists, saying the length and the
+    limit and never the path."""
+    long = settings_with_socket_bytes(short_tmp, size, readlog_collector_sha256=files.sha256_of(files.collector_file()))
+    with pytest.raises(StartRefused) as refused:
+        start(node, long)
+    assert str(refused.value) == (
+        f"the read-log socket path is {size} bytes, over the 107-byte limit of a Unix socket: "
+        "use a shorter [sandbox] work_root"
+    )
+    assert str(short_tmp) not in str(refused.value)
+    assert not node.readlogs
+    assert not node.spawned
+    assert not any(p.name.startswith("run-key") for p in long.work_root.iterdir())
 
 
 def test_o91_a_platform_that_declares_no_collector_has_no_channel_and_no_log(node, tmp_path):

@@ -123,6 +123,9 @@ it declares it in its own platform file.
   `sock` in an empty 0700 directory (`readlog-sock/` of the run's directory) and writes its log in `readlog/`, which no
   cell sees. Every cell binds `readlog-sock/` read-only at `/expcore-readlog` and the client module's directory read-only
   at `/expcore-readlog-client`; a Unix datagram socket takes `sendto` on a read-only bind, as the egress shim's does.
+  The socket's path, `<work_root>/<run id>/readlog-sock/sock`, must fit a Unix socket's 107 bytes (a run id is at most
+  57 bytes), so keep `[sandbox] work_root` to 31 bytes or fewer: a start with a longer path is refused, saying its
+  length and the limit.
 - **The canary:** before the agent runs, a cell sends the canary through the real client; it is the log's first
   record, and a start whose cell cannot send it fails.
 - **The collection** stops the collector on SIGTERM (it drains what is queued and writes its end line), reads the log

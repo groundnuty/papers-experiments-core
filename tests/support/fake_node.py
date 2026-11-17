@@ -246,6 +246,7 @@ class FakeNode:
         self.real_helpers: set[tuple[int, str]] = set()  # the real helpers' pid and start time
         self.gate_busy = 0  # this many gate starts fail as if their port were taken
         self.gate_never_ready = False
+        self.collector_ends_unready = False  # the egress collector ends before it is ready, as a bind that failed does
         self.helpers_ignore: frozenset[int] = frozenset()
         self.cell_left: list[FakeProc] = []  # processes a cell leaves behind (set by a handler)
         self.cgroup: dict[str, Any] = {"depth": 0, "max_bytes": 1 << 34, "events": {"oom": 0, "oom_kill": 0},
@@ -529,6 +530,9 @@ class FakeNode:
         assert not log.exists(), "the collector's log exists before it starts"
         proc = self._new_proc(OWN_NS, "python3", cmdline=tuple(argv), environ=environ, role="collector",
                               ignores=self.helpers_ignore)  # fmt: skip
+        if self.collector_ends_unready:
+            proc.alive, proc.exit_status = False, 1
+            return Spawned(proc.pid, proc.start)
         collector = Collector(log, nonce, proc)
         collector.write("start", format="hpcop-egress/1", nonce=nonce, pid=proc.pid, uid=os.getuid())
         self.collectors.append(collector)

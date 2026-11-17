@@ -320,6 +320,7 @@ class ApptainerSandbox:
             raise StartRefused('work_disk = "image" needs [sandbox.limits] work_disk_bytes of at least 2 MiB')
         self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s), storages=inputs.storage_paths(s))
         layout.check_work_root(s.work_root, os.getuid())
+        self._readlog.check_socket_path()  # O91: a collector that cannot bind its socket ends unready, saying nothing
         self._image_identity = layout.pin_image(self.app.image)  # O13, before anything exists
         self._meta["images"]["agent"] = f"sha256:{self.app.image.sha256}"
 
@@ -411,8 +412,16 @@ class ApptainerSandbox:
         egress = self.dir / "egress"
         argv = [self._host_python(), "-I", "-B", str(egress / "egress-collector.py"), str(self.dir / "egress-sock"),
                 str(egress / "egress.jsonl"), self.egress_nonce]  # fmt: skip
-        helpers.start(self.node, "collector", argv, egress, COLLECTOR_READY, noted=self._note_helper,
-                      env={AV.RUN_TAG: self.sid}, sleep=self._sleep, clock=self._clock)  # fmt: skip
+        try:
+            helpers.start(self.node, "collector", argv, egress, COLLECTOR_READY, noted=self._note_helper,
+                          env={AV.RUN_TAG: self.sid}, sleep=self._sleep, clock=self._clock)  # fmt: skip
+        except SandboxError as error:
+            # a socket path over a Unix socket's limit cannot be bound: the collector ends unready, saying nothing of
+            # why. Said here, not refused up front: a fake node binds no socket, and a start that works must not fail.
+            problem = layout.socket_path_problem(self.dir / "egress-sock" / "sock", "egress")
+            if problem is None:
+                raise
+            raise SandboxError(problem) from error
 
     def _start_mount(self) -> Path:
         """Hook (c): the mount's helper, started before any cell; the node directory bound at the mount path."""

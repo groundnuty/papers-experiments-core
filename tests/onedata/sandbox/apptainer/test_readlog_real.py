@@ -10,15 +10,12 @@ taking a `sendto`, an unprivileged user namespace over it) is the live slot's.
 
 import json
 import os
-import shutil
 import signal
 import stat
-import tempfile
 import time
-from pathlib import Path
 
 import pytest
-from apptainer_support import make_settings
+from apptainer_support import make_settings, settings_with_socket_bytes
 from apptainer_support import start as start_with
 from fake_node import FakeNode
 
@@ -27,7 +24,7 @@ from expcore_onedata.readlog.instrument import ReadLog
 from expcore_onedata.sandbox.hostops import CmdResult
 
 SHA = "ab" * 32
-SOCKET_PATH_LIMIT = 100  # AF_UNIX's sun_path holds 108 bytes
+UNIX_SOCKET_PATH_BYTES = 107  # AF_UNIX's sun_path holds 108 bytes, the last one a NUL
 
 
 @pytest.fixture
@@ -38,11 +35,10 @@ def node() -> FakeNode:
 
 
 @pytest.fixture
-def settings():
-    """A short work root: the collector's socket path must fit a Unix socket's address, which a pytest path may not."""
-    short = Path(tempfile.mkdtemp(prefix="rl"))
-    yield make_settings(short, readlog_collector_sha256=files.sha256_of(files.collector_file()))
-    shutil.rmtree(short, ignore_errors=True)
+def settings(short_tmp):
+    """A short work root: the collector's socket path must fit a Unix socket's address, which a pytest path may not (on
+    a batch node pytest's own paths are well over it, and the start refuses a path that does not fit)."""
+    return make_settings(short_tmp, readlog_collector_sha256=files.sha256_of(files.collector_file()))
 
 
 def start(node, settings):
@@ -77,7 +73,7 @@ def test_o91_a_client_in_a_cell_sends_and_the_record_appears_with_the_expected_p
     sender's uid as the kernel attests it: the driver's own, which the collector was told to expect."""
     box = start(node, settings)
     try:
-        assert len(str(box.dir / "readlog-sock" / paths.SOCKET_NAME)) < SOCKET_PATH_LIMIT
+        assert len(str(box.dir / "readlog-sock" / paths.SOCKET_NAME)) <= UNIX_SOCKET_PATH_BYTES
         node.cell_handler = sends("file-7", range=[0, 10], bytes=10, sha256=SHA)
         box.exec("print('x')", 30)
         box.collect(tmp_path / "out")
@@ -204,6 +200,20 @@ def test_o91_a_real_collector_terminated_before_the_collection_gives_an_unknown_
         snapshot = instrument(box).finish()
         assert snapshot["log"] == "unknown"
         assert "log_missing" in snapshot["unknown"]
+    finally:
+        box.stop()
+
+
+def test_o91_a_socket_path_of_exactly_the_limit_binds_with_the_real_collector(node, short_tmp):
+    """O91: the start's refusal of a long socket path (`test_readlog.py`) is placed where the kernel's own limit is: the
+    real collector binds a path of exactly 107 bytes, and the start, canary included, completes."""
+    long = settings_with_socket_bytes(
+        short_tmp, UNIX_SOCKET_PATH_BYTES, readlog_collector_sha256=files.sha256_of(files.collector_file())
+    )
+    box = start(node, long)
+    try:
+        assert len(os.fsencode(box.dir / "readlog-sock" / paths.SOCKET_NAME)) == UNIX_SOCKET_PATH_BYTES
+        assert stat.S_ISSOCK(os.lstat(box.dir / "readlog-sock" / paths.SOCKET_NAME).st_mode)
     finally:
         box.stop()
 
