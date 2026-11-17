@@ -573,12 +573,13 @@ section 1, "A fleet"). `fleet.py` brings N federations up from one layout, gives
 step and takes them all down. Run it on the login node, from a private 0700 directory of yours, with `-I`. Its
 layout holds each agent's node as a job of its own, `[hpc] sandbox_placement = "separate"`: on the site's Slurm, steps
 on a heterogeneous job's services failed with an interconnect error (a live slot), so `up` refuses a `het` layout.
-Copy `layouts/pilot-shape.toml` and its template beside each other and change that one line:
+`layouts/pilot-shape-separate.toml` is that layout: `layouts/pilot-shape.toml` with that one line changed (a test reads
+both and refuses any other difference), beside the same platform template, so use it as it is:
 
 ```bash
 set -a; . deploy/hpc-federation/site.env; set +a
 F=<an absolute path, not there yet, on the filesystem the login node and the nodes see>
-uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" --layout <your copy of pilot-shape.toml> up 4
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" --layout deploy/hpc-federation/layouts/pilot-shape-separate.toml up 4
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" plan --manifest <shard settings>
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" status
@@ -588,8 +589,10 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
 
 - **How many.** `HPC_FLEET_MAX` (in `site.env`) is your maximum of federations at once in one fleet, which the grant
   and the scratch inode quota set; with none set, `up` refuses. `up N` past it is refused before anything is made, and
-  `add K` counts every federation that may still hold a job (a failed one may, until its `down`). With the inode guard
-  in the core, the fleet asks it once for all N (the account's usage against N times one federation's estimate).
+  `add K` counts every federation that may still hold a job (a failed one may, until its `down`). The inode guard is the
+  core's own (`hpcquota`, mandatory with `HPC_STORAGE_ROOT`: an override, an unset command or a quota that cannot be read
+  refuses the fleet as it refuses one `up`), asked once for all N: the account's usage against N times one
+  federation's estimate. Without a scratch root nothing is on scratch, and the fleet says it made no check.
   `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once. The maximum is one fleet's: two fleets of
   one account share the grant by hand.
 - **What `up` makes.** The fleet's directory (new: never adopted), and federations `fed-1` ... `fed-N`, each its own

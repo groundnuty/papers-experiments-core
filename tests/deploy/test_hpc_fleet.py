@@ -4,16 +4,19 @@ others up when one fails, and takes down only what its own up made, each verifie
 
 Every federation runs over a fake cluster of its own (`hpc_fleet_support.Bench`); nothing reaches a cluster."""
 
+import dataclasses
 import json
 import os
 import shutil
 import sys
 import threading
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, data_stand_in
-from hpc_fleet_support import fleet_modules, job_ids, make_bench, make_ca
+from hpc_fed_support import LAYOUT, SITE, FakeSlurm, data_stand_in
+from hpc_fleet_support import SEPARATE_LAYOUT, fleet_modules, job_ids, make_bench, make_ca
 from tls_support import HAS_OPENSSL
 
 pytestmark = pytest.mark.skipif(not HAS_OPENSSL, reason="the zone's CA is made with openssl")
@@ -348,27 +351,114 @@ def test_o68_down_of_one_member_leaves_the_others_up(bench):
     assert [m["status"] for m in record(bench)["members"]] == ["up", "down", "up"]
 
 
+# ------------------------------------------------------------------------------------------------ the layout
+def test_o68_the_committed_separate_layout_is_the_pilots_but_for_the_agents_nodes_placement():
+    """O68: `layouts/pilot-shape-separate.toml` is the pilot's layout with the agent's node held as a job of its own,
+    which a fleet requires, and nothing else: the same file read as TOML but for `[hpc] sandbox_placement`, the same
+    template, and a comment that says why it exists."""
+    pilot = tomllib.loads(LAYOUT.read_text(encoding="utf-8"))
+    separate_text = SEPARATE_LAYOUT.read_text(encoding="utf-8")
+    separate = tomllib.loads(separate_text)
+    assert pilot["hpc"]["sandbox_placement"] == "het"
+    assert separate["hpc"]["sandbox_placement"] == "separate"
+    pilot["hpc"]["sandbox_placement"] = separate["hpc"]["sandbox_placement"]
+    assert separate == pilot
+    assert SEPARATE_LAYOUT.parent == LAYOUT.parent  # so the template named in the file is the pilot's own
+    assert (SEPARATE_LAYOUT.parent / separate["platform_template"]).is_file()
+    comment = " ".join(line.lstrip("# ") for line in separate_text.split("\n\n")[0].splitlines())
+    for word in ("pilot-shape.toml", "separate", "interconnect"):
+        assert word in comment
+
+
+def test_o68_a_fleet_takes_the_committed_separate_layout_and_refuses_the_pilots_own(deploy):
+    """O68: `separate_only` accepts the committed separate layout and refuses `pilot-shape.toml` as before."""
+    deploy.fleet.separate_only(deploy.fleet.load_spec(SEPARATE_LAYOUT))
+    with pytest.raises(deploy.fleet.FleetError, match='sandbox_placement = "separate"'):
+        deploy.fleet.separate_only(deploy.fleet.load_spec(LAYOUT))
+
+
 # ------------------------------------------------------------------------------------------------ the inode guard
-def test_o68_the_inode_guard_reads_the_quota_once_for_n_times_one_federations_estimate(deploy, monkeypatch):
-    """O68: with the core's inode guard (hpcquota, stood in here), the fleet's check is the account's usage against N
-    times one federation's estimate, read once: N ups would each read the same usage."""
-    asked = []
-    stand_in = SimpleNamespace(
-        estimate_inodes=lambda layout, environ: {"alpha-space": 120, "beta-space": 30},
-        check_inodes=lambda runner, site, estimate: asked.append(estimate) or f"inode check: estimate {estimate}",
-    )
-    monkeypatch.setitem(sys.modules, "hpcquota", stand_in)
-    site = SimpleNamespace(storage_root="/invented/scratch")
-    said = deploy.fleet.inode_guard(object(), 4, object(), site, {})
-    assert asked == [600]
-    assert said == "inode check: estimate 600"
-    assert "HPC_STORAGE_ROOT is not set" in deploy.fleet.inode_guard(object(), 4, object(), SimpleNamespace(), {})
+PATTERN = r"inodes used (?P<used>[0-9,]+) of (?P<quota>[0-9,]+)"  # an invented format, as invented as its tool
+TOOL = "fake-quota"  # an invented command name
+LINE = 19_000  # the 95% line of a quota of 20,000
 
 
-def test_o68_without_the_inode_guard_the_fleet_says_none_was_made(deploy, monkeypatch):
-    monkeypatch.setitem(sys.modules, "hpcquota", None)  # an import of it fails, as in a core without it
-    said = deploy.fleet.inode_guard(object(), 3, object(), SimpleNamespace(storage_root="/x"), {})
-    assert said == "inode check: none: this core has no inode guard (hpcquota)"
+class Quota:
+    """The invented quota command: what it prints, every call recorded."""
+
+    def __init__(self, deploy, used, quota=20_000):
+        self.completed, self.calls, self.text = deploy.hpc.slurm.Completed, [], f"inodes used {used:,} of {quota:,}\n"
+
+    def __call__(self, argv, timeout):
+        self.calls.append(list(argv))
+        return self.completed(0, self.text, "")
+
+
+def scratch_site(deploy):
+    """A site with a scratch root and the invented quota command, as `site.env` would give them."""
+    environ = {**SITE, "SH": "/invented/images", "L": "/invented/logs", "HPC_STORAGE_ROOT": "/invented/scratch",
+               "HPC_QUOTA_CMD": f"{TOOL} --inodes", "HPC_QUOTA_PATTERN": PATTERN}  # fmt: skip
+    return deploy.hpc.settings.site_from_environment(environ)
+
+
+def one_federation(deploy):
+    """The separate layout as one federation's, for the estimate alone (`Fleet.scratch_layout`)."""
+    return deploy.fleet.Layout(Path("/x/fed-1/root"), Path("/x/fed-1"), deploy.fleet.load_spec(SEPARATE_LAYOUT))
+
+
+def test_o68_the_inode_guard_is_the_cores_own_read_once_for_n_times_one_federations_estimate(deploy):
+    """O68: the fleet's check is hpcquota's guard (#343) for N federations at once: the account's usage, read once,
+    against N times one federation's estimate: N ups would each read the same usage. A fleet exactly at the line
+    passes and says the figures; one inode over is refused, naming them."""
+    layout, site = one_federation(deploy), scratch_site(deploy)
+    each = sum(deploy.hpc.quota.estimate_inodes(layout, {}).values())
+    assert each > 0
+    at_the_line = Quota(deploy, used=LINE - 4 * each)
+    said = deploy.fleet.inode_guard(FakeSlurm(tools={TOOL: at_the_line}), 4, layout, site, {})
+    assert at_the_line.calls == [[TOOL, "--inodes"]]
+    for part in (f"estimate {4 * each}", f"95% line {LINE}", "under the line"):
+        assert part in said
+    over = Quota(deploy, used=LINE - 4 * each + 1)
+    with pytest.raises(deploy.hpc.quota.QuotaRefused, match=f"estimate {4 * each}, quota 20000") as refused:
+        deploy.fleet.inode_guard(FakeSlurm(tools={TOOL: over}), 4, layout, site, {})
+    assert "nothing was submitted" in str(refused.value)
+    assert len(over.calls) == 1
+
+
+def test_o68_the_inode_guard_of_a_site_without_a_scratch_root_runs_no_command_and_says_so(deploy):
+    """O68: nothing of the federations is on scratch without `HPC_STORAGE_ROOT`: no quota is read, and the fleet says
+    that no check was made."""
+    quota = Quota(deploy, used=0)
+    site = dataclasses.replace(scratch_site(deploy), storage_root="")
+    said = deploy.fleet.inode_guard(FakeSlurm(tools={TOOL: quota}), 4, one_federation(deploy), site, {})
+    assert said.startswith("inode check: none")
+    assert "HPC_STORAGE_ROOT is not set" in said
+    assert quota.calls == []
+
+
+@pytest.mark.parametrize(
+    ("change", "why"),
+    [({"quota_check": "off"}, "cannot be turned off"), ({"quota_cmd": ""}, "HPC_QUOTA_CMD is not set")],
+    ids=["override", "no-command"],
+)
+def test_o68_the_inode_guard_of_a_scratch_site_fails_closed_as_the_cores_own_does(deploy, change, why):
+    """O68: the mandatory guard of #343 is the fleet's: an override of the check and an unset command each refuse a
+    fleet on scratch, however the site was built, and no quota is read for the override."""
+    quota = Quota(deploy, used=0)
+    site = dataclasses.replace(scratch_site(deploy), **change)
+    with pytest.raises(deploy.hpc.quota.QuotaRefused, match=why):
+        deploy.fleet.inode_guard(FakeSlurm(tools={TOOL: quota}), 3, one_federation(deploy), site, {})
+    assert quota.calls == []
+
+
+def test_o68_the_default_hooks_ask_the_cores_inode_guard_and_the_fleet_no_longer_has_a_stand_in(deploy):
+    """O68: the fleet's default hooks wire `inode_guard` to the core's `hpcquota` with the login node's runner, and the
+    fleet module imports it as every driver module does, with no fallback for a core without it."""
+    hooks = deploy.fleet.default_hooks({})
+    site = dataclasses.replace(scratch_site(deploy), storage_root="")
+    assert "HPC_STORAGE_ROOT is not set" in hooks.inode_guard(2, one_federation(deploy), site, {})
+    assert deploy.fleet.hpcquota is deploy.hpc.quota
+    assert "ImportError" not in Path(deploy.fleet.__file__).read_text(encoding="utf-8")
 
 
 # ------------------------------------------------------------------------------------------------ one process each

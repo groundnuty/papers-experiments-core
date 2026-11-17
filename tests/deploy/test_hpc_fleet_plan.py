@@ -231,14 +231,20 @@ def test_o68_a_moved_shard_resumes_on_a_fresh_federation_whose_first_reset_is_fu
 
 
 def test_o68_a_shard_is_never_moved_to_a_federation_whose_reset_shortcut_is_on(bench):
-    """O68: a moved shard's first reset must be full; fed-3's platform.toml turns the shortcut on: refused."""
+    """O68: a moved shard's first reset must be full; fed-3's platform.toml turns the shortcut on: refused. The
+    shortcut is no part of the platform fingerprint (C35) but the data provider is (C06), so every federation here
+    declares the same `[placement]` and fed-3's differs by the shortcut alone: the fingerprints are one, and it is the
+    fleet's own check that refuses the move."""
+    placement = '\n[placement]\nholder = "aspen"\n'
     assert bench.up(2)[0] == 0
+    for label in ("fed-1", "fed-2"):
+        platform = bench.root(label) / "platform.toml"
+        platform.write_text(platform.read_text(encoding="utf-8") + placement, encoding="utf-8")
     assert plan(bench)[0] == 0
     assert bench.run("down", "--member", "fed-1")[0] == 0
     assert bench.run("add", "1")[0] == 0
     platform = bench.root("fed-3") / "platform.toml"
-    shortcut = '\n[placement]\nholder = "aspen"\nreset_shortcut = true\n'
-    platform.write_text(platform.read_text(encoding="utf-8") + shortcut, encoding="utf-8")
+    platform.write_text(platform.read_text(encoding="utf-8") + placement + "reset_shortcut = true\n", encoding="utf-8")
     code, printed, _ = plan(bench)
     assert code == 1
     assert "shard-1: not moved to fed-3: its platform.toml turns [placement] reset_shortcut on" in printed

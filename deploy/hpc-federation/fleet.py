@@ -11,7 +11,7 @@
 Run on the login node with the site's values exported (`set -a; . site.env; set +a`), as `hpcfed.py up` is.
 
 - up: refused past `HPC_FLEET_MAX` (the operator's maximum, which the grant and the scratch inode quota set; unset
-  refuses), and past the quota by the inode guard (`hpcquota`, when this core has it: the account's usage plus N times
+  refuses), and past the quota by the inode guard (`hpcquota`, mandatory on scratch: the account's usage plus N times
   one federation's estimate, read once, before anything is made); then the fleet's directory (new: never adopted),
   N federations `fed-1` ... `fed-N`, each its own root `<fleet>/fed-k/root` (an exclusive mkdir), state file and held
   job, each brought up by `hpcfed.py up` in a process of its own, `HPC_FLEET_PARALLEL` at a time (1 by default), and N
@@ -44,6 +44,7 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
 
 import fleetplan  # noqa: E402
 import hpcfed  # noqa: E402
+import hpcquota  # noqa: E402
 import hpcstate  # noqa: E402
 from fedlayout import Layout  # noqa: E402
 from fedspec import LayoutError, load_spec  # noqa: E402
@@ -94,16 +95,14 @@ class Hooks:
 
 
 def inode_guard(runner: Any, count: int, layout: Layout, site: Any, environ: Mapping[str, str]) -> str:
-    """The inode guard for `count` federations at once (`hpcquota`, when this core has it): N concurrent ups would each
-    read the same usage, so the fleet reads it once against N times one federation's estimate. QuotaRefused refuses."""
-    try:
-        import hpcquota
-    except ImportError:
-        return "inode check: none: this core has no inode guard (hpcquota)"
-    if not getattr(site, "storage_root", None):
+    """The inode guard for `count` federations at once, the core's own (`hpcquota.guard`, DESIGN.md section 11): N
+    concurrent ups would each read the same usage, so the fleet reads it once against N times one federation's estimate.
+    It is mandatory as it is for one `up`: a scratch root with `HPC_QUOTA_CHECK=off`, an unset command or pattern or a
+    quota that cannot be read refuses the fleet (`hpcquota.QuotaRefused`). Without a scratch root nothing of the
+    federations is on scratch, and the fleet says that no check was made."""
+    if not site.storage_root:
         return "inode check: none: HPC_STORAGE_ROOT is not set, so nothing of the federations is on scratch"
-    each = sum(hpcquota.estimate_inodes(layout, environ).values())
-    return hpcquota.check_inodes(runner, site, count * each)
+    return hpcquota.guard(runner, site, layout, environ, federations=count)
 
 
 def hpcfed_process(environ: Mapping[str, str], run: Callable[..., Any] = subprocess.run) -> Operate:

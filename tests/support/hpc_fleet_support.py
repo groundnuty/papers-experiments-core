@@ -86,7 +86,7 @@ class Bench:
         for name in ("onezone.tar", "oneprovider.tar"):
             (self.base / "images" / name).write_bytes(b"tar")
             (self.base / "images" / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
-        self.layout = separate_layout(self.base / "layout")
+        self.layout = SEPARATE_LAYOUT
         agent = agent_site(self.base / "agent", work_root=self.node_tmp / "agent-work")
         self.environ = {**SITE, **agent, "SH": str(self.base / "images"), "L": str(self.base / "logs"),
                         "HPC_NODE_TMP": str(self.node_tmp), "HPC_FLEET_MAX": "5"}  # fmt: skip
@@ -170,20 +170,7 @@ class Bench:
         return load_platform(self.root(label) / "platform.toml", require_secrets=False).fingerprint()
 
 
-PLACEMENT = 'sandbox_placement = "het"'
-
-
-def separate_layout(folder: Path) -> Path:
-    """The pilot's layout and template as committed, but for the agent's node held as a job of its own
-    (`sandbox_placement = "separate"`), as a fleet's federations hold it: the site's Slurm failed steps on a
-    heterogeneous job's services (live, 16 Nov 2026)."""
-    folder.mkdir(parents=True)
-    text = LAYOUT.read_text(encoding="utf-8")
-    assert text.count(PLACEMENT) == 1
-    (folder / LAYOUT.name).write_text(text.replace(PLACEMENT, 'sandbox_placement = "separate"'), encoding="utf-8")
-    template = LAYOUT.parent / "pilot-shape.platform.toml.template"
-    (folder / template.name).write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
-    return folder / LAYOUT.name
+SEPARATE_LAYOUT = LAYOUT.with_name("pilot-shape-separate.toml")  # the pilot's, the agent's node a job of its own
 
 
 @contextlib.contextmanager
@@ -211,4 +198,4 @@ def another_ca(directory: Path) -> str:
     return make_ca(directory)
 
 
-__all__ = ["Bench", "StepRunner", "another_ca", "fleet_modules", "job_ids", "make_bench", "make_ca", "separate_layout"]
+__all__ = ["SEPARATE_LAYOUT", "Bench", "StepRunner", "another_ca", "fleet_modules", "job_ids", "make_bench", "make_ca"]

@@ -119,7 +119,7 @@ under one record. One federation's job failing ends one shard's step, never anot
 - **How many.** `HPC_FLEET_MAX` in `site.env` is the operator's maximum of federations at once in one fleet, set by
   the grant and the scratch inode quota; unset refuses. `up N` past it is refused before anything is made; `add K`
   counts every federation that may still hold a job (a failed `up` may, until its `down`). The inode guard
-  (`hpcquota`, when the core has it) is asked once for N: N concurrent ups would each read the same usage and pass
+  (`hpcquota.guard`, section 11, mandatory with a scratch root) is asked once for N: N concurrent ups would each read the same usage and pass
   alone, so the fleet reads it against N times one federation's estimate. `HPC_FLEET_PARALLEL` (1 by default) is how
   many ups or downs run at once.
 - **One process per federation.** A federation's driver changes process-wide state (the umask its secrets are written
