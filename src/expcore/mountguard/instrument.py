@@ -21,6 +21,15 @@ the tracers attached to oneclient inside it, `proofs` the isolation proofs read 
 kernel's Yama setting (None without Yama). When the log is unknown the counts are what its readable part shows, a
 lower bound. The reasons are `expcore.mountguard.log`'s. **A missing or damaged log is `"log": "unknown"`, never
 intact with no access; a log without a proof, or with a failed one, is `"isolation": "unproven"`.**
+
+**A run with no mount** (a REST run, a run with no data path) has nothing for the guard to watch: its exposure to the
+mount's token is nil, so the guard does not apply to it. `mount_guard_for(sandbox)` builds the instrument of any run, a
+`MountGuard` for a mount run and `NoMount` for the others, so a study may list it for every run of a campaign that
+mixes data paths. `NoMount` records the statement `{"version": 1, "mount": false, "data_path": "rest" | "none"}`, and
+`judge` reads it as `not_applicable`: the run stays in the mount guard's rerun. **The sandbox's own data path decides,
+never a missing watcher or a missing snapshot:** a mount run whose helper keeps no watcher has no nonce and is
+refused, a mount run whose record lacks the snapshot is `unknown`, and a statement that is not exactly the one above is
+`unknown` too.
 """
 
 from collections.abc import Mapping
@@ -32,6 +41,9 @@ NAMESPACE = "mount_guard"
 VERSION = 1
 INTACT, UNKNOWN = "intact", "unknown"
 PROVEN, UNPROVEN = "proven", "unproven"
+MOUNT_PATH = "mount"  # the data path that has a mount
+NO_MOUNT_PATHS = ("rest", "none")  # the data paths that have none (`expcore_onedata.sandbox.api.DataPathMode`)
+NOT_APPLICABLE_KEYS = {"version", "mount", "data_path"}
 
 
 class MountWatchSource(Protocol):
@@ -55,12 +67,59 @@ def snapshot(reading: Reading) -> dict[str, Any]:
     }
 
 
+class MountRunSource(MountWatchSource, Protocol):
+    """A sandbox as `mount_guard_for` reads it: the data path it was started with, which only its own spec says, and
+    the nonce of its mount's watcher (None without one)."""
+
+    @property
+    def data_path_kind(self) -> str: ...
+
+    @property
+    def mount_guard_nonce(self) -> str | None: ...
+
+
+def not_applicable_snapshot(data_path: str) -> dict[str, Any]:
+    """The statement of a run whose data path has no mount (see the module's text)."""
+    return {"version": VERSION, "mount": False, "data_path": data_path}
+
+
+class NoMount:
+    """The `Instrument` of a run whose data path has no mount: it records that the guard does not apply, and reads
+    nothing. Built through `mount_guard_for`, which takes the data path from the sandbox."""
+
+    namespace = NAMESPACE
+
+    def __init__(self, data_path: str) -> None:
+        if data_path not in NO_MOUNT_PATHS:
+            raise ValueError(f"a run with no mount has a data path of {NO_MOUNT_PATHS}, not {data_path!r}")
+        self._data_path = data_path
+
+    def start(self, identity: Mapping[str, Any]) -> None:
+        """Nothing to read."""
+
+    def finish(self) -> dict[str, Any]:
+        return not_applicable_snapshot(self._data_path)
+
+
+def mount_guard_for(sandbox: MountRunSource) -> "MountGuard | NoMount":
+    """The mount-guard instrument of one run, from its sandbox: a `MountGuard` over the watcher's log for a mount run
+    (`ValueError` when its helper has no nonce: an unguarded mount is not a run the guard does not apply to), `NoMount`
+    for a run whose data path is REST or none. The data path is the sandbox's, never inferred from a missing nonce or
+    log."""
+    kind = sandbox.data_path_kind
+    if kind == MOUNT_PATH:
+        return MountGuard(sandbox, sandbox.mount_guard_nonce)  # a missing nonce raises there
+    if kind in NO_MOUNT_PATHS:
+        return NoMount(kind)
+    raise ValueError(f"the run's data path is {kind!r}, not one of {(MOUNT_PATH, *NO_MOUNT_PATHS)}")
+
+
 class MountGuard:
     """The `Instrument` of one run's mount guard: one per run, holding the source of its watcher's log."""
 
     namespace = NAMESPACE
 
-    def __init__(self, source: MountWatchSource, nonce: str) -> None:
+    def __init__(self, source: MountWatchSource, nonce: str | None) -> None:
         if not isinstance(nonce, str) or not nonce:
             raise ValueError("the run's watcher nonce is a non-empty text")
         self._source, self._nonce = source, nonce

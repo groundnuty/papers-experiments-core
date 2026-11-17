@@ -9,6 +9,13 @@ rows in the same order, the absent runs and the preregistration. It returns None
 and its report is the text it always was. Once one record carries it, every analysed run is judged
 (`expcore.mountguard.flags.judge`): a run whose record lacks the snapshot is unknown (`not_recorded`), never clean.
 
+A campaign may mix data paths. A run whose record says it had no mount (`NoMount`: a REST run, a run with no data path),
+or, with no snapshot at all, whose `data_path` level the campaign fingerprint maps to `rest` or `none` (`data_paths`,
+`mountguard.campaign`), is `not_applicable`: it had no mount exposure, so it stays in the rerun and is counted and
+shown as such; the guard may be listed for it with `expcore.mountguard.mount_guard_for`. Nothing else makes a run not
+applicable: a mount run whose record lacks its snapshot is unknown and left out, as before, and so is a run whose level
+the campaign does not map.
+
 The sensitivity analysis is `stats.analysis.analyse` over the rows of the clean runs, with each other run (flagged, or
 unknown) passed as an absent run of reason `excluded`, so its pairs are counted as missing and its arm's runs as left
 out. The bootstrap seed of each contrast is the preregistered one, so the rerun is as deterministic as the primary
@@ -17,11 +24,12 @@ mount's token or oneclient's process, or could not be shown not to. A rerun the 
 analysis and records the refusal. With every run clean there is no second analysis: it would be the primary one.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from expcore.mountguard.flags import FLAGS, VERDICTS, RunMountGuard, judge
+from expcore.campaign.factors import DATA_PATH_FACTOR
+from expcore.mountguard.flags import FLAGS, NOT_APPLICABLE, VERDICTS, RunMountGuard, judge
 from expcore.mountguard.instrument import NAMESPACE
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
@@ -32,7 +40,8 @@ LEFT_OUT_AS = "excluded"  # the reason a run that is not clean is passed to the 
 @dataclass(frozen=True)
 class MountGuardAnalysis:
     """Every analysed run's mount-guard verdict, in the export's order; the sensitivity analysis without the runs that
-    are not clean (None when every run is clean or when it was refused); and why it was refused, if it was."""
+    are not clean (None when no run is left out or when it was refused); and why it was refused, if it was. A run the
+    guard does not apply to is not left out."""
 
     runs: tuple[RunMountGuard, ...]
     sensitivity: AnalysisResult | None
@@ -43,25 +52,33 @@ class MountGuardAnalysis:
         return tuple(run for run in self.runs if run.left_out)
 
     def counts(self) -> dict[str, int]:
-        """The analysed runs, the left-out ones, each verdict's runs, and the left-out ones by each flag (a run may
-        have several)."""
-        left = self.left_out
+        """The analysed runs, the left-out ones, each verdict's runs (the runs with no mount, `not_applicable`, kept
+        apart from `clean`), and the left-out ones by each flag (a run may have several)."""
+        left, verdicts = self.left_out, (*VERDICTS, NOT_APPLICABLE)
         return (
             {"analysed": len(self.runs), "left_out": len(left)}
-            | {verdict: sum(1 for run in self.runs if run.verdict == verdict) for verdict in VERDICTS}
+            | {verdict: sum(1 for run in self.runs if run.verdict == verdict) for verdict in verdicts}
             | {flag: sum(1 for run in left if flag in run.flags) for flag in FLAGS}
         )
 
 
 def checked(records: Sequence[Any]) -> bool:
-    """True when one record carries the mount-guard instrument: the batch's runs were checked."""
+    """True when one record carries the mount-guard instrument, a statement of no mount included: the batch's runs were
+    checked, and a record without it is judged."""
     return any(NAMESPACE in record.instruments for record in records)
 
 
 def mount_guard_analysis(
-    runs: Sequence[tuple[Any, str]], rows: Sequence[Row], absent: Sequence[AbsentRun], prereg: Any
+    runs: Sequence[tuple[Any, str]],
+    rows: Sequence[Row],
+    absent: Sequence[AbsentRun],
+    prereg: Any,
+    data_paths: Mapping[str, str] | None = None,
+    factor: str = DATA_PATH_FACTOR,
 ) -> MountGuardAnalysis | None:
-    """The mount-guard verdicts and the sensitivity analysis of a batch; None for a batch not checked."""
+    """The mount-guard verdicts and the sensitivity analysis of a batch; None for a batch not checked. `data_paths` is
+    the kind the campaign fingerprint records for each level of the data-path factor (`mountguard.campaign`), and
+    `factor` that factor's name, the study's `[study] data_path_factor` (`data_path` by default)."""
     if len(runs) != len(rows):
         raise ValueError(f"{len(runs)} analysed record(s) for {len(rows)} analysis row(s)")
     records = [record for record, _ in runs]
@@ -70,7 +87,7 @@ def mount_guard_analysis(
     for (record, _), row in zip(runs, rows, strict=True):
         if record.run_key != row.run_key:
             raise ValueError(f"the record of {record.run_key!r} is paired with the row of {row.run_key!r}")
-    verdicts = tuple(judge(record, condition) for record, condition in runs)
+    verdicts = tuple(judge(record, condition, data_paths, factor) for record, condition in runs)
     out = {verdict.run_key for verdict in verdicts if verdict.left_out}
     if not out:
         return MountGuardAnalysis(verdicts, None)

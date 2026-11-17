@@ -11,7 +11,7 @@ from study_support import HEAD, clean_environment, cli
 
 from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
-from expcore.study.pipeline import ANALYSIS_FILE, REPORT_FILE, analyse_study, output_bytes, run_study
+from expcore.study.pipeline import ANALYSIS_FILE, REPORT_FILE, Refused, analyse_study, output_bytes, run_study
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
@@ -23,7 +23,7 @@ GUARD = '''
 
 import json as _json
 
-from expcore.mountguard import MountGuard
+from expcore.mountguard import MountGuard, NoMount
 
 _NONCE = "00112233445566778899aabbccddeeff"
 
@@ -81,25 +81,151 @@ class _StubEgress:
 '''  # fmt: skip
 
 
-def prepared(tmp_path: Path, *, guard: bool, egress: bool = False) -> Path:
+# Added beside the guard for a batch checked by all three: a process-visibility reading that is within the limit for
+# every run but those of the task `river`, whose memory reading is unknown.
+VISIBILITY = '''
+
+from expcore.visibility import ProcessVisibility
+
+
+class _StubSeen:
+    def __init__(self, task):
+        self.task = task
+
+    def process_visibility(self):
+        figures = dict.fromkeys(("margin_bytes", "start_unexplained_bytes", "unexplained_peak_bytes",
+                                 "cgroup_anon_bytes", "visible_anon_bytes"), 1)
+        unknown = self.task == "river"
+        return {"version": 1, "memory": "unknown" if unknown else "within",
+                "unknown": ["memory_unreadable"] if unknown else [], "hidden_process": 0, "hidden_memory": 0,
+                "figures": figures}
+'''  # fmt: skip
+
+
+# A study that mixes data paths: a factor for the data path has a REST level, which only `relay-down` uses, and a mount
+# level, and the plugin records the platform's `data_paths` in the campaign fingerprint. The factor is `data_path` (the
+# platform's own name for it) or, with `[study] data_path_factor`, a name of the study's own with its own levels.
+OWN_FACTOR, OWN_LEVELS = "path", ("A+", "M")  # a study that calls its data-path factor `path`: REST `A+`, mount `M`
+
+
+def with_data_paths(study: Path, factor: str = "data_path") -> None:
+    """Give the copy of the example the data-path factor `factor` and the platform fingerprint that maps its levels;
+    for a factor of another name than `data_path`, the key `[study] data_path_factor` names it."""
+    rest, mount = ("api", "mount") if factor == "data_path" else OWN_LEVELS
+    config = study / "study.toml"
+    text = config.read_text(encoding="utf-8")
+    for old, new in (
+        ("[identity]", f'[factors.{factor}]\nlevels = ["{rest}", "{mount}"]\n\n[identity]'),
+        (
+            'order = ["task", "access", "tools", "model", "seed"]',
+            f'order = ["task", "access", "tools", "{factor}", "model", "seed"]',
+        ),
+        ('access = "direct"\ntools = "basic"\n', f'access = "direct"\ntools = "basic"\n{factor} = "{mount}"\n'),
+        ('access = "direct"\ntools = "extended"\n', f'access = "direct"\ntools = "extended"\n{factor} = "{mount}"\n'),
+        ('access = "relay"\ntools = "basic"\n', f'access = "relay"\ntools = "basic"\n{factor} = "{rest}"\n'),
+        *(
+            (('plugin = "plugin.py"\n', f'plugin = "plugin.py"\ndata_path_factor = "{factor}"\n'),)
+            if factor != "data_path"
+            else ()
+        ),
+    ):
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    config.write_text(text, encoding="utf-8")
+    kinds = f"{{'{rest}': {{'kind': 'rest'}}, '{mount}': {{'kind': 'mount'}}}}"
+    named = "" if factor == "data_path" else f"        data_path_factor={factor!r},\n"  # as `platform.data_path_factor`
+    plugin = study / "plugin.py"
+    code = plugin.read_text(encoding="utf-8")
+    assert code.count("        executor=TinyExecutor(context),\n") == 1
+    plugin.write_text(
+        code.replace(
+            "        executor=TinyExecutor(context),\n",
+            f"        executor=TinyExecutor(context),\n        platform={{'data_paths': {kinds}}},\n{named}",
+        ),
+        "utf-8",
+    )
+
+
+AUTO = "auto"  # the preregistration declares the reruns the instruments listed make this study run (S19)
+
+
+def declared_for(*, guard: bool, egress: bool, visibility: bool) -> list[str] | None:
+    """The reruns a study that lists these instruments runs, to declare; None for a study with no guard, whose
+    preregistration declares nothing, as the example's does."""
+    if not guard:
+        return None
+    named = ["mount_guard", *(["egress"] if egress else []), *(["process_visibility"] if visibility else [])]
+    named.sort(key=("egress", "mount_guard", "process_visibility").index)
+    return [*named, "any_guard"] if len(named) > 1 else named
+
+
+def prepared(
+    tmp_path: Path,
+    *,
+    guard: bool,
+    egress: bool = False,
+    rest_task: str | None = None,
+    visibility: bool = False,
+    data_paths: bool = False,
+    reruns: list[str] | str | None = AUTO,
+) -> Path:
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
+    if reruns == AUTO:
+        reruns = declared_for(guard=guard, egress=egress, visibility=visibility)
+    if reruns is not None:  # the preregistration declares the sensitivity reruns the study expects (S19)
+        declared = study / "preregistration.toml"
+        declared.write_text(declared.read_text("utf-8") + f"\n[sensitivity]\nreruns = {json.dumps(reruns)}\n", "utf-8")
+    if data_paths:  # True: the factor `data_path`; a name: that factor, as `[study] data_path_factor` names it
+        with_data_paths(study, "data_path" if data_paths is True else data_paths)
     if guard:
         plugin = study / "plugin.py"
         text = plugin.read_text(encoding="utf-8")
         assert INSTRUMENTS in text
         added = "instruments = [FactsServed(shelf), MountGuard(_StubWatch(factors['task']), _NONCE)]"
+        if data_paths:  # the guard is listed on the mount runs alone: a REST run's record holds no snapshot
+            factor, mount = ("data_path", "mount") if data_paths is True else (data_paths, OWN_LEVELS[1])
+            added = (
+                "instruments = [FactsServed(shelf), *([MountGuard(_StubWatch(factors['task']), _NONCE)] "
+                f"if factors[{factor!r}] == {mount!r} else [])]"
+            )
+        if rest_task is not None:  # a campaign that mixes data paths: this task's runs are REST runs, with no mount
+            added = (
+                f"instruments = [FactsServed(shelf), NoMount('rest') if factors['task'] == {rest_task!r} "
+                "else MountGuard(_StubWatch(factors['task']), _NONCE)]"
+            )
         if egress:
             added = added[:-1] + ", EgressLog(_StubEgress(factors['task']), declaration([_GATE], _GATE), _NONCE)]"
-        plugin.write_text(text.replace(INSTRUMENTS, added) + GUARD + (EGRESS if egress else ""), encoding="utf-8")
+        if visibility:
+            added = added[:-1] + ", ProcessVisibility(_StubSeen(factors['task']))]"
+        extra = GUARD + (EGRESS if egress else "") + (VISIBILITY if visibility else "")
+        plugin.write_text(text.replace(INSTRUMENTS, added) + extra, encoding="utf-8")
     write_stamp(study, HEAD, load_study(study).scope)
     summary = run_study(study)
     assert summary.statuses == {"done": len(load_study(study).manifest.rows)}, summary.statuses
     return study
 
 
-def checked_study(tmp_path, environment, *, guard: bool, egress: bool = False):
-    study = prepared(tmp_path, guard=guard, egress=egress)
+def checked_study(
+    tmp_path,
+    environment,
+    *,
+    guard: bool,
+    egress: bool = False,
+    rest_task: str | None = None,
+    visibility: bool = False,
+    data_paths: bool = False,
+    reruns: list[str] | str | None = AUTO,
+):
+    study = prepared(
+        tmp_path,
+        guard=guard,
+        egress=egress,
+        rest_task=rest_task,
+        visibility=visibility,
+        data_paths=data_paths,
+        reruns=reruns,
+    )
     code, stderr = cli(environment, "check", str(study / "out" / "runs"), process=True)
     assert code == 0, stderr
     return analyse_study(study)
@@ -170,3 +296,142 @@ def test_a_study_checked_by_both_guards_reruns_without_the_runs_either_leaves_ou
         report.index("## Egress (detected") < report.index("## Mount isolation") < report.index("## Egress and mount")
     )
     assert "#### Preregistered contrasts without the runs either guard leaves out" in report
+
+
+def test_o75_a_campaign_that_mixes_data_paths_keeps_its_rest_runs_in_the_mount_guards_rerun(
+    tmp_path, clean_environment
+):
+    """O75: `river`'s runs are REST runs whose record says they had no mount, `lake`'s mount runs touched the token's
+    directory, `hill`'s logs were never closed and the rest are clean: the REST runs are not applicable, are kept in the
+    rerun and are shown so."""
+    analysis = checked_study(tmp_path, clean_environment, guard=True, rest_task="river")
+    runs = {row.run_key: row for row in analysis.rows}
+    verdicts = {run.run_key: run.verdict for run in analysis.mount_guard.runs}
+    river = {key for key, row in runs.items() if row.factors["task"] == "river"}
+    assert river
+    assert {verdicts[key] for key in river} == {"not_applicable"}
+    assert {verdicts[key] for key in set(runs) - river} == {"clean", "flagged", "unknown"}  # the mount runs
+    assert not river & {run.run_key for run in analysis.mount_guard.left_out}
+    assert analysis.mount_guard.sensitivity is not None
+    made = output_bytes(analysis)
+    summary = json.loads(made[ANALYSIS_FILE])["mount_guard"]
+    assert summary["counts"]["not_applicable"] == len(river)
+    assert not river & set(summary["sensitivity"]["left_out"])
+    assert "Not applicable" in made[REPORT_FILE].decode()
+
+
+def test_o76_a_study_checked_by_all_three_guards_reruns_without_the_runs_any_of_them_leaves_out(
+    tmp_path, clean_environment
+):
+    """O76: the process-visibility check joins the combined rerun: `river`'s runs, whose memory reading is unknown, are
+    left out of it beside the runs the mount guard and egress leave out, and analysis.json, the report and the
+    terminal carry it."""
+    analysis = checked_study(tmp_path, clean_environment, guard=True, egress=True, visibility=True)
+    both = analysis.guards
+    assert both is not None
+    assert both.guards == ("egress", "mount", "visibility")
+    out = {run.run_key for run in both.left_out}
+    assert out == (
+        {run.run_key for run in analysis.mount_guard.left_out}
+        | {run.run_key for run in analysis.egress.flagged}
+        | {run.run_key for run in analysis.visibility.left_out}
+    )
+    assert analysis.visibility.left_out
+    assert {run.by for run in both.left_out if run.visibility == "unknown"} >= {"visibility"}
+    made = output_bytes(analysis)
+    summary = json.loads(made[ANALYSIS_FILE])["guards"]
+    assert summary["guards"] == ["egress", "mount", "visibility"]
+    assert summary["counts"]["left_out"] == len(out)
+    report = made[REPORT_FILE].decode()
+    assert "## Egress, mount isolation and process visibility together" in report
+    assert "#### Preregistered contrasts without the runs any guard leaves out" in report
+
+
+def test_o75_a_rest_arm_that_lists_no_mount_guard_is_not_applicable_by_the_campaigns_recorded_data_paths(
+    tmp_path, clean_environment
+):
+    """O75: the REST level's runs (`relay-down`) hold no mount-guard snapshot at all, as when the guard was listed on
+    the mount runs alone; the campaign fingerprint maps the level to `rest`, so they are not applicable and stay in the
+    rerun, and the mount runs of `lake` (token touched) and `hill` (log never closed) are left out."""
+    analysis = checked_study(tmp_path, clean_environment, guard=True, data_paths=True)
+    rest = {row.run_key for row in analysis.rows if row.factors["data_path"] == "api"}
+    assert rest
+    by_key = {run.run_key: run for run in analysis.mount_guard.runs}
+    assert {(by_key[key].verdict, by_key[key].data_path_from) for key in rest} == {("not_applicable", "campaign")}
+    assert not rest & {run.run_key for run in analysis.mount_guard.left_out}
+    assert {run.verdict for key, run in by_key.items() if key not in rest} >= {"flagged", "unknown"}
+    summary = json.loads(output_bytes(analysis)[ANALYSIS_FILE])["mount_guard"]
+    assert summary["counts"]["not_applicable"] == len(rest)
+    assert not rest & set(summary["sensitivity"]["left_out"])
+
+
+# --- the reruns a preregistration declares (S19) ---------------------------------------------------------------------
+
+
+def test_s19_an_analysis_that_runs_exactly_the_declared_reruns_goes_through_and_analysis_json_names_them(
+    tmp_path, clean_environment
+):
+    """S19: all four reruns are declared and all four run; analysis.json names the declaration."""
+    declared = ["any_guard", "egress", "mount_guard", "process_visibility"]
+    analysis = checked_study(tmp_path, clean_environment, guard=True, egress=True, visibility=True, reruns=declared)
+    assert analysis.guards is not None
+    assert json.loads(output_bytes(analysis)[ANALYSIS_FILE])["sensitivity_reruns"] == declared
+
+
+def test_s19_a_declared_rerun_no_record_supports_is_refused_naming_it(tmp_path, clean_environment):
+    """S19: only the mount guard is listed, and the preregistration expects egress and the rerun of every guard too."""
+    with pytest.raises(Refused) as raised:
+        checked_study(tmp_path, clean_environment, guard=True, reruns=["mount_guard", "egress", "any_guard"])
+    text = str(raised.value)
+    assert "preregistration.toml" in text
+    assert "declared but not run: egress (no analysed record carries the egress instrument); any_guard" in text
+    assert "only mount_guard did" in text
+    assert "run but not declared" not in text
+
+
+def test_s19_a_rerun_the_records_would_produce_and_the_preregistration_does_not_declare_is_refused(
+    tmp_path, clean_environment
+):
+    with pytest.raises(Refused) as raised:
+        checked_study(tmp_path, clean_environment, guard=True, egress=True, reruns=["mount_guard"])
+    text = str(raised.value)
+    assert "run but not declared: egress, any_guard" in text
+    assert "declared but not run" not in text
+
+
+def test_s19_a_guarded_batch_with_no_sensitivity_table_is_refused_naming_the_reruns_to_declare(
+    tmp_path, clean_environment
+):
+    """S19: an absent table reads as `reruns = []`, so a batch the guards checked, which would run reruns nobody
+    declared, is refused; the refusal names them and the missing table."""
+    with pytest.raises(Refused) as raised:
+        checked_study(tmp_path, clean_environment, guard=True, egress=True, reruns=None)
+    text = str(raised.value)
+    assert "preregistration.toml" in text
+    assert "has no [sensitivity] table, and an absent table declares none" in text
+    assert "run but not declared: egress, mount_guard, any_guard" in text
+    assert 'reruns = ["egress", "mount_guard", "any_guard"]' in text
+    assert "declared but not run" not in text
+
+
+def test_s19_a_batch_no_guard_checked_with_no_sensitivity_table_passes_and_analysis_json_is_as_it_was(
+    tmp_path, clean_environment
+):
+    """S19: no guard, no rerun, nothing to declare: an absent table is as it always was."""
+    analysis = checked_study(tmp_path, clean_environment, guard=False)
+    assert (analysis.egress, analysis.mount_guard, analysis.visibility, analysis.guards) == (None,) * 4
+    assert analysis.study.prereg.sensitivity_reruns is None
+    assert "sensitivity_reruns" not in json.loads(output_bytes(analysis)[ANALYSIS_FILE])
+
+
+def test_o75_a_study_that_calls_its_data_path_factor_path_names_it_and_keeps_its_rest_arm(tmp_path, clean_environment):
+    """O75: the factor is `path` (levels `A+` and `M`), named by `[study] data_path_factor`; the records carry the
+    factor under that name alone, and the REST arm, which lists no mount guard, is still not applicable."""
+    analysis = checked_study(tmp_path, clean_environment, guard=True, data_paths="path")
+    assert analysis.study.data_path_factor == "path"
+    rest = {row.run_key for row in analysis.rows if row.factors["path"] == "A+"}
+    assert rest
+    assert all("data_path" not in row.factors for row in analysis.rows)
+    by_key = {run.run_key: run for run in analysis.mount_guard.runs}
+    assert {(by_key[key].verdict, by_key[key].data_path_from) for key in rest} == {("not_applicable", "campaign")}
+    assert not rest & {run.run_key for run in analysis.mount_guard.left_out}

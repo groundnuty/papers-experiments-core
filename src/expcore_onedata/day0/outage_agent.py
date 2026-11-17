@@ -165,7 +165,7 @@ class AgentPlane:
     @contextlib.asynccontextmanager
     async def _sandbox(self, platform: SandboxPlatform, lease: Any, condition: str | None) -> AsyncIterator[None]:
         ctx, level = self._ctx, _level(self._ctx)
-        mode = platform.mode({"data_path": level})
+        mode = platform.mode({platform.data_path_factor: level})
         self.facts["sandbox"]["data_path"] = mode.value
         assert self.ceiling_s is not None
         self.tokens_until = ctx.clock() + self.ceiling_s  # minted after this, for at least the ceiling (O06)

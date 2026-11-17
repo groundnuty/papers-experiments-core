@@ -139,6 +139,8 @@ ONE_ATTEMPT_SITES = {
     ("precampaign.py", "measure_content_type", "consistency.space_root"): ["ONE_ATTEMPT"],
     ("precampaign.py", "measure_content_type", "client.content_answer"): ["<one attempt>", "<one attempt>"],
     ("fault_serves.py", "ServingProbe.__call__", "client.get"): ["ONE_ATTEMPT"],
+    # a service's own liveness at a window's start and end (O86): one attempt, so an unanswered read stays unknown
+    ("fedwatch.py", "FederationWatch._live", "client.get"): ["ONE_ATTEMPT"],
     # a restore's session gate (O35): its probe file made before the injection, Onezone's view, each peer's block map
     ("fault_sessions.py", "SessionGate._root", "consistency.space_root"): ["ONE_ATTEMPT"],
     ("fault_sessions.py", "SessionGate._find", "client.get"): ["ONE_ATTEMPT"],

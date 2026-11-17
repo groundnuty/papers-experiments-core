@@ -240,6 +240,36 @@ def test_the_platform_builds_the_apptainer_sandbox_and_its_probe(tmp_path, fake)
     assert isinstance(platform._prepare("run-key-1", "isolated", None, None, None, 600.0), ApptainerSandbox)
 
 
+def test_o75_the_platform_reads_a_runs_data_path_from_the_factor_the_study_names(tmp_path, fake):
+    """O75: `SandboxPlatform` maps the level of the study's data-path factor, `data_path` unless it is given the name
+    of another (`[study] data_path_factor`), and refuses a name that is not one."""
+    from fake_node import FakeNode
+
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.sandbox.api import DataPathMode
+    from expcore_onedata.sandbox.provider import DATA_PATH_FACTOR, SandboxPlatform
+    from expcore_onedata.testing import write_platform
+
+    def apptainer(data):
+        data["sandbox"] = _document()
+
+    config = load_platform(write_platform(tmp_path, apptainer))
+
+    def built(**more):
+        return SandboxPlatform(config, issuer=None, host=FakeNode(), events=lambda *a, **k: None, **more)
+
+    default, named = built(), built(data_path_factor="path")
+    assert DATA_PATH_FACTOR == "data_path"
+    assert (default.data_path_factor, named.data_path_factor) == ("data_path", "path")
+    assert default.mode({"data_path": "isolated"}) is DataPathMode.NONE
+    assert named.mode({"path": "isolated"}) is DataPathMode.NONE
+    with pytest.raises(KeyError):
+        named.mode({"data_path": "isolated"})  # the name it was given is the only one it reads
+    for bad in ("", " ", None, 3):
+        with pytest.raises(ValueError, match="data_path_factor"):
+            built(data_path_factor=bad)
+
+
 def _mounting(**apptainer_changes):
     document = _document(**apptainer_changes)
     document["data_paths"]["mounted"] = "mount"
@@ -358,3 +388,16 @@ def test_o57_a_platform_that_declares_no_storage_kind_keeps_the_fingerprint_it_h
     assert {"tls", "data_paths"} <= set(docker)  # what the Docker backend's fingerprint held before the key existed
     assert "sandbox_backend" not in docker
     assert "provider_storage" not in json.dumps(docker)  # nothing the key adds reaches a Compose federation's
+
+
+def test_o87_the_apptainer_backend_reads_the_check_provider_as_the_docker_backend_does(tmp_path):
+    """O87: `content_check_provider` is a `[sandbox]` key of both backends: a layout name, kept for the platform's
+    load to check against its providers and the space; unset it is None, the agent's local provider."""
+    assert _load(tmp_path, _document()).content_check_provider is None
+    assert _load(tmp_path, {**_document(), "content_check_provider": "owner"}).content_check_provider == "owner"
+
+
+@pytest.mark.parametrize("value", [5, "", "with space", ["a"]])
+def test_o87_a_check_provider_that_is_no_name_is_refused_naming_the_key(tmp_path, value):
+    with pytest.raises(ConfigError, match="content_check_provider"):
+        _load(tmp_path, {**_document(), "content_check_provider": value})

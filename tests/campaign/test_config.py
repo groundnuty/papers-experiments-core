@@ -210,6 +210,42 @@ def test_c32_the_models_of_one_unit_are_held_to_its_cap_together(tmp_path):
     refused(tmp_path, text, "'m-b'", "with the other models of unit pool gives m-b 2 + m-a 3 = 5 shards", "pool = 3")
 
 
+# One model that costs money on a unit of its own, and two that cost nothing on one unit between them, one shard each.
+ONE_PRICED = (
+    VALID.replace('models = ["m-a", "m-b"]', 'models = ["m-a", "m-b", "m-c"]')
+    .replace('[endpoints.m-a]\nunit = "pool"', '[endpoints.m-a]\nunit = "paid"')
+    .replace("[scheduler.unit_caps]\nm-a = 1", "[scheduler.unit_caps]\nm-a = 1\nshared = 1")
+    + '\n[endpoints.m-b]\nunit = "shared"\n\n[endpoints.m-c]\nunit = "shared"\n'
+    + "\n[shards]\nper_model = { m-a = 1, m-b = 1, m-c = 1 }\n"
+)
+
+
+def test_c32_two_models_of_one_unit_capped_at_one_cannot_have_a_shard_each(tmp_path):
+    """C32: the two models that cost nothing share one unit whose cap is 1, and each has one shard: two shards, which
+    run two runs at once on a unit that takes one. Refused at load, naming the unit's first model and the counts."""
+    refused(
+        tmp_path,
+        ONE_PRICED,
+        "[shards.per_model]",
+        "'m-b'",
+        "with the other models of unit shared gives m-b 1 + m-c 1 = 2 shards, above [scheduler.unit_caps] shared = 1: "
+        "each shard runs one run at a time, so its shards would run more",
+    )
+
+
+@pytest.mark.parametrize("caps", ["shared = 2", ""], ids=["a cap of 2", "no cap"])
+def test_c32_two_models_of_one_unit_capped_at_two_or_not_at_all_load_with_a_shard_each(tmp_path, caps):
+    """C32: with a cap of 2 on the shared unit, or none, the same layout loads and keeps its order and its counts."""
+    text = ONE_PRICED.replace("shared = 1", caps) if caps else ONE_PRICED.replace("shared = 1\n", "")
+    campaign = load(tmp_path, text)
+    assert campaign.shards == ModelShards((("m-a", 1), ("m-b", 1), ("m-c", 1)))
+    assert {model: endpoint.unit for model, endpoint in campaign.endpoints.items()} == {
+        "m-a": "paid",
+        "m-b": "shared",
+        "m-c": "shared",
+    }
+
+
 def test_c32_a_unit_without_a_cap_takes_any_count_but_a_layout_needs_two_shards(tmp_path):
     """C32: an uncapped unit has nothing to exceed; one shard in all is not a sharded campaign."""
     assert load(tmp_path, SHARDED.replace("pool = 3\n", "").replace("m-a = 3 }", "m-a = 40 }")).shards.count == 42

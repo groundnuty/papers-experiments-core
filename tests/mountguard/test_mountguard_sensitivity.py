@@ -8,7 +8,7 @@ from mountguard_logs import NONCE, inotify, log, proof, record
 from stats_support import both_arms
 
 from expcore.campaign.factors import FactorSchema
-from expcore.mountguard import NAMESPACE, MountGuard
+from expcore.mountguard import NAMESPACE, MountGuard, NoMount, judge
 from expcore.mountguard.sensitivity import LEFT_OUT_AS, mount_guard_analysis
 from expcore.stats.analysis import analyse
 from expcore.stats.prereg import parse
@@ -144,3 +144,224 @@ def test_a_rerun_the_kernel_refuses_keeps_the_primary_and_says_why(prereg, monke
     done = mount_guard_analysis(runs_for(rows, lambda i: touched() if i == 0 else clean()), rows, [], prereg)
     assert done.sensitivity is None
     assert done.refused == "a treatment attempt's outcome is None"
+
+
+# --- a campaign that mixes mount runs and REST runs (O60: not applicable) -------------------------------------------
+
+
+def rest():
+    return {NAMESPACE: NoMount("rest").finish()}
+
+
+def mixed_instruments(i: int) -> dict:
+    """Rows 0-3 are mount runs (0 touched the token's directory, 1 has no snapshot, 2 is clean, 3 is unproven), rows
+    4-15 are REST runs, whose record says the guard does not apply."""
+    if i >= 4:
+        return rest()
+    return {0: touched, 1: dict, 2: clean, 3: unproven}[i]()
+
+
+def test_a_rest_run_is_not_applicable_and_stays_in_the_mount_guards_rerun(prereg):
+    """O75: the REST runs had no mount exposure, so the rerun leaves out only the mount runs that are not clean."""
+    rows = rows_of_pairs(8)  # 16 runs: pairs 0-1 are mount runs, pairs 2-7 REST runs
+    done = mount_guard_analysis(runs_for(rows, mixed_instruments), rows, [], prereg)
+    counts = done.counts()
+    assert (counts["flagged"], counts["unknown"], counts["clean"], counts["not_applicable"]) == (1, 2, 1, 12)
+    assert counts["left_out"] == 3
+    out = {run.run_key for run in done.left_out}
+    assert out == {rows[i].run_key for i in (0, 1, 3)}  # flagged, unrecorded and unproven mount runs; no REST run
+    assert all(run.verdict == "not_applicable" for run in done.runs[4:])
+    again = done.sensitivity.contrast("a-vs-b")
+    assert again.n_pairs == 8 - 2  # rows 0, 1, 2, 3 sit in pairs 0 and 1: both pairs lose a run, six REST pairs stay
+    assert sum(a.lost[LEFT_OUT_AS] for a in again.arm_runs) == 3
+
+
+def test_a_mount_run_without_its_snapshot_is_still_unknown_and_excluded_beside_not_applicable_runs(prereg):
+    """O75: not applicable is the run's own statement: the absence of a snapshot does not make a mount run one."""
+    rows = rows_of_pairs(4)
+    done = mount_guard_analysis(runs_for(rows, lambda i: {} if i == 0 else rest()), rows, [], prereg)
+    assert [(run.run_key, run.verdict, run.unknown) for run in done.left_out] == [
+        (rows[0].run_key, "unknown", ("not_recorded",))
+    ]
+    assert done.counts()["not_applicable"] == 7
+
+
+def test_a_batch_of_not_applicable_runs_alone_is_checked_and_has_no_second_analysis(prereg):
+    """O75: every run had no mount: the guard says so, nothing is left out, and a rerun would be the primary one."""
+    rows = rows_of_pairs(3)
+    done = mount_guard_analysis(runs_for(rows, lambda i: rest()), rows, [], prereg)
+    assert done is not None
+    assert done.left_out == ()
+    assert (done.sensitivity, done.refused) == (None, None)
+    assert done.counts()["not_applicable"] == 6
+    assert done.counts()["clean"] == 0  # never clean: the guard did not apply
+
+
+# --- a REST arm whose records carry no mount-guard snapshot at all -------------------------------------------------
+
+DATA_PATHS = {"api": "rest", "mount": "mount"}  # the campaign fingerprint's `data_paths` kinds, by level
+
+
+def arm_rows(pairs: int = 48) -> list:
+    """`pairs` pairs: cond-a is the REST arm (data_path level `api`), cond-b the mount arm (level `mount`)."""
+    rows = rows_of_pairs(pairs)
+    for row in rows:
+        row.factors["data_path"] = "api" if row.condition == "cond-a" else "mount"
+    return rows
+
+
+def arm_runs(rows, flagged=(0, 1, 2, 3)) -> list:
+    """The REST arm lists no mount guard; the mount arm lists it, `flagged` of its runs touched the token's
+    directory (the index counts the mount arm's runs)."""
+    runs, mount_index = [], 0
+    for row in rows:
+        if row.condition == "cond-a":
+            instruments = {}
+        else:
+            instruments = touched() if mount_index in flagged else clean()
+            mount_index += 1
+        runs.append((record(run_key=row.run_key, instruments=instruments, factors=row.factors), row.condition))
+    return runs
+
+
+def test_o75_without_the_campaigns_data_paths_every_rest_run_with_no_snapshot_is_unknown_and_left_out(prereg):
+    """O75: the shape that went wrong: 48 REST runs with no snapshot and 4 flagged mount runs of 96 leave 52 out."""
+    rows = arm_rows()
+    done = mount_guard_analysis(arm_runs(rows), rows, [], prereg)
+    counts = done.counts()
+    assert (counts["analysed"], counts["left_out"], counts["unknown"], counts["flagged"]) == (96, 52, 48, 4)
+    assert counts["not_applicable"] == 0
+
+
+def test_o75_a_rest_arm_with_no_snapshot_is_not_applicable_by_the_campaigns_recorded_data_path(prereg):
+    """O75: the campaign fingerprint's `data_paths` says the level `api` is a REST data path, so a run of it with no
+    snapshot had no mount: not applicable, kept in the rerun; only the 4 flagged mount runs are left out."""
+    rows = arm_rows()
+    done = mount_guard_analysis(arm_runs(rows), rows, [], prereg, DATA_PATHS)
+    counts = done.counts()
+    assert (counts["analysed"], counts["left_out"], counts["not_applicable"]) == (96, 4, 48)
+    assert (counts["flagged"], counts["clean"], counts["unknown"]) == (4, 44, 0)
+    assert {run.not_applicable for run in done.runs if run.condition == "cond-a"} == {"rest"}
+    assert {run.data_path_from for run in done.runs if run.condition == "cond-a"} == {"campaign"}
+    again = done.sensitivity.contrast("a-vs-b")
+    assert again.n_pairs == 48 - 4
+    assert sum(a.lost[LEFT_OUT_AS] for a in again.arm_runs) == 4
+
+
+def test_o75_a_mount_run_with_no_snapshot_is_unknown_whatever_the_campaign_records(prereg):
+    """O75: the level `mount` is a mount data path, so the run's missing snapshot is not a statement of anything."""
+    rows = arm_rows(4)
+    runs = [(record(run_key=row.run_key, factors=row.factors), row.condition) for row in rows]
+    runs[1] = (runs[1][0].__class__(**{**vars(runs[1][0]), "instruments": clean()}), runs[1][1])  # one run carries it
+    done = mount_guard_analysis(runs, rows, [], prereg, DATA_PATHS)
+    kinds = {run.run_key: (run.verdict, run.not_applicable) for run in done.runs}
+    assert kinds[rows[0].run_key] == ("not_applicable", "rest")  # cond-a: no snapshot, a REST level
+    assert kinds[rows[1].run_key] == ("clean", None)  # cond-b: a mount run that carries its snapshot
+    assert kinds[rows[3].run_key] == ("unknown", None)  # cond-b: a mount run with no snapshot
+
+
+@pytest.mark.parametrize(
+    "factors",
+    [
+        {},  # no data_path factor
+        {"data_path": "elsewhere"},  # a level the campaign does not map
+        {"data_path": ["api"]},  # not a level
+        {"data_path": None},
+    ],
+)
+def test_o75_a_run_whose_level_the_campaign_does_not_map_to_a_data_path_stays_unknown(factors):
+    done = judge(record(factors=factors), "c", DATA_PATHS)
+    assert (done.verdict, done.not_applicable) == ("unknown", None)
+
+
+@pytest.mark.parametrize("paths", [None, {}, {"api": "mount"}, {"api": "api"}, {"api": ""}, {"api": None}])
+def test_o75_a_campaign_that_records_no_rest_or_none_data_path_for_the_level_gives_no_exemption(paths):
+    done = judge(record(factors={"data_path": "api"}), "c", paths)
+    assert (done.verdict, done.not_applicable) == ("unknown", None)
+
+
+def test_o75_a_statement_that_contradicts_the_campaigns_data_path_is_unknown():
+    """The record says no mount where the campaign says the level is a mount, or names another data path than it."""
+    as_mount = judge(record(instruments={NAMESPACE: NoMount("rest").finish()}, factors={"data_path": "mount"}), "c",
+                     DATA_PATHS)  # fmt: skip
+    assert (as_mount.verdict, as_mount.unknown) == ("unknown", ("data_path_mismatch",))
+    other = judge(
+        record(instruments={NAMESPACE: NoMount("none").finish()}, factors={"data_path": "api"}), "c", DATA_PATHS
+    )
+    assert (other.verdict, other.unknown) == ("unknown", ("data_path_mismatch",))
+    agrees = judge(
+        record(instruments={NAMESPACE: NoMount("rest").finish()}, factors={"data_path": "api"}), "c", DATA_PATHS
+    )
+    assert (agrees.verdict, agrees.not_applicable, agrees.data_path_from) == ("not_applicable", "rest", "record")
+
+
+def test_o75_a_real_snapshot_is_judged_as_it_is_whatever_the_campaign_says_of_the_level():
+    done = judge(record(instruments=clean(), factors={"data_path": "api"}), "c", DATA_PATHS)
+    assert (done.verdict, done.not_applicable) == ("clean", None)
+    flagged = judge(record(instruments=touched(), factors={"data_path": "api"}), "c", DATA_PATHS)
+    assert flagged.verdict == "flagged"
+
+
+# --- a study whose data-path factor is not called `data_path` (`[study] data_path_factor`) --------------------------
+
+OWN_PATHS = {"A+": "rest", "M": "mount"}  # the fingerprint's kinds by level of a factor the study calls `path`
+
+
+def own_rows(pairs: int = 48) -> list:
+    """The REST arm (level `A+`) and the mount arm (level `M`), the factor called `path` and no `data_path`."""
+    rows = rows_of_pairs(pairs)
+    for row in rows:
+        row.factors["path"] = "A+" if row.condition == "cond-a" else "M"
+    return rows
+
+
+def own_runs(rows, flagged=(0, 1, 2, 3)) -> list:
+    """The REST arm lists no mount guard; the mount arm lists it, `flagged` of its runs touched the token."""
+    runs, mount_index = [], 0
+    for row in rows:
+        if row.condition == "cond-a":
+            instruments = {}
+        else:
+            instruments = touched() if mount_index in flagged else clean()
+            mount_index += 1
+        runs.append((record(run_key=row.run_key, instruments=instruments, factors=row.factors), row.condition))
+    return runs
+
+
+def test_o75_a_study_that_calls_its_data_path_factor_path_keeps_its_rest_arm_by_naming_it(prereg):
+    """O75: 96 runs, a REST arm of 48 with no snapshot and 4 flagged mount runs, the factor called `path`: with its
+    name given, the REST arm is not applicable and only the 4 flagged runs are left out of the rerun."""
+    rows = own_rows()
+    done = mount_guard_analysis(own_runs(rows), rows, [], prereg, OWN_PATHS, "path")
+    counts = done.counts()
+    assert (counts["analysed"], counts["left_out"], counts["not_applicable"]) == (96, 4, 48)
+    assert (counts["flagged"], counts["clean"], counts["unknown"]) == (4, 44, 0)
+    assert {run.data_path_from for run in done.runs if run.condition == "cond-a"} == {"campaign"}
+    assert not {run.run_key for run in done.left_out} & {row.run_key for row in rows if row.condition == "cond-a"}
+    assert done.sensitivity.contrast("a-vs-b").n_pairs == 48 - 4
+
+
+def test_o75_without_the_name_the_core_looks_for_data_path_and_leaves_the_rest_arm_unknown(prereg):
+    """The failure the key fixes: the default name finds no `data_path` among the runs' factors, so 48 REST runs with
+    no snapshot read unknown and 52 of 96 are left out."""
+    rows = own_rows()
+    done = mount_guard_analysis(own_runs(rows), rows, [], prereg, OWN_PATHS)
+    counts = done.counts()
+    assert (counts["left_out"], counts["unknown"], counts["not_applicable"]) == (52, 48, 0)
+
+
+def test_o75_a_named_factor_that_a_run_lacks_leaves_the_run_unknown():
+    done = judge(record(factors={"data_path": "A+"}), "c", OWN_PATHS, "path")
+    assert (done.verdict, done.not_applicable) == ("unknown", None)
+
+
+def test_o75_the_statement_check_reads_the_level_by_the_named_factor_too():
+    """The route by the run's own statement is cross-checked with the campaign's data path by the same factor name: a
+    statement of no mount on a run of the mount level is unknown."""
+    stated = NoMount("rest").finish()
+    contradicted = judge(record(instruments={NAMESPACE: stated}, factors={"path": "M"}), "c", OWN_PATHS, "path")
+    assert (contradicted.verdict, contradicted.unknown) == ("unknown", ("data_path_mismatch",))
+    agreed = judge(record(instruments={NAMESPACE: stated}, factors={"path": "A+"}), "c", OWN_PATHS, "path")
+    assert (agreed.verdict, agreed.data_path_from) == ("not_applicable", "record")
+    blind = judge(record(instruments={NAMESPACE: stated}, factors={"path": "M"}), "c", OWN_PATHS)
+    assert blind.verdict == "not_applicable"  # the default name finds no level, so nothing to contradict

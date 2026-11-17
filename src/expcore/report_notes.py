@@ -345,7 +345,15 @@ MOUNT_SENSITIVITY_NOTES = [
     "out`. The analysis above stands; this says whether its conclusions hold without the runs that touched the",
     "mount's token or oneclient's process, or could not be shown not to. A run is left out for what was detected",
     "about it, never for its outcome. The egress section, if any, leaves out its own runs, and a batch checked by",
-    "both guards also gets a rerun without the runs either leaves out.",
+    "two or more guards also gets a rerun without the runs any of them leaves out.",
+]
+
+MOUNT_NOT_APPLICABLE_NOTES = [
+    "A run with no mount (a REST run, or a run with no data path) is `not_applicable`: its record carries the",
+    "sandbox's statement that the run had none, or, with no snapshot at all, the campaign's fingerprint records that",
+    "the run's data path had none. It had no mount exposure to be left out for and it stays in this rerun. It is",
+    "never counted as clean, and the egress check, if any, still judges it. A mount run whose record has no",
+    "mount-guard snapshot is `unknown`, and left out, whatever it did.",
 ]
 
 VISIBILITY_NOTES = [
@@ -386,6 +394,32 @@ GUARDS_SENSITIVITY_NOTES = [
     "above stands, and so do the two reruns of the single guards. A run is left out for what was detected about it,",
     "never for its outcome.",
 ]
+
+
+def any_guard_notes(names: str) -> list[str]:
+    """The notes of the combined section of a batch checked by guards other than egress and the mount guard alone:
+    `names` lists the guards that checked it (O76)."""
+    return [
+        f"This batch was checked by {names}, and each section above reruns the analysis without its own runs. This one",
+        "reruns it without every run any of them leaves out: flagged or unknown to any, so a run unknown to one guard",
+        "and clean to the others is left out. A guard that does not apply to a run leaves it out for nothing: a run",
+        "with no mount is not applicable to the mount guard and is left out only for another guard that flagged it or",
+        "could not read it. It is the rerun to read when the question is whether the conclusions hold for the runs",
+        "every guard that applies to them shows clean. A run's egress is `flagged` for an outside connection or a",
+        "static-scan hit and `unknown` for an unknown log alone; its mount and its process visibility are those",
+        "guards' verdicts.",
+    ]
+
+
+def any_guard_sensitivity_notes(either: str) -> list[str]:
+    """The notes of the rerun of the combined section (see `any_guard_notes`); `either` is `either` or `any`."""
+    return [
+        f"The preregistered analysis again, without every run {either} guard leaves out: each one is left out as an",
+        "absent run (`excluded`), so its pairs count as `Unpaired or left out` and its arm's runs as `Left out`. The",
+        "analysis above stands, and so do the reruns of the single guards. A run is left out for what was detected",
+        "about it, never for its outcome.",
+    ]
+
 
 SENSITIVITY_NOTES = [
     "The preregistered analysis again, without the flagged runs: each one is left out as an absent run (`excluded`),",

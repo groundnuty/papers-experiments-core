@@ -35,17 +35,20 @@ SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatche
 PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a value the platform template leaves to up (fedfacts)
 SHA256 = re.compile(r"[0-9a-f]{64}")
 # The site's variables of the agent's Apptainer sandbox (M5), by the Site field each fills: the files' paths and the
-# work root, and the SHA-256 each file is declared to have (oneclient's bundle: the host mount's oneclient).
+# work root, and the SHA-256 each file is declared to have (oneclient's bundle: the host mount's oneclient; the
+# gateport: the cell's 443 mapper, `bundle/gateport.c`, the preload of a layout with a REST level).
 AGENT_PATHS = {
     "HPC_AGENT_SIF": "agent_sif",
     "HPC_EGRESS_SHIM": "egress_shim",
     "HPC_ONECLIENT_BUNDLE": "oneclient_bundle",
+    "HPC_GATEPORT": "gateport",
     "HPC_AGENT_WORK_ROOT": "agent_work_root",
 }
 AGENT_PINS = {
     "HPC_AGENT_SIF_SHA256": "agent_sif_sha256",
     "HPC_EGRESS_SHIM_SHA256": "egress_shim_sha256",
     "HPC_ONECLIENT_BUNDLE_SHA256": "oneclient_bundle_sha256",
+    "HPC_GATEPORT_SHA256": "gateport_sha256",
 }
 # The study's own artifacts (its tool server's venv, clone and manifests) on the filesystem the login node and the
 # agent's node see: the directory a platform template (or a space's `data_manifest`) names as `@study_artifacts@`;
@@ -54,6 +57,7 @@ STUDY_PATHS = {"HPC_STUDY_ARTIFACTS": "study_artifacts"}
 OPTIONAL_VARIABLES = {**AGENT_PATHS, **AGENT_PINS, **STUDY_PATHS}  # each may be left out of site.env
 # HPC_QUOTA_CHECK's one value. It never applies to a federation bound onto scratch (a site that sets it with
 # HPC_STORAGE_ROOT is refused), and without a scratch root there is no check to skip (README, "Provider storage").
+# HPC_HOME_QUOTA_CHECK takes the same one value, and skips the home guard wherever it is set.
 QUOTA_CHECK_OFF = "off"
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
@@ -325,15 +329,17 @@ class Site:
     admin_mail: str = "admin@example.org"
     billing_weight: Optional[float] = None  # the site's billing weight per GB of memory, for describe
     # The agent's Apptainer sandbox (M5), for a platform template that names them (`hpcpins`): the SIF and the egress
-    # shim built for it on the filesystem the nodes see, and oneclient's bundle (oneclient_bundle.py), each with the
-    # SHA-256 it is declared to have, and the sandbox's work_root on the agent's node's tmpfs. Empty when the site
-    # declares none.
+    # shim built for it on the filesystem the nodes see, oneclient's bundle (oneclient_bundle.py) and the 443 mapper
+    # (the gateport, built for the SIF: the preload of a layout with a REST level), each with the SHA-256 it is
+    # declared to have, and the sandbox's work_root on the agent's node's tmpfs. Empty when the site declares none.
     agent_sif: str = ""
     agent_sif_sha256: str = ""
     egress_shim: str = ""
     egress_shim_sha256: str = ""
     oneclient_bundle: str = ""
     oneclient_bundle_sha256: str = ""
+    gateport: str = ""
+    gateport_sha256: str = ""
     agent_work_root: str = ""
     # The directory of the study's own artifacts (HPC_STUDY_ARTIFACTS), which `@study_artifacts@` stands for in a
     # template: `up` takes the digest of its tree in its preflight and records it, with this value, in the state file,
@@ -352,6 +358,15 @@ class Site:
     quota_cmd: str = ""
     quota_pattern: str = ""
     quota_check: str = ""
+    # The guard of the account's home (hpcquota.home_guard; README, "The account's home"). `home_quota_cmd` is the
+    # site's command that prints the home's usage and limits, `home_quota_pattern` the regular expression with the
+    # named groups `files_used`, `files_limit`, `bytes_used` and `bytes_limit` that reads its output. The check runs
+    # whenever either is set, with or without a scratch root, and refuses when the home's files or bytes are past 95%
+    # of the limit; `home_quota_check` "off" skips it. None of the three is recorded in the state file: `down` needs
+    # none, and the command line names the user and the home's path.
+    home_quota_cmd: str = ""
+    home_quota_pattern: str = ""
+    home_quota_check: str = ""
     # srun's `--network=<value>` on every step the driver launches, when not empty (HPC_STEP_NETWORK). On a site whose
     # switch plugin gives each job a virtual network identifier, a heterogeneous job's steps on component 0 were refused
     # ("Error configuring interconnect") from a point on while the same steps with `no_vni` ran; the services talk over
@@ -428,6 +443,8 @@ def checked_site(site: Site) -> Site:
         _absolute(site.storage_root, "HPC_STORAGE_ROOT")
     if site.quota_check not in ("", QUOTA_CHECK_OFF):
         raise SettingsError(f"HPC_QUOTA_CHECK: must be '{QUOTA_CHECK_OFF}' or unset (unset is not off)")
+    if site.home_quota_check not in ("", QUOTA_CHECK_OFF):
+        raise SettingsError(f"HPC_HOME_QUOTA_CHECK: must be '{QUOTA_CHECK_OFF}' or unset (unset is not off)")
     if site.storage_root and site.quota_check == QUOTA_CHECK_OFF:
         raise SettingsError(
             f"HPC_QUOTA_CHECK={QUOTA_CHECK_OFF} with HPC_STORAGE_ROOT: a federation whose provider storage is bound "
@@ -468,5 +485,8 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             quota_cmd=environ.get("HPC_QUOTA_CMD") or "",
             quota_pattern=environ.get("HPC_QUOTA_PATTERN") or "",
             quota_check=environ.get("HPC_QUOTA_CHECK") or "",
+            home_quota_cmd=environ.get("HPC_HOME_QUOTA_CMD") or "",
+            home_quota_pattern=environ.get("HPC_HOME_QUOTA_PATTERN") or "",
+            home_quota_check=environ.get("HPC_HOME_QUOTA_CHECK") or "",
         )
     )

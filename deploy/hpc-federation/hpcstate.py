@@ -63,6 +63,7 @@ def new_service(kind: str) -> Dict[str, Any]:
         "workdir": None,
         "rootfs": None,
         "launch": 0,
+        "launch_retries": [],  # each launch `up` repeated, with the proofs that nothing of it ran (hpclaunchproof)
         "step": None,
         "client": None,
         "log": None,
@@ -89,6 +90,9 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
     job = state["allocation"].get("job")
     if job is not None and not (isinstance(job, str) and JOB_ID.fullmatch(job)):
         raise StateError(f"{STATE}: allocation.job is not a Slurm job id")
+    excluded = state["allocation"].get("excluded_nodes")  # a count (O57): none in a state an older up wrote
+    if excluded is not None and not (isinstance(excluded, int) and not isinstance(excluded, bool) and excluded >= 0):
+        raise StateError(f"{STATE}: allocation.excluded_nodes is not a count")
     sandbox = state.get("sandbox")
     if sandbox is not None:
         checked_sandbox(sandbox)

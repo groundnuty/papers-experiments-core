@@ -15,7 +15,7 @@ import dataclasses
 import hashlib
 import json
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -46,10 +46,13 @@ no two drivers share; tests/study/test_merge.py checks them against the store an
 SHARD_SECTION = "## Shards"  # the report's section only a merged batch has (C29), after the conditions
 
 
-def make_study(base: Path, name: str, extra: str = "", declare: Sequence[str] = ()) -> Path:
+def make_study(
+    base: Path, name: str, extra: str = "", declare: Sequence[str] = (), edit: Callable[[Path], None] | None = None
+) -> Path:
     """A stamped copy of the example whose unit caps (1 each) are 2, which two shards can share one of each, with
     `extra` appended to its campaign.toml (a `[shards]` table, say) and the models in `declare` given a set of
-    accepted fingerprints (B18) in models.toml.
+    accepted fingerprints (B18) in models.toml. `edit`, when given, changes the copy's files last (the models of a
+    campaign, say, which `extra` can only append to), before the copy is stamped.
 
     Every copy of a test (the shards, the whole campaign they are compared with, the study they merge into) is made
     here, so they plan the same campaign: the caps are in the campaign's fingerprint.
@@ -66,6 +69,8 @@ def make_study(base: Path, name: str, extra: str = "", declare: Sequence[str] = 
         assert header in models, f"the example no longer has a model {model}"
         models = models.replace(header, header + f'accepted_fingerprints = ["fp-{model}"]\n')
     (root / "models.toml").write_text(models, encoding="utf-8")
+    if edit is not None:
+        edit(root)
     write_stamp(root, HEAD, load_study(root).scope)  # the study's files changed: stamp the copy again
     return root
 
@@ -91,14 +96,15 @@ def run_shard(
     identity: Mapping[str, str] = IDENTITY,
     extra: str = "",
     declare: Sequence[str] = (),
+    edit: Callable[[Path], None] | None = None,
 ) -> Campaign:
     """Run shard `index` of `count` of the example study in a copy named `name` under `base`, and return it.
 
     It is run by the command line, `run --shard index/count --shard-label label`, to the end. It is not checked: the
-    merge does that. `extra` is appended to the copy's campaign.toml, and `declare` names the models that declare
-    accepted fingerprints, as `make_study` takes them.
+    merge does that. `extra` is appended to the copy's campaign.toml, `declare` names the models that declare
+    accepted fingerprints and `edit` changes the copy's files, as `make_study` takes them.
     """
-    root = make_study(base, name, extra, declare)
+    root = make_study(base, name, extra, declare, edit)
     with pytest.MonkeyPatch.context() as patch:
         declaring(patch, identity)
         code, errors = cli(

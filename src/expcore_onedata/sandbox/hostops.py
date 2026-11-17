@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from expcore_onedata.sandbox import marks
+from expcore_onedata.sandbox import hostfacts, marks
 from expcore_onedata.sandbox.api import SandboxError
 
 log = logging.getLogger(__name__)
@@ -151,6 +151,11 @@ class HostOps(Protocol):
 
     def host_facts(self) -> dict[str, Any]:
         """Facts about the host for the run's record: kernel, docker version. No names or addresses."""
+        ...
+
+    def host_readings(self) -> dict[str, Any]:
+        """The host's OS release (ID, VERSION_ID), glibc version and kernel release (`hostfacts.readings`, O87): files
+        read as text and system values asked, nothing executed; a reading that fails is `unknown` with its reason."""
         ...
 
 
@@ -552,6 +557,9 @@ class DockerHost:
     def host_facts(self) -> dict[str, Any]:
         version = self.docker("version", "--format", "{{.Server.Version}}", check=False, timeout=30)
         return {"kernel": platform.release(), "docker_server": version.stdout.strip() or None}
+
+    def host_readings(self) -> dict[str, Any]:
+        return hostfacts.readings()  # the driver's own machine, where it runs docker, as `host_facts`' kernel is
 
 
 # ------------------------------------------------------------------------------------------------ mount tables

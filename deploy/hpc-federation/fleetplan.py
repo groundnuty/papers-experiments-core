@@ -22,7 +22,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import hpcstate
 import shards
@@ -255,6 +255,33 @@ def pin(plan: shards.Plan, environ: Optional[Mapping[str, str]] = None) -> shard
         raise FleetError(str(error)) from None
 
 
+def require_core(plan: shards.Plan) -> None:
+    """Refuse a plan whose interpreter imports a core that `expcore run` would refuse to start on: its commit unknown
+    or its install stale (C06). The fleet builds its lines with `shards.step_argv` and never goes through
+    `shards.py plan`, which makes this check, so it asks the same: the manifest's `python`, as the steps will run."""
+    try:
+        refusal = shards.core_refusal(shards.identify_core(plan))
+    except shards.ShardsError as error:
+        raise FleetError(str(error)) from None
+    if refusal:
+        raise FleetError(refusal)
+
+
+def check_campaign(
+    plan: shards.Plan, labels: Sequence[str], environ: Optional[Mapping[str, str]] = None
+) -> None:
+    """The study's campaign fingerprint, taken beside each of these shards' federations' `platform.toml`, is one
+    (`shards.check_one_campaign`, O63): FleetError otherwise. A study's plugin may fingerprint a setting that the
+    platform's own fingerprint (`platform_fingerprint`) leaves out, and the shards would never merge. The plan is
+    pinned first (`pin`), so the plugin is built with the variables the manifest declares, valued as the steps' lines
+    will carry them (`environ` is the operator's), and an unset one refuses before any program runs."""
+    plan = pin(plan, environ)
+    try:
+        shards.check_one_campaign(plan, labels)
+    except shards.ShardsError as error:
+        raise FleetError(str(error)) from None
+
+
 def check_first_values(plan: shards.Plan, label: str, environ: Optional[Mapping[str, str]] = None) -> None:
     """A shard's declared variables keep the values its first step passed, on whichever federation a later step runs
     (`shards.check_pass_env_origin`, in the results directory every shard shares): the values `environ` gives now (the
@@ -356,4 +383,6 @@ def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], re
         check_first_values(plan, label, environ)  # a later step of the shard carries the values its first one did
         argv, fed = target_of(plan, label, again, root_of(directory, holder), environ)
         found.append(Launch(label, holder, argv, again, note, str(fed["job"]), str(fed["name"])))
+    if found:  # a step that launches nothing reads no core; one that would launch asks first, as the plan did
+        require_core(plan)
     return found, said, refused

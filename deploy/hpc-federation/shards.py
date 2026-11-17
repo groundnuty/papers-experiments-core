@@ -5,6 +5,8 @@
     <python> -I -B deploy/hpc-federation/shards.py step   --study DIR --index I --count N --label L --tmpfs DIR \
         --results DIR --core-src DIR --job J --step-name S  # inside the step on the sandbox node; `lines` writes it
     <python> -I -B deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
+    python3 -I -B deploy/hpc-federation/shards.py verify-copy ARCHIVES_MANIFEST LOCAL_DIR --manifest-sha256 HASH
+                                                        # on the operator's host, after the pull, before `down`
     <python> -I -B deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
     # a step's line may end in: --pre-step REL --pre-step-sha256 HEX --pre-step-timeout S  (`lines` writes them)
     #   and: --expect-render-identity REL --expect-render-identity-sha256 HEX  (the render the plan expects)
@@ -121,9 +123,9 @@ step's record says its script passed.
 **Which render a shard runs against: the render identity (O74).** `hpcfed.py up` writes `render-identity.json` in the
 federation's root (`hpcidentity.py`): mode 0600, canonical JSON, nothing but SHA-256s and a version: the template as it
 was read before it was rendered, the rendered platform's fingerprint, each pin the platform holds (the agent's SIF,
-the egress shim, the egress collector, oneclient's bundle), and, when the site declares `HPC_STUDY_ARTIFACTS`, the
-digest of that directory's tree (`study_artifacts_tree_sha256`; no path of the directory). A manifest that declares
-`expect_render_identity`, a path
+the egress shim, the egress collector, oneclient's bundle, the REST layout's 443 mapper), and, when the site declares
+`HPC_STUDY_ARTIFACTS`, the digest of that directory's tree (`study_artifacts_tree_sha256`; no path of the directory). A
+manifest that declares `expect_render_identity`, a path
 of the study (`render-identity.expected.json` at its root, say: a federation's record copied there), makes every line
 carry `--expect-render-identity REL --expect-render-identity-sha256 HEX` (`plan` and `lines` read the file by the
 guard's path rules, refuse one that is not a well-formed record, and record its hash; with none declared the line and
@@ -161,6 +163,14 @@ it to the node's tmpfs and runs it there, since the campaign's store (SQLite, an
 a network filesystem; it checks first that the interpreter imports the core it was given (`--core-src`), relays SIGTERM
 to the dispatcher, and ends with the dispatcher's exit status.
 
+**The core must name its code (C06).** `expcore run` refuses to start on a core whose commit is unknown (a copy without
+`.git` and without a build identity: what `git archive` leaves) or whose installed source differs from its build's
+(stale), so a shard on one would reach its node, start and stop there. `plan` and `lines` ask the manifest's `python`
+which core it imports (a process of its own, `-I`, under the step's PATH and no home), and `step` reads the identity of
+its own interpreter, which the dispatcher is, before anything is made; each refuses an unknown or stale core, saying to
+use a git checkout of the core or a wheel built with its build identity (`hatch build` writes
+`expcore/_build_identity.json`). A dirty core is not asked here: the run refuses it with its own message.
+
 **How a shard comes back.** Once the dispatcher has exited (its lock released), `step` writes the copy's `out/` whole,
 `campaign.lock` included, to `<results>/<label>.out.tar` with a manifest beside it (`<label>.out.json`: its SHA-256,
 bytes, files, the shard's spec and the dispatcher's exit status), each written whole and renamed into place, and removes
@@ -170,7 +180,29 @@ archive into its copy first, so a repeated launch line never replaces a finished
 copy of every shard's archive against its manifest and the manifest against the plan, unpacks that copy into
 `<into>/<label>/out`, read-only, and prints (or with `--run` runs, in `<into>`, a 0700 directory of ours) `<python> -I
 -B -m expcore merge`. A shard whose archive has no `campaign.lock`, does not verify, or is missing is refused, naming
-its label: the merge would refuse it too.
+its label: the merge would refuse it too. A shard with a snapshot newer than its archive (below) holds runs the merge
+would leave out: `collect` warns of it, and with `--run` refuses, before any merge, naming the shard and the snapshot.
+
+**The copy back (required, after `collect` and before `down`).** Nothing durable may live only on the cluster's
+scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all
+of scratch after 20 days with no job submitted. The cluster cannot push to the operator's host, so the operator PULLS
+(rsync or scp, run from their host), once every step has ended. What the pull must hold, for each shard, is what
+`collect` lists in `<results>/archives.sha256.json` (`expcore-hpc-archives/1`): the archive `<label>.out.tar`; its
+manifest `<label>.out.json`; every file under `<label>/journals/` (a spend journal per step, which holds what a step
+killed outright spent and `--resume` counts as `lost_in_kill`); and the newest snapshot that verifies, when it is NEWER
+than the archive (`newer_snapshot`: a step resumed from the archive was killed before it archived, so its snapshot names
+that archive and holds runs the archive lacks, which the merge does not see). Every other snapshot is resume material,
+superseded by the verified archive (a snapshot of the step that wrote an archive names an earlier one or none, and was
+taken before it), and is not required. The manifest has the plan's `plan_id` (the SHA-256 of the plan's study and
+results directories and each shard's index, count, label and root), then the archives and the other files, each with
+its name relative to `<results>`, size and SHA-256 from the bytes `collect` read, sorted, with no path and no timestamp;
+`collect` prints the file's own SHA-256 on stderr. `verify-copy` takes the pulled manifest, the local directory and that
+hash (`--manifest-sha256`, required: a manifest pulled with the archives proves nothing about itself), and exits 1
+naming each file that is missing, not a regular file, of another size or of another SHA-256 (names and reasons only,
+never a path), 2 for a manifest it cannot use (one without the list of files beside the archives is an earlier tip's,
+which checked the archives alone), and 0 when every file matches. A file of the directory that the manifest does not
+name (an archive, an archive manifest, a journal) is a warning. It uses the standard library alone (Python 3.11 or
+later, for `tomllib`), so it runs on a host without the core.
 
 **Faults.** A campaign with `[faults]` runs here too: the platform layer reaches the federation's login-node fault relay
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
@@ -258,6 +290,17 @@ PLACEMENTS = ("het", "separate")  # the sandbox record's placements: a het compo
 LOCK_NAME = "campaign.lock"  # expcore.campaign.lock.LOCK_NAME: the merge refuses a shard without it
 ALLOWLIST = ("PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT")
 CORE_MISMATCH = 97  # the step's interpreter imports another core than the one it was given
+CORE_REMEDY = (  # what an operator does about a core that names no code (`expcore run` refuses to start on one)
+    "use a git checkout of the core, or a wheel built with its build identity "
+    "(hatch build writes expcore/_build_identity.json)"
+)
+CORE_PROBE_S = 120  # how long the manifest's interpreter has to say which core it imports
+# What the manifest's interpreter runs for `plan` and `lines`: `this_core`, in a process of its own.
+CORE_PROBE = """import json
+from expcore.provenance import core_identity
+found = core_identity.current()
+print(json.dumps({"known": found.known, "stale": found.stale, "why": found.why}))
+"""
 ARCHIVE_FAILED = 75  # the dispatcher ended but its out/ could not be archived: kept on the node's tmpfs
 PRE_STEP_REFUSED = 73  # a script the study declared refused the step, or could not be run as declared, or the
 # federation's render identity is not the expected one (or could not be compared with it): nothing made
@@ -286,6 +329,8 @@ OWNER_POST = ".step.post.json"  # the same with the post-run script's record, wr
 RUNNING, ARCHIVING = "running", "archiving"  # the step's phase: its dispatcher runs; it ended and out/ is whole
 ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not be archived, so it is kept
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
+ARCHIVES_FORMAT = "expcore-hpc-archives/1"  # the copy back's manifest: what `collect` read, for `verify-copy`
+ARCHIVES_MANIFEST = "archives.sha256.json"  # in <results>, beside the archives
 RUNNING_MARK, RUNNING_FORMAT = "running.json", "expcore-hpc-shard-running/1"  # <results>/<label>/: a step runs it
 # The federation's render identity (O74): the record `hpcfed.py up` writes in its root (hpcidentity.py: hashes and a
 # version, no address, id, path or secret). This file runs alone on a node, so it keeps its own copy of the names; a
@@ -297,6 +342,7 @@ RENDER_IDENTITY_PINS = (
     "egress_shim_sha256",
     "egress_collector_sha256",
     "oneclient_bundle_sha256",
+    "gateport_sha256",
 )
 RENDER_IDENTITY_ARTIFACTS = "study_artifacts_tree_sha256"  # in the record only when the site declares the directory
 RENDER_IDENTITY_KEYS = (
@@ -756,6 +802,14 @@ def undeclared_spaces(label: str, root: Path) -> str | None:
     return f"{label}: {', '.join(missing)}" if missing else None
 
 
+def check_one_campaign(plan: Plan, only: Sequence[str] | None = None) -> None:
+    """`ShardsError` unless the study's campaign fingerprint, taken beside each shard's federation's `platform.toml`
+    (`only`: the labels of the shards a line is made for, all by default), is one: the shards would never merge, and
+    `merge` finds it after the spend (O63; `shardresume.check_one_campaign`). `plan` and `lines` call it before they
+    print a line, `fleet.py plan` before it assigns a shard."""
+    _sibling("shardresume").check_one_campaign(sys.modules[__name__], plan, only)
+
+
 def _job_id(job: Any) -> bool:
     return isinstance(job, str) and job.isdigit()
 
@@ -908,6 +962,16 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _measured(path: Path) -> tuple[int, str]:
+    """The size and the SHA-256 of `path`'s bytes, from one pass over them: the size is what was read, not a stat's."""
+    digest, size = hashlib.sha256(), 0
+    with open(path, "rb") as handle:
+        while chunk := handle.read(CHUNK):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
 def _write_whole(path: Path, write: Callable[[Path], None]) -> None:
     """Write `path` through a draft beside it, fsynced and renamed: a reader sees the old file or the whole new one."""
     draft = path.with_name(path.name + ".part")
@@ -1029,6 +1093,124 @@ def _read_only(root: Path) -> None:
     root.chmod(stat.S_IMODE(root.stat().st_mode) & ~0o222)
 
 
+def plan_id(plan: Plan) -> str:
+    """The SHA-256 of the plan as its manifest declares it: the study and results directories, and each shard's index,
+    count, label and federation root, in order. It names the plan, not the campaign: a shard's own manifest carries only
+    an index, a count and a label, and the campaign's fingerprint travels in each shard's export, which the merge
+    compares (C36). Labels alone would not tell plans apart, since a fleet's shards are always `shard-1` to `shard-N`.
+    It is a hash, so no path is in the manifest, and every `collect` of one plan gives the same."""
+    declared = {
+        "study": str(plan.study),
+        "results": str(plan.results),
+        "shards": [[s.index, s.count, s.label, str(s.root)] for s in plan.shards],
+    }
+    return hashlib.sha256(json.dumps(declared, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _files_under(root: Path, results: Path, label: str) -> list[str]:
+    """Every regular file under `root`, by its name relative to `results` (POSIX, sorted); none when `root` is not
+    there. A link, or anything that is neither a regular file nor a directory, is `ShardsError` naming the shard: a
+    link is never followed, and a pull of a tree holding one would not be of the bytes hashed."""
+    try:
+        top = root.lstat()
+    except FileNotFoundError:
+        return []
+    if not stat.S_ISDIR(top.st_mode):
+        raise ShardsError(f"shard {label}: {root.name} is not a plain directory")
+
+    def raise_it(error: OSError) -> None:
+        raise error
+
+    found: list[str] = []
+    for base, dirs, files in os.walk(root, onerror=raise_it):
+        for name in (*dirs, *files):
+            if not stat.S_ISREG(mode := os.lstat(os.path.join(base, name)).st_mode) and not stat.S_ISDIR(mode):
+                raise ShardsError(f"shard {label}: {name}, under {root.name}/, is not a regular file or a directory")
+        found += [Path(base, name).relative_to(results).as_posix() for name in files]
+    return sorted(found)
+
+
+def newer_snapshot(plan: Plan, shard: Shard, archive_sha: str, scratch: Path) -> Path | None:
+    """The snapshot of `shard` that is newer than its archive (`archive_sha`: what the verified archive's manifest
+    names) and that `--resume` would restore, or None. A snapshot names the archive its step started from (`base`), so
+    one that names this archive was taken by a step that began from it and did not archive: it holds the runs that step
+    reached and the archive lacks (the merge does not have them). Every older one (a snapshot of the step that wrote
+    the archive names an earlier archive or none) holds nothing the archive lacks. The pick is `restore_newest`'s, with
+    this archive as the base: restored into a private directory of `scratch`, which is removed, so that it is the
+    newest that verifies (every file against its hash, the store's integrity, every ended attempt's marker)."""
+    try:
+        with os.scandir(plan.results / shard.label / SNAPSHOTS) as listing:
+            if not any(entry.name.startswith("snap-") for entry in listing):
+                return None
+    except FileNotFoundError:
+        return None
+    spec = {"index": shard.index, "count": shard.count, "label": shard.label}
+    check = Path(tempfile.mkdtemp(prefix=".snapshot-check-", dir=scratch))
+    try:
+        found = restore_newest(plan.results, shard.label, spec, archive_sha, check / "out")
+    finally:
+        remove_tree(check)
+    return found
+
+
+def evidence_entries(
+    plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]], scratch: Path
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """What lies beside each verified archive and would be lost with the scratch: its archive manifest
+    (`<label>.out.json`), every file under `<label>/journals/` (a spend journal per step: what a step killed outright
+    spent), and the snapshot newer than the archive when there is one (`newer_snapshot`), each as name (relative to the
+    results directory), size and SHA-256 of the bytes read, sorted by name. The archive manifest is shown to name the
+    archive that was verified, so the two listed are a pair. A link among them refuses the collect; so does a file that
+    cannot be read. Snapshots older than the archive are resume material and not listed (README). Returns the entries
+    and, for each shard that has a snapshot newer than its archive, its (label, snapshot name)."""
+    entries: list[dict[str, Any]] = []
+    ahead: list[tuple[str, str]] = []
+    for shard, (_, manifest) in zip(plan.shards, found, strict=True):
+        try:
+            own = (plan.results / f"{shard.label}.out.json").read_bytes()
+            try:
+                named = json.loads(own).get("sha256")
+            except (ValueError, AttributeError):
+                named = None
+            if named != manifest["sha256"]:
+                raise ShardsError(f"shard {shard.label}: its manifest no longer names the archive that was verified")
+            entries.append({"name": f"{shard.label}.out.json", "bytes": len(own),
+                            "sha256": hashlib.sha256(own).hexdigest()})  # fmt: skip
+            names = _files_under(plan.results / shard.label / JOURNALS, plan.results, shard.label)
+            snapshot = newer_snapshot(plan, shard, manifest["sha256"], scratch)
+            if snapshot is not None:
+                names += _files_under(snapshot, plan.results, shard.label)
+                ahead.append((shard.label, snapshot.name))
+            for name in names:
+                size, digest = _measured(plan.results / name)
+                entries.append({"name": name, "bytes": size, "sha256": digest})
+        except OSError as error:
+            raise ShardsError(f"shard {shard.label}: its evidence could not be read ({type(error).__name__})") from None
+    return sorted(entries, key=lambda entry: entry["name"]), ahead
+
+
+def write_archives_manifest(
+    plan: Plan, found: Sequence[tuple[Path, Mapping[str, Any]]], evidence: Sequence[Mapping[str, Any]]
+) -> Path:
+    """`<results>/archives.sha256.json`, written whole beside the archives `verified` read (`found`, in the plan's
+    order): the plan's id, each archive's name, size and SHA-256, and the `evidence` beside them
+    (`evidence_entries`). The size is the private copy's, whose bytes were hashed, never a step's claim; `verified`
+    raised unless the SHA-256 of those bytes is the manifest's, so that value is theirs. Names are relative and there
+    is no timestamp: collecting one plan twice, with nothing changed in its results, writes the same bytes."""
+    entries = [
+        {"name": f"{shard.label}.out.tar", "bytes": copy.stat().st_size, "sha256": manifest["sha256"]}
+        for shard, (copy, manifest) in zip(plan.shards, found, strict=True)
+    ]
+    document = {"format": ARCHIVES_FORMAT, "plan_id": plan_id(plan), "archives": entries, "evidence": list(evidence)}
+    payload = (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
+    path = plan.results / ARCHIVES_MANIFEST
+    try:
+        _write_whole(path, lambda draft: draft.write_bytes(payload))
+    except OSError as error:
+        raise ShardsError(f"the archives manifest could not be written ({type(error).__name__})") from None
+    return path
+
+
 def final_problem(shard: Shard, manifest: Mapping[str, Any], wanted: str | None) -> str | None:
     """Why a verified shard's results are not to be merged, or None: its manifest says they are not final (the
     study's post-run script did not pass), or, with `wanted` (the plan's SHA-256 of the post-run script), does not say
@@ -1065,10 +1247,17 @@ def pass_env_problem(shard: Shard, manifest: Mapping[str, Any], declared: Sequen
     return None
 
 
-def collect(plan: Plan, into: Path) -> list[Path]:
+def collect(plan: Plan, into: Path, refuse_newer: bool = False) -> list[Path]:
     """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails, when
     any is not final (`final_problem`) and when any step was not given the plan's `pass_env` (`pass_env_problem`),
-    naming it."""
+    naming it. Once every archive has verified and is final, and before
+    anything is unpacked, `archives.sha256.json` is written beside them for the copy back (`verify-copy`): the archives
+    and what lies beside them (`evidence_entries`). A refused collect writes none. Run it once every step has ended: a
+    journal still being written is listed as it was read, and a pull of it later would differ. A shard with a snapshot
+    newer than its archive (a step resumed from the archive was killed before it archived) holds runs the merge would
+    omit: `collect` warns, naming the shard and the snapshot, and lists the snapshot for the copy back; with
+    `refuse_newer` (the merge follows at once: `--run`) it refuses instead, since the merge has no flag to leave a shard
+    short and would analyse an incomplete campaign."""
     if into.exists() and any(into.iterdir()):
         raise ShardsError("the directory to collect into must be new or empty")
     wanted = None
@@ -1089,6 +1278,22 @@ def collect(plan: Plan, into: Path) -> list[Path]:
                 shard, found[-1][1], plan.pass_env
             ):
                 raise ShardsError(problem)
+        evidence, ahead = evidence_entries(plan, found, into)
+        if ahead and refuse_newer:
+            who = "; ".join(f"shard {label}: snapshot {name}" for label, name in ahead)
+            raise ShardsError(
+                f"a snapshot is newer than its archive ({who}), so the merge would leave out the runs it holds: resume "
+                "the shard so that they reach a new archive, or run collect without --run and merge the line it prints "
+                "yourself, knowing they are left out"
+            )
+        for label, name in ahead:
+            print(
+                f"shards: WARNING: shard {label}: snapshot {name} is newer than its archive (a step resumed from the "
+                "archive was killed before it archived): it holds runs the merge leaves out; it is in the "
+                f"{ARCHIVES_MANIFEST} to pull and check, and `--resume` continues from it",
+                file=sys.stderr,
+            )
+        write_archives_manifest(plan, found, evidence)
     except ShardsError:  # refused whole: nothing of it is left behind
         for leftover in into.glob(".*.out.tar"):
             leftover.unlink()
@@ -1112,6 +1317,153 @@ def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
     """`python -I -B -m expcore merge`: isolated, no bytecode written: no module of the directory it is run from is
     imported."""
     return [plan.python, "-I", "-B", "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
+
+
+# ------------------------------------------------------------------------------------------------ the copy back
+# Run on the operator's host, possibly without the core: nothing here may import it (a test runs it under `-I -S`).
+@dataclass(frozen=True)
+class CopyCheck:
+    archives: int  # the archives the manifest names
+    evidence: int  # the files beside them that it names (archive manifests, journals, a snapshot)
+    problems: tuple[str, ...]  # "<name>: <what is wrong>" for each file missing or differing
+    extras: tuple[str, ...]  # files of the directory that look like what the manifest names, and it does not
+
+
+Entry = tuple[str, int, str]  # a file the manifest names: its name, size in bytes and SHA-256
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _plain_part(part: str) -> bool:
+    return part not in ("", ".", "..") and not any(c in part for c in "\\\0")
+
+
+def _entries(items: object, noun: str, nested: bool, seen: set[str]) -> list[Entry]:
+    """The files of one list of the manifest as (name, bytes, sha256), shown well formed; `ShardsError` otherwise. Every
+    name must be a plain file name, or with `nested` a relative path of plain parts (no empty part, `.`, `..`, absolute
+    form, backslash or NUL), and is refused before any file is read; one is never echoed back. `seen` holds the names of
+    the lists before, so that no name is given twice."""
+    if not isinstance(items, list) or not items:
+        raise ShardsError(f"the manifest names no {noun}, so it would verify nothing of them")
+    entries: list[Entry] = []
+    for n, item in enumerate(items, 1):
+        entry = item if isinstance(item, Mapping) else {}
+        name, size, digest = entry.get("name"), entry.get("bytes"), entry.get("sha256")
+        parts = name.split("/") if isinstance(name, str) else []
+        if not parts or not all(_plain_part(part) for part in parts) or (len(parts) > 1 and not nested):
+            raise ShardsError(f"the manifest's {noun} {n} has no plain {'relative path' if nested else 'file name'}")
+        if name in seen:
+            raise ShardsError(f"the manifest names {name} twice")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ShardsError(f"the manifest gives {name} no size in bytes")
+        if not _is_sha256(digest):
+            raise ShardsError(f"the manifest gives {name} no SHA-256")
+        seen.add(name)
+        entries.append((name, size, digest))
+    return entries
+
+
+def _manifest_entries(document: object) -> tuple[list[Entry], list[Entry]]:
+    """The manifest's archives and its evidence (the files beside them), each shown well formed. A manifest with no
+    evidence is one of an earlier tip, which checked the archives alone: it is refused, not passed on them."""
+    if not isinstance(document, Mapping) or document.get("format") != ARCHIVES_FORMAT:
+        raise ShardsError(f"the manifest is not {ARCHIVES_FORMAT}")
+    seen: set[str] = set()
+    archives = _entries(document.get("archives"), "archive", False, seen)
+    return archives, _entries(document.get("evidence"), "evidence file", True, seen)
+
+
+def _copy_problem(local: Path, name: str, size: int, digest: str) -> str | None:
+    """What is wrong with one pulled file, or None. Only a regular file is one, under directories that are directories:
+    a link or a directory of the name is never followed, nor a link on its way, and a pipe is never read."""
+    here = local
+    *directories, last = name.split("/")
+    try:
+        for part in directories:
+            here = here / part
+            if not stat.S_ISDIR(here.lstat().st_mode):
+                return "not under a plain directory"
+        info = (here / last).lstat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+    if not stat.S_ISREG(info.st_mode):
+        return "not a regular file"
+    if info.st_size != size:
+        return "size differs"
+    try:
+        return None if _sha256(here / last) == digest else "SHA-256 differs"
+    except OSError:
+        return "unreadable"
+
+
+def _extras(local: Path, named: set[str]) -> tuple[str, ...]:
+    """What `local` holds that looks like what the manifest names and it does not: an archive or an archive manifest
+    (`*.out.tar`, `*.out.json`) in the directory, and a file in a shard's `journals/` (a step that ran after `collect`).
+    Only a warning: another campaign's files, or a later step's, are not this pull's to fail."""
+    found = [f.name for f in local.iterdir() if f.name.endswith((".out.tar", ".out.json")) and f.name not in named]
+    journal_dirs = {"/".join(parts[:2]) for parts in (name.split("/") for name in named) if parts[1:2] == [JOURNALS]}
+    for directory in sorted(journal_dirs):  # `<label>/journals`, once, whatever lies under it
+        base = local / directory
+        if base.is_symlink() or not base.is_dir():
+            continue
+        for root, _, files in os.walk(base):
+            found += [relative for f in files if (relative := Path(root, f).relative_to(local).as_posix()) not in named]
+    return tuple(sorted(found))
+
+
+def verify_copy(manifest: Path, local: Path, manifest_sha256: str) -> CopyCheck:
+    """Whether `local` holds every file `manifest` names (the archives, and what lies beside them: archive manifests,
+    journals, a snapshot), each with its size and SHA-256, and whether `manifest` is the file whose hash `collect`
+    printed (`manifest_sha256`); `ShardsError` when it is not, or cannot be used, before any file is read. Every file is
+    checked, so one run names them all."""
+    expected = manifest_sha256.lower()
+    if not _is_sha256(expected):
+        raise ShardsError("the hash given for the manifest is not a SHA-256 (64 hex digits)")
+    try:
+        raw = manifest.read_bytes()
+    except OSError as error:
+        raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ShardsError("the manifest's SHA-256 is not the one given: this is not the manifest collect printed")
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        raise ShardsError("the manifest is not JSON") from None
+    archives, evidence = _manifest_entries(document)
+    if not local.is_dir():
+        raise ShardsError("the local directory does not exist")
+    problems = [
+        f"{name}: {why}"
+        for name, size, digest in (*archives, *evidence)
+        if (why := _copy_problem(local, name, size, digest))
+    ]
+    try:
+        extras = _extras(local, {name for name, _, _ in (*archives, *evidence)})
+    except OSError as error:
+        raise ShardsError(f"the local directory could not be listed ({type(error).__name__})") from None
+    return CopyCheck(len(archives), len(evidence), tuple(problems), extras)
+
+
+def run_verify_copy(args: argparse.Namespace) -> int:
+    """0 when every file matches (warnings for extras), 1 naming each that does not; a manifest that cannot be used
+    is `ShardsError`, which `main` reports as 2."""
+    check = verify_copy(args.manifest, args.local_dir, args.manifest_sha256)
+    for name in check.extras:
+        print(f"shards: verify-copy: WARNING: {name} is not named by the manifest", file=sys.stderr)
+    if check.problems:
+        print(f"shards: verify-copy: FAILED: {len(check.problems)} of {check.archives + check.evidence} files",
+              file=sys.stderr)  # fmt: skip
+        for problem in check.problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+    archives = f"{check.archives} {'archive' if check.archives == 1 else 'archives'}"
+    evidence = f"{check.evidence} evidence {'file' if check.evidence == 1 else 'files'}"
+    print(f"shards: verify-copy: ok: {archives} and {evidence}, each with the size and SHA-256 the manifest names")
+    return 0
 
 
 # ------------------------------------------------------------------------------------------------ the step
@@ -1138,6 +1490,52 @@ def imports_core_from(core_src: Path, find: Callable[[], str] | None = None) -> 
         return Path(find()).resolve().is_relative_to(core_src.resolve())
     except (OSError, ValueError):
         return False
+
+
+def this_core() -> dict[str, Any]:
+    """The core this interpreter imports, as `CORE_PROBE` reports it: whether its commit is known, whether an installed
+    core is stale (its source differs from its build's), and why (`expcore.provenance.core_identity`)."""
+    from expcore.provenance import core_identity
+
+    found = core_identity.current()
+    return {"known": found.known, "stale": found.stale, "why": found.why}
+
+
+def core_refusal(report: Mapping[str, Any]) -> str | None:
+    """Why `expcore run` would refuse to start on the core a report describes, else None: its commit is unknown (a copy
+    without `.git` and without a build identity, which is what `git archive` leaves) or its install is stale
+    (`provenance.core_check.require_core`). Dirt is not asked here: the run's own message names it."""
+    if not report["known"]:
+        state = "unknown"
+    elif report["stale"]:
+        state = "stale"
+    else:
+        return None
+    return f"the core is {state} ({report.get('why')}), and `expcore run` refuses to start on it: {CORE_REMEDY}"
+
+
+def identify_core(plan: Plan) -> dict[str, Any]:
+    """What the manifest's interpreter says of the core it imports: `CORE_PROBE` run as the step runs, `-I -B`, under
+    the step's PATH and the no-home environment (a checkout's identity is read with git, so a login node's own PATH and
+    git configuration must not decide it). A refusal, naming why, when it cannot say."""
+    env = {"PATH": plan.step_path, "LC_ALL": "C", **home_env(NO_HOME)}
+    cannot = "the manifest's python could not report the core's identity"
+    try:
+        done = subprocess.run([plan.python, "-I", "-B", "-c", CORE_PROBE], capture_output=True, text=True,
+                              errors="replace", env=env, timeout=CORE_PROBE_S, check=False)  # fmt: skip
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ShardsError(f"{cannot} ({type(error).__name__})") from None
+    if done.returncode != 0:
+        last = (done.stderr.strip().splitlines() or ["no message"])[-1][:200]
+        raise ShardsError(f"{cannot} (exit {done.returncode}: {last})")
+    try:
+        report = json.loads(done.stdout.strip().splitlines()[-1])
+        ok = isinstance(report["known"], bool) and isinstance(report["stale"], bool)
+    except (IndexError, KeyError, TypeError, ValueError):
+        ok = False
+    if not ok:
+        raise ShardsError(f"{cannot} (it printed something else)")
+    return report
 
 
 # The dispatcher's first words, in its own process. It asks the kernel to kill it when its step dies
@@ -2202,6 +2600,9 @@ def step(
     if not core_found(args.core_src):
         print("shards: ERROR: this interpreter does not import the core from --core-src", file=sys.stderr)
         return CORE_MISMATCH
+    refusal = core_refusal(this_core())  # the dispatcher is this interpreter's: it would stop at its start on this core
+    if refusal:
+        raise ShardsError(refusal)
     from expcore.campaign import out_snapshot
 
     if args.tmpfs.is_symlink() or not args.tmpfs.is_dir():
@@ -2405,8 +2806,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     again.add_argument("--label", required=True)
     again.add_argument("--job", required=True)
     again.add_argument("--node", required=True)
+    copy = sub.add_parser("verify-copy", help="check the results pulled to this host against collect's manifest")
+    copy.add_argument("manifest", type=Path, help="the pulled archives.sha256.json")
+    copy.add_argument("local_dir", type=Path, help="the directory the archives were pulled into")
+    copy.add_argument("--manifest-sha256", dest="manifest_sha256", required=True, help="the hash collect printed")
     args = parser.parse_args(argv)
     try:
+        if args.command == "verify-copy":  # before the manifest of the plan: this runs where the core may not be
+            return run_verify_copy(args)
         if args.command == "sweep":
             return sweep(args.tmpfs, args.root, live_fails=args.live_fails)
         if args.command == "resume-line":
@@ -2418,8 +2825,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return archive_left(args) if args.archive_left else step(args)
         plan = load_plan(args.manifest)
         if args.command == "collect":
-            line = merge_argv(plan, collect(plan, args.into))
-            print(shlex.join(line))
+            outs = collect(plan, args.into, refuse_newer=args.run)
+            line = merge_argv(plan, outs)
+            print(shlex.join(line))  # first, and alone on stdout: callers read it as the merge line
+            manifest_hash = _sha256(plan.results / ARCHIVES_MANIFEST)
+            print(f"shards: archives manifest {ARCHIVES_MANIFEST} sha256 {manifest_hash}", file=sys.stderr)
+            print("shards: pull the results directory and run verify-copy with that hash before down (README)",
+                  file=sys.stderr)  # fmt: skip
             return subprocess.run(line, check=False, cwd=args.into).returncode if args.run else 0
         missing = undeclared_data(plan)
         if missing:
@@ -2428,10 +2840,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"(data_manifest in its platform.toml, C06); undeclared: {'; '.join(missing)}"
             )
         plan = pin_pass_env(pinned(plan))  # each declared script hashed, each declared variable read, before any line
+        check_one_campaign(plan)  # every shard's campaign fingerprint shown to be one (O63), by a plugin given the pins
         script = Path(__file__).resolve()
+        built = []
         for shard in plan.shards:
-            fed = federation(shard)
-            line = step_argv(plan, shard, fed, script)
+            line = step_argv(plan, shard, federation(shard), script)
             record = {"shard": shard.label, "argv": line}
             if plan.pre_step is not None:
                 record["pre_step"] = {"path": plan.pre_step, "sha256": plan.pre_step_sha256,
@@ -2444,6 +2857,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                                                     "sha256": plan.expect_render_identity_sha256}  # fmt: skip
             if plan.pass_env_pins:
                 record["pass_env"] = dict(plan.pass_env_pins)
+            built.append((line, record))
+        refusal = core_refusal(identify_core(plan))  # last: it runs the manifest's interpreter, as the step will
+        if refusal:
+            raise ShardsError(refusal)
+        for line, record in built:
             print(json.dumps(record) if args.command == "plan" else shlex.join(line))
         return 0
     except ShardsError as error:
