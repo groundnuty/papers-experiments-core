@@ -213,21 +213,35 @@ class AddressMap:
             raise
 
 
+LAUNCHER_FLAGS = ("-I", "-B")  # every Python of the driver's runs isolated, and writes no bytecode (the driver's rule)
+_PYTHON = re.compile(r"python(3(\.[0-9]+)?)?")
+
+
+def launch_argv(command: str, args: Sequence[str], launcher: Path, map_file: Path) -> list[str]:
+    """The tool server's whole command line, started through the resolve launcher (O73): the interpreter the study
+    declared, `-I -B`, the launcher, the private map as an argument (never the environment), `--`, and the server as
+    that interpreter would have been given it. The server must be a Python started by `-m <module>` or by a script,
+    since only then can the launcher run it; anything else is an AddressMapError naming what to change."""
+    if not _PYTHON.fullmatch(Path(command).name):
+        raise AddressMapError("[toolserver] command must be a Python interpreter: the resolver starts the server by it")
+    if not args or (args[0].startswith("-") and args[0] != "-m"):
+        raise AddressMapError("[toolserver] args must start with -m <module> or a script: the resolver runs the server")
+    if args[0] == "-m" and (len(args) < 2 or not args[1] or args[1].startswith("-")):
+        raise AddressMapError("[toolserver] args: -m needs a module")
+    return [command, *LAUNCHER_FLAGS, str(launcher), str(map_file), "--", *args]
+
+
 def load_addresses(section: Section, base: Path) -> tuple[AddressMap, Path, Path | None]:
-    """Read `[addresses]` of platform.toml: `file`, the map's file, and optionally `resolver`, the directory that holds
-    the resolver shim a Python tool server imports (`sitecustomize.py`, O73); both relative to the platform file.
-    Returns the map, its file's path and the resolver's. A ConfigError names the table's key and never a name, an
-    address or a path."""
+    """Read `[addresses]` of platform.toml: `file`, the map's file, and optionally `resolver`, the launcher a Python
+    tool server is started through (`resolve_launch.py`, O73); both relative to the platform file. Returns the map, its
+    file's path and the launcher's. A ConfigError names the table's key and never a name, an address or a path."""
     section.reject_unknown(("file", "resolver"))
     path = Path(os.path.abspath(base / section.string("file")))  # not resolved: a link as the file itself is refused
     resolver = None
     if "resolver" in section.data:
         resolver = Path(os.path.abspath(base / section.string("resolver")))
-        shim = resolver / "sitecustomize.py"
-        if not resolver.is_dir() or not shim.is_file() or shim.is_symlink():
-            raise section.fail(
-                "resolver", "must be a directory that holds the shim, sitecustomize.py, as a regular file"
-            )
+        if resolver.name != "resolve_launch.py" or not resolver.is_file() or resolver.is_symlink():
+            raise section.fail("resolver", "must be the resolve launcher, resolve_launch.py, as a regular file")
     try:
         return AddressMap.load(path), path, resolver
     except AddressMapError as error:
@@ -241,4 +255,4 @@ def build(hosts: Mapping[str, tuple[str, Sequence[str]]]) -> AddressMap:
     )
 
 
-__all__ = ["FORMAT", "AddressMap", "AddressMapError", "Node", "build", "load_addresses"]
+__all__ = ["FORMAT", "AddressMap", "AddressMapError", "Node", "build", "launch_argv", "load_addresses"]

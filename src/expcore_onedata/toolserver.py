@@ -63,9 +63,11 @@ import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
 
+from expcore.config.loading import ConfigError
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
+from expcore_onedata.addresses import AddressMapError, launch_argv
 from expcore_onedata.admission import (
     TOOL_SERVER_STEP,
     TokenStepRefused,
@@ -101,10 +103,6 @@ ENV_PROVIDER_HOST = "ONEDATA_ONEPROVIDER_HOST"
 ENV_PROVIDER_TOKEN = "ONEDATA_ONEPROVIDER_TOKEN"
 ENV_TOOLS = "ONEDATA_MCP_TOOLS"
 ENV_INSECURE_TLS = "ONEDATA_ALLOW_INSECURE_TLS"
-ENV_ADDRESS_MAP = (
-    "EXPCORE_ADDRESS_MAP"  # O73: the private map file the resolver shim reads (a federation of declared names)
-)
-ENV_PYTHONPATH = "PYTHONPATH"
 MANAGED_ENV = (
     ENV_ZONE_HOST,
     ENV_ZONE_TOKEN,
@@ -112,24 +110,25 @@ MANAGED_ENV = (
     ENV_PROVIDER_TOKEN,
     ENV_TOOLS,
     ENV_INSECURE_TLS,
-    ENV_ADDRESS_MAP,
     *CA_BUNDLE_ENV,
 )
 
 
-def resolver_environment(config: PlatformConfig, caller_path: str | None) -> dict[str, str]:
-    """What lets a Python tool server reach a declared name that resolves nowhere (O73): the settings of the resolver
-    shim, or nothing for a platform with no `[addresses] resolver`.
-
-    The shim is a `sitecustomize.py` the federation's `up` placed in its root; the server's `PYTHONPATH` starts with its
-    directory (before any the caller gave), so Python imports it at start, and `EXPCORE_ADDRESS_MAP` names the private
-    map it reads. It resolves exactly the names of that map, to their addresses, and every other host as before; the
-    URL, the handshake, the certificate check and `Host` stay the declared name. It serves a Python server that does not
-    run isolated (`-I`), which is onedata-mcp: any other needs a mechanism of its own."""
-    if config.addresses_file is None or config.addresses_resolver is None:
-        return {}
-    path = os.pathsep.join(p for p in (str(config.addresses_resolver), caller_path) if p)
-    return {ENV_PYTHONPATH: path, ENV_ADDRESS_MAP: str(config.addresses_file)}
+def server_argv(config: PlatformConfig) -> tuple[str, list[str]]:
+    """The server's command and arguments (O73): `[toolserver]`'s as declared, or, for a platform whose names resolve
+    nowhere (`[addresses] resolver`), started through the resolve launcher (`addresses.launch_argv`): the declared
+    interpreter, `-I -B`, the launcher, the private map as an argument, `--`, and the declared arguments. The server
+    then resolves exactly the map's names, to their addresses, and every other host as before; nothing is put in its
+    environment for it (no `PYTHONPATH`, no setting naming the map), every Python of the driver's running `-I -B`; it
+    covers Python servers only."""
+    server = _server(config)
+    if config.addresses_resolver is None or config.addresses_file is None:
+        return server.command, list(server.args)
+    try:
+        wrapped = launch_argv(server.command, server.args, config.addresses_resolver, config.addresses_file)
+    except AddressMapError as error:
+        raise ConfigError(f"{config.file}: [toolserver]: {error}") from None
+    return wrapped[0], wrapped[1:]
 
 
 def server_environment(
@@ -145,10 +144,9 @@ def server_environment(
     The one token serves the server's Onezone and Oneprovider settings. The provider is the agent's pinned local one.
     The allow-list is the condition's, and a caller cannot set it or any other managed setting.
 
-    With the platform's `[addresses] resolver` (O73, a federation reached by the names its layout declares) it also gets
-    the resolver's settings (`resolver_environment`), so that it resolves those names, and never `ONEDATA_MCP_NODE_NAMES`:
-    once the services register the declared names there is no node name to map, and the server's text is the one a
-    Compose federation's is.
+    It sets no `ONEDATA_MCP_NODE_NAMES`, on any platform: once the services register the declared names there is no
+    node name to map, so onedata-mcp runs unset and its text is a Compose federation's. A platform whose names resolve
+    nowhere starts the server through the resolve launcher instead (`server_argv`).
 
     Its certificate check is the platform's `[tls]`: by default the server's own (it verifies with httpx's CAs); with
     `ca_file`, `ca_copy`, the run's own read-only copy of the verified bundle (`tls.write_private_copy`), never the
@@ -171,7 +169,6 @@ def server_environment(
             ENV_TOOLS: ",".join(condition.allow),
         }
     )
-    env.update(resolver_environment(config, (extra or {}).get(ENV_PYTHONPATH)))
     if config.tls.insecure:
         env[ENV_INSECURE_TLS] = "true"
     elif ca_copy is not None:
@@ -366,9 +363,10 @@ class ToolServerLauncher:
             _private_bundle(self._config) as ca_copy,  # the run's copy of the verified CA bytes, gone with the server
         ):
             env = server_environment(self._config, chosen, token, extra_env, ca_copy=ca_copy)
+            command, args = server_argv(self._config)
             provider = McpToolProvider(
-                server.command,
-                server.args,
+                command,
+                args,
                 frozen=chosen.manifest,
                 env=env,
                 allowed_tools=chosen.allow,

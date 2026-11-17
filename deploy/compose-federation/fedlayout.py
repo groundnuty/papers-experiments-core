@@ -194,8 +194,8 @@ class Layout:
 
     @property
     def toolshim(self) -> Path:
-        """The directory of the resolver shim a Python tool server imports (O73): the HPC federation's `up` copies it
-        into the root, so a copy of the platform file beside a study reads the root's own."""
+        """The directory of the launcher a Python tool server is started through (O73): the HPC federation's `up`
+        copies it into the root, so a copy of the platform file beside a study reads the root's own."""
         return self.root / "toolshim"
 
     @property

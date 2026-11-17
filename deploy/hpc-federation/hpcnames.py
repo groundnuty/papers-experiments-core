@@ -62,19 +62,20 @@ def address_map(declared: Mapping[str, str], services: Mapping[str, Mapping[str,
         ) from None
 
 
-SHIM = Path(__file__).resolve().parent / "toolshim" / "sitecustomize.py"  # the resolver of a Python tool server
+LAUNCHER = "resolve_launch.py"
+SHIM = Path(__file__).resolve().parent / "toolshim" / LAUNCHER  # starts a Python tool server so it resolves the names
 
 
 def install_toolshim(directory: Path) -> Path:
-    """Copy the resolver shim into the root (`directory`, 0700; the file 0644 and never a link), and return the
-    directory: `platform.toml` names it (`[addresses] resolver`), and the tool server's `PYTHONPATH` starts with it
+    """Copy the resolve launcher into the root (`directory`, 0700; the file 0644 and never a link), and return the
+    directory: `platform.toml` names the file (`[addresses] resolver`), and the tool server is started through it
     (O73). A copy an earlier `up` left is replaced: it is the driver's own file."""
     directory.mkdir(mode=0o700, exist_ok=True)
     directory.chmod(0o700)
-    target = directory / "sitecustomize.py"
+    target = directory / LAUNCHER
     if target.is_symlink():
-        raise RuntimeError("the root's resolver shim is a link: refused")
-    scratch = directory / f".sitecustomize.{os.getpid()}.part"
+        raise RuntimeError("the root's resolve launcher is a link: refused")
+    scratch = directory / f".{LAUNCHER}.{os.getpid()}.part"
     shutil.copyfile(SHIM, scratch)
     scratch.chmod(0o644)
     os.replace(scratch, target)

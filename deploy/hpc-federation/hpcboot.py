@@ -279,8 +279,10 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
         return "facts.json written; the layout names no platform_template, so no platform.toml"
     if layout.address_map.is_file():  # the platform layer's clients dial each declared name at its mapped address
         values = {**values, "hpc_addresses": str(layout.address_map)}
-        if layout.toolshim.is_dir():  # the resolver shim `up` copied into the root, for a Python tool server
-            values["hpc_resolver"] = str(layout.toolshim)
+        if (
+            layout.toolshim / hpcnames.LAUNCHER
+        ).is_file():  # the launcher `up` copied into the root, for a Python server
+            values["hpc_resolver"] = str(layout.toolshim / hpcnames.LAUNCHER)
     write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values)
     return "facts.json and platform.toml written"
 

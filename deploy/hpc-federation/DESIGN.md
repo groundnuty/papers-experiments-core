@@ -374,17 +374,19 @@ map. Four parts land together, in this order, since only then does every step ha
    there is nothing to map, so onedata-mcp runs unset on both platforms and its text is a Compose federation's (the
    registration is the fix, since raw REST answers reach the agent without passing through it). It still has to reach
    the declared names, which resolve nowhere on a node. It runs as a process of the driver's, from a venv and a
-   checkout the driver cannot name, so a cell with the agent's hosts file (a bind of those paths) is no option; a
-   Python server resolves them through the **resolver shim** (`toolshim/sitecustomize.py`): `up` copies it into the
-   root, `platform.toml` names its directory (`[addresses] resolver`), and `toolserver.resolver_environment` puts the
-   directory first on the server's `PYTHONPATH` and the map in `EXPCORE_ADDRESS_MAP`. The shim wraps
+   checkout the driver cannot name, so a cell with the agent's hosts file (a bind of those paths) is no option. A
+   Python server is started through the **resolve launcher** (`toolshim/resolve_launch.py`): `up` copies it into the
+   root, `platform.toml` names it (`[addresses] resolver`), and `toolserver.server_argv` starts the server as
+   `<the declared interpreter> -I -B <launcher> <map> -- -m <module> ...` (every Python of the driver's runs
+   isolated, so there is no `PYTHONPATH` and no `sitecustomize`, and nothing is shadowed). The launcher wraps
    `socket.getaddrinfo` so that exactly the names of the private map resolve, to their addresses, and every other host
-   as before; the URL, the handshake, the certificate check and `Host` stay the declared name. A map the shim may not
-   use (readable by others, a link, garbled) maps nothing, so the failure is the name not resolving. It serves a Python
-   server that does not run isolated (`-I`), and replaces another `sitecustomize` on the path; a C preload would
-   cover any process but is a built file pinned in `site.env`. **Fallback, not built:** the same
-   `ONEDATA_MCP_NODE_NAMES` mapping set on both platforms, only if the registration cannot land before the pilot's
-   freeze.
+   as before, never consulting the environment (the map is an argument), then runs the server with `runpy`; the URL,
+   the handshake, the certificate check and `Host` stay the declared name. A map it may not use (readable by others, a
+   link, garbled) stops the start with exit 78, naming nothing. A `[toolserver]` it cannot start (not a Python
+   interpreter, no `-m <module>` or script) is refused when the platform is loaded. It covers Python servers only, and
+   `-I` applies to the server too; a C preload would cover any process but is a built file pinned in `site.env`.
+   **Fallback, not built:** the same `ONEDATA_MCP_NODE_NAMES` mapping set on both platforms, only if the registration
+   cannot land before the pilot's freeze.
 
 What stays as it was: the certificate is the image's generated test certificate for the declared name, signed by the
 image's test CA (section 7 of `up`); the cluster's Erlang names are the node's and use no TLS; the port shim moves
@@ -672,7 +674,7 @@ federation whose step is gone), then releases it.
    `s3.<name>` on a provider), verified by `curl --resolve` with the exported CA; and **a sandbox slot that records the
    cell's environment, `/etc/hosts`, `gate.json` and the gate's certificates' names, the agent's typical REST answers,
    one forced no-connection error, the K1 tools' answers and the transcript, and asserts none holds a node's name or
-   address or `8443`.** The tool server's connection to a declared name through the resolver shim (section 5,
+   address or `8443`.** The tool server's connection to a declared name through the resolve launcher (section 5,
    "The registered names", item 5) is tested offline in a real child process only: on a node, with onedata-mcp's own
    venv and interpreter, it is owed too.
 

@@ -100,12 +100,12 @@ def test_o73_up_writes_the_address_map_into_the_root_private_before_any_service_
     assert set(found.hosts) == set(DECLARED.values())  # the agent's node holds no service and no name
 
 
-def test_o73_up_installs_the_resolver_shim_in_the_root_beside_the_map(rig, hpc):
-    """O73: the shim a Python tool server resolves the declared names by is copied into the root (a directory of the
-    driver's alone, the file a regular copy of the checkout's, replaced by a later `up`), before any service is
-    launched, so a copy of the platform file beside a study names the root's own."""
+def test_o73_up_installs_the_resolve_launcher_in_the_root_beside_the_map(rig, hpc):
+    """O73: the launcher a Python tool server is started through is copied into the root (a directory of the driver's
+    alone, the file a regular copy of the checkout's, replaced by a later `up`), before any service is launched, so a
+    copy of the platform file beside a study names the root's own."""
     directory = rig.root / "toolshim"
-    shim = directory / "sitecustomize.py"
+    shim = directory / "resolve_launch.py"
     assert oct(directory.stat().st_mode & 0o777) == "0o700"
     assert shim.is_file()
     assert not shim.is_symlink()
@@ -281,12 +281,12 @@ def test_o73_the_platform_file_names_the_map_and_loads_with_declared_urls(hpc, p
     _run(hpc, phase, with_map=True)
     text = (phase.root / "platform.toml").read_text(encoding="utf-8")
     assert text.startswith('addresses = { file = "')
-    assert f', resolver = "{phase.root}/toolshim" }}\n' in text.split("\n", 1)[0] + "\n"
+    assert f', resolver = "{phase.root}/toolshim/resolve_launch.py" }}\n' in text.split("\n", 1)[0] + "\n"
     assert f'url = "https://{ZONE_NAME}:8443"' in text
     assert not re.search(r"cluster\.example\.org|10\.0\.0\.", text)
     config = load_platform(phase.root / "platform.toml", require_secrets=False)
     assert config.addresses.address_of(ZONE_NAME) == ADDRESS["zone"]
-    assert config.addresses_resolver == phase.root / "toolshim"
+    assert config.addresses_resolver == phase.root / "toolshim" / "resolve_launch.py"
     assert config.zone.url == f"https://{ZONE_NAME}:8443"
 
 
