@@ -211,6 +211,7 @@ def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
     for space in spec.spaces:
         if spec.members(space.name):
             boot.ensure_members(space.name)
+    boot.audit_slot_users()  # an existing slot user is verified and recorded matched, never changed (O83)
     timer.mark("spaces")
     boot.wait_import(IMPORT_TIMEOUT_S)
     timer.mark("import")

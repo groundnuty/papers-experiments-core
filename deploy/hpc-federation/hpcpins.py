@@ -13,7 +13,7 @@ bundle's own, so `values` hashes this checkout's copy.
 
 import hashlib
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional
 
 from hpcsettings import Site
 
@@ -32,7 +32,7 @@ PLACEHOLDERS = {
     "study_artifacts": ("HPC_STUDY_ARTIFACTS", "study_artifacts"),
 }
 WHY = {  # what names a placeholder, where the default (the template's [sandbox]) is not it
-    "study_artifacts": "a platform template or the layout's tool server names @study_artifacts@ (site.env)",
+    "study_artifacts": "the platform template names @study_artifacts@, the study's own files (site.env)",
 }
 FILES = {  # file -> its pin
     "hpc_agent_sif": "hpc_agent_sif_sha",
@@ -57,11 +57,10 @@ def named(template: str) -> list:
     return [name for name in PLACEHOLDERS if name in found]
 
 
-def check(site: Site, template: Optional[str], also: Sequence[str] = ()) -> None:
-    """Refuse a site that leaves a placeholder of the template (or of `also`, other text that names them: the layout's
-    tool server paths) unfilled, or whose declared file is missing or has another SHA-256 than the one declared; the
-    message names the variable, never the path."""
-    wanted = named("\n".join([template or "", *also]))
+def check(site: Site, template: Optional[str]) -> None:
+    """Refuse a site that leaves a placeholder of the template unfilled, or whose declared file is missing or has
+    another SHA-256 than the one declared; the message names the variable, never the path."""
+    wanted = named(template or "")
     for name in wanted:
         variable, attribute = PLACEHOLDERS[name]
         if not getattr(site, attribute):

@@ -1,9 +1,11 @@
-"""O83: the slots a layout renders are slots the sandbox platform leases from, mints for, journals and revokes.
+"""O83: the slots a platform template declares, rendered, are slots the sandbox platform leases from, mints for,
+journals and revokes.
 
-The platform file's `[slots]` is written by the layout renderer both federations use (`deploy/compose-federation/
-fedtools.py`), not typed as a document. The tests that follow are the existing ones of the sandbox platform
-(`test_lease_groups`, `test_provider`) run over a platform whose `[slots]` that renderer wrote from a layout, so a
-slot the renderer writes is one the lease pool, the token journal and the revocation take as they take a document's.
+The platform file's `[slots]` is the template's text filled by the renderer both federations use
+(`deploy/compose-federation/fedfacts.py`), not a document typed in a test. The tests that follow are the existing ones
+of the sandbox platform (`test_lease_groups`, `test_provider`) run over a platform whose `[slots]` that renderer wrote,
+so a slot the renderer writes is one the lease pool, the token journal and the revocation take as they take a
+document's.
 """
 
 import importlib.util
@@ -14,7 +16,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from federation_support import DEPLOY, MINIMAL
+from federation_support import DEPLOY
 from sandbox_support import SLOT_USERS, add_sandbox, slots_data
 
 from expcore_onedata.config import load_platform
@@ -41,41 +43,34 @@ provider = sibling("test_provider")
 
 @pytest.fixture(scope="module", autouse=True)
 def renderer():
-    """The layout renderer's modules, imported by their plain names while this module runs and no longer."""
+    """The renderer both platforms use, imported by its plain name while this module runs and no longer."""
     with pytest.MonkeyPatch.context() as patch:
         patch.syspath_prepend(str(DEPLOY))
-        import fedlayout
-        import fedspec
-        import fedtools
+        import fedfacts
 
-        MODULES.update(layout=fedlayout, spec=fedspec, tools=fedtools)
+        MODULES.update(facts=fedfacts)
         yield
     MODULES.clear()
 
 
-def layout_text(rights) -> str:
-    """A layout whose two slots, `slot-a` and `slot-b`, have the users of the sandbox tests' document, the tool-server
-    user of each holding the rights `rights` gives it (the baseline when it gives none)."""
-    parts = [MINIMAL]
+def slot_tables(rights) -> str:
+    """The `[slots]` a platform template declares for two slots, `slot-a` and `slot-b`, whose users are those of the
+    sandbox tests' document, each user's id the placeholder `@user_id.<name>@` the renderer fills from the facts, the
+    tool-server user of each declaring the rights `rights` gives it (the baseline when it gives none)."""
+    parts = []
     for slot in ("slot-a", "slot-b"):
         held = json.dumps(list(rights.get(slot, BASELINE)))
-        parts.append(f"[principals.{slot}-data]\nprivileges = {json.dumps(list(BASELINE))}\n")
-        parts.append(f"[principals.{slot}-tools]\nprivileges = {held}\n")
-        parts.append(f'[slots.{slot}]\ndata_path = "{slot}-data"\ntoolserver = "{slot}-tools"\n')
+        parts.append(f'[slots.{slot}.data_path]\nusername = "{slot}-data"\nuser_id = "@user_id.{slot}-data@"\n')
+        tools = f'[slots.{slot}.toolserver]\nusername = "{slot}-tools"\nuser_id = "@user_id.{slot}-tools@"\n'
+        parts.append(tools + f"rights = {held}\n")
     return "\n".join(parts)
 
 
-def rendered_slots(tmp_path: Path, rights) -> dict:
-    """The `[slots]` table the renderer writes for that layout, as the platform layer reads it: the renderer's own entry
-    point (`additions`, the one both platforms call), over the ids the sandbox tests' users have."""
-    source = tmp_path / "layout" / "layout.toml"
-    source.parent.mkdir(parents=True)
-    source.write_text(layout_text(rights), encoding="utf-8")
-    spec = MODULES["spec"].load_spec(source)
-    layout = MODULES["layout"].Layout(tmp_path / "root", spec=spec)
-    facts = {"principals": {login: {"user_id": user_id} for login, (_, user_id) in SLOT_USERS.items()}}
-    text = MODULES["tools"].additions(layout, facts, None, absolute_root=str(layout.root))
-    return tomllib.loads(text)["slots"]
+def rendered_slots(rights) -> dict:
+    """The `[slots]` table the renderer writes for that template, as the platform layer reads it: `fedfacts.render`, the
+    one both platforms call, over the ids the sandbox tests' users have."""
+    ids = {f"user_id.{login}": user_id for login, (_, user_id) in SLOT_USERS.items()}
+    return tomllib.loads(MODULES["facts"].render(slot_tables(rights), ids))["slots"]
 
 
 def platform_from_the_layout(tmp_path, fake, rights):
@@ -83,7 +78,7 @@ def platform_from_the_layout(tmp_path, fake, rights):
 
     def edit(data):
         add_sandbox(data)
-        data["slots"] = rendered_slots(tmp_path, rights)
+        data["slots"] = rendered_slots(rights)
         conditions = data["toolserver"]["conditions"]
         conditions["write"] = {**conditions["manage"], "rights": groups.WRITE}
 
@@ -108,7 +103,7 @@ def the_slots_the_layout_renders(monkeypatch):
 def config(tmp_path, fake):
     """The sandbox tests' platform, its slots the layout's."""
     return load_platform(
-        write_platform(tmp_path, lambda data: (add_sandbox(data), data.update(slots=rendered_slots(tmp_path, {}))))
+        write_platform(tmp_path, lambda data: (add_sandbox(data), data.update(slots=rendered_slots({}))))
     )
 
 
@@ -141,9 +136,9 @@ def normal(slots):
 def test_o83_the_slots_the_renderer_writes_are_the_document_the_sandbox_tests_declare(tmp_path):
     """O83: for the default rights and for a read-only slot beside a writing one, the table is the one the tests'
     document holds: the same slots, users, ids and rights."""
-    assert normal(rendered_slots(tmp_path / "a", {})) == normal(slots_data())
+    assert normal(rendered_slots({})) == normal(slots_data())
     mixed_rights = {"slot-a": BASELINE, "slot-b": groups.WRITE}
-    assert normal(rendered_slots(tmp_path / "b", mixed_rights)) == normal(slots_data(mixed_rights))
+    assert normal(rendered_slots(mixed_rights)) == normal(slots_data(mixed_rights))
 
 
 def test_o83_a_slot_the_renderer_wrote_is_leased_minted_journalled_revoked_and_freed(mixed, tmp_path):

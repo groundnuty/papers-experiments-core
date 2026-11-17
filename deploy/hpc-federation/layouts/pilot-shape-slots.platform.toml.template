@@ -1,0 +1,148 @@
+# platform.toml of the pilot-shape layout, rendered by hpcfed.py up into the federation's root. Each @...@ is filled
+# from facts.json (the ids are new at every up; every URL is https://<node FQDN>:8443) or by the HPC driver:
+# hpc_stop_bound_s is a stop's whole bound ([hpc] stop_seconds + 90 s), and hpc_token_margin_s is the least [tokens]
+# margin_s the platform layer's own loader accepts for the rest of the file. Every path is absolute: the root's
+# (hpc_root), so a copy of the file beside a study (shards.py step) reads the root's own secrets, CA and journal, and
+# [sandbox]'s, which are the site's (hpc_agent_* and hpc_egress_shim* from site.env, each file checked against its
+# declared SHA-256 at up; hpc_egress_collector* the bundle's own). The four data spaces give the link check ten ordered
+# pairs.
+zone = { name = "zone", url = "@zone_url@" }
+providers.aspen = { url = "@provider_url.aspen@", id = "@provider_id.aspen@" }
+providers.larch = { url = "@provider_url.larch@", id = "@provider_id.larch@" }
+providers.rowan = { url = "@provider_url.rowan@", id = "@provider_id.rowan@" }
+providers.alder = { url = "@provider_url.alder@", id = "@provider_id.alder@" }
+providers.hazel = { url = "@provider_url.hazel@", id = "@provider_id.hazel@" }
+credentials.admin = { file = "@hpc_root@/secrets/admin.token" }
+credentials.users = { directory = "@hpc_root@/secrets/users", pattern = "{user}.pass" }
+principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-reader@" }
+principals.toolserver = { username = "alpha-tools", user_id = "@user_id.alpha-tools@" }
+principals.service = { username = "alpha-health", user_id = "@user_id.alpha-health@" }
+tls = { ca_file = "@hpc_root@/ca/federation-ca.pem" }   # the Onedata test CA here: each service's generated web certificate
+link_check = { name = "link-probes", id = "@space_id.link-probes@", prefixes = ["link-"], providers = ["aspen", "larch", "rowan", "alder", "hazel"] }
+
+[tokens]
+margin_s = @hpc_token_margin_s@
+
+[[spaces]]
+label = "alpha"
+name = "alpha-space"
+data_manifest = "@data_manifest.alpha-space@"   # C06: its data, checked at up
+id = "@space_id.alpha-space@"
+prefixes = ["alpha-"]
+providers = ["larch", "aspen", "rowan"]
+local = "aspen"
+holder = "larch"
+
+[[spaces]]
+label = "beta"
+name = "beta-space"
+data_manifest = "@data_manifest.beta-space@"   # C06: its data, checked at up
+id = "@space_id.beta-space@"
+prefixes = ["beta-"]
+providers = ["rowan", "aspen"]
+local = "aspen"
+holder = "rowan"
+
+[[spaces]]
+label = "gamma"
+name = "gamma-space"
+data_manifest = "@data_manifest.gamma-space@"   # C06: its data, checked at up
+id = "@space_id.gamma-space@"
+prefixes = ["gamma-"]
+providers = ["alder", "aspen"]
+local = "aspen"
+holder = "alder"
+
+[[spaces]]
+label = "delta"
+name = "delta-space"
+data_manifest = "@data_manifest.delta-space@"   # C06: its data, checked at up
+id = "@space_id.delta-space@"
+prefixes = ["delta-"]
+providers = ["hazel", "aspen"]
+local = "aspen"
+holder = "hazel"
+
+[faults]                                     # the HPC backend (M4): hpcfed.py's service verbs, through the login node's relay
+sanctioned = false                           # the configuration's half of the sanction: true only for a study that injects
+backend = "hpc"                              # no compose_file, project, command or docker: the HPC backend refuses them
+journal = "@hpc_root@/fault-journal"
+stop_bound_s = @hpc_stop_bound_s@            # settle_timeout_s defaults to it + 60, poll_s to 10, relay_wait_s to 30
+
+[faults.services]
+aspen = "aspen"
+larch = "larch"
+rowan = "rowan"
+alder = "alder"
+hazel = "hazel"
+
+[sandbox]                                    # the agent's Apptainer sandbox on its own node (M5, O56); its limits size
+backend = "apptainer"                        # that node (hpcsettings.agent_limits): an 8-core, 17 GiB step
+work_root = "@hpc_agent_work_root@"          # on the agent's node's tmpfs, never the shared filesystem: shards.py step
+                                             # makes it, 0700, and refuses one under no --tmpfs
+[sandbox.limits]
+cpus = 6
+memory_bytes = 8589934592
+pids = 512
+nofile = 4096
+tmp_bytes = 1073741824
+shm_bytes = 1073741824
+work_disk_bytes = 4294967296
+
+[sandbox.data_paths]                         # the study's data-path levels: an invented one, the mount
+mounted = "mount"
+
+[sandbox.mount]
+path = "/data"
+io_mode = "proxy"
+
+[sandbox.apptainer]                          # every file pinned; the rendered file holds the declared SHA-256s, which
+image = "@hpc_agent_sif@"                    # the campaign fingerprint takes (sandbox_backend), never a path
+image_sha256 = "@hpc_agent_sif_sha@"
+egress_shim = "@hpc_egress_shim@"            # bundle/egresslog.c, built for the image
+egress_shim_sha256 = "@hpc_egress_shim_sha@"
+egress_collector = "@hpc_egress_collector@"  # bundle/egress-collector.py of this checkout
+egress_collector_sha256 = "@hpc_egress_collector_sha@"
+oneclient_bundle = "@hpc_oneclient_bundle@"  # the host mount's oneclient (oneclient_bundle.py), for the mount level
+oneclient_bundle_sha256 = "@hpc_oneclient_bundle_sha@"
+
+# O83: the leased users of a run, each pair a slot, and the tool server that runs as the tool-server user. The users are
+# the layout's principals (pilot-shape-slots.toml), whose ids are the facts': a slot that names another user, a data-path
+# user with more than the baseline, or `rights` that are not exactly the privileges the layout gave the tool-server user
+# is refused when this file is rendered. The tool server is started through the resolve launcher (O73), so its command is
+# a Python interpreter and its arguments start with -m <module>; every path is the study's own (@study_artifacts@), and
+# each manifest is frozen from the pinned server with its condition's allow-list (python -m expcore.tools.manifest freeze).
+[slots.slot-1.data_path]
+username = "slot1-data"
+user_id = "@user_id.slot1-data@"
+
+[slots.slot-1.toolserver]
+username = "slot1-tools"
+user_id = "@user_id.slot1-tools@"
+rights = ["space_view", "space_read_data", "space_view_transfers", "space_view_qos"]
+
+[slots.slot-2.data_path]
+username = "slot2-data"
+user_id = "@user_id.slot2-data@"
+
+[slots.slot-2.toolserver]
+username = "slot2-tools"
+user_id = "@user_id.slot2-tools@"
+rights = ["space_view", "space_read_data", "space_view_transfers", "space_view_qos", "space_schedule_replication"]
+
+[toolserver]
+command = "@study_artifacts@/venv/bin/python"
+args = ["-m", "onedata_mcp"]
+start_timeout_s = 120
+clone = "@study_artifacts@/onedata-mcp"
+commit = "8c9b10c34efdad29498362fc4be4e785ff2a102b"
+
+[toolserver.conditions.knowledge]
+allow = ["get_file_distribution", "list_space_providers", "get_transfer"]
+rights = ["space_view", "space_read_data", "space_view_transfers", "space_view_qos"]
+manifest = "@study_artifacts@/manifests/knowledge.json"
+
+[toolserver.conditions.writing]
+allow = ["get_file_distribution", "list_space_providers", "get_transfer", "schedule_file_replication"]
+rights = ["space_view", "space_read_data", "space_view_transfers", "space_view_qos", "space_schedule_replication"]
+manifest = "@study_artifacts@/manifests/writing.json"

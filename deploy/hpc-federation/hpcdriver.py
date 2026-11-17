@@ -181,11 +181,9 @@ class Driver(Down):
         if self.settings.core == "step" and not site.core_python:
             raise RuntimeError('[hpc] core = "step" needs HPC_CORE_PYTHON, the core\'s Python on the nodes')
         template = self.spec.platform_template
-        tool = self.spec.toolserver  # O83: its paths are under @study_artifacts@, which the site must fill
-        hpcpins.check(
-            site, template.read_text(encoding="utf-8") if template is not None else None, tool.named() if tool else ()
-        )
-        check_artifacts(self.spec, site.study_artifacts)  # the interpreter, the pinned clone and the frozen manifests
+        hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None)
+        # O83: a template that names @study_artifacts@ has its tool server's files checked, and the frozen manifests
+        check_artifacts(self.spec, site.study_artifacts)
         if self.settings.sandbox is not None:
             self.say(
                 f"the layout declares the agent's node ({self.settings.sandbox_placement}): it is held and placed, and "

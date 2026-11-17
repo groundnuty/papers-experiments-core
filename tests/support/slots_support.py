@@ -1,5 +1,6 @@
-"""The slots and tool server a layout declares (O83): one layout text every test of them builds on, and the study's
-artifacts directory the layout's `@study_artifacts@` names, made as a study ships it.
+"""The slots and tool server a platform template declares (O83): a layout whose principals include the slots' four
+users, the template that pairs them, and the study's artifacts directory the template's `@study_artifacts@` names, made
+as a study ships it.
 
 Every name here is invented. The commit is a stand-in of forty hex digits: nothing here runs a real tool server.
 """
@@ -21,8 +22,10 @@ READ_SET = {*BASE_SET, "space_view_transfers", "space_view_qos"}
 WRITE_SET = {*READ_SET, "space_schedule_replication"}
 READ_TOOLS = ["get_file_distribution", "list_space_providers", "get_transfer"]
 WRITE_TOOLS = [*READ_TOOLS, "schedule_file_replication"]
+SLOT_USERS = ("slot1-data", "slot1-tools", "slot2-data", "slot2-tools")
 
-SLOTS = f"""
+# the layout: the users are ordinary principals; nothing here says they are slots
+PRINCIPALS = f"""
 [principals.slot1-data]
 privileges = [{BASE}]
 
@@ -34,38 +37,9 @@ privileges = [{BASE}]
 
 [principals.slot2-tools]
 privileges = [{WRITE}]
-
-[slots.slot-1]
-data_path = "slot1-data"
-toolserver = "slot1-tools"
-
-[slots.slot-2]
-data_path = "slot2-data"
-toolserver = "slot2-tools"
 """
-
-TOOLSERVER = f"""
-[toolserver]
-command = "@study_artifacts@/venv/bin/python"
-args = ["-m", "onedata_mcp"]
-clone = "@study_artifacts@/onedata-mcp"
-commit = "{COMMIT}"
-start_timeout_s = 90
-
-[toolserver.conditions.knowledge]
-allow = {json.dumps(READ_TOOLS)}
-rights = [{READ}]
-manifest = "@study_artifacts@/manifests/knowledge.json"
-
-[toolserver.conditions.writing]
-allow = {json.dumps(WRITE_TOOLS)}
-rights = [{WRITE}]
-manifest = "@study_artifacts@/manifests/writing.json"
-"""
-
-WITH_SLOTS = MINIMAL + SLOTS
-WITH_TOOLSERVER = MINIMAL + SLOTS + TOOLSERVER
-USERS = ("alpha-reader", "slot1-data", "slot1-tools", "slot2-data", "slot2-tools")  # the fixed user and the slots'
+LAYOUT = MINIMAL + PRINCIPALS
+USERS = ("alpha-reader", *SLOT_USERS)  # the fixed user and the slots'
 
 # a minimal platform template: the study space, support and credentials, and nothing of slots or a tool server
 TEMPLATE = """\
@@ -79,39 +53,71 @@ credentials.users = { directory = "secrets/users", pattern = "{user}.pass" }
 principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-reader@" }
 """
 
+SLOTS = f"""
+[slots.slot-1.data_path]
+username = "slot1-data"
+user_id = "@user_id.slot1-data@"
 
-def layout_with_template(text: str, directory: Path) -> Path:
-    """The layout `text` written into `directory` with the platform template above beside it and named by it."""
-    (directory / "platform.toml.template").write_text(TEMPLATE, encoding="utf-8")
+[slots.slot-1.toolserver]
+username = "slot1-tools"
+user_id = "@user_id.slot1-tools@"
+rights = [{READ}]
+
+[slots.slot-2.data_path]
+username = "slot2-data"
+user_id = "@user_id.slot2-data@"
+
+[slots.slot-2.toolserver]
+username = "slot2-tools"
+user_id = "@user_id.slot2-tools@"
+rights = [{WRITE}]
+"""
+
+TOOLSERVER = f"""
+[toolserver]
+command = "@study_artifacts@/venv/bin/python"
+args = ["-m", "onedata_mcp"]
+start_timeout_s = 90
+clone = "@study_artifacts@/onedata-mcp"
+commit = "{COMMIT}"
+
+[toolserver.conditions.knowledge]
+allow = {json.dumps(READ_TOOLS)}
+rights = [{READ}]
+manifest = "@study_artifacts@/manifests/knowledge.json"
+
+[toolserver.conditions.writing]
+allow = {json.dumps(WRITE_TOOLS)}
+rights = [{WRITE}]
+manifest = "@study_artifacts@/manifests/writing.json"
+"""
+
+WITH_SLOTS = TEMPLATE + SLOTS
+WITH_TOOLSERVER = TEMPLATE + SLOTS + TOOLSERVER
+
+
+def layout_with_template(template: str, directory: Path, layout: str = LAYOUT) -> Path:
+    """The layout text `layout` written into `directory` with `template` beside it and named by it."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "platform.toml.template").write_text(template, encoding="utf-8")
     path = directory / "layout.toml"
-    path.write_text(
-        text.replace(
-            'study_space = "alpha-space"',
-            'study_space = "alpha-space"\nplatform_template = "platform.toml.template"',
-            1,
-        ),
-        encoding="utf-8",
-    )
+    named = 'study_space = "alpha-space"\nplatform_template = "platform.toml.template"'
+    path.write_text(layout.replace('study_space = "alpha-space"', named, 1), encoding="utf-8")
     return path
 
 
 def frozen(tools: list[str]) -> str:
     """The text of a frozen manifest of the named tools, as `expcore.tools.manifest freeze` writes one."""
     listed = [
-        {
-            "name": n,
-            "description": f"the {n} tool",
-            "input_schema": {"type": "object"},
-            "output_schema": None,
-            "annotations": None,
-        }
+        {"name": n, "description": f"the {n} tool", "input_schema": {"type": "object"}, "output_schema": None,
+         "annotations": None}
         for n in sorted(tools)
-    ]
+    ]  # fmt: skip
     return FrozenManifest(listed, digest(listed), "invented-server", "1.0", "2025-06-18").dump()
 
 
 def artifacts(directory: Path) -> Path:
-    """A study's artifacts directory as the layout names it: the interpreter, the clone and one frozen manifest per
+    """A study's artifacts directory as the template names it: the interpreter, the clone and one frozen manifest per
     condition. The interpreter is a file of the right name, and the clone a directory; nothing of either runs."""
     (directory / "venv" / "bin").mkdir(parents=True)
     interpreter = directory / "venv" / "bin" / "python"

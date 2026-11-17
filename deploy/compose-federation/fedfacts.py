@@ -16,7 +16,7 @@ from fedboot import Bootstrap, Ids
 from feddocker import gib
 from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout, import_storage_name
 from fedspec import Space, Spec
-from fedtools import additions, attach, check_rendered
+from fedtools import check_rendered
 
 PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")
 
@@ -108,7 +108,7 @@ def facts_of(boot: Bootstrap) -> dict:
             }
             for p in spec.principals
         },
-        **slot_facts(spec),
+        **slot_user_facts(boot),
         "credentials": {
             "admin_access_token_file": "secrets/admin.token",
             "user_password_directory": "secrets/users",
@@ -121,12 +121,12 @@ def facts_of(boot: Bootstrap) -> dict:
     }
 
 
-def slot_facts(spec: Spec) -> dict:
-    """The slots a layout declares, by name, with the principals that are their users (O83); nothing for a layout with
-    none, so its facts are what they always were. The principals' own entries hold each user's id and privileges."""
-    if not spec.slots:
-        return {}
-    return {"slots": {s.name: {"data_path": s.data_path, "toolserver": s.toolserver} for s in spec.slots}}
+def slot_user_facts(boot: Bootstrap) -> dict:
+    """What the bootstrap found of each slot user the platform template declares (O83): `created`, or `matched` (it
+    existed, exactly as declared, and nothing was sent for it). Nothing for a layout whose template declares none, so
+    its facts are what they always were. The principals' own entries hold each user's id and privileges."""
+    found = getattr(boot, "slot_status", None)
+    return {"slot_users": dict(sorted(found.items()))} if found else {}
 
 
 def placeholders(facts: dict) -> dict[str, str]:
@@ -151,16 +151,17 @@ def render(template: str, values: dict[str, str]) -> str:
 
 
 def write_facts(layout: Layout, boot: Bootstrap, study_artifacts: str | None = None) -> str:
-    """Write facts.json, and platform.toml when the layout names a template; say which were written. A layout that
-    declares slots gets them, and its tool server, in platform.toml (`fedtools`), from the study's artifacts."""
+    """Write facts.json, and platform.toml when the layout names a template; say which were written. A template may name
+    `@study_artifacts@`, the directory of the study's own files that `study_artifacts` gives (O83); the written file's
+    slots are checked against the layout's principals (`fedtools.check_rendered`)."""
     facts = facts_of(boot)
     layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     template = layout.spec.platform_template
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
-    text = render(template.read_text(encoding="utf-8"), placeholders(facts))
-    write_private(layout.platform, attach(text, additions(layout, facts, study_artifacts)))
-    check_rendered(layout)
+    values = {**placeholders(facts), **({"study_artifacts": study_artifacts} if study_artifacts else {})}
+    write_private(layout.platform, render(template.read_text(encoding="utf-8"), values))
+    check_rendered(layout, facts)
     return "facts.json and platform.toml written"
 
 

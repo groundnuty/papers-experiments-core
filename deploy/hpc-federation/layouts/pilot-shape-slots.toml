@@ -1,9 +1,9 @@
-# The pilot's shape with the tool-server arm (O83): pilot-shape.toml, and two slots, the leased users of a run, and a
-# tool server that runs from the study's artifacts directory (HPC_STUDY_ARTIFACTS in site.env). Each slot pairs a
-# data-path user with a tool-server user, all four data spaces, and the rights its condition declares exactly: slot-1
-# serves the read-only condition, slot-2 the writing one. Compose brings the same layout up with the same users, rights
-# and secrets (deploy/compose-federation, EXPCORE_FED_STUDY_ARTIFACTS). Every name is invented; the commit is the
-# onedata-mcp pin of docs/inventory.md.
+# The pilot's shape with the tool-server arm (O83): pilot-shape.toml, and the four users of two slots (the leased users of
+# a run). They are ordinary principals: the bootstrap makes each zone user, its 0600 password file and its membership of
+# the four data spaces with exactly these privileges, on Compose and on HPC alike, and never changes one that exists. The
+# template beside it declares the slots that pair them and the tool server that runs from the study's artifacts
+# directory (HPC_STUDY_ARTIFACTS in site.env); a rendered slot that disagrees with these principals is refused. Every
+# name is invented; the commit in the template is the onedata-mcp pin of docs/inventory.md.
 #
 #   set -a; . deploy/hpc-federation/site.env; set +a
 #   uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape-slots.toml \
@@ -17,7 +17,7 @@ project = "expcore-hpc-slots"
 domain = "expcore-hpc-slots.test"
 study_space = "alpha-space"
 memory_limit = "6g"
-platform_template = "pilot-shape.platform.toml.template"
+platform_template = "pilot-shape-slots.platform.toml.template"
 probe_space = "link-probes"
 
 [hpc]
@@ -86,9 +86,8 @@ spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
 privileges = ["space_view", "space_read_data"]
 spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
 
-# The leased users of a run: the user whose token reads the data and the user whose token the tool server gets. They are
-# ordinary principals (a zone user, a 0600 password file in the root, a member of each space with exactly these
-# privileges), paired by [slots]; the data path's hold exactly the baseline, the tool server's the condition's rights.
+# The leased users of a run: the user whose token reads the data and the user whose token the tool server gets. The
+# template pairs them in [slots]; a data-path user holds exactly the baseline, a tool-server user its condition's rights.
 [principals.slot1-data]
 privileges = ["space_view", "space_read_data"]
 spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
@@ -104,31 +103,3 @@ spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
 [principals.slot2-tools]
 privileges = ["space_view", "space_read_data", "space_view_transfers", "space_view_qos", "space_schedule_replication"]
 spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
-
-[slots.slot-1]
-data_path = "slot1-data"
-toolserver = "slot1-tools"
-
-[slots.slot-2]
-data_path = "slot2-data"
-toolserver = "slot2-tools"
-
-# The tool server, started through the resolve launcher of O73 by the interpreter the study ships. Every path is under
-# the study's artifacts directory; the manifests are frozen from the pinned server (python -m expcore.tools.manifest
-# freeze) with each condition's allow-list, and copied into the root by up.
-[toolserver]
-command = "@study_artifacts@/venv/bin/python"
-args = ["-m", "onedata_mcp"]
-clone = "@study_artifacts@/onedata-mcp"
-commit = "8c9b10c34efdad29498362fc4be4e785ff2a102b"
-start_timeout_s = 120
-
-[toolserver.conditions.knowledge]
-allow = ["get_file_distribution", "list_space_providers", "get_transfer"]
-rights = ["space_view", "space_read_data", "space_view_transfers", "space_view_qos"]
-manifest = "@study_artifacts@/manifests/knowledge.json"
-
-[toolserver.conditions.writing]
-allow = ["get_file_distribution", "list_space_providers", "get_transfer", "schedule_file_replication"]
-rights = ["space_view", "space_read_data", "space_view_transfers", "space_view_qos", "space_schedule_replication"]
-manifest = "@study_artifacts@/manifests/writing.json"
