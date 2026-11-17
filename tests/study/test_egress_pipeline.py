@@ -58,6 +58,8 @@ def prepared(tmp_path: Path, *, egress: bool) -> Path:
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
     if egress:
+        declared = study / "preregistration.toml"  # a batch the egress check covers declares its rerun (S19)
+        declared.write_text(declared.read_text("utf-8") + '\n[sensitivity]\nreruns = ["egress"]\n', "utf-8")
         plugin = study / "plugin.py"
         text = plugin.read_text(encoding="utf-8")
         assert INSTRUMENTS in text

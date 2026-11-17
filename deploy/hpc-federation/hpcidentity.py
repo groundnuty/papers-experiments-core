@@ -11,10 +11,11 @@ the same platform fingerprint. The record holds, as canonical JSON with sorted k
   platform's declared identity and its spaces' data identity, never an id the federation made, so two federations of
   one template and one set of data have one (C06); it holds the sandbox's pins too, which is why a pin that changed
   changes it as well.
-- the SHA-256 of each pin the rendered platform holds (`PINS`): the agent's SIF, the egress shim, the egress collector
-  and oneclient's bundle. They are the very values `up` filled in and checked (`hpcpins`: the site's declared hashes,
-  each file measured against its own in the preflight, and the bundle's own collector hashed here), never read again.
-  A pin the template does not name is not in the record: no entry is ever empty or null.
+- the SHA-256 of each pin the rendered platform holds (`PINS`): the agent's SIF, the egress shim, the egress collector,
+  oneclient's bundle and the 443 mapper's preload (`gateport_sha256`, the REST layout's). They are the very values `up`
+  filled in and checked (`hpcpins`: the site's declared hashes, each file measured against its own in the preflight, and
+  the bundle's own collector hashed here), never read again. A pin the template does not name is not in the record: no
+  entry is ever empty or null.
 - `study_artifacts_tree_sha256` (`ARTIFACTS`): when the site declares `HPC_STUDY_ARTIFACTS`, the directory of the
   study's own artifacts (its tool server's clone, its venv, its manifests), the SHA-256 of that directory's tree as
   `tree_sha256` takes it. `up` takes it once, in its preflight on the login node before anything is submitted, and the
@@ -81,6 +82,7 @@ PINS = {
     "egress_shim_sha256": ("hpc_egress_shim", "hpc_egress_shim_sha"),
     "egress_collector_sha256": ("hpc_egress_collector", "hpc_egress_collector_sha"),
     "oneclient_bundle_sha256": ("hpc_oneclient_bundle", "hpc_oneclient_bundle_sha"),
+    "gateport_sha256": ("hpc_gateport", "hpc_gateport_sha"),
 }
 ARTIFACTS = "study_artifacts_tree_sha256"  # in the record only when the site declares HPC_STUDY_ARTIFACTS
 KEYS = ("version", "template_sha256", "platform_fingerprint_sha256", *PINS, ARTIFACTS)

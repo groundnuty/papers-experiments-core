@@ -75,16 +75,25 @@ PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"  # no cer
 
 
 def agent_site(directory: Path, sif: bytes = b"an invented SIF image\n", shim: bytes = b"an invented egress shim\n",
-               work_root: Path | None = None) -> dict:  # fmt: skip
+               work_root: Path | None = None, gateport: bytes | None = None) -> dict:  # fmt: skip
     """The site's variables of the agent's Apptainer sandbox (the pilot template's `[sandbox]`), its files written
     into `directory` and pinned by their SHA-256 (oneclient's bundle an invented tar a host mount can unpack:
     fake_elf); the work root `work_root`, or one under `directory` (made by the shard step on the agent's node, never
-    here)."""
+    here). With `gateport`, the site also declares the 443 mapper's file (the preload of the REST layout) with these
+    bytes; without it, the site declares none, as one whose layout has no REST level does."""
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "agent.sif").write_bytes(sif)
     (directory / "egresslog.so").write_bytes(shim)
     bundle = directory / "oneclient-bundle.tar"
+    mapper = {}
+    if gateport is not None:
+        (directory / "gateport.so").write_bytes(gateport)
+        mapper = {
+            "HPC_GATEPORT": str(directory / "gateport.so"),
+            "HPC_GATEPORT_SHA256": hashlib.sha256(gateport).hexdigest(),
+        }
     return {
+        **mapper,
         "HPC_AGENT_SIF": str(directory / "agent.sif"),
         "HPC_AGENT_SIF_SHA256": hashlib.sha256(sif).hexdigest(),
         "HPC_EGRESS_SHIM": str(directory / "egresslog.so"),
@@ -171,6 +180,7 @@ def hpc_on_path():
 def _import_hpc():
     import hpcboot
     import hpcdriver
+    import hpcexclude
     import hpcfed
     import hpclaunch
     import hpcquota
@@ -185,6 +195,7 @@ def _import_hpc():
         {
             "boot": hpcboot,
             "driver": hpcdriver,
+            "exclude": hpcexclude,
             "cli": hpcfed,
             "launch": hpclaunch,
             "quota": hpcquota,
@@ -272,6 +283,8 @@ def parse_srun(argv: list) -> Srun:
     return Srun(argv, env=env, command=command, **found)
 
 
+NODE_READINGS = {"os": {"id": "invented", "version_id": "9.9"}, "glibc": "glibc 2.99", "kernel": "9.99.0-invented"}
+
 PYTHON = re.compile(r"python[0-9.]*")  # an interpreter by its file name: python, python3, python3.11
 NO_BYTECODE = ["-I", "-B"]  # what every Python the driver launches is given first (B1, O57)
 
@@ -323,6 +336,21 @@ def isolated(argv) -> list:
 
 
 @dataclass
+class OtherJob:
+    """A live job of the account that is none of one fake's own: another federation's held job, or a job of no
+    federation. `squeue --me` lists it as the site's does (`%i %j %T %N`), its nodes as a node list (empty while it
+    is pending)."""
+
+    job: str
+    name: str
+    state: str = "RUNNING"
+    nodes: tuple = ()
+
+    def row(self) -> str:
+        return f"{self.job} {self.name} {self.state} {','.join(self.nodes)}".rstrip()
+
+
+@dataclass
 class FakeSlurm:
     """The login node's view of a cluster with one user's held job. Every command the driver gives it must run each
     Python with `-I -B` (`flagged`, `isolated`), and every step must name `/` as its working directory (`--chdir=/`), or
@@ -344,6 +372,7 @@ class FakeSlurm:
     delivered: list = field(default_factory=list)
     on_control: Callable | None = None  # a test's own answer to a control step, or None for the default
     teardown_rc: int = 0
+    node_readings: Any = field(default_factory=lambda: dict(NODE_READINGS))  # what a facts step prints; None: none
     next_step: int = 0
     queued: bool = True
     relay_calls: list = field(default_factory=list)  # alive, stop, ... in order
@@ -372,6 +401,26 @@ class FakeSlurm:
     # A command of the login node beyond Slurm's, by its first word (the site's quota command, invented): a test's
     # answer, `(argv, timeout) -> Completed`, which may raise what the real Runner does. Every call is in `calls`.
     tools: dict = field(default_factory=dict)
+    # Launches that fail at launch, as two live ones did (17 Nov 2026): the srun client cannot find the node's address,
+    # Slurm accounts the step CANCELLED with exit 0:116, and the run log is made, empty. `launch_failures` maps a
+    # service's name to one dict per launch of it that fails, in order (`{}` is the live shape); a launch with no
+    # entry left succeeds. Keys of an entry: `log` (what the run log holds, "" by default), `no_log` (no run log at
+    # all), `state` and `exit` (the accounted step's, "CANCELLED" and "0:116"), `no_row` (accounting holds no row),
+    # `row_id` (the id accounting shows, when not the step's), `client` (the client log's text instead), `reason` (the
+    # failure's reason in the client log), `client_id` (the StepId the client log names, when not the step's), `listed`
+    # (squeue lists the step, as it did for about 12 s live, until a test makes it vanish) and `end` (the End the
+    # row shows, as sacct prints one, `2027-01-15T12:00:12`; "Unknown" by default).
+    launch_failures: dict = field(default_factory=dict)
+    step_rows: dict = field(default_factory=dict)  # job id -> the `JobID|JobName|State|ExitCode|End` rows sacct prints
+    sacct_steps: Callable | None = None  # a test's own answer to that sacct query, `(argv) -> Completed`, or raises
+    # The rest of the account's live jobs, which `squeue --me` lists beside this fake's own (O57, distinct nodes):
+    # `others` on every read, or `others_by_read` (one list per read, the last repeating) when the cluster changes
+    # between two reads; `peers` are other fakes sharing this one's nodes, whose own jobs are listed too.
+    others: list = field(default_factory=list)
+    others_by_read: list = field(default_factory=list)
+    peers: list = field(default_factory=list)
+    me_reads: int = 0  # the `squeue --me` reads so far
+    on_me: Callable | None = None  # a test's own answer, `(read number, listed rows) -> Completed | None`
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -381,6 +430,12 @@ class FakeSlurm:
         argv = isolated(flagged(argv))
         self.calls.append(argv)
         tool = argv[0]
+        if tool == "squeue" and "--me" in argv:  # the account's live jobs: ids, names, states and node lists only
+            assert argv == ["squeue", "--me", "-h", "-o", "%i %j %T %N"], f"the read is not read-only as agreed: {argv}"
+            self.me_reads += 1
+            listed = self.me_rows()
+            answer = self.on_me(self.me_reads, listed) if self.on_me is not None else None
+            return answer or Completed(0, "".join(f"{row}\n" for row in listed), "")
         if tool == "sbatch":
             ident = self.second_id if self.job_id in self.submitted else self.job_id
             self.submitted[ident] = self._components(argv[1:])
@@ -433,7 +488,12 @@ class FakeSlurm:
             return Completed(0, "", "")
         if tool == "sacct":
             ident = argv[argv.index("-j") + 1]
-            wanted = argv[argv.index("-o") + 1] == "JobID,State,AllocTRES"
+            fields = argv[argv.index("-o") + 1]
+            if fields == "JobID,JobName,State,ExitCode,End":  # a job's steps: raw state, exit code and end
+                if self.sacct_steps is not None:
+                    return self.sacct_steps(argv)
+                return Completed(0, "".join(f"{row}\n" for row in self.step_rows.get(ident, [])), "")
+            wanted = fields == "JobID,State,AllocTRES"
             return Completed(0, self.accounting.get(ident, "") if wanted else "", "")
         if RELAY_MODULE in argv and argv[argv.index(RELAY_MODULE) - 1] == "-m":
             verb = argv[argv.index(RELAY_MODULE) + 1]
@@ -490,17 +550,44 @@ class FakeSlurm:
         return found
 
     def placed(self, ident, component) -> list:
-        """The nodes a component got: the first free ones, in submit order, unless a test names them."""
+        """The nodes a component got: the first free ones, in submit order, that it did not exclude (`--exclude`),
+        unless a test names them. Other jobs of the account are not considered, as on a site whose nodes are shared by
+        cores: what a job did not exclude it may share with them."""
         if (ident, component) in self.node_lists:
             return list(self.node_lists[(ident, component)])
-        start = 0
+        taken: set = set()
         for job in self.submitted or {self.job_id: None}:
             for index, options in enumerate(self._options(job)):
                 count = int(options.get("--nodes", "1"))
+                excluded = set(filter(None, options.get("--exclude", "").split(",")))
+                mine = [n for n in self.nodes if n not in excluded and n not in taken][:count]
                 if (job, index) == (ident, component):
-                    return self.nodes[start : start + count]
-                start += count
+                    return mine
+                taken.update(mine)
         return []
+
+    def own_rows(self) -> list:
+        """This fake's own live jobs as `squeue --me` lists them: a job's id, or `<leader>+<k>` per component of a
+        heterogeneous one, with its name, its state and, once it runs, its nodes."""
+        rows = []
+        for ident in self.submitted:  # none before the first sbatch: the account's own jobs are the ones submitted
+            if self.gone_job(ident):
+                continue
+            state = self.state if ident == self.job_id else self.job_states.get(ident, "RUNNING")
+            options = self._options(ident)
+            for index, component in enumerate(options):
+                listed = ident if len(options) == 1 else f"{ident}+{index}"
+                nodes = () if state == "PENDING" else tuple(self.placed(ident, index))
+                rows.append(OtherJob(listed, component.get("--job-name"), state, nodes).row())
+        return rows
+
+    def me_rows(self) -> list:
+        """Every row `squeue --me` lists now: this fake's own jobs, its peers', and the account's other jobs."""
+        if self.others_by_read:
+            others = self.others_by_read[min(self.me_reads, len(self.others_by_read)) - 1]
+        else:
+            others = self.others
+        return [*self.own_rows(), *(row for peer in self.peers for row in peer.own_rows()), *(o.row() for o in others)]
 
     def scontrol_lines(self, ident) -> str:
         components = self._options(ident)
@@ -572,12 +659,15 @@ class FakeSlurm:
                 "uid": 5001,
                 "gid": 5001,
             }
+            if self.node_readings is not None:  # None: a step that gives none (an older bundle's)
+                facts["readings"] = self.node_readings
             return 0, json.dumps(facts) + "\n", ""
         if script == "zone-export.sh":
             return (0, "A1b2C3d4E5f6G7h8I9j0K1l2\n", "") if command[2] == "passphrase" else (0, self.ca_pem, "")
         if script == "teardown.sh":
             workdir = command[command.index("--workdir") + 1]
-            self.steps = {n: s for n, s in self.steps.items() if not n.endswith(self._service_of(workdir))}
+            service = re.escape(self._service_of(workdir))  # whichever launch of it is listed: -run-1, -run-2
+            self.steps = {n: s for n, s in self.steps.items() if not re.search(service + "[0-9]+$", n)}
             return self.teardown_rc, "", "ok: service stopped\n"
         if command[0] == "test":
             return 0, "", ""
@@ -596,9 +686,9 @@ class FakeSlurm:
 
     def _service_of(self, workdir: str) -> str:
         for name, log in self.logs.items():
-            if workdir in Path(log).read_text(encoding="utf-8"):
-                return f"-{name}-run-1"
-        return "-no-such-service"
+            if Path(log).is_file() and workdir in Path(log).read_text(encoding="utf-8"):
+                return f"-{name}-run-"
+        return "-no-such-service-run-"
 
     def pipe(self, first, second):
         from hpcslurm import Completed
@@ -630,17 +720,51 @@ class FakeSlurm:
             Path(client_log).write_text(srun.refusal, encoding="utf-8")
             self.dead_clients.append(Client(20000 + len(self.spawned), 77))
             return self.dead_clients[-1]
-        self.next_step += 1
-        self.steps[srun.name] = f"{self.listing_of(srun)}.{self.next_step}"
         script = Path(srun.command[1]).name
         kind = "oz" if script == "zone.sbatch" else "op"
         service = "zone" if kind == "oz" else srun.command[4]
+        if self.launch_failures.get(service):
+            return self._failed_launch(srun, service, client_log, self.launch_failures[service].pop(0))
+        self.next_step += 1
+        self.steps[srun.name] = f"{self.listing_of(srun)}.{self.next_step}"
         self.logs[service] = srun.output
         workdir = f"{self.node_tmp}/hpcop-{kind}.{'abcdef' if kind == 'oz' else service[:3] + 'xyz'}"
         lines = [f"hpcop: work directory {workdir}"]
         lines.append("hpcop: OK zone" if kind == "oz" else "hpcop: waiting for the registration token (mint | deliver)")
         Path(srun.output).write_text("\n".join(lines) + "\n", encoding="utf-8")
         return Client(10000 + self.next_step, 77)
+
+    def _failed_launch(self, srun: Srun, service: str, client_log: str, how: dict):
+        """A launch that fails at launch, as the live two did: the step takes an id (never listed here: the driver reads
+        its id from the client's log, as it must where it never saw the step), its run log is made empty, the client
+        names the failure and exits, and accounting shows the step CANCELLED 0:116. The node's name is invented."""
+        from hpcslurm import Client
+
+        self.next_step += 1
+        step = f"{self.listing_of(srun)}.{self.next_step}"
+        self.logs[service] = srun.output
+        if how.get("listed"):
+            self.steps[srun.name] = step
+        if not how.get("no_log"):
+            Path(srun.output).write_text(how.get("log", ""), encoding="utf-8")
+        reason = how.get("reason", "Can't find an address, check slurm.conf")
+        named = how.get("client_id", step)
+        Path(client_log).write_text(
+            how.get(
+                "client",
+                f"srun: error: _fwd_tree_get_addr: can't find address for host {srun.node}, check slurm.conf\n"
+                f"srun: error: Task launch for StepId={named} failed on node {srun.node}: {reason}\n"
+                f"srun: error: Application launch failed: {reason}\n"
+                "srun: Job step aborted\n",
+            ),
+            encoding="utf-8",
+        )
+        if not how.get("no_row"):
+            row = f"{how.get('row_id', step)}|{srun.name}|{how.get('state', 'CANCELLED')}|{how.get('exit', '0:116')}"
+            row += f"|{how.get('end', 'Unknown')}"
+            self.step_rows.setdefault(self.listing_of(srun), []).append(row)
+        self.dead_clients.append(Client(30000 + self.next_step, 77))
+        return self.dead_clients[-1]
 
     def client_alive(self, client) -> bool:
         return client not in self.ended_clients and client not in self.dead_clients

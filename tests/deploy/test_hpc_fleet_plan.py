@@ -5,9 +5,11 @@ reset is full (deploy/hpc-federation/fleetplan.py).
 Every federation runs over a fake cluster of its own (`hpc_fleet_support.Bench`), its platform.toml the one its own
 up rendered; the step's srun is stood in by `StepRunner`, which checks each line on its federation's cluster."""
 
+import hashlib
 import json
 
 import pytest
+from fingerprint_support import seen_platforms
 from hpc_fed_support import data_stand_in
 from hpc_fleet_support import another_ca, fleet_modules, job_ids, make_bench, make_ca
 from tls_support import HAS_OPENSSL
@@ -278,3 +280,47 @@ def test_o68_status_says_each_federation_its_job_and_shard_and_runs_nothing(benc
     assert "shard-1: on fed-1, its step runs" in printed
     assert "shard-2: unassigned" in printed
     assert {label: len(fake.calls) for label, fake in bench.fakes.items()} == calls
+
+
+# ------------------------------------------------------------------------------------------------ one campaign (O63)
+def test_o63_plan_takes_each_assigned_shards_campaign_fingerprint_beside_its_own_federations_platform_file(bench):
+    """O63: three federations of one platform fingerprint: each shard's campaign fingerprint is taken by the manifest's
+    Python beside its own federation's platform.toml, all three equal, and every line printed."""
+    assert bench.up(3)[0] == 0
+    code, printed, lines = plan(bench)
+    assert code == 0, printed
+    assert sorted(lines) == ["shard-1", "shard-2", "shard-3"]
+    files = [bench.root(label) / "platform.toml" for label in ("fed-1", "fed-2", "fed-3")]
+    assert seen_platforms(bench.base / "venv") == [hashlib.sha256(f.read_bytes()).hexdigest() for f in files]
+
+
+def test_o63_plan_refuses_federations_whose_campaign_fingerprints_differ_though_their_platform_fingerprints_do_not(
+    bench,
+):
+    """O63: fed-3 renders a setting only the study's plugin fingerprints (the platform's own fingerprint leaves it out,
+    so O68's check passes): the campaign fingerprints differ, and the plan names the shard and the key, assigns
+    nothing, writes nothing and prints no line, before any step is launched."""
+    assert bench.up(3)[0] == 0
+    with (bench.root("fed-3") / "platform.toml").open("a", encoding="utf-8") as handle:
+        handle.write("\n# study-setting: another\n")
+    assert bench.fingerprint("fed-3") == bench.fingerprint("fed-1")  # the platform's half is one
+    code, printed, lines = plan(bench)
+    assert code == 2
+    assert "shard-3 differs from shard-1, shard-2 (first differing key: study_setting)" in printed
+    assert str(bench.base) not in printed
+    assert lines == {}
+    assert all(member is None for member in assigned(bench).values())
+    assert record(bench)["reference"] is None
+    assert not (bench.fleet / "shards.toml").exists()
+    assert bench.spawned == []
+
+
+def test_o63_a_shard_no_federation_holds_is_not_part_of_the_campaign_check(bench):
+    """O63: fed-2's up failed and shard-2 is unassigned: its federation's file is not read, shard-1 and shard-3 are
+    compared and planned as before."""
+    bench.data["fed-2"] = data_stand_in(differ="alpha-space")
+    assert bench.up(3)[0] == 1
+    code, _, lines = plan(bench)
+    assert code == 1
+    assert sorted(lines) == ["shard-1", "shard-3"]
+    assert len(seen_platforms(bench.base / "venv")) == 2

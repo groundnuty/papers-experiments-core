@@ -304,6 +304,8 @@ provider_storage = "tmpfs"
 read_timeout_s = 30
 """
 
+CHECK_FILE_LINE = 'content_check_file = "dir/check-@space_suffix@.bin"'
+CHECK_PROVIDER_LINE = '\ncontent_check_provider = "birch"'  # supports the space; not the local provider (O87)
 DOCKER = {
     "platform.toml": DOCKER_PLATFORM,
     "ranges.toml": RANGES,
@@ -444,6 +446,7 @@ IN = {
     "sandbox.placeholder_token": edit("docker", platform('placeholder_token = "placeholder"',
                                                          'placeholder_token = "nothing"')),
     "sandbox.kill_grace_s": edit("docker", platform("kill_grace_s = 5", "kill_grace_s = 6")),
+    "sandbox.content_check_provider": edit("docker", platform(CHECK_FILE_LINE, CHECK_FILE_LINE + CHECK_PROVIDER_LINE)),
     "sandbox.images.agent.id": edit("docker", platform(SHA["agent"], SHA["sif"])),
     "sandbox.images.gate.id": edit("docker", platform(SHA["gate"], SHA["sif"])),
     "sandbox.images.oneclient.id": edit("docker", platform(SHA["oneclient"], SHA["sif"])),

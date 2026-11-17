@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from expcore_onedata.sandbox import hostfacts
 from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import loopback
@@ -165,6 +166,16 @@ class NodeOps(Protocol):
     def boot_id(self) -> str | None:
         """This boot of the node: the kernel's random per-boot UUID (`/proc/sys/kernel/random/boot_id`), which names
         neither the node nor its site; None when it cannot be read. What the work disk's kept proof is for (O71)."""
+        ...
+
+    def node_readings(self) -> dict[str, Any]:
+        """The node's OS release (ID, VERSION_ID), glibc version and kernel release (`hostfacts.readings`, O87): files
+        read as text and system values asked, nothing executed; a reading that fails is `unknown` with its reason."""
+        ...
+
+    def tool_server_readings(self) -> dict[str, Any]:
+        """The same readings of the host the run's tool server runs on. The server is the driver's own child, so on
+        the node it is the node's own; a node that places it elsewhere answers for that host."""
         ...
 
 
@@ -517,6 +528,12 @@ class LocalNode:
         except OSError:
             return None
         return found if BOOT_ID_FORM.fullmatch(found) else None
+
+    def node_readings(self) -> dict[str, Any]:
+        return hostfacts.readings()
+
+    def tool_server_readings(self) -> dict[str, Any]:
+        return self.node_readings()  # the tool server is a process of this driver's, on this node
 
 
 __all__ = ["LocalNode", "NodeOps", "Spawned"]

@@ -21,6 +21,8 @@ trust_paths = []                # optional: paths in the agent image of CA bundl
                                 # on a rest data path the image's certifi bundle is added to them, found at the start
 content_check_file = "dir/f"    # a provisioned file under the space root, read once before a campaign to confirm
                                 # the content type the gate streams on (`precampaign.py`); required with a rest level
+content_check_provider = "name" # optional: the provider that read goes through, one of [providers] that supports the
+                                # space; the file's owner, so the local provider fetches and keeps nothing (O87)
 placeholder_token = "placeholder"  # optional: the agent's ONEDATA_TOKEN on a rest data path, never a credential (O23)
 kill_grace_s = 5                # optional, 1 to 60: how long a cell's processes have to end after their kill at its
                                 # deadline before the mount is aborted or the sandbox stopped (deadline.py, O34); the
@@ -141,6 +143,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from expcore.config.loading import ConfigError, Section
+from expcore_onedata.sandbox import checkprovider as CP
 from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.apptainer.settings import ApptainerSettings, load_apptainer
 from expcore_onedata.sandbox.gatelog import DEFAULT_CAPS, Caps
@@ -269,6 +272,7 @@ class SandboxSettings:
     earlyoom_comm: str | None = None
     trust_paths: tuple[str, ...] = ()
     content_check_file: str | None = None  # the file the pre-campaign check reads (`precampaign.py`)
+    content_check_provider: str | None = None  # the provider it reads through; None: the local one (O87)
     tls: TlsSettings = field(default_factory=TlsSettings)  # the platform's [tls]: the gate's upstream and oneclient
     listings: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))  # rest level -> its listing
     served_caps: Caps = DEFAULT_CAPS  # [sandbox.served_bytes]: the bounds of a run's tables of the bytes served (O22)
@@ -644,6 +648,7 @@ def _apptainer_sandbox(
         data_paths=data_paths,
         trust_paths=_words(section, "trust_paths", ()),
         content_check_file=check_file,
+        content_check_provider=CP.read(section, check_file),
         tls=tls if tls is not None else TlsSettings(),
         listings=listings,
         served_caps=_served_caps(section.section("served_bytes")) if "served_bytes" in section.data else DEFAULT_CAPS,
@@ -679,6 +684,7 @@ def load_sandbox(
         "earlyoom_comm",
         "trust_paths",
         "content_check_file",
+        "content_check_provider",
         "placeholder_token",
         "kill_grace_s",
         "backend",
@@ -748,6 +754,7 @@ def load_sandbox(
         earlyoom_comm=comm,
         trust_paths=_words(section, "trust_paths", ()),
         content_check_file=check_file,
+        content_check_provider=CP.read(section, check_file),
         tls=tls if tls is not None else TlsSettings(),
         listings=listings,
         served_caps=_served_caps(section.section("served_bytes")) if "served_bytes" in section.data else DEFAULT_CAPS,

@@ -61,6 +61,7 @@ CGROUP = "/invented.slice/job_1/step_0/user/task_0"  # the driver's own, where i
 CERTIFI = "/usr/lib/invented/certifi/cacert.pem"
 IMAGE_BUNDLE = "-----BEGIN CERTIFICATE-----\ninvented image bundle\n-----END CERTIFICATE-----\n"
 CANARY_MARK = "canary open"
+READINGS = {"os": {"id": "invented", "version_id": "9.9"}, "glibc": "glibc 2.99", "kernel": "9.99.0-invented"}
 
 
 @dataclass
@@ -250,6 +251,9 @@ class FakeNode:
         self.copy_helper_result: CmdResult | None = None  # what every copy exec of a work disk returns, if not its own
         self.boot: str | None = "00000000-0000-4000-8000-000000000001"  # this boot of the node (`boot_id`)
         self.mkfs_superblock = True  # whether the fake's mkfs writes an ext superblock into the image
+        self.readings: Any = READINGS  # what `node_readings` answers (O87); a test sets another, or `readings_error`
+        self.readings_error: Exception | None = None
+        self.tool_server_host: Any = None  # the tool server's host's readings; None: the node's own host
 
     # ------------------------------------------------------------------------------------------------ processes
     def _new_proc(self, pidns: str, comm: str, **kw: Any) -> FakeProc:
@@ -369,6 +373,16 @@ class FakeNode:
 
     def boot_id(self) -> str | None:
         return self.boot
+
+    def node_readings(self) -> dict[str, Any]:
+        if self.readings_error is not None:
+            raise self.readings_error
+        return json.loads(json.dumps(self.readings))
+
+    def tool_server_readings(self) -> dict[str, Any]:
+        if isinstance(self.tool_server_host, Exception):
+            raise self.tool_server_host
+        return self.node_readings() if self.tool_server_host is None else json.loads(json.dumps(self.tool_server_host))
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
         if argv and argv[0] == "fusermount3":

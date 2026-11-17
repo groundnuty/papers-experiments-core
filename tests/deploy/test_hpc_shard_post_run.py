@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import pytest
+from fingerprint_support import standin_python
 
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
 POST = "guards/post_run.py"
@@ -34,6 +35,9 @@ def shards():
     sys.modules["hpc_shards_post_run"] = module  # its dataclasses look their module up by name
     try:
         spec.loader.exec_module(module)
+        # these manifests name an interpreter that does not exist; the core it imports is asked in
+        # test_hpc_shards_core_identity.py (C06), with real interpreters
+        module.identify_core = lambda plan: {"known": True, "stale": False, "why": None}
         yield module
     finally:
         sys.modules.pop("hpc_shards_post_run", None)
@@ -530,7 +534,7 @@ def test_o63_a_resume_of_a_not_final_archive_starts_from_it_without_the_mark_and
 def manifest_file(tmp_path: Path, extra: str = "", post: str | None = PASS, guard: str | None = None) -> Path:
     """A shard plan of two federations; `extra` (top-level keys) goes before the `[[shards]]`."""
     make_study(tmp_path, post, guard)
-    lines = [f'study = "{tmp_path / "study"}"', f'python = "{tmp_path / "venv" / "python"}"',
+    lines = [f'study = "{tmp_path / "study"}"', f'python = "{standin_python(tmp_path / "venv")}"',
              f'core_src = "{tmp_path / "core" / "src"}"', f'results = "{tmp_path / "results"}"',
              f'tmpfs = "{tmp_path / "tmpfs"}"', 'step_path = "/usr/bin:/bin"', "cpus = 6",
              'memory = "18g"']  # fmt: skip

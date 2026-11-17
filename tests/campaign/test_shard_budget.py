@@ -1,5 +1,6 @@
 """The budget of a campaign that shards by model (`expcore-shard/3`, #154): who gets which dollars (C30, C32)."""
 
+import re
 from decimal import Decimal
 from fractions import Fraction
 
@@ -8,8 +9,10 @@ from campaign_support import make_manifest, make_schema
 
 from expcore.campaign.attempt_bounds import bound_usd
 from expcore.campaign.gate import Budget
-from expcore.campaign.shard import ModelShards, ShardError, micro_usd
+from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.shard import RULE_BY_MODEL, ModelShards, ShardError, ShardSpec, micro_usd
 from expcore.campaign.shard_budget import planned_runs, reservation_usd, shard_budgets
+from expcore.campaign.shard_run import share_settings_by_model
 from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import Price
 
@@ -82,10 +85,17 @@ def test_c32_the_parts_of_max_usd_never_sum_past_it_and_no_priced_shard_is_below
 
 
 def test_c32_a_max_usd_too_small_for_every_priced_shard_to_run_once_is_refused():
-    """C32: the five priced shards together need one run's reservation each."""
+    """C32: the five priced shards together need one run's reservation each; the refusal lists each of them with its
+    model, and not the two shards of the free model."""
     need = 3 * reserve("model-falcon") + 2 * reserve("model-heron")
-    with pytest.raises(ShardError, match=r"less than one run's reservation for each of the 5 shards of priced models"):
+    with pytest.raises(
+        ShardError, match=r"less than one run's reservation for each of the 5 shards of priced models"
+    ) as r:
         shard_budgets(Budget(need * 0.99), LAYOUT, plan(), MODELS, LIMITS)
+    assert str(r.value).endswith(
+        "The priced shards: shard 1 (model model-falcon), shard 2 (model model-falcon), shard 3 (model model-falcon), "
+        "shard 4 (model model-heron), shard 5 (model model-heron)"
+    )
 
 
 def test_c32_a_priced_shard_below_one_runs_reservation_is_refused_even_when_the_total_would_cover_every_shard():
@@ -182,3 +192,106 @@ def test_c32_a_campaign_of_free_models_only_gives_every_shard_nothing_and_is_not
     layout = ModelShards((("model-osprey", 1), ("model-plover", 1)))
     parts = shard_budgets(Budget(1.0), layout, plan(tuple(models)), models, LIMITS)
     assert [part["max_usd"] for part in parts.values()] == [0.0, 0.0]
+
+
+# --- one priced model beside two that cost nothing, one shard each: a pilot that prices a single model ---------------
+
+ONE_PRICED = ModelShards((("model-falcon", 1), ("model-osprey", 1), ("model-plover", 1)))
+FREE_WAYS = {
+    "marked free": (model("model-osprey", None, free=True), model("model-plover", None, free=True)),
+    "priced at zero": (model("model-osprey", Price(0.0, 0.0)), model("model-plover", Price(0.0, 0.0))),
+}
+"""The two ways a model costs nothing: marked free, or priced at 0 with its context window."""
+
+
+def one_priced(way: str) -> dict[str, ModelSpec]:
+    """falcon is priced; osprey and plover cost nothing, in the way `way` names."""
+    osprey, plover = FREE_WAYS[way]
+    return {"model-falcon": MODELS["model-falcon"], "model-osprey": osprey, "model-plover": plover}
+
+
+def one_priced_parts(way: str, budget: Budget) -> dict[int, dict]:
+    models = one_priced(way)
+    return shard_budgets(budget, ONE_PRICED, plan(tuple(models)), models, LIMITS)
+
+
+@pytest.mark.parametrize("way", FREE_WAYS)
+@pytest.mark.parametrize(
+    ("max_usd", "ceiling", "whole_max", "whole_ceiling"),
+    [
+        (50.0, 20.0, 50.0, 20.0),
+        (1234.567891, 617.283945, 1234.567891, 617.283945),
+        (7.1234567, 3.5617283, 7.123456, 3.561728),  # past the micro-dollar: rounded down, as every part is
+    ],
+    ids=["whole dollars", "micro-dollars", "past a micro-dollar"],
+)
+def test_c32_the_one_priced_models_only_shard_takes_the_whole_of_max_usd_and_its_ceiling_and_free_shards_get_none(
+    way, max_usd, ceiling, whole_max, whole_ceiling
+):
+    """C32: one priced model with one shard, beside two models that cost nothing with one shard each: the priced
+    shard's part is the whole `max_usd` and the whole `per_model_usd` ceiling of its model, in whole micro-dollars; each
+    free shard's part is 0 and has no ceiling, whether its model is marked free or priced at 0."""
+    parts = one_priced_parts(way, Budget(max_usd, {"model-falcon": ceiling}))
+    assert parts == {
+        1: {"max_usd": whole_max, "per_model_usd": {"model-falcon": whole_ceiling}},
+        2: {"max_usd": 0.0, "per_model_usd": {}},
+        3: {"max_usd": 0.0, "per_model_usd": {}},
+    }
+
+
+@pytest.mark.parametrize("way", FREE_WAYS)
+def test_c32_in_the_one_priced_layout_the_free_shards_run_with_no_budget_and_the_priced_one_on_the_whole_of_it(way):
+    """C32: a shard whose part of `max_usd` is 0 runs with no `Budget` (one of 0 dollars would hold every run) and
+    records its 0; the priced shard's `Budget` holds the whole `max_usd` and ceiling; each has a cap of one run."""
+    budget = Budget(50.0, {"model-falcon": 20.0})
+    parts = one_priced_parts(way, budget)
+    campaign = SchedulerConfig(unit_caps={"unit-falcon": 3, "unit-osprey": 3, "unit-plover": 3}, budget=budget)
+    shared = {}
+    for index, unit in ((1, "unit-falcon"), (2, "unit-osprey"), (3, "unit-plover")):
+        spec = ShardSpec(index, 3, f"shard-{index}", RULE_BY_MODEL)
+        shared[index], recorded = share_settings_by_model(campaign, spec, ONE_PRICED, unit, parts[index])
+        assert (shared[index].unit_caps, recorded) == ({unit: 1}, {"unit_caps": {unit: 1}, "budget": parts[index]})
+    assert (shared[1].budget.max_usd, dict(shared[1].budget.per_model_usd)) == (50.0, {"model-falcon": 20.0})
+    assert [shared[2].budget, shared[3].budget] == [None, None]
+
+
+@pytest.mark.parametrize("way", FREE_WAYS)
+def test_c32_a_max_usd_below_one_runs_reservation_of_the_one_priced_model_is_refused_naming_its_shard_and_model(way):
+    """C32: the one priced shard needs one run's reservation of `max_usd` before its first run; a total below it is
+    refused, with the count of priced shards, the reservation, and the priced shard with its model, and not the free
+    ones; a total a little above it is not refused, and the shard holds all of it."""
+    need = reservation_usd(one_priced(way)["model-falcon"], LIMITS)
+    refusal = (
+        r"\[budget\] max_usd .* less than one run's reservation for each of the 1 shards of priced models together "
+        + re.escape(f"({need:.6f} USD)")
+    )
+    with pytest.raises(ShardError, match=refusal) as refused:
+        one_priced_parts(way, Budget(need * 0.99))
+    assert str(refused.value).endswith("The priced shards: shard 1 (model model-falcon)")
+    barely = need * 1.01
+    assert micro_usd(one_priced_parts(way, Budget(barely))[1]["max_usd"]) == micro_usd(barely)
+
+
+def test_c32_a_max_usd_below_the_reservations_of_two_priced_shards_is_refused_naming_both_and_not_the_free_one():
+    """C32: two priced models with one shard each, a free one between them: the refusal lists shards 1 and 3 with their
+    models, in index order, and not shard 2, which costs nothing and needs no reservation."""
+    layout = ModelShards((("model-falcon", 1), ("model-osprey", 1), ("model-heron", 1)))
+    need = reserve("model-falcon") + reserve("model-heron")
+    with pytest.raises(ShardError, match=r"for each of the 2 shards of priced models together") as refused:
+        shard_budgets(Budget(need * 0.99), layout, plan(), MODELS, LIMITS)
+    assert str(refused.value).endswith("The priced shards: shard 1 (model model-falcon), shard 3 (model model-heron)")
+
+
+@pytest.mark.parametrize("way", FREE_WAYS)
+def test_c32_a_ceiling_of_the_one_priced_model_below_one_runs_reservation_is_refused_naming_shard_and_model(way):
+    """C32: a `per_model_usd` ceiling above 0 and below one run's reservation would hold the priced shard before its
+    first run: refused, naming the shard, the model, the ceiling's key and both figures; a little above it is not."""
+    need = reservation_usd(one_priced(way)["model-falcon"], LIMITS)
+    refusal = r"shard 1 \(model model-falcon\) gets .* of \[budget.per_model_usd\] model-falcon, " + re.escape(
+        f"less than one run's reservation of {need:.6f} USD"
+    )
+    with pytest.raises(ShardError, match=refusal):
+        one_priced_parts(way, Budget(50.0, {"model-falcon": need * 0.5}))
+    barely = need * 1.01
+    part = one_priced_parts(way, Budget(50.0, {"model-falcon": barely}))[1]["per_model_usd"]["model-falcon"]
+    assert micro_usd(part) == micro_usd(barely)

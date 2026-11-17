@@ -19,6 +19,11 @@ The work disk's keys are conditional too (`WORK_DISK_KEYS`, O71): a run of `work
 `disk_watch`, one of `"image"` lists `disk_watch_tmp` and `work_disk_unverified` until its start has proved the image,
 `work_disk_image` after; none lists another's.
 
+Two more entries are readings of the node, made at each run's start (`sandbox/hostfacts.py`, O87): `node`, the OS
+release's ID and VERSION_ID, the glibc version and the kernel release of the agent's node, and `tool_server_host`,
+the same of the tool server's host, only when that differs from the node's. They are recorded and never refused: a
+reading that cannot be made is `unknown`, with its reason beside it. A Docker run records the same `node`.
+
 A cell's processes end with its exec here, its PID namespace ending with it, and on Docker since O72 too (the sandbox
 kills what a cell left once its `docker exec` returns), so the code tool's "State does not carry between calls" holds
 on both: that is no departure, and has no key.

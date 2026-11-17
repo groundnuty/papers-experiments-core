@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from fingerprint_support import standin_python
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in, make_ca
 
@@ -75,8 +76,13 @@ class Bench:
     data: dict = field(default_factory=dict)  # a federation's data as read back, when not its manifest's
     spawned: list = field(default_factory=list)
     alive: set = field(default_factory=set)
+    pool: Any = None  # the nodes of one cluster every federation shares (O57), else each has a cluster of its own
     guard: Any = None  # the inode guard's stand-in: (count, layout, site, environ) -> its words
+    home_guard: Any = None  # the home guard's stand-in: (site) -> its words, "" for none
     real: Any = None  # hpcfed.make_driver as the module has it, before the bench patches it
+    core: Any = None  # what the manifest's interpreter says of its core (`shards.identify_core`'s report), or the
+    # error it raises; a core with a known commit that is not stale until a test says otherwise
+    asked: list = field(default_factory=list)  # the plan of each time the core was asked
 
     def __post_init__(self) -> None:
         self.real = self.deploy.hpc.cli.make_driver
@@ -91,6 +97,14 @@ class Bench:
         self.environ = {**SITE, **agent, "SH": str(self.base / "images"), "L": str(self.base / "logs"),
                         "HPC_NODE_TMP": str(self.node_tmp), "HPC_FLEET_MAX": "5"}  # fmt: skip
 
+    def identify_core(self, plan: Any) -> Any:
+        """Stands in for `shards.identify_core`, which runs the manifest's interpreter: the bench has no core to ask.
+        The probe itself is tested with real interpreters (`test_hpc_shards_core_identity.py`)."""
+        self.asked.append(plan)
+        if isinstance(self.core, Exception):
+            raise self.core
+        return self.core or {"known": True, "stale": False, "why": None}
+
     @property
     def fleet(self) -> Path:
         return self.base / "fleet"
@@ -101,8 +115,13 @@ class Bench:
     def fake(self, label: str) -> FakeSlurm:
         if label not in self.fakes:
             job, second = job_ids(label)
-            self.fakes[label] = FakeSlurm(job_id=job, second_id=second, ca_pem=self.cas.get(label, self.ca_pem),
-                                          node_tmp=str(self.node_tmp))  # fmt: skip
+            shared = {"nodes": list(self.pool)} if self.pool else {}
+            fake = FakeSlurm(job_id=job, second_id=second, ca_pem=self.cas.get(label, self.ca_pem),
+                             node_tmp=str(self.node_tmp), **shared)  # fmt: skip
+            for other in self.fakes.values() if self.pool else ():  # one cluster: each `squeue --me` sees the rest
+                other.peers.append(fake)
+                fake.peers.append(other)
+            self.fakes[label] = fake
         return self.fakes[label]
 
     def driver(self, label: str, layout: Path, root: Path, agent: bool) -> Any:
@@ -160,8 +179,11 @@ class Bench:
     def hooks(self, **given: Any) -> Any:
         fleet = self.deploy.fleet
         guard = self.guard or (lambda count, layout, site, environ: f"inode check: stand-in for {count}")
+        home = self.home_guard or (lambda site: "")
         operate = given.get("federation", self.federation)
-        return fleet.Hooks(federation=operate, runner=lambda label: StepRunner(self, label), inode_guard=guard)
+        return fleet.Hooks(
+            federation=operate, runner=lambda label: StepRunner(self, label), inode_guard=guard, home_guard=home
+        )
 
     def run(self, *argv: str, environ: dict | None = None, **given: Any) -> tuple[int, str]:
         """`fleet.py --fleet <fleet> ARGV`, through its own `main`: its exit status and all it printed."""
@@ -177,8 +199,10 @@ class Bench:
     def settings(self) -> Path:
         """The shard settings an operator gives plan: shards.py's keys, no [[shards]]."""
         path = self.base / "shard-settings.toml"
+        (self.base / "study").mkdir(exist_ok=True)  # the campaign fingerprint is taken on a copy of it (O63)
+        python = standin_python(self.base / "venv", real_platform=True)
         lines = [f'{key} = "{self.base / key}"' for key in ("study", "results")]
-        lines += ['python = "/usr/bin/python3"', f'core_src = "{self.base / "src"}"', f'tmpfs = "{self.node_tmp}"']
+        lines += [f'python = "{python}"', f'core_src = "{self.base / "src"}"', f'tmpfs = "{self.node_tmp}"']
         lines += ['step_path = "/usr/bin:/bin"', "cpus = 2", 'memory = "4g"']
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
@@ -197,16 +221,18 @@ def fleet_modules():
     with hpc_on_path() as hpc:
         import fedlinks
         import fleet
+        import shards
 
-        yield SimpleNamespace(hpc=hpc, fleet=fleet, fedlinks=fedlinks)
+        yield SimpleNamespace(hpc=hpc, fleet=fleet, fedlinks=fedlinks, shards=shards)
 
 
 def make_bench(deploy: Any, base: Path, ca_pem: str, patch: Any) -> Bench:
     """A bench in `base`; while `patch` lasts, the link check's transfers are stood in (`link_check_stand_in`) and
-    `hpcfed.make_driver` is the bench's."""
+    `hpcfed.make_driver` is the bench's, and so is the answer to which core the manifest's interpreter imports."""
     patch.setattr(deploy.fedlinks, "check_links", link_check_stand_in([]))
     bench = Bench(deploy, base, ca_pem)
     patch.setattr(deploy.hpc.cli, "make_driver", bench.make_driver)
+    patch.setattr(deploy.shards, "identify_core", bench.identify_core)  # the fleet asks the core of its plan
     return bench
 
 

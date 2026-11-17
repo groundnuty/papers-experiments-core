@@ -9,6 +9,9 @@ below 1024, and where the node's `/tmp` may be shared with other users. The imag
 Status: what has run live, and what has not, is in the dated facts files under `facts/` (the live-run notes
 themselves are kept privately, since they name the site). The agent's egress detection (below) has not run live.
 `hpcfed.py` ("The driver", below), which brings a whole federation up and down from a layout file, has not run live.
+The dated facts files so far: [`facts/2026-11-14-standing-1.md`](facts/2026-11-14-standing-1.md) (the first standing
+allocation) and [`facts/2026-11-16-slot-7-proxy-equivalence.md`](facts/2026-11-16-slot-7-proxy-equivalence.md) (the host
+mount against the Compose sidecar in forced proxy, with its record beside it).
 
 **This file names no site.** Everything site-specific comes from `site.env`, a local file that is never committed
 (see "Site configuration").
@@ -163,6 +166,42 @@ random administrator, then `bucket-create`.
 `tests/deploy/test_hpc_couchbase_guard.py` and `test_hpc_credentials.py` run the guard and the password rules
 against `tests/fake_couchbase.py`, a loopback stand-in with Couchbase 4.5's access rules (O53).
 
+## Two federations of one account
+
+A federation's services run with no network namespace and the guard watches Couchbase's fixed port 8091, so two
+federations of one account on one node would make the second one's Couchbase fail on its bind and its `up` fail
+(issue 398). Slurm packs jobs onto a node by cores and memory and keeps nothing apart, so `up` keeps them apart itself,
+with two read-only reads of the account's live jobs (`squeue --me`: ids, names, states and node lists, nothing else).
+A job whose name starts with `hpcop-` is a federation's: a held job (`hpcop-<project>-<random>`), an agent's own job
+(`...-sandbox`) and the bundle's own batch scripts (`hpcop-zone`, `hpcop-provider`). A job of any other name is none of
+its business, whatever it runs. It never reads or prints a node's name into a message: only roles and counts.
+
+- **Before it submits,** `up` collects the nodes of every such job (a pending job holds none yet, a completing one still
+  does) and submits every component of its held jobs, and the agent's own job under `separate`, with
+  `--exclude=<those nodes>`; the agent's sandbox never runs on a node that hosts an Onedata service, another
+  federation's included. How many it excluded is in the state (`allocation.excluded_nodes`) and in what `up` says. **Fail
+  closed:** with `squeue` unreadable, or a line of such a job that cannot be taken apart, `up` refuses before anything is
+  made and submits nothing.
+- **Once the job runs and before any step,** `up` reads them again. A node of this federation, a service's or the
+  agent's, that holds another live federation's job (two ups read before either had submitted, and Slurm placed both on
+  it) refuses `up`: its held jobs are cancelled by their ids, no step runs, and the message names the roles (`zone`,
+  `providers[i]`, `agent`), never a host. A second read that fails refuses the same way. Two ups that raced may both
+  refuse: `down`, then `up` again.
+- **Too few nodes.** The exclusion can leave Slurm no node that fits the job: it stays pending, or sbatch refuses it. `up`
+  waits no longer than its queue bound (`TIMEOUTS["queue"]`, 30 minutes), cancels the job by its id and says that it
+  excluded N nodes of other live federations; a refusal by sbatch says the same, with Slurm's own words stripped of those
+  nodes' names.
+
+In a fleet each member's `up` is its own, so each reads the members already up: with `HPC_FLEET_PARALLEL` at 1 (the
+default) every member takes nodes of its own. With more at once, two members that read before either has submitted can
+land on one node, and the later one is refused (reported as a failed member, nothing left held): bring it down and add
+another (`down --member fed-k`, `add 1`).
+
+`tests/deploy/test_hpc_distinct_nodes.py` runs both reads against the fake Slurm (a live federation's nodes excluded
+from each component and job, an unreadable `squeue` refusing, a race refused before any step with the roles named and
+the jobs released, the queue bound's reason) and a fleet of three members on one shared pool. Not run live: what the
+site's `sbatch` does when the exclusion leaves no node that fits (refuses at once, or keeps the job pending to the bound).
+
 ## The host mount's oneclient: a relocatable bundle
 
 A mount run on a batch node (O60, `expcore_onedata.sandbox.apptainer.hostmount`) runs oneclient on the node, outside
@@ -225,6 +264,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `B` | the bundle on a filesystem the nodes see (`<shared_root>/hpc-federation/bundle`), `chmod -R go-w` |
 | `SH` | a 0700 directory for the two rootfs tarballs, each with its `.provenance` (SHA-256): single files only (`<scratch_root>/hpcop-images`) |
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
+| `HPC_GATEPORT`, `HPC_GATEPORT_SHA256` | optional: the 443 mapper (`bundle/gateport.c`, built for the agent's SIF) and its SHA-256, read only for a template that names it (`layouts/pilot-shape-rest.toml`); both or neither |
 | `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's interpreter and venv, the pinned clone, the frozen manifests and its data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it. `up` also digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
@@ -288,6 +328,46 @@ contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   descriptor, so a path swapped afterwards is never followed. A link inside a directory is removed, never followed.
   The bind lives only in the provider's container, so the teardown's removal of its work directory never reaches the
   storage on scratch: only `down` removes it, after the provider has stopped.
+
+## The account's home, and its guard
+
+The cluster account's home is small (a quota of files and of bytes) and shared by every agent of the account, so what a
+checkout, a venv or a slot directory leaves in it counts against everyone's work: a full home breaks every agent of the
+account at once. **A site should set the two keys below**, so that `up` reads the home before it submits anything.
+`DESIGN.md`, section 11, is the full contract; the keys are in `site.env`, and they do not depend on a scratch root:
+
+| Key | What |
+|---|---|
+| `HPC_HOME_QUOTA_CMD` | the site's command that prints the home's usage and limits (`<quota tool> --home <home>`; a site's own script may print them, and the home need not be on the filesystem the scratch quota tool reads), split as a shell would split it and **run without a shell** on the login node |
+| `HPC_HOME_QUOTA_PATTERN` | a regular expression with the named groups `files_used`, `files_limit`, `bytes_used` and `bytes_limit` that reads its output and matches **exactly once**, each figure captured whole. Capture the limit that **binds**: some tools print a soft column that reads 0 beside the hard limit, and a soft figure of 0 is refused as no limit. `files (?P<files_used>[0-9,]+) \(soft [0-9,]+; hard (?P<files_limit>[0-9,]+)\); bytes (?P<bytes_used>[0-9,]+) \(soft [0-9,]+; hard (?P<bytes_limit>[0-9,]+)\)` reads an invented line; you write it for the real output, which this repository never holds |
+| `HPC_HOME_QUOTA_CHECK` | `off` (its only value) skips the check and `up` says so; unset is not off |
+
+- **`up` checks before it submits anything:** it runs the command (bounded at 120 s), reads the four figures and
+  **refuses when the used files or the used bytes pass 95% of their limit** (`used > limit * 95 // 100`, in integers: a
+  figure exactly at the line passes), naming each figure that is past, its limit and the line. The bytes are compared with
+  their own limit, so any unit works as long as the used figure and the limit are in the same one; a figure the pattern cut
+  out of a longer one (`2G`, `1000.5`) is refused, like the inode guard's.
+- **It fails closed.** With either key set, a command or pattern that is not set (a half-set check), a pattern that does
+  not compile or lacks one of the four groups, a command that cannot run, exits non-zero or does not answer, an output
+  the pattern does not match exactly once, a figure that is no whole count and a limit of 0 all refuse `up`, naming why.
+  With **neither** key set there is no check, and `up` says nothing of the home: the keys are optional, which is why a
+  site should set them.
+- **It names figures only.** A home quota tool's stderr and command line name the user and the home's path, so a
+  refusal repeats neither: a failed command is named by its exit status alone. The three keys are not recorded in the
+  state file; `down` needs none of them.
+- **The fleet reads the home once** for all its federations, at `up` and at `add`, before its directory, a slot or a job
+  exists (each federation's own `up` then reads it again, as it reads its inode estimate again).
+
+**Who owns what.** The federation operator owns the `site.env` every `up` reads and fills every pin in it. A study
+supplies its agent image; the operator supplies what is built for that image or for the nodes. Each file is declared
+with its SHA-256, which `up` checks (below, "The agent's sandbox").
+
+| Keys | Supplied by | What |
+|---|---|---|
+| `HPC_AGENT_SIF`, `HPC_AGENT_SIF_SHA256` | the study | the agent's SIF and its SHA-256, in an owner-only (0700) directory under the images path `site.env.example` defines (`<shared_root>/images`), not in `SH`, which holds the rootfs tarballs alone |
+| `HPC_EGRESS_SHIM`, `HPC_EGRESS_SHIM_SHA256` | the operator | the egress shim (`bundle/egresslog.c`) built for that image, and its SHA-256 |
+| `HPC_ONECLIENT_BUNDLE`, `HPC_ONECLIENT_BUNDLE_SHA256` | the operator | the tar `oneclient_bundle.py` builds, and its SHA-256 |
+| `HPC_AGENT_WORK_ROOT` | the operator | the agent's work root on its node's tmpfs |
 
 ## A shared imported tree
 
@@ -488,7 +568,16 @@ section 3).
 - **The agent's sandbox** (O63): the pilot's template declares the Apptainer sandbox, whose limits size the agent's
   node (an 8-core, 17 GiB step), and names the site's values as placeholders `up` fills from `site.env`:
   `HPC_AGENT_SIF`, `HPC_EGRESS_SHIM` and `HPC_ONECLIENT_BUNDLE` (the mount level's oneclient, O65) with their
-  `..._SHA256`, and `HPC_AGENT_WORK_ROOT` (`site.env.example`). A pin
+  `..._SHA256`, and `HPC_AGENT_WORK_ROOT` (`site.env.example`). **A REST arm** (#384) is
+  the layout `layouts/pilot-shape-rest.toml`: the pilot's, but for its own template, which adds the three things a REST
+  level needs and nothing else (a test reads both and refuses any other difference): `[sandbox] content_check_file`
+  (the study space's `hello.txt`, which the layout's own baseline writes at `up`), a REST level beside the mount level
+  in `[sandbox.data_paths]`, and the cell's 443 mapper (`bundle/gateport.c`, built for the agent's SIF) as the one
+  `[sandbox.apptainer] preload`, pinned like the other files: it is `@hpc_gateport@` with `@hpc_gateport_sha@`, filled
+  from `HPC_GATEPORT` and `HPC_GATEPORT_SHA256`, two optional keys that only a template naming them reads. The pilot's
+  template names neither, so a layout with no REST level needs no mapper, and a site that declares one has it read for
+  the REST layout alone. `fleet.py` refuses the REST layout as it does the pilot's (its agent's node is a
+  component of the services' job). A pin
   is a declaration: `up` reads each file and refuses, before the cluster is touched, a variable not set, a file
   missing or one whose SHA-256 is not the one declared, naming the variable and never the path. The egress collector
   is the bundle's own, hashed from this checkout. The rendered file's pins are in the campaign fingerprint
@@ -501,8 +590,8 @@ section 3).
   else: `version` (`expcore-render-identity/1`), `template_sha256` (the template as the renderer read it, before it was
   rendered), `platform_fingerprint_sha256` (the canonical JSON of the rendered file's `PlatformConfig.fingerprint()`,
   hashed as the core hashes a fingerprint) and, for each pin the rendered platform holds, the SHA-256 `up` filled in and
-  checked: `sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256` and `oneclient_bundle_sha256`; and,
-  when `site.env` declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256` (the next bullet). A pin the template
+  checked: `sandbox_sif_sha256`, `egress_shim_sha256`, `egress_collector_sha256`, `oneclient_bundle_sha256` and, for
+  the REST layout, `gateport_sha256`; and, when `site.env` declares `HPC_STUDY_ARTIFACTS`, `study_artifacts_tree_sha256` (the next bullet). A pin the template
   does not name, and the digest of a site that declares no directory, are not in the record, and no entry is ever
   empty. It holds no address, id, job, node, path, user or secret. Two federations rendered from one template, with the same pins and the same data (every space
   declaring its `data_manifest`, as above), have byte-equal records; a changed pin changes its own entry and the
@@ -555,7 +644,13 @@ section 3).
   map `up` writes into the root), writes its baseline, `facts.json` and
   `platform.toml` and its render identity (`render-identity.json`), and runs the platform layer's link check, which
   writes `link-check.json` in the root; last, when
-  the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
+  the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat. The providers are launched
+  1 s apart, and a service whose step ended before its log said anything is launched **once more**, after a 60 s backoff counted from the
+  step's own End (`launch_retry_backoff_s`: providers that failed together wait one backoff in all) and only when sacct shows
+  that exact step as `CANCELLED` with exit `0:116`, srun's client log shows its task launch failing for want of an
+  address, and its run log is empty (zero bytes, read again after the wait): the live failure of 17 Nov, where srun could not find the
+  nodes' addresses. The retry and its proofs are recorded in the state file and printed; a second failure fails `up` as before
+  (`DESIGN.md`, section 5, "A launch that failed at launch").
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, removes the
   recorded work directory of a service whose step it had to cancel (a cancel was an outright kill on the site, which
   left 2 to 2.6 GB per service), checks each node
@@ -595,6 +690,10 @@ over the same work directory, `exec.sh` beside a running service, and every stop
 stop_seconds` is to be set) are the live slot's. The agent's node's step (M5) is not built here. A layout with a shared
 import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
 
+## An observed read of the services (`hpcobserve.py`)
+
+`python -I -B hpcobserve.py --root <root>` prints one JSON line (`expcore-hpc-observe/1`) for the zone and each provider the state file lists: whether the service's step runs, its start, its end and its exit, as Slurm shows them now, by the step's EXACT id (`hpcslurm.Slurm.step_observed`: `squeue -s` and `sacct`; an id neither listed nor recorded, or the two disagreeing, is unknown with the reason, never running). The state file names the step to start from (`services.<n>.step`, `launch`, `stops`); a service whose step name is listed under another id than the state's is read as the listed one (`state_differs`). **Slurm's accounting trails a stop.** The driver confirms a stop once `squeue -s` no longer lists the step; `sacct` follows seconds later, and a read in between finds the step neither listed nor recorded as ended. When the state says the step was stopped (`state` `stopped`, the last recorded stop confirmed, the step the one of its `launch`) and the two commands do not yet agree that it ended (`hpcslurm.accounting_behind`), the read waits, polling every 2 s, for every such service at once, up to `--accounting-wait-s` (default 60 s, at most 300, 0 for none), and each service records the seconds it waited (`accounting_wait_s_used`). At the bound the service reads `unknown` with the reason `accounting_lag`: never running, never stopped by assumption. It never waits for a service the state does not say was stopped, for a step `squeue` lists under another id than the state's, or for a command that failed. `expcore_onedata.fedwatch.watch_for(..., accounting_wait_s=)` passes the bound as this option, so the copy run on the login node must be of this version: an older one exits 2 on the option. It runs where Slurm's client commands answer, the login node, and does nothing but `squeue` and `sacct`: it changes no job, no step and no file, takes no lock, and prints no node, address or path. `expcore_onedata.fedwatch` runs it for a study's post-check and adds each service's own `/configuration` answer and the cross-check against the fault journal and the state's recorded stops (O86; `docs/interfaces.md`, "The platform layer's read of the federation's own services"). The `status` verb is not used: it launches a control step and may record state.
+
 ## The scripts
 
 | Script | Where | Purpose |
@@ -618,7 +717,7 @@ import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs
 | `egresslog.c` | agent's cell | the agent's egress shim: logs each destination, never a payload |
 | `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
 | `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, its snapshots, the archives the merge takes |
-| `nodefacts.py` | control step | a node's FQDN, its IPv4 address, and the job's uid and gid, as JSON (`hpcfed.py up`) |
+| `nodefacts.py` | control step | a node's FQDN, its IPv4 address, the job's uid and gid, and its OS release, glibc and kernel as `readings` (O87; recorded, never refused), as JSON (`hpcfed.py up`) |
 | `leftovers.py` | control step | how many work directories of ours of one kind the node's tmpfs holds, as JSON (`hpcfed.py down`, for a service whose step ended before naming one) |
 | `zone-export.sh` | control step on the zone's node | the zone's passphrase or the Onedata test CA on stdout, for the federation's root (`hpcfed.py up`) |
 | `gateport.c` | agent's cell | the connect-side mapper: a TCP connect to 127.0.0.1:443 goes to the gate's port; nothing else is touched |
@@ -641,14 +740,84 @@ paths and stays out of the repository (the script's docstring has its form). Out
 login node's fault relay (M4), which `up`
 starts.
 
-> **A bare copy of the core without `.git` is refused as `core_src`.** The core names itself by its commit in every
-> campaign's environment (`provenance.core_identity`), read from the git work tree its `src/` lies in, or from the build
-> record of a wheel made from one. A copy of the core's files without `.git` (a tarball, an `rsync` that leaves `.git`
-> out, a `git archive`) has no commit to name: its identity is unknown, and `expcore run`, `check`, `merge` and `analyze`
-> refuse to start on a core whose commit is unknown, with or without the allow-dirty option, so every shard step on it
-> stops at its start with "the core's commit is unknown". Point `core_src` at the `src/` of a `git clone` (or install a
-> wheel built from one into the interpreter's environment), and commit what you run: a checkout with uncommitted changes
-> is refused too unless the command allows dirt, and a campaign run so records the core dirty.
+**Copy the shards' results back and verify them: required, after `collect` and before `down`.** Nothing durable may live only
+on the cluster's scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all of scratch after 20 days with no job submitted (take your site's own limits; these are the ones this
+step was written against). The cluster cannot push to your host, so you pull. Run `collect` once every step has ended
+(a journal still being written is listed as `collect` read it). It writes `archives.sha256.json` in `<results>` and
+prints that file's SHA-256 on stderr, after the merge line; keep that line. From your own host, pull the whole results
+directory and check it:
+
+```bash
+rsync -a <login node>:<results>/ <local dir>/    # or scp -r: the whole directory, with its subdirectories
+python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha256.json <local dir> \
+    --manifest-sha256 <the hash collect printed>
+```
+
+**What the required pull covers.** For each shard, exactly what the manifest lists, which `verify-copy` checks:
+
+| in `<results>` | what it is | why it must be in the pull |
+|---|---|---|
+| `<label>.out.tar` | the shard's `out/`, which the merge reads | the results |
+| `<label>.out.json` | the archive's manifest (its SHA-256, the exit status, the post-run record) | what the archive is |
+| `<label>/journals/*` (every file) | a spend journal per step (`expcore run --spend-journal`) | what a step killed outright spent, which `--resume` counts as `lost_in_kill`: nowhere else |
+| `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one, and `collect --run` refuses |
+
+Every other snapshot is resume material and **not part of the required pull.** A snapshot names the archive its step
+started from (`shards.py`, `_run_step`: `facts = {"shard": spec, "base": base}`), and `--resume` restores the newest one
+only if it names the shard's current archive (`restore_newest`: `facts.get("base") != base` returns none). The snapshots
+of the step that wrote an archive name an earlier archive or none, and the last of them was taken before the archive was
+written, so the verified archive holds all they do. (Also not required: `<label>/running.json` and the manifest's `*.part`
+drafts.) Pulling the whole directory, as above, brings them anyway; `verify-copy` does not check them.
+
+**A snapshot newer than the archive stops `collect --run`.** A step resumed from the archive and killed before it
+archived leaves runs only in its snapshot, and the merge would leave them out. Plain `collect` warns (naming the shard
+and the snapshot), lists the snapshot for the pull and prints the merge line, so you can pull first. `collect --run`
+refuses before any merge (exit 2, nothing written): resume the shard so that its runs reach a new archive, or run
+`collect` without `--run` and run the merge line it prints yourself, knowing they are left out. `merge` has no flag to
+leave a shard short, so there is none to pass.
+
+`verify-copy` uses the standard library alone (Python 3.11 or later), so it runs on a host where the core is not
+installed: take `shards.py` from a checkout. It exits 0 only when the manifest is the file whose hash `collect` printed
+(a manifest pulled with the archives proves nothing about itself, so the hash is required) and every file it names is in
+the directory, as a regular file under plain directories, with its size and SHA-256. It exits 1 naming each file that is
+missing, not a regular file, cut short or changed (name and reason, never a path), and 2 for a manifest it cannot use,
+among them a manifest with no list of the files beside the archives (an earlier tip's: it checked the archives alone).
+A file in the directory that the manifest does not name (an `*.out.tar` or `*.out.json`, or a journal in a shard's
+`journals/`: a step that ran after `collect`) is a warning. **Do not run `down` until it exits 0**: `down` cannot see
+your host and does not check that you did.
+
+> **The core on the shared filesystem is a git checkout, or a wheel built with its build identity (C06).** The core
+> names itself by its commit in every campaign's environment (`provenance.core_identity`), read from the git work tree
+> its `src/` lies in, or from `expcore/_build_identity.json`, which the build (`hatch_build.py`, under `uv build` or
+> `hatch build`) writes into a wheel from the checkout it builds from. A copy of the core's files with neither (a
+> `git archive`, a tarball, an `rsync` that leaves `.git` out) has no commit to name: its identity is unknown, and
+> `expcore run`, `check`, `merge` and `analyze` refuse to start on it, with or without the allow-dirty option. Set the
+> core up one of two ways:
+>
+> - **A checkout:** `git clone` the core's repository to a directory the nodes see, check out the commit to pin, make
+>   the interpreter's environment from it (`uv sync`, or `uv venv` and `uv pip install --editable .`), and give
+>   `core_src` as the checkout's `src/`. Commit what you run: a checkout with uncommitted changes is refused too unless
+>   the command allows dirt, and a campaign run so records the core dirty.
+> - **A wheel:** build it from a checkout of that commit (`uv build --wheel`), install it into the interpreter's
+>   environment (`uv pip install --python <venv>/bin/python <wheel>`), and give `core_src` as that environment's
+>   `site-packages` directory.
+>
+> `shards.py plan` and `lines` ask the manifest's `python` which core it imports, and `step` reads its own, before
+> anything is made: an unknown or stale core (an installed one edited since its build) is refused there, naming this
+> remedy. Before, a shard on a `git archive` reached its node, started, and stopped there with "the core's commit is
+> unknown".
+
+**One campaign fingerprint before any line (O63).** A campaign's fingerprint holds the platform settings that shape a
+run, which each federation's `platform.toml` renders: the faults sanction and targets, the placement bounds, the data
+identity, the sandbox's pins. Shards on federations that render different ones pin different fingerprints, and the core's
+`merge` refuses them only after the shards have run. `shards.py plan` and `lines` therefore take each shard's campaign
+fingerprint first, as `resume-line` does (the manifest's Python, `-I -B`, on a private copy of the study with that
+federation's `platform.toml` beside it, as the step places it; `shardresume.check_one_campaign`), and print nothing
+unless they are all one. A refusal names each shard that differs from the largest group of equal shards by its label and
+the first differing top-level key of the fingerprint (`platform` for a setting of the platform file, the usual one),
+never a host, a path or a value, so the fix is to compare those federations' files; a federation whose `platform.toml`
+cannot be read, or whose fingerprint cannot be taken, is refused by its label too, with the program's status and none
+of its output. It costs one start of the manifest's Python per shard.
 
 **What the step leaves on the node (O63).** When the federation's `platform.toml` declares the Apptainer sandbox, the
 step makes its `work_root` (0700) before the dispatcher and refuses one that is a link, another user's, open to others
@@ -849,6 +1018,8 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" plan --manifest <sh
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" status
 uv run python -I deploy/hpc-federation/shards.py collect --manifest "$F/shards.toml" --into <a new directory> --run
+# REQUIRED before down: pull the manifest's `results` directory (archives, journals and the rest, as listed in the
+# section on a shard's archive) to your own host and run verify-copy with the hash collect printed
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
 ```
 
@@ -858,8 +1029,10 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   core's own (`hpcquota`, mandatory with `HPC_STORAGE_ROOT`: an override, an unset command or a quota that cannot be read
   refuses the fleet as it refuses one `up`), asked once for all N by the fleet: the account's usage against N times one
   federation's estimate (each federation's own `up` then checks its own estimate again, as it always does). Without a scratch root nothing is on scratch, and the fleet says it made no check.
-  `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once. The maximum is one fleet's: two fleets of
-  one account share the grant by hand.
+  The account's home guard (`hpcquota.home_guard`, the section "The account's home, and its guard") is read once too, ahead of the inode guard, whenever the site sets its keys: a home past 95% of its files or bytes refuses the fleet's `up` and `add` before anything is made.
+  `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once; with more than one, two members' ups can
+  race for a node ("Two federations of one account"). The maximum is one fleet's: two fleets of one account share the
+  grant by hand.
 - **What `up` makes.** The fleet's directory (new: never adopted), and federations `fed-1` ... `fed-N`, each its own
   root `<fleet>/fed-k/root`, state file and held job, each brought up by `hpcfed.py up` in a process of its own (its
   output in `<fleet>/logs/fed-k.up.log`). The fleet's record, `<fleet>/fleet.json`, holds each one's root, its job's
@@ -873,11 +1046,16 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   their shards would never merge. It names each federation and the differing keys. **A federation whose layout has an
   ingested space** (the pilot's `delta-space`) is planned only once its data is verified: run `hpcfed.py --layout L
   --root <fleet>/fed-k/root verify-data` on each, after the study's ingest and before `plan` (the fleet has no verb
-  for it); until then `plan` refuses it, naming the space.
+  for it); until then `plan` refuses it, naming the space. **The study's own fingerprint is checked too (O63):** the
+  platform fingerprint above is the platform's half, and a study's plugin may fingerprint a setting that half leaves
+  out, so `plan` also takes the campaign fingerprint beside each assigned shard's `platform.toml`, as `shards.py plan`
+  does, and refuses before it assigns or writes anything unless they are all one.
+  It also refuses a manifest whose `python` imports a core that names no code (unknown or stale: the note above), before anything is recorded.
 - **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never
   starts in the directory you ran it from), its client recorded and its output in `<fleet>/logs/`, after checking the
-  federation again, that `shards.toml` is the one the record gives, and that Slurm still holds the job the line lands
-  in, running, under the name its federation's `up` gave it (Slurm reuses ids). A shard is not launched again while its
+  federation again, that `shards.toml` is the one the record gives, that the manifest's `python` still imports a core
+  that names its code, and that Slurm still holds the job the line lands in, running, under the name its federation's
+  `up` gave it (Slurm reuses ids). A shard is not launched again while its
   client runs; one whose step ended is relaunched only with `--shard L --resume`. A shard refused exits 1. A site that
   needs `HPC_STEP_NETWORK` gives it to each federation's own steps (`hpcfed`); a shard's step, on the agent's own job of
   one component, carries none.
@@ -922,6 +1100,11 @@ not make. `test_hpc_storage_bind.py` and `test_hpc_posix_storage.py` run the bin
 directory and, without the key, word for word as before; the node's checks and refusals; the service's argv with the bind
 and without; two platform fingerprints for a tmpfs and a scratch federation, differing in the storage kind alone; and the
 data check reading the storage on scratch.
+`tests/deploy/test_hpc_home_guard.py` and `test_hpc_fleet_home_guard.py` run the account's home guard (O57) over the
+same fake Slurm and a real `Runner` against a small script, with an invented command and format: files and bytes under,
+at and one past the 95% line, every way the home can fail to be read (a limit of 0 included), messages that hold
+figures and never the tool's stderr or command line, the override, a site with no key, the keys not recorded in the
+state file, and the fleet reading the home once at `up` and at `add`, ahead of the inode guard.
 `tests/deploy/test_hpc_oneclient_bundle.py` builds the oneclient bundle
 from invented images against a fake Docker (O65): the closure inside the image, the scratch container's discipline, a
 reproducible tar and the self-check's refusals. The bundle's wider offline suite reads files copied out of the two pinned images
