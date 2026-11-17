@@ -77,6 +77,9 @@ class Bench:
     alive: set = field(default_factory=set)
     guard: Any = None  # the inode guard's stand-in: (count, layout, site, environ) -> its words
     real: Any = None  # hpcfed.make_driver as the module has it, before the bench patches it
+    core: Any = None  # what the manifest's interpreter says of its core (`shards.identify_core`'s report), or the
+    # error it raises; a core with a known commit that is not stale until a test says otherwise
+    asked: list = field(default_factory=list)  # the plan of each time the core was asked
 
     def __post_init__(self) -> None:
         self.real = self.deploy.hpc.cli.make_driver
@@ -90,6 +93,14 @@ class Bench:
         agent = agent_site(self.base / "agent", work_root=self.node_tmp / "agent-work")
         self.environ = {**SITE, **agent, "SH": str(self.base / "images"), "L": str(self.base / "logs"),
                         "HPC_NODE_TMP": str(self.node_tmp), "HPC_FLEET_MAX": "5"}  # fmt: skip
+
+    def identify_core(self, plan: Any) -> Any:
+        """Stands in for `shards.identify_core`, which runs the manifest's interpreter: the bench has no core to ask.
+        The probe itself is tested with real interpreters (`test_hpc_shards_core_identity.py`)."""
+        self.asked.append(plan)
+        if isinstance(self.core, Exception):
+            raise self.core
+        return self.core or {"known": True, "stale": False, "why": None}
 
     @property
     def fleet(self) -> Path:
@@ -180,16 +191,18 @@ def fleet_modules():
     with hpc_on_path() as hpc:
         import fedlinks
         import fleet
+        import shards
 
-        yield SimpleNamespace(hpc=hpc, fleet=fleet, fedlinks=fedlinks)
+        yield SimpleNamespace(hpc=hpc, fleet=fleet, fedlinks=fedlinks, shards=shards)
 
 
 def make_bench(deploy: Any, base: Path, ca_pem: str, patch: Any) -> Bench:
     """A bench in `base`; while `patch` lasts, the link check's transfers are stood in (`link_check_stand_in`) and
-    `hpcfed.make_driver` is the bench's."""
+    `hpcfed.make_driver` is the bench's, and so is the answer to which core the manifest's interpreter imports."""
     patch.setattr(deploy.fedlinks, "check_links", link_check_stand_in([]))
     bench = Bench(deploy, base, ca_pem)
     patch.setattr(deploy.hpc.cli, "make_driver", bench.make_driver)
+    patch.setattr(deploy.shards, "identify_core", bench.identify_core)  # the fleet asks the core of its plan
     return bench
 
 
