@@ -2,7 +2,9 @@
 
 A failure raises `RestError` with the method, the path as the caller labelled it, the status and Onedata's error id,
 never a body, a header or a URL with an id in it, since an answer can hold a token. Proxies from the environment are
-ignored: the federation is on the host's loopback.
+ignored: the federation is on the host's loopback. A federation whose services' names resolve nowhere (the HPC
+federation's, O70) gives `Rest` its address map: each such name is then dialled at its mapped address, with the name in
+the URL, the handshake, the certificate check and `Host`.
 """
 
 import base64
@@ -13,6 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+from expcore_onedata.addresses import AddressMap
+from expcore_onedata.client import MappedTransport
 
 ZONE_API = "/api/v3/onezone"
 PROVIDER_API = "/api/v3/oneprovider"
@@ -55,9 +60,13 @@ def _error_id(response: httpx.Response) -> str | None:
 class Rest:
     """Calls to the federation's services by their base URL."""
 
-    def __init__(self, ca_file: Path, timeout_s: float = 60.0) -> None:
+    def __init__(self, ca_file: Path, timeout_s: float = 60.0, addresses: AddressMap | None = None) -> None:
         context = ssl.create_default_context(cafile=str(ca_file))
-        self._http = httpx.Client(verify=context, timeout=timeout_s, trust_env=False)
+        if addresses is None:
+            self._http = httpx.Client(verify=context, timeout=timeout_s, trust_env=False)
+        else:
+            transport = MappedTransport(addresses, verify=context)
+            self._http = httpx.Client(transport=transport, timeout=timeout_s, trust_env=False)
 
     def close(self) -> None:
         self._http.close()

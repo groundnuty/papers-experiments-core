@@ -53,6 +53,9 @@ user_id = "..."                 # the id Onezone gives the user: its privileges,
 ca_file = "federation-ca.pem"   # a CA bundle the federation's certificate chains to; verification stays on
 insecure_tls = true             # or: verification off, for a disposable test federation only; never both
 
+[addresses]                     # optional: where each declared name is dialled, when the names resolve nowhere (O70)
+file = "secrets/address-map.json"  # a private file (mode 0600, yours, no link), relative to this one (addresses.py)
+
 [toolserver]
 command = "path/to/executable"
 args = []
@@ -102,6 +105,7 @@ from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.platform_loads import record_platform_load
+from expcore_onedata.addresses import AddressMap, load_addresses
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.linksettings import LinkCheckSettings, load_link_check
 from expcore_onedata.rights import declares_qos, declares_write, rights_problem
@@ -226,6 +230,9 @@ class PlatformConfig:
     tls: TlsSettings = field(default_factory=TlsSettings)  # every client's one certificate check (`[tls]`)
     spaces_table: bool = False  # the spaces came from [[spaces]], one entry or several, not from [space]/[support]
     link_check: LinkCheckSettings | None = None  # the pre-campaign link check's probe space and bounds (O35)
+    # where each declared name is dialled (`[addresses]`, O70): None dials every URL's host as written. Never in a
+    # record, the fingerprint or a message, and never shown: it holds the nodes' addresses and names.
+    addresses: AddressMap | None = field(default=None, repr=False, compare=False)
 
     @property
     def probe_space(self) -> Space | None:
@@ -584,6 +591,7 @@ def load_platform(
             "slots",  # read by users.load_slots
             "faults",  # read by faults.load_faults
             "link_check",  # read by linksettings.load_link_check, below
+            "addresses",  # read below: where each declared name is dialled (O70)
         )
     )
     zone = root.section("zone")
@@ -620,4 +628,7 @@ def load_platform(
         sha256=digest,
         tls=tls,
         link_check=load_link_check(root, providers, spaces),
+        addresses=load_addresses(Section(root.table("addresses"), file, "[addresses]"), file.parent)
+        if "addresses" in root.data
+        else None,
     )
