@@ -20,9 +20,11 @@ from expcore_onedata.addresses import AddressMap, AddressMapError
 @pytest.fixture(scope="module")
 def hpc():
     with hpc_on_path() as modules:
+        import fedlinks
+        import hpcdata
         import hpcnames
 
-        modules.names = hpcnames
+        modules.fedlinks, modules.data, modules.names = fedlinks, hpcdata, hpcnames
         yield modules
 
 
