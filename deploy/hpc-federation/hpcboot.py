@@ -71,7 +71,7 @@ from fedspec import Service, Space, Spec
 from fedtools import check_rendered, require_study_artifacts
 from hpcsettings import DEFAULT_STEP_LAUNCH_WAIT_S, VERB_WORK_S
 
-from expcore_onedata.addresses import AddressMap
+from expcore_onedata.addresses import AddressMap, AddressMapError
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
 from expcore_onedata.importmanifest import Manifest
 
@@ -358,13 +358,49 @@ def direct_storages_value(layout: Layout, boot: Bootstrap, environ: Mapping[str,
     return "{" + ", ".join(f"{json.dumps(key)} = {json.dumps(path)}" for key, path in mapping.items()) + "}"
 
 
+def declares_names(layout: Layout) -> bool:
+    """Whether the layout's services are reached by their declared names (O73): `hpc_spec` (`placed_layout`'s) makes
+    each an `HpcService`, whose URL carries the name, which resolves nowhere on the site. The services of a Compose
+    layout are at loopback ports, and it declares no name to dial."""
+    return any(isinstance(service, HpcService) for service in layout.spec.services)
+
+
+def root_address_map(layout: Layout) -> AddressMap:
+    """The address map the root holds (`up` writes it before any service is launched), or an `AddressMapError` naming
+    the file by its place in the root: it is missing, or it cannot be used and the map's own reason says why. Never a
+    declared name, an address or a path of the host."""
+    shown = layout.address_map.relative_to(layout.root).as_posix()
+    why = (
+        "every service of this federation is at a name that resolves nowhere, so the login node's client could reach "
+        "none without it (`up` writes it before it launches any service)"
+    )
+    try:
+        return AddressMap.load(layout.address_map)
+    except AddressMapError as error:
+        if not os.path.lexists(layout.address_map):
+            raise AddressMapError(f"{shown} is missing: {why}") from None
+        raise AddressMapError(f"{shown} cannot be used ({error}): {why}") from None
+
+
+def service_client(layout: Layout, rest: Callable[..., Any]) -> Any:
+    """The one constructor of the login node's REST client of the federation's services (O73): the core phase's and
+    `verify-data`'s alike, so neither can reach a service by name only. On a layout of declared names every URL carries
+    a name that resolves nowhere, so the client is given the root's address map (`addresses`) and its absence or an
+    unusable one is refused (`AddressMapError`), never answered with a client that has none. A layout that declares no
+    name (a Compose one) is at loopback ports and gets the client with none. `tests/deploy/test_rest_constructors.py`
+    fails on a client of the services built anywhere else that is not listed with its reason."""
+    if not declares_names(layout):
+        return rest(layout.ca_pem)
+    return rest(layout.ca_pem, addresses=root_address_map(layout))
+
+
 def core_phase(
     layout: Layout,
     owner: Tuple[int, int],
     values: Mapping[str, str],
     *,
     environ: Optional[Mapping[str, str]] = None,
-    rest: Callable[[Path], Any] = Rest,
+    rest: Callable[..., Any] = Rest,
     bootstrap: Callable[[Any, Layout, Tuple[int, int]], Bootstrap] = HpcBootstrap,
     steps: Callable[[Bootstrap], None] = bring_up,
     content: Callable[[Bootstrap], Any] = Content,
@@ -382,8 +418,7 @@ def core_phase(
     if not passphrase.is_file() or not layout.ca_pem.is_file():
         raise RuntimeError("the root holds no zone passphrase or no CA: the zone's export did not run")
     env = os.environ if environ is None else environ
-    addresses = AddressMap.load(layout.address_map) if layout.address_map.is_file() else None
-    client = rest(layout.ca_pem) if addresses is None else rest(layout.ca_pem, addresses=addresses)
+    client = service_client(layout, rest)
     try:
         boot = bootstrap(client, layout, owner)
         steps(boot)
@@ -458,21 +493,23 @@ def verify_ingested(
     owner: Tuple[int, int],
     manifests: Mapping[str, Manifest],
     *,
-    rest: Callable[[Path], Any] = Rest,
+    rest: Callable[..., Any] = Rest,
     bootstrap: Callable[[Any, Layout, Tuple[int, int]], Bootstrap] = HpcBootstrap,
     data: Callable[[Bootstrap], Callable[[str], Any]] = hpcdata.content_reader,
 ) -> Dict[str, str]:
     """Read each ingested space back through its owner and compare it with its manifest (O57): what makes each other
     than the manifest, in counts alone (empty for one that is exactly it), never a path. A fresh process holds none of
     the ids the bootstrap made, so the spaces' ids are read from facts.json, which `up` wrote; the services' addresses
-    are the placed layout's. `rest`, `bootstrap` and `data` are the core phase's own, for a stand-in."""
+    are the placed layout's, dialled through the root's address map as the core phase's are (`service_client`, O73:
+    every service's URL carries its declared name, which resolves nowhere on the site, so a root with no usable map is
+    refused). `rest`, `bootstrap` and `data` are the core phase's own, for a stand-in."""
     try:
         recorded = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]
         ids = {name: space["id"] for name, space in recorded.items()}
     except (OSError, ValueError, KeyError, TypeError) as error:
         why = type(error).__name__
         raise RuntimeError(f"{layout.facts.name} cannot be read as the facts up writes ({why})") from None
-    client = rest(layout.ca_pem)
+    client = service_client(layout, rest)
     try:
         boot = bootstrap(client, layout, owner)
         boot.ids.spaces.update(ids)

@@ -9,7 +9,7 @@ import tomllib
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import address_values, data_stand_in, hpc_on_path, manifest_values, pin_values, put_address_map
+from hpc_fed_support import address_values, data_stand_in, hpc_on_path, manifest_values, pin_values, write_address_map
 from hpc_import_support import (
     IMPORT_LAYOUT,
     IMPORT_TEMPLATE,
@@ -161,7 +161,6 @@ def core_root(hpc, tmp_path, make_ca, layout_file):
 
     root = tmp_path / "root"
     (root / "secrets" / "users").mkdir(parents=True)
-    put_address_map(root)  # `up` writes it before the core's phase
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(make_ca(tmp_path / "ca").ca.read_bytes())
     spec = fedspec.load_spec(layout_file)
@@ -171,7 +170,9 @@ def core_root(hpc, tmp_path, make_ca, layout_file):
         (root / name).write_text(value, encoding="utf-8")
         os.chmod(root / name, 0o600)
     hosts = {s.name: f"{s.name}.cluster.example.org" for s in spec.services}
-    return root, fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
+    layout = fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
+    write_address_map(layout)  # `up` leaves one in a root of declared names
+    return root, layout
 
 
 def boot_of(layout, storages=None):

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from fingerprint_support import standin_python
-from hpc_fed_support import LAYOUT, data_stand_in, hpc_on_path, pin_values, put_address_map
+from hpc_fed_support import LAYOUT, data_stand_in, hpc_on_path, pin_values, write_address_map
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
 from expcore_onedata.config import load_platform
@@ -46,7 +46,6 @@ def core(hpc, root: Path, label: str, ca: bytes, data=None) -> str:
     import fedspec
 
     (root / "secrets" / "users").mkdir(parents=True)
-    put_address_map(root)  # `up` writes it before the core's phase
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(ca)
     (root / "fault-journal").mkdir()
@@ -55,6 +54,7 @@ def core(hpc, root: Path, label: str, ca: bytes, data=None) -> str:
     spec = fedspec.load_spec(LAYOUT)
     hosts = {s.name: f"{s.name}.cluster.example.org" for s in spec.services}
     layout = fedlayout.Layout(root, root.parent, hpc.boot.hpc_spec(spec, hosts))
+    write_address_map(layout)  # `up` leaves one in a root of declared names
     values = {**hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, root), **pin_values(root.parent / "pins")}
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(hpc.fedlinks, "check_links", link_check_stand_in([]))

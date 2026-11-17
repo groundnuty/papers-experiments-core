@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
 
-from expcore_onedata.addresses import AddressMap
+from expcore_onedata.addresses import AddressMap, AddressMapError
 from expcore_onedata.config import load_platform
 
 PROVIDERS = ["aspen", "larch", "rowan", "alder", "hazel"]
@@ -271,15 +271,17 @@ def _run(hpc, phase, *, with_map, layout=None, **more):
 
 
 def test_o73_the_core_s_rest_client_is_given_the_map_when_the_root_holds_one(hpc, phase):
-    """O73: the bootstrap's client dials each declared name at its address; a root without a map (a Compose one) builds
-    its client as it always has."""
+    """O73: the bootstrap's client dials each declared name at its address; a root that holds no map is refused, naming
+    it, before any client is made (`service_client`: with every service at a name that resolves nowhere, a client
+    with none would reach no service)."""
     built, _ = _run(hpc, phase, with_map=True)
     (kwargs,) = built
     assert isinstance(kwargs["addresses"], AddressMap)
     assert kwargs["addresses"].address_of(ZONE_NAME) == ADDRESS["zone"]
     phase.layout.address_map.unlink()
-    built, _ = _run(hpc, phase, with_map=False, layout=without_slot(phase))
-    assert built == [{}]
+    with pytest.raises(AddressMapError, match=r"secrets/address-map\.json is missing"):
+        _run(hpc, phase, with_map=False)
+    assert len(built) == 1
 
 
 def test_o73_the_platform_file_names_the_map_and_loads_with_declared_urls(hpc, phase, monkeypatch):
@@ -309,15 +311,26 @@ def test_o73_the_platform_file_names_the_map_and_loads_with_declared_urls(hpc, p
     assert config.zone.url == f"https://{ZONE_NAME}:8443"
 
 
-def test_o73_a_root_without_a_map_renders_a_template_without_the_slot_as_before(hpc, phase):
-    """O73: no `addresses` line without a map, for a template that has no slot."""
+def test_o73_a_root_of_a_layout_with_no_declared_names_renders_the_platform_file_as_before(hpc, phase):
+    """O73: a layout whose services are at loopback ports (the Compose federation's) has no map, and its platform file
+    has no `addresses` line (its template has no slot for one: only the HPC templates carry it)."""
+    import fedlayout
+    import fedspec
+
+    phase.layout = fedlayout.Layout(phase.root, phase.tmp, fedspec.load_spec(LAYOUT))
     _run(hpc, phase, with_map=False, layout=without_slot(phase))
+    assert not phase.layout.address_map.exists()
     assert "addresses" not in (phase.root / "platform.toml").read_text(encoding="utf-8")
 
 
 def test_o73_a_root_without_a_map_refuses_a_template_that_names_the_slot(hpc, phase):
-    """O73: the core's phase finds no map where the template's slot needs one: refused, naming the slot, with no
-    platform.toml written."""
+    """O73: the render finds no map where the template's slot needs one: refused, naming the slot, with no platform.toml
+    written. A layout of declared names never gets that far (`service_client` refuses its root first); this one declares
+    none, as the Compose federation's, so the HPC template's slot is what refuses."""
+    import fedlayout
+    import fedspec
+
+    phase.layout = fedlayout.Layout(phase.root, phase.tmp, fedspec.load_spec(LAYOUT))
     with pytest.raises(RuntimeError, match=r"@hpc_addresses@"):
         _run(hpc, phase, with_map=False)
     assert not (phase.root / "platform.toml").exists()

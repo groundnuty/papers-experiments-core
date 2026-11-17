@@ -21,7 +21,7 @@ from hpc_fed_support import (
     data_stand_in,
     hpc_on_path,
     pin_values,
-    put_address_map,
+    write_address_map,
 )
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
@@ -747,7 +747,6 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
 
     root = tmp_path / "root"
     (root / "secrets" / "users").mkdir(parents=True)
-    put_address_map(root)  # `up` writes it before the core's phase
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(make_ca(tmp_path / "ca").ca.read_bytes())
     spec = fedspec.load_spec(LAYOUT)
@@ -758,6 +757,7 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
         os.chmod(root / name, 0o600)
     hosts = {s.name: f"{s.name}.cluster.example.org" for s in spec.services}
     layout = fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
+    write_address_map(layout)  # `up` leaves one in a root of declared names
     ids = SimpleNamespace(
         admin="uid-admin",
         providers={p.name: f"pid-{p.name}" for p in spec.providers},

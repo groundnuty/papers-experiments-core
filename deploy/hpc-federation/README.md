@@ -492,7 +492,7 @@ node the names are reached through the address map `up` writes into the root (`s
 which `platform.toml` names through its template's own line, `addresses = @hpc_addresses@` (a slot like `@hpc_root@`:
 the render is the template with its slots filled, and adds no line; the slot is the whole inline table `{ file, resolver }`
 and the line stands before the template's first table; `up` refuses a template without it before it submits anything,
-and the render refuses the slot where the root holds no map); see `DESIGN.md`, "The registered names". The first sandbox slot on a federation brought up
+and the render refuses the slot where the root holds no map); see `DESIGN.md`, "The registered names". Every login-side client of the services is built by `hpcboot.service_client`, which refuses a root with no usable map rather than build a client that could reach no name, and `tests/deploy/test_rest_constructors.py` fails on any other construction that is not listed with its reason. The first sandbox slot on a federation brought up
 this way is owed the checks of `DESIGN.md` section 9, item 7.
 
 ## Slots and the tool server (O83)

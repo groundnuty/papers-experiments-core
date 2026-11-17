@@ -28,8 +28,8 @@ from hpc_fed_support import (
     agent_site,
     data_stand_in,
     hpc_on_path,
-    put_address_map,
     services_only,
+    write_address_map,
 )
 from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
@@ -111,7 +111,6 @@ def render(
     import hpcpins
 
     (root / "secrets" / "users").mkdir(parents=True)
-    put_address_map(root)  # `up` writes it before the core's phase
     root.chmod(0o700)  # as `up` makes it
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(ca)
@@ -121,6 +120,7 @@ def render(
     spec = fedspec.load_spec(layout)
     hosts = {s.name: f"{s.name}.{label}.cluster.example.org" for s in spec.services}
     federation = fedlayout.Layout(root, root.parent, hpc.boot.hpc_spec(spec, hosts))
+    write_address_map(federation)  # `up` leaves one in a root of declared names
     site = {
         **SITE,
         **agent_site(root.parent / "pins", sif=sif, work_root=work_root, gateport=gateport),
