@@ -152,10 +152,10 @@ def test_o31_a_tool_the_table_does_not_know_is_not_judged_and_keeps_a_write_righ
 
 
 def test_o31_the_refusal_names_the_position_of_the_condition_and_never_its_name(tmp_path):
-    """O12 and O31: a condition is known by `conditions[i]` in a message, as in every other refusal."""
+    """O31: a condition is known by `conditions[i]` in a message, as in every other refusal."""
 
     def edit(data):
-        data["toolserver"]["conditions"]["9-hidden-name"] = {
+        data["toolserver"]["conditions"]["hidden-name"] = {
             "allow": ["schedule_file_replication"],
             "rights": list(BASELINE),
             "manifest": data["toolserver"]["conditions"]["read"]["manifest"],
@@ -163,7 +163,7 @@ def test_o31_the_refusal_names_the_position_of_the_condition_and_never_its_name(
 
     with pytest.raises(ConfigError, match=r"conditions\[2\]") as caught:
         load_platform(write_platform(tmp_path, edit), require_secrets=False)
-    assert "9-hidden-name" not in str(caught.value)
+    assert "hidden-name" not in str(caught.value)
 
 
 def test_o31_the_default_test_world_still_loads(tmp_path):
