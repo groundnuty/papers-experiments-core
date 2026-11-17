@@ -22,7 +22,7 @@ Nothing here reaches a cluster, a container or a model. The kill is timed by hol
 finds a run ended since the last one. The second attempt is held over the first look, on every run of the module, so
 that look takes a snapshot with that attempt in flight, which the kill must not follow; the fixture accepts the snapshot
 of the next look, which holds the first two attempts ended and the held third in flight. The kill comes within seconds
-of it, and the module checks that it is still the newest. Those two looks are why the module takes about two minutes.
+of it, and the module checks that it is still the newest. Those two looks are why the module takes about a minute and a half.
 """
 
 import contextlib
@@ -67,7 +67,7 @@ from expcore_onedata.config import load_platform
 __all__ = ["clean_environment"]  # a fixture the stages below use, imported from the support module
 
 pytestmark = [
-    pytest.mark.benchmark,  # two minutes of wall time: the step's own snapshot thread looks every 30 s
+    pytest.mark.benchmark,  # a minute and a half of wall time: the step's snapshot thread looks every 30 s
     pytest.mark.skipif(not HAS_OPENSSL, reason="the zone's CA is made with openssl"),
 ]
 
