@@ -295,7 +295,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import tomllib
 
@@ -1009,6 +1009,26 @@ def _measured(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
+def _open_plain(path: Path, label: str) -> BinaryIO:
+    """`path` opened for reading as a regular file and nothing else, as evidence is: a link is never followed
+    (`O_NOFOLLOW`), a pipe is never waited on (`O_NONBLOCK`) and what was opened must be a regular file.
+    `ShardsError` naming the shard otherwise; an absent file is `FileNotFoundError`, as `open` says it."""
+    not_plain = ShardsError(f"shard {label}: {path.name} is not a regular file: a link is never followed")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.EMLINK):  # a link (EMLINK where the system says it so)
+            raise not_plain from None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise not_plain
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _write_whole(path: Path, write: Callable[[Path], None]) -> None:
     """Write `path` through a draft beside it, fsynced and renamed: a reader sees the old file or the whole new one."""
     draft = path.with_name(path.name + ".part")
@@ -1079,10 +1099,13 @@ def archive(
 def verified(results: Path, shard: Shard, scratch: Path) -> tuple[Path, dict[str, Any]]:
     """A shard's archive, as a private copy in `scratch` whose bytes are the ones hashed, and its manifest, shown to be
     this shard's and whole; `ShardsError` naming the label otherwise. The copy, never the original, is what is
-    unpacked, so an archive replaced after its check is never taken for the one checked."""
+    unpacked, so an archive replaced after its check is never taken for the one checked. The archive and its manifest
+    are read as regular files and never through a link (`_open_plain`): a link among the evidence refuses, as
+    `evidence_entries` says, since a pull that keeps links could not reproduce it."""
     tar_path, json_path = results / f"{shard.label}.out.tar", results / f"{shard.label}.out.json"
     try:
-        manifest = json.loads(json_path.read_text(encoding="utf-8"))
+        with _open_plain(json_path, shard.label) as handle:
+            manifest = json.loads(handle.read().decode("utf-8"))
     except (OSError, ValueError):
         raise ShardsError(f"shard {shard.label}: no readable manifest of its out/") from None
     spec = manifest.get("shard") if isinstance(manifest, Mapping) else None
@@ -1097,7 +1120,7 @@ def verified(results: Path, shard: Shard, scratch: Path) -> tuple[Path, dict[str
     copy = scratch / f".{shard.label}.out.tar"
     digest = hashlib.sha256()
     try:
-        with open(tar_path, "rb") as source, open(copy, "xb") as target:
+        with _open_plain(tar_path, shard.label) as source, open(copy, "xb") as target:
             while chunk := source.read(CHUNK):
                 digest.update(chunk)
                 target.write(chunk)
@@ -1264,7 +1287,8 @@ def evidence_entries(
     ahead: list[tuple[str, str]] = []
     for shard, (_, manifest) in zip(plan.shards, found, strict=True):
         try:
-            own = (plan.results / f"{shard.label}.out.json").read_bytes()
+            with _open_plain(plan.results / f"{shard.label}.out.json", shard.label) as handle:
+                own = handle.read()
             try:
                 named = json.loads(own).get("sha256")
             except (ValueError, AttributeError):
