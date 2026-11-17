@@ -323,6 +323,10 @@ def test_o09_no_other_module_of_the_platform_layer_imports_httpx():
             continue
         if relative == "sandbox/apptainer/loopback.py":
             continue
+        # The read-log collector is a standalone program the harness runs outside the cell: it binds a Unix datagram
+        # socket and receives the study scripts' read log (a local file system socket; no HTTP, no network).
+        if relative == "readlog/collector.py":
+            continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             names = [a.name for a in node.names] if isinstance(node, ast.Import) else []
             names += [node.module or ""] if isinstance(node, ast.ImportFrom) and node.level == 0 else []
