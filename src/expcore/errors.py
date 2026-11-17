@@ -426,6 +426,12 @@ class InfraError(RuntimeError):
         self.diagnostic = diagnostic
         self.origin: dict[str, str] | None = None
 
+    def note_origin(self, phase: str, instrument: str) -> None:
+        """Say which instrument's `phase` raised this error, unless an earlier call already did (C40). Reads `origin`
+        with a default, so a subclass that skips this class's initialiser is named too."""
+        if getattr(self, "origin", None) is None:
+            self.origin = {"phase": phase, "instrument": instrument}
+
 
 class CallTimedOut(InfraError):
     """A tool call outlasted its `timeout_s` without the tool server answering it (L16): infrastructure of kind

@@ -96,8 +96,7 @@ def start_instruments(instruments: Sequence[Instrument], identity: Mapping[str, 
         try:
             instrument.start(identity)
         except InfraError as error:  # the same error goes on; it now says which instrument's start it came from (C40)
-            if getattr(error, "origin", None) is None:
-                error.origin = {"phase": "start", "instrument": instrument.namespace}
+            error.note_origin("start", instrument.namespace)
             raise
 
 

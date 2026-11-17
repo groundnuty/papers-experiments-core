@@ -118,6 +118,29 @@ def test_c40_a_redaction_that_raises_is_recorded_as_failed_and_costs_nothing():
     assert kept == {"phase": "start", "instrument": "state_inducer", "ok": False, "error": "RuntimeError"}
 
 
+def test_c40_an_infra_error_subclass_that_skips_the_base_initialiser_is_still_named_and_kept():
+    """C40: reading `origin` and `diagnostic` with a default, a subclass whose own initialiser never calls the base one
+    gives `snapshot_of` an error it can keep, and `start_instruments` an error it can name; nothing raises."""
+
+    class Odd(InfraError):
+        def __init__(self):
+            RuntimeError.__init__(self, "odd")
+
+    class Starter:
+        namespace = "state_inducer"
+
+        def start(self, identity):
+            raise Odd()
+
+        def finish(self):
+            return {}
+
+    with pytest.raises(Odd) as caught:
+        start_instruments([Starter()], {"run_key": "r"})
+    assert snapshot_of(caught.value, plain()) == {"phase": "start", "instrument": "state_inducer"}
+    assert snapshot_of(Odd(), plain()) is None
+
+
 # --- the attempt's result, its marker and its row -------------------------------------------------------------------
 
 
