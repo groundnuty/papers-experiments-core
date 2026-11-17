@@ -184,11 +184,11 @@ def test_o58_a_listing_that_fails_once_is_looked_at_again_and_the_answer_is_stil
 
 
 def test_o58_a_real_relay_process_answers_a_real_client_through_the_listing(tmp_path):
-    """O58: a relay started as `up` starts it (its own process, `-m expcore_onedata.fault_relay serve`) runs a verb
-    through a real prefix (a script that prints a status) and answers a `RelayClient` in this process by its files. On
-    a local file system, where no negative entry exists, this proves the whole round trip over the listing: the
-    request's handoff, the run, the answer's integrity checks and the cleanup of both files (the cache itself is
-    modelled by the tests above)."""
+    """O58 (guard): a relay started as `up` starts it (its own process, `-m expcore_onedata.fault_relay serve`) runs a
+    verb through a real prefix (a script that prints a status) and answers a `RelayClient` in this process by its
+    files. On a local file system, where no negative entry exists, this proves the whole round trip over the listing
+    (the request's handoff, the run, the answer's integrity checks, the cleanup of both files) and passes on the
+    path-polling client too; the cache itself is modelled by the tests above."""
     root, log = root_of(tmp_path), tmp_path / "relay.log"
     verb = tmp_path / "verb.py"
     verb.write_text(

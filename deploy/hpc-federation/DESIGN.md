@@ -435,8 +435,9 @@ file system, and a compute node's NFS client keeps a negative entry for a name i
 missing, failing every later lookup of it until the directory's attributes expire (30 s by default). The client
 therefore never looks the answer's path up while waiting: on every poll (0.5 s) it lists `answers/` with
 `os.scandir`, whose `opendir` revalidates the directory, and reads `<id>.json` only once the listing shows that
-exact name. A relayed verb then costs its own time and at most one poll; polling the path had cost about 30 s
-on every verb, measured live. The relay lists `requests/` the same way; a login-node wait (`up`'s for the
+exact name. The file system then adds at most one poll to a relayed verb's time, which is the verb's own plus
+the wait for any request issued before it (the relay runs one at a time, in order); polling the path had cost
+about 30 s on every verb, measured live. The relay lists `requests/` the same way; a login-node wait (`up`'s for the
 heartbeat, `stop`'s for it to go) runs on the host that writes the file and is no such poll.
 
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
