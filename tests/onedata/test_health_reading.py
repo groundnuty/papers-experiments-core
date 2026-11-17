@@ -19,6 +19,7 @@ from expcore.campaign.healthgate import GO, HealthGate
 from expcore_onedata.admission import run_admission
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_journal import InjectionJournal
+from expcore_onedata.fault_owner import in_progress_of
 from expcore_onedata.faults import load_faults
 from expcore_onedata.federation import ReportedProvider, SpaceView
 from expcore_onedata.health import compare
@@ -28,6 +29,7 @@ from expcore_onedata.healthreading import (
     HealthReading,
     SpaceReading,
     noted_reading,
+    own_injections,
     own_targets,
     read_space,
     target_only,
@@ -144,6 +146,9 @@ def test_o90_a_reading_round_trips_through_its_json_and_refuses_any_malformed_on
         {**good, "spaces": "x"},
         {**good, "targets": "providers[1]"},
         {**good, "targets": ["a name"]},
+        {**good, "held": "providers[1]"},
+        {**good, "held": ["providers[9]"]},
+        {key: value for key, value in good.items() if key != "held"},
         {**good, "spaces": [{"position": "spaces[0]", "read": "yes", "offline": []}]},
         {**good, "spaces": [{"position": "spaces[0]", "read": False, "offline": [TARGET]}]},
         {**good, "spaces": [{"position": "a space", "read": True, "offline": []}]},
@@ -352,6 +357,7 @@ def test_o90_a_run_whose_target_is_back_and_everything_online_reads_true(tmp_pat
         reading = world.health.reading
     assert verdict.ok is True
     assert reading.targets == {TARGET}
+    assert reading.held == frozenset()  # restored: nothing is held down any more
     assert target_only(reading) is True
 
 
@@ -592,3 +598,182 @@ def test_o90_the_gates_post_run_check_of_a_run_whose_restore_failed_reads_nothin
     assert answer.detail.startswith("the restore of providers[1]")
     assert reading == UNREAD
     assert target_only(reading) is None
+
+
+# --- the pilot's order: the run's check inside its own open injection, the restore after ---------------------------
+
+
+def inside_injection(tmp_path, world, *, extra=None, report_offline=True, down_names=()):
+    """The pilot's executor reads health inside the injection and restores after: the run's pre-run check, its
+    exclusive admission, the injector started (its entry open), then the post-run check through the gate; `extra` is
+    given the journal and the attempt's own token while the injection is open (to put another's lines there), and
+    `down_names` go down with the target. Return the answer, the try's reading and the entries open at the check."""
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    store, _, _ = planned_store(campaign)
+    clock = iter(f"2026-01-01T00:{minute:02d}:00Z" for minute in range(1, 60))
+    gate = HealthGate(store, world.health, lambda: next(clock))
+    gate.load()
+    injector = injector_for(world.platform, FakeServices())
+    admit = run_admission(world.config)
+    journal = InjectionJournal(load_faults(world.platform, world.config).journal)
+    with prerun.opened(), liveness.running("camp-a", 5):
+        assert gate.before_run("run-a", attempt=1).verdict == GO
+        with admit(("provider_outage",), {"provider_outage": TARGET}, threading.Event(), False):
+            injector.start(RUN)
+            if report_offline:
+                down(world.fake, "beta", *down_names)
+            if extra is not None:
+                extra(journal, liveness.current())
+            answer, _ = gate.after_run("run-a", attempt=1, attempt_id=5)
+            reading = noted_reading()
+            opened = journal.open_entries()
+            for entry in opened:  # whoever's: the test's journal is left settled
+                if entry["id"] != next(item["id"] for item in opened if item["target"] == TARGET):
+                    journal.append({"event": "cleared", "id": entry["id"]})
+            assert injector.finish()["ok"] is True  # the restore, after the reading
+    return answer, reading, opened
+
+
+def test_o90_inside_its_own_injection_the_runs_check_compares_every_space_and_reads_target_only(tmp_path, fake):
+    """O90: the run's own injection is open when its post-run check runs under its own admission, as in the pilot's
+    order. The fault gate does not answer "unsettled" for it: every space is compared as usual, the text is the first
+    failing space's, and the reading marks the target as held by the run's own injection: target-only."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, opened = inside_injection(tmp_path, world)
+    assert [entry["target"] for entry in opened] == [TARGET]
+    assert answer.detail == "spaces[1]: declared provider(s) reported offline: providers[1]"
+    assert reading.targets == {TARGET}
+    assert reading.held == {TARGET}
+    assert target_only(reading) is True
+
+
+def test_o90_inside_its_own_injection_a_target_still_reported_online_is_a_pass_and_held(tmp_path, fake):
+    """O90: Onezone has not yet seen the target go down: every space compares clean, the check passes, and the reading
+    still says the target is held by the run's own injection."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, _ = inside_injection(tmp_path, world, report_offline=False)
+    assert answer.ok is True
+    assert reading.held == {TARGET}
+    assert target_only(reading) is True
+
+
+def test_o90_inside_its_own_injection_a_second_down_provider_is_not_target_only(tmp_path, fake):
+    """O90: the own injection explains the target and nothing else: providers[2] offline too is a wider outage."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, _ = inside_injection(tmp_path, world, down_names=("gamma",))
+    assert answer.detail == "spaces[0]: declared provider(s) reported offline: providers[2]"
+    assert reading.held == {TARGET}
+    assert target_only(reading) is False
+
+
+def test_o90_another_attempts_open_injection_is_unsettled_and_never_target_only(tmp_path, fake):
+    """O90: an open injection another attempt left is still an unsettled injection under this run's admission, never
+    explained by the run's own: the fault gate answers it, uncharged, before any space is read."""
+
+    def another(journal, _):
+        injection(journal, "other", OTHER, ANOTHER, closed=False)
+
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, _ = inside_injection(tmp_path, world, extra=another)
+    assert answer.detail.startswith("an injection of providers[2] is unsettled")
+    assert answer.charge is False
+    assert reading == UNREAD
+    assert target_only(reading) is None
+
+
+def test_o90_an_open_line_with_no_owner_explains_nothing(tmp_path, fake):
+    """O90: an ownerless journal line is no one's: it is not the run's own, so the check answers it as unsettled, and
+    charged as before (an owner is never guessed)."""
+
+    def ownerless(journal, _):
+        journal.append({"event": "injecting", "id": "none", "target": OTHER, "service": "svc"})
+        journal.append({"event": "stopping", "id": "none"})
+        journal.append({"event": "injected", "id": "none"})
+
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, _ = inside_injection(tmp_path, world, extra=ownerless)
+    assert answer.detail.startswith("an injection of providers[2] is unsettled")
+    assert answer.charge is True
+    assert reading == UNREAD
+
+
+def never_seen_down(journal, mine):
+    """An entry of the run's own whose stop was asked for but the target was never seen down."""
+    journal.append({"event": "injecting", "id": "x", "target": OTHER, "service": "svc", "owner": mine})
+    journal.append({"event": "stopping", "id": "x"})
+
+
+def a_heals_restart(journal, mine):
+    """A container restart a heal made, which names this attempt as its owner."""
+    injection(journal, "h", OTHER, mine, closed=False, heal=True)
+
+
+@pytest.mark.parametrize("extra", [never_seen_down, a_heals_restart], ids=["never-seen-down", "a-heals-restart"])
+def test_o90_a_second_own_entry_that_is_not_in_progress_is_still_unsettled(tmp_path, fake, extra):
+    """O90: of the run's own entries only an injection it holds down is explained: one never seen down, and one with
+    a heal's mark, are answered as unsettled beside it."""
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, _ = inside_injection(tmp_path, world, extra=extra)
+    assert answer.detail.startswith("an injection of providers[2] is unsettled")
+    assert reading == UNREAD
+
+
+def test_o90_the_runs_own_failed_restore_is_still_unsettled_under_its_admission(tmp_path, fake):
+    """O90: an own entry whose restore failed (`clear_failed`) is no injection in progress: its failed restore is
+    answered, charged to the run."""
+
+    def failed_restore(journal, _):
+        key = next(entry["id"] for entry in journal.open_entries() if entry["target"] == TARGET)
+        journal.append({"event": "clear_failed", "id": key, "how": "not_serving"})
+
+    world = four_spaces(tmp_path, fake, faults={})
+    answer, reading, _ = inside_injection(tmp_path, world, extra=failed_restore)
+    assert answer.detail.startswith("the restore of providers[1] (not_serving) failed")
+    assert answer.charge is True
+    assert reading == UNREAD
+
+
+@pytest.mark.parametrize(
+    ("entry", "explained"),
+    [
+        ({"injected": True, "owner": ATTEMPT}, True),
+        ({"injected": False, "owner": ATTEMPT}, False),
+        ({"injected": True, "owner": ANOTHER}, False),
+        ({"injected": True, "owner": {"process": ATTEMPT["process"]}}, False),
+        ({"injected": True}, False),
+        ({"injected": True, "owner": ATTEMPT, "clear_failed": "not_serving"}, False),
+        ({"injected": True, "owner": ATTEMPT, "heal": True}, False),
+        ({"owner": ATTEMPT}, False),
+    ],
+    ids=["own", "not-seen-down", "another", "process-alone", "ownerless", "failed-restore", "heal", "no-injected-flag"],
+)
+def test_o90_only_an_own_injection_seen_down_with_no_failed_restore_is_in_progress(entry, explained):
+    """O90: the one predicate the fault gate explains an open entry by."""
+    assert in_progress_of(entry, ATTEMPT) is explained
+
+
+def test_o90_no_attempt_explains_no_entry():
+    """O90: a check that judges no attempt explains none, whoever's the entry is."""
+    entry = {"injected": True, "owner": ATTEMPT}
+    assert in_progress_of(entry, None) is False
+    assert in_progress_of(entry, {"process": ATTEMPT["process"]}) is False
+
+
+def test_o90_the_held_targets_are_the_own_ones_still_open(tmp_path):
+    """O90: of the run's own targets, those with no `cleared` line are held by its injection."""
+    journal = journal_of(tmp_path)
+    injection(journal, "a", TARGET, ATTEMPT, closed=False)
+    injection(journal, "b", OTHER, ATTEMPT)
+    injection(journal, "c", "providers[3]", ANOTHER, closed=False)
+    found = own_injections(journal, ATTEMPT)
+    assert (found.targets, found.held) == ({TARGET, OTHER}, {TARGET})
+    assert own_targets(journal, ATTEMPT) == found.targets
+
+
+def test_o90_a_held_target_that_is_no_target_of_the_run_is_refused():
+    """O90: a reading cannot hold down a provider the run did not take down."""
+    with pytest.raises(ValueError, match="held"):
+        HealthReading(targets=frozenset({TARGET}), held=frozenset({OTHER}))
+    with pytest.raises(ValueError, match="held"):
+        HealthReading(targets=None, held=frozenset({TARGET}))
