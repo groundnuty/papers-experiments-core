@@ -1,10 +1,13 @@
 # Provenance: new
-"""What a run records of the node it ran on beyond the bounds of `facts.py`: its OS release, glibc and kernel (O87).
+"""What a run records of the machine it ran on: its OS release, glibc and kernel (O87).
 
-A study's agent runs code from an image on whatever node a batch job lands on, and the C library, the kernel and the
-distribution of that node decide what a preloaded shim or a bundled binary can load (a node whose glibc is newer than
-the image's refuses the shim). A reader of a run's record wants to know which node it was, so each run's
-`infrastructure_facts` carries `node`, and `tool_server_host` when the tool server's host differs from the node:
+A study's agent runs code from an image on whatever machine a batch job or a Docker engine lands on, and the C
+library, the kernel and the distribution of that machine decide what a preloaded shim or a bundled binary can load (a
+node whose glibc is newer than the image's refuses the shim). A reader of a run's record wants to know which machine it
+was, so each run's `infrastructure_facts` carries `node`, on the Apptainer backend (the batch node) and on Docker (the
+host that runs the agent's container, the driver's own machine, as `host.kernel` is), in one shape and under one name so
+that a comparison of two shards reads one place; the Apptainer backend adds `tool_server_host` when the tool server's
+host differs from the node:
 
     {"os": {"id": "rocky", "version_id": "9.4"}, "glibc": "glibc 2.34", "kernel": "5.14.0-427.el9.x86_64"}
 

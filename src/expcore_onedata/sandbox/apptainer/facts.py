@@ -15,10 +15,10 @@ data on (`tmpfs` or `shared_filesystem`), which the HPC driver declares in `[san
 the list of keys, only for a platform that declares it, so a Compose federation's runs and an older platform's keep
 their record.
 
-Two more entries are readings of the node, made at each run's start (`hostfacts.py`, O87): `node`, the OS release's ID
-and VERSION_ID, the glibc version and the kernel release of the agent's node, and `tool_server_host`, the same of the
-tool server's host, only when that differs from the node's. They are recorded and never refused: a reading that cannot
-be made is `unknown`, with its reason beside it.
+Two more entries are readings of the node, made at each run's start (`sandbox/hostfacts.py`, O87): `node`, the OS
+release's ID and VERSION_ID, the glibc version and the kernel release of the agent's node, and `tool_server_host`,
+the same of the tool server's host, only when that differs from the node's. They are recorded and never refused: a
+reading that cannot be made is `unknown`, with its reason beside it. A Docker run records the same `node`.
 """
 
 from __future__ import annotations

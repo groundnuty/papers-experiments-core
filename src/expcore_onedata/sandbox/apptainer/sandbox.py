@@ -57,7 +57,7 @@ from expcore.egress import Declaration, declaration
 from expcore_onedata import tls as TLS
 from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import deadline as DL
-from expcore_onedata.sandbox import gatelog, gatepolicy, inputs, kinds, tokenfiles
+from expcore_onedata.sandbox import gatelog, gatepolicy, hostfacts, inputs, kinds, tokenfiles
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
     DataPathMode,
@@ -69,7 +69,7 @@ from expcore_onedata.sandbox.api import (
     StartRefused,
 )
 from expcore_onedata.sandbox.apptainer import argv as AV
-from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, hostfacts, layout, loopback, runs
+from expcore_onedata.sandbox.apptainer import facts, gaterun, helpers, layout, loopback, runs
 from expcore_onedata.sandbox.apptainer.cells import AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.infra import InfraCheck

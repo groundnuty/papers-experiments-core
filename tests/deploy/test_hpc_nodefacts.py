@@ -1,6 +1,6 @@
 """O87: the node's facts step of the HPC federation driver (`bundle/nodefacts.py`: stdlib only, Python 3.9, run with -I
 on the node) also reads the node's OS release, glibc version and kernel release, as text, never executed, and gives
-`unknown` with a reason for one it cannot read. The sandbox's own reader (`sandbox/apptainer/hostfacts.py`) reads the
+`unknown` with a reason for one it cannot read. The sandbox's own reader (`sandbox/hostfacts.py`) reads the
 same three: the two must agree on every input, since a reader compares the runs' records with the state's."""
 
 import importlib.util
@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from hpc_fed_support import hpc_on_path
 
-from expcore_onedata.sandbox.apptainer import hostfacts
+from expcore_onedata.sandbox import hostfacts
 
 BUNDLE = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "bundle"
 GLIBC = "glibc 2.34"

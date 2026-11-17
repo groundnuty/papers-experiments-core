@@ -65,6 +65,7 @@ from expcore_onedata.sandbox import (
     directio,
     gatelog,
     gatepolicy,
+    hostfacts,
     hostops,
     inputs,
     iomode,
@@ -354,6 +355,8 @@ class DockerSandbox:
         self._input_copies = self._snapshot_inputs()  # copied and hashed before any container exists
         self._started = time.time()
         self._meta.update(host=self.host.host_facts(), started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        # O87: the host's OS release, glibc and kernel where an Apptainer run keeps its node's; recorded, never refused
+        self._meta["infrastructure_facts"] = {"node": hostfacts.of_node(lambda: self.host.host_readings())}
         work = self.dir / "work"
         self._note_mount(work)  # registered before the mount (unmounting what never got mounted is harmless)
         self.host.make_quota_dir(self.dir / "work.img", work, s.limits.work_disk_bytes, s.agent_uid)

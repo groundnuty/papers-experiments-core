@@ -8,7 +8,7 @@ refused: one that cannot be made is "unknown", and `unknown` maps its name to wh
 shape, or the type of the exception, never its message or a path). The os-release file is read as text and never
 executed. No secret, and nothing is written.
 
-The readings are the sandbox's own (`expcore_onedata.sandbox.apptainer.hostfacts`, which the tests hold to the same
+The readings are the sandbox's own (`expcore_onedata.sandbox.hostfacts`, which the tests hold to the same
 answers) in a copy of their own: this step runs on a node's own Python with `-I` and nothing of the core imported.
 
 Usage: nodefacts.py

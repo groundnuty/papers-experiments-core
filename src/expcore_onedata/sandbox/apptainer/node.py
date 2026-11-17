@@ -24,9 +24,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from expcore_onedata.sandbox import hostfacts
 from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.api import SandboxError
-from expcore_onedata.sandbox.apptainer import hostfacts, loopback
+from expcore_onedata.sandbox.apptainer import loopback
 from expcore_onedata.sandbox.apptainer import procs as P
 from expcore_onedata.sandbox.hostops import CmdResult, DockerHost, mounts_under, run_bounded
 

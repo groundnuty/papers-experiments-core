@@ -9,7 +9,7 @@ import pytest
 from apptainer_support import make_settings, make_spec, start
 from fake_node import READINGS, FakeNode
 
-from expcore_onedata.sandbox.apptainer import hostfacts
+from expcore_onedata.sandbox import hostfacts
 from expcore_onedata.sandbox.apptainer.node import LocalNode
 
 GLIBC = "glibc 2.34"

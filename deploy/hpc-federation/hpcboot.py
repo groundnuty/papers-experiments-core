@@ -344,7 +344,7 @@ def load_readings(found: Any) -> Dict[str, Any]:
     """A node's OS release, glibc version and kernel release as its facts step printed them (O87), rebuilt from the
     known keys, each a plain string or "unknown" beside its reason. Recorded and never refused: a step that printed
     none (an older bundle's), or anything of another shape, is unknown for that reason. The shape is
-    `expcore_onedata.sandbox.apptainer.hostfacts.checked`'s, which the tests hold this to."""
+    `expcore_onedata.sandbox.hostfacts.checked`'s, which the tests hold this to."""
     if not isinstance(found, Mapping):
         return _unknown_readings("the step gave none" if found is None else "not a mapping")
     os_part, reasons = found.get("os"), found.get("unknown", {})
