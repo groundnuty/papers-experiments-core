@@ -225,7 +225,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `B` | the bundle on a filesystem the nodes see (`<shared_root>/hpc-federation/bundle`), `chmod -R go-w` |
 | `SH` | a 0700 directory for the two rootfs tarballs, each with its `.provenance` (SHA-256): single files only (`<scratch_root>/hpcop-images`) |
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
-| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's clone and venv, its manifests), an absolute path with no `..`, on a filesystem the login node sees (`<shared_root>/studies/<study>/artifacts`). `up` digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
+| `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's venv, clone and data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it. `up` also digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository. The optional keys of the driver, the agent's sandbox and the study's artifacts are in `site.env.example`; the four of the next
@@ -254,8 +254,10 @@ contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   lacks a group, a command that cannot run, fails or does not answer in 120 s, an output the pattern does not match exactly
   once, a figure that is no count (`unlimited` is none) or that the pattern cut out of a longer one (`1000.5`, `2G`: the
   pattern must capture the whole figure) and a quota of 0 all refuse `up`, naming why; nothing turns the check off.
-  For the ingest layout the estimate is a handful (its spaces declare no data);
-  for `layouts/pilot-shape-import.toml` it is the four imported manifests.
+  For the ingest layout the estimate is a handful until its ingested space declares the manifest of the study's data
+  (`data_manifest`): that manifest is counted too (the pilot's largest space is 15,340 files), through the site's
+  `HPC_STUDY_ARTIFACTS`, and a fleet counts it once for each of its federations; for `layouts/pilot-shape-import.toml`
+  it is the four imported manifests.
 - **`up` then makes the federation's storage:** below `HPC_STORAGE_ROOT`, one directory of its own named for its allocation
   (0700) and one per provider, each by an exclusive `mkdir` that never adopts what is already there and each holding an
   owner marker, recorded in the state file before the first is made, and in each provider's, beside its marker, the
@@ -390,6 +392,7 @@ set -a; . deploy/hpc-federation/site.env; set +a
 uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
   --root <a directory on a filesystem the login node and the nodes see> describe   # the plan and what it bills
 uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> up
+uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> verify-data   # after the study's ingest
 uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> down
 ```
 
@@ -427,7 +430,8 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   is the bundle's own, hashed from this checkout. The rendered file's pins are in the campaign fingerprint
   (`sandbox_backend`), no path is. Every path `up` renders into the root is absolute (`@hpc_root@`), so a copy of the
   file (the one a shard step places beside a study) reads the root's secrets, CA and journal.
-- **The data each space holds** (C06, O63): every template's `[[spaces]]` entry names its `data_manifest`. A shared import's is the manifest its layout names; every other space's is written by `up` into `<root>/data-manifests/` from its baseline, the same for every federation of a layout. Before the link check `up` reads every space back through its owner (directories, sizes, bytes; a shared import by `verify_imports`) and fails, naming the space, when it is not exactly its manifest. So shards on two federations of one layout record one campaign fingerprint (each space by its declared identity and its data, never its Onezone id), and `shards.py plan` refuses federations whose platform files leave a space's data undeclared.
+- **The data each space holds** (C06, O63, O57): every template's `[[spaces]]` entry names its `data_manifest`. A shared import's is the manifest its layout names; a baseline space's is written by `up` into `<root>/data-manifests/` from its baseline, the same for every federation of a layout; an ingested space's is the one it declares (below). Before the link check `up` reads every baseline space back through its owner (directories, sizes, bytes; a shared import by `verify_imports`) and fails, naming the space, when it is not exactly its manifest. So shards on two federations of one layout record one campaign fingerprint (each space by its declared identity and its data, never its Onezone id), and `shards.py plan` refuses federations whose platform files leave a space's data undeclared.
+- **An ingested space** is one whose data is the study's own, put there after `up`: `baseline = false`, no `import`, and its `@data_manifest.<space>@` named by the template (a probe space, which nothing names, is not one). Its baseline is empty, so a manifest made from that would fingerprint two federations that ingested different bytes alike; it **declares its manifest** instead, `data_manifest = "@study_artifacts@/manifests/<space>.json"` (or an absolute path) on the space in the layout, and `up` renders that path for the space. The file is in the core's import-manifest format (`expcore_onedata.importmanifest`: `{"version": 1, "files": [{"path", "size", "sha256"}, ...], "directories": [...]}`, files and directories sorted by path, every parent directory listed; `manifest_of_tree` makes one from a local copy of the data); `PlatformConfig.fingerprint()` takes `Manifest.digest()`, the SHA-256 of its canonical JSON, as for any `data_manifest`. A space that declares none is held to the empty manifest, so ingested bytes fail the check below; a template that writes a `data_manifest` path of its own is refused at `up`, since only the manifests `up` renders are checked. `up` checks it neither way (the space holds nothing yet) and prints which spaces await the check. **The order is `up`, the study's ingest, `verify-data`, `shards.py plan`:** `hpcfed.py verify-data` reads each ingested space back through its owner, compares every file's path, size and SHA-256 and every directory with the manifest, and exits 1, naming the space and how many files differ, on any difference; on a pass it records, in the state file (`data.ingested.<space>.verified`), a marker bound to the manifest's digest. `shards.py plan` and `lines` refuse a federation whose ingested spaces have no marker, whose marker is for another manifest than `up` recorded or the platform file names now, or whose state predates the record. A later ingest needs another `verify-data`: nothing watches the space after it. `verify-data` runs on the login node (it reaches the services' 8443 from there, as `core = "login"` does).
 - **The render identity** (O74, `hpcidentity.py`): once `platform.toml` is rendered, `up` writes
   `<root>/render-identity.json` (mode 0600, canonical JSON, sorted keys), which holds hashes and a version and nothing
   else: `version` (`expcore-render-identity/1`), `template_sha256` (the template as the renderer read it, before it was
@@ -492,7 +496,7 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   step uses `--overlap`; a control step's srun client is ended only once its step is gone from `squeue
   -s`, and one still listed at its bound is cancelled by its own id.
 - **The site** comes from `site.env` (`HPC_ACCOUNT`, `HPC_PARTITION`, `SH`, `L`, and optionally `HPC_STEP_PATH`,
-  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, and the four keys of the
+  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, `HPC_STUDY_ARTIFACTS`, and the four keys of the
   provider storage on scratch), recorded in the state file at `up` (of the storage keys, only `HPC_STORAGE_ROOT`), so `down` and the service verbs need no environment. The bundle is this checkout's own, which must lie on a
   filesystem the nodes see. The first `python3.11` on `HPC_STEP_PATH` must be the node's own, not a uv-installed one:
   the bundle's `supervise.py` needs `os.pidfd_open`.
@@ -750,7 +754,10 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   does. A federation that is not linked, is not the one the fleet made, or leaves a space's data undeclared
   (`data_manifest`) gets no shard; a shard whose federation failed stays unassigned. **The first plan refuses outright
   when the federations' platform fingerprints differ** (another zone image's CA, another SIF, another data manifest):
-  their shards would never merge. It names each federation and the differing keys.
+  their shards would never merge. It names each federation and the differing keys. **A federation whose layout has an
+  ingested space** (the pilot's `delta-space`) is planned only once its data is verified: run `hpcfed.py --layout L
+  --root <fleet>/fed-k/root verify-data` on each, after the study's ingest and before `plan` (the fleet has no verb
+  for it); until then `plan` refuses it, naming the space.
 - **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never
   starts in the directory you ran it from), its client recorded and its output in `<fleet>/logs/`, after checking the
   federation again, that `shards.toml` is the one the record gives, and that Slurm still holds the job the line lands

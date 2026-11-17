@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 import pytest
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
 from hpc_import_support import IMPORT_LAYOUT, make_environ
+from hpc_ingested_support import artifacts, manifest_of, study_layout
 
 PATTERN = r"inodes used (?P<used>[0-9,]+) of (?P<quota>[0-9,]+)"  # an invented format, as invented as its tool
 TOOL = "fake-quota"  # an invented command name
@@ -123,6 +124,70 @@ def test_the_estimate_counts_each_spaces_manifest_once_its_files_and_its_directo
     assert found["delta-space"] == 0
 
 
+def pilot_sized_ingest() -> tuple:
+    """The manifest of the study's own ingest into the pilot's largest space: 15,340 files below 51 directories."""
+    files = {f"records/d{k % 50:02d}/f{k:05d}.csv": f"{k}".encode() for k in range(15_340)}
+    manifest = manifest_of(files)
+    return manifest, len(manifest.files) + len(manifest.directories)
+
+
+def test_the_estimate_counts_an_ingested_spaces_declared_manifest_and_one_that_declares_none_as_nothing(hpc, tmp_path):
+    """O57, O68: an ingested space (`baseline = false`) is filled by the study after `up`, and its layout declares the
+    manifest of that data (`data_manifest = "@study_artifacts@/..."`, which `up` loads): the estimate counts that
+    manifest's files and directories, 15,340 files for the pilot's, where it once counted the baseline's nothing. A
+    space of the same layout that declares none stays at 0, and so does every other space (the count is added, never
+    moved)."""
+    import fedlayout
+    import fedspec
+    import hpcdata
+
+    manifest, inodes = pilot_sized_ingest()
+    assert inodes == 15_340 + 51
+    folder = artifacts(tmp_path / "art", manifest)
+    declared = fedlayout.Layout(Path("/x/root"), Path("/x"), fedspec.load_spec(study_layout(tmp_path / "declared")))
+    none = fedlayout.Layout(
+        Path("/x/root"), Path("/x"), fedspec.load_spec(study_layout(tmp_path / "none", declared=None))
+    )
+    values = hpcdata.study_values(str(folder))
+    counted = hpc.quota.estimate_inodes(declared, {}, values)
+    assert counted["delta-space"] == inodes
+    assert {k: v for k, v in counted.items() if k != "delta-space"} == {
+        k: v for k, v in hpc.quota.estimate_inodes(none, {}, values).items() if k != "delta-space"
+    }  # every other space is what it was
+    assert hpc.quota.estimate_inodes(none, {}, values)["delta-space"] == 0
+    assert hpc.quota.estimate_inodes(none, {})["delta-space"] == 0  # no values: the older call, unchanged
+    assert hpc.quota.estimate_inodes(declared, {}, values) == {
+        name: len(m.files) + len(m.directories) for name, m in hpcdata.declared(declared, {}, values).items()
+    }
+
+
+def test_the_estimate_is_the_manifest_up_loads_for_an_ingested_space(hpc, tmp_path):
+    """O57: the estimate and the manifest `up` loads and records for an ingested space (`ingested_manifests`, whose
+    digest the state file holds) are one count, so the guard cannot disagree with what `up` will verify."""
+    import fedlayout
+    import fedspec
+    import hpcdata
+
+    manifest, _ = pilot_sized_ingest()
+    folder = artifacts(tmp_path / "art", manifest)
+    layout = fedlayout.Layout(Path("/x/root"), Path("/x"), fedspec.load_spec(study_layout(tmp_path / "layout")))
+    values = hpcdata.study_values(str(folder))
+    loaded = hpcdata.ingested_manifests(layout, values)["delta-space"]
+    assert loaded.digest() == manifest.digest()
+    assert hpc.quota.estimate_inodes(layout, {}, values)["delta-space"] == len(loaded.files) + len(loaded.directories)
+
+
+def test_a_declared_manifest_that_needs_the_study_directory_the_site_does_not_set_refuses_the_estimate(hpc, tmp_path):
+    """O57: `data_manifest = "@study_artifacts@/..."` with no `HPC_STUDY_ARTIFACTS` is no value: the estimate raises
+    the refusal `up` makes (naming the variable), never counts the space as empty."""
+    import fedlayout
+    import fedspec
+
+    layout = fedlayout.Layout(Path("/x/root"), Path("/x"), fedspec.load_spec(study_layout(tmp_path / "layout")))
+    with pytest.raises(RuntimeError, match="HPC_STUDY_ARTIFACTS is not set"):
+        hpc.quota.estimate_inodes(layout, {}, {})
+
+
 def test_the_estimate_is_what_the_core_phase_writes_and_reads_as_the_data_manifests(hpc, tmp_path):
     """O57: the estimate and `up`'s data manifests (written once the services are up) are one count: a shared
     import's manifest is the layout's own file, every other space's the one written into the root."""
@@ -157,6 +222,27 @@ def test_a_federation_under_the_line_passes_and_the_figures_are_said(hpc, tmp_pa
     assert "95% line 19000" in said
     assert rig.quota.calls
     assert rig.quota.calls[0][0] == [TOOL, "--inodes"]
+
+
+def test_a_federation_whose_ingested_space_would_pass_the_line_is_refused_naming_the_estimate_with_it(
+    hpc, tmp_path, site
+):
+    """O57: the mandatory guard counts the study's own ingest: a quota with room for the baseline alone but not for the
+    pilot's 15,340-file ingested space refuses `up`, naming an estimate that holds it, and submits nothing; the same
+    layout declaring no manifest for that space passes the same quota."""
+    manifest, inodes = pilot_sized_ingest()
+    folder = artifacts(tmp_path / "art", manifest)
+    declared, none = study_layout(tmp_path / "declared"), study_layout(tmp_path / "none", declared=None)
+    baseline = estimate_of(hpc, none)
+    site = {**site, "HPC_STUDY_ARTIFACTS": str(folder)}
+    for name in ("a", "b"):
+        (tmp_path / name / "fed").mkdir(parents=True)
+    passes = Rig(hpc, tmp_path / "a", site, figures(hpc, baseline, used_over=0), layout=none)  # room for the baseline
+    assert passes.up().startswith("core: the link check passed")
+    refused = Rig(hpc, tmp_path / "b", site, figures(hpc, baseline, used_over=0), layout=declared)
+    with pytest.raises(hpc.quota.QuotaRefused, match=f"estimate {baseline + inodes}"):
+        refused.up()
+    assert not refused.fake.submitted
 
 
 def test_a_federation_exactly_at_the_line_passes(hpc, tmp_path, site):

@@ -100,6 +100,9 @@ def federations(deploy, shared, tmp_path_factory) -> dict[str, Federation]:
         for label in LABELS:
             fed = Federation(label, tmp_path_factory.mktemp(label), shared.node_tmp, ca)
             hpcfed(deploy, fed, "up", fed.site())
+            hpcfed(
+                deploy, fed, "verify-data", fed.site()
+            )  # the layout's ingested space is empty: shown, so plan may run
             feds[label] = fed
     for fed in feds.values():
         fed.pairs = pairs
@@ -161,6 +164,17 @@ def test_up_starts_the_login_nodes_fault_relay_last_and_records_it(federations, 
 
 
 # ------------------------------------------------------------------------------------------------ stage 2: the plan
+@pytest.mark.parametrize("label", LABELS)
+def test_o57_verify_data_after_up_read_the_ingested_space_back_and_recorded_the_marker_plan_needs(federations, label):
+    """O57: the layout's one ingested space is verified after `up` (`hpcfed.py verify-data`, over the same stand-in
+    for a federation's spaces), and the state file holds its marker, bound to the manifest `up` recorded."""
+    fed = federations[label]
+    assert fed.codes["verify-data"] == 0, fed.printed["verify-data"]
+    record = state_of(fed)["data"]["ingested"]
+    assert list(record) == ["delta-space"]
+    assert record["delta-space"]["verified"]["manifest"] == record["delta-space"]["manifest"]
+
+
 @pytest.fixture(scope="module")
 def plan(deploy, federations, shared):
     """The study, the manifest over the roots `up` wrote, and each shard's line as `shards.py plan` prints it."""
@@ -396,6 +410,7 @@ def other_build(deploy, plan, shards, merged, federations, shared, tmp_path_fact
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(deploy.fedlinks, "check_links", link_check_stand_in([]))
         hpcfed(deploy, fed, "up", fed.site())
+        hpcfed(deploy, fed, "verify-data", fed.site())
     base = shared.base / "other"
     study = make_study(base / "studies", shared.control.path)
     (base / "results").mkdir()

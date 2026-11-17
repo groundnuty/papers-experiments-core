@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+import hpcdata
 import hpcidentity
 import hpcimport
 import hpcpins
@@ -24,7 +25,7 @@ import hpcstorage
 from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
-from hpcboot import core_phase, hpc_spec, hpc_values, load_owner
+from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, verify_ingested
 from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
 from hpclaunch import Launcher, StateStore
@@ -81,6 +82,7 @@ class Driver(Down):
     command: List[str]  # this driver's argv prefix for this federation: what the fault relay runs a verb through
     say: Callable[[str], None] = _say
     core: Callable[..., str] = core_phase
+    verify: Callable[..., Dict[str, str]] = verify_ingested  # verify-data's read of each ingested space (O57)
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     poll_s: float = 5.0
@@ -186,7 +188,10 @@ class Driver(Down):
         if self.settings.core == "step" and not site.core_python:
             raise RuntimeError('[hpc] core = "step" needs HPC_CORE_PYTHON, the core\'s Python on the nodes')
         template = self.spec.platform_template
-        hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None)
+        declared = [space.data_manifest for space in self.spec.spaces if space.data_manifest]
+        hpcpins.check(site, template.read_text(encoding="utf-8") if template is not None else None, declared)
+        # every declared manifest loads now, so a mistake in one fails before a job is held
+        hpcdata.ingested_manifests(self.layout, hpcdata.study_values(site.study_artifacts))
         self.check_scratch(site)
         if self.settings.sandbox is not None:
             self.say(
@@ -246,6 +251,8 @@ class Driver(Down):
             "services": {role.name: hpcstate.new_service(role.kind) for role in roles},
             "clients": {},
             "owner": None,
+            # the spaces the study ingests into, each to be verified after its ingest (`verify_data`); plan reads it
+            "data": {"ingested": hpcdata.ingested_record(self.layout, hpcdata.study_values(site.study_artifacts))},
             "phase": "preflight",
         }
         if tree is not None:
@@ -655,6 +662,52 @@ class Driver(Down):
         out = self.core(self.placed_layout(state), owner, values, environ=self.environ)
         self.set(lambda s: s.update(phase="bootstrapped"))
         return out
+
+    def verify_data(self) -> str:
+        """After the study's ingest, show that each ingested space holds exactly the data its manifest declares (O57,
+        C06): every file's path, size and SHA-256, and every directory, read through the space's owner and compared with
+        the manifest `up` recorded. A pass is recorded in the state file as a marker bound to the manifest's digest,
+        which `shards.py plan` requires; a space that differs fails loudly, naming it and the counts, and has no marker
+        (one an earlier pass left is cleared). A federation whose `up` has not finished is refused."""
+        state = self.store.read()
+        if state.get("phase") != "linked":
+            raise RuntimeError(f"the federation's up has not finished (phase {state.get('phase')}): nothing to verify")
+        recorded = (state.get("data") or {}).get("ingested")
+        if recorded is None:
+            raise RuntimeError("the state holds no record of the ingested spaces (its up predates it): down, then up")
+        # a verification that fails, or dies mid-read, leaves no marker an earlier pass gave
+        self.set(lambda s: [record.update(verified=None) for record in s["data"]["ingested"].values()])
+        values = hpcdata.study_values(Site.from_json(state["site"]).study_artifacts)
+        now = hpcdata.ingested(self.layout)
+        if set(now) != set(recorded):
+            raise RuntimeError("the layout's ingested spaces are not the ones this up recorded: it changed since up")
+        manifests = hpcdata.ingested_manifests(self.layout, values)
+        for space, manifest in manifests.items():
+            if manifest.digest() != recorded[space]["manifest"]:
+                raise RuntimeError(f"{space}: its manifest is not the one up recorded (its file changed since up)")
+        if not manifests:
+            return "data: no ingested space: nothing to verify"
+        owner = tuple(state["owner"] or ())
+        if len(owner) != 2:
+            raise RuntimeError("the state names no owner of the providers' storage: the node facts did not run")
+        found = self.verify(self.placed_layout(state), owner, manifests)
+        passed = {space: manifests[space] for space, said in found.items() if not said}
+
+        def mark(state: Dict[str, Any]) -> None:
+            for space, record in state["data"]["ingested"].items():
+                manifest = passed.get(space)
+                record["verified"] = None if manifest is None else {
+                    "manifest": manifest.digest(), "files": len(manifest.files), "bytes": manifest.bytes}  # fmt: skip
+
+        self.set(mark)
+        failed = [hpcdata.failure(space, said, recorded[space]["declared"]) for space, said in found.items() if said]
+        if failed:
+            raise RuntimeError("; ".join(failed) + ": not verified")
+        files = sum(len(m.files) for m in manifests.values())
+        return (
+            f"data: every ingested space holds the data its manifest declares ({len(manifests)} space(s), "
+            f"{files} file(s))"
+        )
 
     def run_core(self) -> str:
         """The core's phase where `[hpc] core` says: here, or in a control step on the zone's node."""

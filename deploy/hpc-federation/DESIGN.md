@@ -320,6 +320,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   },
   "clients": {"<step name>": {"pid": 0, "start": 0}},
   "relay": {"pid": 0, "start": 0, "log": "<log dir>/<allocation name>-fault-relay.log"},
+  "data": {"ingested": {"<space>": {"manifest": "<sha256>", "declared": true,
+                                    "verified": null}}},
   "phase": "preflight | submitted | placed | zone | providers | bootstrapped | linked | stopping | down"
 }
 ```
@@ -333,6 +335,13 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   service verbs need no environment. **`command`** is this driver's argv prefix, which `platform.toml`'s `[faults]
   command` holds. **`clients`** are the detached srun clients of the service steps, by step name, which `down` ends
   once their steps are gone. **`owner`** is the job's uid and gid on the nodes (the posix storage's owner).
+- **`data.ingested`** (O57, C06) names each space whose data is the study's own, put there after `up` (section 6a),
+  written by `up` from the layout alone: `manifest` is the SHA-256 of the manifest it is to be verified against
+  (`Manifest.digest()`: the declared file's, or the empty manifest's for a space that declares none), `declared` whether
+  the layout declares it, and `verified` is `null` until `hpcfed.py verify-data` has read the space back and found
+  exactly that manifest, then `{"manifest": <the digest it compared with>, "files": n, "bytes": n}`. **A state without
+  `data`** (an `up` of an earlier driver) cannot be shown verified, and `shards.py plan` refuses it. Every run of
+  `verify-data` sets `verified` back to `null` first, and a pass sets it again.
 - **`storage`** is `null` without a scratch root (`HPC_STORAGE_ROOT`, section 11), else the provider storage `up` makes
   on scratch, recorded before the first `mkdir`; `down` reads its paths here and nowhere else.
 - **Read and changed through one store** (`hpclaunch.StateStore`): `read()` the whole file; `update(fn)` a
@@ -356,8 +365,10 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 
 1. **Preflight**, touching nothing on the cluster: the layout and its `[hpc]` table; `site.env`'s keys; the root's
    rules and mark (as Compose); the two rootfs tarballs and their `.provenance`; the core's self-check; a shared
-   imported tree's variables and manifest (section 8); with a scratch root (`HPC_STORAGE_ROOT`), that root and the
-   inode guard (section 11). A root that holds a state file is refused: `down` first.
+   imported tree's variables and manifest (section 8); `HPC_STUDY_ARTIFACTS` where the template or a space's
+   `data_manifest` names `@study_artifacts@`, and each declared manifest of an ingested space loaded (section 6a); with a
+   scratch root (`HPC_STORAGE_ROOT`), that root and the inode guard (section 11). A root that holds a state file is
+   refused: `down` first.
 2. **The provider storage** (only with a scratch root, section 11): the state file is created, then the federation's
    own directory on scratch and one per provider, each by an exclusive `mkdir`, before any job exists.
    **Submit** the held job: `sbatch --parsable --job-name=<allocation name> --account --partition --no-requeue
@@ -405,8 +416,9 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    shared imported space also has its `import-<space>` storage made before any support, and the scan awaited after
    the members (section 8).
 9. **`facts.json` and `platform.toml`** (section 6) and the render identity of that platform (`render-identity.json`,
-   section 8), then each shared import verified against its manifest (section 8),
-   then **the link check**: `fedlinks.check_after_up`, the platform
+   section 8), then each shared import verified against its manifest (section 8)
+   and each baseline space read back against its own (section 6a; an ingested space holds nothing yet, so it is not
+   checked here), then **the link check**: `fedlinks.check_after_up`, the platform
    layer's own check through the rendered `platform.toml`, which writes `link-check.json` in the root through
    `expcore_onedata.linkrecord`. `up` fails unless every pair passes.
 10. **The fault relay** (M4's `expcore_onedata.fault_relay`), when the core has it: started detached on the login node
@@ -416,6 +428,10 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
     state file as `relay`. One relay per root: it takes a lock.
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
+
+**`verify-data`** (login node, after the study's ingest; section 6a) is no part of `up` and touches no job: it reads
+the state file, and reads each ingested space back through its owner. It is its own branch of the command line, never
+the `else` of `down`.
 
 **`up` and `down` each hold the root's lifecycle lock** (`<root>.lifecycle.lock`, beside the root, `flock`, never
 waited for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job
@@ -494,6 +510,10 @@ serves both:
 - `[faults]` for the HPC backend (M4's loader): `backend = "hpc"`, `stop_bound_s`, `journal`, `[faults.services]`
   naming every provider, and none of `compose_file`, `project`, `command` or `docker`, which that backend refuses;
   its defaults are `settle_timeout_s = stop_bound_s + 60`, `poll_s` 10 and `relay_wait_s` 30;
+- **`@study_artifacts@`**, from `site.env`'s `HPC_STUDY_ARTIFACTS` (section 6a): the study's own directory on the nodes,
+  so a template names the paths of its tool server's venv, clone and manifests under it and a public replication package
+  carries no site path. A template that names it without the key is refused at the preflight, naming the variable; an
+  unset key is no value, so the renderer would refuse the placeholder too, never write an empty path;
 - the values only the HPC driver fills, for a template that names them: **`@hpc_stop_bound_s@`**, `stop_seconds + 90`
   (690 by default, section 7e); **`@hpc_settle_timeout_s@`**, `stop_bound_s + 60`; **`@hpc_command@`**, this
   driver's argv prefix as a TOML array; and **`@hpc_token_margin_s@`**, the least `[tokens] margin_s` the platform
@@ -512,6 +532,55 @@ pairs the pilot's check reports. Its `delta-space` stands for the pilot's larges
 none into it. `layouts/pilot-shape-import.toml` is the same shape with the four data spaces imported from trees on the
 shared filesystem (section 8), whose template adds `import = { readonly = true, shared = true }` to each of them and
 leaves the ten pairs as they were.
+
+## 6a. The data identity of each space (C06, O63, O57)
+
+A space is the same experimental condition across federations when its declared identity and its data identity match,
+and the campaign fingerprint holds a space's data identity only when its `platform.toml` entry declares it
+(`data_manifest`, the manifest's content hash, never its path): otherwise it holds the space's Onezone id, which every
+`up` makes anew. `up` renders `@data_manifest.<space>@` for each space, and shows the space holds exactly it:
+
+| The space | Its manifest | When its data is shown to be it |
+|---|---|---|
+| a shared import (section 8) | the layout's own (`import.manifest_env`) | at `up`, `fedimport.verify_imports` |
+| a baseline space | made by `up` from the baseline plan, into `<root>/data-manifests/` | at `up`, read back through its owner (every directory, every file's size and bytes) |
+| an **ingested** space | the one it declares: `data_manifest` on the space, a path under `@study_artifacts@` or absolute (the empty manifest when it declares none) | **after the ingest**, `hpcfed.py verify-data` |
+
+An **ingested space** is `baseline = false`, no `import`, with its `@data_manifest.<space>@` named by the template (the
+link check's probe space is `baseline = false` too, and nothing names it). Its baseline is empty, so a manifest made from
+that, as for every `baseline = false` space before, fingerprinted two federations that ingested different bytes alike.
+The manifest is **in the core's import-manifest format** (`expcore_onedata.importmanifest`): `{"version": 1, "files":
+[{"path", "size", "sha256"}, ...], "directories": [...]}`, both lists sorted by path, each once, every directory a file
+lies in listed; `manifest_of_tree` makes one from a local copy of the data, `load_manifest` checks one.
+`Manifest.digest()`, the SHA-256 of `json.dumps(manifest.to_json(), sort_keys=True)`, is the hash the fingerprint
+holds, so the directories count: the ingest must create exactly the listed ones.
+
+The layout (`deploy/compose-federation/fedspec.py`, read by this driver only) refuses `data_manifest` on a baseline space
+or an import, and a path that is neither absolute nor under `@study_artifacts@`, of plain names with no `..` (it is
+written into a quoted TOML string). `up` loads each declared manifest in the preflight, so a mistake fails before a job
+is held, naming the space and never the path. **The directory must be on a filesystem both the login node and the
+agent's node see**: `up`, `verify-data` and `plan` read the manifest on the login node, and the dispatcher's fingerprint
+reads it on the agent's node. `up` also refuses a rendered `platform.toml` whose entry for a space names another
+`data_manifest` than the one it rendered (a template that hard-codes a path of its own), or declares one for a space the
+study fills without taking it from `@data_manifest.<space>@` (even the root's own file): only a manifest `up` renders
+is read back or verified.
+
+**`verify-data`** (`Driver.verify_data`, `hpcboot.verify_ingested`): refused unless the state's phase is `linked`, the
+layout's ingested spaces are the ones the state recorded, and each manifest's digest is the one `up` recorded. Each space
+is read back through its owner (`hpcdata.content_reader`: every directory walked, every file's bytes read and hashed; the
+space ids come from `facts.json`, as the process is a fresh one) and compared with the manifest by `hpcdata.differences`,
+which counts, in counts alone (never a path): files missing, files not in the manifest, files of another size or other
+bytes, directories not as listed. On any difference it exits 1 naming the space and the counts, and, for a space that
+declares none, says where to declare it. Every earlier marker is cleared before anything is read, so a failure, or a
+read that dies half way, leaves none. On a pass it records the marker in
+`data.ingested.<space>.verified` (section 4).
+
+**`shards.py plan` and `lines`** (`federation()`, so a shard is never planned past it) refuse a federation whose
+ingested spaces lack a marker bound to the manifest `up` recorded, and to the manifest the platform file names now (a
+file edited after the verification changes the hash the fingerprint carries, which the pass was not for), naming the
+shard and the spaces. A later ingest needs another `verify-data`: nothing watches the space after the pass. Reading
+every file's bytes through the owner holds each whole in memory (16 workers): a very large ingested file is the limit. `verify-data` runs on the login node, as `[hpc] core = "login"`
+runs the core's phase: it reaches the services' 8443 from there, and has no `core = "step"` form yet.
 
 ## 7. Service verbs for faults and the heal (M4)
 
@@ -789,8 +858,11 @@ run is open.
    test pins the two together). A shared import's owner adds nothing on scratch (its storage is the tree, read-only), but
    the copy a mirror fetches does, so it counts once like every other space; a replica on every mirror is **not**
    multiplied in (no multiplier is invented), and the 5% below the line is the room for what the estimate leaves out. For
-   the ingest layout (`pilot-shape.toml`) the estimate is a handful of files (its spaces declare no data: `baseline =
-   false`, or one small file), because the study's own ingest is in no manifest `up` knows; for the import layout
+   the ingest layout (`pilot-shape.toml`) the estimate is a handful of files while its ingested space declares no
+   manifest (`baseline = false`, nothing the study will put there is known to `up`); a study that declares it
+   (`data_manifest = "@study_artifacts@/..."`, which `up` loads and records, section 6a) has that manifest counted too,
+   from the site's `HPC_STUDY_ARTIFACTS`: the pilot's largest space is 15,340 files (`hpcdata.declared` takes it through
+   `ingested_manifests`, so the estimate and the manifest `up` verifies the space against are one count); for the import layout
    (`pilot-shape-import.toml`) it is the four imported manifests, about the pilot's 17,500.
 3. **Refuse** when `used + estimate > quota * 95 // 100`, in integers, so a total exactly at the line passes. The message
    names the used count, the estimate, the quota and the 95% line.
