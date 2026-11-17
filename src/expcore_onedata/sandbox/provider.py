@@ -462,6 +462,7 @@ class SandboxPlatform:
             lease_key=lease_key,
             listing=self._s.listing_of(level) or PAGED,  # the level's listing mode (O21)
             inputs=given,
+            node_names=self._config.addresses.real_hosts() if self._config.addresses is not None else (),
         )
 
     def _mint(

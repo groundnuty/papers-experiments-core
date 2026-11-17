@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -77,8 +77,13 @@ def config(
     port: int,
     upstream_ca: Path | None,
     options: Mapping[str, Any],
+    scan_names: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """The gate's configuration: no secret (the token is in its file), the hook's options added to the sandbox's."""
+    """The gate's configuration: no secret (the token is in its file), the hook's options added to the sandbox's.
+
+    `scan_names` (O73) are the real names and addresses of the federation's nodes, which the gate counts in the answers
+    it relays: it is the gate's own configuration, a file of the run's gate directory that no cell binds and no
+    collection copies, and is set only when there are names to scan."""
     clash = sorted(set(options) & GATE_OWN_KEYS)
     if clash:
         raise SandboxError(f"the gate's options may not set {clash[0]!r}: the sandbox writes it itself")
@@ -100,6 +105,8 @@ def config(
     )
     if upstream_ca is not None:
         out["upstream_ca_file"] = str(upstream_ca)
+    if scan_names:
+        out["scan_names"] = list(scan_names)
     return out
 
 

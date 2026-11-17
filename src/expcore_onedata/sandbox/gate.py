@@ -18,6 +18,7 @@ in argv[1]:
    "listing": "paged|complete", "peer_uid_check": false,
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
                         "port": 443, "tls": true, "dial": "<address to connect to>"}},
+   "scan_names": ["<a node's name or address>", ...],
    "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
 
 `peer_uid_check` (true or false, false when absent; anything else refuses the start) is for a node whose loopback other
@@ -97,9 +98,11 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import functools
 import http.client
 import importlib.util
 import io
+import ipaddress
 import itertools
 import json
 import os
@@ -181,11 +184,15 @@ _LISTING_SLOT = threading.BoundedSemaphore(1)
 CLIENT_WRITE_TIMEOUT_S = 60
 
 
+_ECHOED = ("request_line", "reason", "path", "query")  # the log's fields that hold what the client wrote
+
+
 def _log(rec: dict) -> None:
     rec["t"] = time.time()
+    line = {k: _redact_node_names(v) if k in _ECHOED and isinstance(v, str) else v for k, v in rec.items()}  # O73
     try:
         with _LOCK, open(CFG["log"], "a") as f:
-            f.write(json.dumps(rec) + "\n")
+            f.write(json.dumps(line) + "\n")
     except OSError as e:  # never take the request down, but never be silent
         print("GATE LOG FAILED", e, file=sys.stderr, flush=True)
 
@@ -402,6 +409,149 @@ class _Upstream(Exception):
         super().__init__(repr(cause))
         self.cause = cause
         self.origin = origin_of(cause)
+
+
+_SCAN: dict[tuple[str, ...], tuple[re.Pattern[bytes] | None, frozenset[bytes], frozenset[bytes]]] = {}
+_V6_TOKEN = re.compile(rb"(?<![0-9A-Fa-f:.])[0-9A-Fa-f:.]{3,45}(?![0-9A-Fa-f:.])")  # a run that may be an IPv6 address
+NODE_MARK = "<node>"  # what a known name becomes in the log's fields that echo the client's request
+
+
+def _scan_of(names: tuple[str, ...]) -> tuple[re.Pattern[bytes] | None, frozenset[bytes], frozenset[bytes]]:
+    """The scan of `names` (O73), built once per list: a pattern for the plain names (host names and IPv4 addresses) and
+    the packed IPv6 addresses and IPv4 addresses to compare candidates with. A plain name is a whole name, in any case,
+    longest first, bare or with a port after it: no word character, dot or hyphen before it (but a backslash escape
+    such as `\\t`, as a parser's `%r` prints one, is no part of a name) or word character or hyphen after it, and not the
+    start of a longer name (a dot and a word character after it)."""
+    with _LOCK:
+        if names not in _SCAN:
+            found = sorted({n.lower() for n in names if isinstance(n, str) and n}, key=len, reverse=True)
+            plain, six, four = [], set(), set()
+            for name in found:
+                try:
+                    address = ipaddress.ip_address(name)
+                except ValueError:
+                    plain.append(re.escape(name.encode("ascii", "ignore")))
+                    continue
+                if address.version == 6:
+                    six.add(address.packed)  # any spelling of it is found by parsing the candidates (`_spans`)
+                else:
+                    four.add(address.packed)
+                    plain.append(re.escape(name.encode("ascii")))
+            pattern = (
+                rb"(?:(?<![\w.-])|(?<=\\[ntrbfv]))(?:" + b"|".join(plain) + rb")(?![\w-])(?!\.\w)" if plain else None
+            )
+            _SCAN[names] = (re.compile(pattern, re.IGNORECASE) if pattern else None, frozenset(six), frozenset(four))
+        return _SCAN[names]
+
+
+def _as_the_client_reads(body: bytes) -> bytes:
+    """What a client reads of a body: the strings of a JSON document decoded (an escape such as `\\n`, or a name
+    written with `\\uXXXX`, would otherwise hide it from the raw text), every key and string value on a line of its
+    own; any other body, or a JSON one too deep for the decoder, as it is."""
+    if body.lstrip()[:1] not in (b"{", b"[", b'"'):
+        return body
+    try:
+        document = json.loads(body)
+    except (ValueError, RecursionError):
+        return body
+    strings, stack = [], [document]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            strings.append(item)
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return "\n".join(strings).encode("utf-8", "replace")
+
+
+MAX_V6_COLONS = 8  # the most colons of an IPv6 address (seven groups' separators, or `::ffff:` and a dotted tail)
+
+
+@functools.lru_cache(maxsize=4096)
+def _v6_of(candidate: bytes) -> tuple[bytes | None, bytes | None]:
+    """The packed IPv6 address a candidate is and the packed IPv4 address inside it when it is an IPv4-mapped one; both
+    None when it is no address. Cached: a body repeats its tokens, and the parse is the scan's cost."""
+    try:
+        address = ipaddress.IPv6Address(candidate.decode("ascii"))
+    except ValueError:
+        return None, None
+    mapped = address.ipv4_mapped
+    return address.packed, None if mapped is None else mapped.packed
+
+
+def _spans(text: bytes, names: tuple[str, ...]) -> list[tuple[int, int]]:
+    """Where the known names are in `text`, as spans, one per occurrence: the plain names by pattern, an IPv6 address
+    in any spelling (a run of hex digits, colons and dots is parsed, and so are its suffixes after each colon, since a
+    word that ends in hex digits may precede it: `node:2001:db8::2`) and an IPv4 address written as an IPv4-mapped IPv6
+    address. Spans that overlap (the dotted tail of a mapped address, and the whole of it) are one occurrence."""
+    pattern, six, four = _scan_of(names)
+    found = [m.span() for m in pattern.finditer(text)] if pattern is not None else []
+    if (six or four) and b":" in text:
+        for match in _V6_TOKEN.finditer(text):
+            token = match.group().rstrip(b".")
+            if token.endswith(b":") and not token.endswith(b"::"):
+                token = token[:-1]
+            colons = [i for i, byte in enumerate(token) if byte == 0x3A]
+            # the token, then after each colon: an address has at most 8, so a longer suffix cannot be one (bounded work)
+            for at in [0, *(i + 1 for i in colons)]:
+                candidate = token[at:]
+                colons_here = candidate.count(b":")
+                if colons_here == 0:
+                    break
+                if colons_here > MAX_V6_COLONS or (
+                    b"::" not in candidate and b"." not in candidate and colons_here != 7
+                ):
+                    continue  # without `::` or a dotted tail, an address has exactly eight groups
+                packed, mapped = _v6_of(candidate)
+                if packed in six or (mapped is not None and mapped in four):
+                    found.append((match.start() + at, match.start() + at + len(candidate)))
+                    break
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(found):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _node_name_hits(body: bytes) -> int:
+    """How many known node names or addresses (`scan_names` of the gate's configuration, O73) a body holds as its
+    client reads it: counted in memory, and nothing of the body, of a match or of its context is kept. 0 when the gate
+    has no names to scan (a Compose federation's). A body is scanned whole: an answer that is no file's content is read
+    whole before it goes."""
+    names = tuple(CFG.get("scan_names") or ())
+    if not names or not body:
+        return 0
+    return len(_spans(_as_the_client_reads(body), names))
+
+
+def _redact_node_names(value: str) -> str:
+    """`value` with each known node name or address replaced by `NODE_MARK`: for the log's fields that hold what the
+    client wrote, which a published log must not hold whoever wrote it. `value` as it was when there are no names."""
+    names = tuple(CFG.get("scan_names") or ())
+    if not names or not value:
+        return value
+    data = value.encode("utf-8", "replace")
+    spans = _spans(data, names)
+    if not spans:
+        return value
+    out, last = [], 0
+    for start, end in spans:
+        if start >= last:  # a span inside the last one (the dotted tail of a mapped address) is not cut again
+            out += [data[last:start], NODE_MARK.encode()]
+            last = end
+    return b"".join([*out, data[last:]]).decode("utf-8", "replace")
+
+
+def _count_node_names(rec: dict, body: bytes) -> None:
+    """The request's line says how many node names the answer held, when it held any (`node_name_hits`, an integer)."""
+    hits = _node_name_hits(body)
+    if hits:
+        rec["node_name_hits"] = rec.get("node_name_hits", 0) + hits
 
 
 SERVED_PORT = 443  # where a client of the gate dials every name it serves: the gate's own port, or the 443 mapped to it
@@ -787,6 +937,9 @@ class Handler(BaseHTTPRequestHandler):
             "request_line": (getattr(self, "raw_requestline", b"") or b"")[:200].decode("latin-1", "replace").strip(),
             "body": "gate",
         }
+        _count_node_names(
+            rec, f"{message or ''}\n{explain or ''}".encode("utf-8", "replace")
+        )  # the page quotes the client
         try:
             super().send_error(code, message, explain)
         finally:
@@ -796,12 +949,14 @@ class Handler(BaseHTTPRequestHandler):
         """The gate's own answer, and then its line, so the line has the answer's body bytes; logged whatever the client did meanwhile."""
         rec["body"] = "gate"
         try:
-            self._send_json(code, obj)
+            self._send_json(code, obj, rec=rec)
         finally:
             self._log(rec)
 
-    def _send_json(self, code: int, obj: dict, *, close: bool = True) -> int:
+    def _send_json(self, code: int, obj: dict, *, close: bool = True, rec: dict | None = None) -> int:
         body = json.dumps(obj).encode()
+        if rec is not None:  # the gate's own answer reaches the agent too: it is scanned like an upstream's (O73)
+            _count_node_names(rec, body)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1106,7 +1261,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_whole(self, resp, passed, body: bytes, rec, kind: str) -> tuple[int | None, int, str | None, str]:
         """A checked body and its head, written within CLIENT_WRITE_TIMEOUT_S: (length framed, bytes sent, failure, its
-        origin). A client that stops reading frees its slot: its connection is closed (`client_stalled`)."""
+        origin). A client that stops reading frees its slot: its connection is closed (`client_stalled`). The body is
+        scanned for the nodes' names first (O73), a merged listing's too."""
+        _count_node_names(rec, body)
         self.connection.settimeout(CLIENT_WRITE_TIMEOUT_S)
         rec["body"] = kind
         try:

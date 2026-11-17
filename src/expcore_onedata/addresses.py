@@ -145,6 +145,11 @@ class AddressMap:
         found = self.address_of(host)
         return host if found is None else found
 
+    def real_hosts(self) -> tuple[str, ...]:
+        """Every real name and address the federation's nodes have, in lower case, once and sorted: the map's real
+        side, which the gate scans the answers it relays for (O73). Never a declared name."""
+        return tuple(sorted({h for node in self.hosts.values() for h in (node.address, *node.names)}))
+
     def to_document(self) -> dict[str, Any]:
         """The file's content: what `from_document` reads."""
         return {

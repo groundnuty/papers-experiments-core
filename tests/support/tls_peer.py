@@ -1,14 +1,15 @@
 """A real TLS service on the loopback, for the tests of a client that reaches a service by name (O73).
 
 `TlsPeer(directory, name)` listens on 127.0.0.1 at a free port with a certificate that names `name` alone, signed by a
-CA of its own (`ca`). It answers every request with an empty JSON object, or with the `answer` a test sets, and records
-what it was sent: the server name the client's handshake asked for (`sni`), and each request's method, path and `Host`
-header (`requests`). The names are invented (`.test` resolves nowhere), so a client that connects at all has been given
-the address another way.
+CA of its own (`ca`). It answers every request with an empty JSON object, or with the `answer` a test sets (sent in the
+pieces of `chunks`, when it sets them), and records what it was sent: the server name the client's handshake asked for
+(`sni`), and each request's method, path and `Host` header (`requests`). The names are invented (`.test` resolves
+nowhere), so a client that connects at all has been given the address another way.
 """
 
 import ssl
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -29,9 +30,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.peer.requests.append(  # type: ignore[attr-defined]
             {"method": self.command, "path": self.path, "host": self.headers.get("Host")}
         )
-        status, body = self.server.peer.answer  # type: ignore[attr-defined]
+        peer = self.server.peer  # type: ignore[attr-defined]
+        status, body = peer.answer
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", peer.content_type)
+        if peer.chunks:  # a chunked answer: each piece goes alone, so a name can be split across them
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for piece in peer.chunks:
+                self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.2)
+            self.wfile.write(b"0\r\n\r\n")
+            return
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -56,6 +67,9 @@ class TlsPeer:
         self.sni: list[str | None] = []
         self.requests: list[dict[str, Any]] = []
         self.answer: tuple[int, bytes] = (200, b"{}")  # what every request is answered with: a test sets it
+        self.content_type = "application/json"  # a file's content is answered as bytes: a test sets it
+        # when set, the answer's body is sent in these pieces (Transfer-Encoding: chunked)
+        self.chunks: list[bytes] = []
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(directory / f"{name}.pem", directory / f"{name}.key")
         context.sni_callback = self._remember
