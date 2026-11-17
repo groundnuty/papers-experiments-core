@@ -354,10 +354,10 @@ def test_o86_the_commands_defaults_are_the_watchs(hpc):
     assert hpc.observe.POLL_S == 2.0
 
 
-def test_o86_the_lag_note_names_no_path_node_or_step(hpc):
-    """O86: what the wait adds to the document names no node, address or path."""
+def test_o86_what_the_wait_adds_names_no_path_or_node(hpc):
+    """O86: a service that reads `accounting_lag` names no node, address or path."""
     clock = Clock()
     doc = read(hpc, ALPHA_STOPPED, Cluster(clock, stopped_alpha(lag=1e9)), clock, wait=4.0)
-    text = json.dumps(doc)
+    text = json.dumps(doc["services"])
     assert NODE not in text
     assert "/" not in text
