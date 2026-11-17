@@ -114,8 +114,9 @@ def test_o70_the_hosts_file_lists_the_node_and_every_peers_declared_name_with_it
         if name != own:
             assert [address, name] in entries
     assert oct((work / "hosts").stat().st_mode & 0o777) == "0o644"
-    peers = (work / "rootfs" / "etc" / "hpcop-peers").read_text(encoding="utf-8").split()
-    assert sorted(a for a in peers if a[0].isdigit()) == sorted(peers_of(own))  # the shim moves the same peers' 443
+    listed = (work / "rootfs" / "etc" / "hpcop-peers").read_text(encoding="utf-8").splitlines()
+    peers = [line for line in listed if line and not line.startswith("#")]
+    assert sorted(peers) == sorted(peers_of(own))  # the shim moves the same peers' 443 as the hosts file names
 
 
 def test_o70_without_a_declared_name_a_service_registers_the_nodes_own_as_before(env):
