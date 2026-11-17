@@ -51,6 +51,7 @@ import stat
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -926,8 +927,18 @@ class DockerSandbox:
             self._register_container(container)
 
     def infra_container_check(self) -> dict[str, Any]:
+        """Deprecated: `infra_check()`, the name both backends answer to, gives the same answer."""
+        warnings.warn(
+            "DockerSandbox.infra_container_check() is deprecated: call infra_check(), which both backends have",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.infra_check()
+
+    def infra_check(self) -> dict[str, Any]:
         """The state of every registered container now against its baseline, and the cause of each death. Read from the
-        host while the containers are up, never from the agent's output. A container with no problem ran throughout."""
+        host while the containers are up, never from the agent's output. A container with no problem ran throughout.
+        Every backend's sandbox answers it in this shape (`api.InfraReadings`)."""
         found, containers = [], {}
         for role, w in self._watched.items():
             # a container the harness stopped itself is judged by its state just before that stop: the stop is no death
@@ -1266,7 +1277,7 @@ class DockerSandbox:
             self._note_io_mode()  # while the sidecar runs, and before the direct check below, which may refuse
         if self.spec.mode is DataPathMode.MOUNT and self.s.mount.io_mode == DIRECT:
             self._direct_io_held()  # while the sidecar runs: its log is read in it
-        self._meta["infra_check"] = check = self.infra_container_check()  # while everything runs
+        self._meta["infra_check"] = check = self.infra_check()  # while everything runs
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
         if refused is not None:
             result["refused_output"] = refused
@@ -1368,7 +1379,18 @@ class DockerSandbox:
             note["error"] = describe_error(e)
 
     def sidecar_errors(self) -> dict[str, Any] | None:
-        """Warnings and errors of the oneclient sidecar by origin, or `{"unavailable": reason}`; None without a sidecar."""
+        """Deprecated: `mount_errors()`, the name both backends answer to, gives the same answer."""
+        warnings.warn(
+            "DockerSandbox.sidecar_errors() is deprecated: call mount_errors(), which both backends have",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.mount_errors()
+
+    def mount_log(self) -> dict[str, Any] | None:
+        """oneclient's INFO log as the sidecar holds it, `{"text": ...}` with the token replaced by `<token>`, or
+        `{"unavailable": reason, "stderr": ...}`; None without a sidecar (`api.InfraReadings`). A study reads it here,
+        never with a `docker exec` of its own."""
         if self.spec.mode is not DataPathMode.MOUNT:
             return None
         r = self.host.docker(
@@ -1377,7 +1399,15 @@ class DockerSandbox:
         if r.returncode != 0:
             return {"unavailable": "the oneclient log could not be read", "stderr": stderr_digest(r.stderr)}
         token = self.spec.token.reveal() if self.spec.token else ""
-        return summarize_oneclient_log(r.stdout.replace(token, "<token>") if token else r.stdout)
+        return {"text": r.stdout.replace(token, "<token>") if token else r.stdout}
+
+    def mount_errors(self) -> dict[str, Any] | None:
+        """Warnings and errors of the oneclient sidecar by origin (`oneclient_log.summarize` of `mount_log()`'s text),
+        or its `{"unavailable": reason, ...}`; None without a sidecar."""
+        found = self.mount_log()
+        if found is None or "text" not in found:
+            return found
+        return summarize_oneclient_log(found["text"])
 
     def metadata(self) -> dict[str, Any]:
         """The facts of the run for its record. Never a secret: tokens are not in it, and the sidecar's log is summarised."""
@@ -1387,7 +1417,7 @@ class DockerSandbox:
             meta["cells"] = len(self._cells.cells)
             meta["memory"] = {k: v for k, v in self.obs.memory_facts(self.names.agent).items() if k != "events"}
             meta["containers"] = {r: self.obs.totals(c) for r, c in self._cells.roles.items()}
-            check = self.infra_container_check()
+            check = self.infra_check()
             meta["container_deaths"], meta["infra_death"] = check["deaths"], check["death"]
         if self.spec.mode is DataPathMode.REST:
             try:
@@ -1397,7 +1427,7 @@ class DockerSandbox:
             except ValueError:  # bytes that are not UTF-8, or a line that is not JSON: unknown, never a crash
                 meta["gate"] = gatelog.unknown("the gate log could not be parsed")
         meta["served_bytes"] = self.served_bytes()
-        meta["sidecar_log"] = self.sidecar_errors() if not self._stopped else None
+        meta["sidecar_log"] = self.mount_errors() if not self._stopped else None
         return meta
 
     # ------------------------------------------------------------------------------------------------ stop

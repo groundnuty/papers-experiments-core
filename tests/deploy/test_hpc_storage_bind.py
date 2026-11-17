@@ -513,7 +513,7 @@ def test_o57_the_data_check_reads_each_space_from_the_storage_its_owner_keeps_on
     rig = Rig(hpc, tmp_path, site, ca_pem=ca_pem)
     providers = BoundProviders(hpc, rig)
     rig.driver.core = real_core(hpc, "f", data=providers.data, content=providers.content)
-    assert "data: every space holds the data its manifest declares" in rig.up()
+    assert "data: every space that is not ingested holds the data its manifest declares" in rig.up()
     stored = [path for bound in rig.bound().values() for path in bound.rglob("*") if path.is_file()]
     assert stored  # the baseline is on scratch, in the owners' bound directories
 

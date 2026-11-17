@@ -20,7 +20,7 @@ for n in 1 2 3; do
   peers=()
   for other in P1 P2 P3; do [[ $other == "$role" ]] || peers+=("$(addr_of "$other")"); done
   detached "$E/$role/service-step.rc.json" service_step \
-    srun --jobid="$HPC_JOB" --overlap --export=PATH -w "$(node_of "$role")" -N1 -n1 -c"$SVC_CPUS" --mem="$SVC_MEM" --output="$(svc_log "$role")" \
+    srun --jobid="$HPC_JOB" --overlap --export=PATH --chdir=/ -w "$(node_of "$role")" -N1 -n1 -c"$SVC_CPUS" --mem="$SVC_MEM" --output="$(svc_log "$role")" \
     bash "$B/provider.sbatch" "$B" "$SH/oneprovider.tar" "prov$n" "$ZF" "$ADMIN_MAIL" "$ADDR_Z" "${peers[@]}"
 done
 say "provider steps launched $(date -u +%T)"
@@ -46,7 +46,7 @@ for n in 1 2 3; do
   record_up "$role"
   cat "$E/$role/up.json"
 done
-st Z -c1 --mem=300M python3.11 -I "$RUN/fed_zone.py" --workdir "$ZW" --evidence "$E/providers" online 3 --wait 120 < /dev/null \
+st Z -c1 --mem=300M python3.11 -I -B "$RUN/fed_zone.py" --workdir "$ZW" --evidence "$E/providers" online 3 --wait 120 < /dev/null \
   > "$E/providers/online.out.json"
 rec rc "$E/providers/online.rc.json" online "${PIPESTATUS[0]}"
 squeue -s -j "$HPC_JOB" -h -o "%i %j %M"

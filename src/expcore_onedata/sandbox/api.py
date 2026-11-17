@@ -10,6 +10,7 @@ The data path of a run is one of three kinds. The study's `data_path` factor nam
 """
 
 import dataclasses
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -165,3 +166,42 @@ class Sandbox(Protocol):
     def metadata(self) -> dict[str, Any]:
         """The facts of the run for its record: images by id, limits, the data path, kills, deaths. Never a secret."""
         ...
+
+
+@runtime_checkable
+class InfraReadings(Protocol):
+    """What a study reads of a run's infrastructure after its loop, by the same names and in the same shapes on every
+    backend (`DockerSandbox`, `ApptainerSandbox`). Read them while the sandbox is up, after its collection or before.
+
+    `infra_check()` is `{"containers": {role: {"start", "end", "problems", ...}}, "deaths": [...], "death": [...]}`:
+    the state of each of the run's other components by role (Docker's gate and mount sidecar; on an HPC node the
+    gate, the egress collector, the mount's oneclient with its mount and the mount guard's watcher) against what it was
+    when it came up, each death with `role`, `condition`, `cause`, `category`, `basis` and `problems`
+    (`infradeath`), and the problems of the deaths that are infrastructure. A component the harness stopped itself is
+    judged by its state just before that stop. `start` and `end` hold each backend's own evidence (a container's state,
+    or a process's and a mount's), and a state that cannot be read is a problem, never a clean one (O17).
+
+    `mount_log()` is oneclient's INFO log, `{"text": ...}` with the data-path token replaced by `<token>`, or
+    `{"unavailable": reason, ...}` when it could not be read; None without a mount. `mount_errors()` is the summary of
+    that same text (`oneclient_log.summarize`, which `oneclient_log.platform_errors` counts), the same `unavailable`
+    answer, or None (O18). Both may be read during the run: on an HPC node the read is the driver's, of a file in a
+    directory no cell reaches, which the mount guard does not watch (O60).
+    """
+
+    def infra_check(self) -> dict[str, Any]: ...
+
+    def mount_log(self) -> dict[str, Any] | None: ...
+
+    def mount_errors(self) -> dict[str, Any] | None: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class ServerProcess:
+    """Where a backend runs a run's tool server, when it names it (`SandboxPlatform.tool_server` asks the sandbox's
+    `tool_server_process()`; the Apptainer backend's, O56): `home`, a directory of the run's own, which the server
+    takes as its `HOME` and starts in, and `env`, the settings beside the launcher's (the run's tag). With one, the
+    launcher names the server's whole environment (`toolserver.ToolServerLauncher.launch`). Docker's sandbox names
+    none, and its server's process is as it always was."""
+
+    home: Path
+    env: Mapping[str, str]

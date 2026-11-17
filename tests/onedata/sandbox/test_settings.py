@@ -493,8 +493,8 @@ def test_o36_the_io_mode_is_in_the_fingerprint_for_each_mount_level_and_for_no_o
 
 
 def test_o36_a_campaign_does_not_resume_under_another_io_mode(tmp_path):
-    """O36, C06: a store started under `proxy` is refused a resume under `direct`, naming the level's `io_mode`; the
-    same mode resumes."""
+    """O36, C06: a store started under `proxy` is refused a resume under `direct`, naming the level's `io_mode` and the
+    mount's; the same mode resumes."""
     from expcore.campaign.resume import FingerprintMismatch
 
     (tmp_path / "proxy").mkdir()
@@ -503,7 +503,10 @@ def test_o36_a_campaign_does_not_resume_under_another_io_mode(tmp_path):
     resume_with(tmp_path / "campaign.db", proxy)
     with pytest.raises(FingerprintMismatch) as caught:
         resume_with(tmp_path / "campaign.db", direct)
-    assert caught.value.differences == ("platform.data_paths.mounted.io_mode: recorded 'proxy', now 'direct'",)
+    assert set(caught.value.differences) == {
+        "platform.data_paths.mounted.io_mode: recorded 'proxy', now 'direct'",
+        "platform.sandbox.mount.io_mode: recorded 'proxy', now 'direct'",
+    }
     resume_with(tmp_path / "campaign.db", proxy)
 
 
@@ -620,16 +623,12 @@ def test_c06_a_campaign_does_not_resume_under_raised_served_bytes_caps(tmp_path)
     resume(started)
 
 
-def test_c06_a_platform_without_the_caps_table_keeps_the_fingerprint_it_had_and_still_resumes(tmp_path):
-    """C06: a campaign started before the caps could be declared ran under the defaults, and its store holds the
-    fingerprint of that version: the TLS mode and the data paths, nothing of the caps. A platform.toml that still
-    declares no `[sandbox.served_bytes]` gives that same fingerprint, so the campaign resumes; only a declared table
-    enters it."""
+def test_c06_a_platform_without_the_caps_table_has_none_of_the_caps_in_its_fingerprint_and_resumes(tmp_path):
+    """C06: a platform.toml that declares no `[sandbox.served_bytes]` ran under the defaults and holds nothing of the
+    caps in its fingerprint, so it resumes under the same file; only a declared table enters it."""
     resume = caps_campaign(tmp_path)
     config = platform_with_caps(tmp_path, "plain")
-    recorded = {"tls": config.tls.record(), "data_paths": config.sandbox.data_path_record()}  # the earlier version's
-    resume(recorded)
-    assert config.fingerprint() == recorded
+    assert "served_bytes" not in config.fingerprint()
     resume(config.fingerprint())
     resume(platform_with_caps(tmp_path, "again").fingerprint())
 

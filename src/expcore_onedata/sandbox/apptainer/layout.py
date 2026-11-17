@@ -23,6 +23,7 @@ from expcore_onedata.sandbox.apptainer.argv import bindable
 from expcore_onedata.sandbox.apptainer.settings import Pinned
 
 CHUNK = 1 << 20
+TOOL_SERVER_DIR = "toolserver"  # in the run's directory, 0700, while the run's tool server runs: its HOME (O56)
 Identity = tuple[int, int, int, int, int]
 _HASHED: dict[Identity, str] = {}  # the image's SHA-256 by the identity it had when it was hashed
 _HASHED_LOCK = threading.Lock()

@@ -407,8 +407,8 @@ def test_the_fake_refuses_a_het_jobs_step_that_names_no_component_as_the_site_do
     rig = Rig(hpc, tmp_path, site)
     where = rig.driver.launcher._where
 
-    def no_group(node, name):  # the driver as the slot ran it: no group on a service node
-        job, group, component, at = where(node, name)
+    def no_group(node, name, job=None):  # the driver as the slot ran it: no group on a service node
+        job, group, component, at = where(node, name, job)
         return job, (None if group == 0 else group), component, at
 
     rig.driver.launcher._where = no_group
@@ -706,7 +706,7 @@ def test_o63_down_sweeps_the_agents_node_removing_gone_steps_and_naming_a_kept_o
     printed = rig.driver.down()
     (swept,) = rig.fake.sweeps
     assert (swept.node, swept.job, swept.het_group) == ("node07", job, group)
-    assert swept.command[0] == "python3.11"
+    assert swept.command[:3] == ["/shared/venv/bin/python", "-I", "-B"]  # the core's Python: its reaper (W2)
     assert swept.command[swept.command.index("--tmpfs") + 1] == str(node_tmp)
     assert swept.command[swept.command.index("--root") + 1] == str(rig.root)
     assert not gone.exists()
