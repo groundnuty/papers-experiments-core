@@ -247,11 +247,81 @@ def test_o63_a_name_the_step_sets_itself_refuses_the_plan_naming_it(shards, tmp_
     assert "sets itself" in err
 
 
+LOADER_AND_SHELL = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+                    "GLIBC_TUNABLES", "PERL5LIB", "PERL5OPT", "RUBYOPT", "RUBYLIB", "NODE_OPTIONS", "NODE_PATH",
+                    "BASH_ENV", "ENV", "IFS", "PS4", "SHELLOPTS", "PROMPT_COMMAND", "GCONV_PATH", "LOCPATH",
+                    "NLSPATH"]  # fmt: skip
+
+
+@pytest.mark.parametrize("name", LOADER_AND_SHELL)
+def test_o63_a_loader_or_shell_variable_refuses_the_plan_naming_only_it(shards, tmp_path, capsys, name):
+    """O63: the dynamic loader's variables (a library named by `LD_PRELOAD` runs before Python starts, so before the
+    environment, identity and guard checks), the Perl, Ruby and Node option and path families, the shell's start-up
+    file, field separator, trace prompt, options and prompt command, and the locale and conversion paths change how a
+    program is started: none can be declared, whatever the operator's environment holds (it is not read: the name is
+    refused first). The message names the variable and nothing else."""
+    err = refused_plan(shards, tmp_path, capsys, f'pass_env = ["{name}"]')
+    assert name in err
+    assert "loaded or started" in err
+    assert str(tmp_path) not in err
+
+
+@pytest.mark.parametrize("name", LOADER_AND_SHELL)
+def test_o63_a_step_refuses_a_loader_or_shell_variable_its_line_declares_with_nothing_made(
+    shards, tmp_path, capsys, name
+):
+    """O63: a line typed or edited by hand to pass one is refused by the step as the plan would have, before anything
+    of the study runs; nothing is made."""
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, [name]))
+    assert name in said
+    assert "loaded or started" in said
+    nothing_made(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["LDAP_MODE", "LDFLAGS", "ENVIRONMENT_NAME", "IFS_MODE", "BASH_ENVIRONMENT",
+                                  "LOCPATHS", "DYLD", "LD", "NODE", "NODEMODE", "PERL", "PS40", "A" * 64,
+                                  "EXAMPLE2_ALLOW_OUTAGE", "HPC_STUDY_ARTIFACTS"])  # fmt: skip
+def test_o63_a_name_that_only_starts_like_a_loader_or_shell_variable_is_still_accepted(shards, name):
+    """O63: the refusal is of the families (`LD_`, `DYLD_`, `PERL5`, `RUBY` and `NODE_` as prefixes) and of the exact
+    shell, locale and loader names: no other variable that begins alike is refused, and names of the shapes a study
+    declares pass."""
+    assert shards.pass_env_name_problem(name) is None
+
+
+def test_o63_two_names_of_the_shape_a_study_declares_are_pinned_on_every_line(shards, tmp_path, capsys, monkeypatch):
+    """O63: `EXAMPLE2_ALLOW_OUTAGE` (an invented name, a digit in its first word) and `HPC_STUDY_ARTIFACTS` (the
+    artifacts variable of the pilot) are read from the operator's environment and carried by every line as words of the
+    step's environment and as `--pass-env` options."""
+    monkeypatch.setenv("EXAMPLE2_ALLOW_OUTAGE", "yes")
+    monkeypatch.setenv("HPC_STUDY_ARTIFACTS", TREE)
+    lines = printed(shards, tmp_path, capsys, "lines", 'pass_env = ["EXAMPLE2_ALLOW_OUTAGE", "HPC_STUDY_ARTIFACTS"]')
+    assert len(lines) == 2
+    for line in lines:
+        environ, argv = node_words(line)
+        assert environ["EXAMPLE2_ALLOW_OUTAGE"] == "yes"
+        assert environ["HPC_STUDY_ARTIFACTS"] == TREE
+        assert argv.count("--pass-env") == 2
+
+
 @pytest.mark.parametrize(
-    "name", ["lower_case", "1STARTS_WITH_DIGIT", "HAS-DASH", "WITH SPACE", "A" * 65, "", "NAME\\n"]
+    "name",
+    [
+        "lower_case",
+        "1STARTS_WITH_DIGIT",
+        "HAS-DASH",
+        "WITH SPACE",
+        "A" * 65,
+        "",
+        "NAME\\n",
+        "_LEADING",
+        "TRAILING_",
+        "DOUBLE__UNDERSCORE",
+        "A" * 63 + "_",
+    ],
 )
 def test_o63_a_name_that_is_not_a_plain_upper_case_name_refuses_the_plan(shards, tmp_path, capsys, name):
-    """O63: a name matches `^[A-Z][A-Z0-9_]{0,63}$` (a trailing newline included)."""
+    """O63: a name matches `^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$` and is at most 64 characters: words of letters and digits
+    joined by single underscores, none leading, trailing or doubled (a trailing newline included)."""
     err = refused_plan(shards, tmp_path, capsys, f'pass_env = ["{name}"]')
     assert "must match" in err
 
@@ -855,3 +925,188 @@ def test_o63_a_bad_label_is_still_the_labels_refusal_not_the_origins(shards, tmp
     with pytest.raises(shards.ShardsError, match="label"):
         shards.step(args, runner=run, core_found=lambda path: True)
     assert not (tmp_path / "escape").exists()
+
+
+# -- a deleted origin does not lift the rule: the shard's archive manifest still says what its step passed -----------
+
+
+def resumed_without_origin(shards, tmp_path, monkeypatch, capsys, line, value=VALUE):
+    """A shard whose first step passed NAME, its `pass-env.json` then deleted, and a `--resume` step whose line
+    declares `line` (names, or None for no option) with the node holding `value`: what that step said when refused."""
+    first_step(shards, tmp_path, monkeypatch)
+    origin_file(tmp_path).unlink()
+    node_holds(monkeypatch, value)
+    monkeypatch.setenv(OTHER, value)
+    return refused_step(shards, tmp_path, capsys, step_args(tmp_path, line, resume=True))
+
+
+def test_o63_a_resume_declaring_nothing_after_the_origin_was_deleted_is_refused_naming_the_variable(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: the rule that a shard's variables keep one value for its whole life is held by its origin file, and by the
+    archive manifest that records what its step passed: with the file deleted, a resume that declares nothing was
+    accepted (and its archive then recorded no variable). It is compared with the manifest instead, and refused,
+    naming the variable and no value; the archive is as it was and no origin was made."""
+    said = resumed_without_origin(shards, tmp_path, monkeypatch, capsys, None)
+    assert NAME in said
+    assert VALUE not in said
+    assert manifest_of(tmp_path)["pass_env"] == {NAME: VALUE}
+    assert not origin_file(tmp_path).exists()
+    assert not (tmp_path / "results" / "fed-a" / "running.json").exists()
+
+
+def test_o63_a_resume_with_another_value_after_the_origin_was_deleted_is_refused_naming_only_the_variable(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: the manifest records the values too, so a deleted origin does not make a changed value acceptable (a
+    names-only comparison would have let the resume write a new origin holding it)."""
+    said = resumed_without_origin(shards, tmp_path, monkeypatch, capsys, [NAME], value=CHANGED)
+    assert NAME in said
+    assert VALUE not in said
+    assert CHANGED not in said
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_resume_adding_a_variable_after_the_origin_was_deleted_is_refused_naming_it(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: a name the first step did not pass is named, and the one it did is not."""
+    said = resumed_without_origin(shards, tmp_path, monkeypatch, capsys, [NAME, OTHER])
+    assert OTHER in said
+    assert NAME not in said
+    assert VALUE not in said
+
+
+def test_o63_a_resume_matching_the_archive_manifest_after_the_origin_was_deleted_continues_and_restores_it(
+    shards, tmp_path, monkeypatch
+):
+    """O63: the same names and values as the manifest records are what the first step passed: the shard continues, and
+    the origin is written again with them (as a first step writes it), so the rule holds from there on."""
+    first_step(shards, tmp_path, monkeypatch)
+    origin_file(tmp_path).unlink()
+    node_holds(monkeypatch)
+    run, seen = dispatcher()
+    assert shards.step(step_args(tmp_path, [NAME], resume=True), runner=run, core_found=lambda path: True) == 0
+    assert seen["env"][NAME] == VALUE
+    assert json.loads(origin_file(tmp_path).read_text())["pass_env"] == {NAME: VALUE}
+
+
+@pytest.mark.parametrize("damage", ["not json", "no shard", "of another shard", "a value that is no value"])
+def test_o63_an_archive_manifest_that_cannot_say_what_was_passed_refuses_a_step_with_no_origin(
+    shards, tmp_path, capsys, monkeypatch, damage
+):
+    """O63: with the origin gone, the manifest is the only record: one that cannot be read as this shard's, or that
+    holds a value a variable may not carry, is never taken for "nothing was passed"."""
+    first_step(shards, tmp_path, monkeypatch)
+    origin_file(tmp_path).unlink()
+    path = tmp_path / "results" / "fed-a.out.json"
+    record = json.loads(path.read_text())
+    if damage == "not json":
+        path.write_text("{")
+    elif damage == "no shard":
+        del record["shard"]
+        path.write_text(json.dumps(record))
+    elif damage == "of another shard":
+        record["shard"] = {"index": 2, "count": 2, "label": "fed-b"}
+        path.write_text(json.dumps(record))
+    else:
+        record["pass_env"] = {NAME: ["x"]}
+        path.write_text(json.dumps(record))
+    node_holds(monkeypatch)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, None, resume=True))
+    assert "out.json" in said
+    assert VALUE not in said
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_shard_that_passed_nothing_resumes_with_nothing_as_before(shards, tmp_path, monkeypatch):
+    """O63: no origin and an archive manifest with no `pass_env` is a first step that passed nothing: a resume that
+    declares nothing continues, as it always did."""
+    first_step_passing_nothing(shards, tmp_path, monkeypatch)
+    run, _ = dispatcher()
+    assert shards.step(step_args(tmp_path, resume=True), runner=run, core_found=lambda path: True) == 0
+    assert not origin_file(tmp_path).exists()
+
+
+def test_o63_a_shard_killed_after_its_first_archives_tar_and_before_its_manifest_resumes_as_before(
+    shards, tmp_path, monkeypatch
+):
+    """O63: the archive's tar is renamed into place and hashed before its manifest is written, so a step killed
+    between the two leaves a tar and no manifest (its tmpfs, and so the leftover `--archive-left` needs, is gone). A
+    study that declares no variable has no origin either, and the shard resumes from its snapshots as it always did:
+    no manifest is not an unreadable one. A step that does declare variables is refused for adding them, naming only
+    them."""
+    first_step_passing_nothing(shards, tmp_path, monkeypatch)
+    (tmp_path / "results" / "fed-a.out.json").unlink()
+    assert (tmp_path / "results" / "fed-a.out.tar").exists()
+    results = tmp_path / "results"
+    assert shards.check_pass_env_origin(results, SPEC_A, {}) is None
+    with pytest.raises(shards.ShardsError, match=NAME) as refused:
+        shards.check_pass_env_origin(results, SPEC_A, {NAME: VALUE})
+    assert VALUE not in str(refused.value)
+
+
+def test_o63_an_unreadable_manifest_still_names_the_variable_a_step_adds(shards, tmp_path):
+    """O63: with no origin and a manifest that cannot be read (here an empty record), a step that declares a variable
+    is refused for adding it, as it was before the manifest was read; one that declares nothing is refused naming
+    the manifest."""
+    (tmp_path / "results").mkdir()
+    (tmp_path / "results" / "fed-a.out.json").write_text("{}")
+    with pytest.raises(shards.ShardsError, match=NAME):
+        shards.check_pass_env_origin(tmp_path / "results", SPEC_A, {NAME: VALUE})
+    with pytest.raises(shards.ShardsError, match=r"fed-a\.out\.json"):
+        shards.check_pass_env_origin(tmp_path / "results", SPEC_A, {})
+
+
+# -- the origin is never longer than the reader takes --------------------------------------------------------------
+
+
+def origin_size(passed) -> int:
+    """The bytes `record_pass_env_origin` writes for `passed`, built as it builds them."""
+    record = {"format": "expcore-hpc-shard-pass-env/1", "shard": SPEC_A, "pass_env": passed}
+    return len((json.dumps(record, sort_keys=True) + "\n").encode())
+
+
+def test_o63_an_origin_longer_than_the_reader_takes_is_refused_by_the_writer_before_it_writes(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: 64 valid names with absolute-path values of 1,025 characters each are all accepted by the checks on a
+    line, and wrote a record of 66,404 bytes that the reader (limit 65,536) refuses as a record it cannot take: the
+    step passed, and every later one, however identical, was refused. The writer measures the record first and refuses
+    the step, naming the limit and no variable or value; no draft, no origin and no running mark are left."""
+    passed = {f"V{n}": "/" + "a" * 1024 for n in range(64)}
+    assert origin_size(passed) > shards.PASS_ENV_ORIGIN_MAX
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    for name, value in passed.items():
+        monkeypatch.setenv(name, value)
+    said = refused_step(shards, tmp_path, capsys, step_args(tmp_path, list(passed)))
+    refusal = next(line for line in said.splitlines() if "ERROR" in line)  # the note of what it passed names them
+    assert str(shards.PASS_ENV_ORIGIN_MAX) in refusal
+    assert "V0" not in refusal
+    assert "aaaa" not in said
+    results = tmp_path / "results"
+    assert not origin_file(tmp_path).exists()
+    assert not list(results.glob("**/.pass-env*"))
+    assert not (results / "fed-a" / "running.json").exists()
+    assert not list((tmp_path / "tmpfs").iterdir())
+
+
+def test_o63_the_writer_takes_a_record_of_exactly_the_readers_limit_and_the_reader_reads_it_back(shards, tmp_path):
+    """O63: the limit is the reader's: a record of exactly 65,536 bytes is written, and read back whole (and the record
+    one byte longer is refused)."""
+    full = "/" + "a" * 1024
+    passed = {f"V{n}": full for n in range(63)}
+    room = shards.PASS_ENV_ORIGIN_MAX - origin_size({**passed, "W": "/"})
+    assert 0 < room <= 1024
+    passed["W"] = "/" + "a" * room
+    assert origin_size(passed) == shards.PASS_ENV_ORIGIN_MAX
+    results = tmp_path / "results"
+    shards.record_pass_env_origin(results, SPEC_A, passed)
+    assert origin_file(tmp_path).stat().st_size == shards.PASS_ENV_ORIGIN_MAX
+    assert shards.read_pass_env_origin(results, SPEC_A) == passed
+    other = tmp_path / "other"
+    longer = {**passed, "W": passed["W"] + "a"}
+    assert origin_size(longer) == shards.PASS_ENV_ORIGIN_MAX + 1
+    with pytest.raises(shards.ShardsError, match=str(shards.PASS_ENV_ORIGIN_MAX)):
+        shards.record_pass_env_origin(other / "results", SPEC_A, longer)
+    assert not (other / "results").exists()

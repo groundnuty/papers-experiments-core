@@ -136,13 +136,20 @@ EVIDENCE_TREES = (
 WHOLE_TREES = ("fault-journal",)
 # Every directory of the allow-list is strict: no process of the federation's own rewrites a file in one.
 STRICT_TREES = (*(directory for directory, _ in EVIDENCE_TREES), *WHOLE_TREES)
-_PLAIN_NAME = re.compile(r"[A-Za-z0-9._-]{1,200}")
+MAX_NAME = 200  # the longest plain name (one path component) the archiver takes
+_PLAIN_NAME = re.compile(rf"[A-Za-z0-9._-]{{1,{MAX_NAME}}}")
 # An NFS client's silly-rename file: a file removed while a process still holds it open, which stays (as `.nfsXXXX`)
 # until the last close. It is a removed file, so no evidence: a `down` run again after a removal cut short finds only
 # these, once its state is gone. The same pattern as `hpcremove.SILLY`, which this module cannot import (it uses the
 # standard library alone: `collect` loads it by its path); a test compares the two.
 SILLY = re.compile(r"\.nfs[0-9A-Fa-f]+")
 MAX_DEPTH = 4
+# The longest root-relative path the archiver can hold: the longest tree it walks, `MAX_DEPTH` directories below it and
+# a file, each a name of up to `MAX_NAME` plain characters and a separator (1,018 for the fault journal). The marker
+# accepts every name it can be given and none beyond it.
+MAX_RELATIVE = max(len(tree) for tree in (*(directory for directory, _ in EVIDENCE_TREES), *WHOLE_TREES)) + (
+    (MAX_DEPTH + 1) * (MAX_NAME + 1)
+)
 SCAN_DEPTH = 32  # how deep `down`'s look for evidence goes (a tree below it counts): never the archive's bound
 SECRETS = "secrets"  # never archived; its files' contents are what no archived file may hold
 MIN_SECRET = 8  # the shortest value taken for a secret when scanning (a shorter one would match by chance)
@@ -721,7 +728,7 @@ def _marked_files(value: Any) -> bool:
         return False
     return all(
         isinstance(name, str)
-        and len(name) <= 1000
+        and len(name) <= MAX_RELATIVE
         and all(part not in ("", ".", "..") and _PLAIN_NAME.fullmatch(part) for part in name.split("/"))
         and isinstance(digest, str)
         and SHA256.fullmatch(digest)
