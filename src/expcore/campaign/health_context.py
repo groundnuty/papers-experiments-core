@@ -12,8 +12,9 @@ call signature has a parameter named `context` receives the context, passed by k
 the parameter has a default or not. Every other check is called with no argument, exactly as before: a check with
 `*args` or `**kwargs`, with a parameter of another name even when it has a default (`timeout=30`), a mock, and a
 callable whose signature cannot be read. Only the name opts in, so no check that works today is handed something it
-does not expect. The signature is the callable's own, never that of a function a `functools.wraps` wrapper wraps: a
-decorated check opts in through its wrapper's signature, and a wrapper that takes no argument is called with none.
+does not expect. The signature is the callable's own, not that of a function a `functools.wraps` wrapper wraps: a
+decorated check opts in through its wrapper's signature, and a wrapper that takes no argument is called with none. (A
+`__signature__` attribute is honoured, as `inspect.signature` does, and `functools.wraps` copies one.)
 
 A signature that cannot be read one way is **refused when the gate is built**, with a `ConfigError` that names the
 parameter, and not at the first call, where it read as a failed check for ever: a `context` that cannot be passed by
