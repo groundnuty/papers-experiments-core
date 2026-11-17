@@ -75,6 +75,7 @@ class Bench:
     data: dict = field(default_factory=dict)  # a federation's data as read back, when not its manifest's
     spawned: list = field(default_factory=list)
     alive: set = field(default_factory=set)
+    pool: Any = None  # the nodes of one cluster every federation shares (O57), else each has a cluster of its own
     guard: Any = None  # the inode guard's stand-in: (count, layout, site, environ) -> its words
     real: Any = None  # hpcfed.make_driver as the module has it, before the bench patches it
 
@@ -101,8 +102,13 @@ class Bench:
     def fake(self, label: str) -> FakeSlurm:
         if label not in self.fakes:
             job, second = job_ids(label)
-            self.fakes[label] = FakeSlurm(job_id=job, second_id=second, ca_pem=self.cas.get(label, self.ca_pem),
-                                          node_tmp=str(self.node_tmp))  # fmt: skip
+            shared = {"nodes": list(self.pool)} if self.pool else {}
+            fake = FakeSlurm(job_id=job, second_id=second, ca_pem=self.cas.get(label, self.ca_pem),
+                             node_tmp=str(self.node_tmp), **shared)  # fmt: skip
+            for other in self.fakes.values() if self.pool else ():  # one cluster: each `squeue --me` sees the rest
+                other.peers.append(fake)
+                fake.peers.append(other)
+            self.fakes[label] = fake
         return self.fakes[label]
 
     def driver(self, label: str, layout: Path, root: Path, agent: bool) -> Any:
