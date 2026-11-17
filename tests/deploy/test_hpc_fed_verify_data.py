@@ -451,6 +451,43 @@ def test_c06_a_core_rerun_whose_layout_has_other_ingested_spaces_than_up_recorde
     stays_bootstrapped(shards, tmp_path, fed, said, "ingested spaces are not the ones this up recorded", capsys)
 
 
+def test_c06_a_core_rerun_over_another_layout_than_up_recorded_does_not_link_it_again(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: the rerun renders the platform file from the layout it is given, and `up` built the federation from
+    its own: a rerun over another layout (a wrong `--layout`, a layout edited since, one with no platform template and
+    so no link check to run) passes its own checks and cannot vouch for the federation, so it stays `bootstrapped`
+    and says why."""
+    fed = verified(hpc, tmp_path, ca)
+    fed.driver.set(lambda s: s["layout"].update(digest="ab" * 32))  # the digest `up` recorded of its layout's bytes
+    said: list = []
+    assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its layout is not the one up recorded", capsys)
+
+
+def test_c06_a_core_rerun_that_cannot_compare_the_ingested_spaces_does_not_link_it_again_and_names_no_path(
+    hpc, shards, tmp_path, ca, capsys
+):
+    """C06, O63: whatever goes wrong while the rerun compares the layout's ingested spaces with the recorded ones (here
+    the template cannot be read) is a refusal to link again, in fixed words that name no path: the rerun still runs, and
+    never ends in a traceback before it does."""
+    fed = verified(hpc, tmp_path, ca)
+    real, asked = hpc.data.ingested, []
+
+    def unreadable_once(layout: Any) -> Any:
+        if not asked:
+            asked.append(True)
+            raise OSError("/no/such/place/template.toml: unreadable")
+        return real(layout)
+
+    said: list = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(hpc.data, "ingested", unreadable_once)
+        assert "link check: every pair transferred" in rerun(hpc, fed, link_check_stand_in([]), said)
+    stays_bootstrapped(shards, tmp_path, fed, said, "its ingested spaces could not be compared with the layout", capsys)
+    assert not any("/no/such/place" in line for line in said)
+
+
 def test_c06_a_core_rerun_whose_ingested_manifest_changed_since_up_does_not_link_it_again(
     hpc, shards, tmp_path, ca, capsys
 ):
