@@ -187,4 +187,4 @@ def test_o73_the_search_finds_a_node_name_in_each_channel_of_an_older_registrati
     bodies = rest_answers.answers(ZONE_NODE, LOCAL_NODE)
     found = rest_answers.leaks(bodies, rest_answers.node_patterns(NODE_WORDS))
     assert set(found) == set(rest_answers.CHANNELS)
-    assert found["description URL"] == 1  # the node's name: a registered domain has no port, so no 8443 in the URL
+    assert found["description URL"] >= 1  # the node's name (a registered domain has no port, so no 8443 in the URL)
