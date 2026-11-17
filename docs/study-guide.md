@@ -965,6 +965,20 @@ assert exposed == plugin.tools["relay-down"] == plugin.tools["baseline"] != plug
 assert record.prompt["tools_sha256"] != exposed  # what the model was sent: the cap sentence in each description
 ```
 
+### Analysing without the platform
+
+`build` often needs what the run needed: the rendered federation, the site's variables. A batch run on an HPC allocation is analysed after copy-back, where neither exists, and the analysis needs only the scorers. Define `build_analysis(context)` beside `build` in the plugin, with the same context, returning a `StudyPlugin` whose `scorers` are the ones `build` gives (make both from one function, so the two cannot drift). `analyze`, `report`, `regenerate` and the package's check call it when it is there and `build` when it is not; nothing else of what it returns is read, so give it no prompts, tools, executor or backend factory that would need the platform. A run never calls it. Define it when `build` needs the platform and leave it out when `build` runs wherever the analysis does, as the example's does:
+
+```python
+from expcore.study.analysis_plugin import load_analysis_plugin
+
+analysis = load_analysis_plugin(StudyContext(study, {}))
+assert not analysis.from_build_analysis  # the example defines `build` alone, so its analysis is built by `build`
+assert analysis.plugin.scorer_digest() == plugin.scorer_digest()
+```
+
+The campaign records the digest of the run's scorers (their names and versions) in its fingerprint, and `analyze` refuses a `build_analysis` whose scorers have another, naming them: change a scorer's `version` when its behaviour changes, as for any scorer, so that this can see it. A store from before the fingerprint held a digest cannot be compared; `analyze` and `report` then say so on stderr, and no output file carries the note, so the outputs are the same bytes whichever builder served the analysis. With `build_analysis` defined the campaign's scorers are the reference, so a scorer changed since the run is refused: to re-score with it (see above), analyse a copy of the study whose plugin leaves `build_analysis` out, where `build` can run. See [what the plugin may define](interfaces.md#the-study-plugin).
+
 ### How pairs become a contrast's input
 
 What a contrast estimates is decided by how its pairs are combined, in stages of plain means:
