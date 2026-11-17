@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fingerprint_support import standin_python
 from hpc_fed_support import LAYOUT, hpc_on_path
 from hpc_ingested_support import (
     ONE,
@@ -237,8 +238,10 @@ def test_o57_a_state_file_with_a_malformed_data_record_is_refused_when_it_is_rea
 
 
 def shard_manifest(tmp_path: Path, feds: list) -> Path:
-    lines = [f'{k} = "{tmp_path / k}"' for k in ("study", "python", "core_src", "results", "tmpfs")]
-    lines += ['step_path = "/usr/bin:/bin"', "cpus = 6", 'memory = "18g"']
+    (tmp_path / "study").mkdir(exist_ok=True)  # the campaign fingerprint is taken on a copy of it (O63)
+    lines = [f'{k} = "{tmp_path / k}"' for k in ("study", "core_src", "results", "tmpfs")]
+    lines += [f'python = "{standin_python(tmp_path / "venv")}"', 'step_path = "/usr/bin:/bin"', "cpus = 6"]
+    lines += ['memory = "18g"']
     for n, fed in enumerate(feds):
         lines += ["[[shards]]", f'label = "fed-{n}"', f'root = "{fed.root}"']
     (tmp_path / "shards.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
