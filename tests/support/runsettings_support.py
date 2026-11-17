@@ -506,6 +506,10 @@ IN = {
     "sandbox.apptainer.provider_storage": edit("apptainer", platform('provider_storage = "tmpfs"',
                                                                      'provider_storage = "shared_filesystem"')),
     "sandbox.apptainer.work_disk": edit("apptainer", platform('work_disk = "directory"', 'work_disk = "image"')),
+    # another collector is another experiment (O91); a platform that declares none keeps the fingerprint it had
+    "sandbox.apptainer.readlog_collector_sha256": edit("apptainer", platform(
+        'work_disk = "directory"', f'work_disk = "directory"\nreadlog_collector_sha256 = "{SHA["gate"]}"'
+    )),
     "placement.holder": edit("docker", platform('holder = "birch"', 'holder = "pine"')),
     "placement.map": edit("docker", platform('map = "ranges.toml"\n', "")),
     "placement.map.*.file": edit("docker", ("ranges.toml", 'file = "dir/file.bin"', 'file = "dir/other.bin"')),
