@@ -1,5 +1,5 @@
 # Provenance: new
-"""The address map of a federation reached by the names its layout declares (O70).
+"""The address map of a federation reached by the names its layout declares (O77).
 
 A federation on a batch cluster registers each service under a name the layout declares (a zone's domain, a provider's
 domain), which resolves nowhere: the cluster's nodes have names and addresses of their own, and an unprivileged user

@@ -18,7 +18,7 @@
 # later through a step's stdin.
 # Shared imported trees (O59): a provider that owns imported spaces is given one `--import=SPACE=PATH` per space after
 # the peers; configure.sh checks each tree and the service binds it read-only (importstorage.py).
-# A federation reached by the names its layout declares (O70) gives <zone-fqdn> the zone's declared name and adds
+# A federation reached by the names its layout declares (O77) gives <zone-fqdn> the zone's declared name and adds
 # `--declared=NAME` (the provider's own) and one `--host=NAME=ADDRESS` per service of the federation, itself included
 # (see configure.sh): the provider registers under NAME and its cell is given a hosts file that resolves every peer.
 # Usage: sbatch --nodelist=<node-B> --time=<t> --mem=32G [--exclusive] provider.sbatch \

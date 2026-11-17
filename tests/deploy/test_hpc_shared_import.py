@@ -607,7 +607,7 @@ def test_o59_the_run_binds_the_trees_read_only_before_the_image_and_through_the_
     assert exec_line.index('"${binds[@]}"') < exec_line.index('"$R"')
     assert "--writable --containall --no-home" in exec_line
     # no bind of its own: every tree's is read from the list. The one other bind is our own hosts file over /etc/hosts
-    # (O70), made only for a service registered under a declared name, never a tree of the node's filesystems.
+    # (O77), made only for a service registered under a declared name, never a tree of the node's filesystems.
     ours = 'naming=(--no-mount bind-paths --bind "$W/hosts:/etc/hosts:ro")'
     assert ours in body
     assert not re.search(r"--bind[ =]", exec_line.replace('"${naming[@]}"', "").replace(ours, ""))

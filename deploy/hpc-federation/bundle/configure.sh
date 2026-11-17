@@ -9,7 +9,7 @@
 #   rootfs/etc/hpcop-erlang-env      this job's epmd port (a random free one of 21300-21999), epmd and the Erlang
 #                                    distribution on loopback; sourced by every VM start path and read by
 #                                    the shim, which sends 4369 there.
-#   W/hosts, W/declared-name         with --declared (O70): the name this service registers under, the certificate it is
+#   W/hosts, W/declared-name         with --declared (O77): the name this service registers under, the certificate it is
 #                                    made for and onepanel's domain, and the hosts file run_service binds over /etc/hosts:
 #                                    every peer's declared name with its address (a name missing there crashes a provider's
 #                                    lookup of it), and this node's own names. Without --declared: the node's own FQDN.
@@ -32,7 +32,7 @@ R=$W/rootfs; S=$(secrets_dir "$W")
 FQDN=$(node_fqdn); SHORT=${FQDN%%.*}; DOMAIN=${FQDN#*.}
 split_imports IMPORTS ARGS "$@"; set -- "${ARGS[@]}"
 split_names DECLARED HOSTS ARGS "$@"; set -- "${ARGS[@]}"
-DECLARED_NAME=$FQDN   # registered under the node's own name, unless the layout declares one (O70)
+DECLARED_NAME=$FQDN   # registered under the node's own name, unless the layout declares one (O77)
 if (( ${#DECLARED[@]} > 1 )); then die "more than one --declared name"; fi
 if (( ${#DECLARED[@]} == 1 )); then
   DECLARED_NAME=${DECLARED[0]}; valid fqdn "$DECLARED_NAME"

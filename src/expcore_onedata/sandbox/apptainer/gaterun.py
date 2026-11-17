@@ -44,7 +44,7 @@ def hosts(zone: Endpoint, provider: Endpoint, names: tuple[str, str] | None = No
     `names` are `[sandbox.federation]`'s, the zone's and the provider's (O69): the gate then serves and certifies those
     and dials the URLs' hosts and ports behind them, so the agent sees the names the layout declares and never a
     node's name or port. Without them it serves the URLs' hosts themselves, as it always has. An endpoint with an
-    address (O70) is dialled at it, the name it is served under unchanged."""
+    address (O77) is dialled at it, the name it is served under unchanged."""
     zone_name, provider_name = names if names is not None else (zone.host, provider.host)
     if names is not None and zone_name.lower() == provider_name.lower():
         raise SandboxError("[sandbox.federation] serves the zone and the provider by one name: a name is one host's")
@@ -57,7 +57,7 @@ def hosts(zone: Endpoint, provider: Endpoint, names: tuple[str, str] | None = No
 def _upstream(role: str, endpoint: Endpoint) -> dict[str, Any]:
     """One served name's upstream: the URL's host (`addr`, the name its handshake asks for and its certificate is
     checked against), its port and TLS, and `dial`, the address to connect to, when the platform's `[addresses]` map
-    holds the host (O70): the host is then a declared name that resolves nowhere. Without a map entry there is no `dial`
+    holds the host (O77): the host is then a declared name that resolves nowhere. Without a map entry there is no `dial`
     key, and the gate dials `addr`, as it always has."""
     out: dict[str, Any] = {"role": role, "addr": endpoint.host, "port": endpoint.port, "tls": endpoint.tls}
     if endpoint.address is not None:

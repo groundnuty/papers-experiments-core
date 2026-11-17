@@ -3,7 +3,7 @@
 A failure raises `RestError` with the method, the path as the caller labelled it, the status and Onedata's error id,
 never a body, a header or a URL with an id in it, since an answer can hold a token. Proxies from the environment are
 ignored: the federation is on the host's loopback. A federation whose services' names resolve nowhere (the HPC
-federation's, O70) gives `Rest` its address map: each such name is then dialled at its mapped address, with the name in
+federation's, O77) gives `Rest` its address map: each such name is then dialled at its mapped address, with the name in
 the URL, the handshake, the certificate check and `Host`.
 """
 

@@ -1,5 +1,5 @@
 """onedata-mcp's reading of `ONEDATA_MCP_NODE_NAMES` (`onedata_mcp.config.get_node_names`), for the tests that build it
-(O70).
+(O77).
 
 The value is a JSON object whose keys are real host names or addresses, each bare, `host:port` or `[ipv6]:port`, and
 whose values are non-empty declared names; the server reads each key by its host (port and brackets off, lower case) and

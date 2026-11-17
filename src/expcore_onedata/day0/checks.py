@@ -56,7 +56,7 @@ def _tcp(ctx: Context, name: str) -> dict[str, Any]:
         return {"measured": False}
     parts = urlsplit(ctx.config.providers[name].url)
     host, port = parts.hostname or "", parts.port or (443 if parts.scheme == "https" else 80)
-    if ctx.config.addresses is not None:  # O70: a declared name resolves nowhere; connect where the map says
+    if ctx.config.addresses is not None:  # O77: a declared name resolves nowhere; connect where the map says
         host = ctx.config.addresses.dial(host)
     times: list[float] = []
     errors = 0

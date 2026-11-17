@@ -103,7 +103,7 @@ ENV_PROVIDER_HOST = "ONEDATA_ONEPROVIDER_HOST"
 ENV_PROVIDER_TOKEN = "ONEDATA_ONEPROVIDER_TOKEN"
 ENV_TOOLS = "ONEDATA_MCP_TOOLS"
 ENV_INSECURE_TLS = "ONEDATA_ALLOW_INSECURE_TLS"
-ENV_NODE_NAMES = "ONEDATA_MCP_NODE_NAMES"  # O70: the server's map from every real node name to its declared name
+ENV_NODE_NAMES = "ONEDATA_MCP_NODE_NAMES"  # O77: the server's map from every real node name to its declared name
 MANAGED_ENV = (
     ENV_ZONE_HOST,
     ENV_ZONE_TOKEN,
@@ -149,7 +149,7 @@ def server_environment(
     The one token serves the server's Onezone and Oneprovider settings. The provider is the agent's pinned local one.
     The allow-list is the condition's, and a caller cannot set it or any other managed setting.
 
-    With the platform's `[addresses]` (O70, a federation reached by the names its layout declares) it is also given
+    With the platform's `[addresses]` (O77, a federation reached by the names its layout declares) it is also given
     `ONEDATA_MCP_NODE_NAMES` (`node_names`): the server then names a node by its declared name in the text of an error,
     never by its own name or address or its port. A Compose federation sets none.
 

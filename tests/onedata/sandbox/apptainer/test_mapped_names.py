@@ -1,4 +1,4 @@
-"""O70: on the Apptainer backend the gate and the host mount dial the address the platform's map holds for a declared
+"""O77: on the Apptainer backend the gate and the host mount dial the address the platform's map holds for a declared
 name, and nothing of a cell holds the address, the node's name or the node's port."""
 
 import json
@@ -47,8 +47,8 @@ def _bound_text(cell) -> str:
     return "\n".join(parts)
 
 
-def test_o70_the_endpoint_of_a_url_carries_the_address_its_host_is_dialled_at():
-    """O70: a mapped host keeps its name and gets its address; an unmapped one has none, and the address is no part of
+def test_o77_the_endpoint_of_a_url_carries_the_address_its_host_is_dialled_at():
+    """O77: a mapped host keeps its name and gets its address; an unmapped one has none, and the address is no part of
     the endpoint's repr."""
     mapped = Endpoint.from_url(f"https://{ZONE_NAME}:{NODE_PORT}", MAP)
     assert (mapped.host, mapped.port, mapped.address, mapped.dial) == (ZONE_NAME, 8443, ZONE_ADDRESS, ZONE_ADDRESS)
@@ -58,8 +58,8 @@ def test_o70_the_endpoint_of_a_url_carries_the_address_its_host_is_dialled_at():
     assert Endpoint.from_url(f"https://{ZONE_NAME}").address is None
 
 
-def test_o70_the_gate_serves_the_declared_names_and_dials_their_addresses(node, tmp_path):
-    """O70: the gate's configuration names each upstream by its declared name (`addr`, the handshake's and the
+def test_o77_the_gate_serves_the_declared_names_and_dials_their_addresses(node, tmp_path):
+    """O77: the gate's configuration names each upstream by its declared name (`addr`, the handshake's and the
     certificate check's) and its mapped address (`dial`); a host with no map entry has no `dial` key."""
     box = start(node, make_settings(tmp_path), _spec("via-gate"))
     try:
@@ -79,8 +79,8 @@ def test_o70_the_gate_serves_the_declared_names_and_dials_their_addresses(node, 
     assert not [h for h in unmapped.values() if "dial" in h]
 
 
-def test_o70_nothing_a_cell_is_given_holds_an_address_a_node_name_or_the_node_port(node, tmp_path):
-    """O70: no exec's argv, environment or bound file, and no file the cell's start binds, holds a mapped address; the
+def test_o77_nothing_a_cell_is_given_holds_an_address_a_node_name_or_the_node_port(node, tmp_path):
+    """O77: no exec's argv, environment or bound file, and no file the cell's start binds, holds a mapped address; the
     environment, the hosts file and the gate's file hold neither the port nor any name but the declared ones."""
     box = start(node, make_settings(tmp_path), _spec("via-gate"))
     try:
@@ -98,8 +98,8 @@ def test_o70_nothing_a_cell_is_given_holds_an_address_a_node_name_or_the_node_po
         box.stop()
 
 
-def test_o70_the_host_mount_dials_the_mapped_address(tmp_path):
-    """O70: oneclient is started with the provider's address, which it dials without checking the name, and its port;
+def test_o77_the_host_mount_dials_the_mapped_address(tmp_path):
+    """O77: oneclient is started with the provider's address, which it dials without checking the name, and its port;
     the declared name is not on its command line."""
     node = FakeMountNode()
     settings = make_settings(tmp_path, oneclient_bundle=pinned_bundle(tmp_path / "files"))
@@ -136,8 +136,8 @@ def _mapped_config(tmp_path, monkeypatch):
     return load_platform(write_platform(tmp_path, edit))
 
 
-def test_o70_the_platform_builds_the_run_s_endpoints_with_its_map(tmp_path, monkeypatch):
-    """O70: the spec a run's sandbox is started with holds the zone's and the local provider's endpoints with the
+def test_o77_the_platform_builds_the_run_s_endpoints_with_its_map(tmp_path, monkeypatch):
+    """O77: the spec a run's sandbox is started with holds the zone's and the local provider's endpoints with the
     addresses the platform's map gives their declared names."""
     from types import SimpleNamespace
 
@@ -153,8 +153,8 @@ def test_o70_the_platform_builds_the_run_s_endpoints_with_its_map(tmp_path, monk
     assert (spec.provider.host, spec.provider.address) == (PROVIDER_NAME, PROVIDER_ADDRESS)
 
 
-def test_o70_the_day_zero_reachability_check_connects_where_the_map_says(tmp_path, monkeypatch):
-    """O70: the check's TCP samples go to the mapped address of the provider's declared name, never to the name."""
+def test_o77_the_day_zero_reachability_check_connects_where_the_map_says(tmp_path, monkeypatch):
+    """O77: the check's TCP samples go to the mapped address of the provider's declared name, never to the name."""
     from types import SimpleNamespace
 
     from expcore_onedata.day0 import checks

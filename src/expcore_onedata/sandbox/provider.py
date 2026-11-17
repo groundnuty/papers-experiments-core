@@ -457,7 +457,7 @@ class SandboxPlatform:
             mode=mode,
             token=token,
             zone=Endpoint.from_url(self._config.zone.url, self._config.addresses),
-            # the agent is pinned to its local provider; with `[addresses]` (O70) each is dialled at its mapped address
+            # the agent is pinned to its local provider; with `[addresses]` (O77) each is dialled at its mapped address
             provider=Endpoint.from_url(self._config.local_provider.url, self._config.addresses),
             lease_key=lease_key,
             listing=self._s.listing_of(level) or PAGED,  # the level's listing mode (O21)

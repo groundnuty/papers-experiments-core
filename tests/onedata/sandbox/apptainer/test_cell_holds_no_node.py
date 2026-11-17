@@ -1,4 +1,4 @@
-"""O70: nothing a REST cell receives holds a node's name, a node's address or the nodes' public port, for a federation
+"""O77: nothing a REST cell receives holds a node's name, a node's address or the nodes' public port, for a federation
 whose services register and are reached by the names their layout declares.
 
 The layout is a fake of the HPC pilot's shape with node-shaped names (a rack, a chassis and a blade in each node's name)
@@ -95,8 +95,8 @@ def _everything_a_cell_receives(done) -> dict[str, str]:
 
 
 @pytest.mark.parametrize("table", [False, True], ids=["urls-are-the-names", "federation-table"])
-def test_o70_no_cell_input_holds_a_node_name_an_address_or_the_public_port(config, tmp_path, table):
-    """O70: the environment, the hosts file, the gate's file, the CA and every other file or argument a cell receives
+def test_o77_no_cell_input_holds_a_node_name_an_address_or_the_public_port(config, tmp_path, table):
+    """O77: the environment, the hosts file, the gate's file, the CA and every other file or argument a cell receives
     hold the declared names alone, with or without `[sandbox.federation]`; the gate's leaf certificates name them alone;
     what the run records (its metadata, its egress declaration and its files, but the gate's own directory) holds none
     either, and the gate, which the cell cannot read, is the one place the mapped addresses are."""
@@ -142,8 +142,8 @@ def test_o70_no_cell_input_holds_a_node_name_an_address_or_the_public_port(confi
         box.stop()
 
 
-def test_o70_the_levels_of_the_fake_are_the_apptainer_support_s(config):
-    """O70: the scan above ran a REST level, which `apptainer_support` names `via-gate`."""
+def test_o77_the_levels_of_the_fake_are_the_apptainer_support_s(config):
+    """O77: the scan above ran a REST level, which `apptainer_support` names `via-gate`."""
     assert LEVELS["via-gate"] is DataPathMode.REST
     assert _spec(config).zone.address == NODES[ZONE][0]
 
@@ -158,8 +158,8 @@ def test_o70_the_levels_of_the_fake_are_the_apptainer_support_s(config):
         '"port": 8443}',
     ],
 )
-def test_o70_the_search_finds_a_node_name_an_address_or_the_port_where_one_is(leak):
-    """O70: the patterns the scan uses match each of the forms a leak takes, in any case, and not a declared name or a
+def test_o77_the_search_finds_a_node_name_an_address_or_the_port_where_one_is(leak):
+    """O77: the patterns the scan uses match each of the forms a leak takes, in any case, and not a declared name or a
     hash that holds the digits."""
     assert any(pattern.search(leak) for pattern in forbidden())
     clean = f"{ZONE} {LOCAL} 127.0.0.1 sha256:ab18443cd and port 40443"

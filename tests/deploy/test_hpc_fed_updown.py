@@ -113,7 +113,7 @@ def test_the_held_job_is_shaped_by_the_layout_and_read_back_before_anything_runs
 
 def test_every_service_gets_every_peer_address_before_it_starts(hpc, tmp_path, site):
     """O57: the shim reads its peers once, so the zone's step names every provider's address, and each provider's the
-    zone's name (its declared one, O70) and address and every other provider's address; the flags of the names
+    zone's name (its declared one, O77) and address and every other provider's address; the flags of the names
     (`--declared`, `--host`) follow the peers (tests/deploy/test_hpc_declared_names.py)."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
@@ -181,7 +181,7 @@ def test_each_provider_is_registered_by_a_token_piped_from_the_zone_before_its_v
 
 def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_declared_names(hpc, tmp_path, site):
     """O57: the root gets the zone's passphrase (0600, as the Compose root holds it) and its CA; the core's phase
-    runs over https://<declared name>:8443 (O70: the services' own names, dialled at the root's address map's nodes),
+    runs over https://<declared name>:8443 (O77: the services' own names, dialled at the root's address map's nodes),
     with the job's uid as the storage's owner, this driver's argv prefix and the settle time derived from the layout."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()

@@ -1,4 +1,4 @@
-"""A real TLS service on the loopback, for the tests of a client that reaches a service by name (O70).
+"""A real TLS service on the loopback, for the tests of a client that reaches a service by name (O77).
 
 `TlsPeer(directory, name)` listens on 127.0.0.1 at a free port with a certificate that names `name` alone, signed by a
 CA of its own (`ca`), answers every request with an empty JSON object, and records what it was sent: the server name the

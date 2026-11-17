@@ -1,4 +1,4 @@
-"""O70: the tool server of a federation reached by the names its layout declares is given `ONEDATA_MCP_NODE_NAMES`,
+"""O77: the tool server of a federation reached by the names its layout declares is given `ONEDATA_MCP_NODE_NAMES`,
 built from the platform's address map, so it names no node by its own name, its address or its port in what it
 returns; a Compose federation, whose names are already the declared ones, is given none."""
 
@@ -50,8 +50,8 @@ def _config(tmp_path, *, mapped=True, ports=(8443, 8443, 9443)):
     return load_platform(write_platform(tmp_path, edit))
 
 
-def test_o70_a_mapped_platform_gives_the_tool_server_every_real_name_under_its_declared_name(tmp_path):
-    """O70: each node's names and address, bare and with the URLs' ports and 443, and each declared name under itself,
+def test_o77_a_mapped_platform_gives_the_tool_server_every_real_name_under_its_declared_name(tmp_path):
+    """O77: each node's names and address, bare and with the URLs' ports and 443, and each declared name under itself,
     valid by the server's own rules (a key a host, `host:port` or `[ipv6]:port`, a value a declared name, one host under
     one name)."""
     config = _config(tmp_path)
@@ -66,8 +66,8 @@ def test_o70_a_mapped_platform_gives_the_tool_server_every_real_name_under_its_d
         assert names[declared] == names[f"{declared}:8443"] == declared  # a port after a declared name goes with it
 
 
-def test_o70_the_value_is_built_from_the_same_map_the_clients_dial_through(tmp_path):
-    """O70: every address the clients are given for a declared name is a key of the value."""
+def test_o77_the_value_is_built_from_the_same_map_the_clients_dial_through(tmp_path):
+    """O77: every address the clients are given for a declared name is a key of the value."""
     config = _config(tmp_path)
     names = json.loads(node_names(config))
     for declared, node in config.addresses.hosts.items():
@@ -75,15 +75,15 @@ def test_o70_the_value_is_built_from_the_same_map_the_clients_dial_through(tmp_p
         assert all(names[n] == declared for n in node.names)
 
 
-def test_o70_a_platform_without_a_map_gives_the_tool_server_no_node_names(tmp_path):
-    """O70: Compose stays unset: its names are the declared ones already."""
+def test_o77_a_platform_without_a_map_gives_the_tool_server_no_node_names(tmp_path):
+    """O77: Compose stays unset: its names are the declared ones already."""
     config = _config(tmp_path, mapped=False)
     assert node_names(config) is None
     assert ENV_NODE_NAMES not in server_environment(config, config.condition("read"), TOKEN)
 
 
-def test_o70_the_caller_cannot_set_the_node_names(tmp_path):
-    """O70: the setting is the platform's, like every managed one: a caller's value is refused by name."""
+def test_o77_the_caller_cannot_set_the_node_names(tmp_path):
+    """O77: the setting is the platform's, like every managed one: a caller's value is refused by name."""
     config = _config(tmp_path)
     assert ENV_NODE_NAMES in MANAGED_ENV
     with pytest.raises(ValueError, match=ENV_NODE_NAMES):

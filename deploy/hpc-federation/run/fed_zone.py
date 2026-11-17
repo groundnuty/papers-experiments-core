@@ -62,7 +62,7 @@ def die(msg: str) -> None:
 
 def registered_name(workdir: str) -> str:
     """The name the service is registered under, which its certificate holds: the work directory's `declared-name`
-    when configure.sh wrote one (O70), else the node's own FQDN, as before."""
+    when configure.sh wrote one (O77), else the node's own FQDN, as before."""
     path = os.path.join(workdir, "declared-name")
     if not os.path.lexists(path):
         return subprocess.run(["hostname", "-f"], capture_output=True, text=True, check=True).stdout.strip()

@@ -54,7 +54,7 @@ class SecretLike(Protocol):
 class Endpoint:
     """A host the sandbox reaches through the gate or the mount: name, port and whether it speaks TLS.
 
-    `address`, when the platform's `[addresses]` map holds the name (O70), is where to connect: the name is a layout's
+    `address`, when the platform's `[addresses]` map holds the name (O77), is where to connect: the name is a layout's
     declared one, which resolves nowhere, and stays what the handshake asks for and the certificate is checked
     against. It is never the cell's to see: the gate and the mount dial it, no file or variable of a cell holds it."""
 

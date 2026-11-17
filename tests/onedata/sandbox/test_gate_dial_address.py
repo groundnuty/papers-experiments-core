@@ -1,4 +1,4 @@
-"""O70: a gate whose upstream is a declared name that resolves nowhere dials the mapped address, and asks TLS, the
+"""O77: a gate whose upstream is a declared name that resolves nowhere dials the mapped address, and asks TLS, the
 certificate check and `Host` for the declared name; no answer it gives its client holds the address or the port.
 
 The gate runs in-process: a TLS listener on a loopback port, and a TLS upstream on another whose certificate names the
@@ -76,8 +76,8 @@ def stage(tmp_path):
     gate._CTX.clear()
 
 
-def test_o70_the_gate_dials_the_mapped_address_and_asks_tls_and_host_for_the_declared_name(tmp_path, stage):
-    """O70: the upstream is reached though its name resolves nowhere: the handshake asked for the declared name, which
+def test_o77_the_gate_dials_the_mapped_address_and_asks_tls_and_host_for_the_declared_name(tmp_path, stage):
+    """O77: the upstream is reached though its name resolves nowhere: the handshake asked for the declared name, which
     its certificate holds alone, and the request's `Host` is the name the client used."""
     with TlsPeer(tmp_path / "up", SERVED) as upstream:
         status, _ = _get(*stage(upstream, dial=DIAL))
@@ -86,8 +86,8 @@ def test_o70_the_gate_dials_the_mapped_address_and_asks_tls_and_host_for_the_dec
         assert upstream.requests == [{"method": "GET", "path": FILE, "host": SERVED}]
 
 
-def test_o70_without_a_dial_address_the_declared_name_reaches_nothing(tmp_path, stage):
-    """O70: the same upstream with no `dial` fails: it is the address that connects, and nothing of the gate's answer
+def test_o77_without_a_dial_address_the_declared_name_reaches_nothing(tmp_path, stage):
+    """O77: the same upstream with no `dial` fails: it is the address that connects, and nothing of the gate's answer
     names the address or the port."""
     with TlsPeer(tmp_path / "up", SERVED) as upstream:
         status, body = _get(*stage(upstream))
@@ -96,8 +96,8 @@ def test_o70_without_a_dial_address_the_declared_name_reaches_nothing(tmp_path, 
         assert not [word for word in (DIAL, str(upstream.port)) if word in json.dumps(body)]
 
 
-def test_o70_the_certificate_is_still_checked_against_the_declared_name(tmp_path, stage):
-    """O70: an upstream whose certificate names another host is refused although the gate dials its address, and the
+def test_o77_the_certificate_is_still_checked_against_the_declared_name(tmp_path, stage):
+    """O77: an upstream whose certificate names another host is refused although the gate dials its address, and the
     refusal names the served name, never the address or the port."""
     with TlsPeer(tmp_path / "up", "other.layout.test") as upstream:
         status, body = _get(*stage(upstream, dial=DIAL))
@@ -117,8 +117,8 @@ def test_o70_the_certificate_is_still_checked_against_the_declared_name(tmp_path
         ("not valid for 'depot.layout.test'.", "not valid for 'depot.layout.test'."),
     ],
 )
-def test_o70_the_dialled_address_is_named_by_the_served_name_in_a_failure(text, expected):
-    """O70: a failure's text that quotes the address the gate connected to, with or without the port, is given to the
+def test_o77_the_dialled_address_is_named_by_the_served_name_in_a_failure(text, expected):
+    """O77: a failure's text that quotes the address the gate connected to, with or without the port, is given to the
     client with the served name and 443 in its place; a text that holds only the served name is unchanged."""
     hcfg = {"role": "oneprovider", "addr": SERVED, "dial": "192.0.2.10", "port": 8443, "tls": True}
     assert gate._as_served(text, SERVED, hcfg) == expected
@@ -135,16 +135,16 @@ def test_o70_the_dialled_address_is_named_by_the_served_name_in_a_failure(text, 
         ("not valid for 'depot.layout.test'.", "not valid for 'depot.layout.test'."),
     ],
 )
-def test_o70_a_declared_name_with_the_upstream_port_is_given_on_443(text, expected):
-    """O70: the URL's host is the served name itself on a mapped federation, so the gate's failure text may quote
+def test_o77_a_declared_name_with_the_upstream_port_is_given_on_443(text, expected):
+    """O77: the URL's host is the served name itself on a mapped federation, so the gate's failure text may quote
     `name:8443` (a malformed answer's header, a library's repr): the port of the nodes never reaches the client, and the
     bare name, which needs no replacement, is left as it is."""
     hcfg = {"role": "oneprovider", "addr": SERVED, "dial": "192.0.2.10", "port": 8443, "tls": True}
     assert gate._as_served(text, SERVED, hcfg).lower() == expected.lower()
 
 
-def test_o70_a_host_with_a_node_name_and_an_address_names_both_by_the_served_name():
-    """O70: a gate whose URL host is a node name and which also dials an address (a map of the node's own) names both
+def test_o77_a_host_with_a_node_name_and_an_address_names_both_by_the_served_name():
+    """O77: a gate whose URL host is a node name and which also dials an address (a map of the node's own) names both
     by the served name, the longer form first."""
     hcfg = {"role": "oneprovider", "addr": "node7.site.test", "dial": "192.0.2.10", "port": 8443, "tls": True}
     text = "node7.site.test:8443 then 192.0.2.10:8443 then node7.site.test"

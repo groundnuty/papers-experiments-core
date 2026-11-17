@@ -188,7 +188,7 @@ class Layout:
 
     @property
     def address_map(self) -> Path:
-        """The HPC federation's address map (O70): each declared name's node address, private, which only a federation
+        """The HPC federation's address map (O77): each declared name's node address, private, which only a federation
         whose names resolve nowhere has."""
         return self.secrets / "address-map.json"
 

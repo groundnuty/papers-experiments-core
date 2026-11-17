@@ -332,7 +332,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
-### The registered names (O70)
+### The registered names (O77)
 
 A layout declares a name for the zone and for each provider, `<service>.<domain>`. On a cluster those names resolve
 nowhere, and the nodes have names and addresses of their own that nothing the agent can read may carry (the zone's
@@ -429,7 +429,7 @@ nodes it could not check.
 
 **Rendered by `up` into the root from the layout's own `platform_template`, by the Compose renderer
 (`fedfacts.write_facts`), with the HPC facts:** `@zone_url@` and `@provider_url.<name>@` are `https://<declared
-name>:8443` (O70; the address map's file is named by an `addresses` line the driver puts first); the ids are this
+name>:8443` (O77; the address map's file is named by an `addresses` line the driver puts first); the ids are this
 `up`'s. Every path in the template stays relative to the root, so the same template
 serves both:
 
@@ -651,7 +651,7 @@ federation whose step is gone), then releases it.
    `<leader>+0.<n>`), `scancel <component id>.<n>`, and `sacct -j <component id>` for a step's status. **The fallback
    is a setting:** `sandbox_placement = "separate"`.
 
-7. **The registered names** (O70), not yet run live: the service cells' own hosts file in a `--writable` sandbox
+7. **The registered names** (O77), not yet run live: the service cells' own hosts file in a `--writable` sandbox
    (`--no-mount bind-paths` and a file bind onto `/etc/hosts`, which the site's Apptainer accepted for the agent's SIF
    only); a registered domain unrelated to `cluster.domainName`; the zone's `/configuration` and each provider's
    answering their declared names; a provider's check of a peer and an rtransfer replication between two providers by

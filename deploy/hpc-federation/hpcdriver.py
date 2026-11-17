@@ -416,7 +416,7 @@ class Driver(Down):
 
     def write_address_map(self) -> None:
         """The map from each declared name to its node's address and the node's own names, into the root's secrets
-        (0600), before any service is launched or any client of the login node dials one (O70). It is the root's own
+        (0600), before any service is launched or any client of the login node dials one (O77). It is the root's own
         file, never in a cell, the gate's file or the facts. A service without an address stops up here."""
         state = self.store.read()
         found = hpcnames.address_map(hpcnames.declared_names(self.spec), state["services"])
@@ -500,7 +500,7 @@ class Driver(Down):
             argv = ["bash", str(BUNDLE / "provider.sbatch"), str(BUNDLE), tar, name, zone["declared"], site.admin_mail]
             # --import=SPACE=PATH for each tree it owns, none for a mirror
             imports = hpcimport.provider_import_args(self.layout, name, self.environ)
-            # O70: the name it registers under, and every service's name with its address, for its hosts file
+            # O77: the name it registers under, and every service's name with its address, for its hosts file
             naming = [f"--declared={services[name]['declared']}", *self.host_args(state)]
             self.launch(name, [*argv, zone["address"], *peers, *naming, *imports])
         self.say(f"{len(names)} provider(s) launched; registering each")
@@ -593,7 +593,7 @@ class Driver(Down):
         self.layout.ca_pem.write_text(ca_certificates(export("ca")), encoding="utf-8")
 
     def placed_layout(self, state: Mapping[str, Any]) -> Layout:
-        """The layout with every service at its declared name (O70): its URLs, and the facts and the platform file built
+        """The layout with every service at its declared name (O77): its URLs, and the facts and the platform file built
         from them, hold the name the service registered under, never its node's. The root's address map says where each
         is dialled."""
         hosts = {
