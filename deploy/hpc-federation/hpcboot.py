@@ -68,6 +68,7 @@ from fedlayout import Layout, import_storage_name
 from fedlinks import check_after_up
 from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
+from fedsupport import check_rendered_support
 from fedtools import check_rendered, require_study_artifacts
 from hpcsettings import DEFAULT_STEP_LAUNCH_WAIT_S, VERB_WORK_S
 
@@ -346,6 +347,7 @@ def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> s
     check_rendered(
         layout, facts
     )  # O83: the slots the file declares, against the layout's principals; as a campaign loads it
+    check_rendered_support(layout, facts)  # the file's own support sets, against the zone's (O35)
     return f"facts.json and platform.toml written; {hpcidentity.FILE} written"
 
 

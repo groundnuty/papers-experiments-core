@@ -658,7 +658,7 @@ section 3).
   map `up` writes into the root), which, once the spaces are supported, reads each space's support set back from
   Onezone and refuses any difference from the layout's declaration, naming the space and the provider by layout
   label (O35; the facts keep the measured sets beside the declared ones, with the time read), writes its baseline, `facts.json` and
-  `platform.toml` and its render identity (`render-identity.json`), and runs the platform layer's link check, which
+  `platform.toml` (refused if its support set for a space is not the one Onezone listed, O35) and its render identity (`render-identity.json`), and runs the platform layer's link check, which
   writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat. The providers are launched
   1 s apart, and a service whose step ended before its log said anything is launched **once more**, after a 60 s backoff counted from the

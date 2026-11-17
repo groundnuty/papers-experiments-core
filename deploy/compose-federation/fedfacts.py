@@ -18,6 +18,7 @@ from fedboot import Bootstrap, Ids
 from feddocker import gib
 from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout, import_storage_name
 from fedspec import Space, Spec
+from fedsupport import check_rendered_support
 from fedtools import check_rendered, require_study_artifacts
 
 PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")
@@ -214,6 +215,7 @@ def write_facts(layout: Layout, boot: Bootstrap, study_artifacts: str | None = N
     }
     write_private(layout.platform, render(text, values))
     check_rendered(layout, facts)
+    check_rendered_support(layout, facts)  # the file's own support sets, against the zone's (O35)
     return "facts.json and platform.toml written"
 
 
