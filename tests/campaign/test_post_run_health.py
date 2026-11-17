@@ -120,6 +120,19 @@ def test_o90_a_marker_whose_reading_is_no_object_cannot_be_trusted(tmp_path):
         read_marker(tmp_path, "k", 1)
 
 
+def test_o90_a_marker_nested_past_the_interpreters_limit_cannot_be_trusted_and_never_crashes_the_reader(tmp_path):
+    """O90: a marker file whose reading is nested thousands of lists deep raises `RecursionError` when it is parsed;
+    it is refused as a marker that cannot be trusted, like any other malformed one."""
+    write_marker(tmp_path, "k", 1, AttemptResult(Outcome("finished"), LATER, 1.0))
+    path = tmp_path / MARKER_NAME
+    text = path.read_text().replace(
+        '"result": {', '"result": {"post_run_health": ' + "[" * 5_000 + "]" * 5_000 + ", ", 1
+    )
+    path.write_text(text)
+    with pytest.raises(MarkerError):
+        read_marker(tmp_path, "k", 1)
+
+
 def test_o90_the_helper_keeps_a_small_json_object_and_nothing_else():
     """O90: `prerun.reading_of` answers the reading when it is a JSON object within `READING_MAX_BYTES`, else None."""
     assert prerun.reading_of(READING) == READING
