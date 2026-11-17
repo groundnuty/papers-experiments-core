@@ -267,6 +267,9 @@ def parse_srun(argv: list) -> Srun:
     return Srun(argv, env=env, command=command, **found)
 
 
+NODE_READINGS = {"os": {"id": "invented", "version_id": "9.9"}, "glibc": "glibc 2.99", "kernel": "9.99.0-invented"}
+
+
 @dataclass
 class FakeSlurm:
     """The login node's view of a cluster with one user's held job."""
@@ -286,6 +289,7 @@ class FakeSlurm:
     delivered: list = field(default_factory=list)
     on_control: Callable | None = None  # a test's own answer to a control step, or None for the default
     teardown_rc: int = 0
+    node_readings: Any = field(default_factory=lambda: dict(NODE_READINGS))  # what a facts step prints; None: none
     next_step: int = 0
     queued: bool = True
     relay_calls: list = field(default_factory=list)  # alive, stop, ... in order
@@ -496,6 +500,8 @@ class FakeSlurm:
                 "uid": 5001,
                 "gid": 5001,
             }
+            if self.node_readings is not None:  # None: a step that gives none (an older bundle's)
+                facts["readings"] = self.node_readings
             return 0, json.dumps(facts) + "\n", ""
         if script == "zone-export.sh":
             return (0, "A1b2C3d4E5f6G7h8I9j0K1l2\n", "") if command[2] == "passphrase" else (0, self.ca_pem, "")

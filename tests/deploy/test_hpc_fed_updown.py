@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from hpc_fed_support import (
     LAYOUT,
+    NODE_READINGS,
     PEM,
     SITE,
     FakeProcess,
@@ -561,6 +562,63 @@ def test_a_node_facts_step_that_says_nothing_is_named_so(hpc, tmp_path, site):
     rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(on_control=silent))
     with pytest.raises(RuntimeError, match=r"\(the step's status 0; nothing on its stderr\)$"):
         rig.up()
+
+
+def test_o87_up_records_each_nodes_os_glibc_and_kernel_in_the_state_beside_its_name_and_address(hpc, tmp_path, site):
+    """O87: the node facts step also prints the node's OS release (ID, VERSION_ID), glibc version and kernel release;
+    the state keeps them for every node that runs a service and for the agent's, beside its FQDN and address."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    services = rig.state()["services"]
+    assert set(services) == {"zone", *PROVIDERS, "sandbox"}
+    for name, record in services.items():
+        assert record["readings"] == NODE_READINGS, name
+    assert "unknown" not in services["zone"]["readings"]
+
+
+@pytest.mark.parametrize(
+    "printed",
+    [
+        None,  # a step that gives none (an older bundle's)
+        "garbage",
+        5,
+        ["os"],
+        {"os": "rocky"},
+        {"os": {"id": "x" * 500, "version_id": "1"}, "glibc": "glibc 2.34", "kernel": "5.14"},
+        {"os": {"id": "a", "version_id": "1"}, "glibc": ["glibc 2.34"], "kernel": "5.14"},
+        {"os": {"id": "a", "version_id": "1"}, "glibc": "glibc 2.34", "kernel": "5.14\nsecond"},
+    ],
+)
+def test_o87_readings_a_node_does_not_give_in_the_shape_are_unknown_with_a_reason_and_up_still_succeeds(
+    hpc, tmp_path, site, printed
+):
+    """O87: recorded only, never refused: a step that prints no readings or a malformed value is `unknown` with the
+    reason, for each reading, and the federation comes up all the same."""
+    fake = FakeSlurm()
+    fake.node_readings = printed
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    assert rig.up().startswith("core: the link check passed")
+    for name, record in rig.state()["services"].items():
+        found = record["readings"]
+        assert found["kernel"] == found["glibc"] == "unknown", name
+        assert found["os"] == {"id": "unknown", "version_id": "unknown"}
+        assert set(found["unknown"]) == {"os.id", "os.version_id", "glibc", "kernel"}
+        assert all(reason for reason in found["unknown"].values())
+
+
+def test_o87_a_node_that_marks_some_of_its_readings_unknown_keeps_what_it_read(hpc, tmp_path, site):
+    """O87: the step's own `unknown` (a glibc it could not read, with the reason) reaches the state as printed."""
+    printed = {
+        "os": {"id": "invented", "version_id": "9.9"},
+        "glibc": "unknown",
+        "kernel": "9.99.0-invented",
+        "unknown": {"glibc": "ValueError"},
+    }
+    fake = FakeSlurm()
+    fake.node_readings = printed
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    rig.up()
+    assert rig.state()["services"]["zone"]["readings"] == printed
 
 
 def test_a_step_on_a_node_outside_the_held_job_is_refused(hpc, tmp_path, site):
