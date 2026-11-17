@@ -146,9 +146,11 @@ def check_inodes(runner: Any, site: Site, estimate: int, timeout_s: float = QUOT
     return f"inode check: {figures}: under the line"
 
 
-def guard(runner: Any, site: Site, layout: Any, environ: Mapping[str, str]) -> str:
+def guard(runner: Any, site: Site, layout: Any, environ: Mapping[str, str], federations: int = 1) -> str:
     """`up`'s check: nothing without a scratch root; else, always, the estimate from the layout's manifests against the
-    quota. A site with a scratch root and `HPC_QUOTA_CHECK=off` is refused, never taken as a skip."""
+    quota. A site with a scratch root and `HPC_QUOTA_CHECK=off` is refused, never taken as a skip. `federations` is how
+    many federations of this layout come up at once (`fleet.py`): the usage is read once, against that many estimates,
+    since each of that many separate ups would read the same usage."""
     if not site.storage_root:
         return ""
     if site.quota_check == QUOTA_CHECK_OFF:
@@ -156,4 +158,4 @@ def guard(runner: Any, site: Site, layout: Any, environ: Mapping[str, str]) -> s
             f"HPC_QUOTA_CHECK={QUOTA_CHECK_OFF} with HPC_STORAGE_ROOT: the inode check of a federation bound onto "
             "scratch cannot be turned off; nothing was submitted"
         )
-    return check_inodes(runner, site, sum(estimate_inodes(layout, environ).values()))
+    return check_inodes(runner, site, federations * sum(estimate_inodes(layout, environ).values()))
