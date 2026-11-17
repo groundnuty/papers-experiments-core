@@ -422,7 +422,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | L05 | No hidden per-call limit | `tests/loop/test_loop_time.py`, `tests/loop/test_outcomes_and_config.py`, `tests/tools/test_function_provider.py` |
 | L06 | Tool output is capped by a declared rule, and the rule is pinned | `tests/loop/test_agent_loop.py`, `tests/loop/test_capping.py` |
 | L07 | A truncation by the data source is flagged | `tests/loop/test_agent_loop.py` |
-| L08 | A crash in harness code is not the agent's failure | `tests/campaign/test_defect_log.py`, `tests/loop/test_loop_failures.py`, `tests/package/test_spec.py`, `tests/study/test_study.py`, `tests/test_cli.py` |
+| L08 | A crash in harness code is not the agent's failure | `tests/campaign/test_defect_log.py`, `tests/campaign/test_out_snapshot.py`, `tests/deploy/test_hpc_shards_unpack.py`, `tests/loop/test_loop_failures.py`, `tests/package/test_merged_package.py`, `tests/package/test_spec.py`, `tests/study/test_merge.py`, `tests/study/test_study.py`, `tests/test_cli.py` |
 | L09 | Calls after a terminal call are answered "skipped" | `tests/loop/test_agent_loop.py` |
 | L10 | Leaked tool calls are detected, not nudged | `tests/loop/test_leaks.py` |
 | L11 | An empty final reply differs from no reply | `tests/loop/test_agent_loop.py` |
