@@ -36,7 +36,7 @@ need_2xx "$code" "zone /configuration" "$T/conf.json"
 read_secret PW "$S/passphrase"; curl_auth_file "$T/admin.cfg" admin "$PW"; unset PW
 code=$(http GET "$OZ/user" "$T/user.json" "${TLS[@]}" -K "$T/admin.cfg")
 need_2xx "$code" "zone admin GET /user" "$T/user.json"
-ADMIN_ID=$(jsonget "$T/user.json" userId)
+ADMIN_ID=$(jsonget "$T/user.json" userId) || die "the zone's GET /user names no userId (null or missing)"
 DOM=$(jsonget "$T/conf.json" domain --default "$FQDN")   # the zone's own name for itself; the node's name if it reports none
 if (( RESTART )); then check_identity "$W" kind oz adminUserId "$ADMIN_ID" domain "$DOM"; fi
 

@@ -78,8 +78,8 @@ def test_a_cell_runs_under_the_completion_bootstrap_in_the_apptainer_exec_argv(n
         command = node.execs[-1].command
         assert command[:3] == ["timeout", "-s", "KILL"]
         assert float(command[3]) > 30
-        assert command[4:8] == ["python3", "-I", "-c", completion.BOOTSTRAP]
-        assert command[9:] == [str(len(b"print('hi')")), command[10], "python3"]
+        assert command[4:9] == ["python3", "-I", "-B", "-c", completion.BOOTSTRAP]
+        assert command[10:] == [str(len(b"print('hi')")), command[11], "python3"]
         assert result.exec_check == {"source_whole": True, "exit_status": 0, "nonce_matched": True}
         assert node.execs[-1].flags[-2:] == ["-q", "exec"]
     finally:

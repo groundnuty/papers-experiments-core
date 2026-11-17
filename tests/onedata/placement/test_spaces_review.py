@@ -188,7 +188,7 @@ def test_o04_the_health_token_reaches_only_the_spaces_the_data_path_reaches(tmp_
 
 def test_c06_the_spaces_table_enters_the_fingerprint_with_one_entry_too(tmp_path, fake):
     """C06: a `[[spaces]]` table of one entry is fingerprinted, so a resume after its data provider or its support
-    set changed is refused; the one-space form's fingerprint stays the TLS setting alone."""
+    set changed is refused; the one-space form's holds its support by label (`support`) and no `spaces`."""
 
     def one(holder="alpha", providers=("alpha", "beta")):
         def edit(data):
@@ -198,8 +198,8 @@ def test_c06_the_spaces_table_enters_the_fingerprint_with_one_entry_too(tmp_path
         return edit
 
     first = load_platform(written(tmp_path / "a", one()))
-    assert set(first.fingerprint()) == {"tls", "spaces"}
-    assert set(load_platform(written(tmp_path / "e", None)).fingerprint()) == {"tls"}
+    assert set(first.fingerprint()) == {"tls", "tokens", "toolserver", "spaces"}
+    assert set(load_platform(written(tmp_path / "e", None)).fingerprint()) == {"tls", "tokens", "toolserver", "support"}
     schema, manifest = make_schema(), make_manifest(make_schema())
 
     def resume(config):

@@ -237,6 +237,23 @@ def test_o62_a_damaged_snapshot_is_refused_and_leaves_nothing(live, tmp_path, da
     assert not (tmp_path / "new" / "out").exists()
 
 
+def test_o62_a_snapshot_whose_manifest_leaves_out_an_ended_attempts_marker_is_never_restored(live, tmp_path):
+    """O62 (live slot 5's resume-line): a snapshot's files are its manifest's, and its store names an ended attempt
+    whose marker is in neither (a manifest made otherwise than by `take`): the restore fails, naming the snapshot,
+    and leaves nothing, since the restored store would name a record runs/ does not hold."""
+    out, store = live
+    one_done(out, store, keys_of(store)[0])
+    made = snap(out, tmp_path / "snaps", tmp_path)
+    marker = next(made.rglob(MARKER_NAME))
+    manifest = json.loads((made / "snapshot.json").read_text())
+    del manifest["files"][marker.relative_to(made).as_posix()]
+    (made / "snapshot.json").write_text(json.dumps(manifest))
+    marker.unlink()
+    with pytest.raises(OutSnapshotError, match=r"snap-000001: its store names 1 ended attempt\(s\) whose marker"):
+        restore(made, tmp_path / "new" / "out")
+    assert not (tmp_path / "new" / "out").exists()
+
+
 def test_o62_a_take_that_fails_leaves_no_part_and_the_snapshots_as_they_were(live, tmp_path):
     """O62: a take that fails (no store yet, say) is reported by the caller; nothing of it stays."""
     out, _store = live

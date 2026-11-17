@@ -13,6 +13,17 @@ request names the relay it is for (the `nonce` of its heartbeat), the federation
 file `hpc-federation.json`), one verb of `fault_hpc.VERBS`, one service, for an exec one command of
 `fault_hpc.EXEC_COMMANDS` (a name, never an argv), its command's bound and its deadline.
 
+**How a request and its answer cross hosts.** The client runs on a compute node and the relay on the login node, over
+one shared file system (NFS). A node's NFS client keeps a negative entry for a name it looked up while the file was
+missing, and keeps failing that lookup until the directory's attributes expire (30 s with the default `acdirmin`),
+however soon the file was created. A client that polled `answers/<id>.json` by path made that first lookup before the
+relay had answered, so every verb cost about 30 s whatever its own time. So a poll that waits for a file another host
+creates lists the directory (`os.scandir`: an `opendir` revalidates the directory and drops its stale negative
+entries) and opens the file only once the listing shows its exact name, never a stat or an open of the path first. The
+client does this for its answer, in a fresh listing on every poll; the relay lists `requests/` for its requests the same
+way. The heartbeat is read once per admission and once per try, and `up`'s wait for it and `stop`'s wait for it to go
+run on the host that writes it: none of them is a poll for a file another host creates.
+
 **What the relay runs.** Only the four verbs of its own federation: it claims a request by renaming it into `taken/`
 (so no two relays, or one relay twice, run it), and refuses, with a word and nothing run, anything else: a request for
 another relay (an earlier one: a restart never replays an old request), an id it has taken before (`replayed`: a
@@ -42,6 +53,7 @@ reader's: the login node and the nodes keep the cluster's time.
 
 import contextlib
 import ctypes
+import errno
 import fcntl
 import json
 import math
@@ -65,8 +77,9 @@ RELAY_DIR = "fault-relay"
 STATE_FILE = "hpc-federation.json"
 BEAT_S = 5.0
 RELAY_STALE_S = 30.0  # a heartbeat older than this, by the reader's wall clock, is a relay not answering
+RELAY_MODULE = "expcore_onedata.fault_relay"  # the relay runs as `-m RELAY_MODULE serve --root <root>`: how it is told
 RELAY_NOTE = "fault_relay"  # the try's note key: what the fault gate's pre-run check saw of the relay
-POLL_S = 0.5  # between two looks for an answer, or for a request
+POLL_S = 0.5  # between two listings that look for an answer
 OUTPUT_CAP = 65536  # the most of a command's output an answer carries, per stream
 MIN_RUN_S = 1.0  # a request with less than this left before its deadline is refused, never started
 ENVIRONMENT = ("PATH", "HOME", "LANG", "LC_ALL", "USER", "LOGNAME", "SLURM_CONF")
@@ -114,6 +127,17 @@ def _read(path: Path) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     return record if isinstance(record, dict) else None
+
+
+def _listed(directory: Path, name: str) -> bool:
+    """Whether a fresh listing of `directory` shows a file called exactly `name`; False when it cannot be listed (the
+    next poll lists it again). `os.scandir` opens the directory on every call, which revalidates it on an NFS client;
+    nothing here looks `name` up by path, so no negative entry is left for it."""
+    try:
+        with os.scandir(directory) as entries:
+            return any(entry.name == name for entry in entries)
+    except OSError:
+        return False
 
 
 def _private_dir(path: Path) -> None:
@@ -213,12 +237,14 @@ class RelayClient:
             "deadline": self._wall() + waited,
         }
         _write(directory / "requests" / f"{key}.json", record)
+        answers, name = directory / "answers", f"{key}.json"
         began = self._clock()
         while True:
-            answer = _read(directory / "answers" / f"{key}.json")
+            # the answer's path is looked up only once a listing has shown its name (see the module docstring)
+            answer = _read(answers / name) if _listed(answers, name) else None
             if answer is not None:
                 with contextlib.suppress(OSError):
-                    (directory / "answers" / f"{key}.json").unlink()
+                    (answers / name).unlink()
                 return _answered(answer, key, live["nonce"], timeout_s)
             if self._clock() - began >= waited:
                 break
@@ -479,15 +505,60 @@ def _syscall(number: int, *args: int) -> int:
     return int(done)
 
 
-def signal_if_started(pid: int, start: str, signum: int) -> bool:
-    """Send `signum` to `pid` only while it is the process that started at clock tick `start`: a pidfd is opened first
-    and held across the check, so a PID reused before it shows another start and is never signalled (pidfd_open(2),
-    pidfd_send_signal(2), through `os` and `signal` where this Python has them, else the raw calls). Return whether it
-    was sent; raise ProcessLookupError when the process is gone."""
+def _open_pidfd(pid: int) -> int:
+    """pidfd_open(2): `os.pidfd_open` where this Python has it, else the raw call. Raise OSError with ENOSYS when the
+    kernel has no such call (Linux before 5.3), ProcessLookupError when the process is gone."""
     opener = getattr(os, "pidfd_open", None)
-    handle = opener(pid) if opener is not None else _syscall(PIDFD_OPEN, pid, 0)
+    return opener(pid) if opener is not None else _syscall(PIDFD_OPEN, pid, 0)
+
+
+def proc_runs(pid: int, argv: Sequence[str]) -> bool:
+    """Whether the process's command line (/proc/PID/cmdline) holds `argv` as consecutive arguments, in order; True for
+    an empty `argv` of a process whose command line can be read, False when it cannot be read."""
     try:
-        if proc_start(pid) != start:  # another process holds the PID now
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    want = [word.encode() for word in argv]
+    return any(args[i : i + len(want)] == want for i in range(len(args) - len(want) + 1))
+
+
+def _kill_if_started(pid: int, start: str, signum: int, argv: Sequence[str]) -> bool:
+    """`signal_if_started` where the kernel has no pidfd: read `pid`'s command line, then its start tick and, only while
+    it is `start`, send `signum` with `os.kill` at once; the pattern `hpcslurm.Runner.end_client` follows, whose caller
+    rechecks that the process went (`_stop` waits for its heartbeat to go). A PID taken over since the process ended
+    shows another tick and is never signalled. Weaker than the pidfd, which holds the process across the checks: a PID
+    reused in the instant between the tick's read and the kill is not caught, and a PID is reused only once the whole
+    PID space has cycled."""
+    named = proc_runs(pid, argv)
+    seen = proc_start(pid)  # the last read: the kill follows it at once, and a PID reused since `named` shows another
+    if seen is None:  # no /proc entry: the process is gone, or its start cannot be shown to be ours
+        raise ProcessLookupError(errno.ESRCH, f"no process {pid} with a readable start tick")
+    if seen != start or not named:  # another process holds the PID now, or this one is not what was recorded
+        return False
+    os.kill(pid, signum)
+    return True
+
+
+def signal_if_started(pid: int, start: str, signum: int, *, argv: Sequence[str] = ()) -> bool:
+    """Send `signum` to `pid` only while it is the process that started at clock tick `start` and, when `argv` is given,
+    whose command line holds it as consecutive arguments (a heartbeat is a file: its start tick alone does not make a
+    process the relay). A pidfd is opened first and held across the checks, so a PID reused before it shows another
+    start and is never signalled (pidfd_open(2), pidfd_send_signal(2), through `os` and `signal` where this Python has
+    them, else the raw calls). A kernel that answers ENOSYS to `pidfd_open` (a login node older than Linux 5.3) has no
+    pidfd: the checks are then made and the signal sent with `os.kill` (`_kill_if_started`); any other failure is
+    raised. No process group (PID 0 or below), no init (PID 1) and no process without a recorded start tick is ever
+    signalled. Return whether it was sent; raise ProcessLookupError when the process is gone."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 or not isinstance(start, str) or not start:
+        return False
+    try:
+        handle = _open_pidfd(pid)
+    except OSError as error:
+        if error.errno != errno.ENOSYS:  # a gone process (ESRCH), too many open files, ...: never worked around
+            raise
+        return _kill_if_started(pid, start, signum, argv)
+    try:
+        if proc_start(pid) != start or not proc_runs(pid, argv):  # another process holds the PID now, or not ours
             return False
         sender = getattr(signal, "pidfd_send_signal", None)
         if sender is not None:
@@ -506,7 +577,7 @@ def _stop(root: Path, timeout_s: float = 3 * BEAT_S) -> int:
     pid, start = live.get("pid"), live.get("start")
     if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 and isinstance(start, str):
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            signal_if_started(pid, start, signal.SIGTERM)
+            signal_if_started(pid, start, signal.SIGTERM, argv=("-m", RELAY_MODULE, "serve", "--root", str(root)))
     end = time.monotonic() + timeout_s
     while time.monotonic() < end:
         if not (relay_dir(root) / "heartbeat.json").exists():

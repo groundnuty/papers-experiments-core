@@ -53,10 +53,10 @@ try:
     s.bind((sys.argv[1], int(sys.argv[2]))); print("%s:%d" % s.getsockname())
 except OSError as e:
     print("EADDRINUSE" if e.errno == errno.EADDRINUSE else "errno %d" % e.errno)'
-got=$(apptainer exec --containall --no-home --pwd / "$R" python3 -c "$probe" 127.0.0.1 443 < /dev/null)
+got=$(apptainer exec --containall --no-home --pwd / "$R" python3 -I -B -c "$probe" 127.0.0.1 443 < /dev/null)
 [[ $got == 127.0.0.1:8443 || $got == EADDRINUSE ]] || die "bind() to 443 inside the container gave '$got', not 8443: the shim is not active"
 ok "preload clean; bind(443) lands on 8443 ($got)"
-got=$(apptainer exec --containall --no-home --pwd / "$R" python3 -c "$probe" 0.0.0.0 8091 < /dev/null)
+got=$(apptainer exec --containall --no-home --pwd / "$R" python3 -I -B -c "$probe" 0.0.0.0 8091 < /dev/null)
 [[ $got == 127.0.0.1:8091 || $got == EADDRINUSE ]] || die "bind() to 0.0.0.0:8091 inside the container gave '$got', not 127.0.0.1:8091"
 ok "bind(0.0.0.0:8091), a private port, lands on loopback ($got)"
 

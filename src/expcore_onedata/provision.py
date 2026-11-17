@@ -74,7 +74,7 @@ from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncove
 from expcore_onedata.rangemap import PlacementSettings, safe_path
 from expcore_onedata.readretry import ONE_ATTEMPT, TRANSPORT_ATTEMPTS, TRANSPORT_PAUSES_S, ReadRetry
 from expcore_onedata.readslots import slots
-from expcore_onedata.streamed import OCTET_STREAM, Digest, ReadOutcome, Upload, chunks, media_type
+from expcore_onedata.streamed import OCTET_STREAM, Digest, ReadOutcome, Slice, Upload, chunks, media_type
 
 LISTING_LIMIT = 1000
 _SEGMENT = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # the charset of a file id the client accepts
@@ -656,20 +656,68 @@ class Provisioner:
                     yield entry, True
             listings.pop((provider or self._settings.holder, current), None)  # entered: no longer needed
 
-    def make_dir(self, path: str) -> str:
-        """Create every directory of a path that is missing, log each creation, and return the last one's id."""
+    def make_dir(self, path: str, *, listings: Listings | None = None) -> str:
+        """Create every directory of a path that is missing, log each creation, and return the last one's id.
+
+        `listings` is one operation's cache, as `upload` takes it: each directory on the way is listed once in it, and
+        each one made is added to its parent's listing (and listed as empty). A directory the cache holds is read again
+        by its id before it is descended into (`_named`), so one renamed or moved since is never taken for the path."""
         parent = self.root()
         for part in safe_path(path):
-            existing = self.children(parent).get(part)
+            existing = self._named(parent, part, listings)
             if existing is not None:
                 if existing.kind != "DIR":
                     raise ProvisionError(f"{self._where}a part of the path exists and is not a directory")
                 parent = existing.file_id
                 continue
-            parent = self._create(parent, part, "DIR", path)
+            parent = self._create(parent, part, "DIR", path, listings=listings)
         return parent
 
-    def _create(self, parent_id: str, name: str, kind: str, path: str) -> str:
+    def _named(self, parent: str, name: str, listings: Listings | None) -> Entry | None:
+        """The entry of `name` in a directory, for an upload or `make_dir` to decide on: listed whole without a cache.
+        With one (O67) the directory is listed once, and an entry found in it is read again by its id before anything
+        is decided, a directory on the way as well as the file, so a skip, a resume or a restart compares the file at
+        this path as it is now: an entry that is gone, renamed or moved since
+        (`_current`) drops the directory's listing, which is read afresh. A name the cache does not hold is taken as
+        absent: the cache holds what the directory held when it was listed and every entry made through it, and a
+        file another writer made since is outside it (its creation is refused by the platform, loudly)."""
+        if listings is None:
+            return self.children(parent).get(name)
+        found = self.children(parent, listings=listings).get(name)
+        if found is None:
+            return None
+        current = self._current(found, parent)
+        key = (self._settings.holder, parent)
+        if current is not None:
+            listings[key][name] = current
+            return current
+        listings.pop(key, None)
+        return self.children(parent, listings=listings).get(name)
+
+    def _current(self, entry: Entry, parent: str) -> Entry | None:
+        """A cached entry read again by its id on the data provider: its kind and size now, or None when it is gone or
+        no longer `entry.name` in `parent`. The read names `name` and `type`, which Onedata 25.0 answers as gone for a
+        removed entry, where a read of `size` alone answers from the entry's tombstone for days (`FakeData`,
+        "Tombstones")."""
+        try:
+            answer = self._client.get(
+                f"/data/{_segment(entry.file_id)}",
+                provider=self._settings.holder,
+                params={"attribute": ["name", "type", "size", "parent_id"]},
+                retry=self._retry,
+            )
+        except PlatformError as error:
+            if answered_absent(error):
+                return None
+            raise
+        if not isinstance(answer, dict) or answer.get("name") != entry.name or answer.get("parent_id") != parent:
+            return None
+        size = answer.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise PlatformError("a file's attributes hold no size")
+        return Entry(entry.file_id, entry.name, size, str(answer.get("type") or ""))
+
+    def _create(self, parent_id: str, name: str, kind: str, path: str, *, listings: Listings | None = None) -> str:
         self._verified()
         answer = self.mutate(
             "POST",
@@ -681,6 +729,12 @@ class Provisioner:
         if not isinstance(file_id, str) or not file_id:
             raise PlatformError("a creation answer holds no file id")
         self._write("create", id=file_id, kind=kind, path=path, **({} if self._role is None else {"role": self._role}))
+        if listings is not None:  # what was made is in the cache: its parent's listing, and a new directory, empty
+            held = listings.get((self._settings.holder, parent_id))
+            if held is not None:
+                held[name] = Entry(file_id, name, 0, kind)
+            if kind == "DIR":
+                listings[(self._settings.holder, file_id)] = {}
         return file_id
 
     def put_file(self, path: str, data: bytes, *, content_type: str = OCTET_STREAM) -> str:
@@ -705,11 +759,22 @@ class Provisioner:
         return file_id
 
     def upload(
-        self, path: str, source: Path | str, *, content_type: str = OCTET_STREAM, stop: int | None = None
+        self,
+        path: str,
+        source: Path | str | Slice,
+        *,
+        content_type: str = OCTET_STREAM,
+        stop: int | None = None,
+        listings: Listings | None = None,
     ) -> Upload:
         """Upload a local file to a path of the space on the data provider, never holding it whole; return what was
         done (O25). With `stop`, only the local file's first `stop` bytes are its content here: the target ends as
         that prefix, verified by its hash, and a later upload with a larger stop, or none, resumes from it.
+
+        The source may be a `Slice` of a local file (a member of an uncompressed tar, `streamed.tar_members`): it is
+        then the local file in everything below, its size its own and its bytes only those of its range, so a resume
+        compares the target with the member's first bytes and no read reaches outside it. A slice whose file does not
+        hold its whole range is refused before anything is asked.
 
         The file is read and sent `chunk_bytes` at a time, each chunk a PUT at its offset through the client's mutation
         gate (the space's name is checked first, and the file's space before every write), carrying `content_type`.
@@ -731,20 +796,26 @@ class Provisioner:
 
         Success is reported only once the size and the SHA-256 read back equal those of the bytes read from the local
         file; otherwise ProvisionError. A file that changes while it is uploaded fails that check.
+
+        `listings` (O67) is one operation's cache of directory listings, shared by its uploads: each directory is listed
+        once and every entry made is added to it, so n uploads into one directory cost one listing, not n listings
+        that grow with it. An entry the cache holds is read again by its id before it decides anything (`_named`); a
+        file another writer made since the listing is outside the cache, so an operation that passes one holds the
+        space alone (`bulkingest.ingest_files`, which also lists the result afresh and compares it with its manifest).
         """
-        media, source = media_type(content_type), Path(source)
-        size = source.stat().st_size  # a local file that is not there is refused before anything is asked
+        media = media_type(content_type)
+        source, size = self._source(source)  # a local file that is not there is refused before anything is asked
         if stop is not None:
             if isinstance(stop, bool) or not isinstance(stop, int) or not 1 <= stop <= size:
                 raise ProvisionError(f"{self._where}an upload's stop is a whole number of bytes within the local file")
             size = stop
         self._verified()
         *directory, name = safe_path(path)
-        parent = self.make_dir("/".join(directory)) if directory else self.root()
-        existing = self.children(parent).get(name)
+        parent = self.make_dir("/".join(directory), listings=listings) if directory else self.root()
+        existing = self._named(parent, name, listings)
         if existing is None:
             action, start, hasher = "created", 0, hashlib.sha256()
-            file_id = self._create(parent, name, "REG", path)
+            file_id = self._create(parent, name, "REG", path, listings=listings)
         else:
             action, start, hasher = self._compare(existing, source, size)
             file_id = existing.file_id
@@ -765,7 +836,17 @@ class Provisioner:
             )
         return Upload(file_id, expected, action, sent)
 
-    def _compare(self, existing: Entry, source: Path, size: int) -> tuple[str, int, Any]:
+    def _source(self, source: Path | str | Slice) -> tuple[Path | Slice, int]:
+        """An upload's source and its size: a local file's by its stat, a slice's its own once its file is shown to
+        hold the whole range (a slice past its file's end is refused before anything is asked)."""
+        if not isinstance(source, Slice):
+            path = Path(source)
+            return path, path.stat().st_size
+        if source.path.stat().st_size < source.offset + source.size:
+            raise ProvisionError(f"{self._where}the slice reaches past the end of its file; nothing was sent")
+        return source, source.size
+
+    def _compare(self, existing: Entry, source: Path | Slice, size: int) -> tuple[str, int, Any]:
         """Decide how an upload treats a target that exists: return the action, the offset to send from, and the hash of
         the local bytes before that offset. Resuming or restarting writes into the file, so it needs the log to say
         this provisioner created it."""
@@ -832,7 +913,7 @@ class Provisioner:
         return file_id
 
     def write_range(
-        self, file_id: str, source: Path | str, start: int, stop: int, *, content_type: str = OCTET_STREAM
+        self, file_id: str, source: Path | str | Slice, start: int, stop: int, *, content_type: str = OCTET_STREAM
     ) -> Digest:
         """Write bytes `start` to `stop` of a local file into the same range of a file this provisioner made, chunk by
         chunk, each at its offset; return the size and SHA-256 of the bytes sent (O44, #107). Nothing else of the file
@@ -840,9 +921,9 @@ class Provisioner:
 
         A file the change log does not hold is refused, since writing into it adopts it (O09), and so is a range that
         is empty or outside the local file; a local file that ends before `stop` meanwhile is a ProvisionError. The
-        caller verifies what the file holds."""
-        media, source = media_type(content_type), Path(source)
-        whole = source.stat().st_size
+        caller verifies what the file holds. The source may be a `Slice`, as for `upload`: its offsets are its own."""
+        media = media_type(content_type)
+        source, whole = self._source(source)
         if any(isinstance(n, bool) or not isinstance(n, int) for n in (start, stop)) or not 0 <= start < stop <= whole:
             raise ProvisionError(f"{self._where}a written range lies within the local file and holds a byte at least")
         self._verified()

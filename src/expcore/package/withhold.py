@@ -9,6 +9,12 @@ rewritten module's syntax tree must equal the original's, or the build is refuse
 does not parse is refused too, since what it names could not be collected. Every repository name and every commit or
 blob id the headers held is returned, and the package's final check refuses the build if any of them survives
 anywhere in it, inside the wheels included. A package that is not anonymised keeps the headers.
+
+The core's wheel also carries its build identity (`expcore/_build_identity.json`, `provenance.core_identity`): the
+commit and the git tree it was built from. An anonymised build replaces that member with a neutral one, and returns
+both ids with the headers' ones, so the final check refuses the build if either survives. The core in the package's
+environment then has no identity, which its check never asks for: it compares names and versions only, and runs on
+the wheels the package pins by hash.
 """
 
 import ast
@@ -16,6 +22,7 @@ import base64
 import csv
 import hashlib
 import io
+import json
 import re
 import zipfile
 from collections.abc import Sequence
@@ -23,9 +30,12 @@ from dataclasses import dataclass, field, replace
 
 from expcore.package.spec import PackageError
 from expcore.package.wheels import Wheel, zip_entries
+from expcore.provenance.core_identity import BUILD_FILE, is_sha
 from expcore.provenance.headers import HeaderError, header_span, read_header, split_lines
 
 NEUTRAL = "# (provenance withheld for an anonymous review)\n"
+IDENTITY_MEMBER = f"expcore/{BUILD_FILE}"
+NEUTRAL_IDENTITY = b'{"withheld": "the core\'s build identity, for an anonymous review"}\n'
 _NAMED = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*) @ ([0-9a-f]{7,64})\b")
 _IDS = re.compile(r"\b[0-9a-f]{7,64}\b")
 
@@ -65,6 +75,20 @@ def _neutral(label: str, text: str, withheld: Withheld) -> str | None:
     return rewritten
 
 
+def _neutral_identity(data: bytes, withheld: Withheld) -> bytes:
+    """The neutral build identity, after collecting the ids the original held: every 40-digit id, whatever its key, so
+    one the build named under a key this does not know is withheld and searched for too."""
+    try:
+        text = data.decode("utf-8")
+        json.loads(text)
+    except (UnicodeDecodeError, ValueError):
+        raise PackageError(
+            f"{IDENTITY_MEMBER}: the core's build identity cannot be read; it cannot be withheld"
+        ) from None
+    withheld.ids.update(found for found in _IDS.findall(text) if is_sha(found))
+    return NEUTRAL_IDENTITY
+
+
 def _record(text: str, changed: dict[str, bytes]) -> str:
     """RECORD with the hash and size of each changed member written anew."""
     rows = []
@@ -85,7 +109,9 @@ def _withhold_one(wheel: Wheel, withheld: Withheld) -> Wheel:
         contents = {info.filename: archive.read(info) for info in infos}
     changed = {}
     for name, data in contents.items():
-        if name.endswith(".py"):
+        if name == IDENTITY_MEMBER:
+            changed[name] = _neutral_identity(data, withheld)
+        elif name.endswith(".py"):
             try:
                 text = data.decode("utf-8")
             except UnicodeDecodeError:
