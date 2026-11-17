@@ -56,8 +56,8 @@ from expcore.config.loading import ConfigError
 from expcore.egress import Declaration, declaration
 from expcore_onedata import tls as TLS
 from expcore_onedata.fault_drain import GATE, MOUNT
+from expcore_onedata.sandbox import cellhost, gatelog, gatepolicy, hostfacts, inputs, kinds, tokenfiles
 from expcore_onedata.sandbox import deadline as DL
-from expcore_onedata.sandbox import gatelog, gatepolicy, hostfacts, inputs, kinds, tokenfiles
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
     DataPathMode,
@@ -251,6 +251,8 @@ class ApptainerSandbox:
             sp.mode is not DataPathMode.REST and sp.listing != gatepolicy.PAGED
         ):
             raise StartRefused("the listing mode must be paged or complete, and complete is for a REST data path only")
+        if cellhost.is_node_name(sp.node_names):  # O73: the neutral host name is never a node's
+            raise StartRefused(cellhost.REFUSAL)
         if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
             try:
                 self._ca_bytes = s.tls.bundle()
@@ -474,12 +476,14 @@ class ApptainerSandbox:
         layout.write_text(cell / "resolv.conf", AV.RESOLV_TEXT)
         layout.write_text(cell / "nsswitch.conf", AV.NSSWITCH_TEXT)
         layout.write_text(cell / "ld.so.preload", AV.preload_text([*preloads, AV.SHIM_TARGET]))
+        layout.write_text(cell / "hostname", cellhost.etc_hostname_text())  # O73: the name the exec's --hostname sets
         binds = [
             AV.Bind(self.dir / "work", "/work", True), AV.Bind(self.dir / "tmp", "/tmp", True),
             AV.Bind(self.dir / "shm", "/dev/shm", True), AV.Bind(cell / "hosts", "/etc/hosts"),
             AV.Bind(cell / "resolv.conf", AV.RESOLV_CONF), AV.Bind(cell / "nsswitch.conf", AV.NSSWITCH_CONF),
             AV.Bind(self.dir / "egress-sock", AV.EGRESS_DIR), AV.Bind(cell / "egresslog.so", AV.SHIM_TARGET),
             AV.Bind(cell / "ld.so.preload", "/etc/ld.so.preload"),
+            AV.Bind(cell / "hostname", cellhost.ETC_HOSTNAME),
             *(AV.Bind(cell / f"preload-{n}.so", target) for n, target in enumerate(preloads)),
             *(AV.Bind(cell / f"bind-{n}", b.target) for n, b in enumerate(self.app.binds)),
         ]  # fmt: skip
@@ -925,6 +929,7 @@ class ApptainerSandbox:
             check = self.infra_check()
             meta["container_deaths"], meta["infra_death"] = check["deaths"], check["death"]
         meta["served_bytes"] = self.served_bytes()
+        cellhost.note(meta)  # O73: added at the read, so a record of the facts made again later cannot drop it
         counted, timed = meta.pop("rest_node_name_hits", None), meta.pop("rest_request_durations", None)
         if self.spec.node_names and self.spec.mode is DataPathMode.REST:  # O73: scanned, so never silently absent
             meta["infrastructure_facts"]["rest_node_name_hits"] = counted or gatelog.node_name_hits_unknown(

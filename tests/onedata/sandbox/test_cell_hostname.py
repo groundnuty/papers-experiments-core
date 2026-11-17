@@ -119,8 +119,11 @@ def test_o73_a_node_named_as_the_cell_is_refused_before_anything_is_created(worl
     the start, and the refusal names no node."""
     with pytest.raises(StartRefused, match="host name") as refused:
         started(world, "via-gate", node_names=("198.51.100.7", node_name))
-    assert node_name not in str(refused.value) and "198.51.100.7" not in str(refused.value)
-    assert not world.host.containers and not world.host.networks and not world.host.mounts
+    assert node_name not in str(refused.value)
+    assert "198.51.100.7" not in str(refused.value)
+    assert not world.host.containers
+    assert not world.host.networks
+    assert not world.host.mounts
 
 
 @pytest.mark.parametrize("node_name", ["sandbox-7.example.invalid", "cn-sandbox", "198.51.100.7", "xsandbox"])

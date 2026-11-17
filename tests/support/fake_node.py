@@ -482,7 +482,8 @@ def parse_exec(argv: list[str], stdin: str | None) -> Exec:
     expected = ["--containall", "--cleanenv", "--no-home", "--no-mount", AV.NO_MOUNT, "--pwd", "/work"]
     assert rest[: len(expected)] == expected, f"the exec's flags: {rest[: len(expected)]}"
     rest = rest[len(expected) :]
-    assert rest[:2] == ["--uts", "--hostname"] and len(rest) > 2, f"the exec's UTS flags: {rest[:3]}"
+    assert rest[:2] == ["--uts", "--hostname"], f"the exec's UTS flags: {rest[:3]}"
+    assert len(rest) > 2, f"the exec's UTS flags: {rest[:3]}"
     hostname, rest = rest[2], rest[3:]
     binds: dict[str, tuple[str, bool]] = {}
     env: dict[str, str] = {}

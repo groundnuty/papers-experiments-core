@@ -1,7 +1,8 @@
 """O73: every Apptainer cell has the declared host name, the same string as Docker's. A cell of this backend has no
 network namespace and, without `--uts`, no UTS namespace either: `hostname`, `uname -n` and `/etc/hostname` would show
-the node's own name, a private detail of the site. `--uts --hostname <name>` is in every exec's argv, and `/etc/hostname`
-is a generated file of the name, bound read-only. The Docker sandbox's are in `../test_cell_hostname.py`."""
+the node's own name, a private detail of the site. `--uts --hostname <name>` is in every exec's argv, and
+`/etc/hostname` is a generated file of the name, bound read-only. The Docker sandbox's are in
+`../test_cell_hostname.py`."""
 
 import dataclasses
 from pathlib import Path
@@ -31,7 +32,9 @@ def test_o73_the_exec_argv_gives_the_cell_a_uts_namespace_and_the_declared_name(
     argv = AV.exec_argv(["apptainer"], Path("/i.sif"), [AV.Bind(Path("/r/work"), "/work", True)], {"A": "b"}, ["true"])
     at = argv.index("--uts")
     assert argv[at + 1 : at + 3] == ["--hostname", cellhost.CELL_HOSTNAME]
-    assert at < argv.index("-B") and at < argv.index("--env") and at < argv.index("/i.sif")
+    assert at < argv.index("-B")
+    assert at < argv.index("--env")
+    assert at < argv.index("/i.sif")
 
 
 def test_o73_the_exec_argv_names_the_hostname_once():
@@ -137,7 +140,8 @@ def test_o73_a_node_named_as_the_cell_is_refused_before_any_exec(node, settings,
     spec = dataclasses.replace(make_spec("via-gate"), node_names=("198.51.100.7", node_name))
     with pytest.raises(StartRefused, match="host name") as refused:
         start(node, settings, spec)
-    assert node_name not in str(refused.value) and "198.51.100.7" not in str(refused.value)
+    assert node_name not in str(refused.value)
+    assert "198.51.100.7" not in str(refused.value)
     assert node.execs == []
 
 
