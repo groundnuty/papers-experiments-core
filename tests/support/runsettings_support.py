@@ -254,6 +254,7 @@ rowan = "rowan"
 backend = "apptainer"
 work_root = "@root@/work"
 name_prefix = "@prefix@"
+content_check_file = "dir/check-apptainer.bin"
 trust_paths = ["/etc/ssl/certs/ca-certificates.crt"]
 placeholder_token = "placeholder"
 kill_grace_s = 5
@@ -269,10 +270,15 @@ work_disk_bytes = 4294967296
 
 [sandbox.data_paths]
 mounted = "mount"
+served = {{ kind = "rest", listing = "paged" }}
 
 [sandbox.mount]
 path = "/data"
 io_mode = "proxy"
+
+[sandbox.federation]
+zone = "zone.invented.test"
+providers.aspen = "aspen.invented.test"
 
 [sandbox.apptainer]
 apptainer = ["@apptainer@"]
@@ -393,7 +399,9 @@ IN = {
                                                      'providers = ["rowan", "aspen", "hazel", "larch"]')),
     "spaces.*.local": edit("apptainer", platform('local = "aspen"\nholder = "larch"',
                                                  'local = "hazel"\nholder = "larch"'),
-                           platform('local = "aspen"\nholder = "rowan"', 'local = "hazel"\nholder = "rowan"')),
+                           platform('local = "aspen"\nholder = "rowan"', 'local = "hazel"\nholder = "rowan"'),
+                           platform('providers.aspen = "aspen.invented.test"',
+                                    'providers.hazel = "aspen.invented.test"')),  # the names are the local one's
     "spaces.*.holder": edit("apptainer", platform('holder = "rowan"\ndata', 'holder = "hazel"\ndata')),
     "spaces.*.tokens": edit("apptainer", platform('tokens = ["data_path", "tool_server"]', 'tokens = ["data_path"]')),
     "spaces.*.import": edit("apptainer", platform("import = { readonly = true, shared = false }\n", "")),
