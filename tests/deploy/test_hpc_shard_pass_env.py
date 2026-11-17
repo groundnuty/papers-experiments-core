@@ -15,6 +15,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
+from fingerprint_support import standin_python
 
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
 NAME, VALUE = "FAULT_ACK_MODE", "go-ahead"
@@ -53,7 +54,7 @@ def make_study(tmp_path: Path) -> Path:
 def manifest_file(tmp_path: Path, extra: str = "") -> Path:
     """A shard plan of two federations; `extra` (top-level keys) goes before the `[[shards]]`."""
     make_study(tmp_path)
-    lines = [f'study = "{tmp_path / "study"}"', f'python = "{tmp_path / "venv" / "python"}"',
+    lines = [f'study = "{tmp_path / "study"}"', f'python = "{standin_python(tmp_path / "venv")}"',
              f'core_src = "{tmp_path / "core" / "src"}"', f'results = "{tmp_path / "results"}"',
              f'tmpfs = "{tmp_path / "tmpfs"}"', 'step_path = "/usr/bin:/bin"', "cpus = 6",
              'memory = "18g"']  # fmt: skip
