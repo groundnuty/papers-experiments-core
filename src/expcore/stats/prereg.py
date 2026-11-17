@@ -24,7 +24,8 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     h1 = ["a-vs-b"]            # Holm-adjusted over its own members, apart from the Holm families; each member in a
                                # Holm family with a margin, and in one equivalence family at most
 
-    [sensitivity]              # optional (S19): the sensitivity reruns the study expects, which `analyze` must run
+    [sensitivity]              # (S19) the sensitivity reruns the study expects, which `analyze` must run exactly;
+                               # optional only for a study no guard checks: an absent table reads as reruns = []
     reruns = ["egress", "mount_guard", "process_visibility", "any_guard"]   # any of the four, each at most once
 
     [bootstrap]
@@ -205,7 +206,7 @@ class Preregistration:
     holm_families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)  # named families (S17)
     # named equivalence families (S18), each Holm-adjusted over its own members
     equivalence_families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
-    # the sensitivity reruns the study declares (S19), None when it declares none: `analyze` runs exactly these
+    # the sensitivity reruns the study declares (S19), None without the table, which `analyze` reads as `()`
     sensitivity_reruns: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:

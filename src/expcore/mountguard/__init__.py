@@ -15,7 +15,7 @@ reported, and the analysis is run again without them. This package is the core's
 - `instrument`: `MountGuard`, the instrument (namespace `mount_guard`) whose snapshot holds the counts and reasons;
 - `flags`: `judge`, one run's verdict, `clean`, `flagged` (an access), `unknown` (a log or an isolation not shown) or
   `not_applicable` (a run with no mount: a REST run, a run with no data path, as its record says);
-- `campaign`: the data path of each level of a study's `data_path` factor, as the campaign's fingerprint records it;
+- `campaign`: the data path of each level of a study's data-path factor, as the campaign's fingerprint records it;
 - `sensitivity`: every run's verdict and the analysis again without the runs that are not clean; a run the guard does
   not apply to stays in it.
 

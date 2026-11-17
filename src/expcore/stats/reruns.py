@@ -15,9 +15,12 @@ and `analyze` refuses when the reruns it would run are not exactly these, in eit
 declared rerun that no record supports (no record carries the guard, or fewer than two guards checked the batch for
 `any_guard`), and a rerun the records would produce that the preregistration does not declare. **A rerun counts as run
 when its guard checked the batch, whether or not it left a run out:** a batch whose every run is clean has no second
-analysis, and is still the rerun the study declared. `reruns = []` declares that none is expected. A preregistration
-with no `[sensitivity]` table declares nothing and is not checked, as it never was. The declaration is in the file, so
-in the preregistration's hash.
+analysis, and is still the rerun the study declared. `reruns = []` declares that none is expected. **A preregistration
+with no `[sensitivity]` table reads as `reruns = []`:** a batch no guard checked runs no rerun and passes with no
+table, its analysis.json unchanged, and a batch a guard checked is refused, naming the reruns it would run and the
+declaration that is missing, so no rerun goes unpreregistered. (`Preregistration.sensitivity_reruns` is None for an
+absent table and `()` for `reruns = []`, so that analysis.json says only what was written.) The declaration is in the
+file, so in the preregistration's hash.
 """
 
 from collections.abc import Sequence
@@ -74,6 +77,15 @@ def ran_reruns(egress: object, mount_guard: object, visibility: object, guards: 
     the batch, whether or not a run was left out), and the one of every guard together when it exists."""
     found = (egress, mount_guard, visibility, guards)
     return tuple(name for name, analysis in zip(RERUNS, found, strict=True) if analysis is not None)
+
+
+def missing_table(source: str, ran: Sequence[str]) -> str:
+    """The sentence of a refusal for a preregistration with no `[sensitivity]` table: it declares no reruns, and the
+    table to add for the reruns the analysis would run."""
+    names = ", ".join(f'"{name}"' for name in ran)
+    return (
+        f"{source} has no [sensitivity] table, and an absent table declares none; add [sensitivity] reruns = [{names}]"
+    )
 
 
 def _cannot_run(name: str, ran: Sequence[str]) -> str:

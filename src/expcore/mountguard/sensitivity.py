@@ -28,6 +28,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from expcore.campaign.factors import DATA_PATH_FACTOR
 from expcore.mountguard.flags import FLAGS, NOT_APPLICABLE, VERDICTS, RunMountGuard, judge
 from expcore.mountguard.instrument import NAMESPACE
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
@@ -73,9 +74,11 @@ def mount_guard_analysis(
     absent: Sequence[AbsentRun],
     prereg: Any,
     data_paths: Mapping[str, str] | None = None,
+    factor: str = DATA_PATH_FACTOR,
 ) -> MountGuardAnalysis | None:
     """The mount-guard verdicts and the sensitivity analysis of a batch; None for a batch not checked. `data_paths` is
-    the kind the campaign fingerprint records for each level of the `data_path` factor (`mountguard.campaign`)."""
+    the kind the campaign fingerprint records for each level of the data-path factor (`mountguard.campaign`), and
+    `factor` that factor's name, the study's `[study] data_path_factor` (`data_path` by default)."""
     if len(runs) != len(rows):
         raise ValueError(f"{len(runs)} analysed record(s) for {len(rows)} analysis row(s)")
     records = [record for record, _ in runs]
@@ -84,7 +87,7 @@ def mount_guard_analysis(
     for (record, _), row in zip(runs, rows, strict=True):
         if record.run_key != row.run_key:
             raise ValueError(f"the record of {record.run_key!r} is paired with the row of {row.run_key!r}")
-    verdicts = tuple(judge(record, condition, data_paths) for record, condition in runs)
+    verdicts = tuple(judge(record, condition, data_paths, factor) for record, condition in runs)
     out = {verdict.run_key for verdict in verdicts if verdict.left_out}
     if not out:
         return MountGuardAnalysis(verdicts, None)

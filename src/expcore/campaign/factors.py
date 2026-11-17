@@ -91,6 +91,9 @@ from expcore.config.loading import Section, load_toml
 from expcore.errors import TARGET_LABEL, treatment_vocabulary
 
 BUILTIN_FACTORS = ("task", "model", "seed")
+# The name of the factor whose levels are a study's data paths, when the study does not name another in
+# `[study] data_path_factor` (`expcore.study.config`): the one place the core and the platform layer read it from.
+DATA_PATH_FACTOR = "data_path"
 TREATMENT_KEY = "infrastructure_is_treatment"
 TASKS_KEY = "tasks"
 EXCLUSIVE_KEY = "exclusive"

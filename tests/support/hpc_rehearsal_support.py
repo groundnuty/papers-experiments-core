@@ -227,6 +227,10 @@ def make_study(base: Path, control: Path) -> Path:
         assert text.count(old) == 1, f"study.toml: {old!r}"
         text = text.replace(old, new)  # fmt: skip
     (root / "study.toml").write_text(text, encoding="utf-8")
+    declared = root / "preregistration.toml"  # the plugin lists the egress and mount guards: declare their reruns (S19)
+    declared.write_text(
+        declared.read_text("utf-8") + '\n[sensitivity]\nreruns = ["egress", "mount_guard", "any_guard"]\n', "utf-8"
+    )
     write_stamp(root, HEAD, load_study(root).scope)
     return root
 

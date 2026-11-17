@@ -120,7 +120,7 @@ from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.ratio import OMIT_NONE
 from expcore.stats.reruns import difference as reruns_difference
-from expcore.stats.reruns import ran_reruns
+from expcore.stats.reruns import missing_table, ran_reruns
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
     MODELS_FILE,
@@ -875,7 +875,7 @@ def _analyse_loaded(
     except ContrastRefused as error:  # a treatment attempt's None (S10), a failed run's None numerator (S13)
         raise Refused(str(error)) from None
     egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
-    guard = mount_guard_analysis(runs, rows, absent, study.prereg, data_paths)  # None for a batch not guarded
+    guard = mount_guard_analysis(runs, rows, absent, study.prereg, data_paths, study.data_path_factor)  # O75
     seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
     both = guards_analysis(rows, absent, study.prereg, egress, guard, seen)  # None unless two guards checked the batch
     _require_declared_reruns(study, ran_reruns(egress, guard, seen, both))
@@ -886,15 +886,17 @@ def _analyse_loaded(
 
 def _require_declared_reruns(study: StudyConfig, ran: tuple[str, ...]) -> None:
     """Refuse an analysis whose sensitivity reruns are not exactly those the preregistration declares in
-    `[sensitivity] reruns` (S19), in either direction, naming the difference. A preregistration that declares none is
-    not checked."""
+    `[sensitivity] reruns` (S19), in either direction, naming the difference. An absent table reads as `reruns = []`:
+    a batch no guard checked runs no rerun and passes, and one a guard checked is refused, naming the reruns it would
+    run and the table that is missing."""
     declared = study.prereg.sensitivity_reruns
-    said = None if declared is None else reruns_difference(declared, ran)
+    said = reruns_difference(() if declared is None else declared, ran)
     if said is not None:
+        missing = "" if declared is not None else f"\n  {missing_table(study.prereg.source, ran)}"
         raise Refused(
             f"{study.prereg.source}: the sensitivity reruns this analysis would run are not the ones [sensitivity] "
-            f"reruns declares:\n  {said}\nlist the guard's instrument on the runs it applies to, or change the "
-            "declaration before the analysis"
+            f"reruns declares:\n  {said}{missing}\nlist the guard's instrument on the runs it applies to, or change "
+            "the declaration before the analysis"
         )
 
 

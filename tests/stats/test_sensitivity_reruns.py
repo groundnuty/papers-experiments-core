@@ -1,5 +1,5 @@
 """S19: a preregistration declares the sensitivity reruns the study expects, in `[sensitivity] reruns`, and what an
-analysis would run must be exactly that; a study that declares nothing keeps what it had."""
+analysis would run must be exactly that; an absent table reads as `reruns = []`."""
 
 import pytest
 
@@ -49,7 +49,8 @@ def test_s19_a_preregistration_declares_the_reruns_it_expects_in_the_order_it_gi
 
 
 def test_s19_a_preregistration_that_declares_nothing_has_none_declared(tmp_path):
-    """Absent is not empty: the first keeps what a study had, the second declares that no rerun is expected."""
+    """S19: the field says whether a table was written (None for none, `()` for `reruns = []`); the check reads both as
+    an empty declaration, and analysis.json says only what was written."""
     assert load(write(tmp_path)).sensitivity_reruns is None
     assert load(write(tmp_path, BASE + "\n[sensitivity]\nreruns = []\n")).sensitivity_reruns == ()
 
@@ -151,3 +152,16 @@ def test_s19_a_guard_that_checked_the_batch_ran_its_rerun_whether_or_not_it_left
     assert ran_reruns(None, None, None, None) == ()
     assert ran_reruns(clean, clean, clean, clean) == RERUNS
     assert ran_reruns(None, clean, None, clean) == ("mount_guard", "any_guard")
+
+
+def test_s19_the_refusal_for_an_absent_table_names_the_table_to_add():
+    """S19: an absent table reads as `reruns = []`; the sentence names the file and the reruns to declare."""
+    from expcore.stats.reruns import missing_table
+
+    said = missing_table("study/preregistration.toml", ("egress", "any_guard"))
+    assert said == (
+        "study/preregistration.toml has no [sensitivity] table, and an absent table declares none; add [sensitivity] "
+        'reruns = ["egress", "any_guard"]'
+    )
+    assert difference((), ("egress", "any_guard")) is not None  # what an absent table is checked as
+    assert difference((), ()) is None  # nothing guarded, nothing to declare

@@ -20,7 +20,8 @@ A run whose record carries the statement that it had no mount (`expcore.mountgua
 run with no data path) is `not_applicable`: the guard has nothing to say of it, it has no flag, it is kept in the
 sensitivity analysis (it had no mount exposure to leave it out for), and it is shown as such, never as clean. **Only
 that exact statement makes a run not applicable**, or, for a record with no snapshot at all, the campaign's own record
-that the run's data path had no mount (`expcore.mountguard.campaign`): its `data_path` level maps, in the campaign
+that the run's data path had no mount (`expcore.mountguard.campaign`): its level of the data-path factor (`data_path`,
+or the factor `[study] data_path_factor` names) maps, in the campaign
 fingerprint's `data_paths`, to `rest` or `none`. A record without the snapshot whose level maps to `mount`, to
 anything else or to nothing is `unknown` (`not_recorded`), so a mount run that was not guarded is never not
 applicable, and any other shape under the namespace is `unknown` (`not_a_snapshot`). A statement that names another
@@ -31,6 +32,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from expcore.campaign.factors import DATA_PATH_FACTOR
 from expcore.mountguard.instrument import (
     INTACT,
     MOUNT_PATH,
@@ -52,7 +54,6 @@ CLEAN, FLAGGED, UNKNOWN_VERDICT, NOT_APPLICABLE = "clean", "flagged", "unknown",
 VERDICTS = (CLEAN, FLAGGED, UNKNOWN_VERDICT)  # what a run with a mount can be; NOT_APPLICABLE is a run with none
 NOT_RECORDED, INSTRUMENT_FAILED, NOT_A_SNAPSHOT = "not_recorded", "instrument_failed", "not_a_snapshot"
 DATA_PATH_MISMATCH = "data_path_mismatch"  # a no-mount statement that names another data path than the campaign does
-DATA_PATH_FACTOR = "data_path"  # the study factor whose levels the platform maps to a data path
 FROM_RECORD, FROM_CAMPAIGN = "record", "campaign"  # where a run's not-applicable data path was read from
 SNAPSHOT_KEYS = {"version", "log", "unknown", "isolation", "unproven", "accesses", "traced", "proofs", "ptrace_scope"}
 
@@ -127,21 +128,27 @@ def _readable(data: Any) -> tuple[Mapping[str, Any] | None, str | None]:
     return data, None
 
 
-def _campaign_kind(record: Any, data_paths: Mapping[str, str] | None) -> str | None:
-    """The data path the campaign records for the level of the run's `data_path` factor; None for a run without the
-    factor, a level the campaign does not map, or a campaign that records none."""
+def _campaign_kind(record: Any, data_paths: Mapping[str, str] | None, factor: str) -> str | None:
+    """The data path the campaign records for the level of the run's data-path factor (`factor`, the study's
+    `[study] data_path_factor`); None for a run without the factor, a level the campaign does not map, or a campaign
+    that records none."""
     factors = getattr(record, "factors", None)
-    level = factors.get(DATA_PATH_FACTOR) if isinstance(factors, Mapping) else None
+    level = factors.get(factor) if isinstance(factors, Mapping) else None
     kind = data_paths.get(level) if data_paths and isinstance(level, str) else None
     return kind if kind in (MOUNT_PATH, *NO_MOUNT_PATHS) else None
 
 
-def judge(record: Any, condition: str, data_paths: Mapping[str, str] | None = None) -> RunMountGuard:
+def judge(
+    record: Any, condition: str, data_paths: Mapping[str, str] | None = None, factor: str = DATA_PATH_FACTOR
+) -> RunMountGuard:
     """The mount-guard verdict of one analysed run (see the module's text). `data_paths` is the kind (`mount`, `rest`
-    or `none`) the campaign fingerprint records for each level of the `data_path` factor
-    (`expcore.mountguard.campaign.recorded_data_paths`); without it a run is judged from its own record alone."""
+    or `none`) the campaign fingerprint records for each level of the data-path factor
+    (`expcore.mountguard.campaign.recorded_data_paths`), and `factor` that factor's name, the study's
+    `[study] data_path_factor` (`data_path` by default): both the route by a run's own statement and the route by the
+    campaign's data paths read the run's level from it, and from no other name. Without `data_paths` a run is judged
+    from its own record alone."""
     snapshot = record.instruments.get(NAMESPACE)
-    campaign = _campaign_kind(record, data_paths)
+    campaign = _campaign_kind(record, data_paths, factor)
     if snapshot is None and campaign in NO_MOUNT_PATHS:  # no snapshot, and the campaign says this level had no mount
         return RunMountGuard(record.run_key, record.attempt, condition, *_not_applicable(campaign, FROM_CAMPAIGN))
     stated = _no_mount(snapshot)

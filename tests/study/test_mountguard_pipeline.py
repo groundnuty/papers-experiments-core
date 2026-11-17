@@ -102,39 +102,60 @@ class _StubSeen:
 '''  # fmt: skip
 
 
-# A study that mixes data paths: the factor `data_path` (the platform's own name for it) has a REST level, which only
-# `relay-down` uses, and a mount level, and the plugin records the platform's `data_paths` in the campaign fingerprint.
-PATHS_FACTOR = '[factors.data_path]\nlevels = ["api", "mount"]\n\n[identity]'
-PLATFORM = "platform={'data_paths': {'api': {'kind': 'rest'}, 'mount': {'kind': 'mount'}}},"
+# A study that mixes data paths: a factor for the data path has a REST level, which only `relay-down` uses, and a mount
+# level, and the plugin records the platform's `data_paths` in the campaign fingerprint. The factor is `data_path` (the
+# platform's own name for it) or, with `[study] data_path_factor`, a name of the study's own with its own levels.
+OWN_FACTOR, OWN_LEVELS = "path", ("A+", "M")  # a study that calls its data-path factor `path`: REST `A+`, mount `M`
 
 
-def with_data_paths(study: Path) -> None:
-    """Give the copy of the example the `data_path` factor and the platform fingerprint that maps its levels."""
+def with_data_paths(study: Path, factor: str = "data_path") -> None:
+    """Give the copy of the example the data-path factor `factor` and the platform fingerprint that maps its levels;
+    for a factor of another name than `data_path`, the key `[study] data_path_factor` names it."""
+    rest, mount = ("api", "mount") if factor == "data_path" else OWN_LEVELS
     config = study / "study.toml"
     text = config.read_text(encoding="utf-8")
     for old, new in (
-        ("[identity]", PATHS_FACTOR),
+        ("[identity]", f'[factors.{factor}]\nlevels = ["{rest}", "{mount}"]\n\n[identity]'),
         (
             'order = ["task", "access", "tools", "model", "seed"]',
-            'order = ["task", "access", "tools", "data_path", "model", "seed"]',
+            f'order = ["task", "access", "tools", "{factor}", "model", "seed"]',
         ),
-        ('access = "direct"\ntools = "basic"\n', 'access = "direct"\ntools = "basic"\ndata_path = "mount"\n'),
-        ('access = "direct"\ntools = "extended"\n', 'access = "direct"\ntools = "extended"\ndata_path = "mount"\n'),
-        ('access = "relay"\ntools = "basic"\n', 'access = "relay"\ntools = "basic"\ndata_path = "api"\n'),
+        ('access = "direct"\ntools = "basic"\n', f'access = "direct"\ntools = "basic"\n{factor} = "{mount}"\n'),
+        ('access = "direct"\ntools = "extended"\n', f'access = "direct"\ntools = "extended"\n{factor} = "{mount}"\n'),
+        ('access = "relay"\ntools = "basic"\n', f'access = "relay"\ntools = "basic"\n{factor} = "{rest}"\n'),
+        *(
+            (('plugin = "plugin.py"\n', f'plugin = "plugin.py"\ndata_path_factor = "{factor}"\n'),)
+            if factor != "data_path"
+            else ()
+        ),
     ):
         assert text.count(old) == 1, old
         text = text.replace(old, new)
     config.write_text(text, encoding="utf-8")
+    kinds = f"{{'{rest}': {{'kind': 'rest'}}, '{mount}': {{'kind': 'mount'}}}}"
     plugin = study / "plugin.py"
     code = plugin.read_text(encoding="utf-8")
     assert code.count("        executor=TinyExecutor(context),\n") == 1
     plugin.write_text(
         code.replace(
             "        executor=TinyExecutor(context),\n",
-            f"        executor=TinyExecutor(context),\n        {PLATFORM}\n",
+            f"        executor=TinyExecutor(context),\n        platform={{'data_paths': {kinds}}},\n",
         ),
         "utf-8",
     )
+
+
+AUTO = "auto"  # the preregistration declares the reruns the instruments listed make this study run (S19)
+
+
+def declared_for(*, guard: bool, egress: bool, visibility: bool) -> list[str] | None:
+    """The reruns a study that lists these instruments runs, to declare; None for a study with no guard, whose
+    preregistration declares nothing, as the example's does."""
+    if not guard:
+        return None
+    named = ["mount_guard", *(["egress"] if egress else []), *(["process_visibility"] if visibility else [])]
+    named.sort(key=("egress", "mount_guard", "process_visibility").index)
+    return [*named, "any_guard"] if len(named) > 1 else named
 
 
 def prepared(
@@ -145,24 +166,27 @@ def prepared(
     rest_task: str | None = None,
     visibility: bool = False,
     data_paths: bool = False,
-    reruns: list[str] | None = None,
+    reruns: list[str] | str | None = AUTO,
 ) -> Path:
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
+    if reruns == AUTO:
+        reruns = declared_for(guard=guard, egress=egress, visibility=visibility)
     if reruns is not None:  # the preregistration declares the sensitivity reruns the study expects (S19)
         declared = study / "preregistration.toml"
         declared.write_text(declared.read_text("utf-8") + f"\n[sensitivity]\nreruns = {json.dumps(reruns)}\n", "utf-8")
-    if data_paths:
-        with_data_paths(study)
+    if data_paths:  # True: the factor `data_path`; a name: that factor, as `[study] data_path_factor` names it
+        with_data_paths(study, "data_path" if data_paths is True else data_paths)
     if guard:
         plugin = study / "plugin.py"
         text = plugin.read_text(encoding="utf-8")
         assert INSTRUMENTS in text
         added = "instruments = [FactsServed(shelf), MountGuard(_StubWatch(factors['task']), _NONCE)]"
         if data_paths:  # the guard is listed on the mount runs alone: a REST run's record holds no snapshot
+            factor, mount = ("data_path", "mount") if data_paths is True else (data_paths, OWN_LEVELS[1])
             added = (
                 "instruments = [FactsServed(shelf), *([MountGuard(_StubWatch(factors['task']), _NONCE)] "
-                "if factors['data_path'] == 'mount' else [])]"
+                f"if factors[{factor!r}] == {mount!r} else [])]"
             )
         if rest_task is not None:  # a campaign that mixes data paths: this task's runs are REST runs, with no mount
             added = (
@@ -190,7 +214,7 @@ def checked_study(
     rest_task: str | None = None,
     visibility: bool = False,
     data_paths: bool = False,
-    reruns: list[str] | None = None,
+    reruns: list[str] | str | None = AUTO,
 ):
     study = prepared(
         tmp_path,
@@ -374,9 +398,39 @@ def test_s19_a_rerun_the_records_would_produce_and_the_preregistration_does_not_
     assert "declared but not run" not in text
 
 
-def test_s19_a_preregistration_that_declares_nothing_is_not_checked_and_analysis_json_is_as_it_was(
+def test_s19_a_guarded_batch_with_no_sensitivity_table_is_refused_naming_the_reruns_to_declare(
     tmp_path, clean_environment
 ):
-    analysis = checked_study(tmp_path, clean_environment, guard=True, egress=True)
-    assert analysis.guards is not None  # reruns run that nothing declared
+    """S19: an absent table reads as `reruns = []`, so a batch the guards checked, which would run reruns nobody
+    declared, is refused; the refusal names them and the missing table."""
+    with pytest.raises(Refused) as raised:
+        checked_study(tmp_path, clean_environment, guard=True, egress=True, reruns=None)
+    text = str(raised.value)
+    assert "preregistration.toml" in text
+    assert "has no [sensitivity] table, and an absent table declares none" in text
+    assert "run but not declared: egress, mount_guard, any_guard" in text
+    assert 'reruns = ["egress", "mount_guard", "any_guard"]' in text
+    assert "declared but not run" not in text
+
+
+def test_s19_a_batch_no_guard_checked_with_no_sensitivity_table_passes_and_analysis_json_is_as_it_was(
+    tmp_path, clean_environment
+):
+    """S19: no guard, no rerun, nothing to declare: an absent table is as it always was."""
+    analysis = checked_study(tmp_path, clean_environment, guard=False)
+    assert (analysis.egress, analysis.mount_guard, analysis.visibility, analysis.guards) == (None,) * 4
+    assert analysis.study.prereg.sensitivity_reruns is None
     assert "sensitivity_reruns" not in json.loads(output_bytes(analysis)[ANALYSIS_FILE])
+
+
+def test_o75_a_study_that_calls_its_data_path_factor_path_names_it_and_keeps_its_rest_arm(tmp_path, clean_environment):
+    """O75: the factor is `path` (levels `A+` and `M`), named by `[study] data_path_factor`; the records carry the
+    factor under that name alone, and the REST arm, which lists no mount guard, is still not applicable."""
+    analysis = checked_study(tmp_path, clean_environment, guard=True, data_paths="path")
+    assert analysis.study.data_path_factor == "path"
+    rest = {row.run_key for row in analysis.rows if row.factors["path"] == "A+"}
+    assert rest
+    assert all("data_path" not in row.factors for row in analysis.rows)
+    by_key = {run.run_key: run for run in analysis.mount_guard.runs}
+    assert {(by_key[key].verdict, by_key[key].data_path_from) for key in rest} == {("not_applicable", "campaign")}
+    assert not rest & {run.run_key for run in analysis.mount_guard.left_out}
