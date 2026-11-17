@@ -136,8 +136,15 @@ def world(tls, tmp_path, monkeypatch):
     httpd = gate.GateServer(("127.0.0.1", 0), gate.Handler)
     httpd.socket = gate._tls_context().wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    yield type("World", (), {"port": httpd.server_port, "upstream": upstream, "log": log, "tls": tls, "clock": clock})
+    clients: list[http.client.HTTPConnection] = []
+    yield type(
+        "World",
+        (),
+        {"port": httpd.server_port, "upstream": upstream, "log": log, "tls": tls, "clock": clock, "clients": clients},
+    )
     upstream.release.set()
+    for client in clients:  # no handler is left waiting on a client for the next test's gate to find
+        client.close()
     httpd.shutdown()
     httpd.server_close()
     upstream.shutdown()
@@ -151,6 +158,7 @@ def connect(world) -> http.client.HTTPConnection:
     raw = socket.create_connection(("127.0.0.1", world.port), timeout=20)
     conn = http.client.HTTPConnection(PROVIDER, timeout=20)
     conn.sock = context.wrap_socket(raw, server_hostname=PROVIDER)
+    world.clients.append(conn)
     return conn
 
 
@@ -312,12 +320,18 @@ def test_o73_a_request_still_being_answered_when_the_gate_stops_has_its_age_on_t
     """O73: the answer that has not come when the gate stops writes no request line, so the teardown line of its
     connection says how long it had waited (`request_age_ms`), which keeps the stall's evidence."""
     world.upstream.plan = [("hold", 0)]
+    before = set(gate._LIVE)  # the gate's connections are the process's: only this test's own are looked at
     conn = connect(world)
     conn.request("GET", ATTRS)  # sent, and never read: the answer is held
     assert world.upstream.reached.wait(15)
+    ours = set(gate._LIVE) - before
+    assert len(ours) == 1
     world.clock.advance(90)
     gate._teardown_lines()
-    waiting = [r for r in lines_of(world) if r.get("event") == "conn_close" and r.get("in_request") is True]
+    waiting = [
+        r
+        for r in lines_of(world)
+        if r.get("event") == "conn_close" and r.get("conn") in ours and r.get("in_request") is True
+    ]
     assert [r["request_age_ms"] for r in waiting] == [90_000]
     world.upstream.release.set()
-    conn.close()

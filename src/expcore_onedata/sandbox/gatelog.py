@@ -73,12 +73,13 @@ not name its requests, is a malformed log. Without a mark every answer is the ru
 
 **How long the requests took (O73, `request_durations`).** The line of a request the gate relayed to an upstream carries
 `duration_ms` (from the gate's reading of the request to the last byte of its answer relayed, or to the failure) and, of
-the upstream attempt that waited longest for an answer, `upstream_wait_ms` (from just before the attempt's request went
-to its first answer byte, or to its failure when none came), `upstream_wait_conn` (`new` or `reused`) and
-`upstream_wait_end` (`first_byte` or `failure`), beside `upstream_conn`, the connection of the last attempt. A kept
-connection that hangs and is dropped is retried on a new one, so the request ends on `new` and its wait was on `reused`:
-the summary counts it under the connection it waited on. A request whose answer has not ended when the gate stops writes
-no line; its connection's teardown line says how old it was (`request_age_ms`), and the summary is unknown.
+the upstream attempt that waited longest for an answer, `upstream_wait_ms` (from just before the attempt's request went,
+or from the start of its connect when that fails, to its first answer byte, or to its failure when none came),
+`upstream_wait_conn` (`new` or `reused`) and `upstream_wait_end` (`first_byte` or `failure`), beside `upstream_conn`,
+the connection of the last attempt. A kept connection that hangs and is dropped is retried on a new one, so the request
+ends on `new` and its wait was on `reused`: the summary counts it under the connection it waited on. A request whose
+answer has not ended when the gate stops writes no line; its connection's teardown line says how old it was
+(`request_age_ms`), and the summary is unknown.
 """
 
 import dataclasses
