@@ -13,12 +13,15 @@ from pathlib import Path
 
 import pytest
 from campaign_support import LATER, defect, finished, infra, planned_store, run_one
-from scheduler_support import FakeExecutor, build, settings_for
+from scheduler_support import FakeExecutor, build, models_for, settings_for
 
 from expcore.campaign import recovery
 from expcore.campaign.export import FORMAT, ExportError, export_run_state
 from expcore.campaign.export_join import join_exports
+from expcore.campaign.gate import Budget
 from expcore.campaign.markers import MARKER_NAME, AttemptResult, read_marker, write_marker
+from expcore.campaign.model_usage import usage_of
+from expcore.campaign.selection_ledger import Pricing
 from expcore.campaign.start_diagnostic import EXPORT_KEY, LIMIT_BYTES, snapshot_of
 from expcore.errors import CORE_KINDS, InfraError
 from expcore.loop.outcomes import Outcome
@@ -223,6 +226,33 @@ def test_c40_a_diagnostic_that_cannot_be_kept_never_stops_the_attempt_or_changes
         "error": "TypeError",
     }
     assert marker.diagnostic["ok"] is False
+
+
+def test_c40_an_induction_that_failed_before_any_request_keeps_its_diagnostic_and_is_a_measured_zero_in_the_usage(
+    tmp_path,
+):
+    """C40 with C05: a start that failed before the loop sent no request: with a budget the attempt is charged a
+    measured zero (0 tokens, basis measured, no bound), keeps its diagnostic, and the model usage counts it as a
+    measured attempt of 0 tokens and 0 dollars, never as a bound or as unknown."""
+
+    async def executor(request):
+        start_instruments([Inducer()], {"run_key": request.run_key})
+
+    settings = settings_for(max_attempts=1, budget=Budget(max_usd=50.0))
+    with build(tmp_path / "out", plan=PLAN, executor=FakeExecutor(default=executor), settings=settings) as sched:
+        sched.run()
+        rows = sched.store.q("SELECT * FROM attempts ORDER BY id")
+        pricing = Pricing({"m1": models_for("m1").resolve("m1")}, sched.agent_config.limits)
+        usage = usage_of(sched.store.q, pricing)
+    assert {
+        (r["state"], r["input_tokens"], r["output_tokens"], r["usage_complete"], r["spend_basis"]) for r in rows
+    } == {("infra_fail", 0, 0, 1, "measured")}
+    assert all(json.loads(r["diagnostic"]) == STARTED for r in rows)
+    [m1] = usage["models"]
+    [failed] = [c for c in m1["classes"] if c["class"] == "infra_fail"]
+    assert (failed["attempts"], failed["input_tokens"], failed["usage_incomplete_attempts"]) == (len(rows), 0, 0)
+    assert failed["usd"] == {"measured": 0.0, "measured_plus_inflight": 0.0, "bound": 0.0, "charges": 0.0, "total": 0.0}
+    assert (failed["bounded_attempts"], m1["usd"]["total"]) == (0, 0.0)
 
 
 # --- the export -------------------------------------------------------------------------------------------------------
