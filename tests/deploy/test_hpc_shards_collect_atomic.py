@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from copy_back_support import MANIFEST, SCRIPT, make_plan, plan_file, sha_of
+from root_evidence_support import record_step
 
 
 @pytest.fixture(scope="module")
@@ -178,6 +179,58 @@ def test_a_manifest_that_cannot_be_written_puts_the_into_back_as_found_and_write
     assert sorted(p.name for p in tmp_path.iterdir()) == parent_before
     assert not (plan.results / MANIFEST).exists()
     assert not [s.root for s in plan.shards if (s.root / "evidence-collected.json").exists()]
+
+
+@pytest.mark.parametrize("existed", [False, True], ids=["a new into", "an empty into"])
+def test_any_failure_between_the_move_and_the_manifest_puts_into_back_not_only_a_full_disk(
+    shards, tmp_path, monkeypatch, existed
+):
+    """O63 (G9): whatever goes wrong after the trees are moved in and before the manifest's rename (here a bug, not an
+    OSError), `--into` is as it was found, and nothing says the evidence was collected."""
+    plan = make_plan(shards, tmp_path)
+    into = tmp_path / "merge"
+    if existed:
+        into.mkdir(mode=0o700)
+    real = shards._write_whole
+
+    def failing(path, write):
+        if path.name == MANIFEST:
+            raise RuntimeError("boom")
+        real(path, write)
+
+    monkeypatch.setattr(shards, "_write_whole", failing)
+    with pytest.raises(RuntimeError, match="boom"):
+        shards.collect(plan, into)
+    assert into.is_dir() is existed
+    assert not existed or list(into.iterdir()) == []
+    assert not (plan.results / MANIFEST).exists()
+    assert not [s.root for s in plan.shards if (s.root / "evidence-collected.json").exists()]
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".collect-")]
+
+
+def test_a_marker_that_cannot_be_written_is_a_warning_naming_the_shard_and_the_collect_still_succeeds(
+    shards, tmp_path, monkeypatch, capsys
+):
+    """O63 (G9): the manifest is written and the trees are in place by then, so the collect is done: a refusal now
+    would change `--into` after the fact. The warning names the shard, and `down` keeps refusing that root."""
+    plan = make_plan(shards, tmp_path)
+    module = shards._evidence()
+    real = module.write_marker
+
+    def failing(root, label, *args, **kwargs):
+        if label == "fed-b":
+            raise OSError(13, "Permission denied")
+        return real(root, label, *args, **kwargs)
+
+    monkeypatch.setattr(module, "write_marker", failing)
+    outs = shards.collect(plan, tmp_path / "merge")
+    assert [out.parent.name for out in outs] == ["fed-a", "fed-b"]
+    assert (plan.results / MANIFEST).is_file()
+    assert (plan.shards[0].root / "evidence-collected.json").is_file()
+    assert not (plan.shards[1].root / "evidence-collected.json").exists()
+    assert "WARNING: shard fed-b: the collected-evidence marker could not be written" in capsys.readouterr().err
+    record_step(plan.shards[1].root, "fed-b")
+    assert module.uncollected(plan.shards[1].root) == (["fed-b"], False)
 
 
 def test_the_hash_collect_prints_is_the_hash_of_the_manifest_it_wrote(shards, tmp_path, capsys):

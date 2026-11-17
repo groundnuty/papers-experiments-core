@@ -161,14 +161,16 @@ def test_a_root_without_its_state_or_its_facts_refuses_the_collect_naming_the_sh
     assert not list(plan.results.glob("*.root.*"))
 
 
-def test_a_root_that_is_gone_refuses_the_collect_unless_an_earlier_root_archive_verifies(shards, tmp_path):
+def test_a_root_that_is_gone_refuses_the_collect_unless_an_earlier_root_archive_verifies(shards, tmp_path, capsys):
     """O63: after `down --discard-evidence` (or a down that followed a collect) the root is gone: a collect of the
     archives is refused naming the shard, unless the root archive an earlier collect wrote is still there and verifies
     against its manifest, in which case it is listed again as it is; one that does not verify is refused."""
     plan = _collect(shards, tmp_path, "first")
     first = (plan.results / "fed-a.root.tar").read_bytes()
     shutil.rmtree(plan.shards[0].root)
+    capsys.readouterr()
     shards.collect(plan, tmp_path / "second")  # the earlier archive of fed-a verifies: kept, listed
+    assert "WARNING: shard fed-a: its root is gone" in capsys.readouterr().err
     assert (plan.results / "fed-a.root.tar").read_bytes() == first
     listed = {e["name"] for e in json.loads((plan.results / MANIFEST).read_text())["evidence"]}
     assert {"fed-a.root.tar", "fed-a.root.json"} <= listed

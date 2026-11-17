@@ -438,8 +438,10 @@ def uncollected(root: Path) -> tuple[list[str], bool] | None:
     followed."""
     try:
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:
+    except FileNotFoundError:
         return None  # no root to remove
+    except OSError:
+        return ["(its root cannot be read)"], False  # nothing can be said of what ran: refused, never passed
     try:
         entries = _step_entries(fd)
         if entries == []:

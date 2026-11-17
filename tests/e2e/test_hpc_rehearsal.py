@@ -27,12 +27,14 @@ a half.
 """
 
 import contextlib
+import hashlib
 import io
 import json
 import shlex
 import shutil
 import stat
 import subprocess
+import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -395,6 +397,74 @@ def test_o74_up_wrote_each_federations_render_identity_0600_and_each_shards_out_
     kept = sorted((plan.results.parent / "collected" / label / "out" / "study-state").glob("render-identity.*.json"))
     assert len(kept) == (2 if label == KILLED else 1)
     assert [path.read_bytes() for path in kept] == [record.read_bytes()] * len(kept)
+
+
+# What a root `up` and a campaign made holds that its archive leaves out, and why (O63): every file of a real root is
+# archived, under `secrets/`, or named here. A file `up` writes later that is none of them fails the test below, so that
+# someone decides whether the post-check needs it.
+NOT_EVIDENCE: tuple[tuple[str, str], ...] = ()
+
+
+def _root_files(root: Path) -> list[str]:
+    """Every file and link under `root`, by its name relative to it."""
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() or p.is_symlink())
+
+
+def _archived(plan, label: str) -> dict[str, bytes]:
+    with tarfile.open(plan.results / f"{label}.root.tar") as tar:
+        return {m.name: tar.extractfile(m).read() for m in tar.getmembers() if m.isfile()}
+
+
+@pytest.mark.parametrize("label", LABELS)
+def test_o63_each_real_step_line_left_its_record_in_its_federations_root(merged, federations, label):
+    """O63: `down` cannot see the results directory, so the step line `plan` printed, run as its node runs it, left
+    `shard-steps/<label>.json` in its federation's root: one start for the shard that ran to its end, two for the one
+    killed outright and resumed."""
+    record = json.loads((federations[label].root / "shard-steps" / f"{label}.json").read_text())
+    assert record["shard"]["label"] == label
+    assert record["starts"] == (2 if label == KILLED else 1)
+
+
+@pytest.mark.parametrize("label", LABELS)
+def test_o63_the_root_archive_holds_the_real_evidence_and_nothing_from_secrets(plan, merged, federations, label):
+    """O63: what `up` wrote into the root (the state, the facts, the platform file, the link check, the render identity)
+    is in `<label>.root.tar` byte for byte, nothing of `secrets/` is, and no archived file holds the content of one."""
+    root, held = federations[label].root, _archived(plan, label)
+    for name in ("hpc-federation.json", "facts.json", "platform.toml", "link-check.json", "render-identity.json"):
+        assert held[name] == (root / name).read_bytes(), name
+    assert not [name for name in held if name.startswith("secrets/")]
+    secrets = [p.read_bytes().strip() for p in (root / "secrets").rglob("*") if p.is_file() and not p.is_symlink()]
+    assert secrets, "the real root holds secrets for this test to look for"
+    for name, data in held.items():
+        assert not [s for s in secrets if len(s) >= 8 and s in data], name
+
+
+@pytest.mark.parametrize("label", LABELS)
+def test_o63_every_file_a_real_root_holds_is_archived_a_secret_or_named_as_not_evidence(
+    plan, merged, federations, label
+):
+    """O63: the allow-list was written from the code; this is the check against a root `up` and a campaign really made:
+    nothing is in it that is neither archived, nor under `secrets/`, nor named in `NOT_EVIDENCE` with its reason."""
+    held = set(_archived(plan, label))
+    unclassified = [
+        name
+        for name in _root_files(federations[label].root)
+        if name not in held
+        and not name.startswith("secrets/")
+        and not any(name == path or name.startswith(path) for path, _ in NOT_EVIDENCE)
+    ]
+    assert not unclassified, unclassified
+
+
+@pytest.mark.parametrize("label", LABELS)
+def test_o63_collect_marked_each_root_before_down_naming_the_archive_it_wrote(plan, merged, federations, label):
+    """O63: `collect --run` wrote `evidence-collected.json` in each root, which `down` (stage 5) needs, naming the
+    SHA-256 of the root archive in the results directory."""
+    marker = json.loads((federations[label].root / "evidence-collected.json").read_text())
+    assert marker["label"] == label
+    assert (
+        marker["root_archive_sha256"] == hashlib.sha256((plan.results / f"{label}.root.tar").read_bytes()).hexdigest()
+    )
 
 
 def test_the_merged_export_carries_the_kills_lost_spend_with_its_basis_and_the_interrupted_attempt(merged, shards):

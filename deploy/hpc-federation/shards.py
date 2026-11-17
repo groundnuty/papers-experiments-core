@@ -1020,6 +1020,11 @@ def root_archives(plan: Plan) -> list[Any]:
                 found.append(module.archive_root(shard.root, shard.label))
             except module.RootGone:
                 found.append(module.earlier_archive(plan.results, shard.label))
+                print(
+                    f"shards: WARNING: shard {shard.label}: its root is gone: the root archive of an earlier collect "
+                    "is listed as it is",
+                    file=sys.stderr,
+                )
         except module.EvidenceError as error:
             raise ShardsError(f"shard {shard.label}: {error}") from None
         except OSError as error:
@@ -1136,7 +1141,9 @@ def _publish(plan: Plan, archives: Sequence[Any]) -> None:
 
 
 def _mark_roots(plan: Plan, archives: Sequence[Any]) -> None:
-    """The collected-evidence marker into each archived root (`hpcevidence.write_marker`): what `down` reads."""
+    """The collected-evidence marker into each archived root (`hpcevidence.write_marker`): what `down` reads. The
+    collect is done by now (the trees are in place and the manifest is written), so a marker that cannot be written
+    is a warning naming the shard, never a refusal: that root stays locked against `down` until a collect writes it."""
     module = _evidence()
     for shard, held in zip(plan.shards, archives, strict=True):
         if held.reused:  # its root is gone: there is nothing to mark
@@ -1144,25 +1151,52 @@ def _mark_roots(plan: Plan, archives: Sequence[Any]) -> None:
         try:
             module.write_marker(shard.root, shard.label, held.sha256, held.steps_sha256)
         except (OSError, module.EvidenceError) as error:
-            raise ShardsError(
-                f"shard {shard.label}: the results are collected and the manifest is written, but the marker could "
-                f"not be written in its root ({type(error).__name__}): `down` will refuse it until a collect "
-                "into a new directory writes it"
-            ) from None
+            print(
+                f"shards: WARNING: shard {shard.label}: the collected-evidence marker could not be written in its root "
+                f"({type(error).__name__}); the results are collected and the manifest is written, but `down` refuses "
+                "that root until a collect writes it (or --discard-evidence)",
+                file=sys.stderr,
+            )
+
+
+def _install(
+    plan: Plan,
+    stage: Path,
+    into: Path,
+    existed: bool,
+    entries: Sequence[Mapping[str, Any]],
+    listed: Sequence[Mapping[str, Any]],
+) -> bytes:
+    """The trees into `into` (one rename of `stage` onto it, which may exist only if empty), then
+    `archives.sha256.json` as the last write (a draft, fsynced, renamed); its bytes. Anything that goes wrong after the
+    trees are in, whatever it is, puts `into` back as it was found."""
+    try:
+        os.rename(stage, into)  # onto nothing, or onto the empty directory: one step, never a partial one
+    except OSError as error:
+        raise ShardsError(f"the unpacked trees could not be moved into place ({type(error).__name__})") from None
+    try:
+        payload = archives_payload(plan, entries, listed)
+        _write_whole(plan.results / ARCHIVES_MANIFEST, lambda draft: draft.write_bytes(payload))
+    except BaseException as error:
+        _put_back(into, existed)
+        if isinstance(error, OSError):
+            raise ShardsError(f"the archives manifest could not be written ({type(error).__name__})") from None
+        raise
+    _fsync_dir(plan.results)
+    return payload
 
 
 def collect_hashed(plan: Plan, into: Path, refuse_newer: bool = False) -> tuple[list[Path], str]:
     """`collect`'s outs and the SHA-256 of the archives manifest it wrote (the bytes written, not a file read again).
 
     Atomic (G9). Everything is made in a private directory beside `into` (0700, in its parent): every archive verified
-    into a private copy, every shard unpacked and checked there, every root's evidence read. Only when all of it
-    holds is
-    anything published, in this order: each root archive and its manifest into the results directory, the trees into
-    `into` (one rename of that directory onto `into`, which may exist only if empty), and `archives.sha256.json` last
-    (a draft, fsynced, renamed), then the collected-evidence marker in each root, which unlocks `down` and so comes
-    after
-    the manifest. A refusal before the manifest leaves `into` as it was found (new, or an empty private directory), the
-    results directory unchanged and no marker; a manifest that cannot be written puts `into` back."""
+    into a private copy, every shard unpacked and checked there, every root's evidence read. Only when all of it holds
+    is anything published, in this order: each root archive and its manifest into the results directory, the trees into
+    `into`, and `archives.sha256.json` last. Then the collected-evidence marker in each root, which unlocks `down` and
+    so comes after the manifest. A refusal before the manifest leaves `into` as it was found (new, or an empty private
+    directory), the results directory unchanged and no marker; a manifest that cannot be written puts `into` back. A
+    marker that cannot be written is a warning naming the shard, not a refusal: the collect is done and `down` stays
+    locked for that root."""
     if into.exists() and any(into.iterdir()):
         raise ShardsError("the directory to collect into must be new or empty")
     existed = into.exists()
@@ -1184,18 +1218,8 @@ def collect_hashed(plan: Plan, into: Path, refuse_newer: bool = False) -> tuple[
         archives = root_archives(plan)
         _unpack_shards(plan, found, stage)
         _publish(plan, archives)
-        try:
-            os.rename(stage, into)  # onto nothing, or onto the empty directory: one step, never a partial one
-        except OSError as error:
-            raise ShardsError(f"the unpacked trees could not be moved into place ({type(error).__name__})") from None
         listed = sorted([*evidence, *root_entries(plan, archives)], key=lambda entry: entry["name"])
-        payload = archives_payload(plan, entries, listed)
-        try:
-            _write_whole(plan.results / ARCHIVES_MANIFEST, lambda draft: draft.write_bytes(payload))
-        except OSError as error:
-            _put_back(into, existed)
-            raise ShardsError(f"the archives manifest could not be written ({type(error).__name__})") from None
-        _fsync_dir(plan.results)
+        payload = _install(plan, stage, into, existed, entries, listed)
         _mark_roots(plan, archives)
     except BaseException:
         for directory in reversed(made):  # directories this collect made, once empty (rmdir refuses the others)
