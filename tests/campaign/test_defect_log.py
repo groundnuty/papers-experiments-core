@@ -329,3 +329,20 @@ def test_c40_a_chain_redacts_a_longer_secret_whole_whichever_redactor_holds_the_
         redacted, paths = chain.structure({"seen": f"connected to {url}", "key": key})
         assert redacted == {"seen": "connected to [redacted]", "key": "[redacted]"}
         assert paths, "a structure that was changed says where"
+
+
+def test_c40_the_one_pass_chain_never_redacts_less_than_the_redactors_one_after_the_other_did():
+    """C40: the chain the attempt builds (the base, the installed context, the pin) shows no more of a diagnostic than
+    the same redactors applied one after the other did: a cut longer secret that holds a declared one is one marker,
+    and a string that becomes JSON once a declared secret is replaced has its secret-named keys applied."""
+    long = "postgres://dbuser-private:declared-password-42@db-private.example/main"
+    cut = long[:52] + "\n[output truncated: 10 of 62 characters dropped by the harness cap]"
+    quoted = 'quote"in-secret'
+    leaf = '{"token": "undeclared-value-1234", "seen": "' + quoted + '"}'
+    base, installed = Redactor([long]), Redactor(["declared-password-42", quoted])
+    pin = Redactor(["declared-password-42", quoted, long])
+    chain = Chained(Chained(base, installed), pin)
+    assert chain.structure({"cut": cut})[0] == {
+        "cut": "[redacted]\n[output truncated: 10 of 62 characters dropped by the harness cap]"
+    }
+    assert chain.structure({"leaf": leaf})[0] == {"leaf": '{"token": "[redacted]", "seen": "[redacted]"}'}
