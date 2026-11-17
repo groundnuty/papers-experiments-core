@@ -69,9 +69,9 @@ def test_o73_every_exec_a_run_makes_carries_the_declared_name(node, settings):
 def test_o73_a_cell_reads_the_declared_name_as_its_host_name(node, settings, level):
     """O73: what `hostname` and `uname -n` print in the fake node's cell is the name set in its UTS namespace, whatever
     the data path; with the flags missing the exec would not parse, and the node's own name would show."""
-    node.cell_handler = lambda cell: CmdResult(0, cell.hostname() + "\n")
     box = start(node, settings, make_spec(level))
     try:
+        node.cell_handler = lambda cell: CmdResult(0, cell.hostname() + "\n")  # after the start's canary
         done = box.exec("import socket; print(socket.gethostname())", 30)
         assert done.stdout.strip() == cellhost.CELL_HOSTNAME
     finally:
