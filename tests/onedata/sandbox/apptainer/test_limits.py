@@ -373,3 +373,24 @@ def test_o70_the_gate_s_kill_is_published_before_a_collection_can_read_the_gate_
     racing.reader.join(5)
     assert asked[0] is not None
     assert asked[0]["signalled"] is True
+
+
+def test_o70_the_two_kills_of_a_poll_over_memory_and_pids_are_of_the_cell_that_was_killed(node, tmp_path, monkeypatch):
+    """O70: both records are made in one step against the cell the signal ended: a cell that ends and another that
+    begins while the watch logs the kill is never given the pids kill of the first."""
+    from expcore_onedata.sandbox.apptainer import watch as W
+
+    ns = node.new_namespace()
+    for _ in range(2):
+        node._new_proc(ns, "python3", environ=(TAG,), rss=60 << 20, threads=40)
+    watch = _watch(node, tmp_path, _check(), limit=100 << 20)
+    watch.begin_cell(1, "n")
+
+    def next_cell(*args, **kwargs):  # the exec thread: the cell ended, another began, while the watch logs
+        watch.end_cell()
+        watch.begin_cell(2, "m")
+
+    monkeypatch.setattr(W.log, "info", next_cell)
+    watch.poll()
+    assert [(k["reason"], k["cell"]) for k in watch.kills] == [("memory_limit", 1), ("pids_limit", 1)]
+    assert watch.end_cell()["kills"] == []

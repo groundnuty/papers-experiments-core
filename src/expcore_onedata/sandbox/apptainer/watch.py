@@ -224,12 +224,11 @@ class Watch:
             self._limits.check_affinity(members)
         over_pids = tasks is not None and self._limits is not None and tasks > self._limits.check.pids
         if members and total > self._limit:
-            sent = self._kill(members, "memory_limit", "memory", total, self._limit)
+            beside = (KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids) if over_pids else None
+            sent = self._kill(members, "memory_limit", "memory", total, self._limit, beside=beside)
             if sent == 0:
                 with self._lock:  # nothing was signalled: never a reading of `over`
                     self._hidden.unreached()
-            if over_pids:  # the same signal ended them: the pids limit was past too
-                self._kill(members, KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids, sent=sent)
             return
         if over_pids:
             self._kill(members, KC.PIDS_LIMIT, "pids", tasks, self._limits.check.pids)
@@ -331,12 +330,12 @@ class Watch:
     def _kill(
         self, members: list[Proc], reason: str, what: str, amount: int, limit: int, *,
         figures: Mapping[str, int] | None = None, scope: str = "cell", why: str | None = None, attributed: bool = True,
-        sent: int | None = None,
+        beside: tuple[str, str, int, int] | None = None,
     ) -> int:  # fmt: skip
         """SIGKILL every process of the run through its pidfd, and record it against the running cell; how many were
-        signalled. `sent`: the signal already went (one kill's reason beside another's): only the record is made."""
-        if sent is None:
-            sent = sum(1 for p in members if self._node.signal(p.pid, p.start, signal.SIGKILL) is True)
+        signalled. `beside`: another reason (`reason`, `what`, `amount`, `limit`) that the same signal ended the
+        processes for, recorded in the same step, against the same cell."""
+        sent = sum(1 for p in members if self._node.signal(p.pid, p.start, signal.SIGKILL) is True)
         with self._lock:
             event = {
                 "cell": self._cell,
@@ -355,9 +354,14 @@ class Watch:
                 "utc": dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds"),
                 **({"figures": dict(figures)} if figures else {}),
             }
-            self.kills.append(event)
-            if self._cell is not None:
-                self._cell_kills.append(event)
+            events = [event]
+            if beside is not None:
+                reason2, what2, amount2, limit2 = beside
+                events.append({**event, "reason": reason2, "what": what2, "amount": amount2, "limit": limit2})
+            for each in events:
+                self.kills.append(each)
+                if self._cell is not None:
+                    self._cell_kills.append(each)
         log.info("the run's watch killed its processes: %s of %s over its limit", reason, what)
         return sent
 
