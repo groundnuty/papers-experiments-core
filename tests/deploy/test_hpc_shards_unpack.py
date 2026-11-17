@@ -185,7 +185,13 @@ def test_collect_refuses_a_shard_whose_archive_has_a_member_outside_out_and_extr
     manifest = json.loads((results / "fed-a.out.json").read_text())
     manifest["sha256"] = hashlib.sha256((results / "fed-a.out.tar").read_bytes()).hexdigest()
     (results / "fed-a.out.json").write_text(json.dumps(manifest))
-    plan = types.SimpleNamespace(results=results, shards=[shards.Shard(1, 1, "fed-a", tmp_path)], post_run=None)
+    plan = types.SimpleNamespace(
+        study=tmp_path / "study",
+        results=results,
+        shards=[shards.Shard(1, 1, "fed-a", tmp_path)],
+        post_run=None,
+        pass_env=(),
+    )  # what `collect` reads of a plan, as landing A and the pass_env PR made it read more than this test's base did
     with pytest.raises(shards.ShardsError, match=r"shard fed-a: its archive "):
         shards.collect(plan, tmp_path / "merge")
     assert not (tmp_path / "merge" / "fed-a").exists()  # nothing of the shard was unpacked
