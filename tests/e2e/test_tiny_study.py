@@ -10,6 +10,7 @@ The campaigns are built once per module (the module-scoped fixtures) and each te
 import hashlib
 import json
 import re
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -20,6 +21,9 @@ import pytest
 from study_crash import KILLED
 from study_support import HEAD, ROOT, Campaign, clean_environment, cli, copy_campaign, finish, make_copy, table
 
+from expcore.campaign.model_usage import CLASSES
+from expcore.campaign.selection_ledger import spend_of
+from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.cli import main
 from expcore.provenance.codestamp import write_stamp
 from expcore.records.record import load_record, record_filename
@@ -28,6 +32,7 @@ from expcore.stats.pairing import MISSING_CAUSES
 from expcore.study.config import load_study
 from expcore.study.pipeline import OUTPUT_FILES, regenerate
 from expcore.study.plugin import import_plugin_module
+from expcore.study.selection_start import pricing_of
 
 CRASH = ROOT / "tests" / "support" / "study_crash.py"
 TREATMENT, SUBSET = "relay-down", "extended"
@@ -635,3 +640,84 @@ def test_k07_the_outputs_regenerate_alike_whether_or_not_the_platform_is_loaded(
     )
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+# --- what each model spent (C39) -------------------------------------------------------------------------------------
+
+
+def snapshot_query(campaign: Campaign):
+    """A query over the snapshot of the store the check took, as the analysis reads it."""
+    connection = sqlite3.connect(campaign.runs / SNAPSHOT_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection, lambda sql, args=(): connection.execute(sql, args).fetchall()
+
+
+def test_c39_analysis_json_says_what_each_model_spent_and_each_total_is_the_budget_gates_own_figure(resumed):
+    """C39: `analysis.json` gains `model_usage`: every model of the plan, its attempts and tokens by what became of
+    them and its dollars on each basis, whose total is `spend_of`, the figure the gate counts."""
+    usage = resumed.read("analysis.json")["model_usage"]
+    assert usage["format"] == "model-usage-1"
+    assert usage["dollars"] == {"known": True, "reason": None}
+    assert [m["model"] for m in usage["models"]] == ["alpha-stub", "beta-stub"]
+    connection, query = snapshot_query(resumed)
+    try:
+        gate = spend_of(query, pricing_of(load_study(resumed.root)))
+        for entry in usage["models"]:
+            assert entry["usd"]["total"] == pytest.approx(gate.per_model[entry["model"]])
+            assert [c["class"] for c in entry["classes"]] == [
+                c for c in CLASSES if c in {k["class"] for k in entry["classes"]}
+            ]
+            [done] = [c for c in entry["classes"] if c["class"] == "analysed"]
+            (counted,) = connection.execute(
+                "SELECT COUNT(*), SUM(a.input_tokens), SUM(a.output_tokens) FROM attempts a JOIN runs r USING(run_key) "
+                "WHERE a.state='done' AND r.f_model=?",
+                (entry["model"],),
+            ).fetchall()
+            assert (done["attempts"], done["input_tokens"], done["output_tokens"]) == tuple(counted)
+    finally:
+        connection.close()
+    assert sum(m["usd"]["total"] for m in usage["models"]) == pytest.approx(gate.total)
+
+
+def test_c39_the_report_has_the_section_and_a_provenance_line_for_each_model(resumed):
+    """C39: the report names each model's spend by basis, and its provenance line says which part is measured."""
+    report = resumed.report
+    assert "## Model usage and spend" in report
+    spend = table(report, "### Spend by model")
+    assert set(spend) == {"alpha-stub", "beta-stub"}
+    assert all(cell != "n/a" for row in spend.values() for cell in row)
+    [line] = [line for line in report.splitlines() if line.startswith("- Spend: ")]
+    assert " measured, " in line
+    assert " at a bound, " in line
+    assert report.index("## Conditions") < report.index("## Model usage and spend")
+
+
+def test_c39_the_served_ids_and_retries_are_the_records_and_the_stub_reports_no_served_id(resumed):
+    """C39: what the records say of each model: how many, their turns, and the served id and fingerprint those turns
+    carried (a stub names none: `not reported`, never the id asked for), with the retries of their requests."""
+    for entry in resumed.read("analysis.json")["model_usage"]["models"]:
+        assert entry["records"] > 0
+        assert sum(seen["turns"] for seen in entry["served"]) == entry["turns"] > 0
+        assert {(s["served_model"], s["system_fingerprint"]) for s in entry["served"]} == {(None, None)}
+        assert entry["retries"]["events"] == sum(k["events"] for k in entry["retries"]["by_kind"]) == 0
+    served = table(resumed.report, "### Served model ids and fingerprints")
+    assert served["alpha-stub"][1:3] == ["not reported", "not reported"]
+
+
+def test_c39_a_study_whose_models_changed_since_the_run_is_reported_with_tokens_and_unknown_dollars(
+    resumed, tmp_path, clean_environment
+):
+    """C39: prices that are not the ones the campaign ran under are never applied: the analysis still runs, the
+    dollars are n/a with the reason, and the tokens are the store's. `regenerate` agrees with what was written."""
+    copy = copy_campaign(resumed, tmp_path, "other-prices")
+    models = copy.root / "models.toml"
+    models.write_text(models.read_text(encoding="utf-8").replace("input_per_mtok = 1.0", "input_per_mtok = 9.0"))
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
+    assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)
+    usage = copy.read("analysis.json")["model_usage"]
+    assert usage["dollars"]["known"] is False
+    assert "models.toml entries are not the ones the campaign ran under" in usage["dollars"]["reason"]
+    assert all(m["usd"] is None and m["records"] > 0 for m in usage["models"])
+    assert "n/a" in table(copy.root.joinpath("out", "report.md").read_text(), "### Spend by model")["alpha-stub"]
+    assert regenerate(copy.root, stamped=True) == []
