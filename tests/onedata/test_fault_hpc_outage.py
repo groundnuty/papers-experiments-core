@@ -111,9 +111,10 @@ def test_o58_the_stop_and_the_start_reach_the_target_service_alone_and_the_ident
     assert SERVICE not in json.dumps(injector.snapshot())
 
 
-def crashed(tmp_path, *, stopping):
+def crashed(tmp_path, *, stopping, gate_probe=None):
     """The journal a run killed mid-injection leaves on an HPC federation: `injecting`, and `stopping` after it when
-    `stopping`; the stop command itself was never sent. Return the recovery, the federation and the clock."""
+    `stopping`; the stop command itself was never sent. Return the recovery, the federation and the clock. With a
+    `gate_probe` the injection journalled the session gate's probe file, which a restore's gate reads."""
     platform = write_faults(tmp_path, command_timeout_s=COMMAND_TIMEOUT_S, settle_timeout_s=SETTLE_TIMEOUT_S)
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
     clock = FakeClock()
@@ -122,6 +123,8 @@ def crashed(tmp_path, *, stopping):
     recovery = Recovery(settings, driver, clock=clock, sleep=clock.sleep)
     entry = uuid.uuid4().hex
     line = {"target": OUTAGE_TARGET, "service": SERVICE, "identity_sha256": digest(driver.observe(SERVICE).identity)}
+    if gate_probe is not None:
+        line["gate_probe"] = gate_probe
     recovery.journal.append({"event": "injecting", "id": entry, **line, "holder": {"pid": 999999, "boot_id": "x"}})
     if stopping:
         recovery.journal.append({"event": "stopping", "id": entry})
@@ -318,9 +321,7 @@ def test_o58_the_driver_keeps_the_figure_of_the_latest_ready_status_and_a_start_
 
 def test_o58_a_restore_a_recovery_makes_carries_the_figure_too(tmp_path):
     """O58: the recovery of an injection an earlier run left open reports the same figure in its `recovered` step."""
-    recovery, federation, _ = crashed(tmp_path, stopping=True)
-    federation.stop_noop = False
-    federation.exit_after_s = 0.0
+    recovery, federation, _ = crashed(tmp_path, stopping=True, gate_probe="gate-probe-1")
     federation.domain_wait[SERVICE] = 4.0
     federation.state[SERVICE]["running"] = False  # the earlier run's stop did take effect
     told = []

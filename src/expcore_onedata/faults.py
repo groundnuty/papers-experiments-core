@@ -1093,6 +1093,9 @@ class FaultInjector:
             drain.disarm()  # the provider never went down: nothing was left to drain
         verified = done and how in ("restored", "found_restored")
         timed = {} if ready_after_s is None else {"ready_after_s": ready_after_s}
+        waited = self._recovery.restore_record.get("domain_wait_s") if ready_after_s is not None else None
+        if waited is not None:  # only a driver that reported it: never a 0 nobody measured (O58)
+            timed["domain_wait_s"] = waited
         self._injection = {**injection, "cleared": done, "verified": verified, **timed}
         self._record_links(self._recovery.restore_record)
         self._step("cleared", done, how=how)
@@ -1102,6 +1105,7 @@ class FaultInjector:
             identity_changed=after is not None,
             identity_after_sha256=after,
             ready_after_s=ready_after_s,
+            **({} if waited is None else {"domain_wait_s": waited}),
         )
         if done:
             self._drain(admission, own, how, began)  # before the federation goes back to the other runs

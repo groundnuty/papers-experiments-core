@@ -16,6 +16,7 @@
 # listener answers: both starts wait for a domain that is neither null nor empty (wait_domain), inside the readiness
 # budget (HPCOP_READY_SECONDS, 1800 s), before anything is compared or recorded. A domain that stays null fails the
 # start as that; a different non-null domain still fails it as a changed identity.
+# How long it waited is kept in <workdir>/domain-wait (seconds, three decimals; 0.000 when it did not) and reported by status.sh.
 # Usage: finish.sh [--restart] --workdir W <service-pid>
 source "$(dirname "$0")/lib.sh"
 component op
@@ -62,6 +63,7 @@ fi
 # The domain first: op_worker says null until its Onezone connection is up (wait_domain), and a null is neither
 # compared with the recorded identity nor recorded as one. The wait is the same for a first start and a restart.
 wait_domain "$T" "$FQDN" "$CA" "$SVC" "$READY_END" "$READY_S"
+put_secret "$W/domain-wait" "$DOMAIN_WAIT_S"$'\n'   # this launch's wait, for status.sh once the launch is verified
 ID=$(jsonget "$T/conf.json" providerId) || die "op_worker's /configuration names no providerId (null or missing)"
 DOM=$(jsonget "$T/conf.json" domain) || die "op_worker's /configuration names no domain (null or missing)"
 if (( RESTART )); then check_identity "$W" kind op providerId "$ID" domain "$DOM"; fi

@@ -327,7 +327,9 @@ def test_o58_status_reports_the_figure_finish_sh_writes(text, holder, env, proce
     assert status_of(work, env)["domain_wait_s"] == float(text)
 
 
-@pytest.mark.parametrize("text", ["abc\n", "-1.000\n", "1e3\n", "2\n", "2.5\n", "", "1234567.000\n", "0.000 x\n"])
+@pytest.mark.parametrize(
+    "text", ["abc\n", "-1.000\n", "1e3\n", "2\n", "2.5\n", "", "1234567.000\n", "0.000 x\n", "007.000\n"]
+)
 def test_o58_status_ignores_a_record_that_is_not_the_figure_finish_sh_writes(text, holder, env, processes):
     """O58: only a number of whole seconds and three decimals (the node's own measurement) is printed; the status stays
     a status, ready as before."""

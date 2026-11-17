@@ -617,17 +617,31 @@ ready_budget() {  # prints it; fails on anything that is not a whole number of s
 # There is always one read, and the first non-empty domain ends the wait whatever it is: the identity check then compares
 # it as ever, so another domain is refused as changed, with no wait. A field that is not there (or an answer that is not
 # JSON) is not a connection coming up, and fails at once.
+# DOMAIN_WAIT_S is how long it waited, in seconds with three decimals (as STOP_SECONDS is): from the first read to the
+# answer that held a domain, and exactly 0.000 when the first read held it, so "no wait was needed" is not a measurement.
+# The wait lengthens a restart's down time, so a restart's status reports it (status.sh, `domain_wait_s`).
+DOMAIN_WAIT_S=0.000
 wait_domain() {  # <tmpdir> <fqdn> <ca> <service pid> <deadline> <budget s>: leaves the answer in <tmpdir>/conf.json
-  local code rc dom
+  local code rc dom t0 ms waited=0
+  DOMAIN_WAIT_S=0.000
+  t0=$(date +%s%N)
   while :; do
     code=$(http GET "https://$2:8443/configuration" "$1/conf.json" --cacert "$3" --resolve "$2:8443:127.0.0.1")
     need_2xx "$code" "op_worker /configuration" "$1/conf.json"
     rc=0; dom=$(jsonget "$1/conf.json" domain) || rc=$?
     case $rc in
-      0) if [[ -n $dom ]]; then return 0; fi ;;
+      0)
+        if [[ -n $dom ]]; then
+          if (( waited )); then
+            ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+            DOMAIN_WAIT_S=$(printf '%d.%03d' "$((ms / 1000))" "$((ms % 1000))")
+          fi
+          return 0
+        fi ;;
       "$JSONGET_NULL") ;;
       *) die "op_worker's /configuration has no readable domain field (jsonget status $rc, its message above)" ;;
     esac
+    waited=1
     (( SECONDS < $5 )) || die "the provider's domain stayed null (or empty) in op_worker's /configuration for the readiness budget of $6 s: its Onezone connection did not come up, so its identity could not be checked"
     alive "$4" || die "the service exited before it reported its domain"
     sleep "${HPCOP_POLL_S:-1}"

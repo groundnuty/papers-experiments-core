@@ -50,7 +50,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' TERM INT
 
-rm -f -- "$W/stop-requested" "$W/service-verified" "$W/rootfs/root/service-ready.lock"
+rm -f -- "$W/stop-requested" "$W/service-verified" "$W/domain-wait" "$W/rootfs/root/service-ready.lock"
 say "restarting the $COMP service in $W"
 bash "$HPCOP_BUNDLE/$RUN" --workdir "$W" &
 # supervise.py, once run_service execs it: our uid, visible in /proc; its start time identifies it for every signal
