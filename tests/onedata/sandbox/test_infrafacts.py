@@ -195,9 +195,10 @@ def test_o89_the_declared_owners_hold_disjoint_keys_that_the_features_actually_w
 
 
 def offences(source: str) -> list[int]:
-    """The lines of a source that reach the table: its key as a string, as a keyword argument, or the helper's private
-    name for it (as a name, an attribute, an import or a string). A docstring or a comment that talks about the table is
-    a longer string, or no string, and is not one."""
+    """The lines of a source that reach the table: its key as a string, as a keyword argument, or as an identifier (a
+    name, an attribute, a parameter, a field or a definition: `dataclasses.asdict` would make it a key), or the helper's
+    private name for it (as a name, an attribute, an import or a string). A docstring or a comment that talks about the
+    table is a longer string, or no string, and is not one."""
     found = []
     tree = ast.parse(source)
     documentation = {
@@ -211,9 +212,11 @@ def offences(source: str) -> list[int]:
         elif isinstance(node, ast.keyword) and node.arg == LITERAL:
             found.append(node.value.lineno)
         elif (
-            (isinstance(node, ast.Name) and node.id == PRIVATE)
-            or (isinstance(node, ast.Attribute) and node.attr == PRIVATE)
-            or (isinstance(node, ast.ImportFrom) and any(alias.name == PRIVATE for alias in node.names))
+            (isinstance(node, ast.Name) and node.id in (LITERAL, PRIVATE))
+            or (isinstance(node, ast.Attribute) and node.attr in (LITERAL, PRIVATE))
+            or (isinstance(node, ast.arg) and node.arg == LITERAL)
+            or (isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) and node.name == LITERAL)
+            or (isinstance(node, ast.ImportFrom) and any(alias.name in (LITERAL, PRIVATE) for alias in node.names))
         ):
             found.append(node.lineno)
     return sorted(found)
@@ -235,6 +238,12 @@ def offences(source: str) -> list[int]:
         "from expcore_onedata.sandbox.infrafacts import _TABLE as table",
         'name = getattr(infrafacts, "_TABLE")',
         "meta.setdefault(_TABLE, {})",
+        "@dataclass\nclass Start:\n    infrastructure_facts: dict",
+        "def f(infrastructure_facts):\n    return 1",
+        "self.infrastructure_facts = {}",
+        "infrastructure_facts = {}",
+        "def infrastructure_facts():\n    return 1",
+        "from somewhere import infrastructure_facts",
     ],
 )
 def test_o89_the_scanner_finds_each_way_of_reaching_the_table(source):
@@ -257,6 +266,7 @@ def test_o89_no_source_of_the_core_writes_the_table_but_the_helper():
     """O89: the literal appears in `src` only in the helper. A new writer has to be the helper's, or this fails with the
     line, and with it the next feature that would have dropped another's key. (A source that reads the table by the
     literal fails too: a reader asks the sandbox's `metadata()`.)"""
+    assert getattr(infrafacts, PRIVATE) == LITERAL, "the helper's private name for the table is not the one scanned for"
     assert offences(HELPER.read_text(encoding="utf-8")), "the scanner no longer sees the helper's own key"
     found = {}
     for path in sorted(SRC.rglob("*.py")):
