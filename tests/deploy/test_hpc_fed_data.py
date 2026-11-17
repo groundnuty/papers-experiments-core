@@ -5,10 +5,12 @@ before the federation is ready: one whose data is not its manifest fails `up`, n
 a federation whose `up` has not finished. The bootstrap, the link check's transfers and the space reads stand in for a
 live federation; nothing reaches one."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fingerprint_support import standin_python
@@ -17,6 +19,7 @@ from hpc_rehearsal_support import BootStandIn, link_check_stand_in
 
 from expcore_onedata.config import load_platform
 from expcore_onedata.importmanifest import load_manifest
+from expcore_onedata.linkprobe import probe_name, retired_name
 
 SCRIPT = LAYOUT.parents[1] / "shards.py"
 SPACES = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
@@ -40,15 +43,17 @@ def ca(tmp_path_factory) -> bytes:
     return tls.make_federation_ca(tmp_path_factory.mktemp("ca")).ca.read_bytes()
 
 
-def core(hpc, root: Path, label: str, ca: bytes, data=None) -> str:
-    """The core's phase of the pilot's layout over a root of its own, the bootstrap's ids its federation's own."""
+def core(hpc, root: Path, label: str, ca: bytes, data=None, links=None) -> str:
+    """The core's phase of the pilot's layout over a root of its own, the bootstrap's ids its federation's own. Run
+    again over the same root, it is a rerun of `up`'s core phase (`hpcfed.py core`, a resume). `links` is the link
+    check's stand-in (every pair passing, with none given)."""
     import fedlayout
     import fedspec
 
-    (root / "secrets" / "users").mkdir(parents=True)
-    (root / "ca").mkdir()
+    (root / "secrets" / "users").mkdir(parents=True, exist_ok=True)
+    (root / "ca").mkdir(exist_ok=True)
     (root / "ca" / "federation-ca.pem").write_bytes(ca)
-    (root / "fault-journal").mkdir()
+    (root / "fault-journal").mkdir(exist_ok=True)
     (root / "secrets" / "zone.passphrase").write_text("A1b2C3d4E5f6G7h8", encoding="utf-8")
     os.chmod(root / "secrets" / "zone.passphrase", 0o600)
     spec = fedspec.load_spec(LAYOUT)
@@ -56,7 +61,7 @@ def core(hpc, root: Path, label: str, ca: bytes, data=None) -> str:
     layout = fedlayout.Layout(root, root.parent, hpc.boot.hpc_spec(spec, hosts))
     values = {**hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, root), **pin_values(root.parent / "pins")}
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(hpc.fedlinks, "check_links", link_check_stand_in([]))
+        patch.setattr(hpc.fedlinks, "check_links", links or link_check_stand_in([]))
         return hpc.boot.core_phase(
             layout, (5001, 5001), values, environ={},
             rest=lambda ca_file, **kwargs: SimpleNamespace(close=lambda: None), bootstrap=BootStandIn(label),
@@ -96,6 +101,122 @@ def test_o63_a_federation_whose_data_differs_by_one_file_from_its_manifest_fails
     assert "1 file(s) of another size or other bytes" in str(failed.value)
     assert str(tmp_path) not in str(failed.value)
     assert not (root / "link-check.json").exists()
+
+
+# -- the link check's own files in the probe space (live, 17 Nov 2026) -------------------------------------------------
+
+PROBE_SPACE = "link-probes"
+
+
+def holding(extra: dict[str, list[str]]) -> Any:
+    """`data_stand_in`'s reader with more files in the root of the given spaces, as a federation holds them once the
+    link check has written its probes: each is a file of some size and bytes, none of them declared."""
+    base = data_stand_in()
+
+    def reader(boot: Any) -> Any:
+        read = base(boot)
+
+        def read_with(space: str) -> Any:
+            files, directories = read(space)
+            more = {name: (len(name), hashlib.sha256(name.encode()).hexdigest()) for name in extra.get(space, ())}
+            return {**files, **more}, directories
+
+        return read_with
+
+    return reader
+
+
+def link_check_files() -> list[str]:
+    """What the link check leaves in its probe space, named by the check's own functions: a probe of a pair, a probe of
+    a higher generation, and the marker that retires a failed fetch's file."""
+    return [probe_name("pair-one"), probe_name("pair-two"), probe_name("pair-one", 1), retired_name("pair-one", "id")]
+
+
+def test_o63_a_probe_space_holding_the_link_checks_own_files_passes_the_data_check_and_the_count_is_recorded(
+    hpc, tmp_path, ca
+):
+    """C06, O63: the link check writes its probes (and, after a failed fetch, its retirement markers) into the probe
+    space, whose manifest is empty. Those files are the check's, not data: the data check of a federation whose link
+    check has run leaves them out, and the result says how many."""
+    printed = core(hpc, tmp_path / "root", "fed-a", ca, data=holding({PROBE_SPACE: link_check_files()}))
+    assert "holds the data its manifest declares (4 space(s))" in printed
+    assert f"4 link-check file(s) left out of the probe space ({PROBE_SPACE})" in printed
+
+
+def test_o63_a_probe_space_that_holds_none_of_them_says_so(hpc, tmp_path, ca):
+    """C06, O63: at the first `up` the data check runs before the link check, and records that it left nothing out."""
+    printed = core(hpc, tmp_path / "root", "fed-a", ca)
+    assert f"0 link-check file(s) left out of the probe space ({PROBE_SPACE})" in printed
+
+
+def test_o63_a_study_space_holding_a_file_named_like_a_probe_is_still_refused(hpc, tmp_path, ca):
+    """C06, O63: the link check's files are the probe space's alone: a probe-named file in a study space is data nobody
+    declared, and the federation is not ready."""
+    root = tmp_path / "root"
+    with pytest.raises(RuntimeError, match=r"^alpha-space does not hold the data its manifest declares") as failed:
+        core(hpc, root, "fed-a", ca, data=holding({"alpha-space": [probe_name("pair-one")], PROBE_SPACE: []}))
+    assert "(1 file(s) not in it)" in str(failed.value)
+    assert not (root / "link-check.json").exists()
+
+
+def test_o63_a_probe_space_holding_any_other_undeclared_file_is_still_refused_and_counts_only_those(hpc, tmp_path, ca):
+    """C06, O63: only the names the link check writes are left out. A stray file and the near misses of its names
+    (upper-case hex, generation 0, a suffix, a wrong number of digits) are data nobody declared, however many probes
+    sit beside them."""
+    stem = probe_name("pair-one")
+    upper = stem.upper().replace("EXPCORE-LINK-PROBE-", "expcore-link-probe-")
+    near = ["stray.txt", upper, f"{stem}-g0", f"{stem}.bak", stem[:-1]]
+    assert upper != stem
+    assert len(set(near)) == 5
+    with pytest.raises(RuntimeError, match=rf"^{PROBE_SPACE} does not hold the data its manifest declares") as failed:
+        core(hpc, tmp_path / "root", "fed-a", ca, data=holding({PROBE_SPACE: [*link_check_files(), *near]}))
+    assert "(5 file(s) not in it)" in str(failed.value)
+
+
+def test_o63_a_probe_named_file_below_a_directory_of_the_probe_space_is_still_refused(hpc, tmp_path, ca):
+    """C06, O63: the link check writes into the probe space's root, so its names are matched against a file's whole
+    path: one in a directory is not the check's."""
+    base = data_stand_in()
+    name = f"stray/{probe_name('pair-one')}"
+
+    def reader(boot: Any) -> Any:
+        read = base(boot)
+
+        def read_with(space: str) -> Any:
+            files, directories = read(space)
+            if space == PROBE_SPACE:
+                files = {**files, name: (1, hashlib.sha256(b"x").hexdigest())}
+                directories = {*directories, "stray"}
+            return files, directories
+
+        return read_with
+
+    with pytest.raises(RuntimeError, match=rf"^{PROBE_SPACE} does not hold the data") as failed:
+        core(hpc, tmp_path / "root", "fed-a", ca, data=reader)
+    assert "1 file(s) not in it, 1 director(ies) not as listed" in str(failed.value)
+
+
+def test_o63_the_core_phase_rerun_on_a_root_after_a_link_check_passes_its_data_check(hpc, tmp_path, ca):
+    """C06, O63 (live, 17 Nov 2026, O35): `up`'s first run checks the data before the link check, so the probe space is
+    empty then. The link check then leaves one probe per pair there, and a rerun of the core phase (`hpcfed.py core`, a
+    resume) read them as undeclared data and refused the federation. The rerun passes, leaving the probes out and
+    counting them, and the record the link check writes is rewritten."""
+    root, spaces, pairs = tmp_path / "root", {PROBE_SPACE: []}, []
+    stand_in = link_check_stand_in(pairs)
+
+    def link_check(config: Any, client: Any) -> Any:
+        report = stand_in(config, client)  # the pairs the rendered file declares, each passing
+        spaces[PROBE_SPACE] = [probe_name(f"pair-{index}") for index, _ in enumerate(pairs[-1])]
+        return report
+
+    first = core(hpc, root, "fed-a", ca, data=holding(spaces), links=link_check)
+    assert f"0 link-check file(s) left out of the probe space ({PROBE_SPACE})" in first
+    assert pairs[-1]
+    assert len(spaces[PROBE_SPACE]) == len(pairs[-1])  # the check wrote a probe for each pair
+    (root / "link-check.json").unlink()
+    again = core(hpc, root, "fed-a", ca, data=holding(spaces), links=link_check)
+    assert f"{len(pairs[-1])} link-check file(s) left out of the probe space ({PROBE_SPACE})" in again
+    assert (root / "link-check.json").is_file()
 
 
 def test_o63_the_differences_are_counts_of_files_missing_extra_other_and_directories(hpc):
