@@ -61,8 +61,8 @@ from expcore.config.loading import ConfigError
 from expcore.egress import Declaration, declaration
 from expcore_onedata import tls as TLS
 from expcore_onedata.fault_drain import GATE, MOUNT
+from expcore_onedata.sandbox import cellhost, gatelog, gatepolicy, hostfacts, infrafacts, inputs, kinds, tokenfiles
 from expcore_onedata.sandbox import deadline as DL
-from expcore_onedata.sandbox import gatelog, gatepolicy, hostfacts, infrafacts, inputs, kinds, tokenfiles
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
     DataPathMode,
@@ -83,6 +83,7 @@ from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelp
 from expcore_onedata.sandbox.apptainer.node import NodeOps
 from expcore_onedata.sandbox.apptainer.teardown import Teardown
 from expcore_onedata.sandbox.apptainer.watch import Watch, spaces_of
+from expcore_onedata.sandbox.cellhost import OwnNames
 from expcore_onedata.sandbox.cells import OUTPUT_CAP_BYTES
 from expcore_onedata.sandbox.completion import ExecIncomplete
 from expcore_onedata.sandbox.containers import (
@@ -111,6 +112,9 @@ PROBE_S = 60.0
 
 class ApptainerSandbox:
     """The `Sandbox` of the platform layer on an HPC batch node. Build it with `start`; stop it with `stop`."""
+
+    _own_scan: dict[str, Any] | None = None  # the facts of the agent node's names in the gate's scan (O73)
+    _own: OwnNames = OwnNames()  # what the agent node says of its own names, asked once at the start's checks (O73)
 
     def __init__(
         self,
@@ -267,6 +271,14 @@ class ApptainerSandbox:
             sp.mode is not DataPathMode.REST and sp.listing != gatepolicy.PAGED
         ):
             raise StartRefused("the listing mode must be paged or complete, and complete is for a REST data path only")
+        if cellhost.is_node_name(sp.node_names):  # O73: the neutral host name is never a node's
+            raise StartRefused(cellhost.REFUSAL)
+        if (
+            sp.node_names
+        ):  # O73: asked once, here, before anything exists: a bounded lookup; the gate's list is made of it
+            self._own = self.node.own_names()
+            if cellhost.is_node_name(self._own.names):  # the agent node's own name is never the neutral one either
+                raise StartRefused(cellhost.REFUSAL_OWN)
         if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
             try:
                 self._ca_bytes = s.tls.bundle()
@@ -391,6 +403,21 @@ class ApptainerSandbox:
         declared = self._declared()
         return gaterun.hosts(self.spec.zone, self.spec.provider, declared)
 
+    def _scan_names(self, served: dict[str, dict[str, Any]]) -> tuple[str, ...]:
+        """The names the gate counts in the answers it relays (O73): the federation's nodes' and then the agent node's
+        own, in both forms, read from the node (`cellhost.scan_names`); none when the run has no names to scan, which is
+        a federation whose names are the real ones. The gate's own configuration alone holds them; the run's facts hold
+        how many forms were added and why any could not be read (`own_node_scan`), never a name."""
+        if not self.spec.node_names:
+            return ()
+        own = self._own
+        scanned = cellhost.scan_names(self.spec.node_names, own.names, declared=served)
+        unread = list(own.unread)
+        if not unread and cellhost.lacks_domain(own.names, declared=served):  # a reason given already says why
+            unread.append(cellhost.UNQUALIFIED)
+        self._own_scan = {"version": 1, "forms": len(scanned) - len(self.spec.node_names), "unread": unread}
+        return scanned
+
     def _declared(self) -> tuple[str, str] | None:
         """`[sandbox.federation]`'s zone and provider names in lower case, as the gate matches `Host` and SNI (O69);
         None when the platform declares none."""
@@ -417,13 +444,14 @@ class ApptainerSandbox:
         log_path = gate_dir / "requests.jsonl"
         log_path.touch(mode=0o600)  # there from the start: a log that is missing is unreadable, never empty
         token = self.dir / gaterun.TOKEN_FILE
+        scanned = self._scan_names(served)  # once: a lookup is bounded, and the attempts share it
         for attempt in range(1, GATE_ATTEMPTS + 1):
             self._gate_port = self.node.free_port()
             config = gate_dir / f"gate-{attempt}.json"
             gaterun.write_config(config, gaterun.config(
                 run_key=sp.run_key, tls=self.s.tls, served=served, listing=sp.listing, directory=gate_dir,
                 tls_dir=tls_dir, token_file=token, port=self._gate_port, upstream_ca=self._ca_copy,
-                options=self.app.gate_options, scan_names=sp.node_names,
+                options=self.app.gate_options, scan_names=scanned,
             ))  # fmt: skip
             self._token_files = [token]  # before it exists: every teardown removes it, whatever fails from here
             self.run_record()
@@ -1085,6 +1113,10 @@ class ApptainerSandbox:
             check = self.infra_check()
             meta["container_deaths"], meta["infra_death"] = check["deaths"], check["death"]
         meta["served_bytes"] = self.served_bytes()
+        cellhost.note(meta)  # O73: added at the read, so a record of the facts made again later cannot drop it
+        if self._own_scan is not None:  # a copy, by reason alone (the module's `_scan_names`)
+            scan = {**self._own_scan, "unread": list(self._own_scan["unread"])}
+            meta.setdefault("infrastructure_facts", {})["own_node_scan"] = scan
         counted, timed = meta.pop("rest_node_name_hits", None), meta.pop("rest_request_durations", None)
         if self.spec.node_names and self.spec.mode is DataPathMode.REST:  # O73: scanned, so never silently absent
             read["rest_node_name_hits"] = counted or gatelog.node_name_hits_unknown(gatelog.GATE_NOT_COLLECTED)

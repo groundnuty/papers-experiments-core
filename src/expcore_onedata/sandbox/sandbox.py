@@ -61,6 +61,7 @@ from expcore.config.loading import ConfigError
 from expcore_onedata import tls
 from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import (
+    cellhost,
     copyout,
     directio,
     gatelog,
@@ -289,6 +290,8 @@ class DockerSandbox:
             sp.mode is not DataPathMode.REST and sp.listing != gatepolicy.PAGED
         ):
             raise StartRefused("the listing mode must be paged or complete, and complete is for a REST data path only")
+        if cellhost.is_node_name(sp.node_names):  # O73: the neutral host name is never a node's
+            raise StartRefused(cellhost.REFUSAL)
         if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
             try:  # the bytes the record names by their hash, read once: the containers get these and never the path
                 self._ca_bytes = s.tls.bundle()
@@ -1457,6 +1460,7 @@ class DockerSandbox:
                 meta["gate"] = gatelog.unknown("the gate log could not be parsed")
         meta["served_bytes"] = self.served_bytes()
         meta["sidecar_log"] = self.mount_errors() if not self._stopped else None
+        cellhost.note(meta)  # O73: the name the agent's container was created with, beside the node's readings
         return meta
 
     # ------------------------------------------------------------------------------------------------ stop

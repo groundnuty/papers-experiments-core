@@ -495,6 +495,52 @@ and the line stands before the template's first table; `up` refuses a template w
 and the render refuses the slot where the root holds no map); see `DESIGN.md`, "The registered names". Every login-side client of the services is built by `hpcboot.service_client`, which refuses a root with no usable map rather than build a client that could reach no name, and `tests/deploy/test_rest_constructors.py` fails on any other construction that is not listed with its reason. The first sandbox slot on a federation brought up
 this way is owed the checks of `DESIGN.md` section 9, item 7.
 
+## The cell's host name (O73)
+
+An agent's cell on a batch node has no network namespace, and without `--uts` no UTS namespace either: `hostname`,
+`uname -n`, `uname -a` and `/proc/sys/kernel/hostname` in it show the batch node's own name. That is a name the agent
+must not read (the gate's count of node names, `rest_node_name_hits` in `docs/interfaces.md`, is for the same reason),
+and a Compose cell, which reads its own container's name, does not show it. The core gives every cell on both backends
+one fixed, neutral host name, `sandbox` (`expcore_onedata/sandbox/cellhost.py`, a constant of the core and no setting):
+each `apptainer exec` carries `--uts --hostname sandbox`, and the Docker agent's container is created with
+`--hostname sandbox`. A federation with a node of that name, or, for a run that scans for node names, an agent node whose own host name is that, is
+refused at the start. The gate's scan for node names
+(`rest_node_name_hits`) holds the agent node's own host name instead, in its fully qualified and one-label forms, read
+from the node at the start (`NodeOps.own_names`), after the federation's nodes' names, so a leak of the name the cell
+no longer shows is still counted; never `sandbox`, which is the allowed name and would count false hits. The fully
+qualified names are a resolver lookup (`gethostbyaddr` of the host name: the primary name and every alias, each
+scanned whole and by its first label), so it is bounded: 5 s in a thread of its own, after which the host name is
+scanned alone, and a start waits no longer for a resolver that hangs. The run's facts (`own_node_scan`) say how many
+forms were scanned and, by reason alone (`fqdn_timeout`, `fqdn_failed`, `host_name_failed`, and `fqdn_unqualified` when
+no name the scan keeps has a domain, which a loopback alias or a declared name does not give, so a leak of the node's
+name followed by its domain would not be counted), what was not read, never a name. A live slot should show `own_node_scan.unread` empty.
+
+**`/etc/hostname`:** the sandbox binds none of its own. From Apptainer's source (read on its `main` branch, not on this
+site's release), `--uts` with a `--hostname` makes Apptainer write an `/etc/hostname` of the name and bind it, and it
+never binds the node's own: `/etc/hosts` and `/etc/localtime` are the only default bind paths, and `--containall` binds
+no others of the site's. A bind of ours onto it would, by the same reading (not run), be a second mount on the same
+path: Apptainer mounts its own first and a user bind after it, so ours would win, and for an image with no
+`/etc/hostname` the source makes a user bind fatal where Apptainer's own is skipped (unless an overlay or underlay makes
+the mount point, which was not read). So the sandbox adds none, and a hook (b) bind onto it is refused (it would replace
+the name).
+
+**Measured (17 Nov 2026, the pilot's site):** its Apptainer runs in setuid mode, and `apptainer exec --uts --hostname
+sandbox <image> hostname` and the same with `uname -n` print `sandbox`, exit 0, with no warning; without `--uts` both
+print the node's own name.
+
+**Not shown offline, owed to the next live slot:**
+
+1. `--uts --hostname sandbox` together with the sandbox's whole argv (`--containall`, `--no-mount
+   hostfs,bind-paths,cwd`, the binds, the preloads and the egress shim). The measurement above was a bare exec of an
+   image.
+2. `cat /etc/hostname` in a cell of a live run, with no bind of ours, which is what ships: it must read `sandbox`
+   (record `apptainer --version`, since the source above is `main`'s). If it reads anything else, a generated file bound
+   at `/etc/hostname` is the fallback, and its start must then be shown not to fail on an image with no such file.
+3. `hostname`, `uname -n`, `uname -a` and `cat /etc/hostname` in a cell of a live run, compared with a Compose cell's.
+
+The tests (`tests/onedata/sandbox/apptainer/test_cell_hostname.py`) read the argv and binds a fake node was given; they
+do not run Apptainer.
+
 ## Slots and the tool server (O83)
 
 The tool-server arm needs a slot's users. `layouts/pilot-shape-slots.toml` is the pilot's shape with the four users of two

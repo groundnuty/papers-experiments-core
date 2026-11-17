@@ -4,8 +4,14 @@
 A cell is one `apptainer exec`:
 
     apptainer -q exec --containall --cleanenv --no-home --no-mount hostfs,bind-paths,cwd --pwd /work
+        --uts --hostname <name>
         -B <run>/work:/work -B <run>/tmp:/tmp -B <run>/shm:/dev/shm -B ...:ro ... --env NAME=value ... <image.sif>
         timeout -s KILL <limit> <python> -I -B -c <completion bootstrap> <nonce> <size> <sha256> <python>
+
+`--uts --hostname <name>` gives the cell a UTS namespace of its own with the declared host name (`cellhost.py`, O73),
+so `hostname`, `uname -n` and `/proc/sys/kernel/hostname` show that name, the same as Docker's, and not the node's.
+`/etc/hostname` is not bound by the sandbox: with a UTS namespace and a name, Apptainer writes its own (`cellhost.py`).
+Every exec carries the flags, the harness's one-shot reads of the image included.
 
 `--containall` gives the cell its own PID, IPC and mount namespaces, a minimal `/dev` and an environment of the image's
 and the `--env` values alone; `--no-home` and `--no-mount hostfs,bind-paths,cwd` keep the driver's home, the host's
@@ -28,6 +34,8 @@ import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from expcore_onedata.sandbox.cellhost import CELL_HOSTNAME
 
 NO_MOUNT = "hostfs,bind-paths,cwd"
 RUN_TAG = "EXPCORE_SANDBOX"  # in every cell's environment: the run's sandbox id, how the watch finds its processes
@@ -75,7 +83,7 @@ def exec_argv(
 ) -> list[str]:
     """`apptainer exec` of `command` in `image` with these binds and this environment (the module's docstring)."""
     argv = [*words, "-q", "exec", "--containall", "--cleanenv", "--no-home", "--no-mount", NO_MOUNT]
-    argv += ["--pwd", workdir]
+    argv += ["--pwd", workdir, "--uts", "--hostname", CELL_HOSTNAME]  # O73: no node's name in the cell
     for bind in binds:
         argv += ["-B", bind.arg()]
     for name, value in env.items():
