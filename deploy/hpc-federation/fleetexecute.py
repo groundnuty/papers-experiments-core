@@ -8,9 +8,10 @@ orchestrating host, in the ledger: `fleetcontrol.py drain`, `ended`, `join` and 
 process.
 
 - **The ledger first.** Proven ends, settlements, drains and joins run in the ledger at once, in the decision's order.
-  A lost lease is settled to the spend its dead federation's call log shows, read through the `spend` reader (step 4's
-  reader of a dead store's spend, hooked up in step 6; until then none is read, and the lease stays charged its
-  grant, logged once). A retirement
+  A lost lease is settled to the spend its dead federation's call log shows, read through the `spend` reader:
+  `dead_store_reader(locate, study)` over step 4's `dead_store_spend`, whose `locate` (where the dead store is) step 6
+  gives; until then none is read, and the lease stays charged its grant, logged once. A read that is None, or of
+  another lease, settles nothing. A retirement
   is checked against the ledger again just before it starts: a federation in the ledger must be drained or proven
   ended and hold no lease that is issued or sent; one that is not in the ledger must still not be. A proven end
   `cancelled` comes only on a later tick, once the fleet's record shows the down verified.
@@ -141,6 +142,33 @@ def last_line(text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     said = (lines or ["nothing"])[-1]
     return "".join(c if c.isprintable() else "?" for c in said)[-300:]
+
+
+def dead_store_reader(locate: Callable[[Any, Any], Optional[Tuple[Path, str]]], study: Any,
+                      read: Optional[Callable[[Path, Any], Any]] = None) -> Callable[[Any, Any], Any]:  # fmt: skip
+    """The executor's spend reader over step 4's reader of a dead lease store (`expcore.study.merge_by_run.
+    dead_store_spend(out, study)`, imported when first used; a core without it reads nothing). `locate(site, settle)`
+    gives the dead store's `out/` and where it was read (`root`, the surviving root, or `pulled`), or None: step 6
+    knows where a federation's lease stores are. A lease is settled only from a read that is not None and names that
+    very lease (a store of another lease never settles it); anything else leaves it charged its grant."""
+
+    def spend(site: Any, action: Any) -> Optional[Tuple[int, str, Optional[int]]]:
+        found = locate(site, action)
+        if found is None:
+            return None
+        out, source = found
+        reader = read
+        if reader is None:
+            try:
+                from expcore.study.merge_by_run import dead_store_spend as reader
+            except ImportError:
+                return None
+        got = reader(out, study)
+        if got is None or got.lease_id != action.lease_id:
+            return None
+        return int(got.spend_micro), source, int(got.charged_attempts)
+
+    return spend
 
 
 def drain_refused(ledger: Any, label: str, clock: Callable[[], float]) -> Optional[str]:

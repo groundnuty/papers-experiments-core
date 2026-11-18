@@ -1541,8 +1541,9 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   injected there), or taken down if it never joined. Each lost lease (its holder proven ended with no completion, or
   its archive never verified) not yet settled is settled to the spend its dead federation's call log shows (the root
   is offered only while the member there still holds the jobs the federation joined with), through
-  the spend reader (step 4's reader of a dead store's spend, hooked up in step 6; until then nothing is read, the lease
-  stays charged its grant, and the log says so once): its grant stops locking the budget, and dispatch resumes. A run
+  the spend reader (`fleetexecute.dead_store_reader(locate, study)` over step 4's `dead_store_spend`; step 6 gives
+  `locate`, where a dead federation's lease store is; until then nothing is read, the lease stays charged its grant,
+  and the log says so once; a read that is None, or of another lease, settles nothing): its grant stops locking the budget, and dispatch resumes. A run
   the loss's conservative charge exhausted may reopen when its settle shows fewer attempts, so while such a lease is
   unsettled the controller keeps one idle federation for each such run instead of retiring it.
 - **By hand.** `--dry-run` prints each action as the commands above, one per line, under a comment naming where it runs

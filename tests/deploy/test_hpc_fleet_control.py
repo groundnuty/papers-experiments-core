@@ -744,3 +744,27 @@ def test_c43_a_federation_joins_with_the_digest_of_its_environment_identity_by_l
     path.write_text(json.dumps({"python": "3.13.0", "core_commit": "0123abcd"}), encoding="utf-8")
     argv[argv.index("site-a-fed-9")] = "site-a-fed-10"
     assert deploy.fleetcontrol.main(argv, {}, bench.hooks()) == 2
+
+
+def test_c43_the_dead_store_reader_settles_only_from_a_read_of_that_very_lease(deploy, tmp_path):
+    """C43: over step 4's reader of a dead store, a read that is None, of another lease, or of a store nobody located
+    settles nothing; one of the lease gives its spend, its source and its charged attempts."""
+    from types import SimpleNamespace as Read
+
+    settle = SimpleNamespace(lease_id=11, site="site-a", member="fed-1")
+    store = tmp_path / "store-out"
+    answers = {"none": None, "other": Read(lease_id=12, spend_micro=5, charged_attempts=1)}
+    answers["ours"] = Read(lease_id=11, spend_micro=250_000, charged_attempts=2, settled_running=0)
+    seen = []
+
+    def read(out, study):
+        seen.append((out, study))
+        return answers[study]
+
+    def located(site, action):
+        return store, "pulled"
+
+    for study, expected in (("none", None), ("other", None), ("ours", (250_000, "pulled", 2))):
+        assert deploy.fleetexecute.dead_store_reader(located, study, read)(None, settle) == expected
+    assert deploy.fleetexecute.dead_store_reader(lambda site, action: None, "ours", read)(None, settle) is None
+    assert seen == [(store, "none"), (store, "other"), (store, "ours")]
