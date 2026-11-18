@@ -208,6 +208,19 @@ def test_c43_a_dry_run_prints_exactly_what_a_live_tick_runs_and_runs_nothing(dep
     assert site.commands == [action["steps"][0]]
 
 
+def test_c43_a_read_pulled_earlier_is_for_a_dry_run_and_never_acted_on(deploy, tmp_path, site):
+    """C43: `--observed SITE=FILE` takes a read an operator pulled; a live tick refuses it (a stale read could start an
+    up past what the site holds now), and a dry run prints from it."""
+    pulled = tmp_path / "site-a.json"
+    pulled.write_text(json.dumps(observed(site)), encoding="utf-8")
+    bench = Bench(tmp_path, deploy, [site])
+    assert bench.tick("--observed", f"site-a={pulled}") == 2
+    assert site.commands == []
+    assert bench.tick("--dry-run", "--observed", f"site-a={pulled}") == 0
+    assert site.commands == []
+    assert "add 4" in "\n".join(bench.printed)
+
+
 def test_c43_a_federation_joins_drains_before_its_end_is_collected_then_taken_down_and_proven_cancelled(
     deploy, tmp_path, site
 ):

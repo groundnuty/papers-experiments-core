@@ -172,6 +172,8 @@ def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
     controller, sites = load_config(args.sites)
     known = {site.label for site in sites}
     observed: Dict[str, Path] = {}
+    if args.observed and not args.dry_run:
+        raise ConfigError("--observed takes a read pulled earlier: it is for --dry-run only, never acted on")
     for given in args.observed or []:
         label, _, file = given.partition("=")
         if label not in known or not file:

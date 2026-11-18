@@ -262,14 +262,16 @@ def _room(now: float, settings: SiteSettings, view: SiteView, busy: frozenset[st
     limits: dict = {"maximum": settings.max_federations - len(live)}
     limits["nodes"] = max(view.idle_nodes - per * len(starting), 0) // per if per > 0 else 0
     limits.update(idle_nodes=view.idle_nodes, mixed_nodes=view.mixed_nodes, nodes_reserved=per * len(starting))
-    if view.inodes_error is not None:
-        limits["inodes"] = 0
-    elif view.inodes_quota is None or view.inode_estimate <= 0:
+    if view.inodes_error is not None or (view.inodes_quota is None) != (view.inodes_used is None):
+        limits["inodes"] = 0  # a quota that could not be read is never room
+    elif view.inodes_quota is None:
         limits["inodes"] = None  # nothing on scratch: no inode limit
     else:
         line = view.inodes_quota * LINE_PERCENT // 100
         reserved = view.inode_estimate * len(unsettled)
-        limits["inodes"] = max(line - (view.inodes_used or 0) - reserved, 0) // view.inode_estimate
+        free_inodes = line - view.inodes_used - reserved
+        estimate = max(view.inode_estimate, 1)  # an estimate of 0 still adds only while the usage is under the line
+        limits["inodes"] = 0 if free_inodes < 0 else free_inodes // estimate
         limits["inodes_reserved"] = reserved
     whole = settings.rate_units_per_hour * view.time_s / 3600.0
     made = sum(1 for m in view.members if m.status != "taken")

@@ -71,6 +71,8 @@ def test_c43_quota_exhaustion_adds_nothing_at_that_site_and_moves_the_adds_elsew
     assert adds(decide(NOW, view, [(settings(), unread)])) == {}
     off_scratch = site(inodes_used=None, inodes_quota=None, inode_estimate=0)
     assert adds(decide(NOW, view, [(settings(), off_scratch)])) == {"site-a": 3}
+    no_estimate = site(inodes_used=950_001, inode_estimate=0)  # past the line: an estimate of 0 adds nothing
+    assert adds(decide(NOW, view, [(settings(), no_estimate)])) == {}
 
 
 def test_c43_the_allowance_must_pay_a_new_federations_whole_time():
