@@ -529,7 +529,8 @@ class DockerHost:
             ext.write_text(
                 f"subjectAltName=DNS:{name}\nbasicConstraints=CA:FALSE\n"
                 "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n"
-                "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",  # OpenSSL 1.1.1 adds neither (caconfig)
+                # OpenSSL 3 adds both identifiers itself (as `keyid,issuer`), 1.1.1 neither: see caconfig
+                "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n",
                 encoding="utf-8",
             )
             self._openssl(
