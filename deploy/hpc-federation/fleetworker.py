@@ -5,7 +5,7 @@ gives its lease runs the operator's key files.
     <python> -I -B deploy/hpc-federation/fleetworker.py launch --fleet DIR --member fed-k --settings FILE \
         --federation LABEL --channel DIR --job-end EPOCH
     <python> -I -B deploy/hpc-federation/fleetworker.py node --federation LABEL --channel DIR --study DIR --tmpfs DIR \
-        --root DIR --python EXE [--home-files DIR]
+        --root DIR [--home-files DIR]
 
 `launch` runs on the site's login node (the controller's join runs it, before the federation joins the ledger): it
 starts `node` as a detached `srun` step of the federation's held job (`login_line`), once (a worker whose recorded
@@ -71,8 +71,7 @@ def login_line(
     env = [f"PATH={settings['step_path']}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={root.parent}",
            f"EXPCORE_FED_ROOT={root}", *(f"{k}={v}" for k, v in shards.home_env(shards.NO_HOME).items())]  # fmt: skip
     node = [settings["python"], "-I", "-B", str(SCRIPT), "node", "--federation", federation, "--channel", channel,
-            "--study", settings["study"], "--tmpfs", settings["tmpfs"], "--root", str(root),
-            "--python", settings["python"]]  # fmt: skip
+            "--study", settings["study"], "--tmpfs", settings["tmpfs"], "--root", str(root)]  # fmt: skip
     if settings.get("home_files"):  # the path alone rides here: `node` reads the tree itself
         node += ["--home-files", settings["home_files"]]
     minutes = max(1, -(-int(time_s) // 60))
@@ -181,9 +180,8 @@ def node(args: argparse.Namespace, runner: Any = None) -> int:
             except shards.ShardsError as error:
                 print(f"fleetworker: ERROR: {error}; the worker is not started", file=sys.stderr)
                 return REFUSED
-        words = [args.python, "-I", "-B", "-m", WORKER_MODULE, "--federation", args.federation,
-                 "--channel", args.channel, "--study", str(copy), "--work", str(directory / "work"),
-                 "--python", args.python]  # fmt: skip
+        words = [sys.executable, "-I", "-B", "-m", WORKER_MODULE, "--federation", args.federation,
+                 "--channel", args.channel, "--study", str(copy), "--work", str(directory / "work")]  # fmt: skip
         return runner(words, env, directory)
     finally:
         try:
@@ -258,7 +256,6 @@ def parser() -> argparse.ArgumentParser:
     for key in ("channel", "study", "tmpfs", "root"):
         one.add_argument(f"--{key}", required=True)
     one.add_argument("--federation", required=True)
-    one.add_argument("--python", required=True)
     one.add_argument("--home-files", dest="home_files", default=None)
     login = sub.add_parser("launch")
     for key in ("fleet", "member", "settings", "federation", "channel"):

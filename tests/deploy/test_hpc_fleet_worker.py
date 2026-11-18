@@ -67,7 +67,7 @@ def args_of(tmp_path: Path, tree: Path | None = None, work_root: str | None = No
     (tmp_path / "tmpfs").mkdir(exist_ok=True)
     (tmp_path / "channel").mkdir(exist_ok=True)
     return SimpleNamespace(federation="site-a-fed-1", channel=str(tmp_path / "channel"), study=str(study),
-                           tmpfs=str(tmp_path / "tmpfs"), root=str(root), python=sys.executable,
+                           tmpfs=str(tmp_path / "tmpfs"), root=str(root),
                            home_files=None if tree is None else str(tree))  # fmt: skip
 
 

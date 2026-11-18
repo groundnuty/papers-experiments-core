@@ -44,6 +44,7 @@ ATTEMPTS = "<the charged attempts its store shows>"
 ARCHIVES_MANIFEST = "archives.sha256.json"  # `shards.ARCHIVES_MANIFEST`
 HEX64 = re.compile(r"[0-9a-f]{64}")
 COMMAND_TIMEOUT_S = 6 * 3600.0  # the fleet's commands bound their own waits (an up's queue wait, a down's steps)
+LAUNCH_TIMEOUT_S = 300.0  # a worker's launch only spawns a detached srun client: it never holds the tick for long
 
 
 @dataclass(frozen=True)
@@ -327,7 +328,7 @@ class Executor:
         no channel or the controller no shard settings."""
         for argv in render(action, site, self.evidence, self.ledger_path, settings=self.settings).site_steps:
             try:
-                code, out, err = self.transport.run(site, list(argv), COMMAND_TIMEOUT_S)
+                code, out, err = self.transport.run(site, list(argv), LAUNCH_TIMEOUT_S)
             except (OSError, subprocess.SubprocessError) as error:
                 code, out, err = 1, "", f"it could not be run ({type(error).__name__})"
             self.log.write("result", action="Worker", label=action.label, argv=list(argv), code=code, ok=code == 0,
