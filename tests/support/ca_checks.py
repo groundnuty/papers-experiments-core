@@ -43,7 +43,7 @@ def extensions_of(cert: Path) -> list[tuple[str, bool, tuple[str, ...] | None]]:
     done = subprocess.run(
         ["openssl", "x509", "-in", str(cert), "-noout", "-text"], capture_output=True, text=True, check=True
     )
-    lines = done.stdout.splitlines()
+    lines = [line for line in done.stdout.splitlines() if line.strip()]  # 1.1.1 prints a blank line after the AKI
     after = lines[next(n for n, line in enumerate(lines) if line.strip() == "X509v3 extensions:") + 1 :]
     margin = len(after[0]) - len(after[0].lstrip())
     found: list[tuple[str, bool, list[str]]] = []
