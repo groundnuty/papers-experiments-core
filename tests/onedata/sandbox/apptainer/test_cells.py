@@ -6,6 +6,7 @@ import time
 
 import pytest
 from apptainer_support import make_settings, start
+from cgroup_v1_support import OWN, v1_host
 from fake_node import FakeNode, Unrecorded
 
 from expcore.errors import InfraError
@@ -13,6 +14,7 @@ from expcore.plugin import NO_WAITS
 from expcore_onedata.sandbox import bounds as BD
 from expcore_onedata.sandbox import completion, kinds
 from expcore_onedata.sandbox import deadline as DL
+from expcore_onedata.sandbox.apptainer.node import LocalNode
 from expcore_onedata.sandbox.codetool import CodeExecutionProvider
 from expcore_onedata.sandbox.hostops import CmdResult
 
@@ -279,6 +281,26 @@ def test_an_oom_kill_the_step_s_cgroup_counted_is_infrastructure(node, box):
 
     node.cell_handler = oom
     result = box.exec("print('x')", 30)
+    assert result.kill["reason"] == "host_oom"
+    assert result.kill["category"] == "infrastructure"
+
+
+def test_o56_an_oom_kill_a_cgroup_v1_step_counted_is_infrastructure_as_on_v2(node, box, tmp_path, monkeypatch):
+    """O56: on a v1 host the node reads the step's memory cgroup from the memory controller's tree, where the kernel
+    counts a kill in the cgroup of the cell's own process: a cell during which that count rises is `host_oom`, as on
+    v2; one with no rise has no kill."""
+    sys_cgroup = v1_host(tmp_path / "v1", monkeypatch)
+    node.cgroup_memory = LocalNode().cgroup_memory  # the node's own reading, over the v1 tree
+    control = sys_cgroup / "memory" / OWN.lstrip("/") / "memory.oom_control"
+
+    assert box.exec("print('x')", 30).kill is None
+
+    def oom(cell):
+        control.write_text(control.read_text().replace("oom_kill 0", "oom_kill 1"))
+        return CmdResult(137, "", "")
+
+    node.cell_handler = oom
+    result = box.exec("x = bytearray(1 << 40)", 30)
     assert result.kill["reason"] == "host_oom"
     assert result.kill["category"] == "infrastructure"
 

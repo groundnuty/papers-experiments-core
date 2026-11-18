@@ -260,8 +260,9 @@ def test_o56_children_that_cannot_be_read_make_the_reading_unknown(node, tmp_pat
     assert watch.end_cell()["memory"]["unknown"] == ["children_unreadable"]
 
 
-def test_o56_without_a_cgroup_v2_the_reading_is_unknown(node, tmp_path):
-    """O56: on a v1 or hybrid host there is no cgroup to compare with: the reading is unknown, never within."""
+def test_o56_without_a_readable_cgroup_the_reading_is_unknown(node, tmp_path):
+    """O56: where the driver's memory cgroup cannot be read there is none to compare with: the reading is unknown,
+    never within."""
     node.cgroup_path = None
     watch = _watch(node, tmp_path)
     assert watch.reading()["unknown"] == ["cgroup_unreadable"]

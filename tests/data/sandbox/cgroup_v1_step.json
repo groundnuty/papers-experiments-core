@@ -1,0 +1,57 @@
+{
+  "about": "One step of a Slurm job on a node with cgroup v1 only (an EL8 host, kernel 4.18, `memory` mounted under /sys/fs/cgroup/memory): the step's `/proc/self/cgroup`, and the memory controller's files at the step process's own cgroup (`task_0`, no limit), at the step (limited) and at the job (limited), read before a throwaway child of the step exceeded the step's limit, and (`after_oom`, only the files that changed) after the kernel killed it. Job, user and step numbers are placeholders.",
+  "proc_self_cgroup": "12:devices:/slurm/uid_UID/job_JOB/step_STEP/task_0\n11:blkio:/system.slice/slurmd.service\n10:freezer:/slurm/uid_UID/job_JOB/step_STEP\n9:perf_event:/\n8:cpuset:/slurm/uid_UID/job_JOB/step_STEP\n7:memory:/slurm/uid_UID/job_JOB/step_STEP/task_0\n6:rdma:/\n5:cpu,cpuacct:/slurm/uid_UID/job_JOB/step_STEP/task_0\n4:pids:/system.slice/slurmd.service\n3:hugetlb:/\n2:net_cls,net_prio:/\n1:name=systemd:/system.slice/slurmd.service\n",
+  "levels": [
+    {
+      "path": "/slurm/uid_UID/job_JOB/step_STEP/task_0",
+      "files": {
+        "memory.limit_in_bytes": "9223372036854771712\n",
+        "memory.max_usage_in_bytes": "2048000\n",
+        "memory.usage_in_bytes": "1224704\n",
+        "memory.failcnt": "0\n",
+        "memory.oom_control": "oom_kill_disable 0\nunder_oom 0\noom_kill 0\n",
+        "memory.stat": "cache 0\nrss 450560\nrss_huge 0\nshmem 0\nmapped_file 0\ndirty 0\nwriteback 0\nswap 0\npgpgin 1765\npgpgout 1655\npgfault 4388\npgmajfault 0\ninactive_anon 413696\nactive_anon 8192\ninactive_file 0\nactive_file 0\nunevictable 0\nhierarchical_memory_limit 542236672\nhierarchical_memsw_limit 9223372036854771712\ntotal_cache 0\ntotal_rss 450560\ntotal_rss_huge 0\ntotal_shmem 0\ntotal_mapped_file 0\ntotal_dirty 0\ntotal_writeback 0\ntotal_swap 0\ntotal_pgpgin 1765\ntotal_pgpgout 1655\ntotal_pgfault 4388\ntotal_pgmajfault 0\ntotal_inactive_anon 413696\ntotal_active_anon 8192\ntotal_inactive_file 0\ntotal_active_file 0\ntotal_unevictable 0\n"
+      },
+      "after_oom": {
+        "memory.limit_in_bytes": "9223372036854771712\n",
+        "memory.max_usage_in_bytes": "543354880\n",
+        "memory.failcnt": "0\n",
+        "memory.oom_control": "oom_kill_disable 0\nunder_oom 0\noom_kill 1\n"
+      }
+    },
+    {
+      "path": "/slurm/uid_UID/job_JOB/step_STEP",
+      "files": {
+        "memory.limit_in_bytes": "542236672\n",
+        "memory.max_usage_in_bytes": "3076096\n",
+        "memory.usage_in_bytes": "2281472\n",
+        "memory.failcnt": "0\n",
+        "memory.oom_control": "oom_kill_disable 0\nunder_oom 0\noom_kill 0\n",
+        "memory.stat": "cache 8192\nrss 434176\nrss_huge 0\nshmem 8192\nmapped_file 0\ndirty 0\nwriteback 0\nswap 0\npgpgin 132\npgpgout 24\npgfault 133\npgmajfault 0\ninactive_anon 442368\nactive_anon 0\ninactive_file 0\nactive_file 0\nunevictable 0\nhierarchical_memory_limit 542236672\nhierarchical_memsw_limit 9223372036854771712\ntotal_cache 8192\ntotal_rss 888832\ntotal_rss_huge 0\ntotal_shmem 8192\ntotal_mapped_file 0\ntotal_dirty 0\ntotal_writeback 0\ntotal_swap 0\ntotal_pgpgin 2539\ntotal_pgpgout 2320\ntotal_pgfault 6064\ntotal_pgmajfault 0\ntotal_inactive_anon 860160\ntotal_active_anon 8192\ntotal_inactive_file 0\ntotal_active_file 0\ntotal_unevictable 0\n"
+      },
+      "after_oom": {
+        "memory.limit_in_bytes": "542236672\n",
+        "memory.max_usage_in_bytes": "542236672\n",
+        "memory.failcnt": "74\n",
+        "memory.oom_control": "oom_kill_disable 0\nunder_oom 0\noom_kill 0\n"
+      }
+    },
+    {
+      "path": "/slurm/uid_UID/job_JOB",
+      "files": {
+        "memory.limit_in_bytes": "1084477440\n",
+        "memory.max_usage_in_bytes": "1084477440\n",
+        "memory.usage_in_bytes": "8364032\n",
+        "memory.failcnt": "37\n",
+        "memory.oom_control": "oom_kill_disable 0\nunder_oom 0\noom_kill 0\n",
+        "memory.stat": "cache 0\nrss 0\nrss_huge 0\nshmem 0\nmapped_file 0\ndirty 0\nwriteback 0\nswap 0\npgpgin 0\npgpgout 0\npgfault 0\npgmajfault 0\ninactive_anon 0\nactive_anon 0\ninactive_file 0\nactive_file 0\nunevictable 0\nhierarchical_memory_limit 1084477440\nhierarchical_memsw_limit 9223372036854771712\ntotal_cache 32768\ntotal_rss 5636096\ntotal_rss_huge 0\ntotal_shmem 16384\ntotal_mapped_file 0\ntotal_dirty 8192\ntotal_writeback 0\ntotal_swap 0\ntotal_pgpgin 14037\ntotal_pgpgout 12653\ntotal_pgfault 31249\ntotal_pgmajfault 0\ntotal_inactive_anon 5607424\ntotal_active_anon 16384\ntotal_inactive_file 12288\ntotal_active_file 4096\ntotal_unevictable 0\n"
+      },
+      "after_oom": {
+        "memory.limit_in_bytes": "1084477440\n",
+        "memory.max_usage_in_bytes": "1084477440\n",
+        "memory.failcnt": "37\n",
+        "memory.oom_control": "oom_kill_disable 0\nunder_oom 0\noom_kill 0\n"
+      }
+    }
+  ]
+}

@@ -47,6 +47,8 @@ log = logging.getLogger(__name__)
 SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434
 PROC = Path("/proc")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
+V1_MEMORY = "memory"  # the memory controller's directory under the root on a cgroup v1 host
+V1_UNLIMITED = 1 << 62  # v1 shows no limit as a value near 2**63 (9223372036854771712 on the kernels seen)
 VERSION_S = 20.0
 BOOT_ID = PROC / "sys" / "kernel" / "random" / "boot_id"
 BOOT_ID_FORM = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -140,18 +142,20 @@ class NodeOps(Protocol):
     def cgroup_memory(self) -> dict[str, Any] | None:
         """The memory cgroup that bounds this process (the nearest with a limit): its `max_bytes`, `events`,
         `peak_bytes` and `depth` above this process's own; None when it cannot be read. Never its path (it names a
-        job)."""
+        job). On a cgroup v1 host `events` holds `max` (the limit-holder's `memory.failcnt`) and `oom_kill` (the count
+        in `memory.oom_control` of this process's own cgroup, where the kernel counts a kill of a process in it, not
+        of the limit-holder), each only when it could be read."""
         ...
 
     def own_cgroup(self) -> str | None:
-        """This process's own cgroup v2 path, where the cells it starts are charged, hidden processes and all; None on
-        a v1 or hybrid host or when it cannot be read. Held to tell which processes it counts, never recorded (it
-        names a job)."""
+        """This process's own memory cgroup path (v2's, or on a v1 host the memory controller's), where the cells it
+        starts are charged, hidden processes and all; None when it cannot be read. Held to tell which processes it
+        counts, never recorded (it names a job)."""
         ...
 
     def cgroup_anon(self, path: str) -> int | None:
-        """The `anon` bytes of the `memory.stat` of the cgroup at `path` (v2: every process in it and below); None when
-        it cannot be read."""
+        """The anonymous bytes of the cgroup at `path` (`own_cgroup`'s): every process in it and below, v2's `anon` of
+        its `memory.stat`, on v1 its `total_rss` (`rss` when there is none); None when it cannot be read."""
         ...
 
     def hidden_children(self, pid: int, start: str) -> list[int] | None:
@@ -228,6 +232,64 @@ def pidfd_send_signal(fd: int, sig: int) -> None:
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _memory_on_v1_in(text: str) -> bool:
+    """Whether the memory controller is on a cgroup v1 hierarchy, from this process's `/proc/self/cgroup`: a line lists
+    `memory` among its controllers, and the v2 path (a hybrid host has both) shows no `memory.stat` under the root. A
+    host whose controller is on v2 has no such line."""
+    if P.cgroup_path(text, v1=True) is None:
+        return False
+    unified = P.cgroup_path(text)
+    if unified is None:
+        return True
+    try:
+        _read(CGROUP_ROOT.joinpath(*[p for p in unified.split("/") if p]) / "memory.stat")
+    except OSError:
+        return True
+    return False
+
+
+def _memory_on_v1() -> bool:
+    """`_memory_on_v1_in` of this process's own `/proc/self/cgroup`; False when it cannot be read (the v2 reading)."""
+    try:
+        return _memory_on_v1_in(_read(PROC / "self" / "cgroup"))
+    except OSError:
+        return False
+
+
+def _v1_count(path: Path, key: str | None = None) -> int | None:
+    """A v1 memory file's number: the whole file (`memory.limit_in_bytes`), or `key`'s line (`memory.oom_control`); None
+    when it cannot be read or is no number."""
+    try:
+        text = _read(path)
+    except OSError:
+        return None
+    if key is not None:
+        return P.stat_value(text, key)
+    return int(text.strip()) if text.strip().isdigit() else None
+
+
+def _cgroup_memory_v1(own: str) -> dict[str, Any] | None:
+    """`LocalNode.cgroup_memory` on a v1 host, from the memory controller's files (v2's `memory.max`, `memory.peak` and
+    `memory.events` are `memory.limit_in_bytes`, `memory.max_usage_in_bytes` and, of its counters, `memory.failcnt` as
+    `max`). The walk goes up from the process's own cgroup to the nearest one with a limit, skipping a level whose limit
+    is near 2**63 (none) or unreadable. A kill is counted in the cgroup of the process the kernel killed, not in the one
+    whose limit it hit, so `oom_kill` is the own cgroup's (cells inherit it); a kernel whose `memory.oom_control` has no
+    such line leaves it out, never a guess."""
+    parts = [p for p in own.split("/") if p]
+    root = CGROUP_ROOT / V1_MEMORY
+    oom_kill = _v1_count(root.joinpath(*parts) / "memory.oom_control", "oom_kill")
+    for depth in range(len(parts) + 1):
+        here = root.joinpath(*parts[: len(parts) - depth])
+        limit = _v1_count(here / "memory.limit_in_bytes")
+        if limit is None or limit >= V1_UNLIMITED:
+            continue
+        counters = {"max": _v1_count(here / "memory.failcnt"), "oom_kill": oom_kill}
+        events = {name: count for name, count in counters.items() if count is not None}
+        return {"depth": depth, "max_bytes": limit, "events": events or None,
+                "peak_bytes": _v1_count(here / "memory.max_usage_in_bytes")}  # fmt: skip
+    return None
 
 
 def _start_of(pid: int) -> str | None:
@@ -391,6 +453,7 @@ class LocalNode:
         except OSError:
             return None
         found = []
+        v1 = _memory_on_v1()  # one kind of path for every process, the own cgroup's (`own_cgroup`)
         for name in entries:
             base = PROC / name
             try:
@@ -414,7 +477,7 @@ class LocalNode:
             with contextlib.suppress(OSError):
                 environ = (base / "environ").read_bytes()
             with contextlib.suppress(OSError):
-                cgroup = P.cgroup_path(_read(base / "cgroup"))
+                cgroup = P.cgroup_path(_read(base / "cgroup"), v1=v1)
             found.append(
                 P.Proc(
                     int(name), start, ppid, state, comm, pidns, P.parse_rss(status), P.tags_in(cmdline, environ, tags),
@@ -563,12 +626,12 @@ class LocalNode:
         DockerHost(sudo_command=()).make_ca(directory, names)  # openssl only, as this uid
 
     def cgroup_memory(self) -> dict[str, Any] | None:
-        try:
-            own = P.cgroup_path(_read(PROC / "self" / "cgroup"))
-        except OSError:
+        found = self._own_memory_cgroup()
+        if found is None:
             return None
-        if own is None:
-            return None
+        own, v1 = found
+        if v1:
+            return _cgroup_memory_v1(own)
         parts = [p for p in own.split("/") if p]
         for depth in range(len(parts) + 1):
             here = CGROUP_ROOT.joinpath(*parts[: len(parts) - depth])
@@ -591,17 +654,31 @@ class LocalNode:
         return None
 
     def own_cgroup(self) -> str | None:
+        found = self._own_memory_cgroup()
+        return None if found is None else found[0]
+
+    def _own_memory_cgroup(self) -> tuple[str, bool] | None:
+        """This process's memory cgroup path and whether it is on a v1 hierarchy; None when it cannot be read."""
         try:
-            return P.cgroup_path(_read(PROC / "self" / "cgroup"))
+            text = _read(PROC / "self" / "cgroup")
         except OSError:
             return None
+        v1 = _memory_on_v1_in(text)
+        path = P.cgroup_path(text, v1=v1)
+        return None if path is None else (path, v1)
 
     def cgroup_anon(self, path: str) -> int | None:
         parts = [p for p in path.split("/") if p]
         try:
             return P.stat_value(_read(CGROUP_ROOT.joinpath(*parts) / "memory.stat"), "anon")
         except OSError:
+            pass  # not a v2 cgroup under the root: a v1 memory cgroup's path is read under the memory controller's
+        try:
+            text = _read(CGROUP_ROOT.joinpath(V1_MEMORY, *parts) / "memory.stat")
+        except OSError:
             return None
+        total = P.stat_value(text, "total_rss")  # this cgroup and everything below, as v2's `anon` counts
+        return total if total is not None else P.stat_value(text, "rss")
 
     def hidden_children(self, pid: int, start: str) -> list[int] | None:
         try:
