@@ -90,14 +90,18 @@ class LedgerFacts:
     ceilings: Ceilings  # the ceilings in force: as pinned, or as raised since
     settlements: Mapping[int, Settlement] = field(default_factory=dict)  # lost leases settled, by lease id
     locked_micro: int = 0  # what unsettled leases hold as their grants (`elastic.records.Status.locked_micro`)
+    contradicted: frozenset[int] = frozenset()  # leases whose settlement later evidence showed too low
 
     def unsettled(self, run_key: str) -> list[LeaseRow]:
-        """The run's leases still charged their grant with no settlement (in flight, expired, reported or lost): any
-        of them can still change what the run was charged, and so whether it is exhausted."""
+        """The run's leases in flight, expired, reported or lost that no settlement gave its charged attempts: any of
+        them can still change what the run was charged (a settle with them, a return, a late completion), and so
+        whether it is exhausted. A settlement of the spend alone leaves the loss's provisional attempt open."""
         return [
             lease
             for lease in self.leases.values()
-            if lease.run_key == run_key and lease.state in HELD and lease.lease_id not in self.settlements
+            if lease.run_key == run_key
+            and lease.state in HELD
+            and (lease.lease_id not in self.settlements or self.settlements[lease.lease_id].charged is None)
         ]
 
     def leases_of(self, run_key: str) -> list[LeaseRow]:
@@ -166,7 +170,8 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
     by_lease = {settlement.lease_id: settlement for settlement in settled}
     facts = LedgerFacts(sha256, config, meta.get("environment"), runs, leases, in_force, by_lease, locked)
     _replay(facts, events, where)
-    return facts
+    low = frozenset(e["lease_id"] for e in events if e["kind"] in ("settle_contradicted", "cap_failed"))
+    return replace(facts, contradicted=low)
 
 
 class _Views(LedgerViews):

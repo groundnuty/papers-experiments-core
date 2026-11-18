@@ -43,9 +43,10 @@ class LeaseStore:
 
     @property
     def complete(self) -> bool:
-        """Whether the store holds all its lease spent: its run ended (done, infra_exhausted or harness_error). A store
-        whose run is pending had attempts left, and a lost federation's snapshot of it can miss the attempts after."""
-        return self.status.get(self.lease.run_key) in ("done", "infra_exhausted", "harness_error")
+        """Whether the store holds all its lease spent: its run is done or infra_exhausted. A store whose run is pending
+        had attempts left, and one stopped on a harness error could be requeued, so a lost federation's snapshot of
+        either can miss the attempts after it."""
+        return self.status.get(self.lease.run_key) in ("done", "infra_exhausted")
 
     @property
     def name(self) -> str:

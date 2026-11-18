@@ -63,6 +63,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from expcore.campaign.elastic.config import micro_up, usd_of
+from expcore.campaign.elastic.records import HELD
 from expcore.campaign.lease_facts import LeaseStore
 from expcore.campaign.ledger_read import TERMINAL, LeaseRow, LedgerFacts, RunRow
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
@@ -119,6 +120,7 @@ class ByRun:
 def check_by_run(ledger: LedgerFacts, stores: Sequence[LeaseStore], plan: Manifest, pricing: Pricing | None) -> ByRun:
     """Run checks 1 to 6 of the module docstring; raise MergeRefused for the first fault."""
     refuse_reopenable(ledger)
+    refuse_contradicted(ledger)
     if not stores:
         raise MergeRefused("a merge by run takes the store of every run's counted lease; none was given")
     by_lease = _by_lease(stores)
@@ -140,6 +142,18 @@ def check_by_run(ledger: LedgerFacts, stores: Sequence[LeaseStore], plan: Manife
         _check_store_spend(store, ledger)
     _check_spend(ledger, counted, evidence)
     return ByRun(tuple(counted), tuple(evidence), ledger, tuple(lost))
+
+
+def refuse_contradicted(ledger: LedgerFacts) -> None:
+    """5: refuse a ledger that recorded a lease's settled or granted charge as below what later evidence showed it spent
+    (`settle_contradicted`, `cap_failed`): the ledger keeps the lower charge, so the lease would be counted below its
+    spend."""
+    if ledger.contradicted:
+        lease = min(ledger.contradicted)
+        raise MergeRefused(
+            f"the ledger recorded that lease {lease} spent more than it is charged (a settlement contradicted, or a "
+            "cap that failed): its charge is below its spend, so the campaign's spend cannot be counted from it"
+        )
 
 
 def refuse_reopenable(ledger: LedgerFacts) -> None:
@@ -187,11 +201,10 @@ def require_records(stores: Sequence[LeaseStore], records: Mapping[str, int | No
     stray = sorted(found - set(expected))
     if stray:
         raise MergeRefused(f"{stray[0]}: a record no attempt of a counted lease's store accounts for")
-    foreign = sorted(rel for rel in found if records[rel] not in (None, owner[rel].lease.lease_id))
+    foreign = sorted(rel for rel in found if records[rel] != owner[rel].lease.lease_id)
     if foreign:
-        raise MergeRefused(
-            f"{foreign[0]}: a record of lease {records[foreign[0]]}, where {owner[foreign[0]].name} keeps its own"
-        )
+        named = "no lease" if records[foreign[0]] is None else f"lease {records[foreign[0]]}"
+        raise MergeRefused(f"{foreign[0]}: a record naming {named}, where {owner[foreign[0]].name} keeps its own")
     missing = sorted(rel for rel, state in expected.items() if state == "done" and rel not in found)
     if missing:
         raise MergeRefused(f"{missing[0]}: the record of a counted lease's final attempt is missing")
@@ -239,11 +252,17 @@ def _counted(
         missing = sorted(set(planned) - set(held))
         named = f"run {extra[0]} is not the plan's" if extra else f"run {missing[0]} of the plan is not in it"
         raise MergeRefused(f"the ledger's runs are not the study's plan: {named}")
+    _check_models(ledger, plan)
     counted, lost = [], []
     for key in sorted(planned, key=planned.__getitem__):
         run = ledger.runs[key]
         lease_id = ledger.counted(key)
         if lease_id is None and run.state == "infra_exhausted":
+            if run.charged < ledger.config.max_attempts:
+                raise MergeRefused(
+                    f"run {key} is infra_exhausted in the ledger with {run.charged} charged attempts, below its "
+                    f"{ledger.config.max_attempts}, and no counted lease: its exhaustion is not what its leases give"
+                )
             lost.append(LostRun(run, tuple(r for r in ledger.leases_of(key) if r.state != "cancelled")))
             continue
         if lease_id is None and run.state in TERMINAL:
@@ -268,6 +287,20 @@ def _counted(
             )
         counted.append(store)
     return counted, lost
+
+
+def _check_models(ledger: LedgerFacts, plan: Manifest) -> None:
+    """1: each ledger run, and each lease of it, names the model the plan's run has, so spend is held to its own
+    model's ceiling."""
+    models = {row.key.text: str(row.key.factors["model"]) for row in plan.rows}
+    for key, run in ledger.runs.items():
+        if run.model != models[key]:
+            raise MergeRefused(f"run {key} is of model {models[key]} in the plan and {run.model} in the ledger")
+    for lease in ledger.leases.values():
+        if lease.model != models[lease.run_key]:
+            raise MergeRefused(
+                f"lease {lease.lease_id} names model {lease.model}, and its run is of {models[lease.run_key]}"
+            )
 
 
 def _evidence(ledger: LedgerFacts, by_lease: Mapping[int, LeaseStore], counted: set[int]) -> list[Evidence]:
@@ -316,10 +349,13 @@ def spend_micro(
     measured spend once its completion verified, the spend a settlement gave it, else its grant. The ledger's money is
     the one count; a store given is evidence held to it (`_check_store_spend`)."""
     rows = [ledger.leases[store.lease.lease_id] for store in counted] + [item.lease for item in evidence]
+    unbounded = ledger.ceilings.max_micro is None  # no budget: a grant is 0, no bound on what an unsettled lease spent
     totals: dict[str | None, int | None] = {None: 0}
     for row in rows:
+        unknown = unbounded and row.state in HELD and row.lease_id not in ledger.settlements
         for scope in (None, row.model):
-            totals[scope] = (totals.get(scope) or 0) + row.charge_micro
+            have = totals.get(scope, 0)
+            totals[scope] = None if have is None or unknown else have + row.charge_micro
     return totals
 
 
@@ -349,7 +385,7 @@ def _check_store_spend(store: LeaseStore, ledger: LedgerFacts) -> None:
             f"{store.name}: the ledger settled its lease with {settled.charged} charged attempts, and its store holds "
             f"{store.charged}"
         )
-    if settled is None and micro > row.charge_micro:
+    if micro > row.charge_micro:
         raise MergeRefused(
             f"{store.name}: its store spent USD {usd_of(micro)}, more than the ledger charges its lease "
             f"(USD {usd_of(row.charge_micro)})"

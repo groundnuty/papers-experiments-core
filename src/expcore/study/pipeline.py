@@ -120,7 +120,7 @@ from expcore.provenance.environment import EnvironmentUnknown, differences, envi
 from expcore.readlog.scan import SCAN_VERSION
 from expcore.readlog.sensitivity import ReadLogAnalysis, read_log_analysis
 from expcore.records.build import CORE_DISTRIBUTION
-from expcore.records.record import RunRecord
+from expcore.records.record import RunRecord, is_record_name
 from expcore.records.rescore import rescore, scorer_name, scorer_version
 from expcore.replay.check import (
     CHECK_FILE,
@@ -818,6 +818,10 @@ def _check_merged_by_run(
                 f"{store.name}: its campaign ran under another environment than this check would; check under the "
                 "campaign's environment:\n  " + "\n  ".join(changed)
             )
+    try:  # before anything is replayed: every record is a counted lease's own, by path and by the lease it names
+        require_records(counted, record_leases(directory, _record_paths(directory)))
+    except MergeRefused as error:
+        raise Refused(str(error)) from None
     import_what_the_records_need(study, directory)
     _settle_merged_side_files(study, directory)
     check = verify_batch(
@@ -830,6 +834,11 @@ def _check_merged_by_run(
     check[MERGE_KEY] = {"file": MERGE_FILE, "sha256": hashlib.sha256(raw).hexdigest(), "partial": partial}
     write_check(directory, check)
     return check
+
+
+def _record_paths(batch: Path) -> list[str]:
+    """Every record file under a batch, by its path relative to it."""
+    return [str(path.relative_to(batch)) for path in sorted(batch.rglob("*")) if is_record_name(path.name)]
 
 
 def import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:

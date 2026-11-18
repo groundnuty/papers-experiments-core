@@ -13,11 +13,11 @@ from pathlib import Path
 import pytest
 from elastic_support import SITE, join, leased, make, plan
 
-from expcore.campaign.elastic import SiteReading
+from expcore.campaign.elastic import Return, SiteReading
 from expcore.campaign.lease_facts import LeaseStore
 from expcore.campaign.ledger_read import read_ledger, take_ledger_snapshot
 from expcore.campaign.merge import MergeRefused
-from expcore.campaign.merge_by_run import check_by_run, require_records
+from expcore.campaign.merge_by_run import Evidence, check_by_run, require_records, spend_micro
 from expcore.campaign.run_lease import RunLease
 
 RECORD = "d1/try1/r1.1.json"
@@ -75,11 +75,59 @@ def store_of(lease_id: int) -> LeaseStore:
 
 def test_c45_a_record_of_another_lease_where_a_counted_one_belongs_is_refused():
     """C45: the record lies where the counted store's attempt does, and names a superseded lease: refused."""
-    with pytest.raises(MergeRefused, match="a record of lease 3, where the store of lease 7"):
+    with pytest.raises(MergeRefused, match="a record naming lease 3, where the store of lease 7"):
         require_records([store_of(7)], {RECORD: 3})
 
 
-def test_c45_a_record_naming_its_own_lease_or_none_passes():
-    """C45: the store's own lease, or none (the store's pinned spec then binds it)."""
+def test_c45_a_record_naming_its_own_lease_passes():
+    """C45: the store's own lease."""
     require_records([store_of(7)], {RECORD: 7})
-    require_records([store_of(7)], {RECORD: None})
+
+
+def test_c45_a_record_naming_no_lease_is_refused():
+    """C45: a record that names no lease (one written before records named theirs) could be another lease's at the
+    same path: refused."""
+    with pytest.raises(MergeRefused, match="a record naming no lease"):
+        require_records([store_of(7)], {RECORD: None})
+
+
+def test_c45_a_settlement_of_the_spend_alone_leaves_the_exhausted_run_open(tmp_path):
+    """C45: settled with no charged attempts, the loss's provisional attempt can still be taken back (a return showing
+    the lease unstarted), so the run is still not final."""
+    ledger, lease = exhausted_by_a_loss(tmp_path)
+    ledger.settle(lease.lease_id, 0, "pulled")
+    facts = facts_of(tmp_path, ledger.path)
+    ledger.close()
+    with pytest.raises(MergeRefused, match=f"run {lease.run_key} is infra_exhausted"):
+        check_by_run(facts, [], None, None)
+
+
+def test_c45_a_ledger_that_recorded_a_settlement_below_the_spend_is_refused(tmp_path):
+    """C45: a return reporting more than the lease was settled at is recorded as a contradiction and the lower charge
+    kept: the merge refuses to count the campaign's spend from it."""
+    ledger, lease = exhausted_by_a_loss(tmp_path)
+    ledger.settle(lease.lease_id, 0, "pulled", attempts_charged=1)
+    ledger.observe_site(SITE, SiteReading(returns=(Return(lease.lease_id, 0.5),)))
+    facts = facts_of(tmp_path, ledger.path)
+    ledger.close()
+    assert lease.lease_id in facts.contradicted
+    with pytest.raises(MergeRefused, match=f"lease {lease.lease_id} spent more than it is charged"):
+        check_by_run(facts, [], None, None)
+
+
+def test_c45_without_a_budget_an_unsettled_lost_lease_makes_the_spend_unknown(tmp_path):
+    """C45: with no budget a lease's grant is 0, no bound on what a lost one spent: the campaign's spend is unknown,
+    never 0."""
+    ledger, clock = make(tmp_path, plan(tasks=1), max_attempts=3)
+    join(ledger, clock, "fed-a")
+    lease = leased(ledger, "fed-a")
+    ledger.mark_sent(lease.lease_id)
+    clock.advance(400.0)
+    ledger.observe_site(SITE, SiteReading())
+    ledger.prove_ended("fed-a", "terminal")
+    facts = facts_of(tmp_path, ledger.path)
+    ledger.close()
+    row = facts.leases[lease.lease_id]
+    totals = spend_micro(facts, [], [Evidence(row, "expired", None)])
+    assert totals[None] is None
+    assert totals[row.model] is None

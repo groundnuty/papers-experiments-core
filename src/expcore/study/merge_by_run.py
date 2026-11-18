@@ -102,6 +102,8 @@ def _merge(
         merged = check_by_run(facts, stores, study.manifest, pricing)
         refuse_earlier_form(merged.counted)
         env = environment_like(study, campaign_environment(merged.counted[0].fingerprint))
+        for store in merged.counted:  # before anything is replayed: its records are its own (path and lease named)
+            require_records([store], _records_in(store.out / RUNS_DIR))
         copies = stage / REPLAY_DIR
         copies.mkdir(mode=0o700)
         staged = [_replay(study, store, code, env, copies / str(n)) for n, store in enumerate(merged.counted)]
@@ -117,7 +119,7 @@ def _merge(
         if stage.exists():
             make_writable(stage)
         shutil.rmtree(stage, ignore_errors=True)
-    return MergedByRun(out, len(merged.counted), len(merged.evidence))
+    return MergedByRun(out, len(merged.counted) + len(merged.lost), len(merged.evidence))
 
 
 def _records_in(runs: Path) -> dict[str, int | None]:
@@ -203,7 +205,7 @@ def _settled_copy(out: Path, private: Path, scratch: Path, schema: Any, max_atte
 class DeadStoreSpend:
     """What a dead lease store spent, read as a merge by run reads it: `spend_micro` (whole micro-dollars, as the
     ledger counts them) and its charged attempts (`charged_attempts`), with its lease and run. It is a safe upper figure
-    for the lease: the store's run had ended (done, infra_exhausted or harness_error) with no attempt running, so no
+    for the lease: the store's run had ended (done or infra_exhausted) with no attempt running, so no
     attempt of the lease is missing from it."""
 
     lease_id: int
@@ -220,23 +222,26 @@ def dead_store_spend(out: str | os.PathLike[str], study: StudyConfig) -> DeadSto
     A settled charge is final in the ledger, so a figure below what the lease spent would release budget that was
     spent. A store that came back from a federation lost mid-run is a snapshot: an attempt running in it, or one begun
     after it (its run still pending between attempts), is not all there, and its spend journal, which would hold the
-    rest, is not read here. So the figure is given only for a store whose run had ended (done, infra_exhausted or
-    harness_error) with no attempt running; any other gives None, and the lease stays charged its grant. The store
+    rest, is not read here. So the figure is given only for a store whose run had ended (done or infra_exhausted)
+    with no attempt running; any other gives None, and the lease stays charged its grant. The store
     is snapshotted from a private copy and its spend counted by the budget gate's own figure
     (`selection_ledger.spend_of`) with the study's prices; nothing is written beside it. Its lock is held as a reader
     when it has one (a store pulled without its lock file is read all the same); a store a dispatcher still holds,
     no store, not a lease store, one that changes while copied, one whose spend is unknown, or one that cannot be read
-    gives None. A merge by run refuses a settlement its store does not give exactly, or one of a store that had not
-    ended."""
+    gives None, and so does a study whose prices or caps are not the ones the store's campaign ran under. A merge by
+    run refuses a settlement its store does not give exactly, or one of a store that had not ended."""
     out = Path(out)
     with tempfile.TemporaryDirectory(prefix="expcore-dead-store-") as scratch:
         snapshot = Path(scratch) / "read.sqlite"
         try:
             if not _snapshot_ended(out, snapshot):
                 return None
-            store = lease_store_of_bytes(
-                snapshot.read_bytes(), out, out=out, snapshot=snapshot, pricing=pricing_of(study)
-            )
+            pricing = pricing_of(study)
+            store = lease_store_of_bytes(snapshot.read_bytes(), out, out=out, snapshot=snapshot, pricing=pricing)
+            if (
+                pricing.mismatch(store.fingerprint) is not None
+            ):  # the study's prices are not the ones the lease ran under
+                return None
         except (CampaignLocked, LockUnavailable, SnapshotError, StoreChanged, MergeRefused, OSError, sqlite3.Error):
             return None
     spent = None if store.spend is None else store.spend.total
