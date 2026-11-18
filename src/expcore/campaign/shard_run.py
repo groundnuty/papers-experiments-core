@@ -18,9 +18,8 @@ is computed (`share_settings`, or `share_settings_by_model` for a campaign that 
 reach it. Before any share is taken, a shard holding pairs of a model whose concurrency share is 0 is refused, naming
 the model (`refuse_unrunnable`).
 
-A run on a lease (`campaign.run_lease`, `expcore-shard/5`) pins the same facts, with the lease as its spec and two more,
-its attempt base and its charged attempts (`META_ATTEMPT_BASE`, `META_CHARGED_ATTEMPTS`), and is never resumed: a store
-holds one lease, once. Any later start of it is
+A run on a lease (`campaign.run_lease`, `expcore-shard/5`) pins the same facts, with the lease as its spec and one more,
+its attempt base (`META_ATTEMPT_BASE`), and is never resumed: a store holds one lease, once. Any later start of it is
 refused (`LeaseReplayed` for the same lease id, `ShardMismatch` for another lease or another form), whether or not the
 facts agree, so a replayed or a stale lease file cannot run a store a second time (`_pin_lease`).
 
@@ -39,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.manifest import fingerprint_sha256
-from expcore.campaign.run_lease import META_ATTEMPT_BASE, META_CHARGED_ATTEMPTS, RULE_LEASE, LeaseError, RunLease
+from expcore.campaign.run_lease import META_ATTEMPT_BASE, RULE_LEASE, LeaseError, RunLease
 from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec, describe, resume_hint
 from expcore.campaign.shard import (
     META_ENVIRONMENT,
@@ -53,7 +52,6 @@ from expcore.campaign.shard import (
     budget_shares,
     caps_shares,
     is_default_label,
-    micro_usd,
     part,
 )
 from expcore.campaign.store import Store
@@ -175,7 +173,10 @@ def refuse_lease_misfit(lease: RunLease, campaign_sha256: str, settings: "Schedu
     """The kernel's own hold on a lease (C41), for a start that did not come through `study.lease_start`: the scheduler
     refuses, before it opens the store, a lease issued for another campaign, a run with no attempt left, and settings
     whose budget is not held to the grant (no budget for a grant above 0, a ceiling above the grant, a release; any
-    budget for a grant of 0). `lease_start` makes the settings that pass."""
+    budget for a grant of 0). The ceiling is compared as the gate takes it, in dollars, with the dollars of the grant
+    (`RunLease.grant_usd`, the nearest float to the exact amount): a ceiling a fraction of a micro-dollar above the
+    grant is refused, and the ceiling `lease_start` makes, which is those dollars, always passes, whatever the size
+    of the grant. `lease_start` makes the settings that pass."""
     lease.check_campaign(campaign_sha256)
     lease.check_attempts_left(settings.max_attempts)
     budget = settings.budget
@@ -184,7 +185,7 @@ def refuse_lease_misfit(lease: RunLease, campaign_sha256: str, settings: "Schedu
     else:
         held = (
             budget is not None
-            and micro_usd(budget.max_usd) <= lease.grant_micro_usd
+            and budget.max_usd <= lease.grant_usd
             and budget.release_file is None
             and budget.release_step_usd == 0
         )
@@ -321,11 +322,9 @@ def _pin_lease(store: Store, shard: ShardStart | None, held: Mapping[str, str], 
     for key, text in shard.pinned().items():
         store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (key, text, now))
     store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (META_STARTED, now, now))
-    for key, count in (
-        (META_ATTEMPT_BASE, shard.spec.attempt_base),
-        (META_CHARGED_ATTEMPTS, shard.spec.charged_attempts),
-    ):
-        store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (key, str(count), now))
+    store.db.execute(
+        "INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (META_ATTEMPT_BASE, str(shard.spec.attempt_base), now)
+    )
 
 
 def _wide_flag(recorded: Mapping[str, Any]) -> str:

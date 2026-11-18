@@ -4,19 +4,20 @@
 The orchestrating host keeps a ledger of the campaign's runs and gives each federation one run at a time on a lease. The
 ledger is another module; this one is the shape of what it gives and the kernel's side of the bargain. `run STUDY
 --lease FILE` reads the lease from a file (`read_lease`) and runs exactly the run it names, in a store that holds that
-run and no other, on the settings the lease sets (`study.lease_start`). A lease has seven facts, and nothing else:
+run and no other, on the settings the lease sets (`study.lease_start`). A lease has six facts, and nothing else:
 
 - `run_key`: the run, as its key text (`RunKey.text`) names it in the plan;
 - `lease_id`: a whole number from 1, the fencing token. Which attempt counts is decided by lease order, never by what
   an attempt did, so the id is what a completion is judged by. A store takes one lease, once: a store that already
   holds the id refuses a second start of it (`shard_run.LeaseReplayed`), resumed or not;
-- `attempt_base`: the attempts all the run's earlier leases started, charged or not. The store numbers its attempts
-  from it (`Store.begin_attempt`): the first is base + 1 and each later one is the next number past the charged ones
-  (an uncharged attempt, set aside or interrupted, is run again under the number it had, as in any store). A lease's
-  numbers are all above every earlier lease's, so no attempt of a run has a number another lease's attempt had, and
-  the stores of superseded leases, kept as evidence, never collide by run and attempt;
-- `charged_attempts`: the charged ones among them, never more than the base. They count against the attempt limit
-  (`[scheduler] max_attempts`) with the charged attempts of this lease's own store;
+- `attempt_base`: the run's charged attempts before this lease, in all its earlier leases (the ledger's own count: a
+  lost lease's started attempts cannot be known). The store numbers its attempts from it (`Store.begin_attempt`): the
+  first is base + 1, and the attempt limit (`[scheduler] max_attempts`) counts every lease's charged attempts. Within
+  a run's counted lease the charged attempts are unique; an uncharged attempt (set aside or interrupted) is run again
+  under the number it had, as in any store, so two leases of one run can each have an attempt of one number. **The
+  lease id tells them apart**: it is pinned in the store's meta (`shard_spec`), written in every record the store's
+  attempts produce (`RunRecord.lease_id`, `RunIdentity.lease_id`) and in every run row of its export, so a merge by
+  run keys evidence by (run, lease, attempt) and two leases' attempt 2 never collide;
 - `grant_micro_usd`: what this lease may spend, probes, top-ups and attempts together, as a whole number of
   micro-dollars: exact, with no float to round (the ledger's own unit). It is the run's whole budget, and the kernel
   turns it into dollars (`grant_usd`) only where its budget gate takes dollars;
@@ -47,19 +48,8 @@ LEASE_SCHEMA = "expcore-lease/1"
 META_ATTEMPT_BASE = "lease_attempt_base"
 """Store meta key: the lease's attempt base as a whole number, pinned with the spec at the lease's first start. A store
 without it numbers its attempts from 1, as every store did before leases."""
-META_CHARGED_ATTEMPTS = "lease_charged_attempts"
-"""Store meta key: the lease's charged attempts as a whole number, pinned with the base. A store without it has no
-charged attempt of an earlier lease to count against the attempt limit."""
 
-_FACTS = (
-    "run_key",
-    "lease_id",
-    "attempt_base",
-    "charged_attempts",
-    "grant_micro_usd",
-    "campaign_sha256",
-    "expires_utc",
-)
+_FACTS = ("run_key", "lease_id", "attempt_base", "grant_micro_usd", "campaign_sha256", "expires_utc")
 _TIME = "%Y-%m-%dT%H:%M:%SZ"
 _SHOWN = 12
 _HEX = frozenset("0123456789abcdef")
@@ -91,7 +81,6 @@ class RunLease:
     run_key: str
     lease_id: int
     attempt_base: int
-    charged_attempts: int
     grant_micro_usd: int
     campaign_sha256: str
     expires_utc: str
@@ -107,13 +96,6 @@ class RunLease:
             raise LeaseError(f"a lease's lease_id is a whole number from 1, not {self.lease_id!r}")
         if not _whole(self.attempt_base, 0):
             raise LeaseError(f"a lease's attempt_base is a whole number from 0, not {self.attempt_base!r}")
-        if not _whole(self.charged_attempts, 0) or (
-            _whole(self.attempt_base, 0) and self.charged_attempts > self.attempt_base
-        ):
-            raise LeaseError(
-                "a lease's charged_attempts is a whole number from 0 that is not more than its attempt_base "
-                f"({self.attempt_base!r}), not {self.charged_attempts!r}"
-            )
         if not _whole(self.grant_micro_usd, 0):
             raise LeaseError(
                 f"a lease's grant_micro_usd is a whole number of micro-dollars from 0, not {self.grant_micro_usd!r}"
@@ -157,10 +139,10 @@ class RunLease:
             )
 
     def check_attempts_left(self, max_attempts: int) -> None:
-        """Refuse a lease of a run with no attempt left: its charged attempts count against the campaign's limit."""
-        if self.charged_attempts >= max_attempts:
+        """Refuse a lease of a run with no attempt left: its base counts against the campaign's limit."""
+        if self.attempt_base >= max_attempts:
             raise LeaseError(
-                f"{self.name} follows {self.charged_attempts} charged attempts of its run, and the campaign allows "
+                f"{self.name} follows {self.attempt_base} charged attempts of its run, and the campaign allows "
                 f"{max_attempts}: the run has no attempt left"
             )
 
@@ -181,7 +163,7 @@ def _refuse_constant(text: str) -> Any:
 
 
 def read_lease(path: str | Path) -> RunLease:
-    """Read a lease file: a JSON object with exactly the keys `schema` (`LEASE_SCHEMA`) and the seven facts.
+    """Read a lease file: a JSON object with exactly the keys `schema` (`LEASE_SCHEMA`) and the six facts.
 
     Refuses, naming the problem, a file that cannot be read or is not a JSON object, a key missing or extra, another
     schema, a fact of another form (a grant that is not a whole number of micro-dollars, a float included), and NaN or
@@ -207,7 +189,6 @@ def read_lease(path: str | Path) -> RunLease:
 __all__ = [
     "LEASE_SCHEMA",
     "META_ATTEMPT_BASE",
-    "META_CHARGED_ATTEMPTS",
     "RULE_LEASE",
     "LeaseError",
     "RunLease",
