@@ -82,13 +82,14 @@ from expcore.campaign.export import (
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, LockUnavailable, ReaderLock
-from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
+from expcore.campaign.manifest import Manifest, build_fingerprint, fingerprint_sha256, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
 from expcore.campaign.merged import read_held, verify_merged, verify_queried
 from expcore.campaign.model_usage import usage_of_batch
 from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, read_fingerprint, recorded_fingerprint
-from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
+from expcore.campaign.run_lease import RunLease
+from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler, utc_now
 from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import MERGE_FILE, ModelShards, ShardError, ShardSpec, by_model, check_identity, pair_of
@@ -151,6 +152,7 @@ from expcore.study.config import (
 )
 from expcore.study.core_legacy import earlier_core_fingerprint, earlier_core_hint
 from expcore.study.factory_version import check_factory_version
+from expcore.study.lease_start import lease_start
 from expcore.study.merged_times import timed_export, walls_of
 from expcore.study.platform_deferral import platform_deferrals
 from expcore.study.platform_legacy import legacy_fingerprint_of
@@ -305,6 +307,7 @@ def run_study(
     shard: Spec | None = None,
     after: Sequence[str | os.PathLike[str]] = (),
     spend_journal: str | os.PathLike[str] | None = None,
+    lease: RunLease | None = None,
 ) -> RunSummary:
     """Load the study at `path` and run its campaign: `run_built_study` of what `load_study` returned.
 
@@ -319,6 +322,7 @@ def run_study(
         shard=shard,
         after=after,
         spend_journal=spend_journal,
+        lease=lease,
     )
 
 
@@ -331,6 +335,7 @@ def run_built_study(
     shard: Spec | None = None,
     after: Sequence[str | os.PathLike[str]] = (),
     spend_journal: str | os.PathLike[str] | None = None,
+    lease: RunLease | None = None,
 ) -> RunSummary:
     """Open or resume the campaign of a `StudyConfig` and run the scheduler until nothing more can start.
 
@@ -352,7 +357,10 @@ def run_built_study(
     the same entry for a selection of a study read from disk and of one built in code, so either keeps the study's
     kinds in scope. With `spend_journal`, a new file, the dispatcher journals what it spends there, and first counts
     what the other journals beside it hold that the store lacks (a store copied back after a kill, O62:
-    `campaign.lost_spend`).
+    `campaign.lost_spend`). With a `lease` (`campaign.run_lease`, C41) the campaign runs exactly the one run the lease
+    names, in a store that holds it and no other, with the lease's grant as its whole budget and its attempts numbered
+    from the lease's attempt base (`study.lease_start`); a lease is a form of its own, so it is not given with a `shard`
+    or `after`, and a store is started with one lease, once.
 
     The store is `<study.root>/out`, and the campaign fingerprint covers the plan (the schema, tasks, models and
     seeds), so a cut config refuses to resume the store of the whole study (C06): run a smoke from a copy of the study
@@ -364,9 +372,11 @@ def run_built_study(
             "directory"
         )
     check_study(study)
+    if lease is not None and (shard is not None or after):
+        raise Refused("a lease is a form of its own: it is not combined with a shard, a selection or --after")
     journal = None if spend_journal is None else Path(spend_journal)
     with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
-        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard, [Path(p) for p in after], journal)
+        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard, [Path(p) for p in after], journal, lease)
 
 
 def _run_campaign(
@@ -377,6 +387,7 @@ def _run_campaign(
     shard: Spec | None = None,
     after: Sequence[Path] = (),
     spend_journal: Path | None = None,
+    lease: RunLease | None = None,
 ) -> RunSummary:
     """Internal: the body of `run_built_study`, which is the one to call.
 
@@ -390,7 +401,7 @@ def _run_campaign(
     # the study's build, from its plugin's import to what the pipeline derives from it, is watched for the platform
     # loaders it runs, and the watch ends before the scheduler starts: it holds no build open for the campaign's length
     with watching_platform_loads() as loaded:
-        plugin, leases, settings, fingerprint, manifest, started = _build(study, code, shard, after)
+        plugin, leases, settings, fingerprint, manifest, started = _build(study, code, shard, after, lease)
     out = out_dir(study)
     options: dict[str, Any] = {} if crash_hook is None else {"crash_hook": crash_hook}
     if spend_journal is not None:
@@ -430,7 +441,11 @@ def _run_campaign(
 
 
 def _build(
-    study: StudyConfig, code: Mapping[str, Any], shard: Spec | None, after: Sequence[Path]
+    study: StudyConfig,
+    code: Mapping[str, Any],
+    shard: Spec | None,
+    after: Sequence[Path],
+    lease: RunLease | None = None,
 ) -> tuple[StudyPlugin, LeasePool | None, SchedulerConfig, dict[str, Any], Manifest, ShardStart | None]:
     """The study's plugin and what the pipeline derives from it before a scheduler starts: the lease pool, the
     scheduler's settings, the campaign's fingerprint, and the manifest and the start of a shard or a selection. This is
@@ -440,6 +455,7 @@ def _build(
     leases = None if plugin.probe is None else LeasePool(out_dir(study) / "leases", plugin.lease_keys, plugin.probe)
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
     fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
+    issued = None if lease is None else fingerprint_sha256(fingerprint)  # what a lease is issued for, as made here
     recorded = _store_fingerprint(out_dir(study) / STATE_FILE)
     fingerprint = earlier_core_fingerprint(  # C06: a store an earlier core recorded
         recorded, fingerprint, lambda: environment_like(study, campaign_environment(recorded))
@@ -457,6 +473,15 @@ def _build(
         print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
     elif shard is not None:
         manifest, settings, started = _shard_of(study, plugin, settings, shard)
+        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
+    elif lease is not None:
+        assert issued is not None
+        try:
+            manifest, settings, started = lease_start(
+                study, settings, lease, campaign_sha256=issued, environment=_identity_of(study, plugin), now=utc_now()
+            )
+        except ShardError as error:
+            raise Refused(str(error)) from None
         print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
     return plugin, leases, settings, fingerprint, manifest, started
 
