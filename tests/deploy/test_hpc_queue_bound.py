@@ -75,8 +75,8 @@ def test_o57_the_queue_bound_is_the_drivers_own_when_the_site_sets_none(hpc, tmp
 
 
 def test_o57_the_site_key_is_the_bound_the_wait_gets_and_the_one_the_failure_says(hpc, tmp_path, site):
-    """O57: HPC_QUEUE_TIMEOUT_S=21600 is the bound `wait_running` is given, so a job pending 20,000 s still starts, and
-    one that never starts is cancelled at 21,600 s, saying so."""
+    """O57: HPC_QUEUE_TIMEOUT_S=21600 is the bound `wait_running` is given, and a job that never starts is cancelled at
+    that bound and not at 1800 s, saying so."""
     late = Rig(hpc, tmp_path / "late", site, environ={KEY: "21600"}, fake=FakeSlurm(state="PENDING"))
     seen = []
     wait = late.driver.slurm.wait_running
