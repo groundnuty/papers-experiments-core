@@ -457,20 +457,30 @@ class Driver(Down):
             return contextlib.nullcontext()
         return hpcexclude.placement_lock(self.placement_lock)
 
+    @staticmethod
+    def forget_released(state: Dict[str, Any], excluded: int) -> None:
+        """A later attempt's state, as the first attempt's was before its submit: the new read's count, and no job. The
+        jobs of the attempt before were all cancelled (an up whose cancel failed is never tried again), and a state that
+        still named them would hide a job this attempt submits and dies before it records from `down`, which looks a job
+        up by name only when the state names none."""
+        state["allocation"].update(job=None, readback=None, excluded_nodes=excluded)
+        if state.get("sandbox") is not None:
+            state["sandbox"].update(job=None, component_job=None, readback=None)
+
     def hold_once(
         self, site: Site, tree: Optional[str], first: bool
     ) -> Tuple[List[Tuple[str, Allocation]], List[List[str]], List[Tuple[str, Any, Mapping[str, str]]]]:
         """One attempt to hold this federation's jobs, from the first read of the account's live jobs to the second,
         with the lock (`placing`) held only around those two reads and the submits between. A later attempt reuses the
-        state file, its names and its storage and records the new read's count and, as it submits, the new jobs: the
-        released ones are no job of it."""
+        state file, its names and its storage, forgets the released jobs (`forget_released`) and records the new read's
+        count and, as it submits, the new jobs."""
         with self.placing():
             excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
             if first:
                 state = self.store.create(self.initial_state(site, tree, len(excluded)))
                 self.make_storage(state)  # recorded above, made before any job exists to bill for it
             else:
-                state = self.set(lambda s: s["allocation"].update(excluded_nodes=len(excluded)))
+                state = self.set(lambda s: self.forget_released(s, len(excluded)))
             asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
             held = [(self.submit(asked, "allocation"), asked)]
             if alone is not None:  # sandbox_placement = "separate": the agent's own held job, as the first, held until

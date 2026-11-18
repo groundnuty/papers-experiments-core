@@ -182,6 +182,24 @@ def test_o68_a_dependency_on_another_job_is_no_dependency_on_the_services_job(hp
     assert fake.cancelled == [AGENT]
 
 
+def test_o68_a_dependency_that_cannot_be_checked_cancels_the_agents_job_too(hpc, tmp_path, site):
+    """O68: the read-back with no dependency recorded asks whether the services' job still waits; when that read fails
+    nothing shows the dependency holds, so the agent's job is cancelled by its id and never left free to start."""
+    fake = FakeSlurm(state="PENDING", component_recorded={(AGENT, 0): {"Dependency": "(null)"}})
+    real = fake.run
+
+    def unreadable(argv, timeout):
+        if argv[:5] == ["scontrol", "show", "job", "-o", SERVICES] and AGENT in fake.submitted:
+            return hpc.slurm.Completed(1, "", "slurm_load_jobs error: Socket timed out\n")
+        return real(argv, timeout)
+
+    fake.run = unreadable
+    rig = Rig(hpc, tmp_path, site, fake)
+    with pytest.raises(hpc.slurm.SlurmError, match="dependency could not be checked"):
+        rig.up()
+    assert fake.cancelled == [AGENT]
+
+
 def test_o68_the_het_placement_and_a_job_with_no_agent_carry_no_dependency(hpc):
     """O68: only the agent's own job under "separate" has one: the argv of every other Allocation is what it was."""
     plain = hpc.slurm.Allocation("hpcop-p-abcd", "a", "p", 6, 5, 11264, "02:00:00", 7200)
@@ -239,7 +257,9 @@ def test_o68_the_maximum_still_applies_under_the_ceiling(bench):
 
 
 @needs_openssl
-@pytest.mark.parametrize("value", ["0", "513", "-1", "sixty", "64.0", "1e2", " 64", "٦٤"])
+@pytest.mark.parametrize(
+    "value", ["0", "513", "-1", "sixty", "64.0", "1e2", " 64", "٦٤", pytest.param("9" * 4301, id="4301-nines")]
+)
 def test_o68_a_ceiling_out_of_range_is_refused_naming_the_key(bench, value):
     """O68: a ceiling that is not a whole number from 1 to 512 refuses `up` before anything is made."""
     code, printed = bench.up(2, environ={**bench.environ, "HPC_FLEET_CEILING": value})
@@ -425,6 +445,35 @@ def test_o68_the_retry_has_a_bound_and_ends_in_the_refusal_it_always_had(hpc, tm
     assert len(fake.cancelled) == 6
     assert set(fake.cancelled) == set(fake.submitted)
     assert fake.billing() == []
+
+
+def test_o68_a_retry_that_dies_after_its_sbatch_leaves_down_to_find_the_job_by_name(hpc, tmp_path, site):
+    """O68: the state of a later attempt names none of the jobs the attempt before cancelled: an up that dies after a
+    retry's sbatch and before it records the new id leaves `down` a state that names no job, so `down` finds that job by
+    its name, as for a first attempt, and cancels it, and does not look up a cancelled id and stop there."""
+    fake = FakeSlurm(others_by_read=[[], [OtherJob("9001", RIVAL, "RUNNING", tuple(POOL[:7]))]])
+    fake.nodes = list(POOL)
+    rig = Rig(hpc, tmp_path, site, fake, lock=True)
+    real, submitted = rig.driver.slurm.submit, []
+
+    def dying(asked):
+        submitted.append(real(asked))
+        if len(submitted) == 3:  # the retry's services job: accepted by Slurm, never recorded
+            raise hpc.slurm.SlurmError("the process died")
+        return submitted[-1]
+
+    rig.driver.slurm.submit = dying
+    with pytest.raises(hpc.slurm.SlurmError, match="the process died"):
+        rig.up()
+    assert submitted == [SERVICES, AGENT, "4353"]
+    state = rig.state()
+    assert [state["allocation"]["job"], state["sandbox"]["job"]] == [None, None]
+    assert state["allocation"]["readback"] is None
+    assert fake.billing() == ["4353"]  # the replacement runs, and no state file names it
+    rig.driver.down()
+    assert fake.billing() == []
+    assert "4353" in fake.cancelled
+    assert not (tmp_path / "fed" / "root").exists()
 
 
 def test_o68_a_release_whose_cancel_failed_is_not_tried_again(hpc, tmp_path, site):

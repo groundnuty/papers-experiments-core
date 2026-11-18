@@ -657,7 +657,14 @@ class Slurm:
         if re.fullmatch(rf"after:{asked.after}(?:\([a-z]+\))?", recorded):
             return
         if recorded in ("", "(null)"):
-            waited = self.job(asked.after)
+            try:
+                waited = self.job(asked.after)
+            except SlurmError:  # nothing shows the dependency holds: fail closed, never leave the job free to start
+                self.cancel(job)
+                raise SlurmError(
+                    "the held job's dependency could not be checked (the job it waits for could not be read); it was "
+                    "cancelled"
+                ) from None
             if waited is None or waited.get("JobState") not in WAITING_STATES:
                 return  # it has started (or ended), so the dependency holds: Slurm has dropped it
         self.cancel(job)

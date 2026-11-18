@@ -45,6 +45,7 @@ Run on the login node with the site's values exported (`set -a; . site.env; set 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -86,6 +87,7 @@ from hpcsettings import SettingsError, agent_limits, load_settings, site_from_en
 from hpcslurm import Client, Runner, Slurm, SlurmError  # noqa: E402
 
 MAX_VAR, PARALLEL_VAR, CEILING_VAR = "HPC_FLEET_MAX", "HPC_FLEET_PARALLEL", "HPC_FLEET_CEILING"
+WHOLE = re.compile(r"[0-9]{1,9}")  # a count: ASCII digits only, and too few for int() to refuse a long one
 DEFAULT_CEILING, TOP_CEILING = 64, 512  # no setting of the first two may pass the ceiling; the site's key is 1 to 512
 COMMANDS = ("up", "add", "plan", "step", "step-stop", "status", "down")
 UNSAFE = set('"\\') | {chr(c) for c in range(32)} | {chr(127)}  # never in a path the fleet writes into TOML and JSON
@@ -180,7 +182,7 @@ def ceiling(environ: Mapping[str, str]) -> int:
     value = environ.get(CEILING_VAR) or ""
     if not value:
         return DEFAULT_CEILING
-    if not (value.isascii() and value.isdigit()) or not 1 <= int(value) <= TOP_CEILING:
+    if not WHOLE.fullmatch(value) or not 1 <= int(value) <= TOP_CEILING:
         raise FleetError(f"{CEILING_VAR} must be a whole number from 1 to {TOP_CEILING}")
     return int(value)
 
@@ -192,7 +194,7 @@ def setting(environ: Mapping[str, str], name: str, default: Optional[int] = None
     if not value:
         raise FleetError(f"{name} is not set: the operator's maximum of federations at once (site.env); refused")
     limit = ceiling(environ)
-    if not (value.isascii() and value.isdigit()) or not 1 <= int(value) <= limit:
+    if not WHOLE.fullmatch(value) or not 1 <= int(value) <= limit:
         raise FleetError(f"{name} must be a whole number from 1 to {limit} (the fleet ceiling, {CEILING_VAR})")
     return int(value)
 
