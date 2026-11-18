@@ -213,13 +213,20 @@ its business, whatever it runs. It never reads or prints a node's name into a me
 - **Once the job runs and before any step,** `up` reads them again. A node of this federation, a service's or the
   agent's, that holds another live federation's job (two ups read before either had submitted, and Slurm placed both on
   it) refuses `up`: its held jobs are cancelled by their ids, no step runs, and the message names the roles (`zone`,
-  `providers[i]`, `agent`), never a host. A second read that fails refuses the same way. Two ups that raced may both
-  refuse: `down`, then `up` again.
+  `providers[i]`, `agent`), never a host. A second read that fails refuses the same way. An `up` run by hand that raced
+  is refused once: `down`, then `up` again. Under a fleet it is tried again (below).
 - **Too few nodes.** The exclusion can leave Slurm no node that fits the job: it stays pending, or sbatch refuses it. `up`
   waits no longer than its queue bound (`TIMEOUTS["queue"]`, 30 minutes, or `HPC_QUEUE_WAIT_S` seconds when `site.env`
   sets it: "Site configuration"), cancels the job by its id and says that it
   excluded N nodes of other live federations; a refusal by sbatch says the same, with Slurm's own words stripped of those
   nodes' names.
+- **The agent's own job waits for the services' job to start.** Under `"separate"` it is submitted with
+  `--dependency=after:<services job>` ("begin after the job starts", never `afterok`) and the dependency is read back
+  with the job (a site that drops it has that job cancelled and the `up` fails), so a services job that pends in the
+  queue never leaves the agent's node billing alone. What remains: once the services' job runs, the agent's job still
+  waits for a node of its own, and the services' job runs and bills meanwhile; and a services job cancelled before it
+  started (its wait failing at the bound) satisfies the dependency too, so the agent's job may start in the seconds
+  before `up` cancels it.
 - **A wait that fails releases every held job of that `up`.** Under `"separate"` the services' job and the agent's own are
   waited for in turn, and a job that does not start in time or ends before it ran is cancelled by its wait. `up` then
   cancels the other held job too, still queued or running, by its own id and only if it still carries the name `up`
@@ -239,9 +246,16 @@ its business, whatever it runs. It never reads or prints a node's name into a me
   stay as the guard. Unset, `0` or empty changes nothing.
 
 In a fleet each member's `up` is its own, so each reads the members already up: with `HPC_FLEET_PARALLEL` at 1 (the
-default) every member takes nodes of its own. With more at once, two members that read before either has submitted can
-land on one node, and the later one is refused (reported as a failed member, nothing left held): bring it down and add
-another (`down --member fed-k`, `add 1`).
+default) every member takes nodes of its own. With more at once, the ups share one lock, the file `<fleet>/.placement.lock`
+(the fleet gives each `up` its name in `HPC_FLEET_PLACEMENT_LOCK`: not a site key, and never set by hand), taken for an
+up's first read together with its submits and for its second read once its jobs run, and for nothing else, so the rest of
+every up (the services, the core's phase, the link check) runs in parallel. Two members whose pending jobs land on one
+node are then told apart by the second read: the one that reads first is refused, its jobs are cancelled (by their ids,
+and gone from the live list before the lock is let go), and it is tried again, up to 3 times in all
+(`hpcdriver.PLACEMENT_ATTEMPTS`), each retry reading the jobs now held and submitting with their nodes excluded. Only
+its last refusal is a failed member (nothing left held): bring it down and add another (`down --member fed-k`, `add 1`).
+Two fleets of one account do not share a lock; the second read keeps their federations apart, and a federation refused
+there is tried again too.
 
 `tests/deploy/test_hpc_queue_bound.py` runs the site's bound, the release of every held job of an `up` that fails before the
 federation is up, and `HPC_EXCLUSIVE_NODES`.
@@ -1368,9 +1382,11 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   refuses the fleet as it refuses one `up`), asked once for all N by the fleet: the account's usage against N times one
   federation's estimate (each federation's own `up` then checks its own estimate again, as it always does). Without a scratch root nothing is on scratch, and the fleet says it made no check.
   The account's home guard (`hpcquota.home_guard`, the section "The account's home, and its guard") is read once too, ahead of the inode guard, whenever the site sets its keys: a home past 95% of its files or bytes refuses the fleet's `up` and `add` before anything is made.
-  `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once; with more than one, two members' ups can
-  race for a node ("Two federations of one account"). The maximum is one fleet's: two fleets of one account share the
-  grant by hand.
+  `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once; with more than one, the ups share a lock
+  around their reads and a member that races for a node is tried again ("Two federations of one account").
+  `HPC_FLEET_CEILING` (optional) is the most either of those two may be, a whole number from 1 to 512 (64 when unset, so
+  nothing changes unless the site sets it); `HPC_FLEET_MAX` still applies under it, so a fleet of 66 needs both at 66 or
+  more. The maximum is one fleet's: two fleets of one account share the grant by hand.
 - **What `up` makes.** The fleet's directory (new: never adopted), and federations `fed-1` ... `fed-N`, each its own
   root `<fleet>/fed-k/root`, state file and held job, each brought up by `hpcfed.py up` in a process of its own (its
   output in `<fleet>/logs/fed-k.up.log`). The fleet's record, `<fleet>/fleet.json`, holds each one's root, its job's

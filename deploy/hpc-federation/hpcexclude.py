@@ -10,18 +10,30 @@ and memory, so nothing else keeps them apart. `up` therefore reads the account's
 - **once its job runs, before any step**, none of its service nodes may hold another such job (two ups that raced);
   one that does is refused and its jobs released, naming the role.
 
+Under a fleet the two reads of each up are serialised (`placement_lock`, DESIGN.md section 1): the fleet's ups run in
+parallel but take one lock around the first read and its submit, and around the second read, so the later of two ups
+always sees the earlier one's jobs, and a loser's release (the jobs cancelled and gone from the live list) is done
+before the next up reads. A loser is a `SharedNode`, which the driver retries a bounded number of times.
+
 The prefix is every held job's: `hpcop-<project>-<random>`, the agent's own job under "separate" with `-sandbox`
 after it, and the older bundle's batch scripts (`hpcop-zone`, `hpcop-provider`). A job is read whole, so another
 federation's agent's node is one of its nodes too. Every message here and in its callers names a role, a count
 or a job's own name, never a node, and never says what squeue said.
 """
 
+import contextlib
+import fcntl
+import os
 import re
-from typing import Dict, Iterable, List, NamedTuple, Sequence, Set, Tuple
+import stat
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
 from hpcslurm import JOB_LISTED, Slurm, SlurmError
 
 JOB_PREFIX = "hpcop-"
+PLACEMENT_LOCK = ".placement.lock"  # in a fleet's own directory, beside its record's locks
+LOCK_VAR = "HPC_FLEET_PLACEMENT_LOCK"  # set by the fleet on each `up` it starts, never a site key: the file to lock
 # The read names no state (`-t`): squeue's own default lists every job that holds a node, a suspended one, one staging
 # out, and a running one with a stop or a signal pending among them (Slurm's `_filter_job`, read on master and on 23.02;
 # its manual says only "pending, running, and completing", which is less than the code does). An explicit list of the
@@ -42,6 +54,43 @@ STATE = re.compile(r"[A-Z_]{2,32}")
 LENIENT = ("PENDING", "COMPLETING")  # states whose node list may be none: not yet placed, or all returned to service
 NODE_LIST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._,\[\]-]{0,4095}")  # a compressed host list: `node[01-03],node07`
 UNREADABLE = "the account's live federation jobs could not be read"
+
+
+class SharedNode(SlurmError):
+    """A federation's service or agent placed on a node another live federation holds, the up refused. `released`:
+    every held job of the up was cancelled, so that the up may be tried again; one whose cancel failed is not (`down`
+    must release it). Its message is the one this refusal has always had."""
+
+    def __init__(self, message: str, released: bool) -> None:
+        super().__init__(message)
+        self.released = released
+
+
+def lock_from_environment(environ: Mapping[str, str]) -> Optional[Path]:
+    """The fleet's placement lock this process was started with (`LOCK_VAR`), None for an `up` run by hand: that one
+    takes no lock and is tried once. A value that is not an absolute path refuses."""
+    value = environ.get(LOCK_VAR) or ""
+    if not value:
+        return None
+    if not os.path.isabs(value) or "\0" in value:
+        raise ValueError(f"{LOCK_VAR} must be an absolute path")
+    return Path(value)
+
+
+@contextlib.contextmanager
+def placement_lock(path: Path) -> Iterator[None]:
+    """The fleet-wide lock, held for the body, waiting for it: an `flock` on a descriptor of its own, so that two ups in
+    one process (the tests') exclude each other as two processes do, and one that dies lets it go. Its file is the
+    fleet's, made 0600, never reached through a link, and must be a regular file of this user's."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError(f"{LOCK_VAR} names a file that is not a regular file of this user's")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 class LiveJob(NamedTuple):
