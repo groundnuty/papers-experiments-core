@@ -1288,6 +1288,36 @@ refuses a shard whose manifest lacks a name the plan declares, or holds one it d
 variable, as it refuses one whose line dropped the post-run script. A dropped sanction variable also fails closed: the
 study's own refusal stops the run.
 
+**The operator's key files: `home_files` (O63).** A study's `models.toml` names `key_file = "~/..."` paths, and the
+dispatcher's `HOME` is a private directory on the node's tmpfs, so `~` resolved into an empty home and every model call
+failed at its first request (no secret rides in the environment, and `pass_env` refuses a secret-looking name). The
+manifest's optional `home_files` names the operator's own directory, laid out as it would sit under a home:
+
+    home_files = "/shared/operator/keys"   # an absolute path on the shared filesystem; `.secrets/<...>/key` below it
+
+`plan` and `lines` read it first and refuse, naming `home_files` and the reason and never a path or a file's name, a
+path with a `.`, `..` or empty part or **a link on the way** (give the resolved path: `realpath`), a directory that is
+not this user's or has a group or other bit (0700 or stricter), a file that is not a regular file of this user's, has a
+group, other or execute bit (0600 or stricter) or is a link, more than 64 files, 64 directories, 1 MiB or 8 levels, and a
+directory with no file. Each line then ends in `--home-files PATH` (the path alone); `plan` prints `home_files: true`.
+`step` reads the tree itself, once, with the same checks made on the descriptors it reads the bytes through (nothing is
+checked and then read again; nothing is pinned on the line, so a key rotated after `lines` is the one that arrives), and
+a tree it refuses ends it with 73 before anything is made. After its home exists and before the dispatcher starts it
+writes the tree there: directories 0700, files 0600, created exclusively with no link followed below a descriptor of the
+home (a directory the step made, such as `.config`, is merged into; a file where the step's home already has an entry
+is refused, 73, the directory removed). The step prints how many files went in and nothing else of them.
+
+Nothing of the files is recorded: no name, hash or content in a line's other words, `step.json` (which holds
+`home_files: true` and `home_files_count`), the archive and its manifest, the snapshots, the journals or the step's
+output. The copies go when the dispatcher and the post-run script have ended, before the archive is written (the step
+removes its home), and with the step's directory in every other exit: a normal end, an archive that cannot be written
+(the kept directory holds no key), and a TERM or INT, including one that arrives while the files are written or before
+the dispatcher's relay is installed (the step ends through its cleanup, 128 plus the signal). A step killed outright
+(KILL, the walltime, the node) leaves its directory, and the copies in it, on the node's private tmpfs until `--resume`
+or `sweep` removes it, as for everything else it leaves. With no `home_files` nothing is read or written and the lines,
+the plan and the records are what they were. `fleet.py`'s shard settings do not take the key. A line edited to drop the
+`--home-files` words runs without the keys, and the first model request says so.
+
 **One value for a shard's whole life (O63).** The first step of a shard that passes variables records each name and
 value once, in `<results>/<label>/pass-env.json` (whole, mode 0600, once it holds the shard's running mark; nothing is
 written when it passes none, and never more than 65,536 bytes, which is what its reader takes: a step whose variables

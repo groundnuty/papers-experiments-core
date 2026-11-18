@@ -35,11 +35,39 @@ step's own directory on the tmpfs, made private there. `step` copies the federat
 `up` rendered it with every path absolute into the root (secrets, CA, fault journal) on the filesystem the nodes see,
 into its copy of the study beside `study.toml`, where the study's plugin loads it: a copy, never a link out of the
 study, and never a path of the federation's in `study.toml`, whose bytes and hash are every shard's. A study that holds
-a `platform.toml` of its own is refused. No secret is in the environment: a model's key comes from its key file. When
-that file
-declares the Apptainer sandbox, `step` makes its `work_root` (mode 0700) before the dispatcher, which the sandbox will
-not start without; it refuses one that is a link, not this user's, open to others, or not under `--tmpfs` (the node's
-tmpfs: never the shared filesystem).
+a `platform.toml` of its own is refused. No secret is in the environment: a model's key comes from its key file, which
+the operator's `home_files` puts in that home (below). When that file declares the Apptainer sandbox, `step` makes its
+`work_root` (mode 0700) before the dispatcher, which the sandbox will not start without; it refuses one that is a
+link, not this user's, open to others, or not under `--tmpfs` (the node's tmpfs: never the shared filesystem).
+
+**The operator's key files (`home_files`, O63).** A study's `models.toml` names `key_file = "~/..."` paths, and
+the dispatcher's HOME is a private directory on the node's tmpfs (above), so `~` resolves into an empty home and every
+model call would fail at its first request. The manifest's optional `home_files = "/abs/path"` names a directory of the
+operator's on the shared filesystem laid out as it would sit under a home (`.secrets/<...>/key`). `plan` and `lines`
+read it (`read_home_files`) before anything is printed, and each line ends in `--home-files PATH`, the path alone (as
+the manifest's other paths ride on it; `plan` prints `home_files: true` and no path). The path is absolute with no `.`,
+`..` or empty part and no link on the way (each part is opened with `O_NOFOLLOW`, so the operator gives the resolved
+path); the directory and every directory in it is this user's with no group or other bit (mode 0700 or stricter), every
+other entry is a regular file of this user's with no group or other bit and no execute bit (0600 or stricter): a link,
+a file that is not regular, one of another user's, one open to others, more than 64 files, more than 64 directories,
+more than 1 MiB in all, a tree more than 8 directories deep and a tree with no file are refused, and the refusal names
+`home_files` and why, never a path or a name inside. `step` reads the tree itself, once, as one of its first acts
+(the same checks, on the descriptors it reads the bytes through: nothing is checked and then read again, and nothing
+is pinned on the line, so a key the operator rotated since `lines` is the one that arrives), refusing with
+`PRE_STEP_REFUSED` (73) and nothing made, and holds the bytes. After its home exists and before the dispatcher
+starts, it writes them there: directories 0700 and files 0600 (`fchmod`, whatever the umask), made with `O_EXCL` and
+`O_NOFOLLOW` below a held descriptor of the home; a directory the step already made (`.config`) is merged into, a file
+that would replace anything is refused (73, before the dispatcher, the directory removed). A study's `~/...` then
+resolves to the operator's files in the dispatcher and its children. Nothing of the files is recorded: `step.json`
+holds `home_files: true` and `home_files_count`, and the archive, its manifest, the snapshots, the journals and what the
+step prints hold no name, hash or content. The copies live in the step's own directory on the tmpfs and go with it, and
+sooner: once the dispatcher and the post-run script have ended, before the archive, `step` removes the home; an
+archive that cannot be written keeps the directory without it; and a TERM or INT that arrives while the files are
+staged, or before the dispatcher's relay is installed, ends the step through its cleanup (exit 128 + the signal). A
+step killed outright (KILL, the walltime) leaves its directory, and the copies in it, on the node's private tmpfs until
+`--resume` or `sweep` removes it, as it leaves everything else. With no `home_files` nothing is read or written and
+the line, the plan and every record are what they were. Not covered: the fleet's shard settings (`fleet.py`) do not
+take the key.
 
 **The operator's own variables (`pass_env`, O63).** The one addition to that environment is what the manifest
 declares: variables of the operator's the study needs in its dispatcher's environment, such as the operator's half of a
@@ -271,6 +299,7 @@ The manifest (`shards.toml`, operator-local, never committed, since it names the
     post_run = "guards/post_run.py"   # optional: a script of the study that each step runs after its dispatcher exits 0
     post_run_timeout_s = 300          # optional, with post_run: its bound in seconds (above 0, at most 1800)
     expect_render_identity = "render-identity.expected.json"  # optional: the render a federation must have (see above)
+    home_files = "/shared/operator/keys"  # optional: the operator's key tree, put in the dispatcher's home (see above)
     [[shards]]                        # in order: shard i is the i-th entry
     label = "fed-a"                   # the shard's label (no host name: it travels with the export)
     root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml; one
@@ -343,6 +372,10 @@ HOOKS = {  # what each declared script is called in a message, its default bound
     "post_run": ("post-run script", POST_RUN_TIMEOUT_S, POST_RUN_MAX_S),
 }
 CHUNK = 1 << 20
+HOME_FILES_MAX_FILES = 64  # the operator's key tree (`home_files`): at most this many files,
+HOME_FILES_MAX_DIRS = 64  # this many directories,
+HOME_FILES_MAX_BYTES = 1 << 20  # this many bytes in all,
+HOME_FILES_MAX_DEPTH = 8  # and this many directories deep
 SNAPSHOT_EVERY_S = 900.0  # a running shard's out/ is snapshotted this often, and after each run's end
 POLL_S = 30.0  # how often the snapshot thread looks for a run's end in the store
 SNAPSHOTS, JOURNALS = "snapshots", "journals"  # under <results>/<label>/
@@ -486,6 +519,7 @@ class Plan:
     expect_render_identity_sha256: str | None = None  # its SHA-256, recorded by `pinned`
     pass_env: tuple[str, ...] = ()  # the variables the manifest declares: names only
     pass_env_pins: tuple[tuple[str, str], ...] | None = None  # each name's value, read by `pin_pass_env`
+    home_files: str | None = None  # the operator's key tree: an absolute path, put in the dispatcher's home (O63)
 
 
 # ------------------------------------------------------------------------------------------------ the manifest
@@ -767,7 +801,7 @@ def load_plan(path: Path) -> Plan:
         raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
     keys = {"study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory", "shards"}
     optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s", "post_run", "post_run_timeout_s",
-                "expect_render_identity", "pass_env"}  # fmt: skip
+                "expect_render_identity", "pass_env", "home_files"}  # fmt: skip
     if not keys <= set(data) <= keys | optional:
         raise ShardsError(
             f"the manifest's keys must be: {', '.join(sorted(keys))}, and perhaps {', '.join(sorted(optional))}"
@@ -787,6 +821,8 @@ def load_plan(path: Path) -> Plan:
     if "expect_render_identity" in data and (problem := guard_path_problem(data["expect_render_identity"])):
         raise ShardsError(f"expect_render_identity {problem}")
     declared = pass_env_names(data["pass_env"]) if "pass_env" in data else ()
+    if "home_files" in data and (problem := home_files_path_problem(data["home_files"])):
+        raise ShardsError(f"home_files {problem}")
     for key in sorted({"study", "python", "core_src", "results", "tmpfs"}):  # a step starts in / (`--chdir=/`)
         if not isinstance(data[key], str) or not data[key].startswith("/"):
             raise ShardsError(f"{key} must be an absolute path")
@@ -812,7 +848,8 @@ def load_plan(path: Path) -> Plan:
     return Plan(Path(data["study"]), str(data["python"]), Path(data["core_src"]), Path(data["results"]),
                 Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
                 float(every), data.get("pre_step"), None, float(bounds["pre_step"]), data.get("post_run"), None,
-                float(bounds["post_run"]), data.get("expect_render_identity"), pass_env=declared)  # fmt: skip
+                float(bounds["post_run"]), data.get("expect_render_identity"), pass_env=declared,
+                home_files=data.get("home_files"))  # fmt: skip
 
 
 def federation(shard: Shard) -> dict[str, Any]:
@@ -1025,6 +1062,8 @@ def step_argv(
                               "hashed it")  # fmt: skip
         step += ["--expect-render-identity", plan.expect_render_identity, "--expect-render-identity-sha256",
                  plan.expect_render_identity_sha256]  # fmt: skip
+    if plan.home_files is not None:  # the operator's key tree: `step` reads it itself, so the path alone rides here
+        step += ["--home-files", plan.home_files]
     for name in plan.pass_env:  # the declaration: `step` passes a name only when its line says so, with its value
         step += ["--pass-env", name]
     return [
@@ -1102,6 +1141,221 @@ def read_study_file(study: Path, name: str, path: str) -> bytes:
         os.close(fd)
 
 
+# ------------------------------------------------------------------------------------------------ the key files
+def home_files_path_problem(path: Any) -> str | None:
+    """Why `path` cannot be the manifest's `home_files` (an absolute path of a plain string: no empty, `.` or `..`
+    part), or None."""
+    if isinstance(path, bool) or not isinstance(path, str) or not path or "\0" in path or not path.startswith("/"):
+        return "must be an absolute path, a string"
+    if any(part in ("", ".", "..") for part in path[1:].split("/")):
+        return "must be a plain absolute path: no empty, `.` or `..` part, no trailing slash"
+    return None
+
+
+@dataclass(frozen=True, repr=False)
+class HomeTree:
+    """The operator's key tree as `read_home_files` read it: its directories (parents first) and its files, the
+    paths below its root and each file's bytes (empty unless kept). Names and bytes are secret: nothing prints one,
+    and the representation says a count."""
+
+    dirs: tuple[tuple[str, ...], ...]
+    files: tuple[tuple[tuple[str, ...], bytes], ...]
+
+    def __repr__(self) -> str:
+        return f"HomeTree({len(self.files)} files)"
+
+
+def _home_refusal(why: str, hint: str = "") -> ShardsError:
+    """The refusal of a key tree: the manifest's key and the reason, never a path or a name of the tree."""
+    return ShardsError(f"home_files {why}{hint}")
+
+
+def _home_os_error(error: OSError) -> ShardsError:
+    """An OS error on the key tree as a refusal: the errno's name only (a message holds the file's name)."""
+    code = errno.errorcode.get(error.errno or 0, "an error")
+    if error.errno in (errno.ELOOP, errno.ENOTDIR):  # Linux says either for a link met with O_NOFOLLOW | O_DIRECTORY
+        return _home_refusal("is not a directory, or is, or lies behind, a link: give the resolved path")
+    if error.errno == errno.ENOENT:
+        return _home_refusal("does not exist, or changed while it was read")
+    return _home_refusal(f"could not be read ({code})")
+
+
+def _home_dir_ok(info: os.stat_result, uid: int, subject: str) -> None:
+    """Refuse a directory that is not this user's or is open to group or other; `subject` begins the message."""
+    if not stat.S_ISDIR(info.st_mode):
+        raise _home_refusal(f"{subject} not a directory")
+    if info.st_uid != uid:
+        raise _home_refusal(f"{subject} not this user's")
+    if info.st_mode & 0o077:
+        raise _home_refusal(f"{subject} open to group or other (mode 0700 or stricter)")
+
+
+def _home_scan(fd: int, parts: tuple[str, ...], found: dict[str, Any], uid: int, keep: bool) -> None:
+    """Every entry of the directory `fd` holds: each classified by `lstat`, then opened with `O_NOFOLLOW` and checked
+    again on the descriptor it is read through, so that a name swapped between the two is refused, never followed."""
+    for entry in sorted(os.listdir(fd)):
+        kid = (*parts, entry)
+        listed = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISLNK(listed.st_mode):
+            raise _home_refusal("holds a link")
+        if stat.S_ISDIR(listed.st_mode):
+            if len(kid) > HOME_FILES_MAX_DEPTH:
+                raise _home_refusal(f"is more than {HOME_FILES_MAX_DEPTH} directories deep")
+            if len(found["dirs"]) >= HOME_FILES_MAX_DIRS:
+                raise _home_refusal(f"holds more than {HOME_FILES_MAX_DIRS} directories")
+            sub = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                info = os.fstat(sub)
+                if (info.st_dev, info.st_ino) != (listed.st_dev, listed.st_ino):
+                    raise _home_refusal("changed while it was read")
+                _home_dir_ok(info, uid, "holds a directory that is")
+                found["dirs"].append(kid)
+                _home_scan(sub, kid, found, uid, keep)
+            finally:
+                os.close(sub)
+        elif stat.S_ISREG(listed.st_mode):
+            if len(found["files"]) >= HOME_FILES_MAX_FILES:
+                raise _home_refusal(f"holds more than {HOME_FILES_MAX_FILES} files")
+            # a FIFO swapped in since the `lstat` must not block the open: it is refused below, never waited on
+            file_fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                info = os.fstat(file_fd)
+                if (info.st_dev, info.st_ino) != (listed.st_dev, listed.st_ino) or not stat.S_ISREG(info.st_mode):
+                    raise _home_refusal("changed while it was read")
+                if info.st_uid != uid:
+                    raise _home_refusal("holds a file that is not this user's")
+                if info.st_mode & 0o177:
+                    raise _home_refusal("holds a file open to group or other, or executable (mode 0600 or stricter)")
+                found["bytes"] += info.st_size
+                if found["bytes"] > HOME_FILES_MAX_BYTES:
+                    raise _home_refusal(f"holds more than {HOME_FILES_MAX_BYTES} bytes")
+                data = b""
+                if keep:
+                    data = os.read(file_fd, info.st_size + 1)
+                    if len(data) != info.st_size:
+                        raise _home_refusal("changed while it was read")
+                found["files"].append((kid, data))
+            finally:
+                os.close(file_fd)
+        else:
+            raise _home_refusal("holds something that is neither a file nor a directory")
+
+
+def read_home_files(path: str, *, keep: bool = True, uid: int | None = None) -> HomeTree:
+    """The operator's key tree at `path` (the manifest's `home_files`), read once through descriptors: each part of the
+    path opened with `O_NOFOLLOW` from `/` (a link on the way is refused, so the operator gives the resolved path),
+    the directory and every directory in it this user's with no group or other bit, every other entry a regular file of
+    this user's with no group, other or execute bit, within the bounds (`HOME_FILES_MAX_*`) and at least one file. The
+    checks are made on the descriptors the bytes are read through (`keep`: held in the result; without it only the
+    shape is checked, as `plan` and `lines` do), so nothing is checked and then read again. `ShardsError` naming
+    `home_files` and the reason, never a path or a name of the tree."""
+    if problem := home_files_path_problem(path):
+        raise _home_refusal(problem)
+    uid = os.geteuid() if uid is None else uid
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    found: dict[str, Any] = {"dirs": [], "files": [], "bytes": 0}
+    try:
+        for part in path[1:].split("/"):
+            below = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = below
+        _home_dir_ok(os.fstat(fd), uid, "is")
+        _home_scan(fd, (), found, uid, keep)
+    except OSError as error:
+        raise _home_os_error(error) from None
+    finally:
+        os.close(fd)
+    if not found["files"]:
+        raise _home_refusal("holds no file")
+    return HomeTree(tuple(found["dirs"]), tuple(found["files"]))
+
+
+def _dir_below(root_fd: int, parts: Sequence[str]) -> int:
+    """A descriptor of the directory `parts` below `root_fd`, each part opened with `O_NOFOLLOW`."""
+    fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            below = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = below
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def stage_home_files(tree: HomeTree, home: Path) -> int:
+    """Write `tree` into the dispatcher's `home` (a directory the step made, 0700): directories 0700 and files 0600
+    (set with `fchmod`, whatever the umask), made below a descriptor of `home` with `O_EXCL` and `O_NOFOLLOW`, so a
+    link is never followed and nothing is overwritten. A directory the step made already (`.config`) is merged into
+    (checked: this user's, 0700); a file that would replace anything is refused. The number of files written;
+    `ShardsError` naming `home_files` otherwise, never a path or a name."""
+    root = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        _home_dir_ok(os.fstat(root), os.geteuid(), "cannot be staged: the step's home is")
+        for parts in tree.dirs:
+            parent = _dir_below(root, parts[:-1])
+            try:
+                with contextlib.suppress(FileExistsError):  # one the step made (`HOME_DIRS`): checked below
+                    os.mkdir(parts[-1], 0o700, dir_fd=parent)
+                made = os.open(parts[-1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                try:
+                    os.fchmod(made, 0o700)
+                    _home_dir_ok(os.fstat(made), os.geteuid(), "cannot be staged: a directory of the step's home is")
+                finally:
+                    os.close(made)
+            finally:
+                os.close(parent)
+        for parts, data in tree.files:
+            parent = _dir_below(root, parts[:-1])
+            try:
+                file_fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                  0o600, dir_fd=parent)  # fmt: skip
+                try:
+                    os.fchmod(file_fd, 0o600)
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(file_fd, view) :]
+                finally:
+                    os.close(file_fd)
+            finally:
+                os.close(parent)
+    except FileExistsError:
+        raise _home_refusal("holds a file where the step's own home has an entry") from None
+    except OSError as error:
+        raise _home_os_error(error) from None
+    finally:
+        os.close(root)
+    return len(tree.files)
+
+
+def _unwind_on_stop() -> Callable[[], None]:
+    """Make TERM and INT end this process through its `finally` blocks (exit 128 + the signal) until something else
+    takes the two signals over (`run_dispatcher`'s relay), and return the function that gives back the handlers it
+    replaced when they are still ours. A step that has staged the operator's key files would otherwise leave them on
+    the node if it were told to stop before its dispatcher is running. Once stopped it ignores both, so a second
+    signal cannot interrupt the cleanup."""
+    signums = (signal.SIGTERM, signal.SIGINT)
+    previous = {sig: signal.getsignal(sig) for sig in signums}
+    fired = []
+
+    def unwind(signum: int, _frame: Any) -> None:
+        fired.append(signum)
+        for sig in signums:
+            signal.signal(sig, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+
+    for sig in signums:
+        signal.signal(sig, unwind)
+
+    def disarm() -> None:
+        for sig, old in previous.items():
+            if old is not None and (fired or signal.getsignal(sig) is unwind):
+                signal.signal(sig, old)
+
+    return disarm
+
+
 def pinned(plan: Plan) -> Plan:
     """The plan with the SHA-256 of each declared script (its pre-step guard, its post-run script) and of the expected
     render identity recorded, from the study as it is now: `plan` and `lines` call it, so that a file that leaves the
@@ -1117,6 +1371,8 @@ def pinned(plan: Plan) -> Plan:
         raw = read_study_file(plan.study, name, plan.expect_render_identity)
         parse_render_identity(raw, name)
         found["expect_render_identity_sha256"] = hashlib.sha256(raw).hexdigest()
+    if plan.home_files is not None:
+        read_home_files(plan.home_files, keep=False)  # a tree the step would refuse refuses `plan` and `lines` first
     return replace(plan, **found)
 
 
@@ -1659,7 +1915,7 @@ def _verify_shards(plan: Plan, stage: Path, refuse_newer: bool) -> tuple[list[tu
     merge follows (`refuse_newer`)."""
     wanted = None
     if plan.post_run is not None:  # the script the plan declares, as the study holds it now
-        wanted = pinned(replace(plan, pre_step=None, expect_render_identity=None)).post_run_sha256
+        wanted = pinned(replace(plan, pre_step=None, expect_render_identity=None, home_files=None)).post_run_sha256
     found = []
     for shard in plan.shards:
         found.append(verified(plan.results, shard, stage))
@@ -3382,6 +3638,18 @@ def check_pass_env(args: argparse.Namespace) -> dict[str, str]:
     return passed
 
 
+def check_home_files(args: argparse.Namespace) -> HomeTree | None:
+    """The operator's key tree the line names (`--home-files`), read once with its bytes (`read_home_files`): None when
+    the line names none. `StepRefused` naming `home_files` and why, never a path or a name of the tree."""
+    path = getattr(args, "home_files", None)
+    if path is None:
+        return None
+    try:
+        return read_home_files(path)
+    except ShardsError as error:
+        raise StepRefused(str(error)) from None
+
+
 def check_pass_env_stable(args: argparse.Namespace, passed: Mapping[str, str]) -> None:
     """The variables this step passes are the ones the shard's first step passed, each with the same value
     (`check_pass_env_origin`, on the shard's directory of `--results`): `StepRefused` naming each that is not, never a
@@ -3456,6 +3724,7 @@ def step(
         check_pass_env_stable(args, passed)  # and what the shard's first step passed: one value for its whole life
         identity = check_render_identity(args)  # the federation's render is the plan's, before the study's own guard
         guard, post_hook = start_hooks(args)
+        home = check_home_files(args)  # the operator's key tree, read once: held, and written after the home exists
     except StepRefused as error:
         print(f"shards: ERROR: {error}; the step is refused, with nothing made", file=sys.stderr)
         return PRE_STEP_REFUSED
@@ -3464,6 +3733,9 @@ def step(
     if guard is not None:
         print(f"shards: pre-step guard {guard['path']} (sha256 {guard['sha256']}) passed for shard {args.label}",
               file=sys.stderr)  # fmt: skip
+    if home is not None:
+        print(f"shards: {len(home.files)} file(s) of home_files go to shard {args.label}'s dispatcher (a count: no "
+              "name or content is shown)", file=sys.stderr)  # fmt: skip
     if not core_found(args.core_src):
         print("shards: ERROR: this interpreter does not import the core from --core-src", file=sys.stderr)
         return CORE_MISMATCH
@@ -3497,7 +3769,7 @@ def step(
         except ShardsError as error:
             print(f"shards: ERROR: {error}; the step is refused before its dispatcher starts", file=sys.stderr)
             return PRE_STEP_REFUSED
-        return _run_step(args, spec, runner, snapshots, node, identity, guard, post_hook, passed)
+        return _run_step(args, spec, runner, snapshots, node, identity, guard, post_hook, passed, home)
     finally:
         release_running(args, mark)
 
@@ -3512,24 +3784,29 @@ def _run_step(
     guard: Mapping[str, Any] | None,
     post_hook: Hook | None,
     passed: Mapping[str, str],
+    home: HomeTree | None = None,
 ) -> int:
     """`step` once its checks passed and it holds the shard's running mark: its directory on the tmpfs first (so a
     sweep finds a step of ours here before its work root is used), the sandbox's work root made and its killed runs
     reaped, then copy, restore, run, archive, clean up. `identity`, `guard`, `post_hook` and `passed` are what the
     step's first acts found (the federation's render identity as validated, the pre-step guard that passed, the
-    post-run script declared, the variables its line gave the dispatcher with their values)."""
+    post-run script declared, the variables its line gave the dispatcher with their values); `home` is the operator's
+    key tree it read (`check_home_files`), written into the dispatcher's home just before the dispatcher starts and
+    removed once the dispatcher and the post-run script have ended."""
     from expcore.campaign import out_snapshot
 
     snapdir = args.results / args.label / SNAPSHOTS
     base = archive_named(args.results, args.label)  # the archive this step starts from: its snapshots name it
     work = Path(tempfile.mkdtemp(prefix=f"{WORK_PREFIX}{args.label}.", dir=args.tmpfs))
     keep = False
+    disarm: Callable[[], None] | None = None
     try:
         work.chmod(0o700)
         owner = {"format": OWNER_FORMAT, "shard": spec, "pid": os.getpid(), "start": _start_of(os.getpid()),
                  "root": os.environ.get("EXPCORE_FED_ROOT"), "results": str(args.results), "base": base,
                  "phase": RUNNING, **({"pre_step": guard} if guard is not None else {}),
                  **({"pass_env": dict(passed)} if passed else {}),
+                 **({"home_files": True, "home_files_count": len(home.files)} if home is not None else {}),
                  **({"post_run": {"path": post_hook.path, "sha256": post_hook.sha256, "ran": False, "exit_status": None,
                                   "final": False}} if post_hook is not None else {})}  # fmt: skip
         (work / OWNER).write_text(json.dumps(owner, sort_keys=True) + "\n", encoding="utf-8")
@@ -3575,6 +3852,13 @@ def _run_step(
                 getattr(args, "snapshot_every", SNAPSHOT_EVERY_S),
                 progress=lambda: out_snapshot.ended_attempts(out),
             )
+        if home is not None:  # the operator's key files, last before the dispatcher; a stop in between cleans up
+            disarm = _unwind_on_stop()
+            try:
+                stage_home_files(home, work / "home")
+            except ShardsError as error:
+                print(f"shards: ERROR: {error}; the step is refused before its dispatcher starts", file=sys.stderr)
+                return PRE_STEP_REFUSED
         note_step_started(os.environ.get("EXPCORE_FED_ROOT"), spec)  # `down` learns that a step ran from this
         snapshots.start(out)
         try:
@@ -3601,6 +3885,8 @@ def _run_step(
                 print(f"shards: ERROR: {post['reason']}; shard {args.label}'s results are archived, NOT final",
                       file=sys.stderr)  # fmt: skip
             settle_quietly(out)  # a script that read the store may leave its -shm
+        if home is not None:  # the dispatcher and the post-run script have ended: no key stays for the archive's sake
+            remove_tree(work / "home")
         try:
             manifest = archive(out, args.results, spec, status, guard, post, passed)
         except (OSError, tarfile.TarError) as error:  # the only whole out/ is the tmpfs copy: kept, never removed
@@ -3615,6 +3901,8 @@ def _run_step(
             return status or POST_RUN_FAILED
         return status
     finally:
+        if disarm is not None:
+            disarm()  # the handlers the step found, unless a runner has taken them over
         if not keep:
             remove_tree(work)
 
@@ -3668,6 +3956,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--post-run-timeout", dest="post_run_timeout", type=float, default=None)
     one.add_argument("--expect-render-identity", dest="expect_render_identity", default=None)  # with its hash: both
     one.add_argument("--expect-render-identity-sha256", dest="expect_render_identity_sha256", default=None)
+    one.add_argument("--home-files", dest="home_files", default=None)  # the operator's key tree: `lines` writes it
     one.add_argument("--pass-env", dest="pass_env", action="append", default=None, metavar="NAME",
                      help="a variable the manifest declares: its value is among the line's env words")  # fmt: skip
     left = sub.add_parser("sweep")
@@ -3750,6 +4039,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                                                     "sha256": plan.expect_render_identity_sha256}  # fmt: skip
             if plan.pass_env_pins:
                 record["pass_env"] = dict(plan.pass_env_pins)
+            if plan.home_files is not None:
+                record["home_files"] = True  # the line holds the path; the plan says only that the tree was read
             built.append((line, record))
         refusal = core_refusal(identify_core(plan))  # last: it runs the manifest's interpreter, as the step will
         if refusal:
