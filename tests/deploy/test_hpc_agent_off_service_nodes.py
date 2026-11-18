@@ -165,3 +165,23 @@ def test_o57_a_heterogeneous_job_is_one_job_and_unchanged(hpc, tmp_path, site):
     assert len(rig.sbatch) == 1
     assert excluded(rig.sbatch[0][0]) == ["node01,node02", "node01,node02"]  # each component, the other's nodes only
     assert rig.state()["sandbox"]["node"] not in rig.state()["allocation"]["nodes"]
+
+
+def test_o57_a_services_job_whose_id_was_reused_during_the_agents_wait_is_never_cancelled(hpc, tmp_path, site):
+    """O57: the services' job is read when it runs, and the agent's job queues after that. Every held job is read again
+    once both run, so a services' job id that now carries another name (it ended, Slurm reused its id) is found there:
+    it is named and never cancelled, and the agent's own job is."""
+    fake = FakeSlurm(nodes=POOL, shared_nodes=True)
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    real = fake.run
+
+    def reused(argv, timeout):
+        if argv[0] == "sbatch" and len(rig.sbatch) == 1:  # the agent's job is being submitted: its wait begins
+            fake.component_recorded[(SERVICES, 0)] = {"JobName": "somebody-elses-analysis"}
+        return real(argv, timeout)
+
+    fake.run = reused
+    with pytest.raises(hpc.slurm.SlurmError, match="carries another job's name") as refused:
+        rig.up()
+    assert fake.cancelled == [AGENT]
+    assert f"job(s) {SERVICES} carry another job's name and were not cancelled" in str(refused.value)

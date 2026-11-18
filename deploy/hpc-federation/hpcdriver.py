@@ -436,7 +436,9 @@ class Driver(Down):
         while the agent's job queues, which the queue bound (`HPC_QUEUE_WAIT_S`) limits. With `HPC_EXCLUSIVE_NODES=1`
         both jobs hold whole nodes that no other job shares, so exclusivity already keeps the agent off the services'
         nodes: the two are submitted together, as they were, and wait together. A heterogeneous job (`het`) is one
-        job, whose components Slurm gives nodes of their own: unchanged."""
+        job, whose components Slurm gives nodes of their own: unchanged. Every held job is read back once more when
+        all of them run, as it always was: a services' job that ended during the agent's wait, and whose id Slurm
+        reused, is found then (`Slurm.checked`), not placed from a record the wait made stale."""
         asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
         if site.exclusive_nodes:
             self.say("HPC_EXCLUSIVE_NODES=1: every held job asks for whole nodes (--exclusive), and is read back as "
@@ -456,7 +458,7 @@ class Driver(Down):
                          f"node(s) and the {len(excluded)} of other live federations")  # fmt: skip
                 self.submit(agent, "sandbox", held)
                 self.wait_held(held[1:])
-                records += self.running_records(held[1:])
+                records = self.running_records(held)  # every held job once more: the first record is as old as the wait
             placed = self.placed_nodes(records)
             self.keep_off_other_federations([job for job, _ in held], placed)
             self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
