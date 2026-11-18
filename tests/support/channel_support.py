@@ -100,7 +100,7 @@ def complete(
     *,
     state: str = "done",
     charged: int = 0,
-    spend_usd: float = 0.25,
+    spend_micro_usd: int = 250_000,
     archive: bytes | None = None,
     sha256: str | None = None,
 ) -> str:
@@ -120,7 +120,7 @@ def complete(
             "archive_sha256": claimed,
             "state": state,
             "charged": charged,
-            "spend_usd": spend_usd,
+            "spend_micro_usd": spend_micro_usd,
         },
     )
     return claimed
@@ -180,9 +180,10 @@ def outcome_of(**fields: Any) -> Callable[[Path, Any], Outcome]:
     """A store reading that says the given things (a run done in one attempt, which no limit counts, by default)."""
     values = {
         "attempts": 1,
+        "attempts_started": 1,
         "charged": 0,
         "state": "done",
-        "spend_usd": 0.5,
+        "spend_micro_usd": 500_000,
         "spend_known": True,
     }
     values.update(fields)

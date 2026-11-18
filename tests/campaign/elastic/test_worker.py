@@ -96,7 +96,8 @@ def test_c43_the_worker_runs_its_leases_one_at_a_time_in_lease_order_and_beats_w
     archive = channel / ch.ARCHIVES / ch.archive_name(5)
     assert done["archive_sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
     assert (done["lease_id"], done["run_key"], done["federation"]) == (5, a_lease(5).run_key, LABEL)
-    assert (done["state"], done["attempts"], done["charged"], done["spend_usd"]) == ("done", 1, 0, 0.5)
+    assert (done["state"], done["attempts"], done["attempts_started"], done["charged"]) == ("done", 1, 1, 0)
+    assert (done["spend_micro_usd"], done["spend_usd"]) == (500_000, 0.5)
     assert done["store"].endswith("lease-000000000005/study/out")
     with tarfile.open(archive) as tar:
         assert "out/state.sqlite" in tar.getnames()
@@ -152,16 +153,16 @@ def test_c43_a_second_worker_does_not_start_on_a_channel_where_a_lease_runs(tmp_
 def test_c43_a_lease_that_began_no_attempt_is_returned_with_what_its_store_spent(tmp_path):
     """C43: a lease held before any attempt (a grant below the reservation, a closed gate) is returned with the
     store's spend, and one the kernel refused before making a store is returned with nothing spent."""
-    worker, channel = worker_on(tmp_path, outcome=outcome_of(attempts=0, charged=0, state=None, spend_usd=0.02))
+    worker, channel = worker_on(tmp_path, outcome=outcome_of(attempts=0, charged=0, state=None, spend_micro_usd=20_000))
     deliver(channel, a_lease(1))
     assert worker.step() == "returned"
     returned = outbox(channel, ch.return_name(1))
-    assert (returned["lease_id"], returned["spend_usd"], returned["run_key"]) == (1, 0.02, a_lease(1).run_key)
+    assert (returned["lease_id"], returned["spend_micro_usd"], returned["run_key"]) == (1, 20_000, a_lease(1).run_key)
     assert outbox(channel, ch.completion_name(1)) is None
     worker.outcome = lambda study, lease: None
     deliver(channel, a_lease(2))
     assert worker.step() == "returned"
-    assert outbox(channel, ch.return_name(2))["spend_usd"] == 0.0
+    assert outbox(channel, ch.return_name(2))["spend_micro_usd"] == 0
 
 
 def test_c43_a_run_that_ends_with_an_attempt_still_running_stops_the_worker_unreported(tmp_path):
@@ -278,9 +279,15 @@ def test_c43_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kerne
     assert ledger.run(lease.run_key).state == "done"
     completion = json.loads((channel_of(site, LABEL) / ch.OUTBOX / ch.completion_name(lease.lease_id)).read_text())
     # A done attempt counts against no attempt limit (`attempts.classify`): one attempt, none charged.
-    assert (completion["state"], completion["attempts"], completion["charged"]) == ("done", 1, 0)
+    assert (completion["state"], completion["attempts"], completion["attempts_started"], completion["charged"]) == (
+        "done",
+        1,
+        1,
+        0,
+    )
     assert completion["spend_known"]
-    assert 0 < completion["spend_usd"] <= 5.0
+    assert 0 < completion["spend_micro_usd"] <= 5_000_000
+    assert ledger.lease(lease.lease_id).charge_micro == completion["spend_micro_usd"]
     assert ledger.lease(lease.lease_id).charge_micro > 0
     assert_invariants(ledger)
 

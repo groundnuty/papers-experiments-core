@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from expcore.campaign.elastic import channel as ch
+from expcore.campaign.elastic.config import usd_of
 from expcore.campaign.elastic.exchange import FORMAT
 from expcore.campaign.elastic.ledger import Ledger
 from expcore.campaign.elastic.records import Completion, Lease, LedgerError, Return, SiteReading
@@ -219,7 +220,7 @@ class Dispatcher:
                         lease_id=lease.lease_id,
                         state=record.get("state"),
                         charged=record.get("charged"),
-                        spend_usd=record.get("spend_usd"),
+                        spend_usd=_spend_usd(record),
                         archive_sha256=record.get("archive_sha256"),
                     )
                 except (TypeError, ValueError) as error:
@@ -238,7 +239,7 @@ class Dispatcher:
                 if lease is None or record.get("run_key") != lease.run_key or lease.state not in _RETURNABLE:
                     continue
                 try:
-                    returns.append(Return(lease_id=lease.lease_id, spend_usd=record.get("spend_usd")))
+                    returns.append(Return(lease_id=lease.lease_id, spend_usd=_spend_usd(record)))
                 except (TypeError, ValueError) as error:
                     done.dropped.append(f"{label}: return of lease {lease.lease_id}: {error}")
         for note in done.dropped:
@@ -303,6 +304,14 @@ def _answers(reply: Mapping[str, Any], site: Site, request: Mapping[str, Any]) -
             raise Unreachable(f"site {site.name}: federation {label}'s outbox is not of the reply's form")
         out[label] = answer
     return out
+
+
+def _spend_usd(record: Mapping[str, Any]) -> float:
+    """A file's spend, from its whole micro-dollars (what the ledger charges); ValueError for any other form."""
+    micro = record.get("spend_micro_usd")
+    if isinstance(micro, bool) or not isinstance(micro, int) or micro < 0:
+        raise ValueError(f"spend_micro_usd is a whole number of micro-dollars from 0, not {micro!r}")
+    return usd_of(micro)
 
 
 def _sha256(path: Path) -> str:

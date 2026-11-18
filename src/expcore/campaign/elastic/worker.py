@@ -14,11 +14,12 @@ channel's inbox (`elastic.channel`) by listing it, and for each lease, in lease-
    while the run lives.
 3. **Reports it.** From the lease store (never from the exit status): with at least one attempt, the store's `out/` is
    archived to `archives/lease-<id>.out.tar` and a completion names the lease, its run, the store, the archive's
-   SHA-256, the last attempt's state, this store's attempts and charged attempts (the lease's base not included) and
-   its spend as the budget gate counts it (`selection_ledger.spend_of`; the grant, its
-   bound, when that is unknown). A lease that began no attempt (refused by the kernel, or held before any attempt) is
-   returned, with what its store spent. A run that ended with an attempt still `running` is reported by neither: the
-   worker stops with `running.json` in place, so no other lease runs here, and the ledger expires the lease.
+   SHA-256, the last attempt's state, this store's attempts, the highest attempt number it used and its charged attempts
+   (the lease's base not included), and its spend as the budget gate counts it (`selection_ledger.spend_of`), in
+   micro-dollars rounded up (the grant, its bound, when that is unknown). A lease that began no attempt (refused by the
+   kernel, or held before any attempt) is returned, with what its store spent. A run that ended with an attempt still
+   `running` is reported by neither: the worker stops with `running.json` in place, so no other lease runs here, and the
+   ledger expires the lease.
 4. Waits for the next. After a drain (`inbox/drain.json`, the login watchdog's), it returns any lease not yet taken,
    writes `outbox/exited.json` and stops.
 
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from expcore.campaign.elastic import channel as ch
+from expcore.campaign.elastic.config import micro_up, usd_of
 from expcore.campaign.run_lease import LeaseError, RunLease, read_lease
 
 BEAT_S = 30.0
@@ -101,13 +103,14 @@ class ProcessRunner:
 
 @dataclass(frozen=True)
 class Outcome:
-    """What a lease store says: its attempts, their charged ones, the last one's state and the spend (`spend_known`:
-    False when it is the grant, the bound)."""
+    """What a lease store says: its attempts, the highest attempt number it used, its charged attempts, the last one's
+    state and the spend in whole micro-dollars, rounded up (`spend_known`: False when it is the grant, the bound)."""
 
     attempts: int
+    attempts_started: int
     charged: int
     state: str | None
-    spend_usd: float
+    spend_micro_usd: int
     spend_known: bool
 
 
@@ -119,16 +122,17 @@ def store_outcome(study: Path, lease: RunLease) -> Outcome | None:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
-        rows = connection.execute("SELECT state, charged FROM attempts ORDER BY id").fetchall()
+        rows = connection.execute("SELECT attempt, state, charged FROM attempts ORDER BY id").fetchall()
         spend = _spend(study, lambda sql, args=(): connection.execute(sql, args).fetchall())
     finally:
         connection.close()
     known = spend is not None
     return Outcome(
         attempts=len(rows),
+        attempts_started=max((int(row["attempt"]) for row in rows), default=0),
         charged=sum(int(row["charged"]) for row in rows),
         state=rows[-1]["state"] if rows else None,
-        spend_usd=spend if known else lease.grant_usd,
+        spend_micro_usd=micro_up(spend) if spend is not None else lease.grant_micro_usd,
         spend_known=known,
     )
 
@@ -268,7 +272,7 @@ class Worker:
             return "busy"
         ch.write_json(self._state, {"format": STATE_FORMAT, "federation": self.label, "last_lease_id": lease_id})
         if drain:
-            self._return(lease_id, record["lease"].get("run_key"), 0.0, "draining", None)
+            self._return(lease_id, record["lease"].get("run_key"), 0, "draining", None)
             self._running.unlink()
             return "returned"
         result = self._run(lease_id, record["lease"])
@@ -291,7 +295,7 @@ class Worker:
         except OSError as error:
             print(f"worker {self.label}: lease {lease_id}'s beat {counter} was not written: {error}", file=sys.stderr)
 
-    def _return(self, lease_id: int, run_key: Any, spend: float, reason: str, status: int | None) -> None:
+    def _return(self, lease_id: int, run_key: Any, spend: int, reason: str, status: int | None) -> None:
         ch.write_json(
             self.outbox / ch.return_name(lease_id),
             {
@@ -299,7 +303,8 @@ class Worker:
                 "federation": self.label,
                 "lease_id": lease_id,
                 "run_key": run_key,
-                "spend_usd": spend,
+                "spend_micro_usd": spend,
+                "spend_usd": usd_of(spend),
                 "reason": reason,
                 "exit_status": status,
             },
@@ -316,7 +321,7 @@ class Worker:
         try:
             lease = read_lease(lease_file)
         except LeaseError as error:
-            self._return(lease_id, kernel.get("run_key"), 0.0, f"refused: {error}", None)
+            self._return(lease_id, kernel.get("run_key"), 0, f"refused: {error}", None)
             return "returned"
         copy = place / "study"
         top = self.study.resolve()
@@ -327,7 +332,7 @@ class Worker:
             self._beat(lease_id, counter)
         found = self.outcome(copy, lease)
         if found is None or found.attempts == 0:
-            spend = 0.0 if found is None else found.spend_usd
+            spend = 0 if found is None else found.spend_micro_usd
             self._return(lease_id, lease.run_key, spend, "no attempt began", status)
             return "returned"
         if found.state not in ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded"):
@@ -350,7 +355,9 @@ class Worker:
                 "state": found.state,
                 "charged": found.charged,
                 "attempts": found.attempts,
-                "spend_usd": found.spend_usd,
+                "attempts_started": found.attempts_started,
+                "spend_micro_usd": found.spend_micro_usd,
+                "spend_usd": usd_of(found.spend_micro_usd),
                 "spend_known": found.spend_known,
                 "exit_status": status,
             },

@@ -181,7 +181,7 @@ def test_c43_a_partition_expires_a_sites_leases_after_site_out_and_the_late_comp
     second = next(lease for lease in ledger.leases() if lease.federation == "fed-b")
     assert (second.run_key, second.state) == (first.run_key, "sent")
     complete(site_a, "fed-a", first)
-    complete(site_b, "fed-b", second, spend_usd=0.5)
+    complete(site_b, "fed-b", second, spend_micro_usd=500_000)
     ssh.down.clear()
     ticks(dispatch, clock, 2)
     assert ledger.lease(first.lease_id).state == "superseded"
@@ -194,12 +194,13 @@ def test_c43_a_partition_expires_a_sites_leases_after_site_out_and_the_late_comp
 
 def test_c43_a_completion_read_on_every_tick_counts_once_and_its_pulled_archive_settles_the_run(tmp_path):
     """C43: the completion file stays in the outbox and is read every tick; the ledger reads it once, its archive is
-    pulled and hashed, and the run is done once, its spend measured."""
+    pulled and hashed, and the run is done once, charged the micro-dollars the file names."""
     ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
-    complete(site, "fed-1", lease, spend_usd=0.25)
+    complete(site, "fed-1", lease, spend_micro_usd=250_001)
     ticks(dispatch, clock, 3)
     assert ledger.lease(lease.lease_id).state == "counted"
     assert ledger.run(lease.run_key).state == "done"
+    assert ledger.lease(lease.lease_id).charge_micro == 250_001  # the file's micro-dollars, exactly
     assert [event["kind"] for event in ledger.events()].count("report") == 1
     pulls = [remote for _, remote in ssh.calls if remote[0] == "cat"]
     assert len(pulls) == 1
@@ -228,7 +229,7 @@ def test_c43_a_file_in_one_federations_outbox_naming_anothers_lease_is_never_rea
             "archive_sha256": "0" * 64,
             "state": "done",
             "charged": 1,
-            "spend_usd": 0.1,
+            "spend_micro_usd": 100_000,
         },
     )
     beat(site, "fed-2", lease.lease_id, 9)
