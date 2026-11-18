@@ -342,6 +342,7 @@ class Allocation:
     exclude: Tuple[
         str, ...
     ] = ()  # the nodes of other federations' live jobs (hpcexclude): each component's `--exclude`
+    exclusive: bool = False  # `--exclusive` on every component (HPC_EXCLUSIVE_NODES): no other job shares its nodes
 
     def shapes(self) -> Tuple[Shape, ...]:
         """Every component's shape, component 0 first."""
@@ -352,10 +353,12 @@ class Allocation:
         propagates no partition, nodes or cores to it, and the read-back checks what it recorded) with its own nodes,
         cores and memory; `--wrap` stands once, in component 0's options, as sbatch builds the script once. `--exclude`
         names the same nodes in every component, so that nothing depends on Slurm passing it on, and only when there
-        are nodes to name: without them the argv is what it was before the option existed."""
+        are nodes to name: without them the argv is what it was before the option existed. `--exclusive` follows the
+        memory of every component, likewise only when asked (Slurm propagates it to no component)."""
         if not all(NODE.fullmatch(node) for node in self.exclude):
             raise SlurmError("an excluded node's name is not one an sbatch argv may carry")
         exclude = [f"--exclude={','.join(self.exclude)}"] if self.exclude else []
+        whole = ["--exclusive"] if self.exclusive else []
         argv = [
             "sbatch",
             "--parsable",
@@ -368,6 +371,7 @@ class Allocation:
             "--ntasks-per-node=1",
             f"--cpus-per-task={self.cpus_per_node}",
             f"--mem={self.memory_mib}M",
+            *whole,
             *exclude,
             "--chdir=/",
             "--output=/dev/null",
@@ -384,6 +388,7 @@ class Allocation:
                 "--ntasks-per-node=1",
                 f"--cpus-per-task={shape.cpus_per_node}",
                 f"--mem={shape.memory_mib}M",
+                *whole,
                 *exclude,
             ]
         return argv
@@ -518,6 +523,9 @@ def mismatches(recorded: Mapping[str, str], asked: Allocation, shape: Optional[S
     """The fields of the held job (or of one of its components, `shape`) Slurm recorded otherwise than asked, by name;
     empty when it is what was asked."""
     shape = shape or asked.shapes()[0]
+    cores = _count(recorded.get("NumCPUs", ""))
+    if asked.exclusive and cores is not None and cores >= shape.nodes * shape.cpus_per_node:
+        cores = shape.nodes * shape.cpus_per_node  # an exclusive job holds every core of its nodes, and Slurm says so
     wanted = {
         "JobName": (recorded.get("JobName"), asked.name),
         "TimeLimit": (limit_seconds(recorded.get("TimeLimit", "")), asked.time_s),
@@ -525,10 +533,13 @@ def mismatches(recorded: Mapping[str, str], asked: Allocation, shape: Optional[S
         "Account": ((recorded.get("Account") or "").lower(), asked.account.lower()),
         "Partition": (recorded.get("Partition"), asked.partition),
         "NumNodes": (_count(recorded.get("NumNodes", "")), shape.nodes),
-        "NumCPUs": (_count(recorded.get("NumCPUs", "")), shape.nodes * shape.cpus_per_node),
+        "NumCPUs": (cores, shape.nodes * shape.cpus_per_node),
         "MinMemoryNode": (memory_mib(recorded.get("MinMemoryNode", "")), shape.memory_mib),
     }
-    return [field for field in READBACK if wanted[field][0] != wanted[field][1]]
+    wrong = [field for field in READBACK if wanted[field][0] != wanted[field][1]]
+    if asked.exclusive and recorded.get("OverSubscribe") != "NO":  # read only when asked: not a READBACK field
+        wrong.append("OverSubscribe")
+    return wrong
 
 
 def component_mismatches(records: Sequence[Mapping[str, str]], asked: Allocation, job: str) -> List[str]:

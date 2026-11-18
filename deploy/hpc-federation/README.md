@@ -225,13 +225,26 @@ its business, whatever it runs. It never reads or prints a node's name into a me
   cancels the other held job too, still queued or running, by its own id and only if it still carries the name `up`
   gave it (Slurm reuses ids: a job of another name is never cancelled), and the failure says which were released. A cancel that fails, or a record that
   cannot be read, is named in the failure, and `down` releases it.
+- **So does every other failure before the federation is up.** From the first sbatch to the end of the placement, any
+  failure releases every held job of that `up` that has not ended, by its own id, in the same words: a second sbatch
+  refused or read back otherwise than asked, the read-back of the running jobs, a job placed on a node another holds
+  (Slurm packs jobs that ask a few cores onto one node: live, five ups at once), the live read of other federations' jobs,
+  the recording of the placement. A first sbatch that fails has nothing to release.
+- **Whole nodes: `HPC_EXCLUSIVE_NODES=1`.** The held jobs ask 5 cores and some memory per node, so Slurm may place them
+  beside a job of another federation, or of anyone, and a pending job has no nodes for another `up` to exclude. With the
+  key every held job (the services', the agent's component under `het`, the agent's own under `separate`) is submitted
+  `--exclusive`, so no other job shares its nodes and parallel ups are safe. It bills whole nodes. The read-back
+  refuses a job whose `OverSubscribe` Slurm did not record as `NO`, as any other field recorded otherwise than asked, and
+  accepts a job with more cores than it asked, since an exclusive job holds every core of its nodes. The checks above
+  stay as the guard. Unset, `0` or empty changes nothing.
 
 In a fleet each member's `up` is its own, so each reads the members already up: with `HPC_FLEET_PARALLEL` at 1 (the
 default) every member takes nodes of its own. With more at once, two members that read before either has submitted can
 land on one node, and the later one is refused (reported as a failed member, nothing left held): bring it down and add
 another (`down --member fed-k`, `add 1`).
 
-`tests/deploy/test_hpc_queue_bound.py` runs the site's bound and the release of every held job of an `up` whose wait fails.
+`tests/deploy/test_hpc_queue_bound.py` runs the site's bound, the release of every held job of an `up` that fails before the
+federation is up, and `HPC_EXCLUSIVE_NODES`.
 `tests/deploy/test_hpc_distinct_nodes.py` runs both reads against the fake Slurm (a live federation's nodes excluded
 from each component and job, an unreadable `squeue` refusing, a race refused before any step with the roles named and
 the jobs released, the queue bound's reason) and a fleet of three members on one shared pool. Not run live: what the
@@ -302,6 +315,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `HPC_GATEPORT`, `HPC_GATEPORT_SHA256` | optional: the 443 mapper (`bundle/gateport.c`, built for the agent's SIF) and its SHA-256, read only for a template that names it (`layouts/pilot-shape-rest.toml`); both or neither |
 | `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's interpreter and venv, the pinned clone, the frozen manifests and its data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it. `up` also digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
 | `HPC_QUEUE_WAIT_S` | optional: the seconds `up` waits for a held job to start before it cancels it, 1800 when unset (a queue that keeps a job pending for hours needs more): a whole number from 600 to 86400, else `up` and `describe` refuse, naming the key. `down` never reads it |
+| `HPC_EXCLUSIVE_NODES` | optional: `1` submits every held job `--exclusive`, so no other job shares its nodes and several ups at once are safe; it bills whole nodes. `0` or unset (the default) asks what it always did. Anything else refuses `up`, naming the key. `down` and `describe` never read it, and it is not recorded in the state file |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository. The optional keys of the driver, the agent's sandbox and the study's artifacts are in `site.env.example`; the four of the next
@@ -773,7 +787,10 @@ section 3).
   never in the account's home: every Python the driver and `shards.py` launch takes `-I -B` and writes no bytecode,
   but the home is every job's and agent's of the account (live slot 5 found a node step's `.pyc` there). The bundle is this checkout's own, which must lie on a
   filesystem the nodes see. The first `python3.11` on `HPC_STEP_PATH` must be the node's own, not a uv-installed one:
-  the bundle's `supervise.py` needs `os.pidfd_open`.
+  the bundle's `supervise.py` needs `os.pidfd_open`. A node whose kernel has no `pidfd_open` call (before Linux 5.3: it answers
+  ENOSYS) is supported by a start-tick fallback, which `supervise.py check` names (`mode: start-tick fallback`; the probe's
+  `pidfd` line records it) and whose one remaining window, between the last read of a process's start tick and the signal
+  sent to it, the docstring of `supervise.py` states.
 
 **What has not run, and what the first live slot checks first:** that the login node reaches the services' 8443 (or,
 with `[hpc] core = "step"`, that the core's Python from a venv on the shared filesystem runs on a node); the two
