@@ -258,14 +258,14 @@ def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optio
     return locate
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Optional[Sequence[str]] = None, runner: Callable[..., Any] = subprocess.run) -> int:
     """`read`: this login node's `read_identity` as one JSON line, for the controller of an ssh site."""
     found = argparse.ArgumentParser(prog="fleetidentity.py", description=__doc__.split("\n\n")[0])
     found.add_argument("command", choices=("read",))
     for key in ("fleet", "member", "settings"):
         found.add_argument(f"--{key}", required=True)
     args = found.parse_args(argv)
-    got = read_identity(Path(args.fleet), args.member, Path(args.settings))
+    got = read_identity(Path(args.fleet), args.member, Path(args.settings), runner)
     if got is None:
         return 1
     print(json.dumps({"fingerprint": got[0], "environment": dict(got[1])}, sort_keys=True))
