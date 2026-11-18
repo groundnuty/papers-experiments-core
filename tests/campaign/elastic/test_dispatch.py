@@ -414,3 +414,25 @@ def test_c43_a_reply_missing_part_of_an_answer_is_no_reading_and_never_a_crash(t
     clock.advance(TICK_S)
     assert not dispatch.tick()[SITE].read
     assert ledger.lease(lease.lease_id).counter is None
+
+
+def test_c43_a_cached_archive_that_cannot_be_read_falls_back_to_the_sites_copy(tmp_path, monkeypatch):
+    """C43: a local archive left by an earlier pull that this host cannot read is passed over, never a crash of the
+    tick: the site's copy is pulled and settles the lease."""
+    from expcore.campaign.elastic import dispatch as module
+
+    ledger, clock, _ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
+    complete(site, "fed-1", lease)
+    local = tmp_path / "out" / "leases" / ch.archive_name(lease.lease_id)
+    local.parent.mkdir(parents=True)
+    local.write_bytes(b"left by an earlier pull")
+    real = module._sha256
+
+    def sha256(path):
+        if path == local:
+            raise PermissionError(13, "Permission denied")
+        return real(path)
+
+    monkeypatch.setattr(module, "_sha256", sha256)
+    ticks(dispatch, clock, 1)
+    assert ledger.lease(lease.lease_id).state == "counted"

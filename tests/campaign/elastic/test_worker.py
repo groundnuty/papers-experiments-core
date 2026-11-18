@@ -366,3 +366,24 @@ def test_c43_relative_directories_are_taken_as_absolute_and_a_work_directory_ins
     )
     with pytest.raises(WorkerError):
         inside.open()
+
+
+def test_c43_a_take_whose_state_landed_before_its_fsync_failed_still_runs_the_lease(tmp_path, monkeypatch):
+    """C43: the state's rename landed and the fsync of its directory failed: the state shows the lease as taken, so
+    the worker runs it (a later poll would pass it over as taken), and its completion is written."""
+    runner = FakeRunner()
+    worker, channel = worker_on(tmp_path, runner)
+    deliver(channel, a_lease(1))
+    real, failed = ch.fsync_dir, []
+
+    def fsync_dir(directory):
+        if directory == channel / ch.WORKER and (directory / "state.json").exists() and not failed:
+            failed.append(directory)
+            raise OSError(5, "Input/output error")
+        return real(directory)
+
+    monkeypatch.setattr(ch, "fsync_dir", fsync_dir)
+    assert worker.step() == "ran"
+    assert failed
+    assert runner.started == [1]
+    assert outbox(channel, ch.completion_name(1))["state"] == "done"

@@ -276,16 +276,13 @@ class Worker:
             return "busy"
         try:
             taken = lease_id <= self.last() or self._ended(lease_id)  # another worker took it since the look
-            if not taken:
-                ch.write_json(
-                    self._state, {"format": STATE_FORMAT, "federation": self.label, "last_lease_id": lease_id}
-                )
         except OSError:
             self._running.unlink()  # nothing ran: the lease is looked at again at the next poll
             raise
         if taken:
             self._running.unlink()
             return "busy"
+        self._record_take(lease_id)
         if drain:
             self._return(lease_id, record["lease"].get("run_key"), 0, "draining", None)
             self._running.unlink()
@@ -293,6 +290,24 @@ class Worker:
         result = self._run(lease_id, record["lease"])
         self._running.unlink()
         return result
+
+    def _record_take(self, lease_id: int) -> None:
+        """Write the lease as the last taken. A write that fails may still have landed (its rename, before the fsync
+        of its directory): the lease is then taken and runs; when the state shows the earlier lease the take is undone
+        and the lease is looked at again; when the state cannot be read the worker stops, `running.json` in place."""
+        state = {"format": STATE_FORMAT, "federation": self.label, "last_lease_id": lease_id}
+        try:
+            ch.write_json(self._state, state)
+            return
+        except OSError as error:
+            failed = error
+        try:
+            shown = self.last()
+        except OSError as error:
+            raise WorkerError(f"lease {lease_id}: whether it was taken cannot be told: {error}") from failed
+        if shown != lease_id:
+            self._running.unlink()
+            raise failed
 
     def _beat(self, lease_id: int, counter: int) -> None:
         """Write the heartbeat; a write that fails is a beat missed, never the end of a run that still lives."""

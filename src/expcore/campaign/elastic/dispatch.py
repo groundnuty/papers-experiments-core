@@ -252,37 +252,47 @@ class Dispatcher:
         for lease_id, (label, wanted) in sorted(expected.items()):
             if self.ledger.lease(lease_id).state != "reported":
                 continue
-            remote = str(ch.federation_dir(site.root, label) / ch.ARCHIVES / ch.archive_name(lease_id))
-            self.archives.mkdir(parents=True, exist_ok=True)
-            local = self.archives / ch.archive_name(lease_id)
-            if local.is_file() and _sha256(local) == wanted:  # pulled before a restart, not yet settled
-                self._fetch_failures.pop(lease_id, None)
-                self.ledger.verify_archive(lease_id, wanted)
-                continue
-            draft = local.with_name(f".{local.name}.pull")
-            with contextlib.suppress(FileNotFoundError):
-                draft.unlink()
-            got: str | None = None
             try:
-                self.transport.fetch(site, remote, draft)
-                got = _sha256(draft)
-            except Unreachable as error:
-                _LOG.warning("lease %d's archive not pulled now: %s", lease_id, error)
-                continue
-            except Missing as error:
-                _LOG.warning("lease %d's archive: %s", lease_id, error)
-            if got == wanted:
-                os.replace(draft, local)
-                self._fetch_failures.pop(lease_id, None)
-                self.ledger.verify_archive(lease_id, got)
-                continue
-            with contextlib.suppress(FileNotFoundError):
-                draft.unlink()
-            tries = self._fetch_failures.get(lease_id, 0) + 1
-            self._fetch_failures[lease_id] = tries
-            if tries >= FETCH_TRIES:
-                self._fetch_failures.pop(lease_id, None)
-                self.ledger.verify_archive(lease_id, got)
+                self._pull_one(site, lease_id, label, wanted)
+            except OSError as error:  # this host's own disk: tried again next tick, never a try against the archive
+                _LOG.error("lease %d's archive could not be kept here: %s", lease_id, error)
+
+    def _pull_one(self, site: Site, lease_id: int, label: str, wanted: str) -> None:
+        remote = str(ch.federation_dir(site.root, label) / ch.ARCHIVES / ch.archive_name(lease_id))
+        self.archives.mkdir(parents=True, exist_ok=True)
+        local = self.archives / ch.archive_name(lease_id)
+        try:
+            cached = local.is_file() and _sha256(local) == wanted  # pulled before a restart, not yet settled
+        except OSError:
+            cached = False
+        if cached:
+            self._fetch_failures.pop(lease_id, None)
+            self.ledger.verify_archive(lease_id, wanted)
+            return
+        draft = local.with_name(f".{local.name}.pull")
+        with contextlib.suppress(FileNotFoundError):
+            draft.unlink()
+        got: str | None = None
+        try:
+            self.transport.fetch(site, remote, draft)
+            got = _sha256(draft)
+        except Unreachable as error:
+            _LOG.warning("lease %d's archive not pulled now: %s", lease_id, error)
+            return
+        except Missing as error:
+            _LOG.warning("lease %d's archive: %s", lease_id, error)
+        if got == wanted:
+            os.replace(draft, local)
+            self._fetch_failures.pop(lease_id, None)
+            self.ledger.verify_archive(lease_id, got)
+            return
+        with contextlib.suppress(FileNotFoundError):
+            draft.unlink()
+        tries = self._fetch_failures.get(lease_id, 0) + 1
+        self._fetch_failures[lease_id] = tries
+        if tries >= FETCH_TRIES:
+            self._fetch_failures.pop(lease_id, None)
+            self.ledger.verify_archive(lease_id, got)
 
 
 def _answers(reply: Mapping[str, Any], site: Site, request: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
