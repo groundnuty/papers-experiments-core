@@ -5,6 +5,7 @@ from elastic_support import (
     SITE,
     assert_invariants,
     completion,
+    finish,
     join,
     leased,
     ledger_path,
@@ -22,8 +23,8 @@ def _beat(ledger, lease, counter, site=SITE):
     ledger.observe_site(site, SiteReading(heartbeats={lease.lease_id: counter}))
 
 
-def test_c41_expiry_before_proof_requeues_the_run_at_once_but_holds_its_grant_and_cap_slot(tmp_path):
-    """C41: a stale heartbeat on a readable site expires the lease and puts its run back to pending at once; the cap
+def test_c42_expiry_before_proof_requeues_the_run_at_once_but_holds_its_grant_and_cap_slot(tmp_path):
+    """C42: a stale heartbeat on a readable site expires the lease and puts its run back to pending at once; the cap
     slot and the grant stay held, so the model at cap 1 waits until the holder is proven ended, and then the same
     run goes out again with the expired lease charged at its bound."""
     ledger, clock = make(tmp_path, **ONE_RUN, caps={"m1": 1}, max_usd=10.0, grants_usd={"m1": 2.0})
@@ -49,8 +50,8 @@ def test_c41_expiry_before_proof_requeues_the_run_at_once_but_holds_its_grant_an
     assert_invariants(ledger)
 
 
-def test_c41_an_advancing_counter_renews_the_lease(tmp_path):
-    """C41: a counter that advances at every read keeps its lease, however long the run takes within its term."""
+def test_c42_an_advancing_counter_renews_the_lease(tmp_path):
+    """C42: a counter that advances at every read keeps its lease, however long the run takes within its term."""
     ledger, clock = make(tmp_path)
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -60,8 +61,8 @@ def test_c41_an_advancing_counter_renews_the_lease(tmp_path):
     assert ledger.lease(lease.lease_id).state == "issued"
 
 
-def test_c41_a_counter_that_stops_expires_its_lease_only_after_five_minutes_of_reads(tmp_path):
-    """C41: a counter read unchanged for less than 5 minutes keeps the lease; at 5 minutes it expires."""
+def test_c42_a_counter_that_stops_expires_its_lease_only_after_five_minutes_of_reads(tmp_path):
+    """C42: a counter read unchanged for less than 5 minutes keeps the lease; at 5 minutes it expires."""
     ledger, clock = make(tmp_path)
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -74,8 +75,8 @@ def test_c41_a_counter_that_stops_expires_its_lease_only_after_five_minutes_of_r
     assert ledger.lease(lease.lease_id).state == "expired"
 
 
-def test_c41_a_lease_past_its_hard_term_expires_though_it_still_beats(tmp_path):
-    """C41: a hung kernel can keep its heartbeat thread alive, so the hard term expires a lease that still beats."""
+def test_c42_a_lease_past_its_hard_term_expires_though_it_still_beats(tmp_path):
+    """C42: a hung kernel can keep its heartbeat thread alive, so the hard term expires a lease that still beats."""
     ledger, clock = make(tmp_path, hard_term_s=600.0)
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -85,8 +86,8 @@ def test_c41_a_lease_past_its_hard_term_expires_though_it_still_beats(tmp_path):
     assert ledger.lease(lease.lease_id).state == "expired"
 
 
-def test_c41_a_completion_in_the_same_reading_is_collected_before_the_lease_can_expire(tmp_path):
-    """C41: collect before requeue: a reading that carries the completion of a lease gone stale counts it."""
+def test_c42_a_completion_in_the_same_reading_is_collected_before_the_lease_can_expire(tmp_path):
+    """C42: collect before requeue: a reading that carries the completion of a lease gone stale counts it."""
     ledger, clock = make(tmp_path)
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -97,8 +98,9 @@ def test_c41_a_completion_in_the_same_reading_is_collected_before_the_lease_can_
     assert_invariants(ledger)
 
 
-def test_c41_the_recorded_job_end_plus_kill_wait_proves_the_holder_ended(tmp_path):
-    """C41: an expired lease is freed by the sweep once its job's recorded end plus KillWait has passed, not before."""
+def test_c42_the_recorded_job_end_plus_kill_wait_proves_the_holder_ended(tmp_path):
+    """C42: an expired lease is freed once its job's recorded end plus KillWait has passed and its site was read
+    since then (so a completion written before the end is collected first); not before."""
     ledger, clock = make(tmp_path, caps={"m1": 1})
     join(ledger, clock, "fed-1", job_end_in_s=1000.0, kill_wait_s=180.0)
     lease = leased(ledger, "fed-1")
@@ -106,17 +108,52 @@ def test_c41_the_recorded_job_end_plus_kill_wait_proves_the_holder_ended(tmp_pat
     ledger.observe_site(SITE, SiteReading())
     assert ledger.lease(lease.lease_id).state == "expired"
     clock.advance(779)  # 1179 s: one second short of the end plus KillWait
-    ledger.sweep()
+    ledger.observe_site(SITE, SiteReading())
     assert ledger.slots() == {"m1": 1}
     clock.advance(1)
     ledger.sweep()
+    assert ledger.slots() == {"m1": 1}  # the site was last read before the end plus KillWait
+    ledger.observe_site(SITE, SiteReading())
     assert ledger.slots() == {}
     assert ledger.lease(lease.lease_id).proven
     assert_invariants(ledger)
 
 
-def test_c41_a_federation_holding_an_expired_unproven_lease_gets_no_new_lease(tmp_path):
-    """C41: a federation whose last lease expired may be hung, so it waits until its job is proven ended."""
+def test_c42_a_job_that_ended_while_the_orchestrator_was_down_is_read_before_its_lease_is_given_up(tmp_path):
+    """C42: a job whose end plus KillWait passed during a restart keeps its live lease until its site is read: the
+    completion it left is collected and counts, rather than the run being leased again and its result superseded."""
+    ledger, clock = make(tmp_path)
+    join(ledger, clock, "fed-1", job_end_in_s=600.0, kill_wait_s=180.0)
+    lease = leased(ledger, "fed-1")
+    ledger.observe_site(SITE, SiteReading(heartbeats={lease.lease_id: 1}))
+    ledger.close()
+    clock.advance(1200)
+    ledger = Ledger.open(ledger_path(tmp_path), clock=clock)
+    ledger.sweep()
+    assert ledger.lease(lease.lease_id).state == "issued"
+    assert ledger.run(lease.run_key).state == "leased"
+    assert finish(ledger, lease) == "counted"
+    assert ledger.federations()[0].end_proof == "walltime"
+    assert_invariants(ledger)
+
+
+def test_c42_a_job_that_ended_unread_for_a_whole_site_outage_is_proven_by_its_time(tmp_path):
+    """C42: once a site is out, its jobs past their end plus KillWait are proven ended without a read."""
+    ledger, clock = make(tmp_path, caps={"m1": 1})
+    join(ledger, clock, "fed-1", job_end_in_s=100.0, kill_wait_s=180.0)
+    leased(ledger, "fed-1")
+    ledger.observe_site(SITE, SiteReading())
+    clock.advance(899)
+    ledger.sweep()
+    assert ledger.slots() == {"m1": 1}
+    clock.advance(1)
+    ledger.sweep()
+    assert ledger.slots() == {}
+    assert_invariants(ledger)
+
+
+def test_c42_a_federation_holding_an_expired_unproven_lease_gets_no_new_lease(tmp_path):
+    """C42: a federation whose last lease expired may be hung, so it waits until its job is proven ended."""
     ledger, clock = make(tmp_path)
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -128,8 +165,8 @@ def test_c41_a_federation_holding_an_expired_unproven_lease_gets_no_new_lease(tm
     assert "ended" in ledger.issue("fed-1").reason
 
 
-def test_c41_a_proof_of_end_settles_a_lease_still_live_on_its_federation(tmp_path):
-    """C41: a job proven ended while its lease is live expires that lease, frees its slot and charges its bound."""
+def test_c42_a_proof_of_end_settles_a_lease_still_live_on_its_federation(tmp_path):
+    """C42: a job proven ended while its lease is live expires that lease, frees its slot and charges its bound."""
     ledger, clock = make(tmp_path, max_usd=10.0, grants_usd={"m1": 1.0})
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -141,8 +178,8 @@ def test_c41_a_proof_of_end_settles_a_lease_still_live_on_its_federation(tmp_pat
     assert_invariants(ledger)
 
 
-def test_c41_an_unread_site_expires_nothing_until_it_is_marked_out(tmp_path):
-    """C41: leases on a site that cannot be read are unobserved; after 15 minutes unread the site is out and its
+def test_c42_an_unread_site_expires_nothing_until_it_is_marked_out(tmp_path):
+    """C42: leases on a site that cannot be read are unobserved; after 15 minutes unread the site is out and its
     leases expire, their grants and slots held until each job is proven ended."""
     ledger, clock = make(tmp_path, caps={"m1": 2})
     join(ledger, clock, "fed-1")
@@ -159,8 +196,8 @@ def test_c41_an_unread_site_expires_nothing_until_it_is_marked_out(tmp_path):
     assert_invariants(ledger)
 
 
-def test_c41_a_restart_reloads_every_lease_and_expires_none_until_its_site_is_read(tmp_path):
-    """C41: the ledger is reopened from its file after the orchestrator was down 20 minutes. Leases, grants and slots
+def test_c42_a_restart_reloads_every_lease_and_expires_none_until_its_site_is_read(tmp_path):
+    """C42: the ledger is reopened from its file after the orchestrator was down 20 minutes. Leases, grants and slots
     come back; nothing expires on a site not yet read since the reopen, and the site's 15 minutes start then. A read
     expires the lease whose counter stood still and renews the one that advanced."""
     ledger, clock = make(tmp_path, max_usd=10.0, grants_usd={"m1": 1.0})
@@ -183,8 +220,8 @@ def test_c41_a_restart_reloads_every_lease_and_expires_none_until_its_site_is_re
     assert_invariants(ledger)
 
 
-def test_c41_a_second_process_cannot_open_the_ledger(tmp_path):
-    """C41: the ledger holds one dispatcher lock; a second open while it is held is refused."""
+def test_c42_a_second_process_cannot_open_the_ledger(tmp_path):
+    """C42: the ledger holds one dispatcher lock; a second open while it is held is refused."""
     ledger, clock = make(tmp_path)
     with pytest.raises(CampaignLocked):
         Ledger.open(ledger_path(tmp_path), clock=clock)

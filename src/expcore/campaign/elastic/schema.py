@@ -1,5 +1,5 @@
 # Provenance: new
-"""The elastic ledger's SQLite file: its tables, and how it is created whole and opened (C41).
+"""The elastic ledger's SQLite file: its tables, and how it is created whole and opened (C42).
 
 It follows the store's durability rules (`campaign.store`): WAL, synchronous=FULL, foreign keys on, every change in
 one BEGIN IMMEDIATE transaction. A new ledger is written under a temporary name in one transaction, synced, and renamed

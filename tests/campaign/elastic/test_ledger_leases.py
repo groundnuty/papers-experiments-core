@@ -27,8 +27,8 @@ def _expire(ledger, clock, lease, site=SITE):
     assert ledger.lease(lease.lease_id).state == "expired"
 
 
-def test_c41_a_lease_names_its_run_fingerprint_attempt_base_grant_and_hard_term(tmp_path):
-    """C41: an issued lease carries what its node needs and is `issued` until its file is out, then `sent`."""
+def test_c42_a_lease_names_its_run_fingerprint_attempt_base_grant_and_hard_term(tmp_path):
+    """C42: an issued lease carries what its node needs and is `issued` until its file is out, then `sent`."""
     ledger, clock = make(tmp_path, max_usd=10.0, grants_usd={"m1": 1.5})
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -43,8 +43,8 @@ def test_c41_a_lease_names_its_run_fingerprint_attempt_base_grant_and_hard_term(
     assert_invariants(ledger)
 
 
-def test_c41_a_run_is_never_leased_twice_at_once(tmp_path):
-    """C41: with one run and two idle federations, the second federation waits."""
+def test_c42_a_run_is_never_leased_twice_at_once(tmp_path):
+    """C42: with one run and two idle federations, the second federation waits."""
     ledger, clock = make(tmp_path, runs=plan(conditions=("api-none",), tasks=1))
     join(ledger, clock, "fed-1")
     join(ledger, clock, "fed-2")
@@ -53,8 +53,8 @@ def test_c41_a_run_is_never_leased_twice_at_once(tmp_path):
     assert_invariants(ledger)
 
 
-def test_c41_a_federation_gets_its_next_lease_once_its_last_is_completed(tmp_path):
-    """C41: a federation holding a lease waits; reading its completion frees it, before the archive is verified."""
+def test_c42_a_federation_gets_its_next_lease_once_its_last_is_completed(tmp_path):
+    """C42: a federation holding a lease waits; reading its completion frees it, before the archive is verified."""
     ledger, clock = make(tmp_path)
     join(ledger, clock, "fed-1")
     first = leased(ledger, "fed-1")
@@ -66,8 +66,8 @@ def test_c41_a_federation_gets_its_next_lease_once_its_last_is_completed(tmp_pat
 
 
 @pytest.mark.parametrize("first_to_report", ["old", "new"])
-def test_c41_a_duplicate_completion_counts_the_latest_lease_and_keeps_the_other_as_evidence(tmp_path, first_to_report):
-    """C41: a run leased again after its lease expired has two completions; the latest lease's counts whatever order
+def test_c42_a_duplicate_completion_counts_the_latest_lease_and_keeps_the_other_as_evidence(tmp_path, first_to_report):
+    """C42: a run leased again after its lease expired has two completions; the latest lease's counts whatever order
     they arrive in, and the other is superseded, its spend counted."""
     ledger, clock = make(tmp_path, runs=plan(tasks=1, conditions=("api-none",)), max_usd=10.0, grants_usd={"m1": 1.0})
     join(ledger, clock, "fed-1")
@@ -87,8 +87,8 @@ def test_c41_a_duplicate_completion_counts_the_latest_lease_and_keeps_the_other_
     assert_invariants(ledger)
 
 
-def test_c41_a_late_completion_of_the_latest_lease_still_counts_after_its_expiry(tmp_path):
-    """C41: fencing reads lease order only: an expired lease that is still its run's latest counts when it completes."""
+def test_c42_a_late_completion_of_the_latest_lease_still_counts_after_its_expiry(tmp_path):
+    """C42: fencing reads lease order only: an expired lease that is still its run's latest counts when it completes."""
     ledger, clock = make(tmp_path, runs=plan(tasks=1, conditions=("api-none",)))
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -99,8 +99,8 @@ def test_c41_a_late_completion_of_the_latest_lease_still_counts_after_its_expiry
     assert_invariants(ledger)
 
 
-def test_c41_the_same_completion_read_twice_changes_nothing(tmp_path):
-    """C41: a restart reads the results directories again; the same completion again adds no event and no spend."""
+def test_c42_the_same_completion_read_twice_changes_nothing(tmp_path):
+    """C42: a restart reads the results directories again; the same completion again adds no event and no spend."""
     ledger, clock = make(tmp_path, max_usd=10.0, grants_usd={"m1": 1.0})
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -111,8 +111,8 @@ def test_c41_the_same_completion_read_twice_changes_nothing(tmp_path):
     assert_invariants(ledger)
 
 
-def test_c41_a_second_completion_of_one_lease_with_another_archive_is_refused(tmp_path):
-    """C41: two different completions of one lease are refused, naming the lease, and the reading changes nothing."""
+def test_c42_a_second_completion_of_one_lease_with_another_archive_is_refused(tmp_path):
+    """C42: two different completions of one lease are refused, naming the lease, and the reading changes nothing."""
     ledger, clock = make(tmp_path)
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -125,8 +125,8 @@ def test_c41_a_second_completion_of_one_lease_with_another_archive_is_refused(tm
     assert_invariants(ledger)
 
 
-def test_c41_a_returned_lease_puts_its_run_back_unstarted_and_uncharged(tmp_path):
-    """C41: a lease returned unstarted frees its federation and slot, charges what it spent, and keeps its attempt
+def test_c42_a_returned_lease_puts_its_run_back_unstarted_and_uncharged(tmp_path):
+    """C42: a lease returned unstarted frees its federation and slot, charges what it spent, and keeps its attempt
     base: the run's next lease starts from the same one."""
     ledger, clock = make(tmp_path, runs=plan(tasks=1, conditions=("api-none",)), max_usd=10.0, grants_usd={"m1": 1.0})
     join(ledger, clock, "fed-1")
@@ -140,8 +140,8 @@ def test_c41_a_returned_lease_puts_its_run_back_unstarted_and_uncharged(tmp_path
     assert_invariants(ledger)
 
 
-def test_c41_a_lease_whose_file_never_landed_is_cancelled_and_only_while_issued(tmp_path):
-    """C41: an issued lease is cancelled with nothing charged and its run pending; a sent one cannot be cancelled."""
+def test_c42_a_lease_whose_file_never_landed_is_cancelled_and_only_while_issued(tmp_path):
+    """C42: an issued lease is cancelled with nothing charged and its run pending; a sent one cannot be cancelled."""
     ledger, clock = make(tmp_path, max_usd=10.0, grants_usd={"m1": 1.0})
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -155,8 +155,8 @@ def test_c41_a_lease_whose_file_never_landed_is_cancelled_and_only_while_issued(
     assert_invariants(ledger)
 
 
-def test_c41_an_archive_that_never_verifies_is_a_lost_lease_charged_at_its_bound(tmp_path):
-    """C41: a completion whose archive does not verify is lost: the run goes back to pending and the grant stays
+def test_c42_an_archive_that_never_verifies_is_a_lost_lease_charged_at_its_bound(tmp_path):
+    """C42: a completion whose archive does not verify is lost: the run goes back to pending and the grant stays
     charged, never the completion's measured spend."""
     ledger, clock = make(tmp_path, max_usd=10.0, grants_usd={"m1": 1.0})
     join(ledger, clock, "fed-1")
@@ -169,8 +169,8 @@ def test_c41_an_archive_that_never_verifies_is_a_lost_lease_charged_at_its_bound
     assert_invariants(ledger)
 
 
-def test_c41_the_status_rule_runs_across_leases(tmp_path):
-    """C41: a counted infrastructure failure under the attempt limit returns the run to pending with its charged
+def test_c42_the_status_rule_runs_across_leases(tmp_path):
+    """C42: a counted infrastructure failure under the attempt limit returns the run to pending with its charged
     attempts as the next lease's base; at the limit it is exhausted; a harness error ends its run."""
     runs = plan(tasks=1)
     ledger, clock = make(tmp_path, runs=runs, max_attempts=2)
@@ -189,8 +189,8 @@ def test_c41_the_status_rule_runs_across_leases(tmp_path):
     assert_invariants(ledger)
 
 
-def test_c41_a_federation_with_another_fingerprint_or_environment_is_refused_at_join(tmp_path):
-    """C41: the campaign fingerprint is pinned at creation and the environment at the first join; a federation
+def test_c42_a_federation_with_another_fingerprint_or_environment_is_refused_at_join(tmp_path):
+    """C42: the campaign fingerprint is pinned at creation and the environment at the first join; a federation
     with either different is refused before any lease, and nothing of it is kept."""
     ledger, clock = make(tmp_path)
     common = {"site": SITE, "job_ids": ("1",), "job_end_at": clock() + 3600, "kill_wait_s": 180.0}

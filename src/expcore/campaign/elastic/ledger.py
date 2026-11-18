@@ -1,5 +1,5 @@
 # Provenance: new
-"""The campaign's ledger for an elastic fleet (#462 step 1, C41): its runs, the leases on them, and who may count.
+"""The campaign's ledger for an elastic fleet (#462 step 1, C42): its runs, the leases on them, and who may count.
 
 One SQLite file per campaign on the orchestrating host (`schema`), held by one dispatcher lock (`campaign.lock`).
 Federations join with the campaign's fingerprint and an environment pinned at the first join, and take one run at a
@@ -14,8 +14,9 @@ shown ended; the sweep expires what it must.
   past its hard term, or when its site went unread for `site_out_s`. After a restart no lease expires until its site
   is read, save by the site's own `site_out_s`, counted from the reopen. Expiry puts the run back to pending at once.
 - **The dead-holder rule.** An expired lease keeps its cap slot and its grant until its holder's job is proven ended:
-  a terminal state or the controller's cancel (`prove_ended`), or the recorded job end plus KillWait (the sweep), as
-  `campaign.lease` holds back a key whose holder may still be live. Proven ended with no completion, the lease stays
+  a terminal state or the controller's cancel (`prove_ended`), or the recorded job end plus KillWait once its site was
+  read after that moment (so any completion it left is collected first) or its site is out, as `campaign.lease`
+  holds back a key whose holder may still be live. Proven ended with no completion, the lease stays
   charged its grant, the bound of what it can have spent. A completion or a return read later settles it.
 - **Budget.** A lease is issued only if its grant fits what is left of `max_usd` and of its model's ceiling after the
   charge of every lease. A lease is charged its grant until its spend is settled, so with every lease spending its
@@ -31,28 +32,26 @@ from typing import Any
 
 from expcore.campaign.elastic import schema
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
-from expcore.campaign.elastic.config import PRIOR_RUNS, LedgerConfig, LedgerRun, check_plan, micro_up
+from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
 from expcore.campaign.elastic.records import (
     LIVE,
     PROOFS,
     Completion,
     CompletionConflict,
-    Federation,
     JoinRefused,
     Lease,
     LedgerError,
     Return,
-    Run,
     SiteReading,
     Wait,
 )
+from expcore.campaign.elastic.views import LedgerViews
 from expcore.campaign.lock import DispatchLock
 
-_LEASE_SQL = "SELECT l.*, f.ended_at AS fed_ended FROM leases l JOIN federations f ON f.label = l.federation"
 _LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")  # an operator's label, as a shard's: never a host name or an address
 
 
-class Ledger:
+class Ledger(LedgerViews):
     """One campaign's ledger, open under its dispatcher lock. `clock` gives seconds since the epoch."""
 
     def __init__(self, path: Path, lock: DispatchLock, clock: Callable[[], float]) -> None:
@@ -65,7 +64,10 @@ class Ledger:
             lock.release()
             raise
         try:
-            self.config = LedgerConfig.from_json(self._meta("config") or "null")
+            pinned = self._meta("config")
+            if pinned is None:
+                raise ValueError(f"{path} holds no ledger configuration")
+            self.config = LedgerConfig.from_json(pinned)
         except BaseException:
             self.close()
             raise
@@ -110,10 +112,6 @@ class Ledger:
             self.db.execute("ROLLBACK")
             raise
         return result
-
-    def _meta(self, key: str) -> str | None:
-        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-        return None if row is None else row[0]
 
     def _event(self, now: float, kind: str, *, run_key=None, lease_id=None, federation=None, **detail: Any) -> None:
         self.db.execute(
@@ -398,14 +396,22 @@ class Ledger:
         now = self._clock()
         self._transact(lambda: self._sweep(now, self._last_read))
 
+    def _site_out(self, now: float, last: float | None) -> bool:
+        """A site unread for `site_out_s`, counted from the reopen when it was not read since."""
+        return now - (self._opened_at if last is None else last) >= self.config.site_out_s
+
     def _sweep(self, now: float, read: dict[str, float]) -> None:
+        # A job past its end plus KillWait is proven ended once its site was read after that moment, so the reading
+        # collected any completion it left first, or once its site is out.
         for fed in self.db.execute("SELECT * FROM federations WHERE ended_at IS NULL").fetchall():
-            if now >= fed["job_end_at"] + fed["kill_wait_s"]:
+            gone = fed["job_end_at"] + fed["kill_wait_s"]
+            last = read.get(fed["site"])
+            if now >= gone and ((last is not None and last >= gone) or self._site_out(now, last)):
                 self._prove(fed["label"], "walltime", now)
         cfg = self.config
         for row in self.db.execute("SELECT * FROM leases WHERE state IN ('issued', 'sent')").fetchall():
             last = read.get(row["site"])
-            if now - (self._opened_at if last is None else last) >= cfg.site_out_s:
+            if self._site_out(now, last):
                 self._expire(row, now, "site_out")
             elif last is None:
                 continue  # not read since the reopen: nothing else expires it yet
@@ -421,93 +427,3 @@ class Ledger:
         self._event(
             now, "expire", run_key=row["run_key"], lease_id=row["id"], federation=row["federation"], reason=reason
         )
-
-    # --- reads ------------------------------------------------------------------------------------------------
-
-    def committed_micro(self) -> tuple[int, dict[str, int]]:
-        """What the budget counts: every lease's charge, in micro-dollars, in total and per model."""
-        rows = self.db.execute("SELECT model, SUM(charge_micro) FROM leases GROUP BY model").fetchall()
-        per_model = {model: int(total) for model, total in rows}
-        return sum(per_model.values()), per_model
-
-    def slots(self) -> dict[str, int]:
-        """The cap slots held, per model: leases in flight, and expired ones whose holder is not proven ended."""
-        rows = self.db.execute("SELECT model, COUNT(*) FROM leases WHERE slot=1 GROUP BY model").fetchall()
-        return dict(rows)
-
-    def estimate_s(self, model: str, condition: str) -> float:
-        """A cell's expected lease time: the prior as `PRIOR_RUNS` runs, with every counted lease's time."""
-        row = self.db.execute(
-            "SELECT runs, total_s FROM estimates WHERE model=? AND condition=?", (model, condition)
-        ).fetchone()
-        runs, total = (0, 0.0) if row is None else (row[0], row[1])
-        return (PRIOR_RUNS * self.config.prior_run_s + total) / (PRIOR_RUNS + runs)
-
-    def _lease_view(self, lease_id: int) -> Lease:
-        row = self.db.execute(f"{_LEASE_SQL} WHERE l.id=?", (lease_id,)).fetchone()
-        if row is None:
-            raise LedgerError(f"lease {lease_id} was never issued by this ledger")
-        return self._as_lease(row)
-
-    def _as_lease(self, row: Any) -> Lease:
-        completion = None if row["completion"] is None else json.loads(row["completion"])
-        return Lease(
-            lease_id=row["id"],
-            run_key=row["run_key"],
-            model=row["model"],
-            condition=row["condition"],
-            federation=row["federation"],
-            site=row["site"],
-            fingerprint=self._fingerprint,
-            attempt_base=row["attempt_base"],
-            grant_micro=row["grant_micro"],
-            issued_at=row["issued_at"],
-            renewed_at=row["renewed_at"],
-            counter=row["counter"],
-            hard_term_at=row["hard_term_at"],
-            state=row["state"],
-            slot=bool(row["slot"]),
-            charge_micro=row["charge_micro"],
-            verdict=row["verdict"],
-            completion_state=None if completion is None else completion["state"],
-            proven=row["fed_ended"] is not None,
-        )
-
-    def lease(self, lease_id: int) -> Lease:
-        return self._lease_view(lease_id)
-
-    def leases(self) -> list[Lease]:
-        return [self._as_lease(row) for row in self.db.execute(f"{_LEASE_SQL} ORDER BY l.id")]
-
-    def run(self, run_key: str) -> Run:
-        row = self.db.execute("SELECT * FROM runs WHERE run_key=?", (run_key,)).fetchone()
-        if row is None:
-            raise LedgerError(f"run {run_key} is not in the ledger")
-        return Run(
-            *(row[k] for k in ("run_key", "seq", "model", "condition", "set_index", "state", "charged", "lease_id"))
-        )
-
-    def runs(self) -> list[Run]:
-        return [self.run(row[0]) for row in self.db.execute("SELECT run_key FROM runs ORDER BY seq")]
-
-    def federations(self) -> list[Federation]:
-        return [
-            Federation(
-                row["label"],
-                row["site"],
-                tuple(json.loads(row["job_ids"])),
-                row["job_end_at"],
-                row["kill_wait_s"],
-                row["joined_at"],
-                row["ended_at"],
-                row["end_proof"],
-            )
-            for row in self.db.execute("SELECT * FROM federations ORDER BY joined_at, label")
-        ]
-
-    def events(self) -> list[dict[str, Any]]:
-        """The ledger's log in its global sequence."""
-        return [
-            {**dict(row), "detail": None if row["detail"] is None else json.loads(row["detail"])}
-            for row in self.db.execute("SELECT * FROM events ORDER BY seq")
-        ]

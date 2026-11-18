@@ -33,8 +33,8 @@ def model(key: str, price: Price | None = DEAR, *, free: bool = False) -> ModelS
     return ModelSpec(key=key, backend="stub", api_id=key, status="frozen", price=price, free=free, context_tokens=8192)
 
 
-def test_c41_the_budget_is_never_passed_when_an_expired_run_is_leased_again_and_both_spend_their_grant(tmp_path):
-    """C41: a run whose lease expired is leased again while the first holder may still be spending: both grants are
+def test_c42_the_budget_is_never_passed_when_an_expired_run_is_leased_again_and_both_spend_their_grant(tmp_path):
+    """C42: a run whose lease expired is leased again while the first holder may still be spending: both grants are
     held together, so with both spent to the bound the total is still within max_usd, and the next lease waits."""
     ledger, clock = make(tmp_path, runs=plan(tasks=3, conditions=("api-none",)), max_usd=3.0, grants_usd={"m1": 1.0})
     for label in ("fed-1", "fed-2", "fed-3", "fed-4"):
@@ -59,8 +59,8 @@ def test_c41_the_budget_is_never_passed_when_an_expired_run_is_leased_again_and_
     assert "budget" in waiting.reason
 
 
-def test_c41_a_models_ceiling_holds_its_own_leases(tmp_path):
-    """C41: a model's ceiling is checked like the total: its leases wait while the other model's go out."""
+def test_c42_a_models_ceiling_holds_its_own_leases(tmp_path):
+    """C42: a model's ceiling is checked like the total: its leases wait while the other model's go out."""
     runs = plan(models=("m1", "m2"), tasks=2, conditions=("api-none",))
     ledger, clock = make(
         tmp_path, runs=runs, max_usd=100.0, per_model_usd={"m1": 1.5}, grants_usd={"m1": 1.0, "m2": 1.0}
@@ -72,8 +72,8 @@ def test_c41_a_models_ceiling_holds_its_own_leases(tmp_path):
     assert_invariants(ledger)
 
 
-def test_c41_measured_spend_replaces_the_grant_only_once_the_archive_verifies(tmp_path):
-    """C41: a completion read but not yet verified keeps its grant held; the verified archive returns the rest."""
+def test_c42_measured_spend_replaces_the_grant_only_once_the_archive_verifies(tmp_path):
+    """C42: a completion read but not yet verified keeps its grant held; the verified archive returns the rest."""
     ledger, clock = make(tmp_path, max_usd=10.0, grants_usd={"m1": 4.0})
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")
@@ -83,8 +83,8 @@ def test_c41_measured_spend_replaces_the_grant_only_once_the_archive_verifies(tm
     assert ledger.committed_micro() == (200_000, {"m1": 200_000})
 
 
-def test_c41_the_grant_is_one_runs_reservation_plus_both_probes_and_the_top_up_allowance():
-    """C41: what a lease is granted is the shard budget's reservation of one run, the bound of the two admission
+def test_c42_the_grant_is_one_runs_reservation_plus_both_probes_and_the_top_up_allowance():
+    """C42: what a lease is granted is the shard budget's reservation of one run, the bound of the two admission
     probes every store start sends, and the declared top-up allowance; a free model is granted nothing, and a model
     with no price is refused."""
     spec = model("m1")
@@ -96,8 +96,8 @@ def test_c41_the_grant_is_one_runs_reservation_plus_both_probes_and_the_top_up_a
         lease_grant_usd(model("m3", price=None), LIMITS)
 
 
-def test_c41_a_ledger_whose_grant_cannot_fit_its_budget_is_refused(tmp_path):
-    """C41: a budget without a grant for a planned model, or a grant above the total or the model's ceiling, could
+def test_c42_a_ledger_whose_grant_cannot_fit_its_budget_is_refused(tmp_path):
+    """C42: a budget without a grant for a planned model, or a grant above the total or the model's ceiling, could
     never lease that model's runs and is refused at creation."""
     with pytest.raises(ValueError, match="m1"):
         make(tmp_path / "a", max_usd=10.0)
@@ -107,8 +107,8 @@ def test_c41_a_ledger_whose_grant_cannot_fit_its_budget_is_refused(tmp_path):
         make(tmp_path / "c", max_usd=10.0, per_model_usd={"m1": 1.0}, grants_usd={"m1": 2.0})
 
 
-def test_c41_a_random_walk_of_leases_expiries_completions_losses_proofs_and_restarts_keeps_every_invariant(tmp_path):
-    """C41: a seeded walk over every operation, every completion spending its whole grant: no run is leased twice at
+def test_c42_a_random_walk_of_leases_expiries_completions_losses_proofs_and_restarts_keeps_every_invariant(tmp_path):
+    """C42: a seeded walk over every operation, every completion spending its whole grant: no run is leased twice at
     once, no cap, ceiling or budget is passed, no run is counted done twice, and none is lost across expiries and
     restarts. Once the federations stop failing, every run ends or waits only for the budget, and no slot is held."""
     rng = random.Random(462)
@@ -153,7 +153,9 @@ def _live(ledger, label=None):
 
 def _spend(rng, lease):
     """What a lease spent: its whole grant a third of the time, else a part of it."""
-    return lease.grant_micro / 1e6 if rng.random() < 1 / 3 else round(rng.uniform(0.1, 1.0) * lease.grant_micro / 1e6, 6)
+    return (
+        lease.grant_micro / 1e6 if rng.random() < 1 / 3 else round(rng.uniform(0.1, 1.0) * lease.grant_micro / 1e6, 6)
+    )
 
 
 def _step(rng, ledger, clock, labels, counters, tmp_path):
@@ -229,8 +231,8 @@ def _settle(ledger, clock, labels):
         ledger.issue(label)
 
 
-def test_c41_a_lease_operation_on_an_unknown_lease_is_refused(tmp_path):
-    """C41: nothing is applied for a lease the ledger never issued, or read at another site than its own."""
+def test_c42_a_lease_operation_on_an_unknown_lease_is_refused(tmp_path):
+    """C42: nothing is applied for a lease the ledger never issued, or read at another site than its own."""
     ledger, clock = make(tmp_path)
     join(ledger, clock, "fed-1")
     lease = leased(ledger, "fed-1")

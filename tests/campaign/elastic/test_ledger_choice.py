@@ -10,8 +10,8 @@ from expcore.campaign.elastic import LedgerRun, Return, SiteReading, Wait, ledge
 CORE_FIRST = {"api-none": 0, "mount-read": 1}
 
 
-def test_c41_the_earliest_set_with_a_pending_run_is_filled_first_and_never_skipped(tmp_path):
-    """C41: every run of the core set is leased before any of the next; while the core set's model is at its cap the
+def test_c42_the_earliest_set_with_a_pending_run_is_filled_first_and_never_skipped(tmp_path):
+    """C42: every run of the core set is leased before any of the next; while the core set's model is at its cap the
     federation waits, though the next set has runs pending."""
     runs = plan(tasks=3, sets=CORE_FIRST)
     ledger, clock = make(tmp_path, runs=runs, caps={"m1": 2})
@@ -31,8 +31,8 @@ def test_c41_the_earliest_set_with_a_pending_run_is_filled_first_and_never_skipp
     assert_invariants(ledger)
 
 
-def test_c41_a_returned_run_reopens_its_set(tmp_path):
-    """C41: set progress counts leases, not results: a core run returned after the next set has begun is leased
+def test_c42_a_returned_run_reopens_its_set(tmp_path):
+    """C42: set progress counts leases, not results: a core run returned after the next set has begun is leased
     before any further run of the next set."""
     runs = plan(tasks=1, sets=CORE_FIRST)
     ledger, clock = make(tmp_path, runs=runs)
@@ -48,8 +48,8 @@ def test_c41_a_returned_run_reopens_its_set(tmp_path):
     assert_invariants(ledger)
 
 
-def test_c41_a_run_expired_in_an_earlier_set_reopens_it(tmp_path):
-    """C41: an expired lease puts its run back, so its set is the current one again."""
+def test_c42_a_run_expired_in_an_earlier_set_reopens_it(tmp_path):
+    """C42: an expired lease puts its run back, so its set is the current one again."""
     runs = plan(tasks=1, sets=CORE_FIRST)
     ledger, clock = make(tmp_path, runs=runs)
     for label in ("fed-1", "fed-2", "fed-3"):
@@ -65,8 +65,8 @@ def test_c41_a_run_expired_in_an_earlier_set_reopens_it(tmp_path):
     assert leased(ledger, "fed-3").run_key == core.run_key
 
 
-def test_c41_the_model_with_the_most_remaining_expected_time_is_leased_first(tmp_path):
-    """C41: a model's remaining time is its pending runs' estimates plus what is left of its runs in flight; the
+def test_c42_the_model_with_the_most_remaining_expected_time_is_leased_first(tmp_path):
+    """C42: a model's remaining time is its pending runs' estimates plus what is left of its runs in flight; the
     model with the most gets the idle federation, and time spent in flight lowers it."""
     runs = plan(models=("m1", "m2"), tasks=3, conditions=("api-none",))[:5]  # m1 has 3 runs, m2 has 2
     ledger, clock = make(tmp_path, runs=runs)
@@ -78,8 +78,8 @@ def test_c41_the_model_with_the_most_remaining_expected_time_is_leased_first(tmp
     assert leased(ledger, "fed-3").model == "m2"  # 600 s pending and twice 100 s in flight, against 1200 s
 
 
-def test_c41_a_model_at_its_cap_gives_way_to_the_next(tmp_path):
-    """C41: the most lagging model at its cap is passed over for the next one, which is not a later set's."""
+def test_c42_a_model_at_its_cap_gives_way_to_the_next(tmp_path):
+    """C42: the most lagging model at its cap is passed over for the next one, which is not a later set's."""
     runs = plan(models=("m1", "m2"), tasks=3, conditions=("api-none",))[:5]
     ledger, clock = make(tmp_path, runs=runs, caps={"m1": 1})
     for label in ("fed-1", "fed-2", "fed-3"):
@@ -88,8 +88,8 @@ def test_c41_a_model_at_its_cap_gives_way_to_the_next(tmp_path):
     assert_invariants(ledger)
 
 
-def test_c41_within_a_model_the_first_pending_run_in_the_seeded_order_is_taken_whatever_its_condition(tmp_path):
-    """C41: the run is the model's lowest seq, so conditions interleave as the manifest's seeded order does."""
+def test_c42_within_a_model_the_first_pending_run_in_the_seeded_order_is_taken_whatever_its_condition(tmp_path):
+    """C42: the run is the model's lowest seq, so conditions interleave as the manifest's seeded order does."""
     runs = plan(tasks=2)
     ledger, clock = make(tmp_path, runs=runs)
     labels = ("fed-1", "fed-2", "fed-3", "fed-4")
@@ -98,8 +98,8 @@ def test_c41_within_a_model_the_first_pending_run_in_the_seeded_order_is_taken_w
     assert [leased(ledger, label).run_key for label in labels] == [run.run_key for run in runs]
 
 
-def test_c41_estimates_start_at_the_prior_counted_as_three_runs_and_take_each_counted_lease(tmp_path):
-    """C41: a cell's expected time is the prior until a lease of it counts, then the mean of the prior's three
+def test_c42_estimates_start_at_the_prior_counted_as_three_runs_and_take_each_counted_lease(tmp_path):
+    """C42: a cell's expected time is the prior until a lease of it counts, then the mean of the prior's three
     pseudo-runs and the counted lease times, the federation's reset included; a superseded lease is not counted."""
     ledger, clock = make(tmp_path, runs=plan(tasks=2, conditions=("api-none",)), prior_run_s=600.0)
     join(ledger, clock, "fed-1")
@@ -113,8 +113,8 @@ def test_c41_estimates_start_at_the_prior_counted_as_three_runs_and_take_each_co
     assert ledger.estimate_s("m1", "api-none") == pytest.approx((3 * 600.0 + 200.0) / 4)
 
 
-def test_c41_ledger_runs_takes_each_runs_model_condition_and_declared_set_from_the_manifest():
-    """C41: the ledger's runs come from the manifest in its seeded order; a run is in the first declared set whose
+def test_c42_ledger_runs_takes_each_runs_model_condition_and_declared_set_from_the_manifest():
+    """C42: the ledger's runs come from the manifest in its seeded order; a run is in the first declared set whose
     filters it matches, and a run no set matches is refused."""
     schema = make_schema()
     manifest = make_manifest(schema, models=("m1", "m2"))

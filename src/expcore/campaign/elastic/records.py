@@ -1,5 +1,5 @@
 # Provenance: new
-"""What goes into the elastic ledger from a site, and what it shows of its runs, leases and federations (C41).
+"""What goes into the elastic ledger from a site, and what it shows of its runs, leases and federations (C42).
 
 Lease states:
 

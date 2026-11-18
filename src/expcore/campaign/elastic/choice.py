@@ -1,5 +1,5 @@
 # Provenance: new
-"""Which run an idle federation leases next (#462 step 1, C41): outcome-blind, from lease states, caps, the budget
+"""Which run an idle federation leases next (#462 step 1, C42): outcome-blind, from lease states, caps, the budget
 and expected times only.
 
 1. **Set.** The current set is the earliest declared set with a pending run. Progress counts leases, never results,

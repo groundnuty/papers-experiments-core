@@ -1,5 +1,5 @@
 # Provenance: new
-"""The elastic ledger's settings and its runs (#462 step 1, C41): what is pinned when the ledger is created.
+"""The elastic ledger's settings and its runs (#462 step 1, C42): what is pinned when the ledger is created.
 
 Dollars are counted in whole micro-dollars, so that the budget's sums are exact: a ceiling is rounded down, and a
 grant or a spend is rounded up, so rounding can only make the ledger hold more than it must, never less.

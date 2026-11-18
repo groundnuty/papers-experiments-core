@@ -1,5 +1,5 @@
 # Provenance: new
-"""The elastic fleet's ledger (#462): runs leased one at a time to federations that come and go (C41).
+"""The elastic fleet's ledger (#462): runs leased one at a time to federations that come and go (C42).
 
 Step 1 of the design note: the ledger, its lease state machine with fencing, expiry and the proof of a holder's end,
 grants at lease time, per-model caps, the declared set order and dispatch by remaining work. Nothing here is reached
