@@ -57,8 +57,10 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
         "spend": {
             "total_usd": _usd(totals.get(None)),
             "per_model_usd": {model: _usd(value) for model, value in sorted(totals.items(), key=_model_key) if model},
-            "max_usd": ledger.config.max_usd,
-            "per_model_ceiling_usd": dict(sorted(ledger.config.per_model_usd.items())),
+            "max_usd": _usd(ledger.ceilings.max_micro),
+            "per_model_ceiling_usd": {
+                model: usd_of(micro) for model, micro in sorted(ledger.ceilings.per_model_micro.items())
+            },
         },
     }
 

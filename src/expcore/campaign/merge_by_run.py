@@ -24,8 +24,9 @@
    whose run ended otherwise than the ledger says; a store of a counted or superseded lease that is not given (the
    ledger verified its archive, so it is evidence to keep);
 5. spend: every lease's spend (its store's, as the budget gate counts it; the ledger's charge for a lease whose store
-   is not given: the grant of a lost or expired one, the spend of a returned one) together above `max_usd` or a
-   model's ceiling of the ledger, a store that spent more than its grant, or a spend unknown under a budget.
+   is not given: the grant of a lost or expired one or the spend `settle` gave it, the spend of a returned one)
+   together above the ledger's ceilings in force (`max_usd` and each model's, as pinned or raised), a store that spent
+   more than its grant, or a spend unknown under a budget.
 
 Then each counted store passes the replay check (`study.merge_by_run`), and its records are exactly those of its
 attempts (`require_records`): none it does not account for, and the record of every attempt it holds as done.
@@ -58,8 +59,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any
 
-from expcore.campaign.elastic.config import micro_down, micro_up, usd_of
-from expcore.campaign.ledger_read import LeaseRow, LedgerFacts
+from expcore.campaign.elastic.config import micro_up, usd_of
+from expcore.campaign.ledger_read import TERMINAL, LeaseRow, LedgerFacts
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.merge import (
     MergeRefused,
@@ -293,13 +294,17 @@ def _counted(ledger: LedgerFacts, by_lease: Mapping[int, LeaseStore], plan: Mani
     for key in sorted(planned, key=planned.__getitem__):
         run = ledger.runs[key]
         lease_id = ledger.counted(key)
+        if lease_id is None and run.state in TERMINAL:
+            raise MergeRefused(
+                f"run {key} is {run.state} in the ledger with no counted lease (its latest, lease {run.lease_id}, is "
+                f"{ledger.leases[run.lease_id].state if run.lease_id is not None else 'none'}): a run ended by lost "
+                "leases has no store to merge, so a campaign is merged by run once every run has its counted lease"
+            )
         if lease_id is None:
             raise MergeRefused(
                 f"run {key} is {run.state} in the ledger: a campaign is merged by run once every run has its "
                 "counted lease"
             )
-        if ledger.leases[lease_id].state != "counted":
-            raise MergeRefused(f"run {key}: its latest lease {lease_id} is {ledger.leases[lease_id].state}")
         store = by_lease.get(lease_id)
         if store is None:
             raise MergeRefused(
@@ -334,21 +339,24 @@ def _evidence(ledger: LedgerFacts, by_lease: Mapping[int, LeaseStore], counted: 
 
 
 def _check_spend(ledger: LedgerFacts, counted: Sequence[LeaseStore], evidence: Sequence[Evidence]) -> None:
-    """5: every lease's spend within its grant, and together within the ledger's `max_usd` and each ceiling."""
+    """5: every lease's spend within its grant, and together within the ceilings in force (the ledger's `max_usd` and
+    each model's, as pinned or as raised since)."""
     totals = spend_micro(ledger, counted, evidence)
-    config = ledger.config
-    if config.max_usd is None:
+    ceilings = ledger.ceilings
+    if ceilings.max_micro is None:
         return
     if totals.get(None) is None or any(value is None for value in totals.values()):
         raise MergeRefused("the campaign has a budget and some lease's spend is unknown, so it cannot be checked")
-    if totals[None] > micro_down(config.max_usd):
+    if totals[None] > ceilings.max_micro:
         raise MergeRefused(
-            f"the leases spent USD {usd_of(totals[None])} together, above the campaign's max_usd {config.max_usd}"
+            f"the leases spent USD {usd_of(totals[None])} together, above the campaign's ceiling of USD "
+            f"{usd_of(ceilings.max_micro)}"
         )
-    for model, ceiling in sorted(config.per_model_usd.items()):
-        if totals.get(model, 0) > micro_down(ceiling):
+    for model, ceiling in sorted(ceilings.per_model_micro.items()):
+        if totals.get(model, 0) > ceiling:
             raise MergeRefused(
-                f"the leases of model {model} spent USD {usd_of(totals[model])} together, above its ceiling {ceiling}"
+                f"the leases of model {model} spent USD {usd_of(totals[model])} together, above its ceiling of USD "
+                f"{usd_of(ceiling)}"
             )
 
 

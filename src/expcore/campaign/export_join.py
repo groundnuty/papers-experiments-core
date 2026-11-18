@@ -292,7 +292,8 @@ def _sum_table(name: str, key_fields: tuple[str, ...], parts: Sequence[Sequence[
     return [cell for _, cell in sorted(cells.items(), key=none_last)]
 
 
-LEASE_KEY = "lease"  # in an export of a batch merged by run (C43), each entry's: the id of the lease that ran it
+LEASE_KEY = "lease_id"  # in an export of a batch merged by run (C43), each entry's: the lease that ran it, as a lease
+# store's own export names it in its run rows (`export.LEASE_KEY`)
 FEDERATION_KEY = "federation"  # each run entry's: the federation that held its counted lease, as the ledger labels it
 SITE_KEY = "site"  # each run entry's: the site of that federation, as the ledger labels it
 LEASES_KEY = "leases"  # the top-level key of such an export: merge.json's list of counted leases
@@ -303,7 +304,8 @@ def by_run_export(joined: Mapping[str, Any], leases: Sequence[Mapping[str, Any]]
     """The export of a batch merged by run (C43): the counted leases' exports joined as a merge of shards joins them
     (`join_exports`, one part per lease), with each run's lease, federation and site in place of a shard.
 
-    Every entry `join_exports` marked with its part (`shard`) is marked with its lease instead, and each entry of a
+    Every entry `join_exports` marked with its part (`shard`) is marked with its lease (`lease_id`, as a lease store's
+    own run rows already are) instead, and each entry of a
     run list (and of the per-entry lists: holds, losses, interrupted spend, diagnostics) gains `federation` and `site`
     from merge.json's `leases`, which the check and the analysis rebuilt from the ledger. `shards` becomes `leases`
     and `shard_retries_by_kind` becomes `lease_retries_by_kind`. A batch merged otherwise never reaches this."""

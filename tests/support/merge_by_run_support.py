@@ -107,7 +107,6 @@ def run_lease(base: Path, env: dict[str, str], lease: Lease, sha: str) -> Campai
         "run_key": lease.run_key,
         "lease_id": lease.lease_id,
         "attempt_base": lease.attempt_base,
-        "charged_attempts": lease.attempt_base,
         "grant_micro_usd": lease.grant_micro,
         "campaign_sha256": sha,
         "expires_utc": FAR,

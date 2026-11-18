@@ -12,16 +12,16 @@ their global sequence, and refuses a ledger whose tables say anything else:
 
 - `issue` makes a lease its run's latest, and lease ids rise with the sequence (the fencing token);
 - `report` counts exactly when its lease is its run's latest and the run is not done; any other is superseded;
-- `counted` applies today's status rule across leases (`done`, `harness_error`, `infra_exhausted` once the charged
-  attempts of the run's counted leases reach `max_attempts`, else pending), with the charged attempts of the lease's
-  completion;
-- `lost` of a counting lease, `expire`, a `return` of a live lease and `cancel` put the run back to pending;
-- a lease is settled (counted, superseded or lost) once: a second settlement of it is refused.
+- `counted` and `superseded` settle a lease whose completion was read so; a `counted` completion that ended `done`
+  makes its run done; `lost` settles a lease too, and a lease is settled once.
 
-Each run's state, latest lease and charged attempts, and each lease's final state (counted, superseded, lost) must be
-what the events give. A run's **counted lease** is then its latest lease when the run is terminal (done,
-infra_exhausted or harness_error); that lease's state is `counted`. A lease counted earlier, whose run went back to
-pending and was leased again, is not the run's counted lease.
+Each run's latest lease and whether it is done, each lease's settlement (counted, superseded, lost), and the outcome
+of a terminal run's counted lease (done, harness_error, or infra_fail for infra_exhausted) must be what the events
+give. The ledger's own arithmetic of charged attempts and money (losses, `settle`, raised ceilings) is not repeated:
+the merge reads each lease's charge and the ceilings in force (`elastic.ceilings.effective`). A run's **counted
+lease** is its latest lease when the run is terminal (done, infra_exhausted or harness_error) and that lease is
+`counted`; a run ended by lost leases has none. A lease counted earlier, whose run went back to pending and was
+leased again, is not the run's counted lease.
 """
 
 import json
@@ -32,14 +32,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.elastic.ceilings import effective
 from expcore.campaign.elastic.config import LedgerConfig
+from expcore.campaign.elastic.records import Ceilings
 from expcore.campaign.elastic.schema import SCHEMA
 from expcore.campaign.storecopy import StoreChanged, store_copy
 
 LEDGER_SNAPSHOT = "ledger-snapshot.sqlite"
 TERMINAL = ("done", "infra_exhausted", "harness_error")
-_LIVE = ("issued", "sent")
 _SETTLED = ("counted", "superseded", "lost")
+_OUTCOME = {"done": "done", "harness_error": "harness_error", "infra_exhausted": "infra_fail"}  # a counted lease's
 
 
 class LedgerRefused(RuntimeError):
@@ -83,11 +85,14 @@ class LedgerFacts:
     environment: str | None
     runs: Mapping[str, RunRow]
     leases: Mapping[int, LeaseRow]
+    ceilings: Ceilings  # the ceilings in force: as pinned, or as raised since
 
     def counted(self, run_key: str) -> int | None:
         """The run's counted lease: its latest when the run is terminal; None for a run that is not."""
         run = self.runs[run_key]
-        return run.lease_id if run.state in TERMINAL else None
+        if run.state not in TERMINAL or run.lease_id is None or self.leases[run.lease_id].state != "counted":
+            return None
+        return run.lease_id
 
 
 def take_ledger_snapshot(source: Path, destination: Path) -> None:
@@ -133,11 +138,12 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
             runs = {row["run_key"]: _run_row(row) for row in db.execute("SELECT * FROM runs ORDER BY seq")}
             leases = {row["id"]: _lease_row(row) for row in db.execute("SELECT * FROM leases ORDER BY id")}
             events = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY seq")]
+            in_force = effective(db, config)
         except (sqlite3.Error, KeyError, TypeError, ValueError) as error:
             raise LedgerRefused(f"{where}: cannot read the ledger ({type(error).__name__}: {error})") from None
     finally:
         db.close()
-    facts = LedgerFacts(sha256, config, meta.get("environment"), runs, leases)
+    facts = LedgerFacts(sha256, config, meta.get("environment"), runs, leases, in_force)
     _replay(facts, events, where)
     return facts
 
@@ -167,9 +173,8 @@ class _Replay:
 
     def __init__(self, facts: LedgerFacts, where: object) -> None:
         self.facts, self.where = facts, where
-        self.state = dict.fromkeys(facts.runs, "pending")
+        self.done: set[str] = set()
         self.latest: dict[str, int] = {}
-        self.charged = dict.fromkeys(facts.runs, 0)
         self.verdicts: dict[int, str] = {}
         self.settled: dict[int, str] = {}
         self.last_issued = 0
@@ -182,72 +187,59 @@ class _Replay:
 
     def apply(self, event: Mapping[str, Any]) -> None:
         kind, lease_id, run = event["kind"], event["lease_id"], event["run_key"]
-        if run is not None and run not in self.state:
+        if run is not None and run not in self.facts.runs:
             raise self.refuse(event, f"names run {run}, which the ledger does not hold")
         try:
             detail = json.loads(event["detail"]) if event["detail"] else {}
         except ValueError:
             raise self.refuse(event, "holds a detail that is not JSON") from None
-        if kind in ("counted", "superseded", "lost") and lease_id in self.settled:
+        if kind in _SETTLED and lease_id in self.settled:
             raise self.refuse(event, f"settles a lease already settled as {self.settled[lease_id]}")
         if kind == "issue":
             if lease_id <= self.last_issued:
                 raise self.refuse(event, "issues a lease id not above every earlier one")
             self.last_issued = self.latest[run] = lease_id
-            self.state[run] = "leased"
         elif kind == "report":
-            self._report(event, lease_id, run, detail)
+            expected = "counts" if self.latest.get(run) == lease_id and run not in self.done else "superseded"
+            if detail.get("verdict") != expected:
+                raise self.refuse(
+                    event, f"records the verdict {detail.get('verdict')!r} where the rule gives {expected!r}"
+                )
+            self.verdicts[lease_id] = expected
         elif kind in ("counted", "superseded"):
-            self._settle(event, kind, lease_id, run)
+            wanted = "counts" if kind == "counted" else "superseded"
+            if self.verdicts.get(lease_id) != wanted:
+                raise self.refuse(event, f"settles a lease whose completion was not read as {wanted!r}")
+            self.settled[lease_id] = kind
+            completion = self.facts.leases[lease_id].completion or {}
+            if kind == "counted" and completion.get("state") == "done":
+                self.done.add(run)
         elif kind == "lost":
             self.settled[lease_id] = "lost"
-            if self.verdicts.get(lease_id) == "counts":
-                self.state[run] = "pending"
-        elif kind in ("expire", "cancel") or (kind == "return" and detail.get("was") in _LIVE):
-            self.state[run] = "pending"
-
-    def _report(self, event: Mapping[str, Any], lease_id: int, run: str, detail: Mapping[str, Any]) -> None:
-        counts = self.latest.get(run) == lease_id and self.state[run] != "done"
-        expected = "counts" if counts else "superseded"
-        if detail.get("verdict") != expected:
-            raise self.refuse(event, f"records the verdict {detail.get('verdict')!r} where the rule gives {expected!r}")
-        self.verdicts[lease_id] = expected
-        if counts:
-            self.state[run] = "leased"
-
-    def _settle(self, event: Mapping[str, Any], kind: str, lease_id: int, run: str) -> None:
-        wanted = "counts" if kind == "counted" else "superseded"
-        if self.verdicts.get(lease_id) != wanted:
-            raise self.refuse(event, f"settles a lease whose completion was not read as {wanted!r}")
-        self.settled[lease_id] = kind
-        if kind == "counted":
-            completion = self.facts.leases[lease_id].completion or {}
-            self.charged[run] += int(completion.get("charged", 0))
-            self.state[run] = self._status(str(completion.get("state")), self.charged[run])
-
-    def _status(self, state: str, charged: int) -> str:
-        """Today's status rule across leases (`elastic.Ledger._status_after`)."""
-        if state in ("done", "harness_error"):
-            return state
-        if state == "infra_fail" and charged >= self.facts.config.max_attempts:
-            return "infra_exhausted"
-        return "pending"
 
 
 def _replay(facts: LedgerFacts, events: list[Mapping[str, Any]], where: object) -> None:
-    """Refuse a ledger whose runs and settled leases are not what its events give."""
+    """Refuse a ledger whose runs' latest leases, done runs, settled leases or counted outcomes are not what its events
+    give. The ledger's own arithmetic of charged attempts and money (losses, settlements, ceilings) is not repeated:
+    the merge reads each lease's charge, and each run's attempts come from its counted store."""
     replay = _Replay(facts, where)
     for event in events:
         if event["lease_id"] is not None and event["lease_id"] not in facts.leases:
             raise replay.refuse(event, "names a lease the ledger does not hold")
         replay.apply(event)
     for key, run in facts.runs.items():
-        given = (replay.state[key], replay.latest.get(key), replay.charged[key])
-        if (run.state, run.lease_id, run.charged) != given:
+        if run.lease_id != replay.latest.get(key) or (run.state == "done") != (key in replay.done):
             raise LedgerRefused(
-                f"{where}: run {key} is {run.state} on lease {run.lease_id} with {run.charged} charged attempts, but "
-                f"its events give {given[0]} on lease {given[1]} with {given[2]}: the ledger's tables are not what "
-                "its events give"
+                f"{where}: run {key} is {run.state} on lease {run.lease_id}, but its events give lease "
+                f"{replay.latest.get(key)}{', done' if key in replay.done else ', not done'}: the ledger's tables are "
+                "not what its events give"
+            )
+        latest = facts.leases.get(run.lease_id) if run.lease_id is not None else None
+        ended = None if latest is None or latest.completion is None else latest.completion.get("state")
+        if run.state in _OUTCOME and latest is not None and latest.state == "counted" and ended != _OUTCOME[run.state]:
+            raise LedgerRefused(
+                f"{where}: run {key} is {run.state}, but its counted lease {run.lease_id} ended {ended}: the ledger's "
+                "tables are not what its events give"
             )
     for lease in facts.leases.values():
         if (lease.state if lease.state in _SETTLED else None) != replay.settled.get(lease.lease_id):
