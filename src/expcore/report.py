@@ -61,6 +61,8 @@ are the same text: no clock, no path and no random number enters it.
   figure with its N or `not recorded` (never 0). The shards are a check that the hosts are interchangeable, not a
   factor of the design: every figure is descriptive, no test across shards is made, and no score is shown by shard.
   Without `shards` the report is byte for byte what it was before shards existed (#154).
+- A batch merged by run (C43) gets, after the guards' sections, the balance of its runs over sites and federations
+  and the federation-effect rerun beside the primary result (`expcore.report_balance`); no other report has either.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
