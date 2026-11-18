@@ -442,7 +442,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "command": ["<python>", "-I", "-B", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
-           "billing_weight": null, "step_network": "", "study_artifacts": "<directory, or empty>",
+           "billing_weight": null, "step_network": "", "node_domain": "", "study_artifacts": "<directory, or empty>",
            "storage_root": "<scratch root, or empty>"},
   "study_artifacts_tree_sha256": "<64 hex: the digest of that directory's tree, taken in the preflight (section 8); absent without one>",
   "storage": {"root": "<the site's scratch root>", "parent": "<root>/<allocation name>", "token": "<32 hex>",

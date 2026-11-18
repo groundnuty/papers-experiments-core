@@ -19,6 +19,12 @@ from hpcslurm import valid_network
 SIZE = re.compile(r"([1-9][0-9]{0,6})([mg])")
 TIME = re.compile(r"(?:([0-9]{1,2})-)?([0-9]{1,2}):([0-9]{2}):([0-9]{2})")
 SLURM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")  # an account or a partition
+# HPC_NODE_DOMAIN: the domain suffix of a node whose `hostname -f` gives one label (`bundle/nodefacts.py`, lib.sh's
+# node_fqdn: the same rule); one or more DNS labels, which is what `<short>.<domain>` must be to stay a name the address
+# map holds. 189 is 253 less the longest label and its dot.
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+NODE_DOMAIN = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
+NODE_DOMAIN_MAX = 189
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}")
 HPC_KEYS = (
     "time",
@@ -417,6 +423,11 @@ class Site:
     # ups shared nodes (live, 18 Nov). False: the held jobs ask what they always did. Not recorded in the state file:
     # only `up` submits, and `down` needs none of it.
     exclusive_nodes: bool = False
+    # The domain suffix of a node whose `hostname -f` gives one label (HPC_NODE_DOMAIN): its FQDN is then
+    # `<hostname -s>.<domain>` in every step that names the node (nodefacts.py, lib.sh's node_fqdn), and the step's
+    # environment carries it (`hpclaunch.Launcher`). Empty: a one-label name is refused. Recorded in the state file, so
+    # `down` and the service verbs launch their steps with it all the same.
+    node_domain: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -431,6 +442,7 @@ class Site:
             "admin_mail": self.admin_mail,
             "billing_weight": self.billing_weight,
             "step_network": self.step_network,
+            "node_domain": self.node_domain,
             **{attribute: getattr(self, attribute) for attribute in OPTIONAL_VARIABLES.values()},
             "storage_root": self.storage_root,
         }
@@ -477,6 +489,12 @@ def checked_site(site: Site) -> Site:
         raise SettingsError(
             "HPC_STEP_NETWORK: must be an option of srun's --network (for example 'no_vni'): up to 128 letters, "
             "digits and _ . , = : + -, with no space"
+        )
+    if not isinstance(site.node_domain, str) or (
+        site.node_domain and (len(site.node_domain) > NODE_DOMAIN_MAX or not NODE_DOMAIN.fullmatch(site.node_domain))
+    ):
+        raise SettingsError(
+            "HPC_NODE_DOMAIN: must be DNS labels (letters, digits and '-') joined by '.', 189 characters at most"
         )
     for variable, attribute in {**AGENT_PATHS, **STUDY_PATHS}.items():
         if getattr(site, attribute):
@@ -551,6 +569,7 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             admin_mail=environ.get("HPC_ADMIN_MAIL") or defaults.admin_mail,
             billing_weight=billing,
             step_network=environ.get("HPC_STEP_NETWORK") or "",
+            node_domain=environ.get("HPC_NODE_DOMAIN") or "",
             exclusive_nodes=exclusive_nodes_from_environment(environ),
             **{attribute: environ.get(variable) or "" for variable, attribute in OPTIONAL_VARIABLES.items()},
             storage_root=environ.get("HPC_STORAGE_ROOT") or "",

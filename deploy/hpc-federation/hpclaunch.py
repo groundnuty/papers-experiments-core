@@ -191,7 +191,10 @@ class Launcher:
         size = self.settings.control if kind == "control" else self.settings.size(kind)
         # never the account's home: none at all, until the bundle's scripts point it into the service's own work
         # directory on the node's tmpfs, once they know it (lib.sh, home_in)
-        env = allowlist(site.step_path, site.node_tmp, home_env(NO_HOME))
+        # HPC_NODE_DOMAIN only when the site sets it, so a step of a site that does not is exactly what it was: the node
+        # name the steps derive (nodefacts.py, lib.sh's node_fqdn) is the one rule, from the one value
+        domain = {"HPC_NODE_DOMAIN": site.node_domain} if site.node_domain else {}
+        env = allowlist(site.step_path, site.node_tmp, {**home_env(NO_HOME), **domain})
         return Step(
             job, node, name, size.cpus, size.memory_mib, env, tuple(argv), output, group, component, site.step_network
         )
