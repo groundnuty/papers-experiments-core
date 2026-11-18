@@ -586,18 +586,16 @@ class Driver(Down):
         account's jobs at once both excluded nothing. One that does is refused, every held job of this up cancelled
         by its own id, and the roles named (the zone, providers[i], the agent), never a host. `placed` is each
         component's nodes, the services' first. Fail closed: with the jobs unreadable nothing proves the nodes are
-        this federation's own, and the same release follows. A read of the account's jobs that fails or times out (a
-        slow controller, with the jobs already running) is read again, backed off, and fails only once every read
-        has failed for ten minutes (`Slurm.ride_out`); a line it cannot take apart, or a node held twice, ends it
-        at once."""
+        this federation's own, and the release follows. A read of the account's jobs that fails or times out (a slow
+        controller, with the jobs already running) is read again, backed off, and fails only once every read has
+        failed for ten minutes (`Slurm.ride_out`); a line it cannot take apart ends it at once. Either failure
+        propagates to `releasing`, which reads each held job before it cancels it: ten minutes later a job may have
+        ended and Slurm reused its id, which a cancel by the saved id would hit."""
 
         def read() -> List[str]:
             return hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs)
 
-        try:
-            others = set(self.slurm.ride_out(read, "the read of the account's live jobs", self.say))
-        except SlurmError as error:
-            raise SlurmError(f"{error}; {self.release(jobs)}") from None
+        others = set(self.slurm.ride_out(read, "the read of the account's live jobs", self.say))
         held = [(hpcexclude.role(index), node) for index, node in enumerate(placed[0])]
         held += [(hpcexclude.AGENT, node) for nodes in placed[1:] for node in nodes]
         shared = [role for role, node in held if node in others]

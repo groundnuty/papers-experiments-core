@@ -199,6 +199,26 @@ def test_o57_a_read_after_the_start_that_fails_for_ten_minutes_releases_every_he
     assert str(refused.value).endswith(f"the held job(s) {SERVICES}, {AGENT} were cancelled")
 
 
+def test_o57_a_held_job_whose_id_was_reused_during_the_retries_is_never_cancelled(hpc, tmp_path, site):
+    """O57: ten minutes of failed reads is long enough for a held job to end and Slurm to reuse its id. The release that
+    follows the give-up reads each job first, as every other release does, so the job that now carries another name is
+    not cancelled and is named, and the other held job is."""
+    fake = FakeSlurm(state="RUNNING")
+    rig = Rig(hpc, tmp_path, site, [True] * 1000, layout=SEPARATE_LAYOUT, fake=fake, phase="exclusion")
+    real = fake.run
+
+    def reused(argv, timeout):
+        if len(rig.failed_at) >= 3:  # the agent's id is another job's from the third failed read on
+            fake.component_recorded[(AGENT, 0)] = {"JobName": "somebody-elses-analysis"}
+        return real(argv, timeout)
+
+    fake.run = reused
+    with pytest.raises(hpc.slurm.SlurmError, match="reads in a row failed over") as refused:
+        rig.up()
+    assert fake.cancelled == [SERVICES]
+    assert f"job(s) {AGENT} carry another job's name and were not cancelled" in str(refused.value)
+
+
 def test_o57_reads_that_all_fail_for_ten_minutes_end_the_wait_and_release_every_held_job_as_before(hpc, tmp_path, site):
     """O57: the wait gives up once every read has failed for `MISSED_POLLS_GIVE_UP_S` since the streak's first, not
     before, and then fails as it always did: it says what the last read said and for how long, and releases every held
