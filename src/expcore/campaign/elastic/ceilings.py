@@ -20,6 +20,8 @@ from expcore.campaign.elastic import schema
 from expcore.campaign.elastic.config import LedgerConfig, micro_down
 from expcore.campaign.elastic.records import Ceiling, CeilingRefused, Ceilings
 
+INT64_MAX = 2**63 - 1  # what the ledger file holds in an integer column
+
 
 def pinned(config: LedgerConfig) -> Ceilings:
     """The ceilings as the configuration pinned them, in whole micro-dollars rounded down."""
@@ -67,8 +69,10 @@ def raise_ceiling(
     """Raise the campaign's ceiling (`model` None) or a model's, in the caller's transaction, and record it. Refused
     (`CeilingRefused`) when there is no ceiling to raise, when `new_micro` is not above the current one, and when it is
     below what is committed (every lease's charge, or the model's)."""
-    if isinstance(new_micro, bool) or not isinstance(new_micro, int) or new_micro < 1:
-        raise ValueError(f"new_max_micro_usd must be a whole number of micro-dollars above zero, got {new_micro!r}")
+    if isinstance(new_micro, bool) or not isinstance(new_micro, int) or not 1 <= new_micro <= INT64_MAX:
+        raise ValueError(
+            f"new_max_micro_usd must be a whole number of micro-dollars from 1 to {INT64_MAX}, got {new_micro!r}"
+        )
     reason, actor = _text("reason", reason), _text("actor", actor)
     current = effective(db, config)
     if model is None:

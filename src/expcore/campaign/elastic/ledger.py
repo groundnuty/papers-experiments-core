@@ -376,14 +376,18 @@ class Ledger(LedgerViews):
 
     def _return(self, returned: Return, now: float) -> None:
         row = self._lease_row(returned.lease_id)
-        if row["state"] == "returned" and row["charge_micro"] == micro_up(returned.spend_usd):
+        spend = micro_up(returned.spend_usd)
+        charge = settling.charge_of(self.db, row["id"], spend)
+        if row["state"] == "returned" and row["charge_micro"] == charge:
             return
         if row["state"] not in (*LIVE, "expired"):
             raise CompletionConflict(f"lease {row['id']} is {row['state']}, so it cannot be returned")
         self.db.execute(
             "UPDATE leases SET state='returned', slot=0, charge_micro=?, ended_at=? WHERE id=?",
-            (micro_up(returned.spend_usd), now, row["id"]),
+            (charge, now, row["id"]),
         )
+        if charge < spend:
+            settling.contradicted(self.db, now, row, spend, charge)
         if row["state"] in LIVE:
             self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
         self._event(now, "return", run_key=row["run_key"], lease_id=row["id"], was=row["state"])
@@ -409,10 +413,13 @@ class Ledger(LedgerViews):
             self._event(now, "lost", run_key=row["run_key"], lease_id=lease_id, counted=counts)
             return "lost"
         state = "counted" if counts else "superseded"
-        charge = micro_up(completion["spend_usd"])
+        measured = micro_up(completion["spend_usd"])
+        charge = settling.charge_of(self.db, lease_id, measured)
         self.db.execute(
             "UPDATE leases SET state=?, charge_micro=?, ended_at=? WHERE id=?", (state, charge, now, lease_id)
         )
+        if charge < measured:
+            settling.contradicted(self.db, now, row, measured, charge)
         if counts:
             run = self.db.execute("SELECT * FROM runs WHERE run_key=?", (row["run_key"],)).fetchone()
             charged = run["charged"] + completion["charged"]
@@ -481,7 +488,7 @@ class Ledger(LedgerViews):
         Only a lease expired with its holder proven ended, or one whose archive never verified, is settled; one
         already settled is refused unless the values are the same (then nothing changes), and a spend above the grant
         is recorded as a failed cap and refused (`SettleRefused`). The difference goes back to the budget."""
-        settling.check(spend_micro_usd, source)
+        settling.check(lease_id, spend_micro_usd, source)
         outcome = self._transact(
             lambda: settling.apply(self.db, self.config, self._clock(), lease_id, spend_micro_usd, source)
         )
@@ -498,6 +505,8 @@ class Ledger(LedgerViews):
 
     def raise_model_ceiling(self, model: str, new_max_micro_usd: int, reason: str, actor: str) -> Ceiling:
         """`raise_ceiling` for a model that has a ceiling of its own, never below what the model has committed."""
+        if not isinstance(model, str) or not model:
+            raise ValueError(f"a model's ceiling needs the model's key, got {model!r}")
         return self._transact(
             lambda: ceilings.raise_ceiling(self.db, self.config, self._clock(), new_max_micro_usd, reason, actor, model)
         )

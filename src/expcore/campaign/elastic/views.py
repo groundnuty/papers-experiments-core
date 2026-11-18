@@ -150,7 +150,17 @@ class LedgerViews:
         return read_settlements(self.db)
 
     def status(self) -> Status:
-        """The ceiling and its history, what is committed and left, and what unsettled leases lock as their grants."""
+        """The ceiling and its history, what is committed and left, and what unsettled leases lock as their grants,
+        read in one transaction so an operator's raise from another process cannot split it."""
+        if self.db.in_transaction:
+            return self._status()
+        self.db.execute("BEGIN")
+        try:
+            return self._status()
+        finally:
+            self.db.execute("COMMIT")
+
+    def _status(self) -> Status:
         in_force = self.ceilings()
         total, per_model = self.committed_micro()
         marks = ", ".join("?" * len(HELD))
@@ -191,14 +201,6 @@ class LedgerReader(LedgerViews):
         except BaseException:
             self.db.close()
             raise
-
-    def status(self) -> Status:
-        """`LedgerViews.status`, read in one transaction so a dispatcher writing meanwhile cannot split it."""
-        self.db.execute("BEGIN")
-        try:
-            return super().status()
-        finally:
-            self.db.execute("COMMIT")
 
     def close(self) -> None:
         self.db.close()

@@ -68,3 +68,16 @@ def test_c42_status_gives_the_remaining_budget_per_model_and_the_ceilings_histor
     assert status.remaining_micro == 9_000_000
     assert status.ceilings == (first, second)
     assert dict(status.model_ceiling_micro) == {"m1": 5_000_000}
+
+
+def test_c42_status_is_read_in_one_transaction_so_a_raise_cannot_split_it(tmp_path):
+    """C42: the ceiling, the charges and the history come from one snapshot, even on the dispatcher's own ledger,
+    since an operator's command may raise the ceiling from another process at any moment."""
+    ledger, _ = make(tmp_path, **OPEN)
+    statements: list[str] = []
+    ledger.db.set_trace_callback(statements.append)
+    ledger.status()
+    ledger.db.set_trace_callback(None)
+    assert statements[0] == "BEGIN"
+    assert statements[-1] == "COMMIT"
+    assert statements.count("BEGIN") == statements.count("COMMIT") == 1

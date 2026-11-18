@@ -18,6 +18,7 @@ from elastic_support import (
 from expcore.campaign.elastic import Ledger, LedgerError, Return, SettleRefused, SiteReading, Wait
 
 PRICED = {"runs": plan(tasks=4, conditions=("api-none",)), "max_usd": 2.0, "grants_usd": {"m1": 1.0}}
+LOOSE = {"runs": plan(tasks=4, conditions=("api-none",)), "max_usd": 10.0, "grants_usd": {"m1": 1.0}}
 WIDE = {"runs": plan(tasks=6, conditions=("api-none",)), "max_usd": 20.0, "grants_usd": {"m1": 1.0}}
 
 
@@ -192,21 +193,34 @@ def test_c42_a_lost_lease_nobody_can_read_stays_charged_its_grant_across_a_resta
     assert_invariants(ledger)
 
 
-def test_c42_a_completion_read_after_a_settle_replaces_the_settled_charge_with_its_measured_spend(tmp_path):
-    """C42: evidence that turns up later takes the lease through the usual path: the verified archive's measured spend
-    is its charge (nothing is released twice), and an archive that never verifies leaves the settled spend in place."""
-    ledger, clock = make(tmp_path, **PRICED)
-    late, never = lose(ledger, clock, "fed-1"), lose(ledger, clock, "fed-2")
-    ledger.settle(late.lease_id, 200_000, "root")
-    ledger.settle(never.lease_id, 300_000, "root")
-    ledger.observe_site(SITE, SiteReading(completions=(completion(late, spend_usd=0.25),)))
-    # its run was leased again to fed-2 since, so this is evidence and not the run's outcome: kept, never scored
-    assert ledger.verify_archive(late.lease_id, archive(late.lease_id)) == "superseded"
-    assert ledger.lease(late.lease_id).charge_micro == 250_000
+def test_c42_evidence_read_after_a_settle_never_raises_the_settled_charge_and_may_lower_it(tmp_path):
+    """C42: a completion verified or a return read after a settle replaces the settled spend only with a lower one: a
+    higher one would pass a budget the released money was leased out of, so the charge stays and the contradiction
+    is logged. An archive that never verifies leaves the settled spend, and the same return read again changes
+    nothing."""
+    ledger, clock = make(tmp_path, **LOOSE)
+    higher, lower, never, return_high, return_low = (lose(ledger, clock, f"fed-{n}") for n in range(1, 6))
+    for lease in (higher, lower, never, return_high, return_low):
+        ledger.settle(lease.lease_id, 300_000, "root")
+    both = (completion(higher, spend_usd=0.5), completion(lower, spend_usd=0.1))
+    ledger.observe_site(SITE, SiteReading(completions=both))
+    assert ledger.verify_archive(higher.lease_id, archive(higher.lease_id)) == "superseded"
+    assert ledger.lease(higher.lease_id).charge_micro == 300_000
+    assert ledger.verify_archive(lower.lease_id, archive(lower.lease_id)) == "superseded"
+    assert ledger.lease(lower.lease_id).charge_micro == 100_000
     ledger.observe_site(SITE, SiteReading(completions=(completion(never, spend_usd=0.3),)))
     assert ledger.verify_archive(never.lease_id, None) == "lost"
     assert ledger.lease(never.lease_id).charge_micro == 300_000
     assert ledger.settle(never.lease_id, 300_000, "root").spend_micro == 300_000
+    for lease, spend, charge in ((return_high, 5.0, 300_000), (return_low, 0.2, 200_000)):
+        for _ in range(2):  # the same return read twice
+            ledger.observe_site(SITE, SiteReading(returns=(Return(lease.lease_id, spend),)))
+            assert ledger.lease(lease.lease_id).charge_micro == charge
+            assert ledger.lease(lease.lease_id).state == "returned"
+    contradictions = [e["detail"] for e in ledger.events() if e["kind"] == "settle_contradicted"]
+    assert sorted(c["measured_micro"] for c in contradictions) == [500_000, 5_000_000]
+    assert all(c["settled_micro"] == 300_000 for c in contradictions)
+    assert ledger.committed_micro()[0] == 300_000 + 100_000 + 300_000 + 300_000 + 200_000
     assert ledger.status().locked_micro == 0
     assert_invariants(ledger)
 
@@ -219,6 +233,16 @@ def test_c42_a_spend_that_is_not_a_whole_number_of_micro_dollars_is_refused(tmp_
     with pytest.raises(ValueError, match="spend_micro_usd"):
         ledger.settle(lost.lease_id, spend, "root")
     assert ledger.lease(lost.lease_id).charge_micro == 1_000_000
+
+
+@pytest.mark.parametrize("lease_id", [True, 0, -1, "1", None, 1.0])
+def test_c42_a_lease_id_that_is_not_a_whole_number_from_one_is_refused(tmp_path, lease_id):
+    """C42: the fencing token is a whole number from 1; a bool is not lease 1, and releases nothing."""
+    ledger, clock = make(tmp_path, **PRICED)
+    lose(ledger, clock, "fed-1")
+    with pytest.raises(ValueError, match="lease id"):
+        ledger.settle(lease_id, 0, "root")
+    assert ledger.committed_micro()[0] == 1_000_000
 
 
 def test_c42_a_source_other_than_root_or_pulled_and_a_ledger_without_a_budget_are_refused(tmp_path):

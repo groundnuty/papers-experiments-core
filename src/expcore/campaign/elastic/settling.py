@@ -8,11 +8,12 @@ log; `pulled`: evidence pulled back), and the difference goes back to the budget
 (step 4 recovers it from the journal): this is the ledger's side only, and a lease nobody can read stays charged its
 grant.
 
-A lease is settled once. The same spend and source again changes nothing; any other is refused. A spend above the
-lease's grant would mean its cap failed: it is refused, and the failure is kept in the log (once for each claim), so the
-lease stays charged its grant, the bound it was granted. A lease expired but not yet proven ended is not lost: its
-holder may still be spending. Nor is one whose job the controller cancelled until KillWait has passed, as the job may
-run on, still spending, until then.
+A lease is settled once. The same spend and source again changes nothing; any other is refused. Evidence read after a
+settle (a completion verified, a return) never raises the charge above the settled spend (`charge_of`). A spend above
+the lease's grant would mean its cap failed: it is refused, and the failure is kept in the log (once for each claim),
+so the lease stays charged its grant, the bound it was granted. A lease expired but not yet proven ended is not lost:
+its holder may still be spending. Nor is one whose job the controller cancelled until KillWait has passed, as the job
+may run on, still spending, until then.
 """
 
 import json
@@ -24,14 +25,39 @@ from expcore.campaign.elastic.config import LedgerConfig
 from expcore.campaign.elastic.records import SETTLE_SOURCES, LedgerError, Settlement, SettleRefused
 
 
-def check(spend_micro: Any, source: Any) -> None:
-    """Refuse (ValueError) a spend that is not a whole number of micro-dollars, not below zero, or a source unknown."""
+def check(lease_id: Any, spend_micro: Any, source: Any) -> None:
+    """Refuse (ValueError) a lease id that is not a whole number from 1 (a bool is not lease 1), a spend that is not a
+    whole number of micro-dollars, not below zero, or a source unknown."""
+    if isinstance(lease_id, bool) or not isinstance(lease_id, int) or lease_id < 1:
+        raise ValueError(f"a lease id is a whole number of at least 1, got {lease_id!r}")
     if isinstance(spend_micro, bool) or not isinstance(spend_micro, int) or spend_micro < 0:
         raise ValueError(
             f"spend_micro_usd must be a whole number of micro-dollars, not below zero, got {spend_micro!r}"
         )
     if source not in SETTLE_SOURCES:
         raise ValueError(f"source must be one of {', '.join(SETTLE_SOURCES)}, got {source!r}")
+
+
+def charge_of(db: sqlite3.Connection, lease_id: int, measured_micro: int) -> int:
+    """What a lease is charged once its spend is measured (a verified completion, or a return). A settled lease is
+    never charged more than it was settled at: money it released may be leased out again, so a higher figure read
+    later would pass the budget. It is charged the lower one, and `contradicted` keeps the higher in the log."""
+    row = db.execute("SELECT spend_micro FROM settlements WHERE lease_id=?", (lease_id,)).fetchone()
+    return measured_micro if row is None else min(measured_micro, row["spend_micro"])
+
+
+def contradicted(db: sqlite3.Connection, now: float, lease: Any, measured_micro: int, charged_micro: int) -> None:
+    """Log that evidence read after a settle spent more than the settle said, which the charge does not follow."""
+    schema.add_event(
+        db,
+        now,
+        "settle_contradicted",
+        run_key=lease["run_key"],
+        lease_id=lease["id"],
+        federation=lease["federation"],
+        measured_micro=measured_micro,
+        settled_micro=charged_micro,
+    )
 
 
 def _as_settlement(row: Any) -> Settlement:

@@ -12,12 +12,11 @@ error or a file that is not a ledger.
 """
 
 import argparse
-import math
 import sqlite3
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from expcore.campaign.elastic.ceilings import raise_in_file
@@ -64,11 +63,22 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("ledger", type=Path, help="the ledger file (out/ledger.sqlite)")
     raising = commands.add_parser("raise-ceiling", help="raise the campaign's or a model's dollar ceiling")
     raising.add_argument("ledger", type=Path, help="the ledger file (out/ledger.sqlite)")
-    raising.add_argument("--usd", type=float, required=True, help="the new ceiling in dollars (above the current one)")
+    raising.add_argument("--usd", required=True, help="the new ceiling in dollars (above the current one)")
     raising.add_argument("--reason", required=True, help="why it is raised, recorded")
     raising.add_argument("--actor", required=True, help="who raises it (an operator or an agent), recorded")
     raising.add_argument("--model", help="raise this model's own ceiling instead of the campaign's")
     return parser
+
+
+def _dollars(text: str) -> Decimal:
+    """The operator's dollars exactly as typed (never through a float), finite and above zero."""
+    try:
+        value = Decimal(text.strip())
+    except InvalidOperation:
+        raise ValueError(f"--usd must be a number of dollars, got {text!r}") from None
+    if not value.is_finite() or value <= 0:
+        raise ValueError(f"--usd must be a finite number of dollars above zero, got {text!r}")
+    return value
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -82,9 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             finally:
                 reader.close()
             return 0
-        if not math.isfinite(args.usd) or args.usd <= 0:
-            raise ValueError(f"--usd must be a finite number of dollars above zero, got {args.usd!r}")
-        raised = raise_in_file(args.ledger, micro_down(args.usd), args.reason, args.actor, model=args.model)
+        raised = raise_in_file(args.ledger, micro_down(_dollars(args.usd)), args.reason, args.actor, model=args.model)
     except LedgerError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

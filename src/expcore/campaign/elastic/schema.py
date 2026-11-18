@@ -104,16 +104,16 @@ def connect(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(str(path), isolation_level=None, timeout=30.0)
     db.row_factory = sqlite3.Row
     try:
+        found = None  # look before changing anything: a file that is not a ledger is left as it was
+        with contextlib.suppress(sqlite3.DatabaseError):
+            found = db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
+        if found is None or found[0] != SCHEMA:
+            raise ValueError(f"{path} is not a ledger of {SCHEMA}")
         mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
         if mode != "wal":
             raise sqlite3.OperationalError(f"{path}: the journal mode stayed {mode}, not wal")
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA foreign_keys=ON")
-        found = None
-        with contextlib.suppress(sqlite3.DatabaseError):
-            found = db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
-        if found is None or found[0] != SCHEMA:
-            raise ValueError(f"{path} is not a ledger of {SCHEMA}")
     except BaseException:
         db.close()
         raise

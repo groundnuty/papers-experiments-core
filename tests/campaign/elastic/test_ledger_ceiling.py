@@ -170,3 +170,21 @@ def test_c42_a_raise_never_changes_the_campaign_fingerprint_or_the_pinned_config
             environment=ENVIRONMENT,
             kill_wait_s=0.0,
         )
+
+
+@pytest.mark.parametrize("model", [None, "", 3])
+def test_c42_a_model_ceiling_needs_a_model_and_never_raises_the_campaigns(tmp_path, model):
+    """C42: no model (or a blank one) is refused; it is not the campaign's ceiling."""
+    ledger, _ = make(tmp_path, **BUDGET)
+    with pytest.raises(ValueError, match="model"):
+        ledger.raise_model_ceiling(model, 3_000_000, "why", "op")
+    assert ledger.ceilings().max_micro == 2_000_000
+    assert ledger.ceiling_history() == []
+
+
+def test_c42_a_ceiling_past_what_the_file_can_hold_is_refused(tmp_path):
+    """C42: a micro-dollar count must fit a signed 64-bit integer, or it is a usage error and not an overflow."""
+    ledger, _ = make(tmp_path, **BUDGET)
+    with pytest.raises(ValueError, match="new_max_micro_usd"):
+        ledger.raise_ceiling(2**63, "why", "op")
+    ledger.raise_ceiling(2**63 - 1, "the most there is", "op")

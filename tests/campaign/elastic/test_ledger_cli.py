@@ -1,6 +1,8 @@
 """`python -m expcore.campaign.elastic`: an operator's `status` and `raise-ceiling`, run while a dispatcher holds the
 ledger."""
 
+import sqlite3
+
 import pytest
 from elastic_support import assert_invariants, join, leased, ledger_path, lose, make, plan
 
@@ -84,3 +86,35 @@ def test_c42_the_cli_reports_a_missing_or_foreign_file(tmp_path, capsys):
     other.write_text("not a database")
     assert main(["status", str(other)]) == 2
     assert "error" in capsys.readouterr().err
+
+
+def test_c42_the_cli_never_authorises_more_than_the_operator_typed(tmp_path, capsys):
+    """C42: dollars are read exactly, not as a float: 1.00000099999999999 on a 1 USD ceiling rounds down to what it
+    is and is refused as no raise; a figure past a 64-bit count of micro-dollars is a usage error, not a traceback."""
+    ledger, _ = make(tmp_path, runs=plan(tasks=1, conditions=("api-none",)), max_usd=1.0, grants_usd={"m1": 1.0})
+    path = str(ledger_path(tmp_path))
+    argv = ["raise-ceiling", path, "--reason", "r", "--actor", "a", "--usd"]
+    assert main([*argv, "1.00000099999999999"]) == 1
+    assert "not above" in capsys.readouterr().err
+    assert main([*argv, "10000000000000"]) == 2
+    assert "new_max_micro_usd" in capsys.readouterr().err
+    assert main([*argv, "nan"]) == 2
+    assert main([*argv, "-3"]) == 2
+    capsys.readouterr()
+    assert main([*argv, "1.0000019"]) == 0
+    assert ledger.ceilings().max_micro == 1_000_001
+
+
+def test_c42_status_on_a_file_that_is_not_a_ledger_leaves_it_as_it_was(tmp_path, capsys):
+    """C42: opening a foreign database to look at it must not switch its journal mode."""
+    other = tmp_path / "other.sqlite"
+    db = sqlite3.connect(other)
+    db.execute("CREATE TABLE t(x)")
+    db.commit()
+    assert db.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    db.close()
+    assert main(["status", str(other)]) == 2
+    capsys.readouterr()
+    db = sqlite3.connect(other)
+    assert db.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    db.close()
