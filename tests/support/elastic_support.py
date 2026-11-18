@@ -6,7 +6,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from expcore.campaign.elastic import Completion, Lease, Ledger, LedgerConfig, LedgerRun, SiteReading
-from expcore.campaign.elastic.config import micro_down
 
 FINGERPRINT = hashlib.sha256(b"an invented campaign").hexdigest()
 ENVIRONMENT = hashlib.sha256(b"an invented environment").hexdigest()
@@ -117,10 +116,21 @@ def leased(ledger: Ledger, label: str) -> Lease:
     return got
 
 
+def lose(ledger: Ledger, clock: FakeClock, label: str) -> Lease:
+    """A federation joins, takes a lease and dies: its job is proven ended with no completion. Return the lost lease
+    (`expired`, its slot free, charged its grant)."""
+    join(ledger, clock, label)
+    lease = leased(ledger, label)
+    ledger.prove_ended(label, "terminal")
+    return ledger.lease(lease.lease_id)
+
+
 def assert_invariants(ledger: Ledger) -> None:
     """What every step must keep: one live lease per run and per federation, a live lease being its run's latest, no
-    budget or ceiling passed, no cap passed by live and held-back leases together, and at most one counted done lease
-    per run, which is the run's latest when the run is done."""
+    budget or ceiling (as raised) passed, no cap passed by live and held-back leases together, at most one counted
+    done lease per run, which is the run's latest when the run is done, a settlement never above its lease's grant,
+    a run's charged attempts being the sum of what its leases were counted for, and a locked total that is the grants
+    of the held leases nobody settled."""
     leases = ledger.leases()
     runs = {run.run_key: run for run in ledger.runs()}
     live = [lease for lease in leases if lease.state in ("issued", "sent")]
@@ -138,10 +148,25 @@ def assert_invariants(ledger: Ledger) -> None:
     cfg = ledger.config
     total, per_model = ledger.committed_micro()
     assert total == sum(lease.charge_micro for lease in leases)
-    if cfg.max_usd is not None:
-        assert total <= micro_down(cfg.max_usd), f"committed {total} passes max_usd {cfg.max_usd}"
-        for model, ceiling in cfg.per_model_usd.items():
-            assert per_model.get(model, 0) <= micro_down(ceiling), f"model {model} passes its ceiling"
+    counted = dict(ledger.db.execute("SELECT run_key, SUM(charged_added) FROM leases GROUP BY run_key").fetchall())
+    for run in runs.values():
+        assert run.charged == counted.get(run.run_key, 0), f"run {run.run_key}'s charged attempts are not its leases'"
+    ceilings = ledger.ceilings()
+    if ceilings.max_micro is not None:
+        assert total <= ceilings.max_micro, f"committed {total} passes the ceiling {ceilings.max_micro}"
+        for model, ceiling in ceilings.per_model_micro.items():
+            assert per_model.get(model, 0) <= ceiling, f"model {model} passes its ceiling"
+        assert ledger.status().remaining_micro == ceilings.max_micro - total
+    settled = {settlement.lease_id: settlement for settlement in ledger.settlements()}
+    for lease in leases:
+        if lease.lease_id in settled:
+            assert settled[lease.lease_id].spend_micro <= lease.grant_micro, "a settlement passes its grant"
+    held = sum(
+        lease.grant_micro
+        for lease in leases
+        if lease.state in ("issued", "sent", "expired", "reported", "lost") and lease.lease_id not in settled
+    )
+    assert ledger.status().locked_micro == held, "the locked total is not the grants of the unsettled leases"
     for lease in leases:
         assert lease.charge_micro <= lease.grant_micro or lease.state in ("counted", "superseded", "returned")
     slots = Counter(lease.model for lease in leases if lease.slot)

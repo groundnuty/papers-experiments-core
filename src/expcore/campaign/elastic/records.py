@@ -7,13 +7,17 @@ Lease states:
 |---|---|---|---|
 | `issued` | written before its file goes out | held | the grant |
 | `sent` | its file landed in the federation's inbox | held | the grant |
-| `expired` | its run went back to pending; its holder may still be running | held until proven ended | the grant |
+| `expired` | its run went back to pending; its holder may still run | held until proven ended | grant, or settled |
 | `reported` | its completion was read; the archive is not verified yet | free | the grant |
 | `counted` | the latest lease's completion, archive verified: the run's outcome | free | measured |
 | `superseded` | a completion of a lease that was not its run's latest: evidence | free | measured |
-| `lost` | its archive never verified | free | the grant |
+| `lost` | its archive never verified | free | grant, or settled |
 | `returned` | returned unstarted by its federation | free | what the return names |
 | `cancelled` | its file never landed | free | nothing |
+
+A **settlement** (`Settlement`, `Ledger.settle`) is not a state: a lease expired with its holder proven ended, or
+`lost`, is charged its spend as read from the dead federation instead of its grant ("settled" above), and keeps its
+state, so a completion or a return read later still takes it through the usual path.
 
 A run is `pending`, `leased` (a lease in flight, or a counting completion waiting for its archive), `done`,
 `infra_exhausted` or `harness_error`.
@@ -27,6 +31,8 @@ from typing import Any
 
 LIVE = ("issued", "sent")
 COMPLETION_STATES = ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded")
+HELD = ("issued", "sent", "expired", "reported", "lost")  # states charged their grant until a spend settles them
+SETTLE_SOURCES = ("root", "pulled")  # where a settled spend was read: the surviving root, or evidence pulled back
 PROOFS = ("terminal", "cancelled")  # what a caller may give as a job's proven end; "walltime" is the ledger's own
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
@@ -41,6 +47,14 @@ class JoinRefused(LedgerError):
 
 class CompletionConflict(LedgerError):
     """A completion or return that contradicts what the ledger already read for the same lease."""
+
+
+class SettleRefused(LedgerError):
+    """A lease that is not lost, one already settled with other values, or a spend above its grant."""
+
+
+class CeilingRefused(LedgerError):
+    """A ceiling that is not above the current one, is below what is committed, or has nothing to raise."""
 
 
 def _lease_id(value: Any) -> int:
@@ -201,3 +215,58 @@ class Demand:
     set_index: int | None
     pending: Mapping[str, int]
     slots: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class Settlement:
+    """A lost lease's spend settled: when, from where (`source`), the spend and the grant it replaced."""
+
+    lease_id: int
+    at: float
+    source: str
+    spend_micro: int
+    grant_micro: int
+    charged: int | None = None  # the lease's charged attempts as its log gave them, None: not read
+
+    @property
+    def released_micro(self) -> int:
+        """What settling gave back to the budget."""
+        return self.grant_micro - self.spend_micro
+
+
+@dataclass(frozen=True)
+class Ceiling:
+    """One raise of a dollar ceiling: of the campaign's (`model` None) or of a model's, with when, why and by whom."""
+
+    ceiling_id: int
+    at: float
+    model: str | None
+    old_micro: int
+    new_micro: int
+    reason: str
+    actor: str
+
+
+@dataclass(frozen=True)
+class Ceilings:
+    """The ceilings in force: the campaign's (None: no budget) and each model's own, as pinned and then raised."""
+
+    max_micro: int | None
+    per_model_micro: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class Status:
+    """The ledger's money in micro-dollars. `ceiling_micro` is None with no budget (then `remaining_micro` is too);
+    `locked_*` is what unsettled leases hold as their grants (in flight, expired, reported, lost), by lease state and
+    by model; `ceilings` is the history of raises, oldest first."""
+
+    ceiling_micro: int | None
+    committed_micro: int
+    remaining_micro: int | None
+    locked_micro: int
+    locked_by_state: Mapping[str, int]
+    locked_by_model: Mapping[str, int]
+    model_ceiling_micro: Mapping[str, int]
+    model_remaining_micro: Mapping[str, int]
+    ceilings: tuple[Ceiling, ...]
