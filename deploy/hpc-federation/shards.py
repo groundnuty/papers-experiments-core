@@ -65,20 +65,22 @@ true` and `home_files_count`, and the archive, its manifest, the snapshots, the 
 no name, size, hash or content (the step says how many files, a count). The copies live in the step's own directory on
 the tmpfs and go with it, and sooner: once the dispatcher and the post-run script have ended, before the archive,
 `step` removes the home; on every way out its `finally` removes the home explicitly before the directory
-(`remove_tree`), with TERM, INT and HUP held back while it does, so no signal interrupts it; an archive that cannot be
-written keeps the directory without the home; and a TERM, INT or HUP that arrives while the files are staged, before
-the dispatcher's relay is installed (HUP while it runs: the dispatcher dies with its step) ends the step through that
-cleanup (exit 128 + the signal). **A cell cannot reach them** (the agent's cells run as this user too): `apptainer
-exec --containall --cleanenv --no-home --no-mount hostfs,bind-paths,cwd` (`argv.py:86`, `NO_MOUNT` at `:41`) gives a
-cell its own PID, IPC and mount namespaces (`argv.py:16`) and none of the node's file systems or the driver's home,
-and every bind a cell gets has a source under the run's own directory `work_root/<run id>` (`sandbox.py:586-606`; the
-mount's paths are refused unless they lie inside it, `sandbox.py:435-443`, and the inputs are copies made there,
-`sandbox.py:798`), where `work_root` lies strictly under `--tmpfs` (`make_work_root`) and the dispatcher's home is
-`--tmpfs/expcore-shard-<label>.<random>/home`, a sibling; neither it nor the operator's source tree is bound or under
-a bound path, and the cell's own PID namespace hides the dispatcher's `/proc/<pid>`. A step killed outright (KILL, the
-walltime) leaves its directory, and the copies in it, on the node's private tmpfs until `--resume` or `sweep` removes
-it, as it leaves everything else. With no `home_files` nothing is read or written and the line, the plan and every
-record are what they were. Not covered: the fleet's shard settings (`fleet.py`) do not take the key.
+(`remove_tree`), with the stop signals (TERM, INT, HUP, QUIT, USR1, USR2, ALRM: `STOP_SIGNALS`) held back while it
+does, so none interrupts it; an archive that cannot be written keeps the directory without the home; and one of those
+signals that arrives while the files are staged, before the dispatcher's relay is installed (all but TERM and INT also
+while it runs: the dispatcher dies with its step) ends the step through that cleanup (exit 128 + the signal; a stop
+that lands before the signals are held has the cleanup finished first). **A cell cannot reach them** (the agent's
+cells run as this user too): `apptainer exec --containall --cleanenv --no-home --no-mount hostfs,bind-paths,cwd`
+(`argv.py:86`, `NO_MOUNT` at `:41`) gives a cell its own PID, IPC and mount namespaces (`argv.py:16`) and none of the
+node's file systems or the driver's home, and every bind a cell gets has a source under the run's own directory
+`work_root/<run id>` (`sandbox.py:586-606`; the mount's paths are refused unless they lie inside it,
+`sandbox.py:435-443`, and the inputs are copies made there, `sandbox.py:798`), where `work_root` lies strictly under
+`--tmpfs` (`make_work_root`) and the dispatcher's home is `--tmpfs/expcore-shard-<label>.<random>/home`, a sibling;
+neither it nor the operator's source tree is bound or under a bound path, and the cell's own PID namespace hides the
+dispatcher's `/proc/<pid>`. A step killed outright (KILL, the walltime) leaves its directory, and the copies in it, on
+the node's private tmpfs until `--resume` or `sweep` removes it, as it leaves everything else. With no `home_files`
+nothing is read or written and the line, the plan and every record are what they were. Not covered: the fleet's shard
+settings (`fleet.py`) do not take the key.
 
 **The operator's own variables (`pass_env`, O63).** The one addition to that environment is what the manifest
 declares: variables of the operator's the study needs in its dispatcher's environment, such as the operator's half of a
@@ -387,6 +389,13 @@ HOME_FILES_MAX_FILES = 64  # the operator's key tree (`home_files`): at most thi
 HOME_FILES_MAX_DIRS = 64  # this many directories,
 HOME_FILES_MAX_BYTES = 1 << 20  # this many bytes in all,
 HOME_FILES_MAX_DEPTH = 8  # and this many directories deep
+# Every signal whose default action ends the process and that a scheduler, a shell or a site can send a step: while the
+# operator's key files are in its home, each ends the step through its cleanup instead (`_unwind_on_stop`).
+STOP_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGALRM")
+    if hasattr(signal, name)
+)
 _O_PATH = getattr(os, "O_PATH", os.O_RDONLY)  # Linux: a descriptor that only names a directory, to search below it
 SNAPSHOT_EVERY_S = 900.0  # a running shard's out/ is snapshotted this often, and after each run's end
 POLL_S = 30.0  # how often the snapshot thread looks for a run's end in the store
@@ -1363,10 +1372,9 @@ def stage_home_files(tree: HomeTree, home: Path) -> int:
 
 @contextlib.contextmanager
 def _stop_held() -> Iterator[None]:
-    """TERM, INT and HUP held back (blocked, not ignored) while the key files are removed: one that arrives waits until
-    they are gone, and is then delivered as it would have been."""
-    held = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
-    before = signal.pthread_sigmask(signal.SIG_BLOCK, held)
+    """The stop signals (`STOP_SIGNALS`) held back (blocked, not ignored) while the key files are removed: one that
+    arrives waits until they are gone, and is then delivered as it would have been."""
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, set(STOP_SIGNALS))
     try:
         yield
     finally:
@@ -1374,13 +1382,13 @@ def _stop_held() -> Iterator[None]:
 
 
 def _unwind_on_stop() -> Callable[[], None]:
-    """Make TERM, INT and HUP end this process through its `finally` blocks (exit 128 + the signal) until something else
-    takes a signal over (`run_dispatcher`'s relay takes TERM and INT; HUP stays ours while the dispatcher runs, which
-    dies with its step), and return the function that gives back the handlers it replaced when they are still ours.
-    A step that has staged the operator's key files would otherwise leave them on the node if it were told to stop
-    before its dispatcher is running, or hung up on while it runs. Once stopped it ignores all three, so a second
-    signal cannot interrupt the cleanup."""
-    signums = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)  # the hang-up ends a step as a stop does
+    """Make each stop signal (`STOP_SIGNALS`) end this process through its `finally` blocks (exit 128 + the signal)
+    until something else takes one over (`run_dispatcher`'s relay takes TERM and INT; the others stay ours while the
+    dispatcher runs, which dies with its step), and return the function that gives back the handlers it replaced when
+    they are still ours. A step that has staged the operator's key files would otherwise leave them on the node if it
+    were told to stop before its dispatcher is running, or hung up on while it runs. Once stopped it ignores all of
+    them, so a second signal cannot interrupt the cleanup."""
+    signums = STOP_SIGNALS
     previous = {sig: signal.getsignal(sig) for sig in signums}
     fired = []
 
@@ -3951,16 +3959,33 @@ def _run_step(
         return status
     finally:
         try:
-            with _stop_held() if home is not None else contextlib.nullcontext():
-                if home is not None and os.path.lexists(work / "home"):
-                    remove_tree(
-                        work / "home"
-                    )  # the key copies, explicitly, on every way out: not left to the next line
-                if not keep:
-                    remove_tree(work)
+            try:
+                with _stop_held() if home is not None else contextlib.nullcontext():
+                    _clean_step(work, keep, home is not None)
+            except SystemExit:
+                if home is None:
+                    raise
+                # a stop that landed before the signals were held: its handler now ignores them all, so the cleanup
+                # that it cut short is made whole here, and the stop goes on
+                _clean_step(work, keep, True)
+                raise
         finally:
             if disarm is not None:
                 disarm()  # the handlers the step found, unless a runner has taken them over; a held stop lands here
+
+
+def _clean_step(work: Path, keep: bool, staged: bool) -> None:
+    """What a step removes on its way out, each part only if it is still there (a second pass is a no-op): the key
+    copies, explicitly and by name (a link in their place is unlinked, never walked), then, unless the directory is kept
+    for `--archive-left`, the step's directory."""
+    home = work / "home"
+    if staged and os.path.lexists(home):
+        if home.is_symlink():
+            home.unlink()
+        else:
+            remove_tree(home)
+    if not keep and (not staged or os.path.lexists(work)):
+        remove_tree(work)
 
 
 # ------------------------------------------------------------------------------------------------ the command line

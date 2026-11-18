@@ -1314,10 +1314,11 @@ Nothing of the files is recorded: no name, hash or content in a line's other wor
 `home_files: true` and `home_files_count`), the archive and its manifest, the snapshots, the journals or the step's
 output. The copies go when the dispatcher and the post-run script have ended, before the archive is written (the step
 removes its home), and with the step's directory in every other exit: a normal end, an archive that cannot be written
-(the kept directory holds no key), and a TERM, INT or HUP, including one that arrives while the files are written or
-before the dispatcher's relay is installed (the step ends through its cleanup, 128 plus the signal; HUP also ends it
-while the dispatcher runs, which dies with its step). The `finally` of every way out removes the home explicitly before
-the step's directory, with those three signals held back while it does, so none interrupts the removal. A step killed outright
+(the kept directory holds no key), and any stop signal (TERM, INT, HUP, QUIT, USR1, USR2, ALRM), including one that arrives while the files are written
+or before the dispatcher's relay is installed (the step ends through its cleanup, 128 plus the signal; all but TERM and
+INT also end it while the dispatcher runs, which dies with its step). The `finally` of every way out removes the home
+explicitly before the step's directory (a link in its place is unlinked, never walked), with those signals held back
+while it does, so none interrupts the removal; a stop that lands before they are held has the cleanup finished first. A step killed outright
 (KILL, the walltime, the node) leaves its directory, and the copies in it, on the node's private tmpfs until `--resume`
 or `sweep` removes it, as for everything else it leaves. With no `home_files` nothing is read or written and the lines,
 the plan and the records are what they were. `fleet.py`'s shard settings do not take the key. A line edited to drop the

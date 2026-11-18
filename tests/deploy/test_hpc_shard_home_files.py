@@ -619,3 +619,63 @@ def test_o63_a_tree_below_a_directory_that_only_allows_a_search_is_read(shards, 
         assert len(shards.read_home_files(str(tree)).files) == len(FILES)
     finally:
         shared.chmod(0o700)
+
+
+@pytest.mark.parametrize("name", ["SIGUSR1", "SIGUSR2", "SIGQUIT", "SIGALRM"])
+def test_o63_any_signal_that_would_end_the_step_ends_it_through_its_cleanup_while_keys_are_staged(
+    shards, tmp_path, monkeypatch, name
+):
+    """O63: a scheduler's warning signal (USR1 and the like), whose default action ends the process outright, is a stop
+    too while the key files are in the step's home: exit 128 + the signal, nothing left on the tmpfs."""
+    sig = getattr(signal, name)
+    tree = key_tree(tmp_path)
+    before = {s: signal.getsignal(s) for s in shards.STOP_SIGNALS}
+    real = shards.stage_home_files
+
+    def staged_then_signalled(*args, **kwargs):
+        result = real(*args, **kwargs)
+        os.kill(os.getpid(), sig)
+        return result
+
+    monkeypatch.setattr(shards, "stage_home_files", staged_then_signalled)
+    with pytest.raises(SystemExit) as stopped:
+        run_step(shards, step_args(tmp_path, tree), never_run)
+    assert stopped.value.code == 128 + sig
+    assert not list((tmp_path / "tmpfs").iterdir())
+    assert {s: signal.getsignal(s) for s in before} == before
+
+
+def test_o63_a_stop_that_lands_before_the_cleanup_holds_the_signals_still_leaves_no_key(shards, tmp_path, monkeypatch):
+    """O63: on the way out of a shard that left no out/, a HUP that arrives before the cleanup has blocked the signals
+    would cut the cleanup short; the step makes it whole before the stop goes on."""
+    import contextlib
+
+    tree = key_tree(tmp_path)
+
+    @contextlib.contextmanager
+    def late_hold():
+        os.kill(os.getpid(), signal.SIGHUP)  # lands at once, before anything is held
+        yield
+
+    monkeypatch.setattr(shards, "_stop_held", late_hold)
+    with pytest.raises(SystemExit) as stopped:
+        run_step(shards, step_args(tmp_path, tree), lambda argv, env, cwd: 3)
+    assert stopped.value.code == 128 + signal.SIGHUP
+    assert not list((tmp_path / "tmpfs").iterdir())
+
+
+def test_o63_a_home_the_dispatcher_replaced_by_a_link_is_unlinked_never_walked(shards, tmp_path):
+    """O63: a dispatcher (or a post-run script) that moves its home away and leaves a link in its place: the step's
+    cleanup unlinks the link, does not walk it (and chmod what it leads to), and still removes its own directory."""
+    tree = key_tree(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+
+    def moves_its_home(argv, env, cwd):
+        home = Path(env["HOME"])
+        home.rename(elsewhere)
+        home.symlink_to(elsewhere)
+        return 3
+
+    run_step(shards, step_args(tmp_path, tree), moves_its_home)
+    assert not list((tmp_path / "tmpfs").iterdir())
+    assert stat.S_IMODE(elsewhere.stat().st_mode) == 0o700  # what the link led to was not touched
