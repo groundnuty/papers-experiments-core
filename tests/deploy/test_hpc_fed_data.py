@@ -251,9 +251,9 @@ def test_o63_the_content_reader_does_not_read_the_link_checks_files_and_reads_ev
                 for name, file_id in listing[directory]
             ]
 
-        def read_back(self, service: Any, file_id: str) -> bytes:
+        def read_chunks(self, service: Any, file_id: str) -> Any:
             read.append(file_id)
-            return b"abc"
+            return iter([b"a", b"bc"])  # the file's bytes in pieces: its digest is of all of them
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(fedcontent, "Content", Content)
