@@ -40,34 +40,45 @@ the operator's `home_files` puts in that home (below). When that file declares t
 `work_root` (mode 0700) before the dispatcher, which the sandbox will not start without; it refuses one that is a
 link, not this user's, open to others, or not under `--tmpfs` (the node's tmpfs: never the shared filesystem).
 
-**The operator's key files (`home_files`, O63).** A study's `models.toml` names `key_file = "~/..."` paths, and
-the dispatcher's HOME is a private directory on the node's tmpfs (above), so `~` resolves into an empty home and every
-model call would fail at its first request. The manifest's optional `home_files = "/abs/path"` names a directory of the
-operator's on the shared filesystem laid out as it would sit under a home (`.secrets/<...>/key`). `plan` and `lines`
-read it (`read_home_files`) before anything is printed, and each line ends in `--home-files PATH`, the path alone (as
-the manifest's other paths ride on it; `plan` prints `home_files: true` and no path). The path is absolute with no `.`,
-`..` or empty part and no link on the way (each part is opened with `O_NOFOLLOW`, so the operator gives the resolved
-path); the directory and every directory in it is this user's with no group or other bit (mode 0700 or stricter), every
-other entry is a regular file of this user's with no group or other bit and no execute bit (0600 or stricter): a link,
-a file that is not regular, one of another user's, one open to others, more than 64 files, more than 64 directories,
-more than 1 MiB in all, a tree more than 8 directories deep and a tree with no file are refused, and the refusal names
-`home_files` and why, never a path or a name inside. `step` reads the tree itself, once, as one of its first acts
-(the same checks, on the descriptors it reads the bytes through: nothing is checked and then read again, and nothing
-is pinned on the line, so a key the operator rotated since `lines` is the one that arrives), refusing with
-`PRE_STEP_REFUSED` (73) and nothing made, and holds the bytes. After its home exists and before the dispatcher
-starts, it writes them there: directories 0700 and files 0600 (`fchmod`, whatever the umask), made with `O_EXCL` and
-`O_NOFOLLOW` below a held descriptor of the home; a directory the step already made (`.config`) is merged into, a file
-that would replace anything is refused (73, before the dispatcher, the directory removed). A study's `~/...` then
-resolves to the operator's files in the dispatcher and its children. Nothing of the files is recorded: `step.json`
-holds `home_files: true` and `home_files_count`, and the archive, its manifest, the snapshots, the journals and what the
-step prints hold no name, hash or content. The copies live in the step's own directory on the tmpfs and go with it, and
-sooner: once the dispatcher and the post-run script have ended, before the archive, `step` removes the home; an
-archive that cannot be written keeps the directory without it; and a TERM or INT that arrives while the files are
-staged, or before the dispatcher's relay is installed, ends the step through its cleanup (exit 128 + the signal). A
-step killed outright (KILL, the walltime) leaves its directory, and the copies in it, on the node's private tmpfs until
-`--resume` or `sweep` removes it, as it leaves everything else. With no `home_files` nothing is read or written and
-the line, the plan and every record are what they were. Not covered: the fleet's shard settings (`fleet.py`) do not
-take the key.
+**The operator's key files (`home_files`, O63).** A study's `models.toml` names `key_file = "~/..."` paths, and the
+dispatcher's HOME is a private directory on the node's tmpfs (above), so `~` resolves into an empty home and every
+model call would fail at its first request. The manifest's optional `home_files = "/abs/path"` names a directory of
+the operator's on the shared filesystem laid out as it would sit under a home (`.secrets/<...>/key`). `plan` and
+`lines` read it (`read_home_files`) before anything is printed, and each line carries `--home-files PATH` (before any
+`--pass-env`), the path alone (as the manifest's other paths ride on it; `plan` prints each line, so the path is in
+its `argv`, and says `home_files: true`). The path is absolute with no `.`, `..`, empty or control-character part and
+no link on the way (each part is opened with `O_NOFOLLOW`, and a part above the tree only needs search permission, so
+the operator gives the resolved path), and the tree is outside the study, which the step copies whole; the directory
+and every directory in it is this user's with no group or other bit (mode 0700 or stricter), every other entry is a
+regular file of this user's with no group or other bit and no execute bit (0600 or stricter): a link, a file that is
+not regular, one of another user's, one open to others, more than 64 files, more than 64 directories, more than 1 MiB
+in all, a tree more than 8 directories deep and a tree with no file are refused, and the refusal names `home_files`
+and why, never a path or a name inside. `step` reads the tree itself, once, as one of its first acts (the same checks,
+on the descriptors it reads the bytes through: nothing is checked and then read again, and nothing is pinned on the
+line, so a key the operator rotated since `lines` is the one that arrives), refusing with `PRE_STEP_REFUSED` (73) and
+nothing made, and holds the bytes. After its home exists and before the dispatcher starts, it writes them there:
+directories 0700 and files 0600 (made under a umask of 077 and `fchmod`ed), with `O_EXCL` and `O_NOFOLLOW` below a
+held descriptor of the home; a directory the step already made (`.config`) is merged into, a file that would replace
+anything is refused (73, before the dispatcher, the directory removed). A study's `~/...` then resolves to the
+operator's files in the dispatcher and its children. Nothing of the files is recorded: `step.json` holds `home_files:
+true` and `home_files_count`, and the archive, its manifest, the snapshots, the journals and what the step prints hold
+no name, size, hash or content (the step says how many files, a count). The copies live in the step's own directory on
+the tmpfs and go with it, and sooner: once the dispatcher and the post-run script have ended, before the archive,
+`step` removes the home; on every way out its `finally` removes the home explicitly before the directory
+(`remove_tree`), with TERM, INT and HUP held back while it does, so no signal interrupts it; an archive that cannot be
+written keeps the directory without the home; and a TERM, INT or HUP that arrives while the files are staged, before
+the dispatcher's relay is installed (HUP while it runs: the dispatcher dies with its step) ends the step through that
+cleanup (exit 128 + the signal). **A cell cannot reach them** (the agent's cells run as this user too): `apptainer
+exec --containall --cleanenv --no-home --no-mount hostfs,bind-paths,cwd` (`argv.py:86`, `NO_MOUNT` at `:41`) gives a
+cell its own PID, IPC and mount namespaces (`argv.py:16`) and none of the node's file systems or the driver's home,
+and every bind a cell gets has a source under the run's own directory `work_root/<run id>` (`sandbox.py:586-606`; the
+mount's paths are refused unless they lie inside it, `sandbox.py:435-443`, and the inputs are copies made there,
+`sandbox.py:798`), where `work_root` lies strictly under `--tmpfs` (`make_work_root`) and the dispatcher's home is
+`--tmpfs/expcore-shard-<label>.<random>/home`, a sibling; neither it nor the operator's source tree is bound or under
+a bound path, and the cell's own PID namespace hides the dispatcher's `/proc/<pid>`. A step killed outright (KILL, the
+walltime) leaves its directory, and the copies in it, on the node's private tmpfs until `--resume` or `sweep` removes
+it, as it leaves everything else. With no `home_files` nothing is read or written and the line, the plan and every
+record are what they were. Not covered: the fleet's shard settings (`fleet.py`) do not take the key.
 
 **The operator's own variables (`pass_env`, O63).** The one addition to that environment is what the manifest
 declares: variables of the operator's the study needs in its dispatcher's environment, such as the operator's half of a
@@ -329,7 +340,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -376,6 +387,7 @@ HOME_FILES_MAX_FILES = 64  # the operator's key tree (`home_files`): at most thi
 HOME_FILES_MAX_DIRS = 64  # this many directories,
 HOME_FILES_MAX_BYTES = 1 << 20  # this many bytes in all,
 HOME_FILES_MAX_DEPTH = 8  # and this many directories deep
+_O_PATH = getattr(os, "O_PATH", os.O_RDONLY)  # Linux: a descriptor that only names a directory, to search below it
 SNAPSHOT_EVERY_S = 900.0  # a running shard's out/ is snapshotted this often, and after each run's end
 POLL_S = 30.0  # how often the snapshot thread looks for a run's end in the store
 SNAPSHOTS, JOURNALS = "snapshots", "journals"  # under <results>/<label>/
@@ -1149,6 +1161,18 @@ def home_files_path_problem(path: Any) -> str | None:
         return "must be an absolute path, a string"
     if any(part in ("", ".", "..") for part in path[1:].split("/")):
         return "must be a plain absolute path: no empty, `.` or `..` part, no trailing slash"
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        return "must be a plain absolute path: no control character (it rides on a line)"
+    return None
+
+
+def home_files_overlap_problem(path: str, study: Path) -> str | None:
+    """Why the key tree at `path` and the study cannot both be: the step copies the whole study to its tmpfs, so a tree
+    inside it would be copied a second time into a directory a failed archive keeps, and a study inside the tree is no
+    private tree. None when they are apart."""
+    tree, where = Path(path), Path(os.path.realpath(study))
+    if tree == where or tree.is_relative_to(where) or where.is_relative_to(tree):
+        return "and the study overlap: the key tree must be outside the study, which the step copies whole"
     return None
 
 
@@ -1230,8 +1254,12 @@ def _home_scan(fd: int, parts: tuple[str, ...], found: dict[str, Any], uid: int,
                 if found["bytes"] > HOME_FILES_MAX_BYTES:
                     raise _home_refusal(f"holds more than {HOME_FILES_MAX_BYTES} bytes")
                 data = b""
-                if keep:
-                    data = os.read(file_fd, info.st_size + 1)
+                if keep:  # up to one byte past its size: a file that grew since the `fstat` is refused
+                    chunks, left = [], info.st_size + 1
+                    while left and (chunk := os.read(file_fd, left)):
+                        chunks.append(chunk)
+                        left -= len(chunk)
+                    data = b"".join(chunks)
                     if len(data) != info.st_size:
                         raise _home_refusal("changed while it was read")
                 found["files"].append((kid, data))
@@ -1255,8 +1283,10 @@ def read_home_files(path: str, *, keep: bool = True, uid: int | None = None) -> 
     fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     found: dict[str, Any] = {"dirs": [], "files": [], "bytes": 0}
     try:
-        for part in path[1:].split("/"):
-            below = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+        parts = path[1:].split("/")
+        for n, part in enumerate(parts):  # a directory on the way needs search permission only: O_PATH, not a read
+            how = os.O_RDONLY if n == len(parts) - 1 else _O_PATH
+            below = os.open(part, how | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
             os.close(fd)
             fd = below
         _home_dir_ok(os.fstat(fd), uid, "is")
@@ -1291,6 +1321,7 @@ def stage_home_files(tree: HomeTree, home: Path) -> int:
     (checked: this user's, 0700); a file that would replace anything is refused. The number of files written;
     `ShardsError` naming `home_files` otherwise, never a path or a name."""
     root = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    umask = os.umask(0o077)  # what this makes is the operator's alone, whatever umask the step was started under
     try:
         _home_dir_ok(os.fstat(root), os.geteuid(), "cannot be staged: the step's home is")
         for parts in tree.dirs:
@@ -1325,17 +1356,31 @@ def stage_home_files(tree: HomeTree, home: Path) -> int:
     except OSError as error:
         raise _home_os_error(error) from None
     finally:
+        os.umask(umask)
         os.close(root)
     return len(tree.files)
 
 
+@contextlib.contextmanager
+def _stop_held() -> Iterator[None]:
+    """TERM, INT and HUP held back (blocked, not ignored) while the key files are removed: one that arrives waits until
+    they are gone, and is then delivered as it would have been."""
+    held = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, held)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)
+
+
 def _unwind_on_stop() -> Callable[[], None]:
-    """Make TERM and INT end this process through its `finally` blocks (exit 128 + the signal) until something else
-    takes the two signals over (`run_dispatcher`'s relay), and return the function that gives back the handlers it
-    replaced when they are still ours. A step that has staged the operator's key files would otherwise leave them on
-    the node if it were told to stop before its dispatcher is running. Once stopped it ignores both, so a second
+    """Make TERM, INT and HUP end this process through its `finally` blocks (exit 128 + the signal) until something else
+    takes a signal over (`run_dispatcher`'s relay takes TERM and INT; HUP stays ours while the dispatcher runs, which
+    dies with its step), and return the function that gives back the handlers it replaced when they are still ours.
+    A step that has staged the operator's key files would otherwise leave them on the node if it were told to stop
+    before its dispatcher is running, or hung up on while it runs. Once stopped it ignores all three, so a second
     signal cannot interrupt the cleanup."""
-    signums = (signal.SIGTERM, signal.SIGINT)
+    signums = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)  # the hang-up ends a step as a stop does
     previous = {sig: signal.getsignal(sig) for sig in signums}
     fired = []
 
@@ -1371,8 +1416,10 @@ def pinned(plan: Plan) -> Plan:
         raw = read_study_file(plan.study, name, plan.expect_render_identity)
         parse_render_identity(raw, name)
         found["expect_render_identity_sha256"] = hashlib.sha256(raw).hexdigest()
-    if plan.home_files is not None:
-        read_home_files(plan.home_files, keep=False)  # a tree the step would refuse refuses `plan` and `lines` first
+    if plan.home_files is not None:  # a tree the step would refuse refuses `plan` and `lines` first
+        if problem := home_files_overlap_problem(plan.home_files, plan.study):
+            raise _home_refusal(problem)
+        read_home_files(plan.home_files, keep=False)
     return replace(plan, **found)
 
 
@@ -3645,6 +3692,8 @@ def check_home_files(args: argparse.Namespace) -> HomeTree | None:
     if path is None:
         return None
     try:
+        if problem := home_files_path_problem(path) or home_files_overlap_problem(path, args.study):
+            raise _home_refusal(problem)
         return read_home_files(path)
     except ShardsError as error:
         raise StepRefused(str(error)) from None
@@ -3901,10 +3950,17 @@ def _run_step(
             return status or POST_RUN_FAILED
         return status
     finally:
-        if disarm is not None:
-            disarm()  # the handlers the step found, unless a runner has taken them over
-        if not keep:
-            remove_tree(work)
+        try:
+            with _stop_held() if home is not None else contextlib.nullcontext():
+                if home is not None and os.path.lexists(work / "home"):
+                    remove_tree(
+                        work / "home"
+                    )  # the key copies, explicitly, on every way out: not left to the next line
+                if not keep:
+                    remove_tree(work)
+        finally:
+            if disarm is not None:
+                disarm()  # the handlers the step found, unless a runner has taken them over; a held stop lands here
 
 
 # ------------------------------------------------------------------------------------------------ the command line

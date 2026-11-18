@@ -164,10 +164,10 @@ def test_o63_home_files_rides_on_every_line_and_nothing_else_changes(shards, tmp
 
 
 @pytest.mark.parametrize("value", ['"relative/path"', '"/a/../b"', '"/a/./b"', '"/a//b"', '"/a/b/"', "7", "true",
-                                   '["/a"]', '""'])  # fmt: skip
+                                   '["/a"]', '""', '"/a/b\\nc"', '"/a/b\\tc"', '"/a/b\\u007fc"'])  # fmt: skip
 def test_o63_a_home_files_that_is_not_a_plain_absolute_path_refuses_the_plan(shards, tmp_path, capsys, value):
-    """O63: the manifest's path is absolute with no `.`, `..` or empty part, as a string: `plan` and `lines` refuse
-    anything else naming the key and print nothing."""
+    """O63: the manifest's path is absolute with no `.`, `..`, empty or control-character part (a newline would make
+    two lines of one), as a string: `plan` and `lines` refuse anything else naming the key and print nothing."""
     path = manifest_file(tmp_path, f"home_files = {value}")
     for command in ("plan", "lines"):
         assert shards.main([command, "--manifest", str(path)]) == 2
@@ -473,3 +473,149 @@ def test_o63_an_unset_home_files_arms_no_handler_and_reads_no_tree(shards, tmp_p
     monkeypatch.setattr(shards, "_unwind_on_stop", lambda: pytest.fail("a handler was armed"))
     run, _ = dispatcher()
     assert run_step(shards, step_args(tmp_path), run) == 0
+
+
+# -- what a review found: signals, the study's copy, the path ----------------------------------------------------------
+
+
+def test_o63_a_hang_up_while_the_files_are_staged_ends_the_step_through_its_cleanup(shards, tmp_path, monkeypatch):
+    """O63: a HUP, whose default would end the step outright and leave the copies, is handled as a stop is: exit 129
+    through the cleanup, nothing left on the tmpfs, the handlers given back."""
+    tree = key_tree(tmp_path)
+    before = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    real = shards.stage_home_files
+
+    def staged_then_hung_up(*args, **kwargs):
+        result = real(*args, **kwargs)
+        os.kill(os.getpid(), signal.SIGHUP)
+        return result
+
+    monkeypatch.setattr(shards, "stage_home_files", staged_then_hung_up)
+    with pytest.raises(SystemExit) as stopped:
+        run_step(shards, step_args(tmp_path, tree), never_run)
+    assert stopped.value.code == 128 + signal.SIGHUP
+    assert not list((tmp_path / "tmpfs").iterdir())
+    assert {sig: signal.getsignal(sig) for sig in before} == before
+
+
+def test_o63_a_hang_up_while_the_dispatcher_runs_removes_the_copies_too(shards, tmp_path):
+    """O63: the stop handlers stay armed through the dispatcher's run (HUP is not one `run_dispatcher` takes over): a
+    HUP that arrives while it runs ends the step through its cleanup, and the home is gone."""
+    tree = key_tree(tmp_path)
+    seen = {}
+
+    def hung_up_while_running(argv, env, cwd):
+        seen["home"] = Path(env["HOME"])
+        os.kill(os.getpid(), signal.SIGHUP)
+        raise AssertionError("the hang-up must have ended the step")
+
+    with pytest.raises(SystemExit) as stopped:
+        run_step(shards, step_args(tmp_path, tree), hung_up_while_running)
+    assert stopped.value.code == 128 + signal.SIGHUP
+    assert not list((tmp_path / "tmpfs").iterdir())
+    assert not seen["home"].exists()
+
+
+def test_o63_a_stop_that_arrives_during_the_cleanup_waits_until_the_keys_are_gone(shards, tmp_path, monkeypatch):
+    """O63: a staging that wrote a key and then refused a colliding file starts its cleanup; a TERM that arrives while
+    the home is being removed is held back until it is gone (the step then ends as a TERM ends it), so it can never
+    leave the first key on the disk."""
+    tree = key_tree(tmp_path, {".config/zq-first": "sk-zq-5555\n", ".zqmore/x-zq": "x\n", ".zzcache": "y\n"})
+    (tree / ".zzcache").unlink()
+    (tree / ".cache").write_text("sk-zq-collides\n")  # a file where the step's own `.cache` directory is
+    (tree / ".cache").chmod(0o600)
+    real, order = shards.remove_tree, []
+
+    def stopped_while_removing(path):
+        order.append(Path(path).name)
+        if Path(path).name == "home":
+            os.kill(os.getpid(), signal.SIGTERM)  # held back by the step: delivered after the cleanup
+        real(path)
+
+    monkeypatch.setattr(shards, "remove_tree", stopped_while_removing)
+    with pytest.raises(SystemExit) as stopped:
+        run_step(shards, step_args(tmp_path, tree), never_run)
+    assert stopped.value.code == 128 + signal.SIGTERM
+    assert order[0] == "home"
+    assert not list((tmp_path / "tmpfs").iterdir())
+
+
+@pytest.mark.parametrize("way", ["normal", "dispatcher_failed", "no_out", "archive_failed"])
+def test_o63_the_step_removes_the_copies_explicitly_on_every_way_out(shards, tmp_path, monkeypatch, way):
+    """O63: whatever the way out (a finished shard, a dispatcher that failed, one that left no out/, an archive that
+    could not be written), the key copies are removed by name before the step's directory is, not left to it."""
+    tree = key_tree(tmp_path)
+    real, removed = shards.remove_tree, []
+
+    def noting(path):
+        removed.append((Path(path).name, (Path(path) / ".zqsecrets").exists() or Path(path).name != "home"))
+        real(path)
+
+    monkeypatch.setattr(shards, "remove_tree", noting)
+    if way == "archive_failed":
+        monkeypatch.setattr(shards, "archive", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "no space")))
+    run, _ = dispatcher()
+
+    def runner(argv, env, cwd):
+        if way == "no_out":
+            return 3
+        status = run(argv, env, cwd)
+        return 3 if way == "dispatcher_failed" else status
+
+    run_step(shards, step_args(tmp_path, tree), runner)
+    names = [name for name, _ in removed]
+    assert "home" in names
+    assert any(name.startswith(shards.WORK_PREFIX) for name in names) or way == "archive_failed"
+    if any(name.startswith(shards.WORK_PREFIX) for name in names):
+        assert names.index("home") < min(i for i, n in enumerate(names) if n.startswith(shards.WORK_PREFIX))
+    for left in (tmp_path / "tmpfs").rglob("*"):
+        assert "zq" not in left.name
+
+
+def test_o63_a_tree_inside_the_study_is_refused_because_the_step_copies_the_study(shards, tmp_path, capsys):
+    """O63: the step copies the whole study to its tmpfs, and a failed archive keeps that copy: a key tree inside the
+    study would be copied a second time into it, so `plan`, `lines` and the step refuse one."""
+    make_study(tmp_path)
+    tree = key_tree(tmp_path / "study")
+    path = manifest_file(tmp_path, declared(tree))
+    for command in ("plan", "lines"):
+        assert shards.main([command, "--manifest", str(path)]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "home_files" in captured.err
+        assert "overlap" in captured.err
+        assert "zq" not in captured.err
+    assert run_step(shards, step_args(tmp_path, tree), never_run) == shards.PRE_STEP_REFUSED
+    assert "overlap" in capsys.readouterr().err
+    assert not list((tmp_path / "tmpfs").iterdir())
+
+
+def test_o63_a_study_inside_the_tree_is_refused_by_the_step(shards, tmp_path, capsys):
+    """O63: a tree that holds the study is no private tree: the step refuses it (73, nothing made)."""
+    tree = key_tree(tmp_path)
+    study = tmp_path / "optree" / "study"
+    study.mkdir(mode=0o700)
+    (study / "study.toml").write_text("[study]\n")
+    (study / "campaign.toml").write_text("[scheduler]\nworkers = 1\n")
+    for name in ("tmpfs", "results"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    args = argparse.Namespace(study=study, index=1, count=2, label="fed-a", tmpfs=tmp_path / "tmpfs",
+                              results=tmp_path / "results", core_src=tmp_path, resume=False, archive_left=False,
+                              snapshot_every=3600.0, home_files=str(tree))  # fmt: skip
+    capsys.readouterr()
+    assert run_step(shards, args, never_run) == shards.PRE_STEP_REFUSED
+    assert "overlap" in capsys.readouterr().err
+    assert not list((tmp_path / "tmpfs").iterdir())
+
+
+def test_o63_a_tree_below_a_directory_that_only_allows_a_search_is_read(shards, tmp_path):
+    """O63: a directory above the tree needs search permission, not a read (a shared `0711` directory on a cluster):
+    the tree below it is read by its known path."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    tree = key_tree(shared)
+    shared.chmod(0o311)  # this user's: write and search, no read
+    try:
+        assert len(shards.read_home_files(str(tree)).files) == len(FILES)
+    finally:
+        shared.chmod(0o700)
