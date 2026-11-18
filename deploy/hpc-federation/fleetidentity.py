@@ -66,7 +66,7 @@ def read_identity(
             return None  # the key tree lies in the study: never copied here (the worker refuses it as well)
         root = fleetrecord.root_of(fleet, member)
         scratch = Path(tempfile.mkdtemp(prefix="expcore-identity-", dir=str(fleet)))
-    except (fleetrecord.FleetError, OSError, ValueError):
+    except (fleetrecord.FleetError, OSError, ValueError, TypeError):  # TypeError: a settings value of the wrong kind
         return None
     try:
         for name in ("home", "tmp", *(f"home/{sub}" for sub in shards.HOME_DIRS)):

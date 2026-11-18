@@ -151,7 +151,7 @@ def node(args: argparse.Namespace, runner: Any = None) -> int:
             work_root is not None
         ):  # the sandbox refuses to start without it: made here, 0700, on the tmpfs, as a step does
             shards.make_work_root(work_root, tmpfs)
-    except shards.ShardsError as error:
+    except (shards.ShardsError, OSError) as error:  # OSError: the tmpfs cannot take the sandbox's work root
         print(f"fleetworker: ERROR: {error}; the worker is not started, with nothing made", file=sys.stderr)
         return REFUSED
     count = 0 if tree is None else len(tree.files)
