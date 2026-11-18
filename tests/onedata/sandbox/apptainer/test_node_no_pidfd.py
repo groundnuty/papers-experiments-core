@@ -150,6 +150,48 @@ def test_o56_without_pidfd_open_a_helper_already_reaped_is_never_signalled(enosy
     assert sent == []
 
 
+def test_o56_without_pidfd_open_a_pid_a_reaped_helper_left_behind_is_never_signalled_in_another_child(
+    enosys, child, sent, tmp_path
+):
+    """O56: the node keeps a helper's pid and start after it reaped it. Another child of this process that was given
+    that pid since (here made to stand for it) is no helper: the old identity signals nothing, though `waitid` shows the
+    pid a child of ours."""
+    node, process = child
+    assert node.signal(process.pid, process.start, signal.SIGKILL) is True
+    until = time.monotonic() + 10
+    while node.alive(process.pid, process.start) and time.monotonic() < until:
+        time.sleep(0.02)
+    other = subprocess.Popen([sys.executable, "-c", SLEEP])
+    try:
+        node._children[other.pid] = node._children[process.pid]  # the reaped helper's entry, now under the new pid
+        sent.clear()
+        assert node.signal(other.pid, process.start, signal.SIGKILL) is False
+        assert sent == []
+        assert other.poll() is None
+    finally:
+        other.kill()
+        other.wait(10)
+
+
+def test_o56_without_pidfd_open_a_helper_that_ended_and_is_not_reaped_yet_is_not_reported_signalled(
+    enosys, tmp_path, sent
+):
+    """O56: a gate that ended just before the mark of the run's start is a zombie of ours: `waitid` still shows it, a
+    signal to it can never be received, and the mark must not read as signalled."""
+    node = N.LocalNode()
+    process = node.spawn([sys.executable, "-c", "pass"], stdout=tmp_path / "o", stderr=tmp_path / "e")
+    until = time.monotonic() + 10
+    while time.monotonic() < until:
+        if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+            break  # ended; not reaped
+        time.sleep(0.02)
+    sent.clear()
+    assert node.signal(process.pid, process.start, signal.SIGUSR1) is False
+    assert sent == []
+    assert node.alive(process.pid, process.start) is False
+    assert node.exit_status(process) == 0
+
+
 def test_o56_without_pidfd_open_a_pid_the_node_spawned_under_another_start_is_never_signalled(enosys, child, sent):
     """O56: a pid the node holds as a child that started at another time is another process."""
     node, process = child

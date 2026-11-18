@@ -456,11 +456,14 @@ class LocalNode:
         `signal`: True when sent, False when gone or another process, None when that cannot be told, nothing sent.
 
         * **A child this node spawned** (the data gate, the helpers: `_children`, by pid and start): signalled only
-          while `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)` shows it still this process's unreaped child
-          (`ChildProcessError` once it was reaped: False). A pid is free to be reused only once its parent has waited
-          for it, so no other process can hold it while the kernel shows it so, and `/proc` is not consulted. The
-          node's lock is held from the `waitid` to the `kill` and by `_reaped`, whose poll is what reaps a child here,
-          so no thread of this process reaps it between the two. No PID-reuse window remains.
+          while this node has not reaped it (its `Popen` has no `returncode`: the entry stays after the reap, and its
+          pid may be another child's by then) and `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)` shows it a child of
+          ours that is still running. `ChildProcessError` (reaped) is False, and so is a child that has ended and is not
+          reaped yet (a zombie: nothing can receive a signal there, and one that reads as sent would let the gate's
+          run-start mark pass as signalled). A pid is free to be reused only once its parent has waited for it, so no
+          other process can hold it while this holds, and `/proc` is not consulted. The node's lock is held from the
+          check to the `kill` and by `_reaped`, whose poll is the only thing here that reaps a child, so no thread of
+          this process reaps it between the two. No PID-reuse window remains.
         * **Any other process** (a cell's process, a holder, a helper another driver recorded: no child of ours, and
           `/proc` shows them): signalled only if its real and its effective uid, read from `/proc/<pid>/status`, are
           both this process's uid, and then if its start tick (field 22 of `stat`), read last, is the one named, with
@@ -481,10 +484,14 @@ class LocalNode:
         with self._lock:
             held = self._children.get(pid)
             if held is not None and held[1] == start:
+                if held[0].returncode is not None:
+                    return False  # reaped by this node: the pid may be another child's now
                 try:
-                    os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    ended = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
                 except ChildProcessError:
                     return False  # reaped: the pid may be anyone's now
+                if ended is not None:
+                    return False  # ended, not reaped yet: a zombie takes no signal
                 try:
                     os.kill(pid, sig)
                 except ProcessLookupError:
