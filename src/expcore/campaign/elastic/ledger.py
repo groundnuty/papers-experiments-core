@@ -21,6 +21,10 @@ shown ended; the sweep expires what it must.
 - **Budget.** A lease is issued only if its grant fits what is left of `max_usd` and of its model's ceiling after the
   charge of every lease. A lease is charged its grant until its spend is settled, so with every lease spending its
   whole grant the budget still holds.
+- **Settling and raising.** A lost lease (`settle`) is charged the spend read from its dead federation instead of its
+  grant, and the difference goes back to the budget (`settling`). A ceiling is raised mid-campaign, recorded, never
+  lowered or set below what is committed, and never part of the fingerprint (`ceilings`); `status` shows the money,
+  the grants locked in unsettled leases and the ceilings' history.
 """
 
 import json
@@ -30,18 +34,21 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.elastic import schema
+from expcore.campaign.elastic import attempts, ceilings, schema, settling
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
 from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
 from expcore.campaign.elastic.records import (
     LIVE,
     PROOFS,
+    Ceiling,
     Completion,
     CompletionConflict,
     JoinRefused,
     Lease,
     LedgerError,
     Return,
+    Settlement,
+    SettleRefused,
     SiteReading,
     Wait,
 )
@@ -203,6 +210,7 @@ class Ledger(LedgerViews):
             if row["state"] in LIVE:
                 self._expire(row, now, "ended")
             self.db.execute("UPDATE leases SET slot=0 WHERE id=?", (row["id"],))
+            attempts.lose(self.db, self.config, row["id"])  # proven ended with no completion: the loss is one attempt
         self._event(now, "proven_ended", federation=label, proof=proof)
 
     # --- leasing ----------------------------------------------------------------------------------------------
@@ -232,7 +240,15 @@ class Ledger(LedgerViews):
             for r in self.db.execute("SELECT * FROM leases WHERE state IN ('issued', 'sent')")
         ]
         chosen = choose(
-            current, pending, in_flight, self.slots(), self.committed_micro(), self.config, self.estimate_s, now
+            current,
+            pending,
+            in_flight,
+            self.slots(),
+            self.committed_micro(),
+            self.config,
+            self.estimate_s,
+            now,
+            self.ceilings(),
         )
         if isinstance(chosen, Wait):
             return chosen
@@ -295,7 +311,7 @@ class Ledger(LedgerViews):
             self.db.execute(
                 "UPDATE leases SET state='cancelled', slot=0, charge_micro=0, ended_at=? WHERE id=?", (now, lease_id)
             )
-            self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
+            attempts.requeue(self.db, self.config, row["run_key"])
             self._event(now, "cancel", run_key=row["run_key"], lease_id=lease_id)
 
         self._transact(go)
@@ -361,16 +377,21 @@ class Ledger(LedgerViews):
 
     def _return(self, returned: Return, now: float) -> None:
         row = self._lease_row(returned.lease_id)
-        if row["state"] == "returned" and row["charge_micro"] == micro_up(returned.spend_usd):
+        spend = micro_up(returned.spend_usd)
+        charge = settling.charge_of(self.db, row["id"], spend)
+        if row["state"] == "returned" and row["charge_micro"] == charge:
             return
         if row["state"] not in (*LIVE, "expired"):
             raise CompletionConflict(f"lease {row['id']} is {row['state']}, so it cannot be returned")
         self.db.execute(
             "UPDATE leases SET state='returned', slot=0, charge_micro=?, ended_at=? WHERE id=?",
-            (micro_up(returned.spend_usd), now, row["id"]),
+            (charge, now, row["id"]),
         )
+        if charge < spend:
+            settling.contradicted(self.db, now, row, spend, charge)
+        attempts.unstarted(self.db, self.config, row["id"])  # it never started: its loss, if counted, is taken back
         if row["state"] in LIVE:
-            self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
+            attempts.requeue(self.db, self.config, row["run_key"])
         self._event(now, "return", run_key=row["run_key"], lease_id=row["id"], was=row["state"])
 
     def verify_archive(self, lease_id: int, sha256: str | None) -> str:
@@ -390,19 +411,24 @@ class Ledger(LedgerViews):
         if sha256 is None or sha256 != completion["archive_sha256"]:
             self.db.execute("UPDATE leases SET state='lost', ended_at=? WHERE id=?", (now, lease_id))
             if counts:
-                self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
+                attempts.requeue(self.db, self.config, row["run_key"])
+            attempts.lose(self.db, self.config, lease_id, completion["charged"] if counts else 0)
             self._event(now, "lost", run_key=row["run_key"], lease_id=lease_id, counted=counts)
             return "lost"
         state = "counted" if counts else "superseded"
-        charge = micro_up(completion["spend_usd"])
+        measured = micro_up(completion["spend_usd"])
+        charge = settling.charge_of(self.db, lease_id, measured)
         self.db.execute(
             "UPDATE leases SET state=?, charge_micro=?, ended_at=? WHERE id=?", (state, charge, now, lease_id)
         )
+        if charge < measured:
+            settling.contradicted(self.db, now, row, measured, charge)
         if counts:
             run = self.db.execute("SELECT * FROM runs WHERE run_key=?", (row["run_key"],)).fetchone()
-            charged = run["charged"] + completion["charged"]
+            charged = run["charged"] + completion["charged"] - row["charged_added"]  # its loss was counted for one
             status = self._status_after(completion["state"], charged)
             self.db.execute("UPDATE runs SET state=?, charged=? WHERE run_key=?", (status, charged, row["run_key"]))
+            self.db.execute("UPDATE leases SET charged_added=? WHERE id=?", (completion["charged"], lease_id))
             self.db.execute(
                 "INSERT INTO estimates(model, condition, runs, total_s) VALUES(?,?,1,?) ON CONFLICT(model, condition)"
                 " DO UPDATE SET runs = runs + 1, total_s = total_s + excluded.total_s",
@@ -453,7 +479,43 @@ class Ledger(LedgerViews):
     def _expire(self, row: Any, now: float, reason: str) -> None:
         """The lease expires and its run goes back to pending at once; its slot and grant stay held."""
         self.db.execute("UPDATE leases SET state='expired', ended_at=? WHERE id=?", (now, row["id"]))
-        self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
+        attempts.requeue(self.db, self.config, row["run_key"])
         self._event(
             now, "expire", run_key=row["run_key"], lease_id=row["id"], federation=row["federation"], reason=reason
+        )
+
+    # --- money ------------------------------------------------------------------------------------------------
+
+    def settle(
+        self, lease_id: int, spend_micro_usd: int, source: str, *, attempts_charged: int | None = None
+    ) -> Settlement:
+        """Replace a lost lease's grant with the spend read from its dead federation (`source`: `root` or `pulled`),
+        and, when the log gives them, the lease's charged attempts (`attempts_charged`) for the one its loss counted.
+
+        Only a lease expired with its holder proven ended, or one whose archive never verified, is settled; one
+        already settled is refused unless the values are the same (then nothing changes), and a spend above the grant
+        is recorded as a failed cap and refused (`SettleRefused`). The difference goes back to the budget."""
+        settling.check(lease_id, spend_micro_usd, source, attempts_charged)
+        outcome = self._transact(
+            lambda: settling.apply(
+                self.db, self.config, self._clock(), lease_id, spend_micro_usd, source, attempts_charged
+            )
+        )
+        if isinstance(outcome, str):
+            raise SettleRefused(outcome)  # the failure was committed first
+        return outcome
+
+    def raise_ceiling(self, new_max_micro_usd: int, reason: str, actor: str) -> Ceiling:
+        """Raise the campaign's dollar ceiling to `new_max_micro_usd`, recorded with the time, `reason` and `actor`.
+        Never lowers it or sets it below what is committed (`CeilingRefused`); the fingerprint does not change."""
+        return self._transact(
+            lambda: ceilings.raise_ceiling(self.db, self.config, self._clock(), new_max_micro_usd, reason, actor)
+        )
+
+    def raise_model_ceiling(self, model: str, new_max_micro_usd: int, reason: str, actor: str) -> Ceiling:
+        """`raise_ceiling` for a model that has a ceiling of its own, never below what the model has committed."""
+        if not isinstance(model, str) or not model:
+            raise ValueError(f"a model's ceiling needs the model's key, got {model!r}")
+        return self._transact(
+            lambda: ceilings.raise_ceiling(self.db, self.config, self._clock(), new_max_micro_usd, reason, actor, model)
         )
