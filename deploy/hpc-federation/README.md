@@ -1319,8 +1319,11 @@ or before the dispatcher's relay is installed (the step ends through its cleanup
 INT also end it while the dispatcher runs, which dies with its step). The `finally` of every way out removes the home
 explicitly before the step's directory (a link in its place is unlinked, never walked), with those signals held back
 while it does, so none interrupts the removal; a stop that lands before they are held has the cleanup finished first. A step killed outright
-(KILL, the walltime, the node) leaves its directory, and the copies in it, on the node's private tmpfs until `--resume`
-or `sweep` removes it, as for everything else it leaves. With no `home_files` nothing is read or written and the lines,
+(KILL, the walltime, the node) leaves its directory, and the copies in it, on the node's private tmpfs, which the site
+does not clear at the job's end, until `--resume` or `sweep` removes it, as for everything else it leaves; one killed
+after its dispatcher ended (a kept `archiving` directory, its out/ waiting for `--archive-left`) has its home, and only
+its home, removed by `sweep`, by `--resume`'s look at the node and by `--archive-left`, once its step is shown gone (a
+link is unlinked, never walked). So every campaign ends with `down` (or `shards.py sweep`) on every node a step ran on. With no `home_files` nothing is read or written and the lines,
 the plan and the records are what they were. `fleet.py`'s shard settings do not take the key. A line edited to drop the
 `--home-files` words runs without the keys, and the first model request says so.
 

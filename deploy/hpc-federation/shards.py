@@ -77,10 +77,14 @@ node's file systems or the driver's home, and every bind a cell gets has a sourc
 `sandbox.py:435-443`, and the inputs are copies made there, `sandbox.py:798`), where `work_root` lies strictly under
 `--tmpfs` (`make_work_root`) and the dispatcher's home is `--tmpfs/expcore-shard-<label>.<random>/home`, a sibling;
 neither it nor the operator's source tree is bound or under a bound path, and the cell's own PID namespace hides the
-dispatcher's `/proc/<pid>`. A step killed outright (KILL, the walltime) leaves its directory, and the copies in it, on
-the node's private tmpfs until `--resume` or `sweep` removes it, as it leaves everything else. With no `home_files`
-nothing is read or written and the line, the plan and every record are what they were. Not covered: the fleet's shard
-settings (`fleet.py`) do not take the key.
+dispatcher's `/proc/<pid>`. A step killed outright (KILL, the walltime, the node) leaves its directory, and the copies
+in it, on the node's private tmpfs, which the site does not clear at the job's end, until `--resume` or `sweep`
+removes it, as it leaves everything else; one killed after its dispatcher ended (a kept `archiving` directory, whose
+out/ waits for `--archive-left`) has its home, and only its home, removed by `sweep`, by `--resume`'s look at the node
+and by `--archive-left`, once its step is shown gone (`Left.gone`, the proof a whole removal takes; a link is
+unlinked, never walked). So every campaign ends with `down` (or `shards.py sweep`) on every node a step ran on. With
+no `home_files` nothing is read or written and the line, the plan and every record are what they were. Not covered:
+the fleet's shard settings (`fleet.py`) do not take the key.
 
 **The operator's own variables (`pass_env`, O63).** The one addition to that environment is what the manifest
 declares: variables of the operator's the study needs in its dispatcher's environment, such as the operator's half of a
@@ -3061,9 +3065,17 @@ class Left:
         journals hold what it reached), whose wrapper and every process naming its directory are shown gone. A step
         whose dispatcher ended (`archiving`) holds the only whole out/ until it is archived, and one whose record
         cannot be read could be either: never removable."""
-        if self.phase != RUNNING:
-            return False
-        return alive(self.owner.get("pid"), self.owner.get("start")) is False and naming(self.path) is False
+        return self.phase == RUNNING and self.gone
+
+    @property
+    def gone(self) -> bool:
+        """Whether its step is shown gone: its wrapper no longer holds its pid and no live process of this node names
+        its directory (never when that cannot be told)."""
+        return (
+            self.owner is not None
+            and alive(self.owner.get("pid"), self.owner.get("start")) is False
+            and naming(self.path) is False
+        )
 
     def ours(self, spec: Mapping[str, Any], root: str | None, results: Path) -> bool:
         """Whether it is a step of this shard of this campaign: its whole spec, its federation's root and its results
@@ -3093,6 +3105,22 @@ def leftovers(tmpfs: Path, label: str | None = None) -> list[Left]:
     return found
 
 
+def scrub_kept_home(left: Left) -> bool:
+    """Remove the operator's key copies (`home/`) from a kept step directory: one whose dispatcher ended (`archiving`,
+    its out/ waiting for `--archive-left`), whose record says the step staged `home_files`, and whose step is shown
+    gone (`Left.gone`, the proof a removal of the whole directory takes). A step killed after the dispatcher ended, and
+    before it removed the home itself, leaves them on the node's tmpfs, which the site does not clear at the job's end;
+    nothing after the dispatcher needs them. A link in the home's place is unlinked, never walked; the out/ and the
+    record are not touched. True when something was removed; never a name or a path in what it prints."""
+    if left.owner is None or left.phase == RUNNING or left.owner.get("home_files") is not True or not left.gone:
+        return False
+    if not os.path.lexists(left.path / "home"):
+        return False
+    _clean_step(left.path, True, True)  # keep=True: the home alone, never the directory
+    print("shards: the key copies of a kept step directory are removed (its out/ is not touched)", file=sys.stderr)
+    return True
+
+
 def clear_leftovers(tmpfs: Path, spec: Mapping[str, Any], root: str | None, results: Path) -> None:
     """Before a resume: remove each earlier step's directory of this shard of this campaign whose step was killed while
     its dispatcher ran and is shown gone; refuse while one holds an out/ its dispatcher ended with and that was not
@@ -3105,6 +3133,7 @@ def clear_leftovers(tmpfs: Path, spec: Mapping[str, Any], root: str | None, resu
                   file=sys.stderr)  # fmt: skip
             continue
         if left.phase != RUNNING:
+            scrub_kept_home(left)
             raise ShardsError(
                 f"shard {label}: an earlier step's out/ was not archived and is kept on this node in "
                 f"{left.path.name}; archive it with `shards.py step --archive-left` before resuming"
@@ -3131,6 +3160,7 @@ def archive_left(args: argparse.Namespace) -> int:
     left = found[0]
     if alive(left.owner.get("pid"), left.owner.get("start")) is not False or naming(left.path) is not False:
         raise ShardsError(f"shard {args.label}: the step of {left.path.name} still runs (it archives it itself)")
+    scrub_kept_home(left)  # its step is gone: no key stays on the node should the archive below fail
     if archive_named(args.results, args.label) != left.owner.get("base"):
         raise ShardsError(
             f"shard {args.label}: an archive was published after the step of {left.path.name} started; its out/ is "
@@ -3168,6 +3198,7 @@ def sweep(tmpfs: Path, root: str, node: Any = None, live_fails: bool = False) ->
         if left.owner is None or left.owner.get("root") != root:
             continue  # not this federation's, or not to be told
         if left.phase != RUNNING:
+            scrub_kept_home(left)
             kept.append(f"{left.path.name} (its out/ was not archived: `shards.py step --archive-left`)")
         elif not left.removable:
             kept.append(f"{left.path.name} (its step still runs, or cannot be shown gone)")

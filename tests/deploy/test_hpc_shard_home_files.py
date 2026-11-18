@@ -679,3 +679,92 @@ def test_o63_a_home_the_dispatcher_replaced_by_a_link_is_unlinked_never_walked(s
     run_step(shards, step_args(tmp_path, tree), moves_its_home)
     assert not list((tmp_path / "tmpfs").iterdir())
     assert stat.S_IMODE(elsewhere.stat().st_mode) == 0o700  # what the link led to was not touched
+
+
+# -- a kept step directory: the keys of a step killed after its dispatcher ended ---------------------------------------
+
+
+def kept_with_keys(shards, tmp_path, monkeypatch, *, gone=True):
+    """The directory a step leaves when its archive could not be written (phase `archiving`, out/ whole), as a step
+    killed in the window before it removed its own home would leave it: its record says `home_files`, and the home
+    holds a key. The step is shown gone (its recorded start is not any process's), or, with `gone=False`, still alive
+    (this process)."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    args = step_args(tmp_path, key_tree(tmp_path))
+    run, _ = dispatcher()
+    with monkeypatch.context() as patch:
+        patch.setattr(shards, "archive", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left")))
+        assert run_step(shards, args, run) == shards.ARCHIVE_FAILED
+    (kept,) = (tmp_path / "tmpfs").glob("expcore-shard-fed-a.*")
+    owner = json.loads((kept / "step.json").read_text())
+    assert owner["phase"] == shards.ARCHIVING
+    assert owner["home_files"] is True
+    start = "0" if gone else shards._start_of(os.getpid())
+    (kept / "step.json").write_text(json.dumps({**owner, "start": start, "pid": owner["pid"] if gone else os.getpid()}))
+    (kept / "home" / ".zqsecrets" / "alpha-zq").mkdir(parents=True)
+    (kept / "home" / ".zqsecrets" / "alpha-zq" / "key-zq").write_text("sk-zq-left-behind\n")
+    return kept, args
+
+
+def assert_keys_gone_out_kept(kept: Path) -> None:
+    assert not (kept / "home").exists()
+    assert (kept / "study" / "out" / "campaign.lock").exists()  # the only whole out/ is untouched
+    assert (kept / "step.json").exists()
+    assert json.loads((kept / "step.json").read_text())["phase"] == "archiving"
+
+
+def test_o63_sweep_removes_the_keys_of_a_kept_step_directory_and_keeps_its_out(shards, tmp_path, monkeypatch, capsys):
+    """O63: a step killed after its dispatcher ended and before it removed its home leaves a directory of phase
+    `archiving` whose home holds the keys; `sweep` (the federation's down), its step shown gone, removes the home and
+    keeps the directory, its record and its out/ (still waiting for `--archive-left`)."""
+    kept, _ = kept_with_keys(shards, tmp_path, monkeypatch)
+    capsys.readouterr()
+    assert shards.sweep(tmp_path / "tmpfs", "/fed/root") == 0
+    out = capsys.readouterr()
+    assert f"{kept.name} (its out/ was not archived" in out.out  # still named as kept, as before
+    assert "zq" not in out.out + out.err
+    assert_keys_gone_out_kept(kept)
+
+
+def test_o63_a_resume_removes_the_keys_of_a_kept_directory_and_still_refuses(shards, tmp_path, monkeypatch):
+    """O63: `--resume`'s look at the node refuses a kept out/ as before, and removes its key copies first."""
+    kept, args = kept_with_keys(shards, tmp_path, monkeypatch)
+    spec = {"index": 1, "count": 2, "label": "fed-a"}
+    with pytest.raises(shards.ShardsError, match="was not archived and is kept on this node"):
+        shards.clear_leftovers(tmp_path / "tmpfs", spec, "/fed/root", args.results)
+    assert_keys_gone_out_kept(kept)
+
+
+def test_o63_archive_left_removes_the_keys_before_it_archives(shards, tmp_path, monkeypatch):
+    """O63: `--archive-left` removes the key copies as soon as its step is shown gone, so that an archive that fails
+    again leaves none on the node."""
+    kept, args = kept_with_keys(shards, tmp_path, monkeypatch)
+    monkeypatch.setattr(shards, "archive", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left")))
+    with pytest.raises(OSError, match="No space left"):
+        shards.archive_left(argparse.Namespace(**{**vars(args), "archive_left": True}))
+    assert_keys_gone_out_kept(kept)
+
+
+def test_o63_a_link_in_the_kept_homes_place_is_unlinked_never_walked(shards, tmp_path, monkeypatch):
+    """O63: a link where the home was is unlinked; what it leads to is not walked or changed."""
+    kept, _ = kept_with_keys(shards, tmp_path, monkeypatch)
+    elsewhere = tmp_path / "elsewhere"
+    (kept / "home").rename(elsewhere)
+    (kept / "home").symlink_to(elsewhere)
+    assert shards.sweep(tmp_path / "tmpfs", "/fed/root") == 0
+    assert not os.path.lexists(kept / "home")
+    assert (elsewhere / ".zqsecrets" / "alpha-zq" / "key-zq").exists()  # not followed
+    assert (kept / "study" / "out" / "campaign.lock").exists()
+
+
+def test_o63_the_keys_of_a_step_that_may_still_run_are_not_touched(shards, tmp_path, monkeypatch):
+    """O63: the same proof that lets a whole directory go is needed: a step shown alive keeps its home, and a record
+    that does not say `home_files` has no home removed."""
+    kept, _ = kept_with_keys(shards, tmp_path, monkeypatch, gone=False)
+    assert shards.sweep(tmp_path / "tmpfs", "/fed/root") == 0
+    assert (kept / "home" / ".zqsecrets" / "alpha-zq" / "key-zq").exists()
+    owner = json.loads((kept / "step.json").read_text())
+    del owner["home_files"]
+    (kept / "step.json").write_text(json.dumps({**owner, "start": "0"}))  # the step is shown gone now
+    assert shards.sweep(tmp_path / "tmpfs", "/fed/root") == 0
+    assert (kept / "home" / ".zqsecrets" / "alpha-zq" / "key-zq").exists()  # no `home_files`: not ours to remove
