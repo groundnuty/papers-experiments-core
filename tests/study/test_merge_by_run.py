@@ -19,10 +19,10 @@ from merge_by_run_support import ENVIRONMENT, HEALTHY, Fleet, build_fleet, by_ru
 from shard_support import make_study, write_meta
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish
 
+from expcore.campaign.by_run_layout import EVIDENCE_DIR, LEASES_DIR, MERGE_BY_RUN_SCHEMA
 from expcore.campaign.elastic.config import usd_of
 from expcore.campaign.export_join import FEDERATION_KEY, LEASE_KEY, SITE_KEY
 from expcore.campaign.interrupted_spend import COPIED_BACK_KEY
-from expcore.campaign.merge_by_run import EVIDENCE_DIR, LEASES_DIR, MERGE_BY_RUN_SCHEMA
 from expcore.campaign.shard import META_ENVIRONMENT, NOT_FINAL_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.records.record import is_record_name

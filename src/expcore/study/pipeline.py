@@ -70,6 +70,7 @@ from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.campaign.balance import balance_of
+from expcore.campaign.by_run_layout import MERGE_BY_RUN_SCHEMA, is_by_run
 from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import (
     EXPORT_FINGERPRINT,
@@ -86,9 +87,7 @@ from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, Loc
 from expcore.campaign.manifest import Manifest, build_fingerprint, fingerprint_sha256, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
-from expcore.campaign.merge_by_run import MERGE_BY_RUN_SCHEMA, require_records
 from expcore.campaign.merged import read_held, verify_merged, verify_queried
-from expcore.campaign.merged_by_run import is_by_run, read_by_run, verify_by_run
 from expcore.campaign.model_usage import usage_of_batch
 from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, read_fingerprint, recorded_fingerprint
 from expcore.campaign.run_lease import RunLease
@@ -798,7 +797,11 @@ def _check_merged_by_run(
     """The replay check of a batch merged by run (C43, `campaign.merged_by_run`): merge.json is bound by its hash, the
     ledger snapshot and every lease snapshot are compared with the hashes it names, merge.json is rebuilt from them and
     the study's plan and must be that document, each counted store ran under the environment in use, and the records
-    of the counted leases are replayed as one batch. The evidence's records are not in the batch."""
+    of the counted leases are replayed as one batch. The evidence's records are not in the batch. The merge by run's
+    modules are imported here, on its branch only, so today's forms load nothing of the elastic ledger (C42)."""
+    from expcore.campaign.merge_by_run import require_records
+    from expcore.campaign.merged_by_run import read_by_run, verify_by_run
+
     out = out_dir(study)
     loaded = load_study(study.root)
     try:
@@ -988,6 +991,8 @@ def _analyse_loaded(
         try:
             queries = {index: snapshot.q for index, snapshot in verified.snapshots.items() if index is not None}
             if verified.merge.get("schema") == MERGE_BY_RUN_SCHEMA:  # merged by run (C43): rebuilt with its ledger
+                from expcore.campaign.merged_by_run import verify_by_run  # on this branch only (C42)
+
                 verify_by_run(verified.merge, out, study.manifest, pricing_of(study), queries)
             else:
                 verify_queried(verified.merge, queries, out, study.manifest, pricing_of(study))

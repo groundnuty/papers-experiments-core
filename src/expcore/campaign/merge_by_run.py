@@ -40,10 +40,11 @@ analysed. A store of a lost or expired lease that still holds a running attempt 
 settled by `recover` in the merge's private copy as an infrastructure loss (`study.merge_by_run`); its spend is then
 its bound. A lost or expired lease with no store given is charged its grant, as the ledger charges it.
 
-**merge.json** (`MERGE_BY_RUN_SCHEMA`, written and read back by `campaign.merged_by_run`) holds `fingerprint`,
-`rule`, `environment_identity`, `ledger_sha256`, `runs` (how many the plan holds), `leases` (each counted lease in
-plan order: `lease_id`, `run_key`, `federation`, `site`, `started_utc`, `snapshot_sha256`, `spend_usd`), `evidence`
-(in lease order: the same and `reason`; `started_utc` and `snapshot_sha256` None with no store) and `spend`
+**merge.json** (`by_run_layout.MERGE_BY_RUN_SCHEMA`, written and read back by `campaign.merged_by_run`) holds
+`fingerprint`, `rule`, `environment_identity`, `ledger_sha256`, `runs` (how many the plan holds), `leases` (each
+counted lease in plan order: `lease_id`, `run_key`, `federation`, `site`, `started_utc`, `snapshot_sha256`,
+`spend_usd`), `evidence` (in lease order: the same and `reason`; `started_utc` and `snapshot_sha256` None with no
+store) and `spend`
 (`total_usd`, `per_model_usd`, `max_usd`, `per_model_ceiling_usd`). Federations and sites appear as the operator's
 labels the ledger holds. The check and the analysis rebuild it from the snapshots, the ledger snapshot and the study's
 plan through these checks, and refuse a file that differs.
@@ -77,12 +78,8 @@ from expcore.campaign.shard import (
     ShardError,
     check_identity,
 )
-from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.records.record import record_filename
 
-MERGE_BY_RUN_SCHEMA = "expcore-merge/2"
-LEASES_DIR = "leases"
-EVIDENCE_DIR = "evidence"
 _EVIDENCE_REASONS = {"counted": "earlier", "superseded": "superseded", "lost": "lost", "expired": "expired"}
 _EVIDENCE_REASONS |= {"returned": "returned", "reported": "superseded"}
 _KEPT = ("counted", "superseded")  # a lease whose archive the ledger verified: its store is evidence to keep
@@ -109,11 +106,6 @@ class LeaseStore:
     def name(self) -> str:
         """How a message names the store: its lease and run, never its path."""
         return f"the store of lease {self.lease.lease_id} (run {self.lease.run_key})"
-
-
-def snapshot_rel(directory: str, lease_id: int) -> str:
-    """Where a merged batch keeps a lease store's snapshot, relative to the batch's directory."""
-    return f"{directory}/{lease_id}/{SNAPSHOT_FILE}"
 
 
 def lease_store_of_bytes(

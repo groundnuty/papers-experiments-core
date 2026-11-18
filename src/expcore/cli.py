@@ -63,7 +63,6 @@ from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVeri
 from expcore.report import summary_lines
 from expcore.study.example import ExampleError, write_example
 from expcore.study.merge import merge_shards
-from expcore.study.merge_by_run import merge_by_run
 from expcore.study.pipeline import (
     Refused,
     StudyAnalysis,
@@ -314,6 +313,8 @@ def _merge(args: argparse.Namespace) -> int:
 
 
 def _merge_by_run(args: argparse.Namespace) -> int:
+    from expcore.study.merge_by_run import merge_by_run  # only `--ledger` loads the elastic ledger's modules (C42)
+
     merged = merge_by_run(
         args.out,
         args.shards,

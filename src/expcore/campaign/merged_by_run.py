@@ -16,20 +16,17 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.by_run_layout import EVIDENCE_DIR, LEASES_DIR, MERGE_BY_RUN_SCHEMA, snapshot_rel
 from expcore.campaign.elastic.config import usd_of
 from expcore.campaign.ledger_read import LEDGER_SNAPSHOT, LeaseRow, LedgerFacts, LedgerRefused, read_ledger
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.merge import RUNS_DIR, MergeRefused, Query
 from expcore.campaign.merge_by_run import (
-    EVIDENCE_DIR,
-    LEASES_DIR,
-    MERGE_BY_RUN_SCHEMA,
     ByRun,
     LeaseStore,
     check_by_run,
     lease_store_of,
     lease_store_of_bytes,
-    snapshot_rel,
     spend_micro,
     store_micro,
 )
@@ -118,14 +115,6 @@ def read_by_run(raw: bytes, where: object) -> dict[str, Any]:
 
 def _is_sha(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64
-
-
-def is_by_run(raw: bytes) -> bool:
-    """Whether merge.json's bytes are of a merge by run: its schema says so (anything else is read as today's)."""
-    try:
-        return json.loads(raw).get("schema") == MERGE_BY_RUN_SCHEMA
-    except (ValueError, AttributeError):
-        return False
 
 
 def differences(expected: Mapping[str, Any], found: Mapping[str, Any]) -> list[str]:

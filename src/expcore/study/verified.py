@@ -36,10 +36,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.by_run_layout import LEASES_DIR, MERGE_BY_RUN_SCHEMA, is_by_run, snapshot_rel
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.merge import CHECK_KEY, SHARDS_DIR, MergeRefused, read_merge
-from expcore.campaign.merge_by_run import LEASES_DIR, MERGE_BY_RUN_SCHEMA, snapshot_rel
-from expcore.campaign.merged_by_run import is_by_run, read_by_run
 from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, StoreSnapshot
 from expcore.records.record import RunRecord, decode, record_filename
@@ -137,7 +136,7 @@ def _load_shards(batch: Path, merge: Any, schema: FactorSchema) -> tuple[dict[in
     try:
         raw = _read_verified(out, MERGE_FILE, expected)
         by_run = is_by_run(raw)  # a merge by run (C43) keeps each counted lease's snapshot under its lease id
-        document = read_by_run(raw, MERGE_FILE) if by_run else read_merge(raw, MERGE_FILE)
+        document = _read_by_run(raw) if by_run else read_merge(raw, MERGE_FILE)
     except MergeRefused as error:
         raise Unverified(str(error)) from None
     snapshots: dict[int | None, StoreSnapshot] = {}
@@ -154,6 +153,13 @@ def _load_shards(batch: Path, merge: Any, schema: FactorSchema) -> tuple[dict[in
             opened.close()
         raise
     return snapshots, document
+
+
+def _read_by_run(raw: bytes) -> dict:
+    """merge.json of a batch merged by run, validated; its reader is imported here, on that branch only (C42)."""
+    from expcore.campaign.merged_by_run import read_by_run
+
+    return read_by_run(raw, MERGE_FILE)
 
 
 def _entries(document: Mapping[str, Any]) -> list[Mapping[str, Any]]:
