@@ -251,6 +251,27 @@ def test_o68_o57_a_dependency_check_whose_read_fails_once_is_a_missed_poll_and_c
     assert rig.state()["phase"] == "linked"
 
 
+def test_o68_o57_a_dependency_that_cannot_be_checked_never_cancels_a_job_whose_id_was_reused(hpc, tmp_path, site):
+    """O68, O57: the check rode out ten minutes of failing reads of the services' job, and in that time the agent's id
+    came to carry another job's name (Slurm reuses ids): it is read before the cancel, named and not cancelled, and the
+    failure says so; nothing of another up's is ever cancelled by an id saved ten minutes before."""
+    fake = FakeSlurm(component_recorded={(AGENT, 0): {"Dependency": "(null)"}})
+    real = fake.run
+
+    def unreadable(argv, timeout):
+        if argv[:5] == ["scontrol", "show", "job", "-o", SERVICES] and AGENT in fake.submitted:
+            fake.component_recorded[(AGENT, 0)] = {"Dependency": "(null)", "JobName": "somebody-elses-analysis"}
+            return hpc.slurm.Completed(1, "", "slurm_load_jobs error: Socket timed out\n")
+        return real(argv, timeout)
+
+    fake.run = unreadable
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake)
+    with pytest.raises(hpc.slurm.SlurmError, match="carries another job's name now, and was not cancelled") as refused:
+        rig.up()
+    assert fake.cancelled == []
+    assert f"job(s) {AGENT} carry another job's name and were not cancelled" in str(refused.value)
+
+
 def test_o68_the_het_placement_and_a_job_with_no_agent_carry_no_dependency(hpc):
     """O68: only the agent's own job under "separate" has one: the argv of every other Allocation is what it was."""
     plain = hpc.slurm.Allocation("hpcop-p-abcd", "a", "p", 6, 5, 11264, "02:00:00", 7200)
@@ -566,6 +587,25 @@ def test_o68_an_up_placed_on_another_federations_node_is_released_and_tried_agai
     said = " ".join(rig.said)
     assert "trying again (2 of 3)" in said
     assert "node0" not in said
+
+
+def test_o68_o57_a_refusal_at_the_second_read_never_cancels_a_job_whose_id_was_reused(hpc, tmp_path, site):
+    """O68, O57: the second read (made after the jobs run, and possibly after minutes of failed reads) finds the
+    federation on a node another holds, and by then the agent's id carries another job's name: the refusal cancels the
+    services' job, which is still ours, and names the other and leaves it alone."""
+    fake = FakeSlurm()
+    rival_on_my_nodes(fake, 1)
+
+    def reused(read, listed):
+        fake.component_recorded[(AGENT, 0)] = {"JobName": "somebody-elses-analysis"}  # before the second read's answer
+
+    fake.on_me = lambda read, listed: reused(read, listed) if read == 2 else None
+    rig = Rig(hpc, tmp_path, site, fake)
+    with pytest.raises(hpc.exclude.SharedNode) as refused:
+        rig.up()
+    assert fake.cancelled == [SERVICES]
+    assert f"job(s) {AGENT} carry another job's name and were not cancelled" in str(refused.value)
+    assert f"the held job(s) {SERVICES} were cancelled" in str(refused.value)
 
 
 def test_o68_a_second_loss_is_tried_again_and_the_third_attempt_wins(hpc, tmp_path, site):

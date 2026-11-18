@@ -26,7 +26,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, NoReturn, Optional, Sequence, Tuple, TypeVar
 
 T = TypeVar("T")
 
@@ -736,15 +736,30 @@ class Slurm:
             try:
                 waited = self.ride_out(lambda: self.job(asked.after), f"the job that held job {job} waits for", say)
             except SlurmError:  # nothing shows the dependency holds: fail closed, never leave the job free to start
-                self.cancel(job)
-                raise SlurmError(
-                    "the held job's dependency could not be checked (the job it waits for could not be read); it was "
-                    "cancelled"
-                ) from None
+                self._fail_cancelling(
+                    job,
+                    asked,
+                    "the held job's dependency could not be checked (the job it waits for could not be read)",
+                )
             if waited is None or waited.get("JobState") not in WAITING_STATES:
                 return  # it has started (or ended), so the dependency holds: Slurm has dropped it
+        self._fail_cancelling(job, asked, "the held job was recorded otherwise than asked (its dependency)")
+
+    def _fail_cancelling(self, job: str, asked: Allocation, why: str) -> NoReturn:
+        """Fail the up for `why`, cancelling the job just submitted by its id, but only while it still carries the name
+        it was given: the check may have waited out a slow controller for ten minutes (`ride_out`), and Slurm reuses
+        ids, so a cancel by the saved id could end another up's job. A job that cannot be read is not cancelled on a
+        guess (the failure says so: `down` releases it); one Slurm no longer knows needs none."""
+        try:
+            records = self.components(job)
+        except SlurmError:
+            raise SlurmError(f"{why}; it could not be read to cancel it: run down to release it") from None
+        if records is None:
+            raise SlurmError(f"{why}; Slurm no longer knows it")
+        if records[0].get("JobName") != asked.name:
+            raise SlurmError(f"{why}; job {job} carries another job's name now, and was not cancelled")
         self.cancel(job)
-        raise SlurmError("the held job was recorded otherwise than asked (its dependency); it was cancelled")
+        raise SlurmError(f"{why}; it was cancelled")
 
     def readback(self, job: str, asked: Allocation) -> Dict[str, str]:
         """`checked`, reduced to the read-back's fields of component 0."""

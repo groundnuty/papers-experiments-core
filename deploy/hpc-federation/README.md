@@ -212,7 +212,8 @@ its business, whatever it runs. It never reads or prints a node's name into a me
   made and submits nothing.
 - **Once the job runs and before any step,** `up` reads them again. A node of this federation, a service's or the
   agent's, that holds another live federation's job (two ups read before either had submitted, and Slurm placed both on
-  it) refuses `up`: its held jobs are cancelled by their ids, no step runs, and the message names the roles (`zone`,
+  it) refuses `up`: its held jobs are cancelled by their ids (each read first, and never cancelled once it carries another
+  job's name: Slurm reuses ids, and the reads may have waited out a slow controller), no step runs, and the message names the roles (`zone`,
   `providers[i]`, `agent`), never a host. A second read that fails for ten minutes refuses the same way (one that
   fails once, as a slow controller does, is read again: "A slow controller" below). An `up` run by hand that raced is
   refused once: `down`, then `up` again. Under a fleet it is tried again (below).

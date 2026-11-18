@@ -525,7 +525,7 @@ class Driver(Down):
                 records = self.running_records(held)  # every held job once more: the first record is as old as the wait
             placed = self.placed_nodes(records)
             with self.placing():
-                self.keep_off_other_federations([job for job, _ in held], placed)
+                self.keep_off_other_federations(held, placed)
             self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
 
     def running_records(self, held: Sequence[Tuple[str, Allocation]]) -> List[Tuple[str, Any, Dict[str, str]]]:
@@ -572,6 +572,11 @@ class Driver(Down):
         A job Slurm no longer knows, or that has ended, needs none (the wait that failed cancelled it); one that carries
         another name now is another's, since Slurm reuses ids, and is never cancelled; one whose record cannot be read
         is not guessed at: `down` checks it the same way. Empty when nothing was left to say."""
+        return self.release_held_report(held)[0]
+
+    def release_held_report(self, held: Sequence[Tuple[str, Allocation]]) -> Tuple[str, bool]:
+        """`release_held`, and whether nothing of this up is left held: False when a cancel failed or a job could not be
+        read (an up is tried again only when it is True)."""
         ours, other, unread = [], [], []
         for job, wanted in held:
             try:
@@ -583,12 +588,16 @@ class Driver(Down):
                 other.append(job)
             elif any(record.get("JobState") not in ENDED_STATES for record in records):
                 ours.append(job)
-        said = [self.release(ours)] if ours else []
+        said, released = [], not unread
+        if ours:
+            text, cancelled = self.release_report(ours)
+            said.append(text)
+            released = released and cancelled
         if other:
             said.append(f"job(s) {', '.join(other)} carry another job's name and were not cancelled")
         if unread:
             said.append(f"job(s) {', '.join(unread)} could not be read: run down to release them")
-        return "; ".join(said)
+        return "; ".join(said), released
 
     def link(self) -> None:
         """`up`'s last write, with the core-phase lock held: `bootstrapped` becomes `linked`, and nothing else does. A
@@ -680,29 +689,34 @@ class Driver(Down):
             f"federations of this account: {lack})"
         )
 
-    def keep_off_other_federations(self, jobs: Sequence[str], placed: Sequence[Sequence[str]]) -> None:
+    def keep_off_other_federations(
+        self, held: Sequence[Tuple[str, Allocation]], placed: Sequence[Sequence[str]]
+    ) -> None:
         """Once the held jobs run and before any step, none of this federation's nodes may hold another live
         federation's job (a service's, or an agent's: an agent never runs beside a service): two ups that read the
         account's jobs at once both excluded nothing. One that does is refused, every held job of this up cancelled
         by its own id, and the roles named (the zone, providers[i], the agent), never a host (`hpcexclude.SharedNode`;
         under a fleet, with the lock held, the cancelled jobs are first waited out of the live list, so that the next
-        up does not read them still holding the node). `placed` is each component's nodes, the services' first. Fail
-        closed: with the jobs unreadable nothing proves the nodes are this federation's own, and the release follows.
-        A read of the account's jobs that fails or times out (a slow controller, with the jobs already running) is
-        read again, backed off, and fails only once every read has failed for ten minutes (`Slurm.ride_out`); a line
-        it cannot take apart ends it at once. Either failure propagates to `releasing`, which reads each held job
-        before it cancels it: ten minutes later a job may have ended and Slurm reused its id, which a cancel by the
-        saved id would hit."""
+        up does not read them still holding the node). `held` is this up's jobs, each with what it asked, and `placed`
+        is each component's nodes, the services' first. Fail closed: with the jobs unreadable nothing proves the nodes
+        are this federation's own, and the release follows. A read of the account's jobs that fails or times out (a
+        slow controller, with the jobs already running) is read again, backed off, and fails only once every read has
+        failed for ten minutes (`Slurm.ride_out`); a line it cannot take apart ends it at once. Either failure
+        propagates to `releasing`, and the refusal here releases through `release_held_report`: each reads every held
+        job and cancels it only while it still carries the name `up` gave it, since ten minutes later a job may have
+        ended and Slurm reused its id, which a cancel by the saved id would hit."""
+        jobs = [job for job, _ in held]
 
         def read() -> List[str]:
             return hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs)
 
         others = set(self.slurm.ride_out(read, "the read of the account's live jobs", self.say))
-        held = [(hpcexclude.role(index), node) for index, node in enumerate(placed[0])]
-        held += [(hpcexclude.AGENT, node) for nodes in placed[1:] for node in nodes]
-        shared = [role for role, node in held if node in others]
+        roles = [(hpcexclude.role(index), node) for index, node in enumerate(placed[0])]
+        roles += [(hpcexclude.AGENT, node) for nodes in placed[1:] for node in nodes]
+        shared = [role for role, node in roles if node in others]
         if shared:
-            said, released = self.release_report(jobs)
+            said, released = self.release_held_report(held)
+            said = said or "no held job of this up was left to cancel"
             if released and self.placement_lock is not None:
                 self.wait_unlisted(jobs)
             raise hpcexclude.SharedNode(
