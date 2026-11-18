@@ -10,8 +10,9 @@ process.
 - **The ledger first.** Proven ends, settlements, drains and joins run in the ledger at once, in the decision's order.
   A lost lease is settled to the spend its dead federation's call log shows, read through the `spend` reader:
   `dead_store_reader(locate, study)` over step 4's `dead_store_spend`, whose `locate` (where the dead store is) step 6
-  gives; until then none is read, and the lease stays charged its grant, logged once. A read that is None, or of
-  another lease, settles nothing. A retirement
+  gives; until then none is read, and the lease stays charged its grant, logged once and read again every tick. A
+  read that is None, of another lease, or without its charged attempts settles nothing: a settle always carries the
+  attempts, or the lease's run would not be final. A retirement
   is checked against the ledger again just before it starts: a federation in the ledger must be drained or proven
   ended and hold no lease that is issued or sent; one that is not in the ledger must still not be. A proven end
   `cancelled` comes only on a later tick, once the fleet's record shows the down verified.
@@ -39,6 +40,7 @@ HERE = Path(__file__).resolve().parent
 DIGEST = "<the hash collect printed>"  # the dry run's stand-in for collect's output, which verify-copy takes
 FINGERPRINT, ENVIRONMENT = "<its campaign fingerprint>", "<its environment identity, a JSON file>"
 SPEND = "<the spend its call log shows, micro-dollars>"
+ATTEMPTS = "<the charged attempts its store shows>"
 ARCHIVES_MANIFEST = "archives.sha256.json"  # `shards.ARCHIVES_MANIFEST`
 HEX64 = re.compile(r"[0-9a-f]{64}")
 COMMAND_TIMEOUT_S = 6 * 3600.0  # the fleet's commands bound their own waits (an up's queue wait, a down's steps)
@@ -100,7 +102,7 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
         return Rendered("ledger", ((*control, *words),))
     if kind == "Settle":
         words = ("settle", "--ledger", str(ledger), "--lease", str(action.lease_id), "--spend-micro", SPEND,
-                 "--source", "root")  # fmt: skip
+                 "--source", "root", "--attempts", ATTEMPTS)  # fmt: skip
         return Rendered("ledger", ((*control, *words),))
     if kind == "Join":
         words = ("join", "--ledger", str(ledger), "--label", action.label, "--site", action.site, "--jobs",
@@ -269,9 +271,13 @@ class Executor:
                                    said="its call log could not be read: it stays charged its grant")  # fmt: skip
                 return
             spend, source, charged = found
+            if charged is None:  # a settle closes a lost lease only with its charged attempts: else none at all
+                self.log.write("result", action=kind, label=action.label, lease=action.lease_id, ok=False,
+                               said="its read gave no charged attempts: not settled")  # fmt: skip
+                return
             self.ledger.settle(action.lease_id, spend, source, attempts_charged=charged)
             self.log.write("result", action=kind, label=action.label, lease=action.lease_id, ok=True,
-                           spend_micro=spend, source=source)  # fmt: skip
+                           spend_micro=spend, source=source, attempts_charged=charged)  # fmt: skip
             return
         elif kind == "Join":
             from expcore.campaign.elastic.control import environment_digest

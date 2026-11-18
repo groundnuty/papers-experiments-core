@@ -1543,7 +1543,8 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   is offered only while the member there still holds the jobs the federation joined with), through
   the spend reader (`fleetexecute.dead_store_reader(locate, study)` over step 4's `dead_store_spend`; step 6 gives
   `locate`, where a dead federation's lease store is; until then nothing is read, the lease stays charged its grant,
-  and the log says so once; a read that is None, or of another lease, settles nothing): its grant stops locking the budget, and dispatch resumes. A run
+  and the log says so once while every tick reads again; a read that is None, of another lease, or without its
+  charged attempts settles nothing: `dead_store_spend` gives a figure only once the store's run ended): its grant stops locking the budget, and dispatch resumes. A run
   the loss's conservative charge exhausted may reopen when its settle shows fewer attempts, so while such a lease is
   unsettled the controller keeps one idle federation for each such run instead of retiring it.
 - **By hand.** `--dry-run` prints each action as the commands above, one per line, under a comment naming where it runs
@@ -1551,7 +1552,7 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   --label X`, `ended --ledger L --label X --proof cancelled|terminal`, `join --ledger L --label X --site S --jobs
   J,J --job-end EPOCH --kill-wait S --fingerprint F --environment-file IDENTITY.json` (the ledger keeps the digest of
   the environment identity, as step 4's merge checks it), and `settle --ledger L --lease N --spend-micro S
-  --source root|pulled`.
+  --source root|pulled --attempts N` (a settle always carries the store's charged attempts).
 - **The sites file** (`--sites`, TOML): `[controller]` with `evidence` (absolute: each retired member's root evidence),
   `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one
   per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's

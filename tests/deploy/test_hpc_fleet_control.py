@@ -433,7 +433,7 @@ def test_c43_a_burst_of_lost_priced_leases_blocks_dispatch_until_the_controller_
 
     def spend(config, action):
         read.append((action.lease_id, action.root))
-        return 500_000, "root", None
+        return 500_000, "root", 1
 
     bench.clock.advance(60)
     bench.tick(spend=spend)
@@ -768,3 +768,51 @@ def test_c43_the_dead_store_reader_settles_only_from_a_read_of_that_very_lease(d
         assert deploy.fleetexecute.dead_store_reader(located, study, read)(None, settle) == expected
     assert deploy.fleetexecute.dead_store_reader(lambda site, action: None, "ours", read)(None, settle) is None
     assert seen == [(store, "none"), (store, "other"), (store, "ours")]
+
+
+def test_c43_a_none_read_is_retried_each_tick_and_a_settle_always_carries_its_charged_attempts(deploy, tmp_path, site):
+    """C43: the dead store's read gives None while its run has not ended (the lease stays at its grant); the next tick
+    reads again, and a read without its charged attempts settles nothing; then one settles with the attempts shown."""
+    up(site, "fed-1", 41)
+    bench = Bench(tmp_path, deploy, [site], max_usd=30.0, grants_usd={"m1": 10.0})
+    bench.tick()
+    ledger = bench.open()
+    lease = ledger.issue("site-a-fed-1")
+    ledger.mark_sent(lease.lease_id)
+    ledger.close()
+    site.jobs["41"].state = site.jobs["42"].state = "NODE_FAIL"
+    bench.clock.advance(60)
+    bench.tick()
+    reads = iter([None, (300_000, "pulled", None), (300_000, "pulled", 2)])
+
+    class Stop(Exception):
+        pass
+
+    ticks = []
+
+    def sleep(seconds):
+        ticks.append(seconds)
+        bench.clock.advance(seconds)
+        if len(ticks) == 3:
+            raise Stop
+
+    hooks = bench.hooks(spend=lambda config, action: next(reads))
+    hooks.sleep = sleep
+    with pytest.raises(Stop):
+        bench.deploy.fleetcontrol.main(
+            ["control", "--ledger", str(bench.ledger), "--sites", str(bench.file())], {}, hooks
+        )
+    ledger = bench.open()
+    (settled,) = ledger.settlements()
+    assert (settled.lease_id, settled.spend_micro, settled.source, settled.charged) == (
+        lease.lease_id,
+        300_000,
+        "pulled",
+        2,
+    )
+    ledger.close()
+    said = [r["said"] for r in bench.lines("result") if r.get("action") == "Settle" and not r["ok"]]
+    assert said == [
+        "its call log could not be read: it stays charged its grant",
+        "its read gave no charged attempts: not settled",
+    ]

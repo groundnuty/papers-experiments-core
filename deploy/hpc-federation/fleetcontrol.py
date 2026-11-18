@@ -10,7 +10,7 @@ controller"). `expcore.campaign.elastic.control` decides; this reads the sites, 
                                                        --job-end EPOCH --kill-wait S --fingerprint F
                                                        --environment-file IDENTITY.json
     <python> -I -B deploy/hpc-federation/fleetcontrol.py settle --ledger L --lease N --spend-micro S
-                                                       --source root|pulled [--attempts N]
+                                                       --source root|pulled --attempts N
 
 - observe: one read of the site (`fleetobserve`), as JSON on stdout; nothing is written, submitted or cancelled.
 - control: every `interval_s` (60 by default), each site is read (`observe` through the site's transport, or the JSON
@@ -318,7 +318,7 @@ def parser() -> argparse.ArgumentParser:
     settle.add_argument("--lease", type=int, required=True)
     settle.add_argument("--spend-micro", dest="spend_micro", type=int, required=True)
     settle.add_argument("--source", choices=("root", "pulled"), required=True)
-    settle.add_argument("--attempts", type=int)
+    settle.add_argument("--attempts", type=int, required=True, help="the charged attempts the dead store shows")
     for name in ("drain", "ended", "join"):
         verb = sub.add_parser(name)
         verb.add_argument("--ledger", type=Path, required=True)
