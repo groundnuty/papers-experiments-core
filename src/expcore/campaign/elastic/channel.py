@@ -1,5 +1,5 @@
 # Provenance: new
-"""The file channel between the orchestrating host and a federation's node worker (#462 step 3, C43).
+"""The file channel between the orchestrating host and a federation's node worker (#462 step 3, C44).
 
 Compute nodes cannot reach the orchestrator, and the orchestrator reaches a site only through its login node, so a
 lease goes out, and its heartbeats and its end come back, as files on the site's shared file system. Each federation

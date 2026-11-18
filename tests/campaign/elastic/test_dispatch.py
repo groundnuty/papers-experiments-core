@@ -1,4 +1,4 @@
-"""C43: the dispatcher's loop over a temp-dir site behind a fake ssh: one call per site per tick, the ledger decides."""
+"""C44: the dispatcher's loop over a temp-dir site behind a fake ssh: one call per site per tick, the ledger decides."""
 
 import json
 import os
@@ -42,8 +42,8 @@ def sent_lease(tmp_path, **changes):
     return ledger, clock, ssh, site, dispatch, lease
 
 
-def test_c43_a_lease_goes_out_after_its_site_answered_and_is_sent_only_once_the_listing_shows_it(tmp_path):
-    """C43: the first tick reads the site and issues nothing; the next issues the lease, writes its file in the
+def test_c44_a_lease_goes_out_after_its_site_answered_and_is_sent_only_once_the_listing_shows_it(tmp_path):
+    """C44: the first tick reads the site and issues nothing; the next issues the lease, writes its file in the
     federation's inbox in the same call and marks it sent from that call's listing; one call per site per tick."""
     ledger, clock = make(tmp_path)
     join(ledger, clock, "fed-1")
@@ -68,8 +68,8 @@ def test_c43_a_lease_goes_out_after_its_site_answered_and_is_sent_only_once_the_
     assert_invariants(ledger)
 
 
-def test_c43_one_call_per_site_carries_every_federation_of_the_site(tmp_path):
-    """C43: three federations at one site and one at another: each tick makes one call per site."""
+def test_c44_one_call_per_site_carries_every_federation_of_the_site(tmp_path):
+    """C44: three federations at one site and one at another: each tick makes one call per site."""
     ledger, clock = make(tmp_path, runs=plan(tasks=4))
     for label in ("fed-1", "fed-2", "fed-3"):
         join(ledger, clock, label)
@@ -88,8 +88,8 @@ def test_c43_one_call_per_site_carries_every_federation_of_the_site(tmp_path):
     assert_invariants(ledger)
 
 
-def test_c43_a_crash_between_issued_and_sent_is_settled_on_restart_by_a_tombstone_and_the_run_goes_out_again(tmp_path):
-    """C43: a lease written `issued` whose file never went out (the dispatcher died before its call) is settled on
+def test_c44_a_crash_between_issued_and_sent_is_settled_on_restart_by_a_tombstone_and_the_run_goes_out_again(tmp_path):
+    """C44: a lease written `issued` whose file never went out (the dispatcher died before its call) is settled on
     restart: a tombstone takes its name, so no late delivery can land, the lease is cancelled with nothing charged,
     and its run is leased again under a new id."""
     ledger, clock = make(tmp_path, **ONE_RUN)
@@ -114,8 +114,8 @@ def test_c43_a_crash_between_issued_and_sent_is_settled_on_restart_by_a_tombston
     assert_invariants(ledger)
 
 
-def test_c43_a_lease_whose_file_landed_before_a_lost_reply_is_marked_sent_on_restart_never_cancelled(tmp_path):
-    """C43: the call wrote the lease file and its reply was lost (the connection dropped), so the lease stayed
+def test_c44_a_lease_whose_file_landed_before_a_lost_reply_is_marked_sent_on_restart_never_cancelled(tmp_path):
+    """C44: the call wrote the lease file and its reply was lost (the connection dropped), so the lease stayed
     `issued`; after a restart the settle finds the file under its name and marks it sent: its worker may run it."""
     ledger, clock = make(tmp_path, **ONE_RUN)
     join(ledger, clock, "fed-1")
@@ -141,8 +141,8 @@ def test_c43_a_lease_whose_file_landed_before_a_lost_reply_is_marked_sent_on_res
     assert_invariants(ledger)
 
 
-def test_c43_a_heartbeat_that_advances_keeps_its_lease_and_one_that_stands_still_expires_it(tmp_path):
-    """C43: the worker's counter, read each tick, renews the lease while it advances; read unchanged for the ledger's
+def test_c44_a_heartbeat_that_advances_keeps_its_lease_and_one_that_stands_still_expires_it(tmp_path):
+    """C44: the worker's counter, read each tick, renews the lease while it advances; read unchanged for the ledger's
     stale_s (5 minutes) of reads, the lease expires and its run goes back to pending."""
     ledger, clock, _ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
     for counter in range(1, 21):
@@ -157,8 +157,8 @@ def test_c43_a_heartbeat_that_advances_keeps_its_lease_and_one_that_stands_still
     assert_invariants(ledger)
 
 
-def test_c43_a_partition_expires_a_sites_leases_after_site_out_and_the_late_completion_is_superseded(tmp_path):
-    """C43: a site unreachable for N ticks is unread, not stale: its lease holds until the ledger's site_out_s (15
+def test_c44_a_partition_expires_a_sites_leases_after_site_out_and_the_late_completion_is_superseded(tmp_path):
+    """C44: a site unreachable for N ticks is unread, not stale: its lease holds until the ledger's site_out_s (15
     minutes), then expires, and its run goes to another site's federation. When the site returns, the completion the
     first federation left is read and fenced: the later lease's completion is the run's, the earlier one is
     superseded, and the run is counted once."""
@@ -192,8 +192,8 @@ def test_c43_a_partition_expires_a_sites_leases_after_site_out_and_the_late_comp
     assert_invariants(ledger)
 
 
-def test_c43_a_completion_read_on_every_tick_counts_once_and_its_pulled_archive_settles_the_run(tmp_path):
-    """C43: the completion file stays in the outbox and is read every tick; the ledger reads it once, its archive is
+def test_c44_a_completion_read_on_every_tick_counts_once_and_its_pulled_archive_settles_the_run(tmp_path):
+    """C44: the completion file stays in the outbox and is read every tick; the ledger reads it once, its archive is
     pulled and hashed, and the run is done once, charged the micro-dollars the file names."""
     ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
     complete(site, "fed-1", lease, spend_micro_usd=250_001)
@@ -207,8 +207,8 @@ def test_c43_a_completion_read_on_every_tick_counts_once_and_its_pulled_archive_
     assert_invariants(ledger)
 
 
-def test_c43_a_file_in_one_federations_outbox_naming_anothers_lease_is_never_read(tmp_path):
-    """C43: the ledger fences by site; the dispatcher fences by federation too. A completion and a heartbeat of
+def test_c44_a_file_in_one_federations_outbox_naming_anothers_lease_is_never_read(tmp_path):
+    """C44: the ledger fences by site; the dispatcher fences by federation too. A completion and a heartbeat of
     fed-1's lease found in fed-2's outbox are dropped, and fed-1's lease is as it was."""
     ledger, clock = make(tmp_path, runs=plan(tasks=1), caps={"m1": 2})
     join(ledger, clock, "fed-1")
@@ -242,8 +242,8 @@ def test_c43_a_file_in_one_federations_outbox_naming_anothers_lease_is_never_rea
     assert_invariants(ledger)
 
 
-def test_c43_a_reply_cut_short_is_no_reading_and_the_site_is_only_swept(tmp_path):
-    """C43: a reply that is not one whole JSON document reads nothing (no heartbeat renews), and the sweep runs as for
+def test_c44_a_reply_cut_short_is_no_reading_and_the_site_is_only_swept(tmp_path):
+    """C44: a reply that is not one whole JSON document reads nothing (no heartbeat renews), and the sweep runs as for
     an unreachable site; the next whole reply reads the site."""
     ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
     beat(site, "fed-1", lease.lease_id, 4)
@@ -257,8 +257,8 @@ def test_c43_a_reply_cut_short_is_no_reading_and_the_site_is_only_swept(tmp_path
     assert ledger.lease(lease.lease_id).counter == 4
 
 
-def test_c43_an_outbox_that_cannot_be_listed_leaves_the_site_unread(tmp_path, monkeypatch):
-    """C43: a listing that fails is no reading of the site, never an empty one that would let a running lease's
+def test_c44_an_outbox_that_cannot_be_listed_leaves_the_site_unread(tmp_path, monkeypatch):
+    """C44: a listing that fails is no reading of the site, never an empty one that would let a running lease's
     heartbeat go stale."""
     ledger, clock, _ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
     beat(site, "fed-1", lease.lease_id, 2)
@@ -275,8 +275,8 @@ def test_c43_an_outbox_that_cannot_be_listed_leaves_the_site_unread(tmp_path, mo
     assert ledger.lease(lease.lease_id).counter is None
 
 
-def test_c43_an_archive_that_never_matches_its_completion_makes_the_lease_lost_after_its_tries(tmp_path):
-    """C43: the archive pulled hashes to another value than the completion names: it is pulled again on each tick,
+def test_c44_an_archive_that_never_matches_its_completion_makes_the_lease_lost_after_its_tries(tmp_path):
+    """C44: the archive pulled hashes to another value than the completion names: it is pulled again on each tick,
     and after FETCH_TRIES the lease is lost and its run pending again."""
     ledger, clock, _ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
     complete(site, "fed-1", lease, sha256="f" * 64)
@@ -289,8 +289,8 @@ def test_c43_an_archive_that_never_matches_its_completion_makes_the_lease_lost_a
     assert_invariants(ledger)
 
 
-def test_c43_an_unreachable_pull_is_tried_again_and_never_counts_against_the_archive(tmp_path):
-    """C43: a pull whose ssh fails is no try: after the site answers again, the archive verifies."""
+def test_c44_an_unreachable_pull_is_tried_again_and_never_counts_against_the_archive(tmp_path):
+    """C44: a pull whose ssh fails is no try: after the site answers again, the archive verifies."""
     ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
     complete(site, "fed-1", lease)
     ssh.pull_down.add(SITE)
@@ -301,8 +301,8 @@ def test_c43_an_unreachable_pull_is_tried_again_and_never_counts_against_the_arc
     assert ledger.lease(lease.lease_id).state == "counted"
 
 
-def test_c43_a_drain_asked_by_the_watchdog_drains_the_federation_in_the_ledger(tmp_path):
-    """C43: a drain marker in a federation's inbox stops the ledger leasing to it."""
+def test_c44_a_drain_asked_by_the_watchdog_drains_the_federation_in_the_ledger(tmp_path):
+    """C44: a drain marker in a federation's inbox stops the ledger leasing to it."""
     ledger, clock, _ssh, site, dispatch, lease = sent_lease(tmp_path)
     ch.create_json(channel_of(site, "fed-1") / ch.INBOX / ch.DRAIN, {"format": ch.DRAIN_FORMAT})
     complete(site, "fed-1", lease)
@@ -311,8 +311,8 @@ def test_c43_a_drain_asked_by_the_watchdog_drains_the_federation_in_the_ledger(t
     assert [lease.lease_id for lease in ledger.leases()] == [lease.lease_id]
 
 
-def test_c43_the_exchange_runs_as_its_own_process_behind_an_ssh_command(tmp_path):
-    """C43 (guard): the verb runs as `python -m expcore.campaign.elastic.exchange` behind a real process standing in
+def test_c44_the_exchange_runs_as_its_own_process_behind_an_ssh_command(tmp_path):
+    """C44 (guard): the verb runs as `python -m expcore.campaign.elastic.exchange` behind a real process standing in
     for ssh (it drops the host and runs the command through a shell), with the request on its standard input."""
     ssh_script = tmp_path / "fake-ssh"
     ssh_script.write_text('#!/bin/sh\nshift\nexec /bin/sh -c "$1"\n', encoding="utf-8")
@@ -341,8 +341,8 @@ def test_c43_the_exchange_runs_as_its_own_process_behind_an_ssh_command(tmp_path
 
 
 @pytest.mark.parametrize("bad", ["../escape", "Fed-1", ""])
-def test_c43_the_exchange_refuses_a_federation_label_that_is_not_an_operator_label(tmp_path, bad):
-    """C43: a label is a directory name under the channel root, so only an operator label is taken, and a request
+def test_c44_the_exchange_refuses_a_federation_label_that_is_not_an_operator_label(tmp_path, bad):
+    """C44: a label is a directory name under the channel root, so only an operator label is taken, and a request
     holding another is refused whole, with nothing written."""
     from expcore.campaign.elastic.exchange import RequestError, handle
 
@@ -358,8 +358,8 @@ def test_c43_the_exchange_refuses_a_federation_label_that_is_not_an_operator_lab
     assert not (tmp_path / "channels").exists()
 
 
-def test_c43_a_reported_lease_of_a_federation_proven_ended_is_still_pulled_and_settled(tmp_path):
-    """C43: the archive pull failed, then the federation's job was proven ended: its reported lease is still read and
+def test_c44_a_reported_lease_of_a_federation_proven_ended_is_still_pulled_and_settled(tmp_path):
+    """C44: the archive pull failed, then the federation's job was proven ended: its reported lease is still read and
     pulled once the site answers, so a counting completion settles its run."""
     ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
     complete(site, "fed-1", lease)
@@ -373,8 +373,8 @@ def test_c43_a_reported_lease_of_a_federation_proven_ended_is_still_pulled_and_s
     assert ledger.run(lease.run_key).state == "done"
 
 
-def test_c43_an_archive_pulled_before_a_restart_settles_its_lease_without_another_pull(tmp_path):
-    """C43: the dispatcher pulled and checked an archive and stopped before it settled the lease; on the next tick the
+def test_c44_an_archive_pulled_before_a_restart_settles_its_lease_without_another_pull(tmp_path):
+    """C44: the dispatcher pulled and checked an archive and stopped before it settled the lease; on the next tick the
     archive it holds settles the lease, though the site's copy is gone."""
     ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
     complete(site, "fed-1", lease)
@@ -405,8 +405,8 @@ class Partial:
 
 
 @pytest.mark.parametrize(("key", "in_outbox"), [("drain", False), ("heartbeat", True)])
-def test_c43_a_reply_missing_part_of_an_answer_is_no_reading_and_never_a_crash(tmp_path, key, in_outbox):
-    """C43: an answer without its drain flag, or an outbox without its heartbeat entry, is not the verb's whole form:
+def test_c44_a_reply_missing_part_of_an_answer_is_no_reading_and_never_a_crash(tmp_path, key, in_outbox):
+    """C44: an answer without its drain flag, or an outbox without its heartbeat entry, is not the verb's whole form:
     the site is unread (no heartbeat is taken as absent), and the tick does not fail."""
     ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
     beat(site, "fed-1", lease.lease_id, 3)
@@ -416,8 +416,8 @@ def test_c43_a_reply_missing_part_of_an_answer_is_no_reading_and_never_a_crash(t
     assert ledger.lease(lease.lease_id).counter is None
 
 
-def test_c43_a_cached_archive_that_cannot_be_read_falls_back_to_the_sites_copy(tmp_path, monkeypatch):
-    """C43: a local archive left by an earlier pull that this host cannot read is passed over, never a crash of the
+def test_c44_a_cached_archive_that_cannot_be_read_falls_back_to_the_sites_copy(tmp_path, monkeypatch):
+    """C44: a local archive left by an earlier pull that this host cannot read is passed over, never a crash of the
     tick: the site's copy is pulled and settles the lease."""
     from expcore.campaign.elastic import dispatch as module
 
@@ -435,4 +435,24 @@ def test_c43_a_cached_archive_that_cannot_be_read_falls_back_to_the_sites_copy(t
 
     monkeypatch.setattr(module, "_sha256", sha256)
     ticks(dispatch, clock, 1)
+    assert ledger.lease(lease.lease_id).state == "counted"
+
+
+def test_c44_a_lease_with_both_a_completion_and_a_return_is_read_by_its_completion_alone(tmp_path):
+    """C44: the ledger refuses a whole reading that ends one lease twice, so the dispatcher passes the completion and
+    drops the return; the site is read and the run counts."""
+    ledger, clock, _ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
+    complete(site, "fed-1", lease)
+    ch.write_json(
+        channel_of(site, "fed-1") / ch.OUTBOX / ch.return_name(lease.lease_id),
+        {
+            "format": ch.RETURN_FORMAT,
+            "federation": "fed-1",
+            "lease_id": lease.lease_id,
+            "run_key": lease.run_key,
+            "spend_micro_usd": 0,
+        },
+    )
+    clock.advance(TICK_S)
+    assert dispatch.tick()[SITE].read
     assert ledger.lease(lease.lease_id).state == "counted"

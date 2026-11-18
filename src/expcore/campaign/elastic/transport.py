@@ -1,5 +1,5 @@
 # Provenance: new
-"""How the dispatcher reaches a site's login node: one ssh call per site per tick, and one per archive pulled (C43).
+"""How the dispatcher reaches a site's login node: one ssh call per site per tick, and one per archive pulled (C44).
 
 `SshTransport.exchange` runs the exchange verb (`elastic.exchange`) with the request on standard input and takes its
 whole standard output as one JSON reply: a call that fails, times out, exits non-zero, or prints anything but one reply

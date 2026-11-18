@@ -1,4 +1,4 @@
-"""C43: the login watchdog drains a site's federations once the orchestrator has not reached the site for 30 min."""
+"""C44: the login watchdog drains a site's federations once the orchestrator has not reached the site for 30 min."""
 
 from pathlib import Path
 
@@ -19,8 +19,8 @@ def two_federations(site):
         ch.make_dirs(ch.federation_dir(site.root, label))
 
 
-def test_c43_the_watchdog_waits_while_contacts_are_fresh_and_drains_once_after_thirty_minutes(tmp_path):
-    """C43: contacts within 30 minutes keep it quiet; at 30 minutes without one it writes a drain in every
+def test_c44_the_watchdog_waits_while_contacts_are_fresh_and_drains_once_after_thirty_minutes(tmp_path):
+    """C44: contacts within 30 minutes keep it quiet; at 30 minutes without one it writes a drain in every
     federation's inbox and runs its command once, with the labels, and never again."""
     site, clock = site_of(tmp_path), FakeClock()
     two_federations(site)
@@ -42,8 +42,8 @@ def test_c43_the_watchdog_waits_while_contacts_are_fresh_and_drains_once_after_t
     assert calls == [["fed-1", "fed-2"]]
 
 
-def test_c43_without_any_contact_the_watchdog_counts_from_its_own_start(tmp_path):
-    """C43: a site never reached since the watchdog started is stale 30 minutes after that start, not at once."""
+def test_c44_without_any_contact_the_watchdog_counts_from_its_own_start(tmp_path):
+    """C44: a site never reached since the watchdog started is stale 30 minutes after that start, not at once."""
     site, clock = site_of(tmp_path), FakeClock()
     two_federations(site)
     watchdog = Watchdog(Path(site.root), clock=clock)
@@ -53,8 +53,8 @@ def test_c43_without_any_contact_the_watchdog_counts_from_its_own_start(tmp_path
     assert watchdog.check()
 
 
-def test_c43_the_watchdog_is_bounded_and_exits_quiet_at_its_end(tmp_path):
-    """C43: with contacts arriving, it exits 0 at `--until` having done nothing; nothing is drained."""
+def test_c44_the_watchdog_is_bounded_and_exits_quiet_at_its_end(tmp_path):
+    """C44: with contacts arriving, it exits 0 at `--until` having done nothing; nothing is drained."""
     site, clock = site_of(tmp_path), FakeClock()
     two_federations(site)
     watchdog = Watchdog(Path(site.root), clock=clock)

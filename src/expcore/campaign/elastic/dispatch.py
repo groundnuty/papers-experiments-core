@@ -1,5 +1,5 @@
 # Provenance: new
-"""The dispatcher loop on the orchestrating host (#462 step 3, C43): one call per site per tick, the ledger decides.
+"""The dispatcher loop on the orchestrating host (#462 step 3, C44): one call per site per tick, the ledger decides.
 
 Each tick, for each site, in this order:
 
@@ -242,6 +242,10 @@ class Dispatcher:
                     returns.append(Return(lease_id=lease.lease_id, spend_usd=_spend_usd(record)))
                 except (TypeError, ValueError) as error:
                     done.dropped.append(f"{label}: return of lease {lease.lease_id}: {error}")
+        ended = {completion.lease_id for completion in completions}
+        for returned in [returned for returned in returns if returned.lease_id in ended]:
+            done.dropped.append(f"the return of lease {returned.lease_id}, which has a completion")
+        returns = [returned for returned in returns if returned.lease_id not in ended]  # one end per lease, or none
         for note in done.dropped:
             _LOG.warning("dropped %s", note)
         return SiteReading(heartbeats=heartbeats, completions=completions, returns=returns), expected

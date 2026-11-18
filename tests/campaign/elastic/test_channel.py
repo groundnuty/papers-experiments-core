@@ -1,4 +1,4 @@
-"""C43: the channel's files: written whole and once, read only after a listing shows them, and never half-written."""
+"""C44: the channel's files: written whole and once, read only after a listing shows them, and never half-written."""
 
 import os
 
@@ -33,8 +33,8 @@ def completion(lease_id: int) -> dict:
     }
 
 
-def test_c43_a_name_is_written_once_so_a_late_delivery_and_a_tombstone_never_both_land(tmp_path):
-    """C43: a lease file and its tombstone share one name, created only where no file has it: the second of the two
+def test_c44_a_name_is_written_once_so_a_late_delivery_and_a_tombstone_never_both_land(tmp_path):
+    """C44: a lease file and its tombstone share one name, created only where no file has it: the second of the two
     is refused and the first stays as it was written."""
     path = tmp_path / ch.lease_name(4)
     assert ch.create_json(path, ch.tombstone(LABEL, "site-a", 4))
@@ -43,8 +43,8 @@ def test_c43_a_name_is_written_once_so_a_late_delivery_and_a_tombstone_never_bot
     assert ch.listing(tmp_path) == {path.name}  # no draft is left beside it
 
 
-def test_c43_a_draft_or_a_file_that_does_not_parse_is_never_read_from_an_outbox(tmp_path):
-    """C43: a writer's draft (a dotted name) is not listed, and a file that is not one JSON object is passed over:
+def test_c44_a_draft_or_a_file_that_does_not_parse_is_never_read_from_an_outbox(tmp_path):
+    """C44: a writer's draft (a dotted name) is not listed, and a file that is not one JSON object is passed over:
     the reading holds the whole completion only."""
     site = site_of(tmp_path)
     outbox = ch.federation_dir(site.root, LABEL) / ch.OUTBOX
@@ -59,8 +59,8 @@ def test_c43_a_draft_or_a_file_that_does_not_parse_is_never_read_from_an_outbox(
     assert box["heartbeat"] is None
 
 
-def test_c43_a_file_is_read_only_once_a_listing_shows_its_name(tmp_path, monkeypatch):
-    """C43: an NFS client keeps a failed lookup for up to 30 s, so a reader opens a file only after a fresh listing
+def test_c44_a_file_is_read_only_once_a_listing_shows_its_name(tmp_path, monkeypatch):
+    """C44: an NFS client keeps a failed lookup for up to 30 s, so a reader opens a file only after a fresh listing
     shows its exact name. A listing that does not show a completion (stale) leaves it unread, and the next listing
     that shows it reads it."""
     site = site_of(tmp_path)
@@ -94,8 +94,8 @@ def test_c43_a_file_is_read_only_once_a_listing_shows_its_name(tmp_path, monkeyp
     assert listed == [True, False]
 
 
-def test_c43_a_delivery_of_a_lease_already_in_the_inbox_changes_nothing_and_says_so(tmp_path):
-    """C43: the same lease delivered twice (a call retried after a lost reply) is written once; a lease whose name a
+def test_c44_a_delivery_of_a_lease_already_in_the_inbox_changes_nothing_and_says_so(tmp_path):
+    """C44: the same lease delivered twice (a call retried after a lost reply) is written once; a lease whose name a
     tombstone holds is never delivered over it, and the reply says the name holds a tombstone."""
     site = site_of(tmp_path)
     lease = {
@@ -115,8 +115,8 @@ def test_c43_a_delivery_of_a_lease_already_in_the_inbox_changes_nothing_and_says
     assert ch.listing(inbox) == {ch.lease_name(9), ch.lease_name(10)}
 
 
-def test_c43_the_exchange_stamps_the_contact_with_the_login_nodes_clock(tmp_path):
-    """C43: `contact.json` carries the time of the host that wrote it, which the watchdog on that host reads."""
+def test_c44_the_exchange_stamps_the_contact_with_the_login_nodes_clock(tmp_path):
+    """C44: `contact.json` carries the time of the host that wrote it, which the watchdog on that host reads."""
     site = site_of(tmp_path)
     handle(request(site), clock=lambda: 1234.5)
     contact = ch.read_listed(

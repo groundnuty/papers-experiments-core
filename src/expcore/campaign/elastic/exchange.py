@@ -1,5 +1,5 @@
 # Provenance: new
-"""The login node's side of one dispatcher tick for a site (#462 step 3, C43): one call, every federation of the site.
+"""The login node's side of one dispatcher tick for a site (#462 step 3, C44): one call, every federation of the site.
 
 The dispatcher runs `python -I -B -m expcore.campaign.elastic.exchange` on the site's login node over one ssh call, the
 request (`expcore-elastic-exchange/1`) on standard input, and reads one JSON reply on standard output. For each

@@ -1,4 +1,4 @@
-"""C43: the node worker: one lease at a time in lease-id order, heartbeats while it runs, a completion or a return at
+"""C44: the node worker: one lease at a time in lease-id order, heartbeats while it runs, a completion or a return at
 its end, and a replayed lease, another federation's or a tombstone never run."""
 
 import hashlib
@@ -75,8 +75,8 @@ def outbox(channel: Path, name: str) -> dict | None:
         return None
 
 
-def test_c43_the_worker_runs_its_leases_one_at_a_time_in_lease_order_and_beats_while_each_runs(tmp_path):
-    """C43: two leases in the inbox run one after the other, the lower id first, never at once; the heartbeat's
+def test_c44_the_worker_runs_its_leases_one_at_a_time_in_lease_order_and_beats_while_each_runs(tmp_path):
+    """C44: two leases in the inbox run one after the other, the lower id first, never at once; the heartbeat's
     counter starts at 1 when a lease is taken and advances every beat while its run lives; each ends in a completion
     naming the lease, its run, the store, the archive's hash, the state, the charged attempts and the spend."""
     beats: list[tuple[int, int]] = []
@@ -105,8 +105,8 @@ def test_c43_the_worker_runs_its_leases_one_at_a_time_in_lease_order_and_beats_w
     assert not (channel / ch.WORKER / "running.json").exists()
 
 
-def test_c43_a_lease_id_not_above_the_last_one_taken_is_refused_and_nothing_is_written_for_it(tmp_path):
-    """C43: after lease 7, a lease 6 that lands late is a replay: it is refused, never run, and nothing goes to the
+def test_c44_a_lease_id_not_above_the_last_one_taken_is_refused_and_nothing_is_written_for_it(tmp_path):
+    """C44: after lease 7, a lease 6 that lands late is a replay: it is refused, never run, and nothing goes to the
     outbox for it; a new worker on the channel (a restart) neither runs 6 nor runs 7 again."""
     runner = FakeRunner()
     worker, channel = worker_on(tmp_path, runner)
@@ -123,8 +123,8 @@ def test_c43_a_lease_id_not_above_the_last_one_taken_is_refused_and_nothing_is_w
     assert runner.started == [7]
 
 
-def test_c43_a_lease_file_for_another_federation_or_a_tombstone_is_never_run(tmp_path):
-    """C43: a lease whose file names another federation is refused and not taken; a tombstone holds a cancelled
+def test_c44_a_lease_file_for_another_federation_or_a_tombstone_is_never_run(tmp_path):
+    """C44: a lease whose file names another federation is refused and not taken; a tombstone holds a cancelled
     lease's name and is passed over; the next lease of this federation still runs."""
     runner = FakeRunner()
     worker, channel = worker_on(tmp_path, runner)
@@ -139,8 +139,8 @@ def test_c43_a_lease_file_for_another_federation_or_a_tombstone_is_never_run(tmp
     assert runner.started == [4]
 
 
-def test_c43_a_second_worker_does_not_start_on_a_channel_where_a_lease_runs(tmp_path):
-    """C43: `running.json` marks a lease in progress: no other worker starts on the channel, and one that finds it
+def test_c44_a_second_worker_does_not_start_on_a_channel_where_a_lease_runs(tmp_path):
+    """C44: `running.json` marks a lease in progress: no other worker starts on the channel, and one that finds it
     created between its look and its take runs nothing."""
     worker, channel = worker_on(tmp_path)
     ch.write_json(channel / ch.WORKER / "running.json", {"lease_id": 1})
@@ -150,8 +150,8 @@ def test_c43_a_second_worker_does_not_start_on_a_channel_where_a_lease_runs(tmp_
     assert worker.step() == "busy"
 
 
-def test_c43_a_lease_that_began_no_attempt_is_returned_with_what_its_store_spent(tmp_path):
-    """C43: a lease held before any attempt (a grant below the reservation, a closed gate) is returned with the
+def test_c44_a_lease_that_began_no_attempt_is_returned_with_what_its_store_spent(tmp_path):
+    """C44: a lease held before any attempt (a grant below the reservation, a closed gate) is returned with the
     store's spend, and one the kernel refused before making a store is returned with nothing spent."""
     worker, channel = worker_on(tmp_path, outcome=outcome_of(attempts=0, charged=0, state=None, spend_micro_usd=20_000))
     deliver(channel, a_lease(1))
@@ -165,8 +165,8 @@ def test_c43_a_lease_that_began_no_attempt_is_returned_with_what_its_store_spent
     assert outbox(channel, ch.return_name(2))["spend_micro_usd"] == 0
 
 
-def test_c43_a_run_that_ends_with_an_attempt_still_running_stops_the_worker_unreported(tmp_path):
-    """C43: an attempt left `running` is no end the ledger can count: the worker writes no completion or return,
+def test_c44_a_run_that_ends_with_an_attempt_still_running_stops_the_worker_unreported(tmp_path):
+    """C44: an attempt left `running` is no end the ledger can count: the worker writes no completion or return,
     stops, and leaves `running.json`, so no other lease runs on the federation and the ledger expires the lease."""
     worker, channel = worker_on(tmp_path, outcome=outcome_of(state="running"))
     deliver(channel, a_lease(1))
@@ -178,8 +178,8 @@ def test_c43_a_run_that_ends_with_an_attempt_still_running_stops_the_worker_unre
         worker.open()
 
 
-def test_c43_a_drain_returns_the_lease_not_taken_and_the_worker_exits(tmp_path):
-    """C43: with a drain asked, a lease not yet taken is returned with nothing spent and never run, the worker writes
+def test_c44_a_drain_returns_the_lease_not_taken_and_the_worker_exits(tmp_path):
+    """C44: with a drain asked, a lease not yet taken is returned with nothing spent and never run, the worker writes
     `exited.json` and its command exits 0."""
     runner = FakeRunner()
     worker, channel = worker_on(tmp_path, runner)
@@ -192,8 +192,8 @@ def test_c43_a_drain_returns_the_lease_not_taken_and_the_worker_exits(tmp_path):
     assert outbox(channel, ch.EXITED)["last_lease_id"] == 1
 
 
-def test_c43_the_worker_command_refuses_a_channel_where_a_lease_runs(tmp_path, capsys):
-    """C43: `python -m expcore.campaign.elastic.worker` exits 1 on an occupied channel, saying why."""
+def test_c44_the_worker_command_refuses_a_channel_where_a_lease_runs(tmp_path, capsys):
+    """C44: `python -m expcore.campaign.elastic.worker` exits 1 on an occupied channel, saying why."""
     channel = tmp_path / "channels" / LABEL
     ch.make_dirs(channel)
     ch.write_json(channel / ch.WORKER / "running.json", {"lease_id": 1})
@@ -203,8 +203,8 @@ def test_c43_the_worker_command_refuses_a_channel_where_a_lease_runs(tmp_path, c
     assert "takes no other lease" in capsys.readouterr().err
 
 
-def test_c43_the_lease_file_the_channel_writes_is_the_one_the_kernel_reads(tmp_path):
-    """C43: the inbox's kernel lease, written out by the worker, is read by `run_lease.read_lease` with the ledger's
+def test_c44_the_lease_file_the_channel_writes_is_the_one_the_kernel_reads(tmp_path):
+    """C44: the inbox's kernel lease, written out by the worker, is read by `run_lease.read_lease` with the ledger's
     facts: the run, the id, its base, its grant in micro-dollars, the campaign's hash and the hard term."""
     ledger, clock = make(tmp_path, max_usd=10.0, grants_usd={"m1": 1.25})
     join(ledger, clock, LABEL)
@@ -236,10 +236,10 @@ class InProcess:
         return Done()
 
 
-def test_c43_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kernel_to_a_counted_run(
+def test_c44_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kernel_to_a_counted_run(
     tmp_path, clean_environment
 ):
-    """C43: end to end on the example study: the dispatcher leases a run to a federation over the fake ssh, the
+    """C44: end to end on the example study: the dispatcher leases a run to a federation over the fake ssh, the
     worker runs the kernel on it in a copy of the study, its completion and archive come back on the next tick, and
     the ledger counts the run done with the store's charged attempt and measured spend."""
     study = make_copy(tmp_path, "study")
@@ -293,8 +293,8 @@ def test_c43_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kerne
     assert_invariants(ledger)
 
 
-def test_c43_a_second_run_of_the_same_worker_never_takes_the_ledgers_settled_lease_again(tmp_path):
-    """C43: through the dispatcher, a federation's worker runs its lease, the ledger leases it the next run, and
+def test_c44_a_second_run_of_the_same_worker_never_takes_the_ledgers_settled_lease_again(tmp_path):
+    """C44: through the dispatcher, a federation's worker runs its lease, the ledger leases it the next run, and
     the worker takes that one only: the first is never run twice."""
     ledger, clock = make(tmp_path, runs=plan(tasks=1))
     join(ledger, clock, LABEL)
@@ -315,8 +315,8 @@ def test_c43_a_second_run_of_the_same_worker_never_takes_the_ledgers_settled_lea
     assert_invariants(ledger)
 
 
-def test_c43_a_heartbeat_that_cannot_be_written_never_abandons_the_run_it_beats_for(tmp_path, monkeypatch):
-    """C43: a beat whose write fails is a beat missed: the run goes on and its completion is still written."""
+def test_c44_a_heartbeat_that_cannot_be_written_never_abandons_the_run_it_beats_for(tmp_path, monkeypatch):
+    """C44: a beat whose write fails is a beat missed: the run goes on and its completion is still written."""
     runner = FakeRunner(make=lambda study, lease_file: FakeHandle(beats=2))
     worker, channel = worker_on(tmp_path, runner)
     deliver(channel, a_lease(1))
@@ -332,8 +332,8 @@ def test_c43_a_heartbeat_that_cannot_be_written_never_abandons_the_run_it_beats_
     assert outbox(channel, ch.completion_name(1))["state"] == "done"
 
 
-def test_c43_a_state_that_cannot_be_read_never_lets_an_ended_lease_run_again(tmp_path):
-    """C43: after lease 7 ended, a state file that is listed and cannot be read is no answer (the poll is retried),
+def test_c44_a_state_that_cannot_be_read_never_lets_an_ended_lease_run_again(tmp_path):
+    """C44: after lease 7 ended, a state file that is listed and cannot be read is no answer (the poll is retried),
     and a channel whose state is gone still does not run lease 7 again: its end is in the outbox."""
     runner = FakeRunner()
     worker, channel = worker_on(tmp_path, runner)
@@ -348,10 +348,10 @@ def test_c43_a_state_that_cannot_be_read_never_lets_an_ended_lease_run_again(tmp
     assert runner.started == [7]
 
 
-def test_c43_relative_directories_are_taken_as_absolute_and_a_work_directory_inside_the_study_is_refused(
+def test_c44_relative_directories_are_taken_as_absolute_and_a_work_directory_inside_the_study_is_refused(
     tmp_path, monkeypatch
 ):
-    """C43: the run's working directory is its lease directory, so the worker holds its directories as absolute
+    """C44: the run's working directory is its lease directory, so the worker holds its directories as absolute
     paths; and a work directory inside the study would copy itself, so the worker refuses it."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "study").mkdir()
@@ -368,8 +368,8 @@ def test_c43_relative_directories_are_taken_as_absolute_and_a_work_directory_ins
         inside.open()
 
 
-def test_c43_a_take_whose_state_landed_before_its_fsync_failed_still_runs_the_lease(tmp_path, monkeypatch):
-    """C43: the state's rename landed and the fsync of its directory failed: the state shows the lease as taken, so
+def test_c44_a_take_whose_state_landed_before_its_fsync_failed_still_runs_the_lease(tmp_path, monkeypatch):
+    """C44: the state's rename landed and the fsync of its directory failed: the state shows the lease as taken, so
     the worker runs it (a later poll would pass it over as taken), and its completion is written."""
     runner = FakeRunner()
     worker, channel = worker_on(tmp_path, runner)

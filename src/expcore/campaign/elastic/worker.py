@@ -1,5 +1,5 @@
 # Provenance: new
-"""The node worker (#462 step 3, C43): one long-running process in a federation's held job, one lease at a time.
+"""The node worker (#462 step 3, C44): one long-running process in a federation's held job, one lease at a time.
 
 `python -m expcore.campaign.elastic.worker --federation LABEL --channel DIR --study DIR --work DIR` watches the
 channel's inbox (`elastic.channel`) by listing it, and for each lease, in lease-id order:

@@ -1,5 +1,5 @@
 # Provenance: new
-"""The login watchdog of a site (#462 step 3, C43): when the orchestrator stops reaching the site, drain it.
+"""The login watchdog of a site (#462 step 3, C44): when the orchestrator stops reaching the site, drain it.
 
 Each dispatcher tick writes `contact.json` in the site's channel root with the login node's own clock
 (`elastic.exchange`). `python -m expcore.campaign.elastic.watchdog --root DIR --until EPOCH` runs on the login node
