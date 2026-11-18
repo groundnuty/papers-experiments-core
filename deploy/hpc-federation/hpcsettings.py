@@ -493,6 +493,23 @@ def checked_site(site: Site) -> Site:
     return site
 
 
+def queue_timeout_from_environment(environ: Mapping[str, str]) -> Optional[float]:
+    """`HPC_QUEUE_TIMEOUT_S`: the seconds `up` waits for a held job to start before it cancels it (README, "Site
+    configuration"). None when it is unset or empty: the driver's own bound stands. A value that is not a finite number
+    above 0 is refused, naming the key and never the value. It is not a `Site` value: only `up` waits, and `down` needs
+    no bound."""
+    value = environ.get("HPC_QUEUE_TIMEOUT_S")
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = math.nan
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise SettingsError("HPC_QUEUE_TIMEOUT_S: must be a number of seconds above 0")
+    return seconds
+
+
 def site_from_environment(environ: Mapping[str, str]) -> Site:
     """The site's values from the environment (`set -a; . site.env; set +a`); SettingsError names a missing one."""
     for key in ("HPC_ACCOUNT", "HPC_PARTITION", "SH", "L"):
