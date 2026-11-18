@@ -165,6 +165,25 @@ def test_the_pre_step_guards_claim_files_are_evidence_when_present(shards, tmp_p
     assert not {"shard-claim.json", "shard-claim.lock"} & set(_members(plan.results / "fed-b.root.tar"))
 
 
+def test_the_ingests_evidence_file_is_archived_listed_with_its_hash_and_marked_when_present(shards, tmp_path):
+    """O63: `ingest-evidence.json` at the root (a study's `ingest run --out <root>/ingest-evidence.json`) is archived
+    beside the state, listed with its SHA-256 in the root archive's manifest and in the marker `down` compares it
+    against; a root without it is as it was."""
+    name, content = "ingest-evidence.json", EVIDENCE["ingest-evidence.json"]
+    plan = make_plan(shards, tmp_path)
+    (plan.shards[1].root / name).unlink()
+    shards.collect(plan, tmp_path / "merge")
+    digest = hashlib.sha256(content).hexdigest()
+    assert _members(plan.results / "fed-a.root.tar")[name] == content
+    listed = {
+        entry["name"]: entry["sha256"] for entry in json.loads((plan.results / "fed-a.root.json").read_text())["files"]
+    }
+    assert listed[name] == digest
+    assert json.loads((plan.shards[0].root / "evidence-collected.json").read_text())["files"][name] == digest
+    assert name not in _members(plan.results / "fed-b.root.tar")
+    assert name not in json.loads((plan.shards[1].root / "evidence-collected.json").read_text())["files"]
+
+
 def test_a_link_in_place_of_a_directory_of_the_allow_list_is_refused(shards, tmp_path):
     """O63: `fault-relay` itself a link (to the secrets) is refused, not followed."""
     plan = make_plan(shards, tmp_path)

@@ -306,7 +306,9 @@ def collect(
     one copied to its place under `dest`, as Docker's collection lays them out; raises as `copy_tree` does
     (`UnsafeOutput` before anything is copied)."""
     tree = staging / "work"
-    copied = copyout.copy_tree(host, Path(CELL_WORK), [(rel, tree / rel) for rel in outputs], max_bytes=max_bytes)
+    copied = copyout.copy_tree(
+        host, Path(CELL_WORK), [(rel, tree / rel) for rel in outputs], max_bytes=max_bytes, restore_locked=True
+    )
     tops: list[tuple[str, ...]] = []
     for parts in sorted({copyout.output_parts(rel) for rel in outputs if copied[rel] is not None}, key=len):
         if not any(parts[: len(top)] == top for top in tops):  # one inside another came with it

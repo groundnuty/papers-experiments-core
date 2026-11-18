@@ -58,6 +58,21 @@ def test_o33_a_quiet_reset_records_both_stages_and_their_seconds(scanned, fake, 
     assert quiet["physical_bytes"]["providers[1]"] == 0
 
 
+def test_o46_a_single_space_reset_records_the_quiet_wait_it_took_and_the_one_it_was_owed(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O46: a sleep that overshoots, or a step that starts late, leaves the sizes read later than T plus the bound. The
+    record's `waited_s` is the seconds the reset's own clock counted from the maps reading to the sizes reading, and
+    `nominal_wait_s` is the bound, so the guarantee (at least the bound) stays visible beside the time."""
+    overshoot_s = 2.5
+    provisioner = provisioner_with(
+        client, config, platform_file, ticker, tmp_path, sleep=lambda seconds: ticker.sleep(seconds + overshoot_s)
+    )
+    quiet = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, qos_rights=True)["stages"]["quiet"]
+    assert quiet["waited_s"] == pytest.approx(WAIT_S + overshoot_s)
+    assert quiet["nominal_wait_s"] == WAIT_S
+
+
 def test_o33_with_no_requirement_and_no_qos_rights_the_settle_and_the_quiet_check_are_skipped(scanned, fake, ticker):
     """O33: a run whose condition declares no QoS right, with no requirement of its own at the reset: nothing to settle
     and nothing that could have been added, so neither stage reads a block map or waits, and the record says so."""

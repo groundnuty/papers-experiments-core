@@ -94,7 +94,13 @@ class World:
         driver.poll_s = driver.slurm.poll_s = 0.0
 
         def core(layout, owner, values, environ=None):
-            (root / "platform.toml").write_text("", encoding="utf-8")  # the file the real phase renders (plan reads it)
+            # the files the real phase renders (plan reads them): the facts, with each space's Onezone ID (`up`
+            # records it),
+            # and a platform file that names the same ID for the ingested space (what a verified marker is bound to)
+            (root / "facts.json").write_text('{"spaces": {"delta-space": {"id": "sid-delta"}}}', encoding="utf-8")
+            (root / "platform.toml").write_text(
+                '[[spaces]]\nname = "delta-space"\nid = "sid-delta"\n', encoding="utf-8"
+            )
             return "core: the link check passed"
 
         driver.core = core

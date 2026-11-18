@@ -10,15 +10,18 @@ sure nothing of the agent's runs meanwhile: the sandbox freezes the agent's cont
 1. The tree is listed as root, once per collection, by the copy helper (`copyhelper.py`, run as root with its request on
    stdin), which opens every directory from its parent's descriptor without following a link and never leaves the
    root's file system: each entry's type, link count, device and inode, size, depth and name, the records ended by
-   NUL, so a name may hold any byte but NUL and '/'. Names are matched as the listing spells them.
+   NUL, so a name may hold any byte but NUL and '/'. Names are matched as the listing spells them. A file or
+   directory the agent locked (its owner's bits cleared, `/work` itself too) gets the owner's read bit back from the
+   helper (O71) when the caller asks (`restore_locked`, for the agent's `/work` only), so it is listed and copied; an
+   entry the helper cannot read, or a locked file with another link, is listed as kind `x`.
 2. Each output, with the directories on its way to it, is checked against the listing before anything is copied. A
    symbolic link, a FIFO, socket, device or door, or a directory of another file system, on the way or in it (a
    dangling link too), a regular file with more links than the output holds (a hard link to a file outside it), a
    path longer than `MAX_PATH_BYTES`, or more bytes in all than `max_bytes` (the working disk's quota: only a sparse
    file outgrows the disk it was written on) is refused. `UnsafeOutput` names each by its path relative to the root
-   and what it is, never a link's target, and nothing is copied. An output whose way holds a regular file or nothing
-   is absent. In the agent's working directory each of these is the agent's own doing: the caller records it for the
-   study's scorers.
+   and what it is, never a link's target, and nothing is copied. An entry the helper could not read is refused the
+   same way (`UNREADABLE`). An output whose way holds a regular file or nothing is absent. In the agent's working
+   directory each of these is the agent's own doing: the caller records it for the study's scorers.
 3. Each output is copied by the helper as root, name by name from the parent directory's descriptor with `O_NOFOLLOW`,
    never through a path: every directory on the way and every object copied must have the device, inode, kind and size
    the listing showed, so a name swapped for a link or for another object after the listing stops the copy
@@ -59,17 +62,21 @@ SHOWN_REFUSALS = 16  # how many refusals a record names; it counts them all
 SHOWN_NAME_CHARS = 256  # how much of a refused path a record shows
 LIST_TIMEOUT_S = 120.0
 COPY_TIMEOUT_S = 600.0
-SPECIAL = {"l": "symbolic link", "p": "FIFO", "s": "socket", "b": "block device", "c": "character device", "D": "door"}
 OUTSIDE_LINK = "hard link to a file outside the output"
 TOO_LONG = f"path longer than {MAX_PATH_BYTES} bytes"
 TOO_BIG = "more bytes than the working disk holds"
+UNREADABLE = "entry that cannot be read"  # the helper's kind `x`: not a file type (O71)
+SPECIAL = {
+    "l": "symbolic link", "p": "FIFO", "s": "socket", "b": "block device", "c": "character device", "D": "door",
+    "x": UNREADABLE,
+}  # fmt: skip
 
 
 @dataclass(frozen=True)
 class Entry:
     """One line of the listing."""
 
-    kind: str  # find's %y: f, d, l, p, s, b, c, D, or U for a type it does not know
+    kind: str  # find's %y: f, d, l, p, s, b, c, D, or U for a type it does not know; x for an entry it could not read
     links: int
     inode: str  # "<device>:<inode>"
     size: int
@@ -170,9 +177,11 @@ def _helper(host: HostOps, operation: str, request: Mapping[str, Any], timeout_s
     return host.run(argv, timeout_s, sudo=True, input=json.dumps(dict(request)))
 
 
-def list_tree(host: HostOps, root: Path) -> list[Entry]:
-    """List `root` as root, never following a link or leaving its file system."""
-    done = _helper(host, "list", {"root": str(root), "max_path_bytes": MAX_PATH_BYTES}, LIST_TIMEOUT_S)
+def list_tree(host: HostOps, root: Path, *, restore_locked: bool = False) -> list[Entry]:
+    """List `root` as root, never following a link or leaving its file system. `restore_locked` asks the helper to give
+    the owner's read bit back to what the agent locked (`copyhelper.py`, O71): only for the agent's own `/work`."""
+    request = {"root": str(root), "max_path_bytes": MAX_PATH_BYTES, "restore_locked": restore_locked}
+    done = _helper(host, "list", request, LIST_TIMEOUT_S)
     if done.returncode != 0:
         log.error("listing the sandbox's output failed (%s): %s", done.returncode, describe_stderr(done.stderr))
         raise SandboxError(f"listing the sandbox's output failed ({done.returncode})")
@@ -209,7 +218,7 @@ def check(
                 if names == list(out.parts[: entry.depth]):
                     blocked = _on_the_way(entry, device)
                     if blocked:
-                        refused.append(Refusal(_shown(names), blocked))
+                        refused.append(Refusal(_shown(names) or ".", blocked))
                     elif entry.kind == "d":
                         out.ancestors.append(entry.key)
                 continue
@@ -218,7 +227,7 @@ def check(
             out.present = out.present or entry.depth == k
             problem = _problem(entry, device, lengths[-1])
             if problem:
-                refused.append(Refusal(_shown(names), problem))
+                refused.append(Refusal(_shown(names) or ".", problem))
                 continue
             out.expect[(*entry.key, entry.kind, entry.size)] += 1
             if entry.kind == "d":
@@ -318,7 +327,12 @@ def verify(dst: Path, out: _Output) -> str | None:
 
 
 def copy_tree(
-    host: HostOps, root: Path, copies: Sequence[tuple[str, Path]], *, max_bytes: int | None
+    host: HostOps,
+    root: Path,
+    copies: Sequence[tuple[str, Path]],
+    *,
+    max_bytes: int | None,
+    restore_locked: bool = False,
 ) -> dict[str, dict[str, int] | None]:
     """Copy each output `rel` of `root` to its destination, as root, under the rule of this module.
 
@@ -327,11 +341,12 @@ def copy_tree(
     destination must lie at the same place under the other's. Returns, per output, its files and bytes, or None when it
     is absent; raises `UnsafeOutput` when anything in or on the way to an output cannot be copied safely, before any
     copy is made, `CopyMismatch` when a copy is not what the listing showed (that copy is removed), and `SandboxError`
-    when a command fails."""
+    when a command fails. `restore_locked` is for the agent's own `/work` alone (`list_tree`): the copy of a file of
+    the harness's own never changes a mode."""
     rels = [rel for rel, _ in copies]
     if not host.exists(root):
         return dict.fromkeys(rels)
-    outputs, refused = check(list_tree(host, root), rels, max_bytes=max_bytes)
+    outputs, refused = check(list_tree(host, root, restore_locked=restore_locked), rels, max_bytes=max_bytes)
     if refused:
         raise UnsafeOutput(refused)
     got: dict[str, dict[str, int] | None] = {}

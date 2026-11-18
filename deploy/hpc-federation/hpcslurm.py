@@ -26,12 +26,20 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, NoReturn, Optional, Sequence, Tuple, TypeVar
+
+T = TypeVar("T")
 
 ENV = "/usr/bin/env"
 GONE_POLLS = 3  # a step absent from squeue -s this many polls in a row has ended
 READBACK = ("JobName", "TimeLimit", "Requeue", "Account", "Partition", "NumNodes", "NumCPUs", "MinMemoryNode")
 WAITING_STATES = ("PENDING", "CONFIGURING", "REQUEUED", "RESIZING")
+# The wait for a held job takes a read of it that failed (the command timed out, or exited nonzero: what a slow or
+# restarting controller gives) for a missed poll. It gives up once every read has failed for this many seconds since
+# the first one of the streak, sleeping the poll interval after the first, twice it after the second and so on, but
+# never longer than the backoff cap, so that several reads fit in the time.
+MISSED_POLLS_GIVE_UP_S = 600.0
+MISSED_POLL_BACKOFF_MAX_S = 60.0
 JOB_LINE = re.compile(r"([0-9]{1,12})(?:;[A-Za-z0-9_.-]+)?")
 JOB_LISTED = re.compile(r"([0-9]{1,12})(?:\+[0-9]{1,6})?")  # squeue's %i: a job, or a component <leader>+<k>
 # A step as squeue -s lists it: of a job, or of a heterogeneous job's component (<leader>+<k>.<n>, or the
@@ -133,6 +141,12 @@ def scrubbed(text: str, names: Sequence[str]) -> str:
     return text
 
 
+class ReadFailed(SlurmError):
+    """A read of a job's record that failed: `scontrol show job` timed out or exited nonzero (a controller that is slow
+    or restarting says so). Not Slurm's "Invalid job id" (a job it no longer knows, which `records` answers with
+    None), and not an answer for another job."""
+
+
 class StepTimeout(SlurmError, TimeoutError):
     """A step that was still listed at its bound; it was cancelled by its own id."""
 
@@ -149,6 +163,9 @@ class Client(NamedTuple):
 
     pid: int
     start: int
+
+
+ALIVE, GONE, ANOTHER = "alive", "gone", "another process"  # what a recorded client is now (`Runner.client_state`)
 
 
 class Process:
@@ -216,13 +233,40 @@ def clients_of(job: str, proc: str = "/proc") -> List[Client]:
     return found
 
 
+# squeue takes its defaults (the states, names, accounts and partitions it lists) from SQUEUE_* variables, and the
+# form of what Slurm's commands print from a few SLURM_* ones: a login shell that exported one (`SQUEUE_NAMES=x` hides
+# every federation job) would change what a read of the driver answers, and the guards that read the account's jobs
+# would fail open without a word. The commands `Runner.run` runs get an environment without them; every other variable,
+# the site's own SLURM_CONF and SBATCH_* among them, reaches them as it was.
+OUTPUT_FORMAT_VARIABLES = ("SLURM_TIME_FORMAT", "SLURM_BITSTR_LEN")
+WIDENING_VARIABLES = (
+    "SQUEUE_ALL",
+)  # `--all`: jobs of hidden partitions too. It only widens, and a site that hides its
+# partition may rely on it for every squeue read of the driver, so it is the one SQUEUE_* variable that is kept
+
+
+def read_environment(environ: Mapping[str, str]) -> Dict[str, str]:
+    """`environ` without every SQUEUE_* variable that narrows or reshapes what squeue lists (all but `SQUEUE_ALL`) and
+    without Slurm's output-format variables."""
+    return {
+        k: v
+        for k, v in environ.items()
+        if (not k.startswith("SQUEUE_") or k in WIDENING_VARIABLES) and k not in OUTPUT_FORMAT_VARIABLES
+    }
+
+
 class Runner:
     """Runs the commands on the login node. The tests replace it with a fake Slurm."""
 
     def run(self, argv: Sequence[str], timeout: float) -> Completed:
         try:
             done = subprocess.run(
-                list(argv), capture_output=True, timeout=timeout, check=False, stdin=subprocess.DEVNULL
+                list(argv),
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                env=read_environment(os.environ),
             )
         except subprocess.TimeoutExpired:
             raise SlurmError(f"{argv[0]} did not answer in {timeout:.0f} s") from None
@@ -258,8 +302,17 @@ class Runner:
         start = proc_start(popen.pid)
         return Client(popen.pid, start if start is not None else -1)
 
+    def client_state(self, client: Client) -> str:
+        """What the process a client was recorded as is now: `ALIVE` while its pid holds a process of the recorded start
+        tick; `GONE` when no process (or a zombie) holds the pid; `ANOTHER` when one does with another start tick, or
+        when the client's own tick was never read (-1). A pid is never signalled on less than its start tick."""
+        now = proc_start(client.pid)
+        if now is None:
+            return GONE
+        return ALIVE if client.start >= 0 and now == client.start else ANOTHER
+
     def client_alive(self, client: Client) -> bool:
-        return client.start >= 0 and proc_start(client.pid) == client.start
+        return self.client_state(client) == ALIVE
 
     def clients_of(self, job: str) -> List[Client]:
         return clients_of(job)
@@ -303,6 +356,9 @@ class Allocation:
     exclude: Tuple[
         str, ...
     ] = ()  # the nodes of other federations' live jobs (hpcexclude): each component's `--exclude`
+    after: Optional[str] = None  # the id of a job this one waits to START (`--dependency=after:`, component 0 only)
+    exclusive: bool = False  # `--exclusive` on every component (HPC_EXCLUSIVE_NODES): no other job shares its nodes
+    own: int = 0  # how many of `exclude` are the nodes of this federation's own services job (the agent's, `separate`)
 
     def shapes(self) -> Tuple[Shape, ...]:
         """Every component's shape, component 0 first."""
@@ -313,10 +369,18 @@ class Allocation:
         propagates no partition, nodes or cores to it, and the read-back checks what it recorded) with its own nodes,
         cores and memory; `--wrap` stands once, in component 0's options, as sbatch builds the script once. `--exclude`
         names the same nodes in every component, so that nothing depends on Slurm passing it on, and only when there
-        are nodes to name: without them the argv is what it was before the option existed."""
+        are nodes to name: without them the argv is what it was before the option existed. `--exclusive` follows the
+        memory of every component, likewise only when asked (Slurm propagates it to no component).
+        `--dependency=after:<job>` (`after`, set only on the agent's own job, never on a job that has components) holds
+        the job until `<job>` has started or been cancelled: Slurm's "begin after the job starts" type, never
+        `afterok`, which would wait for the job to end. One argv may carry both."""
         if not all(NODE.fullmatch(node) for node in self.exclude):
             raise SlurmError("an excluded node's name is not one an sbatch argv may carry")
+        if self.after is not None and not re.fullmatch(r"[0-9]{1,12}", self.after):
+            raise SlurmError("the job this one waits to start is not one job id")
         exclude = [f"--exclude={','.join(self.exclude)}"] if self.exclude else []
+        dependency = [f"--dependency=after:{self.after}"] if self.after is not None else []
+        whole = ["--exclusive"] if self.exclusive else []
         argv = [
             "sbatch",
             "--parsable",
@@ -329,7 +393,9 @@ class Allocation:
             "--ntasks-per-node=1",
             f"--cpus-per-task={self.cpus_per_node}",
             f"--mem={self.memory_mib}M",
+            *whole,
             *exclude,
+            *dependency,
             "--chdir=/",
             "--output=/dev/null",
             "--export=NONE",
@@ -345,6 +411,7 @@ class Allocation:
                 "--ntasks-per-node=1",
                 f"--cpus-per-task={shape.cpus_per_node}",
                 f"--mem={shape.memory_mib}M",
+                *whole,
                 *exclude,
             ]
         return argv
@@ -479,6 +546,9 @@ def mismatches(recorded: Mapping[str, str], asked: Allocation, shape: Optional[S
     """The fields of the held job (or of one of its components, `shape`) Slurm recorded otherwise than asked, by name;
     empty when it is what was asked."""
     shape = shape or asked.shapes()[0]
+    cores = _count(recorded.get("NumCPUs", ""))
+    if asked.exclusive and cores is not None and cores >= shape.nodes * shape.cpus_per_node:
+        cores = shape.nodes * shape.cpus_per_node  # an exclusive job holds every core of its nodes, and Slurm says so
     wanted = {
         "JobName": (recorded.get("JobName"), asked.name),
         "TimeLimit": (limit_seconds(recorded.get("TimeLimit", "")), asked.time_s),
@@ -486,10 +556,13 @@ def mismatches(recorded: Mapping[str, str], asked: Allocation, shape: Optional[S
         "Account": ((recorded.get("Account") or "").lower(), asked.account.lower()),
         "Partition": (recorded.get("Partition"), asked.partition),
         "NumNodes": (_count(recorded.get("NumNodes", "")), shape.nodes),
-        "NumCPUs": (_count(recorded.get("NumCPUs", "")), shape.nodes * shape.cpus_per_node),
+        "NumCPUs": (cores, shape.nodes * shape.cpus_per_node),
         "MinMemoryNode": (memory_mib(recorded.get("MinMemoryNode", "")), shape.memory_mib),
     }
-    return [field for field in READBACK if wanted[field][0] != wanted[field][1]]
+    wrong = [field for field in READBACK if wanted[field][0] != wanted[field][1]]
+    if asked.exclusive and recorded.get("OverSubscribe") != "NO":  # read only when asked: not a READBACK field
+        wrong.append("OverSubscribe")
+    return wrong
 
 
 def component_mismatches(records: Sequence[Mapping[str, str]], asked: Allocation, job: str) -> List[str]:
@@ -558,11 +631,14 @@ class Slurm:
     def records(self, job: str) -> Optional[List[Dict[str, str]]]:
         """Every record `scontrol show job -o` answers for a job id, one per line: the job's, or each component's of a
         heterogeneous job asked by its leader's id; None when Slurm no longer knows the id."""
-        done = self.runner.run(["scontrol", "show", "job", "-o", job], self.command_timeout_s)
+        try:
+            done = self.runner.run(["scontrol", "show", "job", "-o", job], self.command_timeout_s)
+        except SlurmError as error:  # the command did not answer within its bound
+            raise ReadFailed(str(error)) from None
         if done.returncode != 0:
             if "Invalid job id" in done.stderr:
                 return None
-            raise SlurmError(f"scontrol show job failed with status {done.returncode}: {done.stderr.strip()[:300]}")
+            raise ReadFailed(f"scontrol show job failed with status {done.returncode}: {done.stderr.strip()[:300]}")
         found = [_fields(line) for line in done.stdout.splitlines() if line.strip()]
         if not any(record.get("JobId") == job for record in found):
             raise SlurmError("scontrol show job answered for another job")
@@ -586,10 +662,48 @@ class Slurm:
             raise SlurmError("a component of the heterogeneous job has no offset")
         return sorted(het, key=lambda record: int(record["HetJobOffset"]))
 
-    def checked(self, job: str, asked: Allocation) -> List[Dict[str, str]]:
-        """Every component's record of the job just submitted, read back; unless each is what was asked, cancel that
-        one job (a heterogeneous job by its leader's id, which ends every component) and fail, naming the fields."""
-        records = self.components(job)
+    def ride_out(
+        self,
+        read: Callable[[], T],
+        what: str,
+        say: Optional[Callable[[str], None]] = None,
+        deadline: Optional[float] = None,
+        past: Optional[Callable[[ReadFailed], SlurmError]] = None,
+    ) -> T:
+        """`read()`, where a `ReadFailed` (a Slurm command that timed out or exited nonzero, as a slow or restarting
+        controller makes it) is a missed poll, not an answer: `say` hears of the first of a streak, the read is made
+        again after a sleep that doubles from the poll interval and never passes `MISSED_POLL_BACKOFF_MAX_S`, and
+        whatever else `read` raises (a definite answer: a job that is gone, a mismatch, an unparsable line) ends it as
+        it always did, and so does an answer. It fails, with a plain `SlurmError`, only once every read has failed for
+        `MISSED_POLLS_GIVE_UP_S` since the streak's first (never on one failure). With `deadline` (a `clock()` time) it
+        fails with `past(error)` at the failed read that finds it passed. It cancels nothing: the caller's release does,
+        after reading what it releases (`Driver.release_held`). `what` names the read in what `say` says."""
+        first_missed: Optional[float] = None  # when the streak of failed reads began
+        missed = 0
+        while True:
+            try:
+                return read()
+            except ReadFailed as error:
+                now = self.clock()
+                first_missed = now if first_missed is None else first_missed
+                missed += 1
+                if now - first_missed >= MISSED_POLLS_GIVE_UP_S:
+                    raise SlurmError(
+                        f"{error}; {missed} reads in a row failed over {now - first_missed:.0f} s"
+                    ) from None
+                if deadline is not None and past is not None and now >= deadline:
+                    raise past(error) from None
+                if missed == 1 and say is not None:
+                    say(f"{error}: a missed poll of {what}; going on, and giving up only if every read fails for "
+                        f"{MISSED_POLLS_GIVE_UP_S:.0f} s")  # fmt: skip
+                left = MISSED_POLL_BACKOFF_MAX_S if deadline is None else deadline - now
+                self.sleep(min(self.poll_s * 2 ** min(missed - 1, 16), MISSED_POLL_BACKOFF_MAX_S, left))
+
+    def checked(self, job: str, asked: Allocation, say: Optional[Callable[[str], None]] = None) -> List[Dict[str, str]]:
+        """Every component's record of the job just submitted, read back (a read that fails is a missed poll,
+        `ride_out`); unless each is what was asked, cancel that one job (a heterogeneous job by its leader's id, which
+        ends every component) and fail, naming the fields."""
+        records = self.ride_out(lambda: self.components(job), f"the read-back of held job {job}", say)
         self._ours(job, records, asked.name)
         wrong = ["the job itself"] if records is None else component_mismatches(records, asked, job)
         if wrong:
@@ -597,6 +711,55 @@ class Slurm:
             raise SlurmError(f"the held job was recorded otherwise than asked ({', '.join(wrong)}); it was cancelled")
         assert records is not None
         return records
+
+    def check_dependency(
+        self,
+        job: str,
+        asked: Allocation,
+        records: Sequence[Mapping[str, str]],
+        say: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Read back the dependency of a job just submitted (`asked.after`), at submit time only: the job's record must
+        name `after:<that job>` (Slurm adds `(unfulfilled)` while it waits), or none while that job is no longer
+        waiting, since Slurm drops a dependency once it holds. A job recorded with no dependency while the job it was to
+        wait for still waits would start with no services, so it is cancelled by its own id and the up fails. The read
+        of the job it waits for, which that asks, is a missed poll when it fails (`ride_out`: said once, read again),
+        and only a read that fails for ten minutes, or a definite answer that is no answer, leaves it unchecked and
+        cancels the job: nothing shows the dependency holds. The check is never repeated on the running job (its
+        dependency is gone by then): `checked` does not look at it."""
+        if asked.after is None:
+            return
+        recorded = records[0].get("Dependency", "")
+        if re.fullmatch(rf"after:{asked.after}(?:\([a-z]+\))?", recorded):
+            return
+        if recorded in ("", "(null)"):
+            try:
+                waited = self.ride_out(lambda: self.job(asked.after), f"the job that held job {job} waits for", say)
+            except SlurmError:  # nothing shows the dependency holds: fail closed, never leave the job free to start
+                self._fail_cancelling(
+                    job,
+                    asked,
+                    "the held job's dependency could not be checked (the job it waits for could not be read)",
+                )
+            if waited is None or waited.get("JobState") not in WAITING_STATES:
+                return  # it has started (or ended), so the dependency holds: Slurm has dropped it
+        self._fail_cancelling(job, asked, "the held job was recorded otherwise than asked (its dependency)")
+
+    def _fail_cancelling(self, job: str, asked: Allocation, why: str) -> NoReturn:
+        """Fail the up for `why`, cancelling the job just submitted by its id, but only while it still carries the name
+        it was given: the check may have waited out a slow controller for ten minutes (`ride_out`), and Slurm reuses
+        ids, so a cancel by the saved id could end another up's job. A job that cannot be read is not cancelled on a
+        guess (the failure says so: `down` releases it); one Slurm no longer knows needs none."""
+        try:
+            records = self.components(job)
+        except SlurmError:
+            raise SlurmError(f"{why}; it could not be read to cancel it: run down to release it") from None
+        if records is None:
+            raise SlurmError(f"{why}; Slurm no longer knows it")
+        if records[0].get("JobName") != asked.name:
+            raise SlurmError(f"{why}; job {job} carries another job's name now, and was not cancelled")
+        self.cancel(job)
+        raise SlurmError(f"{why}; it was cancelled")
 
     def readback(self, job: str, asked: Allocation) -> Dict[str, str]:
         """`checked`, reduced to the read-back's fields of component 0."""
@@ -609,13 +772,32 @@ class Slurm:
         if records and name is not None and records[0].get("JobName") != name:
             raise SlurmError(f"job {job} carries another job's name: not the job submitted, and not cancelled")
 
-    def wait_running(self, job: str, timeout_s: float, name: Optional[str] = None, note: str = "") -> Dict[str, str]:
+    def wait_running(
+        self,
+        job: str,
+        timeout_s: float,
+        name: Optional[str] = None,
+        note: str = "",
+        say: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, str]:
         """Wait for the held job (every component of it) to run; at the bound, or if it ends first, cancel it by its
         id and fail. With `name`, a job that carries another is never cancelled (`_ours`). `note` ends the failure at
-        the bound: what the caller knows that may keep the job waiting."""
+        the bound: what the caller knows that may keep the job waiting.
+
+        A read of the job that fails (`ReadFailed`) is a missed poll, not the job's end (`ride_out`): the wait goes on,
+        and fails only once every read has failed for `MISSED_POLLS_GIVE_UP_S` since the streak's first (never on one
+        failure), or at the bound with a read that failed; it cancels nothing then, since nothing is known of the
+        job: the caller's release reads it first (`Driver.release_held`). A job Slurm no longer knows, one that
+        ended, and an answer for another job or with no offset end the wait as they always did."""
         deadline = self.clock() + timeout_s
+
+        def past(error: ReadFailed) -> SlurmError:
+            return SlurmError(
+                f"the held job did not start within {timeout_s:.0f} s, and the last read of it failed ({error}){note}"
+            )
+
         while True:
-            records = self.components(job) or []
+            records = self.ride_out(lambda: self.components(job) or [], f"held job {job}", say, deadline, past)
             self._ours(job, records, name)
             states = [record.get("JobState") for record in records]
             if states and all(state == "RUNNING" for state in states):
@@ -662,19 +844,29 @@ class Slurm:
 
     # -- steps --------------------------------------------------------------------------------------------------------
 
-    def steps(self, job: str) -> Dict[str, str]:
-        """The job's steps listed now, as name to step id (the batch and extern steps left out)."""
+    def step_listing(self, job: str) -> List[Tuple[str, str]]:
+        """The job's steps listed now, as (step id, name) in listing order, one for each step (the batch and extern
+        steps left out): Slurm lists as many steps of one name as were started."""
         done = self.runner.run(["squeue", "-s", "-j", job, "-h", "-o", "%i %j"], self.command_timeout_s)
         if done.returncode != 0:
             if "Invalid job id" in done.stderr:
-                return {}
+                return []
             raise SlurmError(f"squeue -s failed with status {done.returncode}: {done.stderr.strip()[:300]}")
-        found = {}
+        found = []
         for line in done.stdout.splitlines():
             match = STEP_LINE.fullmatch(line.strip())
             if match and not match.group(1).endswith((".batch", ".extern")):
-                found[match.group(2)] = match.group(1)
+                found.append((match.group(1), match.group(2)))
         return found
+
+    def steps(self, job: str) -> Dict[str, str]:
+        """The job's steps listed now, as name to step id (the batch and extern steps left out); of two steps of one
+        name the later is kept (`steps_named` lists them all)."""
+        return {name: step_id for step_id, name in self.step_listing(job)}
+
+    def steps_named(self, job: str, name: str) -> List[str]:
+        """The ids of every step of the job listed under `name` now, in listing order."""
+        return [step_id for step_id, listed in self.step_listing(job) if listed == name]
 
     def cancel_step(self, step_id: str) -> None:
         """Cancel one step by the id squeue -s lists it under: `<job>.<n>`, or a component's `<leader>+<k>.<n>`."""

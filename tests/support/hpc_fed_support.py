@@ -374,6 +374,16 @@ def isolated(argv) -> list:
     return list(argv)
 
 
+# What `squeue` lists with no `-t` (Slurm's `_filter_job`, read on master and on 23.02): a job whose base state is
+# pending, running or suspended, or that is staging out or completing, whatever flag it carries, so a running job with
+# a signal pending (SIGNALING), a stop sent (STOPPED), configuring or resizing is listed too. Its manual says only
+# "pending, running, and completing", which is less than it does. An explicit `-t` matches a base state by equality
+# with the whole state, flags included, so a list of base names hides those flagged jobs: the guard's read therefore
+# names no state.
+DEFAULT_STATES = {"PENDING", "RUNNING", "SUSPENDED", "STAGE_OUT", "COMPLETING", "CONFIGURING", "RESIZING", "STOPPED",
+                  "SIGNALING"}  # fmt: skip
+
+
 @dataclass
 class OtherJob:
     """A live job of the account that is none of one fake's own: another federation's held job, or a job of no
@@ -459,6 +469,11 @@ class FakeSlurm:
     others_by_read: list = field(default_factory=list)
     peers: list = field(default_factory=list)
     me_reads: int = 0  # the `squeue --me` reads so far
+    # Nodes shared by cores, as the live cluster packed them (18 Nov): a job takes the first nodes it did not exclude,
+    # whichever of this fake's own other jobs hold them (the components of one job never share). Off: its jobs never
+    # share a node, by construction.
+    shared_nodes: bool = False
+    cancel_views: list = field(default_factory=list)  # each job cancel: (the id, the jobs of this fake that bill then)
     on_me: Callable | None = None  # a test's own answer, `(read number, listed rows) -> Completed | None`
 
     # -- the Runner interface ------------------------------------------------------------------------------------
@@ -470,13 +485,18 @@ class FakeSlurm:
         self.calls.append(argv)
         tool = argv[0]
         if tool == "squeue" and "--me" in argv:  # the account's live jobs: ids, names, states and node lists only
-            assert argv == ["squeue", "--me", "-h", "-o", "%i %j %T %N"], f"the read is not read-only as agreed: {argv}"
+            assert argv == ["squeue", "--me", "-h", "--all", "-o", "%i %j %T %N"], f"the read is not as agreed: {argv}"
             self.me_reads += 1
-            listed = self.me_rows()
+            listed = [row for row in self.me_rows() if row.split()[2] in DEFAULT_STATES]  # as squeue lists by default
             answer = self.on_me(self.me_reads, listed) if self.on_me is not None else None
             return answer or Completed(0, "".join(f"{row}\n" for row in listed), "")
         if tool == "sbatch":
-            ident = self.second_id if self.job_id in self.submitted else self.job_id
+            if self.job_id not in self.submitted:
+                ident = self.job_id
+            elif self.second_id not in self.submitted:
+                ident = self.second_id
+            else:  # a later submit (an up that is tried again): a fresh id, ten past the last
+                ident = str(max(int(job) for job in self.submitted) + 10)
             self.submitted[ident] = self._components(argv[1:])
             if ident == self.job_id:
                 self.asked = self.submitted[ident][0]
@@ -516,6 +536,7 @@ class FakeSlurm:
             return Completed(0, "".join(f"{i}\n" for i in self.listed_ids() if i.split("+")[0] == ident), "")
         if tool == "scancel":
             target = argv[1]
+            self.cancel_views.append((target, self.billing()))
             self.cancelled.append(target)
             if "." in target:
                 self.steps = {n: s for n, s in self.steps.items() if s != target}
@@ -574,10 +595,32 @@ class FakeSlurm:
         """The id squeue -s lists a step under: its job's, or its component's own id for a component above 0."""
         return str(int(srun.job) + srun.het_group) if srun.het_group else srun.job
 
+    def state_of(self, ident) -> str:
+        """A job's state: the one a test sets (`state` for this fake's first job, `job_states` for another), else, for a
+        job submitted with `--dependency=after:<job>`, PENDING while that job has not started (Slurm's "begin after the
+        job starts"; the dependency is met once it runs, or is cancelled), else RUNNING."""
+        if ident == self.job_id:
+            return self.state
+        if ident in self.job_states:
+            return self.job_states[ident]
+        return "PENDING" if self.waiting_on(ident) else "RUNNING"
+
+    def waiting_on(self, ident) -> bool:
+        """Whether a job's `--dependency=after:<job>` is still unfulfilled: that job pends and was not cancelled."""
+        dependency = self._options(ident)[0].get("--dependency", "")
+        if not dependency.startswith("after:"):
+            return False
+        target = dependency[len("after:") :]
+        return target not in self.cancelled and self.state_of(target) in ("PENDING", "CONFIGURING")
+
+    def billing(self) -> list:
+        """The ids of this fake's jobs that run now, and so bill: not cancelled, not gone, not waiting."""
+        return [ident for ident in self.submitted if not self.gone_job(ident) and self.state_of(ident) == "RUNNING"]
+
     def gone_job(self, ident) -> bool:
         if ident in self.cancelled:
             return True
-        return (self.state if ident == self.job_id else self.job_states.get(ident, "RUNNING")) == "GONE"
+        return self.state_of(ident) == "GONE"
 
     def listed_ids(self) -> list:
         """What squeue's %i lists of every job still known: a job's id, or `<leader>+<k>` per component."""
@@ -596,6 +639,8 @@ class FakeSlurm:
             return list(self.node_lists[(ident, component)])
         taken: set = set()
         for job in self.submitted or {self.job_id: None}:
+            if self.shared_nodes:  # the components of one heterogeneous job still get nodes of their own
+                taken = set()
             for index, options in enumerate(self._options(job)):
                 count = int(options.get("--nodes", "1"))
                 excluded = set(filter(None, options.get("--exclude", "").split(",")))
@@ -612,7 +657,7 @@ class FakeSlurm:
         for ident in self.submitted:  # none before the first sbatch: the account's own jobs are the ones submitted
             if self.gone_job(ident):
                 continue
-            state = self.state if ident == self.job_id else self.job_states.get(ident, "RUNNING")
+            state = self.state_of(ident)
             options = self._options(ident)
             for index, component in enumerate(options):
                 listed = ident if len(options) == 1 else f"{ident}+{index}"
@@ -621,7 +666,8 @@ class FakeSlurm:
         return rows
 
     def me_rows(self) -> list:
-        """Every row `squeue --me` lists now: this fake's own jobs, its peers', and the account's other jobs."""
+        """Every row `squeue --me` lists now, whatever its state: this fake's own jobs, its peers', and the account's
+        other jobs (`run` keeps the states `squeue` was asked for, as squeue does)."""
         if self.others_by_read:
             others = self.others_by_read[min(self.me_reads, len(self.others_by_read)) - 1]
         else:
@@ -635,14 +681,18 @@ class FakeSlurm:
             count = int(options.get("--nodes", "1"))
             cpus = int(options.get("--cpus-per-task", "1"))
             het = {"HetJobId": ident, "HetJobOffset": str(index)} if len(components) > 1 else {}
+            held = options.get("--dependency")  # a job with a dependency says it, as Slurm does until it holds
+            dependency = {"Dependency": f"{held}(unfulfilled)" if self.waiting_on(ident) else "(null)"} if held else {}
             fields = {
                 "JobId": str(int(ident) + index),
                 **het,
                 "JobName": options.get("--job-name"),
                 "UserId": f"someone({os.getuid()})",
-                "JobState": self.state if ident == self.job_id else self.job_states.get(ident, "RUNNING"),
+                "JobState": self.state_of(ident),
+                **dependency,
                 "TimeLimit": options.get("--time"),
                 "Requeue": "0" if "--no-requeue" in options else "1",
+                "OverSubscribe": "NO" if "--exclusive" in options else "OK",  # as scontrol prints it, whole nodes: NO
                 "Account": options.get("--account"),
                 "Partition": options.get("--partition", "default-partition"),
                 "NumNodes": str(count),

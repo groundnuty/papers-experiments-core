@@ -15,7 +15,14 @@ from fault_support import FakeClock
 from hpc_support import PING, RESTART_LINK, TOOL, FakeHpc, hpc_driver
 
 from expcore_onedata.compose import RESTART_LINK_SCRIPT, CommandResult, DriverError, Observation
-from expcore_onedata.fault_hpc import EXEC_COMMANDS, HpcDriver, Request, VerbCommand, stop_evidence
+from expcore_onedata.fault_hpc import (
+    EXEC_COMMANDS,
+    HpcDriver,
+    Request,
+    VerbCommand,
+    status_domain_wait,
+    stop_evidence,
+)
 
 LABELS = {"store-one": "providers[0]", "store-two": "providers[1]"}
 SERVICE = "store-two"
@@ -188,6 +195,20 @@ def test_o58_serves_asks_the_probe_only_of_a_running_ready_service_and_raises_wh
     driver, _ = answering(status(running=True, identity="x"), probe=asked.append)
     assert driver.serves(SERVICE) is False  # a probe that answers anything but True is no serving
     assert asked == [SERVICE]
+
+
+def test_o58_a_figure_beyond_a_floats_range_is_no_figure_and_raises_nothing():
+    """O58 (Codex, 17 Nov 2026): a whole number of 400 digits in a verb's answer (a corrupt or crafted record) made
+    `math.isfinite` raise OverflowError, turning a verb that had succeeded into an exception. It is no figure, as an
+    infinity is: the stop's evidence keeps the figures that are numbers, and a status gives no domain wait."""
+    huge = "1" + "0" * 400
+    answer = f'{{"stopped": true, "ended": "kill", "seconds": {huge}, "service_seconds": 630.5}}'
+    assert stop_evidence(answer) == {"stopped": True, "ended": "kill", "seconds": None, "service_seconds": 630.5}
+    assert stop_evidence(answer.replace("630.5", huge)) == {
+        "stopped": True, "ended": "kill", "seconds": None, "service_seconds": None}  # fmt: skip
+    assert status_domain_wait(f'{{"domain_wait_s": {huge}}}') is None
+    assert status_domain_wait('{"domain_wait_s": -' + huge + "}") is None
+    assert status_domain_wait('{"domain_wait_s": 12}') == 12.0  # a whole number that fits is the figure it was
 
 
 def test_o58_the_stops_evidence_is_kept_checked_and_nothing_else_of_its_answer():

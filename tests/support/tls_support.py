@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
+from expcore_onedata.sandbox.caconfig import CA_CONFIG, private_file
+
 HAS_OPENSSL = shutil.which("openssl") is not None
 ANSWER = {"name": "tls-test-space", "ok": True}  # what the server answers; a space read takes `name` from it
 
@@ -35,14 +37,16 @@ def make_federation_ca(directory: Path, name: str = "federation-test-ca") -> Sim
         directory / part for part in ("ca.key", "ca.pem", "server.key", "server.csr", "server.pem", "server.ext")
     )
     curve = ("-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes")
-    _openssl(
-        "req", "-x509", *curve, "-keyout", str(ca_key), "-out", str(ca), "-days", "2", "-subj", f"/CN={name}",
-        "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-    )  # fmt: skip
+    with private_file(directory, CA_CONFIG, ".cnf") as config:  # no -addext: see caconfig (OpenSSL 1.1.1)
+        _openssl(
+            "req", "-x509", *curve, "-keyout", str(ca_key), "-out", str(ca), "-days", "2", "-subj", f"/CN={name}",
+            "-config", str(config),
+        )  # fmt: skip
     _openssl("req", *curve, "-keyout", str(key), "-out", str(csr), "-subj", "/CN=127.0.0.1")
     ext.write_text(
         "subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\n"
-        "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n",
+        "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n",  # OpenSSL 1.1.1 adds neither (caconfig)
         encoding="utf-8",
     )
     _openssl(

@@ -5,27 +5,37 @@
     uv run python deploy/hpc-federation/fleet.py --fleet DIR add K
     uv run python deploy/hpc-federation/fleet.py --fleet DIR plan [--manifest SETTINGS]
     uv run python deploy/hpc-federation/fleet.py --fleet DIR step [--shard L] [--resume]
+    uv run python deploy/hpc-federation/fleet.py --fleet DIR step-stop --shard L
     uv run python deploy/hpc-federation/fleet.py --fleet DIR status
     uv run python deploy/hpc-federation/fleet.py --fleet DIR down [--member L]
 
 Run on the login node with the site's values exported (`set -a; . site.env; set +a`), as `hpcfed.py up` is.
 
 - up: refused past `HPC_FLEET_MAX` (the operator's maximum, which the grant and the scratch inode quota set; unset
-  refuses), by the home guard (`hpcquota.home_guard`, when the site sets its keys: the account's home past 95% of its
+  refuses, and no setting of it or of `HPC_FLEET_PARALLEL` may pass `HPC_FLEET_CEILING`, 64 unless the site sets it),
+  by the home guard (`hpcquota.home_guard`, when the site sets its keys: the account's home past 95% of its
   files or bytes, read once for the whole fleet), and past the quota by the inode guard (`hpcquota`, mandatory on
   scratch: the account's usage plus N times one federation's estimate, read once, before anything is made); then the
   fleet's directory (new: never adopted), N federations `fed-1` ... `fed-N`, each its own root `<fleet>/fed-k/root` (an
   exclusive mkdir), state file and held job, each brought up by `hpcfed.py up` in a process of its own,
-  `HPC_FLEET_PARALLEL` at a time (1 by default), and N shards. A federation whose up fails is reported and the
-  others stay up; it may hold a job until `down --member` releases it. Each federation's output is in
-  `<fleet>/logs/<label>.<up|down>.log`.
+  `HPC_FLEET_PARALLEL` at a time (1 by default), and N shards. The ups that run at once share one lock, the file
+  `<fleet>/.placement.lock`, held only around an up's first read of the account's live jobs with its submits and around
+  its second read once its jobs run, so no two federations end on one node; an up placed on another's node is released
+  and tried again, up to three times in all (`hpcdriver.PLACEMENT_ATTEMPTS`), and only the last refusal fails it. A
+  federation whose up fails is reported and the others stay up; it may hold a job until `down --member` releases it.
+  Each federation's output is in `<fleet>/logs/<label>.<up|down>.log`.
 - add: K fresh federations into the fleet, by the same rules, the maximum counting every one that may hold a job.
 - plan: each shard on a federation (`fleetplan`), written to `<fleet>/shards.toml`, and each one's srun line printed
   as `shards.py plan` prints it; refused, with nothing recorded, when the manifest's python imports a core that names
   no code (C06: unknown or stale), as `shards.py plan` refuses it; and, for a campaign that injects faults, a
   federation whose fault relay does not serve (`fleetplan.injection`, read from its state file) is given no shard.
 - step: each assigned shard's line launched detached on the login node, its client recorded; the same core check
-  first, when there is a line to launch.
+  first, when there is a line to launch. A step that resumes carries its running mark's nonce as `--over` when the
+  shard has a mark and `shards.py resume-line`'s proof shows the step that holds it gone; one whose step still runs is
+  refused and launched nowhere (`fleetstuck.over_proof`).
+- step-stop: one shard's step ended, by the ids the fleet recorded for it alone: its srun client by pid and start tick,
+  its Slurm step by its exact `<job>.<n>` id; refused whole when the pid is another process now (`fleetstuck.stop`).
+  A stuck shard then moves: `collect`, `down --member`, `add`, `plan`, `step --shard L --resume` (README.md).
 - status: what the record and each root's state file say, each federation's state in plain words (up and ready, up
   with no relay, failed and still HOLDING jobs by count, down); nothing is run. `plan` says the same states first.
 - down: every federation this fleet made, or one, taken down by `hpcfed.py down` and verified gone; a root or state
@@ -35,6 +45,7 @@ Run on the login node with the site's values exported (`set -a; . site.env; set 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +60,8 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
         sys.path.insert(0, str(_path))
 
 import fleetplan  # noqa: E402
+import fleetstuck  # noqa: E402
+import hpcexclude  # noqa: E402
 import hpcfed  # noqa: E402
 import hpcquota  # noqa: E402
 import hpcstate  # noqa: E402
@@ -73,9 +86,10 @@ from hpcdriver import CORE_MISMATCH, CoreMismatch  # noqa: E402
 from hpcsettings import SettingsError, agent_limits, load_settings, site_from_environment  # noqa: E402
 from hpcslurm import Client, Runner, Slurm, SlurmError  # noqa: E402
 
-MAX_VAR, PARALLEL_VAR = "HPC_FLEET_MAX", "HPC_FLEET_PARALLEL"
-CEILING = 64  # no setting of either may pass it
-COMMANDS = ("up", "add", "plan", "step", "status", "down")
+MAX_VAR, PARALLEL_VAR, CEILING_VAR = "HPC_FLEET_MAX", "HPC_FLEET_PARALLEL", "HPC_FLEET_CEILING"
+WHOLE = re.compile(r"[0-9]{1,9}")  # a count: ASCII digits only, and too few for int() to refuse a long one
+DEFAULT_CEILING, TOP_CEILING = 64, 512  # no setting of the first two may pass the ceiling; the site's key is 1 to 512
+COMMANDS = ("up", "add", "plan", "step", "step-stop", "status", "down")
 UNSAFE = set('"\\') | {chr(c) for c in range(32)} | {chr(127)}  # never in a path the fleet writes into TOML and JSON
 
 
@@ -114,6 +128,17 @@ def inode_guard(runner: Any, count: int, layout: Layout, site: Any, environ: Map
     return hpcquota.guard(runner, site, layout, environ, federations=count)
 
 
+def member_environ(environ: Mapping[str, str], root: Path, command: str) -> Dict[str, str]:
+    """The environment of one federation's `hpcfed.py <command>`: the site's values, and for an `up` the lock the
+    fleet's ups share (`<fleet>/.placement.lock`, the fleet's directory being the root's grandparent), which makes that
+    `up` take it around its reads of the account's live jobs and try again when it is placed on another's node. Never
+    for a `down`, and never one the operator's own environment holds."""
+    member = {name: value for name, value in environ.items() if name != hpcexclude.LOCK_VAR}
+    if command == "up":
+        member[hpcexclude.LOCK_VAR] = str(Path(root).parents[1] / hpcexclude.PLACEMENT_LOCK)
+    return member
+
+
 def hpcfed_process(environ: Mapping[str, str], run: Callable[..., Any] = subprocess.run) -> Operate:
     """Each federation's up or down as an operator runs it by hand: `hpcfed.py` under this interpreter with `-I` (no
     module of the launch directory is ever imported), from the fleet's own 0700 directory (never a shared one), in a
@@ -124,8 +149,8 @@ def hpcfed_process(environ: Mapping[str, str], run: Callable[..., Any] = subproc
                 command]  # fmt: skip
         descriptor = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         try:
-            done = run(argv, env=dict(environ), cwd=str(Path(root).parents[1]), stdin=subprocess.DEVNULL,
-                       stdout=descriptor, stderr=subprocess.STDOUT, check=False)  # fmt: skip
+            done = run(argv, env=member_environ(environ, root, command), cwd=str(Path(root).parents[1]),
+                       stdin=subprocess.DEVNULL, stdout=descriptor, stderr=subprocess.STDOUT, check=False)  # fmt: skip
         finally:
             os.close(descriptor)
         return done.returncode, log.read_text(encoding="utf-8", errors="replace")
@@ -151,14 +176,26 @@ def last_error(printed: str) -> str:
     return "".join(c if c.isprintable() else "?" for c in said)[-300:]
 
 
+def ceiling(environ: Mapping[str, str]) -> int:
+    """`HPC_FLEET_CEILING`: the most `HPC_FLEET_MAX` and `HPC_FLEET_PARALLEL` may be, a whole number from 1 to
+    `TOP_CEILING`; `DEFAULT_CEILING` when unset or empty, so that nothing changes unless the site sets it."""
+    value = environ.get(CEILING_VAR) or ""
+    if not value:
+        return DEFAULT_CEILING
+    if not WHOLE.fullmatch(value) or not 1 <= int(value) <= TOP_CEILING:
+        raise FleetError(f"{CEILING_VAR} must be a whole number from 1 to {TOP_CEILING}")
+    return int(value)
+
+
 def setting(environ: Mapping[str, str], name: str, default: Optional[int] = None) -> int:
     value = environ.get(name) or ""
     if not value and default is not None:
         return default
     if not value:
         raise FleetError(f"{name} is not set: the operator's maximum of federations at once (site.env); refused")
-    if not value.isdigit() or not 1 <= int(value) <= CEILING:
-        raise FleetError(f"{name} must be a whole number from 1 to {CEILING}")
+    limit = ceiling(environ)
+    if not WHOLE.fullmatch(value) or not 1 <= int(value) <= limit:
+        raise FleetError(f"{name} must be a whole number from 1 to {limit} (the fleet ceiling, {CEILING_VAR})")
     return int(value)
 
 
@@ -393,7 +430,8 @@ class Fleet:
                 shard_of(record, only)
             if not (self.directory / fleetplan.MANIFEST).is_file():
                 raise FleetError("the fleet has no shards.toml: run plan first")
-            found, said, refused = fleetplan.launches(record, self.directory, only, resume, self.running, self.environ)
+            found, said, refused = fleetplan.launches(record, self.directory, only, resume, self.running, self.environ,
+                                                      self.prove_over)  # fmt: skip
             logs = self.directory / "logs"
             logs.mkdir(mode=0o700, exist_ok=True)
             for launch in found:
@@ -414,11 +452,25 @@ class Fleet:
                     failed += 1
                 self.record.update(lambda r, c=change, s=launch.shard: shard_of(r, s)["launches"][-1].update(c))
                 done = "FAILED to launch" if change.get("failed") else f"launched (client pid {change['pid']})"
-                self.say(f"{launch.shard} on {launch.member}: {done}{' with --resume' if launch.resume else ''}; "
-                         f"its log {log}" + (f"; {launch.note}" if launch.note else ""))  # fmt: skip
+                how = " with --resume" if launch.resume else ""
+                how += " and --over (the running mark of a step shown gone)" if launch.over else ""
+                self.say(f"{launch.shard} on {launch.member}: {done}{how}; its log {log}"
+                         + (f"; {launch.note}" if launch.note else ""))  # fmt: skip
         for line in said + refused:
             self.say(line)
         return 1 if failed or refused or (only is not None and not found) else 0
+
+    def prove_over(self, plan: Any, label: str, members: Sequence[str]) -> Optional[str]:
+        """`--over`'s nonce for a resuming step, once `shards.py resume-line`'s proof shows the step that holds the
+        shard's running mark gone, asked through the runner of each federation that held or ran the shard."""
+        return fleetstuck.over_proof(plan, label, [self.hooks.runner(member) for member in members])
+
+    def step_stop(self, only: Optional[str]) -> int:
+        """One shard's step ended, by the ids the fleet recorded for it alone (`fleetstuck.stop`)."""
+        if only is None:
+            raise FleetError("step-stop needs --shard: it stops one shard's step, never all")
+        with self.record.lifecycle("step-stop"):
+            return fleetstuck.stop(self.directory, self.record, only, self.hooks.runner, self.say)
 
     def job_ours(self, launch: fleetplan.Launch) -> Optional[str]:
         """Why a launch's job is not the one its federation's up holds, as Slurm records it now; None when it is: the
@@ -459,6 +511,11 @@ class Fleet:
             else:
                 alive = self.running(launches[-1])
                 state = f"on {shard['member']}, its step " + {True: "runs", False: "ended"}.get(alive, "cannot be told")
+                stopped = launches[-1].get("stopped")
+                if alive is False and stopped:
+                    uncancelled = stopped.get("step") is not None and not stopped.get("cancelled")
+                    but = ", but its step was not cancelled" if uncancelled else ""
+                    state += f" (stopped by step-stop{but})"
             print(f"{shard['label']}: {state}" + (" (moved: its first reset there is full)" if shard["moved"] else ""))
         return 0
 
@@ -533,7 +590,7 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[Mapping[str, st
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("count", nargs="?", type=int, help="how many federations (up, add)")
     parser.add_argument("--manifest", type=Path, help="the shard settings (plan): shards.py's keys, no [[shards]]")
-    parser.add_argument("--shard", help="one shard (step)")
+    parser.add_argument("--shard", help="one shard (step; step-stop needs it)")
     parser.add_argument("--resume", action="store_true", help="launch an ended shard's step again, resuming (step)")
     parser.add_argument("--member", help="one federation (down)")
     args = parser.parse_args(argv)
@@ -553,6 +610,8 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[Mapping[str, st
             return fleet.plan(args.manifest)
         if args.command == "step":
             return fleet.step(args.shard, args.resume)
+        if args.command == "step-stop":
+            return fleet.step_stop(args.shard)
         if args.command == "status":
             return fleet.status()
         return fleet.down(args.member)

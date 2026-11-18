@@ -700,7 +700,16 @@ def test_with_core_step_the_core_runs_as_a_control_step_on_the_zones_node(hpc, t
     """O57: [hpc] core = "step" (the fallback when the login node cannot reach the services) runs the core's phase in
     a control step on the zone's node, with the core's Python in isolated mode and this driver's own arguments."""
     rig = Rig(hpc, tmp_path, {**site, "HPC_CORE_PYTHON": "/shared/venv/bin/python"}, layout=step_layout)
+
+    def the_nodes_own_core_phase(srun):
+        """What the node's `hpcfed.py core` leaves in the root's state when it returns: the phase ended `bootstrapped`,
+        which `up`'s last write (compare-and-set on it) moves to `linked`."""
+        if "hpcfed.py" in " ".join(srun.command):
+            rig.driver.set(lambda s: s.update(phase="bootstrapped", core_unfinished=False))
+
+    rig.fake.on_control = the_nodes_own_core_phase
     assert rig.up().startswith("core: the link check passed")
+    assert rig.state()["phase"] == "linked"
     core = next(s for s in rig.fake.sruns if "hpcfed.py" in " ".join(s.command))
     assert core.node == "node01"
     assert core.command[:3] == ["/shared/venv/bin/python", "-I", "-B"]  # isolated, and no bytecode written

@@ -16,7 +16,7 @@ included, since what it holds is a dataset the platform found on a storage, not 
 """
 
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 from typing import Any
@@ -154,6 +154,14 @@ class Content:
             return self.boot.rest.call("GET", url, label=f"{service.name} content", headers=headers).content
         except RestError:
             return None
+
+    def read_chunks(self, service: Service, file_id: str) -> Iterator[bytes]:
+        """A file's bytes through the writer, as `read_back` reads them, in chunks (`Rest.stream`): for a file of any
+        size, read to hash it and never to hold it. Unlike `read_back` it does not turn a failed read into None: it
+        raises RestError, at the start or part-way, and the caller decides what the part it has read is worth."""
+        url = f"{service.url}{PROVIDER_API}/data/{file_id}/content"
+        headers = bearer(self.boot.admin_token())
+        return self.boot.rest.stream("GET", url, label=f"{service.name} content", headers=headers)
 
     def differing(self, service: Service, files: Sequence[BaselineFile], ids: dict[str, str]) -> list[BaselineFile]:
         """The baseline files that are missing or whose bytes, read back, are not theirs."""

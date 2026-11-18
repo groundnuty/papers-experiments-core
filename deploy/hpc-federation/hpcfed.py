@@ -49,7 +49,7 @@ import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 sys.dont_write_bytecode = True  # nothing of the checkout or the venv is written on the login node or a node
 HERE = Path(__file__).resolve().parent
@@ -58,11 +58,18 @@ for _path in (HERE, REPO / "deploy" / "compose-federation"):  # python -I leaves
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+import hpcexclude  # noqa: E402
 from fedlayout import Layout, checked_root  # noqa: E402
 from fedspec import DEFAULT_LAYOUT, LayoutError, Spec, load_spec  # noqa: E402
-from hpcdriver import CORE_MISMATCH, CoreMismatch, Driver  # noqa: E402
+from hpcdriver import CORE_MISMATCH, TIMEOUTS, CoreMismatch, Driver  # noqa: E402
 from hpclaunch import Launcher, StateStore  # noqa: E402
-from hpcsettings import SettingsError, agent_limits, load_settings, site_from_environment  # noqa: E402
+from hpcsettings import (  # noqa: E402
+    SettingsError,
+    agent_limits,
+    load_settings,
+    queue_wait_from_environment,
+    site_from_environment,
+)
 from hpcslurm import Runner, Slurm  # noqa: E402
 
 CONTROL_VERBS = ("stop", "start", "status", "exec")  # hpcfed_control.VERBS (M4)
@@ -118,7 +125,8 @@ def make_driver(
     """The driver of one layout and one root; the runner is the tests' fake Slurm, or the real one. `environ` is the
     environment the driver reads a shared imported tree and its manifest from (O59), and gives the fault relay: this
     process's own when it is None. `agent`: whether the agent's limits in the layout's template size the agent's node,
-    which only up and describe need; down and the verbs work from the state file, so a template edited since up never
+    which only up and describe need, and whether `HPC_QUEUE_WAIT_S` is read (the bound `up` waits for a held job by,
+    1800 s when unset); down and the verbs work from the state file, so a template or a value edited since up never
     stops them."""
     layout_path = layout_path.resolve()
     spec = load_spec(layout_path)
@@ -128,7 +136,12 @@ def make_driver(
     store = StateStore(layout.root)
     command = [sys.executable, "-I", "-B", str(HERE / "hpcfed.py"), "--layout", str(layout_path), "--root",
                str(layout.root)]  # fmt: skip
-    given = {} if environ is None else {"environ": dict(environ)}
+    given: Dict[str, Any] = {} if environ is None else {"environ": dict(environ)}
+    queue_s = queue_wait_from_environment(os.environ if environ is None else environ) if agent else None
+    if queue_s is not None:
+        given["timeouts"] = {**TIMEOUTS, "queue": queue_s}
+    if agent:  # an up of a fleet (fleet.py names the lock its ups share): serialised reads and a bounded retry
+        given["placement_lock"] = hpcexclude.lock_from_environment(os.environ if environ is None else environ)
     return Driver(
         layout_path=layout_path,
         layout=layout,

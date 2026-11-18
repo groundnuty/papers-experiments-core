@@ -554,14 +554,16 @@ def test_separate_up_holds_the_agents_node_in_a_second_job_read_back_like_the_fi
     assert (facts.job, facts.het_group) == ("4343", None)
 
 
-def test_separate_agents_job_recorded_otherwise_is_cancelled_alone_and_down_cancels_the_first(hpc, tmp_path, site):
-    """O57: the agent's job recorded otherwise than asked is cancelled by its own id, the services' job kept for down,
-    which cancels it by its own id and removes the root."""
+def test_separate_agents_job_recorded_otherwise_is_cancelled_and_so_is_the_first(hpc, tmp_path, site):
+    """O57: the agent's job recorded otherwise than asked is cancelled by its own id and up fails, and the services'
+    job, submitted before it and running, is cancelled by its own: no held job of this up is left to bill. The state
+    still records the services' job; down finds both gone and removes the root."""
     fake = FakeSlurm(component_recorded={("4343", 0): {"MinMemoryNode": "1G"}})
     rig = Rig(hpc, tmp_path, site, placement="separate", fake=fake)
-    with pytest.raises(hpc.slurm.SlurmError, match="MinMemoryNode"):
+    with pytest.raises(hpc.slurm.SlurmError, match="MinMemoryNode") as refused:
         rig.up()
-    assert fake.cancelled == ["4343"]
+    assert fake.cancelled == ["4343", "4242"]
+    assert str(refused.value).endswith("the held job(s) 4242 were cancelled")
     assert rig.state()["allocation"]["job"] == "4242"
     rig.driver.down()
     assert fake.cancelled == ["4343", "4242"]
@@ -610,16 +612,16 @@ def test_separate_down_finds_the_agents_job_by_its_own_name_when_its_id_never_re
     assert not rig.root.exists()
 
 
-def test_separate_agents_job_that_never_starts_is_cancelled_and_down_cancels_the_first(hpc, tmp_path, site):
-    """O57: the agent's job still pending at the queue's bound is cancelled by its id and up fails; down cancels the
-    services' job."""
+def test_separate_agents_job_that_never_starts_is_cancelled_and_so_is_the_first(hpc, tmp_path, site):
+    """O57: the agent's job still pending at the queue's bound is cancelled by its id and up fails, and the services'
+    job, running, is cancelled by its own: no held job of this up is left to bill. down finds both gone."""
     fake = FakeSlurm(job_states={"4343": "PENDING"})
     rig = Rig(hpc, tmp_path, site, placement="separate", fake=fake)
     clock = iter(range(0, 10**7, 100))
     rig.driver.slurm.clock = lambda: next(clock)
     with pytest.raises(hpc.slurm.SlurmError, match="did not start"):
         rig.up()
-    assert fake.cancelled == ["4343"]
+    assert fake.cancelled == ["4343", "4242"]
     rig.driver.down()
     assert fake.cancelled == ["4343", "4242"]
 

@@ -329,6 +329,45 @@ def test_o20_declaring_inputs_checks_every_path_the_sandbox_reserves(world, scri
     assert item.sha256 == inputs.digest(scripts)["sha256"]
 
 
+@pytest.mark.parametrize(
+    "target",
+    ["/etc/./hostname", "/etc//hostname", "//work", "/./tmp", "/work/.", "/dev/./shm", "/./etc/sandbox/ca.pem", "/."],
+)
+def test_o73_an_input_whose_path_leads_to_one_the_agent_takes_is_refused_however_it_is_spelled(world, scripts, target):
+    """O73 (Codex, 17 Nov 2026), both backends (each starts through `inputs.validate`): `/etc/./hostname`, `//work` and
+    the like name a path the agent's own mounts take. They are refused as the plain names are."""
+    with pytest.raises(StartRefused, match="read-only input 0"):
+        inputs.validate([ReadOnlyInput(scripts, target)], inputs.taken_paths(world.s))
+
+
+@pytest.mark.parametrize(
+    ("taken", "target"),
+    [
+        ("/etc/ssl/./certs/bundle.pem", "/etc/ssl/certs/bundle.pem"),
+        ("/etc/ssl//certs", "/etc/ssl/certs/extra"),
+        ("//srv", "/srv/more"),
+        ("/srv/./sub", "/srv/sub/x"),
+    ],
+)
+def test_o73_a_taken_path_written_with_dots_or_extra_slashes_still_takes_the_path_it_names(
+    world, scripts, taken, target
+):
+    """O73: the paths the sandbox reserves (a trust path or the data mount, as a platform wrote them) are compared with
+    an input's target as paths, not as text: a trust path spelled with a `.` or a doubled slash takes the path it
+    names, which an input there would replace in the agent."""
+    with pytest.raises(StartRefused, match="read-only input 0"):
+        inputs.validate([ReadOnlyInput(scripts, target)], [*inputs.taken_paths(world.s), taken])
+
+
+def test_o73_an_input_that_is_none_of_the_agents_own_paths_is_taken_as_before(world, scripts):
+    """O73: a name that only starts like one (`/workspace`, `/devtools`, `/etc/hostnames`) is no overlap, and the
+    spelling of a taken path does not widen what it takes."""
+    taken = [*inputs.taken_paths(world.s), "/etc/ssl/./certs"]
+    for target in ("/workspace", "/devtools", "/etc/hostnames", "/etc/ssl/other"):
+        [item] = inputs.validate([ReadOnlyInput(scripts, target)], taken)
+        assert item.target == target
+
+
 # every path the sandbox binds itself into a cell, on either backend: the name-service files, the egress shim and its
 # preloads, the collector's socket directory and the gate's information file (no input may be, hold or lie under one)
 OWN_BINDS = [

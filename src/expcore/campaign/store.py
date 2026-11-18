@@ -52,6 +52,7 @@ from expcore.campaign.attempts import (
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ManifestRow, relative_order_problem
 from expcore.campaign.markers import AttemptResult
+from expcore.campaign.run_lease import META_ATTEMPT_BASE
 from expcore.campaign.spend_journal import (
     CLOSED,
     PROBE,
@@ -107,6 +108,8 @@ _ADDED_COLUMNS = (
     # how an interrupted attempt is charged: measured | measured_plus_inflight | bound; NULL: no log was kept. A
     # finished attempt that raised after its model loop has measured | bound too (`after_loop`); NULL for any other
     ("attempts", "spend_basis", "TEXT"),
+    # JSON: the redacted snapshot of a failed instrument start or another failure that carried a diagnostic (C40); NULL: none
+    ("attempts", "diagnostic", "TEXT"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -463,9 +466,30 @@ class Store:
 
     # --- attempts -----------------------------------------------------------------------------------------------
 
+    def _attempt_base(self) -> int:
+        """The charged attempts the run had in the leases before this store's (`run_lease`, the lease's `attempt_base`,
+        pinned in the store's meta); 0 for every store without a lease. Read from the row each time, so a copy of the
+        store that a merge settles has it too. A row that is not a whole number is refused, never read as 0, which
+        would number a lease's attempts from 1 again and lift its attempt limit."""
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (META_ATTEMPT_BASE,)).fetchone()
+        if row is None:
+            return 0
+        try:
+            base = int(row["value"])
+        except ValueError:
+            base = -1
+        if base < 0 or str(base) != row["value"]:
+            raise ValueError(f"the store's attempt base {row['value']!r} is not a whole number from 0")
+        return base
+
     def charged_attempts(self, run_key: str) -> int:
-        """Return the attempts of a run that count against the attempt limit."""
-        return self.q("SELECT COALESCE(SUM(charged),0) c FROM attempts WHERE run_key=?", (run_key,))[0]["c"]
+        """Return the attempts of a run that count against the attempt limit: the lease's attempt base, when the store
+        holds a lease, and the attempts charged in this store."""
+        with self._lock:
+            charged = self.db.execute(
+                "SELECT COALESCE(SUM(charged),0) c FROM attempts WHERE run_key=?", (run_key,)
+            ).fetchone()["c"]
+            return self._attempt_base() + charged
 
     def begin_attempt(
         self,
@@ -483,7 +507,9 @@ class Store:
         """Insert the 'running' row before the run starts; refuse in the transaction a run that is not pending.
 
         The attempt number is one more than the run's charged attempts, so an interrupted or uncharged attempt is
-        run again under the number it had. The row also takes the next place in the campaign's dispatch sequence (one
+        run again under the number it had; in the store of a lease the run's charged attempts include the lease's
+        attempt base, so a run's attempts are numbered on from its earlier leases' (`run_lease`; the lease id, written in
+        every record and export row, tells two leases' attempts of one number apart). The row also takes the next place in the campaign's dispatch sequence (one
         more than the largest so far, in the same write transaction, so it grows with every attempt and a restart
         carries on from where the dead process stopped), the lease it runs under: how long it waited for it and
         how it was obtained (`LEASE_OUTCOMES`), the bound the budget gate reserved the run when it let it start:
@@ -507,9 +533,12 @@ class Store:
                 raise AttemptRefused(f"{run_key} is not pending (it is {run['status']})")
             if self.db.execute("SELECT 1 FROM attempts WHERE run_key=? AND state='running'", (run_key,)).fetchone():
                 raise AttemptRefused(f"{run_key} already has a running attempt")
-            number = self.db.execute(
-                "SELECT COALESCE(SUM(charged),0)+1 FROM attempts WHERE run_key=?", (run_key,)
-            ).fetchone()[0]
+            number = (
+                self._attempt_base()
+                + self.db.execute(
+                    "SELECT COALESCE(SUM(charged),0)+1 FROM attempts WHERE run_key=?", (run_key,)
+                ).fetchone()[0]
+            )
             sequence = self.db.execute("SELECT COALESCE(MAX(dispatch_seq),0)+1 FROM attempts").fetchone()[0]
             capped = None if reserved_capped is None else int(reserved_capped)
             cursor = self.db.execute(
@@ -688,7 +717,7 @@ class Store:
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"
                 " detail=?, termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?,"
-                " cache_read_tokens=?, usage_complete=?, turn_usage=?, replies_checked=?, spend_basis=? WHERE id=?",
+                " cache_read_tokens=?, usage_complete=?, turn_usage=?, replies_checked=?, spend_basis=?, diagnostic=? WHERE id=?",
                 (
                     state,
                     int(charged),
@@ -707,6 +736,7 @@ class Store:
                     None if result.turn_usage is None else json.dumps(result.turn_usage),
                     int(result.replies_checked),
                     result.spend_basis,
+                    None if result.diagnostic is None else json.dumps(result.diagnostic, sort_keys=True),
                     attempt_id,
                 ),
             )
@@ -726,8 +756,11 @@ class Store:
         if state == "harness_error":
             return "harness_error"
         if state == "infra_fail":
-            charged = self.db.execute(
-                "SELECT COALESCE(SUM(charged),0) FROM attempts WHERE run_key=?", (run_key,)
-            ).fetchone()[0]
+            charged = (
+                self._attempt_base()
+                + self.db.execute(
+                    "SELECT COALESCE(SUM(charged),0) FROM attempts WHERE run_key=?", (run_key,)
+                ).fetchone()[0]
+            )
             return "infra_exhausted" if charged >= max_attempts else "pending"
         return "pending"

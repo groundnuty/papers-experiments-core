@@ -6,10 +6,13 @@ lists the archive and its manifest in an `archives.sha256.json` of the root-only
 writes the collected-evidence marker into the root so that `hpcfed.py down` goes on without `--discard-evidence`.
 Every path, name and token here is invented."""
 
+import errno
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -463,6 +466,69 @@ def test_a_root_already_collected_and_unchanged_is_said_so_and_nothing_is_rewrit
     assert captured.out == first
     assert {name: ((into / name).read_bytes(), (into / name).stat().st_mtime_ns) for name in _written(into)} == seen
     assert (marker.read_bytes(), marker.stat().st_mtime_ns) == marked
+
+
+@pytest.mark.parametrize("change", ["emptied", "a file's hash changed"])
+def test_a_retry_over_a_copy_whose_manifest_no_longer_names_its_archive_is_refused_naming_the_file(
+    shards, tmp_path, capsys, change
+):
+    """O63: `holds_copy` bound only the archive to the root's marker, so the manifest beside it could be swapped (for
+    `{}`, or for one that lists a file with another hash) and its line in `archives.sha256.json` updated to the new
+    bytes: the same command run again said `already collected`, exit 0, and printed a new hash that `verify-copy`
+    passes. The retry now shows the archive and the manifest to be one another's first (the check of
+    `hpcevidence.verified_pair`), and refuses naming the manifest, printing no hash; nothing is rewritten."""
+    root, into = _stopped_root(tmp_path), tmp_path / "copy"
+    assert _collect(shards, root, into) == 0
+    capsys.readouterr()
+    manifest = json.loads((into / INFO).read_bytes())
+    if change == "emptied":
+        swapped = b"{}"
+    else:
+        manifest["files"][0]["sha256"] = "0" * 64
+        swapped = json.dumps(manifest, sort_keys=True).encode()
+    (into / INFO).write_bytes(swapped)
+    outer = json.loads((into / MANIFEST).read_bytes())
+    for entry in outer["evidence"]:
+        if entry["name"] == INFO:
+            entry["bytes"], entry["sha256"] = len(swapped), hashlib.sha256(swapped).hexdigest()
+    (into / MANIFEST).write_bytes((json.dumps(outer, sort_keys=True, indent=2) + "\n").encode())
+    before = {name: (into / name).read_bytes() for name in _written(into)}
+    marker = (root / "evidence-collected.json").read_bytes()
+    assert _collect(shards, root, into) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""  # no hash: the copy is not vouched for
+    assert "already" not in captured.err
+    assert INFO in captured.err
+    assert {name: (into / name).read_bytes() for name in _written(into)} == before
+    assert (root / "evidence-collected.json").read_bytes() == marker
+
+
+def test_a_sync_error_before_the_marker_fails_the_collect_keeps_the_copy_and_writes_no_marker(
+    shards, tmp_path, capsys, monkeypatch
+):
+    """O63: the copy's directory and its parent are synced before the marker that unlocks `down` is written, and an I/O
+    error from either was swallowed, so the marker was written and `down` could remove the only evidence a crash could
+    still lose. It now fails the collect (exit 2) with no marker in the root; the copy stays whole, as for a marker
+    that cannot be written, and a retry into a new directory collects."""
+    root, into = _stopped_root(tmp_path), tmp_path / "copy"
+    real = os.fsync
+
+    def fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    assert _collect(shards, root, into) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "could not be written" in captured.err
+    assert not (root / "evidence-collected.json").exists()
+    assert _written(into) == {TAR, INFO, MANIFEST}
+    assert not list(tmp_path.glob(".collect-*"))
+    monkeypatch.undo()
+    assert _collect(shards, root, tmp_path / "again") == 0
+    assert (root / "evidence-collected.json").is_file()
 
 
 def test_a_root_marked_and_unchanged_whose_copy_is_not_in_into_is_collected_again_there(shards, tmp_path, capsys):

@@ -55,8 +55,28 @@ class StepRunner:
         self.bench.alive.add(pid)
         return Client(pid, 1)
 
+    def client_state(self, client: Any) -> str:
+        """What a recorded client is now, in the real `Runner.client_state`'s words: a pid not in the bench's table is
+        gone, one whose start tick is not the recorded one (`bench.starts`, 1 unless a test says another process holds
+        the pid now) is another process."""
+        from hpcslurm import ALIVE, ANOTHER, GONE
+
+        if client.pid not in self.bench.alive:
+            return GONE
+        return ALIVE if self.bench.starts.get(client.pid, 1) == client.start else ANOTHER
+
     def client_alive(self, client: Any) -> bool:
-        return client.pid in self.bench.alive
+        from hpcslurm import ALIVE
+
+        return self.client_state(client) == ALIVE
+
+    def end_client(self, client: Any, grace_s: float = 10.0) -> bool:
+        """Ends the client it was asked to end and records which: the real one signals while the pid is still the
+        recorded process, and never another's."""
+        self.bench.ended.append(client)
+        if self.client_alive(client):
+            self.bench.alive.discard(client.pid)
+        return True
 
     def run(self, argv: list, timeout: float) -> Any:
         """What Slurm answers on the login node (the fleet asks it of a step's job before the launch)."""
@@ -76,6 +96,8 @@ class Bench:
     data: dict = field(default_factory=dict)  # a federation's data as read back, when not its manifest's
     spawned: list = field(default_factory=list)
     alive: set = field(default_factory=set)
+    starts: dict = field(default_factory=dict)  # pid -> the start tick of the process holding it now (1: the client's)
+    ended: list = field(default_factory=list)  # each client `end_client` was asked to end, in order
     pool: Any = None  # the nodes of one cluster every federation shares (O57), else each has a cluster of its own
     guard: Any = None  # the inode guard's stand-in: (count, layout, site, environ) -> its words
     home_guard: Any = None  # the home guard's stand-in: (site) -> its words, "" for none
@@ -85,6 +107,7 @@ class Bench:
     asked: list = field(default_factory=list)  # the plan of each time the core was asked
     no_relay: set = field(default_factory=set)  # the federations whose up finds no fault relay in its core (O68)
     needs: tuple = ()  # the variables the settings' study plugin refuses to be built without (`standin_python`)
+    sleeping: Any = None  # a test's own wait between two polls, `(label) -> (seconds) -> None`; none: no wait at all
 
     def __post_init__(self) -> None:
         self.real = self.deploy.hpc.cli.make_driver
@@ -126,11 +149,12 @@ class Bench:
             self.fakes[label] = fake
         return self.fakes[label]
 
-    def driver(self, label: str, layout: Path, root: Path, agent: bool) -> Any:
-        """`hpcfed.make_driver` over this federation's fake cluster, its waits not slept on, the core's phase the real
-        one over the bootstrap's stand-in (as the rehearsal's `driver_maker`)."""
-        made = self.real(layout, str(root), self.fake(label), self.environ, agent=agent)
-        made.sleep = made.slurm.sleep = lambda seconds: None
+    def driver(self, label: str, layout: Path, root: Path, agent: bool, environ: Any = None) -> Any:
+        """`hpcfed.make_driver` over this federation's fake cluster, its waits not slept on (unless a test says how,
+        `sleeping`), the core's phase the real one over the bootstrap's stand-in (as the rehearsal's `driver_maker`)."""
+        made = self.real(layout, str(root), self.fake(label), self.environ if environ is None else environ,
+                         agent=agent)  # fmt: skip
+        made.sleep = made.slurm.sleep = self.sleeping(label) if self.sleeping else (lambda seconds: None)
         made.poll_s = made.slurm.poll_s = 0.0
         made.relay_available = lambda: label not in self.no_relay  # every federation serves one unless a test says not
         made.core = functools.partial(
@@ -156,14 +180,16 @@ class Bench:
         runner `main` was given must be that federation's own fake cluster."""
         label = Path(root).parent.name
         assert runner is None or runner is self.fake(label), f"{root} driven over another federation's cluster"
-        return self.driver(label, layout, Path(root), agent)
+        return self.driver(label, layout, Path(root), agent, environ)
 
     def federation(self, label: str, command: str, layout: Path, root: Path, log: Path) -> tuple[int, str]:
         """`hpcfed.py --layout L --root R <command>` through its own `main`, in this process, on the federation's own
-        fake cluster: what the fleet's process of its own would run."""
+        fake cluster: what the fleet's process of its own would run, with the environment it gives it
+        (`fleet.member_environ`: an up's has the lock the fleet's ups share)."""
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
-            code = self.deploy.hpc.cli.main(["--layout", str(layout), "--root", str(root), command], self.environ,
+            code = self.deploy.hpc.cli.main(["--layout", str(layout), "--root", str(root), command],
+                                            self.deploy.fleet.member_environ(self.environ, root, command),
                                             runner=self.fake(label))  # fmt: skip
         log.write_text(printed.getvalue(), encoding="utf-8")
         if code == 0 and command == "up":

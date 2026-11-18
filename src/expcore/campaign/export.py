@@ -85,6 +85,16 @@ A campaign whose interrupted attempts kept a call log (C05, `campaign.interrupte
 `calls_sent` and `calls_answered` (None without a log). A campaign none of whose interrupted attempts records a basis
 (no budget, or attempts from before the log) has no such key, and its export is the one it had before.
 
+A campaign whose attempts kept a diagnostic snapshot (C40, `campaign.start_diagnostic`) also exports
+`attempt_diagnostics`, after `interrupted_spend`: every attempt that kept one in attempt order (`attempt_id`, `run_key`,
+`condition`, `model`, `attempt`, `state`, `infra_kind`, `charged` and the redacted `diagnostic`: for a failed instrument
+start, its phase, the instrument and what the instrument checked and saw). A campaign none of whose attempts kept one,
+or a snapshot from before the column, has no such key, and its export is the one it had before.
+
+A store of a run taken on a lease (C41, `campaign.run_lease`) writes the lease's id, `lease_id`, last in every row of
+`exhausted_runs`, `unfinished_runs`, `analysed_attempts` and `excluded_attempts`: two leases of one run can each have an
+attempt of one number, so a merge by run keys evidence by run, lease and attempt. No other store's row has the key.
+
 A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campaign.shard.EXPORT_KEY`), last: the
 `spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
 budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
@@ -127,11 +137,17 @@ from expcore.campaign.lost_ledger import exported as exported_lost
 from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
 from expcore.campaign.reset_settings import exported as exported_settings
+from expcore.campaign.run_lease import RULE_LEASE
 from expcore.campaign.shard import EXPORT_KEY, META_ENVIRONMENT, META_SHARD, META_SHARES, META_STARTED
+from expcore.campaign.start_diagnostic import EXPORT_KEY as DIAGNOSTICS_KEY
+from expcore.campaign.start_diagnostic import DiagnosticUnreadable
+from expcore.campaign.start_diagnostic import exported as exported_diagnostics
 from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
 FORMAT = "campaign-export-1"
 EXPORT_FINGERPRINT = "campaign_fingerprint"
+LEASE_KEY = "lease_id"
+"""The key a store of a run taken on a lease (C41) writes, last, in every run row of its export."""
 """The export's key for the campaign fingerprint and its hash (C36)."""
 NOT_RECORDED = "fingerprint not recorded"
 """What `verify_export_fingerprint` says of an export that carries no campaign fingerprint."""
@@ -208,6 +224,14 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         except LostSpendError as error:
             raise ExportError(f"{error}, so it cannot be exported") from None
         interrupted = exported_interrupted(store)
+        try:
+            diagnostics = exported_diagnostics(
+                store,
+                {key: who["condition"] for key, who in identities.items()},
+                {key: who["factors"]["model"] for key, who in identities.items()},
+            )
+        except DiagnosticUnreadable as error:
+            raise ExportError(f"{error}, so it cannot be exported") from None
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
     scored: list[tuple[str, Any]] = []  # the model and the analysed attempt of each analysed run
@@ -252,6 +276,11 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
             scored.append((who["factors"]["model"], done[0]))
         else:
             raise ExportError(f"run {run['run_key']}: unknown status {run['status']!r}")
+    lease_id = _lease_of(shard)
+    if lease_id is not None:  # a store of a run taken on a lease says so in every run row, last (C41)
+        for rows in (exhausted, unfinished, analysed, left):
+            for row in rows:
+                row[LEASE_KEY] = lease_id
     unknown = sorted(set(left_out) - {entry["run_key"] for entry in left})
     if unknown:
         raise ExportError(f"cannot leave out run {unknown[0]}: it is not a finished run of this campaign")
@@ -284,6 +313,8 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         data[LOST_KEY] = lost
     if interrupted is not None:  # only a campaign whose interrupted attempts kept a call log has the key (C05)
         data[INTERRUPTED_KEY] = interrupted
+    if diagnostics is not None:  # only a campaign whose attempts kept a diagnostic snapshot has the key (C40)
+        data[DIAGNOSTICS_KEY] = diagnostics
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
@@ -292,6 +323,13 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
     if shard is not None:
         data[EXPORT_KEY] = shard
     return data
+
+
+def _lease_of(shard: Mapping[str, Any] | None) -> int | None:
+    """The lease a store of a run taken on a lease ran on, from the spec it pinned (`campaign.run_lease`); None for
+    every other store."""
+    spec = None if shard is None else shard["spec"]
+    return spec["lease_id"] if isinstance(spec, Mapping) and spec.get("rule") == RULE_LEASE else None
 
 
 def stored_fingerprint(store: RunState) -> dict[str, Any] | None:

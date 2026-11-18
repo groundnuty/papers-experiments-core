@@ -201,7 +201,7 @@ def _reap_one(node: NodeOps, work_root: Path, document: Mapping[str, Any]) -> in
     if any(state is not False for state in states) or left is None or left:  # unknown is never gone
         raise SandboxError("a dead driver's helper or cell is not shown gone")
     if os.path.lexists(image_path(run_dir)):  # a FUSE server of its work disk, say (O71): never left holding it
-        end_holders(node, image_path(run_dir), sid)
+        killed += end_holders(node, image_path(run_dir), sid)
     _unmount_all(node, run_dir)  # a dead oneclient's FUSE mount, say (hook c): never removed from under a mount
     remove_tree(run_dir)
     drop(work_root, sid)

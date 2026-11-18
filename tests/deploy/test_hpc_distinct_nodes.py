@@ -9,12 +9,16 @@ one refuses, and nothing a message says names a host.
 
 Slurm is the fake of hpc_fed_support, whose `squeue --me` lists this fake's own jobs, its peers' and `OtherJob`s."""
 
+import os
+import stat
+
 import pytest
 from hpc_fed_support import LAYOUT, SITE, FakeSlurm, OtherJob, agent_site, hpc_on_path
 from hpc_fleet_support import SEPARATE_LAYOUT, fleet_modules, job_ids, make_bench, make_ca
 from tls_support import HAS_OPENSSL
 
-ME = ["squeue", "--me", "-h", "-o", "%i %j %T %N"]
+# no `-t`: squeue's own default lists every job that holds a node; `--all`: in every partition, hidden ones included
+ME = ["squeue", "--me", "-h", "--all", "-o", "%i %j %T %N"]
 OTHER = "hpcop-another-study-1a2b3c4d"  # another federation's held job: hpcop-<project>-<hex>
 POOL = [f"node{i:02d}" for i in range(1, 41)]  # a cluster big enough for several federations' seven nodes each
 
@@ -122,15 +126,20 @@ def test_o57_up_submits_with_the_nodes_of_the_accounts_other_live_federations_ex
 def test_o57_every_component_and_job_of_the_up_excludes_the_same_nodes(hpc, tmp_path, site):
     """O57: the services' job, the agent's component of a heterogeneous job (named on each, so nothing depends on
     Slurm passing it on) and the agent's own job under "separate" all keep off the other federations' nodes: an agent's
-    sandbox never runs on a node that hosts an Onedata service, another federation's included."""
+    sandbox never runs on a node that hosts an Onedata service, another federation's included. The agent's own job
+    under "separate" also names the services' nodes, which are known once that job runs (it is submitted after)."""
     other = [OtherJob("5001", OTHER, "RUNNING", ("node01", "node02"))]
     for index, layout in enumerate((LAYOUT, SEPARATE_LAYOUT)):
         (tmp_path / str(index) / "fed").mkdir(parents=True)
         rig = Rig(hpc, tmp_path / str(index), site, layout, FakeSlurm(others=other, nodes=POOL))
         rig.up()
-        asked = [word for argv in rig.calls("sbatch") for word in argv]
-        assert asked.count("--exclude=node01,node02") == 2, layout.stem  # a component, or a job, each
-        assert asked.count("--nodes=1") >= 1
+        asked = [word for argv in rig.calls("sbatch") for word in argv if word.startswith("--exclude=")]
+        own = rig.state()["allocation"]["nodes"]
+        if layout is LAYOUT:
+            assert asked == ["--exclude=node01,node02"] * 2, layout.stem  # a component, each
+        else:
+            assert asked == ["--exclude=node01,node02", "--exclude=" + ",".join(sorted({"node01", "node02", *own}))]
+        assert len(rig.calls("sbatch")) == (1 if layout is LAYOUT else 2), layout.stem
         agent = rig.state()["sandbox"]["node"]
         assert agent not in ("node01", "node02"), layout.stem
         assert not set(rig.state()["allocation"]["nodes"]) & {"node01", "node02"}, layout.stem
@@ -280,12 +289,15 @@ def test_o57_this_federations_own_jobs_are_never_another_federations(hpc, tmp_pa
         assert rig.state()["allocation"]["excluded_nodes"] == 0
 
 
-def test_o57_a_second_read_that_fails_refuses_and_releases_the_job_too(hpc, tmp_path, site):
-    """O57: fail closed after the allocation as before it: with the jobs unreadable once this one runs, nothing proves
-    its nodes are its own, so it is refused, released and no step runs; the message names no host."""
+def test_o57_a_second_read_that_keeps_failing_refuses_and_releases_the_job_too(hpc, tmp_path, site):
+    """O57: fail closed after the allocation as before it: with the jobs unreadable for ten minutes once this one runs
+    (a single failed read is read again, test_hpc_queue_transient.py), nothing proves its nodes are its own, so it is
+    refused, released and no step runs; the message names no host."""
     stderr = "squeue: error: slurm_load_jobs error: Socket timed out on node03\n"
-    fake = FakeSlurm(on_me=lambda read, listed: hpc.slurm.Completed(1, "", stderr) if read == 2 else None)
+    fake = FakeSlurm(on_me=lambda read, listed: hpc.slurm.Completed(1, "", stderr) if read >= 2 else None)
     rig = Rig(hpc, tmp_path, site, fake=fake)
+    clock = iter(range(0, 10**7, 100))
+    rig.driver.slurm.clock = lambda: next(clock)
     with pytest.raises(hpc.slurm.SlurmError) as refused:
         rig.up()
     assert names_no_node(refused.value)
@@ -399,12 +411,14 @@ def test_o57_a_fleets_members_keep_their_services_off_the_nodes_of_the_members_a
 
 
 @needs_openssl
-def test_o57_two_members_that_raced_and_share_a_node_leave_the_later_one_refused_and_the_rest_up(
+def test_o57_two_members_that_raced_and_share_a_node_leave_the_later_one_released_and_tried_again(
     deploy, ca, tmp_path, monkeypatch
 ):
-    """O57: a fleet that raced: fed-2's job ran on a node fed-1's already held and nothing was excluded (fed-1's job
-    was pending at fed-2's first read). fed-2's up is refused and its job cancelled, as a failed member of a fleet is
-    reported, and fed-1 stays up."""
+    """O57: a fleet that raced: fed-2's job ran on a node fed-1's already held and nothing was excluded (fed-1's job was
+    pending at fed-2's first read). fed-2's up is refused and its jobs cancelled, as it was before; a fleet's up is then
+    tried again, so fed-2 submits anew keeping off fed-1's nodes, and both members end up, on nodes of their own."""
+    import json
+
     bench = make_bench(deploy, tmp_path, ca, monkeypatch)
     bench.pool = POOL
     first = bench.fake("fed-1")
@@ -418,10 +432,145 @@ def test_o57_two_members_that_raced_and_share_a_node_leave_the_later_one_refused
 
     second.me_rows = rows
     code, printed = bench.up(2)
-    assert code != 0
-    assert sorted(second.cancelled) == sorted(job_ids("fed-2"))  # its services' job and its agent's own
+    assert code == 0, printed
+    assert sorted(second.cancelled) == sorted(job_ids("fed-2"))  # the first attempt's: its services' job, its agent's
     assert first.cancelled == []
+    assert len(second.submitted) == 4  # and the second attempt's two
     log = (bench.fleet / "logs" / "fed-2.up.log").read_text(encoding="utf-8")
-    assert "zone" in log  # the member's own log has the refusal; the fleet's line is the log's last
+    assert "zone" in log  # the member's own log has the refusal, and that it was tried again
+    assert "trying again" in log
     assert names_no_node(log)
     assert names_no_node(printed)
+    held = {}
+    for label in ("fed-1", "fed-2"):
+        state = json.loads((bench.root(label) / "hpc-federation.json").read_text(encoding="utf-8"))
+        held[label] = {*state["allocation"]["nodes"], state["sandbox"]["node"]}
+    assert not held["fed-1"] & held["fed-2"]
+
+
+# -- what the guard reads, and how (a third Codex pass, 17 Nov 2026) --------------------------------------------
+
+
+# a job of another federation that holds its nodes in a state other than running: suspended, a stop sent to it, a signal
+# pending to it, staging out, configuring. squeue lists each by default; a `-t` of base state names would not list the
+# flagged ones (STOPPED, SIGNALING), which hold their node and memory as a running job does
+HOLDING = ["SUSPENDED", "STOPPED", "SIGNALING", "STAGE_OUT", "CONFIGURING"]
+
+
+@pytest.mark.parametrize("state", HOLDING)
+def test_o57_a_federation_job_that_holds_its_nodes_in_any_state_is_read_and_its_nodes_excluded(
+    hpc, tmp_path, site, state
+):
+    """O57 (a third Codex pass, 17 Nov 2026, and the review of its fix): the guard's read names no state, so squeue's
+    own default applies, which lists a suspended job, and a running one with a stop or a signal pending, as it lists a
+    plain running one (an explicit list of state names, tried first, listed fewer: a job that was stopped or about to
+    be signalled would have gone unseen). Each such job's nodes are excluded from a second `up`."""
+    other = [OtherJob("5001", OTHER, state, ("node01", "node02"))]
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(others=other, nodes=POOL))
+    rig.up()
+    assert rig.fake.asked["--exclude"] == "node01,node02"
+    assert not set(rig.state()["allocation"]["nodes"]) & {"node01", "node02"}
+    assert rig.calls("squeue")[0] == ME
+    assert "-t" not in rig.calls("squeue")[0]
+
+
+def test_o57_a_job_that_has_ended_holds_no_node_and_is_not_excluded(hpc, tmp_path, site):
+    """O57: a finished job is not listed by squeue's default, so the nodes it ran on are free for a second `up`."""
+    other = [OtherJob("5001", OTHER, "CANCELLED", ("node01", "node02"))]
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(others=other, nodes=POOL))
+    rig.up()
+    assert not any(word.startswith("--exclude") for argv in rig.calls("sbatch") for word in argv)
+
+
+@pytest.mark.parametrize("state", ["SUSPENDED", "STOPPED"])
+def test_o57_a_service_placed_on_the_node_of_a_job_in_such_a_state_is_refused_after_the_start(
+    hpc, tmp_path, site, state
+):
+    """O57: the second read, once the job runs and before any step, sees such a job on a service's node as it sees a
+    running one: the service is refused, naming its role, and the held job is released."""
+    other = OtherJob("5001", OTHER, state, ("node01",))
+    fake = FakeSlurm(others_by_read=[[], [other]])  # not there at the first read: it raced the second `up`
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(RuntimeError, match=r"zone"):
+        rig.up()
+    assert names_no_node(" ".join(rig.said))
+
+
+def scripts_on_the_path(tmp_path, monkeypatch) -> None:
+    """An invented `squeue` and `scontrol` on the PATH, as the real Runner will find them: squeue lists the federation's
+    job only when no SQUEUE_* variable and no output-format variable reaches it and the site's SLURM_CONF does (the
+    scrub removes the former and keeps the latter); scontrol expands a node list as a word per name."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    squeue = (
+        '#!/bin/sh\nenv | grep -q "^SQUEUE_" && exit 0\n'
+        'env | grep -q "^SLURM_TIME_FORMAT=" && exit 0\nenv | grep -q "^SLURM_BITSTR_LEN=" && exit 0\n'
+        '[ "$SLURM_CONF" = "/invented/slurm.conf" ] || exit 0\n'
+        'case " $* " in *" --all "*) ;; *) exit 0 ;; esac\necho "5001 hpcop-x RUNNING node01"\n'
+    )
+    scontrol = "#!/bin/sh\necho node01\n"
+    for name, text in (("squeue", squeue), ("scontrol", scontrol)):
+        (bin_dir / name).write_text(text, encoding="utf-8")
+        (bin_dir / name).chmod(stat.S_IRWXU)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("SLURM_CONF", "/invented/slurm.conf")
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["SQUEUE_NAMES", "SQUEUE_STATES", "SQUEUE_ACCOUNT", "SQUEUE_FORMAT", "SLURM_TIME_FORMAT", "SLURM_BITSTR_LEN"],
+)
+def test_o57_the_guards_squeue_does_not_inherit_the_login_shells_own_defaults(hpc, tmp_path, monkeypatch, variable):
+    """O57 (Codex, 17 Nov 2026): squeue takes defaults from SQUEUE_* variables (`SQUEUE_NAMES=unrelated` hides every
+    federation job) and its output format from a few SLURM_* ones, and the guard's read inherited the shell's, so it
+    could fail open without a word. The commands the driver runs on the login node get an environment without them, and
+    keep the rest of it (the site's own SLURM_CONF among it): the real runner, an invented squeue."""
+    import hpcexclude
+
+    scripts_on_the_path(tmp_path, monkeypatch)
+    monkeypatch.setenv(variable, "unrelated")
+    jobs = hpcexclude.live_jobs(hpc.slurm.Slurm(hpc.slurm.Runner()))
+    assert [(job.job, job.name, job.nodes) for job in jobs] == [("5001", "hpcop-x", ("node01",))]
+
+
+def test_o57_the_runner_passes_the_rest_of_the_environment_on_unchanged(hpc, monkeypatch):
+    """O57: only the variables that narrow what squeue lists, or change the form it prints in, are left out of a
+    command's environment; a variable of the site (SLURM_CONF, SBATCH_*, PATH) reaches it, and so does SQUEUE_ALL, which
+    only widens what is listed (jobs of hidden partitions) and is what a site that hides its partition relies on for
+    every squeue read of the driver, not the guard's alone."""
+    for name, value in (("SQUEUE_NAMES", "x"), ("SLURM_TIME_FORMAT", "relative"), ("SBATCH_ACCOUNT", "acct"),
+                        ("SLURM_CONF", "/invented/slurm.conf"), ("SQUEUE_ALL", "1")):  # fmt: skip
+        monkeypatch.setenv(name, value)
+    seen = dict(
+        line.split("=", 1) for line in hpc.slurm.Runner().run(["/usr/bin/env"], 10).stdout.splitlines() if "=" in line
+    )
+    assert "SQUEUE_NAMES" not in seen
+    assert "SLURM_TIME_FORMAT" not in seen
+    assert seen["SBATCH_ACCOUNT"] == "acct"
+    assert seen["SLURM_CONF"] == "/invented/slurm.conf"
+    assert seen["SQUEUE_ALL"] == "1"
+    assert seen["PATH"] == os.environ["PATH"]
+
+
+def test_o57_a_pending_federation_job_whose_node_list_cannot_be_expanded_refuses_naming_the_job(hpc, tmp_path, site):
+    """O57 (Codex, 17 Nov 2026): a pending job whose node list is given and cannot be expanded counted as holding no
+    node, so its nodes were not excluded, against the guard's rule that a read that cannot be taken apart refuses. It
+    refuses before anything is submitted, naming the job (its own name) and no node; a pending job with no list is
+    still no node."""
+    fake = FakeSlurm(on_me=lambda read, listed: hpc.slurm.Completed(0, "5001 hpcop-x PENDING node[01\n", ""))
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(hpc.slurm.SlurmError, match=r"hpcop-x.*could not be expanded.*refusing to submit") as refused:
+        rig.up()
+    assert names_no_node(refused.value)
+    assert not rig.calls("sbatch")
+    assert not (rig.root / "hpc-federation.json").exists()
+
+
+@pytest.mark.parametrize("listed", ["", "(null)"], ids=["no list", "null list"])
+def test_o57_a_pending_federation_job_with_no_node_list_holds_none_and_does_not_refuse(hpc, tmp_path, site, listed):
+    """O57: a pending job that has no list holds nothing: `up` goes on, excluding nothing."""
+    row = f"5001 hpcop-x PENDING {listed}".rstrip()
+    fake = FakeSlurm(on_me=lambda read, rows: hpc.slurm.Completed(0, row + "\n", ""))
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    rig.up()
+    assert rig.state()["allocation"]["excluded_nodes"] == 0

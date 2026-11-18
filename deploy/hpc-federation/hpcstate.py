@@ -117,10 +117,17 @@ def load(root: Path) -> Optional[Dict[str, Any]]:
     return state
 
 
+def _space_id(value: Any) -> bool:
+    """A space's Onezone ID as the state holds it: a non-empty string (the zone's own word, never parsed here)."""
+    return isinstance(value, str) and bool(value)
+
+
 def checked_data(data: Any) -> None:
     """The record of the spaces the study ingests into (`data.ingested`, by space name): the digest of the manifest each
-    is verified against, whether the layout declares it, and `verified`, null until `hpcfed.py verify-data` has read
-    the space back and found exactly that manifest, then the digest it was verified against and the counts.
+    is verified against, whether the layout declares it, `space_id`, the space's Onezone ID as `up` recorded it (null
+    until `up` has, and in a state an older `up` wrote), and `verified`, null until `hpcfed.py verify-data` has read the
+    space back and found exactly that manifest, then the digest it was verified against, the counts and the ID of the
+    space it read.
     `shards.py plan` reads it, so a shape other than the driver's is a state that is not this one's."""
     where = f"{STATE}: data"
     if not isinstance(data, dict) or not isinstance(data.get("ingested"), dict):
@@ -130,9 +137,13 @@ def checked_data(data: Any) -> None:
             raise StateError(f"{where}.ingested: a space's record is not the driver's")
         if not (isinstance(record.get("manifest"), str) and SHA256.fullmatch(record["manifest"])):
             raise StateError(f"{where}.ingested: a space's manifest is not a SHA-256")
+        if record.get("space_id") is not None and not _space_id(record["space_id"]):
+            raise StateError(f"{where}.ingested: a space's ID is not the driver's")
         verified = record.get("verified")
         if verified is None:
             continue
+        if isinstance(verified, dict) and verified.get("space_id") is not None and not _space_id(verified["space_id"]):
+            raise StateError(f"{where}.ingested: a space's ID is not the driver's")
         sound = isinstance(verified, dict) and isinstance(verified.get("manifest"), str)
         if not (
             sound

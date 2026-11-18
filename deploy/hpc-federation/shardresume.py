@@ -188,12 +188,16 @@ def study_fingerprint(
     in `pass_env` with the value its lines pin (`shards.pinned_pass_env`: a plugin that needs one refuses to be built
     without it, as the step's dispatcher would), and with `out` (a restored snapshot's) moved in as the copy's `out/`,
     as the step places it: what the step's dispatcher would pin. Nothing else of the operator's environment is given. A
-    plan that declares variables and has not pinned them is refused before anything is copied or run. A program that
-    ends non-zero is refused with the end of its stderr, unless `detail` is false (its words may hold a path)."""
+    plan that declares variables and has not pinned them is refused before anything is copied or run, and so is a study
+    that holds a `platform.toml` of its own (a file, or a link whatever it points to), as the step refuses it: the copy
+    is given the federation's by `copyfile`, which would write through a link to its target. A program that ends
+    non-zero is refused with the end of its stderr, unless `detail` is false (its words may hold a path)."""
     try:
         declared = dict(shards.pinned_pass_env(plan))
     except shards.ShardsError as error:
         refuse(str(error))
+    if os.path.lexists(plan.study / shards.PLATFORM):  # the step places its federation's there (`shards.step`)
+        refuse(f"the study holds a {shards.PLATFORM} of its own: the step places its federation's beside it")
     copy = scratch / "study"
     shutil.copytree(plan.study, copy, symlinks=True)
     platform = shard.root / shards.PLATFORM

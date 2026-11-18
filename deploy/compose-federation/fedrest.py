@@ -10,7 +10,7 @@ the URL, the handshake, the certificate check and `Host`.
 import base64
 import ssl
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,8 @@ ZONE_API = "/api/v3/onezone"
 PROVIDER_API = "/api/v3/oneprovider"
 PANEL_API = "/api/v3/onepanel"
 PANEL_USER = "onepanel"  # the Basic-auth user name of a panel's emergency passphrase, as the images' scripts use it
+CHUNK_BYTES = 256 * 1024  # what `Rest.stream` holds of a body at a time
+ERROR_BODY_BYTES = 64 * 1024  # the most of a streamed error answer's body read to find Onedata's error id
 
 
 class RestError(RuntimeError):
@@ -55,6 +57,16 @@ def _error_id(response: httpx.Response) -> str | None:
         return None
     errno = error.get("details", {}).get("errno") if isinstance(error.get("details"), dict) else None
     return f"{found}: {errno}" if isinstance(errno, str) and errno.isalnum() and len(errno) <= 16 else found
+
+
+def _streamed_error_id(response: httpx.Response) -> str | None:
+    """`_error_id` of a streamed answer, reading at most `ERROR_BODY_BYTES` of its body (more is no Onedata error)."""
+    body = b""
+    for piece in response.iter_bytes():
+        body += piece
+        if len(body) > ERROR_BODY_BYTES:
+            return None
+    return _error_id(httpx.Response(response.status_code, content=body))
 
 
 class Rest:
@@ -95,6 +107,38 @@ class Rest:
             detail = f" ({code})" if code else ""
             raise RestError(f"{method} {label}: answered {response.status_code}{detail}", response.status_code, code)
         return response
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        label: str,
+        headers: Mapping[str, str] | None = None,
+        params: Mapping[str, Any] | None = None,
+        ok: tuple[int, ...] = (200, 201, 202, 204),
+    ) -> Iterator[bytes]:
+        """Send one request and give the body of its answer in chunks of `CHUNK_BYTES` (decoded, as `call`'s `.content`
+        is), holding one chunk and never the body: the answer is not read ahead, never stored on the response, and
+        closed whether the caller reads it to the end, stops, or fails. Raise RestError, named by `label`, unless the
+        status is in `ok`, as `call` does (an error answer's body is read to at most `ERROR_BODY_BYTES`), and for a
+        connection that fails before the answer or part-way through it, which `call` would have raised inside its own
+        send: a caller that hashes the chunks must drop what it has hashed. The request goes out on the first `next`."""
+        request = self._http.build_request(method, url, headers=dict(headers or {}), params=params)
+        try:
+            response = self._http.send(request, stream=True)
+        except httpx.HTTPError as error:
+            raise RestError(f"{method} {label}: no answer ({type(error).__name__})") from None
+        try:
+            if response.status_code not in ok:
+                status, code = response.status_code, _streamed_error_id(response)
+                detail = f" ({code})" if code else ""
+                raise RestError(f"{method} {label}: answered {status}{detail}", status, code)
+            yield from response.iter_bytes(CHUNK_BYTES)
+        except httpx.HTTPError as error:
+            raise RestError(f"{method} {label}: no answer ({type(error).__name__})") from None
+        finally:
+            response.close()
 
     def json(self, method: str, url: str, **options: Any) -> Any:
         """Send one request and return its decoded JSON body, or {} when it has none."""

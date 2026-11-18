@@ -502,7 +502,9 @@ def test_o68_each_federations_up_and_down_is_hpcfed_in_a_process_of_its_own(depl
     assert options["cwd"] == str(tmp_path)
     assert argv[3:] == [str(deploy.fleet.HERE / "hpcfed.py"), "--layout", str(LAYOUT), "--root",
                         str(tmp_path / "fed-1" / "root"), "up"]  # fmt: skip
-    assert options["env"] == {"HPC_ACCOUNT": "invented"}
+    # an up also gets the lock the fleet's ups share (`<fleet>/.placement.lock`, the root's grandparent); a down none
+    lock = str(tmp_path / ".placement.lock")
+    assert options["env"] == {"HPC_ACCOUNT": "invented", "HPC_FLEET_PLACEMENT_LOCK": lock}
     assert (code, printed) == (1, "error: up: refused\n")
     assert log.stat().st_mode & 0o777 == 0o600
     said = deploy.fleet.last_error("hpcfed: zone launched\nerror: up: the zone failed\n")

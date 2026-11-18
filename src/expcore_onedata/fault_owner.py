@@ -21,7 +21,9 @@ charge over those of other attempts, so nothing that cannot be told apart is eve
 read is no entry at all: its check fails closed and charges, as it did.
 """
 
-from collections.abc import Iterable, Mapping
+import contextlib
+from collections.abc import Iterable, Iterator, Mapping
+from contextvars import ContextVar
 from typing import Any
 
 from expcore.campaign import liveness
@@ -57,6 +59,43 @@ def charge_of(entries: Iterable[Mapping[str, Any]]) -> tuple[bool, str | None]:
         elif owner == judged:
             return True, None
     return (True, NO_ATTEMPT) if unattributed else (False, LEFT_BY_ANOTHER)
+
+
+def in_progress_of(entry: Mapping[str, Any], attempt: Mapping[str, Any] | None) -> bool:
+    """Whether an open journal entry is an injection `attempt` (`liveness.current()`) is holding down right now, which
+    its own health reading under its own admission may explain (O90): it names exactly this attempt as its owner, was
+    seen down (`injected`), has no failed restore (`clear_failed`) and is no heal's restart (`heal`). Nothing else is
+    explained: another attempt's, an entry with no owner or a process alone, one not seen down yet, one whose restore
+    failed. None of those is guessed to be this attempt's."""
+    judged = attempt_of(attempt)
+    return (
+        judged is not None
+        and entry.get("heal") is not True
+        and entry.get("injected") is True
+        and "clear_failed" not in entry
+        and attempt_of(entry.get("owner")) == judged
+    )
+
+
+_EXPLAINED: ContextVar[frozenset[str]] = ContextVar("expcore_explained_targets", default=frozenset())
+
+
+@contextlib.contextmanager
+def explaining(targets: Iterable[str]) -> Iterator[None]:
+    """For the body, which is the check inside the fault gate: the labels of the targets the gate has just explained as
+    held down by the judged attempt's own injection (`in_progress_of`, and a live injector holding the target). The
+    check reads them with `explained()`, in the same thread, so it never re-derives the gate's condition."""
+    token = _EXPLAINED.set(frozenset(targets))
+    try:
+        yield
+    finally:
+        _EXPLAINED.reset(token)
+
+
+def explained() -> frozenset[str]:
+    """The labels `explaining` set for the check now running, empty outside one: no injection of the judged attempt is
+    explained there."""
+    return _EXPLAINED.get()
 
 
 def with_note(detail: str, note: str | None) -> str:
