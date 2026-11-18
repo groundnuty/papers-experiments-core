@@ -35,10 +35,15 @@ study. The sites file (`--sites`, TOML) holds a `[controller]` table (`evidence`
 absolute directory each retired member's root evidence is collected into; `interval_s`; `log`, the JSON log's absolute
 path) and one `[[site]]` table per site:
 its `label` (an operator's label, `[a-z0-9-]`, never a site's name), `fleet` (its fleet's absolute directory),
-`transport` (`local` only: the commands run on this host, the site's login node; a remote site is step 6's),
-optionally `interpreter` and `deploy` (the Python and this directory on its login node), and the settings of
-`SiteSettings`: `max_federations`, `allowance_units` and `rate_units_per_hour` (required), `kill_wait_s`,
-`parallel_ups`, `warm_pool`, `retire_idle_s`, `queue_stall_s`, `lease_bound_s`, `collect_s`, `margin_s`.
+`transport` (`local`: the commands run on this host, the site's login node; or `ssh`: every command runs on the
+login node of a remote site over ssh, the ledger staying on this host's local disk), optionally `interpreter` and
+`deploy` (the Python and this directory on its login node), and the settings of `SiteSettings`: `max_federations`,
+`allowance_units` and `rate_units_per_hour` (required), `kill_wait_s`, `parallel_ups`, `warm_pool`, `retire_idle_s`,
+`queue_stall_s`, `lease_bound_s`, `collect_s`, `margin_s`. An `ssh` site also names `host` (an ssh destination or alias
+that the operator's own ssh config resolves: never logged), `interpreter` and `deploy` (absolute, on the login node; the
+core is importable by that interpreter), and optionally `env_file` (its site.env on the login node, sourced before each
+command) and `settings` (the shard settings file on the login node; required when `[controller]` names `settings`).
+One campaign drives one site: the ledger and `archives` are this host's; each archive is pulled over ssh, hashed here.
 """
 
 import argparse
@@ -60,9 +65,9 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
 
 from fleetexecute import (  # noqa: E402
     Executor,
-    LocalTransport,
     Log,
     SiteConfig,
+    SiteTransport,
     dead_store_reader,
     described,
     drain_refused,
@@ -73,9 +78,10 @@ from fleetexecute import (  # noqa: E402
 
 COMMANDS = ("observe", "control", "drain", "ended", "join", "settle")
 CONTROLLER_KEYS = ("evidence", "interval_s", "log", "archives", "settings")
-SITE_KEYS = ("fleet", "transport", "interpreter", "deploy", "channel")
+SITE_KEYS = ("fleet", "transport", "interpreter", "deploy", "channel", "host", "env_file", "settings")
+SSH_ONLY_KEYS = ("host", "env_file", "settings")
 DISPATCH_S = 30.0  # `elastic.dispatch.TICK_S`: with a dispatcher the loop goes round this often
-TRANSPORTS = ("local",)
+TRANSPORTS = ("local", "ssh")
 OBSERVE_TIMEOUT_S = 600.0
 
 
@@ -97,14 +103,15 @@ class Hooks:
     """What the controller reads and runs through: this host's Slurm and commands by default, the tests' fakes."""
 
     runner: Callable[[], Any]  # the login node's Runner, for observe
-    transport: Callable[[Mapping[str, str]], Any] = LocalTransport
+    transport: Callable[[Mapping[str, str]], Any] = SiteTransport
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
     # None: read from the sites file's `settings` (`fleetidentity`), or nothing when it names none
     identity: Optional[Callable[[str, str], Optional[Tuple[str, Mapping[str, str]]]]] = None
     spend: Optional[Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]]] = None
     say: Callable[[str], None] = field(default=print)
-    # the dispatcher's transport, given each site's directory for its calls (`LocalTransport` by default)
+    # the dispatcher's transport, given each site's directory for its calls (`RoutedTransport` by default: ssh for a
+    # site with a host, else here)
     dispatch: Optional[Callable[[Mapping[str, str]], Any]] = None
 
 
@@ -114,9 +121,11 @@ def _absolute(value: Any, what: str) -> Path:
     return Path(os.path.normpath(value))
 
 
-def fleet_identity(fleet: Path) -> Any:
+def fleet_identity(fleet: Path, host: Optional[str] = None) -> Any:
     """One fleet directory however it is named: its device and inode (a link or a bind mount of it is the same), or its
-    resolved path while it does not exist."""
+    resolved path while it does not exist. A remote site's is its host and path: its directory is not on this host."""
+    if host is not None:
+        return ("ssh", host, os.path.normpath(fleet))
     try:
         info = os.stat(fleet)
     except OSError:
@@ -151,7 +160,8 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
         own = {key: entry.pop(key) for key in SITE_KEYS if key in entry}
         if own.get("transport", "local") not in TRANSPORTS:
             raise ConfigError(f"site {entry.get('label')}: transport must be one of {', '.join(TRANSPORTS)}")
-        if own.get("transport", "local") == "local":
+        remote = own.get("transport", "local") == "ssh"
+        if not remote:
             entry.setdefault("login_node", "local")  # every local site's commands run here: one login node, one cgroup
         try:
             settings = SiteSettings(**entry)
@@ -160,17 +170,42 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
         fleet = _absolute(own.get("fleet"), f"site {settings.label}: fleet")
         deploy = _absolute(own["deploy"], f"site {settings.label}: deploy") if "deploy" in own else HERE
         channel = _absolute(own["channel"], f"site {settings.label}: channel") if "channel" in own else None
-        sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), own.get("interpreter", sys.executable),
-                                deploy, channel))  # fmt: skip
+        python = own.get("interpreter", sys.executable)
+        host = env_file = shard_settings = None
+        if remote:
+            host, env_file, shard_settings = ssh_site(settings.label, own, manifest is not None)
+            python = str(_absolute(python, f"site {settings.label}: interpreter"))
+        elif any(key in own for key in SSH_ONLY_KEYS):
+            raise ConfigError(f"site {settings.label}: {', '.join(SSH_ONLY_KEYS)} belong to an ssh site")
+        sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), python, deploy, channel, host,
+                                env_file, shard_settings))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
         raise ConfigError("the sites file needs at least one [[site]], each label once")
     channels = [s.channel is not None for s in sites]
     if (archives is None and any(channels)) or (archives is not None and not all(channels)):
         raise ConfigError("[controller] archives and every site's channel go together: the dispatcher serves each "
                           "site's channel and keeps the archives it pulls")  # fmt: skip
-    if len({fleet_identity(s.fleet) for s in sites}) != len(sites):
+    if len({fleet_identity(s.fleet, s.host) for s in sites}) != len(sites):
         raise ConfigError("two sites name one fleet directory: each fleet is one site's, read and acted on once")
     return controller, sites
+
+
+def ssh_site(label: str, own: Mapping[str, Any], needs_settings: bool) -> Tuple[str, Optional[str], Optional[Path]]:
+    """An ssh site's own keys, checked: its host, and (absolute, on its login node) its site.env and shard settings. The
+    defaults of a local site (this host's interpreter and directory) would be wrong there, so they are named."""
+    from expcore.campaign.elastic.transport import ssh_argv
+
+    named = ("host", "interpreter", "deploy") + (("settings",) if needs_settings else ())
+    missing = [key for key in named if key not in own]
+    if missing:
+        raise ConfigError(f"site {label}: an ssh site names {', '.join(missing)}")
+    try:
+        ssh_argv(own["host"])
+    except ValueError:
+        raise ConfigError(f"site {label}: host is not an ssh destination or alias") from None
+    env_file = str(_absolute(own["env_file"], f"site {label}: env_file")) if "env_file" in own else None
+    settings = _absolute(own["settings"], f"site {label}: settings") if "settings" in own else None
+    return own["host"], env_file, settings
 
 
 def site_view(label: str, text: str) -> Any:
@@ -238,7 +273,8 @@ def status_line(decision: Any, money: Mapping[str, Any]) -> str:
             + f"; {len(decision.actions)} action(s); {gone} relay(s) gone")  # fmt: skip
 
 
-def hooks_read(controller: Controller, sites: Sequence[SiteConfig], hooks: Hooks) -> Tuple[Any, Any]:
+def hooks_read(controller: Controller, sites: Sequence[SiteConfig], hooks: Hooks,
+               transport: Any = None) -> Tuple[Any, Any]:  # fmt: skip
     """What a federation joins with and what a lost lease spent: the hooks' own (the tests'), else read from the sites
     file's `settings` (`fleetidentity.identity_reader` and `dead_store_reader` over `fleetidentity.locator`, with the
     settings' study), else nothing is read: a join waits and a lost lease stays charged its grant."""
@@ -254,23 +290,24 @@ def hooks_read(controller: Controller, sites: Sequence[SiteConfig], hooks: Hooks
             loaded = load_study(study)
         except (OSError, ValueError, RuntimeError, KeyError, ImportError) as error:
             raise ConfigError(f"the study of the shard settings cannot be loaded ({type(error).__name__})") from None
-        identity = identity or fleetidentity.identity_reader(controller.settings, {s.label: s for s in sites})
+        identity = identity or fleetidentity.identity_reader(controller.settings, {s.label: s for s in sites},
+                                                             transport=transport)  # fmt: skip
         spend = spend or dead_store_reader(fleetidentity.locator(controller.evidence), loaded)
     return identity or (lambda site, member: None), spend or (lambda site, action: None)
 
 
 def dispatcher_of(ledger: Any, controller: Controller, sites: Sequence[SiteConfig], hooks: Hooks) -> Any:
     """The dispatcher over the ledger this process holds (the ledger's lock admits one holder, so it ticks in this
-    loop), for each site's channel root; None when the sites file names no archives directory. A site is read through
-    its local transport: its login node is this host (ssh is another site's)."""
+    loop), for each site's channel root; None when the sites file names no archives directory. A local site is read
+    through the local transport (its login node is this host), a remote one over ssh."""
     if controller.archives is None:
         return None
     from expcore.campaign.elastic.dispatch import Dispatcher
-    from expcore.campaign.elastic.transport import LocalTransport, Site
+    from expcore.campaign.elastic.transport import RoutedTransport, Site, ssh_argv
 
-    named = [Site(s.label, str(s.channel), (), (s.python, "-I", "-B")) for s in sites]
-    cwds = {s.label: str(s.fleet) for s in sites}
-    transport = hooks.dispatch(cwds) if hooks.dispatch is not None else LocalTransport(cwds)
+    named = [Site(s.label, str(s.channel), ssh_argv(s.host) if s.remote else (), (s.python, "-I", "-B")) for s in sites]
+    cwds = {s.label: str(s.fleet) for s in sites if not s.remote}
+    transport = hooks.dispatch(cwds) if hooks.dispatch is not None else RoutedTransport(cwds)
     return Dispatcher(ledger, named, transport, controller.archives)
 
 
@@ -318,7 +355,7 @@ def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
             if args.once:
                 return 0
             hooks.sleep(controller.interval_s)
-    identity, spend = hooks_read(controller, sites, hooks)
+    identity, spend = hooks_read(controller, sites, hooks, transport)
     ledger = Ledger.open(args.ledger, clock=hooks.clock)
     executor = Executor(ledger, args.ledger, {s.label: s for s in sites}, transport, controller.evidence, log,
                         identity, spend, settings=controller.settings, clock=hooks.clock)  # fmt: skip

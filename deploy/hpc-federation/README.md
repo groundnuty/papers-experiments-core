@@ -1665,15 +1665,33 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one
   per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's
   only: two sites never share a fleet), `transport`
-  (`local` only: commands run on this host, so step 5 runs where the login node and the ledger are one; a remote site
-  is step 6's), optionally `interpreter` and `deploy` (the Python and this directory on its login node), and the
-  settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required). With `archives` in
+  (`local`: commands run on this host, where the login node and the ledger are one; or `ssh`, below), optionally
+  `interpreter` and `deploy` (the Python and this directory on its login node), and the settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required). With `archives` in
   `[controller]` (absolute: where the dispatcher keeps the archives it pulls) and a `channel` in every site (that site's
   channel root on its shared file system), the controller also runs the elastic dispatcher
   (`expcore.campaign.elastic.dispatch`, DESIGN.md) in its own loop: the ledger's lock admits one holder, so the loop goes
   round every 30 s, dispatching each site through its local transport and deciding every `interval_s`. With `settings`
   (absolute: the fleet's shard settings file, `plan --manifest`'s keys, and `home_files`) it launches each joining
   federation's worker and reads the identity it joins with and where a lost lease's store is.
+- **A remote site** (`transport = "ssh"`, `fleetssh.py`; one campaign drives one site: the controller and its ledger,
+  a SQLite file in WAL mode that never goes on NFS or Lustre, stay on this host's local disk). The site names `host`
+  (an ssh destination or alias that the operator's own ssh config resolves; it is never logged, printed or recorded:
+  logs say the site's label), and `interpreter` and `deploy` (absolute, on the login node; that interpreter imports
+  the core), and optionally `env_file` (its `site.env` on the login node, sourced before each command) and `settings`
+  (the shard settings file on the login node, which the worker's launch and the identity read there use; required when
+  `[controller]` names `settings`). Everything the controller does at the site is one ssh call, each with
+  `-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=3` and never a setting that
+  weakens host-key checking, the remote command `cd <fleet> && set -a && . <env_file> && set +a && exec <argv>` with
+  every word quoted (a login shell that is not POSIX cannot use `env_file`), each call killed with its process group
+  at its bound: the read (`observe`), `fleet.py up`/`add`/`down`, `collect`, the worker's launch, the identity read
+  (`fleetidentity.py read`) and the dispatcher's exchange and archive pulls. A call that fails or times out is the
+  site unread for the tick, exactly as a failed local call: no proof, no retirement. A retirement is collect (at the
+  site, into `<fleet>/collected/<member>`), the pull of that copy to `<evidence>/<site>-<member>` here (the manifest
+  first, its SHA-256 checked against collect's, then each file it names against its size and SHA-256, moved in by one
+  rename), `verify-copy` on this host over the pulled copy, and only then `down`; it waits while the ledger holds a
+  lease of its federation that is `reported`, whose archive the dispatcher has not pulled here yet. A lost lease's store
+  at a remote site is read only from the evidence pulled here, never from the channel (those places are on the login
+  node): otherwise it stays charged its grant. Nothing of it has run live.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 
@@ -1716,7 +1734,7 @@ Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Noth
   `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies (each tried in turn, newest first) is
   restored into a private directory on this host with the journal copied beside it, and read as the first form is; the
   directory is removed at the next read and at exit. Where a place holds neither, the lease stays charged its grant.
-- **Not built**: ssh to a remote site (the dispatcher's and the controller's calls are local), `Ledger.drain` refusing
+- **Not built**: `Ledger.drain` refusing
   past a job's end, the watchdog's `--on-out` command, and measured login-memory shares.
 
 `tests/deploy/test_hpc_fleet_dispatch.py`, `test_hpc_fleet_worker.py`, `test_hpc_fleet_worker_launch.py` and

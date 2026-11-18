@@ -20,8 +20,12 @@ process.
   root with evidence not collected (its gate), and cancels only the jobs that member's up recorded, by id.
 - **One operation per site and per member at a time.** An add (one per site) and a retirement (one per member) run in
   the background; until each ends its key is busy, and the decision gives that site no add and that member nothing.
-- **The copy back.** Step 5 runs every site command on this host (`transport = "local"`, the login node itself), so
-  the collected copy is already here and `verify-copy` checks it; a remote site's pull is step 6's.
+- **The copy back.** A local site's commands run on this host (`transport = "local"`, the login node itself), so the
+  collected copy is already here and `verify-copy` checks it. A site whose `transport` is `ssh` runs every command over
+  ssh (`fleetssh.py`): its retirement is collect (into `<fleet>/collected/<member>` at the site), the pull of that copy
+  to `<evidence>/<site>-<member>` here, `verify-copy` on this host over the pulled copy against collect's hash, and
+  only then `down`; one at a site is refused while the ledger holds a lease of its federation that is `reported`
+  (its archive not yet pulled here).
 """
 
 import json
@@ -36,12 +40,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from fleetssh import SshSiteTransport
+
 HERE = Path(__file__).resolve().parent
 DIGEST = "<the hash collect printed>"  # the dry run's stand-in for collect's output, which verify-copy takes
 FINGERPRINT, ENVIRONMENT = "<its campaign fingerprint>", "<its environment identity, a JSON file>"
 SPEND = "<the spend its call log shows, micro-dollars>"
 ATTEMPTS = "<the charged attempts its store shows>"
 ARCHIVES_MANIFEST = "archives.sha256.json"  # `shards.ARCHIVES_MANIFEST`
+COLLECTED = (
+    "collected"  # at an ssh site, in its fleet's directory: <COLLECTED>/<member> holds a member's collected copy
+)
+SITE, HERE_PLACE, PULL = "site", "here", "pull"  # where a rendered step runs: over the site's transport, here, a pull
 HEX64 = re.compile(r"[0-9a-f]{64}")
 COMMAND_TIMEOUT_S = 6 * 3600.0  # the fleet's commands bound their own waits (an up's queue wait, a down's steps)
 LAUNCH_TIMEOUT_S = 300.0  # a worker's launch only spawns a detached srun client: it never holds the tick for long
@@ -58,10 +68,17 @@ class SiteConfig:
     python: str = sys.executable
     deploy: Path = HERE
     channel: Optional[Path] = None  # the site's channel root on its shared file system, when the dispatcher serves it
+    host: Optional[str] = field(default=None, repr=False)  # an ssh site's destination or alias: never shown or logged
+    env_file: Optional[str] = None  # an ssh site's site.env, a path on its login node, sourced before each command
+    shard_settings: Optional[Path] = None  # an ssh site's shard settings file, a path on its login node
 
     @property
     def label(self) -> str:
         return self.settings.label
+
+    @property
+    def remote(self) -> bool:
+        return self.transport == "ssh"
 
     def script(self, name: str, *words: str) -> List[str]:
         return [self.python, "-I", "-B", str(self.deploy / name), *words]
@@ -74,6 +91,9 @@ class Rendered:
     where: str
     steps: Tuple[Tuple[str, ...], ...]
     site_steps: Tuple[Tuple[str, ...], ...] = ()  # a join's: the worker's launch on the site, before the ledger's join
+    places: Tuple[
+        str, ...
+    ] = ()  # each step's place (`SITE`, `HERE_PLACE`, `PULL`); none given: every step is the site's
 
 
 def evidence_dir(evidence: Path, site: str, member: str) -> Path:
@@ -92,6 +112,8 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
         return Rendered("site", (tuple(site.script("fleet.py", "--fleet", str(site.fleet), "add", str(action.count))),))
     if kind == "Retire":
         into = evidence_dir(evidence, site.label, action.member)
+        if site.remote:
+            return retire_over_ssh(action, site, into, digest)
         steps = []
         if action.collect:
             steps.append(
@@ -118,6 +140,23 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
     raise ValueError(f"no rendering for an action of kind {kind}")
 
 
+def retire_over_ssh(action: Any, site: SiteConfig, into: Path, digest: str) -> Rendered:
+    """A retirement at an ssh site: collect into the site's `<fleet>/collected/<member>`, the pull of that copy to
+    `into` here, `verify-copy` on this host over the pulled copy, then `down`; each only after the one before."""
+    steps: List[Tuple[str, ...]] = []
+    places: List[str] = []
+    if action.collect:
+        there = site.fleet / COLLECTED / action.member
+        steps.append(tuple(site.script("shards.py", "collect", "--roots-only", "--root", action.root, "--into",
+                                       str(there))))  # fmt: skip
+        steps.append((PULL, str(there), str(into), digest))
+        steps.append((sys.executable, "-I", "-B", str(HERE / "shards.py"), "verify-copy", str(into / ARCHIVES_MANIFEST),
+                      str(into), "--manifest-sha256", digest))  # fmt: skip
+        places += [SITE, PULL, HERE_PLACE]
+    steps.append(tuple(site.script("fleet.py", "--fleet", str(site.fleet), "down", "--member", action.member)))
+    return Rendered("site", tuple(steps), places=(*places, SITE))
+
+
 def worker_launch(action: Any, site: SiteConfig, settings: Optional[Path]) -> Tuple[Tuple[str, ...], ...]:
     """A joining federation's worker, launched on its site before the join (idempotent: one already running is not
     launched again): its ledger label, its channel under the site's channel root, and the recorded end of its job."""
@@ -125,6 +164,7 @@ def worker_launch(action: Any, site: SiteConfig, settings: Optional[Path]) -> Tu
         return ()
     from expcore.campaign.elastic import channel as ch
 
+    settings = site.shard_settings if site.remote and site.shard_settings is not None else settings  # the login node's
     words = ("launch", "--fleet", str(site.fleet), "--member", action.member, "--settings", str(settings),
              "--federation", action.label, "--channel", str(ch.federation_dir(str(site.channel), action.label)),
              "--job-end", repr(action.job_end_at))  # fmt: skip
@@ -133,10 +173,13 @@ def worker_launch(action: Any, site: SiteConfig, settings: Optional[Path]) -> Tu
 
 def described(action: Any, rendered: Rendered) -> Dict[str, Any]:
     """An action for the log and the dry run: its kind, site, member, reason and commands."""
-    return {"action": type(action).__name__, "site": action.site, "member": getattr(action, "member", None),
-            "label": getattr(action, "label", None), "reason": action.reason, "where": rendered.where,
-            "site_steps": [list(step) for step in rendered.site_steps],
-            "steps": [list(step) for step in rendered.steps]}  # fmt: skip
+    entry = {"action": type(action).__name__, "site": action.site, "member": getattr(action, "member", None),
+             "label": getattr(action, "label", None), "reason": action.reason, "where": rendered.where,
+             "site_steps": [list(step) for step in rendered.site_steps],
+             "steps": [list(step) for step in rendered.steps]}  # fmt: skip
+    if rendered.places:
+        entry["places"] = list(rendered.places)
+    return entry
 
 
 def printed(entry: Mapping[str, Any]) -> str:
@@ -147,7 +190,12 @@ def printed(entry: Mapping[str, Any]) -> str:
         lines.append(f"# first, on {entry['site']}'s login node:")
         lines += [shlex.join(step) for step in entry["site_steps"]]
         lines.append("# then, in the ledger:")
-    return "\n".join(lines + [shlex.join(step) for step in entry["steps"]])
+    places = entry.get("places") or [SITE] * len(entry["steps"])
+    notes = {PULL: "# pulled to this host over ssh (checked against collect's hash):",
+             HERE_PLACE: "# on this host, over the pulled copy:"}  # fmt: skip
+    for step, place in zip(entry["steps"], places):
+        lines += ([notes[place]] if place in notes else []) + [shlex.join(step)]
+    return "\n".join(lines)
 
 
 class LocalTransport:
@@ -162,6 +210,30 @@ class LocalTransport:
         done = self._run(list(argv), env=self.environ, cwd=str(site.fleet), stdin=subprocess.DEVNULL,
                          capture_output=True, text=True, timeout=timeout, check=False)  # fmt: skip
         return done.returncode, done.stdout, done.stderr
+
+    def run_here(self, argv: Sequence[str], cwd: Path, timeout: float) -> Tuple[int, str, str]:
+        """A command of this host's own (a retirement's `verify-copy` over a pulled copy), from `cwd`."""
+        done = self._run(list(argv), env=self.environ, cwd=str(cwd), stdin=subprocess.DEVNULL, capture_output=True,
+                         text=True, timeout=timeout, check=False)  # fmt: skip
+        return done.returncode, done.stdout, done.stderr
+
+
+class SiteTransport:
+    """Each site's commands as its `transport` says: run here (`local`) or over ssh (`ssh`, `fleetssh.py`)."""
+
+    def __init__(self, environ: Mapping[str, str], run: Callable[..., Any] = subprocess.run,
+                 ssh: Optional[Any] = None) -> None:  # fmt: skip
+        self.local = LocalTransport(environ, run)
+        self.ssh = ssh or SshSiteTransport(environ)
+
+    def run(self, site: SiteConfig, argv: Sequence[str], timeout: float) -> Tuple[int, str, str]:
+        return (self.ssh if site.remote else self.local).run(site, argv, timeout)
+
+    def run_here(self, argv: Sequence[str], cwd: Path, timeout: float) -> Tuple[int, str, str]:
+        return self.local.run_here(argv, cwd, timeout)
+
+    def pull(self, site: SiteConfig, remote: str, local: Path, digest: str) -> Tuple[int, str, str]:
+        return self.ssh.pull(site, remote, local, digest)
 
 
 def last_line(text: str) -> str:
@@ -351,6 +423,9 @@ class Executor:
         if found.drained_at is None and found.ended_at is None:
             return f"{label} is neither drained nor proven ended"
         live = [lease.lease_id for lease in self.ledger.leases() if lease.federation == label and lease.state in LIVE]
+        if self.sites[action.site].remote:  # an archive not pulled here yet is pulled before any down
+            live += [lease.lease_id for lease in self.ledger.leases()
+                     if lease.federation == label and lease.state == "reported"]  # fmt: skip
         return f"{label} holds lease(s) {live} in flight" if live else None
 
     def start(self, action: Any) -> None:
@@ -370,11 +445,17 @@ class Executor:
         """An add's or a retirement's commands on the site, in order, each only after the one before succeeded."""
         kind = type(action).__name__
         digest = DIGEST
-        steps = render(action, site, self.evidence, self.ledger_path).steps
-        for index, step in enumerate(steps):
+        rendered = render(action, site, self.evidence, self.ledger_path)
+        places = rendered.places or (SITE,) * len(rendered.steps)
+        for index, (step, place) in enumerate(zip(rendered.steps, places)):
             argv = [digest if word == DIGEST else word for word in step]
             try:
-                code, out, err = self.transport.run(site, argv, COMMAND_TIMEOUT_S)
+                if place == PULL:
+                    code, out, err = self.transport.pull(site, argv[1], Path(argv[2]), argv[3])
+                elif place == HERE_PLACE:
+                    code, out, err = self.transport.run_here(argv, self.evidence, COMMAND_TIMEOUT_S)
+                else:
+                    code, out, err = self.transport.run(site, argv, COMMAND_TIMEOUT_S)
             except (OSError, subprocess.SubprocessError) as error:
                 code, out, err = 1, "", f"it could not be run ({type(error).__name__})"
             if kind == "Retire" and step[4:5] == ("collect",) and code == 0:
