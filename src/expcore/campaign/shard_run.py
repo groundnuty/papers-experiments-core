@@ -18,9 +18,8 @@ is computed (`share_settings`, or `share_settings_by_model` for a campaign that 
 reach it. Before any share is taken, a shard holding pairs of a model whose concurrency share is 0 is refused, naming
 the model (`refuse_unrunnable`).
 
-A run on a lease (`campaign.run_lease`, `expcore-shard/5`) pins the same facts, with the lease as its spec and two more,
-its attempt base and its charged attempts (`META_ATTEMPT_BASE`, `META_CHARGED_ATTEMPTS`), and is never resumed: a store
-holds one lease, once. Any later start of it is
+A run on a lease (`campaign.run_lease`, `expcore-shard/5`) pins the same facts, with the lease as its spec and one more,
+its attempt base (`META_ATTEMPT_BASE`), and is never resumed: a store holds one lease, once. Any later start of it is
 refused (`LeaseReplayed` for the same lease id, `ShardMismatch` for another lease or another form), whether or not the
 facts agree, so a replayed or a stale lease file cannot run a store a second time (`_pin_lease`).
 
@@ -39,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.manifest import fingerprint_sha256
-from expcore.campaign.run_lease import META_ATTEMPT_BASE, META_CHARGED_ATTEMPTS, RULE_LEASE, LeaseError, RunLease
+from expcore.campaign.run_lease import META_ATTEMPT_BASE, RULE_LEASE, LeaseError, RunLease
 from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec, describe, resume_hint
 from expcore.campaign.shard import (
     META_ENVIRONMENT,
@@ -321,11 +320,9 @@ def _pin_lease(store: Store, shard: ShardStart | None, held: Mapping[str, str], 
     for key, text in shard.pinned().items():
         store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (key, text, now))
     store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (META_STARTED, now, now))
-    for key, count in (
-        (META_ATTEMPT_BASE, shard.spec.attempt_base),
-        (META_CHARGED_ATTEMPTS, shard.spec.charged_attempts),
-    ):
-        store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (key, str(count), now))
+    store.db.execute(
+        "INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (META_ATTEMPT_BASE, str(shard.spec.attempt_base), now)
+    )
 
 
 def _wide_flag(recorded: Mapping[str, Any]) -> str:

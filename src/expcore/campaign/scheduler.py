@@ -375,6 +375,9 @@ class Scheduler:
                 reserved_capped=self._admitted_capped,
                 reply_cap_unheld=self._reply_cap_unheld,
                 campaign=self._campaign,
+                lease_id=self.shard.spec.lease_id
+                if self.shard is not None and isinstance(self.shard.spec, RunLease)
+                else None,
             )
         )
 

@@ -293,7 +293,7 @@ V1 = SchemaVersion("expcore-record/1")
 V2 = SchemaVersion(
     "expcore-record/2",
     added={
-        "record": ("instruments", "treatment_targets", "instrument_refusal"),
+        "record": ("instruments", "treatment_targets", "instrument_refusal", "lease_id"),
         "turn": ("request_sha256",),
         "tool_call": ("detail", "elapsed_s", "exec_check"),
         "usage": ("extra", "extra_cut"),  # the real table's version 3 fields, here added with this version
@@ -304,7 +304,7 @@ V2 = SchemaVersion(
     config_before={"cleanup_deadline_s": 7.0},
     optional={
         "usage": ("extra", "extra_cut"),
-        "record": ("treatment_targets", "instrument_refusal"),
+        "record": ("treatment_targets", "instrument_refusal", "lease_id"),
         "outcome": ("infra_target",),
         "totals": ("reserved_capped", "reply_cap_unheld"),
         "tool_call": ("elapsed_s", "exec_check"),
