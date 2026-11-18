@@ -48,6 +48,7 @@ from expcore.provenance.codestamp import require_known
 from expcore.provenance.core_check import require_core
 from expcore.records.record import is_record_name
 from expcore.study.config import StudyConfig, find_study_root, load_study
+from expcore.study.dead_store_journal import read_with_journal
 from expcore.study.merge import REPLAY_DIR, _refuse_inside_a_shard, _replay, refuse_earlier_form
 from expcore.study.pipeline import campaign_environment, environment_like
 from expcore.study.selection_start import pricing_of
@@ -205,8 +206,8 @@ def _settled_copy(out: Path, private: Path, scratch: Path, schema: Any, max_atte
 class DeadStoreSpend:
     """What a dead lease store spent, read as a merge by run reads it: `spend_micro` (whole micro-dollars, as the
     ledger counts them) and its charged attempts (`charged_attempts`), with its lease and run. It is a safe upper figure
-    for the lease: the store's run had ended (done or infra_exhausted) with no attempt running, so no
-    attempt of the lease is missing from it."""
+    for the lease: the store's run had ended (done or infra_exhausted) with no attempt running, or what the store
+    lacks was counted from the lease's spend journal (`dead_store_journal`), so no attempt of the lease is missing."""
 
     lease_id: int
     run_key: str
@@ -221,10 +222,13 @@ def dead_store_spend(out: str | os.PathLike[str], study: StudyConfig) -> DeadSto
 
     A settled charge is final in the ledger, so a figure below what the lease spent would release budget that was
     spent. A store that came back from a federation lost mid-run is a snapshot: an attempt running in it, or one begun
-    after it (its run still pending between attempts), is not all there, and its spend journal, which would hold the
-    rest, is not read here. So the figure is given only for a store whose run had ended (done or infra_exhausted)
-    with no attempt running; any other gives None, and the lease stays charged its grant. The store
-    is snapshotted from a private copy and its spend counted by the budget gate's own figure
+    after it (its run still pending between attempts), is not all there. So a store whose run had ended (done or
+    infra_exhausted) with no attempt running is read as it is. Any other is read with the lease run's spend journal
+    beside its study copy (`run_lease.LEASE_JOURNAL`, `dead_store_journal`): what the journal holds that the store lacks
+    (attempts begun, top-ups, probe charges after the snapshot) is counted, a running attempt charged by its journaled
+    call log or its bound, and the figure is a safe upper one with the charged attempts the store and the journal
+    show. Where the journal cannot be read as this lease's own, the figure is None and the lease stays charged its
+    grant. The store is snapshotted from a private copy and its spend counted by the budget gate's own figure
     (`selection_ledger.spend_of`) with the study's prices; nothing is written beside it. Its lock is held as a reader
     when it has one (a store pulled without its lock file is read all the same); a store a dispatcher still holds,
     no store, not a lease store, one that changes while copied, one whose spend is unknown, or one that cannot be read
@@ -232,18 +236,27 @@ def dead_store_spend(out: str | os.PathLike[str], study: StudyConfig) -> DeadSto
     run refuses a settlement its store does not give exactly, or one of a store that had not ended."""
     out = Path(out)
     with tempfile.TemporaryDirectory(prefix="expcore-dead-store-") as scratch:
-        snapshot = Path(scratch) / "read.sqlite"
-        try:
-            if not _snapshot_ended(out, snapshot):
-                return None
-            pricing = pricing_of(study)
-            store = lease_store_of_bytes(snapshot.read_bytes(), out, out=out, snapshot=snapshot, pricing=pricing)
-            if (
-                pricing.mismatch(store.fingerprint) is not None
-            ):  # the study's prices are not the ones the lease ran under
-                return None
-        except (CampaignLocked, LockUnavailable, SnapshotError, StoreChanged, MergeRefused, OSError, sqlite3.Error):
+        found = _ended_store_spend(out, study, Path(scratch))
+        if found is not None:
+            return found
+        journaled = read_with_journal(out, study, Path(scratch))
+    if journaled is None:
+        return None
+    return DeadStoreSpend(journaled.lease_id, journaled.run_key, micro_up(journaled.spend_usd), journaled.charged)
+
+
+def _ended_store_spend(out: Path, study: StudyConfig, scratch: Path) -> DeadStoreSpend | None:
+    """The spend of a store whose run ended, from the store alone; None for any other."""
+    snapshot = scratch / "read.sqlite"
+    try:
+        if not _snapshot_ended(out, snapshot):
             return None
+        pricing = pricing_of(study)
+        store = lease_store_of_bytes(snapshot.read_bytes(), out, out=out, snapshot=snapshot, pricing=pricing)
+        if pricing.mismatch(store.fingerprint) is not None:  # the study's prices are not the ones the lease ran under
+            return None
+    except (CampaignLocked, LockUnavailable, SnapshotError, StoreChanged, MergeRefused, OSError, sqlite3.Error):
+        return None
     spent = None if store.spend is None else store.spend.total
     if spent is None or not store.complete:
         return None
