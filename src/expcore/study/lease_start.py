@@ -11,8 +11,8 @@ leaves no store behind:
 - the term: a lease whose expiry has come is refused (a ledger expires a lease by its own clock; this is the node's own
   check at the start, never a replacement for it);
 - the run: it must be a run of the plan; the store holds it and no other, at its place in the whole plan;
-- the attempt limit: the lease's base counts against `[scheduler] max_attempts`, so a run that has used every attempt
-  gets no lease run. The limit is the ledger's; this keeps the kernel from running past it;
+- the attempt limit: the lease's charged attempts count against `[scheduler] max_attempts`, so a run that has used
+  every attempt gets no lease run. The limit is the ledger's; this keeps the kernel from running past it;
 - the money: **the grant is the run's whole budget.** The store's gate is `Budget(max_usd=grant)` and nothing of the
   campaign's own: no per-model ceiling and no release file or step (the ledger holds those, and a release would take
   a run past its grant). A campaign with no `[budget]` is held to the grant all the same. The per-run bound stays: the
@@ -69,13 +69,13 @@ def lease_start(
             f"model {model} has no price and is not marked free, so what its run reserves is unknown and no grant "
             "can pay for it; give it a price, or mark it free"
         )
-    if reserved > 0 and lease.grant_usd == 0:
+    if reserved > 0 and lease.grant_micro_usd == 0:
         raise LeaseError(
             f"{lease.name} grants 0 USD, and a run of model {model} reserves {reserved:.6f} USD: a budget of 0 holds "
             "every run, so a priced model needs a grant above 0"
         )
     caps = {study.campaign.endpoints[model].unit: 1}
-    budget = Budget(max_usd=lease.grant_usd) if lease.grant_usd > 0 else None
+    budget = Budget(max_usd=lease.grant_usd) if lease.grant_micro_usd > 0 else None
     shares = {
         "unit_caps": caps,
         "budget": None if budget is None else {"max_usd": lease.grant_usd, "per_model_usd": {}},

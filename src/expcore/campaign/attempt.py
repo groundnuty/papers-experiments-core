@@ -159,7 +159,7 @@ class AttemptRunner:
         key, factors = row["run_key"], json.loads(row["factors"])
         if p.health is not None:
             # the number this try will have, as `Store.begin_attempt` numbers it: the check is told its attempt
-            pre = p.health.before_run(key, attempt=p.store.charged_attempts(key) + 1)
+            pre = p.health.before_run(key, attempt=p.store.next_attempt_number(key))
             if pre.verdict == HOLD:
                 return 0.0  # nothing is tried, charged or recorded; the gate holds dispatch
             if pre.verdict == DEFER:  # the platform is held on purpose: a wait, so nothing is tried or charged

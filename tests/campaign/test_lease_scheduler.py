@@ -20,7 +20,8 @@ from expcore.campaign.run_lease import LeaseError, RunLease
 from expcore.campaign.scheduler import Scheduler
 from expcore.campaign.shard_run import ShardStart
 
-GRANT = 40.0  # the stub models' one run reserves a few dollars at most at these prices and caps
+GRANT_MICRO = 40_000_000  # the stub models' one run reserves a few dollars at most at these prices and caps
+GRANT = 40.0
 
 
 def lease_for(fingerprint, manifest, **changes) -> RunLease:
@@ -28,7 +29,8 @@ def lease_for(fingerprint, manifest, **changes) -> RunLease:
         "run_key": manifest.rows[0].key.text,
         "lease_id": 1,
         "attempt_base": 0,
-        "grant_usd": GRANT,
+        "charged_attempts": 0,
+        "grant_micro_usd": GRANT_MICRO,
         "campaign_sha256": fingerprint_sha256(fingerprint),
         "expires_utc": "2099-01-01T00:00:00Z",
     }
@@ -74,6 +76,7 @@ def test_c41_a_scheduler_of_a_lease_held_to_its_grant_and_campaign_opens(tmp_pat
     with scheduler_of(tmp_path, budget=Budget(max_usd=GRANT)):
         assert sorted(key for (key,) in pinned(tmp_path)) == [
             "lease_attempt_base",
+            "lease_charged_attempts",
             "shard_shares",
             "shard_spec",
             "shard_started_utc",
@@ -99,6 +102,7 @@ def test_c41_a_scheduler_with_no_budget_does_not_run_a_lease_with_a_grant(tmp_pa
     "budget",
     [
         Budget(max_usd=GRANT * 2),
+        Budget(max_usd=GRANT + 0.000001),  # one micro-dollar above the grant
         Budget(max_usd=GRANT, release_step_usd=1.0, release_file=Path("release.txt")),
     ],
 )
@@ -110,8 +114,10 @@ def test_c41_a_scheduler_refuses_a_budget_that_can_be_raised_past_the_grant(tmp_
 
 
 def test_c41_a_scheduler_refuses_a_lease_whose_run_has_no_attempt_left(tmp_path):
-    """C41: a base at the attempt limit (3 here) would write an attempt number past it before anything could exhaust
-    the run: refused before the store is opened."""
+    """C41: charged attempts at the attempt limit (3 here) would run an attempt past it before anything could exhaust
+    the run: refused before the store is opened, whatever the earlier leases started."""
     with pytest.raises(LeaseError, match="no attempt left"):
-        scheduler_of(tmp_path, budget=Budget(max_usd=GRANT), lease_changes={"attempt_base": 3}).open()
+        scheduler_of(
+            tmp_path, budget=Budget(max_usd=GRANT), lease_changes={"attempt_base": 5, "charged_attempts": 3}
+        ).open()
     assert pinned(tmp_path) == []
