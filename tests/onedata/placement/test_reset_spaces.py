@@ -141,6 +141,31 @@ def test_o46_one_occupancy_wait_and_one_quiet_wait_and_look_cover_every_space(re
         assert space["stages"]["quiet"]["waited_s"] == resetqos.quiet_wait_s(2)
 
 
+def test_o46_each_spaces_quiet_waited_s_is_its_actual_wait_from_its_reading_and_its_nominal_is_kept(
+    resets, fake, ticker, monkeypatch
+):
+    """O46: the quiet stage's one wait runs to the latest space's instant, so a space with a shallower deepest file, or
+    one whose maps were read earlier, waits longer than its own bound before its sizes are read. The record gives each
+    space the seconds between its own maps reading (T) and its sizes reading, and the bound it was owed beside it."""
+    fake.add_file("deep/er/still/data.bin", DATA, space=SPACE_IDS[1])  # the second space's deepest file is 4 deep
+    seen, at, original = root_reads(fake, ticker), {}, SpaceReset._quiet_maps
+
+    def read_a_second_later(self, run):
+        ticker.now += 1.0  # each space's maps are read a second after the previous space's
+        due = original(self, run)
+        at[self._p.space_id] = ticker.now
+        return due
+
+    monkeypatch.setattr(SpaceReset, "_quiet_maps", read_a_second_later)
+    record = SpacesReset(resets, concurrency=1).run(evicting(qos_rights=True))
+    quiet = [space["stages"]["quiet"] for space in record["spaces"]]
+    assert [stage["nominal_wait_s"] for stage in quiet] == [resetqos.quiet_wait_s(depth) for depth in (2, 4, 2)]
+    for space_id, stage in zip(SPACE_IDS[:COUNT], quiet, strict=True):
+        assert stage["waited_s"] == pytest.approx(seen[space_id][-1] - at[space_id])  # T to its sizes reading
+        assert stage["waited_s"] >= stage["nominal_wait_s"]
+    assert [stage["waited_s"] for stage in quiet] == pytest.approx([31.0, 30.0, 29.0])
+
+
 def test_o11_the_spaces_reset_at_once_within_the_bound(resets, fake, ticker, monkeypatch):
     """O51: with `reset_concurrency` 2 three spaces' qos stages run two at once, never three: the first two wait for
     each other, so they cannot pass one at a time."""
