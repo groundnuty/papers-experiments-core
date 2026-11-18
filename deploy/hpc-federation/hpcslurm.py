@@ -32,6 +32,11 @@ ENV = "/usr/bin/env"
 GONE_POLLS = 3  # a step absent from squeue -s this many polls in a row has ended
 READBACK = ("JobName", "TimeLimit", "Requeue", "Account", "Partition", "NumNodes", "NumCPUs", "MinMemoryNode")
 WAITING_STATES = ("PENDING", "CONFIGURING", "REQUEUED", "RESIZING")
+# The wait for a held job takes a read of it that failed (the command timed out, or exited nonzero: what a slow or
+# restarting controller gives) for a missed poll. It gives up after this many reads in a row failed, sleeping the poll
+# interval after the first, twice it after the second and so on, but never longer than this many seconds.
+MISSED_POLLS_MAX = 10
+MISSED_POLL_BACKOFF_MAX_S = 300.0
 JOB_LINE = re.compile(r"([0-9]{1,12})(?:;[A-Za-z0-9_.-]+)?")
 JOB_LISTED = re.compile(r"([0-9]{1,12})(?:\+[0-9]{1,6})?")  # squeue's %i: a job, or a component <leader>+<k>
 # A step as squeue -s lists it: of a job, or of a heterogeneous job's component (<leader>+<k>.<n>, or the
@@ -131,6 +136,12 @@ def scrubbed(text: str, names: Sequence[str]) -> str:
     for name in sorted(names, key=len, reverse=True):
         text = text.replace(name, "<node>")
     return text
+
+
+class ReadFailed(SlurmError):
+    """A read of a job's record that failed: `scontrol show job` timed out or exited nonzero (a controller that is slow
+    or restarting says so). Not Slurm's "Invalid job id" (a job it no longer knows, which `records` answers with
+    None), and not an answer for another job."""
 
 
 class StepTimeout(SlurmError, TimeoutError):
@@ -608,11 +619,14 @@ class Slurm:
     def records(self, job: str) -> Optional[List[Dict[str, str]]]:
         """Every record `scontrol show job -o` answers for a job id, one per line: the job's, or each component's of a
         heterogeneous job asked by its leader's id; None when Slurm no longer knows the id."""
-        done = self.runner.run(["scontrol", "show", "job", "-o", job], self.command_timeout_s)
+        try:
+            done = self.runner.run(["scontrol", "show", "job", "-o", job], self.command_timeout_s)
+        except SlurmError as error:  # the command did not answer within its bound
+            raise ReadFailed(str(error)) from None
         if done.returncode != 0:
             if "Invalid job id" in done.stderr:
                 return None
-            raise SlurmError(f"scontrol show job failed with status {done.returncode}: {done.stderr.strip()[:300]}")
+            raise ReadFailed(f"scontrol show job failed with status {done.returncode}: {done.stderr.strip()[:300]}")
         found = [_fields(line) for line in done.stdout.splitlines() if line.strip()]
         if not any(record.get("JobId") == job for record in found):
             raise SlurmError("scontrol show job answered for another job")
@@ -659,13 +673,46 @@ class Slurm:
         if records and name is not None and records[0].get("JobName") != name:
             raise SlurmError(f"job {job} carries another job's name: not the job submitted, and not cancelled")
 
-    def wait_running(self, job: str, timeout_s: float, name: Optional[str] = None, note: str = "") -> Dict[str, str]:
+    def wait_running(
+        self,
+        job: str,
+        timeout_s: float,
+        name: Optional[str] = None,
+        note: str = "",
+        say: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, str]:
         """Wait for the held job (every component of it) to run; at the bound, or if it ends first, cancel it by its
         id and fail. With `name`, a job that carries another is never cancelled (`_ours`). `note` ends the failure at
-        the bound: what the caller knows that may keep the job waiting."""
+        the bound: what the caller knows that may keep the job waiting.
+
+        A read of the job that fails (`ReadFailed`: the command timed out or exited nonzero, as a slow or restarting
+        controller makes it) is a missed poll, not the job's end: `say` hears of the first of a streak, the wait sleeps
+        longer after each (the poll interval doubled, never past `MISSED_POLL_BACKOFF_MAX_S`) and reads again, and
+        an answer ends the streak. It fails only after `MISSED_POLLS_MAX` reads in a row failed, or at the bound with
+        a read that failed; it cancels nothing then, since nothing is known of the job: the caller's release reads it
+        first (`Driver.release_held`). A job Slurm no longer knows, one that ended, and an answer for another job
+        or with no offset end the wait as they always did."""
         deadline = self.clock() + timeout_s
+        missed = 0
         while True:
-            records = self.components(job) or []
+            try:
+                records = self.components(job) or []
+            except ReadFailed as error:
+                missed += 1
+                if missed >= MISSED_POLLS_MAX:
+                    raise SlurmError(f"{error}; {missed} reads of the held job in a row failed") from None
+                if missed == 1 and say is not None:
+                    say(f"{error}: a missed poll of held job {job}; the wait goes on, and ends only after "
+                        f"{MISSED_POLLS_MAX} reads in a row fail")  # fmt: skip
+                now = self.clock()
+                if now >= deadline:
+                    raise SlurmError(
+                        f"the held job did not start within {timeout_s:.0f} s, and the last read of it failed "
+                        f"({error}){note}"
+                    ) from None
+                self.sleep(min(self.poll_s * 2 ** (missed - 1), MISSED_POLL_BACKOFF_MAX_S, deadline - now))
+                continue
+            missed = 0
             self._ours(job, records, name)
             states = [record.get("JobState") for record in records]
             if states and all(state == "RUNNING" for state in states):

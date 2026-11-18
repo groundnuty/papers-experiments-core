@@ -220,6 +220,11 @@ its business, whatever it runs. It never reads or prints a node's name into a me
   sets it: "Site configuration"), cancels the job by its id and says that it
   excluded N nodes of other live federations; a refusal by sbatch says the same, with Slurm's own words stripped of those
   nodes' names.
+- **A slow controller does not end the wait.** A read of the held job that fails while `up` waits (`scontrol` timing
+  out, or exiting nonzero) is a missed poll: `up` says so once, sleeps the poll interval and then twice it (never
+  more than 300 s), and reads again. It gives up only after 10 reads in a row failed, or at the queue bound with a read
+  that failed, and then releases the held jobs as below. "Invalid job id" (the job is gone), a job that ended and a job
+  of another name end the wait at once.
 - **A wait that fails releases every held job of that `up`.** Under `"separate"` the services' job and the agent's own are
   waited for in turn, and a job that does not start in time or ends before it ran is cancelled by its wait. `up` then
   cancels the other held job too, still queued or running, by its own id and only if it still carries the name `up`

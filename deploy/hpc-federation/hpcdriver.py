@@ -465,9 +465,12 @@ class Driver(Down):
 
     def wait_held(self, held: Sequence[Tuple[str, Allocation]]) -> None:
         """Wait for each held job of this up to run, in turn, at the queue bound. A wait that fails (a job past the
-        bound, or ended before it ran) cancels its own job; `releasing` releases the others."""
+        bound, or ended before it ran) cancels its own job; `releasing` releases the others. A read of the job that
+        fails is a missed poll, said once per streak and waited out (`Slurm.wait_running`)."""
         for job, wanted in held:
-            self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name, note=self.queue_note(wanted))
+            self.slurm.wait_running(
+                job, self.timeouts["queue"], name=wanted.name, note=self.queue_note(wanted), say=self.say
+            )
 
     def release_held(self, held: Sequence[Tuple[str, Allocation]]) -> str:
         """Release what a failed wait leaves: each of this up's own held jobs that has not ended, by its id (`release`).
