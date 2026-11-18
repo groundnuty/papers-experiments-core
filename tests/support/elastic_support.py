@@ -129,7 +129,8 @@ def assert_invariants(ledger: Ledger) -> None:
     """What every step must keep: one live lease per run and per federation, a live lease being its run's latest, no
     budget or ceiling (as raised) passed, no cap passed by live and held-back leases together, at most one counted
     done lease per run, which is the run's latest when the run is done, a settlement never above its lease's grant,
-    a run's charged attempts being the sum of what its leases were counted for, and a locked total that is the grants
+    a run's charged attempts being the sum of what its leases were counted for (an exhausted run has none left, a
+    pending one always has one), and a locked total that is the grants
     of the held leases nobody settled."""
     leases = ledger.leases()
     runs = {run.run_key: run for run in ledger.runs()}
@@ -151,6 +152,10 @@ def assert_invariants(ledger: Ledger) -> None:
     counted = dict(ledger.db.execute("SELECT run_key, SUM(charged_added) FROM leases GROUP BY run_key").fetchall())
     for run in runs.values():
         assert run.charged == counted.get(run.run_key, 0), f"run {run.run_key}'s charged attempts are not its leases'"
+        if run.state == "infra_exhausted":
+            assert run.charged >= ledger.config.max_attempts, f"run {run.run_key} is exhausted with attempts left"
+        if run.state == "pending":
+            assert run.charged < ledger.config.max_attempts, f"run {run.run_key} is pending with no attempt left"
     ceilings = ledger.ceilings()
     if ceilings.max_micro is not None:
         assert total <= ceilings.max_micro, f"committed {total} passes the ceiling {ceilings.max_micro}"

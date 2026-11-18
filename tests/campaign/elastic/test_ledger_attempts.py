@@ -176,3 +176,88 @@ def test_c42_a_lost_lease_whose_return_is_read_later_costs_nothing(tmp_path):
     join(ledger, clock, "fed-2")
     assert leased(ledger, "fed-2").attempt_base == 0
     assert_invariants(ledger)
+
+
+def _reopens(ledger, run_key):
+    return [event for event in ledger.events() if event["kind"] == "reopen" and event["run_key"] == run_key]
+
+
+def test_c42_a_lost_lease_exhausts_its_run_at_max_attempts(tmp_path):
+    """C42: the loss counts one attempt, so with one attempt allowed the run is exhausted at once and not leased."""
+    ledger, clock = make(tmp_path, **ONE, max_attempts=1)
+    lost = lose(ledger, clock, "fed-1")
+    run = ledger.run(lost.run_key)
+    assert (run.charged, run.state) == (1, "infra_exhausted")
+    join(ledger, clock, "fed-2")
+    assert isinstance(ledger.issue("fed-2"), Wait)
+    assert not _reopens(ledger, lost.run_key)
+    assert_invariants(ledger)
+
+
+@pytest.mark.parametrize(("how", "word"), [("settle", "settle"), ("return", "return"), ("completion", "completion")])
+def test_c42_a_run_its_losses_exhausted_reopens_when_the_real_count_leaves_it_below_max_attempts(tmp_path, how, word):
+    """C42: two lost leases exhaust a run of two attempts, the second one conservatively. When the second lease's real
+    count (a settle, a return that shows it unstarted, a late completion) is lower, the run is below `max_attempts`
+    again: it goes back to pending, the log names the lease and the old and new counts, and the next lease leases it."""
+    ledger, clock = make(tmp_path, **PRICED, max_attempts=2)
+    first = lose(ledger, clock, "fed-1")
+    second = lose(ledger, clock, "fed-2")
+    assert second.run_key == first.run_key
+    assert (ledger.run(first.run_key).charged, ledger.run(first.run_key).state) == (2, "infra_exhausted")
+    if how == "settle":
+        ledger.settle(second.lease_id, 100_000, "root", attempts_charged=0)
+    elif how == "return":
+        ledger.observe_site(SITE, SiteReading(returns=(Return(second.lease_id, 0.0),)))
+    else:
+        assert finish(ledger, second, state="infra_fail", charged=0) == "counted"
+    run = ledger.run(first.run_key)
+    assert (run.charged, run.state) == (1, "pending")
+    (event,) = _reopens(ledger, first.run_key)
+    assert event["lease_id"] == second.lease_id
+    detail = event["detail"]
+    assert (detail["lease_charged_before"], detail["lease_charged_after"]) == (1, 0)
+    assert (detail["run_charged_before"], detail["run_charged_after"], detail["max_attempts"]) == (2, 1, 2)
+    assert word in detail["reason"]
+    assert_invariants(ledger)
+    join(ledger, clock, "fed-3")
+    again = leased(ledger, "fed-3")
+    assert (again.run_key, again.attempt_base) == (first.run_key, 1)
+
+
+def test_c42_a_run_exhausted_by_its_real_attempts_stays_exhausted_when_a_loss_is_taken_back(tmp_path):
+    """C42: a settle names two real attempts of two allowed while the next lease is in flight; that lease expires, so
+    the run is exhausted by real attempts. Its own loss, counted one on top and then settled at none, leaves the run at
+    the two real ones: still no attempt left, so no reopen."""
+    ledger, clock = make(tmp_path, **PRICED, max_attempts=2)
+    first = lose(ledger, clock, "fed-1")
+    join(ledger, clock, "fed-2")
+    second = leased(ledger, "fed-2")
+    ledger.settle(first.lease_id, 100_000, "root", attempts_charged=2)
+    clock.advance(301)
+    ledger.observe_site(SITE, SiteReading())
+    assert ledger.lease(second.lease_id).state == "expired"
+    ledger.prove_ended("fed-2", "terminal")
+    assert (ledger.run(first.run_key).charged, ledger.run(first.run_key).state) == (3, "infra_exhausted")
+    ledger.settle(second.lease_id, 100_000, "root", attempts_charged=0)
+    run = ledger.run(first.run_key)
+    assert (run.charged, run.state) == (2, "infra_exhausted")
+    assert not _reopens(ledger, first.run_key)
+    join(ledger, clock, "fed-3")
+    assert isinstance(ledger.issue("fed-3"), Wait)
+    assert_invariants(ledger)
+
+
+def test_c42_a_done_run_does_not_reopen_when_an_earlier_loss_is_settled_at_fewer_attempts(tmp_path):
+    """C42: a run is done by its second lease's counted completion; settling the first lease's loss at none lowers the
+    run's charged attempts below `max_attempts` and leaves it done."""
+    ledger, clock = make(tmp_path, **PRICED, max_attempts=2)
+    first = lose(ledger, clock, "fed-1")
+    join(ledger, clock, "fed-2")
+    second = leased(ledger, "fed-2")
+    assert finish(ledger, second, state="done", charged=1) == "counted"
+    assert (ledger.run(first.run_key).charged, ledger.run(first.run_key).state) == (2, "done")
+    ledger.settle(first.lease_id, 100_000, "root", attempts_charged=0)
+    run = ledger.run(first.run_key)
+    assert (run.charged, run.state) == (1, "done")
+    assert not _reopens(ledger, first.run_key)
+    assert_invariants(ledger)
