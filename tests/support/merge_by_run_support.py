@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 from shard_support import IDENTITY, declaring, make_study
-from study_support import Campaign, cli
+from study_support import Campaign, cli, copy_campaign
 
 from expcore.campaign.elastic import (
     Completion,
@@ -88,6 +88,7 @@ class Fleet:
     pending_copy: Path | None = None  # the ledger as it was with runs still pending
     exhausted: str = ""  # the run the ledger exhausted for its lost leases, every one of them settled
     exhausted_leases: tuple[int, ...] = ()  # that run's leases
+    lost_ended: Campaign | None = None  # the lost lease's store as it was once its run ended, before it was lost
 
     def counted(self) -> list[Campaign]:
         """The stores of every run's counted lease."""
@@ -211,6 +212,7 @@ def build_fleet(base: Path, env: dict[str, str]) -> Fleet:
         fleet.stores[lx.lease_id] = run_lease(base, env, lx, sha)
         assert complete(ledger, lx, fleet.stores[lx.lease_id], "site-b") == "superseded"
         fleet.stores[ly.lease_id] = run_lease(base, env, ly, sha)
+        fleet.lost_ended = copy_campaign(fleet.stores[ly.lease_id], base, f"lease-{ly.lease_id}-ended")
         make_running(fleet.stores[ly.lease_id])
     finally:
         ledger.close()

@@ -424,34 +424,42 @@ def state_bytes(campaign: Campaign) -> bytes:
     return (campaign.root / "out" / "state.sqlite").read_bytes()
 
 
-def test_c45_a_dead_stores_spend_is_read_without_writing_it(fleet):
-    """C45: the lost lease's store, still running when it came back, is read in a private copy: its running attempt
-    settled at its bound, and the store itself not written."""
+def test_c45_a_dead_store_snapshotted_mid_run_gives_no_figure_and_is_not_written(fleet):
+    """C45: the lost lease's store came back with an attempt still running: what it spent after the snapshot is not
+    in it, so it gives no figure to settle with (the lease stays at its grant), and the store is not written."""
     store = fleet.stores[fleet.lost]
     before = state_bytes(store)
-    found = dead_store_spend(store.root / "out", load_study(store.root))
-    assert found is not None
-    assert (found.lease_id, found.settled_running, found.charged_attempts) == (fleet.lost, 1, 0)
-    assert found.spend_micro > 0
+    assert dead_store_spend(store.root / "out", load_study(store.root)) is None
     assert state_bytes(store) == before
     assert store.sql("SELECT state FROM attempts ORDER BY id")[-1]["state"] == "running"
 
 
-def test_c45_a_dead_stores_spend_is_the_one_the_merge_reads(merged, fleet):
-    """C45: what a controller would settle is what the merge reads of the same store."""
-    store = fleet.stores[fleet.lost]
+def test_c45_a_dead_store_between_attempts_gives_no_figure(base, fleet):
+    """C45: a snapshot whose run is pending with nothing running (lost between two attempts) can miss the next
+    attempt's spend: no figure."""
+    copy = copy_campaign(fleet.counted()[0], base, "between-attempts")
+    db = sqlite3.connect(copy.root / "out" / "state.sqlite")
+    try:
+        db.execute("UPDATE runs SET status='pending'")
+        db.commit()
+    finally:
+        db.close()
+    assert dead_store_spend(copy.root / "out", load_study(copy.root)) is None
+
+
+def test_c45_a_dead_stores_figure_is_the_one_the_merge_reads(merged, fleet):
+    """C45: for a store whose run ended, what a controller would settle is what the merge reads of the same store."""
+    store = fleet.stores[fleet.superseded]
     found = dead_store_spend(store.root / "out", load_study(store.root))
-    entry = {e["lease_id"]: e for e in document_of(merged)["evidence"]}[fleet.lost]
+    entry = {e["lease_id"]: e for e in document_of(merged)["evidence"]}[fleet.superseded]
     assert entry["store_spend_usd"] == usd_of(found.spend_micro)
-    assert entry["settled"] is False
 
 
 def test_c45_a_store_that_ended_reads_whole(fleet):
-    """C45: a store with no running attempt is read as it is: nothing settled, its charged attempts counted."""
+    """C45: a store whose run ended is read as it is, its charged attempts counted."""
     store = fleet.counted()[0]
     found = dead_store_spend(store.root / "out", load_study(store.root))
     assert found is not None
-    assert found.settled_running == 0
     assert found.charged_attempts == sum(row["charged"] for row in store.sql("SELECT charged FROM attempts"))
 
 
@@ -478,13 +486,17 @@ def settled(fleet: Fleet, base: Path, name: str, spend_micro: int, charged: int 
     return path
 
 
-def test_c45_a_lease_settled_at_what_its_store_reads_is_merged_at_that_spend(base, fleet):
-    """C45: settled at the dead store's spend, the lease is counted at it and is no longer locked."""
-    store = fleet.stores[fleet.lost]
-    found = dead_store_spend(store.root / "out", load_study(store.root))
+def ended_outs(fleet: Fleet) -> list[str]:
+    """The counted stores, the superseded one, and the lost lease's store as it was once its run ended."""
+    return [*fleet.outs(fleet.superseded), str(fleet.lost_ended.root / "out")]
+
+
+def test_c45_a_lease_settled_at_what_its_ended_store_reads_is_merged_at_that_spend(base, fleet):
+    """C45: settled at the figure its ended store gives, the lease is counted at it and is no longer locked."""
+    found = dead_store_spend(fleet.lost_ended.root / "out", load_study(fleet.lost_ended.root))
     ledger = settled(fleet, base, "settled-ledger", found.spend_micro, found.charged_attempts)
     target = Campaign(by_run_study(base, "settled-merge"))
-    code, errors = fleet.merge(target, fleet.outs(fleet.superseded, fleet.lost), ledger)
+    code, errors = fleet.merge(target, ended_outs(fleet), ledger)
     assert code == 0, errors
     entry = {e["lease_id"]: e for e in document_of(target)["evidence"]}[fleet.lost]
     assert entry["settled"] is True
@@ -493,8 +505,16 @@ def test_c45_a_lease_settled_at_what_its_store_reads_is_merged_at_that_spend(bas
 
 def test_c45_a_lease_settled_at_another_spend_than_its_store_reads_is_refused(base, fleet):
     """C45: a settled value the store given does not give is refused, naming both."""
-    store = fleet.stores[fleet.lost]
-    found = dead_store_spend(store.root / "out", load_study(store.root))
+    found = dead_store_spend(fleet.lost_ended.root / "out", load_study(fleet.lost_ended.root))
     ledger = settled(fleet, base, "missettled-ledger", found.spend_micro - 1, None)
-    errors = refused(fleet, base, "missettled", fleet.outs(fleet.superseded, fleet.lost), ledger)
+    errors = refused(fleet, base, "missettled", ended_outs(fleet), ledger)
     assert "the settled value is not this store's" in errors
+
+
+def test_c45_a_lease_settled_from_a_store_that_had_not_ended_is_refused(base, fleet):
+    """C45: whatever figure the ledger settled, the store given was snapshotted mid-run and cannot show all its lease
+    spent: the settlement is refused as unsafe."""
+    found = dead_store_spend(fleet.lost_ended.root / "out", load_study(fleet.lost_ended.root))
+    ledger = settled(fleet, base, "mid-run-ledger", found.spend_micro, None)
+    errors = refused(fleet, base, "mid-run-settled", fleet.outs(fleet.superseded, fleet.lost), ledger)
+    assert "its store's run had not ended" in errors

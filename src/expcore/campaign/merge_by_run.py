@@ -334,6 +334,11 @@ def _check_store_spend(store: LeaseStore, ledger: LedgerFacts) -> None:
             raise MergeRefused(f"{store.name}: its spend is unknown, and the campaign has a budget")
         return
     settled = ledger.settlements.get(row.lease_id)
+    if settled is not None and not store.complete:
+        raise MergeRefused(
+            f"{store.name}: the ledger settled its lease at USD {usd_of(settled.spend_micro)}, but its store's run had "
+            "not ended, so it cannot show all its lease spent and no settled figure from it is safe"
+        )
     if settled is not None and micro != settled.spend_micro:
         raise MergeRefused(
             f"{store.name}: the ledger settled its lease at USD {usd_of(settled.spend_micro)}, and its store reads USD "

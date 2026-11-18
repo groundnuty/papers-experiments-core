@@ -202,54 +202,58 @@ def _settled_copy(out: Path, private: Path, scratch: Path, schema: Any, max_atte
 @dataclass(frozen=True)
 class DeadStoreSpend:
     """What a dead lease store spent, read as a merge by run reads it: `spend_micro` (whole micro-dollars, as the
-    ledger counts them) and its charged attempts (`charged_attempts`), with its lease and run. `settled_running` is how
-    many attempts were still running in the store and were settled in a private copy at their bound: a store that
-    came back from a federation lost mid-run is a snapshot of it, and an attempt begun after that snapshot is not in
-    it (its spend journal holds it, which this read does not count). A store that ended (0) holds all it spent."""
+    ledger counts them) and its charged attempts (`charged_attempts`), with its lease and run. It is a safe upper figure
+    for the lease: the store's run had ended (done, infra_exhausted or harness_error) with no attempt running, so no
+    attempt of the lease is missing from it."""
 
     lease_id: int
     run_key: str
     spend_micro: int
     charged_attempts: int
-    settled_running: int
 
 
 def dead_store_spend(out: str | os.PathLike[str], study: StudyConfig) -> DeadStoreSpend | None:
     """What the dead lease store whose `out/` is `out` spent, for a controller that settles its lost lease in the
-    ledger (`elastic.Ledger.settle(lease_id, spend_micro, source, attempts_charged=...)`); None when it cannot be read.
+    ledger (`elastic.Ledger.settle(lease_id, spend_micro, source, attempts_charged=...)`); None when the store cannot
+    give a figure that covers all its lease spent.
 
-    The store is read as a merge by run reads a lost lease's store: copied into a private temporary directory and
-    snapshotted, a store with running attempts first settled there by `recover` (`_settled_copy`), and its spend
-    counted by the budget gate's own figure (`selection_ledger.spend_of`) with the study's prices. Nothing is written
-    beside it. Its lock is held as a reader when it has one (a store pulled without its lock file is read all the
-    same, since no dispatcher of it is alive); a store a dispatcher still holds is no dead store, and gives None. So
-    do: no store, not a lease store, a store that changes while it is copied, one whose spend is unknown (a model with
-    no price), or one that cannot be read. A merge by run later refuses a settled value its store does not give."""
+    A settled charge is final in the ledger, so a figure below what the lease spent would release budget that was
+    spent. A store that came back from a federation lost mid-run is a snapshot: an attempt running in it, or one begun
+    after it (its run still pending between attempts), is not all there, and its spend journal, which would hold the
+    rest, is not read here. So the figure is given only for a store whose run had ended (done, infra_exhausted or
+    harness_error) with no attempt running; any other gives None, and the lease stays charged its grant. The store
+    is snapshotted from a private copy and its spend counted by the budget gate's own figure
+    (`selection_ledger.spend_of`) with the study's prices; nothing is written beside it. Its lock is held as a reader
+    when it has one (a store pulled without its lock file is read all the same); a store a dispatcher still holds,
+    no store, not a lease store, one that changes while copied, one whose spend is unknown, or one that cannot be read
+    gives None. A merge by run refuses a settlement its store does not give exactly, or one of a store that had not
+    ended."""
     out = Path(out)
     with tempfile.TemporaryDirectory(prefix="expcore-dead-store-") as scratch:
         snapshot = Path(scratch) / "read.sqlite"
         try:
-            interrupted = _read_dead(out, Path(scratch) / "settle", snapshot, study)
+            if not _snapshot_ended(out, snapshot):
+                return None
             store = lease_store_of_bytes(
                 snapshot.read_bytes(), out, out=out, snapshot=snapshot, pricing=pricing_of(study)
             )
         except (CampaignLocked, LockUnavailable, SnapshotError, StoreChanged, MergeRefused, OSError, sqlite3.Error):
             return None
     spent = None if store.spend is None else store.spend.total
-    if spent is None:
+    if spent is None or not store.complete:
         return None
-    return DeadStoreSpend(store.lease.lease_id, store.lease.run_key, micro_up(spent), store.charged, interrupted)
+    return DeadStoreSpend(store.lease.lease_id, store.lease.run_key, micro_up(spent), store.charged)
 
 
-def _read_dead(out: Path, private: Path, snapshot: Path, study: StudyConfig) -> int:
-    """Snapshot a dead store to `snapshot`, settling a running attempt in a private copy; return how many."""
+def _snapshot_ended(out: Path, snapshot: Path) -> bool:
+    """Snapshot a dead store to `snapshot`; False, with nothing written, when an attempt is still running in it."""
 
-    def read() -> int:
+    def read() -> bool:
         try:
             take_snapshot(out / STATE_FILE, snapshot)
         except AttemptsRunning:
-            return _settled_copy(out, private, snapshot, study.schema, study.campaign.scheduler.max_attempts)[1]
-        return 0
+            return False
+        return True
 
     try:
         with ReaderLock(out):

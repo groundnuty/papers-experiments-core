@@ -42,6 +42,12 @@ class LeaseStore:
     charged: int = 0  # its charged attempts: what a settlement's count is compared with
 
     @property
+    def complete(self) -> bool:
+        """Whether the store holds all its lease spent: its run ended (done, infra_exhausted or harness_error). A store
+        whose run is pending had attempts left, and a lost federation's snapshot of it can miss the attempts after."""
+        return self.status.get(self.lease.run_key) in ("done", "infra_exhausted", "harness_error")
+
+    @property
     def name(self) -> str:
         """How a message names the store: its lease and run, never its path."""
         return f"the store of lease {self.lease.lease_id} (run {self.lease.run_key})"
