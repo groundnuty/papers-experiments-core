@@ -198,6 +198,17 @@ def tags_in(cmdline: bytes, environ: bytes, tags: Collection[str]) -> frozenset[
     return frozenset(t for t in tags if any(e.startswith(t) for e in entries) or any(t in a for a in args))
 
 
+def parse_uids(text: str) -> tuple[int, int] | None:
+    """The real and the effective uid of `/proc/<pid>/status` (the first two fields of `Uid:`), None when the line is
+    missing or they are not numbers."""
+    for line in text.splitlines():
+        if line.startswith("Uid:"):
+            parts = line.split()
+            ok = len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit()
+            return (int(parts[1]), int(parts[2])) if ok else None
+    return None
+
+
 def cgroup_path(text: str) -> str | None:
     """The cgroup v2 path of `/proc/<pid>/cgroup` (its `0::<path>` line), None on a v1 or hybrid host."""
     for line in text.splitlines():
@@ -221,6 +232,7 @@ __all__ = [
     "parse_stat",
     "parse_threads",
     "parse_uid",
+    "parse_uids",
     "stat_value",
     "tags_in",
 ]
