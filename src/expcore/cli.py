@@ -14,7 +14,8 @@ A thin shell; the logic is in the packages.
     merge OUT SHARD_OUT...
                     merge the outputs of a campaign's shards into one batch under OUT (normally STUDY/out), refusing
                     shards that are not one campaign run against one environment; check, analyze and report then read
-                    it as they read any batch
+                    it as they read any batch; with `--ledger LEDGER`, merge an elastic campaign by run: the lease
+                    stores of every run's counted lease into the batch, every other lease store as evidence
     check BATCH     the replay check over a batch of records (the study is found above the batch), with a copy of
                     the campaign store that the analysis reads instead of the live one
     analyze STUDY   refuse without a current replay check; then export, scores (derived from the records anew each time,
@@ -195,6 +196,11 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--study", type=Path, help="the study directory (default: the one above OUT)")
     merge.add_argument("--allow-dirty", action="store_true", help="accept code with uncommitted changes")
     merge.add_argument("--code-root", type=Path, help="where the code identity is read from (default: the study)")
+    merge.add_argument(
+        "--ledger",
+        type=Path,
+        help="merge by run: the campaign's ledger; each SHARD_OUT is then a lease store's out/ (expcore-shard/5)",
+    )
     package = commands.add_parser("package", help="package STUDY: build the replication package package.toml lists")
     package.add_argument("study", type=Path, help="a study directory with a package.toml")
     package.add_argument("--out", type=Path, required=True, help="where the archive is written")
@@ -294,11 +300,31 @@ def _selection_refusal(args: argparse.Namespace) -> str | None:
 
 
 def _merge(args: argparse.Namespace) -> int:
+    if args.ledger is not None:
+        return _merge_by_run(args)
     merged = merge_shards(
         args.out, args.shards, study_root=args.study, allow_dirty=args.allow_dirty, code_root=args.code_root
     )
     print(
         f"merged {merged.shards} shards ({merged.runs} runs) into {merged.out}; "
+        f"next: python -m expcore check {merged.out / 'runs'}"
+    )
+    return EXIT_OK
+
+
+def _merge_by_run(args: argparse.Namespace) -> int:
+    from expcore.study.merge_by_run import merge_by_run  # only `--ledger` loads the elastic ledger's modules (C42)
+
+    merged = merge_by_run(
+        args.out,
+        args.shards,
+        ledger=args.ledger,
+        study_root=args.study,
+        allow_dirty=args.allow_dirty,
+        code_root=args.code_root,
+    )
+    print(
+        f"merged {merged.runs} runs by run, with {merged.evidence} leases kept as evidence, into {merged.out}; "
         f"next: python -m expcore check {merged.out / 'runs'}"
     )
     return EXIT_OK

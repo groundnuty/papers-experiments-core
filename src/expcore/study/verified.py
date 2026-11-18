@@ -18,7 +18,9 @@ that the check holds:
 
 A merged batch (`campaign.merge`) has the snapshot of each of its shards instead of one: the check records the SHA-256
 of its merge.json (`check["merge"]`), merge.json records each snapshot's, and each is read once and compared with the
-hash that names it. The records are cross-validated against all the snapshots together.
+hash that names it. The records are cross-validated against all the snapshots together. A batch merged by run (C45,
+`campaign.merged_by_run`) has the snapshot of each run's counted lease, by lease id; the evidence's snapshots are no
+part of what is analysed.
 
 Any mismatch is refused, naming it. With `partial`, an attempt that no replayed record covers is left out of the
 analysis instead, and the report says so, and attempts still running at the check are tolerated.
@@ -34,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.by_run_layout import LEASES_DIR, MERGE_BY_RUN_SCHEMA, is_by_run, snapshot_rel
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.merge import CHECK_KEY, SHARDS_DIR, MergeRefused, read_merge
 from expcore.campaign.shard import MERGE_FILE
@@ -131,15 +134,18 @@ def _load_shards(batch: Path, merge: Any, schema: FactorSchema) -> tuple[dict[in
             "the replay check's record of the merge was altered; make it again with `python -m expcore check`"
         )
     try:
-        document = read_merge(_read_verified(out, MERGE_FILE, expected), MERGE_FILE)
+        raw = _read_verified(out, MERGE_FILE, expected)
+        by_run = is_by_run(raw)  # a merge by run (C45) keeps each counted lease's snapshot under its lease id
+        document = _read_by_run(raw) if by_run else read_merge(raw, MERGE_FILE)
     except MergeRefused as error:
         raise Unverified(str(error)) from None
     snapshots: dict[int | None, StoreSnapshot] = {}
     try:
-        for shard in document["shards"]:
-            rel = f"{SHARDS_DIR}/{shard['index']}/{SNAPSHOT_FILE}"
+        for shard in _entries(document):
+            key = shard["lease_id"] if by_run else shard["index"]
+            rel = snapshot_rel(LEASES_DIR, key) if by_run else f"{SHARDS_DIR}/{shard['index']}/{SNAPSHOT_FILE}"
             try:
-                snapshots[shard["index"]] = StoreSnapshot(_read_verified(out, rel, shard["snapshot_sha256"]), schema)
+                snapshots[key] = StoreSnapshot(_read_verified(out, rel, shard["snapshot_sha256"]), schema)
             except SnapshotError as error:
                 raise Unverified(f"{rel}: {error}") from None
     except Unverified:
@@ -147,6 +153,18 @@ def _load_shards(batch: Path, merge: Any, schema: FactorSchema) -> tuple[dict[in
             opened.close()
         raise
     return snapshots, document
+
+
+def _read_by_run(raw: bytes) -> dict:
+    """merge.json of a batch merged by run, validated; its reader is imported here, on that branch only (C42)."""
+    from expcore.campaign.merged_by_run import read_by_run
+
+    return read_by_run(raw, MERGE_FILE)
+
+
+def _entries(document: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The snapshots merge.json lists: a merge of shards' `shards`, a merge by run's counted `leases` (C45)."""
+    return document["leases"] if document.get("schema") == MERGE_BY_RUN_SCHEMA else document["shards"]
 
 
 def _parse(rel: str, raw: bytes) -> RunRecord:
@@ -273,5 +291,5 @@ def _cross_validated(
                     "no replayed record covers it; pass --partial to leave it out"
                 )
             excluded.append(row["run_key"])
-    shards = () if document is None else tuple(document["shards"])
+    shards = () if document is None else tuple(_entries(document))
     return VerifiedBatch(dict(snapshots), records, running, tuple(sorted(set(excluded))), held, shards, document)

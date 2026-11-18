@@ -69,6 +69,8 @@ from pathlib import Path
 from typing import Any
 
 from expcore.accounting import condition_accounting
+from expcore.campaign.balance import balance_of
+from expcore.campaign.by_run_layout import MERGE_BY_RUN_SCHEMA, is_by_run
 from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import (
     EXPORT_FINGERPRINT,
@@ -79,7 +81,7 @@ from expcore.campaign.export import (
     stored_fingerprint_sha256,
     verify_export_fingerprint,
 )
-from expcore.campaign.export_join import join_exports
+from expcore.campaign.export_join import FEDERATION_KEY, LOST_KEY_FLAG, SITE_KEY, by_run_export, join_exports
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, fingerprint_sha256, shard_manifest
@@ -118,7 +120,7 @@ from expcore.provenance.environment import EnvironmentUnknown, differences, envi
 from expcore.readlog.scan import SCAN_VERSION
 from expcore.readlog.sensitivity import ReadLogAnalysis, read_log_analysis
 from expcore.records.build import CORE_DISTRIBUTION
-from expcore.records.record import RunRecord
+from expcore.records.record import RunRecord, is_record_name
 from expcore.records.rescore import rescore, scorer_name, scorer_version
 from expcore.replay.check import (
     CHECK_FILE,
@@ -133,6 +135,7 @@ from expcore.replay.native import has_native_parser
 from expcore.replay.side_file_placement import settle_side_files
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
+from expcore.stats.federation_effect import FederationAnalysis, federation_analysis
 from expcore.stats.ratio import OMIT_NONE
 from expcore.stats.reruns import difference as reruns_difference
 from expcore.stats.reruns import missing_table, ran_reruns
@@ -201,6 +204,9 @@ class StudyAnalysis:
     read_log: ReadLogAnalysis | None = (
         None  # a batch whose records carry `read_log`: the scan's verdicts and rerun (S20)
     )
+    # a batch merged by run (C45): its runs' balance over sites and federations, and the federation-effect rerun
+    balance: Mapping[str, Any] | None = None
+    federation: FederationAnalysis | None = None
 
 
 def out_dir(study: StudyConfig | StudyIdentity) -> Path:
@@ -753,6 +759,8 @@ def _check_merged(study: StudyIdentity, directory: Path, code: Mapping[str, Any]
     hashes that file holds."""
     out = out_dir(study)
     raw = (out / MERGE_FILE).read_bytes()
+    if is_by_run(raw):  # an elastic campaign merged by run (C45); every other merged batch reads as before
+        return _check_merged_by_run(study, directory, code, partial, raw)
     try:
         merged = read_merge(raw, out / MERGE_FILE)
         loaded = load_study(study.root) if merged["rule"] == RULE_SELECTION else None
@@ -781,6 +789,56 @@ def _check_merged(study: StudyIdentity, directory: Path, code: Mapping[str, Any]
     check[MERGE_KEY] = {"file": MERGE_FILE, "sha256": hashlib.sha256(raw).hexdigest(), "partial": partial}
     write_check(directory, check)
     return check
+
+
+def _check_merged_by_run(
+    study: StudyIdentity, directory: Path, code: Mapping[str, Any], partial: bool, raw: bytes
+) -> dict[str, Any]:
+    """The replay check of a batch merged by run (C45, `campaign.merged_by_run`): merge.json is bound by its hash, the
+    ledger snapshot and every lease snapshot are compared with the hashes it names, merge.json is rebuilt from them and
+    the study's plan and must be that document, each counted store ran under the environment in use, and the records
+    of the counted leases are replayed as one batch. The evidence's records are not in the batch. The merge by run's
+    modules are imported here, on its branch only, so today's forms load nothing of the elastic ledger (C42)."""
+    from expcore.campaign.lease_facts import record_leases
+    from expcore.campaign.merge_by_run import require_records
+    from expcore.campaign.merged_by_run import read_by_run, verify_by_run
+
+    out = out_dir(study)
+    loaded = load_study(study.root)
+    try:
+        document = read_by_run(raw, out / MERGE_FILE)
+        counted = verify_by_run(document, out, loaded.manifest, pricing_of(loaded))
+    except MergeRefused as error:
+        raise Refused(str(error)) from None
+    env = environment_like(study, campaign_environment(counted[0].fingerprint))
+    for store in counted:
+        changed = differences(campaign_environment(store.fingerprint), env)
+        if changed:
+            raise Refused(
+                f"{store.name}: its campaign ran under another environment than this check would; check under the "
+                "campaign's environment:\n  " + "\n  ".join(changed)
+            )
+    try:  # before anything is replayed: every record is a counted lease's own, by path and by the lease it names
+        require_records(counted, record_leases(directory, _record_paths(directory)))
+    except MergeRefused as error:
+        raise Refused(str(error)) from None
+    import_what_the_records_need(study, directory)
+    _settle_merged_side_files(study, directory)
+    check = verify_batch(
+        directory, code=code, hashed_only=[MARKER_PATTERN], environment=env, side_files=study.side_files
+    )
+    try:  # the records replayed are exactly the counted leases': no evidence's, none missing
+        require_records(counted, record_leases(directory, check["replayed"]))
+    except MergeRefused as error:
+        raise Refused(str(error)) from None
+    check[MERGE_KEY] = {"file": MERGE_FILE, "sha256": hashlib.sha256(raw).hexdigest(), "partial": partial}
+    write_check(directory, check)
+    return check
+
+
+def _record_paths(batch: Path) -> list[str]:
+    """Every record file under a batch, by its path relative to it."""
+    return [str(path.relative_to(batch)) for path in sorted(batch.rglob("*")) if is_record_name(path.name)]
 
 
 def import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
@@ -942,7 +1000,12 @@ def _analyse_loaded(
     if verified.merge is not None:  # what merge.json says must be what its snapshots say, for this plan
         try:
             queries = {index: snapshot.q for index, snapshot in verified.snapshots.items() if index is not None}
-            verify_queried(verified.merge, queries, out, study.manifest, pricing_of(study))
+            if verified.merge.get("schema") == MERGE_BY_RUN_SCHEMA:  # merged by run (C45): rebuilt with its ledger
+                from expcore.campaign.merged_by_run import verify_by_run  # on this branch only (C42)
+
+                verify_by_run(verified.merge, out, study.manifest, pricing_of(study), queries)
+            else:
+                verify_queried(verified.merge, queries, out, study.manifest, pricing_of(study))
         except MergeRefused as error:
             verified.close()
             raise Refused(str(error)) from None
@@ -999,7 +1062,9 @@ def _analyse_loaded(
     seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
     scanned = read_log_analysis(runs, rows, absent, study.prereg)  # None for a batch with no `read_log` record (S20)
     both = guards_analysis(rows, absent, study.prereg, egress, guard, seen, scanned)  # None unless two guards checked
-    _require_declared_reruns(study, ran_reruns(egress, guard, seen, both, scanned))
+    balance = balance_of(export)  # None unless the batch was merged by run (C45)
+    federation = None if balance is None else federation_analysis(rows, absent, study.prereg, _placement(export))
+    _require_declared_reruns(study, ran_reruns(egress, guard, seen, both, scanned, federation))
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
     return StudyAnalysis(
@@ -1018,7 +1083,14 @@ def _analyse_loaded(
         rescored,
         model_usage=usage,
         read_log=scanned,  # by name, so the order of the fields cannot swap them
+        balance=balance,
+        federation=federation,
     )
+
+
+def _placement(export: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
+    """Each analysed run's site and federation, from an export of a batch merged by run (C45)."""
+    return {entry["run_key"]: (entry[SITE_KEY], entry[FEDERATION_KEY]) for entry in export["analysed_attempts"]}
 
 
 def _model_usage(study: StudyConfig, verified: VerifiedBatch) -> dict[str, Any]:
@@ -1071,7 +1143,36 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
         held = {row["run_key"] for row in snapshot.q("SELECT run_key FROM runs")}
         own = export_run_state(snapshot, excluded={key: why for key, why in left_out.items() if key in held})
         parts[index] = timed_export(own, walls_of(snapshot), verified.record_for)  # the merged export's only (#154)
-    return join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
+    seq_of = {row.key.text: row.seq for row in plan.rows}
+    if verified.merge is None or verified.merge.get("schema") != MERGE_BY_RUN_SCHEMA:
+        return join_exports(parts, seq_of, verified.shards)
+    lost = _lost_runs(verified.merge["exhausted"], plan)  # merged by run (C45): runs exhausted with no store
+    joined = join_exports(parts, {key: seq for key, seq in seq_of.items() if key not in lost}, verified.shards)
+    return by_run_export(joined, verified.shards, verified.merge["spend"], list(lost.values()), seq_of)
+
+
+def _lost_runs(exhausted: Sequence[Mapping[str, Any]], plan: Manifest) -> dict[str, dict[str, Any]]:
+    """The runs merge.json lists as exhausted for their lost leases, as a store's export lists an exhausted run: its
+    identity from the plan, its charged attempts, a reason per lease, an admission unknown per attempt, and its last
+    lease's id, federation and site (C45)."""
+    rows = {row.key.text: row for row in plan.rows}
+    found = {}
+    for entry in exhausted:
+        key = rows[entry["run_key"]].key
+        found[key.text] = {
+            "run_key": key.text,
+            "digest": key.digest,
+            "condition": entry["condition"],
+            "factors": dict(key.factors),
+            "attempts": entry["attempts"],
+            "reasons": list(entry["reasons"]),
+            "admissions": [None] * entry["attempts"],
+            "lease_id": entry["lease_id"],
+            FEDERATION_KEY: entry["federation"],
+            SITE_KEY: entry["site"],
+            LOST_KEY_FLAG: True,
+        }
+    return found
 
 
 def _require_campaign(export: Mapping[str, Any], verified: VerifiedBatch) -> None:
@@ -1133,6 +1234,8 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         | ({} if analysis.visibility is None else {"process_visibility": _visibility_summary(analysis.visibility)})
         | ({} if analysis.model_usage is None else {"model_usage": analysis.model_usage})
         | ({} if analysis.read_log is None else {"read_log": _read_log_summary(analysis.read_log)})
+        | ({} if analysis.balance is None else {"balance": analysis.balance})
+        | ({} if analysis.federation is None else {"federation": _federation_summary(analysis.federation)})
         | _declared_reruns_entry(analysis.study.prereg.sensitivity_reruns)
         | ({} if analysis.rescore is None else {"rescore": dict(analysis.rescore)})
     )
@@ -1246,6 +1349,21 @@ def _visibility_summary(seen: VisibilityAnalysis) -> dict[str, Any]:
     }  # fmt: skip
 
 
+def _federation_summary(federation: FederationAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of the federation-effect rerun of a batch merged by run (C45): each adjusted outcome's
+    fit, the outcomes left as they are and why, and the contrasts refit on the adjusted outcomes, or why there are
+    none. The primary analysis's own entries are untouched by it."""
+    sensitivity = federation.sensitivity
+    return {
+        "fits": [dataclasses.asdict(fit) for fit in federation.fits],
+        "unadjusted": [{"outcome": outcome, "reason": reason} for outcome, reason in federation.unadjusted],
+        "sensitivity": None
+        if sensitivity is None
+        else {"contrasts": sensitivity.contrasts, **_holm_entries(sensitivity)},
+        "sensitivity_refused": federation.refused,
+    }
+
+
 def _read_log_summary(scanned: ReadLogAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds of a batch whose records carry the `read_log` instrument (S20): the scan's version,
     each analysed run's verdict (its hits, by cell, kind and fixed name, never the cell's text) and the sensitivity
@@ -1288,6 +1406,8 @@ def report_text(analysis: StudyAnalysis) -> str:
         visibility=analysis.visibility,
         model_usage=analysis.model_usage,
         read_log=analysis.read_log,
+        balance=analysis.balance,
+        federation=analysis.federation,
     )
 
 
