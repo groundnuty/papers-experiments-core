@@ -48,8 +48,10 @@ OPTIONAL = (
     "post_run_timeout_s",
     "expect_render_identity",
     "pass_env",
-)  # the rest of shards.py's optional keys: the study's own guard, post-run script and expected render identity, and
-# the operator's variables its dispatchers are passed (names only: `pin` reads the values)
+    "home_files",
+)  # the rest of shards.py's optional keys: the study's own guard, post-run script and expected render identity, the
+# operator's variables its dispatchers are passed (names only: `pin` reads the values) and the operator's key tree
+# (`home_files`, O63: a path, which a shard step and a worker (`fleetworker.py`) put in their dispatcher's home)
 SCRIPT = Path(__file__).resolve().parent / "shards.py"
 
 

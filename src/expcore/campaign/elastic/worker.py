@@ -44,7 +44,7 @@ from typing import Any, Protocol
 
 from expcore.campaign.elastic import channel as ch
 from expcore.campaign.elastic.config import micro_up, usd_of
-from expcore.campaign.run_lease import LeaseError, RunLease, read_lease
+from expcore.campaign.run_lease import LEASE_JOURNAL, LeaseError, RunLease, read_lease
 
 BEAT_S = 30.0
 POLL_S = 5.0
@@ -83,15 +83,17 @@ class _Process:
 
 
 class ProcessRunner:
-    """`<prefix> <study> --lease <file>`, its output to the lease's log, in a session of its own."""
+    """`<prefix> <study> --lease <file> --spend-journal <place>/spend.jsonl`, its output to the lease's log, in a
+    session of its own."""
 
     def __init__(self, prefix: Sequence[str]) -> None:
         self.prefix = tuple(prefix)
 
     def start(self, study: Path, lease_file: Path, log: Path) -> Handle:
+        journal = lease_file.parent / LEASE_JOURNAL  # beside the study copy: what a dead store's reader reads
         with log.open("ab") as sink:
             process = subprocess.Popen(
-                [*self.prefix, str(study), "--lease", str(lease_file)],
+                [*self.prefix, str(study), "--lease", str(lease_file), "--spend-journal", str(journal)],
                 cwd=study.parent,
                 stdin=subprocess.DEVNULL,
                 stdout=sink,

@@ -3,6 +3,7 @@ its end, and a replayed lease, another federation's or a tombstone never run."""
 
 import hashlib
 import json
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from expcore.campaign.elastic import Ledger, LedgerConfig, ledger_runs
 from expcore.campaign.elastic import channel as ch
 from expcore.campaign.elastic.dispatch import TICK_S, Dispatcher
 from expcore.campaign.elastic.records import Lease
-from expcore.campaign.elastic.worker import Occupied, Worker, WorkerError, main
+from expcore.campaign.elastic.worker import Occupied, ProcessRunner, Worker, WorkerError, main
 from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.run_lease import read_lease
 from expcore.study.config import load_study
@@ -387,3 +388,21 @@ def test_c44_a_take_whose_state_landed_before_its_fsync_failed_still_runs_the_le
     assert failed
     assert runner.started == [1]
     assert outbox(channel, ch.completion_name(1))["state"] == "done"
+
+
+def test_a_lease_run_has_a_spend_journal_beside_its_study_copy(tmp_path):
+    """The real runner starts `<prefix> <study copy> --lease <file> --spend-journal <place>/spend.jsonl`: the journal
+    a dead store's reader (`dead_store_spend`) takes from beside the study copy."""
+    place = tmp_path / "lease-000000000001"
+    (place / "study").mkdir(parents=True)
+    keep = "import json, sys; json.dump(sys.argv[1:], open('argv.json', 'w'))"
+    handle = ProcessRunner([sys.executable, "-c", keep]).start(place / "study", place / "lease.json", place / "run.log")
+    assert handle.wait(60) == 0
+    argv = json.loads((place / "argv.json").read_text(encoding="utf-8"))
+    assert argv == [
+        str(place / "study"),
+        "--lease",
+        str(place / "lease.json"),
+        "--spend-journal",
+        str(place / "spend.jsonl"),
+    ]

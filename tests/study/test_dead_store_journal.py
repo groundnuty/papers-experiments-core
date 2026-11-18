@@ -19,7 +19,7 @@ from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.run_lease import LEASE_JOURNAL
 from expcore.study.config import load_study
 from expcore.study.merge_by_run import dead_store_spend
-from expcore.study.pipeline import campaign_fingerprint
+from expcore.study.pipeline import campaign_fingerprint, campaign_identity
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
@@ -118,7 +118,7 @@ def test_a_store_that_ended_is_read_without_its_journal(ended):
 
 
 def test_a_store_snapshotted_mid_run_is_read_with_its_journal(base, ended):
-    """The snapshot holds the last attempt running; the journal saw it end. The figure is the whole lease's, never
+    """C46: The snapshot holds the last attempt running; the journal saw it end. The figure is the whole lease's, never
     below what the ended store reads."""
     place = _mid_run(base, ended, "mid-run")
     found = _read(place)
@@ -130,8 +130,8 @@ def test_a_store_snapshotted_mid_run_is_read_with_its_journal(base, ended):
 
 
 def test_attempts_the_snapshot_lacks_raise_the_spend_and_the_charged_attempts(base, ended):
-    """An attempt begun after the snapshot, which the journal saw end as an infrastructure failure, is spend the store
-    does not hold; its kind is not journaled, so it is counted as charged (the ledger's own charge is as high)."""
+    """C46: An attempt begun after the snapshot, which the journal saw end as an infrastructure failure, is spend the
+    store does not hold; its kind is not journaled, so it is counted as charged (the ledger's own charge is as high)."""
     place = _mid_run(base, ended, "later-attempt")
     before = _read(place)
     _append(place, *_later_attempt(place, "infra_fail"))
@@ -155,7 +155,7 @@ def test_a_later_attempt_still_running_when_the_federation_was_lost_is_spend_and
 
 
 def test_a_journal_of_another_lease_is_ignored(base, ended, clean_environment):
-    """A journal that names another lease's store (its shard spec) is never read: the mid-run store gives no figure."""
+    """C46: A journal that names another lease's store (its shard spec) is never read: the mid-run store gives none."""
     place = _mid_run(base, ended, "foreign-journal")
     other = _run_lease(base, clean_environment, "other-lease", ("fed-a1", "fed-a2"))
     shutil.copyfile(other / LEASE_JOURNAL, place / LEASE_JOURNAL)
@@ -185,7 +185,7 @@ def test_a_mid_run_store_with_no_journal_gives_no_figure(base, ended):
 
 
 def test_a_torn_last_line_is_not_read(base, ended):
-    """A last line a kill cut short was never spent (`read_journal`): the figure is the one without it."""
+    """C46: A last line a kill cut short was never spent (`read_journal`): the figure is the one without it."""
     place = _mid_run(base, ended, "torn")
     _append(place, *_later_attempt(place, "infra_fail"))
     whole = _read(place)
@@ -209,3 +209,19 @@ def test_the_journal_read_never_writes_beside_the_store(base, ended):
     before = {p: p.read_bytes() for p in sorted(place.rglob("*")) if p.is_file()}
     assert _read(place) is not None
     assert {p: p.read_bytes() for p in sorted(place.rglob("*")) if p.is_file()} == before
+
+
+def test_what_a_federation_joins_with_is_what_its_lease_store_pins(ended):
+    """The fingerprint and environment identity `campaign_identity` reads beside a federation's platform file are the
+    lease's `campaign_sha256` and the identity the lease store pins, so a join with them is never refused at merge."""
+    with pytest.MonkeyPatch.context() as patch:
+        declaring(patch, IDENTITY)
+        fingerprint, environment = campaign_identity(ended / "study")
+    store = sqlite3.connect(ended / "study" / "out" / "state.sqlite")
+    try:
+        pinned = json.loads(store.execute("SELECT value FROM meta WHERE key='environment_identity'").fetchone()[0])
+    finally:
+        store.close()
+    assert environment == pinned == IDENTITY
+    lease = json.loads((ended / "lease.json").read_text(encoding="utf-8"))
+    assert fingerprint_sha256(fingerprint) == lease["campaign_sha256"]
