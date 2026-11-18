@@ -14,6 +14,8 @@ file's `[sandbox]` table, and stop it.
 import dataclasses
 import json
 import os
+import socket
+import stat
 import sys
 
 import pytest
@@ -33,6 +35,8 @@ from expcore_onedata.sandbox.sandbox import DockerSandbox
 PLATFORM = os.environ.get("EXPCORE_LIVE_PLATFORM")
 needs_platform = pytest.mark.skipif(not PLATFORM, reason="EXPCORE_LIVE_PLATFORM is not set")
 FOREIGN_UID = 12345  # a uid that is not the declared agent uid, for a send from "another agent"
+UNIX_SOCKET_PATH_MAX = 107  # a Unix socket's address, without its NUL: what Apptainer's collector must fit under
+LONG_ROOT_COMPONENT = "w" * 100  # a work root's last directory, long enough that the run's socket path passes it
 SEND = (
     "import importlib.util as u\n"
     f"spec = u.spec_from_file_location({paths.CLIENT_MODULE!r}, {paths.CLIENT!r})\n"
@@ -169,3 +173,31 @@ def test_a_collector_killed_during_the_run_gives_an_unknown_log_and_the_client_f
     )
     assert not found.intact
     assert reader.NOT_CLOSED in found.problems
+
+
+@needs_platform
+def test_a_host_socket_path_over_107_bytes_still_starts_with_the_canary_sent(config, host, tmp_path):
+    root = tmp_path / LONG_ROOT_COMPONENT
+    root.mkdir()
+    pinned = dataclasses.replace(
+        config.sandbox, work_root=root, readlog_collector_sha256=files.sha256_of(files.collector_file())
+    )
+    spec = SandboxSpec(run_key=f"live-readlog-long-{os.getpid()}", mode=DataPathMode.NONE)
+    started = DockerSandbox.start(host, pinned, spec)  # raises when the canary cannot be sent from the agent's cell
+    try:
+        host_socket = started.dir / "readlog-sock" / "sock"
+        assert len(os.fsencode(host_socket)) > UNIX_SOCKET_PATH_MAX
+        # the collector bound it at its own short path in its container: the host path is only a bind source
+        assert stat.S_ISSOCK(os.stat(host_socket).st_mode)
+        # the premise: the kernel refuses a socket address as long as the host path
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe, pytest.raises(OSError, match="too long"):
+            probe.bind(os.fspath(host_socket) + ".probe")
+        assert started.metadata()["read_log"]["canary"] is True
+        collected = tmp_path / "collected"
+        collected.mkdir()
+        started.collect(collected)
+        found = reader.read_log(started.read_log(), started.readlog_nonce, expected_peer_uid=config.sandbox.agent_uid)
+        assert found.intact, found.problems
+        assert not found.reads  # the canary alone: the agent read nothing
+    finally:
+        started.stop()
