@@ -235,7 +235,7 @@ under one record. One federation's job failing ends one shard's step, never anot
 
 ### The elastic controller
 
-Step 5 of #462 (C43; `fleetcontrol.py`, `fleetobserve.py`, `fleetexecute.py`; the decision in
+Step 5 of #462 (C45; `fleetcontrol.py`, `fleetobserve.py`, `fleetexecute.py`; the decision in
 `expcore.campaign.elastic.control`; README, "The elastic fleet's controller"). It runs where the campaign's ledger is,
 in the process that drives the ledger (the ledger's lock admits one), and keeps each site's fleet at a target.
 

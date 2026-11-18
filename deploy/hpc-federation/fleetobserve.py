@@ -1,4 +1,4 @@
-"""fleetobserve.py: one read of a site for the elastic fleet's controller (#462 step 5, C43; README.md, "The elastic
+"""fleetobserve.py: one read of a site for the elastic fleet's controller (#462 step 5, C45; README.md, "The elastic
 fleet's controller"), run on the site's login node by `fleetcontrol.py observe --fleet DIR`, with `site.env` exported.
 
 It reads, and never writes, submits or cancels:

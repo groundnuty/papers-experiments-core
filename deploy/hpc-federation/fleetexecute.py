@@ -1,4 +1,4 @@
-"""fleetexecute.py: what the elastic fleet's controller does with a decision (#462 step 5, C43; `fleetcontrol.py`).
+"""fleetexecute.py: what the elastic fleet's controller does with a decision (#462 step 5, C45; `fleetcontrol.py`).
 
 Every action is the call an operator makes by hand, rendered once (`render`): what the dry run prints is exactly what
 the executor runs. On a site's login node: `fleet.py --fleet F add K`; a retirement's `shards.py collect --roots-only

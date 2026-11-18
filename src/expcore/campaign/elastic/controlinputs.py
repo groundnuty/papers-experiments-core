@@ -1,5 +1,5 @@
 # Provenance: new
-"""What the elastic controller reads (#462 step 5, C43): each site's declared settings (`SiteSettings`),
+"""What the elastic controller reads (#462 step 5, C45): each site's declared settings (`SiteSettings`),
 one read of a site and its fleet's members (`SiteView`, `Member`), and the ledger's view (`LedgerView`, `ledger_view`),
 from the ledger the controller drives or from a read-only view of it that takes no lock (`read_only`, for a dry run
 beside the process that drives the ledger).

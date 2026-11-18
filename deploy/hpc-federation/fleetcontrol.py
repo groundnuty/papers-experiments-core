@@ -1,4 +1,4 @@
-"""fleetcontrol.py: the elastic fleet's provisioning controller (#462 step 5, C43; README.md, "The elastic fleet's
+"""fleetcontrol.py: the elastic fleet's provisioning controller (#462 step 5, C45; README.md, "The elastic fleet's
 controller"). `expcore.campaign.elastic.control` decides; this reads the sites, and runs or prints what it decided.
 
     <python> -I -B deploy/hpc-federation/fleetcontrol.py observe --fleet DIR    # on a site's login node, read only

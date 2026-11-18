@@ -1,4 +1,4 @@
-"""What the elastic controller reads of a ledger (C43): the demand, which lease holds each federation's slot, the
+"""What the elastic controller reads of a ledger (C45): the demand, which lease holds each federation's slot, the
 budget left, since when each federation is idle; and a dry run's read-only view, which takes no lock and writes
 nothing."""
 
@@ -8,8 +8,8 @@ from expcore.campaign.elastic import Ledger, SiteReading
 from expcore.campaign.elastic.control import ledger_view, read_only
 
 
-def test_c43_the_ledger_view_gives_slots_held_leases_in_flight_budget_left_and_idle_since(tmp_path):
-    """C43: one lease in flight and one completed: the first federation holds a sent lease, the second is idle since its
+def test_c45_the_ledger_view_gives_slots_held_leases_in_flight_budget_left_and_idle_since(tmp_path):
+    """C45: one lease in flight and one completed: the first federation holds a sent lease, the second is idle since its
     report; the budget left is max_usd less every lease's charge; the hard term is the ledger's."""
     runs = plan(models=("m1",), tasks=3)
     ledger, clock = make(tmp_path, runs=runs, max_usd=100.0, grants_usd={"m1": 10.0}, per_model_usd={"m1": 50.0})
@@ -33,8 +33,8 @@ def test_c43_the_ledger_view_gives_slots_held_leases_in_flight_budget_left_and_i
     ledger.close()
 
 
-def test_c43_a_dry_runs_read_only_view_reads_beside_the_driver_and_never_writes(tmp_path):
-    """C43: while the driving process holds the ledger's lock, the read-only view reads the same demand and slots, and
+def test_c45_a_dry_runs_read_only_view_reads_beside_the_driver_and_never_writes(tmp_path):
+    """C45: while the driving process holds the ledger's lock, the read-only view reads the same demand and slots, and
     the ledger's file is byte for byte what it was."""
     ledger, clock = make(tmp_path)
     join(ledger, clock, "fed-1")
