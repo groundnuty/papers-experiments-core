@@ -554,17 +554,14 @@ def test_separate_up_holds_the_agents_node_in_a_second_job_read_back_like_the_fi
     assert (facts.job, facts.het_group) == ("4343", None)
 
 
-def test_separate_agents_job_recorded_otherwise_is_cancelled_with_the_first_and_down_removes_the_root(
-    hpc, tmp_path, site
-):
-    """O57: the agent's job recorded otherwise than asked is cancelled by its own id, and so is the services' job, by
-    its own (up leaves no held job pending); the state still records it, and down, which finds both gone, removes the
-    root."""
+def test_separate_agents_job_recorded_otherwise_is_cancelled_alone_and_down_cancels_the_first(hpc, tmp_path, site):
+    """O57: the agent's job recorded otherwise than asked is cancelled by its own id, the services' job kept for down,
+    which cancels it by its own id and removes the root."""
     fake = FakeSlurm(component_recorded={("4343", 0): {"MinMemoryNode": "1G"}})
     rig = Rig(hpc, tmp_path, site, placement="separate", fake=fake)
     with pytest.raises(hpc.slurm.SlurmError, match="MinMemoryNode"):
         rig.up()
-    assert fake.cancelled == ["4343", "4242"]
+    assert fake.cancelled == ["4343"]
     assert rig.state()["allocation"]["job"] == "4242"
     rig.driver.down()
     assert fake.cancelled == ["4343", "4242"]

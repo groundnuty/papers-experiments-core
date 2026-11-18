@@ -223,8 +223,7 @@ its business, whatever it runs. It never reads or prints a node's name into a me
 - **A wait that fails releases every held job of that `up`.** Under `"separate"` the services' job and the agent's own are
   waited for in turn, and a job that does not start in time or ends before it ran is cancelled by its wait. `up` then
   cancels the other held job too, still queued or running, by its own id and only if it still carries the name `up`
-  gave it (Slurm reuses ids: a job of another name is never cancelled), and the failure says which were released. The
-  same goes for the services' job when the agent's own is refused by sbatch. A cancel that fails, or a record that
+  gave it (Slurm reuses ids: a job of another name is never cancelled), and the failure says which were released. A cancel that fails, or a record that
   cannot be read, is named in the failure, and `down` releases it.
 
 In a fleet each member's `up` is its own, so each reads the members already up: with `HPC_FLEET_PARALLEL` at 1 (the

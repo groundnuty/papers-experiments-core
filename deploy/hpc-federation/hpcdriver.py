@@ -35,7 +35,7 @@ from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
 from hpclaunch import Launcher, StateStore, client_log
 from hpcsettings import HpcSettings, Site
-from hpcslurm import READBACK, WAITING_STATES, Allocation, Client, Shape, Slurm, SlurmError
+from hpcslurm import ENDED_STATES, READBACK, Allocation, Client, Shape, Slurm, SlurmError
 
 HERE = Path(__file__).resolve().parent
 CORE_MISMATCH = 97  # the exit status of a core step whose interpreter imports another core
@@ -410,7 +410,11 @@ class Driver(Down):
         excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
         state = self.store.create(self.initial_state(site, tree, len(excluded)))
         self.make_storage(state)  # recorded above, made before any job exists to bill for it
-        held = self.hold(self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded))
+        asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
+        held = [(self.submit(asked, "allocation"), asked)]
+        if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
+            held.append((self.submit(alone, "sandbox"), alone))
+        self.wait_held(held)
         # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
         records = [(job, shape, record) for job, wanted in held for shape, record in zip(
             wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
@@ -427,31 +431,25 @@ class Driver(Down):
         retried = self.retried()
         return f"{out}\n{retried}\n{self.start_relay()}" if retried else f"{out}\n{self.start_relay()}"
 
-    def hold(self, asked: Allocation, alone: Optional[Allocation]) -> List[Tuple[str, Allocation]]:
-        """Submit every held job of this up (the services', and under sandbox_placement "separate" the agent's own, a
-        second one exactly as the first) and wait for each to run, at the queue bound. A submit or a wait that fails
-        (a job past the bound, or ended before it ran, cancels itself) releases every held job of this up still queued
-        or running, by its own id, and the failure ends with what was said of them: a held job left pending would start
-        and bill with no federation."""
-        held: List[Tuple[str, Allocation]] = []
+    def wait_held(self, held: Sequence[Tuple[str, Allocation]]) -> None:
+        """Wait for each held job of this up to run, in turn, at the queue bound. A wait that fails (a job past the
+        bound, or ended before it ran, cancels itself) releases every held job of this up that has not ended, by its
+        own id, and the failure ends with what was said of them: a job left queued would start and bill with no
+        federation."""
         try:
-            held.append((self.submit(asked, "allocation"), asked))
-            if alone is not None:
-                held.append((self.submit(alone, "sandbox"), alone))
             for job, wanted in held:
                 self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name, note=self.queue_note(wanted))
         except SlurmError as error:
-            said = self.release_held(held) if held else ""
+            said = self.release_held(held)
             if not said:  # nothing was left to release (one held job, cancelled by its own wait): the failure as it was
                 raise
             raise SlurmError(f"{error}; {said}") from None
-        return held
 
     def release_held(self, held: Sequence[Tuple[str, Allocation]]) -> str:
-        """Release what a failed hold leaves: each of this up's own held jobs that is still queued or running, by its
-        id (`release`). A job Slurm no longer knows, or that has ended, needs none (the wait that failed cancelled it);
-        one that carries another name now is another's, since Slurm reuses ids, and is never cancelled; one whose
-        record cannot be read is not guessed at: `down` checks it the same way. Empty when nothing was left to say."""
+        """Release what a failed wait leaves: each of this up's own held jobs that has not ended, by its id (`release`).
+        A job Slurm no longer knows, or that has ended, needs none (the wait that failed cancelled it); one that carries
+        another name now is another's, since Slurm reuses ids, and is never cancelled; one whose record cannot be read
+        is not guessed at: `down` checks it the same way. Empty when nothing was left to say."""
         ours, other, unread = [], [], []
         for job, wanted in held:
             try:
@@ -461,7 +459,7 @@ class Driver(Down):
                 continue
             if records and records[0].get("JobName") != wanted.name:
                 other.append(job)
-            elif any(record.get("JobState") in (*WAITING_STATES, "RUNNING") for record in records):
+            elif any(record.get("JobState") not in ENDED_STATES for record in records):
                 ours.append(job)
         said = [self.release(ours)] if ours else []
         if other:

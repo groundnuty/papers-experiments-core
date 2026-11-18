@@ -3,7 +3,7 @@ federations of one account" and "Site configuration").
 
 `up` submits every held job (the services', and under sandbox_placement "separate" the agent's own) and then waits for
 each to run, at a bound the site may set (`HPC_QUEUE_TIMEOUT_S`, seconds; 1800 when unset). A wait that fails releases
-every held job of this up by its own id, and never one that is not its own.
+every held job of this up that has not ended, by its own id, and never one that is not its own.
 
 Slurm is the fake of hpc_fed_support."""
 
@@ -105,11 +105,12 @@ def test_o57_a_stale_queue_bound_never_stops_a_command_that_does_not_wait(hpc, t
 # -- the held jobs of one up ----------------------------------------------------------------------------------------
 
 
-def test_o57_the_services_job_timing_out_releases_the_agents_job_too(hpc, tmp_path, site):
+@pytest.mark.parametrize("agent_state", ["PENDING", "SUSPENDED"])
+def test_o57_the_services_job_timing_out_releases_the_agents_job_too(hpc, tmp_path, site, agent_state):
     """O57: under "separate" the services job that never starts is cancelled by the wait, and the agent's own held job,
-    submitted with it, is cancelled by its id too: none of this up's jobs is left to start and bill with no
-    federation. The failure says what was released."""
-    fake = separate("PENDING", "PENDING")
+    submitted with it and in any state short of ended, is cancelled by its id too: none of this up's jobs is left to
+    start and bill with no federation. The failure says what was released."""
+    fake = separate("PENDING", agent_state)
     rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
     with pytest.raises(hpc.slurm.SlurmError, match="did not start within 1800 s") as refused:
         rig.up()
@@ -135,25 +136,6 @@ def test_o57_a_held_job_that_ended_before_it_ran_releases_the_other_one(hpc, tmp
     with pytest.raises(hpc.slurm.SlurmError, match="FAILED before it ran"):
         rig.up()
     assert AGENT in fake.cancelled
-
-
-def test_o57_a_second_submit_that_fails_releases_the_first_job(hpc, tmp_path, site):
-    """O57: the agent's own job refused by sbatch leaves the services job submitted a moment before: it is cancelled by
-    its id."""
-    fake = separate("PENDING")
-    rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
-    real = fake.run
-
-    def refusing(argv, timeout):
-        if argv[0] == "sbatch" and fake.submitted:  # the first one went through: the agent's own is refused
-            return hpc.slurm.Completed(1, "", "sbatch: error: invalid memory request\n")
-        return real(argv, timeout)
-
-    fake.run = refusing
-    with pytest.raises(hpc.slurm.SlurmError, match="sbatch failed") as refused:
-        rig.up()
-    assert fake.cancelled == [SERVICES]
-    assert f"the held job(s) {SERVICES} were cancelled" in str(refused.value)
 
 
 def test_o57_a_release_that_fails_is_said_and_left_to_down(hpc, tmp_path, site):
