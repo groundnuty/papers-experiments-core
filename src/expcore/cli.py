@@ -8,7 +8,9 @@ A thin shell; the logic is in the packages.
                     campaign on several hosts); with `--select FACTOR=L1,L2 --shard-label L [--sequential [--after
                     EARLIER_OUT...]]` run only the selected runs, one batch of the campaign (one campaign in batches);
                     with `--spend-journal FILE` journal what it spends to FILE, new, and first count what the journals
-                    beside it hold that the store lacks (a store copied back after a kill)
+                    beside it hold that the store lacks (a store copied back after a kill); with `--lease FILE` run
+                    exactly the one run a ledger's lease names, in a store of its own, with the lease's grant as its
+                    budget and its attempts numbered from the lease's attempt base
     merge OUT SHARD_OUT...
                     merge the outputs of a campaign's shards into one batch under OUT (normally STUDY/out), refusing
                     shards that are not one campaign run against one environment; check, analyze and report then read
@@ -45,6 +47,7 @@ from expcore.campaign.export import ExportError
 from expcore.campaign.factors import PlanError
 from expcore.campaign.lost_spend import LostSpendError
 from expcore.campaign.merge import MergeRefused
+from expcore.campaign.run_lease import read_lease
 from expcore.campaign.scheduler import CampaignLocked
 from expcore.campaign.selection import Selection, SelectionSpec, Spec
 from expcore.campaign.shard import ShardError, ShardSpec
@@ -156,6 +159,14 @@ def build_parser() -> argparse.ArgumentParser:
                 help="with --sequential: an earlier selection's out/ (or its store); give every earlier one",
             )
             command.add_argument(
+                "--lease",
+                type=Path,
+                metavar="FILE",
+                help="run exactly the one run the lease in FILE names (a JSON file a ledger writes), in a store of its "
+                "own: the lease's grant is the run's whole budget, its attempts are numbered from the lease's attempt "
+                "base, and a store takes one lease, once; not combined with --shard or --select",
+            )
+            command.add_argument(
                 "--spend-journal",
                 type=Path,
                 metavar="FILE",
@@ -213,9 +224,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None) -> int:
-    refusal = _selection_refusal(args)
+    refusal = _lease_refusal(args) or _selection_refusal(args)
     if refusal is not None:
         raise ShardError(refusal)
+    lease = None if args.lease is None else read_lease(args.lease)
     shard: Spec | None = None
     if args.shard is not None:
         shard = ShardSpec.parse(args.shard, args.shard_label, wide_label=args.shard_label_wide)
@@ -230,6 +242,7 @@ def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None
         shard=shard,
         after=args.after or (),
         spend_journal=args.spend_journal,
+        lease=lease,
     )
     runs = sum(summary.statuses.values())
     statuses = dict(sorted(summary.statuses.items()))
@@ -253,6 +266,17 @@ def _check_run_options(parser: argparse.ArgumentParser, args: argparse.Namespace
         parser.error("--shard-label and --shard-label-wide need --shard")
     if args.shard_label_wide and args.shard_label is None:
         parser.error("--shard-label-wide needs --shard-label")
+
+
+def _lease_refusal(args: argparse.Namespace) -> str | None:
+    """Why `--lease` does not combine with the options of another form, said as a refusal; None when it does. A lease is
+    a form of its own (C41), and its store is the one run it names."""
+    if args.lease is not None and (args.shard is not None or args.select or args.sequential or args.after):
+        return (
+            "--lease runs one run on a lease, in a store of its own: it cannot be combined with --shard, --select, "
+            "--sequential or --after"
+        )
+    return None
 
 
 def _selection_refusal(args: argparse.Namespace) -> str | None:

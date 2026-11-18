@@ -92,6 +92,9 @@ class RunRecord:
     # Version 3, optional: the instrument that refused the attempt after the run, `{"namespace", "infra_kind",
     # "detail"}` (C31). None when none did; it is then left out of the file, never written as a null.
     instrument_refusal: dict[str, Any] | None = None
+    # Version 3, optional: the lease the attempt ran on (C41, `campaign.run_lease`), a whole number from 1. None for an
+    # attempt that ran on none; it is then left out of the file, never written as a null.
+    lease_id: int | None = None
     schema_version: str = CURRENT
 
     @property
@@ -135,8 +138,8 @@ class RunRecord:
         optional field that holds its default.
 
         A later-added field is dropped when it holds its default; one that holds data cannot be written into a record
-        of an earlier version, and raises. A field the record's own version marks optional (`treatment_targets` and
-        `instrument_refusal`, from version 3) is absent when it holds its default, "not recorded", never written as an
+        of an earlier version, and raises. A field the record's own version marks optional (`treatment_targets`,
+        `instrument_refusal` and `lease_id`, from version 3) is absent when it holds its default, "not recorded", never written as an
         empty value or a null.
         """
         data = dataclasses.asdict(self)

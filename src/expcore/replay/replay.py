@@ -171,7 +171,7 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
         replayed = _build_record(
             result,
             recording,
-            identity=RunIdentity(rec.run_key, rec.factors, rec.attempt),
+            identity=RunIdentity(rec.run_key, rec.factors, rec.attempt, lease_id=rec.lease_id),
             system=_prompt(rec.prompt["system"]),
             user=_prompt(rec.prompt["user"]),
             specs=[ToolSpec(**spec) for spec in rec.tools],
