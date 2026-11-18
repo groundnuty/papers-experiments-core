@@ -130,6 +130,45 @@
    "runs/e5805d6d29b64c284543960693f382f367fbf4e0c0a5812d3d0900a587d4039a/try1/attempt-marker.json",
    "runs/e5805d6d29b64c284543960693f382f367fbf4e0c0a5812d3d0900a587d4039a/try1/e5805d6d29b64c284543960693f382f367fbf4e0c0a5812d3d0900a587d4039a.1.json"
   ],
+  "export": {
+   "first_attempt_keys": [
+    "admission",
+    "attempt",
+    "condition",
+    "digest",
+    "dispatch_seq",
+    "factors",
+    "infra_kind",
+    "lease_outcome",
+    "lease_wait_s",
+    "run_dir",
+    "run_key",
+    "started_at",
+    "treatment"
+   ],
+   "keys": [
+    "format",
+    "factors",
+    "planned_runs",
+    "exhausted_runs",
+    "unfinished_runs",
+    "analysed_attempts",
+    "discarded_usage",
+    "retries_by_kind",
+    "infrastructure_by_condition",
+    "budget_holds",
+    "kinds",
+    "campaign_fingerprint",
+    "shard"
+   ],
+   "shard_keys": [
+    "environment_identity",
+    "shares",
+    "spec",
+    "started_utc"
+   ],
+   "shard_spec": "{\"label\": \"direct\", \"rule\": \"expcore-shard/4: a declared selection of factor levels\", \"select\": {\"access\": [\"direct\"]}, \"sequential\": false}"
+  },
   "fingerprint_sans_environment_sha256": "66ea91066854aed9af88ed7cb229b0e44c3f5b2b841334f1bbb5fbecc3f54b02",
   "meta": {
    "order_rule": "sha256(order_seed|run_key)",
@@ -146,6 +185,32 @@
    "shard_spec",
    "shard_started_utc"
   ],
+  "record": {
+   "keys": [
+    "agent_config",
+    "agent_config_sha256",
+    "attempt",
+    "clock",
+    "code",
+    "core_version",
+    "factors",
+    "failed_request",
+    "instruments",
+    "outcome",
+    "prompt",
+    "redacted_paths",
+    "route",
+    "run_key",
+    "schema_version",
+    "scores",
+    "tool_calls",
+    "tools",
+    "totals",
+    "transcript",
+    "treatment_kinds"
+   ],
+   "schema": null
+  },
   "runs": [
    [
     "task=hill|access=direct|tools=extended|model=beta-stub|seed=1",
@@ -345,6 +410,45 @@
    "runs/e7aecec581016e27bf9019ee9bff03ce17ab193b92b5242de728481ad7777424/try1/attempt-marker.json",
    "runs/e7aecec581016e27bf9019ee9bff03ce17ab193b92b5242de728481ad7777424/try1/e7aecec581016e27bf9019ee9bff03ce17ab193b92b5242de728481ad7777424.1.json"
   ],
+  "export": {
+   "first_attempt_keys": [
+    "admission",
+    "attempt",
+    "condition",
+    "digest",
+    "dispatch_seq",
+    "factors",
+    "infra_kind",
+    "lease_outcome",
+    "lease_wait_s",
+    "run_dir",
+    "run_key",
+    "started_at",
+    "treatment"
+   ],
+   "keys": [
+    "format",
+    "factors",
+    "planned_runs",
+    "exhausted_runs",
+    "unfinished_runs",
+    "analysed_attempts",
+    "discarded_usage",
+    "retries_by_kind",
+    "infrastructure_by_condition",
+    "budget_holds",
+    "kinds",
+    "campaign_fingerprint",
+    "shard"
+   ],
+   "shard_keys": [
+    "environment_identity",
+    "shares",
+    "spec",
+    "started_utc"
+   ],
+   "shard_spec": "{\"count\": 2, \"index\": 1, \"label\": \"shard-1\", \"rule\": \"expcore-shard/2: per model, pairs ranked by sha256(json [task, model, seed]), dealt round the shards\"}"
+  },
   "fingerprint_sans_environment_sha256": "65d6df2ed65970f6a0d29cae8ad29107a1c95ed88e958a240cd7854fb2467e0c",
   "meta": {
    "order_rule": "sha256(order_seed|run_key)",
@@ -361,6 +465,32 @@
    "shard_spec",
    "shard_started_utc"
   ],
+  "record": {
+   "keys": [
+    "agent_config",
+    "agent_config_sha256",
+    "attempt",
+    "clock",
+    "code",
+    "core_version",
+    "factors",
+    "failed_request",
+    "instruments",
+    "outcome",
+    "prompt",
+    "redacted_paths",
+    "route",
+    "run_key",
+    "schema_version",
+    "scores",
+    "tool_calls",
+    "tools",
+    "totals",
+    "transcript",
+    "treatment_kinds"
+   ],
+   "schema": null
+  },
   "runs": [
    [
     "task=lake|access=direct|tools=basic|model=beta-stub|seed=1",
@@ -541,6 +671,45 @@
    "runs/e5805d6d29b64c284543960693f382f367fbf4e0c0a5812d3d0900a587d4039a/try1/attempt-marker.json",
    "runs/e5805d6d29b64c284543960693f382f367fbf4e0c0a5812d3d0900a587d4039a/try1/e5805d6d29b64c284543960693f382f367fbf4e0c0a5812d3d0900a587d4039a.1.json"
   ],
+  "export": {
+   "first_attempt_keys": [
+    "admission",
+    "attempt",
+    "condition",
+    "digest",
+    "dispatch_seq",
+    "factors",
+    "infra_kind",
+    "lease_outcome",
+    "lease_wait_s",
+    "run_dir",
+    "run_key",
+    "started_at",
+    "treatment"
+   ],
+   "keys": [
+    "format",
+    "factors",
+    "planned_runs",
+    "exhausted_runs",
+    "unfinished_runs",
+    "analysed_attempts",
+    "discarded_usage",
+    "retries_by_kind",
+    "infrastructure_by_condition",
+    "budget_holds",
+    "kinds",
+    "campaign_fingerprint",
+    "shard"
+   ],
+   "shard_keys": [
+    "environment_identity",
+    "shares",
+    "spec",
+    "started_utc"
+   ],
+   "shard_spec": "{\"count\": 2, \"index\": 1, \"label\": \"shard-1\", \"rule\": \"expcore-shard/3: shards by model in the declared order of [shards] per_model; per model, pairs ranked by sha256(json [task, model, seed]), dealt round its own shards\"}"
+  },
   "fingerprint_sans_environment_sha256": "792198e976d030ca22ed77b7ccc9b44bc6620a99156f9dd08d9f56cb909daeac",
   "meta": {
    "order_rule": "sha256(order_seed|run_key)",
@@ -557,6 +726,32 @@
    "shard_spec",
    "shard_started_utc"
   ],
+  "record": {
+   "keys": [
+    "agent_config",
+    "agent_config_sha256",
+    "attempt",
+    "clock",
+    "code",
+    "core_version",
+    "factors",
+    "failed_request",
+    "instruments",
+    "outcome",
+    "prompt",
+    "redacted_paths",
+    "route",
+    "run_key",
+    "schema_version",
+    "scores",
+    "tool_calls",
+    "tools",
+    "totals",
+    "transcript",
+    "treatment_kinds"
+   ],
+   "schema": null
+  },
   "runs": [
    [
     "task=dune|access=direct|tools=basic|model=alpha-stub|seed=1",
@@ -831,6 +1026,39 @@
    "runs/e7aecec581016e27bf9019ee9bff03ce17ab193b92b5242de728481ad7777424/try1/attempt-marker.json",
    "runs/e7aecec581016e27bf9019ee9bff03ce17ab193b92b5242de728481ad7777424/try1/e7aecec581016e27bf9019ee9bff03ce17ab193b92b5242de728481ad7777424.1.json"
   ],
+  "export": {
+   "first_attempt_keys": [
+    "admission",
+    "attempt",
+    "condition",
+    "digest",
+    "dispatch_seq",
+    "factors",
+    "infra_kind",
+    "lease_outcome",
+    "lease_wait_s",
+    "run_dir",
+    "run_key",
+    "started_at",
+    "treatment"
+   ],
+   "keys": [
+    "format",
+    "factors",
+    "planned_runs",
+    "exhausted_runs",
+    "unfinished_runs",
+    "analysed_attempts",
+    "discarded_usage",
+    "retries_by_kind",
+    "infrastructure_by_condition",
+    "budget_holds",
+    "kinds",
+    "campaign_fingerprint"
+   ],
+   "shard_keys": null,
+   "shard_spec": null
+  },
   "fingerprint_sans_environment_sha256": "a25493c28c748eb7c6165e5e463e1d0e65ba2bc3aad9b1459c6ae2fec642c3ee",
   "meta": {
    "order_rule": "sha256(order_seed|run_key)",
@@ -841,6 +1069,32 @@
    "order_rule",
    "order_seed"
   ],
+  "record": {
+   "keys": [
+    "agent_config",
+    "agent_config_sha256",
+    "attempt",
+    "clock",
+    "code",
+    "core_version",
+    "factors",
+    "failed_request",
+    "instruments",
+    "outcome",
+    "prompt",
+    "redacted_paths",
+    "route",
+    "run_key",
+    "schema_version",
+    "scores",
+    "tool_calls",
+    "tools",
+    "totals",
+    "transcript",
+    "treatment_kinds"
+   ],
+   "schema": null
+  },
   "runs": [
    [
     "task=hill|access=direct|tools=extended|model=beta-stub|seed=1",

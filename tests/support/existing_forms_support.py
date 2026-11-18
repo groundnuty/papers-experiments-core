@@ -16,6 +16,11 @@ from selection_support import DIRECT, run_selection
 from shard_support import run_shard
 from study_support import Campaign, cli, make_copy
 
+from expcore.campaign.export import export_run_state
+from expcore.campaign.store import Store
+from expcore.records.record import is_record_name
+from expcore.study.config import load_study
+
 BY_MODEL = "\n[shards]\nper_model = { alpha-stub = 1, beta-stub = 1 }\n"
 PINNED_META = ("order_rule", "order_seed", "shard_spec", "shard_shares", "shard_started_utc")
 FORMS = ("unsharded", "shard-2", "shard-by-model-3", "selection-4")
@@ -35,6 +40,31 @@ def run_form(form: str, base: Path, env: dict[str, str]) -> Campaign:
     if form == "selection-4":
         return run_selection(base, form, env, [DIRECT], "direct")
     raise ValueError(form)
+
+
+def export_facts(campaign: Campaign) -> dict[str, object]:
+    """The shape of the export the store gives (`export_run_state`): its top-level keys in order, the keys of its first
+    analysed attempt, and the shard section's spec text and keys when it has one. No time or host enters."""
+    store = Store(campaign.root / "out" / "state.sqlite", load_study(campaign.root).schema)
+    try:
+        export = export_run_state(store)
+    finally:
+        store.close()
+    shard = export.get("shard")
+    return {
+        "keys": list(export),
+        "first_attempt_keys": sorted(export["analysed_attempts"][0]),
+        "shard_keys": None if shard is None else sorted(shard),
+        "shard_spec": None if shard is None else json.dumps(shard["spec"], sort_keys=True),
+    }
+
+
+def record_facts(campaign: Campaign) -> dict[str, object]:
+    """The top-level keys of the first run record the batch holds, by file name, and its schema tag."""
+    first = sorted((campaign.root / "out" / "runs").rglob("*.json"))
+    records = [path for path in first if is_record_name(path.name)]
+    document = json.loads(records[0].read_text(encoding="utf-8"))
+    return {"keys": sorted(document), "schema": document.get("schema")}
 
 
 def facts_of(campaign: Campaign) -> dict[str, object]:
@@ -59,6 +89,8 @@ def facts_of(campaign: Campaign) -> dict[str, object]:
             for row in campaign.sql("SELECT * FROM attempts ORDER BY run_key, attempt, id")
         ],
         "batch_files": sorted(str(path.relative_to(out)) for path in (out / "runs").rglob("*") if path.is_file()),
+        "export": export_facts(campaign),
+        "record": record_facts(campaign),
     }
 
 
