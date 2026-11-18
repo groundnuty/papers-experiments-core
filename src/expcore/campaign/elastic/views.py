@@ -6,10 +6,25 @@ Every view is read from the file, so a reopened ledger shows exactly what it sho
 
 import json
 import sqlite3
+from pathlib import Path
 from typing import Any
 
+from expcore.campaign.elastic import schema
+from expcore.campaign.elastic.ceilings import effective, history
 from expcore.campaign.elastic.config import PRIOR_RUNS, LedgerConfig
-from expcore.campaign.elastic.records import Demand, Federation, Lease, LedgerError, Run
+from expcore.campaign.elastic.records import (
+    HELD,
+    Ceiling,
+    Ceilings,
+    Demand,
+    Federation,
+    Lease,
+    LedgerError,
+    Run,
+    Settlement,
+    Status,
+)
+from expcore.campaign.elastic.settling import read as read_settlements
 
 _LEASE_SQL = "SELECT l.*, f.ended_at AS fed_ended FROM leases l JOIN federations f ON f.label = l.federation"
 
@@ -121,3 +136,69 @@ class LedgerViews:
             "SELECT model, COUNT(*) FROM runs WHERE state='pending' AND set_index=? GROUP BY model", (current,)
         ).fetchall()
         return Demand(set_index=current, pending=dict(rows), slots=self.slots())
+
+    def ceilings(self) -> Ceilings:
+        """The dollar ceilings in force: the pinned ones, or as raised (`raise_ceiling`)."""
+        return effective(self.db, self.config)
+
+    def ceiling_history(self) -> list[Ceiling]:
+        """Every raise of a ceiling, oldest first, with its time, reason and actor."""
+        return history(self.db)
+
+    def settlements(self) -> list[Settlement]:
+        """Every lost lease whose spend was settled, by lease id, with its time and source."""
+        return read_settlements(self.db)
+
+    def status(self) -> Status:
+        """The ceiling and its history, what is committed and left, and what unsettled leases lock as their grants."""
+        in_force = self.ceilings()
+        total, per_model = self.committed_micro()
+        marks = ", ".join("?" * len(HELD))
+        locked = self.db.execute(
+            f"SELECT l.model, l.state, SUM(l.charge_micro) FROM leases l WHERE l.state IN ({marks})"
+            " AND NOT EXISTS (SELECT 1 FROM settlements s WHERE s.lease_id = l.id) GROUP BY l.model, l.state",
+            HELD,
+        ).fetchall()
+        by_state: dict[str, int] = {}
+        by_model: dict[str, int] = {}
+        for model, state, amount in locked:
+            by_state[state] = by_state.get(state, 0) + int(amount)
+            by_model[model] = by_model.get(model, 0) + int(amount)
+        return Status(
+            ceiling_micro=in_force.max_micro,
+            committed_micro=total,
+            remaining_micro=None if in_force.max_micro is None else in_force.max_micro - total,
+            locked_micro=sum(by_state.values()),
+            locked_by_state=by_state,
+            locked_by_model=by_model,
+            model_ceiling_micro=dict(in_force.per_model_micro),
+            model_remaining_micro={m: c - per_model.get(m, 0) for m, c in in_force.per_model_micro.items()},
+            ceilings=tuple(self.ceiling_history()),
+        )
+
+
+class LedgerReader(LedgerViews):
+    """A ledger file read without its dispatcher lock, for an operator's `status` while a dispatcher runs: the views
+    only, over one connection that writes nothing."""
+
+    def __init__(self, path: Path) -> None:
+        self.db = schema.connect(path)
+        try:
+            pinned = self._meta("config")
+            if pinned is None:
+                raise ValueError(f"{path} holds no ledger configuration")
+            self.config = LedgerConfig.from_json(pinned)
+        except BaseException:
+            self.db.close()
+            raise
+
+    def status(self) -> Status:
+        """`LedgerViews.status`, read in one transaction so a dispatcher writing meanwhile cannot split it."""
+        self.db.execute("BEGIN")
+        try:
+            return super().status()
+        finally:
+            self.db.execute("COMMIT")
+
+    def close(self) -> None:
+        self.db.close()

@@ -21,6 +21,10 @@ shown ended; the sweep expires what it must.
 - **Budget.** A lease is issued only if its grant fits what is left of `max_usd` and of its model's ceiling after the
   charge of every lease. A lease is charged its grant until its spend is settled, so with every lease spending its
   whole grant the budget still holds.
+- **Settling and raising.** A lost lease (`settle`) is charged the spend read from its dead federation instead of its
+  grant, and the difference goes back to the budget (`settling`). A ceiling is raised mid-campaign, recorded, never
+  lowered or set below what is committed, and never part of the fingerprint (`ceilings`); `status` shows the money,
+  the grants locked in unsettled leases and the ceilings' history.
 """
 
 import json
@@ -30,18 +34,21 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.elastic import schema
+from expcore.campaign.elastic import ceilings, schema, settling
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
 from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
 from expcore.campaign.elastic.records import (
     LIVE,
     PROOFS,
+    Ceiling,
     Completion,
     CompletionConflict,
     JoinRefused,
     Lease,
     LedgerError,
     Return,
+    Settlement,
+    SettleRefused,
     SiteReading,
     Wait,
 )
@@ -232,7 +239,15 @@ class Ledger(LedgerViews):
             for r in self.db.execute("SELECT * FROM leases WHERE state IN ('issued', 'sent')")
         ]
         chosen = choose(
-            current, pending, in_flight, self.slots(), self.committed_micro(), self.config, self.estimate_s, now
+            current,
+            pending,
+            in_flight,
+            self.slots(),
+            self.committed_micro(),
+            self.config,
+            self.estimate_s,
+            now,
+            self.ceilings(),
         )
         if isinstance(chosen, Wait):
             return chosen
@@ -456,4 +471,33 @@ class Ledger(LedgerViews):
         self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
         self._event(
             now, "expire", run_key=row["run_key"], lease_id=row["id"], federation=row["federation"], reason=reason
+        )
+
+    # --- money ------------------------------------------------------------------------------------------------
+
+    def settle(self, lease_id: int, spend_micro_usd: int, source: str) -> Settlement:
+        """Replace a lost lease's grant with the spend read from its dead federation (`source`: `root` or `pulled`).
+
+        Only a lease expired with its holder proven ended, or one whose archive never verified, is settled; one
+        already settled is refused unless the values are the same (then nothing changes), and a spend above the grant
+        is recorded as a failed cap and refused (`SettleRefused`). The difference goes back to the budget."""
+        settling.check(spend_micro_usd, source)
+        outcome = self._transact(
+            lambda: settling.apply(self.db, self.config, self._clock(), lease_id, spend_micro_usd, source)
+        )
+        if isinstance(outcome, str):
+            raise SettleRefused(outcome)  # the failure was committed first
+        return outcome
+
+    def raise_ceiling(self, new_max_micro_usd: int, reason: str, actor: str) -> Ceiling:
+        """Raise the campaign's dollar ceiling to `new_max_micro_usd`, recorded with the time, `reason` and `actor`.
+        Never lowers it or sets it below what is committed (`CeilingRefused`); the fingerprint does not change."""
+        return self._transact(
+            lambda: ceilings.raise_ceiling(self.db, self.config, self._clock(), new_max_micro_usd, reason, actor)
+        )
+
+    def raise_model_ceiling(self, model: str, new_max_micro_usd: int, reason: str, actor: str) -> Ceiling:
+        """`raise_ceiling` for a model that has a ceiling of its own, never below what the model has committed."""
+        return self._transact(
+            lambda: ceilings.raise_ceiling(self.db, self.config, self._clock(), new_max_micro_usd, reason, actor, model)
         )

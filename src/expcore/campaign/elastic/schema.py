@@ -6,13 +6,17 @@ one BEGIN IMMEDIATE transaction. A new ledger is written under a temporary name 
 into place, so a kill during creation leaves either no ledger or a whole one.
 
 Two partial unique indexes keep the fencing rules in the file itself: a run has at most one lease in flight, and a
-federation holds at most one cap slot.
+federation holds at most one cap slot. A lease is settled once (`settlements`), and a ceiling only goes up
+(`ceilings`).
 """
 
 import contextlib
+import json
 import os
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 SCHEMA = "expcore-ledger/1"
 
@@ -51,6 +55,15 @@ CREATE TABLE estimates(
 CREATE TABLE events(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, kind TEXT NOT NULL, run_key TEXT, lease_id INTEGER,
   federation TEXT, detail TEXT);
+CREATE TABLE settlements(  -- a lost lease's grant replaced by the spend read from its dead federation, once
+  lease_id INTEGER PRIMARY KEY REFERENCES leases(id), at REAL NOT NULL,
+  source TEXT NOT NULL CHECK(source IN ('root', 'pulled')),
+  spend_micro INTEGER NOT NULL CHECK(spend_micro >= 0), grant_micro INTEGER NOT NULL,
+  CHECK(spend_micro <= grant_micro));
+CREATE TABLE ceilings(  -- the raises of the dollar ceiling, the campaign's (model NULL) or a model's
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, model TEXT,  -- the pinned configuration never changes
+  old_micro INTEGER NOT NULL, new_micro INTEGER NOT NULL, reason TEXT NOT NULL, actor TEXT NOT NULL,
+  CHECK(new_micro > old_micro));
 """
 
 
@@ -105,3 +118,25 @@ def connect(path: Path) -> sqlite3.Connection:
         db.close()
         raise
     return db
+
+
+def add_event(
+    db: sqlite3.Connection, now: float, kind: str, *, run_key=None, lease_id=None, federation=None, **detail: Any
+) -> None:
+    """Append a step to the log, in the caller's transaction."""
+    db.execute(
+        "INSERT INTO events(at, kind, run_key, lease_id, federation, detail) VALUES(?,?,?,?,?,?)",
+        (now, kind, run_key, lease_id, federation, json.dumps(detail, sort_keys=True) if detail else None),
+    )
+
+
+@contextlib.contextmanager
+def transaction(db: sqlite3.Connection) -> Iterator[None]:
+    """One `BEGIN IMMEDIATE` transaction on a connection from `connect`: committed on exit, rolled back on an error."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    db.execute("COMMIT")
