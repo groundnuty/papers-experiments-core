@@ -37,8 +37,6 @@ from expcore.campaign.shard_budget import reservation_usd
 from expcore.campaign.shard_run import ShardStart
 from expcore.study.config import StudyConfig
 
-_SHOWN = 12
-
 
 def lease_start(
     study: StudyConfig,
@@ -54,21 +52,13 @@ def lease_start(
     `campaign_sha256` is the hash of this campaign's fingerprint as `fingerprint_of` made it; `now` is a time with a
     timezone. Raises LeaseError (a ShardError) for every refusal of the module's docstring, before anything is written.
     """
-    if lease.campaign_sha256 != campaign_sha256:
-        raise LeaseError(
-            f"{lease.name} was issued for the campaign with fingerprint sha256 {lease.campaign_sha256[:_SHOWN]}, and "
-            f"this campaign's is {campaign_sha256[:_SHOWN]}: a lease is run only by the campaign it was issued for"
-        )
+    lease.check_campaign(campaign_sha256)
     if lease.expired(now):
         raise LeaseError(f"{lease.name} expired at {lease.expires_utc}")
     rows = [row for row in study.manifest.rows if row.key.text == lease.run_key]
     if not rows:
         raise LeaseError(f"{lease.name}: its run is not a run of this campaign's plan")
-    if lease.attempt_base >= settings.max_attempts:
-        raise LeaseError(
-            f"{lease.name} follows {lease.attempt_base} charged attempts of its run, and the campaign allows "
-            f"{settings.max_attempts}: the run has no attempt left"
-        )
+    lease.check_attempts_left(settings.max_attempts)
     model = str(rows[0].key.factors["model"])
     try:
         reserved = reservation_usd(study.models.resolve(model), study.campaign.agent.limits)

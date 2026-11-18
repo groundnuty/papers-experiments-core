@@ -11,7 +11,8 @@ run and no other, on the settings the lease sets (`study.lease_start`). A lease 
   an attempt did, so the id is what a completion is judged by. A store takes one lease, once: a store that already
   holds the id refuses a second start of it (`shard_run.LeaseReplayed`), resumed or not;
 - `attempt_base`: the run's charged attempts before this lease, in all its earlier leases. The store numbers its
-  attempts from it (`Store.begin_attempt`): the first is base + 1, so attempts stay unique across the leases of one run
+  attempts from it (`Store.begin_attempt`): the first is base + 1, so the run's charged attempts stay unique across
+  its leases (an uncharged one, set aside or interrupted, is run again under the number it had, as in any store),
   and the attempt limit (`[scheduler] max_attempts`) counts every lease's;
 - `grant_usd`: what this lease may spend, probes, top-ups and attempts together; it is the run's whole budget;
 - `campaign_sha256`: the SHA-256 of the campaign fingerprint the lease was issued for (`manifest.fingerprint_sha256`).
@@ -45,6 +46,7 @@ without it numbers its attempts from 1, as every store did before leases."""
 
 _FACTS = ("run_key", "lease_id", "attempt_base", "grant_usd", "campaign_sha256", "expires_utc")
 _TIME = "%Y-%m-%dT%H:%M:%SZ"
+_SHOWN = 12
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -120,6 +122,23 @@ class RunLease:
     def expired(self, now: dt.datetime) -> bool:
         """Whether the lease has ended at `now` (timezone-aware): the term ends at the expiry's own second."""
         return now >= self.expiry
+
+    def check_campaign(self, campaign_sha256: str) -> None:
+        """Refuse a campaign whose fingerprint hash is not the one this lease was issued for."""
+        if self.campaign_sha256 != campaign_sha256:
+            raise LeaseError(
+                f"{self.name} was issued for the campaign with fingerprint sha256 {self.campaign_sha256[:_SHOWN]}, "
+                f"and this campaign's is {campaign_sha256[:_SHOWN]}: a lease is run only by the campaign it was "
+                "issued for"
+            )
+
+    def check_attempts_left(self, max_attempts: int) -> None:
+        """Refuse a lease of a run with no attempt left: its base counts against the campaign's limit."""
+        if self.attempt_base >= max_attempts:
+            raise LeaseError(
+                f"{self.name} follows {self.attempt_base} charged attempts of its run, and the campaign allows "
+                f"{max_attempts}: the run has no attempt left"
+            )
 
     def to_json(self) -> dict[str, Any]:
         """The lease as the store pins it and the export and a merge keep it: the rule and the six facts."""

@@ -1,5 +1,5 @@
 """C41: a store that holds a lease numbers its run's attempts from the lease's attempt base, and counts the base against
-the attempt limit, so attempts stay unique, and limited, across the leases of one run (step 2 of #462).
+the attempt limit, so charged attempts stay unique, and limited, across the leases of one run (step 2 of #462).
 
 A store without a lease has no base, and numbers its attempts from 1 as every store did before leases (the pins of
 `tests/data/existing-forms-pins.json` hold the whole of that; the first test here holds the arithmetic).

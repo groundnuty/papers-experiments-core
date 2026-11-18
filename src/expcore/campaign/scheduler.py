@@ -69,9 +69,10 @@ from expcore.campaign.probe_spend import MeteredProbes
 from expcore.campaign.recovery import Recovery
 from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
+from expcore.campaign.run_lease import RunLease
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import META_SHARD
-from expcore.campaign.shard_run import ShardStart
+from expcore.campaign.shard_run import ShardStart, refuse_lease_misfit
 from expcore.campaign.store import Store, column_for
 from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
@@ -287,6 +288,8 @@ class Scheduler:
             self.models.require_priced(self.plan_models)
         if cfg.budget is not None:  # the reservation bounds the request past the token cap by the window (C25)
             self.models.require_context_window(self.plan_models)
+        if self.shard is not None and isinstance(self.shard.spec, RunLease):  # before any store is opened (C41)
+            refuse_lease_misfit(self.shard.spec, fingerprint_sha256(self.fingerprint), cfg)
         self.store, self.recovery = open_campaign(
             self.root / STATE_FILE,
             self.schema,

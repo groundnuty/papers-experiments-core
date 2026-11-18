@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.manifest import fingerprint_sha256
-from expcore.campaign.run_lease import META_ATTEMPT_BASE, RULE_LEASE, RunLease
+from expcore.campaign.run_lease import META_ATTEMPT_BASE, RULE_LEASE, LeaseError, RunLease
 from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec, describe, resume_hint
 from expcore.campaign.shard import (
     META_ENVIRONMENT,
@@ -166,6 +166,31 @@ def refuse_unrunnable(
             f"shard {spec.index} of {spec.count} holds {held} pair(s) of model {model}, and its share of that model's "
             f"concurrency is 0 ({why}), so it could never run them; shard by model with [shards] per_model "
             "(expcore-shard/3), or use fewer shards"
+        )
+
+
+def refuse_lease_misfit(lease: RunLease, campaign_sha256: str, settings: "SchedulerConfig") -> None:
+    """The kernel's own hold on a lease (C41), for a start that did not come through `study.lease_start`: the scheduler
+    refuses, before it opens the store, a lease issued for another campaign, a run with no attempt left, and settings
+    whose budget is not held to the grant (no budget for a grant above 0, a ceiling above the grant, a release; any
+    budget for a grant of 0). `lease_start` makes the settings that pass."""
+    lease.check_campaign(campaign_sha256)
+    lease.check_attempts_left(settings.max_attempts)
+    budget = settings.budget
+    if lease.grant_usd == 0:
+        held = budget is None
+    else:
+        held = (
+            budget is not None
+            and budget.max_usd <= lease.grant_usd
+            and budget.release_file is None
+            and budget.release_step_usd == 0
+        )
+    if not held:
+        raise LeaseError(
+            f"{lease.name} grants {lease.grant_usd:.6f} USD, and the scheduler's budget is not held to it (a budget "
+            "of at most the grant and no release for a grant above 0, none for a grant of 0): the grant is the "
+            "run's whole budget"
         )
 
 
