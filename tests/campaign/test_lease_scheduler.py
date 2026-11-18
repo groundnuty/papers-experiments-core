@@ -18,6 +18,7 @@ from expcore.campaign.gate import Budget
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.run_lease import LeaseError, RunLease
 from expcore.campaign.scheduler import Scheduler
+from expcore.campaign.shard import usd_of
 from expcore.campaign.shard_run import ShardStart
 
 GRANT_MICRO = 40_000_000  # the stub models' one run reserves a few dollars at most at these prices and caps
@@ -117,3 +118,26 @@ def test_c41_a_scheduler_refuses_a_lease_whose_run_has_no_attempt_left(tmp_path)
     with pytest.raises(LeaseError, match="no attempt left"):
         scheduler_of(tmp_path, budget=Budget(max_usd=GRANT), lease_changes={"attempt_base": 3}).open()
     assert pinned(tmp_path) == []
+
+
+def test_c41_a_scheduler_refuses_a_ceiling_a_fraction_of_a_micro_dollar_above_the_grant(tmp_path):
+    """C41: a grant of 10 micro-dollars is a ceiling of 0.00001 dollars and no more: the gate would admit a run that
+    reserves 10.5 micro-dollars under a ceiling of 0.0000109, so that ceiling is refused, and 0.00001 itself opens."""
+    with pytest.raises(LeaseError, match="grant"):
+        scheduler_of(tmp_path, budget=Budget(max_usd=0.0000109), lease_changes={"grant_micro_usd": 10}).open()
+    assert pinned(tmp_path) == []
+    with scheduler_of(tmp_path, budget=Budget(max_usd=0.00001), lease_changes={"grant_micro_usd": 10}):
+        assert "shard_spec" in {key for (key,) in pinned(tmp_path)}
+
+
+def test_c41_a_scheduler_opens_the_ceiling_lease_start_makes_for_a_grant_too_large_for_a_float_to_hold_exactly(
+    tmp_path,
+):
+    """C41: the ceiling `lease_start` makes is the dollars of the grant, the nearest float to the exact amount; for a
+    grant of 2**53 - 1 micro-dollars that float is one micro-dollar higher, and the scheduler must not refuse the
+    settings that were made for it."""
+    grant = 2**53 - 1
+    lease_dollars = usd_of(grant)
+    assert round(lease_dollars * 1_000_000) == grant + 1
+    with scheduler_of(tmp_path, budget=Budget(max_usd=lease_dollars), lease_changes={"grant_micro_usd": grant}):
+        assert "shard_spec" in {key for (key,) in pinned(tmp_path)}
