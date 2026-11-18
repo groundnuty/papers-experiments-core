@@ -197,7 +197,8 @@ def test_c43_the_worker_command_refuses_a_channel_where_a_lease_runs(tmp_path, c
     channel = tmp_path / "channels" / LABEL
     ch.make_dirs(channel)
     ch.write_json(channel / ch.WORKER / "running.json", {"lease_id": 1})
-    argv = ["--federation", LABEL, "--channel", str(channel), "--study", str(tmp_path), "--work", str(tmp_path / "w")]
+    study, work = str(tmp_path / "study"), str(tmp_path / "work")
+    argv = ["--federation", LABEL, "--channel", str(channel), "--study", study, "--work", work]
     assert main(argv) == 1
     assert "takes no other lease" in capsys.readouterr().err
 
@@ -329,3 +330,39 @@ def test_c43_a_heartbeat_that_cannot_be_written_never_abandons_the_run_it_beats_
     monkeypatch.setattr(ch, "write_json", write_json)
     assert worker.step() == "ran"
     assert outbox(channel, ch.completion_name(1))["state"] == "done"
+
+
+def test_c43_a_state_that_cannot_be_read_never_lets_an_ended_lease_run_again(tmp_path):
+    """C43: after lease 7 ended, a state file that is listed and cannot be read is no answer (the poll is retried),
+    and a channel whose state is gone still does not run lease 7 again: its end is in the outbox."""
+    runner = FakeRunner()
+    worker, channel = worker_on(tmp_path, runner)
+    deliver(channel, a_lease(7))
+    assert worker.step() == "ran"
+    state = channel / ch.WORKER / "state.json"
+    state.write_text('{"format": "expcore-elastic-wor', encoding="utf-8")
+    with pytest.raises(OSError, match="could not be read"):
+        worker.step()
+    state.unlink()
+    assert worker.step() == "idle"
+    assert runner.started == [7]
+
+
+def test_c43_relative_directories_are_taken_as_absolute_and_a_work_directory_inside_the_study_is_refused(
+    tmp_path, monkeypatch
+):
+    """C43: the run's working directory is its lease directory, so the worker holds its directories as absolute
+    paths; and a work directory inside the study would copy itself, so the worker refuses it."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "study").mkdir()
+    worker = Worker(LABEL, Path("channels") / LABEL, Path("study"), Path("work"), FakeRunner(), outcome=outcome_of())
+    assert (worker.channel, worker.study, worker.work) == (
+        tmp_path / "channels" / LABEL,
+        tmp_path / "study",
+        tmp_path / "work",
+    )
+    inside = Worker(
+        LABEL, tmp_path / "channels" / LABEL, tmp_path / "study", tmp_path / "study" / "scratch", FakeRunner()
+    )
+    with pytest.raises(WorkerError):
+        inside.open()

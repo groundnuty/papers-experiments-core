@@ -154,7 +154,7 @@ class Dispatcher:
     def _federations(self, site: Site, leases: Sequence[Lease]) -> set[str]:
         """The federations of the site to read: every one not proven ended, and one holding a lease that may still
         bring a completion."""
-        open_leases = {lease.federation for lease in leases if lease.state in ("issued", "sent", "expired")}
+        open_leases = {lease.federation for lease in leases if lease.state in ("issued", "sent", "expired", "reported")}
         return {
             fed.label
             for fed in self.ledger.federations()
@@ -255,6 +255,10 @@ class Dispatcher:
             remote = str(ch.federation_dir(site.root, label) / ch.ARCHIVES / ch.archive_name(lease_id))
             self.archives.mkdir(parents=True, exist_ok=True)
             local = self.archives / ch.archive_name(lease_id)
+            if local.is_file() and _sha256(local) == wanted:  # pulled before a restart, not yet settled
+                self._fetch_failures.pop(lease_id, None)
+                self.ledger.verify_archive(lease_id, wanted)
+                continue
             draft = local.with_name(f".{local.name}.pull")
             with contextlib.suppress(FileNotFoundError):
                 draft.unlink()
@@ -290,13 +294,19 @@ def _answers(reply: Mapping[str, Any], site: Site, request: Mapping[str, Any]) -
     for entry in request["federations"]:
         label = entry["label"]
         answer = federations.get(label)
-        if not isinstance(answer, dict) or not isinstance(answer.get("inbox"), dict):
-            raise Unreachable(f"site {site.name}: the reply has no answer for federation {label}")
+        if (
+            not isinstance(answer, dict)
+            or not isinstance(answer.get("inbox"), dict)
+            or not all(isinstance(key, str) and key.isdigit() for key in answer["inbox"])
+            or not isinstance(answer.get("drain"), bool)
+        ):
+            raise Unreachable(f"site {site.name}: the reply has no whole answer for federation {label}")
         if answer.get("error") is not None:
             raise Unreachable(f"site {site.name}: federation {label}'s channel: {answer['error']}")
         box = answer.get("outbox")
         if box is not None and not (
             isinstance(box, dict)
+            and {"heartbeat", "exited", "completions", "returns"} <= set(box)
             and isinstance(box.get("completions"), list)
             and isinstance(box.get("returns"), list)
             and all(isinstance(item, dict) for item in [*box["completions"], *box["returns"]])

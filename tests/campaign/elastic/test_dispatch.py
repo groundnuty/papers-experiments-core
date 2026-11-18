@@ -356,3 +356,61 @@ def test_c43_the_exchange_refuses_a_federation_label_that_is_not_an_operator_lab
     with pytest.raises(RequestError):
         handle(request)
     assert not (tmp_path / "channels").exists()
+
+
+def test_c43_a_reported_lease_of_a_federation_proven_ended_is_still_pulled_and_settled(tmp_path):
+    """C43: the archive pull failed, then the federation's job was proven ended: its reported lease is still read and
+    pulled once the site answers, so a counting completion settles its run."""
+    ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
+    complete(site, "fed-1", lease)
+    ssh.pull_down.add(SITE)
+    ticks(dispatch, clock, 1)
+    assert ledger.lease(lease.lease_id).state == "reported"
+    ledger.prove_ended("fed-1", "terminal")
+    ssh.pull_down.clear()
+    ticks(dispatch, clock, 1)
+    assert ledger.lease(lease.lease_id).state == "counted"
+    assert ledger.run(lease.run_key).state == "done"
+
+
+def test_c43_an_archive_pulled_before_a_restart_settles_its_lease_without_another_pull(tmp_path):
+    """C43: the dispatcher pulled and checked an archive and stopped before it settled the lease; on the next tick the
+    archive it holds settles the lease, though the site's copy is gone."""
+    ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
+    complete(site, "fed-1", lease)
+    remote = channel_of(site, "fed-1") / ch.ARCHIVES / ch.archive_name(lease.lease_id)
+    local = tmp_path / "out" / "leases" / ch.archive_name(lease.lease_id)
+    local.parent.mkdir(parents=True)
+    local.write_bytes(remote.read_bytes())
+    remote.unlink()
+    ticks(dispatch, clock, 1)
+    assert ledger.lease(lease.lease_id).state == "counted"
+    assert not [remote for _, remote in ssh.calls if remote[0] == "cat"]
+
+
+class Partial:
+    """A transport whose replies lack one key of fed-1's answer (or of its outbox): a verb of another form."""
+
+    def __init__(self, inner, key, in_outbox=False):
+        self.inner, self.key, self.in_outbox = inner, key, in_outbox
+
+    def exchange(self, site, request):
+        reply = self.inner.exchange(site, request)
+        answer = reply["federations"]["fed-1"]
+        del (answer["outbox"] if self.in_outbox else answer)[self.key]
+        return reply
+
+    def fetch(self, site, remote, local):
+        return self.inner.fetch(site, remote, local)
+
+
+@pytest.mark.parametrize(("key", "in_outbox"), [("drain", False), ("heartbeat", True)])
+def test_c43_a_reply_missing_part_of_an_answer_is_no_reading_and_never_a_crash(tmp_path, key, in_outbox):
+    """C43: an answer without its drain flag, or an outbox without its heartbeat entry, is not the verb's whole form:
+    the site is unread (no heartbeat is taken as absent), and the tick does not fail."""
+    ledger, clock, ssh, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN)
+    beat(site, "fed-1", lease.lease_id, 3)
+    dispatch.transport = Partial(transport(ssh), key, in_outbox)
+    clock.advance(TICK_S)
+    assert not dispatch.tick()[SITE].read
+    assert ledger.lease(lease.lease_id).counter is None

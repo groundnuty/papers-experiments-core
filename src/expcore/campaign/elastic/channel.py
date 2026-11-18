@@ -86,7 +86,8 @@ def make_dirs(channel: Path) -> None:
         (channel / name).mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
-def _fsync_dir(directory: Path) -> None:
+def fsync_dir(directory: Path) -> None:
+    """Make a rename or a link in `directory` durable."""
     fd = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -123,7 +124,7 @@ def write_json(path: Path, record: Mapping[str, Any]) -> None:
         with contextlib.suppress(OSError):
             draft.unlink()
         raise
-    _fsync_dir(path.parent)
+    fsync_dir(path.parent)
 
 
 def create_json(path: Path, record: Mapping[str, Any]) -> bool:
@@ -136,7 +137,7 @@ def create_json(path: Path, record: Mapping[str, Any]) -> bool:
     finally:
         with contextlib.suppress(OSError):
             draft.unlink()
-    _fsync_dir(path.parent)
+    fsync_dir(path.parent)
     return True
 
 
@@ -218,6 +219,7 @@ __all__ = [
     "create_json",
     "envelope",
     "federation_dir",
+    "fsync_dir",
     "is_tombstone",
     "kernel_lease",
     "lease_name",

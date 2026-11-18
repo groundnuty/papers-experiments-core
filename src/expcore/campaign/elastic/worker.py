@@ -166,9 +166,9 @@ class Worker:
         beat_s: float = BEAT_S,
     ) -> None:
         self.label = label
-        self.channel = channel
-        self.study = study
-        self.work = work
+        self.channel = Path(channel).absolute()  # the run's cwd is its lease directory: no path may be relative to ours
+        self.study = Path(study).absolute()
+        self.work = Path(work).absolute()
         self.runner = runner
         self.outcome = outcome
         self.clock = clock
@@ -193,7 +193,10 @@ class Worker:
         return self.channel / ch.WORKER / RUNNING
 
     def open(self) -> None:
-        """Make the channel's directories; refuse a channel where a lease is running or ended unreported."""
+        """Make the channel's directories; refuse a channel where a lease is running or ended unreported, and a work
+        directory inside the study (each lease copies the study into it)."""
+        if self.work.resolve().is_relative_to(self.study.resolve()):
+            raise WorkerError(f"federation {self.label}: the work directory is inside the study it copies")
         ch.make_dirs(self.channel)
         if RUNNING in ch.listing(self.channel / ch.WORKER):
             raise Occupied(
@@ -202,10 +205,14 @@ class Worker:
             )
 
     def last(self) -> int:
-        """The last lease id this federation's worker took (0: none)."""
-        record = ch.read_listed(self.channel / ch.WORKER, ch.listing(self.channel / ch.WORKER), STATE)
-        if record is None:
+        """The last lease id this federation's worker took (0: none). A state the listing shows and that cannot be read
+        is an OSError (read again at the next poll), never 0, which would take an old lease again."""
+        names = ch.listing(self.channel / ch.WORKER)
+        if STATE not in names:
             return 0
+        record = ch.read_listed(self.channel / ch.WORKER, names, STATE)
+        if record is None:
+            raise OSError(f"worker/{STATE} is listed and could not be read")
         last = record.get("last_lease_id")
         if record.get("format") != STATE_FORMAT or record.get("federation") != self.label or not isinstance(last, int):
             raise WorkerError(f"federation {self.label}: worker/{STATE} is not this worker's state")
@@ -235,7 +242,7 @@ class Worker:
             if not isinstance(lease, dict) or lease.get("lease_id") != lease_id:
                 self._refuse("form", lease_id, "its lease does not carry the id its name does")
                 continue
-            if lease_id <= last:
+            if lease_id <= last or self._ended(lease_id):
                 if not self._ended(lease_id):
                     self._refuse("replay", lease_id, f"its id is not above {last}, the last this worker took")
                 continue
@@ -267,10 +274,18 @@ class Worker:
         lease_id, record = found
         if not ch.create_json(self._running, {"lease_id": lease_id, "pid": os.getpid(), "host": socket.gethostname()}):
             return "busy"
-        if lease_id <= self.last():  # another worker took it between the look and the take
+        try:
+            taken = lease_id <= self.last() or self._ended(lease_id)  # another worker took it since the look
+            if not taken:
+                ch.write_json(
+                    self._state, {"format": STATE_FORMAT, "federation": self.label, "last_lease_id": lease_id}
+                )
+        except OSError:
+            self._running.unlink()  # nothing ran: the lease is looked at again at the next poll
+            raise
+        if taken:
             self._running.unlink()
             return "busy"
-        ch.write_json(self._state, {"format": STATE_FORMAT, "federation": self.label, "last_lease_id": lease_id})
         if drain:
             self._return(lease_id, record["lease"].get("run_key"), 0, "draining", None)
             self._running.unlink()
@@ -410,6 +425,7 @@ def _archive(out: Path, archive: Path) -> str:
             for chunk in iter(lambda: handle.read(1 << 20), b""):
                 digest.update(chunk)
         os.replace(draft, archive)
+        ch.fsync_dir(archive.parent)  # before the completion that names it is written
     except BaseException:
         with contextlib.suppress(OSError):
             draft.unlink()
