@@ -449,11 +449,12 @@ class Driver(Down):
     def releasing(self, held: List[Tuple[str, Allocation]]) -> Iterator[None]:
         """Whatever fails inside releases every held job of this up in `held` that has not ended, by its own id
         (`release_held`), and says so: a Slurm failure ends with what was released, any other is raised as it was after
-        the operator is told. `held` grows as the jobs are submitted, each as soon as sbatch prints its id. With nothing
-        left to release (one held job, cancelled by its own failed wait or read-back) the failure is as it was."""
+        the operator is told. An operator's Ctrl-C during a wait that may last hours is one of them. `held` grows as the
+        jobs are submitted, each as soon as sbatch prints its id. With nothing left to release (one held job, cancelled
+        by its own failed wait or read-back) the failure is as it was."""
         try:
             yield
-        except Exception as error:
+        except BaseException as error:
             said = self.release_held(held)
             if not said:
                 raise

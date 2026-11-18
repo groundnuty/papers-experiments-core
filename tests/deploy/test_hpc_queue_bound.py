@@ -280,19 +280,23 @@ def test_o57_a_failure_of_the_live_read_or_the_placement_releases_every_held_job
     assert sorted(fake.cancelled) == [SERVICES, AGENT]
 
 
-def test_o57_a_failure_that_is_no_slurm_error_releases_every_held_job_and_is_raised_as_it_was(hpc, tmp_path, site):
-    """O57: a state that cannot be written (here, a placement that fails on a missing key) is no Slurm error and still
-    leaves no held job to run: they are cancelled, the operator is told, and the error is the one raised."""
+@pytest.mark.parametrize("error", [KeyError("services"), KeyboardInterrupt()], ids=["a missing key", "a Ctrl-C"])
+def test_o57_a_failure_that_is_no_slurm_error_releases_every_held_job_and_is_raised_as_it_was(
+    hpc, tmp_path, site, error
+):
+    """O57: a state that cannot be written (here, a placement that fails on a missing key) is no Slurm error, and an
+    operator's Ctrl-C during a long wait is none either; neither leaves a held job to run: they are cancelled, the
+    operator is told, and the error is the one raised."""
     fake = FakeSlurm()
     rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
     said = []
     rig.driver.say = said.append
 
     def failing(*args, **kwargs):
-        raise KeyError("services")
+        raise error
 
     rig.driver.place = failing
-    with pytest.raises(KeyError):
+    with pytest.raises(type(error)):
         rig.up()
     assert sorted(fake.cancelled) == [SERVICES, AGENT]
     assert f"the held job(s) {SERVICES}, {AGENT} were cancelled" in said
