@@ -6,7 +6,16 @@ import pytest
 from expcore.campaign.factors import FactorSchema
 from expcore.config.loading import ConfigError
 from expcore.stats.prereg import load as load_checked
-from expcore.stats.reruns import ANY_GUARD, EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, RERUNS, difference
+from expcore.stats.reruns import (
+    ANY_GUARD,
+    EGRESS,
+    FEDERATION,
+    MOUNT_GUARD,
+    PROCESS_VISIBILITY,
+    READ_LOG,
+    RERUNS,
+    difference,
+)
 
 SCHEMA = FactorSchema({"arm": ["a", "b"]}, ["task", "arm", "model", "seed"], {f"cond-{a}": {"arm": a} for a in "ab"})
 BASE = """\
@@ -23,7 +32,7 @@ outcome = "score"
 estimator = "wilcoxon_cluster_bootstrap"
 cluster = "group"
 """
-ALL = '[sensitivity]\nreruns = ["egress", "mount_guard", "process_visibility", "read_log", "any_guard"]\n'
+ALL = '[sensitivity]\nreruns = ["egress", "mount_guard", "process_visibility", "read_log", "any_guard", "federation"]\n'
 
 
 def write(tmp_path, text=BASE):
@@ -37,9 +46,10 @@ def load(path):
 
 
 def test_s19_the_reruns_are_named_as_the_core_runs_them():
-    """S19, S20: the four guards' reruns and the one of every guard together, in this order."""
-    assert RERUNS == ("egress", "mount_guard", "process_visibility", "read_log", "any_guard")
-    assert (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, ANY_GUARD) == RERUNS
+    """S19, S20, C43: the four guards' reruns, the one of every guard together and the federation rerun of a batch
+    merged by run, in this order."""
+    assert RERUNS == ("egress", "mount_guard", "process_visibility", "read_log", "any_guard", "federation")
+    assert (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, ANY_GUARD, FEDERATION) == RERUNS
 
 
 def test_s19_a_preregistration_declares_the_reruns_it_expects_in_the_order_it_gives(tmp_path):
@@ -151,7 +161,8 @@ def test_s19_a_guard_that_checked_the_batch_ran_its_rerun_whether_or_not_it_left
     assert clean.sensitivity is None
     assert ran_reruns(clean, None, None, None) == ("egress",)
     assert ran_reruns(None, None, None, None) == ()
-    assert ran_reruns(clean, clean, clean, clean, clean) == RERUNS
+    assert ran_reruns(clean, clean, clean, clean, clean, clean) == RERUNS
+    assert ran_reruns(None, None, None, None, None, clean) == ("federation",)
     assert ran_reruns(clean, clean, clean, clean) == ("egress", "mount_guard", "process_visibility", "any_guard")
     assert ran_reruns(None, clean, None, clean) == ("mount_guard", "any_guard")
 

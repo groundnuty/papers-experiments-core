@@ -4,13 +4,14 @@
 An analysis of a batch checked by a guard runs the preregistered analysis again without the runs the guard leaves out:
 `egress` (the egress check), `mount_guard` (the mount guard), `process_visibility` (the hidden-process check),
 `read_log` (the read-log scan, S20) and `any_guard` (without every run any guard that checked the batch leaves out,
-when two or more did). Which of them an
+when two or more did). A batch merged by run (C43) runs one more, `federation`: the contrasts refit with site as a fixed
+and federation as a random effect (`stats.federation_effect`), whether or not it can be computed. Which of them an
 analysis runs depends on which instruments its records carry, so a study that lists a guard on no record, or on the
 wrong runs, would otherwise get a different set of reruns than the one it meant to preregister. The preregistration
 declares the set:
 
     [sensitivity]
-    reruns = ["egress", "mount_guard", "any_guard"]   # in any order; each of the five names at most once
+    reruns = ["egress", "mount_guard", "any_guard"]   # in any order; each of the six names at most once
 
 and `analyze` refuses when the reruns it would run are not exactly these, in either direction, naming the difference: a
 declared rerun that no record supports (no record carries the guard, or fewer than two guards checked the batch for
@@ -30,7 +31,8 @@ from expcore.config.loading import Section, close_match
 
 EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, ANY_GUARD = "egress", "mount_guard", "process_visibility", "any_guard"
 READ_LOG = "read_log"
-RERUNS = (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, ANY_GUARD)
+FEDERATION = "federation"  # a batch merged by run (C43): the contrasts refit with site and federation effects
+RERUNS = (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, ANY_GUARD, FEDERATION)
 SINGLE = (
     EGRESS,
     MOUNT_GUARD,
@@ -41,7 +43,7 @@ KEYS = ("reruns",)
 
 
 def names_problem(names: object) -> str | None:
-    """Why `names` is not a declaration of reruns (a list of the five names, none twice); None when it is one."""
+    """Why `names` is not a declaration of reruns (a list of the six names, none twice); None when it is one."""
     if not isinstance(names, list | tuple) or not all(isinstance(name, str) for name in names):
         return f"must be an array of names from {', '.join(RERUNS)}"
     for name in names:
@@ -80,11 +82,17 @@ def checked(names: Sequence[str] | None) -> tuple[str, ...] | None:
 
 
 def ran_reruns(
-    egress: object, mount_guard: object, visibility: object, guards: object, read_log: object = None
+    egress: object,
+    mount_guard: object,
+    visibility: object,
+    guards: object,
+    read_log: object = None,
+    federation: object = None,
 ) -> tuple[str, ...]:
     """The reruns an analysis would run, in the order of `RERUNS`: each guard's analysis that exists (its guard checked
-    the batch, whether or not a run was left out), and the one of every guard together when it exists."""
-    found = (egress, mount_guard, visibility, read_log, guards)
+    the batch, whether or not a run was left out), the one of every guard together when it exists, and the federation
+    rerun of a batch merged by run (C43), whether or not it could be computed."""
+    found = (egress, mount_guard, visibility, read_log, guards, federation)
     return tuple(name for name, analysis in zip(RERUNS, found, strict=True) if analysis is not None)
 
 
@@ -99,6 +107,8 @@ def missing_table(source: str, ran: Sequence[str]) -> str:
 
 def _cannot_run(name: str, ran: Sequence[str]) -> str:
     """Why a declared rerun is not one this analysis can run."""
+    if name == FEDERATION:
+        return "the batch was not merged by run, so its runs have no federation or site"
     if name != ANY_GUARD:
         return f"no analysed record carries the {name} instrument"
     guards = [guard for guard in SINGLE if guard in ran]

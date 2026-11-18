@@ -290,3 +290,43 @@ def _sum_table(name: str, key_fields: tuple[str, ...], parts: Sequence[Sequence[
                 else:
                     cell[field] = cell[field] + value
     return [cell for _, cell in sorted(cells.items(), key=none_last)]
+
+
+LEASE_KEY = "lease"  # in an export of a batch merged by run (C43), each entry's: the id of the lease that ran it
+FEDERATION_KEY = "federation"  # each run entry's: the federation that held its counted lease, as the ledger labels it
+SITE_KEY = "site"  # each run entry's: the site of that federation, as the ledger labels it
+LEASES_KEY = "leases"  # the top-level key of such an export: merge.json's list of counted leases
+LEASE_RETRIES_KEY = "lease_retries_by_kind"  # each counted lease's own retries rows, with its lease id
+
+
+def by_run_export(joined: Mapping[str, Any], leases: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The export of a batch merged by run (C43): the counted leases' exports joined as a merge of shards joins them
+    (`join_exports`, one part per lease), with each run's lease, federation and site in place of a shard.
+
+    Every entry `join_exports` marked with its part (`shard`) is marked with its lease instead, and each entry of a
+    run list (and of the per-entry lists: holds, losses, interrupted spend, diagnostics) gains `federation` and `site`
+    from merge.json's `leases`, which the check and the analysis rebuilt from the ledger. `shards` becomes `leases`
+    and `shard_retries_by_kind` becomes `lease_retries_by_kind`. A batch merged otherwise never reaches this."""
+    placed = {entry["lease_id"]: entry for entry in leases}
+    out: dict[str, Any] = {}
+    for key, value in joined.items():
+        if key == SHARDS_KEY:
+            continue
+        if key == SHARD_RETRIES_KEY:
+            out[LEASE_RETRIES_KEY] = [_leased(row, placed, place=False) for row in value]
+        elif isinstance(value, list) and value and all(isinstance(e, dict) and SHARD_KEY in e for e in value):
+            out[key] = [_leased(entry, placed, place=True) for entry in value]
+        elif key == SETTINGS_KEY:  # each change and unknown start names the lease whose store recorded it
+            out[key] = {name: [_leased(entry, placed, place=False) for entry in items] for name, items in value.items()}
+        else:
+            out[key] = value
+    out[LEASES_KEY] = [dict(entry) for entry in leases]
+    return out
+
+
+def _leased(entry: Mapping[str, Any], placed: Mapping[int, Mapping[str, Any]], *, place: bool) -> dict[str, Any]:
+    """An entry with its part's lease id under `lease` in place of `shard`, and its federation and site with `place`."""
+    lease = placed[entry[SHARD_KEY]]
+    found = {key: value for key, value in entry.items() if key != SHARD_KEY}
+    where = {FEDERATION_KEY: lease["federation"], SITE_KEY: lease["site"]} if place else {}
+    return {**found, LEASE_KEY: lease["lease_id"], **where}

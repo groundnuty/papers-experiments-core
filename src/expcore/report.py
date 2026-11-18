@@ -100,6 +100,8 @@ from expcore.guards import GuardsAnalysis
 from expcore.mountguard.sensitivity import MountGuardAnalysis
 from expcore.readlog.scan import KINDS
 from expcore.readlog.sensitivity import ReadLogAnalysis
+from expcore.report_balance import LEFT_OUT as FEDERATION_LEFT_OUT
+from expcore.report_balance import balance_lines, federation_lines
 from expcore.report_diagnostics import section as start_failures
 from expcore.report_egress import egress_lines
 from expcore.report_families import (
@@ -152,6 +154,7 @@ from expcore.report_visibility import LEFT_OUT as HID_OR_UNKNOWN
 from expcore.report_visibility import visibility_lines
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
 from expcore.stats.armruns import LOST_CAUSES
+from expcore.stats.federation_effect import FederationAnalysis
 from expcore.stats.pairing import MISSING_CAUSES
 from expcore.stats.ratio import RATIO_CAUSES, RatioForm
 from expcore.visibility.sensitivity import VisibilityAnalysis
@@ -1027,6 +1030,8 @@ def render_report(
     visibility: VisibilityAnalysis | None = None,
     model_usage: Mapping[str, Any] | None = None,
     read_log: ReadLogAnalysis | None = None,
+    balance: Mapping[str, Any] | None = None,
+    federation: FederationAnalysis | None = None,
 ) -> str:
     """Render the report as Markdown.
 
@@ -1039,8 +1044,9 @@ def render_report(
     the process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
     it, O56), `model_usage` what each model spent and what served and retried its requests (`campaign.model_usage`: no
     section and no provenance line without it, C39), `read_log` the read-log scan's verdicts and rerun of a batch whose
-    records carry the `read_log` instrument (no section without it, S20). A partial analysis is described by the export
-    (`partial`, `running_attempts`, `excluded_attempts`).
+    records carry the `read_log` instrument (no section without it, S20), `balance` and `federation` the balance over
+    sites and federations and the federation-effect rerun of a batch merged by run (no section without them, C43). A
+    partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`).
     What each number counts is stated in the report beside it. The text ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
@@ -1079,6 +1085,8 @@ def render_report(
     both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, left_out_label(guards)))  # O60
     seen = visibility_lines(visibility, _table, lambda r: _sensitivity(r, interval_level, HID_OR_UNKNOWN))  # O56
     scanned = read_log_lines(read_log, _table, lambda r: _sensitivity(r, interval_level, TOUCHED_THE_CHANNEL))  # S20
+    placed = balance_lines(balance, _table)  # only a batch merged by run has these two (C43)
+    refit = federation_lines(federation, _table, lambda r: _sensitivity(r, interval_level, FEDERATION_LEFT_OUT))
     sections = (
         _contrasts(result, interval_level)
         + _conditions(export)
@@ -1089,6 +1097,8 @@ def render_report(
         + seen
         + scanned
         + both
+        + placed
+        + refit
         + _deployments(export)
         + _left_out(left_out)
     )

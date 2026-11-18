@@ -1,0 +1,195 @@
+# Provenance: new
+"""`python -m expcore merge OUT STORE_OUT... --ledger LEDGER`: an elastic campaign merged by run (#462 step 4, C43).
+
+The study is the one above `OUT` (or `--study`). The merge snapshots the ledger it is given (`campaign.ledger_read`),
+reads every lease store's `out/` the way today's merge reads a shard's (its lock held as a reader, its store backed up
+from a private copy, its `NOT-FINAL.json` refused), checks them against the ledger and the plan
+(`campaign.merge_by_run.check_by_run`), replays the records of each run's counted lease in a private copy as `check`
+does (`study.merge._replay`), and writes the batch. Nothing is written to `OUT` unless every check passes, and no
+store given is ever written.
+
+**A lost federation's store.** A store whose lease the ledger holds as lost or expired may still hold a running
+attempt: its federation was lost mid-run, and its store came back from the shared results directory as it was then.
+Today's merge refuses a store with a running attempt. This one settles it in its own private copy: the store and its
+records are copied, the copy is marked copied back and its attempts' directories pointed at the copied records
+(`snapshot.rebase_run_dirs`), and `recover` makes each running attempt interrupted and uncharged, charged at its bound
+since its call log is never trusted on the copy's word (C05). The settled copy is the evidence the batch keeps: its
+spend counts, its records are never analysed (by the ledger's verdict on the lease, never by what an attempt says). A
+store of any other lease with a running attempt is refused.
+"""
+
+import datetime as dt
+import json
+import os
+import shutil
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from expcore.campaign.ledger_read import LEDGER_SNAPSHOT, LedgerFacts, LedgerRefused, read_ledger, take_ledger_snapshot
+from expcore.campaign.lock import CampaignLocked, LockMissing, LockUnavailable, ReaderLock
+from expcore.campaign.merge import RUNS_DIR, MergeRefused, copy_runs, make_writable, refuse_non_empty, sha256_of
+from expcore.campaign.merge_by_run import LeaseStore, check_by_run, lease_store_of_bytes
+from expcore.campaign.merged_by_run import lay_out_by_run
+from expcore.campaign.recovery import recover
+from expcore.campaign.scheduler import STATE_FILE
+from expcore.campaign.shard import META_SHARD, NOT_FINAL_FILE
+from expcore.campaign.snapshot import AttemptsRunning, SnapshotError, rebase_run_dirs, take_snapshot
+from expcore.campaign.store import Store
+from expcore.campaign.storecopy import StoreChanged, copy_store
+from expcore.errors import study_kinds
+from expcore.provenance.codestamp import require_known
+from expcore.provenance.core_check import require_core
+from expcore.study.config import StudyConfig, find_study_root, load_study
+from expcore.study.merge import REPLAY_DIR, _refuse_inside_a_shard, _replay, refuse_earlier_form
+from expcore.study.pipeline import campaign_environment, environment_like
+from expcore.study.selection_start import pricing_of
+
+_SETTLED_LEASES = ("lost", "expired")  # a lease whose store may hold a running attempt, settled in its copy
+
+
+@dataclass(frozen=True)
+class MergedByRun:
+    """What a merge by run wrote: the batch's directory, its runs and how many leases it kept as evidence."""
+
+    out: Path
+    runs: int
+    evidence: int
+
+
+def merge_by_run(
+    out: str | os.PathLike[str],
+    store_outs: Sequence[str | os.PathLike[str]],
+    *,
+    ledger: str | os.PathLike[str],
+    study_root: str | os.PathLike[str] | None = None,
+    allow_dirty: bool = False,
+    code_root: str | os.PathLike[str] | None = None,
+) -> MergedByRun:
+    """Merge the lease stores whose `out/` directories are `store_outs` into the batch `out`, under the ledger at
+    `ledger`; see the module docstring. Raises MergeRefused naming the lease or run and the reason."""
+    out = Path(out)
+    study = load_study(find_study_root(study_root if study_root is not None else out))
+    with study_kinds(study.kinds):  # a replayed record may end in one of the study's own kinds
+        return _merge(study, out, [Path(path) for path in store_outs], Path(ledger), allow_dirty, code_root)
+
+
+def _merge(
+    study: StudyConfig, out: Path, outs: list[Path], ledger: Path, allow_dirty: bool, code_root: Any
+) -> MergedByRun:
+    _refuse_inside_a_shard(out, outs)
+    refuse_non_empty(out)
+    code = require_known("merge", code_root or study.root, study.scope, allow_dirty=allow_dirty)
+    require_core("merge", allow_dirty=allow_dirty)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    stage = out.parent / f".{out.name}.merge-{os.getpid()}"
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir()
+    try:
+        facts = _ledger_of(ledger, stage / LEDGER_SNAPSHOT)
+        pricing = pricing_of(study)
+        stores = [_read_store(path, stage, n, facts, study, pricing) for n, path in enumerate(outs)]
+        mismatch = pricing.mismatch(stores[0].fingerprint) if stores else None
+        if mismatch is not None:
+            raise MergeRefused(f"the study's prices are not the campaign's: {mismatch}")
+        merged = check_by_run(facts, stores, study.manifest, pricing)
+        refuse_earlier_form(merged.counted)
+        env = environment_like(study, campaign_environment(merged.counted[0].fingerprint))
+        copies = stage / REPLAY_DIR
+        copies.mkdir(mode=0o700)
+        staged = [_replay(study, store, code, env, copies / str(n)) for n, store in enumerate(merged.counted)]
+        lay_out_by_run(stage, merged, staged)
+        shutil.rmtree(copies)
+        try:
+            os.replace(stage, out)
+        except OSError as error:
+            raise MergeRefused(f"{out}: cannot be written ({type(error).__name__}: {error})") from None
+    finally:
+        if stage.exists():
+            make_writable(stage)
+        shutil.rmtree(stage, ignore_errors=True)
+    return MergedByRun(out, len(merged.counted), len(merged.evidence))
+
+
+def _ledger_of(source: Path, snapshot: Path) -> LedgerFacts:
+    """The ledger's snapshot, taken into the batch's staging directory, and its facts."""
+    try:
+        take_ledger_snapshot(source, snapshot)
+        return read_ledger(snapshot.read_bytes(), sha256_of(snapshot))
+    except LedgerRefused as error:
+        raise MergeRefused(str(error)) from None
+
+
+def _read_store(out: Path, stage: Path, n: int, ledger: LedgerFacts, study: StudyConfig, pricing: Any) -> LeaseStore:
+    """Snapshot the lease store whose `out/` is `out` into the staging directory and read it; a lost or expired
+    lease's store with a running attempt is settled in a private copy first (module docstring)."""
+    scratch = stage / f"read-{n}.sqlite"
+    try:
+        with ReaderLock(out):
+            try:
+                take_snapshot(out / STATE_FILE, scratch)
+            except AttemptsRunning:
+                _settle(out, stage / f"settle-{n}", scratch, ledger, study)
+    except (CampaignLocked, LockMissing, LockUnavailable) as error:
+        raise MergeRefused(f"{out}: {error}; a lease store is merged when its run has ended") from None
+    except SnapshotError as error:
+        raise MergeRefused(str(error)) from None
+    store = lease_store_of_bytes(scratch.read_bytes(), out, out=out, snapshot=scratch, pricing=pricing)
+    if os.path.lexists(out / NOT_FINAL_FILE):
+        raise MergeRefused(f"{store.name}: its results are marked not final ({NOT_FINAL_FILE})")
+    return store
+
+
+def _settle(out: Path, private: Path, scratch: Path, ledger: LedgerFacts, study: StudyConfig) -> None:
+    """Copy a store with running attempts and its records into `private`, settle the copy with `recover` when the
+    ledger holds its lease as lost or expired, and snapshot the settled copy to `scratch`; refuse any other."""
+    private.mkdir(mode=0o700)
+    try:
+        copied = copy_store(out / STATE_FILE, private)
+    except (StoreChanged, OSError) as error:
+        raise MergeRefused(f"{out}: its store cannot be copied to be settled ({error})") from None
+    store = Store(copied, study.schema)
+    try:
+        lease_id = _pinned_lease_id(store)
+        row = ledger.leases.get(lease_id) if lease_id is not None else None
+        if row is None or row.state not in _SETTLED_LEASES:
+            held = "not a lease the ledger issued" if row is None else f"held by the ledger as {row.state}"
+            raise MergeRefused(
+                f"{out}: its store still has a running attempt, and its lease is {held}: only a lost or expired "
+                "lease's store is settled in the merge's copy"
+            )
+    finally:
+        store.close()
+    runs = private / RUNS_DIR
+    if (out / RUNS_DIR).is_dir():
+        copy_runs(out / RUNS_DIR, runs)
+    rebase_run_dirs(copied, runs)  # marks the copy copied back: its call logs are never trusted on its own word
+    store = Store(copied, study.schema)
+    try:
+        now = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        settled = recover(store, now, ledger.config.max_attempts)
+    finally:
+        store.close()
+    take_snapshot(copied, scratch)
+    print(
+        f"merge: lease {lease_id} ({row.state} in the ledger): {settled.interrupted} running attempt(s) settled as "
+        "interrupted in the merge's private copy, an infrastructure loss charged at its bound; its store is not "
+        "written",
+        file=sys.stderr,
+    )
+    shutil.rmtree(private, ignore_errors=True)
+
+
+def _pinned_lease_id(store: Store) -> int | None:
+    """The lease id a store pins in its shard spec; None for a store of any other form."""
+    try:
+        pinned = json.loads(store.get_meta(META_SHARD) or "null")
+    except ValueError:
+        return None
+    value = pinned.get("lease_id") if isinstance(pinned, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+__all__ = ["MergedByRun", "merge_by_run"]
