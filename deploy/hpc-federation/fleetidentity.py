@@ -10,12 +10,17 @@ fleet's shard settings, `fleetplan.read_settings`).
   and the environment identity a lease store pins, whose digest the ledger pins at its first join. A read that fails is
   None (the join waits and is decided again), never a guess; a read that worked is kept for the member.
 - `locator(evidence)`: `(site, Settle) -> (out/, source)` or None, for `fleetexecute.dead_store_reader`: the lost
-  lease's store as a place `lease-<id>/` holds it, `study/out/` with the lease's `spend.jsonl` beside `study/`
-  (`PLACES`): in the federation's channel on the site's shared file system (`root`, offered only while the decision
-  shows the member's root, that is while it still holds the jobs the federation joined with) or in the evidence the
-  controller collected from the member (`pulled`). Local transport only: those directories are read here.
+  lease's store as a place `lease-<id>/` holds it (`PLACES`): in the federation's channel on the site's shared file
+  system (`root`, offered only while the decision shows the member's root, that is while it still holds the jobs the
+  federation joined with) or in the evidence the controller collected from the member (`pulled`). A place holds
+  either `study/out/` with the lease's `spend.jsonl` beside `study/` (put there by an operator), or what the worker
+  leaves while the lease runs (C46): `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies
+  (`out_snapshot.restore`, each in turn, newest first) is restored into a private directory on this host with the
+  journal copied beside it, as the first form is read, and the reader settles from them; the directory is removed at
+  the next read and at exit. Local transport only: those directories are read here.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -113,13 +118,43 @@ def identity_reader(
 
 def locator(evidence: Path) -> Callable[[Any, Any], Optional[Tuple[Path, str]]]:
     """The spend reader's `locate` (module docstring): where a lost lease's store is, or None."""
+    restored: list = []  # the private directory of the last read: removed at the next one and at exit
+
+    def release() -> None:
+        while restored:
+            shutil.rmtree(restored.pop(), ignore_errors=True)
+
+    atexit.register(release)
+
+    def from_snapshot(place: Path) -> Optional[Path]:
+        """The newest snapshot of `place` that verifies, restored as `study/out` beside the place's journal."""
+        from expcore.campaign import out_snapshot
+        from expcore.campaign.elastic.snapshots import SNAPSHOTS
+        from expcore.campaign.run_lease import LEASE_JOURNAL
+
+        try:
+            found = out_snapshot.snapshots(place / SNAPSHOTS)
+        except OSError:
+            return None
+        for snapshot in found:  # a snapshot that does not verify is passed over for the one before it
+            release()
+            private = Path(tempfile.mkdtemp(prefix="expcore-locate-"))
+            restored.append(private)
+            try:
+                out_snapshot.restore(snapshot, private / "study" / "out")
+                if (place / LEASE_JOURNAL).is_file():
+                    shutil.copyfile(place / LEASE_JOURNAL, private / LEASE_JOURNAL)
+            except (out_snapshot.OutSnapshotError, OSError):
+                continue
+            return private / "study" / "out"
+        return None
 
     def locate(site: Any, action: Any) -> Optional[Tuple[Path, str]]:
         if site is None:
             return None
         from expcore.campaign.elastic import channel as ch
 
-        name = f"lease-{action.lease_id:012d}"
+        name = ch.place_name(action.lease_id)
         candidates = []
         if action.root is not None and site.channel is not None:
             candidates.append((ch.federation_dir(str(site.channel), action.label) / PLACES / name, "root"))
@@ -129,6 +164,9 @@ def locator(evidence: Path) -> Callable[[Any, Any], Optional[Tuple[Path, str]]]:
             out = place / "study" / "out"
             if (out / "state.sqlite").is_file():
                 return out, source
+            found = from_snapshot(place)
+            if found is not None:
+                return found, source
         return None
 
     return locate

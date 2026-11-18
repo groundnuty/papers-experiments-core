@@ -3,23 +3,29 @@ its end, and a replayed lease, another federation's or a tombstone never run."""
 
 import hashlib
 import json
+import shutil
 import sys
 import tarfile
 import time
 from pathlib import Path
+from typing import Any, NamedTuple
 
 import pytest
 from channel_support import FakeHandle, FakeRunner, FakeSsh, channel_of, outcome_of, site_of, transport
 from elastic_support import SITE, assert_invariants, join, make, plan
-from study_support import clean_environment, cli, make_copy
+from hpc_fleet_support import fleet_modules
+from merge_by_run_support import make_running
+from study_support import Campaign, clean_environment, cli, make_copy
 
+from expcore.campaign import out_snapshot
 from expcore.campaign.elastic import Ledger, LedgerConfig, ledger_runs
 from expcore.campaign.elastic import channel as ch
+from expcore.campaign.elastic.control import Settle, SiteSettings
 from expcore.campaign.elastic.dispatch import TICK_S, Dispatcher
 from expcore.campaign.elastic.records import Lease
 from expcore.campaign.elastic.worker import Occupied, ProcessRunner, Worker, WorkerError, main
 from expcore.campaign.manifest import fingerprint_sha256
-from expcore.campaign.run_lease import read_lease
+from expcore.campaign.run_lease import LEASE_JOURNAL, read_lease
 from expcore.study.config import load_study
 from expcore.study.pipeline import campaign_fingerprint
 
@@ -225,24 +231,33 @@ class InProcess:
         self.env = env
         self.codes: list[tuple[int, str]] = []
 
-    def start(self, study: Path, lease_file: Path, log: Path):
+    def start(self, study: Path, lease_file: Path, log: Path, journal: Path):
         outer = self
 
         class Done:
             def wait(self, timeout: float) -> int:
-                code, errors = cli(outer.env, "run", str(study), "--lease", str(lease_file))
+                code, errors = cli(
+                    outer.env, "run", str(study), "--lease", str(lease_file), "--spend-journal", str(journal)
+                )
                 outer.codes.append((code, errors))
                 return code
 
         return Done()
 
 
-def test_c44_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kernel_to_a_counted_run(
-    tmp_path, clean_environment
-):
-    """C44: end to end on the example study: the dispatcher leases a run to a federation over the fake ssh, the
-    worker runs the kernel on it in a copy of the study, its completion and archive come back on the next tick, and
-    the ledger counts the run done with the store's charged attempt and measured spend."""
+class Leased(NamedTuple):
+    """A real lease of the example study, issued to `LABEL` and delivered over the fake ssh."""
+
+    study: Path
+    loaded: Any
+    ledger: Ledger
+    site: Any
+    dispatch: Dispatcher
+    lease: Lease
+    now: list[float]
+
+
+def leased_example(tmp_path: Path) -> Leased:
     study = make_copy(tmp_path, "study")
     loaded = load_study(study)
     config = LedgerConfig(
@@ -270,6 +285,16 @@ def test_c44_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kerne
     dispatch.tick()
     dispatch.tick()
     (lease,) = ledger.leases()
+    return Leased(study, loaded, ledger, site, dispatch, lease, clock_now)
+
+
+def test_c44_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kernel_to_a_counted_run(
+    tmp_path, clean_environment
+):
+    """C44: end to end on the example study: the dispatcher leases a run to a federation over the fake ssh, the
+    worker runs the kernel on it in a copy of the study, its completion and archive come back on the next tick, and
+    the ledger counts the run done with the store's charged attempt and measured spend."""
+    study, _, ledger, site, dispatch, lease, clock_now = leased_example(tmp_path)
     runner = InProcess(clean_environment)
     worker = Worker(LABEL, channel_of(site, LABEL), study, tmp_path / "work", runner)
     worker.open()
@@ -390,19 +415,79 @@ def test_c44_a_take_whose_state_landed_before_its_fsync_failed_still_runs_the_le
     assert outbox(channel, ch.completion_name(1))["state"] == "done"
 
 
-def test_a_lease_run_has_a_spend_journal_beside_its_study_copy(tmp_path):
-    """The real runner starts `<prefix> <study copy> --lease <file> --spend-journal <place>/spend.jsonl`: the journal
-    a dead store's reader (`dead_store_spend`) takes from beside the study copy."""
+def test_a_lease_run_has_its_spend_journal_where_the_worker_puts_it(tmp_path):
+    """The real runner starts `<prefix> <study copy> --lease <file> --spend-journal <journal>`, the journal the
+    worker names (its lease's place on the shared file system)."""
     place = tmp_path / "lease-000000000001"
     (place / "study").mkdir(parents=True)
+    journal = tmp_path / "shared" / "spend.jsonl"
     keep = "import json, sys; json.dump(sys.argv[1:], open('argv.json', 'w'))"
-    handle = ProcessRunner([sys.executable, "-c", keep]).start(place / "study", place / "lease.json", place / "run.log")
+    runner = ProcessRunner([sys.executable, "-c", keep])
+    handle = runner.start(place / "study", place / "lease.json", place / "run.log", journal)
     assert handle.wait(60) == 0
     argv = json.loads((place / "argv.json").read_text(encoding="utf-8"))
-    assert argv == [
-        str(place / "study"),
-        "--lease",
-        str(place / "lease.json"),
-        "--spend-journal",
-        str(place / "spend.jsonl"),
-    ]
+    assert argv == [str(place / "study"), "--lease", str(place / "lease.json"), "--spend-journal", str(journal)]
+
+
+def _ran_for_real(tmp_path: Path, env: dict[str, str]) -> tuple[Leased, Path]:
+    """A worker that ran the example study's lease for real; the lease's place on the channel."""
+    leased = leased_example(tmp_path)
+    channel = channel_of(leased.site, LABEL)
+    worker = Worker(LABEL, channel, leased.study, tmp_path / "work", InProcess(env))
+    worker.open()
+    assert worker.step() == "ran"
+    return leased, channel / ch.PLACES / ch.place_name(leased.lease.lease_id)
+
+
+def test_c46_a_worker_running_a_lease_leaves_a_verifying_snapshot_and_its_spend_journal_in_the_leases_place(
+    tmp_path, clean_environment
+):
+    """C46: while a lease runs the worker snapshots its `out/` (`out_snapshot`), and the run journals its spend, in
+    `<channel>/places/lease-<id>/` on the shared file system, which the dispatcher's later archive fetch leaves."""
+    leased, kept = _ran_for_real(tmp_path, clean_environment)
+    (newest, *_) = out_snapshot.snapshots(kept / "snapshots")
+    manifest = out_snapshot.restore(newest, tmp_path / "restored" / "out")  # every file read against its manifest
+    assert manifest["facts"]["lease"] == {"lease_id": leased.lease.lease_id, "run_key": leased.lease.run_key}
+    lines = [json.loads(line) for line in (kept / LEASE_JOURNAL).read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["kind"] == "header"
+    assert any(line["kind"] == "attempt" for line in lines)
+    assert not (tmp_path / "work" / f"lease-{leased.lease.lease_id:012d}" / LEASE_JOURNAL).exists()  # not the node's
+    leased.now[0] += TICK_S
+    leased.dispatch.tick()  # the archive is fetched, the lease counted: the worker's evidence stays
+    assert leased.ledger.lease(leased.lease.lease_id).state == "counted"
+    assert out_snapshot.snapshots(kept / "snapshots")
+    assert (kept / LEASE_JOURNAL).is_file()
+
+
+def test_c46_locate_gives_a_lost_leases_newest_snapshot_with_its_journal_and_the_read_is_fenced_to_that_lease(
+    tmp_path, clean_environment
+):
+    """C46: a federation lost mid-run leaves its place: the newest snapshot (the store as of its last attempt's
+    start) and the journal. `locate` restores that snapshot beside the journal, `dead_store_reader` settles the lease
+    from them, and the same place under another lease's id gives nothing."""
+    leased, kept = _ran_for_real(tmp_path, clean_environment)
+    lease_id = leased.lease.lease_id
+    ended = out_snapshot.snapshots(kept / "snapshots")[0]
+    manifest = out_snapshot.restore(ended, tmp_path / "mid" / "study" / "out")
+    make_running(Campaign(tmp_path / "mid" / "study"))  # the snapshot the loss left: its last attempt still running
+    out_snapshot.take(
+        tmp_path / "mid" / "study" / "out", kept / "snapshots", scratch=tmp_path / "scratch",
+        facts=manifest["facts"], live=False, now="2026-11-18T12:00:00Z",
+    )  # fmt: skip
+    with fleet_modules():
+        import fleetexecute
+        import fleetidentity
+
+        config = fleetexecute.SiteConfig(
+            SiteSettings(SITE, 7, 1e12, 47.0), tmp_path / "fleet", channel=Path(leased.site.root)
+        )
+        read = fleetexecute.dead_store_reader(fleetidentity.locator(tmp_path / "evidence"), leased.loaded)
+        found = read(config, Settle(SITE, LABEL, LABEL, lease_id, str(tmp_path / "root"), "lost"))
+        assert found is not None
+        spend_micro, source, charged = found
+        assert source == "root"
+        assert spend_micro > 0
+        assert charged == 0  # a done attempt is no attempt of the limit
+        shutil.copytree(kept, kept.with_name(ch.place_name(lease_id + 1)))
+        other = Settle(SITE, LABEL, LABEL, lease_id + 1, str(tmp_path / "root"), "lost")
+        assert read(config, other) is None

@@ -1651,7 +1651,7 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   `fleetidentity.py`: where a dead federation's lease store is; where none is found nothing is read, the lease stays
   charged its grant, and the log says so once while every tick reads again; a read that is None, of another lease, or
   without its charged attempts settles nothing: `dead_store_spend` gives a figure for a store whose run ended, or, for a
-  store snapshotted mid-run, with the lease run's spend journal beside its study copy, `spend.jsonl`): its grant stops
+  store snapshotted mid-run, with the lease run's spend journal beside it, `spend.jsonl`): its grant stops
   locking the budget, and dispatch resumes. A run
   the loss's conservative charge exhausted may reopen when its settle shows fewer attempts, so while such a lease is
   unsettled the controller keeps one idle federation for each such run instead of retiring it.
@@ -1697,21 +1697,27 @@ Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Noth
   find their model keys through that HOME. The directory, the home first and explicitly, is removed on every way out,
   the stop signals held while it is, as a shard step's is. Nothing prints a path, a name or a size of the tree:
   `home_files: true` and a count.
-- **The lease's spend journal.** The worker runs each lease with `--spend-journal <work>/lease-<id>/spend.jsonl`, beside
-  the lease's study copy. A lost lease's store snapshotted mid-run is read with it (`dead_store_spend`; docs/interfaces.md,
-  "A campaign merged by run").
+- **The lease's place, its spend journal and its snapshots** (C46). The worker runs each lease with `--spend-journal
+  <channel>/places/lease-<id>/spend.jsonl` and, while the lease runs, snapshots its `out/` into
+  `<channel>/places/lease-<id>/snapshots/` (`expcore.campaign.out_snapshot`, as a shard step does: every 900 s
+  (`--snapshot-s`) and within 30 s of an attempt's end, and once more after the run, before the archive). The journal's
+  fsynced appends survive the loss of the node and no SQLite store is ever live on the shared file system, only
+  snapshots. A snapshot that fails is reported and never ends the run; the worker removes no snapshot and no journal
+  (`take` keeps the newest two): if the archive cannot be fetched the lease is lost and they are its evidence. A lost
+  lease's store snapshotted mid-run is read with them (`dead_store_spend`; docs/interfaces.md, "A campaign merged by
+  run").
 - **What a federation joins with** (`fleetidentity.py`). The study is copied to a private directory under the fleet with
   the member's own `platform.toml` beside it (as a shard step places it), and the manifest's Python (`-I -B`, the
   allowlist and a home of its own) asks the core for the campaign fingerprint a start there pins and the environment
   identity its plugin declares, the one a lease store pins; the ledger keeps the digest of the identity. A read that fails
   is None and the join waits. **Where a lost lease's store is** (`locator`): a place `<channel>/<label>/places/lease-<id>/`
-  (`study/out/`, `spend.jsonl`) while the decision shows the member's root, or the same under the collected evidence
-  (`pulled`). Nothing in this step writes a place: a lease store lives on the node's tmpfs, which a lost federation takes
-  with it, so a lost lease's spend is read only where an operator (or a later worker snapshot) has put its store and
-  journal in a place, and stays charged its grant otherwise.
-- **Not built**: ssh to a remote site (the dispatcher's and the controller's calls are local), the worker snapshotting
-  its running lease's store to the shared file system, `Ledger.drain` refusing past a job's end, the watchdog's
-  `--on-out` command, and measured login-memory shares.
+  while the decision shows the member's root, or the same under the collected evidence (`pulled`). A place holds
+  `study/out/` with `spend.jsonl` beside `study/` (put there by an operator: read as it is), or what the worker leaves:
+  `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies (each tried in turn, newest first) is
+  restored into a private directory on this host with the journal copied beside it, and read as the first form is; the
+  directory is removed at the next read and at exit. Where a place holds neither, the lease stays charged its grant.
+- **Not built**: ssh to a remote site (the dispatcher's and the controller's calls are local), `Ledger.drain` refusing
+  past a job's end, the watchdog's `--on-out` command, and measured login-memory shares.
 
 `tests/deploy/test_hpc_fleet_dispatch.py`, `test_hpc_fleet_worker.py`, `test_hpc_fleet_worker_launch.py` and
 `test_hpc_fleet_join_worker.py` run these on stand-ins: the dispatcher's lease through a local channel in the
