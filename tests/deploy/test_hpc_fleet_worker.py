@@ -130,7 +130,8 @@ def test_the_home_is_a_sibling_of_the_sandboxs_work_root_and_never_under_it_or_t
     assert stat.S_IMODE(work_root.stat().st_mode) == 0o700  # made for the sandbox, which refuses to start without it
     refused = args_of(tmp_path, key_tree(tmp_path / "again"), work_root=str(tmp_path / "tmpfs"))
     assert worker.node(refused, never_run) == 2
-    assert not list((tmp_path / "tmpfs").iterdir())
+    kept = [p.name for p in (tmp_path / "tmpfs").iterdir()]
+    assert kept == ["sandbox-work"]  # the sandbox's work root stays (down's sweep removes it); no worker directory does
 
 
 def test_a_term_removes_the_home_and_restores_the_handlers(worker, tmp_path):
