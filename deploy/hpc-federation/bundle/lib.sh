@@ -464,11 +464,20 @@ need_2xx() {  # <status> <what> <body-file>: fail on anything but 2xx
 JSONGET_NULL=3
 jsonget() { "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/jsonget.py" "$@"; }
 
+# The node's FQDN: `hostname -f`, whether or not HPC_NODE_DOMAIN is set, when it is dotted; when it is one label,
+# `<hostname -s>.<HPC_NODE_DOMAIN>` (nodefacts.py's node_name makes the same name, by the same rule: the driver puts the
+# value in every step's environment). That name resolves nowhere on the node: write_names maps it to the node's address.
 node_fqdn() {
-  local f
+  local f s d label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
   f=$(hostname -f)
-  [[ $f =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]] || die "hostname -f gave '$f', not a fully qualified name"
-  printf '%s\n' "$f"
+  if [[ $f =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; then printf '%s\n' "$f"; return; fi
+  [[ $f =~ ^[A-Za-z0-9-]+$ ]] || die "hostname -f gave '$f', not a fully qualified name"
+  d=${HPC_NODE_DOMAIN:-}
+  [[ -n $d ]] || die "hostname -f gave the one-label name '$f', not a fully qualified name: set HPC_NODE_DOMAIN in site.env to the domain its FQDN is to carry"
+  s=$(hostname -s)
+  [[ $d =~ ^$label(\.$label)*$ && $s =~ ^[A-Za-z0-9-]+$ && $(( ${#s} + 1 + ${#d} )) -le 253 ]] \
+    || die "HPC_NODE_DOMAIN '$d' and hostname -s '$s' do not make a fully qualified name"
+  printf '%s.%s\n' "$s" "$d"
 }
 
 valid() {  # <kind> <value>: validate one input before it reaches a file or a template

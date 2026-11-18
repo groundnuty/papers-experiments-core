@@ -791,12 +791,12 @@ section 3).
   shows by a count that none of it remains (the previous section), and removes the root. After a partial `up` it finds the
   job by its recorded id, or by its allocation's exact name.
 - **Every step** is `srun --jobid --exact` with a name, its size, `--chdir=/` and `/usr/bin/env -i PATH=... LC_ALL=C
-  TMPDIR=<node tmpfs>` (and `--network=<value>` when `site.env` sets `HPC_STEP_NETWORK`, on every step `up`, `down` and
+  TMPDIR=<node tmpfs>` (and `HPC_NODE_DOMAIN=<domain>` when `site.env` sets it, and `--network=<value>` when `site.env` sets `HPC_STEP_NETWORK`, on every step `up`, `down` and
   the service verbs launch; the line `shards.py lines` prints for a shard step is the manifest's own and does not carry
   it), and every Python in it runs with `-I -B`; no step uses `--overlap`; a control step's srun client is ended only
   once its step is gone from `squeue -s`, and one still listed at its bound is cancelled by its own id.
 - **The site** comes from `site.env` (`HPC_ACCOUNT`, `HPC_PARTITION`, `SH`, `L`, and optionally `HPC_STEP_PATH`,
-  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_QUEUE_WAIT_S`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, `HPC_STUDY_ARTIFACTS`, and the four keys of the
+  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_QUEUE_WAIT_S`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, `HPC_NODE_DOMAIN`, `HPC_STUDY_ARTIFACTS`, and the four keys of the
   provider storage on scratch), recorded in the state file at `up` (of the storage keys, only `HPC_STORAGE_ROOT`; `HPC_QUEUE_WAIT_S` is `up`'s own bound and is not recorded), so `down` and the service verbs need no environment. `HPC_CORE_PYTHON` (a venv of this checkout on the
   shared filesystem) is required with an agent's node: `down`'s sweep reaps the sandbox's runs with the core's reaper.
   **Install that venv's interpreter under the site directory** (`UV_PYTHON_INSTALL_DIR=<site dir>/python uv sync`),
