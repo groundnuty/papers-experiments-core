@@ -212,21 +212,40 @@ its business, whatever it runs. It never reads or prints a node's name into a me
   made and submits nothing.
 - **Once the job runs and before any step,** `up` reads them again. A node of this federation, a service's or the
   agent's, that holds another live federation's job (two ups read before either had submitted, and Slurm placed both on
-  it) refuses `up`: its held jobs are cancelled by their ids, no step runs, and the message names the roles (`zone`,
-  `providers[i]`, `agent`), never a host. A second read that fails refuses the same way. An `up` run by hand that raced
-  is refused once: `down`, then `up` again. Under a fleet it is tried again (below).
+  it) refuses `up`: its held jobs are cancelled by their ids (each read first, and never cancelled once it carries another
+  job's name: Slurm reuses ids, and the reads may have waited out a slow controller), no step runs, and the message names the roles (`zone`,
+  `providers[i]`, `agent`), never a host. A second read that fails for ten minutes refuses the same way (one that
+  fails once, as a slow controller does, is read again: "A slow controller" below). An `up` run by hand that raced is
+  refused once: `down`, then `up` again. Under a fleet it is tried again (below).
 - **Too few nodes.** The exclusion can leave Slurm no node that fits the job: it stays pending, or sbatch refuses it. `up`
   waits no longer than its queue bound (`TIMEOUTS["queue"]`, 30 minutes, or `HPC_QUEUE_WAIT_S` seconds when `site.env`
   sets it: "Site configuration"), cancels the job by its id and says that it
   excluded N nodes of other live federations; a refusal by sbatch says the same, with Slurm's own words stripped of those
   nodes' names.
-- **The agent's own job waits for the services' job to start.** Under `"separate"` it is submitted with
-  `--dependency=after:<services job>` ("begin after the job starts", never `afterok`) and the dependency is read back
-  with the job (a site that drops it has that job cancelled and the `up` fails), so a services job that pends in the
-  queue never leaves the agent's node billing alone. What remains: once the services' job runs, the agent's job still
-  waits for a node of its own, and the services' job runs and bills meanwhile; and a services job cancelled before it
-  started (its wait failing at the bound) satisfies the dependency too, so the agent's job may start in the seconds
-  before `up` cancels it.
+- **A slow controller does not end the wait, nor the reads after it.** A read of the held job that fails while `up`
+  waits (`scontrol` timing out, or exiting nonzero) is a missed poll: `up` says so once, sleeps the poll interval and
+  then twice it (never more than 60 s), and reads again. It gives up only once every read has failed for 10 minutes
+  since the first one, or at the queue bound with a read that failed, and then releases the held jobs as below.
+  "Invalid job id" (the job is gone), a job that ended and a job of another name end the wait at once. The same holds
+  for the reads that follow the jobs' start, where giving up would lose jobs that already run: the read-back of the
+  held job (just submitted, and running), the read of the job a dependent agent's job waits for (below) and the second
+  read of the account's jobs (`squeue`). A definite answer there (a job recorded otherwise than asked, a node another
+  federation holds, a line that cannot be read) ends at once.
+- **Under `"separate"` the agent's own job is submitted once the services' job runs, off its nodes.** Submitted together,
+  Slurm could pack the agent's job onto one of the federation's own services' nodes (live, 18 Nov: four ups refused),
+  and the exclusion read before the submit cannot name nodes that are not yet known. Without `HPC_EXCLUSIVE_NODES`,
+  `up` submits the agent's job after the services' job runs and its nodes are read, with `--exclude` naming them and the
+  other federations' nodes, and waits for it at the same queue bound; it needs no dependency, since the services' job
+  already runs. The services' nodes bill while the agent's job queues, which that bound limits. `"het"` is one job and
+  unchanged.
+- **With `HPC_EXCLUSIVE_NODES=1` the two jobs are submitted together, and the agent's waits for the services' job to
+  start.** Whole nodes are never shared, so no exclusion is needed to keep the agent off the services' nodes. The
+  agent's job is submitted with `--dependency=after:<services job>` ("begin after the job starts", never `afterok`) and
+  the dependency is read back with the job (a site that drops it has that job cancelled and the `up` fails), so a
+  services job that pends in the queue never leaves the agent's node billing alone. What remains: once the services' job
+  runs, the agent's job still waits for a node of its own, and the services' job runs and bills meanwhile; and a services
+  job cancelled before it started (its wait failing at the bound) satisfies the dependency too, so the agent's job may
+  start in the seconds before `up` cancels it.
 - **A wait that fails releases every held job of that `up`.** Under `"separate"` the services' job and the agent's own are
   waited for in turn, and a job that does not start in time or ends before it ran is cancelled by its wait. `up` then
   cancels the other held job too, still queued or running, by its own id and only if it still carries the name `up`
@@ -248,8 +267,10 @@ its business, whatever it runs. It never reads or prints a node's name into a me
 In a fleet each member's `up` is its own, so each reads the members already up: with `HPC_FLEET_PARALLEL` at 1 (the
 default) every member takes nodes of its own. With more at once, the ups share one lock, the file `<fleet>/.placement.lock`
 (the fleet gives each `up` its name in `HPC_FLEET_PLACEMENT_LOCK`: not a site key, and never set by hand), taken for an
-up's first read together with its submits and for its second read once its jobs run, and for nothing else, so the rest of
-every up (the services, the core's phase, the link check) runs in parallel. Two members whose pending jobs land on one
+up's first read together with its submits, for the agent's own submit once the services' job runs (without
+`HPC_EXCLUSIVE_NODES`: it names the first read's nodes and the services', and the second read checks it) and for its
+second read once its jobs run, and for nothing else, a wait included, so the rest of every up (the services, the
+core's phase, the link check) runs in parallel. Two members whose pending jobs land on one
 node are then told apart by the second read: the one that reads first is refused, its jobs are cancelled (by their ids,
 and gone from the live list before the lock is let go), and it is tried again, up to 3 times in all
 (`hpcdriver.PLACEMENT_ATTEMPTS`), each retry reading the jobs now held and submitting with their nodes excluded. Only

@@ -126,15 +126,20 @@ def test_o57_up_submits_with_the_nodes_of_the_accounts_other_live_federations_ex
 def test_o57_every_component_and_job_of_the_up_excludes_the_same_nodes(hpc, tmp_path, site):
     """O57: the services' job, the agent's component of a heterogeneous job (named on each, so nothing depends on
     Slurm passing it on) and the agent's own job under "separate" all keep off the other federations' nodes: an agent's
-    sandbox never runs on a node that hosts an Onedata service, another federation's included."""
+    sandbox never runs on a node that hosts an Onedata service, another federation's included. The agent's own job
+    under "separate" also names the services' nodes, which are known once that job runs (it is submitted after)."""
     other = [OtherJob("5001", OTHER, "RUNNING", ("node01", "node02"))]
     for index, layout in enumerate((LAYOUT, SEPARATE_LAYOUT)):
         (tmp_path / str(index) / "fed").mkdir(parents=True)
         rig = Rig(hpc, tmp_path / str(index), site, layout, FakeSlurm(others=other, nodes=POOL))
         rig.up()
-        asked = [word for argv in rig.calls("sbatch") for word in argv]
-        assert asked.count("--exclude=node01,node02") == 2, layout.stem  # a component, or a job, each
-        assert asked.count("--nodes=1") >= 1
+        asked = [word for argv in rig.calls("sbatch") for word in argv if word.startswith("--exclude=")]
+        own = rig.state()["allocation"]["nodes"]
+        if layout is LAYOUT:
+            assert asked == ["--exclude=node01,node02"] * 2, layout.stem  # a component, each
+        else:
+            assert asked == ["--exclude=node01,node02", "--exclude=" + ",".join(sorted({"node01", "node02", *own}))]
+        assert len(rig.calls("sbatch")) == (1 if layout is LAYOUT else 2), layout.stem
         agent = rig.state()["sandbox"]["node"]
         assert agent not in ("node01", "node02"), layout.stem
         assert not set(rig.state()["allocation"]["nodes"]) & {"node01", "node02"}, layout.stem
@@ -284,12 +289,15 @@ def test_o57_this_federations_own_jobs_are_never_another_federations(hpc, tmp_pa
         assert rig.state()["allocation"]["excluded_nodes"] == 0
 
 
-def test_o57_a_second_read_that_fails_refuses_and_releases_the_job_too(hpc, tmp_path, site):
-    """O57: fail closed after the allocation as before it: with the jobs unreadable once this one runs, nothing proves
-    its nodes are its own, so it is refused, released and no step runs; the message names no host."""
+def test_o57_a_second_read_that_keeps_failing_refuses_and_releases_the_job_too(hpc, tmp_path, site):
+    """O57: fail closed after the allocation as before it: with the jobs unreadable for ten minutes once this one runs
+    (a single failed read is read again, test_hpc_queue_transient.py), nothing proves its nodes are its own, so it is
+    refused, released and no step runs; the message names no host."""
     stderr = "squeue: error: slurm_load_jobs error: Socket timed out on node03\n"
-    fake = FakeSlurm(on_me=lambda read, listed: hpc.slurm.Completed(1, "", stderr) if read == 2 else None)
+    fake = FakeSlurm(on_me=lambda read, listed: hpc.slurm.Completed(1, "", stderr) if read >= 2 else None)
     rig = Rig(hpc, tmp_path, site, fake=fake)
+    clock = iter(range(0, 10**7, 100))
+    rig.driver.slurm.clock = lambda: next(clock)
     with pytest.raises(hpc.slurm.SlurmError) as refused:
         rig.up()
     assert names_no_node(refused.value)

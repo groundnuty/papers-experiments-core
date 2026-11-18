@@ -3,8 +3,10 @@ DESIGN.md section 1, "A fleet"; README.md, "A fleet of federations"), regression
 
 Three changes, each over the fake Slurm of hpc_fed_support (which models `--dependency=after:<job>`):
 
-- under `sandbox_placement = "separate"` the agent's own held job is submitted to START after the services' job, so a
-  pending services job never leaves the agent's node billing alone;
+- under `sandbox_placement = "separate"` with `HPC_EXCLUSIVE_NODES=1` (both jobs submitted together) the agent's own
+  held job is submitted to START after the services' job, so a pending services job never leaves the agent's node
+  billing alone; without exclusive nodes it is submitted once the services' job runs, off its nodes, and carries no
+  dependency (tests/deploy/test_hpc_agent_off_service_nodes.py, and the combination with the lock below);
 - the fleet's ceiling is a site key, `HPC_FLEET_CEILING` (1 to 512, 64 when unset);
 - the ups of a fleet that run at once take one lock around their first read of the account's live jobs with their
   submits and around their second read, and one that is placed on another's node is released and tried again, up to
@@ -22,6 +24,7 @@ from hpc_fleet_support import SEPARATE_LAYOUT, fleet_modules, make_bench, make_c
 from tls_support import HAS_OPENSSL
 
 SERVICES, AGENT = "4242", "4343"  # the fake's two job ids under "separate"
+EXCLUSIVE = "HPC_EXCLUSIVE_NODES"  # whole nodes: the two jobs are submitted together, the agent's with a dependency
 RIVAL = "hpcop-another-study-1a2b3c4d"  # another federation's held job: hpcop-<project>-<hex>
 POOL = [f"node{i:02d}" for i in range(1, 41)]  # a cluster big enough for several federations' seven nodes each
 needs_openssl = pytest.mark.skipif(not HAS_OPENSSL, reason="the zone's CA is made with openssl")
@@ -117,10 +120,10 @@ def lock_is_held(path: Path) -> bool:
 
 # ------------------------------------------------------------------------------------ (1) no idle agent node
 def test_o68_the_agents_job_is_submitted_to_start_after_the_services_job(hpc, tmp_path, site):
-    """O68: [fails before] under "separate" the agent's own held job carries `--dependency=after:<services job>`
-    ("begin after the job starts", never `afterok`), the services' job none, and the dependency is what Slurm
-    recorded."""
-    rig = Rig(hpc, tmp_path, site)
+    """O68: [fails before] under "separate" with `HPC_EXCLUSIVE_NODES=1` (both jobs submitted together) the agent's own
+    held job carries `--dependency=after:<services job>` ("begin after the job starts", never `afterok`), the
+    services' job none, and the dependency is what Slurm recorded."""
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"})
     rig.up()
     services, agent = rig.sbatches()
     assert not any(word.startswith("--dependency") for word in services)
@@ -130,11 +133,32 @@ def test_o68_the_agents_job_is_submitted_to_start_after_the_services_job(hpc, tm
     assert "--dependency" not in rig.fake.submitted[SERVICES][0]
 
 
-def test_o68_a_services_job_that_never_starts_leaves_no_agent_job_billing(hpc, tmp_path, site):
-    """O68: [fails before] a services job that pends past the queue bound is cancelled, and at that moment the agent's
-    job was held with it and billed nothing; both are then cancelled, and the failure says what was released."""
+def test_o68_o57_without_exclusive_nodes_the_agents_job_follows_the_services_job_and_carries_no_dependency(
+    hpc, tmp_path, site
+):
+    """O68, O57: without `HPC_EXCLUSIVE_NODES` the agent's own job is submitted once the services' job runs, and
+    needs no dependency on a job that already runs: neither job carries one, and Slurm recorded none. A services job
+    that never starts leaves no agent job to bill: only the services' job is ever submitted, and cancelled."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    assert not any(word.startswith("--dependency") for argv in rig.sbatches() for word in argv)
+    assert all("--dependency" not in options[0] for options in rig.fake.submitted.values())
+    assert rig.state()["phase"] == "linked"
+    (tmp_path / "pending" / "fed").mkdir(parents=True)
     fake = FakeSlurm(state="PENDING")
-    rig = Rig(hpc, tmp_path, site, fake)
+    pending = Rig(hpc, tmp_path / "pending", site, fake)
+    with pytest.raises(hpc.slurm.SlurmError, match="did not start within 1800 s"):
+        pending.up()
+    assert list(fake.submitted) == [SERVICES]  # the agent's job was never submitted: nothing of it bills
+    assert fake.cancelled == [SERVICES]
+
+
+def test_o68_a_services_job_that_never_starts_leaves_no_agent_job_billing(hpc, tmp_path, site):
+    """O68: [fails before] with `HPC_EXCLUSIVE_NODES=1` a services job that pends past the queue bound is cancelled, and
+    at that moment the agent's job was held with it and billed nothing; both are then cancelled, and the failure says
+    what was released."""
+    fake = FakeSlurm(state="PENDING")
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake)
     with pytest.raises(hpc.slurm.SlurmError, match="did not start within 1800 s") as refused:
         rig.up()
     assert fake.state_of(AGENT) != "PENDING" or AGENT in fake.cancelled
@@ -146,9 +170,9 @@ def test_o68_a_services_job_that_never_starts_leaves_no_agent_job_billing(hpc, t
 def test_o68_the_agents_job_waits_for_the_services_job_and_starts_when_it_does(hpc, tmp_path, site):
     """O68: a services job pending at the read-back (the agent's job shows `after:<job>(unfulfilled)`) and starting
     later brings the agent's job up with it: the agent's job is pending while the services' pends, running once it
-    starts, and the up completes."""
+    starts, and the up completes (with `HPC_EXCLUSIVE_NODES=1`, where both are submitted together)."""
     fake = FakeSlurm(state="PENDING")
-    rig = Rig(hpc, tmp_path, site, fake)
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake)
     seen = []
 
     def start(seconds):  # each poll of the services' pending job
@@ -167,7 +191,7 @@ def test_o68_a_dependency_slurm_did_not_record_cancels_the_agents_job_and_fails_
     services' job still pends, so it would start with no services) has that job cancelled by its own id and the up
     fails, and the services' job, still pending, is released with it (O57: every held job of the up, by its id)."""
     fake = FakeSlurm(state="PENDING", component_recorded={(AGENT, 0): {"Dependency": "(null)"}})
-    rig = Rig(hpc, tmp_path, site, fake)
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake)
     with pytest.raises(hpc.slurm.SlurmError, match=r"recorded otherwise than asked \(its dependency\)") as refused:
         rig.up()
     assert fake.cancelled == [AGENT, SERVICES]
@@ -177,7 +201,7 @@ def test_o68_a_dependency_slurm_did_not_record_cancels_the_agents_job_and_fails_
 def test_o68_a_dependency_on_another_job_is_no_dependency_on_the_services_job(hpc, tmp_path, site):
     """O68: a dependency that names another job than the services' one is recorded otherwise than asked."""
     fake = FakeSlurm(state="PENDING", component_recorded={(AGENT, 0): {"Dependency": "after:9999(unfulfilled)"}})
-    rig = Rig(hpc, tmp_path, site, fake)
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake)
     with pytest.raises(hpc.slurm.SlurmError, match=r"\(its dependency\)"):
         rig.up()
     assert fake.cancelled == [AGENT, SERVICES]  # the services' job is released with it
@@ -197,11 +221,55 @@ def test_o68_a_dependency_that_cannot_be_checked_cancels_the_agents_job_too(hpc,
         return real(argv, timeout)
 
     fake.run = unreadable
-    rig = Rig(hpc, tmp_path, site, fake)
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake)
     with pytest.raises(hpc.slurm.SlurmError, match="dependency could not be checked") as refused:
         rig.up()
     assert fake.cancelled == [AGENT]
     assert str(refused.value).endswith(f"job(s) {SERVICES} could not be read: run down to release them")
+
+
+def test_o68_o57_a_dependency_check_whose_read_fails_once_is_a_missed_poll_and_cancels_nothing(hpc, tmp_path, site):
+    """O68, O57: with no dependency recorded the check reads the services' job, and a read that fails twice (a slow
+    controller) is a missed poll, said once and read again, as every other read of an up is: the services' job runs, so
+    the dependency Slurm dropped holds, and the up goes on with nothing cancelled. Only a read that fails for ten
+    minutes (the test above, where the clock moves 100 s a reading) cancels the agent's job."""
+    fake = FakeSlurm(component_recorded={(AGENT, 0): {"Dependency": "(null)"}})
+    real, failed = fake.run, []
+
+    def slow(argv, timeout):
+        if argv[:5] == ["scontrol", "show", "job", "-o", SERVICES] and AGENT in fake.submitted and len(failed) < 2:
+            failed.append(argv)
+            return hpc.slurm.Completed(1, "", "slurm_load_jobs error: Socket timed out on send/recv operation\n")
+        return real(argv, timeout)
+
+    fake.run = slow
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake)
+    rig.up()
+    assert len(failed) == 2
+    assert sum("a missed poll of the job that held job" in line and AGENT in line for line in rig.said) == 1
+    assert fake.cancelled == []
+    assert rig.state()["phase"] == "linked"
+
+
+def test_o68_o57_a_dependency_that_cannot_be_checked_never_cancels_a_job_whose_id_was_reused(hpc, tmp_path, site):
+    """O68, O57: the check rode out ten minutes of failing reads of the services' job, and in that time the agent's id
+    came to carry another job's name (Slurm reuses ids): it is read before the cancel, named and not cancelled, and the
+    failure says so; nothing of another up's is ever cancelled by an id saved ten minutes before."""
+    fake = FakeSlurm(component_recorded={(AGENT, 0): {"Dependency": "(null)"}})
+    real = fake.run
+
+    def unreadable(argv, timeout):
+        if argv[:5] == ["scontrol", "show", "job", "-o", SERVICES] and AGENT in fake.submitted:
+            fake.component_recorded[(AGENT, 0)] = {"Dependency": "(null)", "JobName": "somebody-elses-analysis"}
+            return hpc.slurm.Completed(1, "", "slurm_load_jobs error: Socket timed out\n")
+        return real(argv, timeout)
+
+    fake.run = unreadable
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake)
+    with pytest.raises(hpc.slurm.SlurmError, match="carries another job's name now, and was not cancelled") as refused:
+        rig.up()
+    assert fake.cancelled == []
+    assert f"job(s) {AGENT} carry another job's name and were not cancelled" in str(refused.value)
 
 
 def test_o68_the_het_placement_and_a_job_with_no_agent_carry_no_dependency(hpc):
@@ -210,9 +278,6 @@ def test_o68_the_het_placement_and_a_job_with_no_agent_carry_no_dependency(hpc):
     assert not any(word.startswith("--dependency") for word in plain.argv())
     with pytest.raises(hpc.slurm.SlurmError, match="not one job id"):
         hpc.slurm.Allocation("hpcop-p-abcd", "a", "p", 1, 5, 11264, "02:00:00", 7200, after="4242; rm").argv()
-
-
-EXCLUSIVE = "HPC_EXCLUSIVE_NODES"
 
 
 def test_o68_o57_an_exclusive_dependent_agent_job_carries_both_flags_and_both_are_read_back(hpc, tmp_path, site):
@@ -406,9 +471,11 @@ def test_o68_make_driver_reads_the_lock_from_the_environment_of_an_up_alone(hpc,
 
 
 def test_o68_the_lock_is_held_around_the_two_reads_and_the_submits_and_nothing_else(hpc, tmp_path, site, monkeypatch):
-    """O68: the whole of an up under a fleet takes the lock twice: around its first read of the account's live jobs with
-    both submits, and around its second read; every read and every submit is inside one, and no step (the services, the
-    core, the link check) is, so the rest of the up runs in parallel with the others'."""
+    """O68: the whole of an up under a fleet takes the lock three times: around its first read of the account's live
+    jobs with the services' submit, around the agent's own submit (made once the services' job runs: O57), and around
+    its second read; every read and every submit is inside one, and no step (the services, the core, the link check)
+    is, so the rest of the up runs in parallel with the others' (a wait is outside it too: see the combination
+    below)."""
     rig = Rig(hpc, tmp_path, site, lock=True)
     entered, seen = [], []
     real_lock = hpc.exclude.placement_lock
@@ -434,7 +501,7 @@ def test_o68_the_lock_is_held_around_the_two_reads_and_the_submits_and_nothing_e
 
     rig.fake.run, rig.fake.start, rig.fake.pipe = run, start, pipe
     rig.up()
-    assert entered == [rig.lock, rig.lock]
+    assert entered == [rig.lock, rig.lock, rig.lock]
     kinds = [kind for kind, _ in seen]
     assert kinds.count("sbatch") == 2
     assert kinds.count("squeue --me") == 2
@@ -442,6 +509,45 @@ def test_o68_the_lock_is_held_around_the_two_reads_and_the_submits_and_nothing_e
     assert all(held for kind, held in seen if kind in ("sbatch", "squeue --me"))
     assert not any(held for kind, held in seen if kind == "step")
     assert not lock_is_held(rig.lock)  # let go when the up ends
+
+
+def test_o68_o57_a_non_exclusive_separate_up_under_the_fleet_lock_rides_out_a_slow_read_off_the_services_nodes(
+    hpc, tmp_path, site
+):
+    """O68, O57 (the fleet's lock with the agent's job submitted once the services' job runs): an up of a fleet without
+    exclusive nodes, on a cluster that packs jobs onto shared nodes, whose reads of the agent's job fail twice during
+    the agent's wait. Both submits are under the lock and the failed reads are not (a wait never holds it); the failure
+    is a missed poll, said once, that cancels nothing; neither job carries a dependency; the agent's job excludes
+    exactly the services' nodes and is placed on another; and the lock is let go."""
+    fake = FakeSlurm(nodes=POOL, shared_nodes=True)
+    rig = Rig(hpc, tmp_path, site, fake, lock=True)
+    real, submits, failed, reads = fake.run, [], [], []
+
+    def slow(argv, timeout):
+        if argv[0] == "sbatch":
+            submits.append(lock_is_held(rig.lock))
+        if argv[:3] == ["scontrol", "show", "job"] and argv[4] == AGENT:
+            reads.append(argv)
+            if len(reads) in (2, 3):  # the read-back after the submit is the first: the wait's next two reads fail
+                failed.append(lock_is_held(rig.lock))
+                return hpc.slurm.Completed(1, "", "slurm_load_jobs error: Socket timed out on send/recv operation\n")
+        return real(argv, timeout)
+
+    fake.run = slow
+    rig.up()
+    state = rig.state()
+    assert state["phase"] == "linked"
+    assert submits == [True, True]  # the services' and the agent's: each under the fleet's lock
+    assert failed == [False, False]  # and the reads that failed were a wait's, which never holds it
+    assert sum("a missed poll of held job" in line and AGENT in line for line in rig.said) == 1
+    assert fake.cancelled == []
+    services, agent = rig.sbatches()
+    assert not any(word.startswith("--dependency") for argv in (services, agent) for word in argv)
+    assert not any(word.startswith("--exclude") for word in services)  # no other federation held a node
+    assert f"--exclude={','.join(state['allocation']['nodes'])}" in agent  # exactly the services' nodes
+    assert state["sandbox"]["node"] not in state["allocation"]["nodes"]
+    assert rig.reads() == 2  # the first read, and the second once both run: the agent's submit made none of its own
+    assert not lock_is_held(rig.lock)
 
 
 def rival_on_my_nodes(fake, attempts_on_rival):
@@ -468,9 +574,11 @@ def test_o68_an_up_placed_on_another_federations_node_is_released_and_tried_agai
     first, second = rig.sbatches()[:2], rig.sbatches()[2:]
     assert not any(word.startswith("--exclude") for word in first[0])
     assert f"--exclude={','.join(POOL[:7])}" in second[0]  # the services' retried job keeps off the rival's nodes
-    assert f"--exclude={','.join(POOL[:7])}" in second[1]  # and so does the agent's
     assert sorted(fake.cancelled) == sorted([SERVICES, AGENT])  # only the first attempt's jobs
     state = rig.state()
+    # the agent's retried job keeps off the rival's nodes and, submitted once the services' job runs (O57), off its own
+    agent_excluded = next(word for word in second[1] if word.startswith("--exclude=")).partition("=")[2]
+    assert set(agent_excluded.split(",")) == {*POOL[:7], *state["allocation"]["nodes"]}
     assert [state["allocation"]["job"], state["sandbox"]["job"]] == ["4353", "4363"]
     assert state["allocation"]["excluded_nodes"] == 7
     assert not set(state["allocation"]["nodes"]) & set(POOL[:7])
@@ -479,6 +587,25 @@ def test_o68_an_up_placed_on_another_federations_node_is_released_and_tried_agai
     said = " ".join(rig.said)
     assert "trying again (2 of 3)" in said
     assert "node0" not in said
+
+
+def test_o68_o57_a_refusal_at_the_second_read_never_cancels_a_job_whose_id_was_reused(hpc, tmp_path, site):
+    """O68, O57: the second read (made after the jobs run, and possibly after minutes of failed reads) finds the
+    federation on a node another holds, and by then the agent's id carries another job's name: the refusal cancels the
+    services' job, which is still ours, and names the other and leaves it alone."""
+    fake = FakeSlurm()
+    rival_on_my_nodes(fake, 1)
+
+    def reused(read, listed):
+        fake.component_recorded[(AGENT, 0)] = {"JobName": "somebody-elses-analysis"}  # before the second read's answer
+
+    fake.on_me = lambda read, listed: reused(read, listed) if read == 2 else None
+    rig = Rig(hpc, tmp_path, site, fake)
+    with pytest.raises(hpc.exclude.SharedNode) as refused:
+        rig.up()
+    assert fake.cancelled == [SERVICES]
+    assert f"job(s) {AGENT} carry another job's name and were not cancelled" in str(refused.value)
+    assert f"the held job(s) {SERVICES} were cancelled" in str(refused.value)
 
 
 def test_o68_a_second_loss_is_tried_again_and_the_third_attempt_wins(hpc, tmp_path, site):

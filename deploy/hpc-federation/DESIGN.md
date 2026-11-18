@@ -87,7 +87,8 @@ what it bills (above), which this problem does not need.
 - **After the allocation, before any step** (step 3): a second read; any of this federation's nodes (a service's or the
   agent's) in another live federation's jobs (this up's own jobs left out by their ids) refuses `up`. Its held jobs are
   cancelled by their ids, none of the placement is recorded, and the refusal names the roles (`zone`, `providers[i]`,
-  `agent`), never a host. A failed second read refuses and releases the same way. Two ups that read before either
+  `agent`), never a host. A second read that fails for ten minutes refuses and releases the same way (one that fails
+  once, as a slow controller does with the jobs already running, is read again: `Slurm.ride_out`). Two ups that read before either
   submitted are the case: the one whose job runs later sees the other's nodes and is refused, and both are when both
   ran before either read again.
 - **Too few nodes.** Slurm keeps a job pending, or sbatch refuses it, when the exclusion leaves none that fits. `up`
@@ -97,8 +98,10 @@ what it bills (above), which this problem does not need.
 - **A fleet** (below) is N such federations: each member's `up` reads the others' jobs, so members brought up one after
   another take distinct nodes by this rule alone. Members brought up at once (`HPC_FLEET_PARALLEL` above 1) share one
   lock, the file `<fleet>/.placement.lock` (`hpcexclude.placement_lock`), taken for each up's first read together with
-  its submits and for its second read once its jobs run, and for nothing else: the rest of every up (the services, the
-  core's phase, the link check) runs in parallel. Two members whose pending jobs end on one node are told apart by the
+  its submits, for the agent's own submit once the services' job runs (under `separate` without exclusive nodes, with
+  the first read's exclusion and the services' nodes: no read of its own) and for its second read once its jobs run,
+  and for nothing else, a wait included: the rest of every up (the services, the core's phase, the link check) runs in
+  parallel. Two members whose pending jobs end on one node are told apart by the
   second read: the one that reads first is refused, its jobs cancelled and gone from the live list before the lock is
   let go (a completing job still lists its nodes), and it is tried again (`hpcdriver.PLACEMENT_ATTEMPTS`, 3 in all),
   each retry reading the jobs now held and submitting with their nodes excluded; only the last refusal fails the
@@ -141,14 +144,19 @@ that has not ended, by its own id (`Driver.releasing`).
   is cancelled by its leader's id, which ends every component. Component 1's own job id (its record's `JobId`) is
   recorded, since squeue -s and sacct list its steps under it.
 - **The fallback, should a site refuse heterogeneous jobs: `sandbox_placement = "separate"`**, a second held job for S
-  alone, named `<name>-sandbox`, submitted, read back and cancelled exactly as the first, and never stopped or started:
-  its gate reaches the providers over the network, as it does in a component. Its steps take its own job id. The two
-  jobs are scheduled apart, but the second is submitted to start after the first (`--dependency=after:<first>`, Slurm's
-  "begin after the job starts", never `afterok`; read back with the job), so a services job that pends in the queue no
-  longer leaves S's node billing alone. What remains: once the first runs, the first can still run, and bill, while the
-  second waits for a node of its own (bounded as the first); a first job cancelled before it started (its wait failing at
-  the bound) satisfies the dependency too, so the second may start in the seconds before the same failure cancels it;
-  and a partition that allows one submitted job per user (reason 5 above) refuses the second.
+  alone, named `<name>-sandbox`, read back and cancelled exactly as the first, and never stopped or started: its gate
+  reaches the providers over the network, as it does in a component. Its steps take its own job id. The two jobs are
+  scheduled apart, and the order they are submitted in depends on the nodes. Without `HPC_EXCLUSIVE_NODES` the second
+  is submitted once the services' job runs and its nodes are read, with `--exclude` naming them and the other
+  federations' nodes, so Slurm cannot pack it onto a services node (it needs no dependency: the first already runs);
+  while it queues the first runs, and bills, bounded as the first by the queue bound. With `HPC_EXCLUSIVE_NODES=1`
+  whole nodes are never shared, so the two are submitted together, the second to start after the first
+  (`--dependency=after:<first>`, Slurm's "begin after the job starts", never `afterok`; read back with the job), so a
+  services job that pends in the queue does not leave S's node billing alone. What remains there: once the first runs,
+  it can still run, and bill, while the second waits for a node of its own (bounded as the first); a first job
+  cancelled before it started (its wait failing at the bound) satisfies the dependency too, so the second may start in
+  the seconds before the same failure cancels it. A partition that allows one submitted job per user (reason 5 above)
+  refuses the second either way.
 - **On a site whose switch plugin gives each job a virtual network identifier, `separate` is the placement to start
   from** (the second live slot, 16 Nov 2026). There a heterogeneous job's steps on component 0 failed from a point on
   (`srun: error: task 0 launch failed: Error configuring interconnect`: after the zone and five providers had started,
