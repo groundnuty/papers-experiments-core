@@ -319,13 +319,12 @@ def test_o58_run_supervises_forwards_a_stop_and_reaps_its_child_where_pidfd_open
 # ------------------------------------------------------------------------------ a kernel that has pidfd_open
 @needs_pidfd
 def test_o58_where_pidfd_open_works_the_pidfd_path_is_taken_and_the_fallback_never_entered(sleeper, tmp_path, capsys):
-    """O58: on a kernel that has the call the check says `pidfd`, `signal` sends through the pidfd (never `os.kill`),
+    """O58: on a kernel that has the call the check prints nothing, `signal` sends through the pidfd (never `os.kill`),
     and `run` holds its child through a pidfd, with the fallback's entry points failing loudly if reached."""
     supervise = load()
     assert supervise.check() == 0
-    said = capsys.readouterr().out
-    assert "mode: pidfd" in said
-    assert "fallback" not in said
+    said = capsys.readouterr()
+    assert (said.out, said.err) == ("", "")  # as it always was: a check that passes prints nothing
     with pytest.MonkeyPatch.context() as local:
         local.setattr(supervise, "signal_by_tick", forbidden)
         local.setattr(supervise, "kill_child", forbidden)
