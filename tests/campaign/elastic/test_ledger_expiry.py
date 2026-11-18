@@ -46,7 +46,7 @@ def test_c42_expiry_before_proof_requeues_the_run_at_once_but_holds_its_grant_an
     assert ledger.slots() == {}
     assert ledger.committed_micro()[0] == 2_000_000  # proven ended with no completion: charged at its bound
     second = leased(ledger, "fed-2")
-    assert (second.run_key, second.attempt_base) == (first.run_key, 0)
+    assert (second.run_key, second.attempt_base) == (first.run_key, 1)  # the loss was one charged attempt
     assert_invariants(ledger)
 
 
