@@ -8,10 +8,13 @@ channel's inbox (`elastic.channel`) by listing it, and for each lease, in lease-
    this federation's worker took (`worker/state.json`, kept across restarts) is never run: a replayed lease is refused
    and nothing is written for it. A lease is taken by creating `worker/running.json` (only if no file has the name),
    so two workers on one channel never run two leases at once, and the last id is written before the run starts.
-2. **Runs it** as `expcore run <copy> --lease <file>` (`ProcessRunner`), in a copy of the study of its own (a lease
-   store is always new, and the kernel keeps its store in `<study>/out`), under `<work>/lease-<id>/`, and writes a
-   heartbeat (`outbox/heartbeat.json`: the lease id and a counter from 1) when it takes the lease and every `BEAT_S`
-   while the run lives.
+2. **Runs it** as `expcore run <copy> --lease <file> --spend-journal <place>/spend.jsonl` (`ProcessRunner`), in a copy
+   of the study of its own (a lease store is always new, and the kernel keeps its store in `<study>/out`), under
+   `<work>/lease-<id>/`, and writes a heartbeat (`outbox/heartbeat.json`: the lease id and a counter from 1) when it
+   takes the lease and every `BEAT_S` while the run lives. The lease's *place* is `<channel>/places/lease-<id>/`, on the
+   shared file system: the spend journal's fsynced appends survive the loss of the node, and the store's `out/` is
+   snapshotted there while the run lives (`elastic.snapshots`), so a controller can settle a lost lease from what
+   survived. The worker removes neither (C46).
 3. **Reports it.** From the lease store (never from the exit status): with at least one attempt, the store's `out/` is
    archived to `archives/lease-<id>.out.tar` and a completion names the lease, its run, the store, the archive's
    SHA-256, the last attempt's state, this store's attempts, the highest attempt number it used and its charged attempts
@@ -42,9 +45,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from expcore.campaign import out_snapshot
 from expcore.campaign.elastic import channel as ch
 from expcore.campaign.elastic.config import micro_up, usd_of
-from expcore.campaign.run_lease import LeaseError, RunLease, read_lease
+from expcore.campaign.elastic.snapshots import SNAPSHOT_S, SNAPSHOTS, LeaseSnapshots, Take
+from expcore.campaign.run_lease import LEASE_JOURNAL, LeaseError, RunLease, read_lease
 
 BEAT_S = 30.0
 POLL_S = 5.0
@@ -68,7 +73,8 @@ class Handle(Protocol):
 
 
 class Runner(Protocol):
-    def start(self, study: Path, lease_file: Path, log: Path) -> Handle: ...
+    def start(self, study: Path, lease_file: Path, log: Path, journal: Path) -> Handle:
+        """Run the lease on the study copy, its spend journal written to `journal` (a new file)."""
 
 
 class _Process:
@@ -83,15 +89,16 @@ class _Process:
 
 
 class ProcessRunner:
-    """`<prefix> <study> --lease <file>`, its output to the lease's log, in a session of its own."""
+    """`<prefix> <study> --lease <file> --spend-journal <journal>`, its output to the lease's log, in a session of its
+    own."""
 
     def __init__(self, prefix: Sequence[str]) -> None:
         self.prefix = tuple(prefix)
 
-    def start(self, study: Path, lease_file: Path, log: Path) -> Handle:
+    def start(self, study: Path, lease_file: Path, log: Path, journal: Path) -> Handle:
         with log.open("ab") as sink:
             process = subprocess.Popen(
-                [*self.prefix, str(study), "--lease", str(lease_file)],
+                [*self.prefix, str(study), "--lease", str(lease_file), "--spend-journal", str(journal)],
                 cwd=study.parent,
                 stdin=subprocess.DEVNULL,
                 stdout=sink,
@@ -164,6 +171,8 @@ class Worker:
         outcome: Callable[[Path, RunLease], Outcome | None] = store_outcome,
         clock: Callable[[], float] = time.time,
         beat_s: float = BEAT_S,
+        snapshot_s: float = SNAPSHOT_S,
+        take: Take = out_snapshot.take,
     ) -> None:
         self.label = label
         self.channel = Path(channel).absolute()  # the run's cwd is its lease directory: no path may be relative to ours
@@ -173,6 +182,8 @@ class Worker:
         self.outcome = outcome
         self.clock = clock
         self.beat_s = beat_s
+        self.snapshot_s = snapshot_s
+        self.take = take
         self.refusals: list[str] = []
         self._noted: set[tuple[str, int]] = set()
 
@@ -356,10 +367,22 @@ class Worker:
         copy = place / "study"
         top = self.study.resolve()
         _copy_study(top, copy)
-        handle = self.runner.start(copy, lease_file, place / "run.log")
-        while (status := handle.wait(self.beat_s)) is None:
-            counter += 1
-            self._beat(lease_id, counter)
+        kept = self.channel / ch.PLACES / ch.place_name(lease_id)  # on the shared file system: a lost node leaves it
+        kept.mkdir(mode=0o700, parents=True, exist_ok=True)
+        facts = {"federation": self.label, "lease": {"lease_id": lease_id, "run_key": lease.run_key}}
+        snapshots = LeaseSnapshots(
+            copy / "out", kept / SNAPSHOTS, place / "snapshot-scratch", facts, every_s=self.snapshot_s, take=self.take
+        )
+        handle = self.runner.start(copy, lease_file, place / "run.log", kept / LEASE_JOURNAL)
+        snapshots.start()
+        try:
+            while (status := handle.wait(self.beat_s)) is None:
+                counter += 1
+                self._beat(lease_id, counter)
+        except BaseException:
+            snapshots.stop()
+            raise
+        snapshots.finish()  # the store its dispatcher left, before the archive and the completion that names it
         found = self.outcome(copy, lease)
         if found is None or found.attempts == 0:
             spend = 0 if found is None else found.spend_micro_usd
@@ -459,13 +482,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--python", default=sys.executable, help="the interpreter with the core (default: this one)")
     parser.add_argument("--beat-s", type=float, default=BEAT_S, help="seconds between heartbeats while a run lives")
     parser.add_argument("--poll-s", type=float, default=POLL_S, help="seconds between two listings of the inbox")
+    parser.add_argument(
+        "--snapshot-s", type=float, default=SNAPSHOT_S, help="seconds between snapshots of a running lease's out/"
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runner = ProcessRunner([args.python, "-I", "-B", "-m", "expcore", "run"])
-    worker = Worker(args.federation, args.channel, args.study, args.work, runner, beat_s=args.beat_s)
+    worker = Worker(
+        args.federation, args.channel, args.study, args.work, runner, beat_s=args.beat_s, snapshot_s=args.snapshot_s
+    )
     try:
         return worker.serve(poll_s=args.poll_s)
     except Occupied as error:

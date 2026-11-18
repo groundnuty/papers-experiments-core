@@ -1589,7 +1589,7 @@ federation that still holds jobs said by count. Not run live.
 Step 5 of #462 (C43): it keeps each site's fleet at a target the campaign's ledger can use, and brings up, drains and
 takes down federations through the fleet's own commands. `expcore.campaign.elastic.control` decides (DESIGN.md,
 section 1, "The elastic controller"); `fleetcontrol.py` reads the sites, and runs or prints the decision. It only adds
-to a fleet that exists: `fleet.py up` makes one (at least two federations). Nothing of it has run live (step 6).
+to a fleet that exists: `fleet.py up` makes one (at least two federations). Nothing of it has run live.
 
 ```bash
 # on a site's login node, from a private 0700 directory of ours, site.env exported: one read of the site, read only
@@ -1630,7 +1630,8 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   ledger's money: what is left, and the dollars locked in unsettled leases.
 - **Join, drain, retire, replace.** A member up, linked, verified and running joins the ledger as
   `<site label>-<fleet label>`, with the earlier end of its two held jobs, its queue wait logged (its fingerprint and
-  environment come from step 6; until then `fleetcontrol.py join ...` takes them by hand). It is drained once its
+  environment are read for it (`fleetidentity.py`, below) when the sites file names `settings`; otherwise `fleetcontrol.py
+  join ...` takes them by hand), after its worker is launched (`fleetworker.py launch`, below). It is drained once its
   recorded end is closer than `lease_bound_s` (by default the ledger's hard term), 60 s of collect, KillWait and 5
   minutes. Drained, or proven ended, with no lease issued or sent (checked again in the ledger as it starts), it is
   retired: `shards.py collect --roots-only --root R --into <evidence>/<site>-<fed-k>`, `shards.py verify-copy` with the
@@ -1646,10 +1647,12 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   injected there), or taken down if it never joined. Each lost lease (its holder proven ended with no completion, or
   its archive never verified) not yet settled is settled to the spend its dead federation's call log shows (the root
   is offered only while the member there still holds the jobs the federation joined with), through
-  the spend reader (`fleetexecute.dead_store_reader(locate, study)` over step 4's `dead_store_spend`; step 6 gives
-  `locate`, where a dead federation's lease store is; until then nothing is read, the lease stays charged its grant,
-  and the log says so once while every tick reads again; a read that is None, of another lease, or without its
-  charged attempts settles nothing: `dead_store_spend` gives a figure only once the store's run ended): its grant stops locking the budget, and dispatch resumes. A run
+  the spend reader (`fleetexecute.dead_store_reader(locate, study)` over step 4's `dead_store_spend`, with `locate` from
+  `fleetidentity.py`: where a dead federation's lease store is; where none is found nothing is read, the lease stays
+  charged its grant, and the log says so once while every tick reads again; a read that is None, of another lease, or
+  without its charged attempts settles nothing: `dead_store_spend` gives a figure for a store whose run ended, or, for a
+  store snapshotted mid-run, with the lease run's spend journal beside it, `spend.jsonl`): its grant stops
+  locking the budget, and dispatch resumes. A run
   the loss's conservative charge exhausted may reopen when its settle shows fewer attempts, so while such a lease is
   unsettled the controller keeps one idle federation for each such run instead of retiring it.
 - **By hand.** `--dry-run` prints each action as the commands above, one per line, under a comment naming where it runs
@@ -1664,7 +1667,63 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   only: two sites never share a fleet), `transport`
   (`local` only: commands run on this host, so step 5 runs where the login node and the ledger are one; a remote site
   is step 6's), optionally `interpreter` and `deploy` (the Python and this directory on its login node), and the
-  settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required).
+  settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required). With `archives` in
+  `[controller]` (absolute: where the dispatcher keeps the archives it pulls) and a `channel` in every site (that site's
+  channel root on its shared file system), the controller also runs the elastic dispatcher
+  (`expcore.campaign.elastic.dispatch`, DESIGN.md) in its own loop: the ledger's lock admits one holder, so the loop goes
+  round every 30 s, dispatching each site through its local transport and deciding every `interval_s`. With `settings`
+  (absolute: the fleet's shard settings file, `plan --manifest`'s keys, and `home_files`) it launches each joining
+  federation's worker and reads the identity it joins with and where a lost lease's store is.
+
+## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
+
+Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Nothing of it has run live.
+
+- **Launch** (`fleetworker.py launch --fleet F --member fed-k --settings S --federation LABEL --channel DIR --job-end
+  EPOCH`, on the site's login node; the controller runs it as the first half of a join, and a join waits when it fails).
+  It refuses a member that is not one this fleet's up made, holds and finds up (`fleetrecord.identity`) or whose job is
+  not the one up held and running, and starts the worker once: one detached `srun` step of the federation's agent job,
+  `--exact` (never `--overlap`), `--chdir=/`, `--time` the job's remaining minutes rounded up, behind `env -i` with the
+  allowlist alone, the step named `<job name>-worker`; its client is recorded as the member's `worker` in `fleet.json`,
+  and a recorded client that lives is not started again. It watches the client for 20 s: a step that ends at once (`node`
+  refuses a start it cannot make) is no launch, nothing is recorded, and the join waits. `fleet.py`'s commands are unchanged.
+- **On the node** (`fleetworker.py node`). The sandbox's work root is made as a shard step makes it (0700, on the tmpfs; the
+  sandbox refuses to start without it). A private directory on the node's `--tmpfs`, named as a shard step's with the
+  same owner record (so `shards.py sweep`, which `down` runs on the node, removes what a killed worker leaves once its
+  process is shown gone), a sibling of the sandbox's work root and never under it or the federation's root. In it: `home`
+  (the worker's HOME and XDG directories), `tmp`, `study` (a copy with the federation's `platform.toml`) and `work`
+  (the lease copies). With `home_files` (the operator's key tree: a shard setting like the shard step's, read with
+  `shards.read_home_files` and staged with `shards.stage_home_files`, directories 0700 and files 0600) the lease runs
+  find their model keys through that HOME. The directory, the home first and explicitly, is removed on every way out,
+  the stop signals held while it is, as a shard step's is. Nothing prints a path, a name or a size of the tree:
+  `home_files: true` and a count.
+- **The lease's place, its spend journal and its snapshots** (C46). The worker runs each lease with `--spend-journal
+  <channel>/places/lease-<id>/spend.jsonl` and, while the lease runs, snapshots its `out/` into
+  `<channel>/places/lease-<id>/snapshots/` (`expcore.campaign.out_snapshot`, as a shard step does: every 900 s
+  (`--snapshot-s`) and within 30 s of an attempt's end, and once more after the run, before the archive). The journal's
+  fsynced appends survive the loss of the node and no SQLite store is ever live on the shared file system, only
+  snapshots. A snapshot that fails is reported and never ends the run; the worker removes no snapshot and no journal
+  (`take` keeps the newest two): if the archive cannot be fetched the lease is lost and they are its evidence. A lost
+  lease's store snapshotted mid-run is read with them (`dead_store_spend`; docs/interfaces.md, "A campaign merged by
+  run").
+- **What a federation joins with** (`fleetidentity.py`). The study is copied to a private directory under the fleet with
+  the member's own `platform.toml` beside it (as a shard step places it), and the manifest's Python (`-I -B`, the
+  allowlist and a home of its own) asks the core for the campaign fingerprint a start there pins and the environment
+  identity its plugin declares, the one a lease store pins; the ledger keeps the digest of the identity. A read that fails
+  is None and the join waits. **Where a lost lease's store is** (`locator`): a place `<channel>/<label>/places/lease-<id>/`
+  while the decision shows the member's root, or the same under the collected evidence (`pulled`). A place holds
+  `study/out/` with `spend.jsonl` beside `study/` (put there by an operator: read as it is), or what the worker leaves:
+  `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies (each tried in turn, newest first) is
+  restored into a private directory on this host with the journal copied beside it, and read as the first form is; the
+  directory is removed at the next read and at exit. Where a place holds neither, the lease stays charged its grant.
+- **Not built**: ssh to a remote site (the dispatcher's and the controller's calls are local), `Ledger.drain` refusing
+  past a job's end, the watchdog's `--on-out` command, and measured login-memory shares.
+
+`tests/deploy/test_hpc_fleet_dispatch.py`, `test_hpc_fleet_worker.py`, `test_hpc_fleet_worker_launch.py` and
+`test_hpc_fleet_join_worker.py` run these on stand-ins: the dispatcher's lease through a local channel in the
+controller's loop, the worker's directory, keys, removal on a normal end and on TERM and a dead one swept, the launch
+checked on a federation's fake cluster, and the join's order, identity and `locate`. `tests/study/test_dead_store_journal.py`
+runs the journal read on a real lease store.
 
 ## What the repository's tests cover
 

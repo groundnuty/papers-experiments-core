@@ -45,6 +45,10 @@ RULE_LEASE = "expcore-shard/5: one run of the campaign on a lease, in a store of
 """The rule of a lease store; kept with every lease spec, never accepted by `ShardSpec` or `SelectionSpec`."""
 LEASE_SCHEMA = "expcore-lease/1"
 """The `schema` key of a lease file."""
+LEASE_JOURNAL = "spend.jsonl"
+"""The name of a lease run's spend journal (`run --spend-journal`): beside the lease's study copy, in the directory that
+holds nothing else the journal's start would count (`lost_spend.open_journal` reads every `*.jsonl` of it). A reader of
+a dead lease store (`study.merge_by_run.dead_store_spend`) takes the journal from there."""
 META_ATTEMPT_BASE = "lease_attempt_base"
 """Store meta key: the lease's attempt base as a whole number, pinned with the spec at the lease's first start. A store
 without it numbers its attempts from 1, as every store did before leases."""
@@ -187,6 +191,7 @@ def read_lease(path: str | Path) -> RunLease:
 
 
 __all__ = [
+    "LEASE_JOURNAL",
     "LEASE_SCHEMA",
     "META_ATTEMPT_BASE",
     "RULE_LEASE",

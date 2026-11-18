@@ -304,6 +304,19 @@ def campaign_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
         return fingerprint
 
 
+def campaign_identity(path: str | os.PathLike[str]) -> tuple[dict[str, Any], dict[str, str]]:
+    """What a federation joins the elastic ledger with (#462 step 6), for the study at `path` as it stands beside the
+    federation's `platform.toml`: the campaign fingerprint a start pins (`campaign_fingerprint`) and the environment
+    identity its plugin declares, which a lease store pins as `environment_identity` (`lease_start`'s own call). Nothing
+    is started and no store is opened."""
+    study = load_study(path)
+    check_study(study)
+    with study_kinds(study.kinds):
+        code = require_known("run", study.root, study.scope, allow_dirty=False)
+        plugin = load_plugin(StudyContext(study, code))
+        return fingerprint_of(study, plugin), _identity_of(study, plugin)
+
+
 def run_study(
     path: str | os.PathLike[str],
     *,

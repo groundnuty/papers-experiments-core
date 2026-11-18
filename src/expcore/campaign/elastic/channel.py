@@ -13,6 +13,9 @@ has one channel directory, `<channel root>/<label>/`, that holds:
   that began no attempt) and `exited.json` (the worker stopped after a drain).
 - `archives/lease-<id>.out.tar`: the lease store's `out/`, whose SHA-256 its completion names.
 - `worker/`: the worker's own state (the last lease id it took, and `running.json` while a lease runs).
+- `places/lease-<id>/`: what a lease leaves for a controller that must settle it from what survived its federation
+  (C46): `snapshots/` (the lease store's `out/`, snapshotted while it runs, `expcore.campaign.out_snapshot`) and
+  `spend.jsonl` (the run's spend journal). The worker never removes them.
 
 **The rules, the fault relay's (`expcore_onedata.fault_relay`).** Every file is written whole: a draft beside it (a
 name starting with a dot, which no reader takes), fsynced, then renamed into place, and the directory fsynced. A lease
@@ -47,7 +50,7 @@ EXITED_FORMAT = "expcore-elastic-exited/1"
 CONTACT_FORMAT = "expcore-elastic-contact/1"
 KERNEL_LEASE_SCHEMA = "expcore-lease/1"  # `run_lease.LEASE_SCHEMA`, the kernel's own file
 
-INBOX, OUTBOX, ARCHIVES, WORKER = "inbox", "outbox", "archives", "worker"
+INBOX, OUTBOX, ARCHIVES, WORKER, PLACES = "inbox", "outbox", "archives", "worker", "places"
 HEARTBEAT, DRAIN, EXITED, CONTACT = "heartbeat.json", "drain.json", "exited.json", "contact.json"
 LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")  # the ledger's operator labels: never a path or a host name
 _NAMED = re.compile(r"(lease|completion|return)-(\d{12})\.json")
@@ -56,6 +59,11 @@ _TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 def lease_name(lease_id: int) -> str:
     return f"lease-{lease_id:012d}.json"
+
+
+def place_name(lease_id: int) -> str:
+    """The directory of a lease's place under `places/`."""
+    return f"lease-{lease_id:012d}"
 
 
 def completion_name(lease_id: int) -> str:
@@ -212,6 +220,7 @@ __all__ = [
     "LABEL",
     "LEASE_FORMAT",
     "OUTBOX",
+    "PLACES",
     "RETURN_FORMAT",
     "WORKER",
     "archive_name",
@@ -226,6 +235,7 @@ __all__ = [
     "listing",
     "make_dirs",
     "named_id",
+    "place_name",
     "read_listed",
     "return_name",
     "tombstone",

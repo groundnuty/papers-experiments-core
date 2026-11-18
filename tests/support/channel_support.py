@@ -155,7 +155,7 @@ class FakeRunner:
     running: int = 0
     overlapped: bool = False
 
-    def start(self, study: Path, lease_file: Path, log: Path) -> Any:
+    def start(self, study: Path, lease_file: Path, log: Path, journal: Path) -> Any:
         lease_id = json.loads(lease_file.read_text(encoding="utf-8"))["lease_id"]
         self.started.append(lease_id)
         if self.running:
