@@ -75,6 +75,7 @@ class RunRow:
     state: str
     lease_id: int | None
     charged: int
+    condition: str = ""
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,10 @@ class LedgerFacts:
             for lease in self.leases.values()
             if lease.run_key == run_key and lease.state in HELD and lease.lease_id not in self.settlements
         ]
+
+    def leases_of(self, run_key: str) -> list[LeaseRow]:
+        """The run's leases, in lease order."""
+        return sorted((lease for lease in self.leases.values() if lease.run_key == run_key), key=lambda r: r.lease_id)
 
     def counted(self, run_key: str) -> int | None:
         """The run's counted lease: its latest when the run is terminal; None for a run that is not."""
@@ -173,7 +178,9 @@ class _Views(LedgerViews):
 
 
 def _run_row(row: Any) -> RunRow:
-    return RunRow(row["run_key"], row["seq"], row["model"], row["state"], row["lease_id"], row["charged"])
+    return RunRow(
+        row["run_key"], row["seq"], row["model"], row["state"], row["lease_id"], row["charged"], row["condition"]
+    )
 
 
 def _lease_row(row: Any) -> LeaseRow:

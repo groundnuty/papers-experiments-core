@@ -20,9 +20,10 @@
    environment (`merge.check_environment`), or than the one the ledger pinned at its first join (`environment_digest`
    of the stores' identity); a campaign whose fingerprint is not the one the ledger was made for;
 4. **not exactly one counted lease per run:** a run of the plan that is not terminal in the ledger (it has no counted
-   lease yet), a run whose counted lease's store is not given (its archive is the run's only record), a counted store
-   whose run ended otherwise than the ledger says; a store of a counted or superseded lease that is not given (the
-   ledger verified its archive, so it is evidence to keep);
+   lease yet; a run the ledger ended as infra_exhausted for its lost leases has none, and is listed as an exhausted
+   run once none of its leases is unsettled, see 6), a run whose counted lease's store is not given (its archive is
+   the run's only record), a counted store whose run ended otherwise than the ledger says; a store of a counted or
+   superseded lease that is not given (the ledger verified its archive, so it is evidence to keep);
 5. spend: every lease is counted at what the ledger charges it (its measured spend once its completion verified,
    the spend a settlement gave a lost lease, else its grant), and the leases together must stay within the ceilings
    in force (`max_usd` and each model's, as pinned or raised); a store given must agree with its lease's charge: the
@@ -63,7 +64,7 @@ from dataclasses import dataclass
 
 from expcore.campaign.elastic.config import micro_up, usd_of
 from expcore.campaign.lease_facts import LeaseStore
-from expcore.campaign.ledger_read import TERMINAL, LeaseRow, LedgerFacts
+from expcore.campaign.ledger_read import TERMINAL, LeaseRow, LedgerFacts, RunRow
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.merge import (
     MergeRefused,
@@ -91,12 +92,28 @@ class Evidence:
 
 
 @dataclass(frozen=True)
+class LostRun:
+    """A run the ledger ended as infra_exhausted for its lost leases, with no counted lease and so no store: every one
+    of its leases (none of them unsettled) and the run as the ledger holds it. It is listed as exhausted, never
+    analysed; its placement is its last lease's."""
+
+    run: RunRow
+    leases: tuple[LeaseRow, ...]
+
+    @property
+    def last(self) -> LeaseRow:
+        return self.leases[-1]
+
+
+@dataclass(frozen=True)
 class ByRun:
-    """A merge by run that passed the checks: each run's counted store in plan order, and the evidence."""
+    """A merge by run that passed the checks: each run's counted store in plan order, the evidence, and the runs the
+    ledger exhausted for their lost leases, in plan order."""
 
     counted: tuple[LeaseStore, ...]
     evidence: tuple[Evidence, ...]
     ledger: LedgerFacts
+    lost: tuple[LostRun, ...] = ()
 
 
 def check_by_run(ledger: LedgerFacts, stores: Sequence[LeaseStore], plan: Manifest, pricing: Pricing | None) -> ByRun:
@@ -117,12 +134,12 @@ def check_by_run(ledger: LedgerFacts, stores: Sequence[LeaseStore], plan: Manife
         )
     check_environment(ordered)
     _check_ledger_environment(ordered[0], ledger)
-    counted = _counted(ledger, by_lease, plan)
+    counted, lost = _counted(ledger, by_lease, plan)
     evidence = _evidence(ledger, by_lease, {store.lease.lease_id for store in counted})
     for store in ordered:
         _check_store_spend(store, ledger)
     _check_spend(ledger, counted, evidence)
-    return ByRun(tuple(counted), tuple(evidence), ledger)
+    return ByRun(tuple(counted), tuple(evidence), ledger, tuple(lost))
 
 
 def refuse_reopenable(ledger: LedgerFacts) -> None:
@@ -209,8 +226,12 @@ def _check_binding(store: LeaseStore, ledger: LedgerFacts) -> None:
         raise MergeRefused(f"{store.name}: holds {others[0] if others else 'no run'}, not exactly its own run")
 
 
-def _counted(ledger: LedgerFacts, by_lease: Mapping[int, LeaseStore], plan: Manifest) -> list[LeaseStore]:
-    """1 and 4: the ledger's runs are the plan's, each terminal, and its counted lease's store is given and agrees."""
+def _counted(
+    ledger: LedgerFacts, by_lease: Mapping[int, LeaseStore], plan: Manifest
+) -> tuple[list[LeaseStore], list[LostRun]]:
+    """1 and 4: the ledger's runs are the plan's, each terminal, and its counted lease's store is given and agrees; a
+    run the ledger exhausted for its lost leases, every lease of it settled or ended (`refuse_reopenable`), has none
+    and is returned apart, to be listed as exhausted."""
     planned = {row.key.text: row.seq for row in plan.rows}
     held = {key: run.seq for key, run in ledger.runs.items()}
     if held != planned:
@@ -218,15 +239,17 @@ def _counted(ledger: LedgerFacts, by_lease: Mapping[int, LeaseStore], plan: Mani
         missing = sorted(set(planned) - set(held))
         named = f"run {extra[0]} is not the plan's" if extra else f"run {missing[0]} of the plan is not in it"
         raise MergeRefused(f"the ledger's runs are not the study's plan: {named}")
-    counted = []
+    counted, lost = [], []
     for key in sorted(planned, key=planned.__getitem__):
         run = ledger.runs[key]
         lease_id = ledger.counted(key)
+        if lease_id is None and run.state == "infra_exhausted":
+            lost.append(LostRun(run, tuple(r for r in ledger.leases_of(key) if r.state != "cancelled")))
+            continue
         if lease_id is None and run.state in TERMINAL:
             raise MergeRefused(
                 f"run {key} is {run.state} in the ledger with no counted lease (its latest, lease {run.lease_id}, is "
-                f"{ledger.leases[run.lease_id].state if run.lease_id is not None else 'none'}): a run ended by lost "
-                "leases has no store to merge, so a campaign is merged by run once every run has its counted lease"
+                f"{ledger.leases[run.lease_id].state if run.lease_id is not None else 'none'})"
             )
         if lease_id is None:
             raise MergeRefused(
@@ -244,7 +267,7 @@ def _counted(ledger: LedgerFacts, by_lease: Mapping[int, LeaseStore], plan: Mani
                 f"{store.name}: its run is {store.status.get(key)} in its store and {run.state} in the ledger"
             )
         counted.append(store)
-    return counted
+    return counted, lost
 
 
 def _evidence(ledger: LedgerFacts, by_lease: Mapping[int, LeaseStore], counted: set[int]) -> list[Evidence]:

@@ -298,11 +298,16 @@ FEDERATION_KEY = "federation"  # each run entry's: the federation that held its 
 SITE_KEY = "site"  # each run entry's: the site of that federation, as the ledger labels it
 LEASES_KEY = "leases"  # the top-level key of such an export: merge.json's list of counted leases
 LEASE_RETRIES_KEY = "lease_retries_by_kind"  # each counted lease's own retries rows, with its lease id
+LOST_KEY_FLAG = "lost_federation"  # an exhausted run's entry: true when the ledger exhausted it for its lost leases
 LEDGER_SPEND_KEY = "ledger_spend"  # merge.json's `spend`: the ledger's money at its snapshot, locked dollars included
 
 
 def by_run_export(
-    joined: Mapping[str, Any], leases: Sequence[Mapping[str, Any]], spend: Mapping[str, Any] | None = None
+    joined: Mapping[str, Any],
+    leases: Sequence[Mapping[str, Any]],
+    spend: Mapping[str, Any] | None = None,
+    lost: Sequence[Mapping[str, Any]] = (),
+    seq_of: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """The export of a batch merged by run (C45): the counted leases' exports joined as a merge of shards joins them
     (`join_exports`, one part per lease), with each run's lease, federation and site in place of a shard.
@@ -313,7 +318,10 @@ def by_run_export(
     from merge.json's `leases`, which the check and the analysis rebuilt from the ledger. `shards` becomes `leases`
     and `shard_retries_by_kind` becomes `lease_retries_by_kind`; merge.json's `spend` (the ledger's money at its
     snapshot: what every lease is charged, the ceilings in force and what unsettled leases still lock) is carried as
-    `ledger_spend`. A batch merged otherwise never reaches this."""
+    `ledger_spend`. The runs the ledger exhausted for their lost leases (`lost`, entries as a store's export lists an
+    exhausted run, each with `lost_federation` true) join `exhausted_runs` in plan order (`seq_of`) and count in
+    `planned_runs`: they are exhausted runs like any other, with no analysed attempt. A batch merged otherwise never
+    reaches this."""
     placed = {entry["lease_id"]: entry for entry in leases}
     out: dict[str, Any] = {}
     for key, value in joined.items():
@@ -327,6 +335,10 @@ def by_run_export(
             out[key] = {name: [_leased(entry, placed, place=False) for entry in items] for name, items in value.items()}
         else:
             out[key] = value
+    if lost:
+        order = seq_of or {}
+        out["exhausted_runs"] = sorted([*out["exhausted_runs"], *map(dict, lost)], key=lambda e: order[e["run_key"]])
+        out["planned_runs"] += len(lost)
     out[LEASES_KEY] = [dict(entry) for entry in leases]
     if spend is not None:
         out[LEDGER_SPEND_KEY] = dict(spend)

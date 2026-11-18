@@ -22,7 +22,7 @@ from study_support import Campaign, clean_environment, cli, copy_campaign, finis
 from expcore.campaign.by_run_layout import EVIDENCE_DIR, LEASES_DIR, MERGE_BY_RUN_SCHEMA
 from expcore.campaign.elastic import Ledger
 from expcore.campaign.elastic.config import usd_of
-from expcore.campaign.export_join import FEDERATION_KEY, LEASE_KEY, SITE_KEY
+from expcore.campaign.export_join import FEDERATION_KEY, LEASE_KEY, LOST_KEY_FLAG, SITE_KEY
 from expcore.campaign.interrupted_spend import COPIED_BACK_KEY
 from expcore.campaign.shard import META_ENVIRONMENT, NOT_FINAL_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
@@ -100,14 +100,16 @@ def test_c45_the_batch_holds_exactly_the_records_of_each_runs_counted_lease(merg
     document = document_of(merged)
     assert document["schema"] == MERGE_BY_RUN_SCHEMA
     plan = [row.key.text for row in load_study(merged.root).manifest.rows]
-    assert [entry["run_key"] for entry in document["leases"]] == plan
-    assert document["runs"] == len(plan) == len(fleet.counted())
+    assert [entry["run_key"] for entry in document["leases"]] == [key for key in plan if key != fleet.exhausted]
+    assert document["runs"] == len(plan) == len(fleet.counted()) + 1
 
 
 def test_c45_the_merged_batch_scores_what_one_driver_of_the_whole_campaign_scores(merged, whole, fleet):
-    """C45: the analysis of the merged batch gives every run the score one driver gives it."""
+    """C45: the analysis of the merged batch gives every run the score one driver gives it, but the run the ledger
+    exhausted for its lost federations, which has none."""
     finish(fleet.env, whole)
-    assert merged.read("scores.json") == whole.read("scores.json")
+    expected = {key: scores for key, scores in whole.read("scores.json").items() if key != fleet.exhausted}
+    assert merged.read("scores.json") == expected
 
 
 def test_c45_each_analysed_run_names_its_counted_lease_federation_and_site(merged, fleet):
@@ -115,7 +117,8 @@ def test_c45_each_analysed_run_names_its_counted_lease_federation_and_site(merge
     export = merged.read("export.json")
     leases = {entry["run_key"]: entry for entry in document_of(merged)["leases"]}
     entries = [e for name in ("analysed_attempts", "exhausted_runs", "unfinished_runs") for e in export[name]]
-    assert len(entries) == export["planned_runs"] == len(leases)
+    assert len(entries) == export["planned_runs"] == len(leases) + 1
+    entries = [entry for entry in entries if entry["run_key"] != fleet.exhausted]
     for entry in entries:
         lease = leases[entry["run_key"]]
         assert (entry[LEASE_KEY], entry[FEDERATION_KEY], entry[SITE_KEY]) == (
@@ -128,6 +131,71 @@ def test_c45_each_analysed_run_names_its_counted_lease_federation_and_site(merge
     assert {fleet.superseded, fleet.lost} & {entry[LEASE_KEY] for entry in entries} == set()
     assert "shards" not in export
     assert export["leases"] == document_of(merged)["leases"]
+
+
+def test_c45_a_run_exhausted_by_lost_federations_is_listed_as_exhausted_once_its_leases_are_settled(merged, fleet):
+    """C45: the run has no counted lease and no store; with every lease of it settled the merge accepts it, lists it
+    in merge.json and among the export's exhausted runs with a reason per lease, and never analyses it."""
+    document = document_of(merged)
+    (entry,) = document["exhausted"]
+    assert entry["run_key"] == fleet.exhausted
+    assert set(fleet.exhausted_leases) <= set(entry["lease_ids"])
+    assert entry["lease_id"] == fleet.exhausted_leases[-1]
+    assert entry["attempts"] == 3
+    assert entry["site"] == "site-b"
+    export = merged.read("export.json")
+    (listed,) = [e for e in export["exhausted_runs"] if e["run_key"] == fleet.exhausted]
+    assert listed[LOST_KEY_FLAG] is True
+    assert listed[LEASE_KEY] == fleet.exhausted_leases[-1]
+    assert len(listed["reasons"]) == len(entry["lease_ids"])
+    assert sum(reason.startswith("federation lost: lease") for reason in listed["reasons"]) >= 2
+    assert fleet.exhausted not in {e["run_key"] for e in export["analysed_attempts"]}
+
+
+def test_c45_the_balance_shows_the_runs_exhausted_by_federation_loss_by_condition_and_site(merged, fleet):
+    """C45: the exhausted run counts once, under its condition and its last lease's site; every other cell is 0, so
+    the condition that lost federations stands out."""
+    export = merged.read("export.json")
+    (listed,) = [e for e in export["exhausted_runs"] if e["run_key"] == fleet.exhausted]
+    model = listed["factors"]["model"]
+    balance = {m["model"]: m for m in merged.read("analysis.json")["balance"]["models"]}
+    cross = balance[model]["exhausted_by_loss"]
+    assert cross[listed["condition"]]["site-b"] == 1
+    assert sum(n for counts in cross.values() for n in counts.values()) == 1
+    for other in balance.values():
+        if other["model"] != model:
+            assert sum(n for counts in other["exhausted_by_loss"].values() for n in counts.values()) == 0
+    assert f"### {model}: runs exhausted by federation loss, condition by site" in merged.report
+
+
+def test_c45_the_analysis_takes_a_run_exhausted_by_federation_loss_as_any_exhausted_run(merged, fleet):
+    """C45: as today's analysis takes an exhausted run (no worst case is imputed anywhere): its condition counts it
+    exhausted, and every contrast of its condition counts its pair missing for cause `exhausted`."""
+    export = merged.read("export.json")
+    (listed,) = [e for e in export["exhausted_runs"] if e["run_key"] == fleet.exhausted]
+    analysis = merged.read("analysis.json")
+    (row,) = [c for c in analysis["conditions"] if c["condition"] == listed["condition"]]
+    assert row["exhausted"] == 1
+    lost_pairs = sum(contrast["pairs_missing"]["exhausted"] for contrast in analysis["contrasts"])
+    assert lost_pairs >= 1
+
+
+def test_c45_a_run_exhausted_while_a_lease_of_it_is_unsettled_is_refused(base, fleet):
+    """C45: with one of the run's settlements gone, a settle could still reopen the run: the merge refuses, naming
+    the run and the lease."""
+    pending = base / "unsettled-ledger" / "ledger.sqlite"
+    pending.parent.mkdir()
+    shutil.copyfile(fleet.ledger_file, pending)
+    db = sqlite3.connect(pending)
+    try:
+        db.execute("DELETE FROM settlements WHERE lease_id=?", (fleet.exhausted_leases[0],))
+        db.commit()
+    finally:
+        db.close()
+    errors = refused(fleet, base, "unsettled", fleet.outs(fleet.superseded, fleet.lost), pending)
+    assert (
+        f"run {fleet.exhausted} is infra_exhausted in the ledger, but its lease {fleet.exhausted_leases[0]}" in errors
+    )
 
 
 # --- the evidence ---------------------------------------------------------------------------------------------------

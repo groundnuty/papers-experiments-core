@@ -22,13 +22,13 @@ from expcore.campaign.lease_facts import LeaseStore, lease_store_of, lease_store
 from expcore.campaign.ledger_read import LEDGER_SNAPSHOT, LeaseRow, LedgerFacts, LedgerRefused, read_ledger
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.merge import RUNS_DIR, MergeRefused, Query
-from expcore.campaign.merge_by_run import ByRun, check_by_run, spend_micro, store_micro
+from expcore.campaign.merge_by_run import ByRun, LostRun, check_by_run, spend_micro, store_micro
 from expcore.campaign.run_lease import RULE_LEASE
 from expcore.campaign.selection_ledger import Pricing
 from expcore.campaign.shard import MERGE_FILE
 
 _DOCUMENT_KEYS = {"schema", "fingerprint", "rule", "environment_identity", "ledger_sha256", "runs", "leases"}
-_DOCUMENT_KEYS |= {"evidence", "spend"}
+_DOCUMENT_KEYS |= {"evidence", "spend", "exhausted"}
 
 
 # --- merge.json -----------------------------------------------------------------------------------------------------
@@ -45,9 +45,10 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
         "rule": RULE_LEASE,
         "environment_identity": dict(first.environment),
         "ledger_sha256": ledger.sha256,
-        "runs": len(merged.counted),
+        "runs": len(merged.counted) + len(merged.lost),
         "leases": [_entry(ledger.leases[store.lease.lease_id], store, settled) for store in merged.counted],
         "evidence": [{**_entry(item.lease, item.store, settled), "reason": item.reason} for item in merged.evidence],
+        "exhausted": [_exhausted(lost) for lost in merged.lost],
         "spend": {
             "total_usd": _usd(totals.get(None)),
             "per_model_usd": {model: _usd(value) for model, value in sorted(totals.items(), key=_model_key) if model},
@@ -58,6 +59,30 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
             "locked_usd": usd_of(ledger.locked_micro),  # held as grants by unsettled leases at the snapshot
         },
     }
+
+
+def _exhausted(lost: LostRun) -> dict[str, Any]:
+    """A run the ledger exhausted for its lost leases: its run, condition and model, its charged attempts, every lease
+    it was given and why each ended, and its last lease's federation and site, which place it."""
+    last = lost.last
+    return {
+        "run_key": lost.run.run_key,
+        "condition": lost.run.condition,
+        "model": lost.run.model,
+        "attempts": lost.run.charged,
+        "lease_ids": [lease.lease_id for lease in lost.leases],
+        "lease_id": last.lease_id,
+        "federation": last.federation,
+        "site": last.site,
+        "reasons": [_why_ended(lease) for lease in lost.leases],
+    }
+
+
+def _why_ended(lease: LeaseRow) -> str:
+    """One lease of a run exhausted for its lost leases, said as an exhausted run's reason: a lost or expired lease is
+    a federation lost; any other says its state (a superseded one's completion came after the run was leased again)."""
+    what = "federation lost" if lease.state in ("lost", "expired") else lease.state
+    return f"{what}: lease {lease.lease_id} at {lease.federation} ({lease.site})"
 
 
 def _model_key(item: tuple[str | None, Any]) -> str:
@@ -102,8 +127,9 @@ def read_by_run(raw: bytes, where: object) -> dict[str, Any]:
         or set(document) != _DOCUMENT_KEYS
     ):
         raise MergeRefused(f"{where}: not an {MERGE_BY_RUN_SCHEMA} merge file")
-    leases, evidence = document["leases"], document["evidence"]
-    ok = isinstance(leases, list) and isinstance(evidence, list) and bool(leases)
+    leases, evidence, exhausted = document["leases"], document["evidence"], document["exhausted"]
+    ok = isinstance(leases, list) and isinstance(evidence, list) and bool(leases) and isinstance(exhausted, list)
+    ok = ok and all(isinstance(entry, dict) and isinstance(entry.get("run_key"), str) for entry in exhausted)
     ok = ok and all(isinstance(entry, dict) and isinstance(entry.get("lease_id"), int) for entry in leases + evidence)
     ok = ok and all(_is_sha(entry.get("snapshot_sha256")) for entry in leases)
     ok = ok and all(entry.get("snapshot_sha256") is None or _is_sha(entry["snapshot_sha256"]) for entry in evidence)

@@ -24,6 +24,12 @@ BALANCE_NOTES = (
     "placements; they are never enforced, and a federation that ran one run of a model holds one condition of it by "
     "design. The federation effect is the declared sensitivity rerun below.",
 )
+LOST_NOTES = (
+    "Runs the ledger ended as exhausted because the federations that held them were lost, counted by condition and by "
+    "the site of each run's last lease. They have no analysed attempt and enter the analysis as exhausted runs (pairs "
+    "missing for cause `exhausted`). A condition that loses federations more often than another (an outage condition, "
+    "say) shows here as a source of bias.",
+)
 FEDERATION_NOTES = (
     "Each outcome of a preregistered contrast of one outcome is refit with a linear mixed model: its (condition, "
     "model) cell and task as fixed effects, site as a fixed effect and federation as a random effect (REML). The "
@@ -53,6 +59,23 @@ def balance_lines(balance: Mapping[str, Any] | None, table: Table) -> list[str]:
             places = sorted({place for counts in cross.values() for place in counts})
             rows = [[condition, *(cross[condition][place] for place in places)] for condition in model["conditions"]]
             lines += [f"### {model['model']}: condition by {label}", "", *table(["Condition", *places], rows), ""]
+    return lines + _lost_lines(balance, table)
+
+
+def _lost_lines(balance: Mapping[str, Any], table: Table) -> list[str]:
+    """The runs exhausted by federation loss, per model, condition by site; a sentence when there are none."""
+    lost = [
+        model for model in balance["models"] if any(n for c in model["exhausted_by_loss"].values() for n in c.values())
+    ]
+    if not lost:
+        return ["No run was exhausted by federation loss.", ""]
+    lines = [*LOST_NOTES, ""]
+    for model in lost:
+        cross = model["exhausted_by_loss"]
+        places = sorted({place for counts in cross.values() for place in counts})
+        rows = [[condition, *(cross[condition][place] for place in places)] for condition in model["conditions"]]
+        lines += [f"### {model['model']}: runs exhausted by federation loss, condition by site", ""]
+        lines += [*table(["Condition", *places], rows), ""]
     return lines
 
 

@@ -10,7 +10,9 @@ run must settle:
   node's completion, read late, is superseded: kept as evidence;
 - `fed-y` takes a lease that expires because its node was lost mid-run: its store comes back with the attempt still
   running and no marker (`make_running`), to be settled in the merge's copy;
-- `fed-z` takes a lease that expires and leaves nothing behind: it is charged its grant.
+- `fed-z` takes a lease that expires and leaves nothing behind: it is charged its grant;
+- `fed-l0`, `fed-l1`, ... each take a lease and are lost, until one run has lost `max_attempts` federations and the
+  ledger ends it as exhausted; every loss is then settled (`exhausted`, `exhausted_leases`).
 
 Every store is the kernel's own; nothing of a lease store is written by hand but the running attempt of `fed-y`.
 """
@@ -84,6 +86,8 @@ class Fleet:
     lost: int = 0
     vanished: int = 0
     pending_copy: Path | None = None  # the ledger as it was with runs still pending
+    exhausted: str = ""  # the run the ledger exhausted for its lost leases, every one of them settled
+    exhausted_leases: tuple[int, ...] = ()  # that run's leases
 
     def counted(self) -> list[Campaign]:
         """The stores of every run's counted lease."""
@@ -201,6 +205,7 @@ def build_fleet(base: Path, env: dict[str, str]) -> Fleet:
     fleet.pending_copy.write_bytes(path.read_bytes())
     ledger = Ledger.open(path, clock)
     try:
+        fleet.exhausted, fleet.exhausted_leases = _exhaust_a_run(ledger, clock, sha)
         _lease_every_run(fleet, ledger)
         lx, ly = doomed["fed-x"], doomed["fed-y"]
         fleet.stores[lx.lease_id] = run_lease(base, env, lx, sha)
@@ -211,6 +216,39 @@ def build_fleet(base: Path, env: dict[str, str]) -> Fleet:
         ledger.close()
     fleet.superseded, fleet.lost, fleet.vanished = (doomed[label].lease_id for label in DOOMED)
     return fleet
+
+
+def _exhaust_a_run(ledger: Ledger, clock: FakeClock, sha: str) -> tuple[str, tuple[int, ...]]:
+    """Lose leases to fresh federations at site-b (each sent, never heard from, its job proven ended) until a run is
+    exhausted by the losses, then settle every loss at no spend and one attempt, so the run is final; the runs lost
+    once go back to pending, one attempt charged."""
+    lost: list[tuple[int, str]] = []
+    for n in range(12):
+        label = f"fed-l{n}"
+        ledger.join(
+            label,
+            site="site-b",
+            job_ids=(f"job-{label}",),
+            job_end_at=clock() + 86_400.0,
+            fingerprint=sha,
+            environment=ENVIRONMENT,
+            kill_wait_s=180.0,
+        )
+        lease = ledger.issue(label)
+        assert isinstance(lease, Lease), lease
+        ledger.mark_sent(lease.lease_id)
+        clock.now += 400.0
+        ledger.observe_site("site-b", SiteReading())
+        ledger.prove_ended(label, "terminal")
+        lost.append((lease.lease_id, lease.run_key))
+        if ledger.run(lease.run_key).state == "infra_exhausted":
+            break
+    run_key = lost[-1][1]
+    assert ledger.run(run_key).state == "infra_exhausted", "no run was exhausted by the losses"
+    for lease_id, _ in lost:
+        ledger.settle(lease_id, 0, "pulled", attempts_charged=1)
+    assert ledger.run(run_key).state == "infra_exhausted"
+    return run_key, tuple(lease_id for lease_id, key in lost if key == run_key)
 
 
 def _lease_every_run(fleet: Fleet, ledger: Ledger) -> None:

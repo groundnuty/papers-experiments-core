@@ -81,7 +81,7 @@ from expcore.campaign.export import (
     stored_fingerprint_sha256,
     verify_export_fingerprint,
 )
-from expcore.campaign.export_join import FEDERATION_KEY, SITE_KEY, by_run_export, join_exports
+from expcore.campaign.export_join import FEDERATION_KEY, LOST_KEY_FLAG, SITE_KEY, by_run_export, join_exports
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, fingerprint_sha256, shard_manifest
@@ -1134,10 +1134,36 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
         held = {row["run_key"] for row in snapshot.q("SELECT run_key FROM runs")}
         own = export_run_state(snapshot, excluded={key: why for key, why in left_out.items() if key in held})
         parts[index] = timed_export(own, walls_of(snapshot), verified.record_for)  # the merged export's only (#154)
-    joined = join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
-    if verified.merge is not None and verified.merge.get("schema") == MERGE_BY_RUN_SCHEMA:
-        return by_run_export(joined, verified.shards, verified.merge["spend"])  # each run's lease and placement (C45)
-    return joined
+    seq_of = {row.key.text: row.seq for row in plan.rows}
+    if verified.merge is None or verified.merge.get("schema") != MERGE_BY_RUN_SCHEMA:
+        return join_exports(parts, seq_of, verified.shards)
+    lost = _lost_runs(verified.merge["exhausted"], plan)  # merged by run (C45): runs exhausted with no store
+    joined = join_exports(parts, {key: seq for key, seq in seq_of.items() if key not in lost}, verified.shards)
+    return by_run_export(joined, verified.shards, verified.merge["spend"], list(lost.values()), seq_of)
+
+
+def _lost_runs(exhausted: Sequence[Mapping[str, Any]], plan: Manifest) -> dict[str, dict[str, Any]]:
+    """The runs merge.json lists as exhausted for their lost leases, as a store's export lists an exhausted run: its
+    identity from the plan, its charged attempts, a reason per lease, an admission unknown per attempt, and its last
+    lease's id, federation and site (C45)."""
+    rows = {row.key.text: row for row in plan.rows}
+    found = {}
+    for entry in exhausted:
+        key = rows[entry["run_key"]].key
+        found[key.text] = {
+            "run_key": key.text,
+            "digest": key.digest,
+            "condition": entry["condition"],
+            "factors": dict(key.factors),
+            "attempts": entry["attempts"],
+            "reasons": list(entry["reasons"]),
+            "admissions": [None] * entry["attempts"],
+            "lease_id": entry["lease_id"],
+            FEDERATION_KEY: entry["federation"],
+            SITE_KEY: entry["site"],
+            LOST_KEY_FLAG: True,
+        }
+    return found
 
 
 def _require_campaign(export: Mapping[str, Any], verified: VerifiedBatch) -> None:
