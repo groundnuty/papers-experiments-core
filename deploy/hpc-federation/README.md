@@ -1291,6 +1291,60 @@ refuses a shard whose manifest lacks a name the plan declares, or holds one it d
 variable, as it refuses one whose line dropped the post-run script. A dropped sanction variable also fails closed: the
 study's own refusal stops the run.
 
+**The operator's key files: `home_files` (O63).** A study's `models.toml` names `key_file = "~/..."` paths, and the
+dispatcher's `HOME` is a private directory on the node's tmpfs, so `~` resolved into an empty home and every model call
+failed at its first request (no secret rides in the environment, and `pass_env` refuses a secret-looking name). The
+manifest's optional `home_files` names the operator's own directory, laid out as it would sit under a home:
+
+    home_files = "/shared/operator/keys"   # an absolute path on the shared filesystem; `.secrets/<...>/key` below it
+
+`plan` and `lines` read it first and refuse, naming `home_files` and the reason and never a path or a file's name, a
+path with a `.`, `..` or empty part or **a link on the way** (give the resolved path: `realpath`), a directory that is
+not this user's or has a group or other bit (0700 or stricter), a file that is not a regular file of this user's, has a
+group, other or execute bit (0600 or stricter) or is a link, more than 64 files, 64 directories, 1 MiB or 8 levels, and a
+directory with no file, a path with a control character (it rides on a line) and a tree inside, or holding, the study
+(the step copies the study whole). A directory above the tree needs search permission only. Each line then carries
+`--home-files PATH` (before any `--pass-env`; the path alone); `plan` prints each line, so the path is in its `argv`,
+and `home_files: true`.
+`step` reads the tree itself, once, with the same checks made on the descriptors it reads the bytes through (nothing is
+checked and then read again; nothing is pinned on the line, so a key rotated after `lines` is the one that arrives), and
+a tree it refuses ends it with 73 before anything is made. After its home exists and before the dispatcher starts it
+writes the tree there: directories 0700, files 0600, created exclusively with no link followed below a descriptor of the
+home (a directory the step made, such as `.config`, is merged into; a file where the step's home already has an entry
+is refused, 73, the directory removed). The step prints how many files went in and nothing else of them.
+
+Nothing of the files is recorded: no name, hash or content in a line's other words, `step.json` (which holds
+`home_files: true` and `home_files_count`), the archive and its manifest, the snapshots, the journals or the step's
+output. The copies go when the dispatcher and the post-run script have ended, before the archive is written (the step
+removes its home), and with the step's directory in every other exit: a normal end, an archive that cannot be written
+(the kept directory holds no key), and any stop signal (TERM, INT, HUP, QUIT, USR1, USR2, ALRM), including one that arrives while the files are written
+or before the dispatcher's relay is installed (the step ends through its cleanup, 128 plus the signal; all but TERM and
+INT also end it while the dispatcher runs, which dies with its step). The `finally` of every way out removes the home
+explicitly before the step's directory (a link in its place is unlinked, never walked), with those signals held back
+while it does, so none interrupts the removal; a stop that lands before they are held has the cleanup finished first. A step killed outright
+(KILL, the walltime, the node) leaves its directory, and the copies in it, on the node's private tmpfs, which the site
+does not clear at the job's end, until `--resume` or `sweep` removes it, as for everything else it leaves; one killed
+after its dispatcher ended (a kept `archiving` directory, its out/ waiting for `--archive-left`) has its home, and only
+its home, removed by `sweep`, by `--resume`'s look at the node and by `--archive-left`, once its step is shown gone (a
+link is unlinked, never walked). So every campaign ends with `down` (or `shards.py sweep`) on every node a step ran on. With no `home_files` nothing is read or written and the lines,
+the plan and the records are what they were. `fleet.py`'s shard settings do not take the key. A line edited to drop the
+`--home-files` words runs without the keys, and the first model request says so.
+
+*The agent's cells cannot read the keys.* On HPC a cell runs as the same user as the dispatcher, so the proof is in the
+cell's command line and its binds. Every cell is `apptainer exec --containall --cleanenv --no-home --no-mount
+hostfs,bind-paths,cwd` (`src/expcore_onedata/sandbox/apptainer/argv.py:86`; `NO_MOUNT` is `argv.py:41`): `--containall`
+gives it its own PID, IPC and mount namespaces (`argv.py:16`), so it cannot read the dispatcher's `/proc/<pid>/environ`,
+`mem` or `cwd`; `--no-home` and `--no-mount hostfs` keep the user's home and the node's file systems out. The binds it
+gets (`sandbox.py:586-606`) all have a source below the run's own directory `work_root/<run id>`: `/work`, `/tmp` and
+`/dev/shm`, the run's files for `/etc`, the egress socket directory and shim, the copies of the read-only inputs
+(`sandbox.py:798`), the read-log channel and, for a mounted level, the mount's directories, which the sandbox refuses
+unless they lie inside the run's directory (`sandbox.py:435-443`). `work_root` lies strictly under `--tmpfs`
+(`make_work_root`), and the dispatcher's home is `--tmpfs/expcore-shard-<label>.<random>/home`, a sibling of it, never
+below it, so the copied keys are not under any bound path; the operator's source tree is outside `--tmpfs` and outside
+the study and is bound nowhere. `tests/onedata/sandbox/apptainer/test_cell_cannot_reach_home_files.py` pins this on the
+real sandbox's binds and flags; `tests/live/test_home_files_cell_isolation.py` runs a real cell (skipped without
+`apptainer` and an image) that tries to list and read both the copy and the source and the dispatcher's `/proc`.
+
 **One value for a shard's whole life (O63).** The first step of a shard that passes variables records each name and
 value once, in `<results>/<label>/pass-env.json` (whole, mode 0600, once it holds the shard's running mark; nothing is
 written when it passes none, and never more than 65,536 bytes, which is what its reader takes: a step whose variables
