@@ -8,6 +8,7 @@ public file; the core points `[tls] ca_file` at it.
 import os
 import secrets
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
@@ -37,6 +38,41 @@ def openssl(*args: str) -> None:
     done = subprocess.run(["openssl", *args], capture_output=True, text=True, check=False)
     if done.returncode != 0:
         raise PkiError(f"openssl {args[0]} failed with status {done.returncode}")
+
+
+# The CA's extensions, each declared once, in a configuration of their own with no `-addext`: on OpenSSL 1.1.1 (EL8's)
+# `req -x509` applies the default configuration's `v3_ca` section and then adds what `-addext` names, so a CA made with
+# `-addext basicConstraints=...` carried it twice and was no trust anchor (`openssl verify`: error 20). The same text is
+# `expcore_onedata.sandbox.caconfig.CA_CONFIG`; this script imports nothing of the core.
+CA_CONFIG = """\
+[req]
+distinguished_name = dn
+prompt = no
+default_md = sha256
+x509_extensions = ca_extensions
+
+[dn]
+CN = ca
+
+[ca_extensions]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+"""
+
+
+@contextmanager
+def private_file(directory: Path, text: str, suffix: str):
+    """A new file of mode 0600 in `directory` holding `text`, removed when the block ends, however it ends."""
+    descriptor, name = tempfile.mkstemp(dir=directory, prefix=".openssl-", suffix=suffix)
+    path = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        yield path
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def private_directory(path: Path) -> Path:
@@ -77,12 +113,10 @@ def make_ca(ca_pem: Path, ca_key: Path, name: str) -> None:
     if ca_pem.exists() and ca_key.exists():
         require_private(ca_key)
         return
-    with private_umask():
+    with private_umask(), private_file(ca_key.parent, CA_CONFIG, ".cnf") as config:
         openssl(
             "req", "-x509", "-newkey", "rsa:3072", "-nodes", "-sha256", "-days", str(CA_DAYS),
-            "-keyout", str(ca_key), "-out", str(ca_pem), "-subj", f"/CN={name}",
-            "-addext", "basicConstraints=critical,CA:TRUE",
-            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            "-keyout", str(ca_key), "-out", str(ca_pem), "-subj", f"/CN={name}", "-config", str(config),
         )  # fmt: skip
     ca_pem.chmod(0o644)
     require_private(ca_key)
