@@ -210,7 +210,8 @@ class Ledger(LedgerViews):
             if row["state"] in LIVE:
                 self._expire(row, now, "ended")
             self.db.execute("UPDATE leases SET slot=0 WHERE id=?", (row["id"],))
-            attempts.lose(self.db, self.config, row["id"])  # proven ended with no completion: the loss is one attempt
+            # proven ended with no completion: the loss is one attempt
+            attempts.lose(self.db, self.config, now, row["id"])
         self._event(now, "proven_ended", federation=label, proof=proof)
 
     # --- leasing ----------------------------------------------------------------------------------------------
@@ -389,7 +390,8 @@ class Ledger(LedgerViews):
         )
         if charge < spend:
             settling.contradicted(self.db, now, row, spend, charge)
-        attempts.unstarted(self.db, self.config, row["id"])  # it never started: its loss, if counted, is taken back
+        # it never started: its loss, if counted, is taken back
+        attempts.unstarted(self.db, self.config, now, row["id"])
         if row["state"] in LIVE:
             attempts.requeue(self.db, self.config, row["run_key"])
         self._event(now, "return", run_key=row["run_key"], lease_id=row["id"], was=row["state"])
@@ -412,7 +414,7 @@ class Ledger(LedgerViews):
             self.db.execute("UPDATE leases SET state='lost', ended_at=? WHERE id=?", (now, lease_id))
             if counts:
                 attempts.requeue(self.db, self.config, row["run_key"])
-            attempts.lose(self.db, self.config, lease_id, completion["charged"] if counts else 0)
+            attempts.lose(self.db, self.config, now, lease_id, completion["charged"] if counts else 0)
             self._event(now, "lost", run_key=row["run_key"], lease_id=lease_id, counted=counts)
             return "lost"
         state = "counted" if counts else "superseded"
@@ -429,6 +431,11 @@ class Ledger(LedgerViews):
             status = self._status_after(completion["state"], charged)
             self.db.execute("UPDATE runs SET state=?, charged=? WHERE run_key=?", (status, charged, row["run_key"]))
             self.db.execute("UPDATE leases SET charged_added=? WHERE id=?", (completion["charged"], lease_id))
+            if status == "pending" and run["charged"] >= self.config.max_attempts:
+                # `_report` put the run back to leased, but it had no attempt left: it was exhausted; this reopens it
+                attempts.log_reopen(
+                    self.db, self.config, now, row, completion["charged"], run["charged"], "its late completion"
+                )
             self.db.execute(
                 "INSERT INTO estimates(model, condition, runs, total_s) VALUES(?,?,1,?) ON CONFLICT(model, condition)"
                 " DO UPDATE SET runs = runs + 1, total_s = total_s + excluded.total_s",
