@@ -10,9 +10,10 @@ import re
 import secrets
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
 import hpcexclude
@@ -354,6 +355,7 @@ class Driver(Down):
             time_s=self.settings.time_s,
             het=(Shape(1, agent.cpus, agent.memory_mib),) if het and agent is not None else (),
             exclude=tuple(exclude),
+            exclusive=site.exclusive_nodes,
         )
 
     def sandbox_allocation(
@@ -374,6 +376,7 @@ class Driver(Down):
             time=self.settings.time,
             time_s=self.settings.time_s,
             exclude=tuple(exclude),
+            exclusive=site.exclusive_nodes,
         )
 
     # -- up -----------------------------------------------------------------------------------------------------------
@@ -410,17 +413,7 @@ class Driver(Down):
         excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
         state = self.store.create(self.initial_state(site, tree, len(excluded)))
         self.make_storage(state)  # recorded above, made before any job exists to bill for it
-        asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
-        held = [(self.submit(asked, "allocation"), asked)]
-        if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
-            held.append((self.submit(alone, "sandbox"), alone))
-        self.wait_held(held)
-        # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
-        records = [(job, shape, record) for job, wanted in held for shape, record in zip(
-            wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
-        placed = self.placed_nodes(records)
-        self.keep_off_other_federations([job for job, _ in held], placed)
-        self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
+        self.hold_and_place(state, site, excluded)
         self.node_facts()
         self.zone_up()
         self.providers_up()
@@ -431,19 +424,49 @@ class Driver(Down):
         retried = self.retried()
         return f"{out}\n{retried}\n{self.start_relay()}" if retried else f"{out}\n{self.start_relay()}"
 
+    def hold_and_place(self, state: Mapping[str, Any], site: Site, excluded: Sequence[str]) -> None:
+        """Submit this up's held jobs (the services', and under `separate` the agent's own), wait for each to run, and
+        place every role on its node. A failure anywhere from the first sbatch to the end of the placement releases
+        every held job of this up (`releasing`): none is left to start and bill with no federation."""
+        asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
+        if site.exclusive_nodes:
+            self.say("HPC_EXCLUSIVE_NODES=1: every held job asks for whole nodes (--exclusive), and is read back as "
+                     "exclusive")  # fmt: skip
+        held: List[Tuple[str, Allocation]] = []
+        with self.releasing(held):
+            self.submit(asked, "allocation", held)
+            if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
+                self.submit(alone, "sandbox", held)
+            self.wait_held(held)
+            # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
+            records = [(job, shape, record) for job, wanted in held for shape, record in zip(
+                wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
+            placed = self.placed_nodes(records)
+            self.keep_off_other_federations([job for job, _ in held], placed)
+            self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
+
+    @contextmanager
+    def releasing(self, held: List[Tuple[str, Allocation]]) -> Iterator[None]:
+        """Whatever fails inside releases every held job of this up in `held` that has not ended, by its own id
+        (`release_held`), and says so: a Slurm failure ends with what was released, any other is raised as it was after
+        the operator is told. `held` grows as the jobs are submitted, each as soon as sbatch prints its id. With nothing
+        left to release (one held job, cancelled by its own failed wait or read-back) the failure is as it was."""
+        try:
+            yield
+        except Exception as error:
+            said = self.release_held(held)
+            if not said:
+                raise
+            if isinstance(error, SlurmError):
+                raise SlurmError(f"{error}; {said}") from None
+            self.say(said)
+            raise
+
     def wait_held(self, held: Sequence[Tuple[str, Allocation]]) -> None:
         """Wait for each held job of this up to run, in turn, at the queue bound. A wait that fails (a job past the
-        bound, or ended before it ran, cancels itself) releases every held job of this up that has not ended, by its
-        own id, and the failure ends with what was said of them: a job left queued would start and bill with no
-        federation."""
-        try:
-            for job, wanted in held:
-                self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name, note=self.queue_note(wanted))
-        except SlurmError as error:
-            said = self.release_held(held)
-            if not said:  # nothing was left to release (one held job, cancelled by its own wait): the failure as it was
-                raise
-            raise SlurmError(f"{error}; {said}") from None
+        bound, or ended before it ran) cancels its own job; `releasing` releases the others."""
+        for job, wanted in held:
+            self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name, note=self.queue_note(wanted))
 
     def release_held(self, held: Sequence[Tuple[str, Allocation]]) -> str:
         """Release what a failed wait leaves: each of this up's own held jobs that has not ended, by its id (`release`).
@@ -614,11 +637,12 @@ class Driver(Down):
         self.set(lambda s: s.update(fault_relay="serving"))  # only now: `relay` above is written at the spawn
         return "fault relay: serving"
 
-    def submit(self, asked: Allocation, key: str) -> str:
+    def submit(self, asked: Allocation, key: str, held: List[Tuple[str, Allocation]]) -> str:
         """Submit one held job (`key`: "allocation", the services' job, or "sandbox", the agent's own); its id is
-        recorded as soon as sbatch prints it, before the read-back, which cancels that one job unless Slurm recorded
-        every component as asked."""
+        recorded, and added to `held`, as soon as sbatch prints it, before the read-back, which cancels that one job
+        unless Slurm recorded every component as asked."""
         job = self.slurm.submit(asked)
+        held.append((job, asked))
 
         def submitted(state: Dict[str, Any]) -> None:
             state[key]["job"] = job
@@ -643,16 +667,16 @@ class Driver(Down):
     def placed_nodes(self, records: Sequence[Any]) -> List[List[str]]:
         """Each component's nodes, the services' first and the agent's last, as Slurm placed them. A component on
         another count of nodes than asked, or on a node another holds (no node runs two services, nor the agent beside
-        one), fails up, its job cancelled by its id before any step."""
+        one), fails up before any step, and `releasing` cancels every held job of this up, by its id: the other one
+        would otherwise run, and bill, with no federation."""
         found: List[List[str]] = []
         seen: set = set()
         for job, shape, record in records:
             nodes = self.slurm.hostnames(record.get("NodeList", ""))
             twice = sorted((set(nodes) & seen) | {n for n in nodes if nodes.count(n) > 1})
             if len(nodes) != shape.nodes or twice:
-                self.slurm.cancel(job)
                 why = f"on {', '.join(twice)}, held twice" if twice else f"on {len(nodes)} node(s)"
-                raise SlurmError(f"job {job} was placed {why}, not on the {shape.nodes} asked for; it was cancelled")
+                raise SlurmError(f"job {job} was placed {why}, not on the {shape.nodes} asked for")
             seen.update(nodes)
             found.append(nodes)
         return found
