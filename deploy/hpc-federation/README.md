@@ -1518,7 +1518,9 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   node takes `relay_mb` (40: about 28 MB measured idle, with margin), each up in flight `up_mb` (256) and each
   verify-data in flight `verify_mb` (1024), beside `login_reserve_mb` (512) for the rest; an add needs room for its up
   and then its relay. Relays stay on the login node their up ran on, so only those beating here count (the read tells
-  a relay here from one elsewhere by the pid and start tick its heartbeat names). Each tick logs every up's queue
+  a relay here from one elsewhere by the pid and start tick its heartbeat names). Sites whose commands run on one
+  login node (`login_node`, an operator label; every `local` site is on this host) share one budget, and a site there
+  that could not be read leaves none. Each tick logs every up's queue
   wait, submit to running, the memory budget beside the quota and the nodes, and prints one status line with the
   ledger's money: what is left, and the dollars locked in unsettled leases.
 - **Join, drain, retire, replace.** A member up, linked, verified and running joins the ledger as
@@ -1529,13 +1531,16 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   retired: `shards.py collect --roots-only --root R --into <evidence>/<site>-<fed-k>`, `shards.py verify-copy` with the
   hash collect printed, then `fleet.py --fleet F down --member fed-k`, each only after the one before succeeded; never
   `--discard-evidence`, never a direct `scancel`. Once the fleet's record shows it down, its end is proven `cancelled`;
-  a job the read shows ended (a node failure, its walltime) is proven `terminal` at once, and a replacement comes up.
+  when the read shows every held job ended (a node failure, its walltime) it is proven `terminal` at once, and a
+  replacement comes up. One job ended beside one still running (the agent's job may still spend), or one still
+  completing, is `BROKEN`: never proven, drained and taken down, its down proving the end.
   Federations no cap lets work are drained once idle past `retire_idle_s` (765 s, an up, a down and an ingest), the
   least walltime left first, keeping `warm_pool` (0). A failed up is taken down with no collect.
 - **Relays and lost leases.** A relay its up recorded serving whose heartbeat is missing or older than 30 s is recorded
   in the log as `relay gone, no exit status` with its last heartbeat, and its federation is drained (no outage can be
   injected there), or taken down if it never joined. Each lost lease (its holder proven ended with no completion, or
-  its archive never verified) not yet settled is settled to the spend its dead federation's call log shows, through
+  its archive never verified) not yet settled is settled to the spend its dead federation's call log shows (the root
+  is offered only while the member there still holds the jobs the federation joined with), through
   the spend reader (step 4's reader of a dead store's spend, hooked up in step 6; until then nothing is read, the lease
   stays charged its grant, and the log says so once): its grant stops locking the budget, and dispatch resumes.
 - **By hand.** `--dry-run` prints each action as the commands above, one per line, under a comment naming where it runs

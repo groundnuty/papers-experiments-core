@@ -98,6 +98,16 @@ def _absolute(value: Any, what: str) -> Path:
     return Path(os.path.normpath(value))
 
 
+def fleet_identity(fleet: Path) -> Any:
+    """One fleet directory however it is named: its device and inode (a link or a bind mount of it is the same), or its
+    resolved path while it does not exist."""
+    try:
+        info = os.stat(fleet)
+    except OSError:
+        return os.path.realpath(fleet)
+    return (info.st_dev, info.st_ino)
+
+
 def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
     """The sites file: the controller's table and each site's, every key checked."""
     import tomllib
@@ -121,6 +131,8 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
         own = {key: entry.pop(key) for key in SITE_KEYS if key in entry}
         if own.get("transport", "local") not in TRANSPORTS:
             raise ConfigError(f"site {entry.get('label')}: transport must be one of {', '.join(TRANSPORTS)}")
+        if own.get("transport", "local") == "local":
+            entry.setdefault("login_node", "local")  # every local site's commands run here: one login node, one cgroup
         try:
             settings = SiteSettings(**entry)
         except TypeError as error:
@@ -131,7 +143,7 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
                                 deploy))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
         raise ConfigError("the sites file needs at least one [[site]], each label once")
-    if len({s.fleet for s in sites}) != len(sites):
+    if len({fleet_identity(s.fleet) for s in sites}) != len(sites):
         raise ConfigError("two sites name one fleet directory: each fleet is one site's, read and acted on once")
     return controller, sites
 
@@ -248,7 +260,7 @@ def by_hand(args: argparse.Namespace, hooks: Hooks) -> int:
     ledger = Ledger.open(args.ledger, clock=hooks.clock)
     try:
         if args.command == "drain":
-            late = drain_refused(ledger, args.label, hooks.clock())
+            late = drain_refused(ledger, args.label, hooks.clock)
             if late is not None:
                 raise ConfigError(late)
             ledger.drain(args.label)

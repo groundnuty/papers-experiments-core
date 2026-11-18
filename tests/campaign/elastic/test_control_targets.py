@@ -166,3 +166,15 @@ def test_c43_a_failed_member_still_holding_a_waiting_job_reserves_its_nodes():
     failed = member("fed-1", status="failed", state="PENDING", linked=False, verified=False, submitted_at=NOW - 60)
     decision = decide(NOW, view, [(settings(), site(idle_nodes=14, members=[failed]))])
     assert decision.targets["site-a"]["limits"]["nodes"] == 1
+
+
+def test_c43_sites_on_one_login_node_share_its_memory_budget():
+    """C43: two fleets whose commands run on one login node share its cgroup: with room there for one more federation,
+    the two sites together get one add, not one each; a site there that could not be read leaves none."""
+    view = ledger(pending={"m1": 6})
+    cap = 512 + 296.0
+    a, b = settings(login_memory_mb=cap, login_node="ln-1"), settings("site-b", login_memory_mb=cap, login_node="ln-1")
+    decision = decide(NOW, view, [(a, site()), (b, site("site-b"))])
+    assert sum(action.count for action in decision.actions if isinstance(action, Add)) == 1
+    dark = decide(NOW, view, [(a, site()), (b, site("site-b", error="unread"))])
+    assert [action for action in dark.actions if isinstance(action, Add)] == []

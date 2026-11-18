@@ -202,3 +202,32 @@ def test_c43_no_path_drains_a_federation_at_or_past_its_recorded_end():
     fleet = site(members=[member("fed-1"), member("fed-2")])
     view = ledger(federations=feds, idle_since={f.label: NOW - 2000 for f in feds})
     assert [d.label for d in of(decide(NOW, view, [(settings(), fleet)]), Drain)] == ["site-a-fed-2"]
+
+
+# ------------------------------------------------------------------------------------------------ review round 2
+def test_c43_a_member_with_one_job_ended_beside_one_running_is_not_proven_ended_but_drained():
+    """C43: services ended while the agent's job still runs (and may spend): not proven ended, never settled; drained
+    and then taken down, its down proving the end; one not joined is taken down, never joined."""
+    view = ledger(pending={"m1": 1}, federations=[joined("fed-1")], holding={"site-a-fed-1": "sent"})
+    decision = decide(NOW, view, [(settings(), site(members=[member("fed-1", state="BROKEN")]))])
+    assert of(decision, ProveEnded) == []
+    assert [d.label for d in of(decision, Drain)] == ["site-a-fed-1"]
+    decision = decide(NOW, ledger(pending={"m1": 1}), [(settings(), site(members=[member("fed-2", state="BROKEN")]))])
+    assert of(decision, Join) == []
+    assert [r.member for r in of(decision, Retire)] == ["fed-2"]
+
+
+def test_c43_a_relay_gone_before_the_data_is_verified_takes_the_member_down():
+    """C43: a linked member whose relay died while its ingest is still unverified is not left up for ever."""
+    fleet = site(members=[member("fed-1", relay="gone", verified=False)])
+    assert [r.member for r in of(decide(NOW, ledger(pending={"m1": 1}), [(settings(), fleet)]), Retire)] == ["fed-1"]
+
+
+def test_c43_a_settle_names_a_root_only_of_the_member_holding_the_jobs_the_federation_joined_with():
+    """C43: a site's fleet label now names another federation (other jobs): its root is not the lost lease's, so the
+    Settle names none and the reader must find the dead federation's evidence elsewhere."""
+    ended = joined("fed-1", ended_at=NOW - 10, end_proof="terminal")
+    view = ledger(federations=[ended], lost=[(11, "site-a-fed-1", "expired")])
+    other = member("fed-1", jobs=("j-replacement",))
+    (settle,) = of(decide(NOW, view, [(settings(), site(members=[other]))]), Settle)
+    assert settle.root is None

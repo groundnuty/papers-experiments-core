@@ -176,16 +176,18 @@ def decide(
     if len(set(labels)) != len(labels) or any(s.label != v.label for s, v in sites):
         raise ValueError("each site is given once, its settings and its read under one label")
     decision = Decision(at=now, wanted=ledger.leases_wanted())
+    memory = login_budgets(sites)
     free = 0
     rooms: dict[str, int] = {}
     for settings, view in sites:
-        site_free, room = _site(now, ledger, settings, view, busy, decision)
+        site_free, room = _site(now, ledger, settings, view, busy, decision, memory[settings.label])
         free += site_free
         rooms[settings.label] = room
     _settle(now, ledger, sites, decision)
     need = decision.wanted - free
     if need > 0:
-        _add(need, rooms, {s.label: s.parallel_ups for s, _ in sites}, decision)
+        shared = {label: (key, room) for label, (key, room, _) in memory.items()}
+        _add(need, rooms, {s.label: s.parallel_ups for s, _ in sites}, shared, decision)
     elif need < 0:
         _retire_idle(now, -need, ledger, sites, decision)
     decision.actions.sort(key=lambda action: ORDER.index(type(action)))
@@ -193,7 +195,13 @@ def decide(
 
 
 def _site(
-    now: float, ledger: LedgerView, settings: SiteSettings, view: SiteView, busy: frozenset[str], decision: Decision
+    now: float,
+    ledger: LedgerView,
+    settings: SiteSettings,
+    view: SiteView,
+    busy: frozenset[str],
+    decision: Decision,
+    memory: tuple[str, int | None, dict],
 ) -> tuple[int, int]:
     """One site's actions on its members, and (its free federations, its room for more)."""
     site = settings.label
@@ -212,7 +220,7 @@ def _site(
             state = _joined(now, ledger, settings, m, fed, decision.actions)
             free += state == "free"
             working += state == "working"
-    room, limits = _room(now, settings, view, busy)
+    room, limits = _room(now, settings, view, busy, memory)
     available = free + working
     decision.targets[site] = {"target": min(settings.max_federations, available + room), "available": available,
                               "room": room, "limits": limits}  # fmt: skip
@@ -225,14 +233,14 @@ def _unjoined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member,
     site = settings.label
     if m.status == "down":
         return 0
-    if m.status in ("failed", "down-failed") or m.ended:
+    if m.status in ("failed", "down-failed") or m.ended or m.broken:
         acts.append(Retire(site, m.label, None, m.root, False, f"never joined: {m.status}, its job {m.state}"))
+        return 0
+    if m.status == "up" and m.linked and m.relay == "gone":
+        acts.append(Retire(site, m.label, None, m.root, True, relay_gone(m)))
         return 0
     if m.status != "up" or not m.linked or not m.verified or m.waiting:
         return 1
-    if m.relay == "gone":
-        acts.append(Retire(site, m.label, None, m.root, True, relay_gone(m)))
-        return 0
     if m.ends_at is None or m.ends_at - cutoff_s(settings, ledger) <= now:
         acts.append(Retire(site, m.label, None, m.root, True, "too close to its job end to take a lease"))
         return 0
@@ -264,6 +272,8 @@ def _joined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member, f
     cutoff = cutoff_s(settings, ledger)
     if m.status != "up":
         acts.append(Drain(site, m.label, label, f"its fleet status is {m.status}: it is taken down again"))
+    elif m.broken:
+        acts.append(Drain(site, m.label, label, f"its jobs are {m.state}: one ended or is ending beside another"))
     elif held == "expired":
         acts.append(Drain(site, m.label, label, "its lease expired on a running job: it is replaced"))
     elif m.relay == "gone":
@@ -282,29 +292,52 @@ def relay_gone(m: Member) -> str:
     return f"relay gone, no exit status (its last heartbeat at {beat}): outage injection cannot run without it"
 
 
-def login_memory(settings: SiteSettings, view: SiteView) -> dict:
-    """The login node's memory budget, in MB: the relays beating there, each up and each verify-data in flight, and
-    the reserve, against the account's cap; `room` is how many more federations (an up now, a relay after) fit."""
-    if settings.login_memory_mb is None:
-        return {"room": None}
+def login_load(settings: SiteSettings, view: SiteView) -> dict:
+    """What one fleet takes of its login node's memory, in MB: the relays beating there, each up and each verify-data
+    in flight."""
     live = [m for m in view.members if m.status not in HOLDS_NOTHING]
     relays = sum(1 for m in live if m.relay == "here")
     ups = sum(1 for m in live if m.status in ("claimed", "made"))
     verifying = sum(1 for m in live if m.status == "up" and m.linked and not m.verified)
-    used = (settings.login_reserve_mb + relays * settings.relay_mb + ups * settings.up_mb
-            + verifying * settings.verify_mb)  # fmt: skip
-    free = settings.login_memory_mb - used
-    each = settings.relay_mb + settings.up_mb
-    room = 0 if free < each else int(free // each)
-    return {"room": room, "cap_mb": settings.login_memory_mb, "used_mb": used, "relays": relays, "ups": ups,
-            "verifying": verifying}  # fmt: skip
+    load = relays * settings.relay_mb + ups * settings.up_mb + verifying * settings.verify_mb
+    return {"load_mb": load, "relays": relays, "ups": ups, "verifying": verifying}
 
 
-def _room(now: float, settings: SiteSettings, view: SiteView, busy: frozenset[str]) -> tuple[int, dict]:
+def login_budgets(sites: Sequence[tuple[SiteSettings, SiteView]]) -> dict[str, tuple[str, int | None, dict]]:
+    """Per site: its login node's key, how many more federations (an up now, a relay after) that login node's memory
+    takes, shared by every site on it (one cgroup), and the figures; None where no site on it declares a cap. A site
+    on it that could not be read leaves no room: its use is unknown."""
+    groups: dict[str, list[tuple[SiteSettings, SiteView]]] = {}
+    for settings, view in sites:
+        groups.setdefault(settings.login_node or settings.label, []).append((settings, view))
+    found: dict[str, tuple[str, int | None, dict]] = {}
+    for key, members in groups.items():
+        caps = [s.login_memory_mb for s, _ in members if s.login_memory_mb is not None]
+        if not caps:
+            room, detail = None, {}
+        else:
+            reserve = max(s.login_reserve_mb for s, _ in members)
+            each = max(s.relay_mb + s.up_mb for s, _ in members)
+            loads = [login_load(s, v) for s, v in members if v.error is None]
+            used = reserve + sum(load["load_mb"] for load in loads)
+            free = min(caps) - used
+            dark = len(loads) < len(members)
+            room = 0 if dark or free < each else int(free // each)
+            detail = {"login_node": key, "cap_mb": min(caps), "used_mb": used, "sites": len(members), "dark": dark,
+                      **{k: sum(load[k] for load in loads) for k in ("relays", "ups", "verifying")}}  # fmt: skip
+        for settings, _ in members:
+            found[settings.label] = (key, room, detail)
+    return found
+
+
+def _room(
+    now: float, settings: SiteSettings, view: SiteView, busy: frozenset[str], memory: tuple[str, int | None, dict]
+) -> tuple[int, dict]:
     """How many more federations the site can take now (before `parallel_ups`), and each limit's own figure."""
     live = [m for m in view.members if m.status not in HOLDS_NOTHING]
     # every up whose job has not started, whatever its record says (a failed one may still hold a waiting job)
-    starting = [m for m in live if (m.status in ("claimed", "made") and m.state is None) or m.state in WAITING]
+    starting = [m for m in live
+                if (m.status in ("claimed", "made") and m.state is None) or m.state in WAITING or m.broken]  # fmt: skip
     unsettled = [m for m in live if not (m.linked and m.verified)]  # its files are not all on scratch yet
     per = view.nodes_per_federation
     limits: dict = {"maximum": settings.max_federations - len(live)}
@@ -326,11 +359,9 @@ def _room(now: float, settings: SiteSettings, view: SiteView, busy: frozenset[st
     left = settings.allowance_units - made * whole
     limits["allowance"] = int(left // whole) if whole > 0 and left >= whole else 0
     limits["stalled"] = any(m.submitted_at is not None and now - m.submitted_at >= settings.queue_stall_s
-                            for m in starting)  # fmt: skip
+                            for m in starting if m.waiting)  # fmt: skip
     limits["adding"] = settings.label in busy
-    memory = login_memory(settings, view)
-    limits["login_memory"] = memory.pop("room")
-    limits["login_memory_mb"] = memory
+    limits["login_memory"], limits["login_memory_mb"] = memory[1], memory[2]
     figures = [limits["maximum"], limits["nodes"], limits["allowance"]]
     figures += [limits[key] for key in ("inodes", "login_memory") if limits[key] is not None]
     room = 0 if limits["stalled"] or limits["adding"] else max(min(figures), 0)
@@ -356,22 +387,38 @@ def _settle(now: float, ledger: LedgerView, sites: Sequence[tuple[SiteSettings, 
         member = label[len(fed.site) + 1 :] if label.startswith(f"{fed.site}-") else label
         view = views[fed.site]
         found = next((m for m in view.members if m.label == member and m.status != "down"), None)
-        root = None if view.error is not None or found is None else found.root
+        same = found is not None and set(found.jobs) == set(fed.job_ids)  # the member holding the jobs it joined with
+        root = found.root if view.error is None and same else None
         why = f"lease {lease_id} is lost ({state}, its holder proven ended) and still charged its grant"
         decision.actions.append(Settle(fed.site, member, label, lease_id, root, why))
 
 
-def _add(need: int, rooms: dict[str, int], parallel: dict[str, int], decision: Decision) -> None:
+def _add(
+    need: int,
+    rooms: dict[str, int],
+    parallel: dict[str, int],
+    shared: dict[str, tuple[str, int | None]],
+    decision: Decision,
+) -> None:
     """`need` more federations, one at a time to the site with the most room left (the first declared on a tie), each
-    site taking at most its `parallel_ups` in one add."""
+    site taking at most its `parallel_ups` in one add, and the sites on one login node together at most what its
+    memory takes."""
     given = dict.fromkeys(rooms, 0)
     order = list(rooms)
+    taken: dict[str, int] = {}
     for _ in range(need):
-        open_ = [s for s in order if given[s] < parallel[s] and rooms[s] - given[s] > 0]
+        open_ = [
+            s
+            for s in order
+            if given[s] < parallel[s]
+            and rooms[s] - given[s] > 0
+            and (shared[s][1] is None or taken.get(shared[s][0], 0) < shared[s][1])
+        ]
         if not open_:
             break
         best = max(open_, key=lambda s: (rooms[s] - given[s], -order.index(s)))
         given[best] += 1
+        taken[shared[best][0]] = taken.get(shared[best][0], 0) + 1
     for site in order:
         if given[site]:
             why = f"{decision.wanted} lease(s) wanted, {need} federation(s) short; room here {rooms[site]}"

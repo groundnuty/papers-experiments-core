@@ -143,11 +143,11 @@ def last_line(text: str) -> str:
     return "".join(c if c.isprintable() else "?" for c in said)[-300:]
 
 
-def drain_refused(ledger: Any, label: str, now: float) -> Optional[str]:
+def drain_refused(ledger: Any, label: str, clock: Callable[[], float]) -> Optional[str]:
     """Why a federation must not be drained now: its recorded job end has passed (the drain comes before it, never
-    after); None when it may."""
+    after); None when it may. The clock is read after the federation, right before the drain."""
     found = {f.label: f for f in ledger.federations()}.get(label)
-    if found is not None and now >= found.job_end_at:
+    if found is not None and clock() >= found.job_end_at:
         return f"{label} is past its recorded job end: it is not drained (its end is proven, not drained)"
     return None
 
@@ -223,13 +223,16 @@ class Executor:
         if kind == "ProveEnded":
             self.ledger.prove_ended(action.label, action.proof)
         elif kind == "Drain":
-            late = drain_refused(self.ledger, action.label, self.clock())
+            late = drain_refused(self.ledger, action.label, self.clock)
             if late is not None:
                 self.log.write("result", action=kind, label=action.label, ok=False, said=late)
                 return
             self.ledger.drain(action.label)
         elif kind == "Settle":
-            found = self.spend(self.sites.get(action.site), action)
+            try:
+                found = self.spend(self.sites.get(action.site), action)
+            except (OSError, ValueError, RuntimeError, LookupError):  # evidence that cannot be read is no spend
+                found = None
             if found is None:
                 if action.lease_id not in self.unread:
                     self.unread.add(action.lease_id)

@@ -308,7 +308,7 @@ def test_c43_a_node_failure_or_walltime_end_is_proven_terminal_replaced_then_col
     lease = ledger.issue("site-a-fed-1")
     ledger.mark_sent(lease.lease_id)
     ledger.close()
-    site.jobs["41"].state = ended
+    site.jobs["41"].state = site.jobs["42"].state = ended  # both held jobs: one alone is BROKEN, not proven
     bench.clock.advance(60)
     bench.tick()
     fed = federations(bench)["site-a-fed-1"]
@@ -419,7 +419,7 @@ def test_c43_a_burst_of_lost_priced_leases_blocks_dispatch_until_the_controller_
         ledger.mark_sent(lease.lease_id)
     ledger.close()
     for n in (1, 2, 3):
-        site.jobs[str(40 + 2 * n)].state = "NODE_FAIL"
+        site.jobs[str(40 + 2 * n)].state = site.jobs[str(41 + 2 * n)].state = "NODE_FAIL"
     bench.clock.advance(60)
     bench.tick()  # each job's end proven terminal: three lost leases, their grants locked
     ledger = bench.open()
@@ -457,7 +457,7 @@ def test_c43_a_lost_lease_whose_log_cannot_be_read_stays_at_its_grant_said_once(
     ledger = bench.open()
     ledger.mark_sent(ledger.issue("site-a-fed-1").lease_id)
     ledger.close()
-    site.jobs["41"].state = "NODE_FAIL"
+    site.jobs["41"].state = site.jobs["42"].state = "NODE_FAIL"
 
     class Stop(Exception):
         pass
@@ -646,3 +646,77 @@ def test_c43_a_site_whose_read_times_out_is_dark_and_the_loop_goes_on(deploy, tm
     tick = bench.lines("tick")[-1]
     assert "TimeoutExpired" in tick["targets"]["site-a"]["dark"]
     assert verbs(other) == ["add"]
+
+
+# ------------------------------------------------------------------------------------------------ review round 2
+def test_c43_a_relay_whose_start_tick_is_text_as_the_relay_writes_it_is_read_here(deploy, site):
+    """C43: the relay records its /proc start tick as text; a live local relay so written is `here`, and counted."""
+    site.add_member("fed-1", jobs={"allocation": ("41", running(site))}, relay="here")
+    path = site.fleet / "fed-1" / "root" / "fault-relay" / "heartbeat.json"
+    beat = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps({**beat, "start": str(beat["start"])}), encoding="utf-8")
+    assert observed(site)["members"][0]["relay"] == "here"
+
+
+def test_c43_a_state_file_replaced_after_the_identity_check_is_not_read_as_ours(deploy, site, monkeypatch):
+    """C43: the state read for the jobs is checked as the identity check read its own: one replaced in between by
+    another federation's (another job) fails the read whole."""
+    up(site, "fed-1", 41)
+    real = deploy.hpcstate.load
+    reads = []
+
+    def load(root):
+        found = real(root)
+        reads.append(root)
+        if found is not None and len(reads) == 2:
+            found["allocation"]["job"] = "202"
+        return found
+
+    monkeypatch.setattr(deploy.hpcstate, "load", load)
+    code, _out, err = site.transport().run(None, ["python", "-I", "-B", "fleetcontrol.py", "observe", "--fleet",
+                                                 str(site.fleet)], 60)  # fmt: skip
+    assert code == 2
+    assert "not the federation this fleet made" in err
+
+
+def test_c43_one_ended_job_beside_a_running_one_is_broken_not_ended(deploy, site):
+    """C43: an ended agent's job beside running services, or a job still completing, reads BROKEN: not proven ended."""
+    site.add_member("fed-1", jobs={"allocation": ("41", running(site)), "sandbox": ("42", Job("TIMEOUT", site.now))})
+    site.add_member("fed-2", jobs={"allocation": ("43", Job("COMPLETING", site.now - 99, site.now - 9))})
+    states = {m["label"]: m["state"] for m in observed(site)["members"]}
+    assert states == {"fed-1": "BROKEN", "fed-2": "BROKEN"}
+
+
+def test_c43_a_fleet_named_twice_through_a_link_is_refused(deploy, tmp_path, site):
+    """C43: a link to a fleet is the same fleet: two sites naming it either way are refused."""
+    alias = tmp_path / "alias"
+    alias.symlink_to(site.fleet)
+    bench = Bench(tmp_path, deploy, [site])
+    path = bench.file()
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text + text[text.index("[[site]]") :].replace('"site-a"', '"site-b"').replace(
+        str(site.fleet), str(alias)), encoding="utf-8")  # fmt: skip
+    argv = ["control", "--ledger", str(bench.ledger), "--sites", str(path), "--once"]
+    assert deploy.fleetcontrol.main(argv, {}, bench.hooks()) == 2
+
+
+def test_c43_a_spend_reader_that_fails_leaves_the_lease_at_its_grant_and_the_tick_goes_on(deploy, tmp_path, site):
+    """C43: a reader whose evidence cannot be read (an OSError) is no spend: the lease stays charged its grant."""
+    up(site, "fed-1", 41)
+    bench = Bench(tmp_path, deploy, [site], max_usd=30.0, grants_usd={"m1": 10.0})
+    bench.tick()
+    ledger = bench.open()
+    ledger.mark_sent(ledger.issue("site-a-fed-1").lease_id)
+    ledger.close()
+    site.jobs["41"].state = site.jobs["42"].state = "NODE_FAIL"
+    bench.clock.advance(60)
+    bench.tick()
+
+    def spend(config, action):
+        raise OSError("the call log is gone")
+
+    bench.clock.advance(60)
+    assert bench.tick(spend=spend) == 0
+    ledger = bench.open()
+    assert ledger.status().locked_micro == 10_000_000
+    ledger.close()

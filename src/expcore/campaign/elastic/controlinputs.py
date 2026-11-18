@@ -19,6 +19,10 @@ COLLECT_S = 60.0
 MARGIN_S = 300.0
 WAITING = ("PENDING", "CONFIGURING", "REQUEUED", "RESIZING")  # `hpcslurm.WAITING_STATES`
 GONE = "GONE"  # Slurm no longer knows the job, or its id now names another job: it ended
+BROKEN = "BROKEN"  # some of a member's jobs ended or are ending and some are not: not proven ended, not usable
+# The states that prove a job ended (`hpcslurm.ENDED_STATES`, and GONE): a member is ended only when every job is
+ENDED = ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "DEADLINE", "PREEMPTED",
+         "BOOT_FAIL", GONE)  # fmt: skip
 HOLDS_NOTHING = ("taken", "down")  # members that can hold no job (`fleetrecord`; a claimed one is an up in flight)
 ENDING_EVENTS = ("report", "return", "cancel", "expire", "lost")  # a lease's events after which its federation is free
 RELAY_MB = 40.0  # a fault relay's share of the login node's memory: about 28 MB measured idle, with margin
@@ -48,7 +52,8 @@ class SiteSettings:
     idle time past which a federation retires, the queue wait that stalls the site, the drain's lease bound (None:
     the ledger's hard term), collect time and margin, and the login node's memory budget: the account's cap there
     (None: not declared, no budget), each fault relay's share, a reserve for each up and each verify-data in flight,
-    and one for everything else the account runs there."""
+    and one for everything else the account runs there; `login_node` names the login node the site's commands run on
+    (sites that name one share one budget: one cgroup), None for one of its own."""
 
     label: str
     max_federations: int
@@ -67,6 +72,7 @@ class SiteSettings:
     up_mb: float = UP_MB
     verify_mb: float = VERIFY_MB
     login_reserve_mb: float = LOGIN_RESERVE_MB
+    login_node: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.label, str) or not self.label or len(self.label) > 40:
@@ -86,6 +92,8 @@ class SiteSettings:
             _positive("login_memory_mb", self.login_memory_mb)
         for name in ("relay_mb", "up_mb", "verify_mb", "login_reserve_mb"):
             _positive(name, getattr(self, name), zero=True)
+        if self.login_node is not None and (not isinstance(self.login_node, str) or not self.login_node):
+            raise ValueError("login_node must be a non-empty operator label")
         if self.relay_mb + self.up_mb <= 0:
             raise ValueError("relay_mb and up_mb cannot both be 0: a federation takes some of the login node")
 
@@ -93,11 +101,12 @@ class SiteSettings:
 @dataclass(frozen=True)
 class Member:
     """One member of a site's fleet, as the site's read shows it: its fleet label and record status, its root, its
-    held jobs and their state (RUNNING when all run, a waiting state while any waits, else an ended state or `GONE`;
-    None before any is submitted), the earliest submit, the latest start and the earliest recorded end (seconds since
-    the epoch), whether its up finished (linked) and whether every ingested space is verified; and its fault relay:
-    `none` (its up recorded none serving), `here` (beating, a process of this login node), `elsewhere` (beating, on
-    another login node), `gone` (its up recorded it serving and no live heartbeat is left), with its last heartbeat."""
+    held jobs and their state (RUNNING when all run; an ended state or `GONE` only when every one ended; `BROKEN` when
+    some ended or are ending and others not; else a waiting state while any waits; None before any is submitted),
+    the earliest submit, the latest start and the earliest recorded end (seconds since the epoch), whether its up
+    finished (linked) and whether every ingested space is verified; and its fault relay: `none` (its up recorded none
+    serving), `here` (beating, a process of this login node), `elsewhere` (beating, on another login node), `gone`
+    (its up recorded it serving and no live heartbeat is left), with its last heartbeat."""
 
     label: str
     status: str
@@ -122,7 +131,14 @@ class Member:
 
     @property
     def ended(self) -> bool:
-        return self.state is not None and self.state not in (*WAITING, "RUNNING")
+        """Every held job is shown ended: the end is proven."""
+        return self.state in ENDED
+
+    @property
+    def broken(self) -> bool:
+        """Neither waiting, running nor proven ended (a job ended beside one that still runs, one still ending, or a
+        state not read): unusable, and its end not proven."""
+        return self.state is not None and not self.waiting and self.state != "RUNNING" and not self.ended
 
 
 @dataclass(frozen=True)
