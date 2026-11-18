@@ -1,0 +1,217 @@
+# Provenance: new
+"""What the elastic controller reads (#462 step 5, C43): each site's declared settings (`SiteSettings`),
+one read of a site and its fleet's members (`SiteView`, `Member`), and the ledger's view (`LedgerView`, `ledger_view`),
+from the ledger the controller drives or from a read-only view of it that takes no lock (`read_only`, for a dry run
+beside the process that drives the ledger).
+"""
+
+import math
+import sqlite3
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+from expcore.campaign.elastic import schema
+from expcore.campaign.elastic.config import LedgerConfig, micro_down
+from expcore.campaign.elastic.records import LIVE, Demand, Federation
+from expcore.campaign.elastic.views import LedgerViews
+
+RE_UP_S = 210.0 + 180.0 + 375.0  # an up (median about 3.5 min), a down (about 3 min) and an ingest (375 s), measured
+STALL_S = 900.0
+COLLECT_S = 60.0
+MARGIN_S = 300.0
+WAITING = ("PENDING", "CONFIGURING", "REQUEUED", "RESIZING")  # `hpcslurm.WAITING_STATES`
+GONE = "GONE"  # Slurm no longer knows the job, or its id now names another job: it ended
+HOLDS_NOTHING = ("taken", "down")  # members that can hold no job (`fleetrecord`; a claimed one is an up in flight)
+ENDING_EVENTS = ("report", "return", "cancel", "expire", "lost")  # a lease's events after which its federation is free
+
+
+def _positive(name: str, value: float, zero: bool = False) -> float:
+    bad = isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
+    if bad or value < 0 or (value == 0 and not zero):
+        raise ValueError(f"{name} must be a {'non-negative' if zero else 'positive'} finite number, got {value!r}")
+    return float(value)
+
+
+def _count(name: str, value: int, least: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < least:
+        raise ValueError(f"{name} must be a whole number of at least {least}, got {value!r}")
+    return value
+
+
+@dataclass(frozen=True)
+class SiteSettings:
+    """What a site declares: its operator's label (never a host or a site's name), its maximum of federations, its
+    billing allowance and rate (declared: no code reads a grant), KillWait, ups at once, the warm pool kept idle, the
+    idle time past which a federation retires, the queue wait that stalls the site, and the drain's lease bound (None:
+    the ledger's hard term), collect time and margin."""
+
+    label: str
+    max_federations: int
+    allowance_units: float
+    rate_units_per_hour: float
+    kill_wait_s: float = 180.0
+    parallel_ups: int = 1
+    warm_pool: int = 0
+    retire_idle_s: float = RE_UP_S
+    queue_stall_s: float = STALL_S
+    lease_bound_s: float | None = None
+    collect_s: float = COLLECT_S
+    margin_s: float = MARGIN_S
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, str) or not self.label or len(self.label) > 40:
+            raise ValueError("a site's label must be 1 to 40 characters")
+        if not all(c.isdigit() or ("a" <= c <= "z") or c == "-" for c in self.label) or self.label[0] == "-":
+            raise ValueError(f"site label {self.label!r} must be [a-z0-9-], not starting with '-'")
+        _count("max_federations", self.max_federations, 0)
+        _count("parallel_ups", self.parallel_ups, 1)
+        _count("warm_pool", self.warm_pool, 0)
+        _positive("allowance_units", self.allowance_units, zero=True)
+        _positive("rate_units_per_hour", self.rate_units_per_hour)
+        for name in ("kill_wait_s", "retire_idle_s", "queue_stall_s", "collect_s", "margin_s"):
+            _positive(name, getattr(self, name), zero=True)
+        if self.lease_bound_s is not None:
+            _positive("lease_bound_s", self.lease_bound_s)
+
+
+@dataclass(frozen=True)
+class Member:
+    """One member of a site's fleet, as the site's read shows it: its fleet label and record status, its root, its
+    held jobs and their state (RUNNING when all run, a waiting state while any waits, else an ended state or `GONE`;
+    None before any is submitted), the earliest submit, the latest start and the earliest recorded end (seconds since
+    the epoch), whether its up finished (linked) and whether every ingested space is verified."""
+
+    label: str
+    status: str
+    root: str
+    jobs: tuple[str, ...] = ()
+    state: str | None = None
+    submitted_at: float | None = None
+    started_at: float | None = None
+    ends_at: float | None = None
+    linked: bool = False
+    verified: bool = False
+
+    @property
+    def waiting(self) -> bool:
+        return self.state is None or self.state in WAITING
+
+    @property
+    def ended(self) -> bool:
+        return self.state is not None and self.state not in (*WAITING, "RUNNING")
+
+
+@dataclass(frozen=True)
+class SiteView:
+    """One read of a site: `error` names why it could not be read (the site is dark), else its free whole nodes (idle)
+    and mixed ones (reported only), a federation's nodes, `--time` and inode estimate, the account's inode usage and
+    quota (None: nothing on scratch), why the quota could not be read, and its fleet's members."""
+
+    label: str
+    error: str | None = None
+    idle_nodes: int = 0
+    mixed_nodes: int = 0
+    nodes_per_federation: int = 7
+    time_s: float = 0.0
+    inodes_used: int | None = None
+    inodes_quota: int | None = None
+    inode_estimate: int = 0
+    inodes_error: str | None = None
+    members: tuple[Member, ...] = ()
+
+
+@dataclass(frozen=True)
+class LedgerView:
+    """What the controller reads of the ledger: the current set's demand, the caps, the budget (grants and what
+    `max_usd` and each ceiling leave, in micro-dollars; `left_micro` None: no budget), the leases in flight, the
+    federations by label, the state of each federation's lease holding a slot, since when each holds no lease, and the
+    hard term."""
+
+    demand: Demand
+    caps: Mapping[str, int]
+    grants_micro: Mapping[str, int]
+    left_micro: int | None
+    left_per_model_micro: Mapping[str, int]
+    in_flight: int
+    federations: Mapping[str, Federation]
+    holding: Mapping[str, str]
+    idle_since: Mapping[str, float]
+    hard_term_s: float
+
+    def leases_wanted(self) -> int:
+        """How many more leases the ledger could issue now: each model of the current set below its cap with runs
+        pending, as many as its budget still grants, the models taken in name order against the shared total."""
+        left = self.left_micro
+        wanted = 0
+        for model in sorted(self.demand.pending):
+            cap = self.caps.get(model)
+            room = self.demand.pending[model]
+            if cap is not None:
+                room = min(room, cap - self.demand.slots.get(model, 0))
+            grant = self.grants_micro.get(model, 0)
+            if left is not None and grant > 0:
+                ceiling = self.left_per_model_micro.get(model)
+                room = min(room, left // grant, room if ceiling is None else ceiling // grant)
+                room = max(room, 0)
+                left -= room * grant
+            wanted += max(room, 0)
+        return wanted
+
+
+def ledger_view(views: LedgerViews) -> LedgerView:
+    """What the controller reads of a ledger: `demand`, the caps and the budget of its configuration,
+    `committed_micro`, `federations`, `leases` (which lease holds each federation's slot, and how many are in flight)
+    and `events` (since when each federation holds no lease: its join, or the last event that freed it)."""
+    config = views.config
+    demand = views.demand()
+    leases = views.leases()
+    total, per_model = views.committed_micro()
+    left = None if config.max_usd is None else micro_down(config.max_usd) - total
+    ceilings = {} if left is None else config.per_model_usd
+    federations = {federation.label: federation for federation in views.federations()}
+    owner = {lease.lease_id: lease.federation for lease in leases}
+    idle = {label: federation.joined_at for label, federation in federations.items()}
+    for event in views.events():
+        label = owner.get(event["lease_id"])
+        if event["kind"] in ENDING_EVENTS and label is not None:
+            idle[label] = max(idle[label], event["at"])
+    return LedgerView(
+        demand=demand,
+        caps=dict(config.caps),
+        grants_micro={model: config.grant_micro(model) for model in demand.pending},
+        left_micro=left,
+        left_per_model_micro={model: micro_down(c) - per_model.get(model, 0) for model, c in ceilings.items()},
+        in_flight=sum(1 for lease in leases if lease.state in LIVE),
+        federations=federations,
+        holding={lease.federation: lease.state for lease in leases if lease.slot},
+        idle_since=idle,
+        hard_term_s=config.hard_term_s,
+    )
+
+
+class ReadOnlyLedger(LedgerViews):
+    """A ledger's views opened read-only, with no lock: a dry run reads it beside the process that drives it, and can
+    never change it."""
+
+    def __init__(self, path: Path) -> None:
+        if not path.is_file():
+            raise FileNotFoundError(f"{path}: no ledger there")
+        self.db = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30.0)
+        self.db.row_factory = sqlite3.Row
+        try:
+            found = self.db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
+            if found is None or found[0] != schema.SCHEMA:
+                raise ValueError(f"{path} is not a ledger of {schema.SCHEMA}")
+            self.config = LedgerConfig.from_json(self._meta("config") or "")
+        except BaseException:
+            self.db.close()
+            raise
+
+    def close(self) -> None:
+        self.db.close()
+
+
+def read_only(path: Path) -> ReadOnlyLedger:
+    """The ledger at `path`, read-only and without its lock."""
+    return ReadOnlyLedger(path)
