@@ -3,7 +3,7 @@
 import pytest
 from elastic_support import SITE, assert_invariants, completion, finish, join, leased, lose, make, plan
 
-from expcore.campaign.elastic import SettleRefused, SiteReading, Wait
+from expcore.campaign.elastic import Return, SettleRefused, SiteReading, Wait
 
 ONE = {"runs": plan(tasks=1, conditions=("api-none",))}
 PRICED = {**ONE, "max_usd": 10.0, "grants_usd": {"m1": 1.0}}
@@ -106,3 +106,73 @@ def test_c42_a_settle_refuses_more_attempts_than_the_lease_could_have_charged_an
         with pytest.raises(SettleRefused, match="already settled"):
             ledger.settle(lost.lease_id, 100_000, "root", attempts_charged=other)
     assert ledger.run(lost.run_key).charged == 1
+
+
+@pytest.mark.parametrize("how", ["cancel", "return", "expire"])
+def test_c42_a_run_put_back_with_no_attempt_left_is_exhausted_however_it_goes_back(tmp_path, how):
+    """C42: a settle names two attempts for lease A while B is in flight, so when B is cancelled, returned unstarted or
+    expired the run is pending with every attempt of 2 charged: it is exhausted, not leased again."""
+    ledger, clock = make(tmp_path, **PRICED, max_attempts=2)
+    lost = lose(ledger, clock, "fed-1")
+    join(ledger, clock, "fed-2")
+    second = leased(ledger, "fed-2")
+    assert second.attempt_base == 1
+    ledger.settle(lost.lease_id, 100_000, "root", attempts_charged=2)
+    assert ledger.run(lost.run_key).state == "leased"
+    if how == "cancel":
+        ledger.cancel(second.lease_id)
+    elif how == "return":
+        ledger.observe_site(SITE, SiteReading(returns=(Return(second.lease_id, 0.0),)))
+    else:
+        clock.advance(301)
+        ledger.observe_site(SITE, SiteReading())
+        assert ledger.lease(second.lease_id).state == "expired"
+    run = ledger.run(lost.run_key)
+    assert (run.charged, run.state) == (2, "infra_exhausted")
+    join(ledger, clock, "fed-3")
+    assert isinstance(ledger.issue("fed-3"), Wait)
+    assert_invariants(ledger)
+
+
+def test_c42_a_superseded_lease_whose_archive_never_arrives_costs_only_the_one_its_loss_did(tmp_path):
+    """C42: a late completion of A that is not its run's latest lease counts nothing it names (as a verified one
+    counts nothing), so its missing archive leaves A at the one attempt its loss cost."""
+    ledger, clock = make(tmp_path, **ONE, max_attempts=3)
+    lost = lose(ledger, clock, "fed-1")
+    join(ledger, clock, "fed-2")
+    second = leased(ledger, "fed-2")
+    ledger.observe_site(SITE, SiteReading(completions=(completion(lost, state="infra_fail", charged=2),)))
+    assert ledger.lease(lost.lease_id).verdict == "superseded"
+    assert ledger.verify_archive(lost.lease_id, None) == "lost"
+    assert ledger.run(lost.run_key).charged == 1
+    ledger.observe_site(SITE, SiteReading(returns=(Return(second.lease_id, 0.0),)))
+    assert leased(ledger, "fed-2").attempt_base == 1
+    assert_invariants(ledger)
+
+
+def test_c42_a_lease_settled_with_its_attempts_keeps_them_when_its_late_archive_never_arrives(tmp_path):
+    """C42: the settle said zero charged attempts: a late completion of the lease that is then lost does not put the
+    one-attempt minimum of an unread loss back."""
+    ledger, clock = make(tmp_path, **PRICED, max_attempts=2)
+    lost = lose(ledger, clock, "fed-1")
+    ledger.settle(lost.lease_id, 100_000, "root", attempts_charged=0)
+    assert ledger.run(lost.run_key).charged == 0
+    ledger.observe_site(SITE, SiteReading(completions=(completion(lost, state="harness_error", charged=0),)))
+    assert ledger.verify_archive(lost.lease_id, None) == "lost"
+    assert ledger.run(lost.run_key).charged == 0
+    join(ledger, clock, "fed-2")
+    assert leased(ledger, "fed-2").attempt_base == 0
+    assert_invariants(ledger)
+
+
+def test_c42_a_lost_lease_whose_return_is_read_later_costs_nothing(tmp_path):
+    """C42: the return shows the lease never started, so the attempt its loss was counted for is taken back."""
+    ledger, clock = make(tmp_path, **ONE, max_attempts=2)
+    lost = lose(ledger, clock, "fed-1")
+    assert ledger.run(lost.run_key).charged == 1
+    ledger.observe_site(SITE, SiteReading(returns=(Return(lost.lease_id, 0.0),)))
+    assert ledger.lease(lost.lease_id).state == "returned"
+    assert ledger.run(lost.run_key).charged == 0
+    join(ledger, clock, "fed-2")
+    assert leased(ledger, "fed-2").attempt_base == 0
+    assert_invariants(ledger)

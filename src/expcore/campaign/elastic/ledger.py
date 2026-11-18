@@ -311,7 +311,7 @@ class Ledger(LedgerViews):
             self.db.execute(
                 "UPDATE leases SET state='cancelled', slot=0, charge_micro=0, ended_at=? WHERE id=?", (now, lease_id)
             )
-            self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
+            attempts.requeue(self.db, self.config, row["run_key"])
             self._event(now, "cancel", run_key=row["run_key"], lease_id=lease_id)
 
         self._transact(go)
@@ -389,8 +389,9 @@ class Ledger(LedgerViews):
         )
         if charge < spend:
             settling.contradicted(self.db, now, row, spend, charge)
+        attempts.unstarted(self.db, self.config, row["id"])  # it never started: its loss, if counted, is taken back
         if row["state"] in LIVE:
-            self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
+            attempts.requeue(self.db, self.config, row["run_key"])
         self._event(now, "return", run_key=row["run_key"], lease_id=row["id"], was=row["state"])
 
     def verify_archive(self, lease_id: int, sha256: str | None) -> str:
@@ -410,8 +411,8 @@ class Ledger(LedgerViews):
         if sha256 is None or sha256 != completion["archive_sha256"]:
             self.db.execute("UPDATE leases SET state='lost', ended_at=? WHERE id=?", (now, lease_id))
             if counts:
-                self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
-            attempts.lose(self.db, self.config, lease_id, completion["charged"])
+                attempts.requeue(self.db, self.config, row["run_key"])
+            attempts.lose(self.db, self.config, lease_id, completion["charged"] if counts else 0)
             self._event(now, "lost", run_key=row["run_key"], lease_id=lease_id, counted=counts)
             return "lost"
         state = "counted" if counts else "superseded"
@@ -478,7 +479,7 @@ class Ledger(LedgerViews):
     def _expire(self, row: Any, now: float, reason: str) -> None:
         """The lease expires and its run goes back to pending at once; its slot and grant stay held."""
         self.db.execute("UPDATE leases SET state='expired', ended_at=? WHERE id=?", (now, row["id"]))
-        self.db.execute("UPDATE runs SET state='pending' WHERE run_key=?", (row["run_key"],))
+        attempts.requeue(self.db, self.config, row["run_key"])
         self._event(
             now, "expire", run_key=row["run_key"], lease_id=row["id"], federation=row["federation"], reason=reason
         )
