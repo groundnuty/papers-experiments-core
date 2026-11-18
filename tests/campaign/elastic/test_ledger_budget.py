@@ -110,10 +110,11 @@ def test_c42_a_ledger_whose_grant_cannot_fit_its_budget_is_refused(tmp_path):
 
 def test_c42_a_random_walk_of_leases_expiries_completions_losses_proofs_and_restarts_keeps_every_invariant(tmp_path):
     """C42: a seeded walk over every operation, settles of lost leases and raises of the ceilings included, each lease
-    having one true spend that its completions and its settle share: no run is leased twice at once, no cap, ceiling
-    (as raised) or budget is passed, no run is counted done twice, a settle never passes its grant, and none is lost
-    across expiries and restarts. Once the federations stop failing, every run ends or waits only for the budget, and
-    no slot is held."""
+    having one true spend and one true count of charged attempts that its completions and its settle share, and few
+    attempts allowed so that losses exhaust runs and a lower real count reopens them: no run is leased twice at once, no
+    cap, ceiling (as raised) or budget is passed, no run is counted done twice, a settle never passes its grant, an
+    exhausted run has no attempt left and a pending one has, and none is lost across expiries and restarts. Once the
+    federations stop failing, every run ends or waits only for the budget, and no slot is held."""
     rng = random.Random(462)
     runs = plan(models=("m1", "m2"), tasks=8, sets={"api-none": 1})
     grants = {"m1": 1.0, "m2": 0.5}
@@ -124,18 +125,19 @@ def test_c42_a_random_walk_of_leases_expiries_completions_losses_proofs_and_rest
         max_usd=24.0,
         per_model_usd={"m1": 15.5},
         grants_usd=grants,
-        max_attempts=50,
+        max_attempts=2,
     )
     labels = [f"fed-{n}" for n in range(1, 5)]
     for label in labels:
         join(ledger, clock, label)
     counters: dict[int, int] = {}
     truth: dict[int, float] = {}
+    real: dict[int, int] = {}
     for _ in range(400):
-        ledger = _step(rng, ledger, clock, labels, (counters, truth), tmp_path)
+        ledger = _step(rng, ledger, clock, labels, (counters, truth, real), tmp_path)
         assert_invariants(ledger)
     kinds = {event["kind"] for event in ledger.events()}
-    assert {"settle", "raise_ceiling"} <= kinds, "the walk never settled a lease or raised a ceiling"
+    assert {"settle", "raise_ceiling", "reopen"} <= kinds, "the walk never settled, raised a ceiling or reopened a run"
     assert "cap_failed" not in kinds
     for _ in range(100):  # the federations stop failing: every lease completes
         _settle(ledger, clock, labels)
@@ -170,9 +172,17 @@ def _spend(rng, truth, lease):
     return truth[lease.lease_id]
 
 
+def _attempts(rng, real, lease):
+    """The charged attempts a lease really cost, fixed at the first ask so a completion and a settle of it agree: none a
+    third of the time, else one."""
+    if lease.lease_id not in real:
+        real[lease.lease_id] = 0 if rng.random() < 1 / 3 else 1
+    return real[lease.lease_id]
+
+
 def _step(rng, ledger, clock, labels, memory, tmp_path):
     """One random operation; return the ledger, reopened when the step was a restart."""
-    counters, truth = memory
+    counters, truth, real = memory
     actions = [
         "issue",
         "issue",
@@ -191,7 +201,7 @@ def _step(rng, ledger, clock, labels, memory, tmp_path):
     ]
     action = rng.choice(actions)
     if action == "settle":
-        _settle_lost(rng, ledger, clock, truth)
+        _settle_lost(rng, ledger, clock, (truth, real))
     elif action == "raise" and rng.random() < 0.4:
         ceilings = ledger.ceilings()
         if rng.random() < 0.7:
@@ -218,11 +228,7 @@ def _step(rng, ledger, clock, labels, memory, tmp_path):
     elif action == "complete":
         open_leases = [lease for lease in ledger.leases() if lease.state in ("issued", "sent", "expired")]
         picked = [lease for lease in open_leases if rng.random() < 0.4]
-        completions = tuple(
-            completion(lease.lease_id, spend_usd=_spend(rng, truth, lease), state=rng.choice(["done", "infra_fail"]))
-            for lease in picked
-            if rng.random() < 0.8
-        )
+        completions = tuple(_completion(rng, truth, real, lease) for lease in picked if rng.random() < 0.8)
         returns = tuple(
             Return(lease.lease_id, spend_usd=0.0)
             for lease in picked
@@ -249,9 +255,23 @@ def _step(rng, ledger, clock, labels, memory, tmp_path):
     return ledger
 
 
-def _settle_lost(rng, ledger, clock, truth):
+def _completion(rng, truth, real, lease):
+    """A lease's completion at its true spend and charged attempts (a done one charged at least one)."""
+    state = rng.choice(["done", "infra_fail"])
+    charged = _attempts(rng, real, lease)
+    return completion(
+        lease.lease_id,
+        spend_usd=_spend(rng, truth, lease),
+        state=state,
+        charged=max(charged, 1 if state == "done" else 0),
+    )
+
+
+def _settle_lost(rng, ledger, clock, memory):
     """Settle some lost leases (expired with their holder proven ended and, if cancelled, past KillWait, or their
-    archive never verified) at their true spend; one settled already is asked again with its recorded values."""
+    archive never verified) at their true spend, and at their true charged attempts two times in three; one settled
+    already is asked again with its recorded values."""
+    truth, real = memory
     settled = {settlement.lease_id: settlement for settlement in ledger.settlements()}
     federations = {federation.label: federation for federation in ledger.federations()}
     for lease in ledger.leases():
@@ -262,9 +282,16 @@ def _settle_lost(rng, ledger, clock, truth):
         if rng.random() < 0.5:
             continue
         if lease.lease_id in settled:
-            ledger.settle(lease.lease_id, settled[lease.lease_id].spend_micro, settled[lease.lease_id].source)
+            again = settled[lease.lease_id]
+            ledger.settle(lease.lease_id, again.spend_micro, again.source, attempts_charged=again.charged)
         else:
-            ledger.settle(lease.lease_id, micro_up(_spend(rng, truth, lease)), rng.choice(["root", "pulled"]))
+            attempts = _attempts(rng, real, lease) if rng.random() < 2 / 3 else None
+            ledger.settle(
+                lease.lease_id,
+                micro_up(_spend(rng, truth, lease)),
+                rng.choice(["root", "pulled"]),
+                attempts_charged=attempts,
+            )
 
 
 def _settle(ledger, clock, labels):

@@ -157,5 +157,5 @@ def apply(
         **known,
     )
     if attempts_charged is not None:
-        attempts.set_charged(db, config, lease_id, attempts_charged)
+        attempts.set_charged(db, config, now, lease_id, attempts_charged, "its settle")
     return Settlement(lease_id, now, source, spend_micro, grant, attempts_charged)
