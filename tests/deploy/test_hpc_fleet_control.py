@@ -1,4 +1,4 @@
-"""C45: the elastic fleet's controller (deploy/hpc-federation/fleetcontrol.py) on simulated sites over a fake Slurm: its
+"""C43: the elastic fleet's controller (deploy/hpc-federation/fleetcontrol.py) on simulated sites over a fake Slurm: its
 read of a site is read-only and fails whole rather than guess, and its loop joins, drains, retires (collect first,
 never with a lease in flight) and replaces federations through the fleet's own commands; a dry run prints exactly
 what a live tick runs, and runs nothing."""
@@ -119,8 +119,8 @@ def retiring(site) -> list:
 
 
 # ------------------------------------------------------------------------------------------------ the site's read
-def test_c45_observe_reads_members_jobs_nodes_and_quota_and_asks_slurm_only_of_its_own_jobs(site):
-    """C45: each member's jobs by the ids its up recorded: running ones with the earliest submit, the latest start and
+def test_c43_observe_reads_members_jobs_nodes_and_quota_and_asks_slurm_only_of_its_own_jobs(site):
+    """C43: each member's jobs by the ids its up recorded: running ones with the earliest submit, the latest start and
     the earliest end; a waiting one; an id Slurm forgot and one that now names another job are GONE (never touched);
     a member down is not read. Only exactly idle nodes are free; the quota and one federation's estimate are read.
     Slurm is asked nothing but sinfo and scontrol on those ids."""
@@ -156,8 +156,8 @@ def test_c45_observe_reads_members_jobs_nodes_and_quota_and_asks_slurm_only_of_i
 
 
 @pytest.mark.parametrize("broken", ["scontrol", "sinfo", "state"])
-def test_c45_a_read_that_fails_anywhere_fails_whole_and_the_site_is_dark(deploy, tmp_path, site, broken):
-    """C45: a job read that times out, sinfo failing, or a job state the controller does not read makes the whole
+def test_c43_a_read_that_fails_anywhere_fails_whole_and_the_site_is_dark(deploy, tmp_path, site, broken):
+    """C43: a job read that times out, sinfo failing, or a job state the controller does not read makes the whole
     read fail: the site is dark, gets no action and proves no end, and the demand comes up at the other site."""
     other = FakeSite(tmp_path / "site-b", deploy)
     up(site, "fed-1", 41)
@@ -181,8 +181,8 @@ def test_c45_a_read_that_fails_anywhere_fails_whole_and_the_site_is_dark(deploy,
     assert "site-b" in {a["site"] for a in tick["actions"] if a["action"] == "Add"}
 
 
-def test_c45_a_quota_that_cannot_be_read_leaves_no_room_but_the_site_stays_readable(deploy, tmp_path, site):
-    """C45: the quota command failing is reported and stops adds at the site; the rest of its read stands."""
+def test_c43_a_quota_that_cannot_be_read_leaves_no_room_but_the_site_stays_readable(deploy, tmp_path, site):
+    """C43: the quota command failing is reported and stops adds at the site; the rest of its read stands."""
     site.quota = None
     bench = Bench(tmp_path, deploy, [site])
     bench.tick()
@@ -193,8 +193,8 @@ def test_c45_a_quota_that_cannot_be_read_leaves_no_room_but_the_site_stays_reada
 
 
 # ------------------------------------------------------------------------------------------------ the loop
-def test_c45_a_dry_run_prints_exactly_what_a_live_tick_runs_and_runs_nothing(deploy, tmp_path, site):
-    """C45: with 4 runs pending and no federation, the dry run prints `fleet.py --fleet F add 4`, the very argv the live
+def test_c43_a_dry_run_prints_exactly_what_a_live_tick_runs_and_runs_nothing(deploy, tmp_path, site):
+    """C43: with 4 runs pending and no federation, the dry run prints `fleet.py --fleet F add 4`, the very argv the live
     tick then gives the site; the dry run gives the site nothing and leaves the ledger's file as it was."""
     bench = Bench(tmp_path, deploy, [site])
     before = bench.ledger.read_bytes()
@@ -210,8 +210,8 @@ def test_c45_a_dry_run_prints_exactly_what_a_live_tick_runs_and_runs_nothing(dep
     assert site.commands == [action["steps"][0]]
 
 
-def test_c45_a_read_pulled_earlier_is_for_a_dry_run_and_never_acted_on(deploy, tmp_path, site):
-    """C45: `--observed SITE=FILE` takes a read an operator pulled; a live tick refuses it (a stale read could start an
+def test_c43_a_read_pulled_earlier_is_for_a_dry_run_and_never_acted_on(deploy, tmp_path, site):
+    """C43: `--observed SITE=FILE` takes a read an operator pulled; a live tick refuses it (a stale read could start an
     up past what the site holds now), and a dry run prints from it."""
     pulled = tmp_path / "site-a.json"
     pulled.write_text(json.dumps(observed(site)), encoding="utf-8")
@@ -223,10 +223,10 @@ def test_c45_a_read_pulled_earlier_is_for_a_dry_run_and_never_acted_on(deploy, t
     assert "add 4" in "\n".join(bench.printed)
 
 
-def test_c45_a_federation_joins_drains_before_its_end_is_collected_then_taken_down_and_proven_cancelled(
+def test_c43_a_federation_joins_drains_before_its_end_is_collected_then_taken_down_and_proven_cancelled(
     deploy, tmp_path, site
 ):
-    """C45: up and verified, it joins with its earliest job end and its queue wait logged; inside the cut-off it is
+    """C43: up and verified, it joins with its earliest job end and its queue wait logged; inside the cut-off it is
     drained; with no lease it is collected, its copy verified with collect's own hash, and taken down, in that order;
     once the fleet shows it down, its end is proven `cancelled`."""
     up(site, "fed-1", 41, ends_in=3000)
@@ -256,8 +256,8 @@ def test_c45_a_federation_joins_drains_before_its_end_is_collected_then_taken_do
     assert (fed.ended_at is not None, fed.end_proof) == (True, "cancelled")
 
 
-def test_c45_a_failed_collect_stops_the_retirement_before_down(deploy, tmp_path, site):
-    """C45: collect failing, or printing no manifest hash, leaves the federation up: nothing verified or taken down."""
+def test_c43_a_failed_collect_stops_the_retirement_before_down(deploy, tmp_path, site):
+    """C43: collect failing, or printing no manifest hash, leaves the federation up: nothing verified or taken down."""
     up(site, "fed-1", 41)
     bench = Bench(tmp_path, deploy, [site])
     bench.tick()
@@ -272,8 +272,8 @@ def test_c45_a_failed_collect_stops_the_retirement_before_down(deploy, tmp_path,
         assert retiring(site) == ["collect"]
 
 
-def test_c45_a_federation_with_a_lease_in_flight_is_never_retired(deploy, tmp_path, site):
-    """C45: drained by hand while its lease is sent, it is not collected or taken down; a retirement decided earlier
+def test_c43_a_federation_with_a_lease_in_flight_is_never_retired(deploy, tmp_path, site):
+    """C43: drained by hand while its lease is sent, it is not collected or taken down; a retirement decided earlier
     is refused when the ledger shows a lease in flight at the moment it would start."""
     up(site, "fed-1", 41)
     bench = Bench(tmp_path, deploy, [site])
@@ -298,8 +298,8 @@ def test_c45_a_federation_with_a_lease_in_flight_is_never_retired(deploy, tmp_pa
 
 
 @pytest.mark.parametrize("ended", ["NODE_FAIL", "TIMEOUT"])
-def test_c45_a_node_failure_or_walltime_end_is_proven_terminal_replaced_then_collected(deploy, tmp_path, site, ended):
-    """C45: Slurm shows a joined federation's job ended: its end is proven `terminal` (its lease expires, its run goes
+def test_c43_a_node_failure_or_walltime_end_is_proven_terminal_replaced_then_collected(deploy, tmp_path, site, ended):
+    """C43: Slurm shows a joined federation's job ended: its end is proven `terminal` (its lease expires, its run goes
     back to pending); on the next tick a replacement is added and the ended one is collected and taken down."""
     up(site, "fed-1", 41)
     bench = Bench(tmp_path, deploy, [site], runs=plan(tasks=1, conditions=("api-none",)))
@@ -323,8 +323,8 @@ def test_c45_a_node_failure_or_walltime_end_is_proven_terminal_replaced_then_col
     assert verbs(site).count("add") == 1
 
 
-def test_c45_a_stalled_queue_stops_adds_there_and_its_wait_is_logged(deploy, tmp_path, site):
-    """C45: an up whose job has waited 1000 s (past the site's 900 s bound) stops adds at its site; the other site
+def test_c43_a_stalled_queue_stops_adds_there_and_its_wait_is_logged(deploy, tmp_path, site):
+    """C43: an up whose job has waited 1000 s (past the site's 900 s bound) stops adds at its site; the other site
     takes them, and the wait is in the log."""
     other = FakeSite(tmp_path / "site-b", deploy)
     site.add_member(
@@ -341,8 +341,8 @@ def test_c45_a_stalled_queue_stops_adds_there_and_its_wait_is_logged(deploy, tmp
 
 
 @pytest.mark.parametrize("limit", ["quota", "nodes", "allowance"])
-def test_c45_quota_exhaustion_no_free_whole_nodes_or_a_spent_allowance_add_nothing(deploy, tmp_path, site, limit):
-    """C45: inodes past the 95% line, 6 idle nodes beside 300 mixed ones, or an allowance short of one more whole
+def test_c43_quota_exhaustion_no_free_whole_nodes_or_a_spent_allowance_add_nothing(deploy, tmp_path, site, limit):
+    """C43: inodes past the 95% line, 6 idle nodes beside 300 mixed ones, or an allowance short of one more whole
     --time: the site adds nothing, and the log names the limit."""
     bench = Bench(tmp_path, deploy, [site])
     if limit == "quota":
@@ -357,8 +357,8 @@ def test_c45_quota_exhaustion_no_free_whole_nodes_or_a_spent_allowance_add_nothi
     assert limits[{"quota": "inodes", "nodes": "nodes", "allowance": "allowance"}[limit]] == 0
 
 
-def test_c45_with_every_model_at_its_cap_idle_federations_are_drained_then_taken_down(deploy, tmp_path, site):
-    """C45: one model capped at 1 with its slot held: the idle federations are drained once idle past their re-up
+def test_c43_with_every_model_at_its_cap_idle_federations_are_drained_then_taken_down(deploy, tmp_path, site):
+    """C43: one model capped at 1 with its slot held: the idle federations are drained once idle past their re-up
     cost, then collected and taken down; the one holding the lease is kept."""
     for n, label in enumerate(("fed-1", "fed-2", "fed-3")):
         up(site, label, 41 + 2 * n, ends_in=(9 - n) * 3600)
@@ -380,8 +380,8 @@ def test_c45_with_every_model_at_its_cap_idle_federations_are_drained_then_taken
 
 
 # ------------------------------------------------------------------------------------------------ today's commands
-def test_c45_todays_fleet_commands_are_unchanged_and_the_controllers_calls_are_theirs(deploy, tmp_path, monkeypatch):
-    """C45: fleet.py keeps exactly today's commands; the controller's add and down are those commands' own argv
+def test_c43_todays_fleet_commands_are_unchanged_and_the_controllers_calls_are_theirs(deploy, tmp_path, monkeypatch):
+    """C43: fleet.py keeps exactly today's commands; the controller's add and down are those commands' own argv
     (`--fleet F add K`, `--fleet F down --member fed-k`), parsed by fleet.py's own parser, and its collect and
     verify-copy are shards.py's."""
     assert deploy.fleet.COMMANDS == ("up", "add", "plan", "step", "step-stop", "status", "down")
@@ -404,8 +404,8 @@ def test_c45_todays_fleet_commands_are_unchanged_and_the_controllers_calls_are_t
 
 
 # ------------------------------------------------------------------------------------------------ the additions
-def test_c45_a_burst_of_lost_priced_leases_blocks_dispatch_until_the_controller_settles_them(deploy, tmp_path, site):
-    """C45: three priced leases whose federations die are lost, each still charged its USD 10 grant, which locks the
+def test_c43_a_burst_of_lost_priced_leases_blocks_dispatch_until_the_controller_settles_them(deploy, tmp_path, site):
+    """C43: three priced leases whose federations die are lost, each still charged its USD 10 grant, which locks the
     whole USD 30 budget, so a fresh federation is told to wait; the controller settles each to the spend its call log
     shows (USD 0.50, from the root), the lock is shown going in its status line and log, and dispatch resumes."""
     for n in (1, 2, 3):
@@ -448,8 +448,8 @@ def test_c45_a_burst_of_lost_priced_leases_blocks_dispatch_until_the_controller_
     assert all(r["ok"] and r["source"] == "root" for r in settled)
 
 
-def test_c45_a_lost_lease_whose_log_cannot_be_read_stays_at_its_grant_said_once(deploy, tmp_path, site):
-    """C45: with no reader of the dead store's spend (step 6 hooks it up), the lease stays charged its grant and the
+def test_c43_a_lost_lease_whose_log_cannot_be_read_stays_at_its_grant_said_once(deploy, tmp_path, site):
+    """C43: with no reader of the dead store's spend (step 6 hooks it up), the lease stays charged its grant and the
     loop says so once, not every tick."""
     up(site, "fed-1", 41)
     bench = Bench(tmp_path, deploy, [site], max_usd=30.0, grants_usd={"m1": 10.0})
@@ -484,8 +484,8 @@ def test_c45_a_lost_lease_whose_log_cannot_be_read_stays_at_its_grant_said_once(
     ledger.close()
 
 
-def test_c45_an_add_is_refused_at_the_login_memory_cap_read_from_the_relays_beating_here(deploy, tmp_path, site):
-    """C45: two relays beating on this login node and one on another: under a cap that leaves less than one more
+def test_c43_an_add_is_refused_at_the_login_memory_cap_read_from_the_relays_beating_here(deploy, tmp_path, site):
+    """C43: two relays beating on this login node and one on another: under a cap that leaves less than one more
     federation's share (its up, then its relay), nothing is added and the budget is logged beside quota and nodes."""
     for n, where in ((1, "here"), (2, "here"), (3, "elsewhere")):
         site.add_member(f"fed-{n}", jobs={"allocation": (str(40 + n), running(site))}, relay=where)
@@ -503,10 +503,10 @@ def test_c45_an_add_is_refused_at_the_login_memory_cap_read_from_the_relays_beat
     assert site.commands[-1][-2:] == ["add", "1"]
 
 
-def test_c45_a_dead_relay_is_detected_recorded_with_its_last_heartbeat_and_its_federation_drained(
+def test_c43_a_dead_relay_is_detected_recorded_with_its_last_heartbeat_and_its_federation_drained(
     deploy, tmp_path, site
 ):
-    """C45: a joined federation's relay stops beating (its heartbeat 300 s old): the tick records it gone with no exit
+    """C43: a joined federation's relay stops beating (its heartbeat 300 s old): the tick records it gone with no exit
     status and its last heartbeat, and drains the federation in the ledger."""
     site.add_member("fed-1", jobs={"allocation": ("41", running(site))}, relay="here")
     bench = Bench(tmp_path, deploy, [site])
@@ -529,8 +529,8 @@ def test_c45_a_dead_relay_is_detected_recorded_with_its_last_heartbeat_and_its_f
 
 # ------------------------------------------------------------------------------------------------ review round 1
 @pytest.mark.parametrize("forged", ["root", "job"])
-def test_c45_a_member_whose_root_is_not_the_one_its_up_made_darkens_the_site(deploy, tmp_path, site, forged):
-    """C45: a state file written by an up of another root, or naming another job than the fleet recorded, is not this
+def test_c43_a_member_whose_root_is_not_the_one_its_up_made_darkens_the_site(deploy, tmp_path, site, forged):
+    """C43: a state file written by an up of another root, or naming another job than the fleet recorded, is not this
     fleet's federation: the read fails whole (nothing of it is read as ours) and the site gets no action."""
     up(site, "fed-1", 41)
     path = site.fleet / "fed-1" / "root" / "hpc-federation.json"
@@ -548,8 +548,8 @@ def test_c45_a_member_whose_root_is_not_the_one_its_up_made_darkens_the_site(dep
     assert not any(call[:4] == ["scontrol", "show", "job", "-o"] and call[4] == "202" for call in site.calls)
 
 
-def test_c45_a_member_is_verified_only_by_markers_bound_to_its_recorded_manifest(deploy, site):
-    """C45: an older state with no record of its ingested spaces, or a marker for another manifest, is not verified,
+def test_c43_a_member_is_verified_only_by_markers_bound_to_its_recorded_manifest(deploy, site):
+    """C43: an older state with no record of its ingested spaces, or a marker for another manifest, is not verified,
     so its inodes stay reserved."""
     up(site, "fed-1", 41)
     path = site.fleet / "fed-1" / "root" / "hpc-federation.json"
@@ -563,8 +563,8 @@ def test_c45_a_member_is_verified_only_by_markers_bound_to_its_recorded_manifest
         assert observed(site)["members"][0]["verified"] is False
 
 
-def test_c45_the_busy_operations_are_taken_before_the_sites_are_read(deploy, tmp_path, site):
-    """C45: an add that ends while the sites are read is still busy for that tick, so the read taken before it ended
+def test_c43_the_busy_operations_are_taken_before_the_sites_are_read(deploy, tmp_path, site):
+    """C43: an add that ends while the sites are read is still busy for that tick, so the read taken before it ended
     never lets the same room be spent twice."""
     bench = Bench(tmp_path, deploy, [site])
     order = []
@@ -594,15 +594,15 @@ def test_c45_the_busy_operations_are_taken_before_the_sites_are_read(deploy, tmp
     assert [type(a).__name__ for a in decision.actions] == []
 
 
-def test_c45_two_sites_never_share_one_fleet(deploy, tmp_path, site):
-    """C45: two site labels naming one fleet directory would read and act on its members twice: refused."""
+def test_c43_two_sites_never_share_one_fleet(deploy, tmp_path, site):
+    """C43: two site labels naming one fleet directory would read and act on its members twice: refused."""
     bench = Bench(tmp_path, deploy, [site, site])
     assert bench.tick() == 2
     assert site.commands == []
 
 
-def test_c45_a_drain_decided_before_the_end_is_not_run_after_it_nor_by_hand(deploy, tmp_path, site):
-    """C45: a drain whose federation's recorded end has passed by the time it runs is refused and logged, and the
+def test_c43_a_drain_decided_before_the_end_is_not_run_after_it_nor_by_hand(deploy, tmp_path, site):
+    """C43: a drain whose federation's recorded end has passed by the time it runs is refused and logged, and the
     `drain` verb refuses one past its end too."""
     up(site, "fed-1", 41, ends_in=3000)
     bench = Bench(tmp_path, deploy, [site])
@@ -621,8 +621,8 @@ def test_c45_a_drain_decided_before_the_end_is_not_run_after_it_nor_by_hand(depl
     assert federations(bench)["site-a-fed-1"].drained_at is None
 
 
-def test_c45_a_site_whose_read_times_out_is_dark_and_the_loop_goes_on(deploy, tmp_path, site):
-    """C45: a read that times out (the local transport's subprocess timeout) darkens that site for the tick; the other
+def test_c43_a_site_whose_read_times_out_is_dark_and_the_loop_goes_on(deploy, tmp_path, site):
+    """C43: a read that times out (the local transport's subprocess timeout) darkens that site for the tick; the other
     site is still read and acted on."""
     other = FakeSite(tmp_path / "site-b", deploy)
     bench = Bench(tmp_path, deploy, [site, other])
@@ -649,8 +649,8 @@ def test_c45_a_site_whose_read_times_out_is_dark_and_the_loop_goes_on(deploy, tm
 
 
 # ------------------------------------------------------------------------------------------------ review round 2
-def test_c45_a_relay_whose_start_tick_is_text_as_the_relay_writes_it_is_read_here(deploy, site):
-    """C45: the relay records its /proc start tick as text; a live local relay so written is `here`, and counted."""
+def test_c43_a_relay_whose_start_tick_is_text_as_the_relay_writes_it_is_read_here(deploy, site):
+    """C43: the relay records its /proc start tick as text; a live local relay so written is `here`, and counted."""
     site.add_member("fed-1", jobs={"allocation": ("41", running(site))}, relay="here")
     path = site.fleet / "fed-1" / "root" / "fault-relay" / "heartbeat.json"
     beat = json.loads(path.read_text(encoding="utf-8"))
@@ -658,8 +658,8 @@ def test_c45_a_relay_whose_start_tick_is_text_as_the_relay_writes_it_is_read_her
     assert observed(site)["members"][0]["relay"] == "here"
 
 
-def test_c45_a_state_file_replaced_after_the_identity_check_is_not_read_as_ours(deploy, site, monkeypatch):
-    """C45: the state read for the jobs is checked as the identity check read its own: one replaced in between by
+def test_c43_a_state_file_replaced_after_the_identity_check_is_not_read_as_ours(deploy, site, monkeypatch):
+    """C43: the state read for the jobs is checked as the identity check read its own: one replaced in between by
     another federation's (another job) fails the read whole."""
     up(site, "fed-1", 41)
     real = deploy.hpcstate.load
@@ -679,16 +679,16 @@ def test_c45_a_state_file_replaced_after_the_identity_check_is_not_read_as_ours(
     assert "not the federation this fleet made" in err
 
 
-def test_c45_one_ended_job_beside_a_running_one_is_broken_not_ended(deploy, site):
-    """C45: an ended agent's job beside running services, or a job still completing, reads BROKEN: not proven ended."""
+def test_c43_one_ended_job_beside_a_running_one_is_broken_not_ended(deploy, site):
+    """C43: an ended agent's job beside running services, or a job still completing, reads BROKEN: not proven ended."""
     site.add_member("fed-1", jobs={"allocation": ("41", running(site)), "sandbox": ("42", Job("TIMEOUT", site.now))})
     site.add_member("fed-2", jobs={"allocation": ("43", Job("COMPLETING", site.now - 99, site.now - 9))})
     states = {m["label"]: m["state"] for m in observed(site)["members"]}
     assert states == {"fed-1": "BROKEN", "fed-2": "BROKEN"}
 
 
-def test_c45_a_fleet_named_twice_through_a_link_is_refused(deploy, tmp_path, site):
-    """C45: a link to a fleet is the same fleet: two sites naming it either way are refused."""
+def test_c43_a_fleet_named_twice_through_a_link_is_refused(deploy, tmp_path, site):
+    """C43: a link to a fleet is the same fleet: two sites naming it either way are refused."""
     alias = tmp_path / "alias"
     alias.symlink_to(site.fleet)
     bench = Bench(tmp_path, deploy, [site])
@@ -700,8 +700,8 @@ def test_c45_a_fleet_named_twice_through_a_link_is_refused(deploy, tmp_path, sit
     assert deploy.fleetcontrol.main(argv, {}, bench.hooks()) == 2
 
 
-def test_c45_a_spend_reader_that_fails_leaves_the_lease_at_its_grant_and_the_tick_goes_on(deploy, tmp_path, site):
-    """C45: a reader whose evidence cannot be read (an OSError) is no spend: the lease stays charged its grant."""
+def test_c43_a_spend_reader_that_fails_leaves_the_lease_at_its_grant_and_the_tick_goes_on(deploy, tmp_path, site):
+    """C43: a reader whose evidence cannot be read (an OSError) is no spend: the lease stays charged its grant."""
     up(site, "fed-1", 41)
     bench = Bench(tmp_path, deploy, [site], max_usd=30.0, grants_usd={"m1": 10.0})
     bench.tick()

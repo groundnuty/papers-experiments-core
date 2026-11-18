@@ -1,5 +1,5 @@
 # Provenance: new
-"""The elastic fleet's provisioning controller (#462 step 5, C45): each site's target, and the actions that reach it.
+"""The elastic fleet's provisioning controller (#462 step 5, C43): each site's target, and the actions that reach it.
 
 `decide` is pure: from what the ledger shows (`LedgerView`, built by `ledger_view`), what each site's read shows
 (`SiteView`, its fleet's members as `Member`) and what each site declares (`SiteSettings`), it returns the targets and

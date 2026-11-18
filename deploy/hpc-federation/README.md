@@ -1481,7 +1481,7 @@ federation that still holds jobs said by count. Not run live.
 
 ## The elastic fleet's controller (`fleetcontrol.py`)
 
-Step 5 of #462 (C45): it keeps each site's fleet at a target the campaign's ledger can use, and brings up, drains and
+Step 5 of #462 (C43): it keeps each site's fleet at a target the campaign's ledger can use, and brings up, drains and
 takes down federations through the fleet's own commands. `expcore.campaign.elastic.control` decides (DESIGN.md,
 section 1, "The elastic controller"); `fleetcontrol.py` reads the sites, and runs or prints the decision. It only adds
 to a fleet that exists: `fleet.py up` makes one (at least two federations). Nothing of it has run live (step 6).
