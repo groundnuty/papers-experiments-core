@@ -1,5 +1,6 @@
-"""The HPC driver's wait for its held jobs rides out a slow or restarting Slurm controller (deploy/hpc-federation/
-hpcslurm.py, `Slurm.wait_running`; hpcdriver.py, `Driver.wait_held`).
+"""The HPC driver's wait for its held jobs, and the reads right after they start, ride out a slow or restarting Slurm
+controller (deploy/hpc-federation/hpcslurm.py, `Slurm.ride_out`, `wait_running`, `checked`; hpcdriver.py,
+`Driver.wait_held`, `keep_off_other_federations`).
 
 Live, 18 Nov: while four ups waited hours for their held jobs, one `scontrol` that did not answer in 60 s ended each of
 them and cancelled its held jobs, and the queue age was lost. A read of the held job that fails during the wait (the
@@ -17,6 +18,7 @@ from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
 from hpc_fleet_support import SEPARATE_LAYOUT
 
 SERVICES, AGENT = "4242", "4343"  # the fake's two job ids under "separate"
+SHOW_SERVICES = ["scontrol", "show", "job", "-o", SERVICES]
 # With a poll interval of 5 s the reads of one streak are at 0, 5, 15, 35, 75, 135, 195, 255, 315, 375, 435, 495 and
 # 555 s (sleeps of 5, 10, 20, 40, then 60 each): the 14th, at 615 s, is the first that passes 600 s.
 READS_BEFORE_GIVING_UP = 13
@@ -41,46 +43,76 @@ def site(tmp_path):
 
 
 class Rig:
-    """A driver over the fake Slurm, whose reads of the services job's record fail as a slow controller's do during the
-    wait for it, and only then. `pattern` has one entry per read: True fails it as `how` says ("timeout" is the Runner's
-    own error, any other text is scontrol's stderr under status 1), False answers PENDING; once it is used up every read
-    answers RUNNING. During the wait the clock is `now`, which only the wait's sleeps move (`sleeps` keeps them): a
-    read takes no time. `failed_at` is `now` at each failed read; what `up` says is in `said`."""
+    """A driver over the fake Slurm, whose reads fail as a slow controller's do in one `phase` of `up`, and only there:
+    "submit" (the read-back of the held job just submitted), "wait" (the wait for it to run), "readback" (the read of
+    the running job, before the placement) or "exclusion" (the second read of the account's jobs, `squeue --me`). The
+    failing read is the services job's `scontrol show job` (`squeue --me` in "exclusion"). `pattern` has one entry per
+    read of the phase: True fails it as `how` says ("timeout" is the Runner's own error, any other text is the
+    command's stderr under status 1); in "wait" False answers PENDING and, once the pattern is used up, every read
+    answers RUNNING; in the other phases False and a used-up pattern answer as the fake does. In a phase the clock is
+    `now`, which only the sleeps move (`sleeps` keeps them): a read takes no time. `failed_at` is `now` at each failed
+    read; what `up` says is in `said`."""
 
-    def __init__(self, hpc, tmp_path, site, pattern, how="timeout", poll_s=5.0, layout=LAYOUT, fake=None):
-        self.hpc, self.site, self.fake = hpc, site, fake or FakeSlurm(state="PENDING")
-        self.now, self.failed_at, self.sleeps, self.said, self.waiting = 0.0, [], [], [], False
+    def __init__(self, hpc, tmp_path, site, pattern, how="timeout", poll_s=5.0, layout=LAYOUT, fake=None, phase="wait"):
+        self.hpc, self.site, self.phase = hpc, site, None
+        self.fake = fake or FakeSlurm(state="PENDING" if phase == "wait" else "RUNNING")
+        self.now, self.failed_at, self.sleeps, self.said = 0.0, [], [], []
         (tmp_path / "fed").mkdir(parents=True, exist_ok=True)
         driver = hpc.cli.make_driver(layout, str(tmp_path / "fed" / "root"), runner=self.fake)
         slurm = driver.slurm
-        ticks, steps, real, wait = itertools.count(0, 100).__next__, iter(pattern), self.fake.run, driver.wait_held
+        ticks, steps, real = itertools.count(0, 100).__next__, iter(pattern), self.fake.run
 
         def run(argv, timeout):
-            if self.waiting and argv[:5] == ["scontrol", "show", "job", "-o", SERVICES]:
+            squeue = argv[:2] == ["squeue", "--me"]
+            if self.phase == phase and (squeue if phase == "exclusion" else argv[:5] == SHOW_SERVICES):
                 step = next(steps, None)
-                self.fake.state = "RUNNING" if step is None else "PENDING"
+                if phase == "wait":
+                    self.fake.state = "RUNNING" if step is None else "PENDING"
                 if step:
                     self.failed_at.append(self.now)
                     if how == "timeout":
-                        raise hpc.slurm.SlurmError(f"scontrol did not answer in {timeout:.0f} s")
-                    return hpc.slurm.Completed(1, "", f"slurm_load_jobs error: {how}\n")
+                        raise hpc.slurm.SlurmError(f"{argv[0]} did not answer in {timeout:.0f} s")
+                    return hpc.slurm.Completed(1, "", f"{argv[0]}: error: {how}\n")
             return real(argv, timeout)
 
-        def waited(held):
-            self.waiting = True
+        def within(name, method):
+            def wrapped(*args):
+                self.phase = name
+                try:
+                    return method(*args)
+                finally:
+                    self.phase = None
+
+            return wrapped
+
+        wait = driver.wait_held
+
+        def waited(held):  # the read-back of the running job follows the wait, until the exclusion read
+            self.phase = "wait"
             try:
                 wait(held)
-            finally:
-                self.waiting = False
+            except BaseException:
+                self.phase = None
+                raise
+            self.phase = "readback"
+
+        release = driver.release_held
+
+        def released(held):  # a failure ends the phase it was in: the release's own reads are never the injected ones
+            self.phase = None
+            return release(held)
 
         def sleep(seconds):
-            if self.waiting:
+            if self.phase is not None:
                 self.sleeps.append(seconds)
                 self.now += seconds
 
-        self.fake.run, driver.wait_held, driver.say = run, waited, self.said.append
+        self.fake.run, driver.say = run, self.said.append
+        driver.submit = within("submit", driver.submit)
+        driver.wait_held, driver.release_held = waited, released
+        driver.keep_off_other_federations = within("exclusion", driver.keep_off_other_federations)
         driver.sleep, driver.poll_s, slurm.poll_s, slurm.sleep = (lambda s: None), 0.0, poll_s, sleep
-        slurm.clock = lambda: self.now if self.waiting else ticks()
+        slurm.clock = lambda: self.now if self.phase is not None else ticks()
         driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
         driver.relay_available = lambda: False
         self.driver = driver
@@ -119,6 +151,54 @@ def test_o57_a_read_of_the_held_job_that_fails_is_a_missed_poll_and_up_goes_on_w
     assert SERVICES in rig.missed[0]
 
 
+@pytest.mark.parametrize(
+    ("phase", "how"),
+    [
+        ("submit", "timeout"),
+        ("readback", "timeout"),
+        ("readback", "Socket timed out on send/recv operation"),
+        ("exclusion", "timeout"),
+        ("exclusion", "Unable to contact slurm controller (connect failure)"),
+    ],
+)
+def test_o57_a_read_made_after_the_job_started_that_fails_is_read_again_and_up_succeeds(
+    hpc, tmp_path, site, phase, how
+):
+    """O57: the reads that follow the jobs' start meet the same slow controller, and failing there loses jobs that
+    already run: the read-back of the held job (just submitted, and running), and the second read of the account's jobs
+    that keeps the federation off its neighbours' nodes. A read that fails there is read again, backed off, and `up`
+    succeeds when the controller answers; nothing is cancelled."""
+    rig = Rig(hpc, tmp_path, site, [True, True], how, phase=phase)
+    rig.up()
+    assert len(rig.failed_at) == 2
+    assert rig.sleeps[:2] == [5.0, 10.0]
+    assert rig.fake.cancelled == []
+    assert len(rig.missed) == 1
+
+
+@pytest.mark.parametrize(
+    ("phase", "said"),
+    [
+        ("readback", "scontrol did not answer in 60 s"),
+        ("exclusion", "the account's live federation jobs could not be read"),
+    ],
+)
+def test_o57_a_read_after_the_start_that_fails_for_ten_minutes_releases_every_held_job_as_before(
+    hpc, tmp_path, site, phase, said
+):
+    """O57: those reads too give up only once every one has failed for `MISSED_POLLS_GIVE_UP_S` since the streak's
+    first, not before, and then fail as they always did: what the last read said, how long, and every held job of this
+    up released by its id."""
+    fake = FakeSlurm(state="RUNNING")
+    rig = Rig(hpc, tmp_path, site, [True] * 1000, layout=SEPARATE_LAYOUT, fake=fake, phase=phase)
+    with pytest.raises(hpc.slurm.SlurmError, match=said) as refused:
+        rig.up()
+    assert rig.streak_s >= hpc.slurm.MISSED_POLLS_GIVE_UP_S > rig.failed_at[-2] - rig.failed_at[0]
+    assert f"{len(rig.failed_at)} reads in a row failed over {rig.streak_s:.0f} s" in str(refused.value)
+    assert sorted(fake.cancelled) == [SERVICES, AGENT]
+    assert str(refused.value).endswith(f"the held job(s) {SERVICES}, {AGENT} were cancelled")
+
+
 def test_o57_reads_that_all_fail_for_ten_minutes_end_the_wait_and_release_every_held_job_as_before(hpc, tmp_path, site):
     """O57: the wait gives up once every read has failed for `MISSED_POLLS_GIVE_UP_S` since the streak's first, not
     before, and then fails as it always did: it says what the last read said and for how long, and releases every held
@@ -129,7 +209,7 @@ def test_o57_reads_that_all_fail_for_ten_minutes_end_the_wait_and_release_every_
         rig.up()
     assert len(rig.failed_at) == READS_BEFORE_GIVING_UP + 1
     assert rig.streak_s >= hpc.slurm.MISSED_POLLS_GIVE_UP_S > rig.failed_at[-2] - rig.failed_at[0]
-    assert f"{len(rig.failed_at)} reads of the held job in a row failed over {rig.streak_s:.0f} s" in str(refused.value)
+    assert f"{len(rig.failed_at)} reads in a row failed over {rig.streak_s:.0f} s" in str(refused.value)
     assert max(rig.sleeps) == hpc.slurm.MISSED_POLL_BACKOFF_MAX_S == 60.0
     assert sorted(fake.cancelled) == [SERVICES, AGENT]
     assert str(refused.value).endswith(f"the held job(s) {SERVICES}, {AGENT} were cancelled")

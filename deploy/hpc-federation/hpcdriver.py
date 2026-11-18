@@ -440,7 +440,7 @@ class Driver(Down):
             self.wait_held(held)
             # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
             records = [(job, shape, record) for job, wanted in held for shape, record in zip(
-                wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
+                wanted.shapes(), self.slurm.checked(job, wanted, self.say))]  # fmt: skip
             placed = self.placed_nodes(records)
             self.keep_off_other_federations([job for job, _ in held], placed)
             self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
@@ -586,9 +586,16 @@ class Driver(Down):
         account's jobs at once both excluded nothing. One that does is refused, every held job of this up cancelled
         by its own id, and the roles named (the zone, providers[i], the agent), never a host. `placed` is each
         component's nodes, the services' first. Fail closed: with the jobs unreadable nothing proves the nodes are
-        this federation's own, and the same release follows."""
+        this federation's own, and the same release follows. A read of the account's jobs that fails or times out (a
+        slow controller, with the jobs already running) is read again, backed off, and fails only once every read
+        has failed for ten minutes (`Slurm.ride_out`); a line it cannot take apart, or a node held twice, ends it
+        at once."""
+
+        def read() -> List[str]:
+            return hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs)
+
         try:
-            others = set(hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs))
+            others = set(self.slurm.ride_out(read, "the read of the account's live jobs", self.say))
         except SlurmError as error:
             raise SlurmError(f"{error}; {self.release(jobs)}") from None
         held = [(hpcexclude.role(index), node) for index, node in enumerate(placed[0])]
@@ -657,7 +664,7 @@ class Driver(Down):
         self.set(submitted)
         self.say(f"held job {job} submitted ({sum(s.nodes for s in asked.shapes())} nodes); reading back what Slurm "
                  "recorded")  # fmt: skip
-        records = self.slurm.checked(job, asked)
+        records = self.slurm.checked(job, asked, self.say)
         self.set(lambda s: self.record_readback(s, key, records))
         return job
 

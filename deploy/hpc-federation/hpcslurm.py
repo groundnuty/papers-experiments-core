@@ -26,7 +26,9 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, TypeVar
+
+T = TypeVar("T")
 
 ENV = "/usr/bin/env"
 GONE_POLLS = 3  # a step absent from squeue -s this many polls in a row has ended
@@ -651,10 +653,48 @@ class Slurm:
             raise SlurmError("a component of the heterogeneous job has no offset")
         return sorted(het, key=lambda record: int(record["HetJobOffset"]))
 
-    def checked(self, job: str, asked: Allocation) -> List[Dict[str, str]]:
-        """Every component's record of the job just submitted, read back; unless each is what was asked, cancel that
-        one job (a heterogeneous job by its leader's id, which ends every component) and fail, naming the fields."""
-        records = self.components(job)
+    def ride_out(
+        self,
+        read: Callable[[], T],
+        what: str,
+        say: Optional[Callable[[str], None]] = None,
+        deadline: Optional[float] = None,
+        past: Optional[Callable[[ReadFailed], SlurmError]] = None,
+    ) -> T:
+        """`read()`, where a `ReadFailed` (a Slurm command that timed out or exited nonzero, as a slow or restarting
+        controller makes it) is a missed poll, not an answer: `say` hears of the first of a streak, the read is made
+        again after a sleep that doubles from the poll interval and never passes `MISSED_POLL_BACKOFF_MAX_S`, and
+        whatever else `read` raises (a definite answer: a job that is gone, a mismatch, an unparsable line) ends it as
+        it always did, and so does an answer. It fails, with a plain `SlurmError`, only once every read has failed for
+        `MISSED_POLLS_GIVE_UP_S` since the streak's first (never on one failure). With `deadline` (a `clock()` time) it
+        fails with `past(error)` at the failed read that finds it passed. It cancels nothing: the caller's release does,
+        after reading what it releases (`Driver.release_held`). `what` names the read in what `say` says."""
+        first_missed: Optional[float] = None  # when the streak of failed reads began
+        missed = 0
+        while True:
+            try:
+                return read()
+            except ReadFailed as error:
+                now = self.clock()
+                first_missed = now if first_missed is None else first_missed
+                missed += 1
+                if now - first_missed >= MISSED_POLLS_GIVE_UP_S:
+                    raise SlurmError(
+                        f"{error}; {missed} reads in a row failed over {now - first_missed:.0f} s"
+                    ) from None
+                if deadline is not None and past is not None and now >= deadline:
+                    raise past(error) from None
+                if missed == 1 and say is not None:
+                    say(f"{error}: a missed poll of {what}; going on, and giving up only if every read fails for "
+                        f"{MISSED_POLLS_GIVE_UP_S:.0f} s")  # fmt: skip
+                left = MISSED_POLL_BACKOFF_MAX_S if deadline is None else deadline - now
+                self.sleep(min(self.poll_s * 2 ** min(missed - 1, 16), MISSED_POLL_BACKOFF_MAX_S, left))
+
+    def checked(self, job: str, asked: Allocation, say: Optional[Callable[[str], None]] = None) -> List[Dict[str, str]]:
+        """Every component's record of the job just submitted, read back (a read that fails is a missed poll,
+        `ride_out`); unless each is what was asked, cancel that one job (a heterogeneous job by its leader's id, which
+        ends every component) and fail, naming the fields."""
+        records = self.ride_out(lambda: self.components(job), f"the read-back of held job {job}", say)
         self._ours(job, records, asked.name)
         wrong = ["the job itself"] if records is None else component_mismatches(records, asked, job)
         if wrong:
@@ -686,39 +726,20 @@ class Slurm:
         id and fail. With `name`, a job that carries another is never cancelled (`_ours`). `note` ends the failure at
         the bound: what the caller knows that may keep the job waiting.
 
-        A read of the job that fails (`ReadFailed`: the command timed out or exited nonzero, as a slow or restarting
-        controller makes it) is a missed poll, not the job's end: `say` hears of the first of a streak, the wait sleeps
-        longer after each (the poll interval doubled, never past `MISSED_POLL_BACKOFF_MAX_S`) and reads again, and
-        an answer ends the streak. It fails only once every read has failed for `MISSED_POLLS_GIVE_UP_S` since the
-        streak's first (never on one failure), or at the bound with a read that failed; it cancels nothing then,
-        since nothing is known of the job: the caller's release reads it first (`Driver.release_held`). A job Slurm
-        no longer knows, one that ended, and an answer for another job or with no offset end the wait as they always
-        did."""
+        A read of the job that fails (`ReadFailed`) is a missed poll, not the job's end (`ride_out`): the wait goes on,
+        and fails only once every read has failed for `MISSED_POLLS_GIVE_UP_S` since the streak's first (never on one
+        failure), or at the bound with a read that failed; it cancels nothing then, since nothing is known of the
+        job: the caller's release reads it first (`Driver.release_held`). A job Slurm no longer knows, one that
+        ended, and an answer for another job or with no offset end the wait as they always did."""
         deadline = self.clock() + timeout_s
-        first_missed: Optional[float] = None  # when the streak of failed reads began, None while the reads answer
-        missed = 0
+
+        def past(error: ReadFailed) -> SlurmError:
+            return SlurmError(
+                f"the held job did not start within {timeout_s:.0f} s, and the last read of it failed ({error}){note}"
+            )
+
         while True:
-            try:
-                records = self.components(job) or []
-            except ReadFailed as error:
-                now = self.clock()
-                first_missed = now if first_missed is None else first_missed
-                missed += 1
-                if now - first_missed >= MISSED_POLLS_GIVE_UP_S:
-                    raise SlurmError(
-                        f"{error}; {missed} reads of the held job in a row failed over {now - first_missed:.0f} s"
-                    ) from None
-                if now >= deadline:
-                    raise SlurmError(
-                        f"the held job did not start within {timeout_s:.0f} s, and the last read of it failed "
-                        f"({error}){note}"
-                    ) from None
-                if missed == 1 and say is not None:
-                    say(f"{error}: a missed poll of held job {job}; the wait goes on, and ends only if every read "
-                        f"fails for {MISSED_POLLS_GIVE_UP_S:.0f} s")  # fmt: skip
-                self.sleep(min(self.poll_s * 2 ** min(missed - 1, 16), MISSED_POLL_BACKOFF_MAX_S, deadline - now))
-                continue
-            first_missed, missed = None, 0
+            records = self.ride_out(lambda: self.components(job) or [], f"held job {job}", say, deadline, past)
             self._ours(job, records, name)
             states = [record.get("JobState") for record in records]
             if states and all(state == "RUNNING" for state in states):

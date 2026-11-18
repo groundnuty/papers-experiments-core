@@ -213,18 +213,22 @@ its business, whatever it runs. It never reads or prints a node's name into a me
 - **Once the job runs and before any step,** `up` reads them again. A node of this federation, a service's or the
   agent's, that holds another live federation's job (two ups read before either had submitted, and Slurm placed both on
   it) refuses `up`: its held jobs are cancelled by their ids, no step runs, and the message names the roles (`zone`,
-  `providers[i]`, `agent`), never a host. A second read that fails refuses the same way. Two ups that raced may both
+  `providers[i]`, `agent`), never a host. A second read that fails for ten minutes refuses the same way (one that
+  fails once, as a slow controller does, is read again: "A slow controller" below). Two ups that raced may both
   refuse: `down`, then `up` again.
 - **Too few nodes.** The exclusion can leave Slurm no node that fits the job: it stays pending, or sbatch refuses it. `up`
   waits no longer than its queue bound (`TIMEOUTS["queue"]`, 30 minutes, or `HPC_QUEUE_WAIT_S` seconds when `site.env`
   sets it: "Site configuration"), cancels the job by its id and says that it
   excluded N nodes of other live federations; a refusal by sbatch says the same, with Slurm's own words stripped of those
   nodes' names.
-- **A slow controller does not end the wait.** A read of the held job that fails while `up` waits (`scontrol` timing
-  out, or exiting nonzero) is a missed poll: `up` says so once, sleeps the poll interval and then twice it (never
-  more than 60 s), and reads again. It gives up only once every read has failed for 10 minutes since the first one, or
-  at the queue bound with a read that failed, and then releases the held jobs as below. "Invalid job id" (the job is gone), a job that ended and a job
-  of another name end the wait at once.
+- **A slow controller does not end the wait, nor the reads after it.** A read of the held job that fails while `up`
+  waits (`scontrol` timing out, or exiting nonzero) is a missed poll: `up` says so once, sleeps the poll interval and
+  then twice it (never more than 60 s), and reads again. It gives up only once every read has failed for 10 minutes
+  since the first one, or at the queue bound with a read that failed, and then releases the held jobs as below.
+  "Invalid job id" (the job is gone), a job that ended and a job of another name end the wait at once. The same holds
+  for the reads that follow the jobs' start, where giving up would lose jobs that already run: the read-back of the
+  held job (just submitted, and running) and the second read of the account's jobs (`squeue`). A definite answer there
+  (a job recorded otherwise than asked, a node another federation holds, a line that cannot be read) ends at once.
 - **A wait that fails releases every held job of that `up`.** Under `"separate"` the services' job and the agent's own are
   waited for in turn, and a job that does not start in time or ends before it ran is cancelled by its wait. `up` then
   cancels the other held job too, still queued or running, by its own id and only if it still carries the name `up`

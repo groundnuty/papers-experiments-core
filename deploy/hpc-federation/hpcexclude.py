@@ -19,7 +19,7 @@ or a job's own name, never a node, and never says what squeue said.
 import re
 from typing import Dict, Iterable, List, NamedTuple, Sequence, Set, Tuple
 
-from hpcslurm import JOB_LISTED, Slurm, SlurmError
+from hpcslurm import JOB_LISTED, ReadFailed, Slurm, SlurmError
 
 JOB_PREFIX = "hpcop-"
 # The read names no state (`-t`): squeue's own default lists every job that holds a node, a suspended one, one staging
@@ -57,13 +57,15 @@ def live_jobs(slurm: Slurm) -> List[LiveJob]:
     """Every job of the account that squeue lists and whose name carries the prefix, in any state (a completing job may
     still hold its node; a pending one holds none). A job of no federation's is none of its business. Anything that
     cannot be taken apart, in a line of a job that carries the prefix, raises `SlurmError`, so that no caller ever
-    acts on a guess; the message says what failed, never what squeue said."""
+    acts on a guess; the message says what failed, never what squeue said. A call that failed or timed out, or that
+    exited nonzero, is a `ReadFailed` (what a slow or restarting controller gives, which a caller may retry:
+    `Slurm.ride_out`); a line that cannot be taken apart is not."""
     try:
         done = slurm.runner.run(LIVE, slurm.command_timeout_s)
     except SlurmError:
-        raise SlurmError(f"{UNREADABLE}: the call failed or timed out") from None
+        raise ReadFailed(f"{UNREADABLE}: the call failed or timed out") from None
     if done.returncode != 0:
-        raise SlurmError(f"{UNREADABLE}: squeue exited with status {done.returncode}")
+        raise ReadFailed(f"{UNREADABLE}: squeue exited with status {done.returncode}")
     found: Dict[str, Tuple[str, Set[str]]] = {}
     for line in done.stdout.splitlines():
         words = line.split()
