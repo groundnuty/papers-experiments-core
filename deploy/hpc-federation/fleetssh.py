@@ -110,6 +110,16 @@ class SshSiteTransport:
                          capture_output=True, text=True, errors="replace", timeout=timeout, check=False)  # fmt: skip
         return self._said(site, done.returncode, done.stdout, done.stderr)
 
+    def stream(self, site: Any, argv: Any, local: Path, timeout_s: Optional[float] = None) -> None:
+        """The standard output of the command `argv` run at the site (as `elastic.transport.SshTransport.stream`: the
+        site's own ssh, no prefix) into the new file `local`, within `timeout_s` (the fetch bound by default); raises
+        `Unreachable` or `Missing` as a pull does."""
+        from expcore.campaign.elastic.transport import Site, SshTransport, ssh_argv
+
+        remote = Site(site.label, str(site.fleet), ssh=ssh_argv(site.host), python=())
+        SshTransport(run=self._run, fetch_timeout_s=self.fetch_timeout_s).stream(remote, list(argv), local,
+                                                                                timeout_s=timeout_s)  # fmt: skip
+
     def pull(self, site: Any, remote_dir: str, local_dir: Path, digest: str) -> Tuple[int, str, str]:
         """The copy at `remote_dir` of the site into `local_dir` (the module's docstring); (0, said, "") when it is here
         whole, else (1, "", why). A `local_dir` that already holds a copy with this manifest is not fetched again; one
@@ -124,7 +134,10 @@ class SshSiteTransport:
             if local_dir.is_symlink():
                 return 1, "", "this host's copy is a link: it is never followed"
             if local_dir.exists():
-                if (local_dir / MANIFEST).is_file() and _sha256(local_dir / MANIFEST) == digest:
+                held = local_dir / MANIFEST
+                if held.is_file() and not held.is_symlink() and _sha256(held) == digest:
+                    _fsync_dir(local_dir)  # a retry after a sync that failed: the copy is made durable before any down
+                    _fsync_dir(local_dir.parent)
                     return 0, "its copy is already here", ""
                 return 1, "", "this host holds another copy in its place: it is not replaced"
             local_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

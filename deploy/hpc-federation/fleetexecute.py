@@ -249,6 +249,10 @@ class SiteTransport:
     def pull(self, site: SiteConfig, remote: str, local: Path, digest: str) -> Tuple[int, str, str]:
         return self.ssh.pull(site, remote, local, digest)
 
+    def stream(self, site: SiteConfig, argv: Sequence[str], local: Path, timeout_s: Optional[float] = None) -> None:
+        """An ssh site's command's standard output into a new file here (`fleetssh.SshSiteTransport.stream`)."""
+        self.ssh.stream(site, argv, local, timeout_s)
+
 
 def last_line(text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]

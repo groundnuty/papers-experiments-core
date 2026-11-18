@@ -296,8 +296,8 @@ in the process that drives the ledger (the ledger's lock admits one), and keeps 
   a lost lease's spend (`fleetidentity.py`). A site with `transport = "ssh"` (`fleetssh.py`) is one remote campaign's:
   the ledger and the archives stay on this host's local disk and every call at the site is one bounded ssh call whose
   failure is the site unread; a retirement there is collect, the pull of its copy here, `verify-copy` here, then
-  `down` (README, "A remote site"). **Not built:** a lost lease's store on a remote site's channel, `--time` per up, and
-  the watchdog's command. `fleet.py`'s commands are unchanged; the controller only adds to a fleet `up` made.
+  `down` (README, "A remote site"); a lost lease's place on the login node is fetched over ssh for the spend reader.
+  **Not built:** `--time` per up, and the watchdog's command. `fleet.py`'s commands are unchanged; the controller only adds to a fleet `up` made.
 
 ## 2. Sizing: service steps, control steps, and the node
 

@@ -41,8 +41,9 @@ login node of a remote site over ssh, the ledger staying on this host's local di
 `allowance_units` and `rate_units_per_hour` (required), `kill_wait_s`, `parallel_ups`, `warm_pool`, `retire_idle_s`,
 `queue_stall_s`, `lease_bound_s`, `collect_s`, `margin_s`. An `ssh` site also names `host` (an ssh destination or alias
 that the operator's own ssh config resolves: never logged), `interpreter` and `deploy` (absolute, on the login node; the
-core is importable by that interpreter), and optionally `env_file` (its site.env on the login node, sourced before each
-command) and `settings` (the shard settings file on the login node; required when `[controller]` names `settings`).
+core is importable by that interpreter), `env_file` (its site.env on the login node, required: sourced before each
+command, which fails without it, never a run on the login shell's defaults) and `settings` (the shard settings file on
+the login node; required when `[controller]` names `settings`).
 One campaign drives one site: the ledger and `archives` are this host's; each archive is pulled over ssh, hashed here.
 """
 
@@ -195,7 +196,7 @@ def ssh_site(label: str, own: Mapping[str, Any], needs_settings: bool) -> Tuple[
     defaults of a local site (this host's interpreter and directory) would be wrong there, so they are named."""
     from expcore.campaign.elastic.transport import ssh_argv
 
-    named = ("host", "interpreter", "deploy") + (("settings",) if needs_settings else ())
+    named = ("host", "interpreter", "deploy", "env_file") + (("settings",) if needs_settings else ())
     missing = [key for key in named if key not in own]
     if missing:
         raise ConfigError(f"site {label}: an ssh site names {', '.join(missing)}")
@@ -203,7 +204,9 @@ def ssh_site(label: str, own: Mapping[str, Any], needs_settings: bool) -> Tuple[
         ssh_argv(own["host"])
     except ValueError:
         raise ConfigError(f"site {label}: host is not an ssh destination or alias") from None
-    env_file = str(_absolute(own["env_file"], f"site {label}: env_file")) if "env_file" in own else None
+    env_file = str(
+        _absolute(own["env_file"], f"site {label}: env_file")
+    )  # required: never a run on the login shell's defaults
     settings = _absolute(own["settings"], f"site {label}: settings") if "settings" in own else None
     return own["host"], env_file, settings
 
@@ -246,14 +249,16 @@ def tick(views: Any, ledger_path: Path, controller: Controller, sites: Sequence[
     reads = [(site.settings, observe_site(transport, site, observed.get(site.label))) for site in sites]
     view = ledger_view(views)
     decision = decide(hooks.clock(), view, reads, busy)
-    entries = [described(a, render(a, by_label[a.site], controller.evidence, ledger_path, settings=controller.settings),
-                         by_label[a.site]) for a in decision.actions]  # fmt: skip
+    rendered = [render(a, by_label[a.site], controller.evidence, ledger_path, settings=controller.settings)
+                for a in decision.actions]  # fmt: skip
+    entries = [described(a, r, by_label[a.site]) for a, r in zip(decision.actions, rendered)]  # logged: no host in it
+    plain = [described(a, r) for a, r in zip(decision.actions, rendered)]  # printed: exactly what a live tick runs
     money = dict(view.money)
     log.write("tick", dry_run=executor is None, wanted=decision.wanted, targets=decision.targets,
               waits=decision.waits, relays=decision.relays, money=money, actions=entries)  # fmt: skip
     hooks.say(status_line(decision, money))
     if executor is None:
-        for entry in entries:
+        for entry in plain:
             hooks.say(printed(entry))
     else:
         executor.run(decision)
@@ -292,7 +297,7 @@ def hooks_read(controller: Controller, sites: Sequence[SiteConfig], hooks: Hooks
             raise ConfigError(f"the study of the shard settings cannot be loaded ({type(error).__name__})") from None
         identity = identity or fleetidentity.identity_reader(controller.settings, {s.label: s for s in sites},
                                                              transport=transport)  # fmt: skip
-        spend = spend or dead_store_reader(fleetidentity.locator(controller.evidence), loaded)
+        spend = spend or dead_store_reader(fleetidentity.locator(controller.evidence, transport), loaded)
     return identity or (lambda site, member: None), spend or (lambda site, action: None)
 
 
@@ -305,7 +310,8 @@ def dispatcher_of(ledger: Any, controller: Controller, sites: Sequence[SiteConfi
     from expcore.campaign.elastic.dispatch import Dispatcher
     from expcore.campaign.elastic.transport import RoutedTransport, Site, ssh_argv
 
-    named = [Site(s.label, str(s.channel), ssh_argv(s.host) if s.remote else (), (s.python, "-I", "-B")) for s in sites]
+    named = [Site(s.label, str(s.channel), ssh_argv(s.host) if s.remote else (), (s.python, "-I", "-B"),
+                  str(s.fleet) if s.remote else None, s.env_file) for s in sites]  # fmt: skip
     cwds = {s.label: str(s.fleet) for s in sites if not s.remote}
     transport = hooks.dispatch(cwds) if hooks.dispatch is not None else RoutedTransport(cwds)
     return Dispatcher(ledger, named, transport, controller.archives)

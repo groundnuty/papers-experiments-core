@@ -1677,21 +1677,27 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   a SQLite file in WAL mode that never goes on NFS or Lustre, stay on this host's local disk). The site names `host`
   (an ssh destination or alias that the operator's own ssh config resolves; it is never logged, printed or recorded:
   logs say the site's label), and `interpreter` and `deploy` (absolute, on the login node; that interpreter imports
-  the core), and optionally `env_file` (its `site.env` on the login node, sourced before each command) and `settings`
-  (the shard settings file on the login node, which the worker's launch and the identity read there use; required when
-  `[controller]` names `settings`). Everything the controller does at the site is one ssh call, each with
+  the core), `env_file` (its `site.env` on the login node: required, sourced before each command and the dispatcher's
+  exchange, so a missing or unreadable file fails the call and a command never runs on the login shell's defaults, where
+  the account's default Slurm account may be another project's) and `settings` (the shard settings file on the login
+  node, which the worker's launch and the identity read there use; required when `[controller]` names `settings`). Everything the controller does at the site is one ssh call, each with
   `-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=3` and never a setting that
   weakens host-key checking, the remote command `cd <fleet> && set -a && . <env_file> && set +a && exec <argv>` with
   every word quoted (a login shell that is not POSIX cannot use `env_file`), each call killed with its process group
   at its bound: the read (`observe`), `fleet.py up`/`add`/`down`, `collect`, the worker's launch, the identity read
   (`fleetidentity.py read`) and the dispatcher's exchange and archive pulls. A call that fails or times out is the
-  site unread for the tick, exactly as a failed local call: no proof, no retirement. A retirement is collect (at the
+  site unread for the tick, exactly as a failed local call: no proof, no retirement. (The exchange runs from the
+  fleet's directory with `env_file` sourced; a pull is a plain `cat`, never prefixed.) A retirement is collect (at the
   site, into `<fleet>/collected/<member>`), the pull of that copy to `<evidence>/<site>-<member>` here (the manifest
   first, its SHA-256 checked against collect's, then each file it names against its size and SHA-256, moved in by one
   rename), `verify-copy` on this host over the pulled copy, and only then `down`; it waits while the ledger holds a
-  lease of its federation that is `reported`, whose archive the dispatcher has not pulled here yet. A lost lease's store
-  at a remote site is read only from the evidence pulled here, never from the channel (those places are on the login
-  node): otherwise it stays charged its grant. Nothing of it has run live.
+  lease of its federation that is `reported`, whose archive the dispatcher has not pulled here yet. A lost lease's
+  place at a remote site (`<channel>/<label>/places/lease-<id>/`, on the login node) is fetched over ssh to a private
+  0700 directory here, removed afterwards: `ls` of its snapshots, then each of the newest two as a `tar` stream
+  (extracted with the `data` filter, so a member that is absolute, a link out or a device is refused) and the journal
+  `spend.jsonl`; each snapshot is verified in turn, newest first, and the lease settles at the journal's spend. A call
+  that fails or times out reads nothing that tick: the lease stays charged its grant and is read again next tick, never
+  taken for a place with nothing in it. Nothing of it has run live.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 

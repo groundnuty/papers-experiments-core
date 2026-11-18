@@ -61,6 +61,10 @@ class Site:
     root: str
     ssh: tuple[str, ...] = field(default=(), repr=False)  # holds the host: never shown
     python: tuple[str, ...] = ("python3", "-I", "-B")
+    cwd: str | None = None  # an ssh site's exchange runs from this directory on its login node (its fleet's own) ...
+    env_file: str | None = (
+        None  # ... with this file (site.env) sourced first: the exchange fails, never runs without it
+    )
 
 
 def ssh_argv(host: str) -> tuple[str, ...]:
@@ -96,20 +100,29 @@ def bounded_run(argv: Sequence[str], *, check: bool = False, timeout: float | No
         stdin = subprocess.PIPE
     process = subprocess.Popen(list(argv), stdin=stdin, stdout=stdout, stderr=stderr, text=text,
                                start_new_session=True, **popen)  # fmt: skip
+    timed_out = False
     try:
         out, err = process.communicate(input, timeout=timeout)
-    except BaseException as error:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-        for pipe in (process.stdin, process.stdout, process.stderr):
-            if pipe is not None:
-                with contextlib.suppress(OSError):
-                    pipe.close()
-        if isinstance(error, subprocess.TimeoutExpired):
-            raise subprocess.TimeoutExpired(str(argv[0]), timeout) from None  # the program only: no host, no command
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    except BaseException:
+        _kill_group(process)
         raise
+    if timed_out:
+        _kill_group(process)
+        # raised outside the handler: the error holds the program's name only, and no context holds the command
+        raise subprocess.TimeoutExpired(str(argv[0]), timeout)
     return subprocess.CompletedProcess(list(argv), process.returncode, out, err)
+
+
+def _kill_group(process: subprocess.Popen) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+    for pipe in (process.stdin, process.stdout, process.stderr):
+        if pipe is not None:
+            with contextlib.suppress(OSError):
+                pipe.close()
 
 
 Run = Callable[..., subprocess.CompletedProcess]
@@ -128,11 +141,16 @@ class SshTransport:
         self._timeout_s = exchange_timeout_s
         self._fetch_s = fetch_timeout_s
 
-    def _call(self, site: Site, remote: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    def _call(
+        self, site: Site, remote: Sequence[str], *, prefixed: bool = False, **kwargs: Any
+    ) -> subprocess.CompletedProcess:
+        """One ssh call. `prefixed` (the exchange) runs it from the site's `cwd` with its `env_file` sourced; a pull is
+        never prefixed (a prefix that fails would read as a file missing there, a try against a good archive)."""
         if not site.ssh:
             raise Unreachable(f"site {site.name} has no ssh command")
+        command = remote_command(remote, cwd=site.cwd, env_file=site.env_file) if prefixed else shlex.join(remote)
         try:
-            return self._run([*site.ssh, shlex.join(remote)], check=False, **kwargs)
+            return self._run([*site.ssh, command], check=False, **kwargs)
         except (OSError, subprocess.SubprocessError) as error:
             raise Unreachable(f"site {site.name}: {type(error).__name__}") from None
 
@@ -140,6 +158,7 @@ class SshTransport:
         done = self._call(
             site,
             [*site.python, "-m", MODULE],
+            prefixed=True,
             input=json.dumps(request, sort_keys=True, allow_nan=False).encode("utf-8"),
             capture_output=True,
             timeout=self._timeout_s,
@@ -159,12 +178,17 @@ class SshTransport:
     def fetch(self, site: Site, remote: str, local: Path, *, timeout_s: float | None = None) -> None:
         """Copy `remote` into `local` (a new file), within `timeout_s` (the transport's fetch bound by default);
         Unreachable or Missing leave no `local` behind."""
+        self.stream(site, ["cat", "--", remote], local, timeout_s=timeout_s)
+
+    def stream(self, site: Site, remote: Sequence[str], local: Path, *, timeout_s: float | None = None) -> None:
+        """The standard output of the remote command `remote` into `local` (a new file), the same bound and the same
+        two failures as `fetch` (a command that exits non-zero, `ls` or `tar` of a path not there, is Missing)."""
         created = local.open("xb")  # an existing file is an error here, and none of ours to remove
         try:
             with created as sink:
                 done = self._call(
                     site,
-                    ["cat", "--", remote],
+                    remote,
                     stdout=sink,
                     stderr=subprocess.DEVNULL,
                     timeout=self._fetch_s if timeout_s is None else timeout_s,
@@ -180,7 +204,7 @@ class SshTransport:
                 local.unlink()
             if done.returncode == SSH_FAILED:
                 raise Unreachable(f"site {site.name}: the pull's ssh failed")
-            raise Missing(f"site {site.name}: the archive could not be read there (exit {done.returncode})")
+            raise Missing(f"site {site.name}: nothing could be read there (exit {done.returncode})")
 
 
 class LocalTransport(SshTransport):
@@ -193,7 +217,9 @@ class LocalTransport(SshTransport):
         super().__init__(**kwargs)
         self._cwds = dict(cwds or {})
 
-    def _call(self, site: Site, remote: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    def _call(
+        self, site: Site, remote: Sequence[str], *, prefixed: bool = False, **kwargs: Any
+    ) -> subprocess.CompletedProcess:
         cwd = self._cwds.get(site.name)
         try:
             return self._run(list(remote), check=False, **({"cwd": cwd} if cwd else {}), **kwargs)
@@ -209,9 +235,11 @@ class RoutedTransport(LocalTransport):
         super().__init__(cwds, **kwargs)
         self._ssh = SshTransport(run=ssh_run, exchange_timeout_s=self._timeout_s, fetch_timeout_s=self._fetch_s)
 
-    def _call(self, site: Site, remote: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    def _call(
+        self, site: Site, remote: Sequence[str], *, prefixed: bool = False, **kwargs: Any
+    ) -> subprocess.CompletedProcess:
         if site.ssh:
-            return self._ssh._call(site, remote, **kwargs)
+            return self._ssh._call(site, remote, prefixed=prefixed, **kwargs)
         return super()._call(site, remote, **kwargs)
 
 

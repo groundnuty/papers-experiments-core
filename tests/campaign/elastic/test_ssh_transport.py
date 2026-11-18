@@ -226,6 +226,30 @@ def test_the_host_is_in_no_log_no_record_and_no_site_repr(tmp_path, fake, caplog
             assert HOST.encode() not in path.read_bytes(), path.name
 
 
+def test_the_exchange_runs_from_the_sites_directory_with_its_env_file_or_not_at_all_and_a_pull_never_needs_it(
+    tmp_path, fake
+):
+    """C47: an ssh site's exchange is prefixed (`cd`, site.env sourced): it fails, the site unread and nothing written,
+    where the file is missing; a pull is never prefixed, so a prefix that fails is never a file missing there."""
+    fleet = tmp_path / "a fleet"
+    fleet.mkdir()
+    env_file = tmp_path / "site.env"
+    env_file.write_text("A_SITE_VARIABLE=1\n", encoding="utf-8")
+    request = {"format": FORMAT, "site": SITE, "root": str(tmp_path / "channels"), "contact": {}, "federations": []}
+    site = Site(SITE, str(tmp_path / "channels"), ssh_argv(HOST), (sys.executable, "-B"), str(fleet), str(env_file))
+    assert SshTransport().exchange(site, request)["site"] == SITE
+    assert fake.calls()[-1]["command"][0].startswith(f"cd '{fleet}' && set -a && . {env_file} && set +a && exec ")
+    no_env = str(tmp_path / "no.env")
+    gone = Site(SITE, str(tmp_path / "other"), ssh_argv(HOST), (sys.executable, "-B"), str(fleet), no_env)
+    with pytest.raises(Unreachable):
+        SshTransport().exchange(gone, {**request, "root": str(tmp_path / "other")})
+    assert not (tmp_path / "other").exists()  # the verb never ran
+    source = tmp_path / "remote.tar"
+    source.write_bytes(b"whole")
+    SshTransport().fetch(gone, str(source), tmp_path / "got.tar")  # the missing env_file is no concern of a pull
+    assert (tmp_path / "got.tar").read_bytes() == b"whole"
+
+
 def test_the_routed_transport_goes_over_ssh_for_a_site_with_an_ssh_command_and_here_for_the_rest(tmp_path, fake):
     """One transport for a sites file with a local site beside a remote one: only the remote one is an ssh call."""
     remote_site = site_over_ssh(tmp_path)

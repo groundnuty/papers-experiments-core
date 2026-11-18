@@ -165,13 +165,14 @@ def sites_file(tmp_path: Path, site_lines: list, controller: list = (), fleet: s
     return path
 
 
-SSH = ['transport = "ssh"', f'host = "{HOST}"', 'interpreter = "/login/py"', 'deploy = "/login/deploy"']
+SSH_ENV = ['env_file = "/login/site.env"']
+SSH = ['transport = "ssh"', f'host = "{HOST}"', 'interpreter = "/login/py"', 'deploy = "/login/deploy"', *SSH_ENV]
 
 
 def test_an_ssh_site_is_read_from_the_sites_file_and_its_host_is_never_shown(deploy, tmp_path):
     """The ssh site names its host and its login node's interpreter and deploy directory (and site.env and shard
     settings); the host is in no repr of the site."""
-    path = sites_file(tmp_path, [*SSH, 'env_file = "/login/site.env"', 'settings = "/login/settings.toml"'],
+    path = sites_file(tmp_path, [*SSH, 'settings = "/login/settings.toml"'],
                       [f'settings = "{tmp_path / "settings.toml"}"'])  # fmt: skip
     _, (site,) = deploy.fleetcontrol.load_config(path)
     assert (site.transport, site.host, site.python, site.env_file) == ("ssh", HOST, "/login/py", "/login/site.env")
@@ -183,11 +184,13 @@ def test_an_ssh_site_is_read_from_the_sites_file_and_its_host_is_never_shown(dep
 @pytest.mark.parametrize(
     ("lines", "controller", "match"),
     [
-        (['transport = "ssh"', 'interpreter = "/p"', 'deploy = "/d"'], [], "names host"),
-        (['transport = "ssh"', f'host = "{HOST}"', 'deploy = "/d"'], [], "names interpreter"),  # this host's default
-        (['transport = "ssh"', f'host = "{HOST}"', 'interpreter = "/p"'], [], "names deploy"),
+        (['transport = "ssh"', 'interpreter = "/p"', 'deploy = "/d"', *SSH_ENV], [], "names host"),
+        (['transport = "ssh"', f'host = "{HOST}"', 'deploy = "/d"', *SSH_ENV], [], "names interpreter"),
+        (['transport = "ssh"', f'host = "{HOST}"', 'interpreter = "/p"', *SSH_ENV], [], "names deploy"),
+        # a command is never run on the login shell's defaults (the account's default Slurm account may be another's)
+        (SSH[:4], [], "names env_file"),
         ([*SSH[:1], 'host = "-oProxyCommand=id"', *SSH[2:]], [], "not an ssh destination"),
-        ([*SSH, 'env_file = "site.env"'], [], "env_file must be an absolute path"),
+        ([*SSH[:4], 'env_file = "site.env"'], [], "env_file must be an absolute path"),
         (SSH, ['settings = "/x/settings.toml"'], "names settings"),  # the login node's copy, for the worker's launch
         ([f'host = "{HOST}"'], [], "belong to an ssh site"),
     ],
@@ -214,6 +217,21 @@ def test_a_site_command_runs_over_ssh_from_the_fleet_with_site_env_and_every_wor
     assert ssh["host"] == HOST
     assert len(ssh["options"]) == 4
     assert not (Path.cwd() / "pwned").exists()
+
+
+def test_a_missing_env_file_on_the_login_node_fails_the_call_and_nothing_runs_on_defaults(deploy, login):
+    """site.env is required of an ssh site: where its file is missing or unreadable on the login node the call fails
+    (the `.` returns non-zero before the command), so a read leaves the site unread and an action fails, never a run
+    on the login shell's defaults (the account's default Slurm account may be another project's)."""
+    gone = deploy.fleetexecute.SiteConfig(**{**vars(login.config), "env_file": str(login.base / "no-such-site.env")})
+    code, _, _ = login.transport.run(gone, gone.script("shards.py", "collect", "--into", str(login.base / "x")), 20.0)
+    assert code != 0
+    assert login.calls("shards") == []  # the stub never ran
+    view = deploy.fleetcontrol.observe_site(login.transport, gone, None)
+    assert view.error
+    executor = login.executor(login.base.parent)
+    assert executor.site_steps(retire(), gone) is False
+    assert not (login.scripts / "downed").exists()
 
 
 def test_ssh_failing_is_said_without_the_host_and_a_remote_message_naming_it_is_scrubbed(login):
@@ -286,7 +304,8 @@ def joined_ledger(tmp_path: Path, clock: FakeClock) -> Path:
 
 
 def one_tick(deploy, tmp_path: Path, login: Login, clock: FakeClock, ledger: Path) -> list:
-    ssh = ['transport = "ssh"', f'host = "{HOST}"', f'interpreter = "{sys.executable}"', f'deploy = "{login.scripts}"']
+    ssh = ['transport = "ssh"', f'host = "{HOST}"', f'interpreter = "{sys.executable}"', f'deploy = "{login.scripts}"',
+           f'env_file = "{login.env_file}"']  # fmt: skip
     sites = sites_file(tmp_path, ssh, [f'log = "{tmp_path / "control.jsonl"}"'], fleet=str(login.fleet))
     hooks = deploy.fleetcontrol.Hooks(runner=lambda: None, clock=clock, sleep=lambda s: None, say=lambda line: None,
                                       identity=lambda site, member: (FINGERPRINT, {"a": "b"}))  # fmt: skip
