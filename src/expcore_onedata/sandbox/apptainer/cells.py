@@ -361,10 +361,11 @@ class AppCellRunner(CellRunner):
 
 
 def _oom_rose(before: dict[str, Any] | None, after: dict[str, Any] | None) -> bool:
-    """Whether the cgroup's `oom_kill` counter rose between the two readings; False when either is unknown."""
+    """Whether the cgroup's `oom_kill` counter rose between the two readings; False when either lacks it (a count that
+    could not be read in one reading is no baseline for the other: a kill from before the cell would read as a rise)."""
     old = (before or {}).get("events") or {}
     new = (after or {}).get("events") or {}
-    return bool(old) and bool(new) and new.get("oom_kill", 0) > old.get("oom_kill", 0)
+    return "oom_kill" in old and "oom_kill" in new and new["oom_kill"] > old["oom_kill"]
 
 
 __all__ = ["AppCellRunner"]

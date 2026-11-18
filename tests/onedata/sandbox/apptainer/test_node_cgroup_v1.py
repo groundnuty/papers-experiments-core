@@ -51,6 +51,7 @@ def test_o56_a_kernel_with_no_oom_kill_line_gives_no_oom_count_and_no_attributio
     got = LocalNode().cgroup_memory()
     assert got["events"] == {"max": 0}
     assert not _oom_rose(got, {"events": {"max": 3}})
+    assert not _oom_rose(got, {"events": {"max": 3, "oom_kill": 1}})  # a kill from before the cell is no rise
 
 
 @pytest.mark.parametrize(
