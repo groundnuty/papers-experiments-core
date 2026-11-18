@@ -5,6 +5,8 @@ from the ledger the controller drives or from a read-only view of it that takes 
 beside the process that drives the ledger).
 """
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -199,6 +201,16 @@ class LedgerView:
                 left -= room * grant
             wanted += max(room, 0)
         return wanted
+
+
+def environment_digest(identity: Mapping[str, str]) -> str:
+    """The environment a federation joins the ledger with: the SHA-256 of its environment identity's canonical JSON
+    (keys sorted, no spaces), the identity a lease store pins, as the merge by run (step 4) computes it to check every
+    store against the ledger's pinned environment."""
+    if not isinstance(identity, Mapping) or not identity:
+        raise ValueError("an environment identity is a non-empty mapping of names to values")
+    text = json.dumps(dict(identity), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def ledger_view(views: LedgerViews) -> LedgerView:

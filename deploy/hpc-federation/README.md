@@ -1548,7 +1548,8 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
 - **By hand.** `--dry-run` prints each action as the commands above, one per line, under a comment naming where it runs
   and why; the live tick runs exactly those. The ledger's half has its own verbs: `fleetcontrol.py drain --ledger L
   --label X`, `ended --ledger L --label X --proof cancelled|terminal`, `join --ledger L --label X --site S --jobs
-  J,J --job-end EPOCH --kill-wait S --fingerprint F --environment E`, and `settle --ledger L --lease N --spend-micro S
+  J,J --job-end EPOCH --kill-wait S --fingerprint F --environment-file IDENTITY.json` (the ledger keeps the digest of
+  the environment identity, as step 4's merge checks it), and `settle --ledger L --lease N --spend-micro S
   --source root|pulled`.
 - **The sites file** (`--sites`, TOML): `[controller]` with `evidence` (absolute: each retired member's root evidence),
   `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one

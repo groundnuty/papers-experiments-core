@@ -36,7 +36,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 HERE = Path(__file__).resolve().parent
 DIGEST = "<the hash collect printed>"  # the dry run's stand-in for collect's output, which verify-copy takes
-FINGERPRINT, ENVIRONMENT = "<its campaign fingerprint>", "<its environment identity>"
+FINGERPRINT, ENVIRONMENT = "<its campaign fingerprint>", "<its environment identity, a JSON file>"
 SPEND = "<the spend its call log shows, micro-dollars>"
 ARCHIVES_MANIFEST = "archives.sha256.json"  # `shards.ARCHIVES_MANIFEST`
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -104,7 +104,7 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
     if kind == "Join":
         words = ("join", "--ledger", str(ledger), "--label", action.label, "--site", action.site, "--jobs",
                  ",".join(action.job_ids), "--job-end", repr(action.job_end_at), "--kill-wait",
-                 repr(action.kill_wait_s), "--fingerprint", FINGERPRINT, "--environment", ENVIRONMENT)  # fmt: skip
+                 repr(action.kill_wait_s), "--fingerprint", FINGERPRINT, "--environment-file", ENVIRONMENT)  # fmt: skip
         return Rendered("ledger", ((*control, *words),))
     raise ValueError(f"no rendering for an action of kind {kind}")
 
@@ -182,7 +182,8 @@ class Executor:
     transport: Any
     evidence: Path
     log: Log
-    identity: Callable[[str, str], Optional[Tuple[str, str]]] = lambda site, member: None
+    # (site, member) -> (its campaign fingerprint, its environment identity as a lease store pins it), or None
+    identity: Callable[[str, str], Optional[Tuple[str, Mapping[str, str]]]] = lambda site, member: None
     # (site, the Settle) -> (spend in micro-dollars, its source "root" or "pulled", charged attempts or None), or None
     spend: Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]] = lambda site, action: None
     unread: set = field(default_factory=set)  # lost leases whose log could not be read, said once each
@@ -245,13 +246,16 @@ class Executor:
                            spend_micro=spend, source=source)  # fmt: skip
             return
         elif kind == "Join":
+            from expcore.campaign.elastic.control import environment_digest
+
             found = self.identity(action.site, action.member)
             if found is None:
                 self.log.write("result", action=kind, label=action.label, ok=False,
                                said="no identity read for it yet: join waits")  # fmt: skip
                 return
             self.ledger.join(action.label, site=action.site, job_ids=tuple(action.job_ids),
-                             job_end_at=action.job_end_at, fingerprint=found[0], environment=found[1],
+                             job_end_at=action.job_end_at, fingerprint=found[0],
+                             environment=environment_digest(found[1]),
                              kill_wait_s=action.kill_wait_s)  # fmt: skip
             self.log.write("queue_wait", site=action.site, member=action.member, queue_wait_s=action.queue_wait_s)
         self.log.write("result", action=kind, label=action.label, ok=True)

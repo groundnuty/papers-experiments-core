@@ -35,6 +35,7 @@ from expcore.campaign.elastic.controlinputs import (
     Member,
     SiteSettings,
     SiteView,
+    environment_digest,
     ledger_view,
     read_only,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "SiteSettings",
     "SiteView",
     "decide",
+    "environment_digest",
     "ledger_label",
     "ledger_view",
     "read_only",

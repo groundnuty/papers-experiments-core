@@ -2,10 +2,11 @@
 budget left, since when each federation is idle; and a dry run's read-only view, which takes no lock and writes
 nothing."""
 
+import pytest
 from elastic_support import finish, join, leased, ledger_path, make, plan
 
 from expcore.campaign.elastic import Ledger, SiteReading
-from expcore.campaign.elastic.control import ledger_view, read_only
+from expcore.campaign.elastic.control import environment_digest, ledger_view, read_only
 
 
 def test_c43_the_ledger_view_gives_slots_held_leases_in_flight_budget_left_and_idle_since(tmp_path):
@@ -68,3 +69,14 @@ def test_c43_an_exhausted_run_with_an_unsettled_lost_lease_is_counted_as_one_tha
     assert ledger.run(lease.run_key).state == "pending"
     assert ledger_view(ledger).reopenable == 0
     ledger.close()
+
+
+def test_c43_the_environment_a_federation_joins_with_is_the_digest_step_4_checks():
+    """C43: the SHA-256 of the identity's canonical JSON (keys sorted, no spaces), whatever the keys' order; an empty
+    or non-mapping identity is refused."""
+    digest = "78bd403ced04f551ce0683afa7aedfd2d6d5df93e9375054cef49f4b54a94ffe"
+    assert environment_digest({"core_commit": "0123abcd", "python": "3.12.7"}) == digest
+    assert environment_digest({"python": "3.12.7", "core_commit": "0123abcd"}) == digest
+    for bad in ({}, ["python"]):
+        with pytest.raises(ValueError, match="non-empty mapping"):
+            environment_digest(bad)

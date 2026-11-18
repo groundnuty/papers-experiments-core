@@ -7,7 +7,8 @@ controller"). `expcore.campaign.elastic.control` decides; this reads the sites, 
     <python> -I -B deploy/hpc-federation/fleetcontrol.py drain --ledger L --label LABEL
     <python> -I -B deploy/hpc-federation/fleetcontrol.py ended --ledger L --label LABEL --proof cancelled|terminal
     <python> -I -B deploy/hpc-federation/fleetcontrol.py join --ledger L --label LABEL --site S --jobs J[,J]
-                                                       --job-end EPOCH --kill-wait S --fingerprint F --environment E
+                                                       --job-end EPOCH --kill-wait S --fingerprint F
+                                                       --environment-file IDENTITY.json
     <python> -I -B deploy/hpc-federation/fleetcontrol.py settle --ledger L --lease N --spend-micro S
                                                        --source root|pulled [--attempts N]
 
@@ -87,7 +88,7 @@ class Hooks:
     transport: Callable[[Mapping[str, str]], Any] = LocalTransport
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
-    identity: Callable[[str, str], Optional[Tuple[str, str]]] = lambda site, member: None
+    identity: Callable[[str, str], Optional[Tuple[str, Mapping[str, str]]]] = lambda site, member: None
     spend: Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]] = lambda site, action: None
     say: Callable[[str], None] = field(default=print)
 
@@ -253,6 +254,19 @@ def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
         ledger.close()
 
 
+def environment_of(path: Path) -> str:
+    """The ledger's environment for a join by hand: the digest of the identity in the file (`environment_digest`)."""
+    from expcore.campaign.elastic.control import environment_digest
+
+    try:
+        identity = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ConfigError(f"--environment-file cannot be read as JSON ({type(error).__name__})") from None
+    if not isinstance(identity, dict) or not all(isinstance(v, str) for v in identity.values()):
+        raise ConfigError("--environment-file must hold a JSON object of names to text values")
+    return environment_digest(identity)
+
+
 def by_hand(args: argparse.Namespace, hooks: Hooks) -> int:
     """`drain`, `ended`, `join` or `settle`: the ledger's half of an action, as the controller calls it."""
     from expcore.campaign.elastic import Ledger
@@ -271,7 +285,7 @@ def by_hand(args: argparse.Namespace, hooks: Hooks) -> int:
         else:
             jobs = tuple(job for job in args.jobs.split(",") if job)
             ledger.join(args.label, site=args.site, job_ids=jobs, job_end_at=args.job_end, fingerprint=args.fingerprint,
-                        environment=args.environment, kill_wait_s=args.kill_wait)  # fmt: skip
+                        environment=environment_of(args.environment_file), kill_wait_s=args.kill_wait)  # fmt: skip
     finally:
         ledger.close()
     hooks.say(f"fleetcontrol: {args.command}: {getattr(args, 'label', None) or args.lease}: done")
@@ -317,7 +331,13 @@ def parser() -> argparse.ArgumentParser:
             verb.add_argument("--job-end", dest="job_end", type=float, required=True)
             verb.add_argument("--kill-wait", dest="kill_wait", type=float, required=True)
             verb.add_argument("--fingerprint", required=True)
-            verb.add_argument("--environment", required=True)
+            verb.add_argument(
+                "--environment-file",
+                dest="environment_file",
+                type=Path,
+                required=True,
+                help="the federation's environment identity as a lease store pins it, a JSON object",
+            )
     return found
 
 

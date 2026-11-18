@@ -10,13 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 from control_site_support import FakeSite, Job, observed
-from elastic_support import ENVIRONMENT, FINGERPRINT, FakeClock, config, plan
+from elastic_support import FINGERPRINT, FakeClock, config, plan
 from hpc_fleet_support import fleet_modules
 
 from expcore.campaign.elastic import Lease, Ledger, Wait
 from expcore.campaign.elastic.control import Add, Drain, Retire, SiteSettings, read_only
 
 DIGEST = "c" * 64
+IDENTITY = {"core_commit": "0123abcd", "python": "3.12.7"}  # an environment identity as a lease store pins it
+IDENTITY_DIGEST = "78bd403ced04f551ce0683afa7aedfd2d6d5df93e9375054cef49f4b54a94ffe"
 
 
 @pytest.fixture(scope="module")
@@ -85,7 +87,7 @@ class Bench:
             transport=lambda environ: Transport(),
             clock=self.clock,
             sleep=lambda s: None,
-            identity=identity or (lambda site, member: (FINGERPRINT, ENVIRONMENT)),
+            identity=identity or (lambda site, member: (FINGERPRINT, IDENTITY)),
             say=self.printed.append,
             spend=spend or (lambda site, action: None),
         )
@@ -720,3 +722,25 @@ def test_c43_a_spend_reader_that_fails_leaves_the_lease_at_its_grant_and_the_tic
     ledger = bench.open()
     assert ledger.status().locked_micro == 10_000_000
     ledger.close()
+
+
+# ------------------------------------------------------------------------------------------------ step 4's contract
+def test_c43_a_federation_joins_with_the_digest_of_its_environment_identity_by_loop_and_by_hand(deploy, tmp_path, site):
+    """C43: the ledger's environment is the SHA-256 of the identity's canonical JSON (step 4's `environment_digest`),
+    whether the loop joins a federation or an operator does with `join --environment-file`."""
+    up(site, "fed-1", 41)
+    bench = Bench(tmp_path, deploy, [site])
+    bench.tick()
+    ledger = bench.open()
+    pinned = ledger.db.execute("SELECT value FROM meta WHERE key='environment'").fetchone()[0]
+    ledger.close()
+    assert pinned == IDENTITY_DIGEST
+    path = tmp_path / "identity.json"
+    path.write_text(json.dumps({"python": "3.12.7", "core_commit": "0123abcd"}), encoding="utf-8")
+    argv = ["join", "--ledger", str(bench.ledger), "--label", "site-a-fed-9", "--site", "site-a", "--jobs", "91",
+            "--job-end", str(site.now + 9000), "--kill-wait", "180", "--fingerprint", FINGERPRINT,
+            "--environment-file", str(path)]  # fmt: skip
+    assert deploy.fleetcontrol.main(argv, {}, bench.hooks()) == 0  # refused if its digest differed from the pinned
+    path.write_text(json.dumps({"python": "3.13.0", "core_commit": "0123abcd"}), encoding="utf-8")
+    argv[argv.index("site-a-fed-9")] = "site-a-fed-10"
+    assert deploy.fleetcontrol.main(argv, {}, bench.hooks()) == 2
