@@ -7,8 +7,8 @@
                            process
   check                    exit 0 if pidfd_open and pidfd_send_signal work here (Linux 5.3 and 5.1): through os and
                            signal where this Python has them, else the raw system calls through ctypes; or if
-                           pidfd_open answers ENOSYS (Linux before 5.3), the start-tick fallback below. It prints the
-                           mode it will use: `mode: pidfd` or `mode: start-tick fallback ...`
+                           pidfd_open answers ENOSYS (Linux before 5.3), the start-tick fallback below, which it
+                           names on stdout (`mode: start-tick fallback ...`); where pidfd works it prints nothing
 
 Why (live run 4): run_service used to exec apptainer, which execs the setuid-root starter under the same PID. On a node
 with hidepid=invisible that process is hidden from its own user: /proc/<pid> is absent while kill -0 succeeds. The
@@ -72,10 +72,7 @@ import sys
 SIGNALS = {"TERM": signal.SIGTERM, "USR1": signal.SIGUSR1, "KILL": signal.SIGKILL}
 SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434  # Linux's generic syscall table (x86_64 and aarch64 alike)
 PIDFD, FALLBACK = "pidfd", "fallback"
-MODE_LINES = {
-    PIDFD: "mode: pidfd",
-    FALLBACK: "mode: start-tick fallback (pidfd_open answers ENOSYS here, Linux before 5.3)",
-}
+FALLBACK_LINE = "mode: start-tick fallback (pidfd_open answers ENOSYS here, Linux before 5.3)"
 FALLBACK_NOTE = "pidfd_open answers ENOSYS here (Linux before 5.3): the start-tick fallback"
 
 
@@ -142,8 +139,9 @@ def check():
     mode = usable_mode()
     if mode is None:
         return 2
-    print(MODE_LINES[mode])
-    sys.stdout.flush()
+    if mode == FALLBACK:  # named for the run's evidence; where pidfd works nothing is printed, as it never was
+        print(FALLBACK_LINE)
+        sys.stdout.flush()
     return 0
 
 
