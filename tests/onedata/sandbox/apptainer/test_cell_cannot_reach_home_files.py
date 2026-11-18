@@ -20,7 +20,7 @@ from expcore_onedata.sandbox.apptainer import hostmount as HM
 from expcore_onedata.sandbox.apptainer.argv import NO_MOUNT
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
 
-KEY = ".zqsecrets/alpha-zq/key-zq"
+KEY = ".ZQsecrets/alpha-ZQ/key-ZQ"
 
 
 def real(path: str | Path) -> Path:
@@ -43,7 +43,7 @@ def lay_out(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     copy, source = home / KEY, tmp_path / "operator-keys" / KEY
     for path in (copy, source):
         path.parent.mkdir(parents=True, mode=0o700)
-        path.write_text("sk-zq-first-1111\n")
+        path.write_text("sk-ZQ-first-1111\n")
         path.chmod(0o600)
     return tmpfs, home, copy, source.parents[2]
 

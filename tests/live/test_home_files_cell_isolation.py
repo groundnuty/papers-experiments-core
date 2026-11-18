@@ -30,8 +30,8 @@ if shutil.which("apptainer") is None or not IMAGE:
 from expcore_onedata.sandbox.apptainer.argv import Bind, exec_argv  # noqa: E402
 
 SHARDS = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
-KEY = ".zqsecrets/alpha-zq/key-zq"
-SECRET = "sk-zq-live-0000"
+KEY = ".ZQsecrets/alpha-ZQ/key-ZQ"
+SECRET = "sk-ZQ-live-0000"
 CANARY = "canary-in-the-cells-own-work"
 
 
@@ -61,7 +61,7 @@ def base():
     a tree there would be hidden by the bind and the probes below would prove nothing about the host's file systems. It
     is under `EXPCORE_LIVE_SCRATCH` when that is set, else under the working directory, removed afterwards."""
     root = Path(os.environ.get("EXPCORE_LIVE_SCRATCH") or Path.cwd()).resolve()
-    where = Path(tempfile.mkdtemp(prefix=".zq-home-files-", dir=root))
+    where = Path(tempfile.mkdtemp(prefix=".ZQ-home-files-", dir=root))
     where.chmod(0o700)
     assert not str(where).startswith(("/tmp/", "/dev/shm/")), "set EXPCORE_LIVE_SCRATCH to a directory outside /tmp"
     try:
@@ -111,5 +111,5 @@ def test_o63_a_real_cell_cannot_list_or_read_the_copy_the_source_or_the_dispatch
     assert all(code not in (0, 127) for code in codes), dict(zip(attempts, codes, strict=True))
     assert [line for line in lines if line.startswith("OUT:")] == ["OUT:"] * len(attempts)  # and printed nothing
     shown = done.stdout + done.stderr
-    for word in (SECRET, "zq", str(base)):
+    for word in (SECRET, "ZQ", str(base)):
         assert word not in shown
