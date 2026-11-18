@@ -116,10 +116,18 @@ the default:
 
 ```
 sbatch --parsable --job-name=<name> --account --partition --no-requeue --time --nodes=<1 + N> --ntasks-per-node=1 \
-       --cpus-per-task=<service node> --mem=<service node> --chdir=/ --output=/dev/null --export=NONE \
+       --cpus-per-task=<service node> --mem=<service node> [--exclusive] --chdir=/ --output=/dev/null --export=NONE \
        --wrap='exec sleep <seconds>' \
-     : --account --partition --time --nodes=1 --ntasks-per-node=1 --cpus-per-task=<S> --mem=<S>
+     : --account --partition --time --nodes=1 --ntasks-per-node=1 --cpus-per-task=<S> --mem=<S> [--exclusive]
 ```
+
+`--exclusive` is on every component, and on the agent's own job under `separate`, only when the site sets
+`HPC_EXCLUSIVE_NODES=1` (the held jobs ask a few cores per node, so Slurm packed several federations' jobs onto one node
+when ups ran at once, and a pending job has no nodes for another `up` to exclude). The read-back then also requires
+`OverSubscribe=NO` in each component's record, and accepts `NumCPUs` at or above the asked count (an exclusive job holds
+every core of its nodes); `OverSubscribe` is read only when the job was asked exclusive, and is no part of the state's
+`readback`. A failure anywhere from the first sbatch to the end of the placement releases every held job of the `up`
+that has not ended, by its own id (`Driver.releasing`).
 
 - **Component 0 holds the services' nodes, component 1 holds S.** Its leader's id (component 0's) is the job's id.
   **Every step names its component:** `--het-group=0` on a service node, `--het-group=1` on S. The site's Slurm

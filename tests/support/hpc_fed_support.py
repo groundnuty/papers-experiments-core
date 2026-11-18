@@ -686,6 +686,7 @@ class FakeSlurm:
                 **dependency,
                 "TimeLimit": options.get("--time"),
                 "Requeue": "0" if "--no-requeue" in options else "1",
+                "OverSubscribe": "NO" if "--exclusive" in options else "OK",  # as scontrol prints it, whole nodes: NO
                 "Account": options.get("--account"),
                 "Partition": options.get("--partition", "default-partition"),
                 "NumNodes": str(count),

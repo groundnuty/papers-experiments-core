@@ -165,12 +165,13 @@ def test_o68_the_agents_job_waits_for_the_services_job_and_starts_when_it_does(h
 def test_o68_a_dependency_slurm_did_not_record_cancels_the_agents_job_and_fails_the_up(hpc, tmp_path, site):
     """O68: the read-back of the dependency: a site that drops it (the agent's job recorded with none while the
     services' job still pends, so it would start with no services) has that job cancelled by its own id and the up
-    fails; the services' job is kept for down, as for any job recorded otherwise than asked."""
+    fails, and the services' job, still pending, is released with it (O57: every held job of the up, by its id)."""
     fake = FakeSlurm(state="PENDING", component_recorded={(AGENT, 0): {"Dependency": "(null)"}})
     rig = Rig(hpc, tmp_path, site, fake)
-    with pytest.raises(hpc.slurm.SlurmError, match=r"recorded otherwise than asked \(its dependency\)"):
+    with pytest.raises(hpc.slurm.SlurmError, match=r"recorded otherwise than asked \(its dependency\)") as refused:
         rig.up()
-    assert fake.cancelled == [AGENT]
+    assert fake.cancelled == [AGENT, SERVICES]
+    assert str(refused.value).endswith(f"the held job(s) {SERVICES} were cancelled")
 
 
 def test_o68_a_dependency_on_another_job_is_no_dependency_on_the_services_job(hpc, tmp_path, site):
@@ -179,12 +180,14 @@ def test_o68_a_dependency_on_another_job_is_no_dependency_on_the_services_job(hp
     rig = Rig(hpc, tmp_path, site, fake)
     with pytest.raises(hpc.slurm.SlurmError, match=r"\(its dependency\)"):
         rig.up()
-    assert fake.cancelled == [AGENT]
+    assert fake.cancelled == [AGENT, SERVICES]  # the services' job is released with it
 
 
 def test_o68_a_dependency_that_cannot_be_checked_cancels_the_agents_job_too(hpc, tmp_path, site):
     """O68: the read-back with no dependency recorded asks whether the services' job still waits; when that read fails
-    nothing shows the dependency holds, so the agent's job is cancelled by its id and never left free to start."""
+    nothing shows the dependency holds, so the agent's job is cancelled by its id and never left free to start. The
+    services' job cannot be read either (the same read), so it is not guessed at (O57): the failure names it for
+    down."""
     fake = FakeSlurm(state="PENDING", component_recorded={(AGENT, 0): {"Dependency": "(null)"}})
     real = fake.run
 
@@ -195,9 +198,10 @@ def test_o68_a_dependency_that_cannot_be_checked_cancels_the_agents_job_too(hpc,
 
     fake.run = unreadable
     rig = Rig(hpc, tmp_path, site, fake)
-    with pytest.raises(hpc.slurm.SlurmError, match="dependency could not be checked"):
+    with pytest.raises(hpc.slurm.SlurmError, match="dependency could not be checked") as refused:
         rig.up()
     assert fake.cancelled == [AGENT]
+    assert str(refused.value).endswith(f"job(s) {SERVICES} could not be read: run down to release them")
 
 
 def test_o68_the_het_placement_and_a_job_with_no_agent_carry_no_dependency(hpc):
@@ -206,6 +210,70 @@ def test_o68_the_het_placement_and_a_job_with_no_agent_carry_no_dependency(hpc):
     assert not any(word.startswith("--dependency") for word in plain.argv())
     with pytest.raises(hpc.slurm.SlurmError, match="not one job id"):
         hpc.slurm.Allocation("hpcop-p-abcd", "a", "p", 1, 5, 11264, "02:00:00", 7200, after="4242; rm").argv()
+
+
+EXCLUSIVE = "HPC_EXCLUSIVE_NODES"
+
+
+def test_o68_o57_an_exclusive_dependent_agent_job_carries_both_flags_and_both_are_read_back(hpc, tmp_path, site):
+    """O68, O57: with `HPC_EXCLUSIVE_NODES=1` under "separate" the agent's own job is submitted with `--exclusive` and
+    `--dependency=after:<services job>` in one argv (the services' job with `--exclusive` alone), and Slurm's record of
+    each is what was read back: the dependency, and OverSubscribe `NO` of both jobs."""
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"})
+    rig.up()
+    services, agent = rig.sbatches()
+    assert "--exclusive" in services
+    assert not any(word.startswith("--dependency") for word in services)
+    assert "--exclusive" in agent
+    assert f"--dependency=after:{SERVICES}" in agent
+    recorded = rig.fake.submitted[AGENT][0]
+    assert recorded["--dependency"] == f"after:{SERVICES}"
+    reads = [call for call in rig.fake.calls if call[:3] == ["scontrol", "show", "job"]]
+    assert any(call[-1] == AGENT for call in reads)  # the agent's job was read back
+    assert rig.state()["sandbox"]["readback"] is not None
+    assert rig.state()["phase"] == "linked"
+
+
+@pytest.mark.parametrize(
+    ("recorded", "words"),
+    [
+        ({"Dependency": "(null)"}, r"\(its dependency\)"),
+        ({"OverSubscribe": "OK"}, "OverSubscribe"),
+    ],
+    ids=["the dependency Slurm dropped", "the exclusivity Slurm did not record"],
+)
+def test_o68_o57_either_read_back_of_an_exclusive_dependent_job_releases_every_held_job(
+    hpc, tmp_path, site, recorded, words
+):
+    """O68, O57: the agent's job is exclusive and dependent, and one of the two records is not what was asked: that
+    job is cancelled by its own id and the services' job, still pending, with it, and no step runs."""
+    fake = FakeSlurm(state="PENDING", component_recorded={(AGENT, 0): recorded})
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake)
+    with pytest.raises(hpc.slurm.SlurmError, match=words) as refused:
+        rig.up()
+    assert sorted(fake.cancelled) == [SERVICES, AGENT]
+    assert str(refused.value).endswith(f"the held job(s) {SERVICES} were cancelled")
+    assert fake.sruns == []
+
+
+def test_o68_o57_a_retried_exclusive_up_starts_clean_and_submits_both_flags_again(hpc, tmp_path, site):
+    """O68, O57: an exclusive up of a fleet released at its second read is tried again from clean state: its state
+    names none of the released jobs before the new submits, and the new jobs carry `--exclusive`, the nodes now held
+    in `--exclude`, and the agent's `--dependency` on the new services' job."""
+    fake = FakeSlurm(others_by_read=[[], [OtherJob("9001", RIVAL, "RUNNING", tuple(POOL[:7]))]])
+    fake.nodes = list(POOL)
+    rig = Rig(hpc, tmp_path, {**site, EXCLUSIVE: "1"}, fake, lock=True)
+    rig.up()
+    first, second = rig.sbatches()[:2], rig.sbatches()[2:]
+    ids = list(fake.submitted)  # in submit order: the first attempt's two jobs, then the retry's
+    assert all("--exclusive" in argv for argv in first + second)
+    assert f"--dependency=after:{ids[0]}" in first[1]
+    assert f"--dependency=after:{ids[2]}" in second[1]  # the retry's services job, not the released one
+    assert all(f"--exclude={','.join(POOL[:7])}" in argv for argv in second)
+    assert sorted(fake.cancelled) == sorted([SERVICES, AGENT])  # once each: the refusal released them, no more
+    state = rig.state()
+    assert [state["allocation"]["job"], state["sandbox"]["job"]] == [ids[2], ids[3]]
+    assert state["phase"] == "linked"
 
 
 # ----------------------------------------------------------------------------- (2) the ceiling, a site key
