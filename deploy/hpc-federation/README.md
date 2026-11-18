@@ -1493,6 +1493,88 @@ shard moved to a fresh federation, the relay's state read from the state file wh
 federation with no relay refused for a campaign that injects faults and accepted for one that does not, and a failed
 federation that still holds jobs said by count. Not run live.
 
+## The elastic fleet's controller (`fleetcontrol.py`)
+
+Step 5 of #462 (C43): it keeps each site's fleet at a target the campaign's ledger can use, and brings up, drains and
+takes down federations through the fleet's own commands. `expcore.campaign.elastic.control` decides (DESIGN.md,
+section 1, "The elastic controller"); `fleetcontrol.py` reads the sites, and runs or prints the decision. It only adds
+to a fleet that exists: `fleet.py up` makes one (at least two federations). Nothing of it has run live (step 6).
+
+```bash
+# on a site's login node, from a private 0700 directory of ours, site.env exported: one read of the site, read only
+uv run python -I -B deploy/hpc-federation/fleetcontrol.py observe --fleet "$F" > site-a.json
+# where the ledger is: print what the controller would do, run nothing (the ledger is read without its lock)
+uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/ledger.sqlite --sites sites.toml \
+    --dry-run --once --observed site-a=site-a.json
+# or run it: every 60 s, each site read, decided, logged and acted on (this process then drives the ledger)
+uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/ledger.sqlite --sites sites.toml
+```
+
+- **The read** (`observe`, `fleetobserve.py`) asks Slurm only `sinfo -h -p <partition> -o "%T %D"` and `scontrol show
+  job -o <id>` on the ids its fleet's record and state files name, and the site's quota command. A job whose id Slurm
+  no longer knows, or that now names another job, is `GONE` (ours ended) and is never touched. Only an exactly `idle`
+  node is free: under `HPC_EXCLUSIVE_NODES=1` a federation takes 7 whole nodes, so a `mixed` node (logged) is not.
+  A member that fails the fleet's own identity check (`fleetrecord.identity`: the root this fleet made, a state an up
+  of that root wrote, the recorded name and jobs), a job read that fails or times out, sinfo failing, or a job state
+  it does not read fails the whole read: the site is dark for that tick (no action, no proof, its federations not
+  counted, the demand served elsewhere). A member's data counts as verified only by markers bound to the manifest and
+  space its up recorded.
+- **The target.** The leases the ledger could issue now (each model of the current set, `min(cap - slots, pending)`,
+  held to the grants its budget fits) less the federations free to take one (idle, or on their way up); the rest are
+  added one at a time to the site with the most room, at most `parallel_ups` in one `fleet.py add`. A site's room is
+  the least of `max_federations` less every member that may hold a job; its idle nodes less 7 per up whose job has
+  not started, over 7; its inodes, the 95% line less the usage less one whole estimate for every member whose data is
+  not all there yet (not linked and verified), over the estimate; and the declared `allowance_units` less every member
+  made at its whole `--time` times `rate_units_per_hour`, over one more whole `--time` (no code reads a grant: set it
+  very high where core-hours do not bind). An up waiting past `queue_stall_s` (900 s), an add still running there, or
+  a quota that cannot be read leave no room. **The login node's memory** binds too where the site declares
+  `login_memory_mb` (the account's per-user cgroup there; its OOM kills are silent): each relay beating on this login
+  node takes `relay_mb` (40: about 28 MB measured idle, with margin), each up in flight `up_mb` (256) and each
+  verify-data in flight `verify_mb` (1024), beside `login_reserve_mb` (512) for the rest; an add needs room for its up
+  and then its relay. Relays stay on the login node their up ran on, so only those beating here count (the read tells
+  a relay here from one elsewhere by the pid and start tick its heartbeat names). Sites whose commands run on one
+  login node (`login_node`, an operator label; every `local` site is on this host) share one budget, and a site there
+  that could not be read leaves none. Each tick logs every up's queue
+  wait, submit to running, the memory budget beside the quota and the nodes, and prints one status line with the
+  ledger's money: what is left, and the dollars locked in unsettled leases.
+- **Join, drain, retire, replace.** A member up, linked, verified and running joins the ledger as
+  `<site label>-<fleet label>`, with the earlier end of its two held jobs, its queue wait logged (its fingerprint and
+  environment come from step 6; until then `fleetcontrol.py join ...` takes them by hand). It is drained once its
+  recorded end is closer than `lease_bound_s` (by default the ledger's hard term), 60 s of collect, KillWait and 5
+  minutes. Drained, or proven ended, with no lease issued or sent (checked again in the ledger as it starts), it is
+  retired: `shards.py collect --roots-only --root R --into <evidence>/<site>-<fed-k>`, `shards.py verify-copy` with the
+  hash collect printed, then `fleet.py --fleet F down --member fed-k`, each only after the one before succeeded; never
+  `--discard-evidence`, never a direct `scancel`. Once the fleet's record shows it down, its end is proven `cancelled`;
+  when the read shows every held job ended (a node failure, its walltime) it is proven `terminal` at once, and a
+  replacement comes up. One job ended beside one still running (the agent's job may still spend), or one still
+  completing, is `BROKEN`: never proven, drained and taken down, its down proving the end.
+  Federations no cap lets work are drained once idle past `retire_idle_s` (765 s, an up, a down and an ingest), the
+  least walltime left first, keeping `warm_pool` (0). A failed up is taken down with no collect.
+- **Relays and lost leases.** A relay its up recorded serving whose heartbeat is missing or older than 30 s is recorded
+  in the log as `relay gone, no exit status` with its last heartbeat, and its federation is drained (no outage can be
+  injected there), or taken down if it never joined. Each lost lease (its holder proven ended with no completion, or
+  its archive never verified) not yet settled is settled to the spend its dead federation's call log shows (the root
+  is offered only while the member there still holds the jobs the federation joined with), through
+  the spend reader (`fleetexecute.dead_store_reader(locate, study)` over step 4's `dead_store_spend`; step 6 gives
+  `locate`, where a dead federation's lease store is; until then nothing is read, the lease stays charged its grant,
+  and the log says so once while every tick reads again; a read that is None, of another lease, or without its
+  charged attempts settles nothing: `dead_store_spend` gives a figure only once the store's run ended): its grant stops locking the budget, and dispatch resumes. A run
+  the loss's conservative charge exhausted may reopen when its settle shows fewer attempts, so while such a lease is
+  unsettled the controller keeps one idle federation for each such run instead of retiring it.
+- **By hand.** `--dry-run` prints each action as the commands above, one per line, under a comment naming where it runs
+  and why; the live tick runs exactly those. The ledger's half has its own verbs: `fleetcontrol.py drain --ledger L
+  --label X`, `ended --ledger L --label X --proof cancelled|terminal`, `join --ledger L --label X --site S --jobs
+  J,J --job-end EPOCH --kill-wait S --fingerprint F --environment-file IDENTITY.json` (the ledger keeps the digest of
+  the environment identity, as step 4's merge checks it), and `settle --ledger L --lease N --spend-micro S
+  --source root|pulled --attempts N` (a settle always carries the store's charged attempts).
+- **The sites file** (`--sites`, TOML): `[controller]` with `evidence` (absolute: each retired member's root evidence),
+  `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one
+  per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's
+  only: two sites never share a fleet), `transport`
+  (`local` only: commands run on this host, so step 5 runs where the login node and the ledger are one; a remote site
+  is step 6's), optionally `interpreter` and `deploy` (the Python and this directory on its login node), and the
+  settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required).
+
 ## What the repository's tests cover
 
 `tests/deploy/test_hpc_*.py` run the Couchbase guard against the stand-in, the password rules, a 3.8 parse of every

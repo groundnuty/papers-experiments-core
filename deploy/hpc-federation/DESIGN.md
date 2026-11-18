@@ -241,6 +241,37 @@ under one record. One federation's job failing ends one shard's step, never anot
   goes), a watch of each job's walltime, and a fleet across accounts (the maximum is one fleet's, not the account's:
   two fleets of one account must share it by hand).
 
+### The elastic controller
+
+Step 5 of #462 (C43; `fleetcontrol.py`, `fleetobserve.py`, `fleetexecute.py`; the decision in
+`expcore.campaign.elastic.control`; README, "The elastic fleet's controller"). It runs where the campaign's ledger is,
+in the process that drives the ledger (the ledger's lock admits one), and keeps each site's fleet at a target.
+
+- **Decision and action are apart.** `decide` is a pure function of one ledger view, one read per site and the sites'
+  declared settings; every action it returns is the call an operator makes by hand, rendered once, so the dry run
+  prints exactly what a live tick runs and step 6 can run with an agent taking the actions.
+- **The site's read is read-only and whole.** `sinfo` and `scontrol show job -o <id>` on the ids the fleet's record
+  and state files name, and the quota command. One job read that fails makes the site dark for the tick: unknown is
+  never taken for ended, so no proof and no retirement come from a site that could not be read.
+- **What each limit counts.** The maximum counts every member that may hold a job. Free whole nodes are idle ones only
+  (`--exclusive` takes whole nodes; mixed ones are logged), less 7 for each up whose job has not started. Inodes are
+  the guard's line less the usage less one whole estimate for each member whose data is not all on scratch yet, so
+  parallel ups never share one reading; the reservation is read from the fleet's record, never memory, and survives a
+  restart. The allowance is declared and charged each member's whole `--time` from the moment it is made. The login
+  node's memory (a per-account cgroup) is budgeted per login node: the relays beating there (each read by its
+  heartbeat's pid and start tick, so one on another login node counts there), the ups and verify-data in flight, and a
+  reserve, against the declared cap.
+- **Relays and money.** A relay recorded serving whose heartbeat is gone drains its federation, recorded with its last
+  heartbeat. A lost lease is settled each tick to the spend its dead federation's call log shows, through a reader the
+  tests fake and step 6 hooks up; the ledger's locked dollars are printed and logged every tick.
+- **Down only through the fleet.** A retirement is collect, verify-copy against collect's own hash, then
+  `fleet.py down --member`, whose `hpcfed.py down` still refuses evidence not collected and cancels only the ids its up
+  recorded. The ledger is checked again just before: drained or proven ended, and no lease issued or sent. The proof
+  `cancelled` comes only once the record shows the down verified.
+- **Not built (step 6).** A remote site's transport (ssh to its login node) and the copy back over it, `--time` per
+  up, the identity a federation joins with, the reader of a dead store's spend, and the watchdog. `fleet.py`'s commands are unchanged; the controller only
+  adds to a fleet `up` made.
+
 ## 2. Sizing: service steps, control steps, and the node
 
 The sizes are layout settings, in an `[hpc]` table of the same layout file. `fedspec.py` accepts the table and keeps
