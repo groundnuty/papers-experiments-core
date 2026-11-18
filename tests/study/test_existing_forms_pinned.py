@@ -49,4 +49,5 @@ def test_c41_the_pins_cover_exactly_the_old_forms_and_name_their_rules(pinned):
         "expcore-shard/3",
         "expcore-shard/4",
     ]
-    assert "lease_attempt_base" not in {key for facts in pinned.values() for key in facts["meta_keys"]}
+    keys = {key for facts in pinned.values() for key in facts["meta_keys"]}
+    assert not keys & {"lease_attempt_base", "lease_charged_attempts"}

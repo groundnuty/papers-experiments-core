@@ -52,7 +52,7 @@ from expcore.campaign.attempts import (
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ManifestRow, relative_order_problem
 from expcore.campaign.markers import AttemptResult
-from expcore.campaign.run_lease import META_ATTEMPT_BASE
+from expcore.campaign.run_lease import META_ATTEMPT_BASE, META_CHARGED_ATTEMPTS
 from expcore.campaign.spend_journal import (
     CLOSED,
     PROBE,
@@ -466,30 +466,49 @@ class Store:
 
     # --- attempts -----------------------------------------------------------------------------------------------
 
-    def _attempt_base(self) -> int:
-        """The charged attempts the run had in the leases before this store's (`run_lease`, the lease's `attempt_base`,
-        pinned in the store's meta); 0 for every store without a lease. Read from the row each time, so a copy of the
-        store that a merge settles has it too. A row that is not a whole number is refused, never read as 0, which
-        would number a lease's attempts from 1 again."""
-        row = self.db.execute("SELECT value FROM meta WHERE key=?", (META_ATTEMPT_BASE,)).fetchone()
+    def _lease_count(self, key: str, what: str) -> int:
+        """A whole number a lease pinned in the store's meta (`run_lease`); 0 for every store without a lease. Read from
+        the row each time, so a copy of the store that a merge settles has it too. A row that is not a whole number is
+        refused, never read as 0, which would number a lease's attempts from 1 again or lift its attempt limit."""
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         if row is None:
             return 0
         try:
-            base = int(row["value"])
+            count = int(row["value"])
         except ValueError:
-            base = -1
-        if base < 0 or str(base) != row["value"]:
-            raise ValueError(f"the store's attempt base {row['value']!r} is not a whole number from 0")
-        return base
+            count = -1
+        if count < 0 or str(count) != row["value"]:
+            raise ValueError(f"the store's {what} {row['value']!r} is not a whole number from 0")
+        return count
+
+    def _attempt_base(self) -> int:
+        """The attempts the run's earlier leases started, charged or not: the lease's `attempt_base`, the number this
+        store's attempts are counted from (0 for a store without a lease)."""
+        return self._lease_count(META_ATTEMPT_BASE, "attempt base")
+
+    def _charged_base(self) -> int:
+        """The charged attempts of the run's earlier leases (the lease's `charged_attempts`), counted with this store's
+        against the attempt limit (0 for a store without a lease)."""
+        return self._lease_count(META_CHARGED_ATTEMPTS, "charged attempts of the earlier leases")
 
     def charged_attempts(self, run_key: str) -> int:
-        """Return the attempts of a run that count against the attempt limit: the lease's attempt base, when the store
-        holds a lease, and the attempts charged in this store."""
+        """Return the attempts of a run that count against the attempt limit: the charged attempts of its earlier
+        leases, when the store holds a lease, and the attempts charged in this store."""
         with self._lock:
             charged = self.db.execute(
                 "SELECT COALESCE(SUM(charged),0) c FROM attempts WHERE run_key=?", (run_key,)
             ).fetchone()["c"]
-            return self._attempt_base() + charged
+            return self._charged_base() + charged
+
+    def next_attempt_number(self, run_key: str) -> int:
+        """Return the number the run's next attempt will have (`begin_attempt`): one more than its charged attempts
+        here, counted from the lease's attempt base when the store holds a lease, so an uncharged attempt is run again
+        under the number it had and no attempt of another lease has a number this one has."""
+        with self._lock:
+            charged = self.db.execute(
+                "SELECT COALESCE(SUM(charged),0) c FROM attempts WHERE run_key=?", (run_key,)
+            ).fetchone()["c"]
+            return self._attempt_base() + charged + 1
 
     def begin_attempt(
         self,
@@ -507,8 +526,8 @@ class Store:
         """Insert the 'running' row before the run starts; refuse in the transaction a run that is not pending.
 
         The attempt number is one more than the run's charged attempts, so an interrupted or uncharged attempt is
-        run again under the number it had; in the store of a lease the run's charged attempts include the lease's
-        attempt base, so a run's attempts are numbered apart across its leases (`run_lease`). The row also takes the next place in the campaign's dispatch sequence (one
+        run again under the number it had; in the store of a lease the numbers start past the lease's attempt base (what
+        the run's earlier leases started), so no attempt of a run has a number another lease's has (`run_lease`). The row also takes the next place in the campaign's dispatch sequence (one
         more than the largest so far, in the same write transaction, so it grows with every attempt and a restart
         carries on from where the dead process stopped), the lease it runs under: how long it waited for it and
         how it was obtained (`LEASE_OUTCOMES`), the bound the budget gate reserved the run when it let it start:
@@ -756,7 +775,7 @@ class Store:
             return "harness_error"
         if state == "infra_fail":
             charged = (
-                self._attempt_base()
+                self._charged_base()
                 + self.db.execute(
                     "SELECT COALESCE(SUM(charged),0) FROM attempts WHERE run_key=?", (run_key,)
                 ).fetchone()[0]

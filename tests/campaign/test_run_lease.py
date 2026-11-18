@@ -15,8 +15,9 @@ FILE = {
     "schema": LEASE_SCHEMA,
     "run_key": KEY,
     "lease_id": 7,
-    "attempt_base": 2,
-    "grant_usd": 1.25,
+    "attempt_base": 3,
+    "charged_attempts": 2,
+    "grant_micro_usd": 1_250_000,
     "campaign_sha256": SHA,
     "expires_utc": "2026-11-18T12:30:00Z",
 }
@@ -29,10 +30,11 @@ def written(tmp_path: Path, document: object, *, text: str | None = None) -> Pat
 
 
 def test_c41_a_lease_file_reads_into_the_lease_and_the_pinned_json_reads_back_to_it(tmp_path):
-    """C41: the shape the ledger produces (run key, lease id, attempt base, grant, campaign sha256, expiry), and the
-    spec a store pins, which names the rule and drops the file's schema tag."""
+    """C41: the shape the ledger produces (run key, lease id, attempt base, charged attempts, grant in micro-dollars,
+    campaign sha256, expiry), and the spec a store pins, which names the rule and drops the file's schema tag."""
     lease = read_lease(written(tmp_path, FILE))
-    assert (lease.run_key, lease.lease_id, lease.attempt_base, lease.grant_usd) == (KEY, 7, 2, 1.25)
+    assert (lease.run_key, lease.lease_id, lease.attempt_base, lease.charged_attempts) == (KEY, 7, 3, 2)
+    assert (lease.grant_micro_usd, lease.grant_usd) == (1_250_000, 1.25)
     assert (lease.campaign_sha256, lease.expires_utc, lease.rule) == (SHA, "2026-11-18T12:30:00Z", RULE_LEASE)
     pinned = lease.to_json()
     assert set(pinned) == {"rule", *(set(FILE) - {"schema"})}
@@ -40,12 +42,21 @@ def test_c41_a_lease_file_reads_into_the_lease_and_the_pinned_json_reads_back_to
     assert lease.name == f"lease 7 of run {KEY}"
 
 
-def test_c41_a_whole_number_grant_is_kept_as_dollars_so_the_pinned_text_is_one_text(tmp_path):
-    """C41: a grant of 5 and of 5.0 pin the same text."""
-    assert read_lease(written(tmp_path, {**FILE, "grant_usd": 5})).to_json() == {
-        **read_lease(written(tmp_path, {**FILE, "grant_usd": 5.0})).to_json()
-    }
-    assert isinstance(read_lease(written(tmp_path, {**FILE, "grant_usd": 5})).grant_usd, float)
+def test_c41_a_grant_is_exact_micro_dollars_and_becomes_dollars_only_for_the_gate(tmp_path):
+    """C41: the file carries whole micro-dollars (the ledger's unit), pinned as that integer; its dollars are the
+    nearest float to the exact amount, so one micro-dollar is never lost to a float."""
+    lease = read_lease(written(tmp_path, {**FILE, "grant_micro_usd": 56_384}))
+    assert lease.to_json()["grant_micro_usd"] == 56_384
+    assert lease.grant_usd == 0.056384
+    assert read_lease(written(tmp_path, {**FILE, "grant_micro_usd": 1})).grant_usd == 0.000001
+    assert read_lease(written(tmp_path, {**FILE, "grant_micro_usd": 0})).grant_usd == 0.0
+
+
+def test_c41_a_lease_that_started_attempts_and_charged_none_or_all_of_them_is_read(tmp_path):
+    """C41: charged attempts are some of the started ones, none and all included."""
+    for base, charged in ((0, 0), (4, 0), (4, 4), (1, 1)):
+        lease = read_lease(written(tmp_path, {**FILE, "attempt_base": base, "charged_attempts": charged}))
+        assert (lease.attempt_base, lease.charged_attempts) == (base, charged)
 
 
 @pytest.mark.parametrize(
@@ -59,10 +70,17 @@ def test_c41_a_whole_number_grant_is_kept_as_dollars_so_the_pinned_text_is_one_t
         {"attempt_base": -1},
         {"attempt_base": True},
         {"attempt_base": 2.0},
-        {"grant_usd": -0.01},
-        {"grant_usd": True},
-        {"grant_usd": "1.25"},
-        {"grant_usd": None},
+        {"charged_attempts": -1},
+        {"charged_attempts": True},
+        {"charged_attempts": 1.0},
+        {"charged_attempts": 4},
+        {"attempt_base": 1},
+        {"grant_micro_usd": -1},
+        {"grant_micro_usd": True},
+        {"grant_micro_usd": 1.25},
+        {"grant_micro_usd": 1_250_000.0},
+        {"grant_micro_usd": "1250000"},
+        {"grant_micro_usd": None},
         {"run_key": ""},
         {"run_key": 5},
         {"campaign_sha256": "ab" * 31},
@@ -81,9 +99,9 @@ def test_c41_a_lease_file_with_a_field_of_another_kind_is_refused(tmp_path, chan
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
-def test_c41_a_grant_that_is_not_a_finite_number_is_refused_whatever_json_allows(tmp_path, constant):
-    """C41: Python's json reads NaN and Infinity; a ceiling made of one would never hold, so the file is refused."""
-    text = json.dumps(FILE).replace("1.25", constant)
+def test_c41_a_lease_file_holding_nan_or_infinity_is_refused_whatever_json_allows(tmp_path, constant):
+    """C41: Python's json reads NaN and Infinity; no fact of a lease is one, so the file is refused."""
+    text = json.dumps(FILE).replace('"attempt_base": 3', f'"attempt_base": {constant}')
     with pytest.raises(LeaseError, match=r"NaN|Infinity|finite"):
         read_lease(written(tmp_path, None, text=text))
 
@@ -118,7 +136,7 @@ def test_c41_a_lease_refusal_is_a_shard_refusal_so_the_command_line_refuses_it()
 
 def test_c41_a_lease_is_expired_from_its_expiry_on_and_not_before():
     """C41: the term ends at the expiry second itself, so a lease started at it is refused."""
-    lease = RunLease(KEY, 7, 0, 0.0, SHA, "2026-11-18T12:30:00Z")
+    lease = RunLease(KEY, 7, 0, 0, 0, SHA, "2026-11-18T12:30:00Z")
     before = dt.datetime(2026, 11, 18, 12, 29, 59, tzinfo=dt.UTC)
     assert not lease.expired(before)
     assert lease.expired(before + dt.timedelta(seconds=1))
@@ -127,8 +145,8 @@ def test_c41_a_lease_is_expired_from_its_expiry_on_and_not_before():
 
 def test_c41_a_spec_with_another_rule_or_keys_does_not_read_as_a_lease():
     """C41: a shard's spec has no lease id, and a lease's spec is not read as a shard's."""
-    lease = RunLease(KEY, 7, 0, 1.0, SHA, "2026-11-18T12:30:00Z")
+    lease = RunLease(KEY, 7, 0, 0, 1_000_000, SHA, "2026-11-18T12:30:00Z")
     with pytest.raises(LeaseError, match="exactly the keys"):
         RunLease.from_json({**lease.to_json(), "index": 1})
     with pytest.raises(ShardError):
-        RunLease(KEY, 7, 0, 1.0, SHA, "2026-11-18T12:30:00Z", rule="expcore-shard/2: per model")
+        RunLease(KEY, 7, 0, 0, 1_000_000, SHA, "2026-11-18T12:30:00Z", rule="expcore-shard/2: per model")

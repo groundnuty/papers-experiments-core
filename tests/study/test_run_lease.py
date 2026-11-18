@@ -10,6 +10,8 @@ or another form on the store), which must leave the store as it was, or absent.
 import dataclasses
 import datetime as dt
 import json
+import math
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -19,7 +21,7 @@ from study_support import Campaign, clean_environment, cli, make_copy
 
 from expcore.campaign.gate import Budget
 from expcore.campaign.manifest import fingerprint_sha256
-from expcore.campaign.run_lease import META_ATTEMPT_BASE, RULE_LEASE, RunLease
+from expcore.campaign.run_lease import META_ATTEMPT_BASE, META_CHARGED_ATTEMPTS, RULE_LEASE, RunLease
 from expcore.campaign.shard_budget import reservation_usd
 from expcore.records.record import record_filename
 from expcore.study.config import load_study
@@ -41,6 +43,11 @@ def first_run(root: Path, model: str = MODEL) -> str:
     return next(row.key.text for row in load_study(root).manifest.rows if row.key.factors["model"] == model)
 
 
+def micro_of(usd: float) -> int:
+    """A dollar figure as the whole micro-dollars that cover it, from the figure's own decimal text."""
+    return math.ceil(Decimal(repr(usd)) * 1_000_000)
+
+
 def lease_of(root: Path, **changes: object) -> dict[str, object]:
     """A lease file's content for the run of `model` that comes first, with the given fields replaced."""
     lease = {
@@ -48,7 +55,8 @@ def lease_of(root: Path, **changes: object) -> dict[str, object]:
         "run_key": first_run(root),
         "lease_id": 1,
         "attempt_base": 0,
-        "grant_usd": 5.0,
+        "charged_attempts": 0,
+        "grant_micro_usd": 5_000_000,
         "campaign_sha256": sha_of(root),
         "expires_utc": FAR,
     }
@@ -81,9 +89,9 @@ def base(tmp_path_factory) -> Path:
 
 @pytest.fixture(scope="module")
 def done(base, clean_environment) -> tuple[Campaign, dict[str, object]]:
-    """A run taken on lease 4 after two charged attempts, to its end."""
+    """A run taken on lease 4 after three attempts started, two of them charged, to its end."""
     campaign = Campaign(make_copy(base, "done"))
-    lease = lease_of(campaign.root, lease_id=4, attempt_base=2)
+    lease = lease_of(campaign.root, lease_id=4, attempt_base=3, charged_attempts=2)
     code, errors = run_lease(clean_environment, campaign.root, lease)
     assert code == 0, errors
     return campaign, lease
@@ -110,35 +118,37 @@ def test_c41_a_lease_runs_exactly_the_one_run_it_names_in_a_store_of_its_own(don
 
 
 def test_c41_a_lease_store_is_pinned_under_the_lease_rule_with_the_lease_as_its_spec(done):
-    """C41: `expcore-shard/5`, the spec the lease's own JSON, the attempt base and the start's time, so a merge by run
+    """C41: `expcore-shard/5`, the spec the lease's own JSON, its two counts and the start's time, so a merge by run
     can tell such a store from every other."""
     campaign, lease = done
     meta = meta_of(campaign)
     spec = json.loads(meta["shard_spec"])
     assert spec["rule"] == RULE_LEASE
     assert {k: v for k, v in spec.items() if k != "rule"} == {k: v for k, v in lease.items() if k != "schema"}
-    assert meta[META_ATTEMPT_BASE] == "2"
+    assert meta[META_ATTEMPT_BASE] == "3"
+    assert meta[META_CHARGED_ATTEMPTS] == "2"
     assert meta["shard_started_utc"]
 
 
 def test_c41_a_leases_attempts_are_numbered_from_its_base_in_the_row_and_in_the_record(done):
-    """C41: the first attempt of a lease after two charged ones is the third: its row, its record's name and its
-    record's own number say so."""
+    """C41: the first attempt of a lease after three started ones (two charged) is the fourth: its row, its record's
+    name and its record's own number say so."""
     campaign, lease = done
     row = campaign.sql("SELECT attempt, state, run_dir FROM attempts")[0]
-    assert (row["attempt"], row["state"]) == (3, "done")
-    name = record_filename(lease["run_key"], 3)
+    assert (row["attempt"], row["state"]) == (4, "done")
+    name = record_filename(lease["run_key"], 4)
     record = Path(row["run_dir"]) / name
     assert record.is_file()
-    assert json.loads(record.read_text(encoding="utf-8"))["attempt"] == 3
+    assert json.loads(record.read_text(encoding="utf-8"))["attempt"] == 4
 
 
 def test_c41_the_leases_grant_is_the_whole_budget_of_its_run_and_its_caps_are_one_run(done):
-    """C41: the shares the store pins are the grant as `max_usd`, no per-model ceiling, and one run of the model's
-    unit; the campaign's own totals are not the store's."""
+    """C41: the shares the store pins are the grant as `max_usd` in dollars, no per-model ceiling, and one run of the
+    model's unit; the campaign's own totals are not the store's."""
     campaign, lease = done
     shares = json.loads(meta_of(campaign)["shard_shares"])
-    assert shares == {"budget": {"max_usd": lease["grant_usd"], "per_model_usd": {}}, "unit_caps": {MODEL: 1}}
+    assert lease["grant_micro_usd"] == 5_000_000
+    assert shares == {"budget": {"max_usd": 5.0, "per_model_usd": {}}, "unit_caps": {MODEL: 1}}
 
 
 def test_c41_a_lease_store_passes_the_replay_check_with_its_attempt_base(done, clean_environment):
@@ -179,9 +189,11 @@ def test_c41_a_lease_of_a_run_the_plan_does_not_have_is_refused_and_leaves_nothi
 
 
 def test_c41_a_lease_at_the_attempt_limit_is_refused(base, clean_environment):
-    """C41: a base that already used every attempt the campaign allows leaves the run none."""
+    """C41: charged attempts that already used every attempt the campaign allows leave the run none, whatever number
+    of attempts were started."""
     campaign = Campaign(make_copy(base, "no-attempt-left"))
-    code, errors = run_lease(clean_environment, campaign.root, lease_of(campaign.root, attempt_base=3))
+    lease = lease_of(campaign.root, attempt_base=5, charged_attempts=3)
+    code, errors = run_lease(clean_environment, campaign.root, lease)
     assert code == 1
     assert "attempt" in errors
     assert not (campaign.root / "out" / "state.sqlite").exists()
@@ -252,16 +264,46 @@ def test_c41_a_grant_below_what_a_run_reserves_holds_the_run_before_any_attempt(
     reserved = reservation_usd(study.models.resolve(MODEL), study.campaign.agent.limits)
     assert reserved
     assert reserved > 0
-    code, errors = run_lease(clean_environment, campaign.root, lease_of(campaign.root, grant_usd=reserved / 2))
+    half = lease_of(campaign.root, grant_micro_usd=micro_of(reserved) // 2)
+    code, errors = run_lease(clean_environment, campaign.root, half)
     assert code == 3, errors
     assert campaign.sql("SELECT * FROM attempts") == []
     assert [row["status"] for row in campaign.sql("SELECT status FROM runs")] == ["pending"]
 
 
+def test_c41_a_grant_of_exactly_one_reservation_runs_the_run_and_one_micro_dollar_less_holds_it(
+    tmp_path, clean_environment
+):
+    """C41: the grant is exact micro-dollars: the example's run reserves 56,384 of them (a whole number, the case a
+    float could miss by a rounding), and that grant starts the run while 56,383 holds it before any attempt."""
+    exact, short = Campaign(make_copy(tmp_path, "exact")), Campaign(make_copy(tmp_path, "one-short"))
+    study = load_study(exact.root)
+    reserved = micro_of(reservation_usd(study.models.resolve(MODEL), study.campaign.agent.limits))
+    assert reserved == 56_384
+    code, errors = run_lease(clean_environment, exact.root, lease_of(exact.root, grant_micro_usd=reserved))
+    assert code == 0, errors
+    assert [row["state"] for row in exact.sql("SELECT state FROM attempts")] == ["done"]
+    code, errors = run_lease(clean_environment, short.root, lease_of(short.root, grant_micro_usd=reserved - 1))
+    assert code == 3, errors
+    assert short.sql("SELECT * FROM attempts") == []
+
+
+def test_c41_a_lease_after_an_uncharged_attempt_numbers_past_it_and_counts_only_the_charged_one(
+    tmp_path, clean_environment
+):
+    """C41: an earlier lease started 2 attempts of the run and charged 1: this one numbers its attempt 3 (the 2 it did
+    not use are never its numbers) and is under the limit of 3, since only 1 counts."""
+    campaign = Campaign(make_copy(tmp_path, "after-uncharged"))
+    lease = lease_of(campaign.root, lease_id=2, attempt_base=2, charged_attempts=1)
+    code, errors = run_lease(clean_environment, campaign.root, lease)
+    assert code == 0, errors
+    assert [row["attempt"] for row in campaign.sql("SELECT attempt FROM attempts")] == [3]
+
+
 def test_c41_a_grant_of_nothing_for_a_priced_model_is_refused_in_words(base, clean_environment):
     """C41: a budget of 0 holds every run, and a bare ValueError would be a traceback: the lease is refused."""
     campaign = Campaign(make_copy(base, "no-grant"))
-    code, errors = run_lease(clean_environment, campaign.root, lease_of(campaign.root, grant_usd=0))
+    code, errors = run_lease(clean_environment, campaign.root, lease_of(campaign.root, grant_micro_usd=0))
     assert code == 1
     assert "grant" in errors
     assert "Traceback" not in errors
@@ -277,7 +319,7 @@ def test_c41_a_release_file_or_a_model_ceiling_of_the_campaign_never_lifts_a_lea
         study.campaign.scheduler,
         budget=Budget(max_usd=5.0, per_model_usd={MODEL: 2.0}, release_step_usd=1.0, release_file=root / "release.txt"),
     )
-    lease = lease_of(root, grant_usd=1.5)
+    lease = lease_of(root, grant_micro_usd=1_500_000)
     _, settings, start = lease_start(
         study,
         campaigns,
