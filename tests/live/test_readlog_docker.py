@@ -1,6 +1,7 @@
 """The read-log channel against a real docker daemon, skipped unless EXPCORE_LIVE_DOCKER=1 (and Linux).
 
-    EXPCORE_LIVE_DOCKER=1 EXPCORE_LIVE_PLATFORM=/path/to/platform.toml uv run pytest tests/live/test_readlog_docker.py
+    EXPCORE_LIVE_DOCKER=1 EXPCORE_LIVE_SUDO=1 EXPCORE_LIVE_PLATFORM=/path/to/platform.toml \
+        uv run pytest tests/live/test_readlog_docker.py
 
 These are the claims no fake can show, which the first live slot proves: that an agent of ANOTHER uid, in another
 container, sends through the 0666 socket in the read-only bound directory, with the uid the kernel attests; what the
@@ -22,6 +23,8 @@ import pytest
 
 if os.environ.get("EXPCORE_LIVE_DOCKER") != "1":
     pytest.skip("EXPCORE_LIVE_DOCKER is not set; these tests use a real docker daemon", allow_module_level=True)
+if os.environ.get("EXPCORE_LIVE_SUDO") != "1":  # each sandbox's work disk runs mkfs, a loop mount and chown via sudo -n
+    pytest.skip("EXPCORE_LIVE_SUDO is not set: these tests run root-level work-disk steps", allow_module_level=True)
 if not sys.platform.startswith("linux"):
     pytest.skip("the read-log channel passes a Unix socket through a bind: Linux only", allow_module_level=True)
 
