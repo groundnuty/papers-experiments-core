@@ -1,13 +1,22 @@
-"""`python -m expcore.campaign.elastic`: an operator's `status` and `raise-ceiling`, run while a dispatcher holds the
-ledger."""
+"""`python -m expcore.campaign.elastic`: an operator's `create`, `status` and `raise-ceiling`; the last two run while a
+dispatcher holds the ledger."""
 
+import hashlib
 import sqlite3
 
 import pytest
 from elastic_support import assert_invariants, join, leased, ledger_path, lose, make, plan
+from shard_support import IDENTITY, declaring
+from study_support import clean_environment, make_copy
 
-from expcore.campaign.elastic import Wait
+from expcore.campaign.elastic import LedgerReader, Wait, ledger_runs
 from expcore.campaign.elastic.__main__ import main
+from expcore.campaign.manifest import fingerprint_sha256
+from expcore.study.config import load_study
+from expcore.study.pipeline import campaign_fingerprint, campaign_identity
+from expcore.study.selection_start import pricing_of
+
+__all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
 BUDGET = {"runs": plan(tasks=4, conditions=("api-none",)), "max_usd": 2.0, "grants_usd": {"m1": 1.0}}
 
@@ -118,3 +127,36 @@ def test_c42_status_on_a_file_that_is_not_a_ledger_leaves_it_as_it_was(tmp_path,
     db = sqlite3.connect(other)
     assert db.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     db.close()
+
+
+def test_c46_create_makes_a_campaigns_ledger_from_its_study_and_refuses_an_existing_one(
+    tmp_path, capsys, clean_environment
+):
+    """C46: `create` writes the ledger of a study (its runs in the seeded order, the fingerprint a federation joins
+    with, the study's attempt limit, one grant per model, the budget given) that `status` reads, and a second `create`
+    refuses with the first untouched."""
+    study = make_copy(tmp_path, "study")
+    loaded = load_study(study)
+    path = ledger_path(tmp_path)
+    args = ["create", str(path), "--study", str(study), "--hard-term-s", "5400", "--max-usd", "7.5"]
+    assert main(args) == 0
+    assert "created" in capsys.readouterr().out
+    reader = LedgerReader(path)
+    try:
+        config = reader.config
+        assert reader.status().ceiling_micro == 7_500_000
+        assert len(reader.runs()) == len(ledger_runs(loaded.manifest, loaded.schema))
+    finally:
+        reader.close()
+    assert (config.hard_term_s, config.max_attempts) == (5400.0, loaded.campaign.scheduler.max_attempts)
+    assert set(config.grants_usd) == set(pricing_of(loaded).models)
+    with pytest.MonkeyPatch.context() as patch:
+        declaring(patch, IDENTITY)
+        joined, _ = campaign_identity(study)
+    assert config.fingerprint == fingerprint_sha256(joined) == fingerprint_sha256(campaign_fingerprint(study))
+    assert main(["status", str(path)]) == 0
+    assert "7.500000" in capsys.readouterr().out
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert main(args) != 0
+    assert "already holds a ledger" in capsys.readouterr().err
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before

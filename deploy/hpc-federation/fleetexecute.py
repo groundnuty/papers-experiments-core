@@ -44,6 +44,7 @@ ATTEMPTS = "<the charged attempts its store shows>"
 ARCHIVES_MANIFEST = "archives.sha256.json"  # `shards.ARCHIVES_MANIFEST`
 HEX64 = re.compile(r"[0-9a-f]{64}")
 COMMAND_TIMEOUT_S = 6 * 3600.0  # the fleet's commands bound their own waits (an up's queue wait, a down's steps)
+LAUNCH_TIMEOUT_S = 300.0  # a worker's launch only spawns a detached srun client: it never holds the tick for long
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class SiteConfig:
     transport: str = "local"
     python: str = sys.executable
     deploy: Path = HERE
+    channel: Optional[Path] = None  # the site's channel root on its shared file system, when the dispatcher serves it
 
     @property
     def label(self) -> str:
@@ -71,6 +73,7 @@ class Rendered:
 
     where: str
     steps: Tuple[Tuple[str, ...], ...]
+    site_steps: Tuple[Tuple[str, ...], ...] = ()  # a join's: the worker's launch on the site, before the ledger's join
 
 
 def evidence_dir(evidence: Path, site: str, member: str) -> Path:
@@ -78,8 +81,11 @@ def evidence_dir(evidence: Path, site: str, member: str) -> Path:
     return evidence / f"{site}-{member}"
 
 
-def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: str = DIGEST) -> Rendered:
-    """The commands of one action, exactly as the dry run prints them and the executor runs them."""
+def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: str = DIGEST,
+           settings: Optional[Path] = None) -> Rendered:  # fmt: skip
+    """The commands of one action, exactly as the dry run prints them and the executor runs them. A join also
+    launches the federation's worker (`fleetworker.py launch`, on the site) when the site has a channel and the shard
+    `settings` are given."""
     kind = type(action).__name__
     control = site.script("fleetcontrol.py")
     if kind == "Add":
@@ -108,14 +114,28 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
         words = ("join", "--ledger", str(ledger), "--label", action.label, "--site", action.site, "--jobs",
                  ",".join(action.job_ids), "--job-end", repr(action.job_end_at), "--kill-wait",
                  repr(action.kill_wait_s), "--fingerprint", FINGERPRINT, "--environment-file", ENVIRONMENT)  # fmt: skip
-        return Rendered("ledger", ((*control, *words),))
+        return Rendered("ledger", ((*control, *words),), worker_launch(action, site, settings))
     raise ValueError(f"no rendering for an action of kind {kind}")
+
+
+def worker_launch(action: Any, site: SiteConfig, settings: Optional[Path]) -> Tuple[Tuple[str, ...], ...]:
+    """A joining federation's worker, launched on its site before the join (idempotent: one already running is not
+    launched again): its ledger label, its channel under the site's channel root, and the recorded end of its job."""
+    if site.channel is None or settings is None:
+        return ()
+    from expcore.campaign.elastic import channel as ch
+
+    words = ("launch", "--fleet", str(site.fleet), "--member", action.member, "--settings", str(settings),
+             "--federation", action.label, "--channel", str(ch.federation_dir(str(site.channel), action.label)),
+             "--job-end", repr(action.job_end_at))  # fmt: skip
+    return (tuple(site.script("fleetworker.py", *words)),)
 
 
 def described(action: Any, rendered: Rendered) -> Dict[str, Any]:
     """An action for the log and the dry run: its kind, site, member, reason and commands."""
     return {"action": type(action).__name__, "site": action.site, "member": getattr(action, "member", None),
             "label": getattr(action, "label", None), "reason": action.reason, "where": rendered.where,
+            "site_steps": [list(step) for step in rendered.site_steps],
             "steps": [list(step) for step in rendered.steps]}  # fmt: skip
 
 
@@ -123,6 +143,10 @@ def printed(entry: Mapping[str, Any]) -> str:
     """One action as the dry run prints it: where it runs, then each command, one per line."""
     where = f"on {entry['site']}'s login node" if entry["where"] == "site" else "in the ledger, on this host"
     lines = [f"# {entry['action']} {entry['label'] or entry['member'] or entry['site']} ({where}): {entry['reason']}"]
+    if entry["site_steps"]:
+        lines.append(f"# first, on {entry['site']}'s login node:")
+        lines += [shlex.join(step) for step in entry["site_steps"]]
+        lines.append("# then, in the ledger:")
     return "\n".join(lines + [shlex.join(step) for step in entry["steps"]])
 
 
@@ -216,6 +240,7 @@ class Executor:
     identity: Callable[[str, str], Optional[Tuple[str, Mapping[str, str]]]] = lambda site, member: None
     # (site, the Settle) -> (spend in micro-dollars, its source "root" or "pulled", charged attempts or None), or None
     spend: Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]] = lambda site, action: None
+    settings: Optional[Path] = None  # the shard settings a joining federation's worker is launched from
     unread: set = field(default_factory=set)  # lost leases whose log could not be read, said once each
     clock: Callable[[], float] = time.time
     pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(max_workers=8))
@@ -287,12 +312,30 @@ class Executor:
                 self.log.write("result", action=kind, label=action.label, ok=False,
                                said="no identity read for it yet: join waits")  # fmt: skip
                 return
+            site = self.sites.get(action.site)
+            if site is not None and not self.launch_worker(action, site):
+                return
             self.ledger.join(action.label, site=action.site, job_ids=tuple(action.job_ids),
                              job_end_at=action.job_end_at, fingerprint=found[0],
                              environment=environment_digest(found[1]),
                              kill_wait_s=action.kill_wait_s)  # fmt: skip
             self.log.write("queue_wait", site=action.site, member=action.member, queue_wait_s=action.queue_wait_s)
         self.log.write("result", action=kind, label=action.label, ok=True)
+
+    def launch_worker(self, action: Any, site: SiteConfig) -> bool:
+        """The joining federation's worker, started on its site before the join, so no lease goes to a federation with
+        none; False (the join waits, and is decided again next tick) when the launch fails. Nothing when the site has
+        no channel or the controller no shard settings."""
+        for argv in render(action, site, self.evidence, self.ledger_path, settings=self.settings).site_steps:
+            try:
+                code, out, err = self.transport.run(site, list(argv), LAUNCH_TIMEOUT_S)
+            except (OSError, subprocess.SubprocessError) as error:
+                code, out, err = 1, "", f"it could not be run ({type(error).__name__})"
+            self.log.write("result", action="Worker", label=action.label, argv=list(argv), code=code, ok=code == 0,
+                           said=last_line(err or out))  # fmt: skip
+            if code != 0:
+                return False
+        return True
 
     def retire_refused(self, action: Any) -> Optional[str]:
         """Why a retirement must not start now, as the ledger shows it at this moment; None when it may."""

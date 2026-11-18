@@ -24,9 +24,16 @@ controller"). `expcore.campaign.elastic.control` decides; this reads the sites, 
 Each tick also prints one status line and logs it: what the ledger wants, its money (`status()`: what is left, and the
 dollars locked in unsettled leases), and each relay found gone.
 
-The controller only adds to a fleet that exists: `fleet.py --fleet F --layout L up N` makes it (at least two). The
-sites file (`--sites`, TOML) holds a `[controller]` table (`evidence`, the absolute directory each retired member's
-root evidence is collected into; `interval_s`; `log`, the JSON log's absolute path) and one `[[site]]` table per site:
+The controller only adds to a fleet that exists: `fleet.py --fleet F --layout L up N` makes it (at least two). With
+`archives` in `[controller]` (the absolute directory the dispatcher keeps the archives it pulls in) and a `channel` in
+every site (that site's channel root on its shared file system), this process also runs the elastic dispatcher
+(`expcore.campaign.elastic.dispatch`) every 30 s on the ledger it holds (the ledger's lock admits one holder), each
+site through its local transport; `settings` names the shard settings (the fleet's `plan --manifest` file, with
+`home_files` when the lease runs need the operator's key files): each joined federation's worker is launched
+(`fleetworker.py launch`) from it, and the identity a federation joins with and a dead store's spend are read with its
+study. The sites file (`--sites`, TOML) holds a `[controller]` table (`evidence`, the
+absolute directory each retired member's root evidence is collected into; `interval_s`; `log`, the JSON log's absolute
+path) and one `[[site]]` table per site:
 its `label` (an operator's label, `[a-z0-9-]`, never a site's name), `fleet` (its fleet's absolute directory),
 `transport` (`local` only: the commands run on this host, the site's login node; a remote site is step 6's),
 optionally `interpreter` and `deploy` (the Python and this directory on its login node), and the settings of
@@ -37,6 +44,7 @@ optionally `interpreter` and `deploy` (the Python and this directory on its logi
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -55,6 +63,7 @@ from fleetexecute import (  # noqa: E402
     LocalTransport,
     Log,
     SiteConfig,
+    dead_store_reader,
     described,
     drain_refused,
     last_line,
@@ -63,8 +72,9 @@ from fleetexecute import (  # noqa: E402
 )
 
 COMMANDS = ("observe", "control", "drain", "ended", "join", "settle")
-CONTROLLER_KEYS = ("evidence", "interval_s", "log")
-SITE_KEYS = ("fleet", "transport", "interpreter", "deploy")
+CONTROLLER_KEYS = ("evidence", "interval_s", "log", "archives", "settings")
+SITE_KEYS = ("fleet", "transport", "interpreter", "deploy", "channel")
+DISPATCH_S = 30.0  # `elastic.dispatch.TICK_S`: with a dispatcher the loop goes round this often
 TRANSPORTS = ("local",)
 OBSERVE_TIMEOUT_S = 600.0
 
@@ -78,6 +88,8 @@ class Controller:
     evidence: Path
     interval_s: float = 60.0
     log: Optional[Path] = None
+    archives: Optional[Path] = None  # where the dispatcher keeps the archives it pulls: set, it runs in this loop
+    settings: Optional[Path] = None  # the shard settings (`fleetplan.read_settings`): the study, python and home_files
 
 
 @dataclass
@@ -88,9 +100,12 @@ class Hooks:
     transport: Callable[[Mapping[str, str]], Any] = LocalTransport
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
-    identity: Callable[[str, str], Optional[Tuple[str, Mapping[str, str]]]] = lambda site, member: None
-    spend: Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]] = lambda site, action: None
+    # None: read from the sites file's `settings` (`fleetidentity`), or nothing when it names none
+    identity: Optional[Callable[[str, str], Optional[Tuple[str, Mapping[str, str]]]]] = None
+    spend: Optional[Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]]] = None
     say: Callable[[str], None] = field(default=print)
+    # the dispatcher's transport, given each site's directory for its calls (`LocalTransport` by default)
+    dispatch: Optional[Callable[[Mapping[str, str]], Any]] = None
 
 
 def _absolute(value: Any, what: str) -> Path:
@@ -126,7 +141,11 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not 1 <= interval <= 3600:
         raise ConfigError("[controller] interval_s must be from 1 to 3600 seconds")
     log = _absolute(table["log"], "[controller] log") if "log" in table else None
-    controller = Controller(_absolute(table["evidence"], "[controller] evidence"), float(interval), log)
+    archives = _absolute(table["archives"], "[controller] archives") if "archives" in table else None
+    manifest = _absolute(table["settings"], "[controller] settings") if "settings" in table else None
+    controller = Controller(
+        _absolute(table["evidence"], "[controller] evidence"), float(interval), log, archives, manifest
+    )
     sites = []
     for entry in data.get("site") or []:
         own = {key: entry.pop(key) for key in SITE_KEYS if key in entry}
@@ -140,10 +159,15 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
             raise ConfigError(f"site {entry.get('label')}: {error}") from None
         fleet = _absolute(own.get("fleet"), f"site {settings.label}: fleet")
         deploy = _absolute(own["deploy"], f"site {settings.label}: deploy") if "deploy" in own else HERE
+        channel = _absolute(own["channel"], f"site {settings.label}: channel") if "channel" in own else None
         sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), own.get("interpreter", sys.executable),
-                                deploy))  # fmt: skip
+                                deploy, channel))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
         raise ConfigError("the sites file needs at least one [[site]], each label once")
+    channels = [s.channel is not None for s in sites]
+    if (archives is None and any(channels)) or (archives is not None and not all(channels)):
+        raise ConfigError("[controller] archives and every site's channel go together: the dispatcher serves each "
+                          "site's channel and keeps the archives it pulls")  # fmt: skip
     if len({fleet_identity(s.fleet) for s in sites}) != len(sites):
         raise ConfigError("two sites name one fleet directory: each fleet is one site's, read and acted on once")
     return controller, sites
@@ -187,7 +211,8 @@ def tick(views: Any, ledger_path: Path, controller: Controller, sites: Sequence[
     reads = [(site.settings, observe_site(transport, site, observed.get(site.label))) for site in sites]
     view = ledger_view(views)
     decision = decide(hooks.clock(), view, reads, busy)
-    entries = [described(a, render(a, by_label[a.site], controller.evidence, ledger_path)) for a in decision.actions]
+    entries = [described(a, render(a, by_label[a.site], controller.evidence, ledger_path, settings=controller.settings))
+               for a in decision.actions]  # fmt: skip
     money = dict(view.money)
     log.write("tick", dry_run=executor is None, wanted=decision.wanted, targets=decision.targets,
               waits=decision.waits, relays=decision.relays, money=money, actions=entries)  # fmt: skip
@@ -211,6 +236,60 @@ def status_line(decision: Any, money: Mapping[str, Any]) -> str:
     return (f"fleetcontrol: {decision.wanted} lease(s) wanted; remaining {usd(money['remaining_micro'])}; locked in "
             f"unsettled leases {usd(money['locked_micro'])}" + (f" ({locked})" if locked else "")
             + f"; {len(decision.actions)} action(s); {gone} relay(s) gone")  # fmt: skip
+
+
+def hooks_read(controller: Controller, sites: Sequence[SiteConfig], hooks: Hooks) -> Tuple[Any, Any]:
+    """What a federation joins with and what a lost lease spent: the hooks' own (the tests'), else read from the sites
+    file's `settings` (`fleetidentity.identity_reader` and `dead_store_reader` over `fleetidentity.locator`, with the
+    settings' study), else nothing is read: a join waits and a lost lease stays charged its grant."""
+    identity, spend = hooks.identity, hooks.spend
+    if controller.settings is not None and (identity is None or spend is None):
+        import fleetidentity
+        import fleetplan
+
+        try:
+            study = fleetplan.read_settings(controller.settings)["study"]
+            from expcore.study.config import load_study
+
+            loaded = load_study(study)
+        except (OSError, ValueError, RuntimeError, KeyError, ImportError) as error:
+            raise ConfigError(f"the study of the shard settings cannot be loaded ({type(error).__name__})") from None
+        identity = identity or fleetidentity.identity_reader(controller.settings, {s.label: s for s in sites})
+        spend = spend or dead_store_reader(fleetidentity.locator(controller.evidence), loaded)
+    return identity or (lambda site, member: None), spend or (lambda site, action: None)
+
+
+def dispatcher_of(ledger: Any, controller: Controller, sites: Sequence[SiteConfig], hooks: Hooks) -> Any:
+    """The dispatcher over the ledger this process holds (the ledger's lock admits one holder, so it ticks in this
+    loop), for each site's channel root; None when the sites file names no archives directory. A site is read through
+    its local transport: its login node is this host (ssh is another site's)."""
+    if controller.archives is None:
+        return None
+    from expcore.campaign.elastic.dispatch import Dispatcher
+    from expcore.campaign.elastic.transport import LocalTransport, Site
+
+    named = [Site(s.label, str(s.channel), (), (s.python, "-I", "-B")) for s in sites]
+    cwds = {s.label: str(s.fleet) for s in sites}
+    transport = hooks.dispatch(cwds) if hooks.dispatch is not None else LocalTransport(cwds)
+    return Dispatcher(ledger, named, transport, controller.archives)
+
+
+def dispatch_tick(dispatcher: Any, log: Log) -> None:
+    """One dispatcher tick, logged when it did anything or read nothing; a failure of the site or the ledger is logged
+    and the loop goes on (the next tick reads again)."""
+    from expcore.campaign.elastic import LedgerError
+
+    try:
+        done = dispatcher.tick()
+    except (OSError, LedgerError, ValueError, sqlite3.Error) as error:
+        log.write("dispatch", ok=False, said=f"{type(error).__name__}: {last_line(str(error))}")
+        return
+    seen = {name: {key: value for key, value in vars(t).items() if value} for name, t in done.items()}
+    busy = {
+        name: found for name, found in seen.items() if set(found) != {"read"}
+    }  # a site read with nothing to do: quiet
+    if busy:
+        log.write("dispatch", ok=True, sites=busy)
 
 
 def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) -> int:
@@ -239,15 +318,24 @@ def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
             if args.once:
                 return 0
             hooks.sleep(controller.interval_s)
+    identity, spend = hooks_read(controller, sites, hooks)
     ledger = Ledger.open(args.ledger, clock=hooks.clock)
     executor = Executor(ledger, args.ledger, {s.label: s for s in sites}, transport, controller.evidence, log,
-                        hooks.identity, hooks.spend, clock=hooks.clock)  # fmt: skip
+                        identity, spend, settings=controller.settings, clock=hooks.clock)  # fmt: skip
+    dispatcher = dispatcher_of(ledger, controller, sites, hooks)
+    # with a dispatcher the loop goes round every DISPATCH_S, and the controller decides every interval_s of them
+    pause = controller.interval_s if dispatcher is None else min(DISPATCH_S, controller.interval_s)
+    decide_at = hooks.clock()
     try:
         while True:
-            tick(ledger, args.ledger, controller, sites, observed, transport, executor, log, hooks)
+            if dispatcher is not None:
+                dispatch_tick(dispatcher, log)
+            if hooks.clock() >= decide_at:
+                tick(ledger, args.ledger, controller, sites, observed, transport, executor, log, hooks)
+                decide_at = hooks.clock() + controller.interval_s
             if args.once:
                 return 0
-            hooks.sleep(controller.interval_s)
+            hooks.sleep(pause)
     finally:
         executor.wait()
         executor.pool.shutdown(wait=True)

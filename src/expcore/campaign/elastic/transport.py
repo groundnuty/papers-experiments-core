@@ -7,6 +7,9 @@ of the format for that site is `Unreachable`, never a partial reading. `fetch` c
 file; ssh's own failures (exit 255, a timeout) are `Unreachable`, and a remote file that cannot be read is `Missing`.
 Paths and the verb are passed as one shell-quoted command, the only form ssh carries.
 
+`LocalTransport` runs the same two calls on this host, for a site whose login node is the dispatcher's own (step 6):
+the verb as a child process and the archive as a copy, with the failures the same two classes.
+
 Live-unproven: the site's ssh options (a control master, `BatchMode`, the login alias) are step 6's; these calls were
 run against a fake ssh only.
 """
@@ -16,7 +19,7 @@ import json
 import os
 import shlex
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -107,4 +110,21 @@ class SshTransport:
             raise Missing(f"site {site.name}: the archive could not be read there (exit {done.returncode})")
 
 
-__all__ = ["Missing", "Site", "SshTransport", "Unreachable"]
+class LocalTransport(SshTransport):
+    """The same calls run here, not over ssh (`site.python`, the verb's interpreter, is this host's): a site whose login
+    node is where the dispatcher runs. A call runs from the directory the site names in `cwds` (its fleet's own 0700
+    directory), never from the dispatcher's."""
+
+    def __init__(self, cwds: Mapping[str, str] | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._cwds = dict(cwds or {})
+
+    def _call(self, site: Site, remote: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        cwd = self._cwds.get(site.name)
+        try:
+            return self._run(list(remote), check=False, **({"cwd": cwd} if cwd else {}), **kwargs)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Unreachable(f"site {site.name}: {type(error).__name__}") from None
+
+
+__all__ = ["LocalTransport", "Missing", "Site", "SshTransport", "Unreachable"]

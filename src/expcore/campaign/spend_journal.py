@@ -9,8 +9,9 @@ every change of what was spent, once the store has committed it and before the s
 
 - `attempt`: an attempt's row as it stands once it began, once it took a top-up and once it ended: its id, run key,
   model, the dispatcher's pid, when it began, its state, the bound it was reserved at (`reserved_capped`, C27), its
-  counts, its top-ups, and how many `call` lines of it the journal holds so far (`calls_sent`, `calls_closed`; None
-  for an attempt that keeps no call log), which the reader checks the call lines against;
+  counts, its top-ups, whether its end was charged an attempt (`charged`, optional: a journal written before it has
+  none) and how many `call` lines of it the journal holds so far (`calls_sent`, `calls_closed`; None for an attempt
+  that keeps no call log), which the reader checks the call lines against;
 - `call` (C05, `campaign.interrupted_spend`): one line per request an attempt sends, before it goes out
   (`phase` `sent`), and one per reply that closes a request (`phase` `closed`, its `entry`: the reply's counts
   `[input, output, cache writes, cache reads]`, or null for a reply billed and not read), each with the attempt's `id`
@@ -137,8 +138,14 @@ class SpendJournal:
 def attempt_entry(row: Mapping[str, Any]) -> dict[str, Any]:
     """The `attempt` line of an attempt's row as the store holds it (the model joined from its run), with the closed
     requests of its call log in place of the log (`calls_closed`; None without a log or with one that cannot be
-    read, which no call line then matches)."""
-    return {"kind": ATTEMPT, **{name: row[name] for name in ROW_FIELDS}, "calls_closed": _closed(row["calls_usage"])}
+    read, which no call line then matches) and whether its end was charged an attempt (`charged`: 0 until it ends; an
+    optional field, absent from a journal written before it, whose reader then falls back to the state alone)."""
+    return {
+        "kind": ATTEMPT,
+        **{name: row[name] for name in ROW_FIELDS},
+        "calls_closed": _closed(row["calls_usage"]),
+        "charged": int(row["charged"]),
+    }
 
 
 def _closed(usage: Any) -> int | None:
