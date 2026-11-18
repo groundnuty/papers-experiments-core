@@ -6,7 +6,9 @@
                            tick START (field 22 of /proc/PID/stat); exit 0 if sent, 1 if PID is gone or is another
                            process
   check                    exit 0 if pidfd_open and pidfd_send_signal work here (Linux 5.3 and 5.1): through os and
-                           signal where this Python has them, else the raw system calls through ctypes
+                           signal where this Python has them, else the raw system calls through ctypes; or if
+                           pidfd_open answers ENOSYS (Linux before 5.3), the start-tick fallback below. It prints the
+                           mode it will use: `mode: pidfd` or `mode: start-tick fallback ...`
 
 Why (live run 4): run_service used to exec apptainer, which execs the setuid-root starter under the same PID. On a node
 with hidepid=invisible that process is hidden from its own user: /proc/<pid> is absent while kill -0 succeeds. The
@@ -34,14 +36,47 @@ library, on a node whose kernel has both) makes the system calls itself: `pidfd_
 424 in Linux's generic table, which every architecture shares for calls this new, through the C library's `syscall`
 (ctypes), as the platform layer's node code does (`expcore_onedata.sandbox.apptainer.node`). A failing call raises
 OSError with its errno, so ESRCH is ProcessLookupError and EPERM PermissionError, as from `os` and `signal`.
+
+A kernel without pidfd_open (Linux before 5.3: an EL8 4.18 kernel answers ENOSYS, errno 38, to pidfd_open and has
+pidfd_send_signal) has no descriptor to hold a process by. Only when pidfd_open answers ENOSYS, never for another
+refusal (EPERM from a filter, EMFILE, ...), which stays an error as it always was, `check`, `run` and `signal` use the
+start-tick fallback, which follows `expcore_onedata.fault_relay._kill_if_started`. On a kernel that has pidfd_open the
+code above runs as before and the fallback is never entered. It is chosen by who is signalled:
+
+- `signal PID START SIG` signals the process lib.sh and teardown.sh recorded: supervise.py itself, our uid, not setuid,
+  so /proc shows it. The fallback reads PID's real and effective uid from /proc/PID/status and signals only if both are
+  this process's own uid (another user's process is refused, and kill(2) would refuse it anyway), then reads the start
+  tick (field 22 of /proc/PID/stat) last and signals with os.kill at once, only if it is START; after the signal it
+  reads the tick again and says on stderr if it changed. A process gone, or one whose uid or tick cannot be read or is
+  not as recorded, is not signalled (exit 1).
+- `run` signals its own child. Its identity is that it is this process's unreaped child, which the kernel guarantees:
+  a PID is free to be reused only once its parent has waited for it. Before every os.kill, os.waitid(P_PID, pid, WEXITED
+  | WNOHANG | WNOWAIT) asks the kernel whether the pid is still such a child (it does not reap): ChildProcessError says
+  it was reaped, and nothing is sent. The signal handler and the wait run in this process's one main thread, so nothing
+  reaps the child between that question and the kill. Neither /proc nor a start tick is consulted: under hidepid the
+  setuid starter is absent from /proc (live run 4), and where /proc shows it the entry is owned by its effective user,
+  root, so a tick-and-uid gate would never forward a stop and the container would outlive its supervisor.
+
+What remains of the PID-reuse window is `signal`'s: between the last read of the start tick and the kill (two system
+calls) the process could end and another process of the same uid be given its PID, which the kill would then reach.
+That needs the whole PID space to cycle inside that gap, and the start tick and the uid make it negligible, but it is
+not the pidfd's guarantee, which holds the process itself across the checks. `run` has no such window. The stop that
+`signal` starts is followed by lib.sh's own re-checks of the recorded process (running_ours: same PID, same start tick).
 """
 
+import errno
 import os
 import signal
 import sys
 
 SIGNALS = {"TERM": signal.SIGTERM, "USR1": signal.SIGUSR1, "KILL": signal.SIGKILL}
 SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434  # Linux's generic syscall table (x86_64 and aarch64 alike)
+PIDFD, FALLBACK = "pidfd", "fallback"
+MODE_LINES = {
+    PIDFD: "mode: pidfd",
+    FALLBACK: "mode: start-tick fallback (pidfd_open answers ENOSYS here, Linux before 5.3)",
+}
+FALLBACK_NOTE = "pidfd_open answers ENOSYS here (Linux before 5.3): the start-tick fallback"
 
 
 def say(msg):
@@ -78,16 +113,37 @@ def pidfd_send_signal(fd, sig):
     _syscall(SYS_PIDFD_SEND_SIGNAL, fd, int(sig), 0, 0)
 
 
-def check():
+def pidfd_mode():
+    """PIDFD where pidfd_open and pidfd_send_signal work here; FALLBACK where pidfd_open answers ENOSYS (the one failure
+    the start-tick fallback covers). Any other failure is raised, as `check` always reported it."""
     try:
         fd = pidfd_open(os.getpid())
-        try:
-            pidfd_send_signal(fd, 0)
-        finally:
-            os.close(fd)
+    except OSError as e:
+        if e.errno == errno.ENOSYS:  # the kernel has no such system call: no descriptor to hold a process by
+            return FALLBACK
+        raise
+    try:
+        pidfd_send_signal(fd, 0)
+    finally:
+        os.close(fd)
+    return PIDFD
+
+
+def usable_mode():
+    """The mode this kernel allows, or None after saying why neither does."""
+    try:
+        return pidfd_mode()
     except (OSError, ImportError, AttributeError) as e:  # ImportError: a Python without ctypes, and no pidfd calls
         say("pidfd_open or pidfd_send_signal failed here: %s (Linux 5.3 or later is needed)" % e)
+        return None
+
+
+def check():
+    mode = usable_mode()
+    if mode is None:
         return 2
+    print(MODE_LINES[mode])
+    sys.stdout.flush()
     return 0
 
 
@@ -158,15 +214,101 @@ def run(cmd):
     return 128 - code if code < 0 else code
 
 
+def uids(pid):
+    """(real, effective) user id of PID from /proc/PID/status, or None if it cannot be read."""
+    try:
+        with open("/proc/%d/status" % pid, "rb") as f:
+            lines = f.read().decode("ascii", "replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith("Uid:"):
+            fields = line.split()[1:3]
+            return (int(fields[0]), int(fields[1])) if len(fields) == 2 and all(x.isdigit() for x in fields) else None
+    return None
+
+
+def signal_by_tick(pid, start, sig):
+    """signal_recorded where pidfd_open answers ENOSYS: the same exit codes. PID's uids first, then its start tick,
+    last, then os.kill at once, then the tick again (the module's docstring states the window that leaves)."""
+    if pid <= 1:  # init, or no process of ours
+        return 1
+    mine = os.getuid()
+    if uids(pid) != (mine, mine):  # another user's process, or none we may read: not ours to signal
+        return 1
+    if start_time(pid) != start:  # another process holds PID now (or none we may read): not ours to signal
+        return 1
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        return 1
+    after = start_time(pid)
+    if after is not None and after != start:
+        say("pid %d now shows start tick %s, not %s: it may have been taken over" % (pid, after, start))
+    return 0
+
+
+def kill_child(pid, sig):
+    """os.kill(pid, sig) only while PID is still this process's own child that nobody has waited for (the kernel's word:
+    os.waitid with WNOWAIT, which does not reap; ChildProcessError once it was reaped, or if PID never was our child),
+    so a PID given to another process after the child's end is never signalled. Return whether it was sent."""
+    try:
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        return False
+    os.kill(pid, sig)
+    return True
+
+
+def run_by_tick(cmd):
+    """run() where pidfd_open answers ENOSYS: the same start, the same forwarding (SIGTERM as it is, SIGUSR1 as
+    SIGKILL), the same wait and exit status, the child signalled with kill_child instead of through a pidfd. run()
+    itself is not touched, so a kernel with pidfd_open runs exactly the code it ran before."""
+    state = {"pid": None}
+    pending = []
+
+    def deliver(sig):
+        if kill_child(state["pid"], sig):
+            say("%s sent to the container's starter (pid %d)" % (signal.Signals(sig).name, state["pid"]))
+
+    def on_signal(signum, _frame):
+        sig = signal.SIGKILL if signum == signal.SIGUSR1 else signum
+        if state["pid"] is None:
+            pending.append(sig)
+        else:
+            deliver(sig)
+
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)  # an ignored SIGCHLD would reap the child without our wait
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGUSR1, on_signal)
+    if pending:  # stopped before the container started: do not start it
+        return 128 + pending[0]
+    pid = os.posix_spawnp(cmd[0], cmd, os.environ)
+    state["pid"] = pid  # from here a stop is forwarded at once; one that came before it is forwarded now
+    for sig in pending:
+        deliver(sig)
+    _, status = os.waitpid(pid, 0)  # reaps it; a signal arriving meanwhile is forwarded, then the wait resumes
+    code = os.waitstatus_to_exitcode(status)
+    return 128 - code if code < 0 else code
+
+
 def main(argv):
     if len(argv) >= 3 and argv[0] == "run" and argv[1] == "--":
-        if check() != 0:
+        mode = usable_mode()
+        if mode is None:
             return 2
+        if mode == FALLBACK:
+            say(FALLBACK_NOTE)  # into run.log, which the run keeps
+            return run_by_tick(argv[2:])
         return run(argv[2:])
     if len(argv) == 4 and argv[0] == "signal" and argv[1].isdigit() and argv[2].isdigit() and argv[3] in SIGNALS:
-        if check() != 0:
+        mode = usable_mode()
+        if mode is None:
             say("no pidfd support here: not signalling")
             return 2
+        if mode == FALLBACK:
+            say(FALLBACK_NOTE)
+            return signal_by_tick(int(argv[1]), argv[2], SIGNALS[argv[3]])
         return signal_recorded(int(argv[1]), argv[2], SIGNALS[argv[3]])
     if argv == ["check"]:
         return check()

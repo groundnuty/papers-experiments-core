@@ -40,7 +40,7 @@ kv unprivileged_port_start "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)
 kv proc_hidepid "$(findmnt -n -o OPTIONS --mountpoint /proc | tail -n 1 | tr ',' '\n' | grep -E '^(hidepid|gid)=' | tr '\n' ' ' || echo none)"
 kv apptainer "$(apptainer --version 2>&1)"
 kv python311 "$("$HPCOP_PY" -I -B --version 2>&1)"
-kv pidfd "$("$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" check 2>&1 && echo ok)"   # the service's stop needs it
+kv pidfd "$("$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" check 2>&1 | paste -sd ' ' -)"   # the mode the service's stop will use: pidfd, or the start-tick fallback
 # Live run 4: a node with IPv6 disabled has no ::1; the shim then keeps memcached and moxi on 127.0.0.1 only.
 kv ipv6_loopback "$("$HPCOP_PY" -I -B -c 'import socket
 try:

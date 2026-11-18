@@ -803,7 +803,10 @@ section 3).
   never in the account's home: every Python the driver and `shards.py` launch takes `-I -B` and writes no bytecode,
   but the home is every job's and agent's of the account (live slot 5 found a node step's `.pyc` there). The bundle is this checkout's own, which must lie on a
   filesystem the nodes see. The first `python3.11` on `HPC_STEP_PATH` must be the node's own, not a uv-installed one:
-  the bundle's `supervise.py` needs `os.pidfd_open`.
+  the bundle's `supervise.py` needs `os.pidfd_open`. A node whose kernel has no `pidfd_open` call (before Linux 5.3: it answers
+  ENOSYS) is supported by a start-tick fallback, which `supervise.py check` names (`mode: start-tick fallback`; the probe's
+  `pidfd` line records it) and whose one remaining window, between the last read of a process's start tick and the signal
+  sent to it, the docstring of `supervise.py` states.
 
 **What has not run, and what the first live slot checks first:** that the login node reaches the services' 8443 (or,
 with `[hpc] core = "step"`, that the core's Python from a venv on the shared filesystem runs on a node); the two
