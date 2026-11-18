@@ -82,15 +82,26 @@ reported offline by label and whether the space was read completely; per run, th
 took down. `reading` holds the calling thread's latest call's and the try's note holds the same as JSON; the text is
 unchanged, and `healthreading.target_only` tells a study whether an outage was the run's own.
 
+**The run's own held target's pairs are left out of the link check it makes (O90).** The executor's own check, under
+the judged attempt's admission, can be due for a link check while the run's injection holds the target's service
+stopped and Onezone still reports the target online: the target's pairs would fail and the gate would raise the
+federation's link epoch inside the run's own measured window. When the fault gate explained the target as held by that
+injection (`fault_owner.explained`) and this call's reading says it is held, that check neither checks nor counts any
+pair that touches it, as reader or as source. Every other pair is checked and counted as ever: a failure among them
+fails the call and raises the epoch. With no pair left the check is not made and the reading says so
+(`healthreading.LINKS_SKIPPED`). Such a check answers its own call only: it replaces no shared report, writes no
+federation record, and the next call outside the injection checks every pair again, the left-out ones included.
+
 **While `[tls] insecure_tls` is on, every reading warns** that no client of the federation checks its certificate, a
 setting for disposable test federations only (`tls.py`). The warning is appended to the detail, so the campaign's
 health record and day-0's report carry it; it does not change the verdict.
 """
 
+import dataclasses
 import re
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from pathlib import Path
 
 from expcore.campaign import prerun
@@ -101,15 +112,16 @@ from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import InjectionJournal
+from expcore_onedata.fault_owner import explained
 from expcore_onedata.fault_recovery import FaultDriver
 from expcore_onedata.fault_serves import provider_serves, recorded
 from expcore_onedata.fault_settings import FaultSettings, compose_driver, hpc_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, parse_scope
-from expcore_onedata.healthreading import READING_NOTE, UNREAD, HealthReading, make_reading, match
+from expcore_onedata.healthreading import LINKS_SKIPPED, READING_NOTE, UNREAD, HealthReading, make_reading, match
 from expcore_onedata.ingesthealth import baseline_health
 from expcore_onedata.linkcheck import LinkReport, check_links
 from expcore_onedata.linkrecord import LINK_RECORD_NOTE, fact, record_path
-from expcore_onedata.linksettings import LinkCheckSettings
+from expcore_onedata.linksettings import LinkCheckSettings, link_pairs
 from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
 from expcore_onedata.tls import WARNING
 from expcore_onedata.tokencheck import TokenRefused
@@ -298,17 +310,54 @@ class PlatformHealth:
         self._content_type = measure_content_type(self._config, self._client)
         return self._content_type.health
 
-    def _check_links(self) -> None:
-        def check() -> LinkReport:
-            return check_links(self._config, self._client, clock=self._monotonic, sleep=self._sleep, now=self._clock)
+    def _check_links(self, left_out: Collection[str] = ()) -> LinkReport:
+        """Make a link check of every pair, or, with `left_out` (provider names), of every pair that touches none of
+        them. The first is the campaign's: it replaces the shared report and is the one this thread's call hands the gate.
+        The second is the run's own held target's (`_left_out`) and answers this call alone: it replaces no shared
+        report, writes no record of the federation (it is no all-pairs check), and the gate sees it only when it
+        failed, which it counts as ever (the link epoch); a pass of some pairs lifts nothing there."""
 
+        def check() -> LinkReport:
+            return check_links(
+                self._config, self._client, clock=self._monotonic, sleep=self._sleep, now=self._clock, without=left_out
+            )
+
+        if left_out:
+            report = check()
+            if not report.ok:
+                self._made.report = report
+            return report
         # with `[faults]`, the routine check writes the federation's record as the restore's and the heal's do (O35)
-        self._links = check() if self._record is None else recorded(self._record, check)
+        report = self._links = check() if self._record is None else recorded(self._record, check)
         self._links_at = self._monotonic()
-        self._links_passed = self._links_passed or self._links.ok
-        self._made.report = self._links  # this thread's own: another thread's call never takes it
-        if self._links.not_written is not None:  # the run whose check this was learns its record was not written
-            prerun.note(LINK_RECORD_NOTE, fact(self._links.not_written))
+        self._links_passed = self._links_passed or report.ok
+        self._made.report = report  # this thread's own: another thread's call never takes it
+        if report.not_written is not None:  # the run whose check this was learns its record was not written
+            prerun.note(LINK_RECORD_NOTE, fact(report.not_written))
+        return report
+
+    def _left_out(self) -> tuple[frozenset[str], bool]:
+        """The providers whose pairs this call's link check leaves out, and whether that leaves no pair at all: the
+        targets the fault gate explained as held by the run's own injection (`fault_owner.explained`) that this call's
+        reading also says are held, by name, when a pair touches one of them. Nothing is left out otherwise (a check
+        outside an own injection, an injection nobody explained, a held provider no pair touches), which is every
+        check as it was."""
+        reading = self.reading
+        if reading is None or not reading.held:
+            return frozenset(), False
+        labels = explained() & reading.held
+        names = frozenset(name for name in self._config.providers if self._config.provider_label(name) in labels)
+        order = list(self._config.providers)
+        pairs, left = link_pairs(self._config.spaces, order), link_pairs(self._config.spaces, order, names)
+        if len(left) == len(pairs):
+            return frozenset(), False
+        return names, not left
+
+    def _skip_links(self) -> None:
+        """Say in this call's reading that its link check was not made (`healthreading.LINKS_SKIPPED`)."""
+        reading = self.reading
+        if reading is not None:
+            self._publish(dataclasses.replace(reading, links_skipped=LINKS_SKIPPED))
 
     def _take_links(self) -> LinkReport | None:
         """The link report this thread's calls made since it last took one, None when they made none (for the fault
@@ -334,19 +383,27 @@ class PlatformHealth:
             return verdict
         settings = self._config.link_check
         every_s = settings.every_s if settings is not None else LinkCheckSettings.every_s
+        own: LinkReport | None = None  # the check of the run's own held target's call: it answers this call alone
         if self._links_lock.acquire(blocking=self._links is None):
             try:
                 last, asked = self._links, self._expiries
                 stale = asked > self._fresh_for or self._monotonic() - self._links_at >= every_s
                 if last is None or not last.ok or stale:
-                    self._check_links()
-                    self._fresh_for = max(self._fresh_for, asked)  # only once a check made after the expiry answered
+                    left_out, nothing_left = self._left_out()
+                    if nothing_left:  # no pair to check: the call answers on the last report, which it leaves as it is
+                        self._skip_links()
+                    elif left_out:
+                        own = self._check_links(left_out)
+                    else:
+                        self._check_links()
+                        # only once a check made after the expiry answered
+                        self._fresh_for = max(self._fresh_for, asked)
             finally:
                 self._links_lock.release()
         elif self._expiries > self._fresh_for:  # another call checks afresh after a heal: the last report is no answer
             detail = "the link check is being made afresh after a heal, so no run is admitted until it answers"
             return Health(False, detail, deferred=True, charge=False)
-        report = self._links
+        report = self._links if own is None else own
         if report is None:  # pragma: no cover - the first check is waited for, so a report is there
             return Health(False, "the link check has not answered yet, so no run is admitted")
         if report.ok:

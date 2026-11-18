@@ -33,6 +33,11 @@ platform with no `[faults]` has no injector, so the empty set. A journal that ca
 
 A reading is per call: `PlatformHealth` resets it at the start of every call, so a call that never reached the space
 (a deferral, a failed baseline, a content type that refused) leaves `UNREAD`, never the call before's reading.
+
+**`links_skipped`** says that the link check a call owed was not made because every provider pair touches a target the
+run's own injection holds down (`LINKS_SKIPPED`): the check leaves out the pairs of a held target, and with none left it
+has nothing to check. It is in the JSON only when set, so every other reading keeps the keys it always had, and it needs
+a held target.
 """
 
 import copy
@@ -59,6 +64,8 @@ FACT = "post_run_health"  # the key a reading has among a run's facts, owned by 
 NAMESPACE = "post_run_health"  # the namespace of `PostRunHealth`'s snapshot, `RunRecord.instruments[NAMESPACE]`
 _POSITION = re.compile(r"spaces\[(0|[1-9][0-9]*)\]")
 _ASKED = ("stopping", "injected", "stop_unknown")  # a journal line that says the stop of the target was asked for
+LINKS_SKIPPED = "every pair touches the run's own held target"  # why a call's link check was not made (`links_skipped`)
+_KEYS = {"spaces", "targets", "held"}
 log = logging.getLogger(__name__)
 
 
@@ -118,10 +125,13 @@ class HealthReading:
     spaces: tuple[SpaceReading, ...] = ()
     targets: frozenset[str] | None = None
     held: frozenset[str] = frozenset()  # of the targets, those whose injection is still open (held down by the run)
+    links_skipped: str | None = None  # `LINKS_SKIPPED` when the call's link check was not made, else None
 
     def __post_init__(self) -> None:
         if not self.held <= (self.targets or frozenset()):
             raise ValueError("a target held by the run's own injection is one of the run's targets")
+        if self.links_skipped is not None and (self.links_skipped != LINKS_SKIPPED or not self.held):
+            raise ValueError("a skipped link check has its one reason, and a held target to give it")
 
     @property
     def offline(self) -> frozenset[str]:
@@ -137,17 +147,21 @@ class HealthReading:
             ],
             "targets": None if self.targets is None else sorted(self.targets),
             "held": sorted(self.held),
+            **({} if self.links_skipped is None else {"links_skipped": self.links_skipped}),
         }
 
     @classmethod
     def from_json(cls, value: Any) -> "HealthReading | None":
         """The reading `to_json` made, or None for anything else: a malformed value is no reading, never a guess."""
-        if not isinstance(value, Mapping) or set(value) != {"spaces", "targets", "held"}:
+        if not isinstance(value, Mapping) or set(value) not in (_KEYS, {*_KEYS, "links_skipped"}):
             return None
         spaces, targets, held = value["spaces"], value["targets"], _labels(value["held"])
+        skipped = value.get("links_skipped")
         if not isinstance(spaces, list) or held is None or not (targets is None or _labels(targets) is not None):
             return None
         if not held <= (_labels(targets) if targets is not None else frozenset()):
+            return None
+        if "links_skipped" in value and (skipped != LINKS_SKIPPED or not held):
             return None
         parsed: list[SpaceReading] = []
         for item in spaces:
@@ -159,7 +173,7 @@ class HealthReading:
             if offline is None or (offline and not read):
                 return None
             parsed.append(SpaceReading(position, read, offline))
-        return cls(tuple(parsed), None if targets is None else _labels(targets), held)
+        return cls(tuple(parsed), None if targets is None else _labels(targets), held, skipped)
 
 
 def _labels(value: Any) -> frozenset[str] | None:
