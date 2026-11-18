@@ -67,13 +67,18 @@ class Ledger(LedgerViews):
             pinned = self._meta("config")
             if pinned is None:
                 raise ValueError(f"{path} holds no ledger configuration")
-            self.config = LedgerConfig.from_json(pinned)
+            self._config = LedgerConfig.from_json(pinned)
         except BaseException:
             self.close()
             raise
         self._fingerprint = self.config.fingerprint
         self._opened_at = clock()
         self._last_read: dict[str, float] = {}  # site -> when it was last read since this open; never persisted
+
+    @property
+    def config(self) -> LedgerConfig:
+        """The configuration pinned at creation; read-only."""
+        return self._config
 
     @classmethod
     def create(cls, path: Path, runs: list[LedgerRun], config: LedgerConfig, clock: Callable[[], float]) -> "Ledger":
@@ -284,6 +289,8 @@ class Ledger(LedgerViews):
             row = self._lease_row(lease_id)
             if row["state"] != "issued":
                 raise LedgerError(f"lease {lease_id} is {row['state']}: only an issued lease can be cancelled")
+            if row["counter"] is not None:
+                raise LedgerError(f"lease {lease_id} has a heartbeat: its file landed, so it cannot be cancelled")
             now = self._clock()
             self.db.execute(
                 "UPDATE leases SET state='cancelled', slot=0, charge_micro=0, ended_at=? WHERE id=?", (now, lease_id)

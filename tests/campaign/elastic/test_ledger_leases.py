@@ -228,4 +228,18 @@ def test_c42_the_pinned_configuration_cannot_be_changed_through_the_open_ledger(
     for name in ("caps", "per_model_usd", "grants_usd"):
         with pytest.raises(TypeError):
             getattr(ledger.config, name)["m1"] = 99
+    with pytest.raises(AttributeError):
+        ledger.config = dataclasses.replace(ledger.config, caps={"m1": 2})
     assert ledger.config.caps == {"m1": 1}
+
+
+def test_c42_a_lease_with_a_recorded_heartbeat_is_never_cancelled(tmp_path):
+    """C42: whatever its state says, a lease whose counter was ever read has a worker, so it cannot be cancelled."""
+    ledger, clock = make(tmp_path, max_usd=1.0, grants_usd={"m1": 1.0})
+    join(ledger, clock, "fed-1")
+    lease = leased(ledger, "fed-1")
+    ledger.observe_site(SITE, SiteReading(heartbeats={lease.lease_id: 1}))
+    ledger.db.execute("UPDATE leases SET state='issued' WHERE id=?", (lease.lease_id,))  # a row left issued
+    with pytest.raises(LedgerError, match="heartbeat"):
+        ledger.cancel(lease.lease_id)
+    assert ledger.committed_micro()[0] == 1_000_000
