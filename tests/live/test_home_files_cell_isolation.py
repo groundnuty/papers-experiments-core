@@ -1,6 +1,6 @@
 """O63, a real Apptainer cell: it cannot read the key files a shard step staged into its dispatcher's home, nor the
 operator's source tree, nor the dispatcher's /proc. Skipped unless `apptainer` is on the PATH and
-`EXPCORE_LIVE_APPTAINER_IMAGE` names an agent image (a SIF with a POSIX `sh`, `ls` and `cat`):
+`EXPCORE_LIVE_APPTAINER_IMAGE` names an agent image (a SIF with a POSIX `sh`, `ls` and `cat`: nothing else):
 
     EXPCORE_LIVE_APPTAINER_IMAGE=/path/to/agent.sif uv run pytest tests/live/test_home_files_cell_isolation.py
 
@@ -23,7 +23,7 @@ IMAGE = os.environ.get("EXPCORE_LIVE_APPTAINER_IMAGE")
 if shutil.which("apptainer") is None or not IMAGE:
     pytest.skip("apptainer or EXPCORE_LIVE_APPTAINER_IMAGE is missing: no real cell to run", allow_module_level=True)
 
-from expcore_onedata.sandbox.apptainer.argv import Bind, cell_command, exec_argv  # noqa: E402
+from expcore_onedata.sandbox.apptainer.argv import Bind, exec_argv  # noqa: E402
 
 SHARDS = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
 KEY = ".zqsecrets/alpha-zq/key-zq"
@@ -65,7 +65,7 @@ def test_o63_a_real_cell_cannot_list_or_read_the_copy_the_source_or_the_dispatch
                 f"ls '{tmp_path}'", f"ls /proc/{dispatcher}", f"cat /proc/{dispatcher}/environ",
                 f"ls -l /proc/{dispatcher}/cwd", f"cat /proc/{dispatcher}/mem"]  # fmt: skip
     script = "; ".join(f"{a} >/dev/null 2>&1; echo $?" for a in attempts)
-    argv = exec_argv(["apptainer"], Path(IMAGE), binds, {}, cell_command(60.0, ["sh", "-c", script]))
+    argv = exec_argv(["apptainer"], Path(IMAGE), binds, {}, ["sh", "-c", script])
     done = subprocess.run(argv, capture_output=True, text=True, timeout=180, check=False)
     assert done.returncode == 0, done.stderr
     codes = [int(line) for line in done.stdout.split()]
