@@ -51,7 +51,7 @@ def history(db: sqlite3.Connection) -> list[Ceiling]:
     ]
 
 
-def _text(name: str, value: Any) -> str:
+def text_of(name: str, value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must say who or why, a non-empty string, got {value!r}")
     return value.strip()
@@ -73,7 +73,7 @@ def raise_ceiling(
         raise ValueError(
             f"new_max_micro_usd must be a whole number of micro-dollars from 1 to {INT64_MAX}, got {new_micro!r}"
         )
-    reason, actor = _text("reason", reason), _text("actor", actor)
+    reason, actor = text_of("reason", reason), text_of("actor", actor)
     current = effective(db, config)
     if model is None:
         old, whose = current.max_micro, "the campaign's ceiling"
