@@ -33,10 +33,11 @@ GONE_POLLS = 3  # a step absent from squeue -s this many polls in a row has ende
 READBACK = ("JobName", "TimeLimit", "Requeue", "Account", "Partition", "NumNodes", "NumCPUs", "MinMemoryNode")
 WAITING_STATES = ("PENDING", "CONFIGURING", "REQUEUED", "RESIZING")
 # The wait for a held job takes a read of it that failed (the command timed out, or exited nonzero: what a slow or
-# restarting controller gives) for a missed poll. It gives up after this many reads in a row failed, sleeping the poll
-# interval after the first, twice it after the second and so on, but never longer than this many seconds.
-MISSED_POLLS_MAX = 10
-MISSED_POLL_BACKOFF_MAX_S = 300.0
+# restarting controller gives) for a missed poll. It gives up once every read has failed for this many seconds since
+# the first one of the streak, sleeping the poll interval after the first, twice it after the second and so on, but
+# never longer than the backoff cap, so that several reads fit in the time.
+MISSED_POLLS_GIVE_UP_S = 600.0
+MISSED_POLL_BACKOFF_MAX_S = 60.0
 JOB_LINE = re.compile(r"([0-9]{1,12})(?:;[A-Za-z0-9_.-]+)?")
 JOB_LISTED = re.compile(r"([0-9]{1,12})(?:\+[0-9]{1,6})?")  # squeue's %i: a job, or a component <leader>+<k>
 # A step as squeue -s lists it: of a job, or of a heterogeneous job's component (<leader>+<k>.<n>, or the
@@ -688,31 +689,36 @@ class Slurm:
         A read of the job that fails (`ReadFailed`: the command timed out or exited nonzero, as a slow or restarting
         controller makes it) is a missed poll, not the job's end: `say` hears of the first of a streak, the wait sleeps
         longer after each (the poll interval doubled, never past `MISSED_POLL_BACKOFF_MAX_S`) and reads again, and
-        an answer ends the streak. It fails only after `MISSED_POLLS_MAX` reads in a row failed, or at the bound with
-        a read that failed; it cancels nothing then, since nothing is known of the job: the caller's release reads it
-        first (`Driver.release_held`). A job Slurm no longer knows, one that ended, and an answer for another job
-        or with no offset end the wait as they always did."""
+        an answer ends the streak. It fails only once every read has failed for `MISSED_POLLS_GIVE_UP_S` since the
+        streak's first (never on one failure), or at the bound with a read that failed; it cancels nothing then,
+        since nothing is known of the job: the caller's release reads it first (`Driver.release_held`). A job Slurm
+        no longer knows, one that ended, and an answer for another job or with no offset end the wait as they always
+        did."""
         deadline = self.clock() + timeout_s
+        first_missed: Optional[float] = None  # when the streak of failed reads began, None while the reads answer
         missed = 0
         while True:
             try:
                 records = self.components(job) or []
             except ReadFailed as error:
-                missed += 1
-                if missed >= MISSED_POLLS_MAX:
-                    raise SlurmError(f"{error}; {missed} reads of the held job in a row failed") from None
-                if missed == 1 and say is not None:
-                    say(f"{error}: a missed poll of held job {job}; the wait goes on, and ends only after "
-                        f"{MISSED_POLLS_MAX} reads in a row fail")  # fmt: skip
                 now = self.clock()
+                first_missed = now if first_missed is None else first_missed
+                missed += 1
+                if now - first_missed >= MISSED_POLLS_GIVE_UP_S:
+                    raise SlurmError(
+                        f"{error}; {missed} reads of the held job in a row failed over {now - first_missed:.0f} s"
+                    ) from None
                 if now >= deadline:
                     raise SlurmError(
                         f"the held job did not start within {timeout_s:.0f} s, and the last read of it failed "
                         f"({error}){note}"
                     ) from None
-                self.sleep(min(self.poll_s * 2 ** (missed - 1), MISSED_POLL_BACKOFF_MAX_S, deadline - now))
+                if missed == 1 and say is not None:
+                    say(f"{error}: a missed poll of held job {job}; the wait goes on, and ends only if every read "
+                        f"fails for {MISSED_POLLS_GIVE_UP_S:.0f} s")  # fmt: skip
+                self.sleep(min(self.poll_s * 2 ** min(missed - 1, 16), MISSED_POLL_BACKOFF_MAX_S, deadline - now))
                 continue
-            missed = 0
+            first_missed, missed = None, 0
             self._ours(job, records, name)
             states = [record.get("JobState") for record in records]
             if states and all(state == "RUNNING" for state in states):

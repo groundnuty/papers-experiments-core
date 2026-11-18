@@ -222,8 +222,8 @@ its business, whatever it runs. It never reads or prints a node's name into a me
   nodes' names.
 - **A slow controller does not end the wait.** A read of the held job that fails while `up` waits (`scontrol` timing
   out, or exiting nonzero) is a missed poll: `up` says so once, sleeps the poll interval and then twice it (never
-  more than 300 s), and reads again. It gives up only after 10 reads in a row failed, or at the queue bound with a read
-  that failed, and then releases the held jobs as below. "Invalid job id" (the job is gone), a job that ended and a job
+  more than 60 s), and reads again. It gives up only once every read has failed for 10 minutes since the first one, or
+  at the queue bound with a read that failed, and then releases the held jobs as below. "Invalid job id" (the job is gone), a job that ended and a job
   of another name end the wait at once.
 - **A wait that fails releases every held job of that `up`.** Under `"separate"` the services' job and the agent's own are
   waited for in turn, and a job that does not start in time or ends before it ran is cancelled by its wait. `up` then
