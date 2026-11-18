@@ -799,6 +799,7 @@ def _check_merged_by_run(
     the study's plan and must be that document, each counted store ran under the environment in use, and the records
     of the counted leases are replayed as one batch. The evidence's records are not in the batch. The merge by run's
     modules are imported here, on its branch only, so today's forms load nothing of the elastic ledger (C42)."""
+    from expcore.campaign.lease_facts import record_leases
     from expcore.campaign.merge_by_run import require_records
     from expcore.campaign.merged_by_run import read_by_run, verify_by_run
 
@@ -823,7 +824,7 @@ def _check_merged_by_run(
         directory, code=code, hashed_only=[MARKER_PATTERN], environment=env, side_files=study.side_files
     )
     try:  # the records replayed are exactly the counted leases': no evidence's, none missing
-        require_records(counted, check["replayed"])
+        require_records(counted, record_leases(directory, check["replayed"]))
     except MergeRefused as error:
         raise Refused(str(error)) from None
     check[MERGE_KEY] = {"file": MERGE_FILE, "sha256": hashlib.sha256(raw).hexdigest(), "partial": partial}
@@ -1135,7 +1136,7 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
         parts[index] = timed_export(own, walls_of(snapshot), verified.record_for)  # the merged export's only (#154)
     joined = join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
     if verified.merge is not None and verified.merge.get("schema") == MERGE_BY_RUN_SCHEMA:
-        return by_run_export(joined, verified.shards)  # each run's lease, federation and site (C45)
+        return by_run_export(joined, verified.shards, verified.merge["spend"])  # each run's lease and placement (C45)
     return joined
 
 

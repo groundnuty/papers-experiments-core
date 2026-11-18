@@ -28,14 +28,14 @@ import json
 import os
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.elastic.ceilings import effective
 from expcore.campaign.elastic.config import LedgerConfig
-from expcore.campaign.elastic.records import Ceilings
+from expcore.campaign.elastic.records import HELD, Ceilings, Settlement
 from expcore.campaign.elastic.schema import SCHEMA
+from expcore.campaign.elastic.views import LedgerViews
 from expcore.campaign.storecopy import StoreChanged, store_copy
 
 LEDGER_SNAPSHOT = "ledger-snapshot.sqlite"
@@ -62,6 +62,7 @@ class LeaseRow:
     grant_micro: int
     charge_micro: int
     completion: Mapping[str, Any] | None
+    proven: bool = False  # its federation's job is proven ended
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,17 @@ class LedgerFacts:
     runs: Mapping[str, RunRow]
     leases: Mapping[int, LeaseRow]
     ceilings: Ceilings  # the ceilings in force: as pinned, or as raised since
+    settlements: Mapping[int, Settlement] = field(default_factory=dict)  # lost leases settled, by lease id
+    locked_micro: int = 0  # what unsettled leases hold as their grants (`elastic.records.Status.locked_micro`)
+
+    def unsettled(self, run_key: str) -> list[LeaseRow]:
+        """The run's leases still charged their grant with no settlement (in flight, expired, reported or lost): any
+        of them can still change what the run was charged, and so whether it is exhausted."""
+        return [
+            lease
+            for lease in self.leases.values()
+            if lease.run_key == run_key and lease.state in HELD and lease.lease_id not in self.settlements
+        ]
 
     def counted(self, run_key: str) -> int | None:
         """The run's counted lease: its latest when the run is terminal; None for a run that is not."""
@@ -138,14 +150,26 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
             runs = {row["run_key"]: _run_row(row) for row in db.execute("SELECT * FROM runs ORDER BY seq")}
             leases = {row["id"]: _lease_row(row) for row in db.execute("SELECT * FROM leases ORDER BY id")}
             events = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY seq")]
-            in_force = effective(db, config)
+            views = _Views(db, config)  # the ledger's own reads of its money and settlements, over the snapshot
+            in_force, settled, locked = views.ceilings(), views.settlements(), views.status().locked_micro
+            proven = {lease.lease_id for lease in views.leases() if lease.proven}
         except (sqlite3.Error, KeyError, TypeError, ValueError) as error:
             raise LedgerRefused(f"{where}: cannot read the ledger ({type(error).__name__}: {error})") from None
     finally:
         db.close()
-    facts = LedgerFacts(sha256, config, meta.get("environment"), runs, leases, in_force)
+    leases = {key: replace(lease, proven=key in proven) for key, lease in leases.items()}
+    by_lease = {settlement.lease_id: settlement for settlement in settled}
+    facts = LedgerFacts(sha256, config, meta.get("environment"), runs, leases, in_force, by_lease, locked)
     _replay(facts, events, where)
     return facts
+
+
+class _Views(LedgerViews):
+    """The ledger's views over a connection to the snapshot's bytes: no lock is taken and nothing is written."""
+
+    def __init__(self, db: sqlite3.Connection, config: LedgerConfig) -> None:
+        self.db = db
+        self.config = config
 
 
 def _run_row(row: Any) -> RunRow:

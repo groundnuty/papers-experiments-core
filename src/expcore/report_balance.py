@@ -39,6 +39,14 @@ def balance_lines(balance: Mapping[str, Any] | None, table: Table) -> list[str]:
     if balance is None:
         return []
     lines = ["## Balance over sites and federations", "", *BALANCE_NOTES, "", f"Runs: {balance['runs']}.", ""]
+    spend = balance.get("ledger_spend")
+    if spend is not None:
+        ceiling = "no ceiling" if spend["max_usd"] is None else f"a ceiling of USD {spend['max_usd']}"
+        lines += [
+            f"Money at the ledger's snapshot: USD {spend['total_usd']} charged to the leases ({ceiling}), of which USD "
+            f"{spend['locked_usd']} is locked in unsettled leases (charged their grant until their spend is settled).",
+            "",
+        ]
     for model in balance["models"]:
         for key, label in (("by_site", "site"), ("by_federation", "federation")):
             cross = model[key]

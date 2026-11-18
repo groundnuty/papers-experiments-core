@@ -18,18 +18,11 @@ from typing import Any
 
 from expcore.campaign.by_run_layout import EVIDENCE_DIR, LEASES_DIR, MERGE_BY_RUN_SCHEMA, snapshot_rel
 from expcore.campaign.elastic.config import usd_of
+from expcore.campaign.lease_facts import LeaseStore, lease_store_of, lease_store_of_bytes
 from expcore.campaign.ledger_read import LEDGER_SNAPSHOT, LeaseRow, LedgerFacts, LedgerRefused, read_ledger
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.merge import RUNS_DIR, MergeRefused, Query
-from expcore.campaign.merge_by_run import (
-    ByRun,
-    LeaseStore,
-    check_by_run,
-    lease_store_of,
-    lease_store_of_bytes,
-    spend_micro,
-    store_micro,
-)
+from expcore.campaign.merge_by_run import ByRun, check_by_run, spend_micro, store_micro
 from expcore.campaign.run_lease import RULE_LEASE
 from expcore.campaign.selection_ledger import Pricing
 from expcore.campaign.shard import MERGE_FILE
@@ -45,6 +38,7 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
     """merge.json's content for a merge by run that passed `check_by_run`."""
     ledger, first = merged.ledger, merged.counted[0]
     totals = spend_micro(ledger, merged.counted, merged.evidence)
+    settled = set(ledger.settlements)
     return {
         "schema": MERGE_BY_RUN_SCHEMA,
         "fingerprint": fingerprint_sha256(first.fingerprint),
@@ -52,8 +46,8 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
         "environment_identity": dict(first.environment),
         "ledger_sha256": ledger.sha256,
         "runs": len(merged.counted),
-        "leases": [_entry(ledger.leases[store.lease.lease_id], store) for store in merged.counted],
-        "evidence": [{**_entry(item.lease, item.store), "reason": item.reason} for item in merged.evidence],
+        "leases": [_entry(ledger.leases[store.lease.lease_id], store, settled) for store in merged.counted],
+        "evidence": [{**_entry(item.lease, item.store, settled), "reason": item.reason} for item in merged.evidence],
         "spend": {
             "total_usd": _usd(totals.get(None)),
             "per_model_usd": {model: _usd(value) for model, value in sorted(totals.items(), key=_model_key) if model},
@@ -61,6 +55,7 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
             "per_model_ceiling_usd": {
                 model: usd_of(micro) for model, micro in sorted(ledger.ceilings.per_model_micro.items())
             },
+            "locked_usd": usd_of(ledger.locked_micro),  # held as grants by unsettled leases at the snapshot
         },
     }
 
@@ -73,8 +68,10 @@ def _usd(micro: int | None) -> float | None:
     return None if micro is None else usd_of(micro)
 
 
-def _entry(row: LeaseRow, store: LeaseStore | None) -> dict[str, Any]:
-    micro = row.charge_micro if store is None else store_micro(store, row)
+def _entry(row: LeaseRow, store: LeaseStore | None, settled: set[int]) -> dict[str, Any]:
+    """A lease's entry: where it ran, its store's snapshot, what the ledger charges it (`spend_usd`), what its store
+    reads (`store_spend_usd`, None without a store) and whether the ledger settled it."""
+    read = None if store is None else store_micro(store, row)
     return {
         "lease_id": row.lease_id,
         "run_key": row.run_key,
@@ -82,7 +79,9 @@ def _entry(row: LeaseRow, store: LeaseStore | None) -> dict[str, Any]:
         "site": row.site,
         "started_utc": None if store is None else store.started_utc,
         "snapshot_sha256": None if store is None else store.snapshot_sha256,
-        "spend_usd": _usd(micro),
+        "spend_usd": usd_of(row.charge_micro),
+        "store_spend_usd": _usd(read),
+        "settled": row.lease_id in settled,
     }
 
 

@@ -15,7 +15,7 @@ balance.
 from collections.abc import Mapping
 from typing import Any
 
-from expcore.campaign.export_join import FEDERATION_KEY, SITE_KEY
+from expcore.campaign.export_join import FEDERATION_KEY, LEDGER_SPEND_KEY, SITE_KEY
 
 _RUN_LISTS = ("analysed_attempts", "exhausted_runs", "unfinished_runs", "excluded_attempts")
 
@@ -27,7 +27,11 @@ def balance_of(export: Mapping[str, Any]) -> dict[str, Any] | None:
     if not entries or any(FEDERATION_KEY not in entry or SITE_KEY not in entry for entry in entries):
         return None
     models = sorted({str(entry["factors"]["model"]) for entry in entries})
-    return {"runs": len(entries), "models": [_model(model, entries) for model in models]}
+    found = {"runs": len(entries), "models": [_model(model, entries) for model in models]}
+    spend = export.get(LEDGER_SPEND_KEY)
+    if spend is not None:  # the ledger's money at its snapshot (merge.json's `spend`), locked dollars included
+        found["ledger_spend"] = dict(spend)
+    return found
 
 
 def _model(model: str, entries: list[Mapping[str, Any]]) -> dict[str, Any]:

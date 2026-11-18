@@ -298,9 +298,12 @@ FEDERATION_KEY = "federation"  # each run entry's: the federation that held its 
 SITE_KEY = "site"  # each run entry's: the site of that federation, as the ledger labels it
 LEASES_KEY = "leases"  # the top-level key of such an export: merge.json's list of counted leases
 LEASE_RETRIES_KEY = "lease_retries_by_kind"  # each counted lease's own retries rows, with its lease id
+LEDGER_SPEND_KEY = "ledger_spend"  # merge.json's `spend`: the ledger's money at its snapshot, locked dollars included
 
 
-def by_run_export(joined: Mapping[str, Any], leases: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def by_run_export(
+    joined: Mapping[str, Any], leases: Sequence[Mapping[str, Any]], spend: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     """The export of a batch merged by run (C45): the counted leases' exports joined as a merge of shards joins them
     (`join_exports`, one part per lease), with each run's lease, federation and site in place of a shard.
 
@@ -308,7 +311,9 @@ def by_run_export(joined: Mapping[str, Any], leases: Sequence[Mapping[str, Any]]
     own run rows already are) instead, and each entry of a
     run list (and of the per-entry lists: holds, losses, interrupted spend, diagnostics) gains `federation` and `site`
     from merge.json's `leases`, which the check and the analysis rebuilt from the ledger. `shards` becomes `leases`
-    and `shard_retries_by_kind` becomes `lease_retries_by_kind`. A batch merged otherwise never reaches this."""
+    and `shard_retries_by_kind` becomes `lease_retries_by_kind`; merge.json's `spend` (the ledger's money at its
+    snapshot: what every lease is charged, the ceilings in force and what unsettled leases still lock) is carried as
+    `ledger_spend`. A batch merged otherwise never reaches this."""
     placed = {entry["lease_id"]: entry for entry in leases}
     out: dict[str, Any] = {}
     for key, value in joined.items():
@@ -323,6 +328,8 @@ def by_run_export(joined: Mapping[str, Any], leases: Sequence[Mapping[str, Any]]
         else:
             out[key] = value
     out[LEASES_KEY] = [dict(entry) for entry in leases]
+    if spend is not None:
+        out[LEDGER_SPEND_KEY] = dict(spend)
     return out
 
 

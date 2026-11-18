@@ -23,10 +23,14 @@
    lease yet), a run whose counted lease's store is not given (its archive is the run's only record), a counted store
    whose run ended otherwise than the ledger says; a store of a counted or superseded lease that is not given (the
    ledger verified its archive, so it is evidence to keep);
-5. spend: every lease's spend (its store's, as the budget gate counts it; the ledger's charge for a lease whose store
-   is not given: the grant of a lost or expired one or the spend `settle` gave it, the spend of a returned one)
-   together above the ledger's ceilings in force (`max_usd` and each model's, as pinned or raised), a store that spent
-   more than its grant, or a spend unknown under a budget.
+5. spend: every lease is counted at what the ledger charges it (its measured spend once its completion verified,
+   the spend a settlement gave a lost lease, else its grant), and the leases together must stay within the ceilings
+   in force (`max_usd` and each model's, as pinned or raised); a store given must agree with its lease's charge: the
+   settled spend exactly (and the settled charged attempts), else no more than the charge, never above its grant, and
+   never unknown under a budget;
+6. a run the ledger holds as `infra_exhausted` while any of its leases is still charged its grant unsettled (in
+   flight, expired, reported or lost): a settle, a return or a late completion can show fewer charged attempts and
+   reopen it (`elastic.attempts`), so it is not final.
 
 Then each counted store passes the replay check (`study.merge_by_run`), and its records are exactly those of its
 attempts (`require_records`): none it does not account for, and the record of every attempt it holds as done.
@@ -38,8 +42,9 @@ only evidence.
 `earlier` (it counted, and its run went back to pending and was leased again), `lost` (its archive never verified),
 `expired` or `returned`. Its spend is counted; its records are never in `runs/`, never checked as the batch, never
 analysed. A store of a lost or expired lease that still holds a running attempt (its federation was lost mid-run) is
-settled by `recover` in the merge's private copy as an infrastructure loss (`study.merge_by_run`); its spend is then
-its bound. A lost or expired lease with no store given is charged its grant, as the ledger charges it.
+settled by `recover` in the merge's private copy as an infrastructure loss (`study.merge_by_run`), its running attempt
+read at its bound (`study.merge_by_run.dead_store_spend` is the same read, for a controller that settles the lease
+in the ledger). A lost or expired lease with no store given is counted at what the ledger charges it.
 
 **merge.json** (`by_run_layout.MERGE_BY_RUN_SCHEMA`, written and read back by `campaign.merged_by_run`) holds
 `fingerprint`, `rule`, `environment_identity`, `ledger_sha256`, `runs` (how many the plan holds), `leases` (each
@@ -53,128 +58,24 @@ plan through these checks, and refuse a file that differs.
 
 import hashlib
 import json
-import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
-from pathlib import Path, PurePath
-from typing import Any
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from expcore.campaign.elastic.config import micro_up, usd_of
+from expcore.campaign.lease_facts import LeaseStore
 from expcore.campaign.ledger_read import TERMINAL, LeaseRow, LedgerFacts
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.merge import (
     MergeRefused,
-    Query,
     check_environment,
     check_fingerprints,
     sha256_of,
 )
-from expcore.campaign.resume import FINGERPRINT_KEY, recorded_fingerprint
-from expcore.campaign.run_lease import RULE_LEASE, RunLease
-from expcore.campaign.selection_ledger import Pricing, Spend, spend_of
-from expcore.campaign.shard import (
-    META_ENVIRONMENT,
-    META_SHARD,
-    META_STARTED,
-    ShardError,
-    check_identity,
-)
-from expcore.records.record import record_filename
+from expcore.campaign.selection_ledger import Pricing
 
 _EVIDENCE_REASONS = {"counted": "earlier", "superseded": "superseded", "lost": "lost", "expired": "expired"}
 _EVIDENCE_REASONS |= {"returned": "returned", "reported": "superseded"}
 _KEPT = ("counted", "superseded")  # a lease whose archive the ledger verified: its store is evidence to keep
-
-
-@dataclass(frozen=True)
-class LeaseStore:
-    """What a lease store's snapshot says of itself, read once from the copy the merge took."""
-
-    out: Path
-    snapshot: Path
-    snapshot_sha256: str
-    lease: RunLease
-    started_utc: str
-    environment: Mapping[str, str]
-    fingerprint: Mapping[str, Any]
-    runs: Mapping[str, Mapping[str, Any]]  # the factors of each run the store holds, by run key
-    status: Mapping[str, str]  # the status of each run the store holds, by run key
-    spend: Spend | None = None
-    # where each attempt's record lies in a batch (`<digest>/try<N>/<record file>`), with the attempt's state
-    attempts: Mapping[str, str] = field(default_factory=dict)
-
-    @property
-    def name(self) -> str:
-        """How a message names the store: its lease and run, never its path."""
-        return f"the store of lease {self.lease.lease_id} (run {self.lease.run_key})"
-
-
-def lease_store_of_bytes(
-    data: bytes, where: object, *, out: Path, snapshot: Path, pricing: Pricing | None
-) -> LeaseStore:
-    """What the lease store whose snapshot's bytes are `data` says of itself (`lease_store_of`)."""
-    db = sqlite3.connect(":memory:")
-    db.row_factory = sqlite3.Row
-    try:
-        try:
-            db.deserialize(data)
-        except sqlite3.Error as error:
-            raise MergeRefused(f"{where}: not a campaign store ({type(error).__name__}: {error})") from None
-        query: Query = lambda sql, args=(): db.execute(sql, tuple(args)).fetchall()  # noqa: E731
-        sha256 = hashlib.sha256(data).hexdigest()
-        return lease_store_of(query, where, out=out, snapshot=snapshot, sha256=sha256, pricing=pricing)
-    finally:
-        db.close()
-
-
-def lease_store_of(
-    query: Query, where: object, *, out: Path, snapshot: Path, sha256: str, pricing: Pricing | None
-) -> LeaseStore:
-    """What a lease store says of itself, read through `query`; refuses a store that is not a lease store, or lacks
-    its start, its environment identity or its fingerprint. Its spend is read when `pricing` is given."""
-    try:
-        meta = {row[0]: row[1] for row in query("SELECT key, value FROM meta")}
-        lease = _lease_of(meta, where)
-        started = meta.get(META_STARTED)
-        if not isinstance(started, str) or not started:
-            raise MergeRefused(f"{where}: its store records no {META_STARTED!r}")
-        try:
-            environment = check_identity(json.loads(meta.get(META_ENVIRONMENT, "null")))
-        except (ShardError, ValueError) as error:
-            raise MergeRefused(f"{where}: the environment identity in its store is unusable: {error}") from None
-        fingerprint = recorded_fingerprint([(meta[FINGERPRINT_KEY],)] if FINGERPRINT_KEY in meta else [])
-        if fingerprint is None:
-            raise MergeRefused(f"{where}: its store records no campaign fingerprint")
-        rows = query("SELECT run_key, factors, status FROM runs")
-        runs = {row[0]: json.loads(row[1]) for row in rows}
-        status = {row[0]: row[2] for row in rows}
-        attempts = {
-            f"{row[0]}/{PurePath(row[1]).name}/{record_filename(row[2], row[3])}": row[4]
-            for row in query(
-                "SELECT r.digest, a.run_dir, a.run_key, a.attempt, a.state FROM attempts a "
-                "JOIN runs r ON r.run_key = a.run_key WHERE a.run_dir IS NOT NULL ORDER BY a.id"
-            )
-        }
-        spend = None if pricing is None else spend_of(query, pricing)
-    except sqlite3.Error as error:
-        raise MergeRefused(f"{where}: cannot read its store ({type(error).__name__}: {error})") from None
-    return LeaseStore(out, snapshot, sha256, lease, started, environment, fingerprint, runs, status, spend, attempts)
-
-
-def _lease_of(meta: Mapping[str, str], where: object) -> RunLease:
-    """The lease a store pins as its shard spec; refuses a store of any other form."""
-    try:
-        pinned = json.loads(meta[META_SHARD]) if META_SHARD in meta else None
-    except ValueError:
-        raise MergeRefused(f"{where}: {META_SHARD!r} in its store is not JSON") from None
-    if not isinstance(pinned, Mapping) or pinned.get("rule") != RULE_LEASE:
-        raise MergeRefused(
-            f"{where}: not a store of a run taken on a lease (expcore-shard/5); merge it by its own form"
-        )
-    try:
-        return RunLease.from_json(pinned)
-    except ShardError as error:
-        raise MergeRefused(f"{where}: the lease in its store is unusable: {error}") from None
 
 
 # --- the checks ----------------------------------------------------------------------------------------------------
@@ -199,7 +100,8 @@ class ByRun:
 
 
 def check_by_run(ledger: LedgerFacts, stores: Sequence[LeaseStore], plan: Manifest, pricing: Pricing | None) -> ByRun:
-    """Run checks 1 to 5 of the module docstring; raise MergeRefused for the first fault."""
+    """Run checks 1 to 6 of the module docstring; raise MergeRefused for the first fault."""
+    refuse_reopenable(ledger)
     if not stores:
         raise MergeRefused("a merge by run takes the store of every run's counted lease; none was given")
     by_lease = _by_lease(stores)
@@ -217,8 +119,25 @@ def check_by_run(ledger: LedgerFacts, stores: Sequence[LeaseStore], plan: Manife
     _check_ledger_environment(ordered[0], ledger)
     counted = _counted(ledger, by_lease, plan)
     evidence = _evidence(ledger, by_lease, {store.lease.lease_id for store in counted})
+    for store in ordered:
+        _check_store_spend(store, ledger)
     _check_spend(ledger, counted, evidence)
     return ByRun(tuple(counted), tuple(evidence), ledger)
+
+
+def refuse_reopenable(ledger: LedgerFacts) -> None:
+    """6: refuse a ledger in which a run is `infra_exhausted` while one of its leases is still charged its grant with
+    no settlement. The ledger charges a lost lease one attempt before its real count is known, and a settle, a return
+    or a late completion that shows fewer charged attempts reopens the run (`elastic.attempts`), so such a run is not
+    final: it is exhausted only once every one of its leases is settled, counted or otherwise ended."""
+    for key, run in ledger.runs.items():
+        unsettled = ledger.unsettled(key) if run.state == "infra_exhausted" else []
+        if unsettled:
+            raise MergeRefused(
+                f"run {key} is infra_exhausted in the ledger, but its lease {unsettled[0].lease_id} is "
+                f"{unsettled[0].state} and not settled: a settle, a return or a late completion can show fewer charged "
+                "attempts and reopen the run, so it is not final; settle its leases and merge again"
+            )
 
 
 def environment_digest(identity: Mapping[str, str]) -> str:
@@ -238,15 +157,24 @@ def _check_ledger_environment(store: LeaseStore, ledger: LedgerFacts) -> None:
         )
 
 
-def require_records(stores: Sequence[LeaseStore], records: Iterable[str]) -> None:
-    """The records of a batch merged by run (paths relative to its `runs/`) are exactly the counted stores': each
-    lies where an attempt of one of them lies, and every attempt a store holds as done has its record. A record of an
-    evidence lease, or one a store does not account for, is refused, and so is a counted run without its record."""
+def require_records(stores: Sequence[LeaseStore], records: Mapping[str, int | None]) -> None:
+    """The records of a batch merged by run (by path relative to its `runs/`, each with the lease id it names, None
+    for a record that names none) are exactly the counted stores': each lies where an attempt of one of them lies and
+    names that store's lease when it names one, and every attempt a store holds as done has its record. Attempt
+    numbers can repeat across a run's leases, so a superseded or lost lease's record can lie where the counted one's
+    belongs: the lease id it names tells it apart. A record of another lease, or one a store does not account for, is
+    refused, and so is a counted run without its record."""
     expected = {rel: state for store in stores for rel, state in store.attempts.items()}
+    owner = {rel: store for store in stores for rel in store.attempts}
     found = set(records)
     stray = sorted(found - set(expected))
     if stray:
         raise MergeRefused(f"{stray[0]}: a record no attempt of a counted lease's store accounts for")
+    foreign = sorted(rel for rel in found if records[rel] not in (None, owner[rel].lease.lease_id))
+    if foreign:
+        raise MergeRefused(
+            f"{foreign[0]}: a record of lease {records[foreign[0]]}, where {owner[foreign[0]].name} keeps its own"
+        )
     missing = sorted(rel for rel, state in expected.items() if state == "done" and rel not in found)
     if missing:
         raise MergeRefused(f"{missing[0]}: the record of a counted lease's final attempt is missing")
@@ -345,8 +273,6 @@ def _check_spend(ledger: LedgerFacts, counted: Sequence[LeaseStore], evidence: S
     ceilings = ledger.ceilings
     if ceilings.max_micro is None:
         return
-    if totals.get(None) is None or any(value is None for value in totals.values()):
-        raise MergeRefused("the campaign has a budget and some lease's spend is unknown, so it cannot be checked")
     if totals[None] > ceilings.max_micro:
         raise MergeRefused(
             f"the leases spent USD {usd_of(totals[None])} together, above the campaign's ceiling of USD "
@@ -363,17 +289,43 @@ def _check_spend(ledger: LedgerFacts, counted: Sequence[LeaseStore], evidence: S
 def spend_micro(
     ledger: LedgerFacts, counted: Sequence[LeaseStore], evidence: Sequence[Evidence]
 ) -> dict[str | None, int | None]:
-    """Each lease's spend in micro-dollars, summed in total (under None) and per model; None where one is unknown.
-    A store's spend is the budget gate's figure; a lease without a store is charged what the ledger charges it."""
-    leases = [(ledger.leases[store.lease.lease_id], store) for store in counted]
-    leases += [(item.lease, item.store) for item in evidence]
+    """Every lease's spend in micro-dollars as the ledger charges it, summed in total (under None) and per model: its
+    measured spend once its completion verified, the spend a settlement gave it, else its grant. The ledger's money is
+    the one count; a store given is evidence held to it (`_check_store_spend`)."""
+    rows = [ledger.leases[store.lease.lease_id] for store in counted] + [item.lease for item in evidence]
     totals: dict[str | None, int | None] = {None: 0}
-    for row, store in leases:
-        micro = row.charge_micro if store is None else store_micro(store, row)
+    for row in rows:
         for scope in (None, row.model):
-            have = totals.get(scope, 0)
-            totals[scope] = None if have is None or micro is None else have + micro
+            totals[scope] = (totals.get(scope) or 0) + row.charge_micro
     return totals
+
+
+def _check_store_spend(store: LeaseStore, ledger: LedgerFacts) -> None:
+    """5: a store's own spend agrees with what the ledger charges its lease: exactly what a settlement gave it (and the
+    charged attempts it gave, when it gave them), else no more than the ledger charges. A spend unknown under a budget
+    is refused."""
+    row = ledger.leases[store.lease.lease_id]
+    micro = store_micro(store, row)
+    if micro is None:
+        if ledger.ceilings.max_micro is not None:
+            raise MergeRefused(f"{store.name}: its spend is unknown, and the campaign has a budget")
+        return
+    settled = ledger.settlements.get(row.lease_id)
+    if settled is not None and micro != settled.spend_micro:
+        raise MergeRefused(
+            f"{store.name}: the ledger settled its lease at USD {usd_of(settled.spend_micro)}, and its store reads USD "
+            f"{usd_of(micro)}: the settled value is not this store's"
+        )
+    if settled is not None and settled.charged is not None and settled.charged != store.charged:
+        raise MergeRefused(
+            f"{store.name}: the ledger settled its lease with {settled.charged} charged attempts, and its store holds "
+            f"{store.charged}"
+        )
+    if settled is None and micro > row.charge_micro:
+        raise MergeRefused(
+            f"{store.name}: its store spent USD {usd_of(micro)}, more than the ledger charges its lease "
+            f"(USD {usd_of(row.charge_micro)})"
+        )
 
 
 def store_micro(store: LeaseStore, row: LeaseRow) -> int | None:

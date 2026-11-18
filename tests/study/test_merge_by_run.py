@@ -15,11 +15,12 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from merge_by_run_support import ENVIRONMENT, HEALTHY, Fleet, build_fleet, by_run_study, make_running
+from merge_by_run_support import ENVIRONMENT, HEALTHY, FakeClock, Fleet, build_fleet, by_run_study, make_running
 from shard_support import make_study, write_meta
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish
 
 from expcore.campaign.by_run_layout import EVIDENCE_DIR, LEASES_DIR, MERGE_BY_RUN_SCHEMA
+from expcore.campaign.elastic import Ledger
 from expcore.campaign.elastic.config import usd_of
 from expcore.campaign.export_join import FEDERATION_KEY, LEASE_KEY, SITE_KEY
 from expcore.campaign.interrupted_spend import COPIED_BACK_KEY
@@ -27,6 +28,7 @@ from expcore.campaign.shard import META_ENVIRONMENT, NOT_FINAL_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.records.record import is_record_name
 from expcore.study.config import load_study
+from expcore.study.merge_by_run import dead_store_spend
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
@@ -195,6 +197,22 @@ def test_c45_the_analysis_reports_the_balance_and_the_federation_rerun_beside_th
     assert "## Sensitivity analysis: site and federation effects" in merged.report
 
 
+def test_c45_the_report_says_what_unsettled_leases_lock_at_the_ledgers_snapshot(merged, fleet):
+    """C45: the two expired leases nobody settled are charged their grants, which merge.json, the balance and the
+    report say are locked."""
+    spend = document_of(merged)["spend"]
+    ledger = sqlite3.connect(fleet.ledger_file)
+    try:
+        grants = ledger.execute(
+            "SELECT SUM(grant_micro) FROM leases WHERE id IN (?, ?)", (fleet.lost, fleet.vanished)
+        ).fetchone()[0]
+    finally:
+        ledger.close()
+    assert spend["locked_usd"] == usd_of(grants) > 0
+    assert merged.read("analysis.json")["balance"]["ledger_spend"] == spend
+    assert f"of which USD {spend['locked_usd']} is locked in unsettled leases" in merged.report
+
+
 def test_c45_a_merged_by_run_batch_whose_merge_json_was_edited_is_refused_by_the_check(base, merged, fleet):
     """C45: merge.json is rebuilt from the snapshots and the ledger; a federation label changed after the merge is
     refused, naming the field."""
@@ -329,3 +347,86 @@ def test_c45_a_counted_store_with_a_running_attempt_is_refused(base, fleet):
     outs = fleet.outs(fleet.superseded)
     errors = refused(fleet, base, "running", [str(copy.root / "out"), *outs[1:]])
     assert "only a lost or expired lease's store is settled" in errors
+
+
+# --- a dead store's spend, and the ledger's settlement of it ---------------------------------------------------------
+
+
+def state_bytes(campaign: Campaign) -> bytes:
+    return (campaign.root / "out" / "state.sqlite").read_bytes()
+
+
+def test_c45_a_dead_stores_spend_is_read_without_writing_it(fleet):
+    """C45: the lost lease's store, still running when it came back, is read in a private copy: its running attempt
+    settled at its bound, and the store itself not written."""
+    store = fleet.stores[fleet.lost]
+    before = state_bytes(store)
+    found = dead_store_spend(store.root / "out", load_study(store.root))
+    assert found is not None
+    assert (found.lease_id, found.settled_running, found.charged_attempts) == (fleet.lost, 1, 0)
+    assert found.spend_micro > 0
+    assert state_bytes(store) == before
+    assert store.sql("SELECT state FROM attempts ORDER BY id")[-1]["state"] == "running"
+
+
+def test_c45_a_dead_stores_spend_is_the_one_the_merge_reads(merged, fleet):
+    """C45: what a controller would settle is what the merge reads of the same store."""
+    store = fleet.stores[fleet.lost]
+    found = dead_store_spend(store.root / "out", load_study(store.root))
+    entry = {e["lease_id"]: e for e in document_of(merged)["evidence"]}[fleet.lost]
+    assert entry["store_spend_usd"] == usd_of(found.spend_micro)
+    assert entry["settled"] is False
+
+
+def test_c45_a_store_that_ended_reads_whole(fleet):
+    """C45: a store with no running attempt is read as it is: nothing settled, its charged attempts counted."""
+    store = fleet.counted()[0]
+    found = dead_store_spend(store.root / "out", load_study(store.root))
+    assert found is not None
+    assert found.settled_running == 0
+    assert found.charged_attempts == sum(row["charged"] for row in store.sql("SELECT charged FROM attempts"))
+
+
+def test_c45_a_store_that_cannot_be_read_gives_none(base, fleet):
+    """C45: no store, or a file that is not one, gives None and no error."""
+    study = load_study(fleet.counted()[0].root)
+    empty = base / "no-store" / "out"
+    empty.mkdir(parents=True)
+    assert dead_store_spend(empty, study) is None
+    (empty / "state.sqlite").write_bytes(b"not a store")
+    assert dead_store_spend(empty, study) is None
+
+
+def settled(fleet: Fleet, base: Path, name: str, spend_micro: int, charged: int | None) -> Path:
+    """A copy of the fleet's ledger in which the lost lease was settled at `spend_micro`."""
+    path = base / name / "ledger.sqlite"
+    path.parent.mkdir()
+    shutil.copyfile(fleet.ledger_file, path)
+    ledger = Ledger.open(path, FakeClock())
+    try:
+        ledger.settle(fleet.lost, spend_micro, "pulled", attempts_charged=charged)
+    finally:
+        ledger.close()
+    return path
+
+
+def test_c45_a_lease_settled_at_what_its_store_reads_is_merged_at_that_spend(base, fleet):
+    """C45: settled at the dead store's spend, the lease is counted at it and is no longer locked."""
+    store = fleet.stores[fleet.lost]
+    found = dead_store_spend(store.root / "out", load_study(store.root))
+    ledger = settled(fleet, base, "settled-ledger", found.spend_micro, found.charged_attempts)
+    target = Campaign(by_run_study(base, "settled-merge"))
+    code, errors = fleet.merge(target, fleet.outs(fleet.superseded, fleet.lost), ledger)
+    assert code == 0, errors
+    entry = {e["lease_id"]: e for e in document_of(target)["evidence"]}[fleet.lost]
+    assert entry["settled"] is True
+    assert entry["spend_usd"] == entry["store_spend_usd"] == usd_of(found.spend_micro)
+
+
+def test_c45_a_lease_settled_at_another_spend_than_its_store_reads_is_refused(base, fleet):
+    """C45: a settled value the store given does not give is refused, naming both."""
+    store = fleet.stores[fleet.lost]
+    found = dead_store_spend(store.root / "out", load_study(store.root))
+    ledger = settled(fleet, base, "missettled-ledger", found.spend_micro - 1, None)
+    errors = refused(fleet, base, "missettled", fleet.outs(fleet.superseded, fleet.lost), ledger)
+    assert "the settled value is not this store's" in errors

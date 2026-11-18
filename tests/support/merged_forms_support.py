@@ -42,6 +42,7 @@ VOLATILE_KEYS = frozenset(
 _HASHED_WHOLE = "fingerprint"  # merge.json's: the SHA-256 of a fingerprint that holds the environment
 _TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)?")
 _SHARD_ROW = re.compile(r"\| shard-\d+ \| ")
+_CORE_LINE = re.compile(r"^- Core version: .*$", re.M)  # the installed core's version, as `core_version` in JSON
 
 
 def _masked(value: Any, key: str | None = None) -> Any:
@@ -65,7 +66,7 @@ def normalized(path: Path) -> str | None:
     if path.suffix == ".json":
         return json.dumps(_masked(json.loads(text)), indent=1, sort_keys=False)
     lines = [_shard_timing_masked(line) for line in text.split("\n")]
-    return _TIME.sub(MASK, "\n".join(lines))
+    return _CORE_LINE.sub(f"- Core version: {MASK}", _TIME.sub(MASK, "\n".join(lines)))
 
 
 def _shard_timing_masked(line: str) -> str:

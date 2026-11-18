@@ -22,16 +22,20 @@ import datetime as dt
 import json
 import os
 import shutil
+import sqlite3
 import sys
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.elastic.config import micro_up
+from expcore.campaign.lease_facts import LeaseStore, lease_store_of_bytes, record_leases
 from expcore.campaign.ledger_read import LEDGER_SNAPSHOT, LedgerFacts, LedgerRefused, read_ledger, take_ledger_snapshot
 from expcore.campaign.lock import CampaignLocked, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.merge import RUNS_DIR, MergeRefused, copy_runs, make_writable, refuse_non_empty, sha256_of
-from expcore.campaign.merge_by_run import LeaseStore, check_by_run, lease_store_of_bytes, require_records
+from expcore.campaign.merge_by_run import check_by_run, require_records
 from expcore.campaign.merged_by_run import lay_out_by_run
 from expcore.campaign.recovery import recover
 from expcore.campaign.scheduler import STATE_FILE
@@ -116,9 +120,10 @@ def _merge(
     return MergedByRun(out, len(merged.counted), len(merged.evidence))
 
 
-def _records_in(runs: Path) -> list[str]:
-    """Every record file under a `runs/` directory, by its path relative to it."""
-    return [str(path.relative_to(runs)) for path in sorted(runs.rglob("*")) if is_record_name(path.name)]
+def _records_in(runs: Path) -> dict[str, int | None]:
+    """Every record file under a `runs/` directory, by its path relative to it, with the lease id it names."""
+    found = [str(path.relative_to(runs)) for path in sorted(runs.rglob("*")) if is_record_name(path.name)]
+    return record_leases(runs, found)
 
 
 def _ledger_of(source: Path, snapshot: Path) -> LedgerFacts:
@@ -151,43 +156,106 @@ def _read_store(out: Path, stage: Path, n: int, ledger: LedgerFacts, study: Stud
 
 
 def _settle(out: Path, private: Path, scratch: Path, ledger: LedgerFacts, study: StudyConfig) -> None:
-    """Copy a store with running attempts and its records into `private`, settle the copy with `recover` when the
-    ledger holds its lease as lost or expired, and snapshot the settled copy to `scratch`; refuse any other."""
-    private.mkdir(mode=0o700)
-    try:
-        copied = copy_store(out / STATE_FILE, private)
-    except (StoreChanged, OSError) as error:
-        raise MergeRefused(f"{out}: its store cannot be copied to be settled ({error})") from None
-    store = Store(copied, study.schema)
-    try:
-        lease_id = _pinned_lease_id(store)
-        row = ledger.leases.get(lease_id) if lease_id is not None else None
-        if row is None or row.state not in _SETTLED_LEASES:
-            held = "not a lease the ledger issued" if row is None else f"held by the ledger as {row.state}"
-            raise MergeRefused(
-                f"{out}: its store still has a running attempt, and its lease is {held}: only a lost or expired "
-                "lease's store is settled in the merge's copy"
-            )
-    finally:
-        store.close()
-    runs = private / RUNS_DIR
-    if (out / RUNS_DIR).is_dir():
-        copy_runs(out / RUNS_DIR, runs)
-    rebase_run_dirs(copied, runs)  # marks the copy copied back: its call logs are never trusted on its own word
-    store = Store(copied, study.schema)
-    try:
-        now = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-        settled = recover(store, now, ledger.config.max_attempts)
-    finally:
-        store.close()
-    take_snapshot(copied, scratch)
+    """Settle a store with running attempts in a private copy (`_settled_copy`) when the ledger holds its lease as
+    lost or expired, and refuse any other."""
+    lease_id, interrupted = _settled_copy(out, private, scratch, study.schema, ledger.config.max_attempts)
+    row = ledger.leases.get(lease_id) if lease_id is not None else None
+    if row is None or row.state not in _SETTLED_LEASES:
+        held = "not a lease the ledger issued" if row is None else f"held by the ledger as {row.state}"
+        raise MergeRefused(
+            f"{out}: its store still has a running attempt, and its lease is {held}: only a lost or expired "
+            "lease's store is settled in the merge's copy"
+        )
     print(
-        f"merge: lease {lease_id} ({row.state} in the ledger): {settled.interrupted} running attempt(s) settled as "
+        f"merge: lease {lease_id} ({row.state} in the ledger): {interrupted} running attempt(s) settled as "
         "interrupted in the merge's private copy, an infrastructure loss charged at its bound; its store is not "
         "written",
         file=sys.stderr,
     )
-    shutil.rmtree(private, ignore_errors=True)
+
+
+def _settled_copy(out: Path, private: Path, scratch: Path, schema: Any, max_attempts: int) -> tuple[int | None, int]:
+    """Copy the store at `out` and its records into the new directory `private`, mark the copy copied back and point
+    its attempts at the copied records (`snapshot.rebase_run_dirs`: its call logs are then never trusted on its own
+    word), settle it with `recover`, and snapshot it to `scratch`; return its pinned lease id and how many running
+    attempts became interrupted. The store at `out` is never written. Raises SnapshotError or StoreChanged."""
+    private.mkdir(mode=0o700)
+    try:
+        copied = copy_store(out / STATE_FILE, private)
+        runs = private / RUNS_DIR
+        if (out / RUNS_DIR).is_dir():
+            copy_runs(out / RUNS_DIR, runs)
+        rebase_run_dirs(copied, runs)
+        store = Store(copied, schema)
+        try:
+            now = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+            settled = recover(store, now, max_attempts)
+            lease_id = _pinned_lease_id(store)
+        finally:
+            store.close()
+        take_snapshot(copied, scratch)
+    finally:
+        shutil.rmtree(private, ignore_errors=True)
+    return lease_id, settled.interrupted
+
+
+@dataclass(frozen=True)
+class DeadStoreSpend:
+    """What a dead lease store spent, read as a merge by run reads it: `spend_micro` (whole micro-dollars, as the
+    ledger counts them) and its charged attempts (`charged_attempts`), with its lease and run. `settled_running` is how
+    many attempts were still running in the store and were settled in a private copy at their bound: a store that
+    came back from a federation lost mid-run is a snapshot of it, and an attempt begun after that snapshot is not in
+    it (its spend journal holds it, which this read does not count). A store that ended (0) holds all it spent."""
+
+    lease_id: int
+    run_key: str
+    spend_micro: int
+    charged_attempts: int
+    settled_running: int
+
+
+def dead_store_spend(out: str | os.PathLike[str], study: StudyConfig) -> DeadStoreSpend | None:
+    """What the dead lease store whose `out/` is `out` spent, for a controller that settles its lost lease in the
+    ledger (`elastic.Ledger.settle(lease_id, spend_micro, source, attempts_charged=...)`); None when it cannot be read.
+
+    The store is read as a merge by run reads a lost lease's store: copied into a private temporary directory and
+    snapshotted, a store with running attempts first settled there by `recover` (`_settled_copy`), and its spend
+    counted by the budget gate's own figure (`selection_ledger.spend_of`) with the study's prices. Nothing is written
+    beside it. Its lock is held as a reader when it has one (a store pulled without its lock file is read all the
+    same, since no dispatcher of it is alive); a store a dispatcher still holds is no dead store, and gives None. So
+    do: no store, not a lease store, a store that changes while it is copied, one whose spend is unknown (a model with
+    no price), or one that cannot be read. A merge by run later refuses a settled value its store does not give."""
+    out = Path(out)
+    with tempfile.TemporaryDirectory(prefix="expcore-dead-store-") as scratch:
+        snapshot = Path(scratch) / "read.sqlite"
+        try:
+            interrupted = _read_dead(out, Path(scratch) / "settle", snapshot, study)
+            store = lease_store_of_bytes(
+                snapshot.read_bytes(), out, out=out, snapshot=snapshot, pricing=pricing_of(study)
+            )
+        except (CampaignLocked, LockUnavailable, SnapshotError, StoreChanged, MergeRefused, OSError, sqlite3.Error):
+            return None
+    spent = None if store.spend is None else store.spend.total
+    if spent is None:
+        return None
+    return DeadStoreSpend(store.lease.lease_id, store.lease.run_key, micro_up(spent), store.charged, interrupted)
+
+
+def _read_dead(out: Path, private: Path, snapshot: Path, study: StudyConfig) -> int:
+    """Snapshot a dead store to `snapshot`, settling a running attempt in a private copy; return how many."""
+
+    def read() -> int:
+        try:
+            take_snapshot(out / STATE_FILE, snapshot)
+        except AttemptsRunning:
+            return _settled_copy(out, private, snapshot, study.schema, study.campaign.scheduler.max_attempts)[1]
+        return 0
+
+    try:
+        with ReaderLock(out):
+            return read()
+    except LockMissing:
+        return read()
 
 
 def _pinned_lease_id(store: Store) -> int | None:
@@ -200,4 +268,4 @@ def _pinned_lease_id(store: Store) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-__all__ = ["MergedByRun", "merge_by_run"]
+__all__ = ["DeadStoreSpend", "MergedByRun", "dead_store_spend", "merge_by_run"]
