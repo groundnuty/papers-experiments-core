@@ -4,7 +4,7 @@ a read site shows, and replace what ended or died."""
 
 from control_support import HOUR, NOW, joined, ledger, member, settings, site
 
-from expcore.campaign.elastic.control import Add, Drain, Join, ProveEnded, Retire, decide
+from expcore.campaign.elastic.control import Add, Drain, Join, ProveEnded, Retire, Settle, decide
 
 CUTOFF = 1800.0 + 60.0 + 180.0 + 300.0  # the lease bound, collect, KillWait and the margin
 
@@ -150,3 +150,40 @@ def test_c43_every_action_names_its_reason_and_the_order_proves_and_drains_befor
     kinds = [type(action).__name__ for action in decision.actions]
     assert kinds == ["ProveEnded", "Drain", "Add"]
     assert all(action.reason for action in decision.actions)
+
+
+def test_c43_a_dead_relay_is_recorded_with_its_last_heartbeat_and_its_federation_drained():
+    """C43: a relay its up recorded serving and that no longer beats is recorded as gone with no exit status and its
+    last heartbeat, and its federation drained (no outage can be injected there); one not yet joined is taken down."""
+    joined_gone = member("fed-1", relay="gone", relay_beat_at=NOW - 300)
+    fresh_gone = member("fed-2", relay="gone", relay_beat_at=None)
+    fleet = site(members=[joined_gone, fresh_gone, member("fed-3", relay="here")])
+    view = ledger(pending={"m1": 1}, federations=[joined("fed-1"), joined("fed-3")])
+    decision = decide(NOW, view, [(settings(), fleet)])
+    (drain,) = of(decision, Drain)
+    assert drain.label == "site-a-fed-1"
+    assert drain.reason.startswith("relay gone, no exit status (its last heartbeat at")
+    assert [(r.member, r.label) for r in of(decision, Retire)] == [("fed-2", None)]
+    assert decision.relays["site-a"] == [
+        {"member": "fed-1", "relay": "gone, no exit status", "last_beat_at": NOW - 300},
+        {"member": "fed-2", "relay": "gone, no exit status", "last_beat_at": None},
+    ]
+
+
+def test_c43_every_lost_lease_not_yet_settled_is_settled_but_one_whose_cancelled_job_may_still_spend():
+    """C43: a lease expired with its holder proven ended, or lost, gets a Settle naming its federation's root while
+    the site shows it; one whose job was cancelled less than KillWait ago waits, as the ledger would refuse it."""
+    ended = joined("fed-1", ended_at=NOW - 10, end_proof="terminal")
+    cancelled = joined("fed-2", ended_at=NOW - 10, end_proof="cancelled")
+    long_cancelled = joined("fed-3", ended_at=NOW - 200, end_proof="cancelled")
+    lost = [(11, "site-a-fed-1", "expired"), (12, "site-a-fed-2", "expired"), (13, "site-a-fed-3", "expired"),
+            (14, "site-a-fed-1", "lost")]  # fmt: skip
+    fleet = site(members=[member("fed-1", state="NODE_FAIL"), member("fed-2", status="down", state=None)])
+    view = ledger(federations=[ended, cancelled, long_cancelled], lost=lost)
+    settles = of(decide(NOW, view, [(settings(), fleet)]), Settle)
+    assert [(a.lease_id, a.member, a.root) for a in settles] == [
+        (11, "fed-1", "/fleet/fed-1/root"),
+        (13, "fed-3", None),
+        (14, "fed-1", "/fleet/fed-1/root"),
+    ]
+    assert all(a.reason for a in settles)

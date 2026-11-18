@@ -4,9 +4,13 @@ Every action is the call an operator makes by hand, rendered once (`render`): wh
 the executor runs. On a site's login node: `fleet.py --fleet F add K`; a retirement's `shards.py collect --roots-only
 --root R --into DIR`, `shards.py verify-copy DIR/archives.sha256.json DIR --manifest-sha256 <the hash collect
 printed>` and `fleet.py --fleet F down --member fed-k`, in that order, each only after the one before succeeded. On the
-orchestrating host, in the ledger: `fleetcontrol.py drain`, `ended` and `join`, which the executor calls in process.
+orchestrating host, in the ledger: `fleetcontrol.py drain`, `ended`, `join` and `settle`, which the executor calls in
+process.
 
-- **The ledger first.** Proven ends, drains and joins run in the ledger at once, in the decision's order. A retirement
+- **The ledger first.** Proven ends, settlements, drains and joins run in the ledger at once, in the decision's order.
+  A lost lease is settled to the spend its dead federation's call log shows, read through the `spend` reader (step 4's
+  reader of a dead store's spend, hooked up in step 6; until then none is read, and the lease stays charged its
+  grant, logged once). A retirement
   is checked against the ledger again just before it starts: a federation in the ledger must be drained or proven
   ended and hold no lease that is issued or sent; one that is not in the ledger must still not be. A proven end
   `cancelled` comes only on a later tick, once the fleet's record shows the down verified.
@@ -33,6 +37,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 HERE = Path(__file__).resolve().parent
 DIGEST = "<the hash collect printed>"  # the dry run's stand-in for collect's output, which verify-copy takes
 FINGERPRINT, ENVIRONMENT = "<its campaign fingerprint>", "<its environment identity>"
+SPEND = "<the spend its call log shows, micro-dollars>"
 ARCHIVES_MANIFEST = "archives.sha256.json"  # `shards.ARCHIVES_MANIFEST`
 HEX64 = re.compile(r"[0-9a-f]{64}")
 COMMAND_TIMEOUT_S = 6 * 3600.0  # the fleet's commands bound their own waits (an up's queue wait, a down's steps)
@@ -91,6 +96,10 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
         return Rendered("ledger", ((*control, "drain", "--ledger", str(ledger), "--label", action.label),))
     if kind == "ProveEnded":
         words = ("ended", "--ledger", str(ledger), "--label", action.label, "--proof", action.proof)
+        return Rendered("ledger", ((*control, *words),))
+    if kind == "Settle":
+        words = ("settle", "--ledger", str(ledger), "--lease", str(action.lease_id), "--spend-micro", SPEND,
+                 "--source", "root")  # fmt: skip
         return Rendered("ledger", ((*control, *words),))
     if kind == "Join":
         words = ("join", "--ledger", str(ledger), "--label", action.label, "--site", action.site, "--jobs",
@@ -164,6 +173,9 @@ class Executor:
     evidence: Path
     log: Log
     identity: Callable[[str, str], Optional[Tuple[str, str]]] = lambda site, member: None
+    # (site, the Settle) -> (spend in micro-dollars, its source "root" or "pulled", charged attempts or None), or None
+    spend: Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]] = lambda site, action: None
+    unread: set = field(default_factory=set)  # lost leases whose log could not be read, said once each
     pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(max_workers=8))
     running: Dict[str, Future] = field(default_factory=dict)
 
@@ -201,6 +213,19 @@ class Executor:
             self.ledger.prove_ended(action.label, action.proof)
         elif kind == "Drain":
             self.ledger.drain(action.label)
+        elif kind == "Settle":
+            found = self.spend(self.sites.get(action.site), action)
+            if found is None:
+                if action.lease_id not in self.unread:
+                    self.unread.add(action.lease_id)
+                    self.log.write("result", action=kind, label=action.label, lease=action.lease_id, ok=False,
+                                   said="its call log could not be read: it stays charged its grant")  # fmt: skip
+                return
+            spend, source, charged = found
+            self.ledger.settle(action.lease_id, spend, source, attempts_charged=charged)
+            self.log.write("result", action=kind, label=action.label, lease=action.lease_id, ok=True,
+                           spend_micro=spend, source=source)  # fmt: skip
+            return
         elif kind == "Join":
             found = self.identity(action.site, action.member)
             if found is None:

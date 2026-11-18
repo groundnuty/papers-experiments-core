@@ -50,6 +50,7 @@ __all__ = [
     "Member",
     "ProveEnded",
     "Retire",
+    "Settle",
     "SiteSettings",
     "SiteView",
     "decide",
@@ -108,8 +109,22 @@ class ProveEnded:
     reason: str
 
 
-Action = ProveEnded | Drain | Join | Retire | Add
-ORDER = (ProveEnded, Drain, Join, Retire, Add)
+@dataclass(frozen=True)
+class Settle:
+    """A lost lease, not yet settled: its spend is read from its dead federation's call log (`root`, the surviving
+    root, when the site still shows one) and settled in the ledger; a lease whose log cannot be read stays at its
+    grant."""
+
+    site: str
+    member: str
+    label: str
+    lease_id: int
+    root: str | None
+    reason: str
+
+
+Action = ProveEnded | Settle | Drain | Join | Retire | Add
+ORDER = (ProveEnded, Settle, Drain, Join, Retire, Add)
 
 
 @dataclass
@@ -121,6 +136,7 @@ class Decision:
     targets: dict[str, dict] = field(default_factory=dict)
     actions: list[Action] = field(default_factory=list)
     waits: dict[str, list[dict]] = field(default_factory=dict)
+    relays: dict[str, list[dict]] = field(default_factory=dict)  # per site: each relay found gone, its last heartbeat
 
 
 def ledger_label(site: str, member: str) -> str:
@@ -165,6 +181,7 @@ def decide(
         site_free, room = _site(now, ledger, settings, view, busy, decision)
         free += site_free
         rooms[settings.label] = room
+    _settle(now, ledger, sites, decision)
     need = decision.wanted - free
     if need > 0:
         _add(need, rooms, {s.label: s.parallel_ups for s, _ in sites}, decision)
@@ -212,6 +229,9 @@ def _unjoined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member,
         return 0
     if m.status != "up" or not m.linked or not m.verified or m.waiting:
         return 1
+    if m.relay == "gone":
+        acts.append(Retire(site, m.label, None, m.root, True, relay_gone(m)))
+        return 0
     if m.ends_at is None or m.ends_at - cutoff_s(settings, ledger) <= now:
         acts.append(Retire(site, m.label, None, m.root, True, "too close to its job end to take a lease"))
         return 0
@@ -243,6 +263,8 @@ def _joined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member, f
         acts.append(Drain(site, m.label, label, f"its fleet status is {m.status}: it is taken down again"))
     elif held == "expired":
         acts.append(Drain(site, m.label, label, "its lease expired on a running job: it is replaced"))
+    elif m.relay == "gone":
+        acts.append(Drain(site, m.label, label, relay_gone(m)))
     elif fed.job_end_at - cutoff <= now < fed.job_end_at:
         left = fed.job_end_at - now
         acts.append(Drain(site, m.label, label, f"{left:.0f} s to its job end, within the {cutoff:.0f} s cut-off"))
@@ -251,6 +273,30 @@ def _joined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member, f
     else:
         return "working" if held in LIVE else "free"
     return "working" if held in LIVE else "gone"
+
+
+def relay_gone(m: Member) -> str:
+    """The record of a fault relay found gone: no outage can be injected on its federation without it."""
+    beat = "none read" if m.relay_beat_at is None else f"{m.relay_beat_at:.0f}"
+    return f"relay gone, no exit status (its last heartbeat at {beat}): outage injection cannot run without it"
+
+
+def login_memory(settings: SiteSettings, view: SiteView) -> dict:
+    """The login node's memory budget, in MB: the relays beating there, each up and each verify-data in flight, and
+    the reserve, against the account's cap; `room` is how many more federations (an up now, a relay after) fit."""
+    if settings.login_memory_mb is None:
+        return {"room": None}
+    live = [m for m in view.members if m.status not in HOLDS_NOTHING]
+    relays = sum(1 for m in live if m.relay == "here")
+    ups = sum(1 for m in live if m.status in ("claimed", "made"))
+    verifying = sum(1 for m in live if m.status == "up" and m.linked and not m.verified)
+    used = (settings.login_reserve_mb + relays * settings.relay_mb + ups * settings.up_mb
+            + verifying * settings.verify_mb)  # fmt: skip
+    free = settings.login_memory_mb - used
+    each = settings.relay_mb + settings.up_mb
+    room = 0 if free < each else int(free // each)
+    return {"room": room, "cap_mb": settings.login_memory_mb, "used_mb": used, "relays": relays, "ups": ups,
+            "verifying": verifying}  # fmt: skip
 
 
 def _room(now: float, settings: SiteSettings, view: SiteView, busy: frozenset[str]) -> tuple[int, dict]:
@@ -280,11 +326,37 @@ def _room(now: float, settings: SiteSettings, view: SiteView, busy: frozenset[st
     limits["stalled"] = any(m.submitted_at is not None and now - m.submitted_at >= settings.queue_stall_s
                             for m in starting)  # fmt: skip
     limits["adding"] = settings.label in busy
+    memory = login_memory(settings, view)
+    limits["login_memory"] = memory.pop("room")
+    limits["login_memory_mb"] = memory
     figures = [limits["maximum"], limits["nodes"], limits["allowance"]]
-    if limits["inodes"] is not None:
-        figures.append(limits["inodes"])
+    figures += [limits[key] for key in ("inodes", "login_memory") if limits[key] is not None]
     room = 0 if limits["stalled"] or limits["adding"] else max(min(figures), 0)
     return room, limits
+
+
+def _settle(now: float, ledger: LedgerView, sites: Sequence[tuple[SiteSettings, SiteView]], decision: Decision) -> None:
+    """A `Settle` for each lost lease not yet settled, but one whose job was cancelled less than KillWait ago (it may
+    still be spending), and each relay found gone, per site."""
+    views = {settings.label: view for settings, view in sites}
+    for settings, view in sites:
+        decision.relays[settings.label] = [
+            {"member": m.label, "relay": "gone, no exit status", "last_beat_at": m.relay_beat_at}
+            for m in view.members
+            if m.relay == "gone" and m.status not in HOLDS_NOTHING
+        ]
+    for lease_id, label, state in ledger.lost:
+        fed = ledger.federations.get(label)
+        if fed is None or fed.site not in views:
+            continue
+        if state == "expired" and fed.end_proof == "cancelled" and now < (fed.ended_at or now) + fed.kill_wait_s:
+            continue
+        member = label[len(fed.site) + 1 :] if label.startswith(f"{fed.site}-") else label
+        view = views[fed.site]
+        found = next((m for m in view.members if m.label == member and m.status != "down"), None)
+        root = None if view.error is not None or found is None else found.root
+        why = f"lease {lease_id} is lost ({state}, its holder proven ended) and still charged its grant"
+        decision.actions.append(Settle(fed.site, member, label, lease_id, root, why))
 
 
 def _add(need: int, rooms: dict[str, int], parallel: dict[str, int], decision: Decision) -> None:

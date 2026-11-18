@@ -249,13 +249,19 @@ in the process that drives the ledger (the ledger's lock admits one), and keeps 
   (`--exclusive` takes whole nodes; mixed ones are logged), less 7 for each up whose job has not started. Inodes are
   the guard's line less the usage less one whole estimate for each member whose data is not all on scratch yet, so
   parallel ups never share one reading; the reservation is read from the fleet's record, never memory, and survives a
-  restart. The allowance is declared and charged each member's whole `--time` from the moment it is made.
+  restart. The allowance is declared and charged each member's whole `--time` from the moment it is made. The login
+  node's memory (a per-account cgroup) is budgeted per login node: the relays beating there (each read by its
+  heartbeat's pid and start tick, so one on another login node counts there), the ups and verify-data in flight, and a
+  reserve, against the declared cap.
+- **Relays and money.** A relay recorded serving whose heartbeat is gone drains its federation, recorded with its last
+  heartbeat. A lost lease is settled each tick to the spend its dead federation's call log shows, through a reader the
+  tests fake and step 6 hooks up; the ledger's locked dollars are printed and logged every tick.
 - **Down only through the fleet.** A retirement is collect, verify-copy against collect's own hash, then
   `fleet.py down --member`, whose `hpcfed.py down` still refuses evidence not collected and cancels only the ids its up
   recorded. The ledger is checked again just before: drained or proven ended, and no lease issued or sent. The proof
   `cancelled` comes only once the record shows the down verified.
 - **Not built (step 6).** A remote site's transport (ssh to its login node) and the copy back over it, `--time` per
-  up, the identity a federation joins with, and the watchdog. `fleet.py`'s commands are unchanged; the controller only
+  up, the identity a federation joins with, the reader of a dead store's spend, and the watchdog. `fleet.py`'s commands are unchanged; the controller only
   adds to a fleet `up` made.
 
 ## 2. Sizing: service steps, control steps, and the node

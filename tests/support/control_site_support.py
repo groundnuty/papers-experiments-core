@@ -49,6 +49,7 @@ class FakeSite:
     commands: list = field(default_factory=list)  # every other command the controller ran on the site
     answers: dict = field(default_factory=dict)  # a command's word ("add", "collect", "verify-copy", "down") -> answer
     on_command: Callable | None = None  # (argv) -> None: what the command does to the fleet (a down marks it down)
+    processes: set = field(default_factory=set)  # (pid, start tick) of the processes alive on this login node
 
     def __post_init__(self) -> None:
         self.fleet = self.base / "fleet"
@@ -64,9 +65,11 @@ class FakeSite:
     # -- the fleet ---------------------------------------------------------------------------------------------------
 
     def add_member(self, label: str, status: str = "up", phase: str | None = "linked", verified: bool = True,
-                   jobs: dict | None = None) -> None:  # fmt: skip
+                   jobs: dict | None = None, relay: str | None = None) -> None:  # fmt: skip
         """A member of the fleet with its state file: its held jobs (`{"allocation": id, "sandbox": id}`, each a `Job`
-        under the name up gave it), its phase and, for its one ingested space, whether it is verified."""
+        under the name up gave it), its phase and, for its one ingested space, whether it is verified; with `relay`
+        (`here`, `elsewhere` or `gone`) its up recorded a fault relay serving, beating now on this login node or
+        another, or last 300 s ago."""
         fleetrecord = self.deploy.fleetrecord
         name = f"hpcop-{label}-abc123"
         jobs = jobs or {}
@@ -90,6 +93,15 @@ class FakeSite:
                  "allocation": {"job": ids.get("allocation"), "name": name},
                  "data": {"ingested": {"delta": {"declared": True, "manifest": "b" * 64, "space_id": "space-one",
                                                  "verified": marker if verified else None}}}}  # fmt: skip
+        if relay is not None:
+            state["fault_relay"] = "serving"
+            pid = 7000 + len(self.processes) + int(label.split("-")[1])
+            if relay == "here":
+                self.processes.add((pid, 99))
+            wall = self.now - (300.0 if relay == "gone" else 3.0)
+            beat = {"format": "relay", "nonce": "n" * 32, "pid": pid, "start": 99, "beat": 7, "wall": wall}
+            (root / "fault-relay").mkdir(mode=0o700)
+            (root / "fault-relay" / "heartbeat.json").write_text(json.dumps(beat), encoding="utf-8")
         if "sandbox" in ids:
             state["sandbox"] = {"placement": "separate", "job": ids["sandbox"], "het_group": None,
                                 "name": f"{name}-sandbox"}  # fmt: skip
@@ -100,6 +112,10 @@ class FakeSite:
         fleetrecord.Record(self.fleet).update(lambda record: fleetrecord.member_of(record, label).update(status=status))
 
     # -- the fake Slurm and quota command (the login node's Runner) ---------------------------------------------------
+
+    def client_alive(self, client: Any) -> bool:
+        """Whether the process (pid and start tick) is alive on this login node."""
+        return (client.pid, client.start) in self.processes
 
     def run(self, argv: list, timeout: float) -> Any:
         from hpcslurm import Completed
@@ -145,7 +161,8 @@ class FakeTransport:
         script = os.path.basename(words[3])
         if script == "fleetcontrol.py" and words[4] == "observe":
             printed = io.StringIO()
-            hooks = self.site.deploy.fleetcontrol.Hooks(runner=lambda: self.site, say=printed.write)
+            hooks = self.site.deploy.fleetcontrol.Hooks(runner=lambda: self.site, clock=lambda: self.site.now,
+                                                        say=printed.write)  # fmt: skip
             with contextlib.redirect_stderr(io.StringIO()) as err:
                 code = self.site.deploy.fleetcontrol.main(words[4:], self.site.environ, hooks)
             return code, printed.getvalue(), err.getvalue()

@@ -13,12 +13,19 @@ It reads, and never writes, submits or cancels:
   not);
 - the account's inode usage and quota (`hpcquota.read_quota`, the guard's own read) and one federation's estimate
   (`hpcquota.estimate_inodes`, the guard's own), when the providers' storage is on scratch (`HPC_STORAGE_ROOT`);
-- one federation's nodes (the layout's roles: services and the agent's node) and its `--time`.
+- one federation's nodes (the layout's roles: services and the agent's node) and its `--time`;
+- each fault relay its member's up recorded serving: its heartbeat file in the root
+  (`<root>/fault-relay/heartbeat.json`, on the shared filesystem) and whether the process it names (pid and start
+  tick) is one of this login node's. A heartbeat older than the relay's own staleness bound, or none, is `gone`; a
+  live one is `here` or `elsewhere` (relays stay on the login node their up ran on, and the controller budgets this
+  login node's memory).
 
 A job read that fails, or a job state that is neither waiting, running nor ended, fails the whole read: unknown is
 never taken for ended. A quota that cannot be read is reported (`inodes_error`) and leaves no room for an add.
 """
 
+import json
+import os
 import re
 import sys
 import time
@@ -38,12 +45,14 @@ from fedlayout import Layout  # noqa: E402
 from fedspec import load_spec  # noqa: E402
 from fleetrecord import HOLDS_NOTHING, LINKED, Record, jobs_of, root_of, sandbox_name, slot_of  # noqa: E402
 from hpcsettings import agent_limits, load_settings, site_from_environment  # noqa: E402
-from hpcslurm import ENDED_STATES, SLURM_TIME, WAITING_STATES, Slurm, SlurmError  # noqa: E402
+from hpcslurm import ENDED_STATES, SLURM_TIME, WAITING_STATES, Client, Slurm, SlurmError  # noqa: E402
 
 GONE = "GONE"  # `expcore.campaign.elastic.control.GONE`
 ENDING = ("COMPLETING",)  # ending now: as good as ended for the controller
 NODE_LINE = re.compile(r"([a-z_]+[^\s]*) ([0-9]{1,9})")
 SINFO_TIMEOUT_S = 60.0
+RELAY_DIR, HEARTBEAT = "fault-relay", "heartbeat.json"  # `expcore_onedata.fault_relay.relay_dir`, its heartbeat
+RELAY_STALE_S = 30.0  # `expcore_onedata.fault_relay.RELAY_STALE_S`: older, the relay is not answering
 
 
 class ObserveError(RuntimeError):
@@ -117,7 +126,35 @@ def verified(state: Mapping[str, Any]) -> bool:
     return all(space.get("verified") is not None for space in spaces)
 
 
-def member_view(directory: Path, member: Mapping[str, Any], slurm: Slurm) -> Dict[str, Any]:
+def heartbeat(root: Path) -> Optional[Dict[str, Any]]:
+    """The relay's last heartbeat record: a JSON object in a file of ours that is no link; None when there is none."""
+    path = root / RELAY_DIR / HEARTBEAT
+    try:
+        if path.is_symlink() or path.stat().st_uid != os.getuid():
+            return None
+        found = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def relay_view(root: Path, state: Optional[Mapping[str, Any]], runner: Any, wall: float) -> Tuple[str, Optional[float]]:
+    """The member's fault relay: `none` unless its up recorded it serving; `gone` with no live heartbeat; else `here`
+    when the process the heartbeat names (pid and start tick) is this login node's, `elsewhere` when not. With the
+    last heartbeat's wall time."""
+    if not state or hpcstate.relay_of(dict(state)) != "serving":
+        return "none", None
+    record = heartbeat(root) or {}
+    at = record.get("wall")
+    at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+    if at is None or abs(wall - at) > RELAY_STALE_S:
+        return "gone", at
+    pid, start = record.get("pid"), record.get("start")
+    ours = isinstance(pid, int) and isinstance(start, int) and runner.client_alive(Client(pid, start))
+    return ("here" if ours else "elsewhere"), at
+
+
+def member_view(directory: Path, member: Mapping[str, Any], slurm: Slurm, wall: float) -> Dict[str, Any]:
     """One member: its record's status, its root, its state file's phase and jobs, and each job as Slurm has it."""
     label, status = member["label"], member["status"]
     root = root_of(directory, label)
@@ -137,6 +174,7 @@ def member_view(directory: Path, member: Mapping[str, Any], slurm: Slurm) -> Dic
     views = [job_view(slurm, job, names.get(key)) for key, job in sorted(jobs.items())]
     view.update(jobs=sorted(set(jobs.values())), linked=(state or {}).get("phase") == LINKED)
     view["verified"] = bool(state) and verified(state)
+    view["relay"], view["relay_beat_at"] = relay_view(root, state, slurm.runner, wall)
     return {**view, **combined(views)}
 
 
@@ -162,13 +200,13 @@ def inodes(runner: Any, site: Any, layout: Any, environ: Mapping[str, str]) -> D
     return {"inodes_used": used, "inodes_quota": quota, "inode_estimate": estimate, "inodes_error": None}
 
 
-def observe(directory: Path, environ: Mapping[str, str], runner: Any) -> Dict[str, Any]:
+def observe(directory: Path, environ: Mapping[str, str], runner: Any, wall: float) -> Dict[str, Any]:
     """One read of the site: what `expcore.campaign.elastic.control.SiteView` takes, less its label, as JSON."""
     record = Record(directory).read()
     site = site_from_environment(environ)
     layout, nodes, time_s = federation_shape(directory, record)
     slurm = Slurm(runner)
-    members = [member_view(directory, member, slurm) for member in record["members"]]
+    members = [member_view(directory, member, slurm, wall) for member in record["members"]]
     idle, mixed = read_nodes(runner, site.partition)
     return {"idle_nodes": idle, "mixed_nodes": mixed, "nodes_per_federation": nodes, "time_s": float(time_s),
             **inodes(runner, site, layout, environ), "members": members}  # fmt: skip

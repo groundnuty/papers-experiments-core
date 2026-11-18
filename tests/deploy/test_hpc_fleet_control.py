@@ -12,7 +12,7 @@ from control_site_support import FakeSite, Job, observed
 from elastic_support import ENVIRONMENT, FINGERPRINT, FakeClock, config, plan
 from hpc_fleet_support import fleet_modules
 
-from expcore.campaign.elastic import Ledger
+from expcore.campaign.elastic import Lease, Ledger, Wait
 from expcore.campaign.elastic.control import Add, Retire, SiteSettings
 
 DIGEST = "c" * 64
@@ -72,7 +72,7 @@ class Bench:
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
 
-    def hooks(self, identity=None):
+    def hooks(self, identity=None, spend=None):
         sites = self.sites
 
         class Transport:
@@ -86,11 +86,12 @@ class Bench:
             sleep=lambda s: None,
             identity=identity or (lambda site, member: (FINGERPRINT, ENVIRONMENT)),
             say=self.printed.append,
+            spend=spend or (lambda site, action: None),
         )
 
-    def tick(self, *extra: str, identity=None) -> int:
+    def tick(self, *extra: str, identity=None, spend=None) -> int:
         argv = ["control", "--ledger", str(self.ledger), "--sites", str(self.file()), "--once", *extra]
-        return self.deploy.fleetcontrol.main(argv, {}, self.hooks(identity))
+        return self.deploy.fleetcontrol.main(argv, {}, self.hooks(identity, spend))
 
     def open(self) -> Ledger:
         return Ledger.open(self.ledger, clock=self.clock)
@@ -399,3 +400,127 @@ def test_c43_todays_fleet_commands_are_unchanged_and_the_controllers_calls_are_t
     for argv in (add[4:], retire[-1][4:]):
         assert deploy.fleet.main(list(argv), {}, hooks) == 0
     assert seen == [("add", 2), ("down", "fed-3")]
+
+
+# ------------------------------------------------------------------------------------------------ the additions
+def test_c43_a_burst_of_lost_priced_leases_blocks_dispatch_until_the_controller_settles_them(deploy, tmp_path, site):
+    """C43: three priced leases whose federations die are lost, each still charged its USD 10 grant, which locks the
+    whole USD 30 budget, so a fresh federation is told to wait; the controller settles each to the spend its call log
+    shows (USD 0.50, from the root), the lock is shown going in its status line and log, and dispatch resumes."""
+    for n in (1, 2, 3):
+        up(site, f"fed-{n}", 40 + 2 * n)
+    up(site, "fed-4", 60)
+    bench = Bench(tmp_path, deploy, [site], runs=plan(tasks=3), max_usd=30.0, grants_usd={"m1": 10.0})
+    bench.tick()
+    ledger = bench.open()
+    leases = [ledger.issue(f"site-a-fed-{n}") for n in (1, 2, 3)]
+    for lease in leases:
+        ledger.mark_sent(lease.lease_id)
+    ledger.close()
+    for n in (1, 2, 3):
+        site.jobs[str(40 + 2 * n)].state = "NODE_FAIL"
+    bench.clock.advance(60)
+    bench.tick()  # each job's end proven terminal: three lost leases, their grants locked
+    ledger = bench.open()
+    assert ledger.status().locked_micro == 30_000_000
+    assert isinstance(ledger.issue("site-a-fed-4"), Wait)
+    ledger.close()
+    assert "locked in unsettled leases 30.000000 USD" in bench.printed[-1]
+    read = []
+
+    def spend(config, action):
+        read.append((action.lease_id, action.root))
+        return 500_000, "root", None
+
+    bench.clock.advance(60)
+    bench.tick(spend=spend)
+    assert sorted(lease_id for lease_id, _ in read) == sorted(lease.lease_id for lease in leases)
+    assert all(root.endswith("/root") for _, root in read)
+    ledger = bench.open()
+    assert ledger.status().locked_micro == 0
+    assert isinstance(ledger.issue("site-a-fed-4"), Lease)
+    ledger.close()
+    tick = bench.lines("tick")[-1]
+    assert tick["money"]["locked_micro"] == 30_000_000  # read before this tick's settlements
+    settled = [r for r in bench.lines("result") if r.get("action") == "Settle"]
+    assert len(settled) == 3
+    assert all(r["ok"] and r["source"] == "root" for r in settled)
+
+
+def test_c43_a_lost_lease_whose_log_cannot_be_read_stays_at_its_grant_said_once(deploy, tmp_path, site):
+    """C43: with no reader of the dead store's spend (step 6 hooks it up), the lease stays charged its grant and the
+    loop says so once, not every tick."""
+    up(site, "fed-1", 41)
+    bench = Bench(tmp_path, deploy, [site], max_usd=30.0, grants_usd={"m1": 10.0})
+    bench.tick()
+    ledger = bench.open()
+    ledger.mark_sent(ledger.issue("site-a-fed-1").lease_id)
+    ledger.close()
+    site.jobs["41"].state = "NODE_FAIL"
+
+    class Stop(Exception):
+        pass
+
+    ticks = []
+
+    def sleep(seconds):
+        ticks.append(seconds)
+        bench.clock.advance(seconds)
+        if len(ticks) == 4:
+            raise Stop
+
+    hooks = bench.hooks()
+    hooks.sleep = sleep
+    with pytest.raises(Stop):
+        bench.deploy.fleetcontrol.main(
+            ["control", "--ledger", str(bench.ledger), "--sites", str(bench.file())], {}, hooks
+        )
+    unread = [r for r in bench.lines("result") if r.get("action") == "Settle"]
+    assert len(unread) == 1
+    assert "could not be read" in unread[0]["said"]
+    ledger = bench.open()
+    assert ledger.status().locked_micro == 10_000_000
+    ledger.close()
+
+
+def test_c43_an_add_is_refused_at_the_login_memory_cap_read_from_the_relays_beating_here(deploy, tmp_path, site):
+    """C43: two relays beating on this login node and one on another: under a cap that leaves less than one more
+    federation's share (its up, then its relay), nothing is added and the budget is logged beside quota and nodes."""
+    for n, where in ((1, "here"), (2, "here"), (3, "elsewhere")):
+        site.add_member(f"fed-{n}", jobs={"allocation": (str(40 + n), running(site))}, relay=where)
+    bench = Bench(tmp_path, deploy, [site])
+    used = 512 + 2 * 40
+    bench.settings = {"site-a": {"login_memory_mb": used + 295.0}}
+    bench.tick()
+    assert "add" not in verbs(site)
+    limits = bench.lines("tick")[-1]["targets"]["site-a"]["limits"]
+    assert (limits["login_memory"], limits["login_memory_mb"]["relays"]) == (0, 2)
+    assert {"inodes", "nodes", "login_memory"} <= set(limits)
+    bench.settings = {"site-a": {"login_memory_mb": used + 296.0}}
+    bench.clock.advance(60)
+    bench.tick()
+    assert site.commands[-1][-2:] == ["add", "1"]
+
+
+def test_c43_a_dead_relay_is_detected_recorded_with_its_last_heartbeat_and_its_federation_drained(
+    deploy, tmp_path, site
+):
+    """C43: a joined federation's relay stops beating (its heartbeat 300 s old): the tick records it gone with no exit
+    status and its last heartbeat, and drains the federation in the ledger."""
+    site.add_member("fed-1", jobs={"allocation": ("41", running(site))}, relay="here")
+    bench = Bench(tmp_path, deploy, [site])
+    bench.tick()
+    assert federations(bench)["site-a-fed-1"].drained_at is None
+    beat = site.fleet / "fed-1" / "root" / "fault-relay" / "heartbeat.json"
+    record = json.loads(beat.read_text(encoding="utf-8"))
+    site.now += 300
+    bench.clock.advance(300)
+    bench.tick()
+    assert federations(bench)["site-a-fed-1"].drained_at is not None
+    tick = bench.lines("tick")[-1]
+    assert tick["relays"]["site-a"] == [
+        {"member": "fed-1", "relay": "gone, no exit status", "last_beat_at": record["wall"]}
+    ]
+    (drain,) = [a for a in tick["actions"] if a["action"] == "Drain"]
+    assert drain["reason"].startswith("relay gone, no exit status")
+    assert "1 relay(s) gone" in bench.printed[-1]

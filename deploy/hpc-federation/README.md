@@ -1510,7 +1510,14 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   not all there yet (not linked and verified), over the estimate; and the declared `allowance_units` less every member
   made at its whole `--time` times `rate_units_per_hour`, over one more whole `--time` (no code reads a grant: set it
   very high where core-hours do not bind). An up waiting past `queue_stall_s` (900 s), an add still running there, or
-  a quota that cannot be read leave no room. Each tick logs every up's queue wait, submit to running.
+  a quota that cannot be read leave no room. **The login node's memory** binds too where the site declares
+  `login_memory_mb` (the account's per-user cgroup there; its OOM kills are silent): each relay beating on this login
+  node takes `relay_mb` (40: about 28 MB measured idle, with margin), each up in flight `up_mb` (256) and each
+  verify-data in flight `verify_mb` (1024), beside `login_reserve_mb` (512) for the rest; an add needs room for its up
+  and then its relay. Relays stay on the login node their up ran on, so only those beating here count (the read tells
+  a relay here from one elsewhere by the pid and start tick its heartbeat names). Each tick logs every up's queue
+  wait, submit to running, the memory budget beside the quota and the nodes, and prints one status line with the
+  ledger's money: what is left, and the dollars locked in unsettled leases.
 - **Join, drain, retire, replace.** A member up, linked, verified and running joins the ledger as
   `<site label>-<fleet label>`, with the earlier end of its two held jobs, its queue wait logged (its fingerprint and
   environment come from step 6; until then `fleetcontrol.py join ...` takes them by hand). It is drained once its
@@ -1522,10 +1529,17 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   a job the read shows ended (a node failure, its walltime) is proven `terminal` at once, and a replacement comes up.
   Federations no cap lets work are drained once idle past `retire_idle_s` (765 s, an up, a down and an ingest), the
   least walltime left first, keeping `warm_pool` (0). A failed up is taken down with no collect.
+- **Relays and lost leases.** A relay its up recorded serving whose heartbeat is missing or older than 30 s is recorded
+  in the log as `relay gone, no exit status` with its last heartbeat, and its federation is drained (no outage can be
+  injected there), or taken down if it never joined. Each lost lease (its holder proven ended with no completion, or
+  its archive never verified) not yet settled is settled to the spend its dead federation's call log shows, through
+  the spend reader (step 4's reader of a dead store's spend, hooked up in step 6; until then nothing is read, the lease
+  stays charged its grant, and the log says so once): its grant stops locking the budget, and dispatch resumes.
 - **By hand.** `--dry-run` prints each action as the commands above, one per line, under a comment naming where it runs
   and why; the live tick runs exactly those. The ledger's half has its own verbs: `fleetcontrol.py drain --ledger L
-  --label X`, `ended --ledger L --label X --proof cancelled|terminal`, and `join --ledger L --label X --site S --jobs
-  J,J --job-end EPOCH --kill-wait S --fingerprint F --environment E`.
+  --label X`, `ended --ledger L --label X --proof cancelled|terminal`, `join --ledger L --label X --site S --jobs
+  J,J --job-end EPOCH --kill-wait S --fingerprint F --environment E`, and `settle --ledger L --lease N --spend-micro S
+  --source root|pulled`.
 - **The sites file** (`--sites`, TOML): `[controller]` with `evidence` (absolute: each retired member's root evidence),
   `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one
   per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet`, `transport`

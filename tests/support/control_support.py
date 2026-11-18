@@ -92,6 +92,7 @@ def ledger(
     left: int | None = None,
     left_per_model: Mapping[str, int] | None = None,
     in_flight: int | None = None,
+    lost: Sequence[tuple[int, str, str]] = (),
 ) -> LedgerView:
     """A ledger's view: the current set's pending runs and held slots per model, the caps, the federations that joined,
     the state of each one's held lease, and the budget (none by default: `left` is what `max_usd` leaves, in
@@ -111,6 +112,7 @@ def ledger(
         holding=holding,
         idle_since=dict(idle_since or {}),
         hard_term_s=7200.0,
+        lost=tuple(lost),
     )
 
 

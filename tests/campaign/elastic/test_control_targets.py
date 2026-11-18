@@ -140,3 +140,21 @@ def test_c43_a_site_busy_with_an_add_gets_no_second_one():
     view = ledger(pending={"m1": 3})
     decision = decide(NOW, view, [(settings(), site())], busy=frozenset({"site-a"}))
     assert adds(decision) == {}
+
+
+def test_c43_an_add_is_refused_at_the_login_nodes_memory_cap():
+    """C43: the login node caps the account's memory; with a 512 MB reserve, three relays beating there (40 MB each),
+    an up in flight (256 MB) and a verify-data in flight (1024 MB), a new federation (its up, then its relay: 296 MB)
+    fits only while that much is left under the cap; relays beating on another login node take none of it."""
+    members = [member(f"fed-{n}", relay="here") for n in (1, 2, 3)]
+    members += [member("fed-4", status="made", state="PENDING", submitted_at=NOW - 30), member("fed-5", verified=False)]
+    members += [member("fed-6", relay="elsewhere")]
+    used = 512 + 3 * 40 + 256 + 1024
+    view = ledger(pending={"m1": 9})
+    tight = decide(NOW, view, [(settings(login_memory_mb=used + 295.0), site(members=members))])
+    assert adds(tight) == {}
+    limits = tight.targets["site-a"]["limits"]
+    assert (limits["login_memory"], limits["login_memory_mb"]["used_mb"]) == (0, used)
+    fits = decide(NOW, view, [(settings(login_memory_mb=used + 296.0), site(members=members))])
+    assert fits.targets["site-a"]["limits"]["login_memory"] == 1
+    assert decide(NOW, view, [(settings(), site(members=members))]).targets["site-a"]["limits"]["login_memory"] is None

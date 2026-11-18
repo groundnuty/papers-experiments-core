@@ -6,15 +6,12 @@ beside the process that drives the ledger).
 """
 
 import math
-import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from expcore.campaign.elastic import schema
-from expcore.campaign.elastic.config import LedgerConfig, micro_down
 from expcore.campaign.elastic.records import LIVE, Demand, Federation
-from expcore.campaign.elastic.views import LedgerViews
+from expcore.campaign.elastic.views import LedgerReader, LedgerViews
 
 RE_UP_S = 210.0 + 180.0 + 375.0  # an up (median about 3.5 min), a down (about 3 min) and an ingest (375 s), measured
 STALL_S = 900.0
@@ -24,6 +21,11 @@ WAITING = ("PENDING", "CONFIGURING", "REQUEUED", "RESIZING")  # `hpcslurm.WAITIN
 GONE = "GONE"  # Slurm no longer knows the job, or its id now names another job: it ended
 HOLDS_NOTHING = ("taken", "down")  # members that can hold no job (`fleetrecord`; a claimed one is an up in flight)
 ENDING_EVENTS = ("report", "return", "cancel", "expire", "lost")  # a lease's events after which its federation is free
+RELAY_MB = 40.0  # a fault relay's share of the login node's memory: about 28 MB measured idle, with margin
+UP_MB = 256.0  # an up in flight on the login node (declared, not measured)
+VERIFY_MB = 1024.0  # a verify-data in flight (declared: one at about 3.9 GB was killed before it streamed)
+LOGIN_RESERVE_MB = 512.0  # the rest of what the account runs there: the controller, the dispatcher's ssh sessions
+RELAY_STATES = ("none", "here", "elsewhere", "gone")  # no relay; beating here; beating on another login node; gone
 
 
 def _positive(name: str, value: float, zero: bool = False) -> float:
@@ -43,8 +45,10 @@ def _count(name: str, value: int, least: int) -> int:
 class SiteSettings:
     """What a site declares: its operator's label (never a host or a site's name), its maximum of federations, its
     billing allowance and rate (declared: no code reads a grant), KillWait, ups at once, the warm pool kept idle, the
-    idle time past which a federation retires, the queue wait that stalls the site, and the drain's lease bound (None:
-    the ledger's hard term), collect time and margin."""
+    idle time past which a federation retires, the queue wait that stalls the site, the drain's lease bound (None:
+    the ledger's hard term), collect time and margin, and the login node's memory budget: the account's cap there
+    (None: not declared, no budget), each fault relay's share, a reserve for each up and each verify-data in flight,
+    and one for everything else the account runs there."""
 
     label: str
     max_federations: int
@@ -58,6 +62,11 @@ class SiteSettings:
     lease_bound_s: float | None = None
     collect_s: float = COLLECT_S
     margin_s: float = MARGIN_S
+    login_memory_mb: float | None = None
+    relay_mb: float = RELAY_MB
+    up_mb: float = UP_MB
+    verify_mb: float = VERIFY_MB
+    login_reserve_mb: float = LOGIN_RESERVE_MB
 
     def __post_init__(self) -> None:
         if not isinstance(self.label, str) or not self.label or len(self.label) > 40:
@@ -73,6 +82,12 @@ class SiteSettings:
             _positive(name, getattr(self, name), zero=True)
         if self.lease_bound_s is not None:
             _positive("lease_bound_s", self.lease_bound_s)
+        if self.login_memory_mb is not None:
+            _positive("login_memory_mb", self.login_memory_mb)
+        for name in ("relay_mb", "up_mb", "verify_mb", "login_reserve_mb"):
+            _positive(name, getattr(self, name), zero=True)
+        if self.relay_mb + self.up_mb <= 0:
+            raise ValueError("relay_mb and up_mb cannot both be 0: a federation takes some of the login node")
 
 
 @dataclass(frozen=True)
@@ -80,7 +95,9 @@ class Member:
     """One member of a site's fleet, as the site's read shows it: its fleet label and record status, its root, its
     held jobs and their state (RUNNING when all run, a waiting state while any waits, else an ended state or `GONE`;
     None before any is submitted), the earliest submit, the latest start and the earliest recorded end (seconds since
-    the epoch), whether its up finished (linked) and whether every ingested space is verified."""
+    the epoch), whether its up finished (linked) and whether every ingested space is verified; and its fault relay:
+    `none` (its up recorded none serving), `here` (beating, a process of this login node), `elsewhere` (beating, on
+    another login node), `gone` (its up recorded it serving and no live heartbeat is left), with its last heartbeat."""
 
     label: str
     status: str
@@ -92,6 +109,12 @@ class Member:
     ends_at: float | None = None
     linked: bool = False
     verified: bool = False
+    relay: str = "none"
+    relay_beat_at: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.relay not in RELAY_STATES:
+            raise ValueError(f"a member's relay is one of {', '.join(RELAY_STATES)}, not {self.relay!r}")
 
     @property
     def waiting(self) -> bool:
@@ -138,6 +161,8 @@ class LedgerView:
     holding: Mapping[str, str]
     idle_since: Mapping[str, float]
     hard_term_s: float
+    lost: tuple[tuple[int, str, str], ...] = ()  # (lease id, federation, state) of each lost lease not yet settled
+    money: Mapping[str, object] = field(default_factory=dict)  # the ledger's `status()`, for the log and the status
 
     def leases_wanted(self) -> int:
         """How many more leases the ledger could issue now: each model of the current set below its cap with runs
@@ -160,15 +185,14 @@ class LedgerView:
 
 
 def ledger_view(views: LedgerViews) -> LedgerView:
-    """What the controller reads of a ledger: `demand`, the caps and the budget of its configuration,
-    `committed_micro`, `federations`, `leases` (which lease holds each federation's slot, and how many are in flight)
-    and `events` (since when each federation holds no lease: its join, or the last event that freed it)."""
+    """What the controller reads of a ledger: `demand`, the caps and grants of its configuration, `status()` (what the
+    ceilings in force leave, and what unsettled leases lock), `federations`, `leases` (which lease holds each
+    federation's slot, how many are in flight, which are lost), `settlements` and `events` (since when each federation
+    holds no lease: its join, or the last event that freed it)."""
     config = views.config
     demand = views.demand()
     leases = views.leases()
-    total, per_model = views.committed_micro()
-    left = None if config.max_usd is None else micro_down(config.max_usd) - total
-    ceilings = {} if left is None else config.per_model_usd
+    status = views.status()
     federations = {federation.label: federation for federation in views.federations()}
     owner = {lease.lease_id: lease.federation for lease in leases}
     idle = {label: federation.joined_at for label, federation in federations.items()}
@@ -176,42 +200,31 @@ def ledger_view(views: LedgerViews) -> LedgerView:
         label = owner.get(event["lease_id"])
         if event["kind"] in ENDING_EVENTS and label is not None:
             idle[label] = max(idle[label], event["at"])
+    settled = {settlement.lease_id for settlement in views.settlements()}
+    lost = tuple(
+        (lease.lease_id, lease.federation, lease.state)
+        for lease in leases
+        if lease.lease_id not in settled and (lease.state == "lost" or (lease.state == "expired" and lease.proven))
+    )
+    money = {"ceiling_micro": status.ceiling_micro, "committed_micro": status.committed_micro,
+             "remaining_micro": status.remaining_micro, "locked_micro": status.locked_micro,
+             "locked_by_state": dict(status.locked_by_state)}  # fmt: skip
     return LedgerView(
         demand=demand,
         caps=dict(config.caps),
         grants_micro={model: config.grant_micro(model) for model in demand.pending},
-        left_micro=left,
-        left_per_model_micro={model: micro_down(c) - per_model.get(model, 0) for model, c in ceilings.items()},
+        left_micro=status.remaining_micro,
+        left_per_model_micro=dict(status.model_remaining_micro),
         in_flight=sum(1 for lease in leases if lease.state in LIVE),
         federations=federations,
         holding={lease.federation: lease.state for lease in leases if lease.slot},
         idle_since=idle,
         hard_term_s=config.hard_term_s,
+        lost=lost,
+        money=money,
     )
 
 
-class ReadOnlyLedger(LedgerViews):
-    """A ledger's views opened read-only, with no lock: a dry run reads it beside the process that drives it, and can
-    never change it."""
-
-    def __init__(self, path: Path) -> None:
-        if not path.is_file():
-            raise FileNotFoundError(f"{path}: no ledger there")
-        self.db = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30.0)
-        self.db.row_factory = sqlite3.Row
-        try:
-            found = self.db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
-            if found is None or found[0] != schema.SCHEMA:
-                raise ValueError(f"{path} is not a ledger of {schema.SCHEMA}")
-            self.config = LedgerConfig.from_json(self._meta("config") or "")
-        except BaseException:
-            self.db.close()
-            raise
-
-    def close(self) -> None:
-        self.db.close()
-
-
-def read_only(path: Path) -> ReadOnlyLedger:
-    """The ledger at `path`, read-only and without its lock."""
-    return ReadOnlyLedger(path)
+def read_only(path: Path) -> LedgerReader:
+    """The ledger at `path`, read without its lock (`LedgerReader`), for a dry run beside the process that drives it."""
+    return LedgerReader(path)

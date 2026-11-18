@@ -8,6 +8,8 @@ controller"). `expcore.campaign.elastic.control` decides; this reads the sites, 
     <python> -I -B deploy/hpc-federation/fleetcontrol.py ended --ledger L --label LABEL --proof cancelled|terminal
     <python> -I -B deploy/hpc-federation/fleetcontrol.py join --ledger L --label LABEL --site S --jobs J[,J]
                                                        --job-end EPOCH --kill-wait S --fingerprint F --environment E
+    <python> -I -B deploy/hpc-federation/fleetcontrol.py settle --ledger L --lease N --spend-micro S
+                                                       --source root|pulled [--attempts N]
 
 - observe: one read of the site (`fleetobserve`), as JSON on stdout; nothing is written, submitted or cancelled.
 - control: every `interval_s` (60 by default), each site is read (`observe` through the site's transport, or the JSON
@@ -16,7 +18,10 @@ controller"). `expcore.campaign.elastic.control` decides; this reads the sites, 
   and its commands). `--dry-run` reads the ledger read-only, without its lock, prints each action's commands, and runs
   nothing; otherwise the controller holds the ledger (one process drives it) and runs them (`fleetexecute`). `--once`
   is one tick, waiting for what it started.
-- drain, ended, join: the ledger's half of an action, by hand, exactly as the controller calls it.
+- drain, ended, join, settle: the ledger's half of an action, by hand, exactly as the controller calls it.
+
+Each tick also prints one status line and logs it: what the ledger wants, its money (`status()`: what is left, and the
+dollars locked in unsettled leases), and each relay found gone.
 
 The controller only adds to a fleet that exists: `fleet.py --fleet F --layout L up N` makes it (at least two). The
 sites file (`--sites`, TOML) holds a `[controller]` table (`evidence`, the absolute directory each retired member's
@@ -45,7 +50,7 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
 
 from fleetexecute import Executor, LocalTransport, Log, SiteConfig, described, last_line, printed, render  # noqa: E402
 
-COMMANDS = ("observe", "control", "drain", "ended", "join")
+COMMANDS = ("observe", "control", "drain", "ended", "join", "settle")
 CONTROLLER_KEYS = ("evidence", "interval_s", "log")
 SITE_KEYS = ("fleet", "transport", "interpreter", "deploy")
 TRANSPORTS = ("local",)
@@ -72,6 +77,7 @@ class Hooks:
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
     identity: Callable[[str, str], Optional[Tuple[str, str]]] = lambda site, member: None
+    spend: Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]] = lambda site, action: None
     say: Callable[[str], None] = field(default=print)
 
 
@@ -153,16 +159,32 @@ def tick(views: Any, ledger_path: Path, controller: Controller, sites: Sequence[
     by_label = {site.label: site for site in sites}
     reads = [(site.settings, observe_site(transport, site, observed.get(site.label))) for site in sites]
     busy = executor.busy() if executor is not None else frozenset()
-    decision = decide(hooks.clock(), ledger_view(views), reads, busy)
+    view = ledger_view(views)
+    decision = decide(hooks.clock(), view, reads, busy)
     entries = [described(a, render(a, by_label[a.site], controller.evidence, ledger_path)) for a in decision.actions]
+    money = dict(view.money)
     log.write("tick", dry_run=executor is None, wanted=decision.wanted, targets=decision.targets,
-              waits=decision.waits, actions=entries)  # fmt: skip
+              waits=decision.waits, relays=decision.relays, money=money, actions=entries)  # fmt: skip
+    hooks.say(status_line(decision, money))
     if executor is None:
         for entry in entries:
             hooks.say(printed(entry))
     else:
         executor.run(decision)
     return decision
+
+
+def usd(micro: Optional[int]) -> str:
+    return "none" if micro is None else f"{micro / 1_000_000:.6f} USD"
+
+
+def status_line(decision: Any, money: Mapping[str, Any]) -> str:
+    """One tick's status: leases wanted, the money left and locked in unsettled leases, relays gone."""
+    locked = ", ".join(f"{state} {usd(amount)}" for state, amount in sorted(money["locked_by_state"].items()))
+    gone = sum(len(found) for found in decision.relays.values())
+    return (f"fleetcontrol: {decision.wanted} lease(s) wanted; remaining {usd(money['remaining_micro'])}; locked in "
+            f"unsettled leases {usd(money['locked_micro'])}" + (f" ({locked})" if locked else "")
+            + f"; {len(decision.actions)} action(s); {gone} relay(s) gone")  # fmt: skip
 
 
 def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) -> int:
@@ -193,7 +215,7 @@ def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
             hooks.sleep(controller.interval_s)
     ledger = Ledger.open(args.ledger, clock=hooks.clock)
     executor = Executor(ledger, args.ledger, {s.label: s for s in sites}, transport, controller.evidence, log,
-                        hooks.identity)  # fmt: skip
+                        hooks.identity, hooks.spend)  # fmt: skip
     try:
         while True:
             tick(ledger, args.ledger, controller, sites, observed, transport, executor, log, hooks)
@@ -207,13 +229,15 @@ def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
 
 
 def by_hand(args: argparse.Namespace, hooks: Hooks) -> int:
-    """`drain`, `ended` or `join`: the ledger's half of an action, as the controller calls it."""
+    """`drain`, `ended`, `join` or `settle`: the ledger's half of an action, as the controller calls it."""
     from expcore.campaign.elastic import Ledger
 
     ledger = Ledger.open(args.ledger, clock=hooks.clock)
     try:
         if args.command == "drain":
             ledger.drain(args.label)
+        elif args.command == "settle":
+            ledger.settle(args.lease, args.spend_micro, args.source, attempts_charged=args.attempts)
         elif args.command == "ended":
             ledger.prove_ended(args.label, args.proof)
         else:
@@ -222,7 +246,7 @@ def by_hand(args: argparse.Namespace, hooks: Hooks) -> int:
                         environment=args.environment, kill_wait_s=args.kill_wait)  # fmt: skip
     finally:
         ledger.close()
-    hooks.say(f"fleetcontrol: {args.command}: {args.label}: done")
+    hooks.say(f"fleetcontrol: {args.command}: {getattr(args, 'label', None) or args.lease}: done")
     return 0
 
 
@@ -231,7 +255,8 @@ def observe(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
 
     if not os.path.isabs(args.fleet):
         raise ConfigError("--fleet must be an absolute path")
-    hooks.say(json.dumps(fleetobserve.observe(Path(args.fleet), environ, hooks.runner()), sort_keys=True))
+    read = fleetobserve.observe(Path(args.fleet), environ, hooks.runner(), hooks.clock())
+    hooks.say(json.dumps(read, sort_keys=True))
     return 0
 
 
@@ -246,6 +271,12 @@ def parser() -> argparse.ArgumentParser:
     loop.add_argument("--dry-run", dest="dry_run", action="store_true")
     loop.add_argument("--observed", action="append", help="SITE=FILE: that site's read, as observe printed it")
     loop.add_argument("--log", type=Path)
+    settle = sub.add_parser("settle")
+    settle.add_argument("--ledger", type=Path, required=True)
+    settle.add_argument("--lease", type=int, required=True)
+    settle.add_argument("--spend-micro", dest="spend_micro", type=int, required=True)
+    settle.add_argument("--source", choices=("root", "pulled"), required=True)
+    settle.add_argument("--attempts", type=int)
     for name in ("drain", "ended", "join"):
         verb = sub.add_parser(name)
         verb.add_argument("--ledger", type=Path, required=True)
