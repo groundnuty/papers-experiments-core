@@ -11,9 +11,11 @@ and memory, so nothing else keeps them apart. `up` therefore reads the account's
   one that does is refused and its jobs released, naming the role.
 
 Under a fleet the two reads of each up are serialised (`placement_lock`, DESIGN.md section 1): the fleet's ups run in
-parallel but take one lock around the first read and its submit, and around the second read, so the later of two ups
-always sees the earlier one's jobs, and a loser's release (the jobs cancelled and gone from the live list) is done
-before the next up reads. A loser is a `SharedNode`, which the driver retries a bounded number of times.
+parallel but take one lock around the first read and its submit, around the agent's own submit when that waits for the
+services' job to run (`separate` without exclusive nodes: it names the first read's nodes and the services', and is
+checked by the second read), and around the second read, so the later of two ups always sees the earlier one's jobs,
+and a loser's release (the jobs cancelled and gone from the live list) is done before the next up reads. A loser is a
+`SharedNode`, which the driver retries a bounded number of times.
 
 The prefix is every held job's: `hpcop-<project>-<random>`, the agent's own job under "separate" with `-sandbox`
 after it, and the older bundle's batch scripts (`hpcop-zone`, `hpcop-provider`). A job is read whole, so another
@@ -29,7 +31,7 @@ import stat
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
-from hpcslurm import JOB_LISTED, Slurm, SlurmError
+from hpcslurm import JOB_LISTED, ReadFailed, Slurm, SlurmError
 
 JOB_PREFIX = "hpcop-"
 PLACEMENT_LOCK = ".placement.lock"  # in a fleet's own directory, beside its record's locks
@@ -106,13 +108,15 @@ def live_jobs(slurm: Slurm) -> List[LiveJob]:
     """Every job of the account that squeue lists and whose name carries the prefix, in any state (a completing job may
     still hold its node; a pending one holds none). A job of no federation's is none of its business. Anything that
     cannot be taken apart, in a line of a job that carries the prefix, raises `SlurmError`, so that no caller ever
-    acts on a guess; the message says what failed, never what squeue said."""
+    acts on a guess; the message says what failed, never what squeue said. A call that failed or timed out, or that
+    exited nonzero, is a `ReadFailed` (what a slow or restarting controller gives, which a caller may retry:
+    `Slurm.ride_out`); a line that cannot be taken apart is not."""
     try:
         done = slurm.runner.run(LIVE, slurm.command_timeout_s)
     except SlurmError:
-        raise SlurmError(f"{UNREADABLE}: the call failed or timed out") from None
+        raise ReadFailed(f"{UNREADABLE}: the call failed or timed out") from None
     if done.returncode != 0:
-        raise SlurmError(f"{UNREADABLE}: squeue exited with status {done.returncode}")
+        raise ReadFailed(f"{UNREADABLE}: squeue exited with status {done.returncode}")
     found: Dict[str, Tuple[str, Set[str]]] = {}
     for line in done.stdout.splitlines():
         words = line.split()
