@@ -1500,8 +1500,11 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   job -o <id>` on the ids its fleet's record and state files name, and the site's quota command. A job whose id Slurm
   no longer knows, or that now names another job, is `GONE` (ours ended) and is never touched. Only an exactly `idle`
   node is free: under `HPC_EXCLUSIVE_NODES=1` a federation takes 7 whole nodes, so a `mixed` node (logged) is not.
-  A job read that fails, sinfo failing, or a job state it does not read fails the whole read: the site is dark for
-  that tick (no action, no proof, its federations not counted, the demand served elsewhere).
+  A member that fails the fleet's own identity check (`fleetrecord.identity`: the root this fleet made, a state an up
+  of that root wrote, the recorded name and jobs), a job read that fails or times out, sinfo failing, or a job state
+  it does not read fails the whole read: the site is dark for that tick (no action, no proof, its federations not
+  counted, the demand served elsewhere). A member's data counts as verified only by markers bound to the manifest and
+  space its up recorded.
 - **The target.** The leases the ledger could issue now (each model of the current set, `min(cap - slots, pending)`,
   held to the grants its budget fits) less the federations free to take one (idle, or on their way up); the rest are
   added one at a time to the site with the most room, at most `parallel_ups` in one `fleet.py add`. A site's room is
@@ -1542,7 +1545,8 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   --source root|pulled`.
 - **The sites file** (`--sites`, TOML): `[controller]` with `evidence` (absolute: each retired member's root evidence),
   `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one
-  per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet`, `transport`
+  per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's
+  only: two sites never share a fleet), `transport`
   (`local` only: commands run on this host, so step 5 runs where the login node and the ledger are one; a remote site
   is step 6's), optionally `interpreter` and `deploy` (the Python and this directory on its login node), and the
   settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required).
