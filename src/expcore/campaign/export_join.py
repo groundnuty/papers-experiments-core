@@ -290,3 +290,64 @@ def _sum_table(name: str, key_fields: tuple[str, ...], parts: Sequence[Sequence[
                 else:
                     cell[field] = cell[field] + value
     return [cell for _, cell in sorted(cells.items(), key=none_last)]
+
+
+LEASE_KEY = "lease_id"  # in an export of a batch merged by run (C45), each entry's: the lease that ran it, as a lease
+# store's own export names it in its run rows (`export.LEASE_KEY`)
+FEDERATION_KEY = "federation"  # each run entry's: the federation that held its counted lease, as the ledger labels it
+SITE_KEY = "site"  # each run entry's: the site of that federation, as the ledger labels it
+LEASES_KEY = "leases"  # the top-level key of such an export: merge.json's list of counted leases
+LEASE_RETRIES_KEY = "lease_retries_by_kind"  # each counted lease's own retries rows, with its lease id
+LOST_KEY_FLAG = "lost_federation"  # an exhausted run's entry: true when the ledger exhausted it for its lost leases
+LEDGER_SPEND_KEY = "ledger_spend"  # merge.json's `spend`: the ledger's money at its snapshot, locked dollars included
+
+
+def by_run_export(
+    joined: Mapping[str, Any],
+    leases: Sequence[Mapping[str, Any]],
+    spend: Mapping[str, Any] | None = None,
+    lost: Sequence[Mapping[str, Any]] = (),
+    seq_of: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """The export of a batch merged by run (C45): the counted leases' exports joined as a merge of shards joins them
+    (`join_exports`, one part per lease), with each run's lease, federation and site in place of a shard.
+
+    Every entry `join_exports` marked with its part (`shard`) is marked with its lease (`lease_id`, as a lease store's
+    own run rows already are) instead, and each entry of a
+    run list (and of the per-entry lists: holds, losses, interrupted spend, diagnostics) gains `federation` and `site`
+    from merge.json's `leases`, which the check and the analysis rebuilt from the ledger. `shards` becomes `leases`
+    and `shard_retries_by_kind` becomes `lease_retries_by_kind`; merge.json's `spend` (the ledger's money at its
+    snapshot: what every lease is charged, the ceilings in force and what unsettled leases still lock) is carried as
+    `ledger_spend`. The runs the ledger exhausted for their lost leases (`lost`, entries as a store's export lists an
+    exhausted run, each with `lost_federation` true) join `exhausted_runs` in plan order (`seq_of`) and count in
+    `planned_runs`: they are exhausted runs like any other, with no analysed attempt. A batch merged otherwise never
+    reaches this."""
+    placed = {entry["lease_id"]: entry for entry in leases}
+    out: dict[str, Any] = {}
+    for key, value in joined.items():
+        if key == SHARDS_KEY:
+            continue
+        if key == SHARD_RETRIES_KEY:
+            out[LEASE_RETRIES_KEY] = [_leased(row, placed, place=False) for row in value]
+        elif isinstance(value, list) and value and all(isinstance(e, dict) and SHARD_KEY in e for e in value):
+            out[key] = [_leased(entry, placed, place=True) for entry in value]
+        elif key == SETTINGS_KEY:  # each change and unknown start names the lease whose store recorded it
+            out[key] = {name: [_leased(entry, placed, place=False) for entry in items] for name, items in value.items()}
+        else:
+            out[key] = value
+    if lost:
+        order = seq_of or {}
+        out["exhausted_runs"] = sorted([*out["exhausted_runs"], *map(dict, lost)], key=lambda e: order[e["run_key"]])
+        out["planned_runs"] += len(lost)
+    out[LEASES_KEY] = [dict(entry) for entry in leases]
+    if spend is not None:
+        out[LEDGER_SPEND_KEY] = dict(spend)
+    return out
+
+
+def _leased(entry: Mapping[str, Any], placed: Mapping[int, Mapping[str, Any]], *, place: bool) -> dict[str, Any]:
+    """An entry with its part's lease id under `lease` in place of `shard`, and its federation and site with `place`."""
+    lease = placed[entry[SHARD_KEY]]
+    found = {key: value for key, value in entry.items() if key != SHARD_KEY}
+    where = {FEDERATION_KEY: lease["federation"], SITE_KEY: lease["site"]} if place else {}
+    return {**found, LEASE_KEY: lease["lease_id"], **where}

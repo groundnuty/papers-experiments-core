@@ -95,7 +95,16 @@ what it bills (above), which this problem does not need.
   other live federations; an sbatch refusal says the same, the nodes' names Slurm repeats removed. What the site's
   sbatch does is not known (a live slot sees it).
 - **A fleet** (below) is N such federations: each member's `up` reads the others' jobs, so members brought up one after
-  another take distinct nodes by this rule alone; members brought up at once may race and the later one is refused.
+  another take distinct nodes by this rule alone. Members brought up at once (`HPC_FLEET_PARALLEL` above 1) share one
+  lock, the file `<fleet>/.placement.lock` (`hpcexclude.placement_lock`), taken for each up's first read together with
+  its submits and for its second read once its jobs run, and for nothing else: the rest of every up (the services, the
+  core's phase, the link check) runs in parallel. Two members whose pending jobs end on one node are told apart by the
+  second read: the one that reads first is refused, its jobs cancelled and gone from the live list before the lock is
+  let go (a completing job still lists its nodes), and it is tried again (`hpcdriver.PLACEMENT_ATTEMPTS`, 3 in all),
+  each retry reading the jobs now held and submitting with their nodes excluded; only the last refusal fails the
+  member, as it did. An `up` run by hand takes no lock and is tried once. Two fleets of one account do not share a
+  lock: each is kept apart from the other's federations by the second read alone, and both may be refused (each is then
+  tried again).
 
 ### The agent's node: a component of its own
 
@@ -134,8 +143,12 @@ that has not ended, by its own id (`Driver.releasing`).
 - **The fallback, should a site refuse heterogeneous jobs: `sandbox_placement = "separate"`**, a second held job for S
   alone, named `<name>-sandbox`, submitted, read back and cancelled exactly as the first, and never stopped or started:
   its gate reaches the providers over the network, as it does in a component. Its steps take its own job id. The two
-  jobs are scheduled apart, so the first can run, and bill, while the second waits (bounded as the first), and a
-  partition that allows one submitted job per user (reason 5 above) refuses the second.
+  jobs are scheduled apart, but the second is submitted to start after the first (`--dependency=after:<first>`, Slurm's
+  "begin after the job starts", never `afterok`; read back with the job), so a services job that pends in the queue no
+  longer leaves S's node billing alone. What remains: once the first runs, the first can still run, and bill, while the
+  second waits for a node of its own (bounded as the first); a first job cancelled before it started (its wait failing at
+  the bound) satisfies the dependency too, so the second may start in the seconds before the same failure cancels it;
+  and a partition that allows one submitted job per user (reason 5 above) refuses the second.
 - **On a site whose switch plugin gives each job a virtual network identifier, `separate` is the placement to start
   from** (the second live slot, 16 Nov 2026). There a heterogeneous job's steps on component 0 failed from a point on
   (`srun: error: task 0 launch failed: Error configuring interconnect`: after the zone and five providers had started,
@@ -172,7 +185,8 @@ under one record. One federation's job failing ends one shard's step, never anot
   section 11, whenever the site sets its keys) is asked once too, ahead of it, at `up` and at `add`: it has no estimate to
   multiply, so one read answers for all N, and a full home refuses the call before the fleet's directory, a slot or a job
   is made. `HPC_FLEET_PARALLEL` (1 by default) is how
-  many ups or downs run at once.
+  many ups or downs run at once. Neither setting may pass `HPC_FLEET_CEILING`, the site's own ceiling, a whole number
+  from 1 to 512 (64 when unset, so nothing changes unless the site sets it; a fleet of 66 needs it at 66 or more).
 - **One process per federation.** A federation's driver changes process-wide state (the umask its secrets are written
   under), so each `up` and `down` is `hpcfed.py` in a child of its own, with `-I`, from the fleet's 0700 directory,
   its output in `<fleet>/logs/<label>.<command>.log`. One that fails is reported; the others go on.
@@ -240,6 +254,37 @@ under one record. One federation's job failing ends one shard's step, never anot
 - **Not built:** a fleet's `down` of a failed federation on its own (the operator decides when a failed `up`'s job
   goes), a watch of each job's walltime, and a fleet across accounts (the maximum is one fleet's, not the account's:
   two fleets of one account must share it by hand).
+
+### The elastic controller
+
+Step 5 of #462 (C43; `fleetcontrol.py`, `fleetobserve.py`, `fleetexecute.py`; the decision in
+`expcore.campaign.elastic.control`; README, "The elastic fleet's controller"). It runs where the campaign's ledger is,
+in the process that drives the ledger (the ledger's lock admits one), and keeps each site's fleet at a target.
+
+- **Decision and action are apart.** `decide` is a pure function of one ledger view, one read per site and the sites'
+  declared settings; every action it returns is the call an operator makes by hand, rendered once, so the dry run
+  prints exactly what a live tick runs and step 6 can run with an agent taking the actions.
+- **The site's read is read-only and whole.** `sinfo` and `scontrol show job -o <id>` on the ids the fleet's record
+  and state files name, and the quota command. One job read that fails makes the site dark for the tick: unknown is
+  never taken for ended, so no proof and no retirement come from a site that could not be read.
+- **What each limit counts.** The maximum counts every member that may hold a job. Free whole nodes are idle ones only
+  (`--exclusive` takes whole nodes; mixed ones are logged), less 7 for each up whose job has not started. Inodes are
+  the guard's line less the usage less one whole estimate for each member whose data is not all on scratch yet, so
+  parallel ups never share one reading; the reservation is read from the fleet's record, never memory, and survives a
+  restart. The allowance is declared and charged each member's whole `--time` from the moment it is made. The login
+  node's memory (a per-account cgroup) is budgeted per login node: the relays beating there (each read by its
+  heartbeat's pid and start tick, so one on another login node counts there), the ups and verify-data in flight, and a
+  reserve, against the declared cap.
+- **Relays and money.** A relay recorded serving whose heartbeat is gone drains its federation, recorded with its last
+  heartbeat. A lost lease is settled each tick to the spend its dead federation's call log shows, through a reader the
+  tests fake and step 6 hooks up; the ledger's locked dollars are printed and logged every tick.
+- **Down only through the fleet.** A retirement is collect, verify-copy against collect's own hash, then
+  `fleet.py down --member`, whose `hpcfed.py down` still refuses evidence not collected and cancels only the ids its up
+  recorded. The ledger is checked again just before: drained or proven ended, and no lease issued or sent. The proof
+  `cancelled` comes only once the record shows the down verified.
+- **Not built (step 6).** A remote site's transport (ssh to its login node) and the copy back over it, `--time` per
+  up, the identity a federation joins with, the reader of a dead store's spend, and the watchdog. `fleet.py`'s commands are unchanged; the controller only
+  adds to a fleet `up` made.
 
 ## 2. Sizing: service steps, control steps, and the node
 

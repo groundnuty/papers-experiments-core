@@ -107,6 +107,7 @@ class Bench:
     asked: list = field(default_factory=list)  # the plan of each time the core was asked
     no_relay: set = field(default_factory=set)  # the federations whose up finds no fault relay in its core (O68)
     needs: tuple = ()  # the variables the settings' study plugin refuses to be built without (`standin_python`)
+    sleeping: Any = None  # a test's own wait between two polls, `(label) -> (seconds) -> None`; none: no wait at all
 
     def __post_init__(self) -> None:
         self.real = self.deploy.hpc.cli.make_driver
@@ -148,11 +149,12 @@ class Bench:
             self.fakes[label] = fake
         return self.fakes[label]
 
-    def driver(self, label: str, layout: Path, root: Path, agent: bool) -> Any:
-        """`hpcfed.make_driver` over this federation's fake cluster, its waits not slept on, the core's phase the real
-        one over the bootstrap's stand-in (as the rehearsal's `driver_maker`)."""
-        made = self.real(layout, str(root), self.fake(label), self.environ, agent=agent)
-        made.sleep = made.slurm.sleep = lambda seconds: None
+    def driver(self, label: str, layout: Path, root: Path, agent: bool, environ: Any = None) -> Any:
+        """`hpcfed.make_driver` over this federation's fake cluster, its waits not slept on (unless a test says how,
+        `sleeping`), the core's phase the real one over the bootstrap's stand-in (as the rehearsal's `driver_maker`)."""
+        made = self.real(layout, str(root), self.fake(label), self.environ if environ is None else environ,
+                         agent=agent)  # fmt: skip
+        made.sleep = made.slurm.sleep = self.sleeping(label) if self.sleeping else (lambda seconds: None)
         made.poll_s = made.slurm.poll_s = 0.0
         made.relay_available = lambda: label not in self.no_relay  # every federation serves one unless a test says not
         made.core = functools.partial(
@@ -178,14 +180,16 @@ class Bench:
         runner `main` was given must be that federation's own fake cluster."""
         label = Path(root).parent.name
         assert runner is None or runner is self.fake(label), f"{root} driven over another federation's cluster"
-        return self.driver(label, layout, Path(root), agent)
+        return self.driver(label, layout, Path(root), agent, environ)
 
     def federation(self, label: str, command: str, layout: Path, root: Path, log: Path) -> tuple[int, str]:
         """`hpcfed.py --layout L --root R <command>` through its own `main`, in this process, on the federation's own
-        fake cluster: what the fleet's process of its own would run."""
+        fake cluster: what the fleet's process of its own would run, with the environment it gives it
+        (`fleet.member_environ`: an up's has the lock the fleet's ups share)."""
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
-            code = self.deploy.hpc.cli.main(["--layout", str(layout), "--root", str(root), command], self.environ,
+            code = self.deploy.hpc.cli.main(["--layout", str(layout), "--root", str(root), command],
+                                            self.deploy.fleet.member_environ(self.environ, root, command),
                                             runner=self.fake(label))  # fmt: skip
         log.write_text(printed.getvalue(), encoding="utf-8")
         if code == 0 and command == "up":

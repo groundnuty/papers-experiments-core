@@ -254,6 +254,8 @@ SRC = DEPLOY.parent / "src"  # the core's own code, which the driver and the san
 # helper, the signal helper's root half and the resolve launcher's flags): each must exist, so the scan below cannot go
 # silent because a launch moved. They are the only `-I` displays in `src/`.
 SRC_LAUNCHES = {
+    "expcore/campaign/elastic/transport.py": 1,  # the elastic channel's exchange verb on a login node (C44)
+    "expcore/campaign/elastic/worker.py": 1,  # the node worker's `expcore run --lease` (C44)
     "expcore_onedata/addresses.py": 1,  # the tool server behind the resolve launcher (O73)
     "expcore_onedata/sandbox/apptainer/gaterun.py": 1,
     "expcore_onedata/sandbox/apptainer/hostmount.py": 1,

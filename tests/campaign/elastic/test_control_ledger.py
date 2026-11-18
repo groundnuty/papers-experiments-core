@@ -1,0 +1,82 @@
+"""What the elastic controller reads of a ledger (C43): the demand, which lease holds each federation's slot, the
+budget left, since when each federation is idle; and a dry run's read-only view, which takes no lock and writes
+nothing."""
+
+import pytest
+from elastic_support import finish, join, leased, ledger_path, make, plan
+
+from expcore.campaign.elastic import Ledger, SiteReading
+from expcore.campaign.elastic.control import environment_digest, ledger_view, read_only
+
+
+def test_c43_the_ledger_view_gives_slots_held_leases_in_flight_budget_left_and_idle_since(tmp_path):
+    """C43: one lease in flight and one completed: the first federation holds a sent lease, the second is idle since its
+    report; the budget left is max_usd less every lease's charge; the hard term is the ledger's."""
+    runs = plan(models=("m1",), tasks=3)
+    ledger, clock = make(tmp_path, runs=runs, max_usd=100.0, grants_usd={"m1": 10.0}, per_model_usd={"m1": 50.0})
+    join(ledger, clock, "fed-1")
+    join(ledger, clock, "fed-2")
+    first = leased(ledger, "fed-1")
+    ledger.mark_sent(first.lease_id)
+    second = leased(ledger, "fed-2")
+    clock.advance(120)
+    assert finish(ledger, second, spend_usd=0.5) == "counted"
+    view = ledger_view(ledger)
+    assert view.holding == {"fed-1": "sent"}
+    assert view.in_flight == 1
+    assert view.left_micro == 100_000_000 - 10_000_000 - 500_000
+    assert view.left_per_model_micro == {"m1": 50_000_000 - 10_000_000 - 500_000}
+    assert view.grants_micro == {"m1": 10_000_000}
+    assert view.idle_since["fed-2"] == clock()
+    assert view.idle_since["fed-1"] == ledger.federations()[0].joined_at
+    assert view.hard_term_s == ledger.config.hard_term_s
+    assert view.leases_wanted() == 3  # 4 runs pending; max_usd leaves 8 grants of USD 10, the ceiling 3
+    ledger.close()
+
+
+def test_c43_a_dry_runs_read_only_view_reads_beside_the_driver_and_never_writes(tmp_path):
+    """C43: while the driving process holds the ledger's lock, the read-only view reads the same demand and slots, and
+    the ledger's file is byte for byte what it was."""
+    ledger, clock = make(tmp_path)
+    join(ledger, clock, "fed-1")
+    leased(ledger, "fed-1")
+    ledger.observe_site("site-a", SiteReading())
+    before = ledger_path(tmp_path).read_bytes()
+    view = read_only(ledger_path(tmp_path))
+    try:
+        assert ledger_view(view).holding == ledger_view(ledger).holding
+        assert view.demand() == ledger.demand()
+    finally:
+        view.close()
+    assert ledger_path(tmp_path).read_bytes() == before
+    ledger.close()
+    reopened = Ledger.open(ledger_path(tmp_path), clock=clock)
+    reopened.close()
+
+
+def test_c43_an_exhausted_run_with_an_unsettled_lost_lease_is_counted_as_one_that_may_reopen(tmp_path):
+    """C43: with one attempt allowed, a lease lost with its holder proven ended exhausts its run by the loss's charge;
+    the view counts it as reopenable until a settle showing no attempt charged reopens it."""
+    ledger, clock = make(tmp_path, runs=plan(tasks=1, conditions=("api-none",)), max_attempts=1, max_usd=30.0,
+                         grants_usd={"m1": 10.0})  # fmt: skip
+    join(ledger, clock, "fed-1")
+    lease = leased(ledger, "fed-1")
+    ledger.mark_sent(lease.lease_id)
+    ledger.prove_ended("fed-1", "terminal")
+    assert ledger.run(lease.run_key).state == "infra_exhausted"
+    assert ledger_view(ledger).reopenable == 1
+    ledger.settle(lease.lease_id, 100_000, "root", attempts_charged=0)
+    assert ledger.run(lease.run_key).state == "pending"
+    assert ledger_view(ledger).reopenable == 0
+    ledger.close()
+
+
+def test_c43_the_environment_a_federation_joins_with_is_the_digest_step_4_checks():
+    """C43: the SHA-256 of the identity's canonical JSON (keys sorted, no spaces), whatever the keys' order; an empty
+    or non-mapping identity is refused."""
+    digest = "78bd403ced04f551ce0683afa7aedfd2d6d5df93e9375054cef49f4b54a94ffe"
+    assert environment_digest({"core_commit": "0123abcd", "python": "3.12.7"}) == digest
+    assert environment_digest({"python": "3.12.7", "core_commit": "0123abcd"}) == digest
+    for bad in ({}, ["python"]):
+        with pytest.raises(ValueError, match="non-empty mapping"):
+            environment_digest(bad)
