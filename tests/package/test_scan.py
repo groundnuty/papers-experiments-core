@@ -473,6 +473,71 @@ def test_k03_a_digest_that_looks_like_a_tiny_deflate_stream_is_never_refused():
     assert found({"record.json": f'{{"sha256": "{encoded}"}}\n'.encode()}) == []
 
 
+def partial_of(raw: bytes) -> bytes:
+    """What zlib returns of a zlib stream that stops before its end (the test fails if it does not, or is not one)."""
+    inflater = zlib.decompressobj()
+    partial = inflater.decompress(raw)
+    assert views._zlib(raw)
+    assert views._text(raw) is None
+    assert not inflater.eof
+    return partial
+
+
+CUT_AT = 24  # inside the deflate data of the streams below, which are 50 bytes or more
+
+
+def cut_short(payload: bytes) -> bytes:
+    return zlib.compress(payload, 9)[:CUT_AT]
+
+
+def test_k03_a_digest_that_is_the_start_of_a_deflate_stream_is_never_refused():
+    """K03: random bytes carry a valid zlib header about once in a thousand runs, and the bytes after it can be a
+    deflate stream that ends before its final block; a hex run of such bytes, long enough to refuse a stream that
+    fails to decompress, refuses nothing in a checksum file."""
+    raw = cut_short(b"nothing private is written in this stream of plain text, " * 4)
+    partial_of(raw)
+    assert len(raw.hex()) >= views.LONG_RUN
+    assert found({"SHA256SUMS": f"{raw.hex()}  data/runs.json\n".encode()}) == []
+
+
+def test_k03_a_name_in_what_a_run_cut_short_decompresses_to_is_found():
+    """K03: a stream cut short is read as far as it goes, and what it gave is scanned: here a name that its partial
+    output holds and its raw bytes do not."""
+    raw = cut_short(f"{PRIVATE} ran this, and the notes say so; the notes say so twice, ".encode() * 4)
+    assert PRIVATE.encode() in partial_of(raw)
+    assert PRIVATE.encode() not in raw
+    findings = found({"SHA256SUMS": f"{raw.hex()}  data/runs.json\n".encode()})
+    assert any(NAMED in finding for finding in findings)
+    assert not any("refused" in finding for finding in findings)
+
+
+def test_k03_a_name_in_the_raw_bytes_of_a_run_cut_short_is_found():
+    """K03: the bytes of a stream cut short are scanned as they are, as for a run that is not deflate at all: here a
+    stored block whose length check is the first two letters of a name, so that the name stands whole in the bytes
+    and its partial output lacks those two."""
+    name = PRIVATE.encode()
+    check = int.from_bytes(name[:2], "little") ^ 0xFFFF  # a stored block's LEN, so that its NLEN is the name's letters
+    raw = b"\x78\x9c\x00" + check.to_bytes(2, "little") + name + b".example is the host of these notes"
+    partial = partial_of(raw)
+    assert name in raw
+    assert name not in partial
+    findings = found({"SHA256SUMS": f"{raw.hex()}  data/runs.json\n".encode()})
+    assert any(NAMED in finding for finding in findings)
+    assert not any("refused" in finding for finding in findings)
+
+
+def test_k03_a_zlib_stream_cut_short_is_refused_everywhere_but_in_a_decoded_run(tmp_path):
+    """K03: only a decoded run is read both ways; a cut-short zlib stream as a file, as an archive member and as the
+    BLOB of a database (also one that is itself a decoded run) refuses the file as it always did."""
+    raw = cut_short(b"nothing private is written in this stream of plain text, " * 4)
+    partial_of(raw)
+    refused({"blob.bin": raw}, "zlib")
+    refused({"bundle.zip": zipped({"inner.bin": raw})}, "zlib")
+    database = sqlite_with(tmp_path / "store.sqlite", raw)
+    refused({"store.sqlite": database}, "cut short")
+    refused({"export.txt": b"database: " + b64(database) + b"\n"}, "cut short")
+
+
 def test_k03_several_caption_lines_above_an_encoded_block_do_not_hide_it():
     """K03: a joined run is also decoded from each line whose width differs from the one before it."""
     assert found({"attachment.txt": b"Experiment\nResults\nPayload\n" + base64.b64encode(zlib.compress(TEXT))})
