@@ -91,7 +91,7 @@ what it bills (above), which this problem does not need.
   submitted are the case: the one whose job runs later sees the other's nodes and is refused, and both are when both
   ran before either read again.
 - **Too few nodes.** Slurm keeps a job pending, or sbatch refuses it, when the exclusion leaves none that fits. `up`
-  waits no longer than the queue bound it always had (30 min, step 3) and its message says that it excluded N nodes of
+  waits no longer than the queue bound it always had (30 min, step 3; `HPC_QUEUE_WAIT_S` sets it) and its message says that it excluded N nodes of
   other live federations; an sbatch refusal says the same, the nodes' names Slurm repeats removed. What the site's
   sbatch does is not known (a live slot sees it).
 - **A fleet** (below) is N such federations: each member's `up` reads the others' jobs, so members brought up one after

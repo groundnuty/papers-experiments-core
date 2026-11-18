@@ -43,6 +43,7 @@ STEP_END_S = 60  # the longest the driver polls for a stopped service's step to 
 SETTLE_SLACK_S = 70  # what settle_timeout_s keeps beyond the stop's bound and the launch wait: the stop verb's
 # own tail past its control step (the wait for the step to leave the list and after a cancel: 40 s) and a 30 s margin
 STEP_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"  # HPC_STEP_PATH's default
+QUEUE_WAIT_MIN_S, QUEUE_WAIT_MAX_S = 600, 86400  # HPC_QUEUE_WAIT_S: how long up waits for a held job to start, in s
 SANDBOX_SPARE_CPUS = 2  # beside the agent's cores on its node: the gate, the dispatcher and the egress collector
 SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatcher, the collector, the store, the SIF
 PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a value the platform template leaves to up (fedfacts)
@@ -491,6 +492,21 @@ def checked_site(site: Site) -> Site:
             "unset HPC_STORAGE_ROOT for storage on the nodes' tmpfs"
         )
     return site
+
+
+def queue_wait_from_environment(environ: Mapping[str, str]) -> Optional[float]:
+    """`HPC_QUEUE_WAIT_S`: the seconds `up` waits for a held job to start before it cancels it (README, "Site
+    configuration"), a whole number from `QUEUE_WAIT_MIN_S` to `QUEUE_WAIT_MAX_S`. None when it is unset or empty: the
+    driver's own bound (1800) stands. Anything else (a word, a fraction, a sign, a number out of range) is refused,
+    naming the key and never the value. It is not a `Site` value: only `up` waits, and `down` needs no bound."""
+    value = environ.get("HPC_QUEUE_WAIT_S")
+    if not value:
+        return None
+    if not re.fullmatch(r"[0-9]{1,9}", value) or not QUEUE_WAIT_MIN_S <= int(value) <= QUEUE_WAIT_MAX_S:
+        raise SettingsError(
+            f"HPC_QUEUE_WAIT_S: must be a whole number of seconds from {QUEUE_WAIT_MIN_S} to {QUEUE_WAIT_MAX_S}"
+        )
+    return float(int(value))
 
 
 def site_from_environment(environ: Mapping[str, str]) -> Site:
