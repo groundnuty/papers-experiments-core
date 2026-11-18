@@ -23,7 +23,7 @@ sites file (`--sites`, TOML) holds a `[controller]` table (`evidence`, the absol
 root evidence is collected into; `interval_s`; `log`, the JSON log's absolute path) and one `[[site]]` table per site:
 its `label` (an operator's label, `[a-z0-9-]`, never a site's name), `fleet` (its fleet's absolute directory),
 `transport` (`local` only: the commands run on this host, the site's login node; a remote site is step 6's),
-optionally `python` and `deploy` (the interpreter and this directory on its login node), and the settings of
+optionally `interpreter` and `deploy` (the Python and this directory on its login node), and the settings of
 `SiteSettings`: `max_federations`, `allowance_units` and `rate_units_per_hour` (required), `kill_wait_s`,
 `parallel_ups`, `warm_pool`, `retire_idle_s`, `queue_stall_s`, `lease_bound_s`, `collect_s`, `margin_s`.
 """
@@ -47,7 +47,7 @@ from fleetexecute import Executor, LocalTransport, Log, SiteConfig, described, l
 
 COMMANDS = ("observe", "control", "drain", "ended", "join")
 CONTROLLER_KEYS = ("evidence", "interval_s", "log")
-SITE_KEYS = ("fleet", "transport", "python", "deploy")
+SITE_KEYS = ("fleet", "transport", "interpreter", "deploy")
 TRANSPORTS = ("local",)
 OBSERVE_TIMEOUT_S = 600.0
 
@@ -110,7 +110,7 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
             raise ConfigError(f"site {entry.get('label')}: {error}") from None
         fleet = _absolute(own.get("fleet"), f"site {settings.label}: fleet")
         deploy = _absolute(own["deploy"], f"site {settings.label}: deploy") if "deploy" in own else HERE
-        sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), own.get("python", sys.executable),
+        sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), own.get("interpreter", sys.executable),
                                 deploy))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
         raise ConfigError("the sites file needs at least one [[site]], each label once")
