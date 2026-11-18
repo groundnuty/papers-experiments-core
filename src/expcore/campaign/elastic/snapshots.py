@@ -5,7 +5,8 @@ A lease store lives on the node's memory filesystem, which a lost federation tak
 live on the shared one. So while a lease runs, its worker copies the store's `out/` there with
 `expcore.campaign.out_snapshot.take` (the store by the online backup, then `runs/`, verified and swapped in by rename),
 as a shard step does (`deploy/hpc-federation/shards.py`): every `SNAPSHOT_S` seconds and within `POLL_S` of an attempt's
-end (the markers in `runs/` change), and once more after the run exited, before its archive. A controller that must
+beginning or end (`runs/` appears, then its markers change: a lease is one run, and a federation lost in its first
+attempt must leave a store to read), and once more after the run exited, before its archive. A controller that must
 settle a lost lease reads the newest snapshot that verifies, with the lease's spend journal beside it
 (`elastic.channel`, `places/lease-<id>/`).
 
@@ -70,11 +71,12 @@ class LeaseSnapshots:
             print(f"worker: a snapshot of the lease's out/ failed ({type(error).__name__}: {error})", file=sys.stderr)
 
     def poll(self) -> None:
-        """Take a snapshot if an attempt ended since the last one (the count of markers changed; none yet counts as 0,
-        so an attempt's beginning is no run's end) or `every_s` passed."""
+        """Take a snapshot if the count of ended attempts' markers changed since the last one (`runs/` appearing is
+        the first change: an attempt began, and a run shorter than `every_s` lost with its federation would otherwise
+        leave a journal and no store) or `every_s` passed."""
         now = out_snapshot.ended_attempts(self.out)
-        ended = now is not None and now != (0 if self._seen is None else self._seen)
-        if ended or self._clock() - self._last >= self.every_s:
+        changed = now is not None and now != self._seen
+        if changed or self._clock() - self._last >= self.every_s:
             self._once(live=True)
             self._last = self._clock()
             self._seen = now if now is not None else self._seen

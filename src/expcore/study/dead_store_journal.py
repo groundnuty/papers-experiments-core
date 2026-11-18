@@ -15,8 +15,10 @@ gate's own figure (`selection_ledger.spend_of`) over the reconciled copy.
 the journal saw end is counted as the store would: by the line's own `charged`, which the run journals with every
 `attempt` line (an infrastructure failure of a kind the key's or the budget's own is not charged). A journal written
 before the field has none, and its `infra_fail` end is then counted charged, the ledger's own provisional charge being
-as high; any other end, and an attempt the journal never saw end (interrupted by the loss, which the store's own
-recovery leaves uncharged), is not charged.
+as high; any other end is not. An attempt the journal never saw end was in flight at the loss, and it is counted as
+one charged attempt, the loss's own (C42: a lost lease costs its run one attempt, so that a run that keeps losing its
+federation reaches `max_attempts` and ends, and a settle replaces that attempt with this count; the store's own
+recovery would leave the interrupted row uncharged and run it again, which a lost lease does not do).
 
 **None** (the lease stays charged its grant) for a journal that is not there, has no whole header (an empty file would
 read as "nothing spent"), does not list every attempt the store holds (a short or damaged journal), is not the one the
@@ -146,10 +148,13 @@ def _read(out: Path, study: StudyConfig, raw: bytes, private: Path) -> JournalRe
 
 
 def _charged(entry: Any) -> bool:
-    """Whether the journal's last line of an attempt is an end that cost its run an attempt: its `charged`, or, in a
-    journal written before the field, an `infra_fail` end."""
+    """Whether the journal's last line of an attempt cost its run an attempt: one still `running` was in flight at the
+    loss (the loss's own attempt, C42); an end by its `charged`, or, in a journal written before the field, by being
+    an `infra_fail`."""
+    if entry["state"] == "running":
+        return True
     charged = entry.get("charged")
-    return entry["state"] == "infra_fail" if charged is None else entry["state"] != "running" and bool(charged)
+    return entry["state"] == "infra_fail" if charged is None else bool(charged)
 
 
 def _figure(out: Path, copied: Path, private: Path, pricing: Any, extra: int) -> JournalRead | None:

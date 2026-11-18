@@ -178,8 +178,9 @@ def test_the_journal_a_lease_run_writes_names_whether_each_attempt_was_charged(e
     assert {line["id"]: line["charged"] for line in lines if line["state"] != "running"} == held
 
 
-def test_a_later_attempt_still_running_when_the_federation_was_lost_is_spend_and_not_charged(base, ended):
-    """An attempt the journal never saw end is interrupted by the loss: its spend counts, its attempt does not."""
+def test_a_later_attempt_still_running_when_the_federation_was_lost_is_spend_and_the_losss_one_attempt(base, ended):
+    """C42: An attempt the journal never saw end was in flight at the loss: its spend counts and it is the one charged
+    attempt a lost lease costs its run, so a run that keeps losing its federation reaches `max_attempts` and ends."""
     place = _mid_run(base, ended, "later-running")
     before = _read(place)
     _append(place, *_later_attempt(place, "running"))
@@ -187,7 +188,7 @@ def test_a_later_attempt_still_running_when_the_federation_was_lost_is_spend_and
     assert before is not None
     assert after is not None
     assert after.spend_micro > before.spend_micro
-    assert after.charged_attempts == before.charged_attempts
+    assert after.charged_attempts == before.charged_attempts + 1
 
 
 def test_a_journal_of_another_lease_is_ignored(base, ended, clean_environment):

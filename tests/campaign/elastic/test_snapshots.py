@@ -47,24 +47,32 @@ def _snapshots(tmp_path: Path, take: Taken, clock: list[float]) -> LeaseSnapshot
     )
 
 
-def test_c46_a_snapshot_is_taken_when_an_attempt_ended_and_when_the_cadence_passed(tmp_path):
-    """C46: a poll that sees an attempt's marker, or `every_s` since the last snapshot, takes one; any other poll
-    takes none (a snapshot copies the whole `out/` to the shared file system)."""
+def test_c46_a_snapshot_is_taken_when_an_attempt_began_or_ended_and_when_the_cadence_passed(tmp_path):
+    """C46: a poll that sees the first attempt begin (`runs/` appears: a run shorter than the cadence, lost with its
+    federation, must leave a store to read), an attempt's marker, or `every_s` since the last snapshot, takes one; any
+    other poll takes none (a snapshot copies the whole `out/` to the shared file system)."""
     take, clock = Taken(), [0.0]
     snapshots = _snapshots(tmp_path, take, clock)
     clock[0] += 30.0
     snapshots.poll()
     assert take.calls == []
+    (tmp_path / "out" / "runs").mkdir()
+    clock[0] += 30.0
+    snapshots.poll()
+    assert take.calls == [True]
+    clock[0] += 30.0
+    snapshots.poll()
+    assert take.calls == [True]
     _an_attempt_ended(tmp_path / "out", 1)
     clock[0] += 30.0
     snapshots.poll()
-    assert take.calls == [True]
+    assert take.calls == [True, True]
     clock[0] += 30.0
     snapshots.poll()
-    assert take.calls == [True]
+    assert take.calls == [True, True]
     clock[0] += 900.0
     snapshots.poll()
-    assert take.calls == [True, True]
+    assert take.calls == [True, True, True]
 
 
 def test_c46_a_snapshot_that_fails_is_reported_and_never_ends_the_run_and_the_last_one_is_taken_after_it(
