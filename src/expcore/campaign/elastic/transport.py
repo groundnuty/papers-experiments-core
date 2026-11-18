@@ -107,7 +107,7 @@ def bounded_run(argv: Sequence[str], *, check: bool = False, timeout: float | No
                 with contextlib.suppress(OSError):
                     pipe.close()
         if isinstance(error, subprocess.TimeoutExpired):
-            raise subprocess.TimeoutExpired(list(argv), timeout) from None
+            raise subprocess.TimeoutExpired(str(argv[0]), timeout) from None  # the program only: no host, no command
         raise
     return subprocess.CompletedProcess(list(argv), process.returncode, out, err)
 
@@ -159,8 +159,9 @@ class SshTransport:
     def fetch(self, site: Site, remote: str, local: Path, *, timeout_s: float | None = None) -> None:
         """Copy `remote` into `local` (a new file), within `timeout_s` (the transport's fetch bound by default);
         Unreachable or Missing leave no `local` behind."""
+        created = local.open("xb")  # an existing file is an error here, and none of ours to remove
         try:
-            with local.open("xb") as sink:
+            with created as sink:
                 done = self._call(
                     site,
                     ["cat", "--", remote],

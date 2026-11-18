@@ -6,6 +6,7 @@ record."""
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -19,7 +20,7 @@ from fake_ssh_bin import install_fake_ssh
 from hpc_fleet_support import fleet_modules
 
 from expcore.campaign.elastic import Ledger
-from expcore.campaign.elastic.control import Retire, SiteSettings
+from expcore.campaign.elastic.control import Drain, Retire, SiteSettings
 
 HOST = "zz-login-7f3a.invalid"
 ROOT_ONLY = "expcore-hpc-root-archives/1"
@@ -99,10 +100,10 @@ class Login:
     """The login node of a remote site: a deploy directory of stub scripts, a fleet directory, a site.env, and the
     site as the controller is told about it."""
 
-    def __init__(self, tmp_path: Path, monkeypatch, deploy, **settings) -> None:
+    def __init__(self, tmp_path: Path, monkeypatch, deploy, host: str = HOST, **settings) -> None:
         self.deploy = deploy
-        self.fake = install_fake_ssh(tmp_path / "bin", monkeypatch, HOST)
-        self.base = tmp_path / "login"
+        self.fake = install_fake_ssh(tmp_path / "bin", monkeypatch, host)
+        self.base = tmp_path / ("login" if host == HOST else host)  # a directory named for the alias, if it has one
         self.scripts = self.base / "deploy"
         self.scripts.mkdir(parents=True)
         for name, text in (("shards.py", STUB_SHARDS), ("fleet.py", STUB_FLEET), ("fleetcontrol.py", STUB_OBSERVE),
@@ -121,7 +122,7 @@ class Login:
             sys.executable,
             self.scripts,
             None,
-            HOST,
+            host,
             str(self.env_file),
             self.base / "settings.toml",
         )
@@ -217,24 +218,48 @@ def test_a_site_command_runs_over_ssh_from_the_fleet_with_site_env_and_every_wor
 
 def test_ssh_failing_is_said_without_the_host_and_a_remote_message_naming_it_is_scrubbed(login):
     """Exit 255 is ssh's own: the call failed, and its message (which names the host) is dropped. What a remote command
-    prints is returned with the host replaced."""
+    prints on stderr is returned with the host replaced; its stdout, which the controller parses, is never altered."""
     login.fake.rule("shards.py", "fail")
     code, out, err = login.transport.run(login.config, login.config.script("shards.py", "x"), 20.0)
     assert (code, out, err) == (255, "", "its ssh call failed")
     login.fake.clear()
     noisy = [sys.executable, "-I", "-c", f"import sys; print({HOST!r}); print('refused by {HOST}', file=sys.stderr)"]
     code, out, err = login.transport.run(login.config, noisy, 20.0)
-    assert HOST not in out + err
-    assert "<host>" in out
+    assert HOST in out
+    assert HOST not in err
     assert "<host>" in err
+
+
+def test_a_short_alias_never_alters_what_the_controller_parses_and_is_removed_from_what_it_logs(deploy, login):
+    """An alias such as `dead` (or one that is a word of a JSON key) must not corrupt collect's hash or an observed
+    read: stdout is returned as it was, and the host is removed only from stderr and from what is logged."""
+    site = deploy.fleetexecute.SiteConfig(**{**vars(login.config), "host": "dead"})
+    digest = "dead" * 16
+    code, out, err = deploy.fleetssh.SshSiteTransport({})._said(site, 0, f"{digest}\n", "dead said no")
+    assert (code, out, err) == (0, f"{digest}\n", "<host> said no")
+    assert deploy.fleetexecute.said_of(site, "", "refused by dead") == "refused by <host>"
+
+
+def test_the_host_is_removed_from_every_logged_argv_even_where_a_path_holds_it(deploy, tmp_path, monkeypatch):
+    """An alias that is also a directory name in the paths of the commands is still never logged: what is logged and
+    printed has it removed, and what is sent and run is unchanged."""
+    login = Login(tmp_path, monkeypatch, deploy, host="far-alias")  # the login node's directories are named for it
+    executor = login.executor(tmp_path)
+    assert executor.site_steps(retire(), login.config) is True
+    assert "far-alias" not in json.dumps(login.log.lines)
+    assert any("far-alias" in word for call in login.calls("shards") for word in call["argv"])  # what ran: unchanged
+    rendered = deploy.fleetexecute.render(retire(), login.config, Path("/ev"), Path("/ledger.sqlite"))
+    entry = deploy.fleetexecute.described(retire(), rendered, login.config)
+    assert "far-alias" not in json.dumps(entry) + deploy.fleetexecute.printed(entry)
 
 
 def test_a_call_past_its_bound_is_killed_with_its_group_and_raises(login):
     """A hung call (a child holding its pipes included) is killed at its bound: a failed call, not a wait."""
     login.fake.rule("shards.py", "hang_child")
     began = time.monotonic()
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(subprocess.TimeoutExpired) as error:
         login.transport.run(login.config, login.config.script("shards.py", "x"), 2.0)
+    assert HOST not in str(error.value)
     assert time.monotonic() - began < 20
     assert login.fake.child_gone()
 
@@ -361,6 +386,12 @@ def test_a_retry_finds_its_pulled_copy_and_a_different_copy_in_its_place_is_neve
     (login.scripts / "downed").unlink()
     assert executor.site_steps(retire(), login.config) is False
     assert not (login.scripts / "downed").exists()
+    shutil.rmtree(whole_copy(tmp_path))
+    whole_copy(tmp_path).symlink_to(
+        login.fleet / "collected" / "fed-1"
+    )  # a link to the site's own copy is no copy here
+    assert executor.site_steps(retire(), login.config) is False
+    assert not (login.scripts / "downed").exists()
 
 
 def test_a_retirement_at_an_ssh_site_waits_for_a_reported_lease_whose_archive_is_not_here_yet(deploy, login, tmp_path):
@@ -385,6 +416,10 @@ def test_the_dry_run_prints_the_ssh_retirement_as_the_steps_it_runs(deploy, logi
     assert printed.index("collect") < printed.index("# pulled to this host") < printed.index("verify-copy")
     assert printed.index("verify-copy") < printed.index("down")
     assert HOST not in printed + json.dumps(entry)
+    drain = Drain("site-a", "fed-1", "site-a-fed-1", "its end is near")
+    (step,) = deploy.fleetexecute.render(drain, login.config, Path("/ev"), Path("/ledger.sqlite")).steps
+    assert step[0] == sys.executable
+    assert str(login.scripts) not in step[3]  # the ledger is this host's: never the login node's interpreter or deploy
 
 
 # ------------------------------------------------------------------------------------------------ join and worker

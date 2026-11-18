@@ -168,6 +168,11 @@ def test_a_failed_pull_is_the_site_unreachable_and_a_hung_one_is_killed_and_leav
     assert (tmp_path / "got.tar").read_bytes() == b"whole"
     with pytest.raises(Missing):
         transport.fetch(site, str(tmp_path / "absent.tar"), tmp_path / "never.tar")
+    kept = tmp_path / "kept.tar"
+    kept.write_bytes(b"a copy already here")
+    with pytest.raises(FileExistsError):
+        transport.fetch(site, str(remote), kept)  # never replaced, and never removed by the failed attempt
+    assert kept.read_bytes() == b"a copy already here"
     fake.rule("cat -- ", "fail")
     with pytest.raises(Unreachable) as error:
         transport.fetch(site, str(remote), tmp_path / "failed.tar")

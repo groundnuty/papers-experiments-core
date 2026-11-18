@@ -246,8 +246,8 @@ def tick(views: Any, ledger_path: Path, controller: Controller, sites: Sequence[
     reads = [(site.settings, observe_site(transport, site, observed.get(site.label))) for site in sites]
     view = ledger_view(views)
     decision = decide(hooks.clock(), view, reads, busy)
-    entries = [described(a, render(a, by_label[a.site], controller.evidence, ledger_path, settings=controller.settings))
-               for a in decision.actions]  # fmt: skip
+    entries = [described(a, render(a, by_label[a.site], controller.evidence, ledger_path, settings=controller.settings),
+                         by_label[a.site]) for a in decision.actions]  # fmt: skip
     money = dict(view.money)
     log.write("tick", dry_run=executor is None, wanted=decision.wanted, targets=decision.targets,
               waits=decision.waits, relays=decision.relays, money=money, actions=entries)  # fmt: skip

@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from fleetssh import SshSiteTransport
+from fleetssh import SshSiteTransport, redact
 
 HERE = Path(__file__).resolve().parent
 DIGEST = "<the hash collect printed>"  # the dry run's stand-in for collect's output, which verify-copy takes
@@ -107,7 +107,10 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
     launches the federation's worker (`fleetworker.py launch`, on the site) when the site has a channel and the shard
     `settings` are given."""
     kind = type(action).__name__
-    control = site.script("fleetcontrol.py")
+    # the ledger is this host's: its commands are run here, with this host's interpreter, never the login node's
+    control = (
+        [sys.executable, "-I", "-B", str(HERE / "fleetcontrol.py")] if site.remote else site.script("fleetcontrol.py")
+    )
     if kind == "Add":
         return Rendered("site", (tuple(site.script("fleet.py", "--fleet", str(site.fleet), "add", str(action.count))),))
     if kind == "Retire":
@@ -171,12 +174,23 @@ def worker_launch(action: Any, site: SiteConfig, settings: Optional[Path]) -> Tu
     return (tuple(site.script("fleetworker.py", *words)),)
 
 
-def described(action: Any, rendered: Rendered) -> Dict[str, Any]:
-    """An action for the log and the dry run: its kind, site, member, reason and commands."""
+def shown(site: Optional[SiteConfig], argv: Sequence[str]) -> List[str]:
+    """An argv as it is logged: an ssh site's host removed from any word that holds it (not from the words sent)."""
+    return [redact(site, word) if site is not None and site.remote else word for word in argv]
+
+
+def said_of(site: Optional[SiteConfig], err: str, out: str) -> str:
+    """The last line of what a command said, as it is logged."""
+    said = last_line(err or out)
+    return redact(site, said) if site is not None and site.remote else said
+
+
+def described(action: Any, rendered: Rendered, site: Optional[SiteConfig] = None) -> Dict[str, Any]:
+    """An action for the log and the dry run: its kind, site, member, reason and commands (no ssh site's host)."""
     entry = {"action": type(action).__name__, "site": action.site, "member": getattr(action, "member", None),
              "label": getattr(action, "label", None), "reason": action.reason, "where": rendered.where,
-             "site_steps": [list(step) for step in rendered.site_steps],
-             "steps": [list(step) for step in rendered.steps]}  # fmt: skip
+             "site_steps": [shown(site, step) for step in rendered.site_steps],
+             "steps": [shown(site, step) for step in rendered.steps]}  # fmt: skip
     if rendered.places:
         entry["places"] = list(rendered.places)
     return entry
@@ -403,8 +417,8 @@ class Executor:
                 code, out, err = self.transport.run(site, list(argv), LAUNCH_TIMEOUT_S)
             except (OSError, subprocess.SubprocessError) as error:
                 code, out, err = 1, "", f"it could not be run ({type(error).__name__})"
-            self.log.write("result", action="Worker", label=action.label, argv=list(argv), code=code, ok=code == 0,
-                           said=last_line(err or out))  # fmt: skip
+            self.log.write("result", action="Worker", label=action.label, argv=shown(site, argv), code=code,
+                           ok=code == 0, said=said_of(site, err, out))  # fmt: skip
             if code != 0:
                 return False
         return True
@@ -463,8 +477,8 @@ class Executor:
                 if not HEX64.fullmatch(digest):
                     code, err = 1, "collect printed no manifest hash: nothing is verified or taken down"
             self.log.write("result", action=kind, site=action.site, member=getattr(action, "member", None),
-                           step=index, argv=argv, code=code, ok=code == 0,
-                           said=last_line(err or out))  # fmt: skip
+                           step=index, argv=shown(site, argv), code=code, ok=code == 0,
+                           said=said_of(site, err, out))  # fmt: skip
             if code != 0:
                 return False
         return True

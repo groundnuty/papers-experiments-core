@@ -67,6 +67,25 @@ def _entries(manifest: Path) -> List[Tuple[str, int, str]]:
     return found
 
 
+def redact(site: Any, text: str) -> str:
+    """`text` with the site's host (and the host part of a `user@host`) replaced: for what is logged, printed or said,
+    never for what is parsed."""
+    host = getattr(site, "host", None)
+    if not host:
+        return text
+    for name in sorted({host, host.rsplit("@", 1)[-1]}, key=len, reverse=True):
+        text = text.replace(name, "<host>")
+    return text
+
+
+def _fsync_dir(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class SshSiteTransport:
     """The controller's calls at a site whose `transport` is `ssh` (`SiteConfig.host`)."""
 
@@ -81,10 +100,7 @@ class SshSiteTransport:
     def _said(self, site: Any, code: int, out: str, err: str) -> Tuple[int, str, str]:
         if code == SSH_FAILED:
             return code, "", "its ssh call failed"
-        names = {site.host, site.host.rsplit("@", 1)[-1]}
-        for name in sorted(names, key=len, reverse=True):
-            out, err = out.replace(name, "<host>"), err.replace(name, "<host>")
-        return code, out, err
+        return code, out, redact(site, err)  # stdout is what the controller parses: it is never altered here
 
     def run(self, site: Any, argv: Any, timeout: float) -> Tuple[int, str, str]:
         from expcore.campaign.elastic.transport import remote_command, ssh_argv
@@ -105,6 +121,8 @@ class SshSiteTransport:
         remote = Site(site.label, str(site.fleet), ssh=ssh_argv(site.host), python=())
         stage: Optional[Path] = None
         try:
+            if local_dir.is_symlink():
+                return 1, "", "this host's copy is a link: it is never followed"
             if local_dir.exists():
                 if (local_dir / MANIFEST).is_file() and _sha256(local_dir / MANIFEST) == digest:
                     return 0, "its copy is already here", ""
@@ -119,8 +137,10 @@ class SshSiteTransport:
                              timeout_s=self.fetch_timeout_s + size / MIN_BYTES_PER_S)  # fmt: skip
                 if (stage / name).stat().st_size != size or _sha256(stage / name) != wanted:
                     return 1, "", "a file read there is not the one the manifest names"
+            _fsync_dir(stage)  # the copy's entries are durable before it is in place, and its place before any down
             os.rename(stage, local_dir)
             stage = None
+            _fsync_dir(local_dir.parent)
             return 0, "its copy is fetched", ""
         except (Unreachable, subprocess.SubprocessError):
             return 1, "", "its ssh call failed or timed out"
