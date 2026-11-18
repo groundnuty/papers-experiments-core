@@ -168,20 +168,14 @@ def utc_text(seconds: float) -> str:
 
 
 def kernel_lease(lease: Lease) -> dict[str, Any]:
-    """The kernel's lease file (`run_lease.read_lease`, `expcore-lease/1`) for a ledger lease.
-
-    The ledger keeps one count of a run's earlier attempts, its charged ones (`Lease.attempt_base`), and gives it as
-    both the kernel's `attempt_base` (where the lease numbers its attempts from) and its `charged_attempts` (what counts
-    against the attempt limit). The kernel takes it: the charged attempts stay unique and limited across leases. An
-    uncharged attempt of an earlier lease can share its number with one of a later lease until the ledger keeps the
-    attempts each lease started, which each completion already reports (`attempts_started`). The term ends at the
-    lease's hard term, rounded down to the second."""
+    """The kernel's lease file (`run_lease.read_lease`, `expcore-lease/1`) for a ledger lease: its run, its id, its
+    attempt base (the run's charged attempts in its earlier leases, the ledger's one count), its grant in micro-dollars,
+    the campaign's fingerprint hash, and its hard term rounded down to the second."""
     return {
         "schema": KERNEL_LEASE_SCHEMA,
         "run_key": lease.run_key,
         "lease_id": lease.lease_id,
         "attempt_base": lease.attempt_base,
-        "charged_attempts": lease.attempt_base,
         "grant_micro_usd": lease.grant_micro,
         "campaign_sha256": lease.fingerprint,
         "expires_utc": utc_text(lease.hard_term_at),

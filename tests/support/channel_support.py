@@ -182,7 +182,6 @@ def outcome_of(**fields: Any) -> Callable[[Path, Any], Outcome]:
         "attempts": 1,
         "charged": 0,
         "state": "done",
-        "attempts_started": 1,
         "spend_usd": 0.5,
         "spend_known": True,
     }

@@ -96,7 +96,7 @@ def test_c43_the_worker_runs_its_leases_one_at_a_time_in_lease_order_and_beats_w
     archive = channel / ch.ARCHIVES / ch.archive_name(5)
     assert done["archive_sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
     assert (done["lease_id"], done["run_key"], done["federation"]) == (5, a_lease(5).run_key, LABEL)
-    assert (done["state"], done["charged"], done["spend_usd"], done["attempts_started"]) == ("done", 0, 0.5, 1)
+    assert (done["state"], done["attempts"], done["charged"], done["spend_usd"]) == ("done", 1, 0, 0.5)
     assert done["store"].endswith("lease-000000000005/study/out")
     with tarfile.open(archive) as tar:
         assert "out/state.sqlite" in tar.getnames()
@@ -210,7 +210,7 @@ def test_c43_the_lease_file_the_channel_writes_is_the_one_the_kernel_reads(tmp_p
     path = tmp_path / "lease.json"
     ch.write_json(path, ch.envelope(lease)["lease"])
     read = read_lease(path)
-    assert (read.run_key, read.lease_id, read.attempt_base, read.charged_attempts) == (lease.run_key, 1, 0, 0)
+    assert (read.run_key, read.lease_id, read.attempt_base) == (lease.run_key, 1, 0)
     assert (read.grant_micro_usd, read.campaign_sha256) == (1_250_000, ledger.config.fingerprint)
     assert read.expiry.timestamp() == int(lease.hard_term_at)
 
@@ -279,7 +279,7 @@ def test_c43_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kerne
     completion = json.loads((channel_of(site, LABEL) / ch.OUTBOX / ch.completion_name(lease.lease_id)).read_text())
     # A done attempt counts against no attempt limit (`attempts.classify`): one attempt, none charged.
     assert (completion["state"], completion["attempts"], completion["charged"]) == ("done", 1, 0)
-    assert (completion["attempts_started"], completion["spend_known"]) == (1, True)
+    assert completion["spend_known"]
     assert 0 < completion["spend_usd"] <= 5.0
     assert ledger.lease(lease.lease_id).charge_micro > 0
     assert_invariants(ledger)

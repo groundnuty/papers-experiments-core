@@ -14,8 +14,8 @@ channel's inbox (`elastic.channel`) by listing it, and for each lease, in lease-
    while the run lives.
 3. **Reports it.** From the lease store (never from the exit status): with at least one attempt, the store's `out/` is
    archived to `archives/lease-<id>.out.tar` and a completion names the lease, its run, the store, the archive's
-   SHA-256, the last attempt's state, this store's charged attempts (the lease's base not included), the highest
-   attempt number it used and its spend as the budget gate counts it (`selection_ledger.spend_of`; the grant, its
+   SHA-256, the last attempt's state, this store's attempts and charged attempts (the lease's base not included) and
+   its spend as the budget gate counts it (`selection_ledger.spend_of`; the grant, its
    bound, when that is unknown). A lease that began no attempt (refused by the kernel, or held before any attempt) is
    returned, with what its store spent. A run that ended with an attempt still `running` is reported by neither: the
    worker stops with `running.json` in place, so no other lease runs here, and the ledger expires the lease.
@@ -101,13 +101,12 @@ class ProcessRunner:
 
 @dataclass(frozen=True)
 class Outcome:
-    """What a lease store says: its attempts, their charged ones, the last one's state, the highest attempt number and
-    the spend (`spend_known`: False when it is the grant, the bound)."""
+    """What a lease store says: its attempts, their charged ones, the last one's state and the spend (`spend_known`:
+    False when it is the grant, the bound)."""
 
     attempts: int
     charged: int
     state: str | None
-    attempts_started: int
     spend_usd: float
     spend_known: bool
 
@@ -120,7 +119,7 @@ def store_outcome(study: Path, lease: RunLease) -> Outcome | None:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
-        rows = connection.execute("SELECT attempt, state, charged FROM attempts ORDER BY id").fetchall()
+        rows = connection.execute("SELECT state, charged FROM attempts ORDER BY id").fetchall()
         spend = _spend(study, lambda sql, args=(): connection.execute(sql, args).fetchall())
     finally:
         connection.close()
@@ -129,7 +128,6 @@ def store_outcome(study: Path, lease: RunLease) -> Outcome | None:
         attempts=len(rows),
         charged=sum(int(row["charged"]) for row in rows),
         state=rows[-1]["state"] if rows else None,
-        attempts_started=max((int(row["attempt"]) for row in rows), default=0),
         spend_usd=spend if known else lease.grant_usd,
         spend_known=known,
     )
@@ -352,7 +350,6 @@ class Worker:
                 "state": found.state,
                 "charged": found.charged,
                 "attempts": found.attempts,
-                "attempts_started": found.attempts_started,
                 "spend_usd": found.spend_usd,
                 "spend_known": found.spend_known,
                 "exit_status": status,
