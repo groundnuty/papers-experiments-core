@@ -418,16 +418,16 @@ class Site:
     # ("Error configuring interconnect") from a point on while the same steps with `no_vni` ran; the services talk over
     # TCP and need none. Empty: no option, as before.
     step_network: str = ""
-    # The domain suffix of a node whose `hostname -f` gives one label (HPC_NODE_DOMAIN): its FQDN is then
-    # `<hostname -s>.<domain>` in every step that names the node (nodefacts.py, lib.sh's node_fqdn), and the step's
-    # environment carries it (`hpclaunch.Launcher`). Empty: a one-label name is refused. Recorded in the state file, so
-    # `down` and the service verbs launch their steps with it all the same.
-    node_domain: str = ""
     # Every held job is submitted `--exclusive` (HPC_EXCLUSIVE_NODES=1): Slurm packs a job that asks a few cores and
     # some memory onto a node another job holds, and a pending job has no node for another `up` to exclude, so parallel
     # ups shared nodes (live, 18 Nov). False: the held jobs ask what they always did. Not recorded in the state file:
     # only `up` submits, and `down` needs none of it.
     exclusive_nodes: bool = False
+    # The domain suffix of a node whose `hostname -f` gives one label (HPC_NODE_DOMAIN): its FQDN is then
+    # `<hostname -s>.<domain>` in every step that names the node (nodefacts.py, lib.sh's node_fqdn), and the step's
+    # environment carries it (`hpclaunch.Launcher`). Empty: a one-label name is refused. Recorded in the state file, so
+    # `down` and the service verbs launch their steps with it all the same.
+    node_domain: str = ""
 
     def to_json(self) -> dict:
         return {

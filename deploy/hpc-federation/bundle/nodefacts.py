@@ -25,6 +25,7 @@ import sys
 FQDN = re.compile(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
 ONE_LABEL = re.compile(r"[A-Za-z0-9-]+")
 LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+SHORT_NAME = re.compile(LABEL)  # `hostname -s` of a one-label node, which becomes the FQDN's first label
 NODE_DOMAIN = re.compile(rf"{LABEL}(?:\.{LABEL})*")  # HPC_NODE_DOMAIN: the same shape hpcsettings.py and lib.sh hold
 NODE_DOMAIN_ENV = "HPC_NODE_DOMAIN"
 FQDN_MAX = 253
@@ -157,6 +158,15 @@ def hostname(flag):
     return subprocess.run(["hostname", flag], capture_output=True, text=True, check=True).stdout.strip()
 
 
+def reads_as_address(name):
+    """Whether the resolver takes `name` for an IPv4 literal (glibc reads a bare 42 as 0.0.0.42), not a host name."""
+    try:
+        socket.inet_aton(name)
+    except OSError:
+        return False
+    return True
+
+
 def node_name(environ=os.environ):
     """The node's FQDN and the name its IPv4 address is read by (lib.sh's node_fqdn makes the same FQDN, by the same
     rule). A dotted `hostname -f` is the FQDN, as it always was, whether or not HPC_NODE_DOMAIN is set. A one-label one
@@ -174,8 +184,10 @@ def node_name(environ=os.environ):
             "to the domain its FQDN is to carry"
         )
     short = hostname("-s")
-    if not NODE_DOMAIN.fullmatch(domain) or not ONE_LABEL.fullmatch(short) or len(short) + 1 + len(domain) > FQDN_MAX:
+    if not NODE_DOMAIN.fullmatch(domain) or not SHORT_NAME.fullmatch(short) or len(short) + 1 + len(domain) > FQDN_MAX:
         raise NameRefused(f"{NODE_DOMAIN_ENV} and hostname -s do not make a fully qualified name")
+    if reads_as_address(short):  # its address would be read as the literal, not the node's: never a wrong peer address
+        raise NameRefused("hostname -s reads as an IPv4 address, so its own address cannot be read by name")
     return f"{short}.{domain}", short
 
 

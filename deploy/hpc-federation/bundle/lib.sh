@@ -475,7 +475,7 @@ node_fqdn() {
   d=${HPC_NODE_DOMAIN:-}
   [[ -n $d ]] || die "hostname -f gave the one-label name '$f', not a fully qualified name: set HPC_NODE_DOMAIN in site.env to the domain its FQDN is to carry"
   s=$(hostname -s)
-  [[ $d =~ ^$label(\.$label)*$ && $s =~ ^[A-Za-z0-9-]+$ && $(( ${#s} + 1 + ${#d} )) -le 253 ]] \
+  [[ $d =~ ^$label(\.$label)*$ && $s =~ ^$label$ && $(( ${#s} + 1 + ${#d} )) -le 253 ]] \
     || die "HPC_NODE_DOMAIN '$d' and hostname -s '$s' do not make a fully qualified name"
   printf '%s.%s\n' "$s" "$d"
 }

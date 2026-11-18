@@ -27,6 +27,7 @@ CASES = [
     pytest.param(DOTTED, "n01", "nodes.example", DOTTED, DOTTED, id="dotted-with-the-setting-is-unchanged"),
     pytest.param(ONE_LABEL, "n01", "nodes.example", "n01.nodes.example", "n01", id="one-label-with-the-setting"),
     pytest.param(ONE_LABEL, "n01", None, None, None, id="one-label-without-the-setting"),
+    pytest.param("n01-", "n01-", "nodes.example", None, None, id="one-label-short-name-that-is-no-dns-label"),
 ]
 ADDRESS = "192.0.2.7"
 FAKE_HOSTNAME = """#!/bin/bash
@@ -114,3 +115,20 @@ def test_node_fqdn_of_the_bundle_gives_the_name_the_facts_step_gives(
     assert done.returncode == 0, done.stderr
     the_node(monkeypatch, fake_hostname, full, short, domain)
     assert done.stdout.strip() == fqdn == nodefacts.node_name()[0]
+
+
+def test_the_facts_step_refuses_a_short_name_the_resolver_reads_as_an_address(
+    nodefacts, monkeypatch, capsys, fake_hostname
+):
+    """A node named 42 would have its address read by the name 42, which glibc takes for the literal 0.0.0.42: one
+    address, and the wrong one. The facts step refuses, recording none."""
+    the_node(monkeypatch, fake_hostname, "42", "42", "nodes.example")
+    monkeypatch.setattr(
+        nodefacts.socket,
+        "getaddrinfo",
+        lambda name, port, family, kind: [(socket.AF_INET, kind, 6, "", ("0.0.0.42", 0))],
+    )
+    assert nodefacts.main() == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "IPv4 address" in err
