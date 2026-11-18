@@ -8,12 +8,15 @@ under a default configuration that adds an extension of its own. Names are inven
 machine.
 """
 
+import subprocess
+
 import pytest
 from ca_checks import (
     DEFAULT_CONFIG_THAT_ADDS_EXTENSIONS,
     HAS_OPENSSL,
     assert_leaf_names_its_key_and_its_issuers_key,
     assert_one_of_each_expected_extension,
+    extensions_of,
     handshake,
     openssl_verifies,
 )
@@ -77,3 +80,32 @@ def test_o92_the_script_and_the_core_declare_the_same_ca_extensions(fed):
     from expcore_onedata.sandbox.caconfig import CA_CONFIG
 
     assert fed.pki.CA_CONFIG == CA_CONFIG
+
+
+def test_o92_a_leaf_is_signed_by_a_reused_ca_that_has_no_subject_key_identifier(fed, tmp_path):
+    """O92: `make_ca` keeps a CA whose files exist, and OpenSSL 3 signs for one with no subject key identifier by
+    naming its issuer and serial in the leaf's authority key identifier; the leaf's `keyid,issuer` does the same."""
+    ca, ca_key, key, cert = tmp_path / "ca.pem", tmp_path / "ca.key", tmp_path / "svc.key", tmp_path / "svc.pem"
+    words = [
+        "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "2",
+        "-keyout", str(ca_key), "-out", str(ca),
+    ]  # fmt: skip
+    for extra in ("", "subjectKeyIdentifier = none\n"):  # 1.1.1 adds none itself; OpenSSL 3 does unless told not to
+        config = tmp_path / "bare.cnf"
+        config.write_text(
+            "[req]\ndistinguished_name = dn\nprompt = no\nx509_extensions = ext\n[dn]\nCN = bare\n"
+            f"[ext]\nbasicConstraints = critical,CA:TRUE\nkeyUsage = critical,keyCertSign,cRLSign\n{extra}",
+            encoding="utf-8",
+        )
+        if subprocess.run(["openssl", *words, "-config", str(config)], capture_output=True).returncode != 0:
+            continue
+        if "X509v3 Subject Key Identifier" not in [name for name, _, _ in extensions_of(ca)]:
+            break
+    else:
+        pytest.skip("this openssl makes no CA without a subject key identifier")
+    ca_key.chmod(0o600)
+    fed.pki.make_ca(ca, ca_key, "ignored")  # the files exist: kept as they are
+    sans = fed.pki.subject_alt_names(DOMAIN, "node1", ["127.0.0.1"])
+    fed.pki.make_leaf(ca, ca_key, key, cert, DOMAIN, sans, tmp_path)
+    assert openssl_verifies(ca, cert)
+    assert_leaf_names_its_key_and_its_issuers_key(cert)

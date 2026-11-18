@@ -137,7 +137,7 @@ def make_leaf(ca_pem: Path, ca_key: Path, key: Path, cert: Path, domain: str, sa
     ext.write_text(
         f"subjectAltName={sans}\nbasicConstraints=CA:FALSE\n"
         "keyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n"
-        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",  # OpenSSL 3 adds both itself, 1.1.1 neither
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n",  # OpenSSL 3 adds both itself, 1.1.1 neither
         encoding="utf-8",
     )
     with private_umask():
