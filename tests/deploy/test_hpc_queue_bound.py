@@ -140,17 +140,15 @@ def test_o57_a_stale_queue_bound_never_stops_a_command_that_does_not_wait(hpc, t
 # -- the held jobs of one up ----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("agent_state", ["PENDING", "SUSPENDED"])
-def test_o57_the_services_job_timing_out_releases_the_agents_job_too(hpc, tmp_path, site, agent_state):
-    """O57: under "separate" the services job that never starts is cancelled by the wait, and the agent's own held job,
-    submitted with it and in any state short of ended, is cancelled by its id too: none of this up's jobs is left to
-    start and bill with no federation. The failure says what was released."""
-    fake = separate("PENDING", agent_state)
+def test_o57_the_services_job_timing_out_leaves_no_agent_job_to_release(hpc, tmp_path, site):
+    """O57: under "separate" the agent's own held job is submitted only once the services' job runs, so a services job
+    that never starts is the only held job: the wait cancels it by its id, and the agent's job never exists to bill."""
+    fake = separate("PENDING")
     rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
-    with pytest.raises(hpc.slurm.SlurmError, match="did not start within 1800 s") as refused:
+    with pytest.raises(hpc.slurm.SlurmError, match="did not start within 1800 s"):
         rig.up()
-    assert sorted(fake.cancelled) == [SERVICES, AGENT]
-    assert f"the held job(s) {AGENT} were cancelled" in str(refused.value)
+    assert fake.cancelled == [SERVICES]
+    assert AGENT not in fake.submitted
 
 
 def test_o57_the_agents_job_timing_out_releases_the_running_services_job_too(hpc, tmp_path, site):
@@ -164,18 +162,27 @@ def test_o57_the_agents_job_timing_out_releases_the_running_services_job_too(hpc
     assert f"the held job(s) {SERVICES} were cancelled" in str(refused.value)
 
 
-def test_o57_a_held_job_that_ended_before_it_ran_releases_the_other_one(hpc, tmp_path, site):
-    """O57: the other way a wait fails (the job ends before it ran) releases the same way."""
-    fake = separate("FAILED", "PENDING")
+def test_o57_a_services_job_that_ended_before_it_ran_leaves_no_agent_job(hpc, tmp_path, site):
+    """O57: the other way a wait fails (the job ends before it ran): the agent's job is not submitted."""
+    fake = separate("FAILED")
     rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
     with pytest.raises(hpc.slurm.SlurmError, match="FAILED before it ran"):
         rig.up()
-    assert AGENT in fake.cancelled
+    assert AGENT not in fake.submitted
+
+
+def test_o57_an_agent_job_that_ended_before_it_ran_releases_the_running_services_job(hpc, tmp_path, site):
+    """O57: the agent's own job ending before it ran cancels the running services' job by its id."""
+    fake = separate("RUNNING", "FAILED")
+    rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
+    with pytest.raises(hpc.slurm.SlurmError, match="FAILED before it ran"):
+        rig.up()
+    assert SERVICES in fake.cancelled
 
 
 def test_o57_a_release_that_fails_is_said_and_left_to_down(hpc, tmp_path, site):
     """O57: a cancel that Slurm refuses is not hidden: the failure names the job and says to run down."""
-    fake = separate("PENDING", "PENDING")
+    fake = separate("RUNNING", "PENDING")
     real = fake.run
 
     def refusing(argv, timeout):
@@ -193,11 +200,11 @@ def test_o57_a_release_that_fails_is_said_and_left_to_down(hpc, tmp_path, site):
 def test_o57_a_held_job_that_cannot_be_read_is_never_guessed_at_and_is_left_to_down(hpc, tmp_path, site):
     """O57: a job whose record cannot be read at the release is not cancelled on a guess (nothing proves it is still
     this up's); the failure names it and says to run down, which checks it the same way."""
-    fake = separate("PENDING", "RUNNING")
+    fake = separate("RUNNING", "PENDING")
     real = fake.run
 
     def unreadable(argv, timeout):
-        if argv[:5] == ["scontrol", "show", "job", "-o", AGENT] and fake.cancelled:
+        if argv[:5] == ["scontrol", "show", "job", "-o", SERVICES] and fake.cancelled:
             return hpc.slurm.Completed(1, "", "slurm_load_jobs error: Socket timed out\n")
         return real(argv, timeout)
 
@@ -205,41 +212,49 @@ def test_o57_a_held_job_that_cannot_be_read_is_never_guessed_at_and_is_left_to_d
     rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
     with pytest.raises(hpc.slurm.SlurmError) as refused:
         rig.up()
-    assert fake.cancelled == [SERVICES]
-    assert f"job(s) {AGENT} could not be read: run down to release them" in str(refused.value)
+    assert fake.cancelled == [AGENT]
+    assert f"job(s) {SERVICES} could not be read: run down to release them" in str(refused.value)
 
 
 def test_o57_a_job_id_that_now_carries_another_name_is_never_cancelled(hpc, tmp_path, site):
-    """O57: Slurm reuses ids. When the services job times out and the agent's id now belongs to a job of another name,
-    that job is not this up's: it is not cancelled, and the failure says so."""
-    fake = separate("PENDING", "RUNNING")
+    """O57: Slurm reuses ids. When the agent's job times out and the services' id now belongs to a job of another
+    name, that job is not this up's: it is not cancelled, and the failure says so."""
+    fake = separate("RUNNING", "PENDING")
     real = fake.run
 
     def reused(argv, timeout):
-        if argv[:2] == ["scancel", SERVICES]:  # the agent's id is another job's from here on
-            fake.component_recorded[(AGENT, 0)] = {"JobName": "somebody-elses-analysis"}
+        if argv[:2] == ["scancel", AGENT]:  # the services' id is another job's from here on
+            fake.component_recorded[(SERVICES, 0)] = {"JobName": "somebody-elses-analysis"}
         return real(argv, timeout)
 
     fake.run = reused
     rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
     with pytest.raises(hpc.slurm.SlurmError) as refused:
         rig.up()
-    assert fake.cancelled == [SERVICES]
-    assert f"job(s) {AGENT} carry another job's name and were not cancelled" in str(refused.value)
+    assert fake.cancelled == [AGENT]
+    assert f"job(s) {SERVICES} carry another job's name and were not cancelled" in str(refused.value)
 
 
 # -- a failure before the federation is up releases every held job --------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("placed", "words"),
+    ("placed", "words", "released"),
     [
-        ({(AGENT, 0): ["node01"]}, f"job {AGENT} was placed on node01, held twice, not on the 1 asked for"),
-        ({(SERVICES, 0): [f"node0{i}" for i in range(1, 6)]}, f"job {SERVICES} was placed on 5 node(s), not on the 6"),
+        (
+            {(AGENT, 0): ["node01"]},
+            f"job {AGENT} was placed on node01, held twice, not on the 1 asked for",
+            [SERVICES, AGENT],
+        ),
+        (
+            {(SERVICES, 0): [f"node0{i}" for i in range(1, 6)]},
+            f"job {SERVICES} was placed on 5 node(s), not on the 6",
+            [SERVICES],  # found before the agent's job is submitted: it never exists
+        ),
     ],
     ids=["the agents job on a node the services job holds", "the services job on fewer nodes than asked"],
 )
-def test_o57_a_job_placed_wrongly_releases_every_held_job_of_the_up(hpc, tmp_path, site, placed, words):
+def test_o57_a_job_placed_wrongly_releases_every_held_job_of_the_up(hpc, tmp_path, site, placed, words, released):
     """O57: Slurm packed a held job onto a node already held (live, 18 Nov: five ups at once). The job placed wrongly is
     no longer the only one cancelled: the other held job of this up, running, is cancelled by its id too, or it would
     bill six nodes with no federation. The failure says what was released, and no step ran."""
@@ -247,20 +262,23 @@ def test_o57_a_job_placed_wrongly_releases_every_held_job_of_the_up(hpc, tmp_pat
     rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
     with pytest.raises(hpc.slurm.SlurmError, match=re.escape(words)) as refused:
         rig.up()
-    assert sorted(fake.cancelled) == [SERVICES, AGENT]
-    assert str(refused.value).endswith(f"the held job(s) {SERVICES}, {AGENT} were cancelled")
+    assert sorted(fake.cancelled) == released
+    assert str(refused.value).endswith(f"the held job(s) {', '.join(released)} were cancelled")
     assert fake.sruns == []
 
 
-def test_o57_a_read_back_of_the_running_jobs_that_fails_releases_every_held_job(hpc, tmp_path, site):
-    """O57: the read-back taken once the jobs run (the scheduler may allocate more than a pending request showed)
-    cancels the job it found otherwise than asked, and the other held job of this up with it."""
+def test_o57_a_read_back_of_the_running_services_job_that_fails_cancels_it_and_submits_no_agent_job(
+    hpc, tmp_path, site
+):
+    """O57: the read-back taken once the services' job runs (the scheduler may allocate more than a pending request
+    showed) cancels the job it found otherwise than asked, before the agent's own job is submitted."""
     fake = FakeSlurm(running_recorded={"NumNodes": "5"})
     rig = Rig(hpc, tmp_path, site, SEPARATE_LAYOUT, fake)
     with pytest.raises(hpc.slurm.SlurmError, match="NumNodes") as refused:
         rig.up()
-    assert fake.cancelled == [SERVICES, AGENT]
-    assert str(refused.value).endswith(f"the held job(s) {AGENT} were cancelled")
+    assert fake.cancelled == [SERVICES]
+    assert AGENT not in fake.submitted
+    assert str(refused.value).endswith("it was cancelled")
 
 
 @pytest.mark.parametrize("method", ["keep_off_other_federations", "place"])

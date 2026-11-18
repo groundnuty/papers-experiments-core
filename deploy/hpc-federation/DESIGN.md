@@ -132,7 +132,9 @@ that has not ended, by its own id (`Driver.releasing`).
   is cancelled by its leader's id, which ends every component. Component 1's own job id (its record's `JobId`) is
   recorded, since squeue -s and sacct list its steps under it.
 - **The fallback, should a site refuse heterogeneous jobs: `sandbox_placement = "separate"`**, a second held job for S
-  alone, named `<name>-sandbox`, submitted, read back and cancelled exactly as the first, and never stopped or started:
+  alone, named `<name>-sandbox`, submitted (once the services' job runs and its nodes are read, with `--exclude`
+  naming them and the other federations' nodes, so Slurm cannot pack it onto a services node; with
+  `HPC_EXCLUSIVE_NODES=1` together with the first), read back and cancelled exactly as the first, and never stopped or started:
   its gate reaches the providers over the network, as it does in a component. Its steps take its own job id. The two
   jobs are scheduled apart, so the first can run, and bill, while the second waits (bounded as the first), and a
   partition that allows one submitted job per user (reason 5 above) refuses the second.

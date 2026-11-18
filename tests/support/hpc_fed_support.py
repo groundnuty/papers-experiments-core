@@ -469,6 +469,10 @@ class FakeSlurm:
     others_by_read: list = field(default_factory=list)
     peers: list = field(default_factory=list)
     me_reads: int = 0  # the `squeue --me` reads so far
+    # Nodes shared by cores, as the live cluster packed them (18 Nov): a job takes the first nodes it did not exclude,
+    # whichever of this fake's own other jobs hold them (the components of one job never share). Off: its jobs never
+    # share a node, by construction.
+    shared_nodes: bool = False
     on_me: Callable | None = None  # a test's own answer, `(read number, listed rows) -> Completed | None`
 
     # -- the Runner interface ------------------------------------------------------------------------------------
@@ -606,6 +610,8 @@ class FakeSlurm:
             return list(self.node_lists[(ident, component)])
         taken: set = set()
         for job in self.submitted or {self.job_id: None}:
+            if self.shared_nodes:  # the components of one heterogeneous job still get nodes of their own
+                taken = set()
             for index, options in enumerate(self._options(job)):
                 count = int(options.get("--nodes", "1"))
                 excluded = set(filter(None, options.get("--exclude", "").split(",")))

@@ -177,26 +177,26 @@ def test_o57_a_read_made_after_the_job_started_that_fails_is_read_again_and_up_s
 
 
 @pytest.mark.parametrize(
-    ("phase", "said"),
+    ("phase", "said", "released"),
     [
-        ("readback", "scontrol did not answer in 60 s"),
-        ("exclusion", "the account's live federation jobs could not be read"),
+        ("readback", "scontrol did not answer in 60 s", [SERVICES]),  # the agent's job is submitted after it
+        ("exclusion", "the account's live federation jobs could not be read", [SERVICES, AGENT]),
     ],
 )
 def test_o57_a_read_after_the_start_that_fails_for_ten_minutes_releases_every_held_job_as_before(
-    hpc, tmp_path, site, phase, said
+    hpc, tmp_path, site, phase, said, released
 ):
     """O57: those reads too give up only once every one has failed for `MISSED_POLLS_GIVE_UP_S` since the streak's
     first, not before, and then fail as they always did: what the last read said, how long, and every held job of this
-    up released by its id."""
+    up released by its id (under "separate" the read-back of the services' job comes before the agent's job exists)."""
     fake = FakeSlurm(state="RUNNING")
     rig = Rig(hpc, tmp_path, site, [True] * 1000, layout=SEPARATE_LAYOUT, fake=fake, phase=phase)
     with pytest.raises(hpc.slurm.SlurmError, match=said) as refused:
         rig.up()
     assert rig.streak_s >= hpc.slurm.MISSED_POLLS_GIVE_UP_S > rig.failed_at[-2] - rig.failed_at[0]
     assert f"{len(rig.failed_at)} reads in a row failed over {rig.streak_s:.0f} s" in str(refused.value)
-    assert sorted(fake.cancelled) == [SERVICES, AGENT]
-    assert str(refused.value).endswith(f"the held job(s) {SERVICES}, {AGENT} were cancelled")
+    assert sorted(fake.cancelled) == released
+    assert str(refused.value).endswith(f"the held job(s) {', '.join(released)} were cancelled")
 
 
 def test_o57_a_held_job_whose_id_was_reused_during_the_retries_is_never_cancelled(hpc, tmp_path, site):
@@ -223,7 +223,7 @@ def test_o57_reads_that_all_fail_for_ten_minutes_end_the_wait_and_release_every_
     """O57: the wait gives up once every read has failed for `MISSED_POLLS_GIVE_UP_S` since the streak's first, not
     before, and then fails as it always did: it says what the last read said and for how long, and releases every held
     job of this up, by its id. The backoff never sleeps longer than its cap."""
-    fake = FakeSlurm(state="PENDING", job_states={AGENT: "PENDING"})
+    fake = FakeSlurm(state="PENDING")
     rig = Rig(hpc, tmp_path, site, [True] * 1000, layout=SEPARATE_LAYOUT, fake=fake)
     with pytest.raises(hpc.slurm.SlurmError, match="scontrol did not answer in 60 s") as refused:
         rig.up()
@@ -231,8 +231,8 @@ def test_o57_reads_that_all_fail_for_ten_minutes_end_the_wait_and_release_every_
     assert rig.streak_s >= hpc.slurm.MISSED_POLLS_GIVE_UP_S > rig.failed_at[-2] - rig.failed_at[0]
     assert f"{len(rig.failed_at)} reads in a row failed over {rig.streak_s:.0f} s" in str(refused.value)
     assert max(rig.sleeps) == hpc.slurm.MISSED_POLL_BACKOFF_MAX_S == 60.0
-    assert sorted(fake.cancelled) == [SERVICES, AGENT]
-    assert str(refused.value).endswith(f"the held job(s) {SERVICES}, {AGENT} were cancelled")
+    assert fake.cancelled == [SERVICES]  # the agent's job is submitted once the services' runs: none exists yet
+    assert str(refused.value).endswith(f"the held job(s) {SERVICES} were cancelled")
 
 
 def test_o57_an_answer_ends_a_streak_of_failed_reads_and_the_next_one_is_said_again(hpc, tmp_path, site):

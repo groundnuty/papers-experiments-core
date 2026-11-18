@@ -11,7 +11,7 @@ import secrets
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -427,23 +427,48 @@ class Driver(Down):
     def hold_and_place(self, state: Mapping[str, Any], site: Site, excluded: Sequence[str]) -> None:
         """Submit this up's held jobs (the services', and under `separate` the agent's own), wait for each to run, and
         place every role on its node. A failure anywhere from the first sbatch to the end of the placement releases
-        every held job of this up (`releasing`): none is left to start and bill with no federation."""
+        every held job of this up (`releasing`): none is left to start and bill with no federation.
+
+        Under `separate`, without `HPC_EXCLUSIVE_NODES`, the agent's job is submitted only once the services' job runs
+        and its nodes are read, and `--exclude` names those nodes beside the other federations' (live, 18 Nov: the
+        two jobs submitted together, and Slurm packed the agent's onto a services node, which no exclusion read before
+        the submit could name, the up's own nodes being unknown: four ups failed). The cost: the services' nodes bill
+        while the agent's job queues, which the queue bound (`HPC_QUEUE_WAIT_S`) limits. With `HPC_EXCLUSIVE_NODES=1`
+        both jobs hold whole nodes that no other job shares, so exclusivity already keeps the agent off the services'
+        nodes: the two are submitted together, as they were, and wait together. A heterogeneous job (`het`) is one
+        job, whose components Slurm gives nodes of their own: unchanged."""
         asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
         if site.exclusive_nodes:
             self.say("HPC_EXCLUSIVE_NODES=1: every held job asks for whole nodes (--exclusive), and is read back as "
                      "exclusive")  # fmt: skip
+        after = alone is not None and not site.exclusive_nodes  # the agent's job waits for the services' nodes
         held: List[Tuple[str, Allocation]] = []
         with self.releasing(held):
             self.submit(asked, "allocation", held)
-            if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
+            if alone is not None and not after:  # exclusive nodes: the agent's own held job, exactly as the first
                 self.submit(alone, "sandbox", held)
             self.wait_held(held)
-            # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
-            records = [(job, shape, record) for job, wanted in held for shape, record in zip(
-                wanted.shapes(), self.slurm.checked(job, wanted, self.say))]  # fmt: skip
+            records = self.running_records(held)
+            if alone is not None and after:
+                own = self.placed_nodes(records)[0]  # the services' nodes, as the running job holds them
+                agent = replace(alone, exclude=tuple(sorted({*excluded, *own})), own=len(own))
+                self.say(f"the services' job runs: the agent's own held job is submitted now, off its {len(own)} "
+                         f"node(s) and the {len(excluded)} of other live federations")  # fmt: skip
+                self.submit(agent, "sandbox", held)
+                self.wait_held(held[1:])
+                records += self.running_records(held[1:])
             placed = self.placed_nodes(records)
             self.keep_off_other_federations([job for job, _ in held], placed)
             self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
+
+    def running_records(self, held: Sequence[Tuple[str, Allocation]]) -> List[Tuple[str, Any, Dict[str, str]]]:
+        """Each component's record of the running held jobs, read once more now they run: the scheduler may allocate
+        more than a pending request showed."""
+        return [
+            (job, shape, record)
+            for job, wanted in held
+            for shape, record in zip(wanted.shapes(), self.slurm.checked(job, wanted, self.say))
+        ]
 
     @contextmanager
     def releasing(self, held: List[Tuple[str, Allocation]]) -> Iterator[None]:
@@ -572,12 +597,17 @@ class Driver(Down):
     @staticmethod
     def queue_note(wanted: Allocation) -> str:
         """What the queue bound's failure adds for a job that excluded nodes: Slurm keeps a job pending when what is
-        left does not fit it, and the bound is the one `up` always had."""
+        left does not fit it, and the bound is the one `up` always had. The agent's job under `separate` counts the
+        federation's own services' nodes (`Allocation.own`) apart from the other federations'."""
         if not wanted.exclude:
             return ""
+        lack = "Slurm may be keeping it pending for lack of others"
+        others = len(wanted.exclude) - wanted.own
+        if not wanted.own:
+            return f" (it excluded {others} node(s) of other live federations of this account: {lack})"
         return (
-            f" (it excluded {len(wanted.exclude)} node(s) of other live federations of this account: Slurm may be "
-            "keeping it pending for lack of others)"
+            f" (it excluded {wanted.own} node(s) of this federation's own services job and {others} of other live "
+            f"federations of this account: {lack})"
         )
 
     def keep_off_other_federations(self, jobs: Sequence[str], placed: Sequence[Sequence[str]]) -> None:

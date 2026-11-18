@@ -357,6 +357,7 @@ class Allocation:
         str, ...
     ] = ()  # the nodes of other federations' live jobs (hpcexclude): each component's `--exclude`
     exclusive: bool = False  # `--exclusive` on every component (HPC_EXCLUSIVE_NODES): no other job shares its nodes
+    own: int = 0  # how many of `exclude` are the nodes of this federation's own services job (the agent's, `separate`)
 
     def shapes(self) -> Tuple[Shape, ...]:
         """Every component's shape, component 0 first."""

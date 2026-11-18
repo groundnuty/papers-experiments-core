@@ -229,6 +229,13 @@ its business, whatever it runs. It never reads or prints a node's name into a me
   for the reads that follow the jobs' start, where giving up would lose jobs that already run: the read-back of the
   held job (just submitted, and running) and the second read of the account's jobs (`squeue`). A definite answer there
   (a job recorded otherwise than asked, a node another federation holds, a line that cannot be read) ends at once.
+- **Under `"separate"` the agent's own job is submitted once the services' job runs, off its nodes.** Submitted together,
+  Slurm could pack the agent's job onto one of the federation's own services' nodes (live, 18 Nov: four ups refused),
+  and the exclusion read before the submit cannot name nodes that are not yet known. Without `HPC_EXCLUSIVE_NODES`,
+  `up` submits the agent's job after the services' job runs and its nodes are read, with `--exclude` naming them and the
+  other federations' nodes, and waits for it at the same queue bound. The services' nodes bill while the agent's job
+  queues, which that bound limits. With `HPC_EXCLUSIVE_NODES=1` whole nodes are never shared, so both jobs are
+  submitted together; `"het"` is one job and unchanged.
 - **A wait that fails releases every held job of that `up`.** Under `"separate"` the services' job and the agent's own are
   waited for in turn, and a job that does not start in time or ends before it ran is cancelled by its wait. `up` then
   cancels the other held job too, still queued or running, by its own id and only if it still carries the name `up`
