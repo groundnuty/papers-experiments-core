@@ -622,6 +622,15 @@ storage_binds() {  # <workdir> [--storage=PATH]: the `apptainer exec` arguments 
   "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/posixstorage.py" binds --workdir "$1" "$2"
 }
 
+hosts_bind() {  # <workdir> <array name>: the `apptainer exec` arguments that put W/hosts in the place of /etc/hosts (O73)
+  # Every container on a service's rootfs takes them: the service itself (run_service), the checks that ping its Erlang
+  # nodes (check-defaults.sh) and the commands run beside it (exec.sh). A node name the site's DNS does not hold (a
+  # one-label node with HPC_NODE_DOMAIN) resolves only through this file; none without one, as before.
+  local -n _hb=$2
+  _hb=()
+  if [[ -e $1/hosts ]]; then _hb=(--no-mount bind-paths --bind "$1/hosts:/etc/hosts:ro"); fi
+}
+
 run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exec) in the foreground of this process
   local W=$1 R=$1/rootfs S epmd b storage=${2:-}
   local -a binds=()
@@ -650,7 +659,7 @@ run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exe
   # file configure.sh wrote, listing every peer's declared name; --no-mount bind-paths drops the site's binds (and with
   # them /etc/localtime, which becomes the image's), and our file is bound read-only in the place of /etc/hosts.
   local -a naming=()
-  if [[ -e $W/hosts ]]; then naming=(--no-mount bind-paths --bind "$W/hosts:/etc/hosts:ro"); fi
+  hosts_bind "$W" naming
   exec "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" run -- apptainer exec --writable --containall --no-home --pwd /root \
     --workdir "$W/work" "${naming[@]}" "${binds[@]}" "$R" /root/hpcop-start.sh > "$W/run.log" 2>&1 < /dev/null
 }

@@ -132,3 +132,31 @@ def test_the_facts_step_refuses_a_short_name_the_resolver_reads_as_an_address(
     out, err = capsys.readouterr()
     assert out == ""
     assert "IPv4 address" in err
+
+
+@pytest.mark.parametrize("has_hosts", [True, False], ids=["with-a-hosts-file", "without-one"])
+def test_hosts_bind_puts_the_services_hosts_file_over_etc_hosts_only_when_there_is_one(tmp_path, has_hosts):
+    """A one-label node's made-up name resolves only through the service's own hosts file, so every container on its
+    rootfs takes the same bind: the service (run_service), the checks that ping its Erlang nodes (check-defaults.sh)
+    and the commands run beside it (exec.sh). With no hosts file there is no bind, as before."""
+    work = tmp_path / "w"
+    work.mkdir(mode=0o700)
+    if has_hosts:
+        (work / "hosts").write_text("192.0.2.7 n01.nodes.example n01 alpha.example\n", encoding="utf-8")
+    holder = tmp_path / "tmpfs"
+    holder.mkdir(mode=0o700)
+    done = node.lib(f'a=(); hosts_bind "{work}" a; printf "%s\\n" "${{a[@]}}"', env=node.node_env(holder))
+    assert done.returncode == 0, done.stderr
+    words = [w for w in done.stdout.split("\n") if w]
+    assert words == (["--no-mount", "bind-paths", "--bind", f"{work}/hosts:/etc/hosts:ro"] if has_hosts else [])
+
+
+@pytest.mark.parametrize("script", ["check-defaults.sh", "exec.sh"])
+def test_every_container_on_a_services_rootfs_takes_its_hosts_file(script):
+    """The checks and the exec verb start containers of their own on the service's rootfs: each must take hosts_bind's
+    arguments, or a name that only the hosts file holds (live, 18 Nov: the Erlang pings of a one-label node) fails."""
+    text = (node.BUNDLE / script).read_text(encoding="utf-8")
+    execs = [line for line in text.splitlines() if "apptainer exec" in line and not line.lstrip().startswith("#")]
+    assert execs
+    assert "hosts_bind" in text
+    assert all('"${naming[@]}"' in line for line in execs)
