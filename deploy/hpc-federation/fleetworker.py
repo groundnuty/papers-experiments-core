@@ -45,6 +45,7 @@ SCRIPT = HERE / "fleetworker.py"
 WORKER_MODULE = "expcore.campaign.elastic.worker"
 OWNER_FORMAT_KEY = "worker"  # the owner record's `shard` for a worker: not a shard's spec, never matched as one
 REFUSED = 2
+SETTLE_S = 20.0  # how long a launch watches its client for an immediate end, one look a second
 
 
 def _shards() -> Any:
@@ -146,6 +147,10 @@ def node(args: argparse.Namespace, runner: Any = None) -> int:
         if refusal:
             raise shards.ShardsError(refusal)
         work_root = shards.sandbox_work_root(args.root)
+        if (
+            work_root is not None
+        ):  # the sandbox refuses to start without it: made here, 0700, on the tmpfs, as a step does
+            shards.make_work_root(work_root, tmpfs)
     except shards.ShardsError as error:
         print(f"fleetworker: ERROR: {error}; the worker is not started, with nothing made", file=sys.stderr)
         return REFUSED
@@ -199,7 +204,12 @@ def node(args: argparse.Namespace, runner: Any = None) -> int:
 
 
 # ------------------------------------------------------------------------------------------------ on the login node
-def launch(args: argparse.Namespace, runner: Any = None, clock: Callable[[], float] = time.time) -> int:
+def launch(
+    args: argparse.Namespace,
+    runner: Any = None,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
     """`launch`: the member's worker started as a detached `srun` step of its held job, its client recorded; 0 when it
     was started or already runs, 2 (with nothing started) when the member is not one this fleet's up made and holds,
     its job is not the one up held and running, or the shard settings cannot be read."""
@@ -242,6 +252,11 @@ def launch(args: argparse.Namespace, runner: Any = None, clock: Callable[[], flo
                     worker={"pid": client.pid, "start": client.start, "log": str(log), "federation": args.federation}
                 )
             )
+            for _ in range(int(SETTLE_S)):  # `node` refuses a start within seconds: a client gone then is no worker
+                sleep(1.0)
+                if not runner.client_alive(client):
+                    record.update(lambda r: fleetrecord.member_of(r, args.member).update(worker=None))
+                    raise fleetrecord.FleetError(f"its worker's step ended at once (see {log.name}): none is running")
     except (fleetrecord.FleetError, shards.ShardsError, hpcslurm.SlurmError, OSError, ValueError) as error:
         print(f"error: launch: {error}", file=sys.stderr)
         return REFUSED

@@ -126,6 +126,8 @@ def test_the_home_is_a_sibling_of_the_sandboxs_work_root_and_never_under_it_or_t
     assert here.parent == tmp_path / "tmpfs"
     assert not here.is_relative_to(tmp_path / "tmpfs" / "sandbox-work")
     assert not here.is_relative_to(Path(args.root))
+    work_root = tmp_path / "tmpfs" / "sandbox-work"
+    assert stat.S_IMODE(work_root.stat().st_mode) == 0o700  # made for the sandbox, which refuses to start without it
     refused = args_of(tmp_path, key_tree(tmp_path / "again"), work_root=str(tmp_path / "tmpfs"))
     assert worker.node(refused, never_run) == 2
     assert not list((tmp_path / "tmpfs").iterdir())

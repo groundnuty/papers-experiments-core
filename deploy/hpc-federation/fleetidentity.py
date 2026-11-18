@@ -60,6 +60,10 @@ def read_identity(
         if why is not None or found["status"] != "up":
             return None
         settings = fleetplan.read_settings(settings_path)
+        if settings.get("home_files") and shards.home_files_overlap_problem(
+            settings["home_files"], Path(settings["study"])
+        ):
+            return None  # the key tree lies in the study: never copied here (the worker refuses it as well)
         root = fleetrecord.root_of(fleet, member)
         scratch = Path(tempfile.mkdtemp(prefix="expcore-identity-", dir=str(fleet)))
     except (fleetrecord.FleetError, OSError, ValueError):

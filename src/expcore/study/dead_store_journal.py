@@ -16,9 +16,11 @@ kind is not journaled). One the store holds ended is its row's; an attempt the j
 store lacks (or holds running) is counted charged, the ledger's own provisional charge being as high; any other end,
 and an attempt the journal never saw end (interrupted by the loss), is not charged.
 
-**None** (the lease stays charged its grant) for a journal that is not there, is not the one the store's own start
-opened (its name, campaign and whole shard spec, so another lease's journal is never read), has a line that is not
-whole before the last (a last line a kill cut short was never spent and is dropped), or names another run; for a store
+**None** (the lease stays charged its grant) for a journal that is not there, has no whole header (an empty file would
+read as "nothing spent"), does not list every attempt the store holds (a short or damaged journal), is not the one the
+store's own start opened (its name, campaign and whole shard spec, so another lease's journal is never read), has a
+line that is not whole before the last (a last line a kill cut short was never spent and is dropped), or names another
+run; for a store
 a dispatcher still holds, one that changes while copied, one the study's prices do not fit, an unknown spend, and a
 figure above the lease's grant (a spend the cap should have held: the ledger would record the lease's cap as failed).
 Nothing is written beside the store or the journal.
@@ -63,6 +65,9 @@ _UNREADABLE = (
     OSError,
     sqlite3.Error,
     ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
 )
 
 
@@ -115,6 +120,11 @@ def _read(out: Path, study: StudyConfig, raw: bytes, private: Path) -> JournalRe
         named = private / "journals" / LEASE_JOURNAL
         named.write_bytes(raw)
         journal = read_journal(named, ledger.campaign, shard)  # another lease's or campaign's journal refuses here
+        held = {r["id"] for r in store.q("SELECT id FROM attempts")}
+        if raw.count(b"\n") < 1 or not held <= set(journal.attempts):
+            return (
+                None  # no whole header, or not every attempt the store holds: a damaged or short journal reads as none
+            )
         if any(entry.get("run_key") != run_key for entry in journal.attempts.values()):
             return None
         ended = {r["id"] for r in store.q("SELECT id FROM attempts WHERE state != 'running'")}

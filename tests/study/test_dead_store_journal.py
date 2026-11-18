@@ -225,3 +225,19 @@ def test_what_a_federation_joins_with_is_what_its_lease_store_pins(ended):
     assert environment == pinned == IDENTITY
     lease = json.loads((ended / "lease.json").read_text(encoding="utf-8"))
     assert fingerprint_sha256(fingerprint) == lease["campaign_sha256"]
+
+
+def test_a_journal_with_no_header_a_short_one_or_a_line_missing_its_state_gives_no_figure(base, ended):
+    """An empty file would read as "nothing spent", and a journal that does not list every attempt the store holds is
+    short or damaged: none for each, and none (never an error) for an attempt line with no state."""
+    empty = _mid_run(base, ended, "empty-journal")
+    (empty / LEASE_JOURNAL).write_text("", encoding="utf-8")
+    assert _read(empty) is None
+    short = _mid_run(base, ended, "short-journal")
+    first = (short / LEASE_JOURNAL).read_text(encoding="utf-8").splitlines()[0]
+    (short / LEASE_JOURNAL).write_text(first + "\n", encoding="utf-8")
+    assert _read(short) is None
+    stateless = _mid_run(base, ended, "stateless-line")
+    (line,) = _later_attempt(stateless, "infra_fail")
+    _append(stateless, {key: value for key, value in line.items() if key != "state"})
+    assert _read(stateless) is None

@@ -1685,8 +1685,10 @@ Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Noth
   not the one up held and running, and starts the worker once: one detached `srun` step of the federation's agent job,
   `--exact` (never `--overlap`), `--chdir=/`, `--time` the job's remaining minutes rounded up, behind `env -i` with the
   allowlist alone, the step named `<job name>-worker`; its client is recorded as the member's `worker` in `fleet.json`,
-  and a recorded client that lives is not started again. `fleet.py`'s commands are unchanged.
-- **On the node** (`fleetworker.py node`). A private directory on the node's `--tmpfs`, named as a shard step's with the
+  and a recorded client that lives is not started again. It watches the client for 20 s: a step that ends at once (`node`
+  refuses a start it cannot make) is no launch, nothing is recorded, and the join waits. `fleet.py`'s commands are unchanged.
+- **On the node** (`fleetworker.py node`). The sandbox's work root is made as a shard step makes it (0700, on the tmpfs; the
+  sandbox refuses to start without it). A private directory on the node's `--tmpfs`, named as a shard step's with the
   same owner record (so `shards.py sweep`, which `down` runs on the node, removes what a killed worker leaves once its
   process is shown gone), a sibling of the sandbox's work root and never under it or the federation's root. In it: `home`
   (the worker's HOME and XDG directories), `tmp`, `study` (a copy with the federation's `platform.toml`) and `work`

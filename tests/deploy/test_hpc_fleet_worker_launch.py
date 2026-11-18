@@ -15,6 +15,10 @@ pytestmark = pytest.mark.skipif(not HAS_OPENSSL, reason="the zone's CA is made w
 NOW = 1_800_000_000.0
 
 
+def quiet(seconds: float) -> None:
+    """The launch's wait on its client, not slept on."""
+
+
 @pytest.fixture(scope="module")
 def deploy():
     with fleet_modules() as found:
@@ -52,7 +56,7 @@ def test_the_workers_line_is_one_exact_step_of_the_agents_job_bounded_by_the_job
     assert bench.up(2)[0] == 0
     settings = bench.settings('home_files = "/operator/keys"')
     runner = StepRunner(bench, "fed-1")
-    assert deploy.fleetworker.launch(arguments(bench, settings, remaining_s=7201.0), runner, lambda: NOW) == 0
+    assert deploy.fleetworker.launch(arguments(bench, settings, remaining_s=7201.0), runner, lambda: NOW, quiet) == 0
     (launched,) = bench.spawned
     argv = launched.argv
     assert f"--jobid={job_ids('fed-1')[1]}" in argv
@@ -75,11 +79,14 @@ def test_a_worker_that_runs_is_not_launched_again_and_a_member_that_is_not_up_ge
     assert bench.up(2)[0] == 0
     settings = bench.settings()
     runner = StepRunner(bench, "fed-1")
-    assert deploy.fleetworker.launch(arguments(bench, settings), runner, lambda: NOW) == 0
-    assert deploy.fleetworker.launch(arguments(bench, settings), runner, lambda: NOW) == 0
+    assert deploy.fleetworker.launch(arguments(bench, settings), runner, lambda: NOW, quiet) == 0
+    assert deploy.fleetworker.launch(arguments(bench, settings), runner, lambda: NOW, quiet) == 0
     assert len(bench.spawned) == 1
     assert bench.run("down", "--member", "fed-2")[0] == 0
-    assert deploy.fleetworker.launch(arguments(bench, settings, "fed-2"), StepRunner(bench, "fed-2"), lambda: NOW) == 2
+    assert (
+        deploy.fleetworker.launch(arguments(bench, settings, "fed-2"), StepRunner(bench, "fed-2"), lambda: NOW, quiet)
+        == 2
+    )
     assert len(bench.spawned) == 1
 
 
@@ -87,3 +94,15 @@ def test_the_fleets_shard_settings_take_home_files(deploy, bench):
     """`home_files` is one of the fleet's optional shard settings: read, and kept for the lines it makes."""
     path = bench.settings('home_files = "/operator/keys"')
     assert deploy.fleetplan.read_settings(path)["home_files"] == "/operator/keys"
+
+
+def test_a_worker_whose_step_ends_at_once_is_no_launch(deploy, bench):
+    """`node` refuses a start (an unreadable key tree, a core it cannot run) within seconds of its step starting: a
+    client that is gone while the launch watches it is no worker, so the launch fails, records none, and the
+    controller's join waits."""
+    assert bench.up(2)[0] == 0
+    settings = bench.settings()
+    runner = StepRunner(bench, "fed-1")
+    died = lambda seconds: bench.alive.clear()  # noqa: E731
+    assert deploy.fleetworker.launch(arguments(bench, settings), runner, lambda: NOW, died) == 2
+    assert member(bench, "fed-1").get("worker") is None
