@@ -158,3 +158,11 @@ def test_c43_an_add_is_refused_at_the_login_nodes_memory_cap():
     fits = decide(NOW, view, [(settings(login_memory_mb=used + 296.0), site(members=members))])
     assert fits.targets["site-a"]["limits"]["login_memory"] == 1
     assert decide(NOW, view, [(settings(), site(members=members))]).targets["site-a"]["limits"]["login_memory"] is None
+
+
+def test_c43_a_failed_member_still_holding_a_waiting_job_reserves_its_nodes():
+    """C43: a failed up whose job still waits (its cancel failed) may still be given its 7 nodes: they stay reserved."""
+    view = ledger(pending={"m1": 3})
+    failed = member("fed-1", status="failed", state="PENDING", linked=False, verified=False, submitted_at=NOW - 60)
+    decision = decide(NOW, view, [(settings(), site(idle_nodes=14, members=[failed]))])
+    assert decision.targets["site-a"]["limits"]["nodes"] == 1

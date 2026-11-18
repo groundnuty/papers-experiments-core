@@ -43,7 +43,7 @@ import hpcquota  # noqa: E402
 import hpcstate  # noqa: E402
 from fedlayout import Layout  # noqa: E402
 from fedspec import load_spec  # noqa: E402
-from fleetrecord import HOLDS_NOTHING, LINKED, Record, jobs_of, root_of, sandbox_name, slot_of  # noqa: E402
+from fleetrecord import HOLDS_NOTHING, LINKED, Record, identity, jobs_of, root_of, sandbox_name, slot_of  # noqa: E402
 from hpcsettings import agent_limits, load_settings, site_from_environment  # noqa: E402
 from hpcslurm import ENDED_STATES, SLURM_TIME, WAITING_STATES, Client, Slurm, SlurmError  # noqa: E402
 
@@ -121,9 +121,20 @@ def combined(views: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def verified(state: Mapping[str, Any]) -> bool:
-    """Every ingested space of the member verified by `hpcfed.py verify-data` (True when it ingests none)."""
-    spaces = ((state.get("data") or {}).get("ingested") or {}).values()
-    return all(space.get("verified") is not None for space in spaces)
+    """Every ingested space of the member verified by `hpcfed.py verify-data` (True when it ingests none): a marker
+    bound to the manifest and the space `up` recorded, as `shards.check_ingested` reads one. A state with no record of
+    its ingested spaces (an older up's) is never verified, so its inodes stay reserved."""
+    data = state.get("data")
+    spaces = data.get("ingested") if isinstance(data, Mapping) else None
+    if not isinstance(spaces, Mapping):
+        return False
+    for record in spaces.values():
+        marker = record.get("verified") if isinstance(record, Mapping) else None
+        if not isinstance(marker, Mapping) or marker.get("manifest") != record.get("manifest"):
+            return False
+        if not isinstance(marker.get("space_id"), str) or marker.get("space_id") != record.get("space_id"):
+            return False
+    return True
 
 
 def heartbeat(root: Path) -> Optional[Dict[str, Any]]:
@@ -159,8 +170,11 @@ def member_view(directory: Path, member: Mapping[str, Any], slurm: Slurm, wall: 
     label, status = member["label"], member["status"]
     root = root_of(directory, label)
     view = {"label": label, "status": status, "root": str(root), "jobs": [], "linked": False, "verified": False}
-    if status in HOLDS_NOTHING and status != "claimed":
+    if status in HOLDS_NOTHING:  # taken or down hold nothing; a claimed slot is not made yet: nothing to read
         return {**view, **combined([])}
+    reason, _name = identity(directory, dict(member))  # the fleet's own check: its root, its state, its jobs
+    if reason is not None:
+        raise ObserveError(f"a member is not the federation this fleet made ({reason})")
     try:
         state = hpcstate.load(root) if root.is_dir() else None
     except hpcstate.StateError:

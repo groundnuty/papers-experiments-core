@@ -187,3 +187,18 @@ def test_c43_every_lost_lease_not_yet_settled_is_settled_but_one_whose_cancelled
         (14, "fed-1", "/fleet/fed-1/root"),
     ]
     assert all(a.reason for a in settles)
+
+
+def test_c43_no_path_drains_a_federation_at_or_past_its_recorded_end():
+    """C43: past its recorded end (Slurm may still show the job running), a federation whose lease expired, whose fleet
+    status is not up, or whose relay is gone is not drained, and the idle surplus never picks it: it is proven ended,
+    never drained."""
+    for changes, holding in (({}, "expired"), ({"status": "down-failed"}, None), ({"relay": "gone"}, None)):
+        fleet = site(members=[member("fed-1", **changes)])
+        hold = {} if holding is None else {"site-a-fed-1": holding}
+        view = ledger(pending={"m1": 1}, federations=[joined("fed-1", end_in_s=-30.0)], holding=hold)
+        assert of(decide(NOW, view, [(settings(), fleet)]), Drain) == [], changes
+    feds = [joined("fed-1", end_in_s=-30.0), joined("fed-2", end_in_s=3 * HOUR)]
+    fleet = site(members=[member("fed-1"), member("fed-2")])
+    view = ledger(federations=feds, idle_since={f.label: NOW - 2000 for f in feds})
+    assert [d.label for d in of(decide(NOW, view, [(settings(), fleet)]), Drain)] == ["site-a-fed-2"]

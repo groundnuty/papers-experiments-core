@@ -36,6 +36,7 @@ optionally `interpreter` and `deploy` (the Python and this directory on its logi
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -48,7 +49,17 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from fleetexecute import Executor, LocalTransport, Log, SiteConfig, described, last_line, printed, render  # noqa: E402
+from fleetexecute import (  # noqa: E402
+    Executor,
+    LocalTransport,
+    Log,
+    SiteConfig,
+    described,
+    drain_refused,
+    last_line,
+    printed,
+    render,
+)
 
 COMMANDS = ("observe", "control", "drain", "ended", "join", "settle")
 CONTROLLER_KEYS = ("evidence", "interval_s", "log")
@@ -120,6 +131,8 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
                                 deploy))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
         raise ConfigError("the sites file needs at least one [[site]], each label once")
+    if len({s.fleet for s in sites}) != len(sites):
+        raise ConfigError("two sites name one fleet directory: each fleet is one site's, read and acted on once")
     return controller, sites
 
 
@@ -146,7 +159,7 @@ def observe_site(transport: Any, site: SiteConfig, observed: Optional[Path]) -> 
             if code != 0:
                 return SiteView(label=site.label, error=f"its read failed with status {code}: {last_line(err)}")
         return site_view(site.label, text)
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError) as error:
         return SiteView(label=site.label, error=f"its read could not be taken or parsed ({type(error).__name__})")
 
 
@@ -157,8 +170,8 @@ def tick(views: Any, ledger_path: Path, controller: Controller, sites: Sequence[
     from expcore.campaign.elastic.control import decide, ledger_view
 
     by_label = {site.label: site for site in sites}
+    busy = executor.busy() if executor is not None else frozenset()  # before the reads: what ends during them is busy
     reads = [(site.settings, observe_site(transport, site, observed.get(site.label))) for site in sites]
-    busy = executor.busy() if executor is not None else frozenset()
     view = ledger_view(views)
     decision = decide(hooks.clock(), view, reads, busy)
     entries = [described(a, render(a, by_label[a.site], controller.evidence, ledger_path)) for a in decision.actions]
@@ -215,7 +228,7 @@ def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
             hooks.sleep(controller.interval_s)
     ledger = Ledger.open(args.ledger, clock=hooks.clock)
     executor = Executor(ledger, args.ledger, {s.label: s for s in sites}, transport, controller.evidence, log,
-                        hooks.identity, hooks.spend)  # fmt: skip
+                        hooks.identity, hooks.spend, clock=hooks.clock)  # fmt: skip
     try:
         while True:
             tick(ledger, args.ledger, controller, sites, observed, transport, executor, log, hooks)
@@ -235,6 +248,9 @@ def by_hand(args: argparse.Namespace, hooks: Hooks) -> int:
     ledger = Ledger.open(args.ledger, clock=hooks.clock)
     try:
         if args.command == "drain":
+            late = drain_refused(ledger, args.label, hooks.clock())
+            if late is not None:
+                raise ConfigError(late)
             ledger.drain(args.label)
         elif args.command == "settle":
             ledger.settle(args.lease, args.spend_micro, args.source, attempts_charged=args.attempts)

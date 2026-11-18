@@ -4,6 +4,7 @@ never with a lease in flight) and replaces federations through the fleet's own c
 what a live tick runs, and runs nothing."""
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,7 +14,7 @@ from elastic_support import ENVIRONMENT, FINGERPRINT, FakeClock, config, plan
 from hpc_fleet_support import fleet_modules
 
 from expcore.campaign.elastic import Lease, Ledger, Wait
-from expcore.campaign.elastic.control import Add, Retire, SiteSettings
+from expcore.campaign.elastic.control import Add, Drain, Retire, SiteSettings, read_only
 
 DIGEST = "c" * 64
 
@@ -524,3 +525,124 @@ def test_c43_a_dead_relay_is_detected_recorded_with_its_last_heartbeat_and_its_f
     (drain,) = [a for a in tick["actions"] if a["action"] == "Drain"]
     assert drain["reason"].startswith("relay gone, no exit status")
     assert "1 relay(s) gone" in bench.printed[-1]
+
+
+# ------------------------------------------------------------------------------------------------ review round 1
+@pytest.mark.parametrize("forged", ["root", "job"])
+def test_c43_a_member_whose_root_is_not_the_one_its_up_made_darkens_the_site(deploy, tmp_path, site, forged):
+    """C43: a state file written by an up of another root, or naming another job than the fleet recorded, is not this
+    fleet's federation: the read fails whole (nothing of it is read as ours) and the site gets no action."""
+    up(site, "fed-1", 41)
+    path = site.fleet / "fed-1" / "root" / "hpc-federation.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if forged == "root":
+        state["command"][state["command"].index("--root") + 1] = "/elsewhere/fed-1/root"
+    else:
+        state["allocation"]["job"] = "202"
+        site.jobs["202"] = running(site)
+    path.write_text(json.dumps(state), encoding="utf-8")
+    bench = Bench(tmp_path, deploy, [site])
+    bench.tick()
+    assert site.commands == []
+    assert "dark" in bench.lines("tick")[-1]["targets"]["site-a"]
+    assert not any(call[:4] == ["scontrol", "show", "job", "-o"] and call[4] == "202" for call in site.calls)
+
+
+def test_c43_a_member_is_verified_only_by_markers_bound_to_its_recorded_manifest(deploy, site):
+    """C43: an older state with no record of its ingested spaces, or a marker for another manifest, is not verified,
+    so its inodes stay reserved."""
+    up(site, "fed-1", 41)
+    path = site.fleet / "fed-1" / "root" / "hpc-federation.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert observed(site)["members"][0]["verified"] is True
+    other = dict(state, data={"ingested": {"delta": {**state["data"]["ingested"]["delta"],
+                                                     "verified": {"manifest": "e" * 64, "files": 1, "bytes": 1,
+                                                                  "space_id": "space-one"}}}})  # fmt: skip
+    for changed in ({k: v for k, v in state.items() if k != "data"}, other):
+        path.write_text(json.dumps(changed), encoding="utf-8")
+        assert observed(site)["members"][0]["verified"] is False
+
+
+def test_c43_the_busy_operations_are_taken_before_the_sites_are_read(deploy, tmp_path, site):
+    """C43: an add that ends while the sites are read is still busy for that tick, so the read taken before it ended
+    never lets the same room be spent twice."""
+    bench = Bench(tmp_path, deploy, [site])
+    order = []
+
+    class Executor:
+        def busy(self):
+            order.append("busy")
+            return frozenset({"site-a"})
+
+        def run(self, decision):
+            order.append("run")
+
+    class Transport:
+        def run(self, config_, argv, timeout):
+            order.append("read")
+            return site.transport().run(config_, argv, timeout)
+
+    controller, sites = deploy.fleetcontrol.load_config(bench.file())
+    log = deploy.fleetexecute.Log(None)
+    views = read_only(bench.ledger)
+    try:
+        decision = deploy.fleetcontrol.tick(views, bench.ledger, controller, sites, {}, Transport(), Executor(), log,
+                                            bench.hooks())  # fmt: skip
+    finally:
+        views.close()
+    assert order == ["busy", "read", "run"]
+    assert [type(a).__name__ for a in decision.actions] == []
+
+
+def test_c43_two_sites_never_share_one_fleet(deploy, tmp_path, site):
+    """C43: two site labels naming one fleet directory would read and act on its members twice: refused."""
+    bench = Bench(tmp_path, deploy, [site, site])
+    assert bench.tick() == 2
+    assert site.commands == []
+
+
+def test_c43_a_drain_decided_before_the_end_is_not_run_after_it_nor_by_hand(deploy, tmp_path, site):
+    """C43: a drain whose federation's recorded end has passed by the time it runs is refused and logged, and the
+    `drain` verb refuses one past its end too."""
+    up(site, "fed-1", 41, ends_in=3000)
+    bench = Bench(tmp_path, deploy, [site])
+    bench.tick()
+    bench.clock.advance(3000)
+    ledger = bench.open()
+    log = deploy.fleetexecute.Log(None)
+    executor = deploy.fleetexecute.Executor(ledger, bench.ledger, {}, None, tmp_path / "evidence", log,
+                                            clock=bench.clock)  # fmt: skip
+    executor.in_ledger(Drain("site-a", "fed-1", "site-a-fed-1", "decided a moment before its end"))
+    assert ledger.federations()[0].drained_at is None
+    ledger.close()
+    assert "past its recorded job end" in log.lines[-1]["said"]
+    argv = ["drain", "--ledger", str(bench.ledger), "--label", "site-a-fed-1"]
+    assert deploy.fleetcontrol.main(argv, {}, bench.hooks()) == 2
+    assert federations(bench)["site-a-fed-1"].drained_at is None
+
+
+def test_c43_a_site_whose_read_times_out_is_dark_and_the_loop_goes_on(deploy, tmp_path, site):
+    """C43: a read that times out (the local transport's subprocess timeout) darkens that site for the tick; the other
+    site is still read and acted on."""
+    other = FakeSite(tmp_path / "site-b", deploy)
+    bench = Bench(tmp_path, deploy, [site, other])
+    real = bench.hooks
+
+    def hooks(identity=None, spend=None):
+        found = real(identity, spend)
+        inner = found.transport({})
+
+        class Transport:
+            def run(self, config_, argv, timeout):
+                if config_.label == "site-a":
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                return inner.run(config_, argv, timeout)
+
+        found.transport = lambda environ: Transport()
+        return found
+
+    bench.hooks = hooks
+    assert bench.tick() == 0
+    tick = bench.lines("tick")[-1]
+    assert "TimeoutExpired" in tick["targets"]["site-a"]["dark"]
+    assert verbs(other) == ["add"]

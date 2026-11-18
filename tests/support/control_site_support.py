@@ -78,18 +78,24 @@ class FakeSite:
             job.name = job.name or (name if key == "allocation" else f"{name}-sandbox")
             self.jobs[job_id] = job
 
+        root = fleetrecord.root_of(self.fleet, label)
+        made = [1, 2]
+        if phase is not None:
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            made = [os.lstat(root).st_dev, os.lstat(root).st_ino]
+
         def change(record: dict) -> None:
             member = fleetrecord.new_member(self.fleet, label)
-            member.update(status=status, name=name, jobs=ids, made=[1, 2] if status != "claimed" else None)
+            member.update(status=status, name=name, jobs=ids, made=made if status != "claimed" else None)
             record["members"].append(member)
 
         fleetrecord.Record(self.fleet).update(change)
         if phase is None:
             return
-        root = fleetrecord.root_of(self.fleet, label)
-        root.mkdir(parents=True, exist_ok=True)
-        marker = {"manifest": "a" * 64, "files": 3, "bytes": 30, "space_id": "space-one"}
+        marker = {"manifest": "b" * 64, "files": 3, "bytes": 30, "space_id": "space-one"}
+        command = ["python", "hpcfed.py", "--layout", str(SEPARATE_LAYOUT), "--root", str(root), "up"]
         state = {"format": "expcore-hpc-federation/1", "project": "p", "phase": phase, "site": {}, "services": {},
+                 "command": command,
                  "allocation": {"job": ids.get("allocation"), "name": name},
                  "data": {"ingested": {"delta": {"declared": True, "manifest": "b" * 64, "space_id": "space-one",
                                                  "verified": marker if verified else None}}}}  # fmt: skip

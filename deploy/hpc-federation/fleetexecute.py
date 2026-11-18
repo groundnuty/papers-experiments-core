@@ -143,6 +143,15 @@ def last_line(text: str) -> str:
     return "".join(c if c.isprintable() else "?" for c in said)[-300:]
 
 
+def drain_refused(ledger: Any, label: str, now: float) -> Optional[str]:
+    """Why a federation must not be drained now: its recorded job end has passed (the drain comes before it, never
+    after); None when it may."""
+    found = {f.label: f for f in ledger.federations()}.get(label)
+    if found is not None and now >= found.job_end_at:
+        return f"{label} is past its recorded job end: it is not drained (its end is proven, not drained)"
+    return None
+
+
 class Log:
     """The controller's JSON log: one object per line, appended and flushed, from the loop and the background."""
 
@@ -155,8 +164,9 @@ class Log:
     def write(self, kind: str, **fields: Any) -> None:
         entry = {"at": self.clock(), "kind": kind, **fields}
         with self.lock:
-            self.lines.append(entry)
-            if self.path is not None:
+            if self.path is None:
+                self.lines.append(entry)  # kept in memory only when there is no file to append to
+            else:
                 with open(self.path, "a", encoding="utf-8") as handle:
                     handle.write(json.dumps(entry, sort_keys=True) + "\n")
                     handle.flush()
@@ -176,6 +186,7 @@ class Executor:
     # (site, the Settle) -> (spend in micro-dollars, its source "root" or "pulled", charged attempts or None), or None
     spend: Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]] = lambda site, action: None
     unread: set = field(default_factory=set)  # lost leases whose log could not be read, said once each
+    clock: Callable[[], float] = time.time
     pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(max_workers=8))
     running: Dict[str, Future] = field(default_factory=dict)
 
@@ -212,6 +223,10 @@ class Executor:
         if kind == "ProveEnded":
             self.ledger.prove_ended(action.label, action.proof)
         elif kind == "Drain":
+            late = drain_refused(self.ledger, action.label, self.clock())
+            if late is not None:
+                self.log.write("result", action=kind, label=action.label, ok=False, said=late)
+                return
             self.ledger.drain(action.label)
         elif kind == "Settle":
             found = self.spend(self.sites.get(action.site), action)

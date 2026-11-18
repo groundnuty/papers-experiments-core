@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from expcore.campaign.elastic.controlinputs import (
     GONE,
     HOLDS_NOTHING,
+    WAITING,
     LedgerView,
     Member,
     SiteSettings,
@@ -258,6 +259,8 @@ def _joined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member, f
     if m.ended:
         acts.append(ProveEnded(site, m.label, label, "terminal", f"the site shows its job ended ({m.state})"))
         return "gone"
+    if now >= fed.job_end_at:
+        return "gone"  # past its recorded end: never drained now; the site's read or the ledger's sweep proves it
     cutoff = cutoff_s(settings, ledger)
     if m.status != "up":
         acts.append(Drain(site, m.label, label, f"its fleet status is {m.status}: it is taken down again"))
@@ -268,8 +271,6 @@ def _joined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member, f
     elif fed.job_end_at - cutoff <= now < fed.job_end_at:
         left = fed.job_end_at - now
         acts.append(Drain(site, m.label, label, f"{left:.0f} s to its job end, within the {cutoff:.0f} s cut-off"))
-    elif now >= fed.job_end_at:
-        return "gone"  # past its end: the site's read or the ledger's sweep proves it
     else:
         return "working" if held in LIVE else "free"
     return "working" if held in LIVE else "gone"
@@ -302,7 +303,8 @@ def login_memory(settings: SiteSettings, view: SiteView) -> dict:
 def _room(now: float, settings: SiteSettings, view: SiteView, busy: frozenset[str]) -> tuple[int, dict]:
     """How many more federations the site can take now (before `parallel_ups`), and each limit's own figure."""
     live = [m for m in view.members if m.status not in HOLDS_NOTHING]
-    starting = [m for m in live if m.status in ("claimed", "made", "up") and m.waiting]
+    # every up whose job has not started, whatever its record says (a failed one may still hold a waiting job)
+    starting = [m for m in live if (m.status in ("claimed", "made") and m.state is None) or m.state in WAITING]
     unsettled = [m for m in live if not (m.linked and m.verified)]  # its files are not all on scratch yet
     per = view.nodes_per_federation
     limits: dict = {"maximum": settings.max_federations - len(live)}
@@ -392,6 +394,8 @@ def _retire_idle(
             fed = ledger.federations.get(label)
             if fed is None or label in drained or fed.drained_at is not None or fed.ended_at is not None:
                 continue
+            if now >= fed.job_end_at:
+                continue  # past its recorded end: never drained
             if m.status != "up" or m.state != "RUNNING" or ledger.holding.get(label) is not None:
                 continue
             since = ledger.idle_since.get(label, fed.joined_at)
